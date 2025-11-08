@@ -99,11 +99,7 @@ async fn start_async(opts: Options) -> Result<(), Error> {
     let all_inbounds = config
         .inbounds
         .into_iter()
-        .map(|inbound| {
-            let server_config = ServerConfig::try_from(inbound).unwrap();
-
-            server_config
-        })
+        .map(|inbound| ServerConfig::try_from(inbound).unwrap())
         .collect::<Vec<_>>();
 
     let mut join_handles = Vec::with_capacity(all_inbounds.len() * 2);
@@ -116,6 +112,6 @@ async fn start_async(opts: Options) -> Result<(), Error> {
         .0
         .map_err(|x| {
             tracing::error!("runtime error: {}, shutting down", x);
-            Error::Io(std::io::Error::new(std::io::ErrorKind::Other, x))
+            Error::Io(std::io::Error::other(x))
         })
 }
