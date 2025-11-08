@@ -28,7 +28,7 @@ pub struct WebsocketStream {
     pending_write_pong: bool,
 
     write_frame: Box<[u8]>,
-    
+
     write_frame_end_offset: usize,
 
     is_client: bool,
@@ -61,7 +61,6 @@ impl OpCode {
             1 => OpCode::Text,
             2 => OpCode::Binary,
             8 => OpCode::Close,
-            
 
             _ => OpCode::Unknown(code),
         }
@@ -69,21 +68,13 @@ impl OpCode {
 }
 
 impl WebsocketStream {
-    pub fn new(
-        stream: Box<dyn AsyncStream>,
-        is_client: bool,
-        
-        unprocessed_data: &[u8],
-    ) -> Self {
+    pub fn new(stream: Box<dyn AsyncStream>, is_client: bool, unprocessed_data: &[u8]) -> Self {
         let mut unprocessed_buf = allocate_vec(16384).into_boxed_slice();
         let mut unprocessed_end_offset = 0;
         let write_frame = allocate_vec(32768).into_boxed_slice();
 
         let pending_initial_data = if !unprocessed_data.is_empty() {
             todo!()
-            
-
-
         } else {
             false
         };
@@ -127,23 +118,12 @@ impl WebsocketStream {
         self.unprocessed_start_offset += 2;
         if self.unprocessed_start_offset == self.unprocessed_end_offset {
             todo!()
-            
-            
         }
 
         let read_frame_final = first & 0x80 != 0;
 
         self.read_frame_masked = second & 0x80 != 0;
 
-        
-        
-        
-        
-        
-        
-        
-        
-        
         self.read_frame_opcode = OpCode::from(first & 0x0f);
 
         if !read_frame_final
@@ -155,8 +135,6 @@ impl WebsocketStream {
 
         let length = second & 0x7f;
 
-        
-        
         if length == 126 {
             self.read_state = ReadState::ReadLength {
                 length_bytes_len: 2,
@@ -170,7 +148,7 @@ impl WebsocketStream {
                 self.read_state = ReadState::ReadMask;
                 self.step_read_mask(cx, buf)
             } else {
-                todo!() 
+                todo!()
             }
         }
     }
@@ -213,7 +191,6 @@ impl WebsocketStream {
             self.step_read_mask(cx, buf)
         } else {
             todo!()
-            
         }
     }
 
@@ -261,7 +238,7 @@ impl WebsocketStream {
                 debug!("Unknown opcode {:?}", self.read_frame_opcode);
                 if self.read_frame_length == 0 {
                     self.read_state = ReadState::Init;
-                    todo!() 
+                    todo!()
                 } else {
                     self.read_state = ReadState::SkipContent;
                     self.step_skip_content(cx, buf)
@@ -279,8 +256,6 @@ impl WebsocketStream {
 
         let available_space = buf.remaining();
         if available_space == 0 {
-            
-            
             debug!("step_read_binary_content No space in buffer");
             return Ok(());
         }
@@ -330,7 +305,6 @@ impl WebsocketStream {
     fn pack_write_frame(&mut self, input: &[u8]) -> usize {
         let available_space = self.write_frame.len() - self.write_frame_end_offset;
 
-        
         if available_space < 40 {
             debug!("poll_write pack_write_frame No space in buffer");
             return 0;
@@ -338,7 +312,6 @@ impl WebsocketStream {
 
         let pack_amount = std::cmp::min(input.len(), available_space - 14);
 
-        
         let written = pack_frame(
             0x02,
             self.is_client,
@@ -359,12 +332,7 @@ impl WebsocketStream {
                 Poll::Ready(Ok(written)) => {
                     debug!("poll_write wrote {} bytes", written);
                     if written == 0 {
-                        
                         todo!()
-                        
-
-
-
                     }
                     self.write_frame_start_offset += written;
                     if self.write_frame_start_offset == self.write_frame_end_offset {
@@ -375,11 +343,9 @@ impl WebsocketStream {
                 }
                 Poll::Ready(Err(e)) => {
                     todo!()
-                    
                 }
                 Poll::Pending => {
                     todo!()
-                    
                 }
             }
         }
@@ -406,7 +372,6 @@ impl WebsocketStream {
             self.read_frame_length -= skip_amount;
             if self.read_frame_length > 0 {
                 todo!()
-                
             }
         }
 
@@ -417,7 +382,7 @@ impl WebsocketStream {
 
 impl AsyncPing for WebsocketStream {
     fn supports_ping(&self) -> bool {
-        todo!() 
+        todo!()
     }
 
     fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<bool>> {
@@ -448,11 +413,9 @@ impl AsyncWrite for WebsocketStream {
 
             if let Err(e) = this.do_write_frame(cx) {
                 todo!()
-                
             }
 
             if this.write_frame_end_offset > 0 {
-                
                 break;
             }
         }
@@ -462,7 +425,6 @@ impl AsyncWrite for WebsocketStream {
             Poll::Ready(Ok(written))
         } else {
             todo!()
-            
         }
     }
 
@@ -478,13 +440,11 @@ impl AsyncWrite for WebsocketStream {
             return Pin::new(&mut this.stream).poll_flush(cx);
         }
 
-        
         while this.write_frame_end_offset > 0 {
             match this.do_write_frame(cx) {
                 Ok(()) => {
                     if this.write_frame_end_offset > 0 {
                         todo!("poll_flush write_frame_end_offset > 0");
-                        
                     }
                 }
                 Err(e) => {
@@ -516,9 +476,6 @@ impl AsyncRead for WebsocketStream {
         debug!("poll_read started");
         let this = self.get_mut();
 
-        
-        
-        
         if this.unprocessed_end_offset > 0 && this.read_state == ReadState::ReadBinaryContent {
             let read_result = this.step_read_binary_content(cx, buf);
             if read_result.is_err() {
@@ -530,18 +487,11 @@ impl AsyncRead for WebsocketStream {
         }
 
         loop {
-            
             if this.unprocessed_start_offset * 2 > this.unprocessed_buf.len() {
                 todo!()
-                
             }
 
-            
-            
             if !this.pending_initial_data {
-                
-                
-                
                 assert!(this.unprocessed_start_offset < this.unprocessed_buf.len());
 
                 let mut read_buf =
@@ -571,7 +521,6 @@ impl AsyncRead for WebsocketStream {
                 }
                 ReadState::ReadLength { length_bytes_len } => {
                     todo!()
-                    
                 }
                 ReadState::ReadMask => {
                     todo!()
@@ -583,7 +532,6 @@ impl AsyncRead for WebsocketStream {
 
             if read_result.is_err() {
                 todo!()
-                
             }
 
             if !buf.filled().is_empty() {
@@ -600,7 +548,6 @@ impl AsyncStream for WebsocketStream {}
 fn pack_frame(opcode: u8, use_mask: bool, input: &[u8], output: &mut [u8]) -> usize {
     let input_len = input.len();
 
-    
     output[0] = opcode | 0x80;
     let mut offset = if input_len < 126 {
         output[1] = input_len as u8;
@@ -614,13 +561,7 @@ fn pack_frame(opcode: u8, use_mask: bool, input: &[u8], output: &mut [u8]) -> us
         todo!()
     };
 
-    
-    let mask: Option<[u8; 4]> = if use_mask {
-        
-        todo!()
-    } else {
-        None
-    };
+    let mask: Option<[u8; 4]> = if use_mask { todo!() } else { None };
 
     if input_len > 0 {
         output[offset..offset + input_len].copy_from_slice(input);

@@ -44,7 +44,6 @@ impl Resolver for NativeResolver {
     }
 }
 
-
 pub async fn resolve_single_address(
     resolver: &Arc<dyn Resolver>,
     location: &NetLocation,

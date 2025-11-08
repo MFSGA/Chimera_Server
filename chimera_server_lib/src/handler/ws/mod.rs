@@ -20,8 +20,6 @@ pub fn create_websocket_server_target(
         matching_path,
         matching_headers,
         protocol,
-        
-
     } = websocket_server_config;
 
     let matching_headers = matching_headers.map(|h| {
@@ -35,7 +33,6 @@ pub fn create_websocket_server_target(
 
     let handler = create_tcp_server_handler(protocol, rules_stack);
 
-    
     WebsocketServerTarget {
         matching_path,
         matching_headers,

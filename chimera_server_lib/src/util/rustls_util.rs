@@ -32,11 +32,6 @@ pub fn create_server_config(
         builder.with_no_client_auth()
     } else {
         todo!()
-        
-        
-
-
-
     };
     let mut config = builder
         .with_single_cert(certs, privkey)

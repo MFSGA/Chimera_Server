@@ -15,17 +15,12 @@ pub async fn start_quic_server(config: ServerConfig) -> std::io::Result<Option<J
         bind_location,
         quic_settings,
         protocol,
-        
         ..
     } = config;
 
     info!("Starting {} QUIC server at {}", &protocol, &bind_location);
     let bind_address = match bind_location {
-        
         BindLocation::Address(a) => a.to_socket_addr()?,
-        
-
-
     };
 
     let ServerQuicConfig {
@@ -54,14 +49,7 @@ pub async fn start_quic_server(config: ServerConfig) -> std::io::Result<Option<J
         ServerProxyConfig::Hysteria2 { clients } => {
             let clients = Arc::new(clients);
             Ok(Some(tokio::spawn(async move {
-                if let Err(err) = run_hysteria2_server(
-                    bind_address,
-                    server_config,
-                    clients,
-                    
-                )
-                .await
-                {
+                if let Err(err) = run_hysteria2_server(bind_address, server_config, clients).await {
                     tracing::error!("hysteria2 server stopped with error: {}", err);
                 }
             })))

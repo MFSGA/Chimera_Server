@@ -8,7 +8,6 @@ pub mod server_config;
 
 pub mod rule;
 
-
 pub enum SupportedFileType {
     Yaml,
     Json,
