@@ -19,6 +19,8 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -76,5 +78,35 @@ jobs:
           name: ${{ steps.version.outputs.version }}
           generate_release_notes: true
           files: dist/chimera_server_app-${{ steps.version.outputs.version }}-linux-x86_64
+        env:
+          GITHUB_TOKEN: ${{ secrets.ADMIN_PAT }}
+
+  release-windows:
+    runs-on: windows-latest
+    needs: release
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.ADMIN_PAT }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --package chimera_server_app
+
+      - name: Prepare binary artifact
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target\release\chimera_server_app.exe dist\chimera_server_app-${{ needs.release.outputs.version }}-windows-x86_64.exe
+          Get-ChildItem -Path dist
+
+      - name: Upload Windows binary to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.release.outputs.version }}
+          files: dist/chimera_server_app-${{ needs.release.outputs.version }}-windows-x86_64.exe
+          generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.ADMIN_PAT }}
