@@ -1,0 +1,41 @@
+[package]
+name = "chimera_server_lib"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+json5 = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+async-trait = { workspace = true }
+
+futures = { workspace = true }
+
+memchr = { workspace = true }
+
+base64 = { workspace = true }
+aws-lc-rs = { workspace = true }
+tokio-rustls = { workspace = true }
+
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+
+axum = { workspace = true }
+tokio-util = { workspace = true }
+
+quinn = { workspace = true }
+socket2 = { workspace = true }
+
+h3-quinn = { workspace = true }
+h3 = { workspace = true }
+bytes = { workspace = true }
+
+http = { workspace = true }
+rand = { workspace = true }

@@ -1,0 +1,93 @@
+[workspace]
+resolver = "2"
+
+members = ["chimera_server_app", "chimera_server_lib"]
+
+[workspace.package]
+name = "chimera_server"
+version = "0.0.1"
+edition = "2021"
+authors = ["chimera_rust@proton.me"]
+
+
+
+[profile.release]
+opt-level = "s"
+codegen-units = 1
+lto = true
+strip = true
+
+[workspace.dependencies]
+structopt = "0.3"
+
+tokio = { version = "1", features = ["full"] }
+
+tracing = "0.1.37"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+    "ansi",
+    "env-filter",
+    "time",
+    "tracing-log",
+] }
+
+anyhow = "1.0"
+
+rustls = { version = "*", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+
+
+
+quinn = { version = "0.11", default-features = false, features = [
+    "futures-io",
+    "runtime-tokio",
+    "rustls",
+] }
+
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = { version = "1.1" }
+
+bytes = "1.6"
+
+tokio-util = { version = "0.7", features = ["net", "codec", "io", "compat"] }
+futures = "0.3"
+quinn-proto = "0.11.8"
+rand = "0.8"
+
+reqwest = { version = "0.12.4", default-features = false, features = [
+    "rustls-tls",
+] }
+axum = { version = "0.7.5", features = [
+    "query",
+    "ws",
+    "tokio",
+    "tracing",
+    "http1",
+    "tower-log",
+    "macros",
+], default-features = false }
+serde = { version = "1.0.198", features = ["derive"] }
+uuid = { version = "1.8.0", features = ["v4"] }
+
+thiserror = "2"
+
+clap = { version = "4.5.4", features = ["derive"] }
+
+serde_json = "1.0"
+serde_yaml = "0.9"
+json5 = "*"
+
+async-trait = "*"
+
+memchr = "*"
+
+base64 = "*"
+aws-lc-rs = { version = "*", default-features = false }
+tokio-rustls = { version = "*", default-features = false, features = [
+    "logging",
+    "tls12",
+    "aws-lc-rs",
+] }
+
+socket2 = "*"
