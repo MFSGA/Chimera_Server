@@ -3,8 +3,6 @@ use std::{
     sync::{OnceLock, RwLock},
 };
 
-
-
 #[derive(Debug, Clone)]
 pub struct TrafficContext {
     pub protocol: &'static str,
@@ -111,12 +109,10 @@ impl TrafficRecorder {
     }
 }
 
-
 pub fn record_transfer(context: Option<TrafficContext>, upload: u64, download: u64) {
     let context = context.unwrap_or_default();
     TrafficRecorder::global().record(context, upload, download);
 }
-
 
 pub fn snapshot() -> TrafficSnapshot {
     TrafficRecorder::global().snapshot()

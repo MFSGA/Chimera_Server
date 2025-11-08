@@ -18,7 +18,6 @@ pub fn new_tcp_socket(
         #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
         tcp_socket.bind_device(Some(_b.as_bytes()))?;
 
-        
         #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
         panic!("Could not find to device, unsupported platform.")
     }
@@ -51,7 +50,6 @@ pub fn new_socket2_udp_socket(
         #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
         socket.bind_device(Some(interface.as_bytes()))?;
 
-        
         #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
         panic!("Could not bind to device, unsupported platform.")
     }

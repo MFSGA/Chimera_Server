@@ -14,10 +14,7 @@ use super::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 
 use crate::util::allocate_vec;
 
-const SERVER_RESPONSE_HEADER: &[u8] = &[
-    0u8, 
-    0u8, 
-];
+const SERVER_RESPONSE_HEADER: &[u8] = &[0u8, 0u8];
 
 #[derive(Debug)]
 pub struct VlessTcpHandler {
@@ -56,12 +53,6 @@ impl TcpServerHandler for VlessTcpHandler {
         let target_id = &prefix[1..17];
         for (b1, b2) in self.user_id.iter().zip(target_id.iter()) {
             info!("todo: add the user check b1: {}, b2: {}", b1, b2);
-            
-
-
-
-
-
         }
 
         let addon_length = prefix[17];
@@ -74,9 +65,7 @@ impl TcpServerHandler for VlessTcpHandler {
         server_stream.read_exact(&mut address_prefix).await?;
 
         match address_prefix[0] {
-            1 => {
-                
-            }
+            1 => {}
             2 => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -95,7 +84,6 @@ impl TcpServerHandler for VlessTcpHandler {
 
         let remote_location = match address_prefix[3] {
             1 => {
-                
                 let mut address_bytes = [0u8; 4];
                 server_stream.read_exact(&mut address_bytes).await?;
 
@@ -108,7 +96,6 @@ impl TcpServerHandler for VlessTcpHandler {
                 NetLocation::new(Address::Ipv4(v4addr), port)
             }
             2 => {
-                
                 let mut domain_name_len = [0u8; 1];
                 server_stream.read_exact(&mut domain_name_len).await?;
 
@@ -125,13 +112,9 @@ impl TcpServerHandler for VlessTcpHandler {
                     }
                 };
 
-                
-                
-                
                 NetLocation::new(Address::from(address_str)?, port)
             }
             3 => {
-                
                 let mut address_bytes = [0u8; 16];
                 server_stream.read_exact(&mut address_bytes).await?;
 
@@ -160,13 +143,11 @@ impl TcpServerHandler for VlessTcpHandler {
             remote_location,
             stream: server_stream,
             need_initial_flush: true,
-            
+
             connection_success_response: Some(SERVER_RESPONSE_HEADER.to_vec().into_boxed_slice()),
             traffic_context: Some(
                 TrafficContext::new("vless").with_identity(self.user_label.clone()),
             ),
-            
-
         })
     }
 }

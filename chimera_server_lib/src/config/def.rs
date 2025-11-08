@@ -7,34 +7,23 @@ use crate::Error;
 
 use super::{Protocol, SettingObject, StreamSettings, SupportedFileType, Transport};
 
-
-
 #[derive(Deserialize, Debug)]
 pub struct LiteralConfig {
     pub inbounds: Vec<InboudItem>,
     pub outbounds: Vec<OutboundItem>,
 }
 
-
 impl TryFrom<PathBuf> for LiteralConfig {
     type Error = Error;
 
     fn try_from(value: PathBuf) -> Result<Self, Self::Error> {
         let content = std::fs::read_to_string(&value)?;
-        
 
         let config = match value.extension() {
             Some(ext) => match ext.to_str() {
-                Some("json") => {
-                    
-                    LiteralConfig::from_str(&content)?
-                }
-                Some("json5") => {
-                    
-                    json5::from_str(&content).map_err(|e| {
-                        Error::InvalidConfig(format!("Could not parse JSON5: {}", e))
-                    })?
-                }
+                Some("json") => LiteralConfig::from_str(&content)?,
+                Some("json5") => json5::from_str(&content)
+                    .map_err(|e| Error::InvalidConfig(format!("Could not parse JSON5: {}", e)))?,
                 Some("yaml") => {
                     todo!()
                 }
@@ -60,8 +49,6 @@ impl TryFrom<PathBuf> for LiteralConfig {
     }
 }
 
-
-
 impl FromStr for LiteralConfig {
     type Err = Error;
 
@@ -74,14 +61,14 @@ impl FromStr for LiteralConfig {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InboudItem {
-    pub allocate: Option<Value>, 
+    pub allocate: Option<Value>,
     pub listen: Option<String>,
     pub port: u16,
     pub protocol: Protocol,
     pub settings: Option<SettingObject>,
     pub sniffing: Option<Value>,
-    #[serde(alias = "streamSettings")] 
-    pub stream_settings: Option<StreamSettings>, 
+    #[serde(alias = "streamSettings")]
+    pub stream_settings: Option<StreamSettings>,
     pub tag: String,
 }
 
@@ -144,6 +131,5 @@ mod tests {
         "#;
         let c = cfg.parse::<LiteralConfig>().expect("should parse");
         println!("{:?}", c);
-        
     }
 }

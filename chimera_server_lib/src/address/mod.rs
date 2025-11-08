@@ -5,14 +5,12 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 #[serde(rename_all = "lowercase")]
 pub enum BindLocation {
     Address(NetLocation),
-    
 }
 
 impl std::fmt::Display for BindLocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BindLocation::Address(n) => write!(f, "{}", n),
-            
         }
     }
 }
@@ -36,13 +34,10 @@ impl NetLocation {
 
     pub fn from_str(s: &str, default_port: Option<u16>) -> std::io::Result<Self> {
         let (address_str, port, expect_ipv6) = match s.rfind(':') {
-            Some(i) => {
-                
-                match s[i + 1..].parse::<u16>() {
-                    Ok(port) => (&s[0..i], Some(port), false),
-                    Err(_) => (s, default_port, true),
-                }
-            }
+            Some(i) => match s[i + 1..].parse::<u16>() {
+                Ok(port) => (&s[0..i], Some(port), false),
+                Err(_) => (s, default_port, true),
+            },
             None => (s, default_port, false),
         };
 
@@ -87,8 +82,7 @@ impl NetLocation {
         match self.address {
             Address::Ipv6(ref addr) => Ok(SocketAddr::new(IpAddr::V6(*addr), self.port)),
             Address::Ipv4(ref addr) => Ok(SocketAddr::new(IpAddr::V4(*addr), self.port)),
-            
-            
+
             Address::Hostname(ref d) => format!("{}:{}", d, self.port)
                 .to_socket_addrs()?
                 .next()
@@ -163,7 +157,6 @@ impl Address {
                 possible_ipv6 = false;
                 dots += 1;
                 if dots > 3 {
-                    
                     break;
                 }
             } else if (b'A'..=b'F').contains(&c) || (b'a'..=b'f').contains(&c) {

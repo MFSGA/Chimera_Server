@@ -7,13 +7,11 @@ use config::{
 use thiserror::Error;
 use tokio_rustls::rustls;
 
-
 mod address;
 
 mod async_stream;
 
 mod beginning;
-
 
 mod config;
 
@@ -27,30 +25,18 @@ mod util;
 
 #[allow(clippy::large_enum_variant)]
 pub enum Config {
-    
-    
-    
-    
-    
     File(String),
-    
-    
-    
+
     Str(String),
 }
 
 impl Config {
     pub fn try_parse(self) -> Result<LiteralConfig, Error> {
         match self {
-            
-            
-            
             Config::File(file) => {
-                
-                
                 TryInto::<def::LiteralConfig>::try_into(std::path::PathBuf::from(file))
             }
-            
+
             _ => {
                 todo!()
             }
@@ -63,15 +49,13 @@ pub enum TokioRuntime {
     SingleThread,
 }
 
-
 pub struct Options {
     pub config: Config,
-    
+
     pub cwd: Option<String>,
     pub rt: Option<TokioRuntime>,
     pub log_file: Option<String>,
 }
-
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -91,7 +75,7 @@ pub fn start(opts: Options) -> Result<(), Error> {
             .enable_all()
             .build()?,
     };
-    
+
     rt.block_on(async {
         match start_async(opts).await {
             Err(e) => {
@@ -102,8 +86,6 @@ pub fn start(opts: Options) -> Result<(), Error> {
         }
     })
 }
-
-
 
 async fn start_async(opts: Options) -> Result<(), Error> {
     tracing_subscriber::fmt()
@@ -119,12 +101,11 @@ async fn start_async(opts: Options) -> Result<(), Error> {
         .into_iter()
         .map(|inbound| {
             let server_config = ServerConfig::try_from(inbound).unwrap();
-            
+
             server_config
         })
         .collect::<Vec<_>>();
 
-    
     let mut join_handles = Vec::with_capacity(all_inbounds.len() * 2);
     for config in all_inbounds {
         join_handles.append(&mut start_servers(config).await.unwrap());

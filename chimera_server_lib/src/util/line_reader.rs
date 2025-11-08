@@ -55,7 +55,6 @@ impl LineReader {
                     return Ok(line);
                 }
                 None => {
-                    
                     self.read(stream).await?;
                 }
             }
@@ -63,8 +62,6 @@ impl LineReader {
     }
 
     async fn read(&mut self, stream: &mut Box<dyn AsyncStream>) -> std::io::Result<()> {
-        
-        
         if self.is_cache_full() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
@@ -72,14 +69,12 @@ impl LineReader {
             ));
         }
 
-        
         self.reset_buf_offset();
 
         loop {
             match stream.read(&mut self.buf[self.end_offset..]).await {
                 Ok(len) => {
                     if len == 0 {
-                        
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::ConnectionAborted,
                             "EOF while reading",

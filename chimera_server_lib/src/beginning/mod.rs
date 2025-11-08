@@ -74,26 +74,22 @@ pub async fn start_servers(config: ServerConfig) -> std::io::Result<Vec<JoinHand
 pub async fn start_tcp_server(config: ServerConfig) -> std::io::Result<Option<JoinHandle<()>>> {
     let ServerConfig {
         bind_location,
-        
+
         protocol,
-        
         ..
     } = config;
 
     tracing::info!("Starting {} TCP server at {}", &protocol, &bind_location);
-    
+
     let mut rules_stack = vec![];
 
-    
     let tcp_handler: Arc<Box<dyn TcpServerHandler>> =
         Arc::new(create_tcp_server_handler(protocol, &mut rules_stack));
     tracing::debug!("TCP handler: {:?}", tcp_handler);
 
-    
     Ok(Some(tokio::spawn(async move {
         match bind_location {
             BindLocation::Address(a) => {
-                
                 let socket_addr = a.to_socket_addr().unwrap();
                 run_tcp_server(socket_addr, tcp_handler).await.unwrap();
             }
@@ -101,15 +97,11 @@ pub async fn start_tcp_server(config: ServerConfig) -> std::io::Result<Option<Jo
     })))
 }
 
-
 async fn run_tcp_server(
     bind_address: SocketAddr,
-    
-    
+
     server_handler: Arc<Box<dyn TcpServerHandler>>,
 ) -> std::io::Result<()> {
-    
-
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
 
     let listener = tokio::net::TcpListener::bind(bind_address).await.unwrap();
@@ -129,10 +121,7 @@ async fn run_tcp_server(
         let cloned_handler = server_handler.clone();
 
         tokio::spawn(async move {
-            if let Err(e) =
-                
-                process_stream(stream, cloned_handler, cloned_cache).await
-            {
+            if let Err(e) = process_stream(stream, cloned_handler, cloned_cache).await {
                 error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
             } else {
                 tracing::debug!("{}:{} finished successfully", addr.ip(), addr.port());
@@ -141,12 +130,10 @@ async fn run_tcp_server(
     }
 }
 
-
 async fn process_stream<AS>(
-    
     stream: AS,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
-    
+
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()>
 where
@@ -181,21 +168,14 @@ where
             connection_success_response,
             traffic_context,
         } => {
-            
             let setup_client_stream_future = timeout(
                 Duration::from_secs(60),
-                setup_client_stream(
-                    &mut server_stream,
-                    
-                    resolver,
-                    remote_location.clone(),
-                ),
+                setup_client_stream(&mut server_stream, resolver, remote_location.clone()),
             );
 
             let mut client_stream = match setup_client_stream_future.await {
                 Ok(Ok(Some(s))) => s,
                 Ok(Ok(None)) => {
-                    
                     let _ = server_stream.shutdown().await;
                     return Ok(());
                 }
@@ -217,20 +197,10 @@ where
                     ));
                 }
             };
-            
+
             if let Some(data) = connection_success_response {
                 server_stream.write_all(&data).await?;
-                
             }
-
-            
-
-
-
-
-
-
-
 
             let copy_result =
                 tokio::io::copy_bidirectional(&mut server_stream, &mut client_stream).await;
@@ -248,7 +218,6 @@ where
     }
 }
 
-
 async fn setup_server_stream<AS>(
     stream: AS,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
@@ -262,12 +231,12 @@ where
 
 pub async fn setup_client_stream(
     server_stream: &mut Box<dyn AsyncStream>,
-    
+
     resolver: Arc<dyn Resolver>,
     remote_location: NetLocation,
 ) -> std::io::Result<Option<Box<dyn AsyncStream>>> {
     let target_addr = resolve_single_address(&resolver, &remote_location).await?;
-    
+
     let tcp_socket = new_tcp_socket(None, target_addr.is_ipv6())?;
     let client_stream = tcp_socket.connect(target_addr).await?;
 

@@ -15,12 +15,6 @@ pub struct ServerConfig {
     pub transport: Transport,
     #[serde(default)]
     pub quic_settings: Option<ServerQuicConfig>,
-    
-
-
-
-
-
 }
 
 #[derive(Debug, Clone, Deserialize)]
