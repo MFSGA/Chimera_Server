@@ -1,0 +1,8 @@
+[package]
+name = "chimera_server_app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chimera_server_lib = { path = "../chimera_server_lib", version = "*" }
+clap = { workspace = true }
