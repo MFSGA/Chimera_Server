@@ -56,10 +56,10 @@ jobs:
             target: x86_64-unknown-linux-musl
             tool: cross
             extra-args: -F "perf"
-          - os: ubuntu-latest
-            target: i686-unknown-linux-musl
-            tool: cross
-            extra-args: -F "plus"
+          #- os: ubuntu-latest
+          #  target: i686-unknown-linux-musl
+          #  tool: cross
+          #  extra-args: -F "plus"
           # Linux x86 gnu static-crt
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
@@ -72,15 +72,15 @@ jobs:
             tool: cross
             extra-args: -F "plus"
             zig: "2.17"
-          - os: ubuntu-latest
-            target: armv7-unknown-linux-gnueabi
-            tool: cross
-            extra-args: -F "plus"
-          - os: ubuntu-latest
-            target: armv7-unknown-linux-gnueabihf
-            tool: cross
-            extra-args: -F "plus"
-            zig: "2.17"
+          #- os: ubuntu-latest
+          #  target: armv7-unknown-linux-gnueabi
+          #  tool: cross
+          #  extra-args: -F "plus"
+          #- os: ubuntu-latest
+          #  target: armv7-unknown-linux-gnueabihf
+          #  tool: cross
+          #  extra-args: -F "plus"
+          #  zig: "2.17"
           #- target: mipsel-unknown-linux-musl
           #  tool: cross
           #  extra-args: --no-default-features -F "standard,ring" -Z build-std=std,panic_abort
@@ -91,10 +91,10 @@ jobs:
             target: x86_64-pc-windows-msvc
             postfix: ".exe"
             extra-args: -F "plus"
-          - os: windows-latest
-            target: i686-pc-windows-msvc
-            postfix: ".exe"
-            extra-args: -F "plus"
+          #- os: windows-latest
+          #  target: i686-pc-windows-msvc
+          #  postfix: ".exe"
+          #  extra-args: -F "plus"
           - os: windows-latest
             target: aarch64-pc-windows-msvc
             postfix: ".exe"
