@@ -46,6 +46,16 @@ jobs:
           echo "version=v$VERSION" >> $GITHUB_OUTPUT
           echo "New version: v$VERSION"
 
+      - name: Build release binary
+        run: cargo build --release --package chimera_server_app
+
+      - name: Prepare binary artifact
+        run: |
+          mkdir -p dist
+          cp target/release/chimera_server_app dist/chimera_server_app-${{ steps.version.outputs.version }}-linux-x86_64
+          chmod +x dist/chimera_server_app-${{ steps.version.outputs.version }}-linux-x86_64
+          ls -lh dist
+
       - name: Commit version bump
         run: |
           git add Cargo.toml chimera_server_app/Cargo.toml chimera_server_lib/Cargo.toml Cargo.lock
@@ -58,3 +68,13 @@ jobs:
         run: |
           git push origin master
           git push origin ${{ steps.version.outputs.version }}
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          files: dist/chimera_server_app-${{ steps.version.outputs.version }}-linux-x86_64
+        env:
+          GITHUB_TOKEN: ${{ secrets.ADMIN_PAT }}
