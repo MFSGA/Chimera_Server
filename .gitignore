@@ -1,0 +1,9 @@
+/target
+*.ps1
+# set the test config file
+# config.json*
+
+# the dir is used for test.
+cert/
+
+config.json5

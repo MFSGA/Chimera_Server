@@ -1,0 +1,208 @@
+mod collectors;
+mod tls;
+
+use crate::{
+    address::{Address, BindLocation, NetLocation},
+    config::{def::InboudItem, Protocol, Transport},
+    util::option::{NoneOrSome, OneOrSome},
+    Error,
+};
+
+use super::{
+    quic::ServerQuicConfig,
+    types::{ServerConfig, ServerProxyConfig},
+    ws::WebsocketServerConfig,
+};
+
+use collectors::{
+    collect_hysteria_clients, collect_socks_accounts, collect_trojan_clients,
+    collect_xhttp_settings,
+};
+use tls::apply_tls_if_needed;
+
+
+impl TryFrom<InboudItem> for ServerConfig {
+    type Error = Error;
+    
+    
+    
+    fn try_from(value: InboudItem) -> Result<Self, Self::Error> {
+        tracing::info!("try from inbound item {:?}", &value);
+
+        let InboudItem {
+            listen,
+            port,
+            protocol,
+            settings,
+            stream_settings,
+            ..
+        } = value;
+
+        let bind_location = BindLocation::Address(NetLocation::new(
+            Address::from(&listen.clone().unwrap_or_else(|| "0.0.0.0".to_string())).unwrap(),
+            port,
+        ));
+
+        let user_id = settings
+            .as_ref()
+            .and_then(|setting| setting.clients())
+            .and_then(|clients| clients.into_iter().next())
+            .map(|client| {
+                tracing::info!("just use the first user_id");
+                client.id
+            })
+            .unwrap_or_else(|| "ddb573cb-55f8-4d8d-a609-bd444b14b19b".to_string());
+
+        match protocol {
+            Protocol::DokodemoDoor => {
+                tracing::warn!("DokodemoDoor is not supported yet");
+                Ok(ServerConfig {
+                    bind_location,
+                    protocol: ServerProxyConfig::Vless { user_id },
+                    transport: Transport::Tcp,
+                    quic_settings: None,
+                })
+            }
+            Protocol::Hysteria2 => {
+                let stream_settings = stream_settings.ok_or_else(|| {
+                    Error::InvalidConfig("hysteria2 inbound missing streamSettings".into())
+                })?;
+                let tls_settings = stream_settings.tls_settings.ok_or_else(|| {
+                    Error::InvalidConfig("hysteria2 inbound requires tlsSettings".into())
+                })?;
+                let item = tls_settings.certificates[0].clone();
+
+                let settings = settings.ok_or_else(|| {
+                    Error::InvalidConfig("hysteria2 inbound requires clients".into())
+                })?;
+                let clients = collect_hysteria_clients(settings);
+                if clients.is_empty() {
+                    return Err(Error::InvalidConfig(
+                        "hysteria2 inbound requires at least one client".into(),
+                    ));
+                }
+
+                let quic_settings = Some(ServerQuicConfig {
+                    cert: item.certificate_file,
+                    key: item.key_file,
+                    alpn_protocols: NoneOrSome::Some(tls_settings.alpn),
+                    client_fingerprints: NoneOrSome::None,
+                });
+                Ok(ServerConfig {
+                    bind_location,
+                    protocol: ServerProxyConfig::Hysteria2 { clients },
+                    transport: Transport::Quic,
+                    quic_settings,
+                })
+            }
+            Protocol::Vless => {
+                let mut protocol = if let Some(stream_setting) = stream_settings.as_ref() {
+                    if let Some(ws_setting) = stream_setting.ws_settings.clone() {
+                        tracing::info!("use websocket");
+                        ServerProxyConfig::Websocket {
+                            targets: Box::new(OneOrSome::One(WebsocketServerConfig {
+                                matching_path: ws_setting.path,
+                                matching_headers: None,
+                                protocol: ServerProxyConfig::Vless { user_id },
+                            })),
+                        }
+                    } else {
+                        ServerProxyConfig::Vless { user_id }
+                    }
+                } else {
+                    ServerProxyConfig::Vless { user_id }
+                };
+
+                if let Some(stream_setting) = stream_settings.as_ref() {
+                    protocol = apply_tls_if_needed(protocol, stream_setting)?;
+                }
+
+                return Ok(ServerConfig {
+                    bind_location,
+                    protocol,
+                    transport: Transport::Tcp,
+                    quic_settings: None,
+                });
+            }
+            Protocol::Vmess => todo!(),
+
+            Protocol::Trojan => {
+                let settings = settings.ok_or_else(|| {
+                    Error::InvalidConfig("trojan inbound requires clients".into())
+                })?;
+                let trojan_users = collect_trojan_clients(settings)?;
+                let mut protocol = ServerProxyConfig::Trojan {
+                    users: trojan_users,
+                };
+
+                if let Some(stream_setting) = stream_settings.as_ref() {
+                    if let Some(ws_setting) = stream_setting.ws_settings.clone() {
+                        tracing::info!("use websocket");
+                        protocol = ServerProxyConfig::Websocket {
+                            targets: Box::new(OneOrSome::One(WebsocketServerConfig {
+                                matching_path: ws_setting.path,
+                                matching_headers: None,
+                                protocol,
+                            })),
+                        };
+                    }
+
+                    protocol = apply_tls_if_needed(protocol, stream_setting)?;
+                }
+
+                Ok(ServerConfig {
+                    bind_location,
+                    protocol,
+                    transport: Transport::Tcp,
+                    quic_settings: None,
+                })
+            }
+
+            Protocol::Xhttp => {
+                let settings = settings.ok_or_else(|| {
+                    Error::InvalidConfig("xhttp inbound requires settings".into())
+                })?;
+                let xhttp_config = collect_xhttp_settings(settings)?;
+
+                Ok(ServerConfig {
+                    bind_location,
+                    protocol: ServerProxyConfig::Xhttp {
+                        config: xhttp_config,
+                    },
+                    transport: Transport::Tcp,
+                    quic_settings: None,
+                })
+            }
+
+            Protocol::Socks => {
+                let settings = settings.ok_or_else(|| {
+                    Error::InvalidConfig("socks inbound requires settings".into())
+                })?;
+                let accounts = collect_socks_accounts(settings)?;
+                let mut protocol = ServerProxyConfig::Socks { accounts };
+
+                if let Some(stream_setting) = stream_settings.as_ref() {
+                    if let Some(ws_setting) = stream_setting.ws_settings.clone() {
+                        tracing::info!("use websocket");
+                        protocol = ServerProxyConfig::Websocket {
+                            targets: Box::new(OneOrSome::One(WebsocketServerConfig {
+                                matching_path: ws_setting.path,
+                                matching_headers: None,
+                                protocol,
+                            })),
+                        };
+                    }
+
+                    protocol = apply_tls_if_needed(protocol, stream_setting)?;
+                }
+
+                Ok(ServerConfig {
+                    bind_location,
+                    protocol,
+                    transport: Transport::Tcp,
+                    quic_settings: None,
+                })
+            }
+        }
+    }
+}
