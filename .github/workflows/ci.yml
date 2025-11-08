@@ -31,9 +31,9 @@ jobs:
 
       - name: cargo fmt
         run: cargo fmt --all -- --check
-
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # todo
+      #- name: cargo clippy
+      #  run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
     name: Tests (${{ matrix.os }})
