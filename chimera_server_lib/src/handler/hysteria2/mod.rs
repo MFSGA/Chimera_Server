@@ -10,14 +10,12 @@ use crate::{
 
 pub mod connection;
 
-
 const MAX_QUIC_ENDPOINTS: usize = 1;
 
 pub async fn run_hysteria2_server(
     bind_address: SocketAddr,
     server_config: Arc<rustls::ServerConfig>,
     clients: Arc<Vec<Hysteria2Client>>,
-    
 ) -> std::io::Result<()> {
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
 
@@ -41,7 +39,6 @@ pub async fn run_hysteria2_server(
             Arc::get_mut(&mut server_config.transport)
                 .unwrap()
                 .max_concurrent_bidi_streams(4096_u32.into())
-                
                 .max_concurrent_uni_streams(1024_u32.into())
                 .keep_alive_interval(Some(Duration::from_secs(15)))
                 .max_idle_timeout(Some(Duration::from_secs(120).try_into().unwrap()));
@@ -59,18 +56,12 @@ pub async fn run_hysteria2_server(
             .unwrap();
 
             while let Some(conn) = endpoint.accept().await {
-                
                 let cloned_resolver = resolver.clone();
                 let auth_clients = clients.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) = process_hysteria2_connection(
-                        
-                        cloned_resolver,
-                        auth_clients,
-                        conn,
-                    )
-                    .await
+                    if let Err(e) =
+                        process_hysteria2_connection(cloned_resolver, auth_clients, conn).await
                     {
                         tracing::error!("Connection ended with error: {}", e);
                     }

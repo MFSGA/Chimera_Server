@@ -4,7 +4,6 @@ use async_trait::async_trait;
 
 use crate::{address::NetLocation, async_stream::AsyncStream, traffic::TrafficContext};
 
-
 #[async_trait]
 pub trait TcpServerHandler: Send + Sync + Debug {
     async fn setup_server_stream(
@@ -18,16 +17,10 @@ pub enum TcpServerSetupResult {
         remote_location: NetLocation,
         stream: Box<dyn AsyncStream>,
         need_initial_flush: bool,
-        
-        
+
         connection_success_response: Option<Box<[u8]>>,
         traffic_context: Option<TrafficContext>,
-        
-        
-
-
     },
-    
 }
 
 impl TcpServerSetupResult {

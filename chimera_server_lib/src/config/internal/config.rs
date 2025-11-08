@@ -1,6 +1,5 @@
 use crate::config::def::LiteralConfig;
 
-
 pub struct InternalConfig {}
 
 impl TryFrom<LiteralConfig> for InternalConfig {

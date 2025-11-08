@@ -12,9 +12,6 @@ use tokio_rustls::server::TlsStream;
 pub trait AsyncPing {
     fn supports_ping(&self) -> bool;
 
-    
-    
-    
     fn poll_write_ping(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<bool>>;
 }
 

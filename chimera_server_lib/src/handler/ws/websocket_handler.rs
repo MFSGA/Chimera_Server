@@ -60,10 +60,8 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                 ));
             }
 
-            
             first_line.truncate(first_line.len() - 9);
 
-            
             first_line.split_off(4)
         };
         debug!("request path is {}", request_path);
@@ -77,8 +75,6 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                 matching_path,
                 matching_headers,
                 handler,
-                
-
             } = server_target;
             debug!("matching path is {:?} {:?}", matching_path, &request_path);
             if let Some(path) = matching_path {
@@ -127,7 +123,6 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             let websocket_stream = Box::new(WebsocketStream::new(
                 server_stream,
                 false,
-                
                 line_reader.unparsed_data(),
             ));
 
@@ -136,11 +131,6 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             if let Ok(ref mut setup_result) = target_setup_result {
                 setup_result.set_need_initial_flush(true);
                 debug!("todo override_proxy_provider_unspecified");
-                
-
-
-
-
             }
 
             return target_setup_result;
@@ -159,5 +149,4 @@ fn create_websocket_key_response(key: String) -> String {
     input.extend_from_slice(WS_GUID);
     let hash = digest(&SHA1_FOR_LEGACY_USE_ONLY, &input);
     BASE64.encode(hash.as_ref())
-    
 }

@@ -20,12 +20,9 @@ use collectors::{
 };
 use tls::apply_tls_if_needed;
 
-
 impl TryFrom<InboudItem> for ServerConfig {
     type Error = Error;
-    
-    
-    
+
     fn try_from(value: InboudItem) -> Result<Self, Self::Error> {
         tracing::info!("try from inbound item {:?}", &value);
 

@@ -90,10 +90,7 @@ async fn auth_hysteria2_connection(
     loop {
         match h3_conn.accept().await.map_err(map_h3_error)? {
             Some(resolver) => {
-                let (req, mut stream) = resolver
-                    .resolve_request()
-                    .await
-                    .map_err(map_h3_error)?;
+                let (req, mut stream) = resolver.resolve_request().await.map_err(map_h3_error)?;
                 match validate_auth_request(req, clients.as_ref()) {
                     Ok(auth_ctx) => {
                         send_auth_success(&mut stream, auth_ctx.udp_enabled).await?;
@@ -126,10 +123,7 @@ async fn drain_http3_requests(
     mut h3_conn: h3::server::Connection<h3_quinn::Connection, Bytes>,
 ) -> std::io::Result<()> {
     while let Some(resolver) = h3_conn.accept().await.map_err(map_h3_error)? {
-        let (req, mut stream) = resolver
-            .resolve_request()
-            .await
-            .map_err(map_h3_error)?;
+        let (req, mut stream) = resolver.resolve_request().await.map_err(map_h3_error)?;
         debug!(
             "received non-auth hysteria2 request: {} {}",
             req.method(),

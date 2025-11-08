@@ -8,7 +8,6 @@ use clap::Parser;
 
 extern crate chimera_server_lib as chimera;
 
-
 #[derive(Parser)]
 struct Cli {
     directory: Option<PathBuf>,
@@ -27,10 +26,8 @@ fn main() {
         .to_string();
 
     if !Path::new(&file).exists() {
-        
         panic!("config file not found: {}", file);
     }
-    
 
     match chimera::start(chimera::Options {
         config: chimera::Config::File(file),

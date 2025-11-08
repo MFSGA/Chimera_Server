@@ -14,7 +14,6 @@ use crate::{
 
 use super::tcp_handler::TcpServerHandler;
 
-
 pub fn create_tcp_server_handler(
     server_proxy_config: ServerProxyConfig,
     rules_stack: &mut Vec<Vec<RuleConfig>>,
@@ -28,12 +27,6 @@ pub fn create_tcp_server_handler(
                 .map(|config| create_websocket_server_target(config, rules_stack))
                 .collect::<Vec<_>>();
             Box::new(WebsocketTcpServerHandler::new(server_targets))
-            
-
-
-
-
-
         }
         ServerProxyConfig::Trojan { users } => Box::new(TrojanTcpHandler::new(users)),
         ServerProxyConfig::Tls(tls_config) => {
@@ -58,7 +51,7 @@ pub fn create_tcp_server_handler(
         ServerProxyConfig::Xhttp { .. } => {
             panic!("Xhttp server should not be served via TCP handler")
         }
-        
+
         unknown_config => {
             panic!("Unsupported TCP proxy config: {:?}", unknown_config)
         }
