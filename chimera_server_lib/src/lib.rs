@@ -15,6 +15,8 @@ mod beginning;
 
 mod config;
 
+mod log;
+
 mod handler;
 
 mod resolver;
@@ -88,14 +90,13 @@ pub fn start(opts: Options) -> Result<(), Error> {
 }
 
 async fn start_async(opts: Options) -> Result<(), Error> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
-        .with_writer(std::io::stderr)
-        .with_max_level(tracing::Level::DEBUG)
-        .init();
-
     let config = opts.config.try_parse()?;
+    log::init(
+        config.log.as_ref(),
+        opts.cwd.as_deref(),
+        opts.log_file.as_deref(),
+    )?;
+
     let all_inbounds = config
         .inbounds
         .into_iter()

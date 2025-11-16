@@ -3,7 +3,7 @@ use std::{collections::HashMap, path::PathBuf, str::FromStr};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::Error;
+use crate::{log::LogConfig, Error};
 
 use super::{Protocol, SettingObject, StreamSettings, SupportedFileType, Transport};
 
@@ -11,6 +11,7 @@ use super::{Protocol, SettingObject, StreamSettings, SupportedFileType, Transpor
 pub struct LiteralConfig {
     pub inbounds: Vec<InboudItem>,
     pub outbounds: Vec<OutboundItem>,
+    pub log: Option<LogConfig>,
 }
 
 impl TryFrom<PathBuf> for LiteralConfig {
