@@ -22,7 +22,7 @@ structopt = "0.3"
 
 tokio = { version = "1", features = ["full"] }
 
-tracing = "0.1.37"
+tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", default-features = false, features = [
     "fmt",
     "ansi",
@@ -46,9 +46,9 @@ quinn = { version = "0.11", default-features = false, features = [
 
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
-http = { version = "1.1" }
+http = { version = "1.4" }
 
-bytes = "1.6"
+bytes = "1.11"
 
 tokio-util = { version = "0.7", features = ["net", "codec", "io", "compat"] }
 futures = "0.3"
@@ -58,7 +58,7 @@ rand = "0.9"
 reqwest = { version = "0.12.4", default-features = false, features = [
     "rustls-tls",
 ] }
-axum = { version = "0.8.6", features = [
+axum = { version = "0.8.8", features = [
     "query",
     "ws",
     "tokio",
@@ -72,7 +72,7 @@ uuid = { version = "1.8.0", features = ["v4"] }
 
 thiserror = "2"
 
-clap = { version = "4.5.51", features = ["derive"] }
+clap = { version = "4.5.53", features = ["derive"] }
 
 serde_json = "1.0"
 serde_yaml = "0.9"
@@ -92,5 +92,5 @@ tokio-rustls = { version = "*", default-features = false, features = [
 
 socket2 = "*"
 log = "0.4"
-rcgen = { version = "0.13", features = ["x509-parser"] }
+rcgen = { version = "0.14", features = ["x509-parser"] }
 subtle = "2"
