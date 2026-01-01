@@ -90,6 +90,7 @@ impl LogConfig {
             .or_else(|| parse_destination(self.error.as_deref(), base_ref))
             .unwrap_or(LogDestination::Stderr);
 
+        let use_ansi = error_destination.ansi_enabled();
         let writer = error_destination
             .make_writer()
             .map_err(Error::from)?;
@@ -101,6 +102,7 @@ impl LogConfig {
             .with_env_filter(env_filter)
             .with_span_events(FmtSpan::FULL)
             .with_writer(writer)
+            .with_ansi(use_ansi)
             .with_max_level(self.loglevel.as_filter())
             .try_init()
             .map_err(|err| Error::InvalidConfig(format!("failed to initialize logger: {err}")))?;
@@ -141,6 +143,10 @@ enum LogDestination {
 }
 
 impl LogDestination {
+    fn ansi_enabled(&self) -> bool {
+        matches!(self, LogDestination::Stdout | LogDestination::Stderr)
+    }
+
     fn make_writer(&self) -> io::Result<BoxMakeWriter> {
         match self {
             LogDestination::None => Ok(BoxMakeWriter::new(|| io::sink())),
@@ -180,7 +186,10 @@ struct SharedFileWriter {
 impl Write for SharedFileWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut guard = self.inner.lock().unwrap();
-        guard.write(buf)
+        // Flush immediately so file logs are visible in tail -f without waiting for the large buffer.
+        let written = guard.write(buf)?;
+        guard.flush()?;
+        Ok(written)
     }
 
     fn flush(&mut self) -> io::Result<()> {
