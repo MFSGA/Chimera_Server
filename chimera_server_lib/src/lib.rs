@@ -1,7 +1,6 @@
 use beginning::start_servers;
 use config::{
     def::{self, LiteralConfig},
-    internal::InternalConfig,
     server_config::ServerConfig,
 };
 use thiserror::Error;
@@ -14,6 +13,8 @@ mod async_stream;
 mod beginning;
 
 mod config;
+
+pub mod reality;
 
 mod log;
 

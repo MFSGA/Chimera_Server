@@ -4,6 +4,6 @@ mod types;
 pub mod ws;
 
 pub use types::{
-    Hysteria2Client, RangeConfig, ServerConfig, ServerProxyConfig, SocksUser, TlsServerConfig,
-    TrojanUser, XhttpServerConfig,
+    Hysteria2Client, RangeConfig, RealityTransportConfig, ServerConfig, ServerProxyConfig,
+    SocksUser, TlsServerConfig, TrojanUser, XhttpServerConfig,
 };

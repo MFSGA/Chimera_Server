@@ -42,6 +42,8 @@ pub struct StreamSettings {
     security: Option<String>,
     tls_settings: Option<TlsSettings>,
     ws_settings: Option<WsSettings>,
+    #[serde(alias = "realitySettings")]
+    reality_settings: Option<RealitySettings>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -122,4 +124,30 @@ struct Certificate {
     ocsp_stapling: u64,
     one_time_loading: bool,
     usage: String,
+}
+
+#[derive(Deserialize, Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RealitySettings {
+    #[serde(default)]
+    pub server_names: Vec<String>,
+    pub private_key: String,
+    pub short_ids: Vec<String>,
+    pub dest: String,
+    #[serde(default)]
+    pub max_time_diff: Option<u64>,
+    #[serde(default)]
+    pub min_client_ver: Option<String>,
+    #[serde(default)]
+    pub max_client_ver: Option<String>,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+    #[serde(default)]
+    pub public_key: Option<String>,
+    #[serde(default)]
+    pub spider_x: Option<String>,
+    #[serde(default)]
+    pub show: Option<bool>,
+    #[serde(default)]
+    pub xver: Option<i64>,
 }

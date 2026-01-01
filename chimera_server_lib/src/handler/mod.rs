@@ -10,3 +10,4 @@ pub mod trojan;
 pub mod socks;
 
 pub mod tls;
+pub mod reality;
