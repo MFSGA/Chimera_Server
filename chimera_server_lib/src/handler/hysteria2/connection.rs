@@ -12,8 +12,8 @@ use bytes::{Bytes, BytesMut};
 use h3_quinn::BidiStream;
 use http::{Request, Response, StatusCode};
 use rand::{
-    distributions::{Alphanumeric, DistString},
-    Rng,
+    // distributions::{Alphanumeric, DistString},
+    Rng, distr::{Alphanumeric, SampleString},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
