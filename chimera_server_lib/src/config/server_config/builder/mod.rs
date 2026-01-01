@@ -18,7 +18,7 @@ use collectors::{
     collect_hysteria_clients, collect_socks_accounts, collect_trojan_clients,
     collect_xhttp_settings,
 };
-use tls::apply_tls_if_needed;
+use tls::apply_security_layers;
 
 impl TryFrom<InboudItem> for ServerConfig {
     type Error = Error;
@@ -111,7 +111,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                 };
 
                 if let Some(stream_setting) = stream_settings.as_ref() {
-                    protocol = apply_tls_if_needed(protocol, stream_setting)?;
+                    protocol = apply_security_layers(protocol, stream_setting)?;
                 }
 
                 return Ok(ServerConfig {
@@ -144,7 +144,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                         };
                     }
 
-                    protocol = apply_tls_if_needed(protocol, stream_setting)?;
+                    protocol = apply_security_layers(protocol, stream_setting)?;
                 }
 
                 Ok(ServerConfig {
@@ -190,7 +190,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                         };
                     }
 
-                    protocol = apply_tls_if_needed(protocol, stream_setting)?;
+                    protocol = apply_security_layers(protocol, stream_setting)?;
                 }
 
                 Ok(ServerConfig {

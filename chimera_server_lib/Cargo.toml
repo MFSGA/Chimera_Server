@@ -39,3 +39,6 @@ bytes = { workspace = true }
 
 http = { workspace = true }
 rand = { workspace = true }
+rcgen = { version = "0.13", features = ["x509-parser"] }
+subtle = "2"
+x509-parser = "0.16"

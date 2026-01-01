@@ -2,7 +2,11 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
-use crate::{address::BindLocation, config::Transport, util::option::OneOrSome};
+use crate::{
+    address::{BindLocation, NetLocation},
+    config::Transport,
+    util::option::OneOrSome,
+};
 
 use super::{quic::ServerQuicConfig, ws::WebsocketServerConfig};
 
@@ -78,6 +82,35 @@ pub struct TlsServerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct RealityTransportConfig {
+    pub dest: NetLocation,
+    pub private_key: [u8; 32],
+    pub short_ids: Vec<[u8; 8]>,
+    #[serde(default)]
+    pub max_time_diff: Option<u64>,
+    #[serde(default)]
+    pub min_client_version: Option<[u8; 3]>,
+    #[serde(default)]
+    pub max_client_version: Option<[u8; 3]>,
+    #[serde(default)]
+    pub server_names: Vec<String>,
+    pub inner: Box<ServerProxyConfig>,
+}
+
+impl RealityTransportConfig {
+    pub fn to_reality_server_config(&self) -> crate::reality::RealityServerConfig {
+        crate::reality::RealityServerConfig {
+            private_key: self.private_key,
+            short_ids: self.short_ids.clone(),
+            dest: self.dest.clone(),
+            max_time_diff: self.max_time_diff,
+            min_client_version: self.min_client_version,
+            max_client_version: self.max_client_version,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub enum ServerProxyConfig {
     Vless {
         user_id: String,
@@ -94,6 +127,7 @@ pub enum ServerProxyConfig {
         users: Vec<TrojanUser>,
     },
     Tls(TlsServerConfig),
+    Reality(RealityTransportConfig),
     Xhttp {
         config: XhttpServerConfig,
     },
@@ -113,6 +147,7 @@ impl std::fmt::Display for ServerProxyConfig {
                 Self::Hysteria2 { .. } => "Hysteria2",
                 Self::Trojan { .. } => "Trojan",
                 Self::Tls(_) => "Tls",
+                Self::Reality(_) => "Reality",
                 Self::Xhttp { .. } => "Xhttp",
                 Self::Socks { .. } => "Socks",
             }
