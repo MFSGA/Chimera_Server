@@ -4,6 +4,7 @@ use crate::{
         server_config::{ServerProxyConfig, TlsServerConfig},
     },
     handler::{
+        reality::RealityServerHandler,
         socks::SocksTcpServerHandler,
         tls::TlsServerHandler,
         trojan::TrojanTcpHandler,
@@ -46,6 +47,11 @@ pub fn create_tcp_server_handler(
                 )
                 .expect("failed to initialize TLS handler"),
             )
+        }
+        ServerProxyConfig::Reality(reality_config) => {
+            let inner_handler =
+                create_tcp_server_handler((*reality_config.inner).clone(), rules_stack);
+            Box::new(RealityServerHandler::new(reality_config, inner_handler))
         }
         ServerProxyConfig::Socks { accounts } => Box::new(SocksTcpServerHandler::new(accounts)),
         ServerProxyConfig::Xhttp { .. } => {

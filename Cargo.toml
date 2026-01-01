@@ -91,3 +91,6 @@ tokio-rustls = { version = "*", default-features = false, features = [
 ] }
 
 socket2 = "*"
+log = "0.4"
+rcgen = { version = "0.13", features = ["x509-parser"] }
+subtle = "2"
