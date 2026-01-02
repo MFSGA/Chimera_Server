@@ -12,6 +12,7 @@ use super::{quic::ServerQuicConfig, ws::WebsocketServerConfig};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
+    pub tag: String,
     #[serde(flatten)]
     pub bind_location: BindLocation,
     pub protocol: ServerProxyConfig,
@@ -26,6 +27,25 @@ pub struct Hysteria2Client {
     pub password: String,
     pub email: Option<String>,
     pub flow: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Hysteria2BandwidthConfig {
+    #[serde(default, alias = "up")]
+    pub max_tx: u64,
+    #[serde(default, alias = "down")]
+    pub max_rx: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Hysteria2ServerConfig {
+    pub clients: Vec<Hysteria2Client>,
+    #[serde(default)]
+    pub bandwidth: Hysteria2BandwidthConfig,
+    #[serde(default)]
+    pub ignore_client_bandwidth: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -114,6 +134,7 @@ impl RealityTransportConfig {
 pub enum ServerProxyConfig {
     Vless {
         user_id: String,
+        user_label: String,
     },
     #[serde(alias = "ws")]
     Websocket {
@@ -121,7 +142,7 @@ pub enum ServerProxyConfig {
         targets: Box<OneOrSome<WebsocketServerConfig>>,
     },
     Hysteria2 {
-        clients: Vec<Hysteria2Client>,
+        config: Hysteria2ServerConfig,
     },
     Trojan {
         users: Vec<TrojanUser>,

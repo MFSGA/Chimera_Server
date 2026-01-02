@@ -20,13 +20,15 @@ const SERVER_RESPONSE_HEADER: &[u8] = &[0u8, 0u8];
 pub struct VlessTcpHandler {
     user_id: Box<[u8]>,
     user_label: String,
+    inbound_tag: String,
 }
 
 impl VlessTcpHandler {
-    pub fn new(user_id: &str) -> Self {
+    pub fn new(user_id: &str, user_label: &str, inbound_tag: &str) -> Self {
         Self {
             user_id: parse_hex(user_id),
-            user_label: user_id.to_string(),
+            user_label: user_label.to_string(),
+            inbound_tag: inbound_tag.to_string(),
         }
     }
 }
@@ -146,7 +148,9 @@ impl TcpServerHandler for VlessTcpHandler {
 
             connection_success_response: Some(SERVER_RESPONSE_HEADER.to_vec().into_boxed_slice()),
             traffic_context: Some(
-                TrafficContext::new("vless").with_identity(self.user_label.clone()),
+                TrafficContext::new("vless")
+                    .with_identity(self.user_label.clone())
+                    .with_inbound_tag(self.inbound_tag.clone()),
             ),
         })
     }

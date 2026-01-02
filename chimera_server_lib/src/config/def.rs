@@ -12,6 +12,7 @@ pub struct LiteralConfig {
     pub inbounds: Vec<InboudItem>,
     pub outbounds: Vec<OutboundItem>,
     pub log: Option<LogConfig>,
+    pub api: Option<ApiConfig>,
 }
 
 impl TryFrom<PathBuf> for LiteralConfig {
@@ -84,10 +85,20 @@ impl InboudItem {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboundItem {
-    protocol: String,
-    tag: String,
+    pub protocol: String,
+    pub tag: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiConfig {
+    pub tag: Option<String>,
+    #[serde(default)]
+    pub services: Vec<String>,
+    #[serde(default)]
+    pub listen: Option<String>,
 }
 
 #[cfg(test)]
