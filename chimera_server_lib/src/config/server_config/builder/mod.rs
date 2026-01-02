@@ -15,7 +15,7 @@ use super::{
 };
 
 use collectors::{
-    collect_hysteria_clients, collect_socks_accounts, collect_trojan_clients,
+    collect_hysteria2_settings, collect_socks_accounts, collect_trojan_clients,
     collect_xhttp_settings,
 };
 use tls::apply_security_layers;
@@ -32,6 +32,7 @@ impl TryFrom<InboudItem> for ServerConfig {
             protocol,
             settings,
             stream_settings,
+            tag,
             ..
         } = value;
 
@@ -40,22 +41,34 @@ impl TryFrom<InboudItem> for ServerConfig {
             port,
         ));
 
-        let user_id = settings
+        let (user_id, user_label) = settings
             .as_ref()
             .and_then(|setting| setting.clients())
             .and_then(|clients| clients.into_iter().next())
             .map(|client| {
                 tracing::info!("just use the first user_id");
-                client.id
+                let label = if client.email.is_empty() {
+                    client.id.clone()
+                } else {
+                    client.email
+                };
+                (client.id, label)
             })
-            .unwrap_or_else(|| "ddb573cb-55f8-4d8d-a609-bd444b14b19b".to_string());
+            .unwrap_or_else(|| {
+                let fallback = "ddb573cb-55f8-4d8d-a609-bd444b14b19b".to_string();
+                (fallback.clone(), fallback)
+            });
 
         match protocol {
             Protocol::DokodemoDoor => {
                 tracing::warn!("DokodemoDoor is not supported yet");
                 Ok(ServerConfig {
+                    tag,
                     bind_location,
-                    protocol: ServerProxyConfig::Vless { user_id },
+                    protocol: ServerProxyConfig::Vless {
+                        user_id,
+                        user_label,
+                    },
                     transport: Transport::Tcp,
                     quic_settings: None,
                 })
@@ -72,8 +85,8 @@ impl TryFrom<InboudItem> for ServerConfig {
                 let settings = settings.ok_or_else(|| {
                     Error::InvalidConfig("hysteria2 inbound requires clients".into())
                 })?;
-                let clients = collect_hysteria_clients(settings);
-                if clients.is_empty() {
+                let config = collect_hysteria2_settings(settings)?;
+                if config.clients.is_empty() {
                     return Err(Error::InvalidConfig(
                         "hysteria2 inbound requires at least one client".into(),
                     ));
@@ -86,8 +99,9 @@ impl TryFrom<InboudItem> for ServerConfig {
                     client_fingerprints: NoneOrSome::None,
                 });
                 Ok(ServerConfig {
+                    tag,
                     bind_location,
-                    protocol: ServerProxyConfig::Hysteria2 { clients },
+                    protocol: ServerProxyConfig::Hysteria2 { config },
                     transport: Transport::Quic,
                     quic_settings,
                 })
@@ -100,14 +114,20 @@ impl TryFrom<InboudItem> for ServerConfig {
                             targets: Box::new(OneOrSome::One(WebsocketServerConfig {
                                 matching_path: ws_setting.path,
                                 matching_headers: None,
-                                protocol: ServerProxyConfig::Vless { user_id },
+                                protocol: ServerProxyConfig::Vless {
+                                    user_id: user_id.clone(),
+                                    user_label: user_label.clone(),
+                                },
                             })),
                         }
                     } else {
-                        ServerProxyConfig::Vless { user_id }
+                        ServerProxyConfig::Vless {
+                            user_id: user_id.clone(),
+                            user_label: user_label.clone(),
+                        }
                     }
                 } else {
-                    ServerProxyConfig::Vless { user_id }
+                    ServerProxyConfig::Vless { user_id, user_label }
                 };
 
                 if let Some(stream_setting) = stream_settings.as_ref() {
@@ -115,6 +135,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                 }
 
                 return Ok(ServerConfig {
+                    tag,
                     bind_location,
                     protocol,
                     transport: Transport::Tcp,
@@ -148,6 +169,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                 }
 
                 Ok(ServerConfig {
+                    tag,
                     bind_location,
                     protocol,
                     transport: Transport::Tcp,
@@ -162,6 +184,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                 let xhttp_config = collect_xhttp_settings(settings)?;
 
                 Ok(ServerConfig {
+                    tag,
                     bind_location,
                     protocol: ServerProxyConfig::Xhttp {
                         config: xhttp_config,
@@ -194,6 +217,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                 }
 
                 Ok(ServerConfig {
+                    tag,
                     bind_location,
                     protocol,
                     transport: Transport::Tcp,

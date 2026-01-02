@@ -15,7 +15,7 @@ use crate::{
         tcp_handler_util::create_tcp_server_handler,
     },
     resolver::{resolve_single_address, NativeResolver, Resolver},
-    traffic::record_transfer,
+    traffic::{record_transfer, register_connection},
     util::socket::new_tcp_socket,
 };
 
@@ -73,6 +73,7 @@ pub async fn start_servers(config: ServerConfig) -> std::io::Result<Vec<JoinHand
 
 pub async fn start_tcp_server(config: ServerConfig) -> std::io::Result<Option<JoinHandle<()>>> {
     let ServerConfig {
+        tag,
         bind_location,
 
         protocol,
@@ -84,27 +85,28 @@ pub async fn start_tcp_server(config: ServerConfig) -> std::io::Result<Option<Jo
     let mut rules_stack = vec![];
 
     let tcp_handler: Arc<Box<dyn TcpServerHandler>> =
-        Arc::new(create_tcp_server_handler(protocol, &mut rules_stack));
+        Arc::new(create_tcp_server_handler(protocol, &tag, &mut rules_stack));
     tracing::debug!("TCP handler: {:?}", tcp_handler);
 
+    let listener = match bind_location {
+        BindLocation::Address(a) => {
+            let socket_addr = a.to_socket_addr()?;
+            tokio::net::TcpListener::bind(socket_addr).await?
+        }
+    };
+
     Ok(Some(tokio::spawn(async move {
-        match bind_location {
-            BindLocation::Address(a) => {
-                let socket_addr = a.to_socket_addr().unwrap();
-                run_tcp_server(socket_addr, tcp_handler).await.unwrap();
-            }
+        if let Err(err) = run_tcp_server(listener, tcp_handler).await {
+            error!("TCP server stopped with error: {}", err);
         }
     })))
 }
 
 async fn run_tcp_server(
-    bind_address: SocketAddr,
-
+    listener: tokio::net::TcpListener,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
 ) -> std::io::Result<()> {
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
-
-    let listener = tokio::net::TcpListener::bind(bind_address).await.unwrap();
 
     loop {
         let (stream, addr) = match listener.accept().await {
@@ -121,7 +123,7 @@ async fn run_tcp_server(
         let cloned_handler = server_handler.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = process_stream(stream, cloned_handler, cloned_cache).await {
+            if let Err(e) = process_stream(stream, cloned_handler, cloned_cache, addr).await {
                 error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
             } else {
                 tracing::debug!("{}:{} finished successfully", addr.ip(), addr.port());
@@ -135,6 +137,7 @@ async fn process_stream<AS>(
     server_handler: Arc<Box<dyn TcpServerHandler>>,
 
     resolver: Arc<dyn Resolver>,
+    peer_addr: SocketAddr,
 ) -> std::io::Result<()>
 where
     AS: AsyncStream + 'static,
@@ -168,6 +171,10 @@ where
             connection_success_response,
             traffic_context,
         } => {
+            let traffic_context =
+                traffic_context.map(|context| context.with_client_ip(peer_addr.ip()));
+            let _connection_guard = register_connection(traffic_context.as_ref());
+
             let setup_client_stream_future = timeout(
                 Duration::from_secs(60),
                 setup_client_stream(&mut server_stream, resolver, remote_location.clone()),

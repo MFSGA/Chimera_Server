@@ -4,7 +4,10 @@ use std::{
     io::{Error, ErrorKind},
     net::SocketAddr,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
 };
 
@@ -23,9 +26,9 @@ use tracing::{debug, warn};
 
 use crate::{
     address::NetLocation,
-    config::server_config::Hysteria2Client,
+    config::server_config::{Hysteria2Client, Hysteria2ServerConfig},
     resolver::{resolve_single_address, Resolver},
-    traffic::{record_transfer, TrafficContext},
+    traffic::{record_transfer, register_connection, TrafficContext},
 };
 
 const AUTH_PATH: &str = "/auth";
@@ -43,24 +46,27 @@ const TCP_ERROR_STATUS: u8 = 0x01;
 #[derive(Clone)]
 struct AuthContext {
     client: Hysteria2Client,
-    #[allow(unused)]
-    client_rx_limit: Option<u64>,
     udp_enabled: bool,
+}
+
+struct AuthInfo {
+    client: Hysteria2Client,
+    client_rx_limit: Option<u64>,
 }
 
 pub async fn process_hysteria2_connection(
     resolver: Arc<dyn Resolver>,
-    clients: Arc<Vec<Hysteria2Client>>,
-    conn: quinn::Incoming,
+    config: Arc<Hysteria2ServerConfig>,
+    tx_bps: Arc<AtomicU64>,
+    connection: quinn::Connection,
+    inbound_tag: Arc<String>,
 ) -> std::io::Result<()> {
-    let connection = conn.await?;
-
     let h3_quinn_connection = h3_quinn::Connection::new(connection.clone());
     let mut h3_conn = h3::server::Connection::new(h3_quinn_connection)
         .await
         .map_err(map_h3_error)?;
 
-    let auth_ctx = auth_hysteria2_connection(&mut h3_conn, clients.clone()).await?;
+    let auth_ctx = auth_hysteria2_connection(&mut h3_conn, config.as_ref(), tx_bps.clone()).await?;
 
     let http3_task = tokio::spawn(async move {
         if let Err(err) = drain_http3_requests(h3_conn).await {
@@ -70,12 +76,12 @@ pub async fn process_hysteria2_connection(
 
     let proxy_result = if auth_ctx.udp_enabled {
         tokio::try_join!(
-            drive_tcp_streams(connection.clone(), resolver.clone(), &auth_ctx),
+            drive_tcp_streams(connection.clone(), resolver.clone(), &auth_ctx, inbound_tag.clone()),
             drive_udp_datagrams(connection, resolver.clone()),
         )
         .map(|_| ())
     } else {
-        drive_tcp_streams(connection, resolver.clone(), &auth_ctx).await
+        drive_tcp_streams(connection, resolver.clone(), &auth_ctx, inbound_tag.clone()).await
     };
 
     let _ = http3_task.await;
@@ -85,16 +91,29 @@ pub async fn process_hysteria2_connection(
 
 async fn auth_hysteria2_connection(
     h3_conn: &mut h3::server::Connection<h3_quinn::Connection, Bytes>,
-    clients: Arc<Vec<Hysteria2Client>>,
+    config: &Hysteria2ServerConfig,
+    tx_bps: Arc<AtomicU64>,
 ) -> std::io::Result<AuthContext> {
     loop {
         match h3_conn.accept().await.map_err(map_h3_error)? {
             Some(resolver) => {
                 let (req, mut stream) = resolver.resolve_request().await.map_err(map_h3_error)?;
-                match validate_auth_request(req, clients.as_ref()) {
-                    Ok(auth_ctx) => {
-                        send_auth_success(&mut stream, auth_ctx.udp_enabled).await?;
-                        return Ok(auth_ctx);
+                match validate_auth_request(req, config.clients.as_ref()) {
+                    Ok(auth_info) => {
+                        let (actual_tx, response_rx, response_rx_auto) =
+                            resolve_bandwidth_settings(config, auth_info.client_rx_limit);
+                        tx_bps.store(actual_tx, Ordering::Relaxed);
+                        send_auth_success(
+                            &mut stream,
+                            true,
+                            response_rx,
+                            response_rx_auto,
+                        )
+                        .await?;
+                        return Ok(AuthContext {
+                            client: auth_info.client,
+                            udp_enabled: true,
+                        });
                     }
                     Err(AuthReject::NotAuthRequest) => {
                         send_simple_response(&mut stream, StatusCode::NOT_FOUND).await?;
@@ -141,14 +160,19 @@ async fn drive_tcp_streams(
     connection: quinn::Connection,
     resolver: Arc<dyn Resolver>,
     auth_ctx: &AuthContext,
+    inbound_tag: Arc<String>,
 ) -> std::io::Result<()> {
+    let peer_ip = connection.remote_address().ip();
     loop {
         match connection.accept_bi().await {
             Ok((send, recv)) => {
                 let resolver = resolver.clone();
                 let client = auth_ctx.client.clone();
+                let inbound_tag = inbound_tag.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_tcp_stream(send, recv, resolver, client).await {
+                    if let Err(err) =
+                        handle_tcp_stream(send, recv, resolver, client, inbound_tag, peer_ip).await
+                    {
                         debug!("hysteria2 tcp stream ended with error: {}", err);
                     }
                 });
@@ -166,6 +190,8 @@ async fn handle_tcp_stream(
     mut recv: quinn::RecvStream,
     resolver: Arc<dyn Resolver>,
     client: Hysteria2Client,
+    inbound_tag: Arc<String>,
+    peer_ip: std::net::IpAddr,
 ) -> std::io::Result<()> {
     let request = TcpRequest::read(&mut recv).await?;
     let target = if request.target.address().is_hostname() {
@@ -191,7 +217,10 @@ async fn handle_tcp_stream(
         .clone()
         .or_else(|| client.flow.clone())
         .unwrap_or(client.password.clone());
-    let context = TrafficContext::new("hysteria2").with_identity(context_identity);
+    let context = TrafficContext::new("hysteria2")
+        .with_identity(context_identity)
+        .with_inbound_tag((*inbound_tag).clone())
+        .with_client_ip(peer_ip);
 
     proxy_tcp(send, recv, tcp_stream, context).await
 }
@@ -242,6 +271,7 @@ async fn proxy_tcp(
     tcp_stream: tokio::net::TcpStream,
     context: TrafficContext,
 ) -> std::io::Result<()> {
+    let _connection_guard = register_connection(Some(&context));
     let mut quic_stream = QuicStream { send, recv };
     let mut tcp_stream = tcp_stream;
     match tokio::io::copy_bidirectional(&mut quic_stream, &mut tcp_stream).await {
@@ -303,10 +333,26 @@ enum AuthReject {
     BadRequest(&'static str),
 }
 
+fn resolve_bandwidth_settings(
+    config: &Hysteria2ServerConfig,
+    client_rx_limit: Option<u64>,
+) -> (u64, u64, bool) {
+    if config.ignore_client_bandwidth {
+        return (0, config.bandwidth.max_rx, true);
+    }
+
+    let mut actual_tx = client_rx_limit.unwrap_or(0);
+    if actual_tx > 0 && config.bandwidth.max_tx > 0 && actual_tx > config.bandwidth.max_tx {
+        actual_tx = config.bandwidth.max_tx;
+    }
+
+    (actual_tx, config.bandwidth.max_rx, false)
+}
+
 fn validate_auth_request(
     req: Request<()>,
     clients: &[Hysteria2Client],
-) -> Result<AuthContext, AuthReject> {
+) -> Result<AuthInfo, AuthReject> {
     if req.method() != http::Method::POST || req.uri().path() != AUTH_PATH {
         return Err(AuthReject::NotAuthRequest);
     }
@@ -344,25 +390,31 @@ fn validate_auth_request(
         _ => None,
     };
 
-    Ok(AuthContext {
+    Ok(AuthInfo {
         client,
         client_rx_limit,
-        udp_enabled: true,
     })
 }
 
 async fn send_auth_success(
     stream: &mut h3::server::RequestStream<BidiStream<Bytes>, Bytes>,
     udp_enabled: bool,
+    server_rx_limit: u64,
+    rx_auto: bool,
 ) -> std::io::Result<()> {
     let padding = random_padding();
+    let cc_rx_value = if rx_auto {
+        "auto".to_string()
+    } else {
+        server_rx_limit.to_string()
+    };
     let response = Response::builder()
         .status(StatusCode::from_u16(SUCCESS_STATUS).expect("valid hysteria2 status"))
         .header(
             UDP_SUPPORT_HEADER,
             if udp_enabled { "true" } else { "false" },
         )
-        .header(CLIENT_CC_RX_HEADER, "0")
+        .header(CLIENT_CC_RX_HEADER, cc_rx_value.as_str())
         .header(PADDING_HEADER, &padding)
         .header(http::header::CONTENT_LENGTH, "0")
         .body(())

@@ -14,6 +14,7 @@ use super::tcp::tcp_handler_util::create_tcp_server_handler;
 
 pub fn create_websocket_server_target(
     websocket_server_config: WebsocketServerConfig,
+    inbound_tag: &str,
     rules_stack: &mut Vec<Vec<RuleConfig>>,
 ) -> WebsocketServerTarget {
     let WebsocketServerConfig {
@@ -31,7 +32,7 @@ pub fn create_websocket_server_target(
             .collect::<HashMap<_, _>>()
     });
 
-    let handler = create_tcp_server_handler(protocol, rules_stack);
+    let handler = create_tcp_server_handler(protocol, inbound_tag, rules_stack);
 
     WebsocketServerTarget {
         matching_path,

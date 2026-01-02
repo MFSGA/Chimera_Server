@@ -1,17 +1,32 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{OpenOptions},
+    fs::OpenOptions,
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock, RwLock},
 };
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{
-    fmt::{self, format::FmtSpan, writer::BoxMakeWriter},
+    filter::Filtered,
+    fmt::{
+        self,
+        format::{DefaultFields, Format, FmtSpan},
+        writer::BoxMakeWriter,
+    },
+    layer::SubscriberExt,
+    reload,
+    util::SubscriberInitExt,
     EnvFilter,
+    Registry,
+    Layer,
 };
 
 use crate::Error;
+
+type LogLayer = Filtered<fmt::Layer<Registry, DefaultFields, Format, BoxMakeWriter>, EnvFilter, Registry>;
+
+static LOG_RELOAD: OnceLock<reload::Handle<LogLayer, Registry>> = OnceLock::new();
+static LOG_STATE: OnceLock<RwLock<LogState>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -77,6 +92,7 @@ pub fn init(
     override_error_target: Option<&str>,
 ) -> Result<(), Error> {
     let log_cfg = cfg.cloned().unwrap_or_default();
+    LogState::store(log_cfg.clone(), cwd, override_error_target);
     log_cfg.install(cwd, override_error_target)
 }
 
@@ -91,24 +107,62 @@ impl LogConfig {
             .unwrap_or(LogDestination::Stderr);
 
         let use_ansi = error_destination.ansi_enabled();
-        let writer = error_destination
-            .make_writer()
-            .map_err(Error::from)?;
-
+        let writer = error_destination.make_writer().map_err(Error::from)?;
         let env_filter = EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new(self.loglevel.as_directive()));
 
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
+        let layer = fmt::layer()
             .with_span_events(FmtSpan::FULL)
             .with_writer(writer)
             .with_ansi(use_ansi)
-            .with_max_level(self.loglevel.as_filter())
+            .with_filter(env_filter);
+
+        if let Some(handle) = LOG_RELOAD.get() {
+            handle
+                .reload(layer)
+                .map_err(|err| Error::InvalidConfig(format!("failed to reload logger: {err}")))?;
+            return Ok(());
+        }
+
+        let (reload_layer, handle) = reload::Layer::new(layer);
+        tracing_subscriber::registry()
+            .with(reload_layer)
             .try_init()
             .map_err(|err| Error::InvalidConfig(format!("failed to initialize logger: {err}")))?;
 
+        let _ = LOG_RELOAD.set(handle);
+
         Ok(())
     }
+}
+
+#[derive(Clone, Debug)]
+struct LogState {
+    cfg: LogConfig,
+    cwd: Option<String>,
+    override_error_target: Option<String>,
+}
+
+impl LogState {
+    fn store(cfg: LogConfig, cwd: Option<&str>, override_error_target: Option<&str>) {
+        let state = LogState {
+            cfg,
+            cwd: cwd.map(|value| value.to_string()),
+            override_error_target: override_error_target.map(|value| value.to_string()),
+        };
+        let lock = LOG_STATE.get_or_init(|| RwLock::new(state.clone()));
+        *lock.write().expect("log state poisoned") = state;
+    }
+}
+
+pub fn restart() -> Result<(), Error> {
+    let state = LOG_STATE
+        .get()
+        .ok_or_else(|| Error::InvalidConfig("logger not initialized".into()))?;
+    let guard = state.read().expect("log state poisoned");
+    guard
+        .cfg
+        .install(guard.cwd.as_deref(), guard.override_error_target.as_deref())
 }
 
 fn parse_destination(value: Option<&str>, base: Option<&Path>) -> Option<LogDestination> {
