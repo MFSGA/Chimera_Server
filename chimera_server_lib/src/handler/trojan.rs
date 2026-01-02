@@ -29,10 +29,11 @@ struct TrojanCredential {
 #[derive(Debug)]
 pub struct TrojanTcpHandler {
     credentials: Vec<TrojanCredential>,
+    inbound_tag: String,
 }
 
 impl TrojanTcpHandler {
-    pub fn new(users: Vec<TrojanUser>) -> Self {
+    pub fn new(users: Vec<TrojanUser>, inbound_tag: &str) -> Self {
         let credentials = users
             .into_iter()
             .map(|user| {
@@ -49,7 +50,10 @@ impl TrojanTcpHandler {
                 }
             })
             .collect();
-        Self { credentials }
+        Self {
+            credentials,
+            inbound_tag: inbound_tag.to_string(),
+        }
     }
 }
 
@@ -110,7 +114,11 @@ impl TcpServerHandler for TrojanTcpHandler {
         let traffic_context = credential
             .identity
             .as_ref()
-            .map(|label| TrafficContext::new("trojan").with_identity(label.clone()));
+            .map(|label| {
+                TrafficContext::new("trojan")
+                    .with_identity(label.clone())
+                    .with_inbound_tag(self.inbound_tag.clone())
+            });
 
         Ok(TcpServerSetupResult::TcpForward {
             remote_location,

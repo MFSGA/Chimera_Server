@@ -39,11 +39,15 @@ const SUCCESS_RESPONSE: [u8; 10] = [
 #[derive(Debug)]
 pub struct SocksTcpServerHandler {
     accounts: Vec<SocksUser>,
+    inbound_tag: String,
 }
 
 impl SocksTcpServerHandler {
-    pub fn new(accounts: Vec<SocksUser>) -> Self {
-        Self { accounts }
+    pub fn new(accounts: Vec<SocksUser>, inbound_tag: &str) -> Self {
+        Self {
+            accounts,
+            inbound_tag: inbound_tag.to_string(),
+        }
     }
 
     fn requires_auth(&self) -> bool {
@@ -83,8 +87,10 @@ impl TcpServerHandler for SocksTcpServerHandler {
         let remote_location = read_connect_request(&mut server_stream).await?;
 
         let traffic_context = Some(match identity {
-            Some(id) => TrafficContext::new("socks").with_identity(id),
-            None => TrafficContext::new("socks"),
+            Some(id) => TrafficContext::new("socks")
+                .with_identity(id)
+                .with_inbound_tag(self.inbound_tag.clone()),
+            None => TrafficContext::new("socks").with_inbound_tag(self.inbound_tag.clone()),
         });
 
         Ok(TcpServerSetupResult::TcpForward {

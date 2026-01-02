@@ -2,13 +2,46 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
-use crate::{config::SettingObject, Error};
+use crate::{
+    config::{ClientSetting, SettingObject},
+    util::bandwidth::{parse_bandwidth, BandwidthValue},
+    Error,
+};
 
-use super::super::types::{Hysteria2Client, RangeConfig, SocksUser, TrojanUser, XhttpServerConfig};
+use super::super::types::{
+    Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2ServerConfig, RangeConfig, SocksUser,
+    TrojanUser, XhttpServerConfig,
+};
 
-pub(super) fn collect_hysteria_clients(settings: SettingObject) -> Vec<Hysteria2Client> {
-    let clients = settings.clients().unwrap_or_default();
-    clients
+pub(super) fn collect_hysteria2_settings(
+    settings: SettingObject,
+) -> Result<Hysteria2ServerConfig, Error> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Hysteria2InboundSettings {
+        #[serde(default)]
+        clients: Vec<ClientSetting>,
+        #[serde(default)]
+        bandwidth: Option<Hysteria2BandwidthSetting>,
+        #[serde(default)]
+        ignore_client_bandwidth: bool,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Hysteria2BandwidthSetting {
+        #[serde(default)]
+        up: Option<BandwidthValue>,
+        #[serde(default)]
+        down: Option<BandwidthValue>,
+    }
+
+    let raw: Hysteria2InboundSettings = settings
+        .deserialize()
+        .map_err(|e| Error::InvalidConfig(format!("failed to parse hysteria2 settings: {}", e)))?;
+
+    let clients = raw
+        .clients
         .into_iter()
         .map(|client| Hysteria2Client {
             password: client.id,
@@ -23,7 +56,38 @@ pub(super) fn collect_hysteria_clients(settings: SettingObject) -> Vec<Hysteria2
                 Some(client.flow)
             },
         })
-        .collect()
+        .collect();
+
+    let mut bandwidth = Hysteria2BandwidthConfig::default();
+    if let Some(config) = raw.bandwidth {
+        if let Some(up) = config.up {
+            bandwidth.max_tx = parse_bandwidth(up).map_err(|err| {
+                Error::InvalidConfig(format!("invalid hysteria2 bandwidth.up: {}", err))
+            })?;
+        }
+        if let Some(down) = config.down {
+            bandwidth.max_rx = parse_bandwidth(down).map_err(|err| {
+                Error::InvalidConfig(format!("invalid hysteria2 bandwidth.down: {}", err))
+            })?;
+        }
+    }
+
+    if bandwidth.max_tx != 0 && bandwidth.max_tx < 65_536 {
+        return Err(Error::InvalidConfig(
+            "hysteria2 bandwidth.up must be at least 65536 bytes/s".into(),
+        ));
+    }
+    if bandwidth.max_rx != 0 && bandwidth.max_rx < 65_536 {
+        return Err(Error::InvalidConfig(
+            "hysteria2 bandwidth.down must be at least 65536 bytes/s".into(),
+        ));
+    }
+
+    Ok(Hysteria2ServerConfig {
+        clients,
+        bandwidth,
+        ignore_client_bandwidth: raw.ignore_client_bandwidth,
+    })
 }
 
 pub(super) fn collect_trojan_clients(settings: SettingObject) -> Result<Vec<TrojanUser>, Error> {
