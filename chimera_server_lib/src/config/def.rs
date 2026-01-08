@@ -13,6 +13,7 @@ pub struct LiteralConfig {
     pub outbounds: Vec<OutboundItem>,
     pub log: Option<LogConfig>,
     pub api: Option<ApiConfig>,
+    pub mcp: Option<McpConfig>,
 }
 
 impl TryFrom<PathBuf> for LiteralConfig {
@@ -99,6 +100,25 @@ pub struct ApiConfig {
     pub services: Vec<String>,
     #[serde(default)]
     pub listen: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpConfig {
+    #[serde(default)]
+    pub listen: Option<String>,
+    #[serde(default = "default_mcp_path")]
+    pub path: String,
+    #[serde(default = "default_mcp_update_interval_ms")]
+    pub update_interval_ms: u64,
+}
+
+fn default_mcp_path() -> String {
+    "/mcp".to_string()
+}
+
+fn default_mcp_update_interval_ms() -> u64 {
+    1000
 }
 
 #[cfg(test)]
