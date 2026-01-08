@@ -1,4 +1,5 @@
 use beginning::start_servers;
+use std::time::Duration;
 use config::{
     def::{self, LiteralConfig},
     server_config::ServerConfig,
@@ -16,6 +17,8 @@ mod beginning;
 mod config;
 
 mod grpc;
+
+mod mcp;
 
 mod runtime;
 
@@ -104,6 +107,7 @@ async fn start_async(opts: Options) -> Result<(), Error> {
     )?;
 
     let api_config = config.api.clone();
+    let mcp_config = config.mcp.clone();
     let outbounds = config
         .outbounds
         .iter()
@@ -161,6 +165,24 @@ async fn start_async(opts: Options) -> Result<(), Error> {
             } else {
                 tracing::warn!("api is configured but no services are enabled");
             }
+        }
+    }
+
+    if let Some(mcp) = mcp_config.as_ref() {
+        if let Some(listen) = mcp.listen.as_ref() {
+            let listen = listen.parse::<std::net::SocketAddr>().map_err(|err| {
+                Error::InvalidConfig(format!("invalid mcp.listen {}: {}", listen, err))
+            })?;
+            let interval_ms = mcp.update_interval_ms.max(100);
+            let mcp_handle = mcp::start_mcp_server(mcp::McpServerConfig {
+                listen,
+                path: mcp.path.clone(),
+                update_interval: Duration::from_millis(interval_ms),
+            })
+            .await?;
+            join_handles.push(mcp_handle);
+        } else {
+            tracing::warn!("mcp is configured but no listen address was resolved");
         }
     }
 
