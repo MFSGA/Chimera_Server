@@ -212,6 +212,11 @@ impl ActiveConnections {
             })
             .collect()
     }
+
+    fn count(&self) -> usize {
+        let guard = self.inner.read().expect("active connections poisoned");
+        guard.len()
+    }
 }
 
 #[derive(Debug)]
@@ -248,4 +253,8 @@ pub fn register_connection(context: Option<&TrafficContext>) -> ConnectionGuard 
 
 pub fn active_connections() -> Vec<ActiveConnectionSnapshot> {
     ActiveConnections::global().snapshot()
+}
+
+pub fn active_connection_count() -> usize {
+    ActiveConnections::global().count()
 }
