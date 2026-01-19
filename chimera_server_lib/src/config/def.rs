@@ -13,6 +13,7 @@ pub struct LiteralConfig {
     pub outbounds: Vec<OutboundItem>,
     pub log: Option<LogConfig>,
     pub api: Option<ApiConfig>,
+    // mcp settings
     pub mcp: Option<McpConfig>,
 }
 
