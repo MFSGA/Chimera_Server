@@ -100,11 +100,12 @@ pub fn start(opts: Options) -> Result<(), Error> {
 
 async fn start_async(opts: Options) -> Result<(), Error> {
     let config = opts.config.try_parse()?;
+    /* todo: log mod 
     log::init(
         config.log.as_ref(),
         opts.cwd.as_deref(),
         opts.log_file.as_deref(),
-    )?;
+    )?; */
 
     let api_config = config.api.clone();
     let mcp_config = config.mcp.clone();
@@ -187,6 +188,7 @@ async fn start_async(opts: Options) -> Result<(), Error> {
     }
 
     for config in all_inbounds {
+        // Skip the API inbound if it's configured to avoid port conflicts
         if skip_inbound_tag.as_deref() == Some(config.tag.as_str()) {
             tracing::info!("skip api inbound {} to avoid grpc port conflict", config.tag);
             continue;
