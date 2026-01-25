@@ -8,14 +8,17 @@ pub(super) struct RoutingServiceImpl;
 impl proto::xray::app::router::command::routing_service_server::RoutingService
     for RoutingServiceImpl
 {
-    type SubscribeRoutingStatsStream =
-        tokio_stream::wrappers::ReceiverStream<Result<proto::xray::app::router::command::RoutingContext, Status>>;
+    type SubscribeRoutingStatsStream = tokio_stream::wrappers::ReceiverStream<
+        Result<proto::xray::app::router::command::RoutingContext, Status>,
+    >;
 
     async fn subscribe_routing_stats(
         &self,
         _request: Request<proto::xray::app::router::command::SubscribeRoutingStatsRequest>,
     ) -> Result<Response<Self::SubscribeRoutingStatsStream>, Status> {
-        Err(Status::unimplemented("SubscribeRoutingStats is not supported"))
+        Err(Status::unimplemented(
+            "SubscribeRoutingStats is not supported",
+        ))
     }
 
     async fn test_route(
@@ -35,8 +38,11 @@ impl proto::xray::app::router::command::routing_service_server::RoutingService
     async fn override_balancer_target(
         &self,
         _request: Request<proto::xray::app::router::command::OverrideBalancerTargetRequest>,
-    ) -> Result<Response<proto::xray::app::router::command::OverrideBalancerTargetResponse>, Status> {
-        Err(Status::unimplemented("OverrideBalancerTarget is not supported"))
+    ) -> Result<Response<proto::xray::app::router::command::OverrideBalancerTargetResponse>, Status>
+    {
+        Err(Status::unimplemented(
+            "OverrideBalancerTarget is not supported",
+        ))
     }
 
     async fn add_rule(

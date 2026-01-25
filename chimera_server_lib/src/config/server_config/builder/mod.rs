@@ -127,7 +127,10 @@ impl TryFrom<InboudItem> for ServerConfig {
                         }
                     }
                 } else {
-                    ServerProxyConfig::Vless { user_id, user_label }
+                    ServerProxyConfig::Vless {
+                        user_id,
+                        user_label,
+                    }
                 };
 
                 if let Some(stream_setting) = stream_settings.as_ref() {

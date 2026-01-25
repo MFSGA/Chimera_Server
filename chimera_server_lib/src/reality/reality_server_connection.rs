@@ -5,8 +5,8 @@
 
 use std::io::{self, Read, Write};
 
-use crate::address::{Address, NetLocation};
 use super::slide_buffer::SlideBuffer;
+use crate::address::{Address, NetLocation};
 
 use super::common::{
     self, CIPHERTEXT_READ_BUF_CAPACITY, CONTENT_TYPE_ALERT, CONTENT_TYPE_APPLICATION_DATA,
@@ -823,7 +823,9 @@ impl RealityServerConnection {
         let (app_write_key, app_write_iv) = match (&self.app_write_key, &self.app_write_iv) {
             (Some(key), Some(iv)) => (key, iv),
             _ => {
-                tracing::debug!("REALITY: Cannot send close_notify - application keys not available");
+                tracing::debug!(
+                    "REALITY: Cannot send close_notify - application keys not available"
+                );
                 return;
             }
         };

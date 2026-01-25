@@ -1,14 +1,11 @@
 use std::{
     net::SocketAddr,
-    sync::{
-        atomic::AtomicU64,
-        Arc,
-    },
+    sync::{atomic::AtomicU64, Arc},
     time::Duration,
 };
 
-use connection::process_hysteria2_connection;
 use congestion::BrutalConfig;
+use connection::process_hysteria2_connection;
 
 use crate::{
     config::server_config::Hysteria2ServerConfig,
@@ -16,8 +13,8 @@ use crate::{
     util::socket::new_socket2_udp_socket,
 };
 
-pub mod connection;
 mod congestion;
+pub mod connection;
 
 const MAX_QUIC_ENDPOINTS: usize = 1;
 
@@ -74,7 +71,8 @@ pub async fn run_hysteria2_server(
                         return;
                     }
                 };
-                transport.congestion_controller_factory(Arc::new(BrutalConfig::new(tx_bps.clone())));
+                transport
+                    .congestion_controller_factory(Arc::new(BrutalConfig::new(tx_bps.clone())));
 
                 let mut server_config = base_server_config.clone();
                 server_config.transport_config(Arc::new(transport));

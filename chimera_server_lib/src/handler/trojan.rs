@@ -111,14 +111,11 @@ impl TcpServerHandler for TrojanTcpHandler {
             ));
         }
 
-        let traffic_context = credential
-            .identity
-            .as_ref()
-            .map(|label| {
-                TrafficContext::new("trojan")
-                    .with_identity(label.clone())
-                    .with_inbound_tag(self.inbound_tag.clone())
-            });
+        let traffic_context = credential.identity.as_ref().map(|label| {
+            TrafficContext::new("trojan")
+                .with_identity(label.clone())
+                .with_inbound_tag(self.inbound_tag.clone())
+        });
 
         Ok(TcpServerSetupResult::TcpForward {
             remote_location,

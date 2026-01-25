@@ -108,8 +108,7 @@ impl Controller for BrutalController {
 
     fn window(&self) -> u64 {
         if self.use_brutal() {
-            self.brutal
-                .window(self.tx_bps.load(Ordering::Relaxed))
+            self.brutal.window(self.tx_bps.load(Ordering::Relaxed))
         } else {
             self.bbr.window()
         }
@@ -193,10 +192,8 @@ impl BrutalState {
             return self.initial_window();
         }
 
-        let cwnd = (tx_bps as f64)
-            * rtt.as_secs_f64()
-            * CONGESTION_WINDOW_MULTIPLIER
-            / self.ack_rate;
+        let cwnd =
+            (tx_bps as f64) * rtt.as_secs_f64() * CONGESTION_WINDOW_MULTIPLIER / self.ack_rate;
         (cwnd as u64).max(self.max_datagram_size)
     }
 
@@ -205,9 +202,7 @@ impl BrutalState {
     }
 
     fn record(&mut self, now: Instant, ack_count: u64, loss_count: u64) {
-        let timestamp = now
-            .saturating_duration_since(self.start)
-            .as_secs();
+        let timestamp = now.saturating_duration_since(self.start).as_secs();
         let slot = (timestamp % PACKET_INFO_SLOT_COUNT) as usize;
         if self.slots[slot].timestamp == timestamp {
             self.slots[slot].ack_count += ack_count;
