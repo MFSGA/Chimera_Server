@@ -30,7 +30,7 @@ fn main() {
     }
 
     match chimera::start(chimera::Options {
-        config: chimera::Config::File(file),
+        config: chimera::ConfigType::File(file),
         cwd: cli.directory.map(|x| x.to_string_lossy().to_string()),
         rt: Some(TokioRuntime::MultiThread),
         log_file: None,
