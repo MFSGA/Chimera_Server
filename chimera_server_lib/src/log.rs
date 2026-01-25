@@ -10,20 +10,19 @@ use tracing_subscriber::{
     filter::Filtered,
     fmt::{
         self,
-        format::{DefaultFields, Format, FmtSpan},
+        format::{DefaultFields, FmtSpan, Format},
         writer::BoxMakeWriter,
     },
     layer::SubscriberExt,
     reload,
     util::SubscriberInitExt,
-    EnvFilter,
-    Registry,
-    Layer,
+    EnvFilter, Layer, Registry,
 };
 
 use crate::Error;
 
-type LogLayer = Filtered<fmt::Layer<Registry, DefaultFields, Format, BoxMakeWriter>, EnvFilter, Registry>;
+type LogLayer =
+    Filtered<fmt::Layer<Registry, DefaultFields, Format, BoxMakeWriter>, EnvFilter, Registry>;
 
 static LOG_RELOAD: OnceLock<reload::Handle<LogLayer, Registry>> = OnceLock::new();
 static LOG_STATE: OnceLock<RwLock<LogState>> = OnceLock::new();
@@ -218,10 +217,7 @@ fn create_file_writer(path: &Path) -> io::Result<BoxMakeWriter> {
         }
     }
 
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
     let buffer = Arc::new(Mutex::new(BufWriter::with_capacity(64 * 1024, file)));
 
     Ok(BoxMakeWriter::new({

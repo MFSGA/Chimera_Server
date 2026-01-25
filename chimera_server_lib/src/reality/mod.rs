@@ -1,9 +1,9 @@
 mod buf_reader;
+mod client;
 mod common;
 mod reality_aead;
 mod reality_auth;
 mod reality_certificate;
-mod client;
 mod reality_client_verify;
 mod reality_io_state;
 mod reality_reader_writer;
@@ -13,15 +13,13 @@ mod reality_tls13_keys;
 mod reality_tls13_messages;
 mod reality_util;
 mod slide_buffer;
-mod sync_adapter;
 mod stream;
+mod sync_adapter;
 
 use serde::Deserialize;
 
 pub use buf_reader::BufReader;
-pub use client::{
-    feed_reality_client_connection, RealityClientConfig, RealityClientConnection,
-};
+pub use client::{feed_reality_client_connection, RealityClientConfig, RealityClientConnection};
 pub use reality_reader_writer::{RealityReader, RealityWriter};
 pub use reality_server_connection::{
     feed_reality_server_connection, RealityServerConfig, RealityServerConnection,

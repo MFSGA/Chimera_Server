@@ -15,8 +15,9 @@ use bytes::{Bytes, BytesMut};
 use h3_quinn::BidiStream;
 use http::{Request, Response, StatusCode};
 use rand::{
+    distr::{Alphanumeric, SampleString},
     // distributions::{Alphanumeric, DistString},
-    Rng, distr::{Alphanumeric, SampleString},
+    Rng,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
@@ -76,7 +77,12 @@ pub async fn process_hysteria2_connection(
 
     let proxy_result = if auth_ctx.udp_enabled {
         tokio::try_join!(
-            drive_tcp_streams(connection.clone(), resolver.clone(), &auth_ctx, inbound_tag.clone()),
+            drive_tcp_streams(
+                connection.clone(),
+                resolver.clone(),
+                &auth_ctx,
+                inbound_tag.clone()
+            ),
             drive_udp_datagrams(connection, resolver.clone()),
         )
         .map(|_| ())
@@ -103,13 +109,7 @@ async fn auth_hysteria2_connection(
                         let (actual_tx, response_rx, response_rx_auto) =
                             resolve_bandwidth_settings(config, auth_info.client_rx_limit);
                         tx_bps.store(actual_tx, Ordering::Relaxed);
-                        send_auth_success(
-                            &mut stream,
-                            true,
-                            response_rx,
-                            response_rx_auto,
-                        )
-                        .await?;
+                        send_auth_success(&mut stream, true, response_rx, response_rx_auto).await?;
                         return Ok(AuthContext {
                             client: auth_info.client,
                             udp_enabled: true,

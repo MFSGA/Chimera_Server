@@ -25,7 +25,11 @@ pub async fn start_grpc_server(
     let mut service_count = 0usize;
 
     if has_service(&config.services, "StatsService") {
-        router = Some(add_service(builder.take(), router.take(), stats::build_service()));
+        router = Some(add_service(
+            builder.take(),
+            router.take(),
+            stats::build_service(),
+        ));
         service_count += 1;
     }
 

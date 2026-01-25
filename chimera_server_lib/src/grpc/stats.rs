@@ -1,11 +1,11 @@
+use super::proto;
+use crate::traffic;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
     time::{Instant, UNIX_EPOCH},
 };
 use tonic::{Request, Response, Status};
-use crate::traffic;
-use super::proto;
 
 #[derive(Default)]
 struct StatsReset {
@@ -235,10 +235,8 @@ impl proto::xray::app::stats::command::stats_service_server::StatsService for St
     async fn get_stats_online_ip_list(
         &self,
         request: Request<proto::xray::app::stats::command::GetStatsRequest>,
-    ) -> Result<
-        Response<proto::xray::app::stats::command::GetStatsOnlineIpListResponse>,
-        Status,
-    > {
+    ) -> Result<Response<proto::xray::app::stats::command::GetStatsOnlineIpListResponse>, Status>
+    {
         let request = request.into_inner();
         let ips = self
             .online_ip_list(&request.name)
