@@ -35,16 +35,16 @@ pub mod traffic;
 mod util;
 
 #[allow(clippy::large_enum_variant)]
-pub enum Config {
+pub enum ConfigType {
     File(String),
 
     Str(String),
 }
 
-impl Config {
+impl ConfigType {
     pub fn try_parse(self) -> Result<LiteralConfig, Error> {
         match self {
-            Config::File(file) => {
+            ConfigType::File(file) => {
                 TryInto::<def::LiteralConfig>::try_into(std::path::PathBuf::from(file))
             }
 
@@ -61,7 +61,7 @@ pub enum TokioRuntime {
 }
 
 pub struct Options {
-    pub config: Config,
+    pub config: ConfigType,
 
     pub cwd: Option<String>,
     pub rt: Option<TokioRuntime>,
@@ -99,6 +99,7 @@ pub fn start(opts: Options) -> Result<(), Error> {
 }
 
 async fn start_async(opts: Options) -> Result<(), Error> {
+    // 1. config parse
     let config = opts.config.try_parse()?;
     /* todo: log mod 
     log::init(
