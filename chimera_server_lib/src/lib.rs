@@ -1,10 +1,10 @@
 use beginning::start_servers;
-use std::time::Duration;
 use config::{
     def::{self, LiteralConfig},
     server_config::ServerConfig,
 };
 use runtime::{OutboundSummary, RuntimeState};
+use std::time::Duration;
 use thiserror::Error;
 use tokio_rustls::rustls;
 
@@ -101,13 +101,13 @@ pub fn start(opts: Options) -> Result<(), Error> {
 async fn start_async(opts: Options) -> Result<(), Error> {
     // 1. config parse
     let config = opts.config.try_parse()?;
-    /* todo: log mod 
+    /* todo: log mod
     log::init(
         config.log.as_ref(),
         opts.cwd.as_deref(),
         opts.log_file.as_deref(),
     )?; */
-
+    // 2. api config
     let api_config = config.api.clone();
     let mcp_config = config.mcp.clone();
     let outbounds = config
@@ -191,7 +191,10 @@ async fn start_async(opts: Options) -> Result<(), Error> {
     for config in all_inbounds {
         // Skip the API inbound if it's configured to avoid port conflicts
         if skip_inbound_tag.as_deref() == Some(config.tag.as_str()) {
-            tracing::info!("skip api inbound {} to avoid grpc port conflict", config.tag);
+            tracing::info!(
+                "skip api inbound {} to avoid grpc port conflict",
+                config.tag
+            );
             continue;
         }
         let mut handles = start_servers(config).await?;

@@ -4,12 +4,12 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use super::client::RealityClientConnection;
 use super::reality_io_state::RealityIoState;
 use super::reality_server_connection::RealityServerConnection;
-use super::{RealityReader, RealityWriter};
-use super::client::RealityClientConnection;
-use crate::async_stream::{AsyncPing, AsyncStream};
 use super::sync_adapter::{SyncReadAdapter, SyncWriteAdapter};
+use super::{RealityReader, RealityWriter};
+use crate::async_stream::{AsyncPing, AsyncStream};
 
 /// Minimal trait that both REALITY server and client connections satisfy.
 pub trait RealitySession {
@@ -242,9 +242,7 @@ where
                         };
                         match this.session.write_tls(&mut adapter) {
                             Ok(_) => {}
-                            Err(ref write_err)
-                                if write_err.kind() == io::ErrorKind::WouldBlock =>
-                            {
+                            Err(ref write_err) if write_err.kind() == io::ErrorKind::WouldBlock => {
                                 break;
                             }
                             Err(_) => break,

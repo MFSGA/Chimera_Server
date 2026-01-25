@@ -48,7 +48,7 @@ pub(super) fn generate_client_hello(conn: &mut RealityClientConnection) -> io::R
     session_id_plaintext[1] = 8; // Protocol version minor
     session_id_plaintext[2] = 0; // Protocol version patch
     session_id_plaintext[3] = 0; // Padding byte
-    // Timestamp (4 bytes as uint32, in seconds)
+                                 // Timestamp (4 bytes as uint32, in seconds)
     session_id_plaintext[4..8].copy_from_slice(&(timestamp as u32).to_be_bytes());
     // Short ID (8 bytes)
     session_id_plaintext[8..16].copy_from_slice(&conn.config.short_id);
@@ -83,8 +83,9 @@ pub(super) fn generate_client_hello(conn: &mut RealityClientConnection) -> io::R
     );
     tracing::debug!("  aad[0..4]={:02x?}", &client_hello[0..4]);
 
-    let encrypted_session_id = encrypt_session_id(&session_id_plaintext, &auth_key, nonce, &client_hello)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let encrypted_session_id =
+        encrypt_session_id(&session_id_plaintext, &auth_key, nonce, &client_hello)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
     tracing::debug!(
         "REALITY CLIENT: Encrypted SessionId={:02x?}",
@@ -95,8 +96,10 @@ pub(super) fn generate_client_hello(conn: &mut RealityClientConnection) -> io::R
     client_hello[39..71].copy_from_slice(&encrypted_session_id);
 
     // Wrap in TLS record
-    let mut record =
-        write_record_header(super::super::common::CONTENT_TYPE_HANDSHAKE, client_hello.len() as u16);
+    let mut record = write_record_header(
+        super::super::common::CONTENT_TYPE_HANDSHAKE,
+        client_hello.len() as u16,
+    );
     record.extend_from_slice(&client_hello);
 
     // Buffer for sending

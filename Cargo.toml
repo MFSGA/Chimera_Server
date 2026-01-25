@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 
-members = ["chimera_server_app", "chimera_server_lib"]
+members = ["chimera_server_app", "chimera_server_lib", "chimera_cli"]
 
 [workspace.package]
 name = "chimera_server"
@@ -100,3 +100,4 @@ socket2 = "*"
 log = "0.4"
 rcgen = { version = "0.13", features = ["x509-parser"] }
 subtle = "2"
+x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }

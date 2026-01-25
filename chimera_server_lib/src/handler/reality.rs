@@ -177,6 +177,8 @@ impl TcpServerHandler for RealityServerHandler {
         }
 
         let wrapped_stream = RealityTlsStream::new(server_stream, reality_conn);
-        self.inner.setup_server_stream(Box::new(wrapped_stream)).await
+        self.inner
+            .setup_server_stream(Box::new(wrapped_stream))
+            .await
     }
 }

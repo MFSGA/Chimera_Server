@@ -3,15 +3,13 @@ mod process;
 
 use std::io::{self, Read, Write};
 
-use crate::reality::common::{self, CIPHERTEXT_READ_BUF_CAPACITY, PLAINTEXT_READ_BUF_CAPACITY};
 use super::reality_io_state::RealityIoState;
 use super::reality_reader_writer::{RealityReader, RealityWriter};
 use super::reality_records::encrypt_plaintext_to_records;
 use super::slide_buffer::SlideBuffer;
+use crate::reality::common::{self, CIPHERTEXT_READ_BUF_CAPACITY, PLAINTEXT_READ_BUF_CAPACITY};
 use handshake::generate_client_hello;
-use process::{
-    process_application_data, process_encrypted_handshake, process_server_hello,
-};
+use process::{process_application_data, process_encrypted_handshake, process_server_hello};
 
 /// Configuration for REALITY client connections
 #[derive(Clone)]

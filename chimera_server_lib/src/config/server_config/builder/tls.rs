@@ -1,4 +1,8 @@
-use crate::{config::StreamSettings, reality::{decode_private_key, decode_short_id}, Error};
+use crate::{
+    config::StreamSettings,
+    reality::{decode_private_key, decode_short_id},
+    Error,
+};
 
 use super::super::types::{RealityTransportConfig, ServerProxyConfig, TlsServerConfig};
 use crate::address::{Address, NetLocation};
@@ -9,10 +13,15 @@ fn parse_version_triplet(value: &Option<String>, field: &str) -> Result<Option<[
         Some(text) if text.trim().is_empty() => Ok(None),
         Some(text) => {
             let mut parts = [0u8; 3];
-            for (idx, part) in text.split('.').filter(|s| !s.is_empty()).take(3).enumerate() {
-                parts[idx] = part.parse::<u8>().map_err(|_| {
-                    Error::InvalidConfig(format!("invalid {field} value: {text}"))
-                })?;
+            for (idx, part) in text
+                .split('.')
+                .filter(|s| !s.is_empty())
+                .take(3)
+                .enumerate()
+            {
+                parts[idx] = part
+                    .parse::<u8>()
+                    .map_err(|_| Error::InvalidConfig(format!("invalid {field} value: {text}")))?;
             }
             Ok(Some(parts))
         }
@@ -38,16 +47,17 @@ fn build_reality_layer(
         ));
     }
 
-    let private_key = decode_private_key(&settings.private_key).map_err(|err| {
-        Error::InvalidConfig(format!("invalid reality privateKey: {err}"))
-    })?;
+    let private_key = decode_private_key(&settings.private_key)
+        .map_err(|err| Error::InvalidConfig(format!("invalid reality privateKey: {err}")))?;
 
     let short_ids = settings
         .short_ids
         .iter()
-        .map(|short_id| decode_short_id(short_id).map_err(|err| {
-            Error::InvalidConfig(format!("invalid reality shortId {short_id}: {err}"))
-        }))
+        .map(|short_id| {
+            decode_short_id(short_id).map_err(|err| {
+                Error::InvalidConfig(format!("invalid reality shortId {short_id}: {err}"))
+            })
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     let max_time_diff = settings.max_time_diff;

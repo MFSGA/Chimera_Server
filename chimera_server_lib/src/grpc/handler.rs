@@ -1,9 +1,6 @@
 use tonic::{Request, Response, Status};
 
-use crate::{
-    config::server_config::ServerProxyConfig,
-    runtime::RuntimeState,
-};
+use crate::{config::server_config::ServerProxyConfig, runtime::RuntimeState};
 
 use super::proto;
 
@@ -20,10 +17,9 @@ impl HandlerServiceImpl {
     fn collect_identities(&self, protocol: &ServerProxyConfig) -> Vec<String> {
         match protocol {
             ServerProxyConfig::Vless { user_label, .. } => vec![user_label.clone()],
-            ServerProxyConfig::Trojan { users } => users
-                .iter()
-                .filter_map(|user| user.email.clone())
-                .collect(),
+            ServerProxyConfig::Trojan { users } => {
+                users.iter().filter_map(|user| user.email.clone()).collect()
+            }
             ServerProxyConfig::Socks { accounts } => accounts
                 .iter()
                 .map(|account| account.username.clone())
@@ -138,10 +134,8 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
     async fn get_inbound_users_count(
         &self,
         request: Request<proto::xray::app::proxyman::command::GetInboundUserRequest>,
-    ) -> Result<
-        Response<proto::xray::app::proxyman::command::GetInboundUsersCountResponse>,
-        Status,
-    > {
+    ) -> Result<Response<proto::xray::app::proxyman::command::GetInboundUsersCountResponse>, Status>
+    {
         let request = request.into_inner();
         let inbound = self
             .runtime
