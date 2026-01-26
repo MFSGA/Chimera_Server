@@ -17,7 +17,8 @@ impl HandlerServiceImpl {
     fn collect_identities(&self, protocol: &ServerProxyConfig) -> Vec<String> {
         match protocol {
             ServerProxyConfig::Vless { user_label, .. } => vec![user_label.clone()],
-            ServerProxyConfig::Trojan { users } => {
+            #[cfg(feature = "trojan")]
+            ServerProxyConfig::Trojan { users, .. } => {
                 users.iter().filter_map(|user| user.email.clone()).collect()
             }
             ServerProxyConfig::Socks { accounts } => accounts

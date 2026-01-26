@@ -8,6 +8,8 @@ pub mod socket;
 
 pub mod bandwidth;
 
+pub mod prefixed_stream;
+
 #[inline]
 #[allow(clippy::uninit_vec)]
 pub fn allocate_vec<T>(len: usize) -> Vec<T> {
