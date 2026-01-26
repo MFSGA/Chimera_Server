@@ -27,6 +27,7 @@ pub enum Transport {
 pub enum Protocol {
     Vless,
     Vmess,
+    #[cfg(feature = "hysteria")]
     Hysteria2,
     #[serde(alias = "dokodemo-door")]
     DokodemoDoor,
