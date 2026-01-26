@@ -98,6 +98,71 @@ pub fn start(opts: Options) -> Result<(), Error> {
     })
 }
 
+pub fn validate(opts: Options) -> Result<(), Error> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    // 1. config parse
+    let config = opts.config.try_parse()?;
+
+    // 2. api/mcp config validation
+    let api_config = config.api.clone();
+    let mcp_config = config.mcp.clone();
+
+    let all_inbounds = config
+        .inbounds
+        .into_iter()
+        .map(ServerConfig::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut api_addr = None;
+    if let Some(api) = api_config.as_ref() {
+        if let Some(listen) = api.listen.as_ref() {
+            api_addr = Some(listen.parse::<std::net::SocketAddr>().map_err(|err| {
+                Error::InvalidConfig(format!("invalid api.listen {}: {}", listen, err))
+            })?);
+        }
+
+        if api_addr.is_none() {
+            if let Some(tag) = api.tag.as_ref() {
+                if let Some(inbound) = all_inbounds.iter().find(|cfg| cfg.tag == *tag) {
+                    if let crate::address::BindLocation::Address(addr) = &inbound.bind_location {
+                        api_addr = Some(addr.to_socket_addr()?);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(mcp) = mcp_config.as_ref() {
+        if let Some(listen) = mcp.listen.as_ref() {
+            let _ = listen.parse::<std::net::SocketAddr>().map_err(|err| {
+                Error::InvalidConfig(format!("invalid mcp.listen {}: {}", listen, err))
+            })?;
+            let _ = mcp.update_interval_ms.max(100);
+        }
+    }
+
+    let mut any_server = !all_inbounds.is_empty();
+    if let Some(api) = api_config.as_ref() {
+        if api_addr.is_some() && !api.services.is_empty() {
+            any_server = true;
+        }
+    }
+    if let Some(mcp) = mcp_config.as_ref() {
+        if mcp.listen.as_ref().is_some() {
+            any_server = true;
+        }
+    }
+
+    if !any_server {
+        return Err(Error::InvalidConfig(
+            "no servers started; check inbounds/api configuration".into(),
+        ));
+    }
+
+    Ok(())
+}
+
 async fn start_async(opts: Options) -> Result<(), Error> {
     // 1. config parse
     let config = opts.config.try_parse()?;
