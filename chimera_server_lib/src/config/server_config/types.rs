@@ -51,10 +51,17 @@ pub struct Hysteria2ServerConfig {
     pub ignore_client_bandwidth: bool,
 }
 
+#[cfg(feature = "trojan")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct TrojanUser {
     pub password: String,
     pub email: Option<String>,
+}
+
+#[cfg(feature = "trojan")]
+#[derive(Debug, Clone, Deserialize)]
+pub struct TrojanFallback {
+    pub dest: NetLocation,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -148,8 +155,11 @@ pub enum ServerProxyConfig {
     Hysteria2 {
         config: Hysteria2ServerConfig,
     },
+    #[cfg(feature = "trojan")]
     Trojan {
         users: Vec<TrojanUser>,
+        #[serde(default)]
+        fallbacks: Vec<TrojanFallback>,
     },
     Tls(TlsServerConfig),
     Reality(RealityTransportConfig),
@@ -171,6 +181,7 @@ impl std::fmt::Display for ServerProxyConfig {
                 Self::Websocket { .. } => "Websocket",
                 #[cfg(feature = "hysteria")]
                 Self::Hysteria2 { .. } => "Hysteria2",
+                #[cfg(feature = "trojan")]
                 Self::Trojan { .. } => "Trojan",
                 Self::Tls(_) => "Tls",
                 Self::Reality(_) => "Reality",

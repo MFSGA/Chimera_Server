@@ -7,9 +7,10 @@ use tokio::io::AsyncReadExt;
 use crate::{
     address::{Address, NetLocation},
     async_stream::AsyncStream,
-    config::server_config::TrojanUser,
+    config::server_config::{TrojanFallback, TrojanUser},
     handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
     traffic::TrafficContext,
+    util::prefixed_stream::PrefixedStream,
 };
 
 const CMD_CONNECT: u8 = 0x01;
@@ -29,11 +30,12 @@ struct TrojanCredential {
 #[derive(Debug)]
 pub struct TrojanTcpHandler {
     credentials: Vec<TrojanCredential>,
+    fallbacks: Vec<TrojanFallback>,
     inbound_tag: String,
 }
 
 impl TrojanTcpHandler {
-    pub fn new(users: Vec<TrojanUser>, inbound_tag: &str) -> Self {
+    pub fn new(users: Vec<TrojanUser>, fallbacks: Vec<TrojanFallback>, inbound_tag: &str) -> Self {
         let credentials = users
             .into_iter()
             .map(|user| {
@@ -52,6 +54,7 @@ impl TrojanTcpHandler {
             .collect();
         Self {
             credentials,
+            fallbacks,
             inbound_tag: inbound_tag.to_string(),
         }
     }
@@ -63,6 +66,55 @@ impl TcpServerHandler for TrojanTcpHandler {
         &self,
         mut server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
+        if !self.fallbacks.is_empty() {
+            let mut prefix = Vec::with_capacity(512);
+            let password_line = match read_line_crlf_with_prefix(
+                &mut server_stream,
+                MAX_PASSWORD_LINE,
+                &mut prefix,
+            )
+            .await
+            {
+                Ok(line) => line,
+                Err(_) => {
+                    return Ok(TcpServerSetupResult::TcpForward {
+                        remote_location: self.fallbacks[0].dest.clone(),
+                        stream: Box::new(PrefixedStream::new(prefix, server_stream)),
+                        need_initial_flush: false,
+                        connection_success_response: None,
+                        traffic_context: None,
+                    });
+                }
+            };
+
+            if password_line.len() != 56 {
+                return Ok(TcpServerSetupResult::TcpForward {
+                    remote_location: self.fallbacks[0].dest.clone(),
+                    stream: Box::new(PrefixedStream::new(prefix, server_stream)),
+                    need_initial_flush: false,
+                    connection_success_response: None,
+                    traffic_context: None,
+                });
+            }
+
+            if self
+                .credentials
+                .iter()
+                .all(|cred| cred.password_hash.as_ref() != password_line.as_slice())
+            {
+                return Ok(TcpServerSetupResult::TcpForward {
+                    remote_location: self.fallbacks[0].dest.clone(),
+                    stream: Box::new(PrefixedStream::new(prefix, server_stream)),
+                    need_initial_flush: false,
+                    connection_success_response: None,
+                    traffic_context: None,
+                });
+            }
+
+            // Auth looks valid; hand off to the standard Trojan parser with bytes replayed.
+            server_stream = Box::new(PrefixedStream::new(prefix, server_stream));
+        }
+
         let password_line = read_line_crlf(&mut server_stream, MAX_PASSWORD_LINE).await?;
         if password_line.len() != 56 {
             return Err(std::io::Error::new(
@@ -141,6 +193,36 @@ async fn read_line_crlf<T: AsyncReadExt + Unpin>(
         }
 
         let byte = stream.read_u8().await?;
+        buf.push(byte);
+        if byte == b'\n' {
+            if buf.len() < 2 || buf[buf.len() - 2] != b'\r' {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "line is not terminated by CRLF",
+                ));
+            }
+            buf.truncate(buf.len() - 2);
+            return Ok(buf);
+        }
+    }
+}
+
+async fn read_line_crlf_with_prefix<T: AsyncReadExt + Unpin>(
+    stream: &mut T,
+    max_len: usize,
+    prefix: &mut Vec<u8>,
+) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(64);
+    loop {
+        if buf.len() >= max_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "line too long",
+            ));
+        }
+
+        let byte = stream.read_u8().await?;
+        prefix.push(byte);
         buf.push(byte);
         if byte == b'\n' {
             if buf.len() < 2 || buf[buf.len() - 2] != b'\r' {
