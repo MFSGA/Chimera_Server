@@ -51,3 +51,7 @@ x509-parser = "0.16"
 [build-dependencies]
 tonic-build = { workspace = true }
 protoc-bin-vendored = { workspace = true }
+
+[features]
+hysteria = []
+default = ["hysteria"]

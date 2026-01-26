@@ -14,10 +14,9 @@ use super::{
     ws::WebsocketServerConfig,
 };
 
-use collectors::{
-    collect_hysteria2_settings, collect_socks_accounts, collect_trojan_clients,
-    collect_xhttp_settings,
-};
+#[cfg(feature = "hysteria")]
+use collectors::collect_hysteria2_settings;
+use collectors::{collect_socks_accounts, collect_trojan_clients, collect_xhttp_settings};
 use tls::apply_security_layers;
 
 impl TryFrom<InboudItem> for ServerConfig {
@@ -73,6 +72,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                     quic_settings: None,
                 })
             }
+            #[cfg(feature = "hysteria")]
             Protocol::Hysteria2 => {
                 let stream_settings = stream_settings.ok_or_else(|| {
                     Error::InvalidConfig("hysteria2 inbound missing streamSettings".into())

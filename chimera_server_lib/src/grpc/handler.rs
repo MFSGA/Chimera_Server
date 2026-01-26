@@ -24,6 +24,7 @@ impl HandlerServiceImpl {
                 .iter()
                 .map(|account| account.username.clone())
                 .collect(),
+            #[cfg(feature = "hysteria")]
             ServerProxyConfig::Hysteria2 { config } => config
                 .clients
                 .iter()

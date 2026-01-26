@@ -3,10 +3,11 @@ use std::sync::Arc;
 use tokio::{io::AsyncReadExt, task::JoinHandle};
 use tracing::info;
 
+#[cfg(feature = "hysteria")]
+use crate::handler::hysteria2::run_hysteria2_server;
 use crate::{
     address::BindLocation,
     config::server_config::{quic::ServerQuicConfig, ServerConfig, ServerProxyConfig},
-    handler::hysteria2::run_hysteria2_server,
     util::rustls_util::create_server_config,
 };
 
@@ -47,6 +48,7 @@ pub async fn start_quic_server(config: ServerConfig) -> std::io::Result<Option<J
     ));
 
     match protocol {
+        #[cfg(feature = "hysteria")]
         ServerProxyConfig::Hysteria2 { config } => Ok(Some(tokio::spawn(async move {
             if let Err(err) = run_hysteria2_server(bind_address, server_config, config, tag).await {
                 tracing::error!("hysteria2 server stopped with error: {}", err);
