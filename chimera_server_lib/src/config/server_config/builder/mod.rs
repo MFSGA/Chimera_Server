@@ -16,7 +16,10 @@ use super::{
 
 #[cfg(feature = "hysteria")]
 use collectors::collect_hysteria2_settings;
-use collectors::{collect_socks_accounts, collect_trojan_clients, collect_xhttp_settings};
+use collectors::{collect_socks_accounts, collect_xhttp_settings};
+
+#[cfg(feature = "trojan")]
+use collectors::{collect_trojan_clients, collect_trojan_fallbacks};
 use tls::apply_security_layers;
 
 impl TryFrom<InboudItem> for ServerConfig {
@@ -147,13 +150,16 @@ impl TryFrom<InboudItem> for ServerConfig {
             }
             Protocol::Vmess => todo!(),
 
+            #[cfg(feature = "trojan")]
             Protocol::Trojan => {
                 let settings = settings.ok_or_else(|| {
                     Error::InvalidConfig("trojan inbound requires clients".into())
                 })?;
+                let trojan_fallbacks = collect_trojan_fallbacks(&settings)?;
                 let trojan_users = collect_trojan_clients(settings)?;
                 let mut protocol = ServerProxyConfig::Trojan {
                     users: trojan_users,
+                    fallbacks: trojan_fallbacks,
                 };
 
                 if let Some(stream_setting) = stream_settings.as_ref() {

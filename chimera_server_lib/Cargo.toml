@@ -54,4 +54,5 @@ protoc-bin-vendored = { workspace = true }
 
 [features]
 hysteria = []
-default = ["hysteria"]
+trojan = []
+default = ["hysteria", "trojan"]

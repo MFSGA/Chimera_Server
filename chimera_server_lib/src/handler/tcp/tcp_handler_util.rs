@@ -7,7 +7,6 @@ use crate::{
         reality::RealityServerHandler,
         socks::SocksTcpServerHandler,
         tls::TlsServerHandler,
-        trojan::TrojanTcpHandler,
         vless_handler::VlessTcpHandler,
         ws::{create_websocket_server_target, WebsocketTcpServerHandler},
     },
@@ -34,7 +33,10 @@ pub fn create_tcp_server_handler(
                 .collect::<Vec<_>>();
             Box::new(WebsocketTcpServerHandler::new(server_targets))
         }
-        ServerProxyConfig::Trojan { users } => Box::new(TrojanTcpHandler::new(users, inbound_tag)),
+        #[cfg(feature = "trojan")]
+        ServerProxyConfig::Trojan { users, fallbacks } => Box::new(
+            crate::handler::trojan::TrojanTcpHandler::new(users, fallbacks, inbound_tag),
+        ),
         ServerProxyConfig::Tls(tls_config) => {
             let TlsServerConfig {
                 certificate_path,

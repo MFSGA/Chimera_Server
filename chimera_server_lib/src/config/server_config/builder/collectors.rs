@@ -10,7 +10,13 @@ use crate::{
 
 #[cfg(feature = "hysteria")]
 use super::super::types::{Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2ServerConfig};
-use super::super::types::{RangeConfig, SocksUser, TrojanUser, XhttpServerConfig};
+use super::super::types::{RangeConfig, SocksUser, XhttpServerConfig};
+
+#[cfg(feature = "trojan")]
+use crate::address::NetLocation;
+
+#[cfg(feature = "trojan")]
+use super::super::types::{TrojanFallback, TrojanUser};
 
 #[cfg(feature = "hysteria")]
 pub(super) fn collect_hysteria2_settings(
@@ -90,6 +96,7 @@ pub(super) fn collect_hysteria2_settings(
     })
 }
 
+#[cfg(feature = "trojan")]
 pub(super) fn collect_trojan_clients(settings: SettingObject) -> Result<Vec<TrojanUser>, Error> {
     let clients = settings.trojan_clients().unwrap_or_default();
     if clients.is_empty() {
@@ -114,6 +121,53 @@ pub(super) fn collect_trojan_clients(settings: SettingObject) -> Result<Vec<Troj
             })
         })
         .collect()
+}
+
+#[cfg(feature = "trojan")]
+pub(super) fn collect_trojan_fallbacks(
+    settings: &SettingObject,
+) -> Result<Vec<TrojanFallback>, Error> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct TrojanInboundSettings {
+        #[serde(default)]
+        fallbacks: Vec<TrojanInboundFallback>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct TrojanInboundFallback {
+        dest: String,
+    }
+
+    let trojan_settings: TrojanInboundSettings = settings
+        .deserialize()
+        .map_err(|e| Error::InvalidConfig(format!("failed to parse trojan settings: {e}")))?;
+
+    let mut fallbacks = Vec::new();
+    for fallback in trojan_settings.fallbacks {
+        let dest = fallback.dest.trim();
+        if dest.is_empty() {
+            return Err(Error::InvalidConfig(
+                "trojan fallback dest cannot be empty".into(),
+            ));
+        }
+
+        // dest-only mode: require explicit host:port (no port-only, no unix)
+        if dest.find(':').is_none() {
+            return Err(Error::InvalidConfig(
+                "trojan fallback dest must be host:port".into(),
+            ));
+        }
+
+        let net_location = NetLocation::from_str(dest, None).map_err(|e| {
+            Error::InvalidConfig(format!("invalid trojan fallback dest {dest}: {e}"))
+        })?;
+
+        fallbacks.push(TrojanFallback { dest: net_location });
+    }
+
+    Ok(fallbacks)
 }
 
 pub(super) fn collect_socks_accounts(settings: SettingObject) -> Result<Vec<SocksUser>, Error> {

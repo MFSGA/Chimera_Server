@@ -7,5 +7,8 @@ pub mod ws;
 pub use types::{Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2ServerConfig};
 pub use types::{
     RangeConfig, RealityTransportConfig, ServerConfig, ServerProxyConfig, SocksUser,
-    TlsServerConfig, TrojanUser, XhttpServerConfig,
+    TlsServerConfig, XhttpServerConfig,
 };
+
+#[cfg(feature = "trojan")]
+pub use types::{TrojanFallback, TrojanUser};

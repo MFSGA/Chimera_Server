@@ -31,6 +31,7 @@ pub enum Protocol {
     Hysteria2,
     #[serde(alias = "dokodemo-door")]
     DokodemoDoor,
+    #[cfg(feature = "trojan")]
     Trojan,
     Xhttp,
     Socks,
@@ -66,6 +67,7 @@ impl SettingObject {
             .unwrap_or(None)
     }
 
+    #[cfg(feature = "trojan")]
     pub fn trojan_clients(&self) -> Option<Vec<TrojanClientSetting>> {
         self.0
             .get("clients")
@@ -95,6 +97,7 @@ pub struct ClientSetting {
     id: String,
 }
 
+#[cfg(feature = "trojan")]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TrojanClientSetting {
     #[serde(default)]
