@@ -8,11 +8,11 @@ use crate::{
     Error,
 };
 
-use super::super::types::{
-    Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2ServerConfig, RangeConfig, SocksUser,
-    TrojanUser, XhttpServerConfig,
-};
+#[cfg(feature = "hysteria")]
+use super::super::types::{Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2ServerConfig};
+use super::super::types::{RangeConfig, SocksUser, TrojanUser, XhttpServerConfig};
 
+#[cfg(feature = "hysteria")]
 pub(super) fn collect_hysteria2_settings(
     settings: SettingObject,
 ) -> Result<Hysteria2ServerConfig, Error> {

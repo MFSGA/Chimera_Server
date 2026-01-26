@@ -3,6 +3,7 @@ pub mod vless_handler;
 
 pub mod ws;
 
+#[cfg(feature = "hysteria")]
 pub mod hysteria2;
 
 pub mod trojan;

@@ -22,6 +22,7 @@ pub struct ServerConfig {
     pub quic_settings: Option<ServerQuicConfig>,
 }
 
+#[cfg(feature = "hysteria")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct Hysteria2Client {
     pub password: String,
@@ -29,6 +30,7 @@ pub struct Hysteria2Client {
     pub flow: Option<String>,
 }
 
+#[cfg(feature = "hysteria")]
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Hysteria2BandwidthConfig {
@@ -38,6 +40,7 @@ pub struct Hysteria2BandwidthConfig {
     pub max_rx: u64,
 }
 
+#[cfg(feature = "hysteria")]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Hysteria2ServerConfig {
@@ -141,6 +144,7 @@ pub enum ServerProxyConfig {
         #[serde(alias = "target")]
         targets: Box<OneOrSome<WebsocketServerConfig>>,
     },
+    #[cfg(feature = "hysteria")]
     Hysteria2 {
         config: Hysteria2ServerConfig,
     },
@@ -165,6 +169,7 @@ impl std::fmt::Display for ServerProxyConfig {
             match self {
                 Self::Vless { .. } => "Vless",
                 Self::Websocket { .. } => "Websocket",
+                #[cfg(feature = "hysteria")]
                 Self::Hysteria2 { .. } => "Hysteria2",
                 Self::Trojan { .. } => "Trojan",
                 Self::Tls(_) => "Tls",
