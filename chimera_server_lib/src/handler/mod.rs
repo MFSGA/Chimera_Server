@@ -1,6 +1,7 @@
 pub mod tcp;
 #[cfg(feature = "tls")]
 pub mod tls;
+#[cfg(feature = "vless")]
 pub mod vless_handler;
 
 #[cfg(feature = "ws")]
