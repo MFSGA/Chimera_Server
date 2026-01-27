@@ -1,12 +1,13 @@
-use crate::{
-    config::StreamSettings,
-    reality::{decode_private_key, decode_short_id},
-    Error,
-};
+use crate::{config::StreamSettings, Error};
 
+#[cfg(feature = "reality")]
+use crate::reality::{decode_private_key, decode_short_id};
+
+#[cfg(feature = "reality")]
+use super::super::types::RealityTransportConfig;
+use super::super::types::ServerProxyConfig;
 #[cfg(feature = "tls")]
 use super::super::types::TlsServerConfig;
-use super::super::types::{RealityTransportConfig, ServerProxyConfig};
 use crate::address::{Address, NetLocation};
 
 fn parse_version_triplet(value: &Option<String>, field: &str) -> Result<Option<[u8; 3]>, Error> {
@@ -30,6 +31,7 @@ fn parse_version_triplet(value: &Option<String>, field: &str) -> Result<Option<[
     }
 }
 
+#[cfg(feature = "reality")]
 fn build_reality_layer(
     protocol: ServerProxyConfig,
     stream_settings: &StreamSettings,
@@ -114,25 +116,24 @@ pub(super) fn apply_security_layers(
     protocol: ServerProxyConfig,
     stream_settings: &StreamSettings,
 ) -> Result<ServerProxyConfig, Error> {
-    match stream_settings
+    let security = stream_settings
         .security
         .as_deref()
-        .map(|value| value.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("tls") => {
-            #[cfg(feature = "tls")]
-            {
-                build_tls_layer(protocol, stream_settings)
-            }
-            #[cfg(not(feature = "tls"))]
-            {
-                Err(Error::InvalidConfig(
-                    "tls inbound requires enabling the tls feature".into(),
-                ))
-            }
-        }
+        .map(|value| value.to_ascii_lowercase());
+
+    match security.as_deref() {
+        #[cfg(feature = "tls")]
+        Some("tls") => build_tls_layer(protocol, stream_settings),
+        #[cfg(not(feature = "tls"))]
+        Some("tls") => Err(Error::InvalidConfig(
+            "tls security layer requires the tls feature".into(),
+        )),
+        #[cfg(feature = "reality")]
         Some("reality") => build_reality_layer(protocol, stream_settings),
+        #[cfg(not(feature = "reality"))]
+        Some("reality") => Err(Error::InvalidConfig(
+            "reality security layer requires the reality feature".into(),
+        )),
         _ => Ok(protocol),
     }
 }

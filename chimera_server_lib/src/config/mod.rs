@@ -50,6 +50,7 @@ pub struct StreamSettings {
     ws_settings: Option<WsSettings>,
     #[serde(alias = "hysteriaSettings")]
     hysteria_settings: Option<HysteriaSettings>,
+    #[cfg(feature = "reality")]
     #[serde(alias = "realitySettings")]
     reality_settings: Option<RealitySettings>,
 }

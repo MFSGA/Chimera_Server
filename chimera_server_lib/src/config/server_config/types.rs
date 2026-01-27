@@ -115,6 +115,7 @@ pub struct TlsServerConfig {
     pub inner: Box<ServerProxyConfig>,
 }
 
+#[cfg(feature = "reality")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct RealityTransportConfig {
     pub dest: NetLocation,
@@ -131,6 +132,7 @@ pub struct RealityTransportConfig {
     pub inner: Box<ServerProxyConfig>,
 }
 
+#[cfg(feature = "reality")]
 impl RealityTransportConfig {
     pub fn to_reality_server_config(&self) -> crate::reality::RealityServerConfig {
         crate::reality::RealityServerConfig {
@@ -168,6 +170,7 @@ pub enum ServerProxyConfig {
     },
     #[cfg(feature = "tls")]
     Tls(TlsServerConfig),
+    #[cfg(feature = "reality")]
     Reality(RealityTransportConfig),
     Xhttp {
         config: XhttpServerConfig,
@@ -190,9 +193,10 @@ impl std::fmt::Display for ServerProxyConfig {
                 Self::Hysteria2 { .. } => "Hysteria2",
                 #[cfg(feature = "trojan")]
                 Self::Trojan { .. } => "Trojan",
+                #[cfg(feature = "reality")]
+                Self::Reality(_) => "Reality",
                 #[cfg(feature = "tls")]
                 Self::Tls(_) => "Tls",
-                Self::Reality(_) => "Reality",
                 Self::Xhttp { .. } => "Xhttp",
                 Self::Socks { .. } => "Socks",
             }

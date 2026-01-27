@@ -6,11 +6,10 @@ pub mod ws;
 
 #[cfg(feature = "hysteria")]
 pub use types::{Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2ServerConfig};
-pub use types::{
-    RangeConfig, RealityTransportConfig, ServerConfig, ServerProxyConfig, SocksUser,
-    XhttpServerConfig,
-};
+pub use types::{ServerConfig, ServerProxyConfig, SocksUser, XhttpServerConfig};
 
+#[cfg(feature = "reality")]
+pub use types::RealityTransportConfig;
 #[cfg(feature = "tls")]
 pub use types::TlsServerConfig;
 
