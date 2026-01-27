@@ -96,7 +96,7 @@ tokio-rustls = { version = "*", default-features = false, features = [
     "aws-lc-rs",
 ] }
 
-socket2 = "*"
+socket2 = { version = "*", features = ["all"] }
 log = "0.4"
 rcgen = { version = "0.13", features = ["x509-parser"] }
 subtle = "2"
