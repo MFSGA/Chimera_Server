@@ -1,12 +1,14 @@
 #[cfg(feature = "reality")]
 use crate::handler::reality::RealityServerHandler;
+#[cfg(feature = "vless")]
+use crate::handler::vless_handler::VlessTcpHandler;
 #[cfg(feature = "ws")]
 use crate::handler::ws::{create_websocket_server_target, WebsocketTcpServerHandler};
 #[cfg(feature = "tls")]
 use crate::{config::server_config::TlsServerConfig, handler::tls::TlsServerHandler};
 use crate::{
     config::{rule::RuleConfig, server_config::ServerProxyConfig},
-    handler::{socks::SocksTcpServerHandler, vless_handler::VlessTcpHandler},
+    handler::socks::SocksTcpServerHandler,
 };
 
 use super::tcp_handler::TcpServerHandler;
@@ -17,6 +19,7 @@ pub fn create_tcp_server_handler(
     rules_stack: &mut Vec<Vec<RuleConfig>>,
 ) -> Box<dyn TcpServerHandler> {
     match server_proxy_config {
+        #[cfg(feature = "vless")]
         ServerProxyConfig::Vless {
             user_id,
             user_label,

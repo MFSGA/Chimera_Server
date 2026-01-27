@@ -148,6 +148,7 @@ impl RealityTransportConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub enum ServerProxyConfig {
+    #[cfg(feature = "vless")]
     Vless {
         user_id: String,
         user_label: String,
@@ -186,6 +187,7 @@ impl std::fmt::Display for ServerProxyConfig {
             f,
             "{}",
             match self {
+                #[cfg(feature = "vless")]
                 Self::Vless { .. } => "Vless",
                 #[cfg(feature = "ws")]
                 Self::Websocket { .. } => "Websocket",

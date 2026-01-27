@@ -1,3 +1,5 @@
+#![cfg(feature = "vless")]
+
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use async_trait::async_trait;
