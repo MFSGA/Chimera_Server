@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::util::bandwidth::BandwidthValue;
+
 pub mod internal;
 
 pub mod def;
@@ -28,6 +30,7 @@ pub enum Protocol {
     Vless,
     Vmess,
     #[cfg(feature = "hysteria")]
+    #[serde(alias = "hysteria")]
     Hysteria2,
     #[serde(alias = "dokodemo-door")]
     DokodemoDoor,
@@ -44,6 +47,8 @@ pub struct StreamSettings {
     security: Option<String>,
     tls_settings: Option<TlsSettings>,
     ws_settings: Option<WsSettings>,
+    #[serde(alias = "hysteriaSettings")]
+    hysteria_settings: Option<HysteriaSettings>,
     #[serde(alias = "realitySettings")]
     reality_settings: Option<RealitySettings>,
 }
@@ -52,6 +57,21 @@ pub struct StreamSettings {
 pub struct WsSettings {
     host: String,
     path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HysteriaSettings {
+    #[serde(default)]
+    pub version: Option<u8>,
+    #[serde(default)]
+    pub congestion: Option<String>,
+    #[serde(default)]
+    pub up: Option<BandwidthValue>,
+    #[serde(default)]
+    pub down: Option<BandwidthValue>,
+    #[serde(default)]
+    pub ignore_client_bandwidth: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -110,24 +130,26 @@ pub struct TrojanClientSetting {
 struct TlsSettings {
     alpn: Vec<String>,
     certificates: Vec<Certificate>,
-    cipher_suites: String,
-    disable_system_root: bool,
-    enable_session_resumption: bool,
+    cipher_suites: Option<String>,
+    disable_system_root: Option<bool>,
+    enable_session_resumption: Option<bool>,
     max_version: String,
     min_version: String,
-    reject_unknown_sni: bool,
+    reject_unknown_sni: Option<bool>,
     server_name: String,
 }
 
 #[derive(Deserialize, Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Certificate {
-    build_chain: bool,
+    build_chain: Option<bool>,
     certificate_file: String,
     key_file: String,
-    ocsp_stapling: u64,
-    one_time_loading: bool,
-    usage: String,
+    // reload the certificate every n seconds
+    ocsp_stapling: Option<u64>,
+    one_time_loading: Option<bool>,
+    // set Certificate type
+    usage: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone, Serialize)]

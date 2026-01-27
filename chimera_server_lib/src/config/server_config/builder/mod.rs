@@ -80,6 +80,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                 let stream_settings = stream_settings.ok_or_else(|| {
                     Error::InvalidConfig("hysteria2 inbound missing streamSettings".into())
                 })?;
+                let hysteria_settings = stream_settings.hysteria_settings.as_ref();
                 let tls_settings = stream_settings.tls_settings.ok_or_else(|| {
                     Error::InvalidConfig("hysteria2 inbound requires tlsSettings".into())
                 })?;
@@ -88,7 +89,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                 let settings = settings.ok_or_else(|| {
                     Error::InvalidConfig("hysteria2 inbound requires clients".into())
                 })?;
-                let config = collect_hysteria2_settings(settings)?;
+                let config = collect_hysteria2_settings(settings, hysteria_settings)?;
                 if config.clients.is_empty() {
                     return Err(Error::InvalidConfig(
                         "hysteria2 inbound requires at least one client".into(),
