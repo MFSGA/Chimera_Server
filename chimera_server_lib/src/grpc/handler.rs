@@ -31,6 +31,7 @@ impl HandlerServiceImpl {
                 .iter()
                 .filter_map(|client| client.email.clone())
                 .collect(),
+            #[cfg(feature = "ws")]
             ServerProxyConfig::Websocket { targets } => {
                 let mut identities = Vec::new();
                 match targets.as_ref() {

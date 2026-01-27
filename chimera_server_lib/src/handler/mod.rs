@@ -1,6 +1,7 @@
 pub mod tcp;
 pub mod vless_handler;
 
+#[cfg(feature = "ws")]
 pub mod ws;
 
 #[cfg(feature = "hysteria")]

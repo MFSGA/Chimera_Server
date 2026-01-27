@@ -5,10 +5,14 @@ use serde::Deserialize;
 use crate::{
     address::{BindLocation, NetLocation},
     config::Transport,
-    util::option::OneOrSome,
 };
 
-use super::{quic::ServerQuicConfig, ws::WebsocketServerConfig};
+#[cfg(feature = "ws")]
+use crate::util::option::OneOrSome;
+
+use super::quic::ServerQuicConfig;
+#[cfg(feature = "ws")]
+use super::ws::WebsocketServerConfig;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
@@ -145,6 +149,7 @@ pub enum ServerProxyConfig {
         user_id: String,
         user_label: String,
     },
+    #[cfg(feature = "ws")]
     #[serde(alias = "ws")]
     Websocket {
         #[serde(alias = "target")]
@@ -177,6 +182,7 @@ impl std::fmt::Display for ServerProxyConfig {
             "{}",
             match self {
                 Self::Vless { .. } => "Vless",
+                #[cfg(feature = "ws")]
                 Self::Websocket { .. } => "Websocket",
                 #[cfg(feature = "hysteria")]
                 Self::Hysteria2 { .. } => "Hysteria2",
