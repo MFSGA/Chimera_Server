@@ -4,8 +4,9 @@ use std::{
     time::Duration,
 };
 
-use congestion::BrutalConfig;
+// use congestion::BrutalConfig;
 use connection::process_hysteria2_connection;
+use quinn::congestion::BbrConfig;
 
 use crate::{
     config::server_config::Hysteria2ServerConfig,
@@ -71,8 +72,9 @@ pub async fn run_hysteria2_server(
                         return;
                     }
                 };
-                transport
-                    .congestion_controller_factory(Arc::new(BrutalConfig::new(tx_bps.clone())));
+
+                // use brutal in the future
+                transport.congestion_controller_factory(Arc::new(BbrConfig::default()));
 
                 let mut server_config = base_server_config.clone();
                 server_config.transport_config(Arc::new(transport));
