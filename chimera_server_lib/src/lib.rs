@@ -16,6 +16,7 @@ mod beginning;
 
 mod config;
 
+#[cfg(feature = "api")]
 mod grpc;
 
 mod mcp;
@@ -218,6 +219,7 @@ async fn start_async(opts: Options) -> Result<(), Error> {
     }
 
     let mut join_handles = Vec::with_capacity(all_inbounds.len() * 2 + 1);
+    #[cfg(feature = "api")]
     if let Some(api) = api_config.as_ref() {
         if let Some(listen) = api_addr {
             if !api.services.is_empty() {
@@ -233,6 +235,13 @@ async fn start_async(opts: Options) -> Result<(), Error> {
             } else {
                 tracing::warn!("api is configured but no services are enabled");
             }
+        }
+    }
+
+    #[cfg(not(feature = "api"))]
+    if let Some(api) = api_config.as_ref() {
+        if !api.services.is_empty() {
+            tracing::warn!("api services configured but the \"api\" feature is disabled; grpc support is unavailable");
         }
     }
 
