@@ -212,11 +212,7 @@ async fn handle_tcp_stream(
 
     send_tcp_response(&mut send, TCP_SUCCESS_STATUS, "").await?;
 
-    let context_identity = client
-        .email
-        .clone()
-        .or_else(|| client.flow.clone())
-        .unwrap_or(client.password.clone());
+    let context_identity = client.email.clone().unwrap_or(client.password.clone());
     let context = TrafficContext::new("hysteria2")
         .with_identity(context_identity)
         .with_inbound_tag((*inbound_tag).clone())

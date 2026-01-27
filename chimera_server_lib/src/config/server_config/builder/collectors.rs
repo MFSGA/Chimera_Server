@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::Deserialize;
 
 use crate::{
-    config::{ClientSetting, SettingObject},
+    config::{HysteriaSettings, SettingObject},
     util::bandwidth::{parse_bandwidth, BandwidthValue},
     Error,
 };
@@ -21,16 +21,25 @@ use super::super::types::{TrojanFallback, TrojanUser};
 #[cfg(feature = "hysteria")]
 pub(super) fn collect_hysteria2_settings(
     settings: SettingObject,
+    hysteria_settings: Option<&HysteriaSettings>,
 ) -> Result<Hysteria2ServerConfig, Error> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Hysteria2InboundSettings {
         #[serde(default)]
-        clients: Vec<ClientSetting>,
+        clients: Vec<Hysteria2ClientSetting>,
         #[serde(default)]
         bandwidth: Option<Hysteria2BandwidthSetting>,
         #[serde(default)]
-        ignore_client_bandwidth: bool,
+        ignore_client_bandwidth: Option<bool>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Hysteria2ClientSetting {
+        id: String,
+        #[serde(default)]
+        email: String,
     }
 
     #[derive(Deserialize)]
@@ -56,25 +65,49 @@ pub(super) fn collect_hysteria2_settings(
             } else {
                 Some(client.email)
             },
-            flow: if client.flow.is_empty() {
-                None
-            } else {
-                Some(client.flow)
-            },
         })
         .collect();
 
     let mut bandwidth = Hysteria2BandwidthConfig::default();
+    let mut saw_up = false;
+    let mut saw_down = false;
     if let Some(config) = raw.bandwidth {
         if let Some(up) = config.up {
             bandwidth.max_tx = parse_bandwidth(up).map_err(|err| {
                 Error::InvalidConfig(format!("invalid hysteria2 bandwidth.up: {}", err))
             })?;
+            saw_up = true;
         }
         if let Some(down) = config.down {
             bandwidth.max_rx = parse_bandwidth(down).map_err(|err| {
                 Error::InvalidConfig(format!("invalid hysteria2 bandwidth.down: {}", err))
             })?;
+            saw_down = true;
+        }
+    }
+
+    if let Some(hysteria_settings) = hysteria_settings {
+        if let Some(version) = hysteria_settings.version {
+            if version != 2 {
+                return Err(Error::InvalidConfig(format!(
+                    "hysteriaSettings.version must be 2 for hysteria2 inbound (got {version})"
+                )));
+            }
+        }
+
+        if !saw_up {
+            if let Some(up) = hysteria_settings.up.clone() {
+                bandwidth.max_tx = parse_bandwidth(up).map_err(|err| {
+                    Error::InvalidConfig(format!("invalid hysteriaSettings.up value: {}", err))
+                })?;
+            }
+        }
+        if !saw_down {
+            if let Some(down) = hysteria_settings.down.clone() {
+                bandwidth.max_rx = parse_bandwidth(down).map_err(|err| {
+                    Error::InvalidConfig(format!("invalid hysteriaSettings.down value: {}", err))
+                })?;
+            }
         }
     }
 
@@ -89,10 +122,16 @@ pub(super) fn collect_hysteria2_settings(
         ));
     }
 
+    let ignore_client_bandwidth = raw.ignore_client_bandwidth.unwrap_or_else(|| {
+        hysteria_settings
+            .and_then(|settings| settings.ignore_client_bandwidth)
+            .unwrap_or(false)
+    });
+
     Ok(Hysteria2ServerConfig {
         clients,
         bandwidth,
-        ignore_client_bandwidth: raw.ignore_client_bandwidth,
+        ignore_client_bandwidth,
     })
 }
 
