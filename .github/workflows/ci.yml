@@ -16,11 +16,11 @@ defaults:
     shell: bash
 
 env:
-  PACKAGE: "clash"
-  REGISTRY: "ghcr.io"
-  IMAGE_NAME: "clash-rs"
+  # PACKAGE: "chimera_server_app"
+  # REGISTRY: "ghcr.io"
+  # IMAGE_NAME: "clash-rs"
   RUST_LOG: "clash=TRACE"
-  RUST_TOOLCHAIN: "nightly-2025-09-15"
+  # RUST_TOOLCHAIN: "nightly-2025-09-15"
   SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
   CROSS_CONTAINER_UID: 1001
   CROSS_CONTAINER_GID: 118
@@ -68,3 +68,141 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace --all-features
+
+  compile:
+    name: ${{ matrix.release-name || matrix.target || 'Unknown' }}
+    runs-on: ${{ matrix.os || 'ubuntu-latest' }}
+    strategy:
+      # todo: changed to false to test all combinations
+      fail-fast: true
+      matrix:
+        include:
+          # Example
+          # when not set, default will be used (except target, cross)
+          # - os: ubuntu-latest
+          #   target: x86_64-unknown-linux-gnu
+          #   release-name: $target
+          #   toolchain: nightly
+          #   tool: cargo/cross
+          #   postfix: ""
+          #   extra-args: ""
+          #   components: ""
+          #   rustflags: "--cfg tokio_unstable"
+
+          # Linux x86 gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            tool: cross
+            extra-args: -F "full"
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            postfix: ".exe"
+            extra-args: -F "full"
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            /target
+          key: ${{ matrix.release-name || matrix.target }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ matrix.release-name || matrix.target }}
+
+      # - name: Cache Docker images for cross
+      #   if: matrix.tool == 'cross'
+      #   uses: AndreKurait/docker-cache@0.6.0
+      #   with:
+      #     key: docker-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('**/Cross.toml') }}
+
+      - uses: ilammy/setup-nasm@v1
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain || env.RUST_TOOLCHAIN || 'nightly' }}
+          targets: ${{ matrix.build-std && 'x86_64-unknown-linux-gnu' || matrix.target }}
+          components: ${{ matrix.components || matrix.build-std && 'rustfmt,clippy,rust-src' || 'rustfmt,clippy' }}
+
+      - name: Install cross-rs/cross
+        if: matrix.tool == 'cross'
+        run: |
+          rm -f ~/.cargo/bin/cross*
+          cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "23.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set environment variables
+        run: |
+          echo "CLASH_GIT_REF=${GITHUB_REF}" >> $GITHUB_ENV
+          echo "CLASH_GIT_SHA=${GITHUB_SHA}" >> $GITHUB_ENV
+
+      - name: Cargo fmt
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: clechasseur/rs-cargo@v4
+        with:
+          command: fmt
+          args: --all -- --check
+        env:
+          CLASH_DOCKER_TEST: "true"
+
+      - name: Cargo clippy
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: clechasseur/rs-cargo@v4
+        with:
+          tool: ${{ matrix.tool }}
+          command: clippy
+          args: -p chimera_server_app --target ${{ matrix.target }} ${{ matrix.extra-args }} -- -D warnings
+        env:
+          CLASH_DOCKER_TEST: "true"
+
+      #- name: Cargo test
+      #  uses: clechasseur/rs-cargo@v4
+      #  if: ${{ !matrix.no-test &&  github.event_name == 'pull_request' }}
+      #  with:
+      #    tool: ${{ matrix.tool }}
+      #    command: "test"
+      #    args: --workspace --exclude clash-ffi --target ${{ matrix.target }} ${{ matrix.extra-args }}
+      #  env:
+      #    CROSS_CONTAINER_OPTS: "--network host"
+      #    CLASH_DOCKER_TEST: ${{ (startsWith(matrix.os, 'ubuntu') && !matrix.no-docker-test) && 'true' || 'false' }}
+      #   RUSTFLAGS: ${{ matrix.rustflags || '--cfg tokio_unstable' }}
+
+      - name: Cargo build
+        uses: clechasseur/rs-cargo@v4
+        with:
+          tool: ${{ matrix.tool }}
+          command: build
+          args: --release --target ${{ matrix.target }} ${{ matrix.extra-args }} --package chimera_server_app
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags || '--cfg tokio_unstable' }}
+          CROSS_BUILD_ZIG: ${{ matrix.zig }}
+
+      # - name: Rename binary
+      #  run: mv target/${{ matrix.target }}/release/clash-rs${{ matrix.postfix }} ${{ env.PACKAGE }}-${{ matrix.release-name || matrix.target }}${{ matrix.postfix }}
+
+      #- name: Upload binaries
+      #  uses: actions/upload-artifact@v6
+      #  if: ${{ !matrix.no-release }}
+      #  with:
+      #    name: ${{ matrix.release-name || matrix.target }}
+      #    path: ${{ env.PACKAGE }}-${{ matrix.release-name || matrix.target }}${{ matrix.postfix }}
+
+      #- name: Setup tmate session
+      #  if: ${{ failure() }}
+      #  uses: mxschmitt/action-tmate@v3
+      #  with:
+      #    detached: true
+      #    timeout-minutes: 15
+      #    limit-access-to-actor: true
