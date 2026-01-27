@@ -60,6 +60,10 @@ tls = []
 reality = []
 vless = []
 traffic = []
-# api = ["tonic", "prost", "prost-types", "tokio-stream"]
-default = ["hysteria", "trojan", "ws", "tls", "reality", "vless"]
+api = ["tonic", "prost", "prost-types", "tokio-stream"]
+
+full = ["hysteria", "trojan", "ws", "tls", "reality", "vless", "api"]
+
+default = ["full"]
+
 # default = ["trojan", "ws", "tls"]

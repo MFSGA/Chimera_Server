@@ -16,11 +16,11 @@ defaults:
     shell: bash
 
 env:
-  PACKAGE: "clash"
-  REGISTRY: "ghcr.io"
-  IMAGE_NAME: "clash-rs"
+  # PACKAGE: "chimera_server_app"
+  # REGISTRY: "ghcr.io"
+  # IMAGE_NAME: "clash-rs"
   RUST_LOG: "clash=TRACE"
-  RUST_TOOLCHAIN: "nightly-2025-09-15"
+  # RUST_TOOLCHAIN: "nightly-2025-09-15"
   SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
   CROSS_CONTAINER_UID: 1001
   CROSS_CONTAINER_GID: 118
@@ -68,3 +68,33 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace --all-features
+
+  compile:
+    name: ${{ matrix.release-name || matrix.target || 'Unknown' }}
+    runs-on: ${{ matrix.os || 'ubuntu-latest' }}
+    strategy:
+      # todo: changed to false to test all combinations
+      fail-fast: true
+      matrix:
+        include:
+          # Example
+          # when not set, default will be used (except target, cross)
+          # - os: ubuntu-latest
+          #   target: x86_64-unknown-linux-gnu
+          #   release-name: $target
+          #   toolchain: nightly
+          #   tool: cargo/cross
+          #   postfix: ""
+          #   extra-args: ""
+          #   components: ""
+          #   rustflags: "--cfg tokio_unstable"
+
+          # Linux x86 gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            tool: cross
+            extra-args: -F "full"
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            postfix: ".exe"
+            extra-args: -F "full"
