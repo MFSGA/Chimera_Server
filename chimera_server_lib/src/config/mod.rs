@@ -27,6 +27,7 @@ pub enum Transport {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Protocol {
+    #[cfg(feature = "vless")]
     Vless,
     Vmess,
     #[cfg(feature = "hysteria")]

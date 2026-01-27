@@ -68,16 +68,26 @@ impl TryFrom<InboudItem> for ServerConfig {
         match protocol {
             Protocol::DokodemoDoor => {
                 tracing::warn!("DokodemoDoor is not supported yet");
-                Ok(ServerConfig {
-                    tag,
-                    bind_location,
-                    protocol: ServerProxyConfig::Vless {
-                        user_id,
-                        user_label,
-                    },
-                    transport: Transport::Tcp,
-                    quic_settings: None,
-                })
+                #[cfg(feature = "vless")]
+                {
+                    return Ok(ServerConfig {
+                        tag,
+                        bind_location,
+                        protocol: ServerProxyConfig::Vless {
+                            user_id,
+                            user_label,
+                        },
+                        transport: Transport::Tcp,
+                        quic_settings: None,
+                    });
+                }
+
+                #[cfg(not(feature = "vless"))]
+                {
+                    return Err(Error::InvalidConfig(
+                        "DokodemoDoor requires the vless feature".into(),
+                    ));
+                }
             }
             #[cfg(feature = "hysteria")]
             Protocol::Hysteria2 => {
@@ -114,6 +124,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                     quic_settings,
                 })
             }
+            #[cfg(feature = "vless")]
             Protocol::Vless => {
                 let mut protocol = ServerProxyConfig::Vless {
                     user_id: user_id.clone(),
