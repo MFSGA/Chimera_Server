@@ -371,7 +371,7 @@ impl WebsocketStream {
 
             self.read_frame_length -= skip_amount;
             if self.read_frame_length > 0 {
-                todo!()
+                return Ok(());
             }
         }
 
@@ -516,18 +516,14 @@ impl AsyncRead for WebsocketStream {
 
             let read_result = match this.read_state {
                 ReadState::Init => this.step_init(cx, buf),
-                ReadState::ReadBinaryContent => {
-                    todo!()
-                }
+                ReadState::ReadBinaryContent => this.step_read_binary_content(cx, buf),
                 ReadState::ReadLength { length_bytes_len } => {
                     todo!()
                 }
                 ReadState::ReadMask => {
                     todo!()
                 }
-                ReadState::SkipContent => {
-                    todo!()
-                }
+                ReadState::SkipContent => this.step_skip_content(cx, buf),
             };
 
             if read_result.is_err() {
