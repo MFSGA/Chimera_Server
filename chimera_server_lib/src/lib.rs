@@ -22,6 +22,7 @@ mod mcp;
 
 mod runtime;
 
+#[cfg(feature = "reality")]
 pub mod reality;
 
 mod log;

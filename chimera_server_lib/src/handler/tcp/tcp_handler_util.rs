@@ -1,12 +1,12 @@
+#[cfg(feature = "reality")]
+use crate::handler::reality::RealityServerHandler;
 #[cfg(feature = "ws")]
 use crate::handler::ws::{create_websocket_server_target, WebsocketTcpServerHandler};
 #[cfg(feature = "tls")]
 use crate::{config::server_config::TlsServerConfig, handler::tls::TlsServerHandler};
 use crate::{
     config::{rule::RuleConfig, server_config::ServerProxyConfig},
-    handler::{
-        reality::RealityServerHandler, socks::SocksTcpServerHandler, vless_handler::VlessTcpHandler,
-    },
+    handler::{socks::SocksTcpServerHandler, vless_handler::VlessTcpHandler},
 };
 
 use super::tcp_handler::TcpServerHandler;
@@ -54,6 +54,7 @@ pub fn create_tcp_server_handler(
                 .expect("failed to initialize TLS handler"),
             )
         }
+        #[cfg(feature = "reality")]
         ServerProxyConfig::Reality(reality_config) => {
             let inner_handler = create_tcp_server_handler(
                 (*reality_config.inner).clone(),

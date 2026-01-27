@@ -1,3 +1,5 @@
+#![cfg(feature = "reality")]
+
 use std::io::{self, Cursor};
 
 use async_trait::async_trait;
