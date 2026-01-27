@@ -31,11 +31,28 @@ pub fn new_socket2_udp_socket(
     bind_address: Option<SocketAddr>,
     reuse_port: bool,
 ) -> std::io::Result<socket2::Socket> {
-    debug!("new_socket2_udp_socket");
+    new_socket2_udp_socket_with_buffer_size(is_ipv6, bind_interface, bind_address, reuse_port, None)
+}
+
+pub fn new_socket2_udp_socket_with_buffer_size(
+    is_ipv6: bool,
+    bind_interface: Option<String>,
+    bind_address: Option<SocketAddr>,
+    reuse_port: bool,
+    buffer_size: Option<usize>,
+) -> std::io::Result<socket2::Socket> {
     let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
 
     socket.set_nonblocking(true)?;
+
+    // Set socket buffer sizes if specified.
+    // This helps prevent packet drops during bursts for high-throughput connections.
+    if let Some(size) = buffer_size {
+        // Ignore errors - kernel may cap the value
+        let _ = socket.set_recv_buffer_size(size);
+        let _ = socket.set_send_buffer_size(size);
+    }
 
     if reuse_port {
         #[cfg(all(unix, not(any(target_os = "solaris", target_os = "illumos"))))]
@@ -45,18 +62,16 @@ pub fn new_socket2_udp_socket(
         panic!("Cannot support reuse sockets");
     }
 
-    debug!("new_socket2_udp_socket 2");
     if let Some(ref interface) = bind_interface {
         #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
         socket.bind_device(Some(interface.as_bytes()))?;
 
+        // This should be handled during config validation.
         #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
         panic!("Could not bind to device, unsupported platform.")
     }
 
-    debug!("new_socket2_udp_socket 3");
     if let Some(bind_address) = bind_address {
-        debug!("new_socket2_udp_socket 4 {:?}", bind_address);
         socket.bind(&SockAddr::from(bind_address))?;
     }
 
