@@ -6,10 +6,10 @@ edition.workspace = true
 [dependencies]
 thiserror = { workspace = true }
 tokio = { workspace = true }
-tonic = { workspace = true }
-prost = { workspace = true }
-prost-types = { workspace = true }
-tokio-stream = { workspace = true }
+tonic = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+prost-types = { workspace = true, optional = true }
+tokio-stream = { workspace = true, optional = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -59,4 +59,7 @@ ws = []
 tls = []
 reality = []
 vless = []
+traffic = []
+api = ["tonic", "prost", "prost-types", "tokio-stream"]
 default = ["hysteria", "trojan", "ws", "tls", "reality", "vless"]
+# default = ["trojan", "ws", "tls"]
