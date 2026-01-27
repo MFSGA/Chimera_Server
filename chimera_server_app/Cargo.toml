@@ -6,3 +6,8 @@ edition.workspace = true
 [dependencies]
 chimera_server_lib = { path = "../chimera_server_lib", version = "*" }
 clap = { workspace = true }
+
+
+[features]
+default = ["full"]
+full = ["chimera_server_lib/full"]
