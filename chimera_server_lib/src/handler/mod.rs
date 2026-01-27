@@ -13,4 +13,6 @@ pub mod trojan;
 pub mod socks;
 
 pub mod reality;
+
+#[cfg(feature = "tls")]
 pub mod tls;
