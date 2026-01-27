@@ -33,6 +33,7 @@ pub struct LogConfig {
     pub access: Option<String>,
     pub dns_log: bool,
     pub error: Option<String>,
+    // default value is Debug
     pub loglevel: LogLevel,
 }
 
@@ -42,7 +43,7 @@ impl Default for LogConfig {
             access: Some("none".to_string()),
             dns_log: false,
             error: None,
-            loglevel: LogLevel::Warning,
+            loglevel: Default::default(),
         }
     }
 }
@@ -59,7 +60,7 @@ pub enum LogLevel {
 
 impl Default for LogLevel {
     fn default() -> Self {
-        LogLevel::Warning
+        LogLevel::Debug
     }
 }
 

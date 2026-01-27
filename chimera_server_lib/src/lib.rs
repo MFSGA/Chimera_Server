@@ -166,12 +166,12 @@ pub fn validate(opts: Options) -> Result<(), Error> {
 async fn start_async(opts: Options) -> Result<(), Error> {
     // 1. config parse
     let config = opts.config.try_parse()?;
-    /* todo: log mod
+    //  todo: log mod
     log::init(
         config.log.as_ref(),
         opts.cwd.as_deref(),
         opts.log_file.as_deref(),
-    )?; */
+    )?; 
     // 2. api config
     let api_config = config.api.clone();
     let mcp_config = config.mcp.clone();
