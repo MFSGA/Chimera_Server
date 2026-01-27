@@ -1,3 +1,5 @@
+#![cfg(feature = "tls")]
+
 use std::{
     fs::File,
     io::{self, BufReader},

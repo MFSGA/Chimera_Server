@@ -1,13 +1,11 @@
 #[cfg(feature = "ws")]
 use crate::handler::ws::{create_websocket_server_target, WebsocketTcpServerHandler};
+#[cfg(feature = "tls")]
+use crate::{config::server_config::TlsServerConfig, handler::tls::TlsServerHandler};
 use crate::{
-    config::{
-        rule::RuleConfig,
-        server_config::{ServerProxyConfig, TlsServerConfig},
-    },
+    config::{rule::RuleConfig, server_config::ServerProxyConfig},
     handler::{
-        reality::RealityServerHandler, socks::SocksTcpServerHandler, tls::TlsServerHandler,
-        vless_handler::VlessTcpHandler,
+        reality::RealityServerHandler, socks::SocksTcpServerHandler, vless_handler::VlessTcpHandler,
     },
 };
 
@@ -37,6 +35,7 @@ pub fn create_tcp_server_handler(
         ServerProxyConfig::Trojan { users, fallbacks } => Box::new(
             crate::handler::trojan::TrojanTcpHandler::new(users, fallbacks, inbound_tag),
         ),
+        #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(tls_config) => {
             let TlsServerConfig {
                 certificate_path,

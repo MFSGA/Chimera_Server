@@ -106,6 +106,7 @@ pub struct XhttpServerConfig {
     pub headers: HashMap<String, String>,
 }
 
+#[cfg(feature = "tls")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct TlsServerConfig {
     pub certificate_path: String,
@@ -165,6 +166,7 @@ pub enum ServerProxyConfig {
         #[serde(default)]
         fallbacks: Vec<TrojanFallback>,
     },
+    #[cfg(feature = "tls")]
     Tls(TlsServerConfig),
     Reality(RealityTransportConfig),
     Xhttp {
@@ -188,6 +190,7 @@ impl std::fmt::Display for ServerProxyConfig {
                 Self::Hysteria2 { .. } => "Hysteria2",
                 #[cfg(feature = "trojan")]
                 Self::Trojan { .. } => "Trojan",
+                #[cfg(feature = "tls")]
                 Self::Tls(_) => "Tls",
                 Self::Reality(_) => "Reality",
                 Self::Xhttp { .. } => "Xhttp",

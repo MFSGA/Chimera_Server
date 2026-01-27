@@ -7,6 +7,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpStream,
 };
+#[cfg(feature = "tls")]
 use tokio_rustls::server::TlsStream;
 
 pub trait AsyncPing {
@@ -41,6 +42,7 @@ impl<T: ?Sized + AsyncStream> AsyncPing for Box<T> {
 
 impl<T: ?Sized + AsyncStream> AsyncStream for Box<T> {}
 
+#[cfg(feature = "tls")]
 impl<S> AsyncPing for TlsStream<S>
 where
     S: AsyncPing + AsyncRead + AsyncWrite + Unpin + Send,
@@ -54,4 +56,5 @@ where
     }
 }
 
+#[cfg(feature = "tls")]
 impl<S> AsyncStream for TlsStream<S> where S: AsyncStream {}

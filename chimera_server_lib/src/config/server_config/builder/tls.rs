@@ -4,7 +4,9 @@ use crate::{
     Error,
 };
 
-use super::super::types::{RealityTransportConfig, ServerProxyConfig, TlsServerConfig};
+#[cfg(feature = "tls")]
+use super::super::types::TlsServerConfig;
+use super::super::types::{RealityTransportConfig, ServerProxyConfig};
 use crate::address::{Address, NetLocation};
 
 fn parse_version_triplet(value: &Option<String>, field: &str) -> Result<Option<[u8; 3]>, Error> {
@@ -83,6 +85,7 @@ fn build_reality_layer(
     }))
 }
 
+#[cfg(feature = "tls")]
 fn build_tls_layer(
     protocol: ServerProxyConfig,
     stream_settings: &StreamSettings,
@@ -117,7 +120,18 @@ pub(super) fn apply_security_layers(
         .map(|value| value.to_ascii_lowercase())
         .as_deref()
     {
-        Some("tls") => build_tls_layer(protocol, stream_settings),
+        Some("tls") => {
+            #[cfg(feature = "tls")]
+            {
+                build_tls_layer(protocol, stream_settings)
+            }
+            #[cfg(not(feature = "tls"))]
+            {
+                Err(Error::InvalidConfig(
+                    "tls inbound requires enabling the tls feature".into(),
+                ))
+            }
+        }
         Some("reality") => build_reality_layer(protocol, stream_settings),
         _ => Ok(protocol),
     }
