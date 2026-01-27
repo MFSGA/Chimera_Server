@@ -1,3 +1,5 @@
+#![cfg(feature = "ws")]
+
 use std::collections::HashMap;
 
 use serde::Deserialize;

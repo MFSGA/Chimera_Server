@@ -1,6 +1,7 @@
 mod builder;
 pub mod quic;
 mod types;
+#[cfg(feature = "ws")]
 pub mod ws;
 
 #[cfg(feature = "hysteria")]
