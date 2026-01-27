@@ -4,14 +4,18 @@ mod tls;
 use crate::{
     address::{Address, BindLocation, NetLocation},
     config::{def::InboudItem, Protocol, Transport},
-    util::option::{NoneOrSome, OneOrSome},
+    util::option::NoneOrSome,
     Error,
 };
 
+#[cfg(feature = "ws")]
+use crate::util::option::OneOrSome;
+
+#[cfg(feature = "ws")]
+use super::ws::WebsocketServerConfig;
 use super::{
     quic::ServerQuicConfig,
     types::{ServerConfig, ServerProxyConfig},
-    ws::WebsocketServerConfig,
 };
 
 #[cfg(feature = "hysteria")]
@@ -111,31 +115,24 @@ impl TryFrom<InboudItem> for ServerConfig {
                 })
             }
             Protocol::Vless => {
-                let mut protocol = if let Some(stream_setting) = stream_settings.as_ref() {
+                let mut protocol = ServerProxyConfig::Vless {
+                    user_id: user_id.clone(),
+                    user_label: user_label.clone(),
+                };
+
+                #[cfg(feature = "ws")]
+                if let Some(stream_setting) = stream_settings.as_ref() {
                     if let Some(ws_setting) = stream_setting.ws_settings.clone() {
                         tracing::info!("use websocket");
-                        ServerProxyConfig::Websocket {
+                        protocol = ServerProxyConfig::Websocket {
                             targets: Box::new(OneOrSome::One(WebsocketServerConfig {
                                 matching_path: ws_setting.path,
                                 matching_headers: None,
-                                protocol: ServerProxyConfig::Vless {
-                                    user_id: user_id.clone(),
-                                    user_label: user_label.clone(),
-                                },
+                                protocol,
                             })),
-                        }
-                    } else {
-                        ServerProxyConfig::Vless {
-                            user_id: user_id.clone(),
-                            user_label: user_label.clone(),
-                        }
+                        };
                     }
-                } else {
-                    ServerProxyConfig::Vless {
-                        user_id,
-                        user_label,
-                    }
-                };
+                }
 
                 if let Some(stream_setting) = stream_settings.as_ref() {
                     protocol = apply_security_layers(protocol, stream_setting)?;
@@ -163,6 +160,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                     fallbacks: trojan_fallbacks,
                 };
 
+                #[cfg(feature = "ws")]
                 if let Some(stream_setting) = stream_settings.as_ref() {
                     if let Some(ws_setting) = stream_setting.ws_settings.clone() {
                         tracing::info!("use websocket");
@@ -174,7 +172,9 @@ impl TryFrom<InboudItem> for ServerConfig {
                             })),
                         };
                     }
+                }
 
+                if let Some(stream_setting) = stream_settings.as_ref() {
                     protocol = apply_security_layers(protocol, stream_setting)?;
                 }
 
@@ -211,6 +211,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                 let accounts = collect_socks_accounts(settings)?;
                 let mut protocol = ServerProxyConfig::Socks { accounts };
 
+                #[cfg(feature = "ws")]
                 if let Some(stream_setting) = stream_settings.as_ref() {
                     if let Some(ws_setting) = stream_setting.ws_settings.clone() {
                         tracing::info!("use websocket");
@@ -222,7 +223,9 @@ impl TryFrom<InboudItem> for ServerConfig {
                             })),
                         };
                     }
+                }
 
+                if let Some(stream_setting) = stream_settings.as_ref() {
                     protocol = apply_security_layers(protocol, stream_setting)?;
                 }
 

@@ -1,14 +1,13 @@
+#[cfg(feature = "ws")]
+use crate::handler::ws::{create_websocket_server_target, WebsocketTcpServerHandler};
 use crate::{
     config::{
         rule::RuleConfig,
         server_config::{ServerProxyConfig, TlsServerConfig},
     },
     handler::{
-        reality::RealityServerHandler,
-        socks::SocksTcpServerHandler,
-        tls::TlsServerHandler,
+        reality::RealityServerHandler, socks::SocksTcpServerHandler, tls::TlsServerHandler,
         vless_handler::VlessTcpHandler,
-        ws::{create_websocket_server_target, WebsocketTcpServerHandler},
     },
 };
 
@@ -25,6 +24,7 @@ pub fn create_tcp_server_handler(
             user_label,
         } => Box::new(VlessTcpHandler::new(&user_id, &user_label, inbound_tag)),
 
+        #[cfg(feature = "ws")]
         ServerProxyConfig::Websocket { targets } => {
             let server_targets = targets
                 .into_vec()

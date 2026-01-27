@@ -46,6 +46,7 @@ pub struct StreamSettings {
     network: String,
     security: Option<String>,
     tls_settings: Option<TlsSettings>,
+    #[cfg(feature = "ws")]
     ws_settings: Option<WsSettings>,
     #[serde(alias = "hysteriaSettings")]
     hysteria_settings: Option<HysteriaSettings>,
@@ -53,6 +54,7 @@ pub struct StreamSettings {
     reality_settings: Option<RealitySettings>,
 }
 
+#[cfg(feature = "ws")]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WsSettings {
     host: String,
