@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const BYTE: u64 = 1;
 const KILOBYTE: u64 = BYTE * 1_000;
@@ -6,7 +6,7 @@ const MEGABYTE: u64 = KILOBYTE * 1_000;
 const GIGABYTE: u64 = MEGABYTE * 1_000;
 const TERABYTE: u64 = GIGABYTE * 1_000;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum BandwidthValue {
     Number(u64),

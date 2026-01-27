@@ -27,7 +27,6 @@ pub struct ServerConfig {
 pub struct Hysteria2Client {
     pub password: String,
     pub email: Option<String>,
-    pub flow: Option<String>,
 }
 
 #[cfg(feature = "hysteria")]
