@@ -156,6 +156,7 @@ struct Certificate {
     usage: Option<String>,
 }
 
+#[cfg(feature = "reality")]
 #[derive(Deserialize, Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RealitySettings {
@@ -164,11 +165,11 @@ pub struct RealitySettings {
     pub private_key: String,
     pub short_ids: Vec<String>,
     pub dest: String,
-    #[serde(default)]
+    #[serde(default, alias = "maxTimediff")]
     pub max_time_diff: Option<u64>,
-    #[serde(default)]
+    #[serde(default, alias = "minClient")]
     pub min_client_ver: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "maxClient")]
     pub max_client_ver: Option<String>,
     #[serde(default)]
     pub fingerprint: Option<String>,
