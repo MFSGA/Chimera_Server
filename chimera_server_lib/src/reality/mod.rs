@@ -1,3 +1,5 @@
+#![cfg(feature = "reality")]
+
 mod buf_reader;
 mod client;
 mod common;

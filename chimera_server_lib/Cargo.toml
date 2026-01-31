@@ -44,9 +44,9 @@ bytes = { workspace = true }
 
 http = { workspace = true }
 rand = { workspace = true }
-rcgen = { version = "0.13", features = ["x509-parser"] }
-subtle = "2"
-x509-parser = "0.16"
+rcgen = { workspace = true, optional = true }
+subtle = { version = "2", optional = true }
+x509-parser = { version = "0.16", optional = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }
@@ -57,7 +57,7 @@ hysteria = []
 trojan = []
 ws = []
 tls = []
-reality = []
+reality = ["rcgen", "subtle", "x509-parser"]
 vless = []
 traffic = []
 api = ["tonic", "prost", "prost-types", "tokio-stream"]
