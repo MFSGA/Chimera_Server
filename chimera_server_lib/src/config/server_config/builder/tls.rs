@@ -10,6 +10,7 @@ use super::super::types::ServerProxyConfig;
 use super::super::types::TlsServerConfig;
 use crate::address::{Address, NetLocation};
 
+#[cfg(feature = "reality")]
 fn parse_version_triplet(value: &Option<String>, field: &str) -> Result<Option<[u8; 3]>, Error> {
     match value {
         None => Ok(None),
