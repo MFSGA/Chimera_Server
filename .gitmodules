@@ -1,0 +1,9 @@
+[submodule "ref/shoes"]
+	path = ref/shoes
+	url = https://github.com/cfal/shoes
+[submodule "ref/clash-rs"]
+	path = ref/clash-rs
+	url = https://github.com/Watfaq/clash-rs
+[submodule "ref/xray-core"]
+	path = ref/xray-core
+	url = https://github.com/xtls/xray-core
