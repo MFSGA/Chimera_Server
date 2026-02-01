@@ -32,6 +32,8 @@ impl HandlerServiceImpl {
                 .iter()
                 .filter_map(|client| client.email.clone())
                 .collect(),
+            #[cfg(feature = "tuic")]
+            ServerProxyConfig::TuicV5 { config } => vec![config.uuid.clone()],
             #[cfg(feature = "ws")]
             ServerProxyConfig::Websocket { targets } => {
                 let mut identities = Vec::new();

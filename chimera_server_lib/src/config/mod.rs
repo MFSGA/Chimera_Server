@@ -37,6 +37,9 @@ pub enum Protocol {
     DokodemoDoor,
     #[cfg(feature = "trojan")]
     Trojan,
+    #[cfg(feature = "tuic")]
+    #[serde(alias = "tuic")]
+    TuicV5,
     Xhttp,
     Socks,
 }

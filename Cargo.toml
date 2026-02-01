@@ -97,6 +97,8 @@ tokio-rustls = { version = "*", default-features = false, features = [
 ] }
 
 socket2 = { version = "*", features = ["all"] }
+dashmap = "*"
+lru = "*"
 log = "0.4"
 rcgen = { version = "0.13", features = ["x509-parser"] }
 subtle = "2"

@@ -22,6 +22,8 @@ use super::{
 use collectors::collect_hysteria2_settings;
 use collectors::{collect_socks_accounts, collect_xhttp_settings};
 
+#[cfg(feature = "tuic")]
+use collectors::collect_tuic_settings;
 #[cfg(feature = "trojan")]
 use collectors::{collect_trojan_clients, collect_trojan_fallbacks};
 use tls::apply_security_layers;
@@ -195,6 +197,44 @@ impl TryFrom<InboudItem> for ServerConfig {
                     protocol,
                     transport: Transport::Tcp,
                     quic_settings: None,
+                })
+            }
+
+            #[cfg(feature = "tuic")]
+            Protocol::TuicV5 => {
+                let stream_settings = stream_settings.ok_or_else(|| {
+                    Error::InvalidConfig("tuic inbound missing streamSettings".into())
+                })?;
+                let tls_settings = stream_settings.tls_settings.ok_or_else(|| {
+                    Error::InvalidConfig("tuic inbound requires tlsSettings".into())
+                })?;
+                let certificate = tls_settings
+                    .certificates
+                    .get(0)
+                    .ok_or_else(|| {
+                        Error::InvalidConfig(
+                            "tuic inbound requires at least one certificate".into(),
+                        )
+                    })?
+                    .clone();
+
+                let settings = settings
+                    .ok_or_else(|| Error::InvalidConfig("tuic inbound requires settings".into()))?;
+                let config = collect_tuic_settings(settings)?;
+
+                let quic_settings = Some(ServerQuicConfig {
+                    cert: certificate.certificate_file,
+                    key: certificate.key_file,
+                    alpn_protocols: NoneOrSome::Some(tls_settings.alpn),
+                    client_fingerprints: NoneOrSome::None,
+                });
+
+                Ok(ServerConfig {
+                    tag,
+                    bind_location,
+                    protocol: ServerProxyConfig::TuicV5 { config },
+                    transport: Transport::Quic,
+                    quic_settings,
                 })
             }
 
