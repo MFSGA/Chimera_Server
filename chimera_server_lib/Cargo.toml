@@ -37,6 +37,9 @@ tokio-util = { workspace = true }
 quinn = { workspace = true }
 quinn-proto = { workspace = true }
 socket2 = { workspace = true }
+dashmap = { workspace = true, optional = true }
+lru = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
 
 h3-quinn = { workspace = true }
 h3 = { workspace = true }
@@ -59,10 +62,11 @@ ws = []
 tls = []
 reality = ["rcgen", "subtle", "x509-parser"]
 vless = []
+tuic = ["dashmap", "lru", "uuid"]
 traffic = []
 api = ["tonic", "prost", "prost-types", "tokio-stream"]
 
-full = ["hysteria", "trojan", "ws", "tls", "reality", "vless", "api"]
+full = ["hysteria", "trojan", "ws", "tls", "reality", "vless", "tuic", "api"]
 
 default = ["full"]
 

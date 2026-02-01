@@ -5,6 +5,8 @@ use tracing::info;
 
 #[cfg(feature = "hysteria")]
 use crate::handler::hysteria2::run_hysteria2_server;
+#[cfg(feature = "tuic")]
+use crate::handler::tuic::run_tuic_server;
 use crate::{
     address::BindLocation,
     config::server_config::{quic::ServerQuicConfig, ServerConfig, ServerProxyConfig},
@@ -54,7 +56,13 @@ pub async fn start_quic_server(config: ServerConfig) -> std::io::Result<Option<J
                 tracing::error!("hysteria2 server stopped with error: {}", err);
             }
         }))),
-        tcp => {
+        #[cfg(feature = "tuic")]
+        ServerProxyConfig::TuicV5 { config } => Ok(Some(tokio::spawn(async move {
+            if let Err(err) = run_tuic_server(bind_address, server_config, config, tag).await {
+                tracing::error!("tuic server stopped with error: {}", err);
+            }
+        }))),
+        _other => {
             let _ = {};
             todo!()
         }
