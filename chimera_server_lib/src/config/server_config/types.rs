@@ -54,6 +54,17 @@ pub struct Hysteria2ServerConfig {
     pub ignore_client_bandwidth: bool,
 }
 
+#[cfg(feature = "tuic")]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+/// TUIC v5 inbound settings after config parsing and validation.
+pub struct TuicServerConfig {
+    pub uuid: String,
+    pub password: String,
+    #[serde(default, alias = "zero_rtt_handshake")]
+    pub zero_rtt_handshake: bool,
+}
+
 #[cfg(feature = "trojan")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct TrojanUser {
@@ -163,6 +174,10 @@ pub enum ServerProxyConfig {
     Hysteria2 {
         config: Hysteria2ServerConfig,
     },
+    #[cfg(feature = "tuic")]
+    TuicV5 {
+        config: TuicServerConfig,
+    },
     #[cfg(feature = "trojan")]
     Trojan {
         users: Vec<TrojanUser>,
@@ -193,6 +208,8 @@ impl std::fmt::Display for ServerProxyConfig {
                 Self::Websocket { .. } => "Websocket",
                 #[cfg(feature = "hysteria")]
                 Self::Hysteria2 { .. } => "Hysteria2",
+                #[cfg(feature = "tuic")]
+                Self::TuicV5 { .. } => "TuicV5",
                 #[cfg(feature = "trojan")]
                 Self::Trojan { .. } => "Trojan",
                 #[cfg(feature = "reality")]

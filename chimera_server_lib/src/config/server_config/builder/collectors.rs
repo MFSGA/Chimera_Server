@@ -8,6 +8,8 @@ use crate::{
     Error,
 };
 
+#[cfg(feature = "tuic")]
+use super::super::types::TuicServerConfig;
 #[cfg(feature = "hysteria")]
 use super::super::types::{Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2ServerConfig};
 use super::super::types::{RangeConfig, SocksUser, XhttpServerConfig};
@@ -305,6 +307,42 @@ pub(super) fn collect_xhttp_settings(settings: SettingObject) -> Result<XhttpSer
     })
 }
 
+#[cfg(feature = "tuic")]
+pub(super) fn collect_tuic_settings(settings: SettingObject) -> Result<TuicServerConfig, Error> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct TuicInboundSettings {
+        uuid: String,
+        password: String,
+        #[serde(default, alias = "zero_rtt_handshake")]
+        zero_rtt_handshake: bool,
+    }
+
+    let raw: TuicInboundSettings = settings
+        .deserialize()
+        .map_err(|e| Error::InvalidConfig(format!("failed to parse tuic settings: {e}")))?;
+
+    if raw.uuid.trim().is_empty() {
+        return Err(Error::InvalidConfig(
+            "tuic settings require a non-empty uuid".into(),
+        ));
+    }
+    if raw.password.trim().is_empty() {
+        return Err(Error::InvalidConfig(
+            "tuic settings require a non-empty password".into(),
+        ));
+    }
+
+    uuid::Uuid::parse_str(raw.uuid.trim())
+        .map_err(|e| Error::InvalidConfig(format!("invalid tuic uuid {}: {e}", raw.uuid)))?;
+
+    Ok(TuicServerConfig {
+        uuid: raw.uuid,
+        password: raw.password,
+        zero_rtt_handshake: raw.zero_rtt_handshake,
+    })
+}
+
 pub(super) fn normalize_path(path: Option<String>) -> String {
     let mut normalized = path.unwrap_or_else(|| "/".to_string());
     if normalized.is_empty() {
@@ -317,4 +355,39 @@ pub(super) fn normalize_path(path: Option<String>) -> String {
         normalized = normalized.trim_end_matches('/').to_string();
     }
     normalized
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "tuic")]
+    #[test]
+    fn collect_tuic_settings_accepts_valid_config() {
+        let settings = SettingObject(serde_json::json!({
+            "uuid": "550e8400-e29b-41d4-a716-446655440000",
+            "password": "tuic-password",
+            "zeroRttHandshake": true
+        }));
+
+        let config = collect_tuic_settings(settings).expect("valid tuic settings");
+        assert_eq!(config.uuid, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(config.password, "tuic-password");
+        assert!(config.zero_rtt_handshake);
+    }
+
+    #[cfg(feature = "tuic")]
+    #[test]
+    fn collect_tuic_settings_rejects_invalid_uuid() {
+        let settings = SettingObject(serde_json::json!({
+            "uuid": "not-a-uuid",
+            "password": "tuic-password"
+        }));
+
+        let err = collect_tuic_settings(settings).expect_err("invalid uuid");
+        assert!(
+            matches!(err, Error::InvalidConfig(_)),
+            "expected InvalidConfig"
+        );
+    }
 }
