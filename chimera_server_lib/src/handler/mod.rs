@@ -17,3 +17,6 @@ pub mod socks;
 
 #[cfg(feature = "reality")]
 pub mod reality;
+
+#[cfg(feature = "tuic")]
+pub mod tuic;
