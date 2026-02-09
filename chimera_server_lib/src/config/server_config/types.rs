@@ -1,3 +1,4 @@
+#[cfg(feature = "xhttp")]
 use std::collections::HashMap;
 
 use serde::Deserialize;
@@ -92,26 +93,22 @@ pub struct RangeConfig {
     pub to: i32,
 }
 
-impl RangeConfig {
-    pub fn clamp_with_defaults(&self, default_from: i32, default_to: i32) -> (usize, usize) {
-        let mut from = if self.from <= 0 {
-            default_from
-        } else {
-            self.from
-        };
-        let mut to = if self.to <= 0 { default_to } else { self.to };
-        if from > to {
-            std::mem::swap(&mut from, &mut to);
-        }
-        (from.max(0) as usize, to.max(0) as usize)
-    }
+#[cfg(feature = "xhttp")]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub enum XhttpMode {
+    Auto,
+    PacketUp,
+    StreamUp,
+    StreamOne,
 }
 
+#[cfg(feature = "xhttp")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct XhttpServerConfig {
-    pub upstream: String,
+    pub upstream: Option<String>,
     pub host: Option<String>,
     pub path: String,
+    pub mode: XhttpMode,
     pub min_padding: usize,
     pub max_padding: usize,
     pub headers: HashMap<String, String>,
@@ -188,8 +185,11 @@ pub enum ServerProxyConfig {
     Tls(TlsServerConfig),
     #[cfg(feature = "reality")]
     Reality(RealityTransportConfig),
+    #[cfg(feature = "xhttp")]
     Xhttp {
         config: XhttpServerConfig,
+        #[serde(default)]
+        inner: Option<Box<ServerProxyConfig>>,
     },
     Socks {
         accounts: Vec<SocksUser>,
@@ -216,6 +216,7 @@ impl std::fmt::Display for ServerProxyConfig {
                 Self::Reality(_) => "Reality",
                 #[cfg(feature = "tls")]
                 Self::Tls(_) => "Tls",
+                #[cfg(feature = "xhttp")]
                 Self::Xhttp { .. } => "Xhttp",
                 Self::Socks { .. } => "Socks",
             }

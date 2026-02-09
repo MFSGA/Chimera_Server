@@ -22,9 +22,11 @@ use crate::{
 use tracing::{error, info};
 
 mod quic;
+#[cfg(feature = "xhttp")]
 mod xhttp;
 
 pub async fn start_servers(config: ServerConfig) -> std::io::Result<Vec<JoinHandle<()>>> {
+    #[cfg(feature = "xhttp")]
     if matches!(config.protocol, ServerProxyConfig::Xhttp { .. }) {
         return xhttp::start_xhttp_server(config).await;
     }

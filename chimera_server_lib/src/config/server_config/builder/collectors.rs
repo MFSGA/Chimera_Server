@@ -8,11 +8,15 @@ use crate::{
     Error,
 };
 
+use super::super::types::SocksUser;
 #[cfg(feature = "tuic")]
 use super::super::types::TuicServerConfig;
 #[cfg(feature = "hysteria")]
 use super::super::types::{Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2ServerConfig};
-use super::super::types::{RangeConfig, SocksUser, XhttpServerConfig};
+#[cfg(feature = "xhttp")]
+use super::super::types::{RangeConfig, XhttpMode, XhttpServerConfig};
+#[cfg(feature = "xhttp")]
+use crate::config::StreamSettings;
 
 #[cfg(feature = "trojan")]
 use crate::address::NetLocation;
@@ -267,18 +271,34 @@ pub(super) fn collect_socks_accounts(settings: SettingObject) -> Result<Vec<Sock
     }
 }
 
-pub(super) fn collect_xhttp_settings(settings: SettingObject) -> Result<XhttpServerConfig, Error> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct RawXhttpSettings {
-        upstream: String,
-        host: Option<String>,
-        path: Option<String>,
-        headers: Option<HashMap<String, String>>,
-        x_padding_bytes: Option<RangeConfig>,
-    }
+#[cfg(feature = "xhttp")]
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct RawXhttpTransportSettings {
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    headers: Option<HashMap<String, String>>,
+    #[serde(default)]
+    x_padding_bytes: Option<RangeConfig>,
+}
 
-    let raw: RawXhttpSettings = settings
+#[cfg(feature = "xhttp")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawXhttpInboundSettings {
+    upstream: String,
+    #[serde(flatten)]
+    transport: RawXhttpTransportSettings,
+}
+
+#[cfg(feature = "xhttp")]
+pub(super) fn collect_xhttp_settings(settings: SettingObject) -> Result<XhttpServerConfig, Error> {
+    let raw: RawXhttpInboundSettings = settings
         .deserialize()
         .map_err(|e| Error::InvalidConfig(format!("failed to parse xhttp settings: {}", e)))?;
 
@@ -288,23 +308,125 @@ pub(super) fn collect_xhttp_settings(settings: SettingObject) -> Result<XhttpSer
         ));
     }
 
-    let normalized_path = normalize_path(raw.path);
-    let (min_padding, max_padding) = raw
-        .x_padding_bytes
-        .unwrap_or_else(|| RangeConfig {
-            from: 100,
-            to: 1000,
-        })
-        .clamp_with_defaults(100, 1000);
+    build_xhttp_settings(
+        raw.transport,
+        Some(raw.upstream.trim().to_string()),
+        "xhttp settings",
+    )
+}
+
+#[cfg(feature = "xhttp")]
+pub(super) fn collect_xhttp_transport_settings(
+    stream_settings: &StreamSettings,
+) -> Result<XhttpServerConfig, Error> {
+    let raw = if let Some(value) = stream_settings.xhttp_settings.as_ref() {
+        value
+            .deserialize::<RawXhttpTransportSettings>()
+            .map_err(|e| {
+                Error::InvalidConfig(format!(
+                    "failed to parse streamSettings.xhttpSettings: {}",
+                    e
+                ))
+            })?
+    } else if let Some(value) = stream_settings.splithttp_settings.as_ref() {
+        value
+            .deserialize::<RawXhttpTransportSettings>()
+            .map_err(|e| {
+                Error::InvalidConfig(format!(
+                    "failed to parse streamSettings.splithttpSettings: {}",
+                    e
+                ))
+            })?
+    } else {
+        RawXhttpTransportSettings::default()
+    };
+
+    build_xhttp_settings(raw, None, "streamSettings.xhttpSettings")
+}
+
+#[cfg(feature = "xhttp")]
+fn build_xhttp_settings(
+    raw: RawXhttpTransportSettings,
+    upstream: Option<String>,
+    source_name: &str,
+) -> Result<XhttpServerConfig, Error> {
+    let mode = parse_xhttp_mode(raw.mode.as_deref(), source_name)?;
+
+    if matches!(mode, XhttpMode::StreamOne | XhttpMode::StreamUp) {
+        return Err(Error::InvalidConfig(format!(
+            "{} mode {:?} is not supported yet (supported: auto, packet-up)",
+            source_name, mode
+        )));
+    }
+
+    if let Some(headers) = raw.headers.as_ref() {
+        for key in headers.keys() {
+            if key.eq_ignore_ascii_case("host") {
+                return Err(Error::InvalidConfig(format!(
+                    "{}.headers cannot include host",
+                    source_name
+                )));
+            }
+        }
+    }
+
+    let (min_padding, max_padding) = parse_padding_range(raw.x_padding_bytes, source_name)?;
 
     Ok(XhttpServerConfig {
-        upstream: raw.upstream,
-        host: raw.host.map(|h| h.to_ascii_lowercase()),
-        path: normalized_path,
+        upstream,
+        host: raw
+            .host
+            .map(|host| host.trim().to_ascii_lowercase())
+            .filter(|host| !host.is_empty()),
+        path: normalize_xhttp_path(raw.path),
+        mode,
         min_padding,
         max_padding,
         headers: raw.headers.unwrap_or_default(),
     })
+}
+
+#[cfg(feature = "xhttp")]
+fn parse_xhttp_mode(value: Option<&str>, source_name: &str) -> Result<XhttpMode, Error> {
+    match value
+        .map(|text| text.trim().to_ascii_lowercase())
+        .as_deref()
+        .unwrap_or("auto")
+    {
+        "auto" => Ok(XhttpMode::Auto),
+        "packet-up" => Ok(XhttpMode::PacketUp),
+        "stream-up" => Ok(XhttpMode::StreamUp),
+        "stream-one" => Ok(XhttpMode::StreamOne),
+        other => Err(Error::InvalidConfig(format!(
+            "{}.mode has unsupported value: {}",
+            source_name, other
+        ))),
+    }
+}
+
+#[cfg(feature = "xhttp")]
+fn parse_padding_range(
+    value: Option<RangeConfig>,
+    source_name: &str,
+) -> Result<(usize, usize), Error> {
+    let Some(range) = value else {
+        return Ok((100, 1000));
+    };
+
+    if range.from <= 0 || range.to <= 0 {
+        return Err(Error::InvalidConfig(format!(
+            "{}.xPaddingBytes cannot be disabled",
+            source_name
+        )));
+    }
+
+    let mut from = range.from as usize;
+    let mut to = range.to as usize;
+    if from > to {
+        std::mem::swap(&mut from, &mut to);
+    }
+
+    Ok((from, to))
 }
 
 #[cfg(feature = "tuic")]
@@ -343,16 +465,18 @@ pub(super) fn collect_tuic_settings(settings: SettingObject) -> Result<TuicServe
     })
 }
 
-pub(super) fn normalize_path(path: Option<String>) -> String {
-    let mut normalized = path.unwrap_or_else(|| "/".to_string());
-    if normalized.is_empty() {
+#[cfg(feature = "xhttp")]
+pub(super) fn normalize_xhttp_path(path: Option<String>) -> String {
+    let raw = path.unwrap_or_else(|| "/".to_string());
+    let mut normalized = raw.split('?').next().unwrap_or_default().to_string();
+    if normalized.trim().is_empty() {
         normalized = "/".to_string();
     }
     if !normalized.starts_with('/') {
         normalized.insert(0, '/');
     }
-    if normalized.len() > 1 {
-        normalized = normalized.trim_end_matches('/').to_string();
+    if !normalized.ends_with('/') {
+        normalized.push('/');
     }
     normalized
 }
@@ -389,5 +513,89 @@ mod tests {
             matches!(err, Error::InvalidConfig(_)),
             "expected InvalidConfig"
         );
+    }
+
+    #[cfg(feature = "xhttp")]
+    #[test]
+    fn collect_xhttp_transport_settings_defaults_and_path_normalization() {
+        let stream_settings = serde_json::from_value::<StreamSettings>(serde_json::json!({
+            "network": "xhttp",
+            "xhttpSettings": {
+                "path": "api",
+                "headers": {
+                    "x-test": "ok"
+                }
+            }
+        }))
+        .expect("stream settings");
+
+        let config =
+            collect_xhttp_transport_settings(&stream_settings).expect("valid xhttp transport");
+
+        assert_eq!(config.path, "/api/");
+        assert_eq!(config.mode, XhttpMode::Auto);
+        assert_eq!(config.min_padding, 100);
+        assert_eq!(config.max_padding, 1000);
+        assert_eq!(config.upstream, None);
+    }
+
+    #[cfg(feature = "xhttp")]
+    #[test]
+    fn collect_xhttp_transport_settings_accepts_splithttp_alias() {
+        let stream_settings = serde_json::from_value::<StreamSettings>(serde_json::json!({
+            "network": "splithttp",
+            "splithttpSettings": {
+                "host": "Example.COM",
+                "xPaddingBytes": {
+                    "from": 120,
+                    "to": 180
+                }
+            }
+        }))
+        .expect("stream settings");
+
+        let config =
+            collect_xhttp_transport_settings(&stream_settings).expect("valid xhttp transport");
+
+        assert_eq!(config.host.as_deref(), Some("example.com"));
+        assert_eq!(config.min_padding, 120);
+        assert_eq!(config.max_padding, 180);
+    }
+
+    #[cfg(feature = "xhttp")]
+    #[test]
+    fn collect_xhttp_transport_settings_rejects_host_header() {
+        let stream_settings = serde_json::from_value::<StreamSettings>(serde_json::json!({
+            "network": "xhttp",
+            "xhttpSettings": {
+                "headers": {
+                    "Host": "example.com"
+                }
+            }
+        }))
+        .expect("stream settings");
+
+        let err =
+            collect_xhttp_transport_settings(&stream_settings).expect_err("host header rejected");
+        assert!(matches!(err, Error::InvalidConfig(_)));
+    }
+
+    #[cfg(feature = "xhttp")]
+    #[test]
+    fn collect_xhttp_transport_settings_rejects_disabled_padding() {
+        let stream_settings = serde_json::from_value::<StreamSettings>(serde_json::json!({
+            "network": "xhttp",
+            "xhttpSettings": {
+                "xPaddingBytes": {
+                    "from": 0,
+                    "to": 10
+                }
+            }
+        }))
+        .expect("stream settings");
+
+        let err = collect_xhttp_transport_settings(&stream_settings)
+            .expect_err("zero padding range must be rejected");
+        assert!(matches!(err, Error::InvalidConfig(_)));
     }
 }

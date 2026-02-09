@@ -40,6 +40,7 @@ pub enum Protocol {
     #[cfg(feature = "tuic")]
     #[serde(alias = "tuic")]
     TuicV5,
+    #[cfg(feature = "xhttp")]
     Xhttp,
     Socks,
 }
@@ -47,11 +48,16 @@ pub enum Protocol {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamSettings {
-    network: String,
+    #[serde(default)]
+    network: Option<String>,
     security: Option<String>,
     tls_settings: Option<TlsSettings>,
     #[cfg(feature = "ws")]
     ws_settings: Option<WsSettings>,
+    #[cfg(feature = "xhttp")]
+    xhttp_settings: Option<SettingObject>,
+    #[cfg(feature = "xhttp")]
+    splithttp_settings: Option<SettingObject>,
     #[serde(alias = "hysteriaSettings")]
     hysteria_settings: Option<HysteriaSettings>,
     #[cfg(feature = "reality")]

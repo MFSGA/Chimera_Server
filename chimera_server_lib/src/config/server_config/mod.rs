@@ -9,7 +9,10 @@ pub use types::TuicServerConfig;
 #[cfg(feature = "hysteria")]
 #[allow(unused_imports)]
 pub use types::{Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2ServerConfig};
-pub use types::{ServerConfig, ServerProxyConfig, SocksUser, XhttpServerConfig};
+pub use types::{ServerConfig, ServerProxyConfig, SocksUser};
+#[cfg(feature = "xhttp")]
+#[allow(unused_imports)]
+pub use types::{XhttpMode, XhttpServerConfig};
 
 #[cfg(feature = "reality")]
 pub use types::RealityTransportConfig;

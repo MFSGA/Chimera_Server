@@ -3,7 +3,7 @@ mod tls;
 
 use crate::{
     address::{Address, BindLocation, NetLocation},
-    config::{def::InboudItem, Protocol, Transport},
+    config::{def::InboudItem, Protocol, StreamSettings, Transport},
     util::option::NoneOrSome,
     Error,
 };
@@ -20,13 +20,118 @@ use super::{
 
 #[cfg(feature = "hysteria")]
 use collectors::collect_hysteria2_settings;
-use collectors::{collect_socks_accounts, collect_xhttp_settings};
+use collectors::collect_socks_accounts;
+#[cfg(feature = "xhttp")]
+use collectors::{collect_xhttp_settings, collect_xhttp_transport_settings};
 
 #[cfg(feature = "tuic")]
 use collectors::collect_tuic_settings;
 #[cfg(feature = "trojan")]
 use collectors::{collect_trojan_clients, collect_trojan_fallbacks};
 use tls::apply_security_layers;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum StreamNetwork {
+    Tcp,
+    Ws,
+    Xhttp,
+}
+
+fn parse_stream_network(stream_settings: Option<&StreamSettings>) -> Result<StreamNetwork, Error> {
+    let Some(stream_settings) = stream_settings else {
+        return Ok(StreamNetwork::Tcp);
+    };
+
+    let normalized = stream_settings
+        .network
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| "tcp".to_string());
+
+    match normalized.as_str() {
+        "tcp" | "raw" => Ok(StreamNetwork::Tcp),
+        "ws" | "websocket" => Ok(StreamNetwork::Ws),
+        "xhttp" | "splithttp" => Ok(StreamNetwork::Xhttp),
+        other => Err(Error::InvalidConfig(format!(
+            "unsupported streamSettings.network: {}",
+            other
+        ))),
+    }
+}
+
+fn apply_stream_transport_layer(
+    mut protocol: ServerProxyConfig,
+    stream_settings: Option<&StreamSettings>,
+    network: StreamNetwork,
+) -> Result<ServerProxyConfig, Error> {
+    match network {
+        StreamNetwork::Tcp => Ok(protocol),
+        StreamNetwork::Ws => {
+            #[cfg(feature = "ws")]
+            {
+                let stream_settings = stream_settings.ok_or_else(|| {
+                    Error::InvalidConfig("streamSettings.network=ws requires streamSettings".into())
+                })?;
+                let ws_setting = stream_settings.ws_settings.clone().ok_or_else(|| {
+                    Error::InvalidConfig("streamSettings.network=ws requires wsSettings".into())
+                })?;
+                tracing::info!("use websocket transport");
+                protocol = ServerProxyConfig::Websocket {
+                    targets: Box::new(OneOrSome::One(WebsocketServerConfig {
+                        matching_path: ws_setting.path,
+                        matching_headers: None,
+                        protocol,
+                    })),
+                };
+                Ok(protocol)
+            }
+
+            #[cfg(not(feature = "ws"))]
+            {
+                let _ = stream_settings;
+                Err(Error::InvalidConfig(
+                    "streamSettings.network=ws requires the ws feature".into(),
+                ))
+            }
+        }
+        StreamNetwork::Xhttp => {
+            #[cfg(feature = "xhttp")]
+            {
+                let stream_settings = stream_settings.ok_or_else(|| {
+                    Error::InvalidConfig(
+                        "streamSettings.network=xhttp requires streamSettings".into(),
+                    )
+                })?;
+                if stream_settings
+                    .security
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_some_and(|value| !value.eq_ignore_ascii_case("none"))
+                {
+                    return Err(Error::InvalidConfig(
+                        "xhttp transport currently does not support streamSettings.security".into(),
+                    ));
+                }
+                let config = collect_xhttp_transport_settings(stream_settings)?;
+                Ok(ServerProxyConfig::Xhttp {
+                    config,
+                    inner: Some(Box::new(protocol)),
+                })
+            }
+
+            #[cfg(not(feature = "xhttp"))]
+            {
+                let _ = stream_settings;
+                Err(Error::InvalidConfig(
+                    "streamSettings.network=xhttp requires the xhttp feature".into(),
+                ))
+            }
+        }
+    }
+}
 
 impl TryFrom<InboudItem> for ServerConfig {
     type Error = Error;
@@ -133,22 +238,17 @@ impl TryFrom<InboudItem> for ServerConfig {
                     user_label: user_label.clone(),
                 };
 
-                #[cfg(feature = "ws")]
-                if let Some(stream_setting) = stream_settings.as_ref() {
-                    if let Some(ws_setting) = stream_setting.ws_settings.clone() {
-                        tracing::info!("use websocket");
-                        protocol = ServerProxyConfig::Websocket {
-                            targets: Box::new(OneOrSome::One(WebsocketServerConfig {
-                                matching_path: ws_setting.path,
-                                matching_headers: None,
-                                protocol,
-                            })),
-                        };
-                    }
-                }
+                let stream_network = parse_stream_network(stream_settings.as_ref())?;
+                protocol = apply_stream_transport_layer(
+                    protocol,
+                    stream_settings.as_ref(),
+                    stream_network,
+                )?;
 
-                if let Some(stream_setting) = stream_settings.as_ref() {
-                    protocol = apply_security_layers(protocol, stream_setting)?;
+                if stream_network != StreamNetwork::Xhttp {
+                    if let Some(stream_setting) = stream_settings.as_ref() {
+                        protocol = apply_security_layers(protocol, stream_setting)?;
+                    }
                 }
 
                 return Ok(ServerConfig {
@@ -173,22 +273,17 @@ impl TryFrom<InboudItem> for ServerConfig {
                     fallbacks: trojan_fallbacks,
                 };
 
-                #[cfg(feature = "ws")]
-                if let Some(stream_setting) = stream_settings.as_ref() {
-                    if let Some(ws_setting) = stream_setting.ws_settings.clone() {
-                        tracing::info!("use websocket");
-                        protocol = ServerProxyConfig::Websocket {
-                            targets: Box::new(OneOrSome::One(WebsocketServerConfig {
-                                matching_path: ws_setting.path,
-                                matching_headers: None,
-                                protocol,
-                            })),
-                        };
-                    }
-                }
+                let stream_network = parse_stream_network(stream_settings.as_ref())?;
+                protocol = apply_stream_transport_layer(
+                    protocol,
+                    stream_settings.as_ref(),
+                    stream_network,
+                )?;
 
-                if let Some(stream_setting) = stream_settings.as_ref() {
-                    protocol = apply_security_layers(protocol, stream_setting)?;
+                if stream_network != StreamNetwork::Xhttp {
+                    if let Some(stream_setting) = stream_settings.as_ref() {
+                        protocol = apply_security_layers(protocol, stream_setting)?;
+                    }
                 }
 
                 Ok(ServerConfig {
@@ -238,6 +333,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                 })
             }
 
+            #[cfg(feature = "xhttp")]
             Protocol::Xhttp => {
                 let settings = settings.ok_or_else(|| {
                     Error::InvalidConfig("xhttp inbound requires settings".into())
@@ -249,6 +345,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                     bind_location,
                     protocol: ServerProxyConfig::Xhttp {
                         config: xhttp_config,
+                        inner: None,
                     },
                     transport: Transport::Tcp,
                     quic_settings: None,
@@ -262,22 +359,17 @@ impl TryFrom<InboudItem> for ServerConfig {
                 let accounts = collect_socks_accounts(settings)?;
                 let mut protocol = ServerProxyConfig::Socks { accounts };
 
-                #[cfg(feature = "ws")]
-                if let Some(stream_setting) = stream_settings.as_ref() {
-                    if let Some(ws_setting) = stream_setting.ws_settings.clone() {
-                        tracing::info!("use websocket");
-                        protocol = ServerProxyConfig::Websocket {
-                            targets: Box::new(OneOrSome::One(WebsocketServerConfig {
-                                matching_path: ws_setting.path,
-                                matching_headers: None,
-                                protocol,
-                            })),
-                        };
-                    }
-                }
+                let stream_network = parse_stream_network(stream_settings.as_ref())?;
+                protocol = apply_stream_transport_layer(
+                    protocol,
+                    stream_settings.as_ref(),
+                    stream_network,
+                )?;
 
-                if let Some(stream_setting) = stream_settings.as_ref() {
-                    protocol = apply_security_layers(protocol, stream_setting)?;
+                if stream_network != StreamNetwork::Xhttp {
+                    if let Some(stream_setting) = stream_settings.as_ref() {
+                        protocol = apply_security_layers(protocol, stream_setting)?;
+                    }
                 }
 
                 Ok(ServerConfig {
@@ -289,5 +381,82 @@ impl TryFrom<InboudItem> for ServerConfig {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::def::InboudItem;
+
+    use super::*;
+
+    #[cfg(all(feature = "vless", feature = "xhttp"))]
+    #[test]
+    fn vless_xhttp_network_wraps_inner_protocol() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 8443,
+            "protocol": "vless",
+            "settings": {
+                "clients": [
+                    {
+                        "email": "u@example.com",
+                        "flow": "",
+                        "id": "550e8400-e29b-41d4-a716-446655440000"
+                    }
+                ]
+            },
+            "streamSettings": {
+                "network": "xhttp",
+                "xhttpSettings": {
+                    "path": "/edge"
+                }
+            },
+            "tag": "inbound-xhttp"
+        }))
+        .expect("inbound item");
+
+        let server_config = ServerConfig::try_from(inbound).expect("server config");
+        assert_eq!(server_config.transport, Transport::Tcp);
+
+        match server_config.protocol {
+            ServerProxyConfig::Xhttp { config, inner } => {
+                assert_eq!(config.path, "/edge/");
+                let inner = inner.expect("xhttp transport should wrap an inner protocol");
+                assert!(matches!(*inner, ServerProxyConfig::Vless { .. }));
+            }
+            other => panic!("unexpected protocol: {:?}", other),
+        }
+    }
+
+    #[cfg(all(feature = "vless", feature = "xhttp"))]
+    #[test]
+    fn xhttp_network_rejects_security_layer_for_now() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 8443,
+            "protocol": "vless",
+            "settings": {
+                "clients": [
+                    {
+                        "email": "u@example.com",
+                        "flow": "",
+                        "id": "550e8400-e29b-41d4-a716-446655440000"
+                    }
+                ]
+            },
+            "streamSettings": {
+                "network": "xhttp",
+                "security": "tls",
+                "xhttpSettings": {
+                    "path": "/edge"
+                }
+            },
+            "tag": "inbound-xhttp"
+        }))
+        .expect("inbound item");
+
+        let err = ServerConfig::try_from(inbound).expect_err("xhttp with tls should fail for now");
+        assert!(matches!(err, Error::InvalidConfig(_)));
     }
 }

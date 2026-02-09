@@ -60,13 +60,14 @@ hysteria = []
 trojan = []
 ws = []
 tls = []
+xhttp = []
 reality = ["rcgen", "subtle", "x509-parser"]
 vless = []
 tuic = ["dashmap", "lru", "uuid"]
 traffic = []
 api = ["tonic", "prost", "prost-types", "tokio-stream"]
 
-full = ["hysteria", "trojan", "ws", "tls", "reality", "vless", "tuic", "api"]
+full = ["hysteria", "trojan", "ws", "tls", "xhttp", "reality", "vless", "tuic", "api"]
 
 default = ["full"]
 
