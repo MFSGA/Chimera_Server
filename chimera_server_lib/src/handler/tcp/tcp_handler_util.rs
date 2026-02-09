@@ -69,6 +69,7 @@ pub fn create_tcp_server_handler(
         ServerProxyConfig::Socks { accounts } => {
             Box::new(SocksTcpServerHandler::new(accounts, inbound_tag))
         }
+        #[cfg(feature = "xhttp")]
         ServerProxyConfig::Xhttp { .. } => {
             panic!("Xhttp server should not be served via TCP handler")
         }

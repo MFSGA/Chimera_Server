@@ -53,6 +53,7 @@ impl HandlerServiceImpl {
             ServerProxyConfig::Tls(tls) => self.collect_identities(&tls.inner),
             #[cfg(feature = "reality")]
             ServerProxyConfig::Reality(reality) => self.collect_identities(&reality.inner),
+            #[cfg(feature = "xhttp")]
             ServerProxyConfig::Xhttp { .. } => Vec::new(),
         }
     }

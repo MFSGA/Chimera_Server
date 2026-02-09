@@ -20,13 +20,15 @@ use tracing::error;
 
 use crate::{
     address::BindLocation,
-    config::server_config::{ServerConfig, ServerProxyConfig, XhttpServerConfig},
+    config::server_config::{ServerConfig, ServerProxyConfig, XhttpMode, XhttpServerConfig},
+    handler::tcp::{tcp_handler::TcpServerHandler, tcp_handler_util::create_tcp_server_handler},
 };
 
 pub async fn start_xhttp_server(
     config: ServerConfig,
 ) -> std::io::Result<Vec<tokio::task::JoinHandle<()>>> {
     let ServerConfig {
+        tag,
         bind_location,
         protocol,
         ..
@@ -34,19 +36,48 @@ pub async fn start_xhttp_server(
 
     let ServerProxyConfig::Xhttp {
         config: xhttp_config,
+        inner,
     } = protocol
     else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "invalid protocol for xhttp server",
-        ));
+        return Err(std::io::Error::other("invalid protocol for xhttp server"));
     };
 
     let bind_addr = match bind_location {
         BindLocation::Address(address) => address.to_socket_addr()?,
     };
 
-    let state = AppState::new(xhttp_config);
+    let mut join_handles = Vec::with_capacity(2);
+    let upstream = match (xhttp_config.upstream.clone(), inner) {
+        (Some(upstream), None) => upstream,
+        (None, Some(inner_protocol)) => {
+            let inner_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let inner_upstream = inner_listener.local_addr()?.to_string();
+            let mut rules_stack = vec![];
+            let inner_handler: Arc<Box<dyn TcpServerHandler>> = Arc::new(
+                create_tcp_server_handler(*inner_protocol, &tag, &mut rules_stack),
+            );
+
+            let inner_handle = tokio::spawn(async move {
+                if let Err(err) = super::run_tcp_server(inner_listener, inner_handler).await {
+                    error!("xhttp inner tcp server stopped with error: {}", err);
+                }
+            });
+            join_handles.push(inner_handle);
+            inner_upstream
+        }
+        (Some(_), Some(_)) => {
+            return Err(std::io::Error::other(
+                "invalid xhttp config: upstream and inner protocol cannot both be set",
+            ));
+        }
+        (None, None) => {
+            return Err(std::io::Error::other(
+                "invalid xhttp config: upstream is missing",
+            ));
+        }
+    };
+
+    let state = AppState::new(xhttp_config, upstream);
 
     let router = Router::new()
         .route("/*rest", get(down_handler).post(up_handler))
@@ -58,8 +89,8 @@ pub async fn start_xhttp_server(
             error!("xhttp server exited: {}", err);
         }
     });
-
-    Ok(vec![handle])
+    join_handles.push(handle);
+    Ok(join_handles)
 }
 
 #[derive(Clone)]
@@ -67,6 +98,7 @@ struct AppState {
     upstream: String,
     host: Option<String>,
     path_prefix: String,
+    mode: XhttpMode,
     min_padding: usize,
     max_padding: usize,
     response_headers: Arc<HashMap<String, String>>,
@@ -74,11 +106,12 @@ struct AppState {
 }
 
 impl AppState {
-    fn new(config: XhttpServerConfig) -> Self {
+    fn new(config: XhttpServerConfig, upstream: String) -> Self {
         Self {
-            upstream: config.upstream,
+            upstream,
             host: config.host,
             path_prefix: config.path,
+            mode: config.mode,
             min_padding: config.min_padding,
             max_padding: config.max_padding,
             response_headers: Arc::new(config.headers),
@@ -240,6 +273,13 @@ async fn up_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
+    if !matches!(state.mode, XhttpMode::Auto | XhttpMode::PacketUp) {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::empty())
+            .unwrap();
+    }
+
     let host_header = headers
         .get(http::header::HOST)
         .and_then(|value| value.to_str().ok());
