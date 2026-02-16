@@ -6,7 +6,7 @@ members = ["chimera_server_app", "chimera_server_lib", "chimera_cli"]
 [workspace.package]
 name = "chimera_server"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["chimera_rust@proton.me"]
 
 
