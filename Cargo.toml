@@ -32,10 +32,10 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 ] }
 
 anyhow = "1.0"
-tonic = { version = "0.12", features = ["transport"] }
-tonic-build = "0.12"
-prost = "0.13"
-prost-types = "0.13"
+tonic = { version = "0.14", features = ["transport"] }
+tonic-build = "0.14"
+prost = "0.14"
+prost-types = "0.14"
 tokio-stream = { version = "0.1", features = ["net"] }
 protoc-bin-vendored = "3"
 
@@ -59,7 +59,7 @@ bytes = "1.6"
 tokio-util = { version = "0.7", features = ["net", "codec", "io", "compat"] }
 futures = "0.3"
 quinn-proto = "0.11.8"
-rand = "0.9"
+rand = "0.10"
 
 reqwest = { version = "0.12.4", default-features = false, features = [
     "rustls-tls",
@@ -100,6 +100,6 @@ socket2 = { version = "*", features = ["all"] }
 dashmap = "*"
 lru = "*"
 log = "0.4"
-rcgen = { version = "0.13", features = ["x509-parser"] }
+rcgen = { version = "0.14", features = ["x509-parser"] }
 subtle = "2"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
