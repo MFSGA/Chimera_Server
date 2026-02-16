@@ -1,11 +1,15 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let protoc_path = protoc_bin_vendored::protoc_bin_path()
         .map_err(|err| format!("failed to locate vendored protoc: {err}"))?;
-    std::env::set_var("PROTOC", protoc_path);
+    // Safety: build.rs runs single-threaded and we set PROTOC before any other
+    // threads or environment reads are introduced in this process.
+    unsafe {
+        std::env::set_var("PROTOC", protoc_path);
+    }
 
     let proto_root = "proto";
     println!("cargo:rerun-if-changed={}", proto_root);
-    tonic_build::configure().build_client(false).compile(
+    tonic_build::configure().build_client(false).compile_protos(
         &[
             "proto/app/stats/command/command.proto",
             "proto/app/log/command/config.proto",

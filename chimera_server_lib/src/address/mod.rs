@@ -200,7 +200,7 @@ impl Address {
 
     pub fn hostname(&self) -> Option<&str> {
         match self {
-            Address::Hostname(ref hostname) => Some(hostname),
+            Address::Hostname(hostname) => Some(hostname),
             _ => None,
         }
     }
