@@ -27,7 +27,7 @@ impl TcpServerSetupResult {
     pub fn set_need_initial_flush(&mut self, need_initial_flush: bool) {
         match self {
             TcpServerSetupResult::TcpForward {
-                need_initial_flush: ref mut flush,
+                need_initial_flush: flush,
                 ..
             } => {
                 *flush = need_initial_flush;
