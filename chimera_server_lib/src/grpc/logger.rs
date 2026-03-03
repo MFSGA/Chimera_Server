@@ -20,9 +20,29 @@ impl proto::xray::app::log::command::logger_service_server::LoggerService for Lo
     }
 }
 
-pub(super) fn build_service(
-) -> proto::xray::app::log::command::logger_service_server::LoggerServiceServer<LoggerServiceImpl> {
+pub(super) fn build_service()
+-> proto::xray::app::log::command::logger_service_server::LoggerServiceServer<LoggerServiceImpl> {
     proto::xray::app::log::command::logger_service_server::LoggerServiceServer::new(
         LoggerServiceImpl,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::proto::xray::app::log::command::logger_service_server::LoggerService;
+    use super::*;
+    use tonic::Request;
+
+    #[tokio::test]
+    async fn logger_restart_after_init() {
+        crate::log::init(None, None, None).expect("log init failed");
+
+        let service = LoggerServiceImpl;
+        service
+            .restart_logger(Request::new(
+                proto::xray::app::log::command::RestartLoggerRequest {},
+            ))
+            .await
+            .expect("restart_logger failed");
+    }
 }

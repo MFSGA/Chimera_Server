@@ -55,7 +55,7 @@ pub async fn start_grpc_server(
         router = Some(add_service(
             builder.take(),
             router.take(),
-            routing::build_service(),
+            routing::build_service(runtime.clone()),
         ));
         service_count += 1;
     }
@@ -64,7 +64,7 @@ pub async fn start_grpc_server(
         router = Some(add_service(
             builder.take(),
             router.take(),
-            observatory::build_service(),
+            observatory::build_service(runtime.clone()),
         ));
         service_count += 1;
     }
