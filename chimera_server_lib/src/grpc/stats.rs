@@ -289,9 +289,320 @@ fn parse_online_name(name: &str) -> Option<OnlineKey> {
         _ => None,
     }
 }
-pub(super) fn build_service(
-) -> proto::xray::app::stats::command::stats_service_server::StatsServiceServer<StatsServiceImpl> {
+pub(super) fn build_service()
+-> proto::xray::app::stats::command::stats_service_server::StatsServiceServer<StatsServiceImpl> {
     proto::xray::app::stats::command::stats_service_server::StatsServiceServer::new(
         StatsServiceImpl::new(),
     )
+}
+
+#[cfg(all(test, feature = "traffic"))]
+mod tests {
+    use super::proto::xray::app::stats::command::stats_service_server::StatsService;
+    use super::*;
+    use crate::traffic::{self, TrafficContext};
+    use std::{
+        collections::HashMap,
+        net::{IpAddr, Ipv4Addr},
+        sync::atomic::{AtomicU64, Ordering},
+    };
+    use tonic::{Code, Request};
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn unique_tag(prefix: &str) -> String {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        format!("{prefix}-{id}")
+    }
+
+    fn record_transfer(tag: &str, user: &str, upload: u64, download: u64) {
+        let context = TrafficContext::new("test")
+            .with_inbound_tag(tag)
+            .with_identity(user);
+        traffic::record_transfer(Some(context), upload, download);
+    }
+
+    fn name_inbound(tag: &str, suffix: &str) -> String {
+        format!("inbound>>>{tag}>>>traffic>>>{suffix}")
+    }
+
+    #[tokio::test]
+    async fn stats_get_stats_and_reset() {
+        let service = StatsServiceImpl::new();
+        let tag = unique_tag("inbound");
+        let user = unique_tag("user");
+
+        record_transfer(&tag, &user, 120, 450);
+
+        let uplink = name_inbound(&tag, "uplink");
+        let downlink = name_inbound(&tag, "downlink");
+
+        let response = service
+            .get_stats(Request::new(
+                proto::xray::app::stats::command::GetStatsRequest {
+                    name: uplink.clone(),
+                    reset: false,
+                },
+            ))
+            .await
+            .expect("get_stats uplink failed")
+            .into_inner();
+        assert_eq!(response.stat.unwrap().value, 120);
+
+        let response = service
+            .get_stats(Request::new(
+                proto::xray::app::stats::command::GetStatsRequest {
+                    name: downlink.clone(),
+                    reset: false,
+                },
+            ))
+            .await
+            .expect("get_stats downlink failed")
+            .into_inner();
+        assert_eq!(response.stat.unwrap().value, 450);
+
+        let response = service
+            .get_stats(Request::new(
+                proto::xray::app::stats::command::GetStatsRequest {
+                    name: uplink.clone(),
+                    reset: true,
+                },
+            ))
+            .await
+            .expect("reset uplink failed")
+            .into_inner();
+        assert_eq!(response.stat.unwrap().value, 120);
+
+        let response = service
+            .get_stats(Request::new(
+                proto::xray::app::stats::command::GetStatsRequest {
+                    name: downlink.clone(),
+                    reset: true,
+                },
+            ))
+            .await
+            .expect("reset downlink failed")
+            .into_inner();
+        assert_eq!(response.stat.unwrap().value, 450);
+
+        record_transfer(&tag, &user, 30, 70);
+
+        let response = service
+            .get_stats(Request::new(
+                proto::xray::app::stats::command::GetStatsRequest {
+                    name: uplink.clone(),
+                    reset: false,
+                },
+            ))
+            .await
+            .expect("delta uplink failed")
+            .into_inner();
+        assert_eq!(response.stat.unwrap().value, 30);
+
+        let response = service
+            .get_stats(Request::new(
+                proto::xray::app::stats::command::GetStatsRequest {
+                    name: downlink.clone(),
+                    reset: false,
+                },
+            ))
+            .await
+            .expect("delta downlink failed")
+            .into_inner();
+        assert_eq!(response.stat.unwrap().value, 70);
+    }
+
+    #[tokio::test]
+    async fn stats_query_stats_pattern_and_reset() {
+        let service = StatsServiceImpl::new();
+        let tag = unique_tag("query");
+        let user = unique_tag("user");
+
+        record_transfer(&tag, &user, 50, 60);
+
+        let response = service
+            .query_stats(Request::new(
+                proto::xray::app::stats::command::QueryStatsRequest {
+                    pattern: tag.clone(),
+                    reset: true,
+                },
+            ))
+            .await
+            .expect("query stats failed")
+            .into_inner();
+
+        let mut stats = HashMap::new();
+        for stat in response.stat {
+            stats.insert(stat.name, stat.value);
+        }
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats[&name_inbound(&tag, "uplink")], 50);
+        assert_eq!(stats[&name_inbound(&tag, "downlink")], 60);
+
+        record_transfer(&tag, &user, 7, 11);
+
+        let response = service
+            .query_stats(Request::new(
+                proto::xray::app::stats::command::QueryStatsRequest {
+                    pattern: tag.clone(),
+                    reset: false,
+                },
+            ))
+            .await
+            .expect("query stats delta failed")
+            .into_inner();
+
+        let mut stats = HashMap::new();
+        for stat in response.stat {
+            stats.insert(stat.name, stat.value);
+        }
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats[&name_inbound(&tag, "uplink")], 7);
+        assert_eq!(stats[&name_inbound(&tag, "downlink")], 11);
+    }
+
+    #[tokio::test]
+    async fn stats_online_counts_unique_ips() {
+        let service = StatsServiceImpl::new();
+        let tag = unique_tag("online");
+        let user = unique_tag("user");
+
+        let ip1 = IpAddr::V4(Ipv4Addr::new(10, 1, 1, 1));
+        let ip2 = IpAddr::V4(Ipv4Addr::new(10, 1, 1, 2));
+
+        let ctx1 = TrafficContext::new("test")
+            .with_inbound_tag(&tag)
+            .with_identity(&user)
+            .with_client_ip(ip1);
+        let _guard1 = traffic::register_connection(Some(&ctx1));
+        let _guard2 = traffic::register_connection(Some(&ctx1));
+
+        let ctx2 = TrafficContext::new("test")
+            .with_inbound_tag(&tag)
+            .with_identity(&user)
+            .with_client_ip(ip2);
+        let _guard3 = traffic::register_connection(Some(&ctx2));
+
+        let inbound_name = format!("inbound>>>{tag}>>>online");
+        let response = service
+            .get_stats_online(Request::new(
+                proto::xray::app::stats::command::GetStatsRequest {
+                    name: inbound_name,
+                    reset: false,
+                },
+            ))
+            .await
+            .expect("get_stats_online inbound failed")
+            .into_inner();
+        assert_eq!(response.stat.unwrap().value, 2);
+
+        let user_name = format!("user>>>{user}>>>online");
+        let response = service
+            .get_stats_online(Request::new(
+                proto::xray::app::stats::command::GetStatsRequest {
+                    name: user_name,
+                    reset: false,
+                },
+            ))
+            .await
+            .expect("get_stats_online user failed")
+            .into_inner();
+        assert_eq!(response.stat.unwrap().value, 2);
+    }
+
+    #[tokio::test]
+    async fn stats_online_ip_list_contains_ips() {
+        let service = StatsServiceImpl::new();
+        let tag = unique_tag("iplist");
+        let user = unique_tag("user");
+
+        let ip1 = IpAddr::V4(Ipv4Addr::new(10, 2, 1, 1));
+        let ip2 = IpAddr::V4(Ipv4Addr::new(10, 2, 1, 2));
+
+        let ctx1 = TrafficContext::new("test")
+            .with_inbound_tag(&tag)
+            .with_identity(&user)
+            .with_client_ip(ip1);
+        let _guard1 = traffic::register_connection(Some(&ctx1));
+
+        let ctx2 = TrafficContext::new("test")
+            .with_inbound_tag(&tag)
+            .with_identity(&user)
+            .with_client_ip(ip2);
+        let _guard2 = traffic::register_connection(Some(&ctx2));
+
+        let inbound_name = format!("inbound>>>{tag}>>>online");
+        let response = service
+            .get_stats_online_ip_list(Request::new(
+                proto::xray::app::stats::command::GetStatsRequest {
+                    name: inbound_name,
+                    reset: false,
+                },
+            ))
+            .await
+            .expect("get_stats_online_ip_list failed")
+            .into_inner();
+
+        let ip1_key = ip1.to_string();
+        let ip2_key = ip2.to_string();
+        assert!(response.ips.contains_key(&ip1_key));
+        assert!(response.ips.contains_key(&ip2_key));
+        assert!(response.ips[&ip1_key] > 0);
+    }
+
+    #[tokio::test]
+    async fn stats_all_online_users_unique() {
+        let service = StatsServiceImpl::new();
+        let tag = unique_tag("users");
+        let prefix = unique_tag("user");
+        let user_a = format!("{prefix}-a");
+        let user_b = format!("{prefix}-b");
+
+        let ip1 = IpAddr::V4(Ipv4Addr::new(10, 3, 1, 1));
+        let ip2 = IpAddr::V4(Ipv4Addr::new(10, 3, 1, 2));
+
+        let ctx1 = TrafficContext::new("test")
+            .with_inbound_tag(&tag)
+            .with_identity(&user_a)
+            .with_client_ip(ip1);
+        let _guard1 = traffic::register_connection(Some(&ctx1));
+        let _guard2 = traffic::register_connection(Some(&ctx1));
+
+        let ctx2 = TrafficContext::new("test")
+            .with_inbound_tag(&tag)
+            .with_identity(&user_b)
+            .with_client_ip(ip2);
+        let _guard3 = traffic::register_connection(Some(&ctx2));
+
+        let response = service
+            .get_all_online_users(Request::new(
+                proto::xray::app::stats::command::GetAllOnlineUsersRequest {},
+            ))
+            .await
+            .expect("get_all_online_users failed")
+            .into_inner();
+
+        let matching: Vec<&String> = response
+            .users
+            .iter()
+            .filter(|user| user.starts_with(&prefix))
+            .collect();
+        assert_eq!(matching.len(), 2);
+        assert!(matching.iter().any(|user| *user == &user_a));
+        assert!(matching.iter().any(|user| *user == &user_b));
+    }
+
+    #[tokio::test]
+    async fn stats_invalid_online_name_returns_not_found() {
+        let service = StatsServiceImpl::new();
+        let tag = unique_tag("invalid");
+        let name = format!("inbound>>>{tag}>>>traffic");
+        let err = service
+            .get_stats_online(Request::new(
+                proto::xray::app::stats::command::GetStatsRequest { name, reset: false },
+            ))
+            .await
+            .expect_err("expected not found");
+        assert_eq!(err.code(), Code::NotFound);
+    }
 }
