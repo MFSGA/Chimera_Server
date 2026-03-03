@@ -366,6 +366,9 @@ version = "0.1.0"
 dependencies = [
  "chimera_server_lib",
  "clap",
+ "prost",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]
