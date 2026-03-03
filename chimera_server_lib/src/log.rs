@@ -5,26 +5,28 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, RwLock},
 };
-use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{
-    filter::Filtered,
+    EnvFilter, Registry,
     fmt::{
         self,
         format::{DefaultFields, FmtSpan, Format},
         writer::BoxMakeWriter,
     },
+    layer::Layered,
     layer::SubscriberExt,
     reload,
     util::SubscriberInitExt,
-    EnvFilter, Layer, Registry,
 };
 
 use crate::Error;
 
-type LogLayer =
-    Filtered<fmt::Layer<Registry, DefaultFields, Format, BoxMakeWriter>, EnvFilter, Registry>;
+type FormatLayer = fmt::Layer<Registry, DefaultFields, Format, BoxMakeWriter>;
+type FormatReloadLayer = reload::Layer<FormatLayer, Registry>;
+type FormatSubscriber = Layered<FormatReloadLayer, Registry>;
+type FilterReloadHandle = reload::Handle<EnvFilter, FormatSubscriber>;
 
-static LOG_RELOAD: OnceLock<reload::Handle<LogLayer, Registry>> = OnceLock::new();
+static LOG_FORMAT_RELOAD: OnceLock<reload::Handle<FormatLayer, Registry>> = OnceLock::new();
+static LOG_FILTER_RELOAD: OnceLock<FilterReloadHandle> = OnceLock::new();
 static LOG_STATE: OnceLock<RwLock<LogState>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,16 +67,6 @@ impl Default for LogLevel {
 }
 
 impl LogLevel {
-    fn as_filter(self) -> LevelFilter {
-        match self {
-            LogLevel::Debug => LevelFilter::DEBUG,
-            LogLevel::Info => LevelFilter::INFO,
-            LogLevel::Warning => LevelFilter::WARN,
-            LogLevel::Error => LevelFilter::ERROR,
-            LogLevel::None => LevelFilter::OFF,
-        }
-    }
-
     fn as_directive(self) -> &'static str {
         match self {
             LogLevel::Debug => "debug",
@@ -111,26 +103,35 @@ impl LogConfig {
         let env_filter = EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new(self.loglevel.as_directive()));
 
-        let layer = fmt::layer()
+        let fmt_layer = fmt::layer()
             .with_span_events(FmtSpan::FULL)
             .with_writer(writer)
-            .with_ansi(use_ansi)
-            .with_filter(env_filter);
+            .with_ansi(use_ansi);
 
-        if let Some(handle) = LOG_RELOAD.get() {
-            handle
-                .reload(layer)
-                .map_err(|err| Error::InvalidConfig(format!("failed to reload logger: {err}")))?;
+        if let (Some(format_handle), Some(filter_handle)) =
+            (LOG_FORMAT_RELOAD.get(), LOG_FILTER_RELOAD.get())
+        {
+            format_handle.reload(fmt_layer).map_err(|err| {
+                Error::InvalidConfig(format!("failed to reload logger format layer: {err}"))
+            })?;
+            filter_handle.reload(env_filter).map_err(|err| {
+                Error::InvalidConfig(format!("failed to reload logger filter layer: {err}"))
+            })?;
             return Ok(());
         }
 
-        let (reload_layer, handle) = reload::Layer::new(layer);
+        let (reload_format_layer, format_handle): (FormatReloadLayer, _) =
+            reload::Layer::new(fmt_layer);
+        let (reload_filter_layer, filter_handle): (reload::Layer<EnvFilter, FormatSubscriber>, _) =
+            reload::Layer::new(env_filter);
         tracing_subscriber::registry()
-            .with(reload_layer)
+            .with(reload_format_layer)
+            .with(reload_filter_layer)
             .try_init()
             .map_err(|err| Error::InvalidConfig(format!("failed to initialize logger: {err}")))?;
 
-        let _ = LOG_RELOAD.set(handle);
+        let _ = LOG_FORMAT_RELOAD.set(format_handle);
+        let _ = LOG_FILTER_RELOAD.set(filter_handle);
 
         Ok(())
     }
