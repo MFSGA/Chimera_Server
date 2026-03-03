@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::config::server_config::ServerConfig;
 
@@ -10,27 +10,50 @@ pub struct OutboundSummary {
 
 #[derive(Debug, Clone)]
 pub struct RuntimeState {
-    inbounds: Arc<Vec<ServerConfig>>,
-    outbounds: Arc<Vec<OutboundSummary>>,
+    inbounds: Arc<RwLock<Vec<ServerConfig>>>,
+    outbounds: Arc<RwLock<Vec<OutboundSummary>>>,
 }
 
 impl RuntimeState {
     pub fn new(inbounds: Vec<ServerConfig>, outbounds: Vec<OutboundSummary>) -> Self {
         Self {
-            inbounds: Arc::new(inbounds),
-            outbounds: Arc::new(outbounds),
+            inbounds: Arc::new(RwLock::new(inbounds)),
+            outbounds: Arc::new(RwLock::new(outbounds)),
         }
     }
 
-    pub fn inbounds(&self) -> &[ServerConfig] {
-        self.inbounds.as_slice()
+    pub fn inbounds(&self) -> Vec<ServerConfig> {
+        self.inbounds
+            .read()
+            .expect("runtime inbounds lock poisoned")
+            .clone()
     }
 
-    pub fn inbound_by_tag(&self, tag: &str) -> Option<&ServerConfig> {
-        self.inbounds.iter().find(|cfg| cfg.tag == tag)
+    pub fn inbound_by_tag(&self, tag: &str) -> Option<ServerConfig> {
+        self.inbounds
+            .read()
+            .expect("runtime inbounds lock poisoned")
+            .iter()
+            .find(|cfg| cfg.tag == tag)
+            .cloned()
     }
 
-    pub fn outbounds(&self) -> &[OutboundSummary] {
-        self.outbounds.as_slice()
+    pub fn with_inbound_mut<R, F>(&self, tag: &str, mutator: F) -> Option<R>
+    where
+        F: FnOnce(&mut ServerConfig) -> R,
+    {
+        let mut guard = self
+            .inbounds
+            .write()
+            .expect("runtime inbounds lock poisoned");
+        let inbound = guard.iter_mut().find(|cfg| cfg.tag == tag)?;
+        Some(mutator(inbound))
+    }
+
+    pub fn outbounds(&self) -> Vec<OutboundSummary> {
+        self.outbounds
+            .read()
+            .expect("runtime outbounds lock poisoned")
+            .clone()
     }
 }
