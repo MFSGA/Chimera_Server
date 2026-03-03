@@ -8,6 +8,11 @@ chimera_server_lib = { path = "../chimera_server_lib", version = "*" }
 clap = { workspace = true }
 
 
+[dev-dependencies]
+prost = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+
 [features]
 default = ["full"]
 full = ["chimera_server_lib/full"]
