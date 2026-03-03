@@ -7,4 +7,4 @@ mod routing;
 mod server;
 mod stats;
 
-pub use server::{start_grpc_server, GrpcServerConfig};
+pub use server::{GrpcServerConfig, start_grpc_server};
