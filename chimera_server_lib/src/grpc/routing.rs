@@ -14,7 +14,8 @@ use super::proto;
 pub(super) struct RoutingServiceImpl {
     runtime: RuntimeState,
     balancer_overrides: Arc<RwLock<HashMap<String, String>>>,
-    routing_stats_tx: broadcast::Sender<proto::xray::app::router::command::RoutingContext>,
+    routing_stats_tx:
+        broadcast::Sender<proto::xray::app::router::command::RoutingContext>,
 }
 
 impl RoutingServiceImpl {
@@ -145,7 +146,9 @@ impl proto::xray::app::router::command::routing_service_server::RoutingService
 
     async fn subscribe_routing_stats(
         &self,
-        request: Request<proto::xray::app::router::command::SubscribeRoutingStatsRequest>,
+        request: Request<
+            proto::xray::app::router::command::SubscribeRoutingStatsRequest,
+        >,
     ) -> Result<Response<Self::SubscribeRoutingStatsStream>, Status> {
         let selectors = request.into_inner().field_selectors;
         let mut routing_updates = self.routing_stats_tx.subscribe();
@@ -172,11 +175,12 @@ impl proto::xray::app::router::command::routing_service_server::RoutingService
     async fn test_route(
         &self,
         request: Request<proto::xray::app::router::command::TestRouteRequest>,
-    ) -> Result<Response<proto::xray::app::router::command::RoutingContext>, Status> {
+    ) -> Result<Response<proto::xray::app::router::command::RoutingContext>, Status>
+    {
         let request = request.into_inner();
-        let mut context = request
-            .routing_context
-            .ok_or_else(|| Status::invalid_argument("routing_context is required"))?;
+        let mut context = request.routing_context.ok_or_else(|| {
+            Status::invalid_argument("routing_context is required")
+        })?;
         context.outbound_tag = self.resolve_outbound_tag(&context)?;
 
         if request.publish_result {
@@ -192,7 +196,10 @@ impl proto::xray::app::router::command::routing_service_server::RoutingService
     async fn get_balancer_info(
         &self,
         request: Request<proto::xray::app::router::command::GetBalancerInfoRequest>,
-    ) -> Result<Response<proto::xray::app::router::command::GetBalancerInfoResponse>, Status> {
+    ) -> Result<
+        Response<proto::xray::app::router::command::GetBalancerInfoResponse>,
+        Status,
+    > {
         let request = request.into_inner();
         let balancer_tag = request.tag.trim();
         if balancer_tag.is_empty() {
@@ -219,8 +226,9 @@ impl proto::xray::app::router::command::routing_service_server::RoutingService
         Ok(Response::new(
             proto::xray::app::router::command::GetBalancerInfoResponse {
                 balancer: Some(proto::xray::app::router::command::BalancerMsg {
-                    r#override: override_target
-                        .map(|target| proto::xray::app::router::command::OverrideInfo { target }),
+                    r#override: override_target.map(|target| {
+                        proto::xray::app::router::command::OverrideInfo { target }
+                    }),
                     principle_target: Some(
                         proto::xray::app::router::command::PrincipleTargetInfo {
                             tag: principle_targets,
@@ -233,9 +241,13 @@ impl proto::xray::app::router::command::routing_service_server::RoutingService
 
     async fn override_balancer_target(
         &self,
-        request: Request<proto::xray::app::router::command::OverrideBalancerTargetRequest>,
-    ) -> Result<Response<proto::xray::app::router::command::OverrideBalancerTargetResponse>, Status>
-    {
+        request: Request<
+            proto::xray::app::router::command::OverrideBalancerTargetRequest,
+        >,
+    ) -> Result<
+        Response<proto::xray::app::router::command::OverrideBalancerTargetResponse>,
+        Status,
+    > {
         let request = request.into_inner();
         let balancer_tag = request.balancer_tag.trim();
         if balancer_tag.is_empty() {
@@ -267,14 +279,18 @@ impl proto::xray::app::router::command::routing_service_server::RoutingService
     async fn add_rule(
         &self,
         _request: Request<proto::xray::app::router::command::AddRuleRequest>,
-    ) -> Result<Response<proto::xray::app::router::command::AddRuleResponse>, Status> {
+    ) -> Result<Response<proto::xray::app::router::command::AddRuleResponse>, Status>
+    {
         Err(Status::unimplemented("AddRule is not supported"))
     }
 
     async fn remove_rule(
         &self,
         _request: Request<proto::xray::app::router::command::RemoveRuleRequest>,
-    ) -> Result<Response<proto::xray::app::router::command::RemoveRuleResponse>, Status> {
+    ) -> Result<
+        Response<proto::xray::app::router::command::RemoveRuleResponse>,
+        Status,
+    > {
         Err(Status::unimplemented("RemoveRule is not supported"))
     }
 }
@@ -319,10 +335,12 @@ mod tests {
         let response = service
             .test_route(Request::new(
                 proto::xray::app::router::command::TestRouteRequest {
-                    routing_context: Some(proto::xray::app::router::command::RoutingContext {
-                        inbound_tag: "inbound-a".to_string(),
-                        ..Default::default()
-                    }),
+                    routing_context: Some(
+                        proto::xray::app::router::command::RoutingContext {
+                            inbound_tag: "inbound-a".to_string(),
+                            ..Default::default()
+                        },
+                    ),
                     field_selectors: vec![],
                     publish_result: false,
                 },
@@ -376,7 +394,10 @@ mod tests {
         let mut stream = service
             .subscribe_routing_stats(Request::new(
                 proto::xray::app::router::command::SubscribeRoutingStatsRequest {
-                    field_selectors: vec!["inbound".to_string(), "outbound".to_string()],
+                    field_selectors: vec![
+                        "inbound".to_string(),
+                        "outbound".to_string(),
+                    ],
                 },
             ))
             .await
@@ -386,10 +407,12 @@ mod tests {
         service
             .test_route(Request::new(
                 proto::xray::app::router::command::TestRouteRequest {
-                    routing_context: Some(proto::xray::app::router::command::RoutingContext {
-                        inbound_tag: "inbound-stream".to_string(),
-                        ..Default::default()
-                    }),
+                    routing_context: Some(
+                        proto::xray::app::router::command::RoutingContext {
+                            inbound_tag: "inbound-stream".to_string(),
+                            ..Default::default()
+                        },
+                    ),
                     field_selectors: vec![],
                     publish_result: true,
                 },
@@ -453,9 +476,11 @@ mod tests {
         let err = service
             .test_route(Request::new(
                 proto::xray::app::router::command::TestRouteRequest {
-                    routing_context: Some(proto::xray::app::router::command::RoutingContext {
-                        ..Default::default()
-                    }),
+                    routing_context: Some(
+                        proto::xray::app::router::command::RoutingContext {
+                            ..Default::default()
+                        },
+                    ),
                     field_selectors: vec![],
                     publish_result: false,
                 },

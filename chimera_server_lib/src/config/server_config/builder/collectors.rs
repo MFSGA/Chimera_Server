@@ -3,15 +3,17 @@ use std::collections::HashMap;
 use serde::Deserialize;
 
 use crate::{
-    config::{HysteriaSettings, SettingObject},
-    util::bandwidth::{parse_bandwidth, BandwidthValue},
     Error,
+    config::{HysteriaSettings, SettingObject},
+    util::bandwidth::{BandwidthValue, parse_bandwidth},
 };
 
 #[cfg(feature = "tuic")]
 use super::super::types::TuicServerConfig;
 #[cfg(feature = "hysteria")]
-use super::super::types::{Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2ServerConfig};
+use super::super::types::{
+    Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2ServerConfig,
+};
 use super::super::types::{RangeConfig, SocksUser, XhttpServerConfig};
 
 #[cfg(feature = "trojan")]
@@ -53,9 +55,9 @@ pub(super) fn collect_hysteria2_settings(
         down: Option<BandwidthValue>,
     }
 
-    let raw: Hysteria2InboundSettings = settings
-        .deserialize()
-        .map_err(|e| Error::InvalidConfig(format!("failed to parse hysteria2 settings: {}", e)))?;
+    let raw: Hysteria2InboundSettings = settings.deserialize().map_err(|e| {
+        Error::InvalidConfig(format!("failed to parse hysteria2 settings: {}", e))
+    })?;
 
     let clients = raw
         .clients
@@ -76,13 +78,19 @@ pub(super) fn collect_hysteria2_settings(
     if let Some(config) = raw.bandwidth {
         if let Some(up) = config.up {
             bandwidth.max_tx = parse_bandwidth(up).map_err(|err| {
-                Error::InvalidConfig(format!("invalid hysteria2 bandwidth.up: {}", err))
+                Error::InvalidConfig(format!(
+                    "invalid hysteria2 bandwidth.up: {}",
+                    err
+                ))
             })?;
             saw_up = true;
         }
         if let Some(down) = config.down {
             bandwidth.max_rx = parse_bandwidth(down).map_err(|err| {
-                Error::InvalidConfig(format!("invalid hysteria2 bandwidth.down: {}", err))
+                Error::InvalidConfig(format!(
+                    "invalid hysteria2 bandwidth.down: {}",
+                    err
+                ))
             })?;
             saw_down = true;
         }
@@ -100,14 +108,20 @@ pub(super) fn collect_hysteria2_settings(
         if !saw_up {
             if let Some(up) = hysteria_settings.up.clone() {
                 bandwidth.max_tx = parse_bandwidth(up).map_err(|err| {
-                    Error::InvalidConfig(format!("invalid hysteriaSettings.up value: {}", err))
+                    Error::InvalidConfig(format!(
+                        "invalid hysteriaSettings.up value: {}",
+                        err
+                    ))
                 })?;
             }
         }
         if !saw_down {
             if let Some(down) = hysteria_settings.down.clone() {
                 bandwidth.max_rx = parse_bandwidth(down).map_err(|err| {
-                    Error::InvalidConfig(format!("invalid hysteriaSettings.down value: {}", err))
+                    Error::InvalidConfig(format!(
+                        "invalid hysteriaSettings.down value: {}",
+                        err
+                    ))
                 })?;
             }
         }
@@ -138,7 +152,9 @@ pub(super) fn collect_hysteria2_settings(
 }
 
 #[cfg(feature = "trojan")]
-pub(super) fn collect_trojan_clients(settings: SettingObject) -> Result<Vec<TrojanUser>, Error> {
+pub(super) fn collect_trojan_clients(
+    settings: SettingObject,
+) -> Result<Vec<TrojanUser>, Error> {
     let clients = settings.trojan_clients().unwrap_or_default();
     if clients.is_empty() {
         return Err(Error::InvalidConfig(
@@ -156,9 +172,9 @@ pub(super) fn collect_trojan_clients(settings: SettingObject) -> Result<Vec<Troj
             }
             Ok(TrojanUser {
                 password: client.password,
-                email: client
-                    .email
-                    .and_then(|value| if value.is_empty() { None } else { Some(value) }),
+                email: client.email.and_then(|value| {
+                    if value.is_empty() { None } else { Some(value) }
+                }),
             })
         })
         .collect()
@@ -181,9 +197,10 @@ pub(super) fn collect_trojan_fallbacks(
         dest: String,
     }
 
-    let trojan_settings: TrojanInboundSettings = settings
-        .deserialize()
-        .map_err(|e| Error::InvalidConfig(format!("failed to parse trojan settings: {e}")))?;
+    let trojan_settings: TrojanInboundSettings =
+        settings.deserialize().map_err(|e| {
+            Error::InvalidConfig(format!("failed to parse trojan settings: {e}"))
+        })?;
 
     let mut fallbacks = Vec::new();
     for fallback in trojan_settings.fallbacks {
@@ -211,7 +228,9 @@ pub(super) fn collect_trojan_fallbacks(
     Ok(fallbacks)
 }
 
-pub(super) fn collect_socks_accounts(settings: SettingObject) -> Result<Vec<SocksUser>, Error> {
+pub(super) fn collect_socks_accounts(
+    settings: SettingObject,
+) -> Result<Vec<SocksUser>, Error> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct SocksInboundSettings {
@@ -227,9 +246,10 @@ pub(super) fn collect_socks_accounts(settings: SettingObject) -> Result<Vec<Sock
         pass: String,
     }
 
-    let socks_settings: SocksInboundSettings = settings
-        .deserialize()
-        .map_err(|e| Error::InvalidConfig(format!("failed to parse socks settings: {}", e)))?;
+    let socks_settings: SocksInboundSettings =
+        settings.deserialize().map_err(|e| {
+            Error::InvalidConfig(format!("failed to parse socks settings: {}", e))
+        })?;
 
     let auth_mode = socks_settings
         .auth
@@ -267,7 +287,9 @@ pub(super) fn collect_socks_accounts(settings: SettingObject) -> Result<Vec<Sock
     }
 }
 
-pub(super) fn collect_xhttp_settings(settings: SettingObject) -> Result<XhttpServerConfig, Error> {
+pub(super) fn collect_xhttp_settings(
+    settings: SettingObject,
+) -> Result<XhttpServerConfig, Error> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct RawXhttpSettings {
@@ -278,9 +300,9 @@ pub(super) fn collect_xhttp_settings(settings: SettingObject) -> Result<XhttpSer
         x_padding_bytes: Option<RangeConfig>,
     }
 
-    let raw: RawXhttpSettings = settings
-        .deserialize()
-        .map_err(|e| Error::InvalidConfig(format!("failed to parse xhttp settings: {}", e)))?;
+    let raw: RawXhttpSettings = settings.deserialize().map_err(|e| {
+        Error::InvalidConfig(format!("failed to parse xhttp settings: {}", e))
+    })?;
 
     if raw.upstream.trim().is_empty() {
         return Err(Error::InvalidConfig(
@@ -308,7 +330,9 @@ pub(super) fn collect_xhttp_settings(settings: SettingObject) -> Result<XhttpSer
 }
 
 #[cfg(feature = "tuic")]
-pub(super) fn collect_tuic_settings(settings: SettingObject) -> Result<TuicServerConfig, Error> {
+pub(super) fn collect_tuic_settings(
+    settings: SettingObject,
+) -> Result<TuicServerConfig, Error> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct TuicInboundSettings {
@@ -318,9 +342,9 @@ pub(super) fn collect_tuic_settings(settings: SettingObject) -> Result<TuicServe
         zero_rtt_handshake: bool,
     }
 
-    let raw: TuicInboundSettings = settings
-        .deserialize()
-        .map_err(|e| Error::InvalidConfig(format!("failed to parse tuic settings: {e}")))?;
+    let raw: TuicInboundSettings = settings.deserialize().map_err(|e| {
+        Error::InvalidConfig(format!("failed to parse tuic settings: {e}"))
+    })?;
 
     if raw.uuid.trim().is_empty() {
         return Err(Error::InvalidConfig(
@@ -333,8 +357,9 @@ pub(super) fn collect_tuic_settings(settings: SettingObject) -> Result<TuicServe
         ));
     }
 
-    uuid::Uuid::parse_str(raw.uuid.trim())
-        .map_err(|e| Error::InvalidConfig(format!("invalid tuic uuid {}: {e}", raw.uuid)))?;
+    uuid::Uuid::parse_str(raw.uuid.trim()).map_err(|e| {
+        Error::InvalidConfig(format!("invalid tuic uuid {}: {e}", raw.uuid))
+    })?;
 
     Ok(TuicServerConfig {
         uuid: raw.uuid,

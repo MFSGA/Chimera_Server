@@ -13,7 +13,10 @@ use tokio_rustls::server::TlsStream;
 pub trait AsyncPing {
     fn supports_ping(&self) -> bool;
 
-    fn poll_write_ping(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<bool>>;
+    fn poll_write_ping(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<bool>>;
 }
 
 pub trait AsyncStream: AsyncRead + AsyncWrite + AsyncPing + Unpin + Send {}
@@ -23,7 +26,10 @@ impl AsyncPing for TcpStream {
         false
     }
 
-    fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<bool>> {
+    fn poll_write_ping(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<bool>> {
         Poll::Ready(Ok(false))
     }
 }
@@ -35,7 +41,10 @@ impl<T: ?Sized + AsyncStream> AsyncPing for Box<T> {
         (**self).supports_ping()
     }
 
-    fn poll_write_ping(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<bool>> {
+    fn poll_write_ping(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<bool>> {
         unsafe { self.map_unchecked_mut(|boxed| &mut **boxed) }.poll_write_ping(cx)
     }
 }
@@ -51,7 +60,10 @@ where
         false
     }
 
-    fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<bool>> {
+    fn poll_write_ping(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<bool>> {
         Poll::Ready(Ok(false))
     }
 }

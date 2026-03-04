@@ -2,8 +2,8 @@ use std::{
     collections::HashMap,
     net::IpAddr,
     sync::{
-        atomic::{AtomicU64, Ordering},
         OnceLock, RwLock,
+        atomic::{AtomicU64, Ordering},
     },
     time::SystemTime,
 };

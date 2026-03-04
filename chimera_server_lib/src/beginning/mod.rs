@@ -7,14 +7,14 @@ use crate::{
     address::{BindLocation, NetLocation},
     async_stream::AsyncStream,
     config::{
-        server_config::{ServerConfig, ServerProxyConfig},
         Transport,
+        server_config::{ServerConfig, ServerProxyConfig},
     },
     handler::tcp::{
         tcp_handler::{TcpServerHandler, TcpServerSetupResult},
         tcp_handler_util::create_tcp_server_handler,
     },
-    resolver::{resolve_single_address, NativeResolver, Resolver},
+    resolver::{NativeResolver, Resolver, resolve_single_address},
     traffic::{record_transfer, register_connection},
     util::socket::new_tcp_socket,
 };
@@ -24,7 +24,9 @@ use tracing::{error, info};
 mod quic;
 mod xhttp;
 
-pub async fn start_servers(config: ServerConfig) -> std::io::Result<Vec<JoinHandle<()>>> {
+pub async fn start_servers(
+    config: ServerConfig,
+) -> std::io::Result<Vec<JoinHandle<()>>> {
     if matches!(config.protocol, ServerProxyConfig::Xhttp { .. }) {
         return xhttp::start_xhttp_server(config).await;
     }
@@ -71,7 +73,9 @@ pub async fn start_servers(config: ServerConfig) -> std::io::Result<Vec<JoinHand
     Ok(join_handles)
 }
 
-pub async fn start_tcp_server(config: ServerConfig) -> std::io::Result<Option<JoinHandle<()>>> {
+pub async fn start_tcp_server(
+    config: ServerConfig,
+) -> std::io::Result<Option<JoinHandle<()>>> {
     let ServerConfig {
         tag,
         bind_location,
@@ -123,10 +127,16 @@ async fn run_tcp_server(
         let cloned_handler = server_handler.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = process_stream(stream, cloned_handler, cloned_cache, addr).await {
+            if let Err(e) =
+                process_stream(stream, cloned_handler, cloned_cache, addr).await
+            {
                 error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
             } else {
-                tracing::debug!("{}:{} finished successfully", addr.ip(), addr.port());
+                tracing::debug!(
+                    "{}:{} finished successfully",
+                    addr.ip(),
+                    addr.port()
+                );
             }
         });
     }
@@ -171,13 +181,17 @@ where
             connection_success_response,
             traffic_context,
         } => {
-            let traffic_context =
-                traffic_context.map(|context| context.with_client_ip(peer_addr.ip()));
+            let traffic_context = traffic_context
+                .map(|context| context.with_client_ip(peer_addr.ip()));
             let _connection_guard = register_connection(traffic_context.as_ref());
 
             let setup_client_stream_future = timeout(
                 Duration::from_secs(60),
-                setup_client_stream(&mut server_stream, resolver, remote_location.clone()),
+                setup_client_stream(
+                    &mut server_stream,
+                    resolver,
+                    remote_location.clone(),
+                ),
             );
 
             let mut client_stream = match setup_client_stream_future.await {
@@ -200,7 +214,10 @@ where
                     let _ = server_stream.shutdown().await;
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
-                        format!("client setup to {} timed out: {}", remote_location, elapsed),
+                        format!(
+                            "client setup to {} timed out: {}",
+                            remote_location, elapsed
+                        ),
                     ));
                 }
             };
@@ -209,10 +226,14 @@ where
                 server_stream.write_all(&data).await?;
             }
 
-            let copy_result =
-                tokio::io::copy_bidirectional(&mut server_stream, &mut client_stream).await;
+            let copy_result = tokio::io::copy_bidirectional(
+                &mut server_stream,
+                &mut client_stream,
+            )
+            .await;
 
-            let (_, _) = futures::join!(server_stream.shutdown(), client_stream.shutdown());
+            let (_, _) =
+                futures::join!(server_stream.shutdown(), client_stream.shutdown());
             let copy_result = copy_result?;
 
             info!(

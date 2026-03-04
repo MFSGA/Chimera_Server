@@ -1,12 +1,12 @@
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::{HashMap, hash_map::Entry},
     convert::TryFrom,
     io::{Error, ErrorKind},
     net::SocketAddr,
     pin::Pin,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     task::{Context, Poll},
 };
@@ -15,9 +15,9 @@ use bytes::{Bytes, BytesMut};
 use h3_quinn::BidiStream;
 use http::{Request, Response, StatusCode};
 use rand::{
-    distr::{Alphanumeric, SampleString},
     // distributions::{Alphanumeric, DistString},
     Rng,
+    distr::{Alphanumeric, SampleString},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
@@ -28,8 +28,8 @@ use tracing::{debug, warn};
 use crate::{
     address::NetLocation,
     config::server_config::{Hysteria2Client, Hysteria2ServerConfig},
-    resolver::{resolve_single_address, Resolver},
-    traffic::{record_transfer, register_connection, TrafficContext},
+    resolver::{Resolver, resolve_single_address},
+    traffic::{TrafficContext, record_transfer, register_connection},
 };
 
 const AUTH_PATH: &str = "/auth";
@@ -67,7 +67,9 @@ pub async fn process_hysteria2_connection(
         .await
         .map_err(map_h3_error)?;
 
-    let auth_ctx = auth_hysteria2_connection(&mut h3_conn, config.as_ref(), tx_bps.clone()).await?;
+    let auth_ctx =
+        auth_hysteria2_connection(&mut h3_conn, config.as_ref(), tx_bps.clone())
+            .await?;
 
     let http3_task = tokio::spawn(async move {
         if let Err(err) = drain_http3_requests(h3_conn).await {
@@ -87,7 +89,13 @@ pub async fn process_hysteria2_connection(
         )
         .map(|_| ())
     } else {
-        drive_tcp_streams(connection, resolver.clone(), &auth_ctx, inbound_tag.clone()).await
+        drive_tcp_streams(
+            connection,
+            resolver.clone(),
+            &auth_ctx,
+            inbound_tag.clone(),
+        )
+        .await
     };
 
     let _ = http3_task.await;
@@ -103,28 +111,41 @@ async fn auth_hysteria2_connection(
     loop {
         match h3_conn.accept().await.map_err(map_h3_error)? {
             Some(resolver) => {
-                let (req, mut stream) = resolver.resolve_request().await.map_err(map_h3_error)?;
+                let (req, mut stream) =
+                    resolver.resolve_request().await.map_err(map_h3_error)?;
                 match validate_auth_request(req, config.clients.as_ref()) {
                     Ok(auth_info) => {
                         let (actual_tx, response_rx, response_rx_auto) =
-                            resolve_bandwidth_settings(config, auth_info.client_rx_limit);
+                            resolve_bandwidth_settings(
+                                config,
+                                auth_info.client_rx_limit,
+                            );
                         tx_bps.store(actual_tx, Ordering::Relaxed);
-                        send_auth_success(&mut stream, true, response_rx, response_rx_auto).await?;
+                        send_auth_success(
+                            &mut stream,
+                            true,
+                            response_rx,
+                            response_rx_auto,
+                        )
+                        .await?;
                         return Ok(AuthContext {
                             client: auth_info.client,
                             udp_enabled: true,
                         });
                     }
                     Err(AuthReject::NotAuthRequest) => {
-                        send_simple_response(&mut stream, StatusCode::NOT_FOUND).await?;
+                        send_simple_response(&mut stream, StatusCode::NOT_FOUND)
+                            .await?;
                     }
                     Err(AuthReject::Unauthorized(msg)) => {
                         warn!("hysteria2 auth rejected: {}", msg);
-                        send_simple_response(&mut stream, StatusCode::FORBIDDEN).await?;
+                        send_simple_response(&mut stream, StatusCode::FORBIDDEN)
+                            .await?;
                     }
                     Err(AuthReject::BadRequest(msg)) => {
                         warn!("hysteria2 auth request invalid: {}", msg);
-                        send_simple_response(&mut stream, StatusCode::BAD_REQUEST).await?;
+                        send_simple_response(&mut stream, StatusCode::BAD_REQUEST)
+                            .await?;
                     }
                 }
             }
@@ -142,13 +163,16 @@ async fn drain_http3_requests(
     mut h3_conn: h3::server::Connection<h3_quinn::Connection, Bytes>,
 ) -> std::io::Result<()> {
     while let Some(resolver) = h3_conn.accept().await.map_err(map_h3_error)? {
-        let (req, mut stream) = resolver.resolve_request().await.map_err(map_h3_error)?;
+        let (req, mut stream) =
+            resolver.resolve_request().await.map_err(map_h3_error)?;
         debug!(
             "received non-auth hysteria2 request: {} {}",
             req.method(),
             req.uri()
         );
-        if let Err(err) = send_simple_response(&mut stream, StatusCode::NOT_FOUND).await {
+        if let Err(err) =
+            send_simple_response(&mut stream, StatusCode::NOT_FOUND).await
+        {
             warn!("failed to respond to HTTP/3 request: {}", err);
             break;
         }
@@ -170,8 +194,15 @@ async fn drive_tcp_streams(
                 let client = auth_ctx.client.clone();
                 let inbound_tag = inbound_tag.clone();
                 tokio::spawn(async move {
-                    if let Err(err) =
-                        handle_tcp_stream(send, recv, resolver, client, inbound_tag, peer_ip).await
+                    if let Err(err) = handle_tcp_stream(
+                        send,
+                        recv,
+                        resolver,
+                        client,
+                        inbound_tag,
+                        peer_ip,
+                    )
+                    .await
                     {
                         debug!("hysteria2 tcp stream ended with error: {}", err);
                     }
@@ -204,7 +235,8 @@ async fn handle_tcp_stream(
         Ok(stream) => stream,
         Err(err) => {
             warn!("failed to connect to {}: {}", request.target, err);
-            let _ = send_tcp_response(&mut send, TCP_ERROR_STATUS, "connect failed").await;
+            let _ = send_tcp_response(&mut send, TCP_ERROR_STATUS, "connect failed")
+                .await;
             let _ = send.finish();
             return Err(err);
         }
@@ -253,8 +285,9 @@ impl TcpRequest {
         let target = NetLocation::from_str(&address, None)?;
 
         let padding_len = read_varint(stream).await?;
-        let padding_len = usize::try_from(padding_len)
-            .map_err(|_| Error::new(ErrorKind::InvalidData, "padding length too large"))?;
+        let padding_len = usize::try_from(padding_len).map_err(|_| {
+            Error::new(ErrorKind::InvalidData, "padding length too large")
+        })?;
         skip_padding(stream, padding_len).await?;
 
         Ok(Self { target })
@@ -274,8 +307,7 @@ async fn proxy_tcp(
         Ok((client_to_server, server_to_client)) => {
             debug!(
                 "hysteria2 tcp stream forwarded {} bytes client->server and {} bytes server->client",
-                client_to_server,
-                server_to_client
+                client_to_server, server_to_client
             );
             record_transfer(Some(context), client_to_server, server_to_client);
             Ok(())
@@ -310,13 +342,19 @@ impl AsyncWrite for QuicStream {
             .map_err(|err| Error::new(ErrorKind::Other, err))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.get_mut().send)
             .poll_flush(cx)
             .map_err(|err| Error::new(ErrorKind::Other, err))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.get_mut().send)
             .poll_shutdown(cx)
             .map_err(|err| Error::new(ErrorKind::Other, err))
@@ -338,7 +376,10 @@ fn resolve_bandwidth_settings(
     }
 
     let mut actual_tx = client_rx_limit.unwrap_or(0);
-    if actual_tx > 0 && config.bandwidth.max_tx > 0 && actual_tx > config.bandwidth.max_tx {
+    if actual_tx > 0
+        && config.bandwidth.max_tx > 0
+        && actual_tx > config.bandwidth.max_tx
+    {
         actual_tx = config.bandwidth.max_tx;
     }
 
@@ -369,22 +410,22 @@ fn validate_auth_request(
         .cloned()
         .ok_or(AuthReject::Unauthorized("password mismatch"))?;
 
-    let client_rx_limit = match headers.get(CLIENT_CC_RX_HEADER) {
-        Some(value) if !value.is_empty() => match value.to_str() {
-            Ok(val) => {
-                if val.eq_ignore_ascii_case("auto") {
-                    None
-                } else {
-                    Some(
-                        val.parse::<u64>()
-                            .map_err(|_| AuthReject::BadRequest("invalid cc header"))?,
-                    )
+    let client_rx_limit =
+        match headers.get(CLIENT_CC_RX_HEADER) {
+            Some(value) if !value.is_empty() => match value.to_str() {
+                Ok(val) => {
+                    if val.eq_ignore_ascii_case("auto") {
+                        None
+                    } else {
+                        Some(val.parse::<u64>().map_err(|_| {
+                            AuthReject::BadRequest("invalid cc header")
+                        })?)
+                    }
                 }
-            }
-            Err(_) => return Err(AuthReject::BadRequest("invalid cc header")),
-        },
-        _ => None,
-    };
+                Err(_) => return Err(AuthReject::BadRequest("invalid cc header")),
+            },
+            _ => None,
+        };
 
     Ok(AuthInfo {
         client,
@@ -405,7 +446,9 @@ async fn send_auth_success(
         server_rx_limit.to_string()
     };
     let response = Response::builder()
-        .status(StatusCode::from_u16(SUCCESS_STATUS).expect("valid hysteria2 status"))
+        .status(
+            StatusCode::from_u16(SUCCESS_STATUS).expect("valid hysteria2 status"),
+        )
         .header(
             UDP_SUPPORT_HEADER,
             if udp_enabled { "true" } else { "false" },
@@ -475,7 +518,10 @@ async fn read_varint(stream: &mut quinn::RecvStream) -> std::io::Result<u64> {
     Ok(value)
 }
 
-async fn skip_padding(stream: &mut quinn::RecvStream, mut len: usize) -> std::io::Result<()> {
+async fn skip_padding(
+    stream: &mut quinn::RecvStream,
+    mut len: usize,
+) -> std::io::Result<()> {
     if len == 0 {
         return Ok(());
     }
@@ -593,7 +639,8 @@ async fn drive_udp_datagrams(
         };
 
         if remote_location != session.last_location {
-            let updated_addr = resolve_single_address(&resolver, &remote_location).await?;
+            let updated_addr =
+                resolve_single_address(&resolver, &remote_location).await?;
             session.last_location = remote_location.clone();
             session.last_socket_addr = updated_addr;
         }
@@ -615,16 +662,15 @@ async fn drive_udp_datagrams(
                 continue;
             }
 
-            let entry = session
-                .fragments
-                .entry(packet_id)
-                .or_insert_with(|| FragmentedPacket {
+            let entry = session.fragments.entry(packet_id).or_insert_with(|| {
+                FragmentedPacket {
                     fragment_count,
                     fragment_received: 0,
                     packet_len: 0,
                     received: vec![None; fragment_count as usize],
                     remote_location: remote_location.clone(),
-                });
+                }
+            });
 
             if entry.fragment_count != fragment_count {
                 warn!(
@@ -667,7 +713,8 @@ async fn drive_udp_datagrams(
             }
 
             if remembered_location != session.last_location {
-                let updated_addr = resolve_single_address(&resolver, &remembered_location).await?;
+                let updated_addr =
+                    resolve_single_address(&resolver, &remembered_location).await?;
                 session.last_location = remembered_location;
                 session.last_socket_addr = updated_addr;
             }
@@ -721,8 +768,12 @@ async fn create_udp_session(
     let connection_for_task = connection.clone();
 
     tokio::spawn(async move {
-        if let Err(err) =
-            run_udp_remote_to_local_loop(session_id, connection_for_task, socket_for_task).await
+        if let Err(err) = run_udp_remote_to_local_loop(
+            session_id,
+            connection_for_task,
+            socket_for_task,
+        )
+        .await
         {
             debug!(
                 "hysteria2 UDP remote-to-local loop for session {} ended: {}",
@@ -744,28 +795,29 @@ async fn run_udp_remote_to_local_loop(
     connection: quinn::Connection,
     socket: Arc<UdpSocket>,
 ) -> std::io::Result<()> {
-    let max_datagram_size = connection
-        .max_datagram_size()
-        .ok_or_else(|| Error::new(ErrorKind::Other, "peer does not support datagrams"))?
-        as usize;
+    let max_datagram_size = connection.max_datagram_size().ok_or_else(|| {
+        Error::new(ErrorKind::Other, "peer does not support datagrams")
+    })? as usize;
 
     let mut next_packet_id: u16 = 0;
     let mut buf = vec![0u8; 65535];
 
     loop {
-        let (payload_len, src_addr) = socket.recv_from(&mut buf).await.map_err(|err| {
-            Error::new(
-                ErrorKind::Other,
-                format!("failed to receive hysteria2 UDP payload: {}", err),
-            )
-        })?;
+        let (payload_len, src_addr) =
+            socket.recv_from(&mut buf).await.map_err(|err| {
+                Error::new(
+                    ErrorKind::Other,
+                    format!("failed to receive hysteria2 UDP payload: {}", err),
+                )
+            })?;
 
         let address_bytes = Bytes::from(src_addr.to_string().into_bytes());
         let mut address_len_buf = Vec::with_capacity(8);
         push_varint(&mut address_len_buf, address_bytes.len() as u64)?;
         let address_len_bytes = Bytes::from(address_len_buf);
 
-        let header_overhead = 4 + 2 + 1 + 1 + address_len_bytes.len() + address_bytes.len();
+        let header_overhead =
+            4 + 2 + 1 + 1 + address_len_bytes.len() + address_bytes.len();
         if header_overhead >= max_datagram_size {
             warn!(
                 "hysteria2 UDP datagram header larger than max datagram size ({} >= {})",
@@ -781,7 +833,8 @@ async fn run_udp_remote_to_local_loop(
         }
 
         if payload_len <= available_payload {
-            let mut datagram = BytesMut::with_capacity(header_overhead + payload_len);
+            let mut datagram =
+                BytesMut::with_capacity(header_overhead + payload_len);
             datagram.extend_from_slice(&session_id.to_be_bytes());
             datagram.extend_from_slice(&next_packet_id.to_be_bytes());
             datagram.extend_from_slice(&[0, 1]);
@@ -793,7 +846,8 @@ async fn run_udp_remote_to_local_loop(
                 .send_datagram(datagram.freeze())
                 .map_err(|err| Error::new(ErrorKind::Other, err))?;
         } else {
-            let fragment_count = (payload_len + available_payload - 1) / available_payload;
+            let fragment_count =
+                (payload_len + available_payload - 1) / available_payload;
             if fragment_count > u8::MAX as usize {
                 warn!(
                     "hysteria2 UDP packet too large to fragment ({} fragments)",
@@ -806,10 +860,12 @@ async fn run_udp_remote_to_local_loop(
                 let start = fragment_id * available_payload;
                 let end = std::cmp::min(start + available_payload, payload_len);
 
-                let mut datagram = BytesMut::with_capacity(header_overhead + (end - start));
+                let mut datagram =
+                    BytesMut::with_capacity(header_overhead + (end - start));
                 datagram.extend_from_slice(&session_id.to_be_bytes());
                 datagram.extend_from_slice(&next_packet_id.to_be_bytes());
-                datagram.extend_from_slice(&[fragment_id as u8, fragment_count as u8]);
+                datagram
+                    .extend_from_slice(&[fragment_id as u8, fragment_count as u8]);
                 datagram.extend_from_slice(&address_len_bytes);
                 datagram.extend_from_slice(&address_bytes);
                 datagram.extend_from_slice(&buf[start..end]);

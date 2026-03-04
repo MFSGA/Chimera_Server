@@ -25,7 +25,8 @@ type FormatReloadLayer = reload::Layer<FormatLayer, Registry>;
 type FormatSubscriber = Layered<FormatReloadLayer, Registry>;
 type FilterReloadHandle = reload::Handle<EnvFilter, FormatSubscriber>;
 
-static LOG_FORMAT_RELOAD: OnceLock<reload::Handle<FormatLayer, Registry>> = OnceLock::new();
+static LOG_FORMAT_RELOAD: OnceLock<reload::Handle<FormatLayer, Registry>> =
+    OnceLock::new();
 static LOG_FILTER_RELOAD: OnceLock<FilterReloadHandle> = OnceLock::new();
 static LOG_STATE: OnceLock<RwLock<LogState>> = OnceLock::new();
 
@@ -89,7 +90,11 @@ pub fn init(
 }
 
 impl LogConfig {
-    fn install(&self, cwd: Option<&str>, override_error_target: Option<&str>) -> Result<(), Error> {
+    fn install(
+        &self,
+        cwd: Option<&str>,
+        override_error_target: Option<&str>,
+    ) -> Result<(), Error> {
         let base_dir = cwd.map(PathBuf::from);
         let base_ref = base_dir.as_deref();
 
@@ -112,23 +117,31 @@ impl LogConfig {
             (LOG_FORMAT_RELOAD.get(), LOG_FILTER_RELOAD.get())
         {
             format_handle.reload(fmt_layer).map_err(|err| {
-                Error::InvalidConfig(format!("failed to reload logger format layer: {err}"))
+                Error::InvalidConfig(format!(
+                    "failed to reload logger format layer: {err}"
+                ))
             })?;
             filter_handle.reload(env_filter).map_err(|err| {
-                Error::InvalidConfig(format!("failed to reload logger filter layer: {err}"))
+                Error::InvalidConfig(format!(
+                    "failed to reload logger filter layer: {err}"
+                ))
             })?;
             return Ok(());
         }
 
         let (reload_format_layer, format_handle): (FormatReloadLayer, _) =
             reload::Layer::new(fmt_layer);
-        let (reload_filter_layer, filter_handle): (reload::Layer<EnvFilter, FormatSubscriber>, _) =
-            reload::Layer::new(env_filter);
+        let (reload_filter_layer, filter_handle): (
+            reload::Layer<EnvFilter, FormatSubscriber>,
+            _,
+        ) = reload::Layer::new(env_filter);
         tracing_subscriber::registry()
             .with(reload_format_layer)
             .with(reload_filter_layer)
             .try_init()
-            .map_err(|err| Error::InvalidConfig(format!("failed to initialize logger: {err}")))?;
+            .map_err(|err| {
+                Error::InvalidConfig(format!("failed to initialize logger: {err}"))
+            })?;
 
         let _ = LOG_FORMAT_RELOAD.set(format_handle);
         let _ = LOG_FILTER_RELOAD.set(filter_handle);
@@ -145,11 +158,16 @@ struct LogState {
 }
 
 impl LogState {
-    fn store(cfg: LogConfig, cwd: Option<&str>, override_error_target: Option<&str>) {
+    fn store(
+        cfg: LogConfig,
+        cwd: Option<&str>,
+        override_error_target: Option<&str>,
+    ) {
         let state = LogState {
             cfg,
             cwd: cwd.map(|value| value.to_string()),
-            override_error_target: override_error_target.map(|value| value.to_string()),
+            override_error_target: override_error_target
+                .map(|value| value.to_string()),
         };
         let lock = LOG_STATE.get_or_init(|| RwLock::new(state.clone()));
         *lock.write().expect("log state poisoned") = state;
@@ -166,7 +184,10 @@ pub fn restart() -> Result<(), Error> {
         .install(guard.cwd.as_deref(), guard.override_error_target.as_deref())
 }
 
-fn parse_destination(value: Option<&str>, base: Option<&Path>) -> Option<LogDestination> {
+fn parse_destination(
+    value: Option<&str>,
+    base: Option<&Path>,
+) -> Option<LogDestination> {
     value
         .map(|entry| entry.trim())
         .filter(|entry| !entry.is_empty())

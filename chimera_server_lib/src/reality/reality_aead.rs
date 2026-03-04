@@ -3,9 +3,10 @@
 // AES-GCM encryption for TLS 1.3 records using aws-lc-rs
 
 use super::common::{
-    CONTENT_TYPE_ALERT, CONTENT_TYPE_APPLICATION_DATA, VERSION_TLS_1_2_MAJOR, VERSION_TLS_1_2_MINOR,
+    CONTENT_TYPE_ALERT, CONTENT_TYPE_APPLICATION_DATA, VERSION_TLS_1_2_MAJOR,
+    VERSION_TLS_1_2_MINOR,
 };
-use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM};
+use aws_lc_rs::aead::{AES_128_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use std::io::{Error, ErrorKind, Result};
 
 /// Encrypt TLS 1.3 record using AES-128-GCM
@@ -50,12 +51,14 @@ pub fn encrypt_tls13_record(
     }
 
     // Create key and nonce for aws-lc-rs
-    let unbound_key = UnboundKey::new(&AES_128_GCM, key)
-        .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("Invalid key: {:?}", e)))?;
+    let unbound_key = UnboundKey::new(&AES_128_GCM, key).map_err(|e| {
+        Error::new(ErrorKind::InvalidInput, format!("Invalid key: {:?}", e))
+    })?;
     let sealing_key = LessSafeKey::new(unbound_key);
 
-    let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes)
-        .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("Invalid nonce: {:?}", e)))?;
+    let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes).map_err(|e| {
+        Error::new(ErrorKind::InvalidInput, format!("Invalid nonce: {:?}", e))
+    })?;
 
     let aad = Aad::from(additional_data);
 
@@ -118,25 +121,28 @@ pub fn decrypt_tls13_record(
     }
 
     // Create key and nonce for aws-lc-rs
-    let unbound_key = UnboundKey::new(&AES_128_GCM, key)
-        .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("Invalid key: {:?}", e)))?;
+    let unbound_key = UnboundKey::new(&AES_128_GCM, key).map_err(|e| {
+        Error::new(ErrorKind::InvalidInput, format!("Invalid key: {:?}", e))
+    })?;
     let opening_key = LessSafeKey::new(unbound_key);
 
-    let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes)
-        .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("Invalid nonce: {:?}", e)))?;
+    let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes).map_err(|e| {
+        Error::new(ErrorKind::InvalidInput, format!("Invalid nonce: {:?}", e))
+    })?;
 
     let aad = Aad::from(additional_data);
 
     // aws-lc-rs requires in-place decryption
     let mut in_out = ciphertext.to_vec();
-    let plaintext = opening_key
-        .open_in_place(nonce, aad, &mut in_out)
-        .map_err(|e| {
-            Error::new(
-                ErrorKind::InvalidData,
-                format!("Decryption failed: {:?}", e),
-            )
-        })?;
+    let plaintext =
+        opening_key
+            .open_in_place(nonce, aad, &mut in_out)
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Decryption failed: {:?}", e),
+                )
+            })?;
 
     Ok(plaintext.to_vec())
 }
@@ -154,11 +160,17 @@ pub fn decrypt_handshake_message(
     // Additional data for decryption
     let mut additional_data = Vec::new();
     additional_data.push(0x17); // ApplicationData
-    additional_data.extend_from_slice(&[VERSION_TLS_1_2_MAJOR, VERSION_TLS_1_2_MINOR]); // TLS 1.2
+    additional_data
+        .extend_from_slice(&[VERSION_TLS_1_2_MAJOR, VERSION_TLS_1_2_MINOR]); // TLS 1.2
     additional_data.extend_from_slice(&record_length.to_be_bytes());
 
-    let mut plaintext =
-        decrypt_tls13_record(key, iv, sequence_number, ciphertext, &additional_data)?;
+    let mut plaintext = decrypt_tls13_record(
+        key,
+        iv,
+        sequence_number,
+        ciphertext,
+        &additional_data,
+    )?;
 
     // Remove ContentType trailer
     if plaintext.is_empty() {
@@ -206,7 +218,8 @@ mod tests {
 
         let ciphertext = encrypt_tls13_record(&key, &iv, 0, plaintext, aad).unwrap();
 
-        let decrypted = decrypt_tls13_record(&key, &iv, 0, &ciphertext, aad).unwrap();
+        let decrypted =
+            decrypt_tls13_record(&key, &iv, 0, &ciphertext, aad).unwrap();
 
         assert_eq!(&decrypted[..], plaintext);
     }
@@ -230,10 +243,12 @@ mod tests {
             (ciphertext_length & 0xff) as u8,
         ];
 
-        let ciphertext = encrypt_tls13_record(&key, &iv, 0, &plaintext, &aad).unwrap();
+        let ciphertext =
+            encrypt_tls13_record(&key, &iv, 0, &plaintext, &aad).unwrap();
 
         let decrypted =
-            decrypt_handshake_message(&key, &iv, 0, &ciphertext, ciphertext_length).unwrap();
+            decrypt_handshake_message(&key, &iv, 0, &ciphertext, ciphertext_length)
+                .unwrap();
 
         assert_eq!(decrypted, handshake_msg);
     }
@@ -325,7 +340,8 @@ mod tests {
         let plaintext = b"Test corruption";
         let aad = b"aad";
 
-        let mut ciphertext = encrypt_tls13_record(&key, &iv, 0, plaintext, aad).unwrap();
+        let mut ciphertext =
+            encrypt_tls13_record(&key, &iv, 0, plaintext, aad).unwrap();
 
         // Corrupt the ciphertext
         ciphertext[5] ^= 0xFF;
@@ -346,7 +362,8 @@ mod tests {
         // Should still produce a ciphertext with auth tag
         assert!(ciphertext.len() >= 16); // At least the auth tag
 
-        let decrypted = decrypt_tls13_record(&key, &iv, 0, &ciphertext, aad).unwrap();
+        let decrypted =
+            decrypt_tls13_record(&key, &iv, 0, &ciphertext, aad).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
@@ -357,8 +374,10 @@ mod tests {
         let plaintext = vec![0xAB; 16384]; // 16KB
         let aad = b"aad";
 
-        let ciphertext = encrypt_tls13_record(&key, &iv, 42, &plaintext, aad).unwrap();
-        let decrypted = decrypt_tls13_record(&key, &iv, 42, &ciphertext, aad).unwrap();
+        let ciphertext =
+            encrypt_tls13_record(&key, &iv, 42, &plaintext, aad).unwrap();
+        let decrypted =
+            decrypt_tls13_record(&key, &iv, 42, &ciphertext, aad).unwrap();
 
         assert_eq!(decrypted, plaintext);
     }

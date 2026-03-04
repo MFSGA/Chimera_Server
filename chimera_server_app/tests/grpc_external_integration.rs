@@ -31,13 +31,18 @@ fn trace_step(step: impl AsRef<str>) {
     eprintln!("[grpc-external-e2e] {}", step.as_ref());
 }
 
-const PATH_STATS_GET_SYS_STATS: &str = "/xray.app.stats.command.StatsService/GetSysStats";
-const PATH_LOGGER_RESTART: &str = "/xray.app.log.command.LoggerService/RestartLogger";
-const PATH_HANDLER_LIST_INBOUNDS: &str = "/xray.app.proxyman.command.HandlerService/ListInbounds";
+const PATH_STATS_GET_SYS_STATS: &str =
+    "/xray.app.stats.command.StatsService/GetSysStats";
+const PATH_LOGGER_RESTART: &str =
+    "/xray.app.log.command.LoggerService/RestartLogger";
+const PATH_HANDLER_LIST_INBOUNDS: &str =
+    "/xray.app.proxyman.command.HandlerService/ListInbounds";
 const PATH_HANDLER_GET_INBOUND_USERS_COUNT: &str =
     "/xray.app.proxyman.command.HandlerService/GetInboundUsersCount";
-const PATH_HANDLER_LIST_OUTBOUNDS: &str = "/xray.app.proxyman.command.HandlerService/ListOutbounds";
-const PATH_ROUTING_TEST_ROUTE: &str = "/xray.app.router.command.RoutingService/TestRoute";
+const PATH_HANDLER_LIST_OUTBOUNDS: &str =
+    "/xray.app.proxyman.command.HandlerService/ListOutbounds";
+const PATH_ROUTING_TEST_ROUTE: &str =
+    "/xray.app.router.command.RoutingService/TestRoute";
 const PATH_OBSERVATORY_GET_OUTBOUND_STATUS: &str =
     "/xray.core.app.observatory.command.ObservatoryService/GetOutboundStatus";
 
@@ -95,7 +100,8 @@ impl ServerProcess {
                 )));
             }
 
-            if let Ok(stream) = TcpStream::connect_timeout(&listen_addr, IO_TIMEOUT) {
+            if let Ok(stream) = TcpStream::connect_timeout(&listen_addr, IO_TIMEOUT)
+            {
                 drop(stream);
                 trace_step(format!("listener {} is ready", listen_addr));
                 return Ok(());
@@ -105,7 +111,9 @@ impl ServerProcess {
                 let logs = self.logs();
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    format!("timeout waiting for listener {listen_addr}; logs:\n{logs}"),
+                    format!(
+                        "timeout waiting for listener {listen_addr}; logs:\n{logs}"
+                    ),
                 ));
             }
 
@@ -143,7 +151,8 @@ fn unique_test_dir() -> io::Result<PathBuf> {
         .as_millis();
     let pid = std::process::id();
     let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("chimera-grpc-e2e-{pid}-{millis}-{test_id}"));
+    let path = std::env::temp_dir()
+        .join(format!("chimera-grpc-e2e-{pid}-{millis}-{test_id}"));
     fs::create_dir_all(&path)?;
     trace_step(format!("allocated temporary test dir {}", path.display()));
     Ok(path)
@@ -207,12 +216,13 @@ fn build_config(grpc_port: u16, socks_port: u16) -> String {
 async fn connect_channel(grpc_addr: SocketAddr) -> io::Result<Channel> {
     trace_step(format!("connecting grpc channel to {}", grpc_addr));
     let deadline = Instant::now() + STARTUP_TIMEOUT;
-    let endpoint = Endpoint::from_shared(format!("http://{grpc_addr}")).map_err(|err| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid grpc endpoint for {grpc_addr}: {err}"),
-        )
-    })?;
+    let endpoint =
+        Endpoint::from_shared(format!("http://{grpc_addr}")).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid grpc endpoint for {grpc_addr}: {err}"),
+            )
+        })?;
     let endpoint = endpoint.connect_timeout(IO_TIMEOUT).timeout(IO_TIMEOUT);
 
     loop {
@@ -383,7 +393,8 @@ fn grpc_services_external_end_to_end() {
         "using grpc_addr={} socks_port={}",
         grpc_addr, socks_port
     ));
-    let mut server = ServerProcess::spawn(&config).expect("failed to spawn chimera process");
+    let mut server =
+        ServerProcess::spawn(&config).expect("failed to spawn chimera process");
     server
         .wait_until_ready(SocketAddr::V4(grpc_addr))
         .unwrap_or_else(|err| panic!("chimera grpc listener not ready: {err}"));
@@ -408,7 +419,9 @@ fn grpc_services_external_end_to_end() {
             PATH_STATS_GET_SYS_STATS,
             SysStatsRequest {},
         ))
-        .unwrap_or_else(|err| panic!("stats service call failed: {err}; logs:\n{}", server.logs()));
+        .unwrap_or_else(|err| {
+            panic!("stats service call failed: {err}; logs:\n{}", server.logs())
+        });
     let _ = sys_stats.uptime;
     trace_step(format!("stats uptime={}", sys_stats.uptime));
 
@@ -505,7 +518,9 @@ fn grpc_services_external_end_to_end() {
                 publish_result: false,
             },
         ))
-        .unwrap_or_else(|err| panic!("routing TestRoute failed: {err}; logs:\n{}", server.logs()));
+        .unwrap_or_else(|err| {
+            panic!("routing TestRoute failed: {err}; logs:\n{}", server.logs())
+        });
     assert_eq!(route.outbound_tag, DIRECT_TAG);
     trace_step(format!(
         "routing test route returned outbound_tag={}",

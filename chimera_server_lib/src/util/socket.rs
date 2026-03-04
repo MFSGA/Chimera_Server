@@ -15,10 +15,18 @@ pub fn new_tcp_socket(
     };
 
     if let Some(_b) = bind_interface {
-        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        #[cfg(any(
+            target_os = "android",
+            target_os = "fuchsia",
+            target_os = "linux"
+        ))]
         tcp_socket.bind_device(Some(_b.as_bytes()))?;
 
-        #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
+        #[cfg(not(any(
+            target_os = "android",
+            target_os = "fuchsia",
+            target_os = "linux"
+        )))]
         panic!("Could not find to device, unsupported platform.")
     }
 
@@ -31,7 +39,13 @@ pub fn new_socket2_udp_socket(
     bind_address: Option<SocketAddr>,
     reuse_port: bool,
 ) -> std::io::Result<socket2::Socket> {
-    new_socket2_udp_socket_with_buffer_size(is_ipv6, bind_interface, bind_address, reuse_port, None)
+    new_socket2_udp_socket_with_buffer_size(
+        is_ipv6,
+        bind_interface,
+        bind_address,
+        reuse_port,
+        None,
+    )
 }
 
 pub fn new_socket2_udp_socket_with_buffer_size(
@@ -63,11 +77,19 @@ pub fn new_socket2_udp_socket_with_buffer_size(
     }
 
     if let Some(ref interface) = bind_interface {
-        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        #[cfg(any(
+            target_os = "android",
+            target_os = "fuchsia",
+            target_os = "linux"
+        ))]
         socket.bind_device(Some(interface.as_bytes()))?;
 
         // This should be handled during config validation.
-        #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
+        #[cfg(not(any(
+            target_os = "android",
+            target_os = "fuchsia",
+            target_os = "linux"
+        )))]
         panic!("Could not bind to device, unsupported platform.")
     }
 

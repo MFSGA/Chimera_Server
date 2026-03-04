@@ -31,39 +31,53 @@ const TEST_USERNAME: &str = "grpc-e2e-user";
 const TEST_PASSWORD: &str = "grpc-e2e-pass";
 
 const PATH_STATS_GET_STATS: &str = "/xray.app.stats.command.StatsService/GetStats";
-const PATH_STATS_GET_STATS_ONLINE: &str = "/xray.app.stats.command.StatsService/GetStatsOnline";
-const PATH_STATS_QUERY_STATS: &str = "/xray.app.stats.command.StatsService/QueryStats";
-const PATH_STATS_GET_SYS_STATS: &str = "/xray.app.stats.command.StatsService/GetSysStats";
+const PATH_STATS_GET_STATS_ONLINE: &str =
+    "/xray.app.stats.command.StatsService/GetStatsOnline";
+const PATH_STATS_QUERY_STATS: &str =
+    "/xray.app.stats.command.StatsService/QueryStats";
+const PATH_STATS_GET_SYS_STATS: &str =
+    "/xray.app.stats.command.StatsService/GetSysStats";
 const PATH_STATS_GET_STATS_ONLINE_IP_LIST: &str =
     "/xray.app.stats.command.StatsService/GetStatsOnlineIpList";
 const PATH_STATS_GET_ALL_ONLINE_USERS: &str =
     "/xray.app.stats.command.StatsService/GetAllOnlineUsers";
 
-const PATH_LOGGER_RESTART: &str = "/xray.app.log.command.LoggerService/RestartLogger";
+const PATH_LOGGER_RESTART: &str =
+    "/xray.app.log.command.LoggerService/RestartLogger";
 
-const PATH_HANDLER_ADD_INBOUND: &str = "/xray.app.proxyman.command.HandlerService/AddInbound";
-const PATH_HANDLER_REMOVE_INBOUND: &str = "/xray.app.proxyman.command.HandlerService/RemoveInbound";
-const PATH_HANDLER_ALTER_INBOUND: &str = "/xray.app.proxyman.command.HandlerService/AlterInbound";
-const PATH_HANDLER_LIST_INBOUNDS: &str = "/xray.app.proxyman.command.HandlerService/ListInbounds";
+const PATH_HANDLER_ADD_INBOUND: &str =
+    "/xray.app.proxyman.command.HandlerService/AddInbound";
+const PATH_HANDLER_REMOVE_INBOUND: &str =
+    "/xray.app.proxyman.command.HandlerService/RemoveInbound";
+const PATH_HANDLER_ALTER_INBOUND: &str =
+    "/xray.app.proxyman.command.HandlerService/AlterInbound";
+const PATH_HANDLER_LIST_INBOUNDS: &str =
+    "/xray.app.proxyman.command.HandlerService/ListInbounds";
 const PATH_HANDLER_GET_INBOUND_USERS: &str =
     "/xray.app.proxyman.command.HandlerService/GetInboundUsers";
 const PATH_HANDLER_GET_INBOUND_USERS_COUNT: &str =
     "/xray.app.proxyman.command.HandlerService/GetInboundUsersCount";
-const PATH_HANDLER_ADD_OUTBOUND: &str = "/xray.app.proxyman.command.HandlerService/AddOutbound";
+const PATH_HANDLER_ADD_OUTBOUND: &str =
+    "/xray.app.proxyman.command.HandlerService/AddOutbound";
 const PATH_HANDLER_REMOVE_OUTBOUND: &str =
     "/xray.app.proxyman.command.HandlerService/RemoveOutbound";
-const PATH_HANDLER_ALTER_OUTBOUND: &str = "/xray.app.proxyman.command.HandlerService/AlterOutbound";
-const PATH_HANDLER_LIST_OUTBOUNDS: &str = "/xray.app.proxyman.command.HandlerService/ListOutbounds";
+const PATH_HANDLER_ALTER_OUTBOUND: &str =
+    "/xray.app.proxyman.command.HandlerService/AlterOutbound";
+const PATH_HANDLER_LIST_OUTBOUNDS: &str =
+    "/xray.app.proxyman.command.HandlerService/ListOutbounds";
 
 const PATH_ROUTING_SUBSCRIBE_ROUTING_STATS: &str =
     "/xray.app.router.command.RoutingService/SubscribeRoutingStats";
-const PATH_ROUTING_TEST_ROUTE: &str = "/xray.app.router.command.RoutingService/TestRoute";
+const PATH_ROUTING_TEST_ROUTE: &str =
+    "/xray.app.router.command.RoutingService/TestRoute";
 const PATH_ROUTING_GET_BALANCER_INFO: &str =
     "/xray.app.router.command.RoutingService/GetBalancerInfo";
 const PATH_ROUTING_OVERRIDE_BALANCER_TARGET: &str =
     "/xray.app.router.command.RoutingService/OverrideBalancerTarget";
-const PATH_ROUTING_ADD_RULE: &str = "/xray.app.router.command.RoutingService/AddRule";
-const PATH_ROUTING_REMOVE_RULE: &str = "/xray.app.router.command.RoutingService/RemoveRule";
+const PATH_ROUTING_ADD_RULE: &str =
+    "/xray.app.router.command.RoutingService/AddRule";
+const PATH_ROUTING_REMOVE_RULE: &str =
+    "/xray.app.router.command.RoutingService/RemoveRule";
 
 const PATH_OBSERVATORY_GET_OUTBOUND_STATUS: &str =
     "/xray.core.app.observatory.command.ObservatoryService/GetOutboundStatus";
@@ -128,7 +142,8 @@ impl ServerProcess {
                 )));
             }
 
-            if let Ok(stream) = TcpStream::connect_timeout(&listen_addr, IO_TIMEOUT) {
+            if let Ok(stream) = TcpStream::connect_timeout(&listen_addr, IO_TIMEOUT)
+            {
                 drop(stream);
                 trace_step(format!("listener {} is ready", listen_addr));
                 return Ok(());
@@ -138,7 +153,9 @@ impl ServerProcess {
                 let logs = self.logs();
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    format!("timeout waiting for listener {listen_addr}; logs:\n{logs}"),
+                    format!(
+                        "timeout waiting for listener {listen_addr}; logs:\n{logs}"
+                    ),
                 ));
             }
 
@@ -179,9 +196,9 @@ struct Harness {
 impl Harness {
     fn start() -> io::Result<Self> {
         trace_step("harness start");
-        let guard = global_test_lock()
-            .lock()
-            .map_err(|err| io::Error::other(format!("failed to acquire test lock: {err}")))?;
+        let guard = global_test_lock().lock().map_err(|err| {
+            io::Error::other(format!("failed to acquire test lock: {err}"))
+        })?;
         trace_step("global test lock acquired");
 
         let grpc_port = free_localhost_port()?;
@@ -201,15 +218,16 @@ impl Harness {
             .build()?;
         trace_step("tokio runtime built");
 
-        let channel = match runtime.block_on(connect_channel(SocketAddr::V4(grpc_addr))) {
-            Ok(channel) => channel,
-            Err(err) => {
-                return Err(io::Error::other(format!(
-                    "failed to connect grpc channel: {err}; logs:\n{}",
-                    server.logs()
-                )));
-            }
-        };
+        let channel =
+            match runtime.block_on(connect_channel(SocketAddr::V4(grpc_addr))) {
+                Ok(channel) => channel,
+                Err(err) => {
+                    return Err(io::Error::other(format!(
+                        "failed to connect grpc channel: {err}; logs:\n{}",
+                        server.logs()
+                    )));
+                }
+            };
         trace_step("grpc channel connected");
 
         Ok(Self {
@@ -224,7 +242,11 @@ impl Harness {
         self.server.logs()
     }
 
-    fn unary<Req, Resp>(&self, path: &'static str, request: Req) -> Result<Resp, Status>
+    fn unary<Req, Resp>(
+        &self,
+        path: &'static str,
+        request: Req,
+    ) -> Result<Resp, Status>
     where
         Req: prost::Message + Default + Send + Sync + 'static,
         Resp: prost::Message + Default + Send + Sync + 'static,
@@ -241,10 +263,17 @@ impl Harness {
 
     fn expect_ok<T>(&self, result: Result<T, Status>, context: &str) -> T {
         trace_step(format!("expect_ok context={}", context));
-        result.unwrap_or_else(|err| panic!("{context} failed: {err}; logs:\n{}", self.logs()))
+        result.unwrap_or_else(|err| {
+            panic!("{context} failed: {err}; logs:\n{}", self.logs())
+        })
     }
 
-    fn assert_status_code<T>(&self, result: Result<T, Status>, expected: Code, context: &str) {
+    fn assert_status_code<T>(
+        &self,
+        result: Result<T, Status>,
+        expected: Code,
+        context: &str,
+    ) {
         trace_step(format!(
             "assert_status_code context={} expected={:?}",
             context, expected
@@ -274,7 +303,8 @@ fn unique_test_dir() -> io::Result<PathBuf> {
         .as_millis();
     let pid = std::process::id();
     let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("chimera-grpc-all-e2e-{pid}-{millis}-{test_id}"));
+    let path = std::env::temp_dir()
+        .join(format!("chimera-grpc-all-e2e-{pid}-{millis}-{test_id}"));
     fs::create_dir_all(&path)?;
     trace_step(format!("allocated temporary test dir {}", path.display()));
     Ok(path)
@@ -338,12 +368,13 @@ fn build_config(grpc_port: u16, socks_port: u16) -> String {
 async fn connect_channel(grpc_addr: SocketAddr) -> io::Result<Channel> {
     trace_step(format!("connecting grpc channel to {}", grpc_addr));
     let deadline = Instant::now() + STARTUP_TIMEOUT;
-    let endpoint = Endpoint::from_shared(format!("http://{grpc_addr}")).map_err(|err| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid grpc endpoint for {grpc_addr}: {err}"),
-        )
-    })?;
+    let endpoint =
+        Endpoint::from_shared(format!("http://{grpc_addr}")).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid grpc endpoint for {grpc_addr}: {err}"),
+            )
+        })?;
     let endpoint = endpoint.connect_timeout(IO_TIMEOUT).timeout(IO_TIMEOUT);
 
     loop {
@@ -763,7 +794,9 @@ struct OutboundStatus {
 
 #[test]
 fn stats_get_stats_returns_not_found_for_unknown_name() {
-    trace_step("==== test stats_get_stats_returns_not_found_for_unknown_name start ====");
+    trace_step(
+        "==== test stats_get_stats_returns_not_found_for_unknown_name start ====",
+    );
     let harness = Harness::start().expect("failed to start test harness");
     let result: Result<GetStatsResponse, Status> = harness.unary(
         PATH_STATS_GET_STATS,
@@ -869,7 +902,11 @@ fn handler_add_inbound_is_unimplemented() {
         PATH_HANDLER_ADD_INBOUND,
         AddInboundRequest { inbound: None },
     );
-    harness.assert_status_code(result, Code::Unimplemented, "HandlerService/AddInbound");
+    harness.assert_status_code(
+        result,
+        Code::Unimplemented,
+        "HandlerService/AddInbound",
+    );
 }
 
 #[test]
@@ -882,12 +919,18 @@ fn handler_remove_inbound_is_unimplemented() {
             tag: SOCKS_TAG.to_string(),
         },
     );
-    harness.assert_status_code(result, Code::Unimplemented, "HandlerService/RemoveInbound");
+    harness.assert_status_code(
+        result,
+        Code::Unimplemented,
+        "HandlerService/RemoveInbound",
+    );
 }
 
 #[test]
 fn handler_alter_inbound_without_operation_is_noop() {
-    trace_step("==== test handler_alter_inbound_without_operation_is_noop start ====");
+    trace_step(
+        "==== test handler_alter_inbound_without_operation_is_noop start ====",
+    );
     let harness = Harness::start().expect("failed to start test harness");
     let _: AlterInboundResponse = harness.expect_ok(
         harness.unary(
@@ -915,7 +958,9 @@ fn handler_alter_inbound_without_operation_is_noop() {
 
 #[test]
 fn handler_alter_inbound_add_and_remove_user_executes() {
-    trace_step("==== test handler_alter_inbound_add_and_remove_user_executes start ====");
+    trace_step(
+        "==== test handler_alter_inbound_add_and_remove_user_executes start ====",
+    );
     let harness = Harness::start().expect("failed to start test harness");
     let added_user = "grpc-e2e-added-user";
 
@@ -968,7 +1013,8 @@ fn handler_alter_inbound_add_and_remove_user_executes() {
             AlterInboundRequest {
                 tag: SOCKS_TAG.to_string(),
                 operation: Some(TypedMessage {
-                    r#type: "xray.app.proxyman.command.RemoveUserOperation".to_string(),
+                    r#type: "xray.app.proxyman.command.RemoveUserOperation"
+                        .to_string(),
                     value: remove_operation.encode_to_vec(),
                 }),
             },
@@ -1061,7 +1107,11 @@ fn handler_add_outbound_is_unimplemented() {
         PATH_HANDLER_ADD_OUTBOUND,
         AddOutboundRequest { outbound: None },
     );
-    harness.assert_status_code(result, Code::Unimplemented, "HandlerService/AddOutbound");
+    harness.assert_status_code(
+        result,
+        Code::Unimplemented,
+        "HandlerService/AddOutbound",
+    );
 }
 
 #[test]
@@ -1074,7 +1124,11 @@ fn handler_remove_outbound_is_unimplemented() {
             tag: DIRECT_TAG.to_string(),
         },
     );
-    harness.assert_status_code(result, Code::Unimplemented, "HandlerService/RemoveOutbound");
+    harness.assert_status_code(
+        result,
+        Code::Unimplemented,
+        "HandlerService/RemoveOutbound",
+    );
 }
 
 #[test]
@@ -1088,7 +1142,11 @@ fn handler_alter_outbound_is_unimplemented() {
             operation: None,
         },
     );
-    harness.assert_status_code(result, Code::Unimplemented, "HandlerService/AlterOutbound");
+    harness.assert_status_code(
+        result,
+        Code::Unimplemented,
+        "HandlerService/AlterOutbound",
+    );
 }
 
 #[test]
@@ -1113,7 +1171,10 @@ fn routing_subscribe_routing_stats_executes() {
     trace_step("==== test routing_subscribe_routing_stats_executes start ====");
     let harness = Harness::start().expect("failed to start test harness");
     let result = harness.runtime.block_on(async {
-        let mut stream = grpc_server_stream::<SubscribeRoutingStatsRequest, RoutingContext>(
+        let mut stream = grpc_server_stream::<
+            SubscribeRoutingStatsRequest,
+            RoutingContext,
+        >(
             harness.channel.clone(),
             PATH_ROUTING_SUBSCRIBE_ROUTING_STATS,
             SubscribeRoutingStatsRequest {
@@ -1267,7 +1328,11 @@ fn routing_add_rule_is_unimplemented() {
             should_append: false,
         },
     );
-    harness.assert_status_code(result, Code::Unimplemented, "RoutingService/AddRule");
+    harness.assert_status_code(
+        result,
+        Code::Unimplemented,
+        "RoutingService/AddRule",
+    );
 }
 
 #[test]
@@ -1280,7 +1345,11 @@ fn routing_remove_rule_is_unimplemented() {
             rule_tag: "rule-a".to_string(),
         },
     );
-    harness.assert_status_code(result, Code::Unimplemented, "RoutingService/RemoveRule");
+    harness.assert_status_code(
+        result,
+        Code::Unimplemented,
+        "RoutingService/RemoveRule",
+    );
 }
 
 #[test]

@@ -2,10 +2,10 @@ mod collectors;
 mod tls;
 
 use crate::{
-    address::{Address, BindLocation, NetLocation},
-    config::{def::InboudItem, Protocol, Transport},
-    util::option::NoneOrSome,
     Error,
+    address::{Address, BindLocation, NetLocation},
+    config::{Protocol, Transport, def::InboudItem},
+    util::option::NoneOrSome,
 };
 
 #[cfg(feature = "ws")]
@@ -45,7 +45,8 @@ impl TryFrom<InboudItem> for ServerConfig {
         } = value;
 
         let bind_location = BindLocation::Address(NetLocation::new(
-            Address::from(&listen.clone().unwrap_or_else(|| "0.0.0.0".to_string())).unwrap(),
+            Address::from(&listen.clone().unwrap_or_else(|| "0.0.0.0".to_string()))
+                .unwrap(),
             port,
         ));
 
@@ -94,18 +95,24 @@ impl TryFrom<InboudItem> for ServerConfig {
             #[cfg(feature = "hysteria")]
             Protocol::Hysteria2 => {
                 let stream_settings = stream_settings.ok_or_else(|| {
-                    Error::InvalidConfig("hysteria2 inbound missing streamSettings".into())
+                    Error::InvalidConfig(
+                        "hysteria2 inbound missing streamSettings".into(),
+                    )
                 })?;
                 let hysteria_settings = stream_settings.hysteria_settings.as_ref();
-                let tls_settings = stream_settings.tls_settings.ok_or_else(|| {
-                    Error::InvalidConfig("hysteria2 inbound requires tlsSettings".into())
-                })?;
+                let tls_settings =
+                    stream_settings.tls_settings.ok_or_else(|| {
+                        Error::InvalidConfig(
+                            "hysteria2 inbound requires tlsSettings".into(),
+                        )
+                    })?;
                 let item = tls_settings.certificates[0].clone();
 
                 let settings = settings.ok_or_else(|| {
                     Error::InvalidConfig("hysteria2 inbound requires clients".into())
                 })?;
-                let config = collect_hysteria2_settings(settings, hysteria_settings)?;
+                let config =
+                    collect_hysteria2_settings(settings, hysteria_settings)?;
                 if config.clients.is_empty() {
                     return Err(Error::InvalidConfig(
                         "hysteria2 inbound requires at least one client".into(),
@@ -138,11 +145,13 @@ impl TryFrom<InboudItem> for ServerConfig {
                     if let Some(ws_setting) = stream_setting.ws_settings.clone() {
                         tracing::info!("use websocket");
                         protocol = ServerProxyConfig::Websocket {
-                            targets: Box::new(OneOrSome::One(WebsocketServerConfig {
-                                matching_path: ws_setting.path,
-                                matching_headers: None,
-                                protocol,
-                            })),
+                            targets: Box::new(OneOrSome::One(
+                                WebsocketServerConfig {
+                                    matching_path: ws_setting.path,
+                                    matching_headers: None,
+                                    protocol,
+                                },
+                            )),
                         };
                     }
                 }
@@ -178,11 +187,13 @@ impl TryFrom<InboudItem> for ServerConfig {
                     if let Some(ws_setting) = stream_setting.ws_settings.clone() {
                         tracing::info!("use websocket");
                         protocol = ServerProxyConfig::Websocket {
-                            targets: Box::new(OneOrSome::One(WebsocketServerConfig {
-                                matching_path: ws_setting.path,
-                                matching_headers: None,
-                                protocol,
-                            })),
+                            targets: Box::new(OneOrSome::One(
+                                WebsocketServerConfig {
+                                    matching_path: ws_setting.path,
+                                    matching_headers: None,
+                                    protocol,
+                                },
+                            )),
                         };
                     }
                 }
@@ -203,11 +214,16 @@ impl TryFrom<InboudItem> for ServerConfig {
             #[cfg(feature = "tuic")]
             Protocol::TuicV5 => {
                 let stream_settings = stream_settings.ok_or_else(|| {
-                    Error::InvalidConfig("tuic inbound missing streamSettings".into())
+                    Error::InvalidConfig(
+                        "tuic inbound missing streamSettings".into(),
+                    )
                 })?;
-                let tls_settings = stream_settings.tls_settings.ok_or_else(|| {
-                    Error::InvalidConfig("tuic inbound requires tlsSettings".into())
-                })?;
+                let tls_settings =
+                    stream_settings.tls_settings.ok_or_else(|| {
+                        Error::InvalidConfig(
+                            "tuic inbound requires tlsSettings".into(),
+                        )
+                    })?;
                 let certificate = tls_settings
                     .certificates
                     .get(0)
@@ -218,8 +234,9 @@ impl TryFrom<InboudItem> for ServerConfig {
                     })?
                     .clone();
 
-                let settings = settings
-                    .ok_or_else(|| Error::InvalidConfig("tuic inbound requires settings".into()))?;
+                let settings = settings.ok_or_else(|| {
+                    Error::InvalidConfig("tuic inbound requires settings".into())
+                })?;
                 let config = collect_tuic_settings(settings)?;
 
                 let quic_settings = Some(ServerQuicConfig {
@@ -267,11 +284,13 @@ impl TryFrom<InboudItem> for ServerConfig {
                     if let Some(ws_setting) = stream_setting.ws_settings.clone() {
                         tracing::info!("use websocket");
                         protocol = ServerProxyConfig::Websocket {
-                            targets: Box::new(OneOrSome::One(WebsocketServerConfig {
-                                matching_path: ws_setting.path,
-                                matching_headers: None,
-                                protocol,
-                            })),
+                            targets: Box::new(OneOrSome::One(
+                                WebsocketServerConfig {
+                                    matching_path: ws_setting.path,
+                                    matching_headers: None,
+                                    protocol,
+                                },
+                            )),
                         };
                     }
                 }

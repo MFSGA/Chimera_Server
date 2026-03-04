@@ -37,36 +37,50 @@ const TEST_USERNAME: &str = "grpc-e2e-user";
 const TEST_PASSWORD: &str = "grpc-e2e-pass";
 
 const PATH_STATS_GET_STATS: &str = "/xray.app.stats.command.StatsService/GetStats";
-const PATH_STATS_GET_STATS_ONLINE: &str = "/xray.app.stats.command.StatsService/GetStatsOnline";
-const PATH_STATS_QUERY_STATS: &str = "/xray.app.stats.command.StatsService/QueryStats";
-const PATH_STATS_GET_SYS_STATS: &str = "/xray.app.stats.command.StatsService/GetSysStats";
+const PATH_STATS_GET_STATS_ONLINE: &str =
+    "/xray.app.stats.command.StatsService/GetStatsOnline";
+const PATH_STATS_QUERY_STATS: &str =
+    "/xray.app.stats.command.StatsService/QueryStats";
+const PATH_STATS_GET_SYS_STATS: &str =
+    "/xray.app.stats.command.StatsService/GetSysStats";
 const PATH_STATS_GET_STATS_ONLINE_IP_LIST: &str =
     "/xray.app.stats.command.StatsService/GetStatsOnlineIpList";
 const PATH_STATS_GET_ALL_ONLINE_USERS: &str =
     "/xray.app.stats.command.StatsService/GetAllOnlineUsers";
-const PATH_LOGGER_RESTART: &str = "/xray.app.log.command.LoggerService/RestartLogger";
-const PATH_HANDLER_ADD_INBOUND: &str = "/xray.app.proxyman.command.HandlerService/AddInbound";
-const PATH_HANDLER_REMOVE_INBOUND: &str = "/xray.app.proxyman.command.HandlerService/RemoveInbound";
-const PATH_HANDLER_ALTER_INBOUND: &str = "/xray.app.proxyman.command.HandlerService/AlterInbound";
-const PATH_HANDLER_LIST_INBOUNDS: &str = "/xray.app.proxyman.command.HandlerService/ListInbounds";
+const PATH_LOGGER_RESTART: &str =
+    "/xray.app.log.command.LoggerService/RestartLogger";
+const PATH_HANDLER_ADD_INBOUND: &str =
+    "/xray.app.proxyman.command.HandlerService/AddInbound";
+const PATH_HANDLER_REMOVE_INBOUND: &str =
+    "/xray.app.proxyman.command.HandlerService/RemoveInbound";
+const PATH_HANDLER_ALTER_INBOUND: &str =
+    "/xray.app.proxyman.command.HandlerService/AlterInbound";
+const PATH_HANDLER_LIST_INBOUNDS: &str =
+    "/xray.app.proxyman.command.HandlerService/ListInbounds";
 const PATH_HANDLER_GET_INBOUND_USERS: &str =
     "/xray.app.proxyman.command.HandlerService/GetInboundUsers";
 const PATH_HANDLER_GET_INBOUND_USERS_COUNT: &str =
     "/xray.app.proxyman.command.HandlerService/GetInboundUsersCount";
-const PATH_HANDLER_ADD_OUTBOUND: &str = "/xray.app.proxyman.command.HandlerService/AddOutbound";
+const PATH_HANDLER_ADD_OUTBOUND: &str =
+    "/xray.app.proxyman.command.HandlerService/AddOutbound";
 const PATH_HANDLER_REMOVE_OUTBOUND: &str =
     "/xray.app.proxyman.command.HandlerService/RemoveOutbound";
-const PATH_HANDLER_ALTER_OUTBOUND: &str = "/xray.app.proxyman.command.HandlerService/AlterOutbound";
-const PATH_HANDLER_LIST_OUTBOUNDS: &str = "/xray.app.proxyman.command.HandlerService/ListOutbounds";
+const PATH_HANDLER_ALTER_OUTBOUND: &str =
+    "/xray.app.proxyman.command.HandlerService/AlterOutbound";
+const PATH_HANDLER_LIST_OUTBOUNDS: &str =
+    "/xray.app.proxyman.command.HandlerService/ListOutbounds";
 const PATH_ROUTING_SUBSCRIBE_ROUTING_STATS: &str =
     "/xray.app.router.command.RoutingService/SubscribeRoutingStats";
-const PATH_ROUTING_TEST_ROUTE: &str = "/xray.app.router.command.RoutingService/TestRoute";
+const PATH_ROUTING_TEST_ROUTE: &str =
+    "/xray.app.router.command.RoutingService/TestRoute";
 const PATH_ROUTING_GET_BALANCER_INFO: &str =
     "/xray.app.router.command.RoutingService/GetBalancerInfo";
 const PATH_ROUTING_OVERRIDE_BALANCER_TARGET: &str =
     "/xray.app.router.command.RoutingService/OverrideBalancerTarget";
-const PATH_ROUTING_ADD_RULE: &str = "/xray.app.router.command.RoutingService/AddRule";
-const PATH_ROUTING_REMOVE_RULE: &str = "/xray.app.router.command.RoutingService/RemoveRule";
+const PATH_ROUTING_ADD_RULE: &str =
+    "/xray.app.router.command.RoutingService/AddRule";
+const PATH_ROUTING_REMOVE_RULE: &str =
+    "/xray.app.router.command.RoutingService/RemoveRule";
 const PATH_OBSERVATORY_GET_OUTBOUND_STATUS: &str =
     "/xray.core.app.observatory.command.ObservatoryService/GetOutboundStatus";
 
@@ -173,7 +187,8 @@ impl ServerProcess {
                     self.logs()
                 )));
             }
-            if let Ok(stream) = TcpStream::connect_timeout(&listen_addr, IO_TIMEOUT) {
+            if let Ok(stream) = TcpStream::connect_timeout(&listen_addr, IO_TIMEOUT)
+            {
                 drop(stream);
                 trace_step(format!(
                     "{} listener {} is ready",
@@ -269,7 +284,11 @@ impl Harness {
         })
     }
 
-    fn unary<Req, Resp>(&self, path: &'static str, request: Req) -> Result<Resp, Status>
+    fn unary<Req, Resp>(
+        &self,
+        path: &'static str,
+        request: Req,
+    ) -> Result<Resp, Status>
     where
         Req: prost::Message + Default + Send + Sync + 'static,
         Resp: prost::Message + Default + Send + Sync + 'static,
@@ -290,7 +309,10 @@ impl Harness {
     }
 }
 
-fn build_target_command(target: TargetKind, workdir: &Path) -> io::Result<(&'static str, Command)> {
+fn build_target_command(
+    target: TargetKind,
+    workdir: &Path,
+) -> io::Result<(&'static str, Command)> {
     match target {
         TargetKind::Chimera => Ok((
             "config.json5",
@@ -324,7 +346,8 @@ fn unique_test_dir(prefix: &str) -> io::Result<PathBuf> {
         .as_millis();
     let pid = std::process::id();
     let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("{prefix}-grpc-compat-{pid}-{millis}-{test_id}"));
+    let path = std::env::temp_dir()
+        .join(format!("{prefix}-grpc-compat-{pid}-{millis}-{test_id}"));
     fs::create_dir_all(&path)?;
     trace_step(format!("allocated temporary test dir {}", path.display()));
     Ok(path)
@@ -467,12 +490,13 @@ fn build_xray_config(grpc_port: u16, socks_port: u16) -> String {
 async fn connect_channel(grpc_addr: SocketAddr) -> io::Result<Channel> {
     trace_step(format!("connecting grpc channel to {}", grpc_addr));
     let deadline = Instant::now() + STARTUP_TIMEOUT;
-    let endpoint = Endpoint::from_shared(format!("http://{grpc_addr}")).map_err(|err| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid grpc endpoint for {grpc_addr}: {err}"),
-        )
-    })?;
+    let endpoint =
+        Endpoint::from_shared(format!("http://{grpc_addr}")).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid grpc endpoint for {grpc_addr}: {err}"),
+            )
+        })?;
     let endpoint = endpoint.connect_timeout(IO_TIMEOUT).timeout(IO_TIMEOUT);
 
     loop {
@@ -815,7 +839,10 @@ fn grpc_all_interfaces_compat_with_xray_core() {
         if chimera_outcome.code != case.chimera_expected {
             failures.push(format!(
                 "[{}] chimera expected {:?}, got {:?} (detail: {})",
-                case.name, case.chimera_expected, chimera_outcome.code, chimera_outcome.detail
+                case.name,
+                case.chimera_expected,
+                chimera_outcome.code,
+                chimera_outcome.detail
             ));
         }
         if !case.xray_allowed.contains(&xray_outcome.code) {
@@ -878,7 +905,8 @@ fn run_stats_query_stats(harness: &Harness) -> RpcOutcome {
 }
 
 fn run_stats_get_sys_stats(harness: &Harness) -> RpcOutcome {
-    let result: Result<Empty, Status> = harness.unary(PATH_STATS_GET_SYS_STATS, Empty {});
+    let result: Result<Empty, Status> =
+        harness.unary(PATH_STATS_GET_SYS_STATS, Empty {});
     outcome_from_result(result, |_| "ok".to_string())
 }
 
@@ -894,7 +922,8 @@ fn run_stats_get_stats_online_ip_list(harness: &Harness) -> RpcOutcome {
 }
 
 fn run_stats_get_all_online_users(harness: &Harness) -> RpcOutcome {
-    let result: Result<Empty, Status> = harness.unary(PATH_STATS_GET_ALL_ONLINE_USERS, Empty {});
+    let result: Result<Empty, Status> =
+        harness.unary(PATH_STATS_GET_ALL_ONLINE_USERS, Empty {});
     outcome_from_result(result, |_| "ok".to_string())
 }
 
@@ -992,7 +1021,8 @@ fn run_handler_alter_outbound(harness: &Harness) -> RpcOutcome {
 }
 
 fn run_handler_list_outbounds(harness: &Harness) -> RpcOutcome {
-    let result: Result<Empty, Status> = harness.unary(PATH_HANDLER_LIST_OUTBOUNDS, Empty {});
+    let result: Result<Empty, Status> =
+        harness.unary(PATH_HANDLER_LIST_OUTBOUNDS, Empty {});
     outcome_from_result(result, |_| "ok".to_string())
 }
 
@@ -1024,7 +1054,11 @@ fn run_routing_subscribe_routing_stats(harness: &Harness) -> RpcOutcome {
 
         let _event = tokio::time::timeout(IO_TIMEOUT, stream.message())
             .await
-            .map_err(|_| Status::deadline_exceeded("timed out waiting for routing stream event"))??
+            .map_err(|_| {
+                Status::deadline_exceeded(
+                    "timed out waiting for routing stream event",
+                )
+            })??
             .ok_or_else(|| Status::unavailable("routing stream closed"))?;
 
         Ok::<(), Status>(())

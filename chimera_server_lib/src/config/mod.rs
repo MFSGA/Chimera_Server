@@ -98,7 +98,9 @@ impl SettingObject {
     pub fn trojan_clients(&self) -> Option<Vec<TrojanClientSetting>> {
         self.0
             .get("clients")
-            .map(|value| serde_json::from_value::<Vec<TrojanClientSetting>>(value.clone()))
+            .map(|value| {
+                serde_json::from_value::<Vec<TrojanClientSetting>>(value.clone())
+            })
             .transpose()
             .unwrap_or(None)
     }

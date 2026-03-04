@@ -49,7 +49,9 @@ impl NetLocation {
             ));
         }
 
-        let port = port.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "No port"))?;
+        let port = port.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "No port")
+        })?;
 
         Ok(Self { address, port })
     }
@@ -80,20 +82,30 @@ impl NetLocation {
 
     pub fn to_socket_addr(&self) -> std::io::Result<SocketAddr> {
         match self.address {
-            Address::Ipv6(ref addr) => Ok(SocketAddr::new(IpAddr::V6(*addr), self.port)),
-            Address::Ipv4(ref addr) => Ok(SocketAddr::new(IpAddr::V4(*addr), self.port)),
+            Address::Ipv6(ref addr) => {
+                Ok(SocketAddr::new(IpAddr::V6(*addr), self.port))
+            }
+            Address::Ipv4(ref addr) => {
+                Ok(SocketAddr::new(IpAddr::V4(*addr), self.port))
+            }
 
             Address::Hostname(ref d) => format!("{}:{}", d, self.port)
                 .to_socket_addrs()?
                 .next()
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "Lookup failed")),
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::Other, "Lookup failed")
+                }),
         }
     }
 
     pub fn to_socket_addr_nonblocking(&self) -> Option<SocketAddr> {
         match self.address {
-            Address::Ipv6(ref addr) => Some(SocketAddr::new(IpAddr::V6(*addr), self.port)),
-            Address::Ipv4(ref addr) => Some(SocketAddr::new(IpAddr::V4(*addr), self.port)),
+            Address::Ipv6(ref addr) => {
+                Some(SocketAddr::new(IpAddr::V6(*addr), self.port))
+            }
+            Address::Ipv4(ref addr) => {
+                Some(SocketAddr::new(IpAddr::V4(*addr), self.port))
+            }
             Address::Hostname(ref _d) => None,
         }
     }
@@ -113,12 +125,13 @@ where
     D: serde::de::Deserializer<'de>,
 {
     let value = String::deserialize(deserializer)?;
-    let net_location = NetLocation::from_str(&value, default_port).map_err(|_| {
-        serde::de::Error::invalid_value(
-            serde::de::Unexpected::Other("invalid net location"),
-            &"invalid net location",
-        )
-    })?;
+    let net_location =
+        NetLocation::from_str(&value, default_port).map_err(|_| {
+            serde::de::Error::invalid_value(
+                serde::de::Unexpected::Other("invalid net location"),
+                &"invalid net location",
+            )
+        })?;
 
     Ok(net_location)
 }

@@ -6,12 +6,12 @@ use std::{
 };
 
 use axum::{
+    Router,
     body::{Body, Bytes},
     extract::{Path, Query, State},
     http::{self, HeaderMap, StatusCode},
     response::Response,
     routing::get,
-    Router,
 };
 use futures::StreamExt;
 use tokio::{io::AsyncWriteExt, net::TcpStream, sync::Mutex};
@@ -118,11 +118,17 @@ impl AppState {
         len >= self.min_padding && len <= self.max_padding
     }
 
-    async fn acquire_session(&self, session_id: &str) -> Result<Arc<Mutex<Session>>, ()> {
+    async fn acquire_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Arc<Mutex<Session>>, ()> {
         self.sessions.acquire(session_id, &self.upstream).await
     }
 
-    async fn upsert_session(&self, session_id: String) -> Result<Arc<Mutex<Session>>, ()> {
+    async fn upsert_session(
+        &self,
+        session_id: String,
+    ) -> Result<Arc<Mutex<Session>>, ()> {
         self.sessions
             .acquire(session_id.as_str(), &self.upstream)
             .await
@@ -203,10 +209,11 @@ async fn down_handler(
         session_id: session_id.to_string(),
     });
 
-    let stream = ReaderStream::new(reader).chain(futures::stream::poll_fn(move |_| {
-        let _ = session_guard.take();
-        Poll::Ready(None)
-    }));
+    let stream =
+        ReaderStream::new(reader).chain(futures::stream::poll_fn(move |_| {
+            let _ = session_guard.take();
+            Poll::Ready(None)
+        }));
 
     let mut response_builder = Response::builder()
         .status(StatusCode::OK)
@@ -219,7 +226,8 @@ async fn down_handler(
     for (key, value) in state.response_headers.iter() {
         if let Ok(header_name) = http::header::HeaderName::try_from(key.as_str()) {
             if let Ok(header_value) = http::header::HeaderValue::from_str(value) {
-                response_builder = response_builder.header(header_name, header_value);
+                response_builder =
+                    response_builder.header(header_name, header_value);
             }
         }
     }
@@ -281,7 +289,8 @@ async fn up_handler(
             .unwrap();
     };
 
-    let Ok(upload_socket) = state.upsert_session(session_id.to_string()).await else {
+    let Ok(upload_socket) = state.upsert_session(session_id.to_string()).await
+    else {
         return Response::builder()
             .status(StatusCode::BAD_GATEWAY)
             .body(Body::empty())
@@ -302,7 +311,8 @@ async fn up_handler(
 
         let packet = upload_socket.packet_queue.pop().unwrap();
         if packet.seq == upload_socket.next_seq {
-            if let Err(err) = upload_socket.raw_writer.write_all(&packet.data).await {
+            if let Err(err) = upload_socket.raw_writer.write_all(&packet.data).await
+            {
                 error!("failed to write to upstream: {}", err);
                 return Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
@@ -342,7 +352,11 @@ impl SessionStore {
         }
     }
 
-    async fn acquire(&self, session_id: &str, upstream: &str) -> Result<Arc<Mutex<Session>>, ()> {
+    async fn acquire(
+        &self,
+        session_id: &str,
+        upstream: &str,
+    ) -> Result<Arc<Mutex<Session>>, ()> {
         if let Some(existing) = self.inner.read().unwrap().get(session_id) {
             return Ok(existing.clone());
         }

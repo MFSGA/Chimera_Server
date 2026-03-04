@@ -76,7 +76,8 @@ impl TcpServerHandler for SocksTcpServerHandler {
         &self,
         mut server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
-        let method = negotiate_method(&mut server_stream, self.requires_auth()).await?;
+        let method =
+            negotiate_method(&mut server_stream, self.requires_auth()).await?;
 
         let mut identity = None;
         if method == SocksMethod::UsernamePassword {
@@ -90,14 +91,17 @@ impl TcpServerHandler for SocksTcpServerHandler {
             Some(id) => TrafficContext::new("socks")
                 .with_identity(id)
                 .with_inbound_tag(self.inbound_tag.clone()),
-            None => TrafficContext::new("socks").with_inbound_tag(self.inbound_tag.clone()),
+            None => TrafficContext::new("socks")
+                .with_inbound_tag(self.inbound_tag.clone()),
         });
 
         Ok(TcpServerSetupResult::TcpForward {
             remote_location,
             stream: server_stream,
             need_initial_flush: false,
-            connection_success_response: Some(SUCCESS_RESPONSE.to_vec().into_boxed_slice()),
+            connection_success_response: Some(
+                SUCCESS_RESPONSE.to_vec().into_boxed_slice(),
+            ),
             traffic_context,
         })
     }
@@ -202,7 +206,9 @@ async fn authenticate(
     }
 }
 
-async fn read_connect_request(stream: &mut Box<dyn AsyncStream>) -> std::io::Result<NetLocation> {
+async fn read_connect_request(
+    stream: &mut Box<dyn AsyncStream>,
+) -> std::io::Result<NetLocation> {
     let version = stream.read_u8().await?;
     if version != SOCKS_VERSION {
         send_command_response(stream, REP_GENERAL_FAILURE).await?;
@@ -244,7 +250,9 @@ async fn read_connect_request(stream: &mut Box<dyn AsyncStream>) -> std::io::Res
             stream.read_exact(&mut address).await?;
             let mut port_bytes = [0u8; 2];
             stream.read_exact(&mut port_bytes).await?;
-            let ipv4 = std::net::Ipv4Addr::new(address[0], address[1], address[2], address[3]);
+            let ipv4 = std::net::Ipv4Addr::new(
+                address[0], address[1], address[2], address[3],
+            );
             NetLocation::new(Address::Ipv4(ipv4), u16::from_be_bytes(port_bytes))
         }
         ADDR_TYPE_IPV6 => {

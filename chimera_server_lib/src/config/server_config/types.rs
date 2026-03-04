@@ -93,7 +93,11 @@ pub struct RangeConfig {
 }
 
 impl RangeConfig {
-    pub fn clamp_with_defaults(&self, default_from: i32, default_to: i32) -> (usize, usize) {
+    pub fn clamp_with_defaults(
+        &self,
+        default_from: i32,
+        default_to: i32,
+    ) -> (usize, usize) {
         let mut from = if self.from <= 0 {
             default_from
         } else {

@@ -1,6 +1,6 @@
 use std::{
     net::SocketAddr,
-    sync::{atomic::AtomicU64, Arc},
+    sync::{Arc, atomic::AtomicU64},
     time::Duration,
 };
 
@@ -45,11 +45,16 @@ pub async fn run_hysteria2_server(
         let inbound_tag = inbound_tag.clone();
 
         let base_transport = build_transport_config()?;
-        let mut base_server_config = quinn::ServerConfig::with_crypto(quic_server_config);
+        let mut base_server_config =
+            quinn::ServerConfig::with_crypto(quic_server_config);
         base_server_config.transport_config(Arc::new(base_transport));
 
-        let socket2_socket =
-            new_socket2_udp_socket(bind_address.is_ipv6(), None, Some(bind_address), false)?;
+        let socket2_socket = new_socket2_udp_socket(
+            bind_address.is_ipv6(),
+            None,
+            Some(bind_address),
+            false,
+        )?;
 
         let endpoint = quinn::Endpoint::new(
             quinn::EndpointConfig::default(),
@@ -68,30 +73,41 @@ pub async fn run_hysteria2_server(
                 let mut transport = match build_transport_config() {
                     Ok(transport) => transport,
                     Err(err) => {
-                        tracing::error!("Failed to configure hysteria2 transport: {}", err);
+                        tracing::error!(
+                            "Failed to configure hysteria2 transport: {}",
+                            err
+                        );
                         return;
                     }
                 };
 
                 // use brutal in the future
-                transport.congestion_controller_factory(Arc::new(BbrConfig::default()));
+                transport
+                    .congestion_controller_factory(Arc::new(BbrConfig::default()));
 
                 let mut server_config = base_server_config.clone();
                 server_config.transport_config(Arc::new(transport));
 
                 tokio::spawn(async move {
-                    let connecting = match incoming.accept_with(Arc::new(server_config)) {
-                        Ok(connecting) => connecting,
-                        Err(err) => {
-                            tracing::error!("Failed to accept hysteria2 connection: {}", err);
-                            return;
-                        }
-                    };
+                    let connecting =
+                        match incoming.accept_with(Arc::new(server_config)) {
+                            Ok(connecting) => connecting,
+                            Err(err) => {
+                                tracing::error!(
+                                    "Failed to accept hysteria2 connection: {}",
+                                    err
+                                );
+                                return;
+                            }
+                        };
 
                     let connection = match connecting.await {
                         Ok(connection) => connection,
                         Err(err) => {
-                            tracing::error!("Failed to establish hysteria2 connection: {}", err);
+                            tracing::error!(
+                                "Failed to establish hysteria2 connection: {}",
+                                err
+                            );
                             return;
                         }
                     };
