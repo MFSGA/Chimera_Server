@@ -21,7 +21,10 @@ impl LineReader {
         }
     }
 
-    pub async fn read_line(&mut self, stream: &mut Box<dyn AsyncStream>) -> std::io::Result<&str> {
+    pub async fn read_line(
+        &mut self,
+        stream: &mut Box<dyn AsyncStream>,
+    ) -> std::io::Result<&str> {
         let line_bytes = self.read_line_bytes(stream).await?;
 
         std::str::from_utf8(line_bytes).map_err(|e| {
@@ -40,11 +43,12 @@ impl LineReader {
             match memchr(b'\n', &self.buf[self.start_offset..self.end_offset]) {
                 Some(pos) => {
                     let newline_pos = self.start_offset + pos;
-                    let line = if newline_pos > 0 && self.buf[newline_pos - 1] == b'\r' {
-                        &mut self.buf[self.start_offset..newline_pos - 1]
-                    } else {
-                        &mut self.buf[self.start_offset..newline_pos]
-                    };
+                    let line =
+                        if newline_pos > 0 && self.buf[newline_pos - 1] == b'\r' {
+                            &mut self.buf[self.start_offset..newline_pos - 1]
+                        } else {
+                            &mut self.buf[self.start_offset..newline_pos]
+                        };
                     let new_start_offset = newline_pos + 1;
                     if new_start_offset == self.end_offset {
                         self.start_offset = 0;
@@ -61,7 +65,10 @@ impl LineReader {
         }
     }
 
-    async fn read(&mut self, stream: &mut Box<dyn AsyncStream>) -> std::io::Result<()> {
+    async fn read(
+        &mut self,
+        stream: &mut Box<dyn AsyncStream>,
+    ) -> std::io::Result<()> {
         if self.is_cache_full() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,

@@ -54,8 +54,9 @@ impl ParsedHttpData {
             }
         }
 
-        let first_line = first_line
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "empty http request"))?;
+        let first_line = first_line.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "empty http request")
+        })?;
 
         Ok(Self {
             first_line,

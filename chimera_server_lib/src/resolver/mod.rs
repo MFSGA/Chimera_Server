@@ -31,16 +31,16 @@ impl Resolver for NativeResolver {
         let address = location.address().clone();
         let port = location.port();
 
-        Box::pin(
-            tokio::net::lookup_host((address.to_string(), port)).map(move |result| {
+        Box::pin(tokio::net::lookup_host((address.to_string(), port)).map(
+            move |result| {
                 let ret = result.map(|r| {
                     r.filter(|addr| !addr.ip().is_unspecified())
                         .collect::<Vec<_>>()
                 });
                 debug!("NativeResolver resolved {}:{} -> {:?}", address, port, ret);
                 ret
-            }),
-        )
+            },
+        ))
     }
 }
 

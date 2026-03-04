@@ -2,7 +2,9 @@ use std::fmt::Debug;
 
 use async_trait::async_trait;
 
-use crate::{address::NetLocation, async_stream::AsyncStream, traffic::TrafficContext};
+use crate::{
+    address::NetLocation, async_stream::AsyncStream, traffic::TrafficContext,
+};
 
 #[async_trait]
 pub trait TcpServerHandler: Send + Sync + Debug {

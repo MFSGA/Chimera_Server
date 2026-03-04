@@ -1,16 +1,16 @@
 use std::{
     any::Any,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
 };
 
 use std::time::{Duration, Instant};
 
 use quinn_proto::{
-    congestion::{Bbr, BbrConfig, Controller, ControllerFactory},
     RttEstimator,
+    congestion::{Bbr, BbrConfig, Controller, ControllerFactory},
 };
 use tracing::debug;
 
@@ -39,7 +39,11 @@ impl BrutalConfig {
 }
 
 impl ControllerFactory for BrutalConfig {
-    fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+    fn build(
+        self: Arc<Self>,
+        now: Instant,
+        current_mtu: u16,
+    ) -> Box<dyn Controller> {
         Box::new(BrutalController {
             tx_bps: self.tx_bps.clone(),
             brutal: BrutalState::new(now, current_mtu),
@@ -96,8 +100,12 @@ impl Controller for BrutalController {
         is_persistent_congestion: bool,
         lost_bytes: u64,
     ) {
-        self.bbr
-            .on_congestion_event(now, sent, is_persistent_congestion, lost_bytes);
+        self.bbr.on_congestion_event(
+            now,
+            sent,
+            is_persistent_congestion,
+            lost_bytes,
+        );
         self.brutal.on_congestion_event(now, lost_bytes);
     }
 
@@ -175,7 +183,8 @@ impl BrutalState {
         if lost_bytes == 0 {
             return;
         }
-        let loss_count = (lost_bytes + self.max_datagram_size - 1) / self.max_datagram_size;
+        let loss_count =
+            (lost_bytes + self.max_datagram_size - 1) / self.max_datagram_size;
         self.record(now, 0, loss_count);
     }
 
@@ -193,7 +202,8 @@ impl BrutalState {
         }
 
         let cwnd =
-            (tx_bps as f64) * rtt.as_secs_f64() * CONGESTION_WINDOW_MULTIPLIER / self.ack_rate;
+            (tx_bps as f64) * rtt.as_secs_f64() * CONGESTION_WINDOW_MULTIPLIER
+                / self.ack_rate;
         (cwnd as u64).max(self.max_datagram_size)
     }
 
@@ -277,6 +287,8 @@ impl BrutalState {
     }
 
     fn can_print_ack_rate(&self, timestamp: u64) -> bool {
-        self.debug && timestamp.saturating_sub(self.last_debug_timestamp) >= DEBUG_PRINT_INTERVAL
+        self.debug
+            && timestamp.saturating_sub(self.last_debug_timestamp)
+                >= DEBUG_PRINT_INTERVAL
     }
 }

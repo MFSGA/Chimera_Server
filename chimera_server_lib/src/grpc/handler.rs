@@ -11,8 +11,10 @@ use prost::Message;
 use super::proto;
 
 const TYPE_ADD_USER_OPERATION: &str = "xray.app.proxyman.command.AddUserOperation";
-const TYPE_REMOVE_USER_OPERATION: &str = "xray.app.proxyman.command.RemoveUserOperation";
-const TYPE_ADD_USER_OPERATION_V2RAY: &str = "v2ray.core.app.proxyman.command.AddUserOperation";
+const TYPE_REMOVE_USER_OPERATION: &str =
+    "xray.app.proxyman.command.RemoveUserOperation";
+const TYPE_ADD_USER_OPERATION_V2RAY: &str =
+    "v2ray.core.app.proxyman.command.AddUserOperation";
 const TYPE_REMOVE_USER_OPERATION_V2RAY: &str =
     "v2ray.core.app.proxyman.command.RemoveUserOperation";
 const TYPE_PROXY_SOCKS_ACCOUNT: &str = "xray.proxy.socks.Account";
@@ -65,12 +67,15 @@ impl HandlerServiceImpl {
         let op_type = operation.r#type.trim_start_matches('.');
         match op_type {
             TYPE_ADD_USER_OPERATION | TYPE_ADD_USER_OPERATION_V2RAY => {
-                let decoded = proto::xray::app::proxyman::command::AddUserOperation::decode(
-                    operation.value.as_slice(),
-                )
-                .map_err(|err| {
-                    Status::invalid_argument(format!("invalid AddUserOperation payload: {err}"))
-                })?;
+                let decoded =
+                    proto::xray::app::proxyman::command::AddUserOperation::decode(
+                        operation.value.as_slice(),
+                    )
+                    .map_err(|err| {
+                        Status::invalid_argument(format!(
+                            "invalid AddUserOperation payload: {err}"
+                        ))
+                    })?;
                 Ok(AlterInboundOperation::AddUser(decoded))
             }
             TYPE_REMOVE_USER_OPERATION | TYPE_REMOVE_USER_OPERATION_V2RAY => {
@@ -88,7 +93,9 @@ impl HandlerServiceImpl {
         }
     }
 
-    fn parse_typed_message_type(typed_message: &proto::xray::common::serial::TypedMessage) -> &str {
+    fn parse_typed_message_type(
+        typed_message: &proto::xray::common::serial::TypedMessage,
+    ) -> &str {
         typed_message.r#type.trim_start_matches('.')
     }
 
@@ -115,9 +122,12 @@ impl HandlerServiceImpl {
             )));
         }
 
-        let payload = SocksAccountPayload::decode(account.value.as_slice()).map_err(|err| {
-            Status::invalid_argument(format!("invalid socks account payload: {err}"))
-        })?;
+        let payload = SocksAccountPayload::decode(account.value.as_slice())
+            .map_err(|err| {
+                Status::invalid_argument(format!(
+                    "invalid socks account payload: {err}"
+                ))
+            })?;
         let username = if payload.username.trim().is_empty() {
             fallback_username
         } else {
@@ -138,7 +148,9 @@ impl HandlerServiceImpl {
         user: &proto::xray::common::protocol::User,
     ) -> Result<String, Status> {
         let account = user.account.as_ref().ok_or_else(|| {
-            Status::invalid_argument("AddUserOperation.user.account is required for trojan")
+            Status::invalid_argument(
+                "AddUserOperation.user.account is required for trojan",
+            )
         })?;
         let account_type = Self::parse_typed_message_type(account);
         if account_type != TYPE_PROXY_TROJAN_ACCOUNT
@@ -149,9 +161,12 @@ impl HandlerServiceImpl {
             )));
         }
 
-        let payload = TrojanAccountPayload::decode(account.value.as_slice()).map_err(|err| {
-            Status::invalid_argument(format!("invalid trojan account payload: {err}"))
-        })?;
+        let payload = TrojanAccountPayload::decode(account.value.as_slice())
+            .map_err(|err| {
+                Status::invalid_argument(format!(
+                    "invalid trojan account payload: {err}"
+                ))
+            })?;
         let password = payload.password.trim();
         if password.is_empty() {
             return Err(Status::invalid_argument(
@@ -215,7 +230,10 @@ impl HandlerServiceImpl {
                 crate::util::option::OneOrSome::Some(target_list) => {
                     let mut handled = false;
                     for target in target_list.iter_mut() {
-                        handled |= self.apply_add_user_to_protocol(&mut target.protocol, user)?;
+                        handled |= self.apply_add_user_to_protocol(
+                            &mut target.protocol,
+                            user,
+                        )?;
                     }
                     Ok(handled)
                 }
@@ -237,9 +255,9 @@ impl HandlerServiceImpl {
         protocol: &mut ServerProxyConfig,
         operation: proto::xray::app::proxyman::command::AddUserOperation,
     ) -> Result<(), Status> {
-        let user = operation
-            .user
-            .ok_or_else(|| Status::invalid_argument("AddUserOperation.user is required"))?;
+        let user = operation.user.ok_or_else(|| {
+            Status::invalid_argument("AddUserOperation.user is required")
+        })?;
         if self.apply_add_user_to_protocol(protocol, &user)? {
             return Ok(());
         }
@@ -272,8 +290,10 @@ impl HandlerServiceImpl {
                 crate::util::option::OneOrSome::Some(target_list) => {
                     let mut handled = false;
                     for target in target_list.iter_mut() {
-                        handled |=
-                            self.apply_remove_user_from_protocol(&mut target.protocol, email)?;
+                        handled |= self.apply_remove_user_from_protocol(
+                            &mut target.protocol,
+                            email,
+                        )?;
                     }
                     Ok(handled)
                 }
@@ -356,7 +376,8 @@ impl HandlerServiceImpl {
                     }
                     crate::util::option::OneOrSome::Some(list) => {
                         for target in list {
-                            identities.extend(self.collect_identities(&target.protocol));
+                            identities
+                                .extend(self.collect_identities(&target.protocol));
                         }
                     }
                 }
@@ -365,7 +386,9 @@ impl HandlerServiceImpl {
             #[cfg(feature = "tls")]
             ServerProxyConfig::Tls(tls) => self.collect_identities(&tls.inner),
             #[cfg(feature = "reality")]
-            ServerProxyConfig::Reality(reality) => self.collect_identities(&reality.inner),
+            ServerProxyConfig::Reality(reality) => {
+                self.collect_identities(&reality.inner)
+            }
             ServerProxyConfig::Xhttp { .. } => Vec::new(),
         }
     }
@@ -386,21 +409,30 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
     async fn add_inbound(
         &self,
         _request: Request<proto::xray::app::proxyman::command::AddInboundRequest>,
-    ) -> Result<Response<proto::xray::app::proxyman::command::AddInboundResponse>, Status> {
+    ) -> Result<
+        Response<proto::xray::app::proxyman::command::AddInboundResponse>,
+        Status,
+    > {
         Err(Status::unimplemented("AddInbound is not supported"))
     }
 
     async fn remove_inbound(
         &self,
         _request: Request<proto::xray::app::proxyman::command::RemoveInboundRequest>,
-    ) -> Result<Response<proto::xray::app::proxyman::command::RemoveInboundResponse>, Status> {
+    ) -> Result<
+        Response<proto::xray::app::proxyman::command::RemoveInboundResponse>,
+        Status,
+    > {
         Err(Status::unimplemented("RemoveInbound is not supported"))
     }
 
     async fn alter_inbound(
         &self,
         request: Request<proto::xray::app::proxyman::command::AlterInboundRequest>,
-    ) -> Result<Response<proto::xray::app::proxyman::command::AlterInboundResponse>, Status> {
+    ) -> Result<
+        Response<proto::xray::app::proxyman::command::AlterInboundResponse>,
+        Status,
+    > {
         let request = request.into_inner();
         let operation = self.parse_alter_inbound_operation(request.operation)?;
         let result = self.runtime.with_inbound_mut(&request.tag, |inbound| {
@@ -419,7 +451,10 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
     async fn list_inbounds(
         &self,
         request: Request<proto::xray::app::proxyman::command::ListInboundsRequest>,
-    ) -> Result<Response<proto::xray::app::proxyman::command::ListInboundsResponse>, Status> {
+    ) -> Result<
+        Response<proto::xray::app::proxyman::command::ListInboundsResponse>,
+        Status,
+    > {
         let request = request.into_inner();
         let mut inbounds = Vec::new();
         for inbound in self.runtime.inbounds() {
@@ -442,7 +477,10 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
     async fn get_inbound_users(
         &self,
         request: Request<proto::xray::app::proxyman::command::GetInboundUserRequest>,
-    ) -> Result<Response<proto::xray::app::proxyman::command::GetInboundUserResponse>, Status> {
+    ) -> Result<
+        Response<proto::xray::app::proxyman::command::GetInboundUserResponse>,
+        Status,
+    > {
         let request = request.into_inner();
         let inbound = self
             .runtime
@@ -467,8 +505,10 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
     async fn get_inbound_users_count(
         &self,
         request: Request<proto::xray::app::proxyman::command::GetInboundUserRequest>,
-    ) -> Result<Response<proto::xray::app::proxyman::command::GetInboundUsersCountResponse>, Status>
-    {
+    ) -> Result<
+        Response<proto::xray::app::proxyman::command::GetInboundUsersCountResponse>,
+        Status,
+    > {
         let request = request.into_inner();
         let inbound = self
             .runtime
@@ -476,35 +516,51 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
             .ok_or_else(|| Status::not_found("inbound not found"))?;
         let count = self.collect_identities(&inbound.protocol).len() as i64;
         Ok(Response::new(
-            proto::xray::app::proxyman::command::GetInboundUsersCountResponse { count },
+            proto::xray::app::proxyman::command::GetInboundUsersCountResponse {
+                count,
+            },
         ))
     }
 
     async fn add_outbound(
         &self,
         _request: Request<proto::xray::app::proxyman::command::AddOutboundRequest>,
-    ) -> Result<Response<proto::xray::app::proxyman::command::AddOutboundResponse>, Status> {
+    ) -> Result<
+        Response<proto::xray::app::proxyman::command::AddOutboundResponse>,
+        Status,
+    > {
         Err(Status::unimplemented("AddOutbound is not supported"))
     }
 
     async fn remove_outbound(
         &self,
-        _request: Request<proto::xray::app::proxyman::command::RemoveOutboundRequest>,
-    ) -> Result<Response<proto::xray::app::proxyman::command::RemoveOutboundResponse>, Status> {
+        _request: Request<
+            proto::xray::app::proxyman::command::RemoveOutboundRequest,
+        >,
+    ) -> Result<
+        Response<proto::xray::app::proxyman::command::RemoveOutboundResponse>,
+        Status,
+    > {
         Err(Status::unimplemented("RemoveOutbound is not supported"))
     }
 
     async fn alter_outbound(
         &self,
         _request: Request<proto::xray::app::proxyman::command::AlterOutboundRequest>,
-    ) -> Result<Response<proto::xray::app::proxyman::command::AlterOutboundResponse>, Status> {
+    ) -> Result<
+        Response<proto::xray::app::proxyman::command::AlterOutboundResponse>,
+        Status,
+    > {
         Err(Status::unimplemented("AlterOutbound is not supported"))
     }
 
     async fn list_outbounds(
         &self,
         _request: Request<proto::xray::app::proxyman::command::ListOutboundsRequest>,
-    ) -> Result<Response<proto::xray::app::proxyman::command::ListOutboundsResponse>, Status> {
+    ) -> Result<
+        Response<proto::xray::app::proxyman::command::ListOutboundsResponse>,
+        Status,
+    > {
         let outbounds = self
             .runtime
             .outbounds()
@@ -527,7 +583,7 @@ pub(super) fn build_service(
     runtime: RuntimeState,
 ) -> proto::xray::app::proxyman::command::handler_service_server::HandlerServiceServer<
     HandlerServiceImpl,
-> {
+>{
     proto::xray::app::proxyman::command::handler_service_server::HandlerServiceServer::new(
         HandlerServiceImpl::new(runtime),
     )
@@ -569,8 +625,10 @@ mod tests {
         let user_b = unique_tag("user-b");
         let outbound_tag = unique_tag("outbound");
 
-        let bind_location =
-            BindLocation::Address(NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 1080));
+        let bind_location = BindLocation::Address(NetLocation::new(
+            Address::Ipv4(Ipv4Addr::LOCALHOST),
+            1080,
+        ));
         let protocol = ServerProxyConfig::Socks {
             accounts: vec![
                 SocksUser {
@@ -715,7 +773,8 @@ mod tests {
 
         let err = service
             .remove_outbound(Request::new(
-                proto::xray::app::proxyman::command::RemoveOutboundRequest::default(),
+                proto::xray::app::proxyman::command::RemoveOutboundRequest::default(
+                ),
             ))
             .await
             .expect_err("expected remove_outbound to be unimplemented");
@@ -771,16 +830,18 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(users.iter().any(|email| email == &user));
 
-        let remove_operation = proto::xray::app::proxyman::command::RemoveUserOperation {
-            email: user.clone(),
-        };
-        let remove_request = proto::xray::app::proxyman::command::AlterInboundRequest {
-            tag: fixture.inbound_tag.clone(),
-            operation: Some(proto::xray::common::serial::TypedMessage {
-                r#type: TYPE_REMOVE_USER_OPERATION.to_string(),
-                value: remove_operation.encode_to_vec(),
-            }),
-        };
+        let remove_operation =
+            proto::xray::app::proxyman::command::RemoveUserOperation {
+                email: user.clone(),
+            };
+        let remove_request =
+            proto::xray::app::proxyman::command::AlterInboundRequest {
+                tag: fixture.inbound_tag.clone(),
+                operation: Some(proto::xray::common::serial::TypedMessage {
+                    r#type: TYPE_REMOVE_USER_OPERATION.to_string(),
+                    value: remove_operation.encode_to_vec(),
+                }),
+            };
         service
             .alter_inbound(Request::new(remove_request))
             .await
@@ -878,7 +939,9 @@ mod tests {
                 },
             ))
             .await
-            .expect_err("expected invalid argument for unsupported socks account type");
+            .expect_err(
+                "expected invalid argument for unsupported socks account type",
+            );
         assert_eq!(err.code(), Code::InvalidArgument);
     }
 
@@ -886,8 +949,10 @@ mod tests {
     #[tokio::test]
     async fn handler_alter_inbound_adds_and_removes_trojan_users() {
         let inbound_tag = unique_tag("trojan-inbound");
-        let bind_location =
-            BindLocation::Address(NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 1091));
+        let bind_location = BindLocation::Address(NetLocation::new(
+            Address::Ipv4(Ipv4Addr::LOCALHOST),
+            1091,
+        ));
         let inbound = ServerConfig {
             tag: inbound_tag.clone(),
             bind_location,
@@ -947,9 +1012,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(users_after_add.iter().any(|candidate| candidate == &email));
 
-        let remove_operation = proto::xray::app::proxyman::command::RemoveUserOperation {
-            email: email.clone(),
-        };
+        let remove_operation =
+            proto::xray::app::proxyman::command::RemoveUserOperation {
+                email: email.clone(),
+            };
         service
             .alter_inbound(Request::new(
                 proto::xray::app::proxyman::command::AlterInboundRequest {
@@ -994,7 +1060,8 @@ mod tests {
                 proto::xray::app::proxyman::command::AlterInboundRequest {
                     tag: fixture.inbound_tag,
                     operation: Some(proto::xray::common::serial::TypedMessage {
-                        r#type: "xray.app.proxyman.command.UnknownOperation".to_string(),
+                        r#type: "xray.app.proxyman.command.UnknownOperation"
+                            .to_string(),
                         value: vec![1, 2, 3],
                     }),
                 },
