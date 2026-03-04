@@ -11,7 +11,14 @@ extern crate chimera_server_lib as chimera;
 #[derive(Parser)]
 struct Cli {
     directory: Option<PathBuf>,
-    #[clap(default_value = "config.json5", value_name = "FILE", value_parser)]
+    #[clap(
+        short,
+        long,
+        value_parser,
+        value_name = "FILE",
+        default_value = "config.json5",
+        help = "Specify configuration file"
+    )]
     config: PathBuf,
 
     #[arg(long, default_value_t = false)]
