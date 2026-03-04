@@ -1,4 +1,4 @@
-use crate::{config::StreamSettings, Error};
+use crate::{Error, config::StreamSettings};
 
 #[cfg(feature = "reality")]
 use crate::reality::{decode_private_key, decode_short_id};
@@ -65,7 +65,8 @@ fn build_reality_layer(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let max_time_diff = settings.max_time_diff;
+    // Keep xray-core style behavior: maxTimeDiff = 0 means disabled.
+    let max_time_diff = settings.max_time_diff.filter(|diff| *diff > 0);
     let min_client_version = parse_version_triplet(&settings.min_client_ver, "minClientVer")?;
     let max_client_version = parse_version_triplet(&settings.max_client_ver, "maxClientVer")?;
 
