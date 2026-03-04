@@ -1,6 +1,6 @@
 use anyhow::Result;
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use clap::{Parser, Subcommand, ValueEnum};
 use rand_core::{OsRng, RngCore};
 use std::fmt::{self, Write};

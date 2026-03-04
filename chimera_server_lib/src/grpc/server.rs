@@ -78,7 +78,8 @@ pub async fn start_grpc_server(
 
     let incoming = TcpListenerStream::new(listener);
 
-    let router = router.expect("grpc router should exist when services are configured");
+    let router =
+        router.expect("grpc router should exist when services are configured");
     Ok(tokio::spawn(async move {
         if let Err(err) = router.serve_with_incoming(incoming).await {
             tracing::error!("grpc server stopped with error: {}", err);
@@ -105,7 +106,9 @@ where
     match (builder, router) {
         (Some(mut builder), None) => builder.add_service(service),
         (None, Some(router)) => router.add_service(service),
-        (Some(_), Some(_)) => unreachable!("grpc builder/router should be mutually exclusive"),
+        (Some(_), Some(_)) => {
+            unreachable!("grpc builder/router should be mutually exclusive")
+        }
         (None, None) => unreachable!("grpc builder or router must be available"),
     }
 }

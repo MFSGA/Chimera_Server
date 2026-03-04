@@ -32,7 +32,10 @@ impl AsyncPing for PrefixedStream {
         self.inner.supports_ping()
     }
 
-    fn poll_write_ping(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<bool>> {
+    fn poll_write_ping(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<bool>> {
         let this = self.get_mut();
         Pin::new(&mut this.inner).poll_write_ping(cx)
     }
@@ -70,12 +73,18 @@ impl AsyncWrite for PrefixedStream {
         Pin::new(&mut this.inner).poll_write(cx, buf)
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         Pin::new(&mut this.inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         Pin::new(&mut this.inner).poll_shutdown(cx)
     }

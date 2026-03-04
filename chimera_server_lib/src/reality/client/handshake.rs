@@ -6,10 +6,16 @@ use aws_lc_rs::{
 };
 
 use super::{HandshakeState, RealityClientConnection};
-use crate::reality::reality_auth::{derive_auth_key, encrypt_session_id, perform_ecdh};
-use crate::reality::reality_tls13_messages::{construct_client_hello, write_record_header};
+use crate::reality::reality_auth::{
+    derive_auth_key, encrypt_session_id, perform_ecdh,
+};
+use crate::reality::reality_tls13_messages::{
+    construct_client_hello, write_record_header,
+};
 
-pub(super) fn generate_client_hello(conn: &mut RealityClientConnection) -> io::Result<()> {
+pub(super) fn generate_client_hello(
+    conn: &mut RealityClientConnection,
+) -> io::Result<()> {
     let rng = SystemRandom::new();
 
     // Generate our X25519 keypair
@@ -17,9 +23,11 @@ pub(super) fn generate_client_hello(conn: &mut RealityClientConnection) -> io::R
     rng.fill(&mut our_private_bytes)
         .map_err(|_| io::Error::other("RNG failed"))?;
 
-    let our_private_key =
-        agreement::PrivateKey::from_private_key(&agreement::X25519, &our_private_bytes)
-            .map_err(|_| io::Error::other("Failed to create X25519 key"))?;
+    let our_private_key = agreement::PrivateKey::from_private_key(
+        &agreement::X25519,
+        &our_private_bytes,
+    )
+    .map_err(|_| io::Error::other("Failed to create X25519 key"))?;
     let our_public_key_bytes = our_private_key
         .compute_public_key()
         .map_err(|_| io::Error::other("Failed to compute public key"))?;
@@ -34,8 +42,10 @@ pub(super) fn generate_client_hello(conn: &mut RealityClientConnection) -> io::R
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
     // Use slice directly from client_random to avoid copying
-    let auth_key = derive_auth_key(&shared_secret, &client_random[0..20], b"REALITY")
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let auth_key =
+        derive_auth_key(&shared_secret, &client_random[0..20], b"REALITY").map_err(
+            |e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()),
+        )?;
 
     // Create session ID with REALITY metadata
     let timestamp = std::time::SystemTime::now()
@@ -48,7 +58,7 @@ pub(super) fn generate_client_hello(conn: &mut RealityClientConnection) -> io::R
     session_id_plaintext[1] = 8; // Protocol version minor
     session_id_plaintext[2] = 0; // Protocol version patch
     session_id_plaintext[3] = 0; // Padding byte
-                                 // Timestamp (4 bytes as uint32, in seconds)
+    // Timestamp (4 bytes as uint32, in seconds)
     session_id_plaintext[4..8].copy_from_slice(&(timestamp as u32).to_be_bytes());
     // Short ID (8 bytes)
     session_id_plaintext[8..16].copy_from_slice(&conn.config.short_id);
@@ -122,7 +132,8 @@ pub(super) fn generate_client_hello(conn: &mut RealityClientConnection) -> io::R
 }
 
 fn digest_client_hello(client_hello: &[u8]) -> [u8; 32] {
-    let mut ch_transcript = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
+    let mut ch_transcript =
+        aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
     ch_transcript.update(client_hello);
     let client_hello_hash = ch_transcript.finish();
     let mut client_hello_hash_arr = [0u8; 32];

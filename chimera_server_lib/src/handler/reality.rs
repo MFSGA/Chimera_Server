@@ -8,9 +8,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::async_stream::AsyncStream;
 use crate::config::server_config::RealityTransportConfig;
 use crate::handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
-use crate::reality::{BufReader, RealityServerConfig, RealityServerConnection, RealityTlsStream};
+use crate::reality::{
+    BufReader, RealityServerConfig, RealityServerConnection, RealityTlsStream,
+};
 
-async fn read_client_hello(stream: &mut Box<dyn AsyncStream>) -> io::Result<Vec<u8>> {
+async fn read_client_hello(
+    stream: &mut Box<dyn AsyncStream>,
+) -> io::Result<Vec<u8>> {
     let mut header = [0u8; 5];
     stream.read_exact(&mut header).await?;
 
@@ -103,7 +107,10 @@ pub struct RealityServerHandler {
 }
 
 impl RealityServerHandler {
-    pub fn new(config: RealityTransportConfig, inner: Box<dyn TcpServerHandler>) -> Self {
+    pub fn new(
+        config: RealityTransportConfig,
+        inner: Box<dyn TcpServerHandler>,
+    ) -> Self {
         Self {
             handshake_config: config.to_reality_server_config(),
             server_names: config.server_names,
@@ -132,18 +139,19 @@ impl TcpServerHandler for RealityServerHandler {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         format!("SNI {name} not allowed for REALITY inbound"),
-                    ))
+                    ));
                 }
                 None => {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "REALITY inbound requires an SNI value",
-                    ))
+                    ));
                 }
             }
         }
 
-        let mut reality_conn = RealityServerConnection::new(self.handshake_config.clone())?;
+        let mut reality_conn =
+            RealityServerConnection::new(self.handshake_config.clone())?;
         reality_conn.read_tls(&mut Cursor::new(&client_hello))?;
         reality_conn.process_new_packets()?;
 

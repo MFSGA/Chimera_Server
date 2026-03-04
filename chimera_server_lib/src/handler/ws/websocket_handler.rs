@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use aws_lc_rs::digest::{digest, SHA1_FOR_LEGACY_USE_ONLY};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info};
 
@@ -46,7 +46,9 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
         } = ParsedHttpData::parse(&mut server_stream).await?;
 
         let request_path = {
-            if !first_line.ends_with(" HTTP/1.0") && !first_line.ends_with(" HTTP/1.1") {
+            if !first_line.ends_with(" HTTP/1.0")
+                && !first_line.ends_with(" HTTP/1.1")
+            {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("invalid http request version: {}", first_line),
@@ -65,9 +67,13 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             first_line.split_off(4)
         };
         debug!("request path is {}", request_path);
-        let websocket_key = request_headers.remove("sec-websocket-key").ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "missing websocket key header")
-        })?;
+        let websocket_key =
+            request_headers.remove("sec-websocket-key").ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "missing websocket key header",
+                )
+            })?;
 
         'outer: for server_target in self.server_targets.iter() {
             debug!("checking server target {:?}", server_target);
@@ -92,7 +98,8 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                 }
             }
 
-            let websocket_key_response = create_websocket_key_response(websocket_key);
+            let websocket_key_response =
+                create_websocket_key_response(websocket_key);
 
             let host_response_header = match request_headers.get("host") {
                 Some(v) => format!("Host: {}\r\n", v),
@@ -115,7 +122,9 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                     "Sec-WebSocket-Accept: {}\r\n",
                     "\r\n"
                 ),
-                host_response_header, websocket_version_response_header, websocket_key_response,
+                host_response_header,
+                websocket_version_response_header,
+                websocket_key_response,
             );
 
             server_stream.write_all(http_response.as_bytes()).await?;
@@ -126,7 +135,8 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                 line_reader.unparsed_data(),
             ));
 
-            let mut target_setup_result = handler.setup_server_stream(websocket_stream).await;
+            let mut target_setup_result =
+                handler.setup_server_stream(websocket_stream).await;
 
             if let Ok(ref mut setup_result) = target_setup_result {
                 setup_result.set_need_initial_flush(true);

@@ -21,7 +21,11 @@ pub struct Tls13HandshakeKeys {
 
 /// HKDF-Expand implementation using HMAC-SHA256 directly
 /// This follows RFC 5869 Section 2.3
-pub fn hkdf_expand_sha256(prk: &[u8], info: &[u8], length: usize) -> Result<Vec<u8>> {
+pub fn hkdf_expand_sha256(
+    prk: &[u8],
+    info: &[u8],
+    length: usize,
+) -> Result<Vec<u8>> {
     use aws_lc_rs::hmac;
 
     const HASH_LEN: usize = 32; // SHA256 output length
@@ -106,7 +110,11 @@ fn hkdf_expand_label(
 }
 
 /// Derive-Secret as defined in RFC 8446 Section 7.1
-fn derive_secret(secret: &[u8], label: &[u8], messages_hash: &[u8]) -> Result<Vec<u8>> {
+fn derive_secret(
+    secret: &[u8],
+    label: &[u8],
+    messages_hash: &[u8],
+) -> Result<Vec<u8>> {
     hkdf_expand_label(secret, label, messages_hash, 32)
 }
 
@@ -164,7 +172,8 @@ pub fn derive_handshake_keys(
     let mut empty_ctx = digest::Context::new(&digest::SHA256);
     empty_ctx.update(b"");
     let empty_hash = empty_ctx.finish();
-    let derived_secret = derive_secret(&early_secret, b"derived", empty_hash.as_ref())?;
+    let derived_secret =
+        derive_secret(&early_secret, b"derived", empty_hash.as_ref())?;
 
     // 3. Handshake Secret = HKDF-Extract(salt=derived_secret, IKM=shared_secret)
     let handshake_secret = hkdf_extract(&derived_secret, shared_secret);
@@ -181,7 +190,8 @@ pub fn derive_handshake_keys(
     let mut empty_ctx_2 = digest::Context::new(&digest::SHA256);
     empty_ctx_2.update(b"");
     let empty_hash_2 = empty_ctx_2.finish();
-    let derived_secret_2 = derive_secret(&handshake_secret, b"derived", empty_hash_2.as_ref())?;
+    let derived_secret_2 =
+        derive_secret(&handshake_secret, b"derived", empty_hash_2.as_ref())?;
 
     // 7. Master Secret = HKDF-Extract(salt=derived_secret, IKM=0)
     let master_secret = hkdf_extract(&derived_secret_2, &zero_salt);
@@ -263,7 +273,10 @@ pub fn derive_application_secrets(
 ///
 /// # Returns
 /// (key, iv) tuple for AES-GCM
-pub fn derive_traffic_keys(traffic_secret: &[u8], cipher_suite: u16) -> Result<(Vec<u8>, Vec<u8>)> {
+pub fn derive_traffic_keys(
+    traffic_secret: &[u8],
+    cipher_suite: u16,
+) -> Result<(Vec<u8>, Vec<u8>)> {
     // For TLS_AES_128_GCM_SHA256 (0x1301):
     // - key_length = 16 bytes
     // - iv_length = 12 bytes
@@ -276,7 +289,7 @@ pub fn derive_traffic_keys(traffic_secret: &[u8], cipher_suite: u16) -> Result<(
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 format!("Unsupported cipher suite: 0x{:04x}", cipher_suite),
-            ))
+            ));
         }
     };
 
@@ -304,7 +317,10 @@ pub fn derive_traffic_keys(traffic_secret: &[u8], cipher_suite: u16) -> Result<(
 ///
 /// finished_key = HKDF-Expand-Label(BaseKey, "finished", "", Hash.length)
 /// verify_data = HMAC(finished_key, Transcript-Hash(Handshake Context))
-pub fn compute_finished_verify_data(base_key: &[u8], handshake_hash: &[u8]) -> Result<Vec<u8>> {
+pub fn compute_finished_verify_data(
+    base_key: &[u8],
+    handshake_hash: &[u8],
+) -> Result<Vec<u8>> {
     use aws_lc_rs::hmac;
 
     // finished_key = HKDF-Expand-Label(BaseKey, "finished", "", 32)
@@ -327,9 +343,9 @@ mod tests {
     fn test_hkdf_expand_sha256_rfc_vector() {
         // Test Case 1 from RFC 5869 (simplified - using extracted PRK directly)
         let prk = [
-            0x07, 0x77, 0x09, 0x36, 0x2c, 0x2e, 0x32, 0xdf, 0x0d, 0xdc, 0x3f, 0x0d, 0xc4, 0x7b,
-            0xba, 0x63, 0x90, 0xb6, 0xc7, 0x3b, 0xb5, 0x0f, 0x9c, 0x31, 0x22, 0xec, 0x84, 0x4a,
-            0xd7, 0xc2, 0xb3, 0xe5,
+            0x07, 0x77, 0x09, 0x36, 0x2c, 0x2e, 0x32, 0xdf, 0x0d, 0xdc, 0x3f, 0x0d,
+            0xc4, 0x7b, 0xba, 0x63, 0x90, 0xb6, 0xc7, 0x3b, 0xb5, 0x0f, 0x9c, 0x31,
+            0x22, 0xec, 0x84, 0x4a, 0xd7, 0xc2, 0xb3, 0xe5,
         ];
         let info = [0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9];
 

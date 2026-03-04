@@ -140,7 +140,10 @@ where
         Poll::Ready(Ok(()))
     }
 
-    fn complete_handshake_if_needed(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn complete_handshake_if_needed(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         while self.session.is_handshaking() {
             match self.drain_all_writes(cx) {
                 Poll::Ready(Ok(())) => {}
@@ -157,7 +160,7 @@ where
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "EOF during handshake",
-                    )))
+                    )));
                 }
                 Ok(_) => {
                     self.session.process_new_packets()?;
@@ -242,7 +245,9 @@ where
                         };
                         match this.session.write_tls(&mut adapter) {
                             Ok(_) => {}
-                            Err(ref write_err) if write_err.kind() == io::ErrorKind::WouldBlock => {
+                            Err(ref write_err)
+                                if write_err.kind() == io::ErrorKind::WouldBlock =>
+                            {
                                 break;
                             }
                             Err(_) => break,
@@ -306,7 +311,10 @@ where
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
         match this.drain_all_writes(cx) {
@@ -318,7 +326,10 @@ where
         Pin::new(&mut this.io).poll_flush(cx)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         this.session.send_close_notify();
 
@@ -341,7 +352,10 @@ where
         self.io.supports_ping()
     }
 
-    fn poll_write_ping(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+    fn poll_write_ping(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<bool>> {
         let this = self.get_mut();
         Pin::new(&mut this.io).poll_write_ping(cx)
     }

@@ -1,7 +1,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use async_trait::async_trait;
-use aws_lc_rs::digest::{digest, SHA224};
+use aws_lc_rs::digest::{SHA224, digest};
 use tokio::io::AsyncReadExt;
 
 use crate::{
@@ -35,17 +35,22 @@ pub struct TrojanTcpHandler {
 }
 
 impl TrojanTcpHandler {
-    pub fn new(users: Vec<TrojanUser>, fallbacks: Vec<TrojanFallback>, inbound_tag: &str) -> Self {
+    pub fn new(
+        users: Vec<TrojanUser>,
+        fallbacks: Vec<TrojanFallback>,
+        inbound_tag: &str,
+    ) -> Self {
         let credentials = users
             .into_iter()
             .map(|user| {
-                let identity = user.email.filter(|value| !value.is_empty()).or_else(|| {
-                    if user.password.is_empty() {
-                        None
-                    } else {
-                        Some(user.password.clone())
-                    }
-                });
+                let identity =
+                    user.email.filter(|value| !value.is_empty()).or_else(|| {
+                        if user.password.is_empty() {
+                            None
+                        } else {
+                            Some(user.password.clone())
+                        }
+                    });
                 TrojanCredential {
                     password_hash: create_password_hash(&user.password),
                     identity,
@@ -115,7 +120,8 @@ impl TcpServerHandler for TrojanTcpHandler {
             server_stream = Box::new(PrefixedStream::new(prefix, server_stream));
         }
 
-        let password_line = read_line_crlf(&mut server_stream, MAX_PASSWORD_LINE).await?;
+        let password_line =
+            read_line_crlf(&mut server_stream, MAX_PASSWORD_LINE).await?;
         if password_line.len() != 56 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -237,7 +243,9 @@ async fn read_line_crlf_with_prefix<T: AsyncReadExt + Unpin>(
     }
 }
 
-async fn read_location(stream: &mut Box<dyn AsyncStream>) -> std::io::Result<NetLocation> {
+async fn read_location(
+    stream: &mut Box<dyn AsyncStream>,
+) -> std::io::Result<NetLocation> {
     let address_type = stream.read_u8().await?;
     match address_type {
         ADDR_TYPE_IPV4 => {

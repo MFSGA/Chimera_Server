@@ -3,7 +3,7 @@ use std::{collections::HashMap, path::PathBuf, str::FromStr};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{log::LogConfig, Error};
+use crate::{Error, log::LogConfig};
 
 use super::{Protocol, SettingObject, StreamSettings, SupportedFileType, Transport};
 
@@ -26,8 +26,9 @@ impl TryFrom<PathBuf> for LiteralConfig {
         let config = match value.extension() {
             Some(ext) => match ext.to_str() {
                 Some("json") => LiteralConfig::from_str(&content)?,
-                Some("json5") => json5::from_str(&content)
-                    .map_err(|e| Error::InvalidConfig(format!("Could not parse JSON5: {}", e)))?,
+                Some("json5") => json5::from_str(&content).map_err(|e| {
+                    Error::InvalidConfig(format!("Could not parse JSON5: {}", e))
+                })?,
                 Some("yaml") => {
                     todo!()
                 }
@@ -38,14 +39,14 @@ impl TryFrom<PathBuf> for LiteralConfig {
                     return Err(Error::InvalidConfig(format!(
                         "unsupported file type: {:?}",
                         value.extension()
-                    )))
+                    )));
                 }
             },
             None => {
                 return Err(Error::InvalidConfig(format!(
                     "unknown file type {:?}",
                     value.extension()
-                )))
+                )));
             }
         };
 
@@ -58,7 +59,10 @@ impl FromStr for LiteralConfig {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         serde_json::from_str(s).map_err(|x| {
-            Error::InvalidConfig(format!("cound not parse config content {}: {}", s, x))
+            Error::InvalidConfig(format!(
+                "cound not parse config content {}: {}",
+                s, x
+            ))
         })
     }
 }

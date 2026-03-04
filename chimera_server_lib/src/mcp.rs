@@ -1,16 +1,16 @@
 use std::{collections::HashSet, net::SocketAddr, time::Duration};
 
 use axum::{
+    Router,
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
         State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::IntoResponse,
     routing::get,
-    Router,
 };
 use futures::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
@@ -35,7 +35,9 @@ struct AppState {
     update_tx: watch::Sender<u64>,
 }
 
-pub async fn start_mcp_server(config: McpServerConfig) -> std::io::Result<JoinHandle<()>> {
+pub async fn start_mcp_server(
+    config: McpServerConfig,
+) -> std::io::Result<JoinHandle<()>> {
     let McpServerConfig {
         listen,
         path,
@@ -84,7 +86,10 @@ fn normalize_path(path: String) -> String {
     }
 }
 
-async fn mcp_ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
+async fn mcp_ws_handler(
+    State(state): State<AppState>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
@@ -155,12 +160,22 @@ fn handle_incoming(
             let params = value.get("params");
 
             if jsonrpc != Some("2.0") {
-                send_error(out_tx, id.unwrap_or(Value::Null), -32600, "invalid request");
+                send_error(
+                    out_tx,
+                    id.unwrap_or(Value::Null),
+                    -32600,
+                    "invalid request",
+                );
                 return true;
             }
 
             let Some(method) = method else {
-                send_error(out_tx, id.unwrap_or(Value::Null), -32600, "invalid request");
+                send_error(
+                    out_tx,
+                    id.unwrap_or(Value::Null),
+                    -32600,
+                    "invalid request",
+                );
                 return true;
             };
 
@@ -285,7 +300,12 @@ fn send_result(out_tx: &mpsc::UnboundedSender<Message>, id: Value, result: Value
     send_json(out_tx, response);
 }
 
-fn send_error(out_tx: &mpsc::UnboundedSender<Message>, id: Value, code: i32, message: &str) {
+fn send_error(
+    out_tx: &mpsc::UnboundedSender<Message>,
+    id: Value,
+    code: i32,
+    message: &str,
+) {
     let response = json!({
         "jsonrpc": "2.0",
         "id": id,

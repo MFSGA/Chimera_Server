@@ -68,7 +68,8 @@ pub const MAX_TLS_PLAINTEXT_LEN: usize = 16384;
 pub const TLS_RECORD_HEADER_SIZE: usize = 5;
 
 /// Maximum TLS record size (ciphertext + header)
-pub const TLS_MAX_RECORD_SIZE: usize = MAX_TLS_CIPHERTEXT_LEN + TLS_RECORD_HEADER_SIZE;
+pub const TLS_MAX_RECORD_SIZE: usize =
+    MAX_TLS_CIPHERTEXT_LEN + TLS_RECORD_HEADER_SIZE;
 
 /// Buffer capacity for ciphertext read (2x TLS max record for safety)
 pub const CIPHERTEXT_READ_BUF_CAPACITY: usize = TLS_MAX_RECORD_SIZE * 2;
@@ -79,7 +80,11 @@ pub const PLAINTEXT_READ_BUF_CAPACITY: usize = TLS_MAX_RECORD_SIZE * 2;
 /// Build an encrypted close_notify alert for TLS 1.3
 ///
 /// In TLS 1.3, alerts must be encrypted like application data.
-pub fn build_close_notify_alert(key: &[u8], iv: &[u8], seq_num: u64) -> io::Result<Vec<u8>> {
+pub fn build_close_notify_alert(
+    key: &[u8],
+    iv: &[u8],
+    seq_num: u64,
+) -> io::Result<Vec<u8>> {
     // Build alert message: level(1) + description(0) + ContentType
     let alert_with_type = vec![
         ALERT_LEVEL_WARNING,
@@ -99,7 +104,8 @@ pub fn build_close_notify_alert(key: &[u8], iv: &[u8], seq_num: u64) -> io::Resu
     tls_header[3..5].copy_from_slice(&ciphertext_len.to_be_bytes());
 
     // Encrypt the alert
-    let ciphertext = encrypt_tls13_record(key, iv, seq_num, &alert_with_type, &tls_header)?;
+    let ciphertext =
+        encrypt_tls13_record(key, iv, seq_num, &alert_with_type, &tls_header)?;
 
     // Build complete TLS record
     let mut record = Vec::with_capacity(5 + ciphertext.len());
