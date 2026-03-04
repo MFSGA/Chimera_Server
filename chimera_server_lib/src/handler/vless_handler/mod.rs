@@ -125,7 +125,8 @@ impl TcpServerHandler for VlessTcpHandler {
                 let mut domain_name_len = [0u8; 1];
                 server_stream.read_exact(&mut domain_name_len).await?;
 
-                let mut domain_name_bytes = allocate_vec(domain_name_len[0] as usize);
+                let mut domain_name_bytes =
+                    allocate_vec(domain_name_len[0] as usize);
                 server_stream.read_exact(&mut domain_name_bytes).await?;
 
                 let address_str = match std::str::from_utf8(&domain_name_bytes) {
@@ -170,7 +171,9 @@ impl TcpServerHandler for VlessTcpHandler {
             stream: server_stream,
             need_initial_flush: true,
 
-            connection_success_response: Some(SERVER_RESPONSE_HEADER.to_vec().into_boxed_slice()),
+            connection_success_response: Some(
+                SERVER_RESPONSE_HEADER.to_vec().into_boxed_slice(),
+            ),
             traffic_context: Some(
                 TrafficContext::new("vless")
                     .with_identity(self.user_label.clone())
@@ -229,7 +232,10 @@ fn read_varint(data: &[u8]) -> std::io::Result<(u64, usize)> {
     }
 }
 
-async fn read_addons(stream: &mut Box<dyn AsyncStream>, addon_length: u8) -> std::io::Result<()> {
+async fn read_addons(
+    stream: &mut Box<dyn AsyncStream>,
+    addon_length: u8,
+) -> std::io::Result<()> {
     let mut addon_bytes = allocate_vec(addon_length as usize).into_boxed_slice();
     stream.read_exact(&mut addon_bytes).await?;
 

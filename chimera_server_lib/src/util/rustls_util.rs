@@ -23,7 +23,8 @@ pub fn create_server_config(
             .into_owned(),
     ];
 
-    let privkey = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_bytes).unwrap();
+    let privkey =
+        rustls::pki_types::PrivateKeyDer::from_pem_slice(key_bytes).unwrap();
 
     let builder = rustls::ServerConfig::builder_with_provider(get_crypto_provider())
         .with_safe_default_protocol_versions()

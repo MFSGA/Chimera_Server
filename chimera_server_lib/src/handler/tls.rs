@@ -9,6 +9,7 @@ use std::{
 use async_trait::async_trait;
 use rustls_pemfile::{certs, ec_private_keys, pkcs8_private_keys, rsa_private_keys};
 use tokio_rustls::{
+    TlsAcceptor,
     rustls::{
         self,
         pki_types::{
@@ -16,7 +17,6 @@ use tokio_rustls::{
             PrivateSec1KeyDer,
         },
     },
-    TlsAcceptor,
 };
 
 use crate::{
@@ -36,7 +36,11 @@ impl TlsServerHandler {
         alpn_protocols: Vec<String>,
         inner: Box<dyn TcpServerHandler>,
     ) -> io::Result<Self> {
-        let config = build_server_config(&certificate_path, &private_key_path, &alpn_protocols)?;
+        let config = build_server_config(
+            &certificate_path,
+            &private_key_path,
+            &alpn_protocols,
+        )?;
         Ok(Self {
             acceptor: TlsAcceptor::from(Arc::new(config)),
             inner,
@@ -88,7 +92,8 @@ fn build_server_config(
 fn load_certs(path: &str) -> io::Result<Vec<CertificateDer<'static>>> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
-    let certs: Vec<CertificateDer<'static>> = certs(&mut reader).collect::<Result<_, _>>()?;
+    let certs: Vec<CertificateDer<'static>> =
+        certs(&mut reader).collect::<Result<_, _>>()?;
     if certs.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

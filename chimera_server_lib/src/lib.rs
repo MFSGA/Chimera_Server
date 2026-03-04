@@ -46,9 +46,9 @@ pub enum ConfigType {
 impl ConfigType {
     pub fn try_parse(self) -> Result<LiteralConfig, Error> {
         match self {
-            ConfigType::File(file) => {
-                TryInto::<def::LiteralConfig>::try_into(std::path::PathBuf::from(file))
-            }
+            ConfigType::File(file) => TryInto::<def::LiteralConfig>::try_into(
+                std::path::PathBuf::from(file),
+            ),
 
             _ => {
                 todo!()
@@ -119,15 +119,23 @@ pub fn validate(opts: Options) -> Result<(), Error> {
     let mut api_addr = None;
     if let Some(api) = api_config.as_ref() {
         if let Some(listen) = api.listen.as_ref() {
-            api_addr = Some(listen.parse::<std::net::SocketAddr>().map_err(|err| {
-                Error::InvalidConfig(format!("invalid api.listen {}: {}", listen, err))
-            })?);
+            api_addr =
+                Some(listen.parse::<std::net::SocketAddr>().map_err(|err| {
+                    Error::InvalidConfig(format!(
+                        "invalid api.listen {}: {}",
+                        listen, err
+                    ))
+                })?);
         }
 
         if api_addr.is_none() {
             if let Some(tag) = api.tag.as_ref() {
-                if let Some(inbound) = all_inbounds.iter().find(|cfg| cfg.tag == *tag) {
-                    if let crate::address::BindLocation::Address(addr) = &inbound.bind_location {
+                if let Some(inbound) =
+                    all_inbounds.iter().find(|cfg| cfg.tag == *tag)
+                {
+                    if let crate::address::BindLocation::Address(addr) =
+                        &inbound.bind_location
+                    {
                         api_addr = Some(addr.to_socket_addr()?);
                     }
                 }
@@ -138,7 +146,10 @@ pub fn validate(opts: Options) -> Result<(), Error> {
     if let Some(mcp) = mcp_config.as_ref() {
         if let Some(listen) = mcp.listen.as_ref() {
             let _ = listen.parse::<std::net::SocketAddr>().map_err(|err| {
-                Error::InvalidConfig(format!("invalid mcp.listen {}: {}", listen, err))
+                Error::InvalidConfig(format!(
+                    "invalid mcp.listen {}: {}",
+                    listen, err
+                ))
             })?;
             let _ = mcp.update_interval_ms.max(100);
         }
@@ -198,15 +209,23 @@ async fn start_async(opts: Options) -> Result<(), Error> {
     let mut skip_inbound_tag = None;
     if let Some(api) = api_config.as_ref() {
         if let Some(listen) = api.listen.as_ref() {
-            api_addr = Some(listen.parse::<std::net::SocketAddr>().map_err(|err| {
-                Error::InvalidConfig(format!("invalid api.listen {}: {}", listen, err))
-            })?);
+            api_addr =
+                Some(listen.parse::<std::net::SocketAddr>().map_err(|err| {
+                    Error::InvalidConfig(format!(
+                        "invalid api.listen {}: {}",
+                        listen, err
+                    ))
+                })?);
         }
 
         if api_addr.is_none() {
             if let Some(tag) = api.tag.as_ref() {
-                if let Some(inbound) = all_inbounds.iter().find(|cfg| cfg.tag == *tag) {
-                    if let crate::address::BindLocation::Address(addr) = &inbound.bind_location {
+                if let Some(inbound) =
+                    all_inbounds.iter().find(|cfg| cfg.tag == *tag)
+                {
+                    if let crate::address::BindLocation::Address(addr) =
+                        &inbound.bind_location
+                    {
                         api_addr = Some(addr.to_socket_addr()?);
                         skip_inbound_tag = Some(tag.clone());
                     }
@@ -241,14 +260,19 @@ async fn start_async(opts: Options) -> Result<(), Error> {
     #[cfg(not(feature = "api"))]
     if let Some(api) = api_config.as_ref() {
         if !api.services.is_empty() {
-            tracing::warn!("api services configured but the \"api\" feature is disabled; grpc support is unavailable");
+            tracing::warn!(
+                "api services configured but the \"api\" feature is disabled; grpc support is unavailable"
+            );
         }
     }
 
     if let Some(mcp) = mcp_config.as_ref() {
         if let Some(listen) = mcp.listen.as_ref() {
             let listen = listen.parse::<std::net::SocketAddr>().map_err(|err| {
-                Error::InvalidConfig(format!("invalid mcp.listen {}: {}", listen, err))
+                Error::InvalidConfig(format!(
+                    "invalid mcp.listen {}: {}",
+                    listen, err
+                ))
             })?;
             let interval_ms = mcp.update_interval_ms.max(100);
             let mcp_handle = mcp::start_mcp_server(mcp::McpServerConfig {

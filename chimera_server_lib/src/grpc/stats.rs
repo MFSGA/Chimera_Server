@@ -57,11 +57,14 @@ impl StatsServiceImpl {
                 totals.download_bytes as i64,
             );
         }
-        let mut user_totals: HashMap<String, traffic::TransferTotals> = HashMap::new();
+        let mut user_totals: HashMap<String, traffic::TransferTotals> =
+            HashMap::new();
         for ((_, identity), totals) in snapshot.per_inbound_user {
             let entry = user_totals.entry(identity).or_default();
-            entry.upload_bytes = entry.upload_bytes.saturating_add(totals.upload_bytes);
-            entry.download_bytes = entry.download_bytes.saturating_add(totals.download_bytes);
+            entry.upload_bytes =
+                entry.upload_bytes.saturating_add(totals.upload_bytes);
+            entry.download_bytes =
+                entry.download_bytes.saturating_add(totals.download_bytes);
         }
         for (identity, totals) in user_totals {
             stats.insert(
@@ -122,8 +125,12 @@ impl StatsServiceImpl {
 
         for entry in entries {
             let matches = match &online {
-                OnlineKey::Inbound(tag) => entry.inbound_tag.as_deref() == Some(tag.as_str()),
-                OnlineKey::User(identity) => entry.identity.as_deref() == Some(identity.as_str()),
+                OnlineKey::Inbound(tag) => {
+                    entry.inbound_tag.as_deref() == Some(tag.as_str())
+                }
+                OnlineKey::User(identity) => {
+                    entry.identity.as_deref() == Some(identity.as_str())
+                }
             };
 
             if !matches {
@@ -146,15 +153,20 @@ impl StatsServiceImpl {
     }
 }
 #[tonic::async_trait]
-impl proto::xray::app::stats::command::stats_service_server::StatsService for StatsServiceImpl {
+impl proto::xray::app::stats::command::stats_service_server::StatsService
+    for StatsServiceImpl
+{
     async fn get_stats(
         &self,
         request: Request<proto::xray::app::stats::command::GetStatsRequest>,
-    ) -> Result<Response<proto::xray::app::stats::command::GetStatsResponse>, Status> {
+    ) -> Result<Response<proto::xray::app::stats::command::GetStatsResponse>, Status>
+    {
         let request = request.into_inner();
         let value = self
             .get_stat_value(&request.name, request.reset)
-            .ok_or_else(|| Status::not_found(format!("{} not found", request.name)))?;
+            .ok_or_else(|| {
+                Status::not_found(format!("{} not found", request.name))
+            })?;
         Ok(Response::new(
             proto::xray::app::stats::command::GetStatsResponse {
                 stat: Some(proto::xray::app::stats::command::Stat {
@@ -168,11 +180,12 @@ impl proto::xray::app::stats::command::stats_service_server::StatsService for St
     async fn get_stats_online(
         &self,
         request: Request<proto::xray::app::stats::command::GetStatsRequest>,
-    ) -> Result<Response<proto::xray::app::stats::command::GetStatsResponse>, Status> {
+    ) -> Result<Response<proto::xray::app::stats::command::GetStatsResponse>, Status>
+    {
         let request = request.into_inner();
-        let value = self
-            .online_stats(&request.name)
-            .ok_or_else(|| Status::not_found(format!("{} not found", request.name)))?;
+        let value = self.online_stats(&request.name).ok_or_else(|| {
+            Status::not_found(format!("{} not found", request.name))
+        })?;
         Ok(Response::new(
             proto::xray::app::stats::command::GetStatsResponse {
                 stat: Some(proto::xray::app::stats::command::Stat {
@@ -186,7 +199,8 @@ impl proto::xray::app::stats::command::stats_service_server::StatsService for St
     async fn query_stats(
         &self,
         request: Request<proto::xray::app::stats::command::QueryStatsRequest>,
-    ) -> Result<Response<proto::xray::app::stats::command::QueryStatsResponse>, Status> {
+    ) -> Result<Response<proto::xray::app::stats::command::QueryStatsResponse>, Status>
+    {
         let request = request.into_inner();
         let current_stats = self.current_stats();
         let pattern = request.pattern;
@@ -214,7 +228,8 @@ impl proto::xray::app::stats::command::stats_service_server::StatsService for St
     async fn get_sys_stats(
         &self,
         _request: Request<proto::xray::app::stats::command::SysStatsRequest>,
-    ) -> Result<Response<proto::xray::app::stats::command::SysStatsResponse>, Status> {
+    ) -> Result<Response<proto::xray::app::stats::command::SysStatsResponse>, Status>
+    {
         let uptime = self.start_time.elapsed().as_secs() as u32;
         Ok(Response::new(
             proto::xray::app::stats::command::SysStatsResponse {
@@ -235,12 +250,14 @@ impl proto::xray::app::stats::command::stats_service_server::StatsService for St
     async fn get_stats_online_ip_list(
         &self,
         request: Request<proto::xray::app::stats::command::GetStatsRequest>,
-    ) -> Result<Response<proto::xray::app::stats::command::GetStatsOnlineIpListResponse>, Status>
-    {
+    ) -> Result<
+        Response<proto::xray::app::stats::command::GetStatsOnlineIpListResponse>,
+        Status,
+    > {
         let request = request.into_inner();
-        let ips = self
-            .online_ip_list(&request.name)
-            .ok_or_else(|| Status::not_found(format!("{} not found", request.name)))?;
+        let ips = self.online_ip_list(&request.name).ok_or_else(|| {
+            Status::not_found(format!("{} not found", request.name))
+        })?;
         Ok(Response::new(
             proto::xray::app::stats::command::GetStatsOnlineIpListResponse {
                 name: request.name,
@@ -251,8 +268,13 @@ impl proto::xray::app::stats::command::stats_service_server::StatsService for St
 
     async fn get_all_online_users(
         &self,
-        _request: Request<proto::xray::app::stats::command::GetAllOnlineUsersRequest>,
-    ) -> Result<Response<proto::xray::app::stats::command::GetAllOnlineUsersResponse>, Status> {
+        _request: Request<
+            proto::xray::app::stats::command::GetAllOnlineUsersRequest,
+        >,
+    ) -> Result<
+        Response<proto::xray::app::stats::command::GetAllOnlineUsersResponse>,
+        Status,
+    > {
         let entries = traffic::active_connections();
         let mut users = HashSet::new();
         for entry in entries {
@@ -290,7 +312,9 @@ fn parse_online_name(name: &str) -> Option<OnlineKey> {
     }
 }
 pub(super) fn build_service()
--> proto::xray::app::stats::command::stats_service_server::StatsServiceServer<StatsServiceImpl> {
+-> proto::xray::app::stats::command::stats_service_server::StatsServiceServer<
+    StatsServiceImpl,
+> {
     proto::xray::app::stats::command::stats_service_server::StatsServiceServer::new(
         StatsServiceImpl::new(),
     )
@@ -599,7 +623,10 @@ mod tests {
         let name = format!("inbound>>>{tag}>>>traffic");
         let err = service
             .get_stats_online(Request::new(
-                proto::xray::app::stats::command::GetStatsRequest { name, reset: false },
+                proto::xray::app::stats::command::GetStatsRequest {
+                    name,
+                    reset: false,
+                },
             ))
             .await
             .expect_err("expected not found");

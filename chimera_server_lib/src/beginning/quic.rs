@@ -9,11 +9,15 @@ use crate::handler::hysteria2::run_hysteria2_server;
 use crate::handler::tuic::run_tuic_server;
 use crate::{
     address::BindLocation,
-    config::server_config::{quic::ServerQuicConfig, ServerConfig, ServerProxyConfig},
+    config::server_config::{
+        ServerConfig, ServerProxyConfig, quic::ServerQuicConfig,
+    },
     util::rustls_util::create_server_config,
 };
 
-pub async fn start_quic_server(config: ServerConfig) -> std::io::Result<Option<JoinHandle<()>>> {
+pub async fn start_quic_server(
+    config: ServerConfig,
+) -> std::io::Result<Option<JoinHandle<()>>> {
     let ServerConfig {
         tag,
         bind_location,
@@ -51,14 +55,21 @@ pub async fn start_quic_server(config: ServerConfig) -> std::io::Result<Option<J
 
     match protocol {
         #[cfg(feature = "hysteria")]
-        ServerProxyConfig::Hysteria2 { config } => Ok(Some(tokio::spawn(async move {
-            if let Err(err) = run_hysteria2_server(bind_address, server_config, config, tag).await {
-                tracing::error!("hysteria2 server stopped with error: {}", err);
-            }
-        }))),
+        ServerProxyConfig::Hysteria2 { config } => {
+            Ok(Some(tokio::spawn(async move {
+                if let Err(err) =
+                    run_hysteria2_server(bind_address, server_config, config, tag)
+                        .await
+                {
+                    tracing::error!("hysteria2 server stopped with error: {}", err);
+                }
+            })))
+        }
         #[cfg(feature = "tuic")]
         ServerProxyConfig::TuicV5 { config } => Ok(Some(tokio::spawn(async move {
-            if let Err(err) = run_tuic_server(bind_address, server_config, config, tag).await {
+            if let Err(err) =
+                run_tuic_server(bind_address, server_config, config, tag).await
+            {
                 tracing::error!("tuic server stopped with error: {}", err);
             }
         }))),

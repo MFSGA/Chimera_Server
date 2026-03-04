@@ -71,7 +71,8 @@ pub fn generate_hmac_certificate(
     let public_key_bytes = signing_key.public_key().as_ref();
 
     // Replace signature with HMAC
-    let cert_with_hmac = replace_signature_with_hmac(cert_der, auth_key, public_key_bytes)?;
+    let cert_with_hmac =
+        replace_signature_with_hmac(cert_der, auth_key, public_key_bytes)?;
 
     tracing::debug!("REALITY DEBUG: Replaced signature with HMAC");
 
@@ -96,7 +97,8 @@ fn replace_signature_with_hmac(
     // Search backwards for BIT STRING tag
     let mut sig_offset = None;
     for i in (0..cert_der.len().saturating_sub(66)).rev() {
-        if cert_der[i] == 0x03 && cert_der[i + 1] == 0x41 && cert_der[i + 2] == 0x00 {
+        if cert_der[i] == 0x03 && cert_der[i + 1] == 0x41 && cert_der[i + 2] == 0x00
+        {
             // Found it!
             sig_offset = Some(i + 3); // Skip tag, length, unused bits
             break;

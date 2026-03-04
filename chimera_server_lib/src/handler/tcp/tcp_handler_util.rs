@@ -3,9 +3,13 @@ use crate::handler::reality::RealityServerHandler;
 #[cfg(feature = "vless")]
 use crate::handler::vless_handler::VlessTcpHandler;
 #[cfg(feature = "ws")]
-use crate::handler::ws::{create_websocket_server_target, WebsocketTcpServerHandler};
+use crate::handler::ws::{
+    WebsocketTcpServerHandler, create_websocket_server_target,
+};
 #[cfg(feature = "tls")]
-use crate::{config::server_config::TlsServerConfig, handler::tls::TlsServerHandler};
+use crate::{
+    config::server_config::TlsServerConfig, handler::tls::TlsServerHandler,
+};
 use crate::{
     config::{rule::RuleConfig, server_config::ServerProxyConfig},
     handler::socks::SocksTcpServerHandler,
@@ -30,14 +34,20 @@ pub fn create_tcp_server_handler(
             let server_targets = targets
                 .into_vec()
                 .into_iter()
-                .map(|config| create_websocket_server_target(config, inbound_tag, rules_stack))
+                .map(|config| {
+                    create_websocket_server_target(config, inbound_tag, rules_stack)
+                })
                 .collect::<Vec<_>>();
             Box::new(WebsocketTcpServerHandler::new(server_targets))
         }
         #[cfg(feature = "trojan")]
-        ServerProxyConfig::Trojan { users, fallbacks } => Box::new(
-            crate::handler::trojan::TrojanTcpHandler::new(users, fallbacks, inbound_tag),
-        ),
+        ServerProxyConfig::Trojan { users, fallbacks } => {
+            Box::new(crate::handler::trojan::TrojanTcpHandler::new(
+                users,
+                fallbacks,
+                inbound_tag,
+            ))
+        }
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(tls_config) => {
             let TlsServerConfig {
@@ -46,7 +56,8 @@ pub fn create_tcp_server_handler(
                 alpn_protocols,
                 inner,
             } = tls_config;
-            let inner_handler = create_tcp_server_handler(*inner, inbound_tag, rules_stack);
+            let inner_handler =
+                create_tcp_server_handler(*inner, inbound_tag, rules_stack);
             Box::new(
                 TlsServerHandler::new(
                     certificate_path,

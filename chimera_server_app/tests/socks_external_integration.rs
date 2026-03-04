@@ -85,7 +85,9 @@ impl ServerProcess {
                 let logs = self.logs();
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    format!("timeout waiting for socks listener {socks_addr}; logs:\n{logs}"),
+                    format!(
+                        "timeout waiting for socks listener {socks_addr}; logs:\n{logs}"
+                    ),
                 ));
             }
 
@@ -123,7 +125,8 @@ fn unique_test_dir() -> io::Result<PathBuf> {
         .as_millis();
     let pid = std::process::id();
     let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("chimera-socks-e2e-{pid}-{millis}-{test_id}"));
+    let path = std::env::temp_dir()
+        .join(format!("chimera-socks-e2e-{pid}-{millis}-{test_id}"));
     fs::create_dir_all(&path)?;
     trace_step(format!("allocated temporary test dir {}", path.display()));
     Ok(path)
@@ -297,7 +300,10 @@ fn socks_roundtrip_password(
     Ok(echoed)
 }
 
-fn write_connect_request(stream: &mut TcpStream, target_addr: SocketAddrV4) -> io::Result<()> {
+fn write_connect_request(
+    stream: &mut TcpStream,
+    target_addr: SocketAddrV4,
+) -> io::Result<()> {
     trace_step(format!("sending connect request to {}", target_addr));
     let ip = target_addr.ip().octets();
     let port = target_addr.port().to_be_bytes();
@@ -324,7 +330,8 @@ fn socks_noauth_external_roundtrip() {
     let _guard = global_test_lock()
         .lock()
         .expect("failed to acquire test lock");
-    let (echo_addr, echo_handle) = spawn_echo_server().expect("failed to start echo server");
+    let (echo_addr, echo_handle) =
+        spawn_echo_server().expect("failed to start echo server");
     let socks_port = free_localhost_port().expect("failed to allocate socks port");
     let socks_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, socks_port);
 
@@ -354,7 +361,8 @@ fn socks_noauth_external_roundtrip() {
         socks_addr, echo_addr
     ));
 
-    let mut server = ServerProcess::spawn(&config).expect("failed to spawn chimera process");
+    let mut server =
+        ServerProcess::spawn(&config).expect("failed to spawn chimera process");
     server
         .wait_until_ready(SocketAddr::V4(socks_addr))
         .unwrap_or_else(|err| panic!("chimera not ready: {err}"));
@@ -362,7 +370,9 @@ fn socks_noauth_external_roundtrip() {
     let payload = b"chimera-socks-noauth-e2e";
     trace_step(format!("test payload={}", String::from_utf8_lossy(payload)));
     let echoed = socks_roundtrip_noauth(socks_addr, echo_addr, payload)
-        .unwrap_or_else(|err| panic!("noauth roundtrip failed: {err}; logs:\n{}", server.logs()));
+        .unwrap_or_else(|err| {
+            panic!("noauth roundtrip failed: {err}; logs:\n{}", server.logs())
+        });
     assert_eq!(echoed, payload);
     trace_step("assertion passed: noauth echoed payload matches input");
 
@@ -377,7 +387,8 @@ fn socks_password_external_roundtrip() {
     let _guard = global_test_lock()
         .lock()
         .expect("failed to acquire test lock");
-    let (echo_addr, echo_handle) = spawn_echo_server().expect("failed to start echo server");
+    let (echo_addr, echo_handle) =
+        spawn_echo_server().expect("failed to start echo server");
     let socks_port = free_localhost_port().expect("failed to allocate socks port");
     let socks_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, socks_port);
 
@@ -415,15 +426,19 @@ fn socks_password_external_roundtrip() {
         socks_addr, echo_addr, username
     ));
 
-    let mut server = ServerProcess::spawn(&config).expect("failed to spawn chimera process");
+    let mut server =
+        ServerProcess::spawn(&config).expect("failed to spawn chimera process");
     server
         .wait_until_ready(SocketAddr::V4(socks_addr))
         .unwrap_or_else(|err| panic!("chimera not ready: {err}"));
 
     let payload = b"chimera-socks-password-e2e";
     trace_step(format!("test payload={}", String::from_utf8_lossy(payload)));
-    let echoed = socks_roundtrip_password(socks_addr, echo_addr, username, password, payload)
-        .unwrap_or_else(|err| panic!("password roundtrip failed: {err}; logs:\n{}", server.logs()));
+    let echoed =
+        socks_roundtrip_password(socks_addr, echo_addr, username, password, payload)
+            .unwrap_or_else(|err| {
+                panic!("password roundtrip failed: {err}; logs:\n{}", server.logs())
+            });
     assert_eq!(echoed, payload);
     trace_step("assertion passed: password echoed payload matches input");
 

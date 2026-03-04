@@ -113,6 +113,7 @@ mod traffic_noop {
 
 #[cfg(not(feature = "traffic"))]
 pub use traffic_noop::{
-    active_connection_count, active_connections, record_transfer, register_connection, snapshot,
-    ActiveConnectionSnapshot, ConnectionGuard, TrafficContext, TrafficSnapshot, TransferTotals,
+    ActiveConnectionSnapshot, ConnectionGuard, TrafficContext, TrafficSnapshot,
+    TransferTotals, active_connection_count, active_connections, record_transfer,
+    register_connection, snapshot,
 };

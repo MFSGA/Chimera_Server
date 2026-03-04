@@ -7,9 +7,13 @@ use super::reality_io_state::RealityIoState;
 use super::reality_reader_writer::{RealityReader, RealityWriter};
 use super::reality_records::encrypt_plaintext_to_records;
 use super::slide_buffer::SlideBuffer;
-use crate::reality::common::{self, CIPHERTEXT_READ_BUF_CAPACITY, PLAINTEXT_READ_BUF_CAPACITY};
+use crate::reality::common::{
+    self, CIPHERTEXT_READ_BUF_CAPACITY, PLAINTEXT_READ_BUF_CAPACITY,
+};
 use handshake::generate_client_hello;
-use process::{process_application_data, process_encrypted_handshake, process_server_hello};
+use process::{
+    process_application_data, process_encrypted_handshake, process_server_hello,
+};
 
 /// Configuration for REALITY client connections
 #[derive(Clone)]
@@ -38,7 +42,7 @@ enum HandshakeState {
         master_secret: Vec<u8>,
         cipher_suite: u16,
         handshake_transcript_bytes: Vec<u8>, // Accumulated transcript for hash computation
-        auth_key: [u8; 32],                  // REALITY authentication key for HMAC verification
+        auth_key: [u8; 32], // REALITY authentication key for HMAC verification
     },
     /// Handshake complete, ready for application data
     Complete,
@@ -107,7 +111,9 @@ impl RealityClientConnection {
     /// Uses pre-allocated buffer to avoid allocation on every call.
     pub fn read_tls(&mut self, rd: &mut dyn Read) -> io::Result<usize> {
         // Compact if remaining capacity is insufficient for a full TLS record
-        if self.ciphertext_read_buf.remaining_capacity() < common::TLS_MAX_RECORD_SIZE {
+        if self.ciphertext_read_buf.remaining_capacity()
+            < common::TLS_MAX_RECORD_SIZE
+        {
             self.ciphertext_read_buf.compact();
         }
 
@@ -162,15 +168,16 @@ impl RealityClientConnection {
 
         // Encrypt any pending plaintext (with automatic fragmentation for large data)
         if !self.plaintext_write_buf.is_empty() {
-            let (app_write_key, app_write_iv) = match (&self.app_write_key, &self.app_write_iv) {
-                (Some(key), Some(iv)) => (key, iv),
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Application keys not available",
-                    ))
-                }
-            };
+            let (app_write_key, app_write_iv) =
+                match (&self.app_write_key, &self.app_write_iv) {
+                    (Some(key), Some(iv)) => (key, iv),
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Application keys not available",
+                        ));
+                    }
+                };
 
             encrypt_plaintext_to_records(
                 &mut self.plaintext_write_buf,
@@ -200,12 +207,17 @@ impl RealityClientConnection {
     pub fn send_close_notify(&mut self) {
         // In TLS 1.3, alerts must be encrypted like application data
         if !matches!(self.handshake_state, HandshakeState::Complete) {
-            tracing::debug!("REALITY CLIENT: Cannot send close_notify - handshake not complete");
+            tracing::debug!(
+                "REALITY CLIENT: Cannot send close_notify - handshake not complete"
+            );
             return;
         }
 
         // Get application keys
-        let (app_write_key, app_write_iv) = match (&self.app_write_key, &self.app_write_iv) {
+        let (app_write_key, app_write_iv) = match (
+            &self.app_write_key,
+            &self.app_write_iv,
+        ) {
             (Some(key), Some(iv)) => (key, iv),
             _ => {
                 tracing::debug!(
@@ -216,14 +228,23 @@ impl RealityClientConnection {
         };
 
         // Use common helper to build encrypted close_notify alert
-        match common::build_close_notify_alert(app_write_key, app_write_iv, self.write_seq) {
+        match common::build_close_notify_alert(
+            app_write_key,
+            app_write_iv,
+            self.write_seq,
+        ) {
             Ok(record) => {
                 self.write_seq += 1;
                 self.ciphertext_write_buf.extend_from_slice(&record);
-                tracing::debug!("REALITY CLIENT: Encrypted close_notify alert queued");
+                tracing::debug!(
+                    "REALITY CLIENT: Encrypted close_notify alert queued"
+                );
             }
             Err(e) => {
-                tracing::error!("REALITY CLIENT: Failed to encrypt close_notify: {}", e);
+                tracing::error!(
+                    "REALITY CLIENT: Failed to encrypt close_notify: {}",
+                    e
+                );
             }
         }
     }

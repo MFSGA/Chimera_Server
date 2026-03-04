@@ -21,12 +21,16 @@ mod sync_adapter;
 use serde::Deserialize;
 
 pub use buf_reader::BufReader;
-pub use client::{feed_reality_client_connection, RealityClientConfig, RealityClientConnection};
+pub use client::{
+    RealityClientConfig, RealityClientConnection, feed_reality_client_connection,
+};
 pub use reality_reader_writer::{RealityReader, RealityWriter};
 pub use reality_server_connection::{
-    feed_reality_server_connection, RealityServerConfig, RealityServerConnection,
+    RealityServerConfig, RealityServerConnection, feed_reality_server_connection,
 };
-pub use reality_util::{decode_private_key, decode_public_key, decode_short_id, generate_keypair};
+pub use reality_util::{
+    decode_private_key, decode_public_key, decode_short_id, generate_keypair,
+};
 pub use stream::RealityTlsStream;
 
 /// mihomo (Clash.Meta) reality-opts helper for building a client config.
@@ -51,10 +55,13 @@ impl MihomoRealityOpts {
         &self,
         default_server_name: &str,
     ) -> Result<RealityClientConfig, crate::Error> {
-        let public_key = decode_public_key(&self.public_key)
-            .map_err(|e| crate::Error::InvalidConfig(format!("invalid reality public key: {e}")))?;
+        let public_key = decode_public_key(&self.public_key).map_err(|e| {
+            crate::Error::InvalidConfig(format!("invalid reality public key: {e}"))
+        })?;
         let short_id = decode_short_id(self.short_id.as_deref().unwrap_or(""))
-            .map_err(|e| crate::Error::InvalidConfig(format!("invalid reality short_id: {e}")))?;
+            .map_err(|e| {
+                crate::Error::InvalidConfig(format!("invalid reality short_id: {e}"))
+            })?;
         let server_name = self
             .server_name
             .clone()

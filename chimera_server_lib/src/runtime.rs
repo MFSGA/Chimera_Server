@@ -15,7 +15,10 @@ pub struct RuntimeState {
 }
 
 impl RuntimeState {
-    pub fn new(inbounds: Vec<ServerConfig>, outbounds: Vec<OutboundSummary>) -> Self {
+    pub fn new(
+        inbounds: Vec<ServerConfig>,
+        outbounds: Vec<OutboundSummary>,
+    ) -> Self {
         Self {
             inbounds: Arc::new(RwLock::new(inbounds)),
             outbounds: Arc::new(RwLock::new(outbounds)),

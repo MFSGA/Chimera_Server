@@ -11,7 +11,10 @@ use super::super::types::TlsServerConfig;
 use crate::address::{Address, NetLocation};
 
 #[cfg(feature = "reality")]
-fn parse_version_triplet(value: &Option<String>, field: &str) -> Result<Option<[u8; 3]>, Error> {
+fn parse_version_triplet(
+    value: &Option<String>,
+    field: &str,
+) -> Result<Option<[u8; 3]>, Error> {
     match value {
         None => Ok(None),
         Some(text) if text.trim().is_empty() => Ok(None),
@@ -23,9 +26,9 @@ fn parse_version_triplet(value: &Option<String>, field: &str) -> Result<Option<[
                 .take(3)
                 .enumerate()
             {
-                parts[idx] = part
-                    .parse::<u8>()
-                    .map_err(|_| Error::InvalidConfig(format!("invalid {field} value: {text}")))?;
+                parts[idx] = part.parse::<u8>().map_err(|_| {
+                    Error::InvalidConfig(format!("invalid {field} value: {text}"))
+                })?;
             }
             Ok(Some(parts))
         }
@@ -37,38 +40,46 @@ fn build_reality_layer(
     protocol: ServerProxyConfig,
     stream_settings: &StreamSettings,
 ) -> Result<ServerProxyConfig, Error> {
-    let settings = stream_settings
-        .reality_settings
-        .as_ref()
-        .ok_or_else(|| Error::InvalidConfig("reality inbound requires realitySettings".into()))?;
+    let settings = stream_settings.reality_settings.as_ref().ok_or_else(|| {
+        Error::InvalidConfig("reality inbound requires realitySettings".into())
+    })?;
 
     let dest = NetLocation::from_str(&settings.dest, Some(443)).map_err(|_| {
-        Error::InvalidConfig(format!("invalid reality.dest value: {}", settings.dest))
+        Error::InvalidConfig(format!(
+            "invalid reality.dest value: {}",
+            settings.dest
+        ))
     })?;
 
     if !matches!(dest.address(), Address::Hostname(_)) {
         return Err(Error::InvalidConfig(
-            "reality.dest must be a hostname (ip addresses are not supported)".into(),
+            "reality.dest must be a hostname (ip addresses are not supported)"
+                .into(),
         ));
     }
 
-    let private_key = decode_private_key(&settings.private_key)
-        .map_err(|err| Error::InvalidConfig(format!("invalid reality privateKey: {err}")))?;
+    let private_key = decode_private_key(&settings.private_key).map_err(|err| {
+        Error::InvalidConfig(format!("invalid reality privateKey: {err}"))
+    })?;
 
     let short_ids = settings
         .short_ids
         .iter()
         .map(|short_id| {
             decode_short_id(short_id).map_err(|err| {
-                Error::InvalidConfig(format!("invalid reality shortId {short_id}: {err}"))
+                Error::InvalidConfig(format!(
+                    "invalid reality shortId {short_id}: {err}"
+                ))
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
 
     // Keep xray-core style behavior: maxTimeDiff = 0 means disabled.
     let max_time_diff = settings.max_time_diff.filter(|diff| *diff > 0);
-    let min_client_version = parse_version_triplet(&settings.min_client_ver, "minClientVer")?;
-    let max_client_version = parse_version_triplet(&settings.max_client_ver, "maxClientVer")?;
+    let min_client_version =
+        parse_version_triplet(&settings.min_client_ver, "minClientVer")?;
+    let max_client_version =
+        parse_version_triplet(&settings.max_client_ver, "maxClientVer")?;
 
     let mut server_names = settings.server_names.clone();
     if server_names.is_empty() {
@@ -102,7 +113,9 @@ fn build_tls_layer(
         .certificates
         .get(0)
         .ok_or_else(|| {
-            Error::InvalidConfig("tls inbound requires at least one certificate".into())
+            Error::InvalidConfig(
+                "tls inbound requires at least one certificate".into(),
+            )
         })?
         .clone();
 

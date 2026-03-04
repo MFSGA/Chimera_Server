@@ -91,7 +91,10 @@ pub fn extract_certificate_der(certificate_message: &[u8]) -> io::Result<&[u8]> 
 ///
 /// Uses proper X.509 parsing via x509-parser crate for robust extraction.
 #[inline]
-pub fn verify_certificate_hmac(cert_der: &[u8], auth_key: &[u8; 32]) -> io::Result<()> {
+pub fn verify_certificate_hmac(
+    cert_der: &[u8],
+    auth_key: &[u8; 32],
+) -> io::Result<()> {
     // Parse the X.509 certificate properly
     let (_, cert) = X509Certificate::from_der(cert_der).map_err(|e| {
         io::Error::new(
