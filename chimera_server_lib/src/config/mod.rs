@@ -168,11 +168,11 @@ pub struct RealitySettings {
     pub private_key: String,
     pub short_ids: Vec<String>,
     pub dest: String,
-    #[serde(default, alias = "maxTimediff")]
+    #[serde(default, alias = "maxTimediff", alias = "maxTimeDiff")]
     pub max_time_diff: Option<u64>,
-    #[serde(default, alias = "minClient")]
+    #[serde(default, alias = "minClient", alias = "minClientVer")]
     pub min_client_ver: Option<String>,
-    #[serde(default, alias = "maxClient")]
+    #[serde(default, alias = "maxClient", alias = "maxClientVer")]
     pub max_client_ver: Option<String>,
     #[serde(default)]
     pub fingerprint: Option<String>,
