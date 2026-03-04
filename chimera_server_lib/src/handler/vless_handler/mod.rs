@@ -4,7 +4,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use async_trait::async_trait;
 use tokio::io::AsyncReadExt;
-use tracing::info;
+use tracing::warn;
 
 use crate::{
     address::{Address, NetLocation},
@@ -54,9 +54,31 @@ impl TcpServerHandler for VlessTcpHandler {
             ));
         }
 
+        if self.user_id.len() != 16 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "configured VLESS user id length is {}, expected 16 bytes",
+                    self.user_id.len()
+                ),
+            ));
+        }
+
         let target_id = &prefix[1..17];
-        for (b1, b2) in self.user_id.iter().zip(target_id.iter()) {
-            info!("todo: add the user check b1: {}, b2: {}", b1, b2);
+        if self.user_id.as_ref() != target_id {
+            let expected = encode_hex(self.user_id.as_ref());
+            let got = encode_hex(target_id);
+            warn!(
+                inbound_tag = %self.inbound_tag,
+                expected = %expected,
+                got = %got,
+                "VLESS inbound rejected request with mismatched user id"
+            );
+
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("invalid VLESS user id: {got}"),
+            ));
         }
 
         let addon_length = prefix[17];
@@ -175,6 +197,15 @@ fn parse_hex(hex_asm: &str) -> Box<[u8]> {
         bytes.push(h << 4 | l)
     }
     bytes.into_boxed_slice()
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 
 fn read_varint(data: &[u8]) -> std::io::Result<(u64, usize)> {
