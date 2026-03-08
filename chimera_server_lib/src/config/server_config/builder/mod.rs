@@ -169,12 +169,6 @@ impl TryFrom<InboudItem> for ServerConfig {
                             .as_deref()
                             .unwrap_or("none")
                             .to_ascii_lowercase();
-                        if security != "none" {
-                            return Err(Error::InvalidConfig(
-                                "xhttp inbound currently supports only security=none"
-                                    .into(),
-                            ));
-                        }
 
                         let xhttp_settings =
                             stream_setting.xhttp_settings.clone().ok_or_else(|| {
@@ -187,6 +181,19 @@ impl TryFrom<InboudItem> for ServerConfig {
                             config: collect_xhttp_settings(xhttp_settings)?,
                             inner: Box::new(protocol),
                         };
+
+                        match security.as_str() {
+                            "none" => {}
+                            "tls" => {
+                                protocol =
+                                    apply_security_layers(protocol, stream_setting)?;
+                            }
+                            unsupported => {
+                                return Err(Error::InvalidConfig(format!(
+                                    "xhttp inbound currently supports only security=none or tls, got {unsupported}"
+                                )));
+                            }
+                        }
                     } else {
                         protocol = apply_security_layers(protocol, stream_setting)?;
                     }
