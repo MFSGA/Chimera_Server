@@ -1,10 +1,8 @@
-use std::collections::HashMap;
-
 use serde::Deserialize;
 
 use crate::{
     Error,
-    config::{HysteriaSettings, SettingObject},
+    config::{HysteriaSettings, SettingObject, XhttpRange, XhttpSettings},
     util::bandwidth::{BandwidthValue, parse_bandwidth},
 };
 
@@ -288,45 +286,53 @@ pub(super) fn collect_socks_accounts(
 }
 
 pub(super) fn collect_xhttp_settings(
-    settings: SettingObject,
+    raw: XhttpSettings,
 ) -> Result<XhttpServerConfig, Error> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct RawXhttpSettings {
-        upstream: String,
-        host: Option<String>,
-        path: Option<String>,
-        headers: Option<HashMap<String, String>>,
-        x_padding_bytes: Option<RangeConfig>,
-    }
-
-    let raw: RawXhttpSettings = settings.deserialize().map_err(|e| {
-        Error::InvalidConfig(format!("failed to parse xhttp settings: {}", e))
-    })?;
-
-    if raw.upstream.trim().is_empty() {
-        return Err(Error::InvalidConfig(
-            "xhttp settings require a non-empty upstream address".into(),
-        ));
-    }
-
     let normalized_path = normalize_path(raw.path);
-    let (min_padding, max_padding) = raw
-        .x_padding_bytes
-        .unwrap_or_else(|| RangeConfig {
+    let (min_padding, max_padding) = clamp_xhttp_range(
+        raw.x_padding_bytes.unwrap_or(XhttpRange {
             from: 100,
             to: 1000,
-        })
-        .clamp_with_defaults(100, 1000);
+        }),
+        100,
+        1000,
+    );
+    let (_, max_each_post_bytes) = clamp_xhttp_range(
+        raw.sc_max_each_post_bytes.unwrap_or(XhttpRange {
+            from: 1_000_000,
+            to: 1_000_000,
+        }),
+        1_000_000,
+        1_000_000,
+    );
+    let (_, session_ttl_secs) = clamp_xhttp_range(
+        raw.sc_stream_up_server_secs
+            .unwrap_or(XhttpRange { from: 30, to: 30 }),
+        30,
+        30,
+    );
 
     Ok(XhttpServerConfig {
-        upstream: raw.upstream,
         host: raw.host.map(|h| h.to_ascii_lowercase()),
         path: normalized_path,
         min_padding,
         max_padding,
-        headers: raw.headers.unwrap_or_default(),
+        max_each_post_bytes,
+        max_buffered_posts: raw.sc_max_buffered_posts.unwrap_or(30).max(1) as usize,
+        session_ttl_secs: session_ttl_secs as u64,
     })
+}
+
+fn clamp_xhttp_range(
+    range: XhttpRange,
+    default_from: i32,
+    default_to: i32,
+) -> (usize, usize) {
+    RangeConfig {
+        from: range.from,
+        to: range.to,
+    }
+    .clamp_with_defaults(default_from, default_to)
 }
 
 #[cfg(feature = "tuic")]
@@ -414,5 +420,19 @@ mod tests {
             matches!(err, Error::InvalidConfig(_)),
             "expected InvalidConfig"
         );
+    }
+
+    #[test]
+    fn collect_xhttp_settings_applies_reference_defaults() {
+        let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
+            "path": "/xhttp/"
+        }))
+        .expect("xhttp settings");
+
+        let config = collect_xhttp_settings(settings).expect("valid xhttp settings");
+        assert_eq!(config.path, "/xhttp");
+        assert_eq!(config.max_each_post_bytes, 1_000_000);
+        assert_eq!(config.max_buffered_posts, 30);
+        assert_eq!(config.session_ttl_secs, 30);
     }
 }
