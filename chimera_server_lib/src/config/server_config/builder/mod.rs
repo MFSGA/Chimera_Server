@@ -139,25 +139,57 @@ impl TryFrom<InboudItem> for ServerConfig {
                     user_id: user_id.clone(),
                     user_label: user_label.clone(),
                 };
+                let uses_xhttp = stream_settings
+                    .as_ref()
+                    .map(|settings| settings.network.eq_ignore_ascii_case("xhttp"))
+                    .unwrap_or(false);
 
                 #[cfg(feature = "ws")]
-                if let Some(stream_setting) = stream_settings.as_ref() {
-                    if let Some(ws_setting) = stream_setting.ws_settings.clone() {
-                        tracing::info!("use websocket");
-                        protocol = ServerProxyConfig::Websocket {
-                            targets: Box::new(OneOrSome::One(
-                                WebsocketServerConfig {
-                                    matching_path: ws_setting.path,
-                                    matching_headers: None,
-                                    protocol,
-                                },
-                            )),
-                        };
+                if !uses_xhttp {
+                    if let Some(stream_setting) = stream_settings.as_ref() {
+                        if let Some(ws_setting) = stream_setting.ws_settings.clone() {
+                            tracing::info!("use websocket");
+                            protocol = ServerProxyConfig::Websocket {
+                                targets: Box::new(OneOrSome::One(
+                                    WebsocketServerConfig {
+                                        matching_path: ws_setting.path,
+                                        matching_headers: None,
+                                        protocol,
+                                    },
+                                )),
+                            };
+                        }
                     }
                 }
 
                 if let Some(stream_setting) = stream_settings.as_ref() {
-                    protocol = apply_security_layers(protocol, stream_setting)?;
+                    if uses_xhttp {
+                        let security = stream_setting
+                            .security
+                            .as_deref()
+                            .unwrap_or("none")
+                            .to_ascii_lowercase();
+                        if security != "none" {
+                            return Err(Error::InvalidConfig(
+                                "xhttp inbound currently supports only security=none"
+                                    .into(),
+                            ));
+                        }
+
+                        let xhttp_settings =
+                            stream_setting.xhttp_settings.clone().ok_or_else(|| {
+                                Error::InvalidConfig(
+                                    "xhttp inbound requires xhttpSettings".into(),
+                                )
+                            })?;
+
+                        protocol = ServerProxyConfig::Xhttp {
+                            config: collect_xhttp_settings(xhttp_settings)?,
+                            inner: Box::new(protocol),
+                        };
+                    } else {
+                        protocol = apply_security_layers(protocol, stream_setting)?;
+                    }
                 }
 
                 return Ok(ServerConfig {
@@ -256,20 +288,10 @@ impl TryFrom<InboudItem> for ServerConfig {
             }
 
             Protocol::Xhttp => {
-                let settings = settings.ok_or_else(|| {
-                    Error::InvalidConfig("xhttp inbound requires settings".into())
-                })?;
-                let xhttp_config = collect_xhttp_settings(settings)?;
-
-                Ok(ServerConfig {
-                    tag,
-                    bind_location,
-                    protocol: ServerProxyConfig::Xhttp {
-                        config: xhttp_config,
-                    },
-                    transport: Transport::Tcp,
-                    quic_settings: None,
-                })
+                Err(Error::InvalidConfig(
+                    "protocol=xhttp is no longer supported; use protocol=vless with streamSettings.network=xhttp"
+                        .into(),
+                ))
             }
 
             Protocol::Socks => {
