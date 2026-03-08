@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     convert::Infallible,
+    fs,
     pin::Pin,
     sync::{
         Arc, RwLock,
@@ -27,8 +28,10 @@ use tokio::{
     sync::Mutex,
     time::{Duration, sleep},
 };
+#[cfg(feature = "tls")]
+use tokio_rustls::TlsAcceptor;
 use tokio_util::io::ReaderStream;
-use tracing::error;
+use tracing::{debug, error};
 
 use crate::{
     address::BindLocation,
@@ -38,6 +41,10 @@ use crate::{
         tcp_handler::TcpServerHandler, tcp_handler_util::create_tcp_server_handler,
     },
     resolver::{NativeResolver, Resolver},
+};
+#[cfg(feature = "tls")]
+use crate::{
+    config::server_config::TlsServerConfig, util::rustls_util::create_server_config,
 };
 
 use super::process_stream;
@@ -56,24 +63,26 @@ pub async fn start_xhttp_server(
         ..
     } = config;
 
-    let ServerProxyConfig::Xhttp {
-        config: xhttp_config,
-        inner,
-    } = protocol
-    else {
-        return Err(std::io::Error::other("invalid protocol for xhttp server"));
-    };
+    let listener_config = parse_listener_protocol(protocol)?;
 
     let bind_addr = match bind_location {
         BindLocation::Address(address) => address.to_socket_addr()?,
     };
 
     let mut rules_stack = vec![];
-    let server_handler =
-        Arc::new(create_tcp_server_handler(*inner, &tag, &mut rules_stack));
+    let server_handler = Arc::new(create_tcp_server_handler(
+        listener_config.inner,
+        &tag,
+        &mut rules_stack,
+    ));
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
-    let state = Arc::new(AppState::new(xhttp_config, server_handler, resolver));
+    let state = Arc::new(AppState::new(
+        listener_config.xhttp_config,
+        server_handler,
+        resolver,
+    ));
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    let tls_acceptor = listener_config.tls_acceptor.clone();
 
     let handle = tokio::spawn(async move {
         loop {
@@ -86,22 +95,101 @@ pub async fn start_xhttp_server(
             };
             let _ = stream.set_nodelay(true);
 
-            let io = TokioIo::new(stream);
             let state = state.clone();
+            let tls_acceptor = tls_acceptor.clone();
             tokio::spawn(async move {
-                let builder = auto::Builder::new(TokioExecutor::new());
-                let service = service_fn(move |request| {
-                    handle_request(request, state.clone(), peer_addr)
-                });
-
-                if let Err(err) = builder.serve_connection(io, service).await {
-                    error!("xhttp connection {} exited: {}", peer_addr, err);
+                #[cfg(feature = "tls")]
+                if let Some(acceptor) = tls_acceptor {
+                    match acceptor.accept(stream).await {
+                        Ok(tls_stream) => {
+                            serve_http_connection(tls_stream, state, peer_addr)
+                                .await;
+                        }
+                        Err(err) => {
+                            error!("xhttp tls accept {} failed: {}", peer_addr, err);
+                        }
+                    }
+                    return;
                 }
+
+                serve_http_connection(stream, state, peer_addr).await;
             });
         }
     });
 
     Ok(vec![handle])
+}
+
+struct XhttpListenerConfig {
+    xhttp_config: XhttpServerConfig,
+    inner: ServerProxyConfig,
+    #[cfg(feature = "tls")]
+    tls_acceptor: Option<TlsAcceptor>,
+    #[cfg(not(feature = "tls"))]
+    tls_acceptor: Option<()>,
+}
+
+fn parse_listener_protocol(
+    protocol: ServerProxyConfig,
+) -> std::io::Result<XhttpListenerConfig> {
+    match protocol {
+        ServerProxyConfig::Xhttp { config, inner } => Ok(XhttpListenerConfig {
+            xhttp_config: config,
+            inner: *inner,
+            tls_acceptor: None,
+        }),
+        #[cfg(feature = "tls")]
+        ServerProxyConfig::Tls(TlsServerConfig {
+            certificate_path,
+            private_key_path,
+            mut alpn_protocols,
+            inner,
+        }) => match *inner {
+            ServerProxyConfig::Xhttp { config, inner } => {
+                if alpn_protocols.is_empty() {
+                    alpn_protocols.push("h2".to_string());
+                } else if !alpn_protocols.iter().any(|proto| proto == "h2") {
+                    alpn_protocols.push("h2".to_string());
+                }
+
+                let cert_bytes = fs::read(&certificate_path)?;
+                let key_bytes = fs::read(&private_key_path)?;
+                let tls_config = create_server_config(
+                    &cert_bytes,
+                    &key_bytes,
+                    &alpn_protocols,
+                    &[],
+                );
+
+                Ok(XhttpListenerConfig {
+                    xhttp_config: config,
+                    inner: *inner,
+                    tls_acceptor: Some(TlsAcceptor::from(Arc::new(tls_config))),
+                })
+            }
+            _ => Err(std::io::Error::other(
+                "invalid tls-wrapped protocol for xhttp server",
+            )),
+        },
+        _ => Err(std::io::Error::other("invalid protocol for xhttp server")),
+    }
+}
+
+async fn serve_http_connection<IO>(
+    io: IO,
+    state: Arc<AppState>,
+    peer_addr: std::net::SocketAddr,
+) where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let io = TokioIo::new(io);
+    let builder = auto::Builder::new(TokioExecutor::new());
+    let service =
+        service_fn(move |request| handle_request(request, state.clone(), peer_addr));
+
+    if let Err(err) = builder.serve_connection(io, service).await {
+        error!("xhttp connection {} exited: {}", peer_addr, err);
+    }
 }
 
 #[derive(Clone)]
@@ -157,17 +245,16 @@ impl AppState {
         path_query: Option<&str>,
         headers: &hyper::HeaderMap,
     ) -> bool {
-        let mut padding_len = path_query
-            .and_then(query_padding_length)
-            .unwrap_or_default();
-
-        if padding_len == 0 {
-            padding_len = headers
+        let padding_len = path_query.and_then(query_padding_length).or_else(|| {
+            headers
                 .get(header::REFERER)
                 .and_then(|value| value.to_str().ok())
                 .and_then(referer_padding_length)
-                .unwrap_or_default();
-        }
+        });
+
+        let Some(padding_len) = padding_len else {
+            return true;
+        };
 
         padding_len >= self.min_padding && padding_len <= self.max_padding
     }
@@ -182,14 +269,30 @@ async fn handle_request(
         .headers()
         .get(header::HOST)
         .and_then(|value| value.to_str().ok());
-    if !state.validate_host(host_header)
+    let authority_host = request.uri().authority().map(|value| value.as_str());
+    let request_host = host_header.or(authority_host);
+
+    if !state.validate_host(request_host)
         || !state.validate_padding(request.uri().query(), request.headers())
     {
+        debug!(
+            method = %request.method(),
+            path = %request.uri().path(),
+            query = ?request.uri().query(),
+            host = ?request_host,
+            "xhttp request rejected by host/padding validation"
+        );
         return Ok(simple_response(StatusCode::NOT_FOUND));
     }
 
     let path = request.uri().path().to_string();
     if !matches_base_path(&path, &state.base_path) {
+        debug!(
+            method = %request.method(),
+            path = %path,
+            base_path = %state.base_path,
+            "xhttp request rejected by path validation"
+        );
         return Ok(simple_response(StatusCode::NOT_FOUND));
     }
     let (session_id, seq) = extract_meta_path(&path, &state.base_path);

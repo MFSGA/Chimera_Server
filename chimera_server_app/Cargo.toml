@@ -17,3 +17,4 @@ tonic = { workspace = true }
 default = ["full"]
 full = ["chimera_server_lib/full"]
 minimal-vless = ["chimera_server_lib/vless"]
+minimal-vless-tls = ["chimera_server_lib/vless", "chimera_server_lib/tls"]
