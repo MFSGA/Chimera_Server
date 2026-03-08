@@ -27,7 +27,7 @@ mod xhttp;
 pub async fn start_servers(
     config: ServerConfig,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
-    if matches!(config.protocol, ServerProxyConfig::Xhttp { .. }) {
+    if is_xhttp_server_protocol(&config.protocol) {
         return xhttp::start_xhttp_server(config).await;
     }
 
@@ -71,6 +71,17 @@ pub async fn start_servers(
     }
 
     Ok(join_handles)
+}
+
+fn is_xhttp_server_protocol(protocol: &ServerProxyConfig) -> bool {
+    match protocol {
+        ServerProxyConfig::Xhttp { .. } => true,
+        #[cfg(feature = "tls")]
+        ServerProxyConfig::Tls(tls_config) => {
+            matches!(tls_config.inner.as_ref(), ServerProxyConfig::Xhttp { .. })
+        }
+        _ => false,
+    }
 }
 
 pub async fn start_tcp_server(
