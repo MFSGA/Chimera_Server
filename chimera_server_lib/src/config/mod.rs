@@ -50,6 +50,8 @@ pub struct StreamSettings {
     network: String,
     security: Option<String>,
     tls_settings: Option<TlsSettings>,
+    #[serde(alias = "xhttpSettings")]
+    xhttp_settings: Option<XhttpSettings>,
     #[cfg(feature = "ws")]
     ws_settings: Option<WsSettings>,
     #[serde(alias = "hysteriaSettings")]
@@ -57,6 +59,33 @@ pub struct StreamSettings {
     #[cfg(feature = "reality")]
     #[serde(alias = "realitySettings")]
     reality_settings: Option<RealitySettings>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct XhttpSettings {
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    x_padding_bytes: Option<XhttpRange>,
+    #[serde(default)]
+    sc_max_each_post_bytes: Option<XhttpRange>,
+    #[serde(default)]
+    sc_max_buffered_posts: Option<i64>,
+    #[serde(default)]
+    sc_stream_up_server_secs: Option<XhttpRange>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct XhttpRange {
+    #[serde(default)]
+    from: i32,
+    #[serde(default)]
+    to: i32,
 }
 
 #[cfg(feature = "ws")]
