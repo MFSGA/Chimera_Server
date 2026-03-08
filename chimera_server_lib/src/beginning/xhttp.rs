@@ -1,32 +1,56 @@
 use std::{
-    cmp::Ordering,
-    collections::{BinaryHeap, HashMap},
-    sync::{Arc, RwLock},
-    task::Poll,
+    collections::{BTreeMap, HashMap},
+    convert::Infallible,
+    pin::Pin,
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::{Context, Poll},
 };
 
-use axum::{
-    Router,
-    body::{Body, Bytes},
-    extract::{Path, Query, State},
-    http::{self, HeaderMap, StatusCode},
-    response::Response,
-    routing::get,
-};
+use bytes::Bytes;
 use futures::StreamExt;
-use tokio::{io::AsyncWriteExt, net::TcpStream, sync::Mutex};
+use http_body_util::{BodyExt, Empty, StreamBody, combinators::UnsyncBoxBody};
+use hyper::{
+    Method, Request, Response, StatusCode,
+    body::{Frame, Incoming},
+    header,
+    service::service_fn,
+};
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto,
+};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex},
+    sync::Mutex,
+    time::{Duration, sleep},
+};
 use tokio_util::io::ReaderStream;
 use tracing::error;
 
 use crate::{
     address::BindLocation,
+    async_stream::{AsyncPing, AsyncStream},
     config::server_config::{ServerConfig, ServerProxyConfig, XhttpServerConfig},
+    handler::tcp::{
+        tcp_handler::TcpServerHandler, tcp_handler_util::create_tcp_server_handler,
+    },
+    resolver::{NativeResolver, Resolver},
 };
+
+use super::process_stream;
+
+const XHTTP_PIPE_CAPACITY: usize = 64 * 1024;
+
+type ResponseBody = UnsyncBoxBody<Bytes, Infallible>;
 
 pub async fn start_xhttp_server(
     config: ServerConfig,
 ) -> std::io::Result<Vec<tokio::task::JoinHandle<()>>> {
     let ServerConfig {
+        tag,
         bind_location,
         protocol,
         ..
@@ -34,28 +58,46 @@ pub async fn start_xhttp_server(
 
     let ServerProxyConfig::Xhttp {
         config: xhttp_config,
+        inner,
     } = protocol
     else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "invalid protocol for xhttp server",
-        ));
+        return Err(std::io::Error::other("invalid protocol for xhttp server"));
     };
 
     let bind_addr = match bind_location {
         BindLocation::Address(address) => address.to_socket_addr()?,
     };
 
-    let state = AppState::new(xhttp_config);
-
-    let router = Router::new()
-        .route("/*rest", get(down_handler).post(up_handler))
-        .with_state(state);
-
+    let mut rules_stack = vec![];
+    let server_handler =
+        Arc::new(create_tcp_server_handler(*inner, &tag, &mut rules_stack));
+    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let state = Arc::new(AppState::new(xhttp_config, server_handler, resolver));
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+
     let handle = tokio::spawn(async move {
-        if let Err(err) = axum::serve(listener, router).await {
-            error!("xhttp server exited: {}", err);
+        loop {
+            let (stream, peer_addr) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(err) => {
+                    error!("xhttp accept failed: {}", err);
+                    continue;
+                }
+            };
+            let _ = stream.set_nodelay(true);
+
+            let io = TokioIo::new(stream);
+            let state = state.clone();
+            tokio::spawn(async move {
+                let builder = auto::Builder::new(TokioExecutor::new());
+                let service = service_fn(move |request| {
+                    handle_request(request, state.clone(), peer_addr)
+                });
+
+                if let Err(err) = builder.serve_connection(io, service).await {
+                    error!("xhttp connection {} exited: {}", peer_addr, err);
+                }
+            });
         }
     });
 
@@ -64,25 +106,34 @@ pub async fn start_xhttp_server(
 
 #[derive(Clone)]
 struct AppState {
-    upstream: String,
     host: Option<String>,
-    path_prefix: String,
+    base_path: String,
     min_padding: usize,
     max_padding: usize,
-    response_headers: Arc<HashMap<String, String>>,
+    max_each_post_bytes: usize,
+    server_handler: Arc<Box<dyn TcpServerHandler>>,
+    resolver: Arc<dyn Resolver>,
     sessions: SessionStore,
 }
 
 impl AppState {
-    fn new(config: XhttpServerConfig) -> Self {
+    fn new(
+        config: XhttpServerConfig,
+        server_handler: Arc<Box<dyn TcpServerHandler>>,
+        resolver: Arc<dyn Resolver>,
+    ) -> Self {
         Self {
-            upstream: config.upstream,
             host: config.host,
-            path_prefix: config.path,
+            base_path: normalize_base_path(config.path),
             min_padding: config.min_padding,
             max_padding: config.max_padding,
-            response_headers: Arc::new(config.headers),
-            sessions: SessionStore::new(),
+            max_each_post_bytes: config.max_each_post_bytes,
+            server_handler,
+            resolver,
+            sessions: SessionStore::new(
+                Duration::from_secs(config.session_ttl_secs),
+                config.max_buffered_posts,
+            ),
         }
     }
 
@@ -93,7 +144,7 @@ impl AppState {
                 let normalized = actual
                     .split(':')
                     .next()
-                    .map(|h| h.to_ascii_lowercase())
+                    .map(|host| host.to_ascii_lowercase())
                     .unwrap_or_default();
                 &normalized == expected
             }
@@ -101,346 +152,480 @@ impl AppState {
         }
     }
 
-    fn strip_prefix(&self, request_path: &str) -> Option<String> {
-        if self.path_prefix == "/" {
-            return Some(request_path.trim_start_matches('/').to_string());
+    fn validate_padding(
+        &self,
+        path_query: Option<&str>,
+        headers: &hyper::HeaderMap,
+    ) -> bool {
+        let mut padding_len = path_query
+            .and_then(query_padding_length)
+            .unwrap_or_default();
+
+        if padding_len == 0 {
+            padding_len = headers
+                .get(header::REFERER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(referer_padding_length)
+                .unwrap_or_default();
         }
 
-        let prefix = format!("{}/", self.path_prefix.trim_end_matches('/'));
-        if request_path.starts_with(&prefix) {
-            Some(request_path[prefix.len()..].to_string())
-        } else {
-            None
-        }
-    }
-
-    fn padding_in_range(&self, len: usize) -> bool {
-        len >= self.min_padding && len <= self.max_padding
-    }
-
-    async fn acquire_session(
-        &self,
-        session_id: &str,
-    ) -> Result<Arc<Mutex<Session>>, ()> {
-        self.sessions.acquire(session_id, &self.upstream).await
-    }
-
-    async fn upsert_session(
-        &self,
-        session_id: String,
-    ) -> Result<Arc<Mutex<Session>>, ()> {
-        self.sessions
-            .acquire(session_id.as_str(), &self.upstream)
-            .await
+        padding_len >= self.min_padding && padding_len <= self.max_padding
     }
 }
 
-#[derive(serde::Deserialize)]
-struct DownQuery {
-    #[serde(default)]
-    x_padding: Option<String>,
-}
-
-async fn down_handler(
-    State(state): State<AppState>,
-    Path(rest): Path<String>,
-    headers: HeaderMap,
-    Query(params): Query<DownQuery>,
-) -> Response<Body> {
-    let host_header = headers
-        .get(http::header::HOST)
+async fn handle_request(
+    request: Request<Incoming>,
+    state: Arc<AppState>,
+    peer_addr: std::net::SocketAddr,
+) -> Result<Response<ResponseBody>, Infallible> {
+    let host_header = request
+        .headers()
+        .get(header::HOST)
         .and_then(|value| value.to_str().ok());
-
-    if !state.validate_host(host_header) {
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Body::empty())
-            .unwrap();
+    if !state.validate_host(host_header)
+        || !state.validate_padding(request.uri().query(), request.headers())
+    {
+        return Ok(simple_response(StatusCode::NOT_FOUND));
     }
 
-    let request_path = format!("/{}", rest);
-    let Some(remainder) = state.strip_prefix(&request_path) else {
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Body::empty())
-            .unwrap();
+    let path = request.uri().path().to_string();
+    if !matches_base_path(&path, &state.base_path) {
+        return Ok(simple_response(StatusCode::NOT_FOUND));
+    }
+    let (session_id, seq) = extract_meta_path(&path, &state.base_path);
+
+    let response = match *request.method() {
+        Method::GET => match session_id {
+            Some(session_id) if seq.is_none() => {
+                handle_stream_down(state, session_id, peer_addr).await
+            }
+            _ => simple_response(StatusCode::METHOD_NOT_ALLOWED),
+        },
+        Method::POST => match (session_id, seq) {
+            (None, None) => handle_stream_one(request, state, peer_addr).await,
+            (Some(session_id), Some(seq)) => {
+                handle_packet_up(request, state, session_id, seq, peer_addr).await
+            }
+            _ => simple_response(StatusCode::METHOD_NOT_ALLOWED),
+        },
+        _ => simple_response(StatusCode::METHOD_NOT_ALLOWED),
     };
 
-    let session_id = remainder.trim_matches('/');
-    if session_id.is_empty() || session_id.contains('/') {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(Body::empty())
-            .unwrap();
-    }
+    Ok(response)
+}
 
-    let mut padding_len = params.x_padding.as_deref().map(|s| s.len()).unwrap_or(0);
-    if padding_len == 0 {
-        padding_len = headers
-            .get(http::header::REFERER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(referer_padding_length)
-            .unwrap_or(0);
-    }
+async fn handle_stream_one(
+    request: Request<Incoming>,
+    state: Arc<AppState>,
+    peer_addr: std::net::SocketAddr,
+) -> Response<ResponseBody> {
+    let (client_upload, server_read) = duplex(XHTTP_PIPE_CAPACITY);
+    let (server_write, client_download) = duplex(XHTTP_PIPE_CAPACITY);
+    let logical_stream = XhttpLogicalStream::new(server_read, server_write);
 
-    if !state.padding_in_range(padding_len) {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(Body::empty())
-            .unwrap();
-    }
+    spawn_handler_stream(logical_stream, state.clone(), peer_addr);
 
-    let Ok(upload_socket) = state.acquire_session(session_id).await else {
-        return Response::builder()
-            .status(StatusCode::BAD_GATEWAY)
-            .body(Body::empty())
-            .unwrap();
-    };
-
-    let Some(reader) = upload_socket.lock().await.raw_reader.take() else {
-        return Response::builder()
-            .status(StatusCode::BAD_GATEWAY)
-            .body(Body::empty())
-            .unwrap();
-    };
-
-    let mut session_guard = Some(SessionDropGuard {
-        store: state.sessions.clone(),
-        session_id: session_id.to_string(),
+    let mut upload_writer = client_upload;
+    let mut body = request.into_body();
+    tokio::spawn(async move {
+        while let Some(frame_result) = body.frame().await {
+            match frame_result {
+                Ok(frame) => {
+                    if let Some(chunk) = frame.data_ref()
+                        && upload_writer.write_all(chunk).await.is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = upload_writer.shutdown().await;
     });
 
-    let stream =
-        ReaderStream::new(reader).chain(futures::stream::poll_fn(move |_| {
-            let _ = session_guard.take();
-            Poll::Ready(None)
-        }));
-
-    let mut response_builder = Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "text/event-stream")
-        .header("Cache-Control", "no-cache")
-        .header("X-Accel-Buffering", "no")
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Access-Control-Allow-Methods", "GET, POST");
-
-    for (key, value) in state.response_headers.iter() {
-        if let Ok(header_name) = http::header::HeaderName::try_from(key.as_str()) {
-            if let Ok(header_value) = http::header::HeaderValue::from_str(value) {
-                response_builder =
-                    response_builder.header(header_name, header_value);
-            }
-        }
-    }
-
-    response_builder
-        .body(Body::from_stream(stream))
-        .unwrap_or_else(|_| {
-            Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::empty())
-                .unwrap()
-        })
+    reader_response(StatusCode::OK, client_download)
 }
 
-async fn up_handler(
-    State(state): State<AppState>,
-    Path(rest): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response<Body> {
-    let host_header = headers
-        .get(http::header::HOST)
-        .and_then(|value| value.to_str().ok());
-
-    if !state.validate_host(host_header) {
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Body::empty())
-            .unwrap();
-    }
-
-    let request_path = format!("/{}", rest);
-    let Some(remainder) = state.strip_prefix(&request_path) else {
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Body::empty())
-            .unwrap();
-    };
-
-    let mut segments = remainder.split('/').filter(|segment| !segment.is_empty());
-    let Some(session_id) = segments.next() else {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(Body::empty())
-            .unwrap();
-    };
-
-    let Some(seq_str) = segments.next() else {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(Body::empty())
-            .unwrap();
-    };
-
-    let Ok(seq) = seq_str.parse::<u64>() else {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(Body::empty())
-            .unwrap();
-    };
-
-    let Ok(upload_socket) = state.upsert_session(session_id.to_string()).await
-    else {
-        return Response::builder()
-            .status(StatusCode::BAD_GATEWAY)
-            .body(Body::empty())
-            .unwrap();
-    };
-
-    let mut upload_socket = upload_socket.lock().await;
-    upload_socket.packet_queue.push(Packet { seq, data: body });
-
-    loop {
-        let Some(peeked) = upload_socket.packet_queue.peek() else {
-            break;
-        };
-
-        if peeked.seq > upload_socket.next_seq {
-            break;
-        }
-
-        let packet = upload_socket.packet_queue.pop().unwrap();
-        if packet.seq == upload_socket.next_seq {
-            if let Err(err) = upload_socket.raw_writer.write_all(&packet.data).await
-            {
-                error!("failed to write to upstream: {}", err);
-                return Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(Body::empty())
-                    .unwrap();
-            }
-            upload_socket.next_seq += 1;
-        }
-    }
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .body(Body::empty())
-        .unwrap()
-}
-
-struct SessionDropGuard {
-    store: SessionStore,
+async fn handle_stream_down(
+    state: Arc<AppState>,
     session_id: String,
+    peer_addr: std::net::SocketAddr,
+) -> Response<ResponseBody> {
+    let session = state.sessions.get_or_create(&session_id);
+    session.fully_connected.store(true, Ordering::Release);
+
+    if let Some(stream) = session.take_handler_stream().await {
+        spawn_handler_stream(stream, state.clone(), peer_addr);
+    }
+
+    let Some(reader) = session.take_downlink_reader().await else {
+        return simple_response(StatusCode::CONFLICT);
+    };
+
+    let sessions = state.sessions.clone();
+    let session_id_for_drop = session_id.clone();
+    let body_stream = ReaderStream::new(reader).filter_map(move |result| {
+        let sessions = sessions.clone();
+        let session_id = session_id_for_drop.clone();
+        async move {
+            match result {
+                Ok(bytes) => Some(Ok(Frame::data(bytes))),
+                Err(err) => {
+                    error!("xhttp stream-down read failed: {}", err);
+                    sessions.remove(&session_id).await;
+                    None
+                }
+            }
+        }
+    });
+
+    stream_response(StatusCode::OK, body_stream.boxed())
 }
 
-impl Drop for SessionDropGuard {
-    fn drop(&mut self) {
-        self.store.remove(&self.session_id);
+async fn handle_packet_up(
+    request: Request<Incoming>,
+    state: Arc<AppState>,
+    session_id: String,
+    seq: String,
+    peer_addr: std::net::SocketAddr,
+) -> Response<ResponseBody> {
+    let Ok(seq) = seq.parse::<u64>() else {
+        return simple_response(StatusCode::BAD_REQUEST);
+    };
+
+    let collected = match request.into_body().collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => return simple_response(StatusCode::BAD_REQUEST),
+    };
+    if collected.len() > state.max_each_post_bytes {
+        return simple_response(StatusCode::PAYLOAD_TOO_LARGE);
     }
+
+    let session = state.sessions.get_or_create(&session_id);
+    if let Some(stream) = session.take_handler_stream().await {
+        spawn_handler_stream(stream, state.clone(), peer_addr);
+    }
+
+    let mut upload_state = session.upload.lock().await;
+    match upload_state.packet_queue.push_packet(seq, collected) {
+        Ok(()) => {}
+        Err(QueueError::TooManyBuffered) => {
+            return simple_response(StatusCode::CONFLICT);
+        }
+    }
+
+    while let Some(chunk) = upload_state.packet_queue.pop_ready() {
+        if let Err(err) = upload_state.writer.write_all(&chunk).await {
+            error!("xhttp packet-up write failed: {}", err);
+            state.sessions.remove(&session_id).await;
+            return simple_response(StatusCode::BAD_GATEWAY);
+        }
+    }
+
+    simple_response(StatusCode::OK)
+}
+
+fn spawn_handler_stream(
+    stream: XhttpLogicalStream,
+    state: Arc<AppState>,
+    peer_addr: std::net::SocketAddr,
+) {
+    tokio::spawn(async move {
+        if let Err(err) = process_stream(
+            stream,
+            state.server_handler.clone(),
+            state.resolver.clone(),
+            peer_addr,
+        )
+        .await
+        {
+            error!("xhttp logical stream {} failed: {}", peer_addr, err);
+        }
+    });
+}
+
+fn reader_response(
+    status: StatusCode,
+    reader: DuplexStream,
+) -> Response<ResponseBody> {
+    let body_stream = ReaderStream::new(reader).filter_map(|result| async move {
+        match result {
+            Ok(bytes) => Some(Ok(Frame::data(bytes))),
+            Err(err) => {
+                error!("xhttp response read failed: {}", err);
+                None
+            }
+        }
+    });
+    stream_response(status, body_stream.boxed())
+}
+
+fn stream_response<S>(status: StatusCode, body_stream: S) -> Response<ResponseBody>
+where
+    S: futures::Stream<Item = Result<Frame<Bytes>, Infallible>> + Send + 'static,
+{
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header("x-accel-buffering", "no")
+        .body(BodyExt::boxed_unsync(StreamBody::new(body_stream)))
+        .unwrap_or_else(|_| simple_response(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
+fn simple_response(status: StatusCode) -> Response<ResponseBody> {
+    Response::builder()
+        .status(status)
+        .body(BodyExt::boxed_unsync(Empty::<Bytes>::new()))
+        .unwrap()
 }
 
 #[derive(Clone)]
 struct SessionStore {
-    inner: Arc<RwLock<HashMap<String, Arc<Mutex<Session>>>>>,
+    inner: Arc<RwLock<HashMap<String, Arc<XhttpSession>>>>,
+    ttl: Duration,
+    max_buffered_posts: usize,
 }
 
 impl SessionStore {
-    fn new() -> Self {
+    fn new(ttl: Duration, max_buffered_posts: usize) -> Self {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
+            ttl,
+            max_buffered_posts,
         }
     }
 
-    async fn acquire(
-        &self,
-        session_id: &str,
-        upstream: &str,
-    ) -> Result<Arc<Mutex<Session>>, ()> {
+    fn get_or_create(&self, session_id: &str) -> Arc<XhttpSession> {
         if let Some(existing) = self.inner.read().unwrap().get(session_id) {
-            return Ok(existing.clone());
+            return existing.clone();
         }
 
-        let upstream_conn = match TcpStream::connect(upstream).await {
-            Ok(stream) => stream,
-            Err(err) => {
-                error!("failed to connect upstream {}: {}", upstream, err);
-                return Err(());
-            }
-        };
-        upstream_conn.set_nodelay(true).ok();
-        let (reader, writer) = upstream_conn.into_split();
-        let session = Arc::new(Mutex::new(Session::new(reader, writer)));
-
-        Ok(self
+        let session = Arc::new(XhttpSession::new(self.max_buffered_posts));
+        let inserted = self
             .inner
             .write()
             .unwrap()
-            .insert(session_id.to_string(), session.clone())
-            .unwrap_or(session))
+            .entry(session_id.to_string())
+            .or_insert_with(|| session.clone())
+            .clone();
+        self.spawn_ttl_cleanup(session_id.to_string());
+        inserted
     }
 
-    fn remove(&self, session_id: &str) {
+    async fn remove(&self, session_id: &str) {
         self.inner.write().unwrap().remove(session_id);
     }
+
+    fn spawn_ttl_cleanup(&self, session_id: String) {
+        let ttl = self.ttl;
+        let store = self.clone();
+        tokio::spawn(async move {
+            sleep(ttl).await;
+
+            let session = { store.inner.read().unwrap().get(&session_id).cloned() };
+
+            if let Some(session) = session
+                && !session.fully_connected.load(Ordering::Acquire)
+            {
+                store.remove(&session_id).await;
+            }
+        });
+    }
 }
 
-struct Session {
-    raw_reader: Option<tokio::net::tcp::OwnedReadHalf>,
-    raw_writer: tokio::net::tcp::OwnedWriteHalf,
-    next_seq: u64,
-    packet_queue: BinaryHeap<Packet>,
+struct XhttpSession {
+    upload: Mutex<UploadState>,
+    downlink_reader: Mutex<Option<DuplexStream>>,
+    handler_stream: Mutex<Option<XhttpLogicalStream>>,
+    fully_connected: AtomicBool,
 }
 
-impl Session {
-    fn new(
-        reader: tokio::net::tcp::OwnedReadHalf,
-        writer: tokio::net::tcp::OwnedWriteHalf,
-    ) -> Self {
+impl XhttpSession {
+    fn new(max_buffered_posts: usize) -> Self {
+        let (client_upload, server_read) = duplex(XHTTP_PIPE_CAPACITY);
+        let (server_write, client_download) = duplex(XHTTP_PIPE_CAPACITY);
+
         Self {
-            raw_reader: Some(reader),
-            raw_writer: writer,
-            next_seq: 0,
-            packet_queue: BinaryHeap::new(),
+            upload: Mutex::new(UploadState {
+                writer: client_upload,
+                packet_queue: PacketQueue::new(max_buffered_posts),
+            }),
+            downlink_reader: Mutex::new(Some(client_download)),
+            handler_stream: Mutex::new(Some(XhttpLogicalStream::new(
+                server_read,
+                server_write,
+            ))),
+            fully_connected: AtomicBool::new(false),
         }
     }
-}
 
-struct Packet {
-    data: Bytes,
-    seq: u64,
-}
+    async fn take_handler_stream(&self) -> Option<XhttpLogicalStream> {
+        self.handler_stream.lock().await.take()
+    }
 
-impl PartialEq for Packet {
-    fn eq(&self, other: &Self) -> bool {
-        self.seq == other.seq
+    async fn take_downlink_reader(&self) -> Option<DuplexStream> {
+        self.downlink_reader.lock().await.take()
     }
 }
 
-impl Eq for Packet {}
+struct UploadState {
+    writer: DuplexStream,
+    packet_queue: PacketQueue,
+}
 
-impl PartialOrd for Packet {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+struct XhttpLogicalStream {
+    reader: DuplexStream,
+    writer: DuplexStream,
+}
+
+impl XhttpLogicalStream {
+    fn new(reader: DuplexStream, writer: DuplexStream) -> Self {
+        Self { reader, writer }
     }
 }
 
-impl Ord for Packet {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other.seq.cmp(&self.seq)
+impl AsyncRead for XhttpLogicalStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.reader).poll_read(cx, buf)
     }
 }
 
-fn referer_padding_length(referer: &str) -> Option<usize> {
-    let query = referer.splitn(2, '?').nth(1)?;
+impl AsyncWrite for XhttpLogicalStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        Pin::new(&mut self.writer).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.writer).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.writer).poll_shutdown(cx)
+    }
+}
+
+impl AsyncPing for XhttpLogicalStream {
+    fn supports_ping(&self) -> bool {
+        false
+    }
+
+    fn poll_write_ping(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<bool>> {
+        Poll::Ready(Ok(false))
+    }
+}
+
+impl AsyncStream for XhttpLogicalStream {}
+
+struct PacketQueue {
+    next_seq: u64,
+    buffered: BTreeMap<u64, Bytes>,
+    ready: Vec<Bytes>,
+    max_buffered_posts: usize,
+}
+
+impl PacketQueue {
+    fn new(max_buffered_posts: usize) -> Self {
+        Self {
+            next_seq: 0,
+            buffered: BTreeMap::new(),
+            ready: Vec::new(),
+            max_buffered_posts,
+        }
+    }
+
+    fn push_packet(&mut self, seq: u64, data: Bytes) -> Result<(), QueueError> {
+        if seq < self.next_seq {
+            return Ok(());
+        }
+        if self.buffered.len() >= self.max_buffered_posts
+            && !self.buffered.contains_key(&seq)
+        {
+            return Err(QueueError::TooManyBuffered);
+        }
+
+        self.buffered.insert(seq, data);
+        while let Some(chunk) = self.buffered.remove(&self.next_seq) {
+            self.ready.push(chunk);
+            self.next_seq += 1;
+        }
+
+        Ok(())
+    }
+
+    fn pop_ready(&mut self) -> Option<Bytes> {
+        if self.ready.is_empty() {
+            return None;
+        }
+        Some(self.ready.remove(0))
+    }
+}
+
+enum QueueError {
+    TooManyBuffered,
+}
+
+fn normalize_base_path(mut path: String) -> String {
+    if !path.starts_with('/') {
+        path.insert(0, '/');
+    }
+    if !path.ends_with('/') {
+        path.push('/');
+    }
+    path
+}
+
+fn extract_meta_path(
+    request_path: &str,
+    base_path: &str,
+) -> (Option<String>, Option<String>) {
+    let trimmed_base_path = base_path.trim_end_matches('/');
+    if request_path == trimmed_base_path {
+        return (None, None);
+    }
+
+    let tail = &request_path[base_path.len()..];
+    let mut segments = tail.split('/').filter(|segment| !segment.is_empty());
+    let session_id = segments.next().map(ToOwned::to_owned);
+    let seq = segments.next().map(ToOwned::to_owned);
+    (session_id, seq)
+}
+
+fn matches_base_path(request_path: &str, base_path: &str) -> bool {
+    let trimmed_base_path = base_path.trim_end_matches('/');
+    request_path == trimmed_base_path || request_path.starts_with(base_path)
+}
+
+fn query_padding_length(query: &str) -> Option<usize> {
     for pair in query.split('&') {
-        let (key, value) = match pair.split_once('=') {
-            Some(result) => result,
-            None => continue,
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
         };
         if key == "x_padding" {
             return Some(value.len());
         }
     }
     None
+}
+
+fn referer_padding_length(referer: &str) -> Option<usize> {
+    let query = referer.split_once('?')?.1;
+    query_padding_length(query)
 }

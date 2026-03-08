@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use serde::Deserialize;
 
 use crate::{
@@ -113,12 +111,13 @@ impl RangeConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct XhttpServerConfig {
-    pub upstream: String,
     pub host: Option<String>,
     pub path: String,
     pub min_padding: usize,
     pub max_padding: usize,
-    pub headers: HashMap<String, String>,
+    pub max_each_post_bytes: usize,
+    pub max_buffered_posts: usize,
+    pub session_ttl_secs: u64,
 }
 
 #[cfg(feature = "tls")]
@@ -194,6 +193,7 @@ pub enum ServerProxyConfig {
     Reality(RealityTransportConfig),
     Xhttp {
         config: XhttpServerConfig,
+        inner: Box<ServerProxyConfig>,
     },
     Socks {
         accounts: Vec<SocksUser>,

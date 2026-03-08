@@ -142,7 +142,7 @@ async fn run_tcp_server(
     }
 }
 
-async fn process_stream<AS>(
+pub(super) async fn process_stream<AS>(
     stream: AS,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
 

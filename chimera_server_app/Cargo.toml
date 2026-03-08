@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-chimera_server_lib = { path = "../chimera_server_lib", version = "*" }
+chimera_server_lib = { path = "../chimera_server_lib", version = "*", default-features = false }
 clap = { workspace = true }
 
 
@@ -16,3 +16,4 @@ tonic = { workspace = true }
 [features]
 default = ["full"]
 full = ["chimera_server_lib/full"]
+minimal-vless = ["chimera_server_lib/vless"]
