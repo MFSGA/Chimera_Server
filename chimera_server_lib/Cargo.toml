@@ -7,6 +7,7 @@ edition.workspace = true
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true, optional = true }
+tonic-prost = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 prost-types = { workspace = true, optional = true }
 tokio-stream = { workspace = true, optional = true }
@@ -68,7 +69,7 @@ reality = ["rcgen", "subtle", "x509-parser"]
 vless = []
 tuic = ["dashmap", "lru", "uuid"]
 traffic = []
-api = ["tonic", "prost", "prost-types", "tokio-stream"]
+api = ["tonic", "tonic-prost", "prost", "prost-types", "tokio-stream"]
 
 full = ["hysteria", "trojan", "ws", "tls", "reality", "vless", "tuic", "api"]
 
