@@ -150,7 +150,9 @@ impl Default for SettingObject {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ClientSetting {
+    #[serde(default)]
     email: String,
+    #[serde(default)]
     flow: String,
     id: String,
 }
