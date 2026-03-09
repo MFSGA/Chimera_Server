@@ -1,7 +1,8 @@
+#[cfg(feature = "tls")]
+use std::fs;
 use std::{
     collections::{BTreeMap, HashMap},
     convert::Infallible,
-    fs,
     pin::Pin,
     sync::{
         Arc, RwLock,
@@ -41,6 +42,11 @@ use crate::{
         tcp_handler::TcpServerHandler, tcp_handler_util::create_tcp_server_handler,
     },
     resolver::{NativeResolver, Resolver},
+};
+#[cfg(feature = "reality")]
+use crate::{
+    config::server_config::RealityTransportConfig,
+    handler::reality::accept_reality_stream,
 };
 #[cfg(feature = "tls")]
 use crate::{
@@ -82,7 +88,7 @@ pub async fn start_xhttp_server(
         resolver,
     ));
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    let tls_acceptor = listener_config.tls_acceptor.clone();
+    let security = listener_config.security.clone();
 
     let handle = tokio::spawn(async move {
         loop {
@@ -96,23 +102,31 @@ pub async fn start_xhttp_server(
             let _ = stream.set_nodelay(true);
 
             let state = state.clone();
-            let tls_acceptor = tls_acceptor.clone();
+            let security = security.clone();
             tokio::spawn(async move {
-                #[cfg(feature = "tls")]
-                if let Some(acceptor) = tls_acceptor {
-                    match acceptor.accept(stream).await {
-                        Ok(tls_stream) => {
-                            serve_http_connection(tls_stream, state, peer_addr)
-                                .await;
-                        }
-                        Err(err) => {
-                            error!("xhttp tls accept {} failed: {}", peer_addr, err);
-                        }
+                let stream: Box<dyn AsyncStream> = Box::new(stream);
+                let wrapped_stream = match security {
+                    XhttpSecurityLayer::None => Ok(stream),
+                    #[cfg(feature = "tls")]
+                    XhttpSecurityLayer::Tls(acceptor) => {
+                        acceptor.accept(stream).await.map(|tls_stream| {
+                            Box::new(tls_stream) as Box<dyn AsyncStream>
+                        })
                     }
-                    return;
-                }
+                    #[cfg(feature = "reality")]
+                    XhttpSecurityLayer::Reality(config) => {
+                        accept_reality_stream(stream, &config).await
+                    }
+                };
 
-                serve_http_connection(stream, state, peer_addr).await;
+                match wrapped_stream {
+                    Ok(stream) => {
+                        serve_http_connection(stream, state, peer_addr).await
+                    }
+                    Err(err) => {
+                        error!("xhttp accept {} failed: {}", peer_addr, err);
+                    }
+                }
             });
         }
     });
@@ -123,10 +137,16 @@ pub async fn start_xhttp_server(
 struct XhttpListenerConfig {
     xhttp_config: XhttpServerConfig,
     inner: ServerProxyConfig,
+    security: XhttpSecurityLayer,
+}
+
+#[derive(Clone)]
+enum XhttpSecurityLayer {
+    None,
     #[cfg(feature = "tls")]
-    tls_acceptor: Option<TlsAcceptor>,
-    #[cfg(not(feature = "tls"))]
-    tls_acceptor: Option<()>,
+    Tls(TlsAcceptor),
+    #[cfg(feature = "reality")]
+    Reality(RealityTransportConfig),
 }
 
 fn parse_listener_protocol(
@@ -136,7 +156,7 @@ fn parse_listener_protocol(
         ServerProxyConfig::Xhttp { config, inner } => Ok(XhttpListenerConfig {
             xhttp_config: config,
             inner: *inner,
-            tls_acceptor: None,
+            security: XhttpSecurityLayer::None,
         }),
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(TlsServerConfig {
@@ -164,13 +184,30 @@ fn parse_listener_protocol(
                 Ok(XhttpListenerConfig {
                     xhttp_config: config,
                     inner: *inner,
-                    tls_acceptor: Some(TlsAcceptor::from(Arc::new(tls_config))),
+                    security: XhttpSecurityLayer::Tls(TlsAcceptor::from(Arc::new(
+                        tls_config,
+                    ))),
                 })
             }
             _ => Err(std::io::Error::other(
                 "invalid tls-wrapped protocol for xhttp server",
             )),
         },
+        #[cfg(feature = "reality")]
+        ServerProxyConfig::Reality(reality_config) => {
+            match reality_config.inner.as_ref() {
+                ServerProxyConfig::Xhttp { config, inner } => {
+                    Ok(XhttpListenerConfig {
+                        xhttp_config: config.clone(),
+                        inner: (**inner).clone(),
+                        security: XhttpSecurityLayer::Reality(reality_config),
+                    })
+                }
+                _ => Err(std::io::Error::other(
+                    "invalid reality-wrapped protocol for xhttp server",
+                )),
+            }
+        }
         _ => Err(std::io::Error::other("invalid protocol for xhttp server")),
     }
 }

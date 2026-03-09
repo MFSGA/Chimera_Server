@@ -16,8 +16,8 @@ use h3_quinn::BidiStream;
 use http::{Request, Response, StatusCode};
 use rand::{
     // distributions::{Alphanumeric, DistString},
-    Rng,
     distr::{Alphanumeric, SampleString},
+    RngExt,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
@@ -476,8 +476,8 @@ async fn send_simple_response(
 }
 
 fn random_padding() -> String {
-    let mut rng = rand::thread_rng();
-    let len = rng.gen_range(16..=64);
+    let mut rng = rand::rng();
+    let len = rng.random_range(16..=64);
     Alphanumeric.sample_string(&mut rng, len)
 }
 
