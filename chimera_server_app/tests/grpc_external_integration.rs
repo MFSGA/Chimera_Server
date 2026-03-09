@@ -266,7 +266,7 @@ where
     grpc.ready()
         .await
         .map_err(|err| Status::unknown(format!("grpc service not ready: {err}")))?;
-    let codec = tonic::codec::ProstCodec::default();
+    let codec = tonic_prost::ProstCodec::default();
     let path = PathAndQuery::from_static(path);
     let response = grpc.unary(Request::new(request), path, codec).await?;
     trace_step("rpc response received");

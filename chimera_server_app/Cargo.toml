@@ -12,6 +12,7 @@ clap = { workspace = true }
 prost = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
+tonic-prost = { workspace = true }
 
 [features]
 default = ["full"]

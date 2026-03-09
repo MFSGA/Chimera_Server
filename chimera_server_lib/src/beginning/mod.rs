@@ -80,6 +80,13 @@ fn is_xhttp_server_protocol(protocol: &ServerProxyConfig) -> bool {
         ServerProxyConfig::Tls(tls_config) => {
             matches!(tls_config.inner.as_ref(), ServerProxyConfig::Xhttp { .. })
         }
+        #[cfg(feature = "reality")]
+        ServerProxyConfig::Reality(reality_config) => {
+            matches!(
+                reality_config.inner.as_ref(),
+                ServerProxyConfig::Xhttp { .. }
+            )
+        }
         _ => false,
     }
 }
