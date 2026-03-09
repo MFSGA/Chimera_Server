@@ -194,13 +194,13 @@ impl TryFrom<InboudItem> for ServerConfig {
 
                         match security.as_str() {
                             "none" => {}
-                            "tls" => {
+                            "tls" | "reality" => {
                                 protocol =
                                     apply_security_layers(protocol, stream_setting)?;
                             }
                             unsupported => {
                                 return Err(Error::InvalidConfig(format!(
-                                    "xhttp inbound currently supports only security=none or tls, got {unsupported}"
+                                    "xhttp inbound currently supports only security=none, tls, or reality, got {unsupported}"
                                 )));
                             }
                         }
@@ -346,6 +346,66 @@ impl TryFrom<InboudItem> for ServerConfig {
                     quic_settings: None,
                 })
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(all(feature = "reality", feature = "vless"))]
+    #[test]
+    fn vless_xhttp_reality_builds_nested_protocol_chain() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "xhttp-reality",
+            "settings": {
+                "clients": [
+                    {
+                        "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+                        "email": "user@example.com"
+                    }
+                ],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "xhttp",
+                "security": "reality",
+                "realitySettings": {
+                    "show": false,
+                    "dest": "www.apple.com:443",
+                    "xver": 0,
+                    "serverNames": ["www.apple.com"],
+                    "privateKey": "CAe1AlfoOhzR5zwWRYxUSUm2qdzWXM0qDJzbOWUvTno",
+                    "shortIds": ["6ba85179e30d4fc2"],
+                    "maxTimeDiff": 0,
+                    "minClient": "",
+                    "maxClient": ""
+                },
+                "xhttpSettings": {
+                    "host": "www.apple.com",
+                    "path": "/xhttp"
+                }
+            }
+        }))
+        .expect("valid inbound item");
+
+        let config = ServerConfig::try_from(inbound).expect("xhttp reality config");
+
+        match config.protocol {
+            ServerProxyConfig::Reality(reality) => match reality.inner.as_ref() {
+                ServerProxyConfig::Xhttp { inner, .. } => {
+                    assert!(matches!(
+                        inner.as_ref(),
+                        ServerProxyConfig::Vless { .. }
+                    ));
+                }
+                other => panic!("expected xhttp inside reality, got {other:?}"),
+            },
+            other => panic!("expected reality protocol, got {other:?}"),
         }
     }
 }

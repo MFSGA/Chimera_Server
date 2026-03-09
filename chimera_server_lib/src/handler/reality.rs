@@ -8,9 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::async_stream::AsyncStream;
 use crate::config::server_config::RealityTransportConfig;
 use crate::handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
-use crate::reality::{
-    BufReader, RealityServerConfig, RealityServerConnection, RealityTlsStream,
-};
+use crate::reality::{BufReader, RealityServerConnection, RealityTlsStream};
 
 async fn read_client_hello(
     stream: &mut Box<dyn AsyncStream>,
@@ -99,10 +97,77 @@ fn extract_sni_from_client_hello(client_hello: &[u8]) -> io::Result<Option<Strin
     Ok(None)
 }
 
+pub async fn accept_reality_stream(
+    mut server_stream: Box<dyn AsyncStream>,
+    config: &RealityTransportConfig,
+) -> io::Result<Box<dyn AsyncStream>> {
+    let client_hello = read_client_hello(&mut server_stream).await?;
+
+    if !config.server_names.is_empty() {
+        let sni = extract_sni_from_client_hello(&client_hello)?;
+        match sni {
+            Some(name)
+                if config
+                    .server_names
+                    .iter()
+                    .any(|expected| expected.eq_ignore_ascii_case(&name)) => {}
+            Some(name) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("SNI {name} not allowed for REALITY inbound"),
+                ));
+            }
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "REALITY inbound requires an SNI value",
+                ));
+            }
+        }
+    }
+
+    let mut reality_conn =
+        RealityServerConnection::new(config.to_reality_server_config())?;
+    reality_conn.read_tls(&mut Cursor::new(&client_hello))?;
+    reality_conn.process_new_packets()?;
+
+    let mut handshake_bytes = Vec::new();
+    while reality_conn.wants_write() {
+        reality_conn.write_tls(&mut handshake_bytes)?;
+    }
+    if !handshake_bytes.is_empty() {
+        server_stream.write_all(&handshake_bytes).await?;
+        server_stream.flush().await?;
+    }
+
+    while reality_conn.is_handshaking() {
+        let mut buf = vec![0u8; 4096];
+        let n = server_stream.read(&mut buf).await?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "EOF while waiting for REALITY client Finished",
+            ));
+        }
+        reality_conn.read_tls(&mut Cursor::new(&buf[..n]))?;
+        reality_conn.process_new_packets()?;
+    }
+
+    let mut final_flush = Vec::new();
+    while reality_conn.wants_write() {
+        reality_conn.write_tls(&mut final_flush)?;
+    }
+    if !final_flush.is_empty() {
+        server_stream.write_all(&final_flush).await?;
+        server_stream.flush().await?;
+    }
+
+    Ok(Box::new(RealityTlsStream::new(server_stream, reality_conn)))
+}
+
 #[derive(Debug)]
 pub struct RealityServerHandler {
-    handshake_config: RealityServerConfig,
-    server_names: Vec<String>,
+    transport_config: RealityTransportConfig,
     inner: Box<dyn TcpServerHandler>,
 }
 
@@ -112,8 +177,7 @@ impl RealityServerHandler {
         inner: Box<dyn TcpServerHandler>,
     ) -> Self {
         Self {
-            handshake_config: config.to_reality_server_config(),
-            server_names: config.server_names,
+            transport_config: config,
             inner,
         }
     }
@@ -123,72 +187,10 @@ impl RealityServerHandler {
 impl TcpServerHandler for RealityServerHandler {
     async fn setup_server_stream(
         &self,
-        mut server_stream: Box<dyn AsyncStream>,
+        server_stream: Box<dyn AsyncStream>,
     ) -> io::Result<TcpServerSetupResult> {
-        let client_hello = read_client_hello(&mut server_stream).await?;
-
-        if !self.server_names.is_empty() {
-            let sni = extract_sni_from_client_hello(&client_hello)?;
-            match sni {
-                Some(name)
-                    if self
-                        .server_names
-                        .iter()
-                        .any(|expected| expected.eq_ignore_ascii_case(&name)) => {}
-                Some(name) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        format!("SNI {name} not allowed for REALITY inbound"),
-                    ));
-                }
-                None => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "REALITY inbound requires an SNI value",
-                    ));
-                }
-            }
-        }
-
-        let mut reality_conn =
-            RealityServerConnection::new(self.handshake_config.clone())?;
-        reality_conn.read_tls(&mut Cursor::new(&client_hello))?;
-        reality_conn.process_new_packets()?;
-
-        let mut handshake_bytes = Vec::new();
-        while reality_conn.wants_write() {
-            reality_conn.write_tls(&mut handshake_bytes)?;
-        }
-        if !handshake_bytes.is_empty() {
-            server_stream.write_all(&handshake_bytes).await?;
-            server_stream.flush().await?;
-        }
-
-        while reality_conn.is_handshaking() {
-            let mut buf = vec![0u8; 4096];
-            let n = server_stream.read(&mut buf).await?;
-            if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "EOF while waiting for REALITY client Finished",
-                ));
-            }
-            reality_conn.read_tls(&mut Cursor::new(&buf[..n]))?;
-            reality_conn.process_new_packets()?;
-        }
-
-        let mut final_flush = Vec::new();
-        while reality_conn.wants_write() {
-            reality_conn.write_tls(&mut final_flush)?;
-        }
-        if !final_flush.is_empty() {
-            server_stream.write_all(&final_flush).await?;
-            server_stream.flush().await?;
-        }
-
-        let wrapped_stream = RealityTlsStream::new(server_stream, reality_conn);
-        self.inner
-            .setup_server_stream(Box::new(wrapped_stream))
-            .await
+        let wrapped_stream =
+            accept_reality_stream(server_stream, &self.transport_config).await?;
+        self.inner.setup_server_stream(wrapped_stream).await
     }
 }

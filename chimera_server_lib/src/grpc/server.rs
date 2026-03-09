@@ -94,12 +94,13 @@ fn add_service<S>(
 ) -> tonic::transport::server::Router
 where
     S: tonic::codegen::Service<
-            http::Request<tonic::body::BoxBody>,
-            Response = http::Response<tonic::body::BoxBody>,
+            http::Request<tonic::body::Body>,
+            Response = http::Response<tonic::body::Body>,
             Error = std::convert::Infallible,
         > + tonic::server::NamedService
         + Clone
         + Send
+        + Sync
         + 'static,
     S::Future: Send + 'static,
 {
