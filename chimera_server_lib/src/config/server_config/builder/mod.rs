@@ -50,7 +50,7 @@ impl TryFrom<InboudItem> for ServerConfig {
             port,
         ));
 
-        let (user_id, user_label) = settings
+        let first_client = settings
             .as_ref()
             .and_then(|setting| setting.clients())
             .and_then(|clients| clients.into_iter().next())
@@ -62,10 +62,6 @@ impl TryFrom<InboudItem> for ServerConfig {
                     client.email
                 };
                 (client.id, label)
-            })
-            .unwrap_or_else(|| {
-                let fallback = "ddb573cb-55f8-4d8d-a609-bd444b14b19b".to_string();
-                (fallback.clone(), fallback)
             });
 
         match protocol {
@@ -73,6 +69,14 @@ impl TryFrom<InboudItem> for ServerConfig {
                 tracing::warn!("DokodemoDoor is not supported yet");
                 #[cfg(feature = "vless")]
                 {
+                    let (user_id, user_label) =
+                        first_client.clone().ok_or_else(|| {
+                            Error::InvalidConfig(
+                                "dokodemodoor fallback requires at least one client"
+                                    .into(),
+                            )
+                        })?;
+
                     return Ok(ServerConfig {
                         tag,
                         bind_location,
@@ -135,9 +139,15 @@ impl TryFrom<InboudItem> for ServerConfig {
             }
             #[cfg(feature = "vless")]
             Protocol::Vless => {
+                let (user_id, user_label) = first_client.clone().ok_or_else(|| {
+                    Error::InvalidConfig(
+                        "vless inbound requires at least one client".into(),
+                    )
+                })?;
+
                 let mut protocol = ServerProxyConfig::Vless {
-                    user_id: user_id.clone(),
-                    user_label: user_label.clone(),
+                    user_id,
+                    user_label,
                 };
                 let uses_xhttp = stream_settings
                     .as_ref()
