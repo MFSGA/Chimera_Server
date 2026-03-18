@@ -50,18 +50,22 @@ impl TryFrom<InboudItem> for ServerConfig {
             port,
         ));
 
-        let first_client = settings
+        #[cfg(feature = "vless")]
+        let vless_users = settings
             .as_ref()
             .and_then(|setting| setting.clients())
-            .and_then(|clients| clients.into_iter().next())
-            .map(|client| {
-                tracing::info!("just use the first user_id");
-                let label = if client.email.is_empty() {
-                    client.id.clone()
-                } else {
-                    client.email
-                };
-                (client.id, label)
+            .map(|clients| {
+                clients
+                    .into_iter()
+                    .map(|client| crate::config::server_config::VlessUser {
+                        user_id: client.id.clone(),
+                        user_label: if client.email.is_empty() {
+                            client.id
+                        } else {
+                            client.email
+                        },
+                    })
+                    .collect::<Vec<_>>()
             });
 
         match protocol {
@@ -69,21 +73,17 @@ impl TryFrom<InboudItem> for ServerConfig {
                 tracing::warn!("DokodemoDoor is not supported yet");
                 #[cfg(feature = "vless")]
                 {
-                    let (user_id, user_label) =
-                        first_client.clone().ok_or_else(|| {
-                            Error::InvalidConfig(
-                                "dokodemodoor fallback requires at least one client"
-                                    .into(),
-                            )
-                        })?;
+                    let users = vless_users.clone().ok_or_else(|| {
+                        Error::InvalidConfig(
+                            "dokodemodoor fallback requires at least one client"
+                                .into(),
+                        )
+                    })?;
 
                     return Ok(ServerConfig {
                         tag,
                         bind_location,
-                        protocol: ServerProxyConfig::Vless {
-                            user_id,
-                            user_label,
-                        },
+                        protocol: ServerProxyConfig::Vless { users },
                         transport: Transport::Tcp,
                         quic_settings: None,
                     });
@@ -139,16 +139,13 @@ impl TryFrom<InboudItem> for ServerConfig {
             }
             #[cfg(feature = "vless")]
             Protocol::Vless => {
-                let (user_id, user_label) = first_client.clone().ok_or_else(|| {
+                let users = vless_users.clone().ok_or_else(|| {
                     Error::InvalidConfig(
                         "vless inbound requires at least one client".into(),
                     )
                 })?;
 
-                let mut protocol = ServerProxyConfig::Vless {
-                    user_id,
-                    user_label,
-                };
+                let mut protocol = ServerProxyConfig::Vless { users };
                 let uses_xhttp = stream_settings
                     .as_ref()
                     .map(|settings| settings.network.eq_ignore_ascii_case("xhttp"))
@@ -353,6 +350,45 @@ impl TryFrom<InboudItem> for ServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn vless_builder_preserves_multiple_clients() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-multi-user",
+            "settings": {
+                "clients": [
+                    {
+                        "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+                        "email": "user-a@example.com"
+                    },
+                    {
+                        "id": "9d2d3c52-a386-4f2f-a507-0ca29f8d13f0",
+                        "email": "user-b@example.com"
+                    }
+                ],
+                "decryption": "none"
+            }
+        }))
+        .expect("valid vless inbound item");
+
+        let config = ServerConfig::try_from(inbound)
+            .expect("vless inbound config should build");
+
+        match config.protocol {
+            ServerProxyConfig::Vless { users } => {
+                assert_eq!(users.len(), 2);
+                assert_eq!(users[0].user_id, "114cb5a6-3787-4357-a5da-69b5782cb74f");
+                assert_eq!(users[0].user_label, "user-a@example.com");
+                assert_eq!(users[1].user_id, "9d2d3c52-a386-4f2f-a507-0ca29f8d13f0");
+                assert_eq!(users[1].user_label, "user-b@example.com");
+            }
+            other => panic!("expected vless protocol, got {other:?}"),
+        }
+    }
 
     #[cfg(all(feature = "reality", feature = "vless"))]
     #[test]
