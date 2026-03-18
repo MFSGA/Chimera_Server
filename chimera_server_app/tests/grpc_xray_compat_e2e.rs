@@ -41,6 +41,13 @@ const ADDED_USER: &str = "grpc-e2e-added-user";
 const ADDED_PASSWORD: &str = "grpc-e2e-added-pass";
 const ADDED_INBOUND_TAG: &str = "grpc-e2e-added-inbound";
 const ADDED_OUTBOUND_TAG: &str = "grpc-e2e-added-outbound";
+const VLESS_TAG: &str = "vless-grpc-e2e";
+const VLESS_USER_A_EMAIL: &str = "vless-user-a@example.com";
+const VLESS_USER_B_EMAIL: &str = "vless-user-b@example.com";
+const VLESS_USER_A_ID: &str = "114cb5a6-3787-4357-a5da-69b5782cb74f";
+const VLESS_USER_B_ID: &str = "9d2d3c52-a386-4f2f-a507-0ca29f8d13f0";
+const VLESS_ADDED_USER_EMAIL: &str = "vless-added-user@example.com";
+const VLESS_ADDED_USER_ID: &str = "f7b11076-5a8d-4f86-b03c-c57dcf0fd5f4";
 
 const PATH_STATS_GET_STATS: &str = "/xray.app.stats.command.StatsService/GetStats";
 const PATH_STATS_GET_STATS_ONLINE: &str =
@@ -274,11 +281,19 @@ impl Harness {
             socks_port = free_localhost_port()?;
         }
 
-        let grpc_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, grpc_port);
         let config = match target {
             TargetKind::Chimera => build_chimera_config(grpc_port, socks_port),
             TargetKind::Xray => build_xray_config(grpc_port, socks_port),
         };
+        Self::start_with_config(target, grpc_port, config)
+    }
+
+    fn start_with_config(
+        target: TargetKind,
+        grpc_port: u16,
+        config: String,
+    ) -> io::Result<Self> {
+        let grpc_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, grpc_port);
 
         let mut server = ServerProcess::spawn(target, &config)?;
         server.wait_until_ready(SocketAddr::V4(grpc_addr))?;
@@ -490,6 +505,111 @@ fn build_xray_config(grpc_port: u16, socks_port: u16) -> String {
         "selector": ["{DIRECT_TAG}", "{BACKUP_TAG}"]
       }}
     ],
+    "rules": [
+      {{
+        "type": "field",
+        "inboundTag": ["{API_INBOUND_TAG}"],
+        "outboundTag": "{API_OUTBOUND_TAG}"
+      }}
+    ]
+  }}
+}}"#
+    )
+}
+
+fn build_chimera_vless_multi_user_config(grpc_port: u16, vless_port: u16) -> String {
+    format!(
+        r#"{{
+  "inbounds": [
+    {{
+      "listen": "127.0.0.1",
+      "port": {vless_port},
+      "protocol": "vless",
+      "settings": {{
+        "clients": [
+          {{
+            "id": "{VLESS_USER_A_ID}",
+            "email": "{VLESS_USER_A_EMAIL}"
+          }},
+          {{
+            "id": "{VLESS_USER_B_ID}",
+            "email": "{VLESS_USER_B_EMAIL}"
+          }}
+        ],
+        "decryption": "none"
+      }},
+      "tag": "{VLESS_TAG}"
+    }}
+  ],
+  "outbounds": [
+    {{
+      "protocol": "freedom",
+      "tag": "{DIRECT_TAG}"
+    }}
+  ],
+  "api": {{
+    "listen": "127.0.0.1:{grpc_port}",
+    "services": [
+      "HandlerService"
+    ]
+  }}
+}}"#
+    )
+}
+
+fn build_xray_vless_multi_user_config(grpc_port: u16, vless_port: u16) -> String {
+    format!(
+        r#"{{
+  "log": {{
+    "loglevel": "warning"
+  }},
+  "api": {{
+    "tag": "{API_OUTBOUND_TAG}",
+    "services": [
+      "HandlerService"
+    ]
+  }},
+  "inbounds": [
+    {{
+      "listen": "127.0.0.1",
+      "port": {vless_port},
+      "protocol": "vless",
+      "settings": {{
+        "clients": [
+          {{
+            "id": "{VLESS_USER_A_ID}",
+            "email": "{VLESS_USER_A_EMAIL}"
+          }},
+          {{
+            "id": "{VLESS_USER_B_ID}",
+            "email": "{VLESS_USER_B_EMAIL}"
+          }}
+        ],
+        "decryption": "none"
+      }},
+      "tag": "{VLESS_TAG}"
+    }},
+    {{
+      "listen": "127.0.0.1",
+      "port": {grpc_port},
+      "protocol": "dokodemo-door",
+      "settings": {{
+        "address": "127.0.0.1"
+      }},
+      "tag": "{API_INBOUND_TAG}"
+    }}
+  ],
+  "outbounds": [
+    {{
+      "protocol": "freedom",
+      "tag": "{DIRECT_TAG}"
+    }},
+    {{
+      "protocol": "freedom",
+      "tag": "{API_OUTBOUND_TAG}"
+    }}
+  ],
+  "routing": {{
     "rules": [
       {{
         "type": "field",
@@ -743,6 +863,66 @@ fn grpc_all_interfaces_compat_with_xray_core() {
         panic!(
             "grpc compatibility report contains failures\n{}",
             failures.join("\n")
+        );
+    }
+}
+
+#[test]
+#[ignore = "runs vless multi-user grpc compatibility against xray baseline"]
+fn grpc_vless_multi_user_compat_with_xray_core() {
+    trace_step("==== test grpc_vless_multi_user_compat_with_xray_core start ====");
+    let _guard = global_test_lock()
+        .lock()
+        .expect("failed to acquire global test lock");
+
+    let chimera_grpc_port =
+        free_localhost_port().expect("failed to allocate chimera grpc port");
+    let mut chimera_vless_port =
+        free_localhost_port().expect("failed to allocate chimera vless port");
+    while chimera_vless_port == chimera_grpc_port {
+        chimera_vless_port =
+            free_localhost_port().expect("failed to re-allocate chimera vless port");
+    }
+
+    let mut xray_grpc_port =
+        free_localhost_port().expect("failed to allocate xray grpc port");
+    while xray_grpc_port == chimera_grpc_port || xray_grpc_port == chimera_vless_port
+    {
+        xray_grpc_port =
+            free_localhost_port().expect("failed to re-allocate xray grpc port");
+    }
+
+    let mut xray_vless_port =
+        free_localhost_port().expect("failed to allocate xray vless port");
+    while xray_vless_port == chimera_grpc_port
+        || xray_vless_port == chimera_vless_port
+        || xray_vless_port == xray_grpc_port
+    {
+        xray_vless_port =
+            free_localhost_port().expect("failed to re-allocate xray vless port");
+    }
+
+    let chimera = Harness::start_with_config(
+        TargetKind::Chimera,
+        chimera_grpc_port,
+        build_chimera_vless_multi_user_config(chimera_grpc_port, chimera_vless_port),
+    )
+    .expect("failed to start chimera vless harness");
+    let xray = Harness::start_with_config(
+        TargetKind::Xray,
+        xray_grpc_port,
+        build_xray_vless_multi_user_config(xray_grpc_port, xray_vless_port),
+    )
+    .expect("failed to start xray vless harness");
+
+    let chimera_steps = run_vless_multi_user_flow(&chimera);
+    let xray_steps = run_vless_multi_user_flow(&xray);
+
+    if !steps_match(&chimera_steps, &xray_steps) {
+        panic!(
+            "vless multi-user flow diverged: chimera={} xray={}",
+            steps_normalized_summary(&chimera_steps),
+            steps_normalized_summary(&xray_steps),
         );
     }
 }
@@ -1405,10 +1585,14 @@ fn query_list_inbounds(harness: &Harness) -> CompatSnapshot {
 }
 
 fn query_get_inbound_users(harness: &Harness) -> CompatSnapshot {
+    query_get_inbound_users_for_tag(harness, SOCKS_TAG)
+}
+
+fn query_get_inbound_users_for_tag(harness: &Harness, tag: &str) -> CompatSnapshot {
     let result: Result<GetInboundUserResponse, Status> = harness.unary(
         PATH_HANDLER_GET_INBOUND_USERS,
         GetInboundUserRequest {
-            tag: SOCKS_TAG.to_string(),
+            tag: tag.to_string(),
             email: String::new(),
         },
     );
@@ -1423,10 +1607,17 @@ fn query_get_inbound_users(harness: &Harness) -> CompatSnapshot {
 }
 
 fn query_get_inbound_users_count(harness: &Harness) -> CompatSnapshot {
+    query_get_inbound_users_count_for_tag(harness, SOCKS_TAG)
+}
+
+fn query_get_inbound_users_count_for_tag(
+    harness: &Harness,
+    tag: &str,
+) -> CompatSnapshot {
     let result: Result<GetInboundUsersCountResponse, Status> = harness.unary(
         PATH_HANDLER_GET_INBOUND_USERS_COUNT,
         GetInboundUserRequest {
-            tag: SOCKS_TAG.to_string(),
+            tag: tag.to_string(),
             email: String::new(),
         },
     );
@@ -1697,6 +1888,100 @@ fn mutate_remove_user_step(harness: &Harness) -> CompatStepResult {
         "AlterInbound(RemoveUserOperation)",
         snapshot_from_result(result, |_| "ok".to_string()),
     )
+}
+
+fn mutate_add_vless_user_snapshot(harness: &Harness, tag: &str) -> CompatSnapshot {
+    let add_operation = AddUserOperation {
+        user: Some(User {
+            level: 0,
+            email: VLESS_ADDED_USER_EMAIL.to_string(),
+            account: Some(TypedMessage {
+                r#type: "xray.proxy.vless.Account".to_string(),
+                value: VlessAccount {
+                    id: VLESS_ADDED_USER_ID.to_string(),
+                    flow: String::new(),
+                }
+                .encode_to_vec(),
+            }),
+        }),
+    };
+    let result: Result<AlterInboundResponse, Status> = harness.unary(
+        PATH_HANDLER_ALTER_INBOUND,
+        AlterInboundRequest {
+            tag: tag.to_string(),
+            operation: Some(TypedMessage {
+                r#type: "xray.app.proxyman.command.AddUserOperation".to_string(),
+                value: add_operation.encode_to_vec(),
+            }),
+        },
+    );
+    snapshot_from_result(result, |_| "ok".to_string())
+}
+
+fn mutate_remove_user_snapshot(
+    harness: &Harness,
+    tag: &str,
+    email: &str,
+) -> CompatSnapshot {
+    let remove_operation = RemoveUserOperation {
+        email: email.to_string(),
+    };
+    let result: Result<AlterInboundResponse, Status> = harness.unary(
+        PATH_HANDLER_ALTER_INBOUND,
+        AlterInboundRequest {
+            tag: tag.to_string(),
+            operation: Some(TypedMessage {
+                r#type: "xray.app.proxyman.command.RemoveUserOperation".to_string(),
+                value: remove_operation.encode_to_vec(),
+            }),
+        },
+    );
+    snapshot_from_result(result, |_| "ok".to_string())
+}
+
+fn run_vless_multi_user_flow(harness: &Harness) -> Vec<CompatStepResult> {
+    vec![
+        grpc_step(
+            "query-users-initial",
+            &format!("GetInboundUsers(tag={VLESS_TAG}, email=\"\")"),
+            query_get_inbound_users_for_tag(harness, VLESS_TAG),
+        ),
+        grpc_step(
+            "query-count-initial",
+            &format!("GetInboundUsersCount(tag={VLESS_TAG}, email=\"\")"),
+            query_get_inbound_users_count_for_tag(harness, VLESS_TAG),
+        ),
+        grpc_step(
+            "mutate-add",
+            "AlterInbound(AddUserOperation:vless)",
+            mutate_add_vless_user_snapshot(harness, VLESS_TAG),
+        ),
+        grpc_step(
+            "verify-users-after-add",
+            &format!("GetInboundUsers(tag={VLESS_TAG}, email=\"\")"),
+            query_get_inbound_users_for_tag(harness, VLESS_TAG),
+        ),
+        grpc_step(
+            "verify-count-after-add",
+            &format!("GetInboundUsersCount(tag={VLESS_TAG}, email=\"\")"),
+            query_get_inbound_users_count_for_tag(harness, VLESS_TAG),
+        ),
+        grpc_step(
+            "mutate-remove",
+            "AlterInbound(RemoveUserOperation:vless)",
+            mutate_remove_user_snapshot(harness, VLESS_TAG, VLESS_ADDED_USER_EMAIL),
+        ),
+        grpc_step(
+            "verify-users-after-remove",
+            &format!("GetInboundUsers(tag={VLESS_TAG}, email=\"\")"),
+            query_get_inbound_users_for_tag(harness, VLESS_TAG),
+        ),
+        grpc_step(
+            "verify-count-after-remove",
+            &format!("GetInboundUsersCount(tag={VLESS_TAG}, email=\"\")"),
+            query_get_inbound_users_count_for_tag(harness, VLESS_TAG),
+        ),
+    ]
 }
 
 fn mutate_override_balancer_step(
@@ -2205,6 +2490,14 @@ struct SocksAccount {
     username: String,
     #[prost(string, tag = "2")]
     password: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct VlessAccount {
+    #[prost(string, tag = "1")]
+    id: String,
+    #[prost(string, tag = "2")]
+    flow: String,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
