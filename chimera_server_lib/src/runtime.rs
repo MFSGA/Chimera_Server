@@ -5,7 +5,7 @@ use std::{
 
 use tokio::task::{AbortHandle, JoinHandle};
 
-use crate::config::server_config::ServerConfig;
+use crate::{config::server_config::ServerConfig, routing_state::RoutingState};
 
 #[derive(Debug, Clone)]
 pub struct OutboundSummary {
@@ -18,6 +18,7 @@ pub struct RuntimeState {
     inbounds: Arc<RwLock<Vec<ServerConfig>>>,
     outbounds: Arc<RwLock<Vec<OutboundSummary>>>,
     inbound_tasks: Arc<RwLock<HashMap<String, Vec<AbortHandle>>>>,
+    routing: Arc<RwLock<RoutingState>>,
 }
 
 impl RuntimeState {
@@ -29,6 +30,7 @@ impl RuntimeState {
             inbounds: Arc::new(RwLock::new(inbounds)),
             outbounds: Arc::new(RwLock::new(outbounds)),
             inbound_tasks: Arc::new(RwLock::new(HashMap::new())),
+            routing: Arc::new(RwLock::new(RoutingState::default())),
         }
     }
 
@@ -133,5 +135,24 @@ impl RuntimeState {
         }
         guard.push(outbound);
         Ok(())
+    }
+
+    pub fn routing(&self) -> RoutingState {
+        self.routing
+            .read()
+            .expect("runtime routing lock poisoned")
+            .clone()
+    }
+
+    pub fn replace_routing(&self, routing: RoutingState) {
+        *self.routing.write().expect("runtime routing lock poisoned") = routing;
+    }
+
+    pub fn with_routing_mut<R, F>(&self, mutator: F) -> R
+    where
+        F: FnOnce(&mut RoutingState) -> R,
+    {
+        let mut guard = self.routing.write().expect("runtime routing lock poisoned");
+        mutator(&mut guard)
     }
 }

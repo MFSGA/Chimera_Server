@@ -7,7 +7,9 @@ use crate::reality::{decode_private_key, decode_short_id};
 use super::super::types::RealityTransportConfig;
 use super::super::types::ServerProxyConfig;
 #[cfg(feature = "tls")]
-use super::super::types::TlsServerConfig;
+use super::super::types::{
+    TlsCertificateConfig, TlsCertificateUsage, TlsServerConfig,
+};
 use crate::address::{Address, NetLocation};
 
 #[cfg(feature = "reality")]
@@ -101,6 +103,70 @@ fn build_reality_layer(
 }
 
 #[cfg(feature = "tls")]
+fn pem_lines_to_bytes(lines: &[String]) -> Vec<u8> {
+    lines.join("\n").into_bytes()
+}
+
+#[cfg(feature = "tls")]
+fn parse_certificate_usage(value: Option<&str>) -> TlsCertificateUsage {
+    match value
+        .unwrap_or("encipherment")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "verify" => TlsCertificateUsage::Verify,
+        "issue" => TlsCertificateUsage::Issue,
+        _ => TlsCertificateUsage::Encipherment,
+    }
+}
+
+#[cfg(feature = "tls")]
+fn build_tls_certificate(
+    certificate: &crate::config::Certificate,
+) -> Result<TlsCertificateConfig, Error> {
+    let certificate_path = certificate
+        .certificate_file
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let key_path = certificate
+        .key_file
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let certificate_pem = pem_lines_to_bytes(&certificate.certificate);
+    let key_pem =
+        (!certificate.key.is_empty()).then(|| pem_lines_to_bytes(&certificate.key));
+    let usage = parse_certificate_usage(certificate.usage.as_deref());
+
+    if certificate_path.is_none() && certificate_pem.is_empty() {
+        return Err(Error::InvalidConfig(
+            "tls certificate requires certificateFile or certificate".into(),
+        ));
+    }
+
+    if matches!(usage, TlsCertificateUsage::Encipherment)
+        && key_path.is_none()
+        && key_pem.is_none()
+    {
+        return Err(Error::InvalidConfig(
+            "tls encipherment certificate requires keyFile or key".into(),
+        ));
+    }
+
+    Ok(TlsCertificateConfig {
+        certificate_path,
+        certificate_pem,
+        key_path,
+        key_pem,
+        usage,
+    })
+}
+
+#[cfg(feature = "tls")]
 fn build_tls_layer(
     protocol: ServerProxyConfig,
     stream_settings: &StreamSettings,
@@ -109,20 +175,28 @@ fn build_tls_layer(
         Error::InvalidConfig("tls inbound requires tlsSettings configuration".into())
     })?;
 
-    let certificate = tls_settings
+    let certificates = tls_settings
         .certificates
-        .get(0)
-        .ok_or_else(|| {
-            Error::InvalidConfig(
-                "tls inbound requires at least one certificate".into(),
-            )
-        })?
-        .clone();
+        .iter()
+        .map(build_tls_certificate)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if certificates.is_empty() {
+        return Err(Error::InvalidConfig(
+            "tls inbound requires at least one certificate".into(),
+        ));
+    }
 
     Ok(ServerProxyConfig::Tls(TlsServerConfig {
-        certificate_path: certificate.certificate_file,
-        private_key_path: certificate.key_file,
+        certificates,
         alpn_protocols: tls_settings.alpn.clone(),
+        enable_session_resumption: tls_settings
+            .enable_session_resumption
+            .unwrap_or(false),
+        reject_unknown_sni: tls_settings.reject_unknown_sni.unwrap_or(false),
+        min_version: tls_settings.min_version.clone(),
+        max_version: tls_settings.max_version.clone(),
+        server_name: tls_settings.server_name.clone(),
         inner: Box::new(protocol),
     }))
 }

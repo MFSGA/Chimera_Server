@@ -71,7 +71,17 @@ tuic = ["dashmap", "lru", "uuid"]
 traffic = []
 api = ["tonic", "tonic-prost", "prost", "prost-types", "tokio-stream"]
 
-full = ["hysteria", "trojan", "ws", "tls", "reality", "vless", "tuic", "api"]
+full = [
+    "hysteria",
+    "trojan",
+    "ws",
+    "tls",
+    "reality",
+    "vless",
+    "tuic",
+    "api",
+    "traffic",
+]
 
 default = ["full"]
 
