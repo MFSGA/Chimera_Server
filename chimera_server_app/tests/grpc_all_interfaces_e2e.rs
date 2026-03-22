@@ -25,10 +25,13 @@ const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 const SOCKS_TAG: &str = "socks-grpc-e2e";
+const VLESS_TAG: &str = "vless-grpc-e2e";
 const DIRECT_TAG: &str = "direct";
 const BACKUP_TAG: &str = "backup";
 const TEST_USERNAME: &str = "grpc-e2e-user";
 const TEST_PASSWORD: &str = "grpc-e2e-pass";
+const VLESS_ADDED_USER_EMAIL: &str = "grpc-vless-added-user@example.com";
+const VLESS_ADDED_USER_ID: &str = "7f7f0d6e-1b98-4700-9f5f-22644193f520";
 
 const PATH_STATS_GET_STATS: &str = "/xray.app.stats.command.StatsService/GetStats";
 const PATH_STATS_GET_STATS_ONLINE: &str =
@@ -238,6 +241,53 @@ impl Harness {
         })
     }
 
+    fn start_with_config_builder<F>(config_builder: F) -> io::Result<Self>
+    where
+        F: FnOnce(u16, u16) -> String,
+    {
+        trace_step("harness start with custom config");
+        let guard = global_test_lock().lock().map_err(|err| {
+            io::Error::other(format!("failed to acquire test lock: {err}"))
+        })?;
+        trace_step("global test lock acquired");
+
+        let grpc_port = free_localhost_port()?;
+        let data_port = free_localhost_port()?;
+        let grpc_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, grpc_port);
+        trace_step(format!(
+            "allocated grpc_port={} data_port={}",
+            grpc_port, data_port
+        ));
+
+        let config = config_builder(grpc_port, data_port);
+        let mut server = ServerProcess::spawn(&config)?;
+        server.wait_until_ready(SocketAddr::V4(grpc_addr))?;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        trace_step("tokio runtime built");
+
+        let channel =
+            match runtime.block_on(connect_channel(SocketAddr::V4(grpc_addr))) {
+                Ok(channel) => channel,
+                Err(err) => {
+                    return Err(io::Error::other(format!(
+                        "failed to connect grpc channel: {err}; logs:\n{}",
+                        server.logs()
+                    )));
+                }
+            };
+        trace_step("grpc channel connected");
+
+        Ok(Self {
+            _guard: guard,
+            server,
+            runtime,
+            channel,
+        })
+    }
+
     fn logs(&self) -> String {
         self.server.logs()
     }
@@ -339,6 +389,52 @@ fn build_config(grpc_port: u16, socks_port: u16) -> String {
         ]
       }},
       "tag": "{SOCKS_TAG}"
+    }}
+  ],
+  "outbounds": [
+    {{
+      "protocol": "freedom",
+      "tag": "{DIRECT_TAG}"
+    }},
+    {{
+      "protocol": "blackhole",
+      "tag": "{BACKUP_TAG}"
+    }}
+  ],
+  "api": {{
+    "listen": "127.0.0.1:{grpc_port}",
+    "services": [
+      "StatsService",
+      "LoggerService",
+      "HandlerService",
+      "RoutingService",
+      "ObservatoryService"
+    ]
+  }}
+}}"#
+    )
+}
+
+fn build_vless_config(grpc_port: u16, vless_port: u16) -> String {
+    trace_step(format!(
+        "building vless integration config grpc_port={} vless_port={}",
+        grpc_port, vless_port
+    ));
+    format!(
+        r#"{{
+  "inbounds": [
+    {{
+      "listen": "127.0.0.1",
+      "port": {vless_port},
+      "protocol": "vless",
+      "settings": {{
+        "clients": [],
+        "decryption": "none"
+      }},
+      "streamSettings": {{
+        "network": "tcp"
+      }},
+      "tag": "{VLESS_TAG}"
     }}
   ],
   "outbounds": [
@@ -598,6 +694,14 @@ struct SocksAccount {
     username: String,
     #[prost(string, tag = "2")]
     password: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct VlessAccount {
+    #[prost(string, tag = "1")]
+    id: String,
+    #[prost(string, tag = "2")]
+    flow: String,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -1033,6 +1137,143 @@ fn handler_alter_inbound_add_and_remove_user_executes() {
         "HandlerService/GetInboundUsersCount(after remove)",
     );
     assert_eq!(users_count_after_remove.count, 1);
+}
+
+#[test]
+fn handler_node_style_vless_add_and_remove_user_executes() {
+    trace_step(
+        "==== test handler_node_style_vless_add_and_remove_user_executes start ====",
+    );
+    let harness = Harness::start_with_config_builder(build_vless_config)
+        .expect("failed to start vless test harness");
+
+    let users_before_add: GetInboundUserResponse = harness.expect_ok(
+        harness.unary(
+            PATH_HANDLER_GET_INBOUND_USERS,
+            GetInboundUserRequest {
+                tag: VLESS_TAG.to_string(),
+                email: String::new(),
+            },
+        ),
+        "HandlerService/GetInboundUsers(before add)",
+    );
+    assert!(users_before_add.users.is_empty());
+
+    let count_before_add: GetInboundUsersCountResponse = harness.expect_ok(
+        harness.unary(
+            PATH_HANDLER_GET_INBOUND_USERS_COUNT,
+            GetInboundUserRequest {
+                tag: VLESS_TAG.to_string(),
+                email: String::new(),
+            },
+        ),
+        "HandlerService/GetInboundUsersCount(before add)",
+    );
+    assert_eq!(count_before_add.count, 0);
+
+    let add_operation = AddUserOperation {
+        user: Some(User {
+            level: 0,
+            email: VLESS_ADDED_USER_EMAIL.to_string(),
+            account: Some(TypedMessage {
+                r#type: "xray.proxy.vless.Account".to_string(),
+                value: VlessAccount {
+                    id: VLESS_ADDED_USER_ID.to_string(),
+                    flow: String::new(),
+                }
+                .encode_to_vec(),
+            }),
+        }),
+    };
+    let _: AlterInboundResponse = harness.expect_ok(
+        harness.unary(
+            PATH_HANDLER_ALTER_INBOUND,
+            AlterInboundRequest {
+                tag: VLESS_TAG.to_string(),
+                operation: Some(TypedMessage {
+                    r#type: "xray.app.proxyman.command.AddUserOperation".to_string(),
+                    value: add_operation.encode_to_vec(),
+                }),
+            },
+        ),
+        "HandlerService/AlterInbound(add user vless node style)",
+    );
+
+    let users_after_add: GetInboundUserResponse = harness.expect_ok(
+        harness.unary(
+            PATH_HANDLER_GET_INBOUND_USERS,
+            GetInboundUserRequest {
+                tag: VLESS_TAG.to_string(),
+                email: String::new(),
+            },
+        ),
+        "HandlerService/GetInboundUsers(after add)",
+    );
+    assert_eq!(users_after_add.users.len(), 1);
+    assert_eq!(users_after_add.users[0].email, VLESS_ADDED_USER_EMAIL);
+
+    let count_after_add: GetInboundUsersCountResponse = harness.expect_ok(
+        harness.unary(
+            PATH_HANDLER_GET_INBOUND_USERS_COUNT,
+            GetInboundUserRequest {
+                tag: VLESS_TAG.to_string(),
+                email: String::new(),
+            },
+        ),
+        "HandlerService/GetInboundUsersCount(after add)",
+    );
+    assert_eq!(count_after_add.count, 1);
+
+    let remove_operation = RemoveUserOperation {
+        email: VLESS_ADDED_USER_EMAIL.to_string(),
+    };
+    let _: AlterInboundResponse = harness.expect_ok(
+        harness.unary(
+            PATH_HANDLER_ALTER_INBOUND,
+            AlterInboundRequest {
+                tag: VLESS_TAG.to_string(),
+                operation: Some(TypedMessage {
+                    r#type: "xray.app.proxyman.command.RemoveUserOperation"
+                        .to_string(),
+                    value: remove_operation.encode_to_vec(),
+                }),
+            },
+        ),
+        "HandlerService/AlterInbound(remove user vless node style)",
+    );
+
+    let users_after_remove: GetInboundUserResponse = harness.expect_ok(
+        harness.unary(
+            PATH_HANDLER_GET_INBOUND_USERS,
+            GetInboundUserRequest {
+                tag: VLESS_TAG.to_string(),
+                email: String::new(),
+            },
+        ),
+        "HandlerService/GetInboundUsers(after remove)",
+    );
+    assert!(
+        users_after_remove.users.is_empty(),
+        "expected no VLESS users after remove, got {:?}; logs:\n{}",
+        users_after_remove
+            .users
+            .iter()
+            .map(|user| user.email.clone())
+            .collect::<Vec<_>>(),
+        harness.logs()
+    );
+
+    let count_after_remove: GetInboundUsersCountResponse = harness.expect_ok(
+        harness.unary(
+            PATH_HANDLER_GET_INBOUND_USERS_COUNT,
+            GetInboundUserRequest {
+                tag: VLESS_TAG.to_string(),
+                email: String::new(),
+            },
+        ),
+        "HandlerService/GetInboundUsersCount(after remove)",
+    );
+    assert_eq!(count_after_remove.count, 0);
 }
 
 #[test]

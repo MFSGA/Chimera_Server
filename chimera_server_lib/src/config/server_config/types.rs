@@ -127,12 +127,41 @@ pub struct XhttpServerConfig {
     pub session_ttl_secs: u64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct DokodemoDoorConfig {
+    pub target: NetLocation,
+    #[serde(default)]
+    pub follow_redirect: bool,
+}
+
+#[cfg(feature = "tls")]
+#[derive(Debug, Clone, Deserialize)]
+pub enum TlsCertificateUsage {
+    Encipherment,
+    Verify,
+    Issue,
+}
+
+#[cfg(feature = "tls")]
+#[derive(Debug, Clone, Deserialize)]
+pub struct TlsCertificateConfig {
+    pub certificate_path: Option<String>,
+    pub certificate_pem: Vec<u8>,
+    pub key_path: Option<String>,
+    pub key_pem: Option<Vec<u8>>,
+    pub usage: TlsCertificateUsage,
+}
+
 #[cfg(feature = "tls")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct TlsServerConfig {
-    pub certificate_path: String,
-    pub private_key_path: String,
+    pub certificates: Vec<TlsCertificateConfig>,
     pub alpn_protocols: Vec<String>,
+    pub enable_session_resumption: bool,
+    pub reject_unknown_sni: bool,
+    pub min_version: Option<String>,
+    pub max_version: Option<String>,
+    pub server_name: Option<String>,
     pub inner: Box<ServerProxyConfig>,
 }
 
@@ -204,6 +233,9 @@ pub enum ServerProxyConfig {
     Socks {
         accounts: Vec<SocksUser>,
     },
+    DokodemoDoor {
+        config: DokodemoDoorConfig,
+    },
 }
 
 impl std::fmt::Display for ServerProxyConfig {
@@ -228,6 +260,7 @@ impl std::fmt::Display for ServerProxyConfig {
                 Self::Tls(_) => "Tls",
                 Self::Xhttp { .. } => "Xhttp",
                 Self::Socks { .. } => "Socks",
+                Self::DokodemoDoor { .. } => "DokodemoDoor",
             }
         )
     }

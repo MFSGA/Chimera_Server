@@ -10,6 +10,8 @@ use crate::config::server_config::TrojanUser;
 use crate::config::server_config::VlessUser;
 #[cfg(feature = "ws")]
 use crate::config::server_config::ws::WebsocketServerConfig;
+    #[cfg(feature = "tls")]
+use crate::config::server_config::{TlsCertificateConfig, TlsCertificateUsage};
 #[cfg(feature = "ws")]
 use crate::util::option::OneOrSome;
 use crate::{
@@ -645,9 +647,19 @@ impl HandlerServiceImpl {
                     ));
                 }
                 Ok(ServerProxyConfig::Tls(TlsServerConfig {
-                    certificate_path: certificate_path.to_string(),
-                    private_key_path: private_key_path.to_string(),
+                    certificates: vec![TlsCertificateConfig {
+                        certificate_path: Some(certificate_path.to_string()),
+                        certificate_pem: certificate.certificate.clone(),
+                        key_path: Some(private_key_path.to_string()),
+                        key_pem: Some(certificate.key.clone()),
+                        usage: TlsCertificateUsage::Encipherment,
+                    }],
                     alpn_protocols: tls.next_protocol,
+                    enable_session_resumption: false,
+                    reject_unknown_sni: false,
+                    min_version: None,
+                    max_version: None,
+                    server_name: None,
                     inner: Box::new(protocol),
                 }))
             }
@@ -1034,6 +1046,98 @@ impl HandlerServiceImpl {
                 self.get_user_manager_identities(inner)
             }
             ServerProxyConfig::Socks { .. } => None,
+            ServerProxyConfig::DokodemoDoor { .. } => None,
+        }
+    }
+
+    fn get_user_manager_users(
+        &self,
+        protocol: &ServerProxyConfig,
+    ) -> Option<Vec<proto::xray::common::protocol::User>> {
+        match protocol {
+            #[cfg(feature = "vless")]
+            ServerProxyConfig::Vless { users } => Some(
+                users.iter()
+                    .map(|user| proto::xray::common::protocol::User {
+                        level: 0,
+                        email: user.user_label.clone(),
+                        account: Some(proto::xray::common::serial::TypedMessage {
+                            r#type: TYPE_PROXY_VLESS_ACCOUNT.to_string(),
+                            value: VlessAccountPayload {
+                                id: user.user_id.clone(),
+                                flow: String::new(),
+                            }
+                            .encode_to_vec(),
+                        }),
+                    })
+                    .collect(),
+            ),
+            #[cfg(feature = "trojan")]
+            ServerProxyConfig::Trojan { users, .. } => Some(
+                users.iter()
+                    .map(|user| proto::xray::common::protocol::User {
+                        level: 0,
+                        email: user.email.clone().unwrap_or_default(),
+                        account: Some(proto::xray::common::serial::TypedMessage {
+                            r#type: TYPE_PROXY_TROJAN_ACCOUNT.to_string(),
+                            value: TrojanAccountPayload {
+                                password: user.password.clone(),
+                            }
+                            .encode_to_vec(),
+                        }),
+                    })
+                    .collect(),
+            ),
+            #[cfg(feature = "hysteria")]
+            ServerProxyConfig::Hysteria2 { config } => Some(
+                config
+                    .clients
+                    .iter()
+                    .filter_map(|client| client.email.clone())
+                    .map(|email| self.build_user(email))
+                    .collect(),
+            ),
+            #[cfg(feature = "tuic")]
+            ServerProxyConfig::TuicV5 { config } => {
+                Some(vec![self.build_user(config.uuid.clone())])
+            }
+            #[cfg(feature = "ws")]
+            ServerProxyConfig::Websocket { targets } => {
+                let mut users = Vec::new();
+                let mut handled = false;
+                match targets.as_ref() {
+                    crate::util::option::OneOrSome::One(target) => {
+                        if let Some(items) =
+                            self.get_user_manager_users(&target.protocol)
+                        {
+                            users.extend(items);
+                            handled = true;
+                        }
+                    }
+                    crate::util::option::OneOrSome::Some(list) => {
+                        for target in list {
+                            if let Some(items) =
+                                self.get_user_manager_users(&target.protocol)
+                            {
+                                users.extend(items);
+                                handled = true;
+                            }
+                        }
+                    }
+                }
+                handled.then_some(users)
+            }
+            #[cfg(feature = "tls")]
+            ServerProxyConfig::Tls(tls) => self.get_user_manager_users(&tls.inner),
+            #[cfg(feature = "reality")]
+            ServerProxyConfig::Reality(reality) => {
+                self.get_user_manager_users(&reality.inner)
+            }
+            ServerProxyConfig::Xhttp { inner, .. } => {
+                self.get_user_manager_users(inner)
+            }
+            ServerProxyConfig::Socks { .. } => None,
+            ServerProxyConfig::DokodemoDoor { .. } => None,
         }
     }
 
@@ -1156,10 +1260,9 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
             .ok_or_else(|| Status::not_found("inbound not found"))?;
 
         let mut users = self
-            .get_user_manager_identities(&inbound.protocol)
+            .get_user_manager_users(&inbound.protocol)
             .ok_or_else(|| Status::unknown(ERR_PROXY_NOT_USER_MANAGER))?
             .into_iter()
-            .map(|email| self.build_user(email))
             .collect::<Vec<_>>();
 
         if !request.email.is_empty() {
@@ -1700,8 +1803,16 @@ mod tests {
         assert_eq!(parsed.transport, Transport::Tcp);
         match parsed.protocol {
             ServerProxyConfig::Tls(tls) => {
-                assert_eq!(tls.certificate_path, "/tmp/test-cert.pem");
-                assert_eq!(tls.private_key_path, "/tmp/test-key.pem");
+                assert_eq!(tls.certificates.len(), 1);
+                let certificate = &tls.certificates[0];
+                assert_eq!(
+                    certificate.certificate_path.as_deref(),
+                    Some("/tmp/test-cert.pem")
+                );
+                assert_eq!(
+                    certificate.key_path.as_deref(),
+                    Some("/tmp/test-key.pem")
+                );
                 assert_eq!(tls.alpn_protocols, vec!["h2", "http/1.1"]);
                 match tls.inner.as_ref() {
                     ServerProxyConfig::Websocket { targets } => match targets
@@ -1936,10 +2047,17 @@ mod tests {
             .into_inner()
             .users
             .into_iter()
-            .map(|user| user.email)
             .collect::<Vec<_>>();
         assert_eq!(users_after_add.len(), 3);
-        assert!(users_after_add.iter().any(|candidate| candidate == &email));
+        let added_user = users_after_add
+            .iter()
+            .find(|user| user.email == email)
+            .expect("added vless user should be returned");
+        let account = added_user
+            .account
+            .as_ref()
+            .expect("returned vless user should include account");
+        assert_eq!(account.r#type, TYPE_PROXY_VLESS_ACCOUNT);
 
         let count_after_add = service
             .get_inbound_users_count(Request::new(
@@ -2002,6 +2120,155 @@ mod tests {
             .expect("vless get users count after remove failed")
             .into_inner();
         assert_eq!(count_after_remove.count, 2);
+    }
+
+    #[cfg(feature = "vless")]
+    #[tokio::test]
+    async fn handler_node_style_flow_on_empty_vless_inbound() {
+        let inbound_tag = unique_tag("debug-vless");
+        let username = unique_tag("debug-user");
+        let user_id = "33333333-3333-4333-8333-333333333333".to_string();
+
+        let inbound = ServerConfig {
+            tag: inbound_tag.clone(),
+            bind_location: BindLocation::Address(NetLocation::new(
+                Address::Ipv4(Ipv4Addr::LOCALHOST),
+                12080,
+            )),
+            protocol: ServerProxyConfig::Vless { users: vec![] },
+            transport: Transport::Tcp,
+            quic_settings: None,
+        };
+        let runtime = RuntimeState::new(vec![inbound], Vec::new());
+        let service = HandlerServiceImpl::new(runtime);
+
+        let users_before_add = service
+            .get_inbound_users(Request::new(
+                proto::xray::app::proxyman::command::GetInboundUserRequest {
+                    tag: inbound_tag.clone(),
+                    email: String::new(),
+                },
+            ))
+            .await
+            .expect("empty vless get users before add failed")
+            .into_inner()
+            .users;
+        assert!(users_before_add.is_empty());
+
+        let count_before_add = service
+            .get_inbound_users_count(Request::new(
+                proto::xray::app::proxyman::command::GetInboundUserRequest {
+                    tag: inbound_tag.clone(),
+                    email: String::new(),
+                },
+            ))
+            .await
+            .expect("empty vless get users count before add failed")
+            .into_inner();
+        assert_eq!(count_before_add.count, 0);
+
+        let add_operation = proto::xray::app::proxyman::command::AddUserOperation {
+            user: Some(proto::xray::common::protocol::User {
+                level: 0,
+                email: username.clone(),
+                account: Some(proto::xray::common::serial::TypedMessage {
+                    r#type: TYPE_PROXY_VLESS_ACCOUNT.to_string(),
+                    value: VlessAccountPayload {
+                        id: user_id.clone(),
+                        flow: String::new(),
+                    }
+                    .encode_to_vec(),
+                }),
+            }),
+        };
+        service
+            .alter_inbound(Request::new(
+                proto::xray::app::proxyman::command::AlterInboundRequest {
+                    tag: inbound_tag.clone(),
+                    operation: Some(proto::xray::common::serial::TypedMessage {
+                        r#type: TYPE_ADD_USER_OPERATION.to_string(),
+                        value: add_operation.encode_to_vec(),
+                    }),
+                },
+            ))
+            .await
+            .expect("node-style add user should succeed");
+
+        let users_after_add = service
+            .get_inbound_users(Request::new(
+                proto::xray::app::proxyman::command::GetInboundUserRequest {
+                    tag: inbound_tag.clone(),
+                    email: String::new(),
+                },
+            ))
+            .await
+            .expect("empty vless get users after add failed")
+            .into_inner()
+            .users;
+        assert_eq!(users_after_add.len(), 1);
+        assert_eq!(users_after_add[0].email, username);
+        let account_after_add = users_after_add[0]
+            .account
+            .as_ref()
+            .expect("node-style returned user should include account");
+        assert_eq!(account_after_add.r#type, TYPE_PROXY_VLESS_ACCOUNT);
+        let decoded_account = VlessAccountPayload::decode(account_after_add.value.as_slice())
+            .expect("decode vless account from node-style response");
+        assert_eq!(decoded_account.id, user_id);
+
+        let count_after_add = service
+            .get_inbound_users_count(Request::new(
+                proto::xray::app::proxyman::command::GetInboundUserRequest {
+                    tag: inbound_tag.clone(),
+                    email: String::new(),
+                },
+            ))
+            .await
+            .expect("empty vless get users count after add failed")
+            .into_inner();
+        assert_eq!(count_after_add.count, 1);
+
+        let remove_operation =
+            proto::xray::app::proxyman::command::RemoveUserOperation {
+                email: users_after_add[0].email.clone(),
+            };
+        service
+            .alter_inbound(Request::new(
+                proto::xray::app::proxyman::command::AlterInboundRequest {
+                    tag: inbound_tag.clone(),
+                    operation: Some(proto::xray::common::serial::TypedMessage {
+                        r#type: TYPE_REMOVE_USER_OPERATION.to_string(),
+                        value: remove_operation.encode_to_vec(),
+                    }),
+                },
+            ))
+            .await
+            .expect("node-style remove user should succeed");
+
+        let users_after_remove = service
+            .get_inbound_users(Request::new(
+                proto::xray::app::proxyman::command::GetInboundUserRequest {
+                    tag: inbound_tag.clone(),
+                    email: String::new(),
+                },
+            ))
+            .await
+            .expect("empty vless get users after remove failed")
+            .into_inner()
+            .users;
+        assert!(users_after_remove.is_empty());
+
+        let count_after_remove = service
+            .get_inbound_users_count(Request::new(
+                proto::xray::app::proxyman::command::GetInboundUserRequest {
+                    tag: inbound_tag,
+                    email: String::new(),
+                },
+            ))
+            .await
+            .expect("empty vless get users count after remove failed")
+            .into_inner();
+        assert_eq!(count_after_remove.count, 0);
     }
 
     #[tokio::test]
