@@ -115,7 +115,9 @@ pub async fn start_xhttp_server(
                     }
                     #[cfg(feature = "reality")]
                     XhttpSecurityLayer::Reality(config) => {
-                        accept_reality_stream(stream, &config).await
+                        accept_reality_stream(stream, &config)
+                            .await
+                            .map(|stream| Box::new(stream) as Box<dyn AsyncStream>)
                     }
                 };
 
