@@ -10,7 +10,7 @@ use crate::config::server_config::TrojanUser;
 use crate::config::server_config::VlessUser;
 #[cfg(feature = "ws")]
 use crate::config::server_config::ws::WebsocketServerConfig;
-    #[cfg(feature = "tls")]
+#[cfg(feature = "tls")]
 use crate::config::server_config::{TlsCertificateConfig, TlsCertificateUsage};
 #[cfg(feature = "ws")]
 use crate::util::option::OneOrSome;
@@ -168,6 +168,16 @@ struct VlessAccountPayload {
     id: String,
     #[prost(string, tag = "2")]
     flow: String,
+}
+
+#[cfg(feature = "vless")]
+fn validate_vless_flow(flow: &str) -> Result<(), Status> {
+    match flow {
+        "" | "xtls-rprx-vision" => Ok(()),
+        unsupported => Err(Status::invalid_argument(format!(
+            "vless clients.flow doesn't support {unsupported}"
+        ))),
+    }
 }
 
 #[cfg(feature = "trojan")]
@@ -501,6 +511,7 @@ impl HandlerServiceImpl {
         if user_id.is_empty() {
             return Err(Status::invalid_argument("vless client id is required"));
         }
+        validate_vless_flow(&account.flow)?;
         Ok(VlessUser {
             user_id: user_id.to_string(),
             user_label: if user.email.trim().is_empty() {
@@ -508,6 +519,7 @@ impl HandlerServiceImpl {
             } else {
                 user.email.clone()
             },
+            flow: account.flow,
         })
     }
 
@@ -1057,7 +1069,8 @@ impl HandlerServiceImpl {
         match protocol {
             #[cfg(feature = "vless")]
             ServerProxyConfig::Vless { users } => Some(
-                users.iter()
+                users
+                    .iter()
                     .map(|user| proto::xray::common::protocol::User {
                         level: 0,
                         email: user.user_label.clone(),
@@ -1065,7 +1078,7 @@ impl HandlerServiceImpl {
                             r#type: TYPE_PROXY_VLESS_ACCOUNT.to_string(),
                             value: VlessAccountPayload {
                                 id: user.user_id.clone(),
-                                flow: String::new(),
+                                flow: user.flow.clone(),
                             }
                             .encode_to_vec(),
                         }),
@@ -1074,7 +1087,8 @@ impl HandlerServiceImpl {
             ),
             #[cfg(feature = "trojan")]
             ServerProxyConfig::Trojan { users, .. } => Some(
-                users.iter()
+                users
+                    .iter()
                     .map(|user| proto::xray::common::protocol::User {
                         level: 0,
                         email: user.email.clone().unwrap_or_default(),
@@ -1956,10 +1970,12 @@ mod tests {
                     VlessUser {
                         user_id: "11111111-1111-1111-1111-111111111111".to_string(),
                         user_label: "first-user@example.com".to_string(),
+                        flow: String::new(),
                     },
                     VlessUser {
                         user_id: "22222222-2222-2222-2222-222222222222".to_string(),
                         user_label: "second-user@example.com".to_string(),
+                        flow: "xtls-rprx-vision".to_string(),
                     },
                 ],
             },
@@ -1981,19 +1997,38 @@ mod tests {
             .into_inner()
             .users
             .into_iter()
-            .map(|user| user.email)
+            .map(|user| {
+                let account = user.account.as_ref().map(|account| {
+                    VlessAccountPayload::decode(account.value.as_slice())
+                        .expect("decode vless account from initial users")
+                });
+                (user.email, account)
+            })
+            .into_iter()
             .collect::<Vec<_>>();
         assert_eq!(initial_users.len(), 2);
         assert!(
             initial_users
                 .iter()
-                .any(|email| email == "first-user@example.com")
+                .any(|(email, _)| email == "first-user@example.com")
         );
         assert!(
             initial_users
                 .iter()
-                .any(|email| email == "second-user@example.com")
+                .any(|(email, _)| email == "second-user@example.com")
         );
+        assert!(initial_users.iter().any(|(email, account)| {
+            email == "first-user@example.com"
+                && account
+                    .as_ref()
+                    .is_some_and(|account| account.flow.is_empty())
+        }));
+        assert!(initial_users.iter().any(|(email, account)| {
+            email == "second-user@example.com"
+                && account
+                    .as_ref()
+                    .is_some_and(|account| account.flow == "xtls-rprx-vision")
+        }));
 
         let initial_count = service
             .get_inbound_users_count(Request::new(
@@ -2212,9 +2247,11 @@ mod tests {
             .as_ref()
             .expect("node-style returned user should include account");
         assert_eq!(account_after_add.r#type, TYPE_PROXY_VLESS_ACCOUNT);
-        let decoded_account = VlessAccountPayload::decode(account_after_add.value.as_slice())
-            .expect("decode vless account from node-style response");
+        let decoded_account =
+            VlessAccountPayload::decode(account_after_add.value.as_slice())
+                .expect("decode vless account from node-style response");
         assert_eq!(decoded_account.id, user_id);
+        assert_eq!(decoded_account.flow, "");
 
         let count_after_add = service
             .get_inbound_users_count(Request::new(
