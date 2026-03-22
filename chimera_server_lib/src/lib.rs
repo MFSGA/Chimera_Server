@@ -1,8 +1,9 @@
 use beginning::start_servers;
 use config::{
-    def::{self, LiteralConfig},
+    def::LiteralConfig,
     server_config::ServerConfig,
 };
+pub use config_loader::{ConfigFormat, resolve_config_source};
 use runtime::{OutboundSummary, RuntimeState};
 use std::time::Duration;
 use thiserror::Error;
@@ -15,6 +16,8 @@ mod async_stream;
 mod beginning;
 
 mod config;
+
+mod config_loader;
 
 #[cfg(feature = "api")]
 mod grpc;
@@ -44,11 +47,14 @@ pub enum ConfigType {
 }
 
 impl ConfigType {
-    pub fn try_parse(self) -> Result<LiteralConfig, Error> {
+    pub fn try_parse(
+        self,
+        format: Option<ConfigFormat>,
+    ) -> Result<LiteralConfig, Error> {
         match self {
-            ConfigType::File(file) => TryInto::<def::LiteralConfig>::try_into(
-                std::path::PathBuf::from(file),
-            ),
+            ConfigType::File(file) => {
+                config_loader::parse_config_source(&file, format)
+            }
 
             _ => {
                 todo!()
@@ -64,6 +70,7 @@ pub enum TokioRuntime {
 
 pub struct Options {
     pub config: ConfigType,
+    pub config_format: Option<ConfigFormat>,
 
     pub cwd: Option<String>,
     pub rt: Option<TokioRuntime>,
@@ -104,7 +111,7 @@ pub fn validate(opts: Options) -> Result<(), Error> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     // 1. config parse
-    let config = opts.config.try_parse()?;
+    let config = opts.config.try_parse(opts.config_format)?;
 
     // 2. api/mcp config validation
     let api_config = config.api.clone();
@@ -178,7 +185,7 @@ pub fn validate(opts: Options) -> Result<(), Error> {
 
 async fn start_async(opts: Options) -> Result<(), Error> {
     // 1. config parse
-    let config = opts.config.try_parse()?;
+    let config = opts.config.try_parse(opts.config_format)?;
     //  todo: log mod
     log::init(
         config.log.as_ref(),
