@@ -1,27 +1,37 @@
 #![cfg(feature = "vless")]
 
-use std::net::{Ipv4Addr, Ipv6Addr};
-
 use async_trait::async_trait;
-use tokio::io::AsyncReadExt;
+use bytes::{Buf, BytesMut};
+use tokio::io::ReadBuf;
 use tracing::warn;
 
 use crate::{
-    address::{Address, NetLocation},
-    async_stream::AsyncStream,
-    config::server_config::VlessUser,
+    async_stream::AsyncStream, config::server_config::VlessUser,
     traffic::TrafficContext,
 };
 
-use super::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
+pub(crate) mod protocol;
+mod reality_vision_stream;
+mod vision;
+mod vision_pad;
+mod vision_stream;
+mod vision_unpad;
 
-use crate::util::allocate_vec;
+use self::protocol::{
+    COMMAND_TCP, ParsedVlessHeader, XTLS_VISION_FLOW, read_request_header,
+};
+use super::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
+use vision_pad::{pad_with_command, pad_with_uuid_and_command};
+use vision_unpad::{UnpadCommand, VisionUnpadder};
+
+pub(crate) use vision::{ParsedVisionUser, parse_vision_users};
+pub use vision::{VisionVlessTcpHandler, setup_reality_vision_server_stream};
 
 const SERVER_RESPONSE_HEADER: &[u8] = &[0u8, 0u8];
 
 #[derive(Debug)]
 pub struct VlessTcpHandler {
-    users: Vec<(Box<[u8]>, String)>,
+    users: Vec<(Box<[u8]>, String, String)>,
     inbound_tag: String,
 }
 
@@ -30,11 +40,21 @@ impl VlessTcpHandler {
         Self {
             users: users
                 .iter()
-                .map(|user| (parse_hex(&user.user_id), user.user_label.clone()))
+                .map(|user| {
+                    (
+                        parse_hex(&user.user_id),
+                        user.user_label.clone(),
+                        user.flow.clone(),
+                    )
+                })
                 .collect(),
             inbound_tag: inbound_tag.to_string(),
         }
     }
+}
+
+pub fn users_require_vision(users: &[VlessUser]) -> bool {
+    users.iter().any(|user| user.flow == XTLS_VISION_FLOW)
 }
 
 #[async_trait]
@@ -43,32 +63,25 @@ impl TcpServerHandler for VlessTcpHandler {
         &self,
         mut server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
-        let mut prefix = [0u8; 18];
-        server_stream.read_exact(&mut prefix).await?;
-
-        if prefix[0] != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "invalid client protocol version, expected 0, got {}",
-                    prefix[0]
-                ),
-            ));
-        }
-
-        let target_id = &prefix[1..17];
-        let matched_user = self.users.iter().find(|(user_id, _)| {
-            user_id.len() == 16 && user_id.as_ref() == target_id
+        let ParsedVlessHeader {
+            user_id,
+            flow: request_flow,
+            command,
+            remote_location,
+        } = read_request_header(&mut server_stream).await?;
+        let matched_user = self.users.iter().find(|(stored_user_id, _, _)| {
+            stored_user_id.len() == 16
+                && stored_user_id.as_ref() == user_id.as_slice()
         });
 
-        let Some((_, user_label)) = matched_user else {
+        let Some((_, user_label, configured_flow)) = matched_user else {
             let expected = self
                 .users
                 .iter()
-                .map(|(user_id, _)| encode_hex(user_id.as_ref()))
+                .map(|(user_id, _, _)| encode_hex(user_id.as_ref()))
                 .collect::<Vec<_>>()
                 .join(",");
-            let got = encode_hex(target_id);
+            let got = encode_hex(&user_id);
             warn!(
                 inbound_tag = %self.inbound_tag,
                 expected = %expected,
@@ -82,18 +95,11 @@ impl TcpServerHandler for VlessTcpHandler {
             ));
         };
 
-        let addon_length = prefix[17];
+        validate_request_flow(configured_flow, &request_flow, command)?;
 
-        if addon_length > 0 {
-            read_addons(&mut server_stream, addon_length).await?;
-        }
-
-        let mut address_prefix = [0u8; 4];
-        server_stream.read_exact(&mut address_prefix).await?;
-
-        match address_prefix[0] {
-            1 => {}
-            2 => {
+        match command {
+            COMMAND_TCP => {}
+            protocol::COMMAND_UDP => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "UDP was requested",
@@ -106,66 +112,6 @@ impl TcpServerHandler for VlessTcpHandler {
                 ));
             }
         }
-
-        let port = ((address_prefix[1] as u16) << 8) | (address_prefix[2] as u16);
-
-        let remote_location = match address_prefix[3] {
-            1 => {
-                let mut address_bytes = [0u8; 4];
-                server_stream.read_exact(&mut address_bytes).await?;
-
-                let v4addr = Ipv4Addr::new(
-                    address_bytes[0],
-                    address_bytes[1],
-                    address_bytes[2],
-                    address_bytes[3],
-                );
-                NetLocation::new(Address::Ipv4(v4addr), port)
-            }
-            2 => {
-                let mut domain_name_len = [0u8; 1];
-                server_stream.read_exact(&mut domain_name_len).await?;
-
-                let mut domain_name_bytes =
-                    allocate_vec(domain_name_len[0] as usize);
-                server_stream.read_exact(&mut domain_name_bytes).await?;
-
-                let address_str = match std::str::from_utf8(&domain_name_bytes) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("Failed to decode address: {}", e),
-                        ));
-                    }
-                };
-
-                NetLocation::new(Address::from(address_str)?, port)
-            }
-            3 => {
-                let mut address_bytes = [0u8; 16];
-                server_stream.read_exact(&mut address_bytes).await?;
-
-                let v6addr = Ipv6Addr::new(
-                    ((address_bytes[0] as u16) << 8) | (address_bytes[1] as u16),
-                    ((address_bytes[2] as u16) << 8) | (address_bytes[3] as u16),
-                    ((address_bytes[4] as u16) << 8) | (address_bytes[5] as u16),
-                    ((address_bytes[6] as u16) << 8) | (address_bytes[7] as u16),
-                    ((address_bytes[8] as u16) << 8) | (address_bytes[9] as u16),
-                    ((address_bytes[10] as u16) << 8) | (address_bytes[11] as u16),
-                    ((address_bytes[12] as u16) << 8) | (address_bytes[13] as u16),
-                    ((address_bytes[14] as u16) << 8) | (address_bytes[15] as u16),
-                );
-
-                NetLocation::new(Address::Ipv6(v6addr), port)
-            }
-            invalid_type => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Invalid address type: {}", invalid_type),
-                ));
-            }
-        };
 
         Ok(TcpServerSetupResult::TcpForward {
             remote_location,
@@ -182,6 +128,49 @@ impl TcpServerHandler for VlessTcpHandler {
             ),
         })
     }
+}
+
+fn validate_request_flow(
+    configured_flow: &str,
+    request_flow: &str,
+    command: u8,
+) -> std::io::Result<()> {
+    match request_flow {
+        "" => {
+            if configured_flow == XTLS_VISION_FLOW {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "client flow is empty but account requires xtls-rprx-vision",
+                ));
+            }
+        }
+        XTLS_VISION_FLOW => {
+            if configured_flow != XTLS_VISION_FLOW {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("account is not allowed to use flow {XTLS_VISION_FLOW}"),
+                ));
+            }
+            if command != 1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "xtls-rprx-vision currently supports only TCP requests",
+                ));
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "xtls-rprx-vision requires a dedicated Vision handler",
+            ));
+        }
+        other => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown request flow {other}"),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn parse_hex(hex_asm: &str) -> Box<[u8]> {
@@ -212,61 +201,214 @@ fn encode_hex(bytes: &[u8]) -> String {
     out
 }
 
-fn read_varint(data: &[u8]) -> std::io::Result<(u64, usize)> {
+pub(crate) fn looks_like_tls_record(data: &[u8]) -> bool {
+    data.len() >= 5
+        && matches!(data[0], 0x14..=0x17)
+        && data[1] == 0x03
+        && matches!(data[2], 0x01..=0x03)
+}
+
+pub(crate) fn contains_tls_application_data(data: &[u8]) -> bool {
     let mut cursor = 0usize;
-    let mut length = 0u64;
-    loop {
-        let byte = data[cursor];
-        if (byte & 0b10000000) != 0 {
-            length = (length << 8) | ((byte ^ 0b10000000) as u64);
-        } else {
-            length = (length << 8) | (byte as u64);
-            return Ok((length, cursor + 1));
+    while cursor + 5 <= data.len() {
+        let content_type = data[cursor];
+        let version_major = data[cursor + 1];
+        let version_minor = data[cursor + 2];
+        let payload_len =
+            u16::from_be_bytes([data[cursor + 3], data[cursor + 4]]) as usize;
+        if version_major != 0x03 || !(0x01..=0x03).contains(&version_minor) {
+            return false;
         }
-        if cursor == 7 || cursor == data.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Varint is too long",
-            ));
+
+        let end = cursor + 5 + payload_len;
+        if end > data.len() {
+            return false;
         }
-        cursor += 1;
+        if content_type == 0x17 {
+            return true;
+        }
+        cursor = end;
+    }
+
+    false
+}
+
+pub(crate) fn drain_pending_read(
+    pending_read: &mut BytesMut,
+    buf: &mut ReadBuf<'_>,
+) -> bool {
+    if pending_read.is_empty() {
+        return false;
+    }
+
+    let len = buf.remaining().min(pending_read.len());
+    buf.put_slice(&pending_read[..len]);
+    pending_read.advance(len);
+    true
+}
+
+pub(crate) fn append_plaintext_to_read_buf(
+    pending_read: &mut BytesMut,
+    buf: &mut ReadBuf<'_>,
+    plaintext: &[u8],
+) {
+    let len = buf.remaining().min(plaintext.len());
+    buf.put_slice(&plaintext[..len]);
+    if len < plaintext.len() {
+        pending_read.extend_from_slice(&plaintext[len..]);
     }
 }
 
-async fn read_addons(
-    stream: &mut Box<dyn AsyncStream>,
-    addon_length: u8,
-) -> std::io::Result<()> {
-    let mut addon_bytes = allocate_vec(addon_length as usize).into_boxed_slice();
-    stream.read_exact(&mut addon_bytes).await?;
+pub(crate) fn take_vless_response_header(
+    vless_response_to_send: &mut bool,
+) -> Option<&'static [u8]> {
+    if *vless_response_to_send {
+        *vless_response_to_send = false;
+        Some(SERVER_RESPONSE_HEADER)
+    } else {
+        None
+    }
+}
 
-    let mut addon_cursor = 0;
-    let (flow_length, bytes_used) = read_varint(&addon_bytes)?;
-    addon_cursor += bytes_used;
+pub(crate) fn bounded_write_chunk<'a>(
+    buf: &'a [u8],
+    max_content_len: usize,
+) -> &'a [u8] {
+    &buf[..buf.len().min(max_content_len)]
+}
 
-    let flow_bytes = &addon_bytes[addon_cursor..addon_cursor + flow_length as usize];
-    addon_cursor += flow_length as usize;
+pub(crate) fn queue_padded_packet(
+    pending_write: &mut BytesMut,
+    first_write: &mut bool,
+    user_uuid: &[u8; 16],
+    content: &[u8],
+    command: u8,
+) {
+    let is_tls = looks_like_tls_record(content);
+    let packet = if *first_write {
+        *first_write = false;
+        pad_with_uuid_and_command(content, user_uuid, command, is_tls)
+    } else {
+        pad_with_command(content, command, is_tls)
+    };
+    pending_write.extend_from_slice(&packet);
+}
 
-    let (seed_length, bytes_used) = read_varint(&addon_bytes[addon_cursor..])?;
-    addon_cursor += bytes_used;
-    let seed_bytes = &addon_bytes[addon_cursor..addon_cursor + seed_length as usize];
-    addon_cursor += seed_length as usize;
+pub(crate) fn unpad_into_pending_read(
+    unpadder: &mut VisionUnpadder,
+    pending_read: &mut BytesMut,
+    padded: &[u8],
+) -> std::io::Result<Option<UnpadCommand>> {
+    let result = unpadder.unpad(padded)?;
+    if !result.content.is_empty() {
+        pending_read.extend_from_slice(&result.content);
+    }
+    Ok(result.command)
+}
 
-    if addon_cursor as u8 != addon_length {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!(
-                "Did not consume all addon bytes, cursor is at {}, length is {}",
-                addon_cursor, addon_length
-            ),
-        ));
+#[cfg(test)]
+mod tests {
+    use super::{
+        XTLS_VISION_FLOW, append_plaintext_to_read_buf, bounded_write_chunk,
+        contains_tls_application_data, drain_pending_read, looks_like_tls_record,
+        queue_padded_packet, take_vless_response_header, unpad_into_pending_read,
+        validate_request_flow,
+    };
+    use crate::handler::vless_handler::vision_unpad::{
+        UnpadCommand, VisionUnpadder,
+    };
+    use bytes::BytesMut;
+    use tokio::io::ReadBuf;
+
+    #[test]
+    fn validate_request_flow_allows_plain_vless() {
+        validate_request_flow("", "", 1).expect("plain vless should be allowed");
     }
 
-    tracing::info!(
-        "Read addon bytes: flow: {:?}, seed: {:?}",
-        &flow_bytes,
-        &seed_bytes
-    );
+    #[test]
+    fn validate_request_flow_rejects_vision_on_plain_account() {
+        let err = validate_request_flow("", XTLS_VISION_FLOW, 1)
+            .expect_err("plain account should reject vision");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
 
-    Ok(())
+    #[test]
+    fn validate_request_flow_rejects_missing_vision_flow() {
+        let err = validate_request_flow(XTLS_VISION_FLOW, "", 1)
+            .expect_err("vision account should require client flow");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn validate_request_flow_marks_vision_as_unimplemented() {
+        let err = validate_request_flow(XTLS_VISION_FLOW, XTLS_VISION_FLOW, 1)
+            .expect_err("vision should require dedicated handler");
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn looks_like_tls_record_accepts_tls_header() {
+        assert!(looks_like_tls_record(&[0x16, 0x03, 0x03, 0x00, 0x10]));
+    }
+
+    #[test]
+    fn contains_tls_application_data_detects_app_record() {
+        let record = [0x17, 0x03, 0x03, 0x00, 0x02, 0x01, 0x02];
+        assert!(contains_tls_application_data(&record));
+    }
+
+    #[test]
+    fn drain_pending_read_moves_data_into_readbuf() {
+        let mut pending = BytesMut::from(&b"hello"[..]);
+        let mut storage = [0u8; 3];
+        let mut read_buf = ReadBuf::new(&mut storage);
+
+        assert!(drain_pending_read(&mut pending, &mut read_buf));
+        assert_eq!(read_buf.filled(), b"hel");
+        assert_eq!(&pending[..], b"lo");
+    }
+
+    #[test]
+    fn append_plaintext_to_read_buf_spills_remainder() {
+        let mut pending = BytesMut::new();
+        let mut storage = [0u8; 2];
+        let mut read_buf = ReadBuf::new(&mut storage);
+
+        append_plaintext_to_read_buf(&mut pending, &mut read_buf, b"abcd");
+
+        assert_eq!(read_buf.filled(), b"ab");
+        assert_eq!(&pending[..], b"cd");
+    }
+
+    #[test]
+    fn unpad_into_pending_read_returns_command_and_content() {
+        let uuid = [9u8; 16];
+        let mut padded = BytesMut::new();
+        let mut first_write = true;
+        queue_padded_packet(&mut padded, &mut first_write, &uuid, b"ping", 0);
+
+        let mut pending = BytesMut::new();
+        let mut unpadder = VisionUnpadder::new(uuid);
+        let command = unpad_into_pending_read(&mut unpadder, &mut pending, &padded)
+            .expect("unpad should succeed");
+
+        assert_eq!(command, Some(UnpadCommand::Continue));
+        assert_eq!(&pending[..], b"ping");
+    }
+
+    #[test]
+    fn take_vless_response_header_only_returns_once() {
+        let mut should_send = true;
+        assert_eq!(
+            take_vless_response_header(&mut should_send),
+            Some(&[0, 0][..])
+        );
+        assert_eq!(take_vless_response_header(&mut should_send), None);
+    }
+
+    #[test]
+    fn bounded_write_chunk_limits_to_max_content_len() {
+        assert_eq!(bounded_write_chunk(b"abcdef", 4), b"abcd");
+        assert_eq!(bounded_write_chunk(b"ab", 4), b"ab");
+    }
 }
