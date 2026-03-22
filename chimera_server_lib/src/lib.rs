@@ -1,10 +1,12 @@
 use beginning::start_servers;
 use config::{
-    def::LiteralConfig,
-    server_config::ServerConfig,
+    def::{ApiConfig, LiteralConfig},
+    rule::RoutingConfig,
+    server_config::{ServerConfig, ServerProxyConfig},
 };
 pub use config_loader::{ConfigFormat, resolve_config_source};
 use runtime::{OutboundSummary, RuntimeState};
+use std::net::SocketAddr;
 use std::time::Duration;
 use thiserror::Error;
 use tokio_rustls::rustls;
@@ -34,6 +36,8 @@ mod log;
 mod handler;
 
 mod resolver;
+
+mod routing_state;
 
 pub mod traffic;
 
@@ -85,6 +89,109 @@ pub enum Error {
     InvalidConfig(String),
 }
 
+#[derive(Default)]
+struct ResolvedApiConfig<'a> {
+    listen_addr: Option<SocketAddr>,
+    inbound: Option<&'a ServerConfig>,
+}
+
+fn resolve_api_config<'a>(
+    api_config: Option<&ApiConfig>,
+    routing_config: Option<&RoutingConfig>,
+    all_inbounds: &'a [ServerConfig],
+) -> Result<ResolvedApiConfig<'a>, Error> {
+    let Some(api) = api_config else {
+        return Ok(ResolvedApiConfig::default());
+    };
+
+    if let Some(listen) = api.listen.as_ref() {
+        let listen_addr = listen.parse::<SocketAddr>().map_err(|err| {
+            Error::InvalidConfig(format!("invalid api.listen {}: {}", listen, err))
+        })?;
+        return Ok(ResolvedApiConfig {
+            listen_addr: Some(listen_addr),
+            inbound: None,
+        });
+    }
+
+    let Some(api_tag) = api.tag.as_deref() else {
+        return Ok(ResolvedApiConfig::default());
+    };
+    let Some(routing) = routing_config else {
+        return Ok(ResolvedApiConfig::default());
+    };
+
+    let mut matched_api_rule = false;
+    for rule in &routing.rules {
+        if rule.outbound_tag.as_deref() != Some(api_tag) {
+            continue;
+        }
+        matched_api_rule = true;
+
+        for inbound_tag in &rule.inbound_tag {
+            let Some(inbound) = all_inbounds
+                .iter()
+                .find(|config| config.tag == *inbound_tag)
+            else {
+                continue;
+            };
+
+            ensure_api_inbound_protocol(inbound)?;
+            return Ok(ResolvedApiConfig {
+                listen_addr: Some(api_inbound_listen_addr(inbound)?),
+                inbound: Some(inbound),
+            });
+        }
+    }
+
+    if matched_api_rule {
+        return Err(Error::InvalidConfig(format!(
+            "api routing for outbound {} does not reference an existing inbound",
+            api_tag
+        )));
+    }
+
+    Ok(ResolvedApiConfig::default())
+}
+
+fn api_inbound_listen_addr(inbound: &ServerConfig) -> Result<SocketAddr, Error> {
+    match &inbound.bind_location {
+        crate::address::BindLocation::Address(addr) => Ok(addr.to_socket_addr()?),
+    }
+}
+
+fn ensure_api_inbound_protocol(inbound: &ServerConfig) -> Result<(), Error> {
+    if is_api_inbound_protocol(&inbound.protocol) {
+        return Ok(());
+    }
+
+    Err(Error::InvalidConfig(format!(
+        "api inbound {} must use dokodemo-door semantics",
+        inbound.tag
+    )))
+}
+
+fn is_api_inbound_protocol(protocol: &ServerProxyConfig) -> bool {
+    match protocol {
+        ServerProxyConfig::DokodemoDoor { .. } => true,
+        #[cfg(feature = "tls")]
+        ServerProxyConfig::Tls(tls_config) => matches!(
+            tls_config.inner.as_ref(),
+            ServerProxyConfig::DokodemoDoor { .. }
+        ),
+        _ => false,
+    }
+}
+
+fn api_inbound_uses_tls(protocol: &ServerProxyConfig) -> bool {
+    #[cfg(feature = "tls")]
+    if matches!(protocol, ServerProxyConfig::Tls(_)) {
+        return true;
+    }
+
+    false
+}
+
 pub fn start(opts: Options) -> Result<(), Error> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let rt = match opts.rt.as_ref().unwrap_or(&TokioRuntime::MultiThread) {
@@ -116,39 +223,22 @@ pub fn validate(opts: Options) -> Result<(), Error> {
     // 2. api/mcp config validation
     let api_config = config.api.clone();
     let mcp_config = config.mcp.clone();
+    let routing_config = config.routing.clone();
 
     let all_inbounds = config
         .inbounds
         .into_iter()
         .map(ServerConfig::try_from)
         .collect::<Result<Vec<_>, _>>()?;
+    routing_state::RoutingState::from_config(config.routing.as_ref())
+        .map_err(Error::InvalidConfig)?;
 
-    let mut api_addr = None;
-    if let Some(api) = api_config.as_ref() {
-        if let Some(listen) = api.listen.as_ref() {
-            api_addr =
-                Some(listen.parse::<std::net::SocketAddr>().map_err(|err| {
-                    Error::InvalidConfig(format!(
-                        "invalid api.listen {}: {}",
-                        listen, err
-                    ))
-                })?);
-        }
-
-        if api_addr.is_none() {
-            if let Some(tag) = api.tag.as_ref() {
-                if let Some(inbound) =
-                    all_inbounds.iter().find(|cfg| cfg.tag == *tag)
-                {
-                    match &inbound.bind_location {
-                        crate::address::BindLocation::Address(addr) => {
-                            api_addr = Some(addr.to_socket_addr()?);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let api_addr = resolve_api_config(
+        api_config.as_ref(),
+        routing_config.as_ref(),
+        &all_inbounds,
+    )?
+    .listen_addr;
 
     if let Some(mcp) = mcp_config.as_ref() {
         if let Some(listen) = mcp.listen.as_ref() {
@@ -195,6 +285,7 @@ async fn start_async(opts: Options) -> Result<(), Error> {
     // 2. api config
     let api_config = config.api.clone();
     let mcp_config = config.mcp.clone();
+    let routing_config = config.routing.clone();
     let outbounds = config
         .outbounds
         .iter()
@@ -211,32 +302,25 @@ async fn start_async(opts: Options) -> Result<(), Error> {
         .collect::<Result<Vec<_>, _>>()?;
 
     let runtime_state = RuntimeState::new(all_inbounds.clone(), outbounds);
+    runtime_state.replace_routing(
+        routing_state::RoutingState::from_config(config.routing.as_ref())
+            .map_err(Error::InvalidConfig)?,
+    );
 
-    let mut api_addr = None;
-    let mut skip_inbound_tag = None;
-    if let Some(api) = api_config.as_ref() {
-        if let Some(listen) = api.listen.as_ref() {
-            api_addr =
-                Some(listen.parse::<std::net::SocketAddr>().map_err(|err| {
-                    Error::InvalidConfig(format!(
-                        "invalid api.listen {}: {}",
-                        listen, err
-                    ))
-                })?);
-        }
-
-        if api_addr.is_none() {
-            if let Some(tag) = api.tag.as_ref() {
-                if let Some(inbound) =
-                    all_inbounds.iter().find(|cfg| cfg.tag == *tag)
-                {
-                    match &inbound.bind_location {
-                        crate::address::BindLocation::Address(addr) => {
-                            api_addr = Some(addr.to_socket_addr()?);
-                            skip_inbound_tag = Some(tag.clone());
-                        }
-                    }
-                }
+    let resolved_api = resolve_api_config(
+        api_config.as_ref(),
+        routing_config.as_ref(),
+        &all_inbounds,
+    )?;
+    let api_addr = resolved_api.listen_addr;
+    let skip_inbound_tag = resolved_api.inbound.map(|inbound| inbound.tag.clone());
+    if api_config.is_some() {
+        if let Some(inbound) = resolved_api.inbound {
+            if api_inbound_uses_tls(&inbound.protocol) {
+                tracing::warn!(
+                    "api inbound {} uses tls settings, but local grpc currently listens without tls",
+                    inbound.tag
+                );
             }
         }
         if api_addr.is_none() {
@@ -322,5 +406,97 @@ async fn start_async(opts: Options) -> Result<(), Error> {
             tracing::error!("runtime error: {}, shutting down", x);
             Err(Error::Io(std::io::Error::other(x)))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_api_config;
+    use crate::{
+        address::{Address, BindLocation, NetLocation},
+        config::{
+            Transport,
+            def::ApiConfig,
+            rule::{RoutingConfig, RuleConfig},
+            server_config::{DokodemoDoorConfig, ServerConfig, ServerProxyConfig},
+        },
+    };
+
+    fn make_inbound(tag: &str, port: u16) -> ServerConfig {
+        ServerConfig {
+            tag: tag.to_string(),
+            bind_location: BindLocation::Address(NetLocation::new(
+                Address::from("127.0.0.1").expect("valid ip"),
+                port,
+            )),
+            protocol: ServerProxyConfig::DokodemoDoor {
+                config: DokodemoDoorConfig {
+                    target: NetLocation::new(
+                        Address::from("127.0.0.1").expect("valid ip"),
+                        port,
+                    ),
+                    follow_redirect: false,
+                },
+            },
+            transport: Transport::Tcp,
+            quic_settings: None,
+        }
+    }
+
+    #[test]
+    fn resolve_api_config_prefers_explicit_listen() {
+        let api = ApiConfig {
+            tag: Some("api".into()),
+            services: vec!["StatsService".into()],
+            listen: Some("127.0.0.1:7000".into()),
+        };
+        let routing = RoutingConfig {
+            rules: vec![RuleConfig {
+                inbound_tag: vec!["api-in".into()],
+                outbound_tag: Some("api".into()),
+                ..RuleConfig::default()
+            }],
+            ..RoutingConfig::default()
+        };
+        let inbounds = vec![make_inbound("api-in", 61000)];
+
+        let resolved = resolve_api_config(Some(&api), Some(&routing), &inbounds)
+            .expect("api config should resolve");
+
+        assert_eq!(
+            resolved.listen_addr.map(|addr| addr.to_string()),
+            Some("127.0.0.1:7000".into())
+        );
+        assert!(resolved.inbound.is_none());
+    }
+
+    #[test]
+    fn resolve_api_config_uses_routing_rule_for_api_tag() {
+        let api = ApiConfig {
+            tag: Some("REMNAWAVE_API".into()),
+            services: vec!["HandlerService".into()],
+            listen: None,
+        };
+        let routing = RoutingConfig {
+            rules: vec![RuleConfig {
+                inbound_tag: vec!["REMNAWAVE_API_INBOUND".into()],
+                outbound_tag: Some("REMNAWAVE_API".into()),
+                ..RuleConfig::default()
+            }],
+            ..RoutingConfig::default()
+        };
+        let inbounds = vec![make_inbound("REMNAWAVE_API_INBOUND", 61000)];
+
+        let resolved = resolve_api_config(Some(&api), Some(&routing), &inbounds)
+            .expect("api inbound should resolve from routing");
+
+        assert_eq!(
+            resolved.listen_addr.map(|addr| addr.to_string()),
+            Some("127.0.0.1:61000".into())
+        );
+        assert_eq!(
+            resolved.inbound.map(|inbound| inbound.tag.as_str()),
+            Some("REMNAWAVE_API_INBOUND")
+        );
     }
 }

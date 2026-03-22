@@ -5,14 +5,22 @@ use serde_json::Value;
 
 use crate::{Error, log::LogConfig};
 
-use super::{Protocol, SettingObject, StreamSettings, SupportedFileType, Transport};
+use super::{
+    Protocol, SettingObject, StreamSettings, Transport, rule::RoutingConfig,
+};
 
 #[derive(Deserialize, Debug)]
 pub struct LiteralConfig {
     pub inbounds: Vec<InboudItem>,
     pub outbounds: Vec<OutboundItem>,
     pub log: Option<LogConfig>,
+    #[serde(default)]
+    pub stats: Option<StatsConfig>,
     pub api: Option<ApiConfig>,
+    #[serde(default)]
+    pub policy: Option<PolicyConfig>,
+    #[serde(default)]
+    pub routing: Option<RoutingConfig>,
     // mcp settings
     pub mcp: Option<McpConfig>,
 }
@@ -98,6 +106,9 @@ pub struct OutboundItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StatsConfig {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiConfig {
     pub tag: Option<String>,
@@ -105,6 +116,15 @@ pub struct ApiConfig {
     pub services: Vec<String>,
     #[serde(default)]
     pub listen: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyConfig {
+    #[serde(default)]
+    pub levels: HashMap<String, Value>,
+    #[serde(default)]
+    pub system: HashMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,9 +148,6 @@ fn default_mcp_update_interval_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-
-    use crate::config::internal::InternalConfig;
-
     use super::LiteralConfig;
 
     #[test]

@@ -4,6 +4,7 @@ mod types;
 #[cfg(feature = "ws")]
 pub mod ws;
 
+pub use types::DokodemoDoorConfig;
 #[cfg(feature = "tuic")]
 pub use types::TuicServerConfig;
 #[cfg(feature = "vless")]
@@ -16,7 +17,7 @@ pub use types::{ServerConfig, ServerProxyConfig, SocksUser, XhttpServerConfig};
 #[cfg(feature = "reality")]
 pub use types::RealityTransportConfig;
 #[cfg(feature = "tls")]
-pub use types::TlsServerConfig;
+pub use types::{TlsCertificateConfig, TlsCertificateUsage, TlsServerConfig};
 
 #[cfg(feature = "trojan")]
 pub use types::{TrojanFallback, TrojanUser};
