@@ -160,9 +160,13 @@ fn parse_listener_protocol(
         }),
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(TlsServerConfig {
-            certificate_path,
-            private_key_path,
+            certificates,
             mut alpn_protocols,
+            enable_session_resumption: _,
+            reject_unknown_sni: _,
+            min_version: _,
+            max_version: _,
+            server_name: _,
             inner,
         }) => match *inner {
             ServerProxyConfig::Xhttp { config, inner } => {
@@ -172,8 +176,30 @@ fn parse_listener_protocol(
                     alpn_protocols.push("h2".to_string());
                 }
 
-                let cert_bytes = fs::read(&certificate_path)?;
-                let key_bytes = fs::read(&private_key_path)?;
+                let certificate = certificates
+                    .into_iter()
+                    .find(|certificate| {
+                        certificate.key_path.is_some()
+                            || certificate.key_pem.is_some()
+                    })
+                    .ok_or_else(|| {
+                        std::io::Error::other(
+                            "missing tls key material for xhttp server",
+                        )
+                    })?;
+                let cert_bytes = match certificate.certificate_path {
+                    Some(path) => fs::read(path)?,
+                    None => certificate.certificate_pem,
+                };
+                let key_bytes = match (certificate.key_path, certificate.key_pem) {
+                    (Some(path), _) => fs::read(path)?,
+                    (None, Some(key)) => key,
+                    (None, None) => {
+                        return Err(std::io::Error::other(
+                            "missing tls private key for xhttp server",
+                        ));
+                    }
+                };
                 let tls_config = create_server_config(
                     &cert_bytes,
                     &key_bytes,

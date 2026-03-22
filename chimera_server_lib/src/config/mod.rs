@@ -47,6 +47,7 @@ pub enum Protocol {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamSettings {
+    #[serde(default)]
     network: String,
     security: Option<String>,
     tls_settings: Option<TlsSettings>,
@@ -168,27 +169,45 @@ pub struct TrojanClientSetting {
 #[derive(Deserialize, Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TlsSettings {
+    #[serde(default)]
     alpn: Vec<String>,
     certificates: Vec<Certificate>,
+    #[serde(default)]
     cipher_suites: Option<String>,
+    #[serde(default)]
     disable_system_root: Option<bool>,
+    #[serde(default)]
     enable_session_resumption: Option<bool>,
-    max_version: String,
-    min_version: String,
+    #[serde(default)]
+    max_version: Option<String>,
+    #[serde(default)]
+    min_version: Option<String>,
+    #[serde(default)]
     reject_unknown_sni: Option<bool>,
-    server_name: String,
+    #[serde(default)]
+    server_name: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Certificate {
+    #[serde(default)]
     build_chain: Option<bool>,
-    certificate_file: String,
-    key_file: String,
+    #[serde(default)]
+    certificate: Vec<String>,
+    #[serde(default)]
+    certificate_file: Option<String>,
+    #[serde(default)]
+    key: Vec<String>,
+    #[serde(default)]
+    key_file: Option<String>,
     // reload the certificate every n seconds
+    #[serde(default)]
     ocsp_stapling: Option<u64>,
+    #[serde(default)]
     one_time_loading: Option<bool>,
     // set Certificate type
+    #[serde(default)]
     usage: Option<String>,
 }
 

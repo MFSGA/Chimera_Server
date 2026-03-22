@@ -1,6 +1,8 @@
 mod collectors;
 mod tls;
 
+use serde::Deserialize;
+
 use crate::{
     Error,
     address::{Address, BindLocation, NetLocation},
@@ -27,6 +29,17 @@ use collectors::collect_tuic_settings;
 #[cfg(feature = "trojan")]
 use collectors::{collect_trojan_clients, collect_trojan_fallbacks};
 use tls::apply_security_layers;
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DokodemoDoorSettings {
+    #[serde(default)]
+    address: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    follow_redirect: bool,
+}
 
 impl TryFrom<InboudItem> for ServerConfig {
     type Error = Error;
@@ -73,31 +86,43 @@ impl TryFrom<InboudItem> for ServerConfig {
 
         match protocol {
             Protocol::DokodemoDoor => {
-                tracing::warn!("DokodemoDoor is not supported yet");
-                #[cfg(feature = "vless")]
-                {
-                    let users = vless_users.clone().ok_or_else(|| {
-                        Error::InvalidConfig(
-                            "dokodemodoor fallback requires at least one client"
-                                .into(),
-                        )
-                    })?;
+                let settings = settings
+                    .map(|value| value.deserialize::<DokodemoDoorSettings>())
+                    .transpose()
+                    .map_err(|err| {
+                        Error::InvalidConfig(format!(
+                            "invalid dokodemo-door settings: {err}"
+                        ))
+                    })?
+                    .unwrap_or_default();
 
-                    return Ok(ServerConfig {
-                        tag,
-                        bind_location,
-                        protocol: ServerProxyConfig::Vless { users },
-                        transport: Transport::Tcp,
-                        quic_settings: None,
-                    });
+                let address = match settings.address.as_deref() {
+                    Some(value) => Address::from(value)?,
+                    None => match &bind_location {
+                        BindLocation::Address(addr) => addr.address().clone(),
+                    },
+                };
+                let remote_location =
+                    NetLocation::new(address, settings.port.unwrap_or(port));
+
+                let mut protocol = ServerProxyConfig::DokodemoDoor {
+                    config: super::types::DokodemoDoorConfig {
+                        target: remote_location,
+                        follow_redirect: settings.follow_redirect,
+                    },
+                };
+
+                if let Some(stream_setting) = stream_settings.as_ref() {
+                    protocol = apply_security_layers(protocol, stream_setting)?;
                 }
 
-                #[cfg(not(feature = "vless"))]
-                {
-                    return Err(Error::InvalidConfig(
-                        "DokodemoDoor requires the vless feature".into(),
-                    ));
-                }
+                return Ok(ServerConfig {
+                    tag,
+                    bind_location,
+                    protocol,
+                    transport: Transport::Tcp,
+                    quic_settings: None,
+                });
             }
             #[cfg(feature = "hysteria")]
             Protocol::Hysteria2 => {
@@ -114,6 +139,17 @@ impl TryFrom<InboudItem> for ServerConfig {
                         )
                     })?;
                 let item = tls_settings.certificates[0].clone();
+                let cert = item.certificate_file.ok_or_else(|| {
+                    Error::InvalidConfig(
+                        "hysteria2 inbound currently requires certificateFile"
+                            .into(),
+                    )
+                })?;
+                let key = item.key_file.ok_or_else(|| {
+                    Error::InvalidConfig(
+                        "hysteria2 inbound currently requires keyFile".into(),
+                    )
+                })?;
 
                 let settings = settings.ok_or_else(|| {
                     Error::InvalidConfig("hysteria2 inbound requires clients".into())
@@ -127,8 +163,8 @@ impl TryFrom<InboudItem> for ServerConfig {
                 }
 
                 let quic_settings = Some(ServerQuicConfig {
-                    cert: item.certificate_file,
-                    key: item.key_file,
+                    cert,
+                    key,
                     alpn_protocols: NoneOrSome::Some(tls_settings.alpn),
                     client_fingerprints: NoneOrSome::None,
                 });
@@ -282,6 +318,16 @@ impl TryFrom<InboudItem> for ServerConfig {
                         )
                     })?
                     .clone();
+                let cert = certificate.certificate_file.ok_or_else(|| {
+                    Error::InvalidConfig(
+                        "tuic inbound currently requires certificateFile".into(),
+                    )
+                })?;
+                let key = certificate.key_file.ok_or_else(|| {
+                    Error::InvalidConfig(
+                        "tuic inbound currently requires keyFile".into(),
+                    )
+                })?;
 
                 let settings = settings.ok_or_else(|| {
                     Error::InvalidConfig("tuic inbound requires settings".into())
@@ -289,8 +335,8 @@ impl TryFrom<InboudItem> for ServerConfig {
                 let config = collect_tuic_settings(settings)?;
 
                 let quic_settings = Some(ServerQuicConfig {
-                    cert: certificate.certificate_file,
-                    key: certificate.key_file,
+                    cert,
+                    key,
                     alpn_protocols: NoneOrSome::Some(tls_settings.alpn),
                     client_fingerprints: NoneOrSome::None,
                 });

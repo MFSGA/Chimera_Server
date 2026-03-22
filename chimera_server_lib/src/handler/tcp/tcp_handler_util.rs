@@ -12,6 +12,7 @@ use crate::{
 };
 use crate::{
     config::{rule::RuleConfig, server_config::ServerProxyConfig},
+    handler::dokodemo::DokodemoDoorTcpHandler,
     handler::socks::SocksTcpServerHandler,
 };
 
@@ -50,18 +51,26 @@ pub fn create_tcp_server_handler(
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(tls_config) => {
             let TlsServerConfig {
-                certificate_path,
-                private_key_path,
+                certificates,
                 alpn_protocols,
+                enable_session_resumption,
+                reject_unknown_sni,
+                min_version,
+                max_version,
+                server_name,
                 inner,
             } = tls_config;
             let inner_handler =
                 create_tcp_server_handler(*inner, inbound_tag, rules_stack);
             Box::new(
                 TlsServerHandler::new(
-                    certificate_path,
-                    private_key_path,
+                    certificates,
                     alpn_protocols,
+                    enable_session_resumption,
+                    reject_unknown_sni,
+                    min_version,
+                    max_version,
+                    server_name,
                     inner_handler,
                 )
                 .expect("failed to initialize TLS handler"),
@@ -78,6 +87,9 @@ pub fn create_tcp_server_handler(
         }
         ServerProxyConfig::Socks { accounts } => {
             Box::new(SocksTcpServerHandler::new(accounts, inbound_tag))
+        }
+        ServerProxyConfig::DokodemoDoor { config } => {
+            Box::new(DokodemoDoorTcpHandler::new(config, inbound_tag))
         }
         ServerProxyConfig::Xhttp { .. } => {
             panic!("Xhttp server should not be served via TCP handler")
