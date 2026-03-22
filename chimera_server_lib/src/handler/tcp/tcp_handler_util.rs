@@ -1,7 +1,11 @@
 #[cfg(feature = "reality")]
-use crate::handler::reality::RealityServerHandler;
+use crate::handler::reality::{
+    RealityServerHandler, RealityVisionVlessServerHandler,
+};
 #[cfg(feature = "vless")]
-use crate::handler::vless_handler::VlessTcpHandler;
+use crate::handler::vless_handler::{
+    VisionVlessTcpHandler, VlessTcpHandler, users_require_vision,
+};
 #[cfg(feature = "ws")]
 use crate::handler::ws::{
     WebsocketTcpServerHandler, create_websocket_server_target,
@@ -26,7 +30,11 @@ pub fn create_tcp_server_handler(
     match server_proxy_config {
         #[cfg(feature = "vless")]
         ServerProxyConfig::Vless { users } => {
-            Box::new(VlessTcpHandler::new(&users, inbound_tag))
+            if users_require_vision(&users) {
+                Box::new(VisionVlessTcpHandler::new(&users, inbound_tag))
+            } else {
+                Box::new(VlessTcpHandler::new(&users, inbound_tag))
+            }
         }
 
         #[cfg(feature = "ws")]
@@ -78,6 +86,25 @@ pub fn create_tcp_server_handler(
         }
         #[cfg(feature = "reality")]
         ServerProxyConfig::Reality(reality_config) => {
+            #[cfg(feature = "vless")]
+            let vision_users = match reality_config.inner.as_ref() {
+                ServerProxyConfig::Vless { users }
+                    if users_require_vision(users) =>
+                {
+                    Some(users.clone())
+                }
+                _ => None,
+            };
+
+            #[cfg(feature = "vless")]
+            if let Some(users) = vision_users {
+                return Box::new(RealityVisionVlessServerHandler::new(
+                    reality_config,
+                    users,
+                    inbound_tag,
+                ));
+            }
+
             let inner_handler = create_tcp_server_handler(
                 (*reality_config.inner).clone(),
                 inbound_tag,
