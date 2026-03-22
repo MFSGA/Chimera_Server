@@ -8,6 +8,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::async_stream::AsyncStream;
 use crate::config::server_config::RealityTransportConfig;
 use crate::handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
+use crate::handler::vless_handler::{
+    ParsedVisionUser, parse_vision_users, setup_reality_vision_server_stream,
+};
 use crate::reality::{BufReader, RealityServerConnection, RealityTlsStream};
 
 async fn read_client_hello(
@@ -100,7 +103,7 @@ fn extract_sni_from_client_hello(client_hello: &[u8]) -> io::Result<Option<Strin
 pub async fn accept_reality_stream(
     mut server_stream: Box<dyn AsyncStream>,
     config: &RealityTransportConfig,
-) -> io::Result<Box<dyn AsyncStream>> {
+) -> io::Result<RealityTlsStream<Box<dyn AsyncStream>, RealityServerConnection>> {
     let client_hello = read_client_hello(&mut server_stream).await?;
 
     if !config.server_names.is_empty() {
@@ -162,7 +165,7 @@ pub async fn accept_reality_stream(
         server_stream.flush().await?;
     }
 
-    Ok(Box::new(RealityTlsStream::new(server_stream, reality_conn)))
+    Ok(RealityTlsStream::new(server_stream, reality_conn))
 }
 
 #[derive(Debug)]
@@ -191,6 +194,46 @@ impl TcpServerHandler for RealityServerHandler {
     ) -> io::Result<TcpServerSetupResult> {
         let wrapped_stream =
             accept_reality_stream(server_stream, &self.transport_config).await?;
-        self.inner.setup_server_stream(wrapped_stream).await
+        self.inner
+            .setup_server_stream(Box::new(wrapped_stream))
+            .await
+    }
+}
+
+#[derive(Debug)]
+pub struct RealityVisionVlessServerHandler {
+    transport_config: RealityTransportConfig,
+    users: Vec<ParsedVisionUser>,
+    inbound_tag: String,
+}
+
+impl RealityVisionVlessServerHandler {
+    pub fn new(
+        config: RealityTransportConfig,
+        users: Vec<crate::config::server_config::VlessUser>,
+        inbound_tag: &str,
+    ) -> Self {
+        Self {
+            transport_config: config,
+            users: parse_vision_users(&users),
+            inbound_tag: inbound_tag.to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl TcpServerHandler for RealityVisionVlessServerHandler {
+    async fn setup_server_stream(
+        &self,
+        server_stream: Box<dyn AsyncStream>,
+    ) -> io::Result<TcpServerSetupResult> {
+        let tls_stream =
+            accept_reality_stream(server_stream, &self.transport_config).await?;
+        setup_reality_vision_server_stream(
+            tls_stream,
+            &self.users,
+            &self.inbound_tag,
+        )
+        .await
     }
 }

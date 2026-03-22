@@ -87,6 +87,8 @@ pub struct SocksUser {
 pub struct VlessUser {
     pub user_id: String,
     pub user_label: String,
+    #[serde(default)]
+    pub flow: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

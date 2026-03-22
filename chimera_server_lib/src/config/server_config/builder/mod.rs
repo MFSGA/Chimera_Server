@@ -41,6 +41,28 @@ struct DokodemoDoorSettings {
     follow_redirect: bool,
 }
 
+#[cfg(feature = "vless")]
+fn validate_vless_flow(flow: &str) -> Result<(), Error> {
+    match flow {
+        "" | "xtls-rprx-vision" => Ok(()),
+        unsupported => Err(Error::InvalidConfig(format!(
+            "vless clients.flow doesn't support {unsupported}"
+        ))),
+    }
+}
+
+#[cfg(feature = "vless")]
+fn has_vless_vision_flow(users: &[crate::config::server_config::VlessUser]) -> bool {
+    users.iter().any(|user| user.flow == "xtls-rprx-vision")
+}
+
+#[cfg(feature = "vless")]
+fn has_non_vision_vless_flow(
+    users: &[crate::config::server_config::VlessUser],
+) -> bool {
+    users.iter().any(|user| user.flow != "xtls-rprx-vision")
+}
+
 impl TryFrom<InboudItem> for ServerConfig {
     type Error = Error;
 
@@ -73,16 +95,21 @@ impl TryFrom<InboudItem> for ServerConfig {
             .map(|clients| {
                 clients
                     .into_iter()
-                    .map(|client| crate::config::server_config::VlessUser {
-                        user_id: client.id.clone(),
-                        user_label: if client.email.is_empty() {
-                            client.id
-                        } else {
-                            client.email
-                        },
+                    .map(|client| {
+                        validate_vless_flow(&client.flow)?;
+                        Ok(crate::config::server_config::VlessUser {
+                            user_id: client.id.clone(),
+                            user_label: if client.email.is_empty() {
+                                client.id
+                            } else {
+                                client.email
+                            },
+                            flow: client.flow,
+                        })
                     })
-                    .collect::<Vec<_>>()
-            });
+                    .collect::<Result<Vec<_>, Error>>()
+            })
+            .transpose()?;
 
         match protocol {
             Protocol::DokodemoDoor => {
@@ -183,17 +210,51 @@ impl TryFrom<InboudItem> for ServerConfig {
                         "vless inbound requires at least one client".into(),
                     )
                 })?;
+                let uses_vision = has_vless_vision_flow(&users);
+                let mixes_plain_and_vision =
+                    uses_vision && has_non_vision_vless_flow(&users);
 
                 let mut protocol = ServerProxyConfig::Vless { users };
                 let uses_xhttp = stream_settings
                     .as_ref()
                     .map(|settings| settings.network.eq_ignore_ascii_case("xhttp"))
                     .unwrap_or(false);
+                let security = stream_settings
+                    .as_ref()
+                    .and_then(|settings| settings.security.as_deref())
+                    .unwrap_or("none")
+                    .to_ascii_lowercase();
+
+                if uses_vision {
+                    if mixes_plain_and_vision {
+                        return Err(Error::InvalidConfig(
+                            "xtls-rprx-vision users cannot share one inbound with plain vless users"
+                                .into(),
+                        ));
+                    }
+                    if uses_xhttp {
+                        return Err(Error::InvalidConfig(
+                            "xtls-rprx-vision does not support xhttp transport".into(),
+                        ));
+                    }
+                    if security != "tls" && security != "reality" {
+                        return Err(Error::InvalidConfig(
+                            "xtls-rprx-vision requires streamSettings.security=tls or reality"
+                                .into(),
+                        ));
+                    }
+                }
 
                 #[cfg(feature = "ws")]
                 if !uses_xhttp {
                     if let Some(stream_setting) = stream_settings.as_ref() {
                         if let Some(ws_setting) = stream_setting.ws_settings.clone() {
+                            if uses_vision {
+                                return Err(Error::InvalidConfig(
+                                    "xtls-rprx-vision does not support websocket transport"
+                                        .into(),
+                                ));
+                            }
                             tracing::info!("use websocket");
                             protocol = ServerProxyConfig::Websocket {
                                 targets: Box::new(OneOrSome::One(
@@ -210,12 +271,6 @@ impl TryFrom<InboudItem> for ServerConfig {
 
                 if let Some(stream_setting) = stream_settings.as_ref() {
                     if uses_xhttp {
-                        let security = stream_setting
-                            .security
-                            .as_deref()
-                            .unwrap_or("none")
-                            .to_ascii_lowercase();
-
                         let xhttp_settings =
                             stream_setting.xhttp_settings.clone().ok_or_else(|| {
                                 Error::InvalidConfig(
@@ -432,11 +487,223 @@ mod tests {
                 assert_eq!(users.len(), 2);
                 assert_eq!(users[0].user_id, "114cb5a6-3787-4357-a5da-69b5782cb74f");
                 assert_eq!(users[0].user_label, "user-a@example.com");
+                assert_eq!(users[0].flow, "");
                 assert_eq!(users[1].user_id, "9d2d3c52-a386-4f2f-a507-0ca29f8d13f0");
                 assert_eq!(users[1].user_label, "user-b@example.com");
+                assert_eq!(users[1].flow, "");
             }
             other => panic!("expected vless protocol, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn vless_builder_preserves_client_flow() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-vision-flow",
+            "settings": {
+                "clients": [
+                    {
+                        "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+                        "email": "vision-user@example.com",
+                        "flow": "xtls-rprx-vision"
+                    }
+                ],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "security": "reality",
+                "realitySettings": {
+                    "show": false,
+                    "dest": "www.apple.com:443",
+                    "xver": 0,
+                    "serverNames": ["www.apple.com"],
+                    "privateKey": "CAe1AlfoOhzR5zwWRYxUSUm2qdzWXM0qDJzbOWUvTno",
+                    "shortIds": ["6ba85179e30d4fc2"],
+                    "maxTimeDiff": 0,
+                    "minClient": "",
+                    "maxClient": ""
+                }
+            }
+        }))
+        .expect("valid vless inbound item");
+
+        let config = ServerConfig::try_from(inbound)
+            .expect("vless inbound config should build");
+
+        match config.protocol {
+            ServerProxyConfig::Reality(reality) => match reality.inner.as_ref() {
+                ServerProxyConfig::Vless { users } => {
+                    assert_eq!(users.len(), 1);
+                    assert_eq!(users[0].flow, "xtls-rprx-vision");
+                }
+                other => {
+                    panic!("expected vless protocol inside reality, got {other:?}")
+                }
+            },
+            #[cfg(feature = "tls")]
+            ServerProxyConfig::Tls(tls) => match tls.inner.as_ref() {
+                ServerProxyConfig::Vless { users } => {
+                    assert_eq!(users.len(), 1);
+                    assert_eq!(users[0].flow, "xtls-rprx-vision");
+                }
+                other => panic!("expected vless protocol inside tls, got {other:?}"),
+            },
+            ServerProxyConfig::Vless { users } => {
+                assert_eq!(users.len(), 1);
+                assert_eq!(users[0].flow, "xtls-rprx-vision");
+            }
+            other => panic!("expected vless protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn vless_builder_rejects_unknown_client_flow() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-invalid-flow",
+            "settings": {
+                "clients": [
+                    {
+                        "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+                        "email": "bad-flow@example.com",
+                        "flow": "xtls-rprx-vision-udp443"
+                    }
+                ],
+                "decryption": "none"
+            }
+        }))
+        .expect("valid vless inbound item");
+
+        let err = ServerConfig::try_from(inbound)
+            .expect_err("unsupported vless flow should fail validation");
+        assert!(
+            err.to_string().contains(
+                "vless clients.flow doesn't support xtls-rprx-vision-udp443"
+            )
+        );
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn vless_builder_rejects_vision_without_tls_or_reality() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-vision-no-tls",
+            "settings": {
+                "clients": [
+                    {
+                        "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+                        "email": "vision-user@example.com",
+                        "flow": "xtls-rprx-vision"
+                    }
+                ],
+                "decryption": "none"
+            }
+        }))
+        .expect("valid vless inbound item");
+
+        let err = ServerConfig::try_from(inbound)
+            .expect_err("vision without tls/reality should fail");
+        assert!(err.to_string().contains(
+            "xtls-rprx-vision requires streamSettings.security=tls or reality"
+        ));
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn vless_builder_rejects_mixed_plain_and_vision_users() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-mixed-flow-users",
+            "settings": {
+                "clients": [
+                    {
+                        "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+                        "email": "plain-user@example.com"
+                    },
+                    {
+                        "id": "9d2d3c52-a386-4f2f-a507-0ca29f8d13f0",
+                        "email": "vision-user@example.com",
+                        "flow": "xtls-rprx-vision"
+                    }
+                ],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "security": "reality",
+                "realitySettings": {
+                    "show": false,
+                    "dest": "www.apple.com:443",
+                    "xver": 0,
+                    "serverNames": ["www.apple.com"],
+                    "privateKey": "CAe1AlfoOhzR5zwWRYxUSUm2qdzWXM0qDJzbOWUvTno",
+                    "shortIds": ["6ba85179e30d4fc2"],
+                    "maxTimeDiff": 0,
+                    "minClient": "",
+                    "maxClient": ""
+                }
+            }
+        }))
+        .expect("valid vless inbound item");
+
+        let err = ServerConfig::try_from(inbound)
+            .expect_err("mixed plain and vision users should fail");
+        assert!(err.to_string().contains(
+            "xtls-rprx-vision users cannot share one inbound with plain vless users"
+        ));
+    }
+
+    #[cfg(all(feature = "vless", feature = "ws"))]
+    #[test]
+    fn vless_builder_rejects_vision_over_websocket() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-vision-ws",
+            "settings": {
+                "clients": [
+                    {
+                        "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+                        "email": "vision-user@example.com",
+                        "flow": "xtls-rprx-vision"
+                    }
+                ],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "security": "tls",
+                "wsSettings": {
+                    "host": "example.com",
+                    "path": "/ws"
+                },
+                "tlsSettings": {
+                    "certificates": [{
+                        "certificate": ["-----BEGIN CERTIFICATE-----","MIIB","-----END CERTIFICATE-----"],
+                        "key": ["-----BEGIN PRIVATE KEY-----","MIIB","-----END PRIVATE KEY-----"]
+                    }]
+                }
+            }
+        }))
+        .expect("valid vless inbound item");
+
+        let err = ServerConfig::try_from(inbound)
+            .expect_err("vision over websocket should fail");
+        assert!(
+            err.to_string()
+                .contains("xtls-rprx-vision does not support websocket transport")
+        );
     }
 
     #[cfg(all(feature = "reality", feature = "vless"))]
