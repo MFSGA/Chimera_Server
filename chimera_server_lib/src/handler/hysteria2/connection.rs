@@ -15,12 +15,12 @@ use bytes::{Bytes, BytesMut};
 use h3_quinn::BidiStream;
 use http::{Request, Response, StatusCode};
 use rand::{
+    RngExt,
     // distributions::{Alphanumeric, DistString},
     distr::{Alphanumeric, SampleString},
-    RngExt,
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::UdpSocket,
 };
 use tracing::{debug, warn};
