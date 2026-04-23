@@ -2,6 +2,7 @@
 name = "chimera_server_lib"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
