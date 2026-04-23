@@ -44,11 +44,14 @@ impl TryFrom<InboudItem> for ServerConfig {
             ..
         } = value;
 
-        let bind_location = BindLocation::Address(NetLocation::new(
-            Address::from(&listen.clone().unwrap_or_else(|| "0.0.0.0".to_string()))
-                .unwrap(),
-            port,
-        ));
+        let listen = listen.unwrap_or_else(|| "0.0.0.0".to_string());
+        let address = Address::from(&listen).map_err(|err| {
+            Error::InvalidConfig(format!(
+                "invalid inbound listen for tag {}: {} ({})",
+                tag, listen, err
+            ))
+        })?;
+        let bind_location = BindLocation::Address(NetLocation::new(address, port));
 
         let first_client = settings
             .as_ref()
