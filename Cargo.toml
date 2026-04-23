@@ -8,6 +8,7 @@ name = "chimera_server"
 version = "0.3.0"
 edition = "2024"
 authors = ["chimera_rust@proton.me"]
+license = "LGPL-3.0-or-later"
 
 
 
