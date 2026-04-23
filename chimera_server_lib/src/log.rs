@@ -109,6 +109,9 @@ impl LogConfig {
             .unwrap_or_else(|_| EnvFilter::new(self.loglevel.as_directive()));
 
         let fmt_layer = fmt::layer()
+            .with_file(true)
+            .with_line_number(true)
+            .with_target(true)
             .with_span_events(FmtSpan::FULL)
             .with_writer(writer)
             .with_ansi(use_ansi);
