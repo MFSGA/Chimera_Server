@@ -133,10 +133,10 @@ pub fn validate(opts: Options) -> Result<(), Error> {
                 if let Some(inbound) =
                     all_inbounds.iter().find(|cfg| cfg.tag == *tag)
                 {
-                    if let crate::address::BindLocation::Address(addr) =
-                        &inbound.bind_location
-                    {
-                        api_addr = Some(addr.to_socket_addr()?);
+                    match &inbound.bind_location {
+                        crate::address::BindLocation::Address(addr) => {
+                            api_addr = Some(addr.to_socket_addr()?);
+                        }
                     }
                 }
             }
@@ -200,8 +200,8 @@ async fn start_async(opts: Options) -> Result<(), Error> {
     let all_inbounds = config
         .inbounds
         .into_iter()
-        .map(|inbound| ServerConfig::try_from(inbound).unwrap())
-        .collect::<Vec<_>>();
+        .map(ServerConfig::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
 
     let runtime_state = RuntimeState::new(all_inbounds.clone(), outbounds);
 
@@ -223,11 +223,11 @@ async fn start_async(opts: Options) -> Result<(), Error> {
                 if let Some(inbound) =
                     all_inbounds.iter().find(|cfg| cfg.tag == *tag)
                 {
-                    if let crate::address::BindLocation::Address(addr) =
-                        &inbound.bind_location
-                    {
-                        api_addr = Some(addr.to_socket_addr()?);
-                        skip_inbound_tag = Some(tag.clone());
+                    match &inbound.bind_location {
+                        crate::address::BindLocation::Address(addr) => {
+                            api_addr = Some(addr.to_socket_addr()?);
+                            skip_inbound_tag = Some(tag.clone());
+                        }
                     }
                 }
             }
