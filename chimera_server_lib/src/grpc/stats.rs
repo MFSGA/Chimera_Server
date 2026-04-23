@@ -151,6 +151,50 @@ impl StatsServiceImpl {
 
         Some(ips)
     }
+
+    fn collect_user_stats(&self) -> HashMap<String, UserStatsEntry> {
+        let mut users = HashMap::new();
+        for entry in traffic::active_connections() {
+            let Some(identity) = entry.identity.as_ref() else {
+                continue;
+            };
+            let Some(ip) = entry.client_ip else {
+                continue;
+            };
+
+            let last_seen = entry
+                .started_at
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+
+            users
+                .entry(identity.clone())
+                .or_insert_with(|| UserStatsEntry::new(identity.clone()))
+                .add_ip(ip.to_string(), last_seen);
+        }
+        users
+    }
+
+    fn user_traffic_value(
+        &self,
+        current_stats: &HashMap<String, i64>,
+        email: &str,
+        direction: &str,
+        reset: bool,
+    ) -> i64 {
+        let name = format!("user>>>{email}>>>traffic>>>{direction}");
+        match current_stats.get(&name).copied() {
+            Some(value) => {
+                if reset {
+                    self.reset.reset(&name, value)
+                } else {
+                    value.saturating_sub(self.reset.read(&name))
+                }
+            }
+            None => 0,
+        }
+    }
 }
 #[tonic::async_trait]
 impl proto::xray::app::stats::command::stats_service_server::StatsService
@@ -288,10 +332,94 @@ impl proto::xray::app::stats::command::stats_service_server::StatsService
             },
         ))
     }
+
+    async fn get_users_stats(
+        &self,
+        request: Request<proto::xray::app::stats::command::GetUsersStatsRequest>,
+    ) -> Result<
+        Response<proto::xray::app::stats::command::GetUsersStatsResponse>,
+        Status,
+    > {
+        let request = request.into_inner();
+        let current_stats = self.current_stats();
+        let mut users = self.collect_user_stats();
+        let mut response_users = Vec::with_capacity(users.len());
+
+        for (email, mut user) in users.drain() {
+            let mut ips = user
+                .ips
+                .drain()
+                .map(|(ip, last_seen)| {
+                    proto::xray::app::stats::command::OnlineIpEntry { ip, last_seen }
+                })
+                .collect::<Vec<_>>();
+            ips.sort_by(|left, right| {
+                left.ip
+                    .cmp(&right.ip)
+                    .then(left.last_seen.cmp(&right.last_seen))
+            });
+
+            let traffic = if request.include_traffic {
+                let uplink = self.user_traffic_value(
+                    &current_stats,
+                    &email,
+                    "uplink",
+                    request.reset,
+                );
+                let downlink = self.user_traffic_value(
+                    &current_stats,
+                    &email,
+                    "downlink",
+                    request.reset,
+                );
+                Some(proto::xray::app::stats::command::TrafficUserStat {
+                    uplink,
+                    downlink,
+                })
+            } else {
+                None
+            };
+
+            response_users.push(proto::xray::app::stats::command::UserStat {
+                email: user.email,
+                ips,
+                traffic,
+            });
+        }
+
+        response_users.sort_by(|left, right| left.email.cmp(&right.email));
+
+        Ok(Response::new(
+            proto::xray::app::stats::command::GetUsersStatsResponse {
+                users: response_users,
+            },
+        ))
+    }
 }
 enum OnlineKey {
     Inbound(String),
     User(String),
+}
+
+struct UserStatsEntry {
+    email: String,
+    ips: HashMap<String, i64>,
+}
+
+impl UserStatsEntry {
+    fn new(email: String) -> Self {
+        Self {
+            email,
+            ips: HashMap::new(),
+        }
+    }
+
+    fn add_ip(&mut self, ip: String, last_seen: i64) {
+        self.ips
+            .entry(ip)
+            .and_modify(|current| *current = (*current).max(last_seen))
+            .or_insert(last_seen);
+    }
 }
 
 fn parse_online_name(name: &str) -> Option<OnlineKey> {
@@ -614,6 +742,109 @@ mod tests {
         assert_eq!(matching.len(), 2);
         assert!(matching.iter().any(|user| *user == &user_a));
         assert!(matching.iter().any(|user| *user == &user_b));
+    }
+
+    #[tokio::test]
+    async fn stats_get_users_stats_includes_ips_and_traffic() {
+        let service = StatsServiceImpl::new();
+        let tag = unique_tag("userstats");
+        let user = unique_tag("user");
+
+        let ip1 = IpAddr::V4(Ipv4Addr::new(10, 4, 1, 1));
+        let ip2 = IpAddr::V4(Ipv4Addr::new(10, 4, 1, 2));
+
+        let ctx1 = TrafficContext::new("test")
+            .with_inbound_tag(&tag)
+            .with_identity(&user)
+            .with_client_ip(ip1);
+        let _guard1 = traffic::register_connection(Some(&ctx1));
+        let _guard2 = traffic::register_connection(Some(&ctx1));
+
+        let ctx2 = TrafficContext::new("test")
+            .with_inbound_tag(&tag)
+            .with_identity(&user)
+            .with_client_ip(ip2);
+        let _guard3 = traffic::register_connection(Some(&ctx2));
+
+        record_transfer(&tag, &user, 120, 450);
+        record_transfer(&tag, &user, 30, 70);
+
+        let response = service
+            .get_users_stats(Request::new(
+                proto::xray::app::stats::command::GetUsersStatsRequest {
+                    include_traffic: true,
+                    reset: false,
+                },
+            ))
+            .await
+            .expect("get_users_stats failed")
+            .into_inner();
+
+        let user_stat = response
+            .users
+            .iter()
+            .find(|entry| entry.email == user)
+            .expect("user stat not found");
+
+        assert_eq!(user_stat.ips.len(), 2);
+        assert!(
+            user_stat
+                .ips
+                .iter()
+                .any(|entry| entry.ip == ip1.to_string())
+        );
+        assert!(
+            user_stat
+                .ips
+                .iter()
+                .any(|entry| entry.ip == ip2.to_string())
+        );
+
+        let traffic = user_stat.traffic.as_ref().expect("traffic missing");
+        assert_eq!(traffic.uplink, 150);
+        assert_eq!(traffic.downlink, 520);
+
+        let response = service
+            .get_users_stats(Request::new(
+                proto::xray::app::stats::command::GetUsersStatsRequest {
+                    include_traffic: true,
+                    reset: true,
+                },
+            ))
+            .await
+            .expect("reset get_users_stats failed")
+            .into_inner();
+
+        let user_stat = response
+            .users
+            .iter()
+            .find(|entry| entry.email == user)
+            .expect("user stat not found after reset");
+        let traffic = user_stat.traffic.as_ref().expect("traffic missing");
+        assert_eq!(traffic.uplink, 150);
+        assert_eq!(traffic.downlink, 520);
+
+        record_transfer(&tag, &user, 10, 20);
+
+        let response = service
+            .get_users_stats(Request::new(
+                proto::xray::app::stats::command::GetUsersStatsRequest {
+                    include_traffic: true,
+                    reset: false,
+                },
+            ))
+            .await
+            .expect("delta get_users_stats failed")
+            .into_inner();
+
+        let user_stat = response
+            .users
+            .iter()
+            .find(|entry| entry.email == user)
+            .expect("user stat not found after delta");
+        let traffic = user_stat.traffic.as_ref().expect("traffic missing");
+        assert_eq!(traffic.uplink, 10);
+        assert_eq!(traffic.downlink, 20);
     }
 
     #[tokio::test]
