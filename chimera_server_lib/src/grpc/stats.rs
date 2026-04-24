@@ -2,7 +2,6 @@ use super::proto;
 use crate::traffic;
 use std::{
     collections::{HashMap, HashSet},
-    fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::{Arc, RwLock},
     time::{Instant, UNIX_EPOCH},
@@ -212,7 +211,7 @@ impl StatsServiceImpl {
     }
 
     fn sys_stats(&self) -> SysStatsSnapshot {
-        let mut snapshot = SysStatsSnapshot {
+        let snapshot = SysStatsSnapshot {
             uptime: self.start_time.elapsed().as_secs() as u32,
             ..SysStatsSnapshot::default()
         };
@@ -223,7 +222,8 @@ impl StatsServiceImpl {
         // rest at 0 as an explicit compatibility fallback.
         #[cfg(target_os = "linux")]
         {
-            if let Ok(status) = fs::read_to_string("/proc/self/status") {
+            let mut snapshot = snapshot;
+            if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
                 if let Some(threads) = parse_status_kib_value(&status, "Threads:") {
                     snapshot.num_goroutine = threads as u32;
                 }
@@ -234,6 +234,7 @@ impl StatsServiceImpl {
                     snapshot.sys = sys.saturating_mul(1024);
                 }
             }
+            return snapshot;
         }
 
         snapshot
