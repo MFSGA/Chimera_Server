@@ -9,3 +9,8 @@ cert/
 config.json5
 
 docs
+
+deploy/
+
+geo*
+xray
