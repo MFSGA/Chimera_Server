@@ -10,6 +10,9 @@ use tonic::{Request, Response, Status};
 
 use super::proto;
 
+const ERR_NOT_ENOUGH_INFO: &str =
+    "common: not enough information for making a decision";
+
 #[derive(Clone)]
 pub(super) struct RoutingServiceImpl {
     runtime: RuntimeState,
@@ -50,6 +53,10 @@ impl RoutingServiceImpl {
             };
         }
 
+        if context.outbound_group_tags.is_empty() {
+            return Err(Status::unknown(ERR_NOT_ENOUGH_INFO));
+        }
+
         let overrides = self
             .balancer_overrides
             .read()
@@ -69,11 +76,7 @@ impl RoutingServiceImpl {
             }
         }
 
-        self.runtime
-            .outbounds()
-            .first()
-            .map(|outbound| outbound.tag.clone())
-            .ok_or_else(|| Status::failed_precondition("no outbounds configured"))
+        Err(Status::unknown(ERR_NOT_ENOUGH_INFO))
     }
 }
 
@@ -330,7 +333,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routing_test_route_selects_default_outbound() {
+    async fn routing_test_route_requires_route_clues() {
+        let service = RoutingServiceImpl::new(build_runtime(&["direct", "backup"]));
+        let err = service
+            .test_route(Request::new(
+                proto::xray::app::router::command::TestRouteRequest {
+                    routing_context: Some(
+                        proto::xray::app::router::command::RoutingContext {
+                            inbound_tag: "inbound-a".to_string(),
+                            ..Default::default()
+                        },
+                    ),
+                    field_selectors: vec![],
+                    publish_result: false,
+                },
+            ))
+            .await
+            .expect_err("expected missing routing clues error");
+        assert_eq!(err.code(), Code::Unknown);
+        assert_eq!(err.message(), ERR_NOT_ENOUGH_INFO);
+    }
+
+    #[tokio::test]
+    async fn routing_test_route_accepts_explicit_outbound() {
         let service = RoutingServiceImpl::new(build_runtime(&["direct", "backup"]));
         let response = service
             .test_route(Request::new(
@@ -338,6 +363,7 @@ mod tests {
                     routing_context: Some(
                         proto::xray::app::router::command::RoutingContext {
                             inbound_tag: "inbound-a".to_string(),
+                            outbound_tag: "direct".to_string(),
                             ..Default::default()
                         },
                     ),
@@ -410,6 +436,7 @@ mod tests {
                     routing_context: Some(
                         proto::xray::app::router::command::RoutingContext {
                             inbound_tag: "inbound-stream".to_string(),
+                            outbound_tag: "direct".to_string(),
                             ..Default::default()
                         },
                     ),
@@ -471,7 +498,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routing_without_outbounds_returns_failed_precondition() {
+    async fn routing_without_outbounds_returns_unknown_without_route_clues() {
         let service = RoutingServiceImpl::new(build_runtime(&[]));
         let err = service
             .test_route(Request::new(
@@ -486,8 +513,9 @@ mod tests {
                 },
             ))
             .await
-            .expect_err("expected no outbounds configured error");
-        assert_eq!(err.code(), Code::FailedPrecondition);
+            .expect_err("expected missing routing clues error");
+        assert_eq!(err.code(), Code::Unknown);
+        assert_eq!(err.message(), ERR_NOT_ENOUGH_INFO);
 
         let err = service
             .get_balancer_info(Request::new(

@@ -53,10 +53,52 @@ impl RuntimeState {
         Some(mutator(inbound))
     }
 
+    pub fn remove_inbound(&self, tag: &str) -> Option<ServerConfig> {
+        let mut guard = self
+            .inbounds
+            .write()
+            .expect("runtime inbounds lock poisoned");
+        let index = guard.iter().position(|cfg| cfg.tag == tag)?;
+        Some(guard.remove(index))
+    }
+
+    pub fn add_inbound(&self, inbound: ServerConfig) -> Result<(), String> {
+        let mut guard = self
+            .inbounds
+            .write()
+            .expect("runtime inbounds lock poisoned");
+        if guard.iter().any(|cfg| cfg.tag == inbound.tag) {
+            return Err(format!("inbound {} already exists", inbound.tag));
+        }
+        guard.push(inbound);
+        Ok(())
+    }
+
     pub fn outbounds(&self) -> Vec<OutboundSummary> {
         self.outbounds
             .read()
             .expect("runtime outbounds lock poisoned")
             .clone()
+    }
+
+    pub fn remove_outbound(&self, tag: &str) -> Option<OutboundSummary> {
+        let mut guard = self
+            .outbounds
+            .write()
+            .expect("runtime outbounds lock poisoned");
+        let index = guard.iter().position(|cfg| cfg.tag == tag)?;
+        Some(guard.remove(index))
+    }
+
+    pub fn add_outbound(&self, outbound: OutboundSummary) -> Result<(), String> {
+        let mut guard = self
+            .outbounds
+            .write()
+            .expect("runtime outbounds lock poisoned");
+        if guard.iter().any(|cfg| cfg.tag == outbound.tag) {
+            return Err(format!("outbound {} already exists", outbound.tag));
+        }
+        guard.push(outbound);
+        Ok(())
     }
 }
