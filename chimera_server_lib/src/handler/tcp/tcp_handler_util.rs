@@ -24,10 +24,9 @@ pub fn create_tcp_server_handler(
 ) -> Box<dyn TcpServerHandler> {
     match server_proxy_config {
         #[cfg(feature = "vless")]
-        ServerProxyConfig::Vless {
-            user_id,
-            user_label,
-        } => Box::new(VlessTcpHandler::new(&user_id, &user_label, inbound_tag)),
+        ServerProxyConfig::Vless { users } => {
+            Box::new(VlessTcpHandler::new(&users, inbound_tag))
+        }
 
         #[cfg(feature = "ws")]
         ServerProxyConfig::Websocket { targets } => {
