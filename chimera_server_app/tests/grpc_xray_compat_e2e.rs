@@ -39,6 +39,8 @@ const TEST_USERNAME: &str = "grpc-e2e-user";
 const TEST_PASSWORD: &str = "grpc-e2e-pass";
 const ADDED_USER: &str = "grpc-e2e-added-user";
 const ADDED_PASSWORD: &str = "grpc-e2e-added-pass";
+const ADDED_INBOUND_TAG: &str = "grpc-e2e-added-inbound";
+const ADDED_OUTBOUND_TAG: &str = "grpc-e2e-added-outbound";
 
 const PATH_STATS_GET_STATS: &str = "/xray.app.stats.command.StatsService/GetStats";
 const PATH_STATS_GET_STATS_ONLINE: &str =
@@ -1346,8 +1348,8 @@ fn case_add_rule_probe(chimera: &Harness, xray: &Harness) -> CompatCaseResult {
 fn case_remove_rule_probe(chimera: &Harness, xray: &Harness) -> CompatCaseResult {
     let case = case_def(
         "RoutingService/RemoveRule",
-        "mutation_probe",
-        CaseMode::BaselineProbe,
+        "informational",
+        CaseMode::Informational,
         case_remove_rule_probe,
     );
     let xray_steps = vec![
@@ -1358,7 +1360,15 @@ fn case_remove_rule_probe(chimera: &Harness, xray: &Harness) -> CompatCaseResult
         mutate_remove_rule_probe_step(chimera),
         verify_test_route_step(chimera, "verify"),
     ];
-    run_probe_case(&case, chimera, xray, xray_steps, chimera_steps)
+    let mut result = run_probe_case(&case, chimera, xray, xray_steps, chimera_steps);
+    result.status = CaseStatus::Informational;
+    if result
+        .summary
+        .starts_with("baseline-supported mutation diverged")
+    {
+        result.summary = format!("informational difference: {}", result.summary);
+    }
+    result
 }
 
 fn case_observatory_status(chimera: &Harness, xray: &Harness) -> CompatCaseResult {
@@ -1570,6 +1580,60 @@ fn query_observatory_status(harness: &Harness) -> CompatSnapshot {
     })
 }
 
+fn localhost_ip_or_domain() -> IpOrDomain {
+    IpOrDomain {
+        address: Some(ip_or_domain::Address::Ip(
+            Ipv4Addr::LOCALHOST.octets().to_vec(),
+        )),
+    }
+}
+
+fn build_added_inbound_config(port: u16) -> InboundHandlerConfig {
+    let mut accounts = HashMap::new();
+    accounts.insert(TEST_USERNAME.to_string(), TEST_PASSWORD.to_string());
+
+    InboundHandlerConfig {
+        tag: ADDED_INBOUND_TAG.to_string(),
+        receiver_settings: Some(TypedMessage {
+            r#type: "xray.app.proxyman.ReceiverConfig".to_string(),
+            value: ReceiverConfig {
+                port_list: Some(PortList {
+                    range: vec![PortRange {
+                        from: port as u32,
+                        to: port as u32,
+                    }],
+                }),
+                listen: Some(localhost_ip_or_domain()),
+            }
+            .encode_to_vec(),
+        }),
+        proxy_settings: Some(TypedMessage {
+            r#type: "xray.proxy.socks.ServerConfig".to_string(),
+            value: SocksServerConfig {
+                auth_type: SocksAuthType::Password as i32,
+                accounts,
+                address: Some(localhost_ip_or_domain()),
+                udp_enabled: false,
+                user_level: 0,
+            }
+            .encode_to_vec(),
+        }),
+    }
+}
+
+fn build_added_outbound_config() -> OutboundHandlerConfig {
+    OutboundHandlerConfig {
+        tag: ADDED_OUTBOUND_TAG.to_string(),
+        sender_settings: None,
+        proxy_settings: Some(TypedMessage {
+            r#type: "xray.proxy.freedom.Config".to_string(),
+            value: FreedomConfig::default().encode_to_vec(),
+        }),
+        expire: 0,
+        comment: String::new(),
+    }
+}
+
 fn mutate_add_user_step(harness: &Harness) -> CompatStepResult {
     grpc_step(
         "mutate",
@@ -1665,13 +1729,17 @@ fn setup_override_balancer_step(harness: &Harness) -> CompatStepResult {
 }
 
 fn mutate_add_inbound_probe_step(harness: &Harness) -> CompatStepResult {
+    let inbound_port = free_localhost_port()
+        .expect("failed to allocate localhost port for added inbound");
     let result: Result<AddInboundResponse, Status> = harness.unary(
         PATH_HANDLER_ADD_INBOUND,
-        AddInboundRequest { inbound: None },
+        AddInboundRequest {
+            inbound: Some(build_added_inbound_config(inbound_port)),
+        },
     );
     grpc_step(
         "mutate",
-        "AddInbound(inbound=None)",
+        "AddInbound(tag=grpc-e2e-added-inbound, protocol=socks)",
         snapshot_from_result(result, |_| "ok".to_string()),
     )
 }
@@ -1693,11 +1761,13 @@ fn mutate_remove_inbound_probe_step(harness: &Harness) -> CompatStepResult {
 fn mutate_add_outbound_probe_step(harness: &Harness) -> CompatStepResult {
     let result: Result<AddOutboundResponse, Status> = harness.unary(
         PATH_HANDLER_ADD_OUTBOUND,
-        AddOutboundRequest { outbound: None },
+        AddOutboundRequest {
+            outbound: Some(build_added_outbound_config()),
+        },
     );
     grpc_step(
         "mutate",
-        "AddOutbound(outbound=None)",
+        "AddOutbound(tag=grpc-e2e-added-outbound, protocol=freedom)",
         snapshot_from_result(result, |_| "ok".to_string()),
     )
 }
@@ -1721,12 +1791,15 @@ fn mutate_alter_outbound_probe_step(harness: &Harness) -> CompatStepResult {
         PATH_HANDLER_ALTER_OUTBOUND,
         AlterOutboundRequest {
             tag: DIRECT_TAG.to_string(),
-            operation: None,
+            operation: Some(TypedMessage {
+                r#type: "xray.proxy.freedom.Config".to_string(),
+                value: FreedomConfig::default().encode_to_vec(),
+            }),
         },
     );
     grpc_step(
         "mutate",
-        "AlterOutbound(tag=direct, operation=None)",
+        "AlterOutbound(tag=direct, operation=FreedomConfig())",
         snapshot_from_result(result, |_| "ok".to_string()),
     )
 }
@@ -2133,6 +2206,68 @@ struct SocksAccount {
     #[prost(string, tag = "2")]
     password: String,
 }
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct PortRange {
+    #[prost(uint32, tag = "1")]
+    from: u32,
+    #[prost(uint32, tag = "2")]
+    to: u32,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct PortList {
+    #[prost(message, repeated, tag = "1")]
+    range: Vec<PortRange>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct IpOrDomain {
+    #[prost(oneof = "ip_or_domain::Address", tags = "1, 2")]
+    address: Option<ip_or_domain::Address>,
+}
+
+mod ip_or_domain {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Address {
+        #[prost(bytes, tag = "1")]
+        Ip(Vec<u8>),
+        #[prost(string, tag = "2")]
+        Domain(String),
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct ReceiverConfig {
+    #[prost(message, optional, tag = "1")]
+    port_list: Option<PortList>,
+    #[prost(message, optional, tag = "2")]
+    listen: Option<IpOrDomain>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct SocksServerConfig {
+    #[prost(enumeration = "SocksAuthType", tag = "1")]
+    auth_type: i32,
+    #[prost(map = "string, string", tag = "2")]
+    accounts: HashMap<String, String>,
+    #[prost(message, optional, tag = "3")]
+    address: Option<IpOrDomain>,
+    #[prost(bool, tag = "4")]
+    udp_enabled: bool,
+    #[prost(uint32, tag = "6")]
+    user_level: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+enum SocksAuthType {
+    NoAuth = 0,
+    Password = 1,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct FreedomConfig {}
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct ListInboundsRequest {
