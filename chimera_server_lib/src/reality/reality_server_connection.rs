@@ -849,6 +849,17 @@ impl RealityServerConnection {
         !matches!(self.handshake_state, HandshakeState::Complete)
     }
 
+    /// Drain unread bytes still buffered as would-be ciphertext.
+    ///
+    /// After the VISION direct-mode transition, post-splice raw TCP bytes can
+    /// already be buffered here. They are no longer REALITY records and must be
+    /// passed back to the raw transport path.
+    pub fn take_remaining_ciphertext(&mut self) -> Vec<u8> {
+        let pending = self.ciphertext_read_buf.as_slice().to_vec();
+        self.ciphertext_read_buf.consume(pending.len());
+        pending
+    }
+
     /// Queue a close notification alert
     pub fn send_close_notify(&mut self) {
         // In TLS 1.3, alerts must be encrypted like application data
@@ -946,5 +957,24 @@ mod tests {
 
         assert_eq!(state.plaintext_bytes_to_read(), 0);
         assert!(!conn.wants_write());
+    }
+
+    #[test]
+    fn take_remaining_ciphertext_drains_buffered_bytes() {
+        let config = RealityServerConfig {
+            private_key: [0u8; 32],
+            short_ids: vec![[0u8; 8]],
+            dest: NetLocation::new(Address::UNSPECIFIED, 443),
+            max_time_diff: None,
+            min_client_version: None,
+            max_client_version: None,
+        };
+        let mut conn = RealityServerConnection::new(config).unwrap();
+
+        let buffered = b"post-splice-raw";
+        conn.read_tls(&mut std::io::Cursor::new(buffered)).unwrap();
+
+        assert_eq!(conn.take_remaining_ciphertext(), buffered);
+        assert!(conn.take_remaining_ciphertext().is_empty());
     }
 }

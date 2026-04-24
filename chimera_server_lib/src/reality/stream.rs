@@ -20,6 +20,9 @@ pub trait RealitySession {
     fn write_tls(&mut self, wr: &mut dyn Write) -> io::Result<usize>;
     fn wants_write(&self) -> bool;
     fn is_handshaking(&self) -> bool;
+    fn take_remaining_ciphertext(&mut self) -> Vec<u8> {
+        Vec::new()
+    }
     fn send_close_notify(&mut self);
 }
 
@@ -50,6 +53,10 @@ impl RealitySession for RealityServerConnection {
 
     fn is_handshaking(&self) -> bool {
         RealityServerConnection::is_handshaking(self)
+    }
+
+    fn take_remaining_ciphertext(&mut self) -> Vec<u8> {
+        RealityServerConnection::take_remaining_ciphertext(self)
     }
 
     fn send_close_notify(&mut self) {

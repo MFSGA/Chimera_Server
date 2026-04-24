@@ -206,6 +206,10 @@ where
                 if !leftover.is_empty() {
                     self.pending_read.extend_from_slice(&leftover);
                 }
+                let raw_leftover = self.session.take_remaining_ciphertext();
+                if !raw_leftover.is_empty() {
+                    self.pending_read.extend_from_slice(&raw_leftover);
+                }
                 self.read_mode = ReadMode::Direct;
                 Ok(())
             }
