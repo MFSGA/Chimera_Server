@@ -115,7 +115,11 @@ impl StatsServiceImpl {
                 }
             }
         }
-        Some(ips.len() as i64)
+        if ips.is_empty() {
+            None
+        } else {
+            Some(ips.len() as i64)
+        }
     }
 
     fn online_ip_list(&self, name: &str) -> Option<HashMap<String, i64>> {
@@ -149,7 +153,7 @@ impl StatsServiceImpl {
             }
         }
 
-        Some(ips)
+        if ips.is_empty() { None } else { Some(ips) }
     }
 
     fn collect_user_stats(&self) -> HashMap<String, UserStatsEntry> {
@@ -856,6 +860,34 @@ mod tests {
             .get_stats_online(Request::new(
                 proto::xray::app::stats::command::GetStatsRequest {
                     name,
+                    reset: false,
+                },
+            ))
+            .await
+            .expect_err("expected not found");
+        assert_eq!(err.code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn stats_online_without_matching_entries_returns_not_found() {
+        let service = StatsServiceImpl::new();
+        let tag = unique_tag("empty");
+
+        let err = service
+            .get_stats_online(Request::new(
+                proto::xray::app::stats::command::GetStatsRequest {
+                    name: format!("inbound>>>{tag}>>>online"),
+                    reset: false,
+                },
+            ))
+            .await
+            .expect_err("expected not found");
+        assert_eq!(err.code(), Code::NotFound);
+
+        let err = service
+            .get_stats_online_ip_list(Request::new(
+                proto::xray::app::stats::command::GetStatsRequest {
+                    name: format!("inbound>>>{tag}>>>online"),
                     reset: false,
                 },
             ))
