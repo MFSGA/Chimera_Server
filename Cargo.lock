@@ -309,6 +309,8 @@ dependencies = [
  "chimera_server_lib",
  "clap",
  "prost",
+ "serde",
+ "serde_json",
  "tokio",
  "tonic",
  "tonic-prost",
