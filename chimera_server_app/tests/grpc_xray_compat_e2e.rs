@@ -1,6 +1,6 @@
 use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
     env,
-    ffi::OsString,
     fs::{self, File},
     io,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream},
@@ -14,6 +14,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use prost::Message;
+use serde::Serialize;
 use tonic::{
     Code, Request, Status,
     codegen::http::uri::PathAndQuery,
@@ -25,7 +27,7 @@ const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 const XRAY_BIN_ENV: &str = "XRAY_BIN";
-const XRAY_STRICT_ENV: &str = "XRAY_COMPAT_STRICT";
+const DEFAULT_XRAY_BIN: &str = "xray";
 
 const SOCKS_TAG: &str = "socks-grpc-e2e";
 const DIRECT_TAG: &str = "direct";
@@ -35,20 +37,16 @@ const API_INBOUND_TAG: &str = "api-in";
 const API_OUTBOUND_TAG: &str = "api";
 const TEST_USERNAME: &str = "grpc-e2e-user";
 const TEST_PASSWORD: &str = "grpc-e2e-pass";
+const ADDED_USER: &str = "grpc-e2e-added-user";
+const ADDED_PASSWORD: &str = "grpc-e2e-added-pass";
 
 const PATH_STATS_GET_STATS: &str = "/xray.app.stats.command.StatsService/GetStats";
 const PATH_STATS_GET_STATS_ONLINE: &str =
     "/xray.app.stats.command.StatsService/GetStatsOnline";
-const PATH_STATS_QUERY_STATS: &str =
-    "/xray.app.stats.command.StatsService/QueryStats";
-const PATH_STATS_GET_SYS_STATS: &str =
-    "/xray.app.stats.command.StatsService/GetSysStats";
 const PATH_STATS_GET_STATS_ONLINE_IP_LIST: &str =
     "/xray.app.stats.command.StatsService/GetStatsOnlineIpList";
 const PATH_STATS_GET_ALL_ONLINE_USERS: &str =
     "/xray.app.stats.command.StatsService/GetAllOnlineUsers";
-const PATH_LOGGER_RESTART: &str =
-    "/xray.app.log.command.LoggerService/RestartLogger";
 const PATH_HANDLER_ADD_INBOUND: &str =
     "/xray.app.proxyman.command.HandlerService/AddInbound";
 const PATH_HANDLER_REMOVE_INBOUND: &str =
@@ -69,8 +67,6 @@ const PATH_HANDLER_ALTER_OUTBOUND: &str =
     "/xray.app.proxyman.command.HandlerService/AlterOutbound";
 const PATH_HANDLER_LIST_OUTBOUNDS: &str =
     "/xray.app.proxyman.command.HandlerService/ListOutbounds";
-const PATH_ROUTING_SUBSCRIBE_ROUTING_STATS: &str =
-    "/xray.app.router.command.RoutingService/SubscribeRoutingStats";
 const PATH_ROUTING_TEST_ROUTE: &str =
     "/xray.app.router.command.RoutingService/TestRoute";
 const PATH_ROUTING_GET_BALANCER_INFO: &str =
@@ -84,33 +80,14 @@ const PATH_ROUTING_REMOVE_RULE: &str =
 const PATH_OBSERVATORY_GET_OUTBOUND_STATUS: &str =
     "/xray.core.app.observatory.command.ObservatoryService/GetOutboundStatus";
 
-const CODES_OK_ONLY: &[Code] = &[Code::Ok];
-const CODES_OK_OR_UNKNOWN: &[Code] = &[Code::Ok, Code::Unknown];
-const CODES_NOT_FOUND_ONLY: &[Code] = &[Code::NotFound];
-const CODES_OK_OR_UNIMPLEMENTED: &[Code] = &[Code::Ok, Code::Unimplemented];
-const CODES_OK_OR_UNIMPLEMENTED_OR_UNKNOWN: &[Code] =
-    &[Code::Ok, Code::Unimplemented, Code::Unknown];
-const CODES_OK_OR_UNIMPLEMENTED_OR_UNKNOWN_OR_UNAVAILABLE: &[Code] = &[
-    Code::Ok,
-    Code::Unimplemented,
-    Code::Unknown,
-    Code::Unavailable,
-];
-const CODES_OK_OR_NOT_FOUND: &[Code] = &[Code::Ok, Code::NotFound];
-const CODES_OK_OR_NOT_FOUND_OR_UNIMPLEMENTED: &[Code] =
-    &[Code::Ok, Code::NotFound, Code::Unimplemented];
-const CODES_OK_OR_NOT_FOUND_OR_UNIMPLEMENTED_OR_UNKNOWN: &[Code] =
-    &[Code::Ok, Code::NotFound, Code::Unimplemented, Code::Unknown];
-const CODES_OK_OR_UNIMPLEMENTED_OR_FAILED_PRECONDITION: &[Code] =
-    &[Code::Ok, Code::Unimplemented, Code::FailedPrecondition];
-
 static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
 
 fn trace_step(step: impl AsRef<str>) {
     eprintln!("[grpc-xray-compat-e2e] {}", step.as_ref());
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum TargetKind {
     Chimera,
     Xray,
@@ -123,6 +100,74 @@ impl TargetKind {
             Self::Xray => "xray",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CaseStatus {
+    Passed,
+    Failed,
+    Skipped,
+    Informational,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CaseMode {
+    Strict,
+    Informational,
+    BaselineProbe,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CompatSnapshot {
+    outcome: String,
+    grpc_code: String,
+    raw: String,
+    normalized: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CompatStepResult {
+    phase: String,
+    request: String,
+    snapshot: CompatSnapshot,
+}
+
+#[derive(Debug, Serialize)]
+struct CompatTargetResult {
+    target: TargetKind,
+    log_path: String,
+    workdir: String,
+    steps: Vec<CompatStepResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct CompatCase {
+    name: String,
+    category: String,
+    mode: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CompatCaseResult {
+    case: CompatCase,
+    status: CaseStatus,
+    summary: String,
+    xray: CompatTargetResult,
+    chimera: CompatTargetResult,
+}
+
+#[derive(Debug, Serialize)]
+struct CompatReport {
+    generated_at_unix_ms: u128,
+    xray_version: String,
+    xray_bin: String,
+    config_summary: Vec<String>,
+    passed: usize,
+    failed: usize,
+    skipped: usize,
+    informational: usize,
+    cases: Vec<CompatCaseResult>,
 }
 
 fn global_test_lock() -> &'static Mutex<()> {
@@ -157,12 +202,6 @@ impl ServerProcess {
             .stdout(Stdio::from(stdout_file))
             .stderr(Stdio::from(stderr_file));
         let child = command.spawn()?;
-        trace_step(format!(
-            "{} server spawned pid={} log={}",
-            target.as_str(),
-            child.id(),
-            log_path.display()
-        ));
 
         Ok(Self {
             target,
@@ -173,11 +212,6 @@ impl ServerProcess {
     }
 
     fn wait_until_ready(&mut self, listen_addr: SocketAddr) -> io::Result<()> {
-        trace_step(format!(
-            "waiting for {} listener {}",
-            self.target.as_str(),
-            listen_addr
-        ));
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         loop {
             if let Some(status) = self.child.try_wait()? {
@@ -190,11 +224,6 @@ impl ServerProcess {
             if let Ok(stream) = TcpStream::connect_timeout(&listen_addr, IO_TIMEOUT)
             {
                 drop(stream);
-                trace_step(format!(
-                    "{} listener {} is ready",
-                    self.target.as_str(),
-                    listen_addr
-                ));
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -223,12 +252,6 @@ impl ServerProcess {
 
 impl Drop for ServerProcess {
     fn drop(&mut self) {
-        trace_step(format!(
-            "teardown {} server pid={} workspace={}",
-            self.target.as_str(),
-            self.child.id(),
-            self.workdir.display()
-        ));
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = fs::remove_dir_all(&self.workdir);
@@ -243,30 +266,24 @@ struct Harness {
 
 impl Harness {
     fn start_unlocked(target: TargetKind) -> io::Result<Self> {
-        trace_step(format!("harness start for {}", target.as_str()));
         let grpc_port = free_localhost_port()?;
         let mut socks_port = free_localhost_port()?;
         while socks_port == grpc_port {
             socks_port = free_localhost_port()?;
         }
-        trace_step(format!(
-            "{} allocated grpc_port={} socks_port={}",
-            target.as_str(),
-            grpc_port,
-            socks_port
-        ));
+
         let grpc_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, grpc_port);
         let config = match target {
             TargetKind::Chimera => build_chimera_config(grpc_port, socks_port),
             TargetKind::Xray => build_xray_config(grpc_port, socks_port),
         };
+
         let mut server = ServerProcess::spawn(target, &config)?;
         server.wait_until_ready(SocketAddr::V4(grpc_addr))?;
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        trace_step(format!("{} tokio runtime built", target.as_str()));
         let channel = runtime
             .block_on(connect_channel(SocketAddr::V4(grpc_addr)))
             .map_err(|err| {
@@ -276,7 +293,7 @@ impl Harness {
                     server.logs()
                 ))
             })?;
-        trace_step(format!("{} grpc channel connected", target.as_str()));
+
         Ok(Self {
             server,
             runtime,
@@ -293,19 +310,17 @@ impl Harness {
         Req: prost::Message + Default + Send + Sync + 'static,
         Resp: prost::Message + Default + Send + Sync + 'static,
     {
-        trace_step(format!(
-            "{} unary path={} req_type={} resp_type={}",
-            self.server.target.as_str(),
-            path,
-            std::any::type_name::<Req>(),
-            std::any::type_name::<Resp>()
-        ));
         self.runtime
             .block_on(grpc_unary(self.channel.clone(), path, request))
     }
 
-    fn logs(&self) -> String {
-        self.server.logs()
+    fn target_result(&self, steps: Vec<CompatStepResult>) -> CompatTargetResult {
+        CompatTargetResult {
+            target: self.server.target,
+            log_path: self.server.log_path.display().to_string(),
+            workdir: self.server.workdir.display().to_string(),
+            steps,
+        }
     }
 }
 
@@ -319,24 +334,33 @@ fn build_target_command(
             Command::new(env!("CARGO_BIN_EXE_chimera_server_app")),
         )),
         TargetKind::Xray => {
-            let xray_bin = env::var_os(XRAY_BIN_ENV).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("missing {XRAY_BIN_ENV} environment variable"),
-                )
-            })?;
-            let mut command = Command::new(PathBuf::from(xray_bin));
+            let xray_bin = resolve_xray_bin();
+            let mut command = Command::new(&xray_bin);
             command
                 .arg("run")
                 .arg("-c")
                 .arg(workdir.join("config.json"));
-            trace_step(format!(
-                "xray command configured with config {}",
-                workdir.join("config.json").display()
-            ));
             Ok(("config.json", command))
         }
     }
+}
+
+fn resolve_xray_bin() -> PathBuf {
+    let candidate = env::var_os(XRAY_BIN_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root().join(DEFAULT_XRAY_BIN));
+    if candidate.is_absolute() {
+        candidate
+    } else {
+        workspace_root().join(candidate)
+    }
+}
+
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf()
 }
 
 fn unique_test_dir(prefix: &str) -> io::Result<PathBuf> {
@@ -349,22 +373,15 @@ fn unique_test_dir(prefix: &str) -> io::Result<PathBuf> {
     let path = std::env::temp_dir()
         .join(format!("{prefix}-grpc-compat-{pid}-{millis}-{test_id}"));
     fs::create_dir_all(&path)?;
-    trace_step(format!("allocated temporary test dir {}", path.display()));
     Ok(path)
 }
 
 fn free_localhost_port() -> io::Result<u16> {
     let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
-    let port = listener.local_addr()?.port();
-    trace_step(format!("allocated localhost tcp port {}", port));
-    Ok(port)
+    Ok(listener.local_addr()?.port())
 }
 
 fn build_chimera_config(grpc_port: u16, socks_port: u16) -> String {
-    trace_step(format!(
-        "building chimera config grpc_port={} socks_port={}",
-        grpc_port, socks_port
-    ));
     format!(
         r#"{{
   "inbounds": [
@@ -409,10 +426,6 @@ fn build_chimera_config(grpc_port: u16, socks_port: u16) -> String {
 }
 
 fn build_xray_config(grpc_port: u16, socks_port: u16) -> String {
-    trace_step(format!(
-        "building xray config grpc_port={} socks_port={}",
-        grpc_port, socks_port
-    ));
     format!(
         r#"{{
   "log": {{
@@ -488,7 +501,6 @@ fn build_xray_config(grpc_port: u16, socks_port: u16) -> String {
 }
 
 async fn connect_channel(grpc_addr: SocketAddr) -> io::Result<Channel> {
-    trace_step(format!("connecting grpc channel to {}", grpc_addr));
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     let endpoint =
         Endpoint::from_shared(format!("http://{grpc_addr}")).map_err(|err| {
@@ -501,10 +513,7 @@ async fn connect_channel(grpc_addr: SocketAddr) -> io::Result<Channel> {
 
     loop {
         match endpoint.clone().connect().await {
-            Ok(channel) => {
-                trace_step(format!("grpc channel connected to {}", grpc_addr));
-                return Ok(channel);
-            }
+            Ok(channel) => return Ok(channel),
             Err(err) => {
                 if Instant::now() >= deadline {
                     return Err(io::Error::new(
@@ -529,12 +538,6 @@ where
     Req: prost::Message + Default + Send + Sync + 'static,
     Resp: prost::Message + Default + Send + Sync + 'static,
 {
-    trace_step(format!(
-        "rpc unary path={} req_type={} resp_type={}",
-        path,
-        std::any::type_name::<Req>(),
-        std::any::type_name::<Resp>()
-    ));
     let mut grpc = tonic::client::Grpc::new(channel);
     grpc.ready()
         .await
@@ -542,533 +545,901 @@ where
     let codec = tonic_prost::ProstCodec::default();
     let path = PathAndQuery::from_static(path);
     let response = grpc.unary(Request::new(request), path, codec).await?;
-    trace_step("rpc unary response received");
     Ok(response.into_inner())
 }
 
-async fn grpc_server_stream<Req, Resp>(
-    channel: Channel,
-    path: &'static str,
-    request: Req,
-) -> Result<tonic::Streaming<Resp>, Status>
-where
-    Req: prost::Message + Default + Send + Sync + 'static,
-    Resp: prost::Message + Default + Send + Sync + 'static,
-{
-    trace_step(format!(
-        "rpc server stream path={} req_type={} resp_type={}",
-        path,
-        std::any::type_name::<Req>(),
-        std::any::type_name::<Resp>()
-    ));
-    let mut grpc = tonic::client::Grpc::new(channel);
-    grpc.ready()
-        .await
-        .map_err(|err| Status::unknown(format!("grpc service not ready: {err}")))?;
-    let codec = tonic_prost::ProstCodec::default();
-    let path = PathAndQuery::from_static(path);
-    let response = grpc
-        .server_streaming(Request::new(request), path, codec)
-        .await?;
-    trace_step("rpc server stream established");
-    Ok(response.into_inner())
-}
+type CaseRunner = fn(&Harness, &Harness) -> CompatCaseResult;
 
-#[derive(Debug)]
-struct RpcOutcome {
-    code: Code,
-    detail: String,
-}
-
-fn outcome_from_result<T>(
-    result: Result<T, Status>,
-    on_ok: impl FnOnce(&T) -> String,
-) -> RpcOutcome {
-    match result {
-        Ok(response) => RpcOutcome {
-            code: Code::Ok,
-            detail: on_ok(&response),
-        },
-        Err(status) => RpcOutcome {
-            code: status.code(),
-            detail: status.message().to_string(),
-        },
-    }
-}
-
-fn outcome_from_status(status: Status) -> RpcOutcome {
-    RpcOutcome {
-        code: status.code(),
-        detail: status.message().to_string(),
-    }
-}
-
-type RpcRunner = fn(&Harness) -> RpcOutcome;
-
-struct RpcCase {
+struct CaseDef {
     name: &'static str,
-    runner: RpcRunner,
-    chimera_expected: Code,
-    xray_allowed: &'static [Code],
+    category: &'static str,
+    mode: CaseMode,
+    runner: CaseRunner,
 }
 
-fn strict_mode_enabled() -> bool {
-    trace_step("evaluating strict mode from XRAY_COMPAT_STRICT");
-    match env::var_os(XRAY_STRICT_ENV) {
-        Some(value) => {
-            let lowered = os_string_to_lower(value);
-            matches!(lowered.as_str(), "1" | "true" | "yes" | "on")
-        }
-        None => false,
+fn case_def(
+    name: &'static str,
+    category: &'static str,
+    mode: CaseMode,
+    runner: CaseRunner,
+) -> CaseDef {
+    CaseDef {
+        name,
+        category,
+        mode,
+        runner,
     }
 }
 
-fn os_string_to_lower(value: OsString) -> String {
-    value.to_string_lossy().to_ascii_lowercase()
-}
-
-fn format_codes(codes: &[Code]) -> String {
-    codes
-        .iter()
-        .map(|code| format!("{code:?}"))
-        .collect::<Vec<_>>()
-        .join("|")
-}
-
-fn rpc_cases() -> Vec<RpcCase> {
-    trace_step("constructing rpc compatibility matrix");
+fn compat_cases() -> Vec<CaseDef> {
     vec![
-        RpcCase {
-            name: "StatsService/GetStats",
-            runner: run_stats_get_stats,
-            chimera_expected: Code::NotFound,
-            xray_allowed: CODES_NOT_FOUND_ONLY,
-        },
-        RpcCase {
-            name: "StatsService/GetStatsOnline",
-            runner: run_stats_get_stats_online,
-            chimera_expected: Code::Ok,
-            xray_allowed: CODES_OK_OR_NOT_FOUND,
-        },
-        RpcCase {
-            name: "StatsService/QueryStats",
-            runner: run_stats_query_stats,
-            chimera_expected: Code::Ok,
-            xray_allowed: CODES_OK_OR_UNKNOWN,
-        },
-        RpcCase {
-            name: "StatsService/GetSysStats",
-            runner: run_stats_get_sys_stats,
-            chimera_expected: Code::Ok,
-            xray_allowed: CODES_OK_ONLY,
-        },
-        RpcCase {
-            name: "StatsService/GetStatsOnlineIpList",
-            runner: run_stats_get_stats_online_ip_list,
-            chimera_expected: Code::Ok,
-            xray_allowed: CODES_OK_OR_NOT_FOUND,
-        },
-        RpcCase {
-            name: "StatsService/GetAllOnlineUsers",
-            runner: run_stats_get_all_online_users,
-            chimera_expected: Code::Ok,
-            xray_allowed: CODES_OK_ONLY,
-        },
-        RpcCase {
-            name: "LoggerService/RestartLogger",
-            runner: run_logger_restart_logger,
-            chimera_expected: Code::Ok,
-            xray_allowed: CODES_OK_OR_UNIMPLEMENTED_OR_FAILED_PRECONDITION,
-        },
-        RpcCase {
-            name: "HandlerService/AddInbound",
-            runner: run_handler_add_inbound,
-            chimera_expected: Code::Unimplemented,
-            xray_allowed: CODES_OK_OR_UNIMPLEMENTED_OR_UNKNOWN_OR_UNAVAILABLE,
-        },
-        RpcCase {
-            name: "HandlerService/RemoveInbound",
-            runner: run_handler_remove_inbound,
-            chimera_expected: Code::Unimplemented,
-            xray_allowed: CODES_OK_OR_UNIMPLEMENTED,
-        },
-        RpcCase {
-            name: "HandlerService/AlterInbound",
-            runner: run_handler_alter_inbound,
-            chimera_expected: Code::Ok,
-            xray_allowed: CODES_OK_OR_UNIMPLEMENTED_OR_UNKNOWN,
-        },
-        RpcCase {
-            name: "HandlerService/ListInbounds",
-            runner: run_handler_list_inbounds,
-            chimera_expected: Code::Ok,
-            xray_allowed: CODES_OK_ONLY,
-        },
-        RpcCase {
-            name: "HandlerService/GetInboundUsers",
-            runner: run_handler_get_inbound_users,
-            chimera_expected: Code::Ok,
-            xray_allowed: CODES_OK_OR_NOT_FOUND_OR_UNIMPLEMENTED_OR_UNKNOWN,
-        },
-        RpcCase {
-            name: "HandlerService/GetInboundUsersCount",
-            runner: run_handler_get_inbound_users_count,
-            chimera_expected: Code::Ok,
-            xray_allowed: CODES_OK_OR_NOT_FOUND_OR_UNIMPLEMENTED_OR_UNKNOWN,
-        },
-        RpcCase {
-            name: "HandlerService/AddOutbound",
-            runner: run_handler_add_outbound,
-            chimera_expected: Code::Unimplemented,
-            xray_allowed: CODES_OK_OR_UNIMPLEMENTED_OR_UNKNOWN,
-        },
-        RpcCase {
-            name: "HandlerService/RemoveOutbound",
-            runner: run_handler_remove_outbound,
-            chimera_expected: Code::Unimplemented,
-            xray_allowed: CODES_OK_OR_UNIMPLEMENTED,
-        },
-        RpcCase {
-            name: "HandlerService/AlterOutbound",
-            runner: run_handler_alter_outbound,
-            chimera_expected: Code::Unimplemented,
-            xray_allowed: CODES_OK_OR_UNIMPLEMENTED_OR_UNKNOWN,
-        },
-        RpcCase {
-            name: "HandlerService/ListOutbounds",
-            runner: run_handler_list_outbounds,
-            chimera_expected: Code::Ok,
-            xray_allowed: CODES_OK_ONLY,
-        },
-        RpcCase {
-            name: "RoutingService/SubscribeRoutingStats",
-            runner: run_routing_subscribe_routing_stats,
-            chimera_expected: Code::Ok,
-            xray_allowed: CODES_OK_OR_UNIMPLEMENTED_OR_UNKNOWN,
-        },
-        RpcCase {
-            name: "RoutingService/TestRoute",
-            runner: run_routing_test_route,
-            chimera_expected: Code::Ok,
-            xray_allowed: CODES_OK_OR_UNIMPLEMENTED_OR_UNKNOWN,
-        },
-        RpcCase {
-            name: "RoutingService/GetBalancerInfo",
-            runner: run_routing_get_balancer_info,
-            chimera_expected: Code::Ok,
-            xray_allowed: CODES_OK_OR_NOT_FOUND_OR_UNIMPLEMENTED,
-        },
-        RpcCase {
-            name: "RoutingService/OverrideBalancerTarget",
-            runner: run_routing_override_balancer_target,
-            chimera_expected: Code::Ok,
-            xray_allowed: CODES_OK_OR_NOT_FOUND_OR_UNIMPLEMENTED,
-        },
-        RpcCase {
-            name: "RoutingService/AddRule",
-            runner: run_routing_add_rule,
-            chimera_expected: Code::Unimplemented,
-            xray_allowed: CODES_OK_OR_UNIMPLEMENTED_OR_UNKNOWN,
-        },
-        RpcCase {
-            name: "RoutingService/RemoveRule",
-            runner: run_routing_remove_rule,
-            chimera_expected: Code::Unimplemented,
-            xray_allowed: CODES_OK_OR_UNIMPLEMENTED,
-        },
-        RpcCase {
-            name: "ObservatoryService/GetOutboundStatus",
-            runner: run_observatory_get_outbound_status,
-            chimera_expected: Code::Ok,
-            xray_allowed: CODES_OK_OR_UNIMPLEMENTED,
-        },
+        case_def(
+            "HandlerService/ListInbounds",
+            "query",
+            CaseMode::Strict,
+            case_list_inbounds,
+        ),
+        case_def(
+            "HandlerService/GetInboundUsers",
+            "query",
+            CaseMode::Strict,
+            case_get_inbound_users,
+        ),
+        case_def(
+            "HandlerService/GetInboundUsersCount",
+            "query",
+            CaseMode::Strict,
+            case_get_inbound_users_count,
+        ),
+        case_def(
+            "HandlerService/ListOutbounds",
+            "query",
+            CaseMode::Strict,
+            case_list_outbounds,
+        ),
+        case_def(
+            "RoutingService/TestRoute",
+            "query",
+            CaseMode::Strict,
+            case_test_route,
+        ),
+        case_def(
+            "RoutingService/GetBalancerInfo",
+            "query",
+            CaseMode::Strict,
+            case_get_balancer_info,
+        ),
+        case_def(
+            "StatsService/GetStats",
+            "query",
+            CaseMode::Strict,
+            case_get_stats,
+        ),
+        case_def(
+            "StatsService/GetStatsOnline",
+            "query",
+            CaseMode::Strict,
+            case_get_stats_online,
+        ),
+        case_def(
+            "StatsService/GetStatsOnlineIpList",
+            "query",
+            CaseMode::Strict,
+            case_get_stats_online_ip_list,
+        ),
+        case_def(
+            "StatsService/GetAllOnlineUsers",
+            "query",
+            CaseMode::Strict,
+            case_get_all_online_users,
+        ),
+        case_def(
+            "HandlerService/AlterInbound AddUser",
+            "mutation",
+            CaseMode::Strict,
+            case_alter_inbound_add_user,
+        ),
+        case_def(
+            "HandlerService/AlterInbound RemoveUser",
+            "mutation",
+            CaseMode::Strict,
+            case_alter_inbound_remove_user,
+        ),
+        case_def(
+            "RoutingService/OverrideBalancerTarget set backup",
+            "mutation",
+            CaseMode::Strict,
+            case_override_balancer_set,
+        ),
+        case_def(
+            "RoutingService/OverrideBalancerTarget clear",
+            "mutation",
+            CaseMode::Strict,
+            case_override_balancer_clear,
+        ),
+        case_def(
+            "HandlerService/AddInbound",
+            "mutation_probe",
+            CaseMode::BaselineProbe,
+            case_add_inbound_probe,
+        ),
+        case_def(
+            "HandlerService/RemoveInbound",
+            "mutation_probe",
+            CaseMode::BaselineProbe,
+            case_remove_inbound_probe,
+        ),
+        case_def(
+            "HandlerService/AddOutbound",
+            "mutation_probe",
+            CaseMode::BaselineProbe,
+            case_add_outbound_probe,
+        ),
+        case_def(
+            "HandlerService/RemoveOutbound",
+            "mutation_probe",
+            CaseMode::BaselineProbe,
+            case_remove_outbound_probe,
+        ),
+        case_def(
+            "HandlerService/AlterOutbound",
+            "mutation_probe",
+            CaseMode::BaselineProbe,
+            case_alter_outbound_probe,
+        ),
+        case_def(
+            "RoutingService/AddRule",
+            "mutation_probe",
+            CaseMode::BaselineProbe,
+            case_add_rule_probe,
+        ),
+        case_def(
+            "RoutingService/RemoveRule",
+            "mutation_probe",
+            CaseMode::BaselineProbe,
+            case_remove_rule_probe,
+        ),
+        case_def(
+            "ObservatoryService/GetOutboundStatus",
+            "informational",
+            CaseMode::Informational,
+            case_observatory_status,
+        ),
     ]
 }
 
 #[test]
-#[ignore = "requires XRAY_BIN=<path-to-xray>; optional XRAY_COMPAT_STRICT=1"]
+#[ignore = "runs xray baseline gRPC compatibility matrix and writes target/grpc-xray-compat/report.{json,md}"]
 fn grpc_all_interfaces_compat_with_xray_core() {
     trace_step("==== test grpc_all_interfaces_compat_with_xray_core start ====");
-    if env::var_os(XRAY_BIN_ENV).is_none() {
-        panic!("missing required env var {XRAY_BIN_ENV}");
-    }
-
     let _guard = global_test_lock()
         .lock()
         .expect("failed to acquire global test lock");
-    trace_step("global test lock acquired");
-    let strict_mode = strict_mode_enabled();
-    trace_step(format!("strict_mode={}", strict_mode));
 
-    let mut failures = Vec::new();
-    for case in rpc_cases() {
-        trace_step(format!("running compatibility case {}", case.name));
-        let chimera = match Harness::start_unlocked(TargetKind::Chimera) {
-            Ok(harness) => harness,
-            Err(err) => {
-                failures.push(format!(
-                    "[{}] failed to start chimera harness: {err}",
-                    case.name
-                ));
-                continue;
-            }
-        };
-
-        let xray = match Harness::start_unlocked(TargetKind::Xray) {
-            Ok(harness) => harness,
-            Err(err) => {
-                failures.push(format!(
-                    "[{}] failed to start xray harness: {err}",
-                    case.name
-                ));
-                continue;
-            }
-        };
-
-        let chimera_outcome = (case.runner)(&chimera);
-        let xray_outcome = (case.runner)(&xray);
-        trace_step(format!(
-            "case={} chimera={:?} xray={:?} chimera_detail={} xray_detail={}",
-            case.name,
-            chimera_outcome.code,
-            xray_outcome.code,
-            chimera_outcome.detail,
-            xray_outcome.detail
-        ));
-
-        if chimera_outcome.code != case.chimera_expected {
-            failures.push(format!(
-                "[{}] chimera expected {:?}, got {:?} (detail: {})",
-                case.name,
-                case.chimera_expected,
-                chimera_outcome.code,
-                chimera_outcome.detail
-            ));
-        }
-        if !case.xray_allowed.contains(&xray_outcome.code) {
-            failures.push(format!(
-                "[{}] xray expected one of [{}], got {:?} (detail: {})",
-                case.name,
-                format_codes(case.xray_allowed),
-                xray_outcome.code,
-                xray_outcome.detail
-            ));
-        }
-        if strict_mode && chimera_outcome.code != xray_outcome.code {
-            failures.push(format!(
-                "[{}] strict mode mismatch: chimera={:?}, xray={:?}",
-                case.name, chimera_outcome.code, xray_outcome.code
-            ));
+    let mut results = Vec::new();
+    for case in compat_cases() {
+        trace_step(format!("running case {}", case.name));
+        match run_case(&case) {
+            Ok(result) => results.push(result),
+            Err(err) => results.push(infra_failure_result(&case, err)),
         }
     }
+
+    let xray_bin = resolve_xray_bin();
+    let xray_version = xray_version(&xray_bin);
+    let report = build_report(results, xray_bin.display().to_string(), xray_version);
+    write_report_artifacts(&report).expect("failed to write compatibility report");
+
+    let failures = report
+        .cases
+        .iter()
+        .filter(|case| matches!(case.status, CaseStatus::Failed))
+        .map(|case| format!("[{}] {}", case.case.name, case.summary))
+        .collect::<Vec<_>>();
 
     if !failures.is_empty() {
         panic!(
-            "grpc compatibility matrix failed (strict_mode={strict_mode})\n{}",
+            "grpc compatibility report contains failures\n{}",
             failures.join("\n")
         );
     }
-    trace_step("==== test grpc_all_interfaces_compat_with_xray_core done ====");
 }
 
-fn run_stats_get_stats(harness: &Harness) -> RpcOutcome {
-    let result: Result<Empty, Status> = harness.unary(
-        PATH_STATS_GET_STATS,
-        GetStatsRequest {
-            name: "inbound>>>non-existent>>>traffic>>>uplink".to_string(),
-            reset: false,
+fn run_case(case: &CaseDef) -> io::Result<CompatCaseResult> {
+    let chimera = Harness::start_unlocked(TargetKind::Chimera)?;
+    let xray = Harness::start_unlocked(TargetKind::Xray)?;
+    Ok((case.runner)(&chimera, &xray))
+}
+
+fn infra_failure_result(case: &CaseDef, err: io::Error) -> CompatCaseResult {
+    let snapshot = CompatSnapshot {
+        outcome: "infra_error".to_string(),
+        grpc_code: "n/a".to_string(),
+        raw: err.to_string(),
+        normalized: err.to_string(),
+    };
+    CompatCaseResult {
+        case: describe_case(case),
+        status: CaseStatus::Failed,
+        summary: format!("failed to start harnesses: {err}"),
+        xray: CompatTargetResult {
+            target: TargetKind::Xray,
+            log_path: String::new(),
+            workdir: String::new(),
+            steps: vec![CompatStepResult {
+                phase: "infra".to_string(),
+                request: "start harness".to_string(),
+                snapshot: snapshot.clone(),
+            }],
         },
-    );
-    outcome_from_result(result, |_| "ok".to_string())
-}
-
-fn run_stats_get_stats_online(harness: &Harness) -> RpcOutcome {
-    let result: Result<Empty, Status> = harness.unary(
-        PATH_STATS_GET_STATS_ONLINE,
-        GetStatsRequest {
-            name: format!("inbound>>>{SOCKS_TAG}>>>online"),
-            reset: false,
+        chimera: CompatTargetResult {
+            target: TargetKind::Chimera,
+            log_path: String::new(),
+            workdir: String::new(),
+            steps: vec![CompatStepResult {
+                phase: "infra".to_string(),
+                request: "start harness".to_string(),
+                snapshot,
+            }],
         },
-    );
-    outcome_from_result(result, |_| "ok".to_string())
+    }
 }
 
-fn run_stats_query_stats(harness: &Harness) -> RpcOutcome {
-    let result: Result<Empty, Status> = harness.unary(
-        PATH_STATS_QUERY_STATS,
-        QueryStatsRequest {
-            pattern: String::new(),
-            reset: false,
+fn describe_case(case: &CaseDef) -> CompatCase {
+    CompatCase {
+        name: case.name.to_string(),
+        category: case.category.to_string(),
+        mode: match case.mode {
+            CaseMode::Strict => "strict",
+            CaseMode::Informational => "informational",
+            CaseMode::BaselineProbe => "baseline_probe",
+        }
+        .to_string(),
+    }
+}
+
+fn run_strict_query_case(
+    case: &CaseDef,
+    chimera: &Harness,
+    xray: &Harness,
+    request: &str,
+    query: fn(&Harness) -> CompatSnapshot,
+) -> CompatCaseResult {
+    let chimera_step = CompatStepResult {
+        phase: "query".to_string(),
+        request: request.to_string(),
+        snapshot: query(chimera),
+    };
+    let xray_step = CompatStepResult {
+        phase: "query".to_string(),
+        request: request.to_string(),
+        snapshot: query(xray),
+    };
+    let matched = chimera_step.snapshot.normalized == xray_step.snapshot.normalized;
+
+    CompatCaseResult {
+        case: describe_case(case),
+        status: if matched {
+            CaseStatus::Passed
+        } else {
+            CaseStatus::Failed
         },
-    );
-    outcome_from_result(result, |_| "ok".to_string())
-}
-
-fn run_stats_get_sys_stats(harness: &Harness) -> RpcOutcome {
-    let result: Result<Empty, Status> =
-        harness.unary(PATH_STATS_GET_SYS_STATS, Empty {});
-    outcome_from_result(result, |_| "ok".to_string())
-}
-
-fn run_stats_get_stats_online_ip_list(harness: &Harness) -> RpcOutcome {
-    let result: Result<Empty, Status> = harness.unary(
-        PATH_STATS_GET_STATS_ONLINE_IP_LIST,
-        GetStatsRequest {
-            name: format!("inbound>>>{SOCKS_TAG}>>>online"),
-            reset: false,
+        summary: if matched {
+            "query snapshot matches xray baseline".to_string()
+        } else {
+            format!(
+                "query snapshot mismatch: chimera={} xray={}",
+                chimera_step.snapshot.normalized, xray_step.snapshot.normalized
+            )
         },
-    );
-    outcome_from_result(result, |_| "ok".to_string())
+        xray: xray.target_result(vec![xray_step]),
+        chimera: chimera.target_result(vec![chimera_step]),
+    }
 }
 
-fn run_stats_get_all_online_users(harness: &Harness) -> RpcOutcome {
-    let result: Result<Empty, Status> =
-        harness.unary(PATH_STATS_GET_ALL_ONLINE_USERS, Empty {});
-    outcome_from_result(result, |_| "ok".to_string())
-}
+fn run_informational_case(
+    case: &CaseDef,
+    chimera: &Harness,
+    xray: &Harness,
+    request: &str,
+    query: fn(&Harness) -> CompatSnapshot,
+) -> CompatCaseResult {
+    let chimera_step = CompatStepResult {
+        phase: "query".to_string(),
+        request: request.to_string(),
+        snapshot: query(chimera),
+    };
+    let xray_step = CompatStepResult {
+        phase: "query".to_string(),
+        request: request.to_string(),
+        snapshot: query(xray),
+    };
+    let matched = chimera_step.snapshot.normalized == xray_step.snapshot.normalized;
 
-fn run_logger_restart_logger(harness: &Harness) -> RpcOutcome {
-    let result: Result<Empty, Status> = harness.unary(PATH_LOGGER_RESTART, Empty {});
-    outcome_from_result(result, |_| "ok".to_string())
-}
-
-fn run_handler_add_inbound(harness: &Harness) -> RpcOutcome {
-    let result: Result<Empty, Status> = harness.unary(
-        PATH_HANDLER_ADD_INBOUND,
-        AddInboundRequest { inbound: None },
-    );
-    outcome_from_result(result, |_| "ok".to_string())
-}
-
-fn run_handler_remove_inbound(harness: &Harness) -> RpcOutcome {
-    let result: Result<Empty, Status> = harness.unary(
-        PATH_HANDLER_REMOVE_INBOUND,
-        RemoveInboundRequest {
-            tag: SOCKS_TAG.to_string(),
+    CompatCaseResult {
+        case: describe_case(case),
+        status: CaseStatus::Informational,
+        summary: if matched {
+            "informational snapshot matches xray baseline".to_string()
+        } else {
+            format!(
+                "informational difference: chimera={} xray={}",
+                chimera_step.snapshot.normalized, xray_step.snapshot.normalized
+            )
         },
-    );
-    outcome_from_result(result, |_| "ok".to_string())
+        xray: xray.target_result(vec![xray_step]),
+        chimera: chimera.target_result(vec![chimera_step]),
+    }
 }
 
-fn run_handler_alter_inbound(harness: &Harness) -> RpcOutcome {
-    let result: Result<Empty, Status> = harness.unary(
-        PATH_HANDLER_ALTER_INBOUND,
-        AlterInboundRequest {
-            tag: SOCKS_TAG.to_string(),
-            operation: None,
-        },
-    );
-    outcome_from_result(result, |_| "ok".to_string())
+fn run_mutation_case(
+    case: &CaseDef,
+    chimera: &Harness,
+    xray: &Harness,
+    xray_steps: Vec<CompatStepResult>,
+    chimera_steps: Vec<CompatStepResult>,
+) -> CompatCaseResult {
+    let status = if steps_match(&chimera_steps, &xray_steps) {
+        CaseStatus::Passed
+    } else {
+        CaseStatus::Failed
+    };
+    let summary = if matches!(status, CaseStatus::Passed) {
+        "mutation side effects match xray baseline".to_string()
+    } else {
+        format!(
+            "mutation side effects diverged: chimera={} xray={}",
+            steps_normalized_summary(&chimera_steps),
+            steps_normalized_summary(&xray_steps),
+        )
+    };
+
+    CompatCaseResult {
+        case: describe_case(case),
+        status,
+        summary,
+        xray: xray.target_result(xray_steps),
+        chimera: chimera.target_result(chimera_steps),
+    }
 }
 
-fn run_handler_list_inbounds(harness: &Harness) -> RpcOutcome {
-    let result: Result<Empty, Status> = harness.unary(
+fn run_probe_case(
+    case: &CaseDef,
+    chimera: &Harness,
+    xray: &Harness,
+    xray_steps: Vec<CompatStepResult>,
+    chimera_steps: Vec<CompatStepResult>,
+) -> CompatCaseResult {
+    let xray_mutation = xray_steps
+        .iter()
+        .find(|step| step.phase == "mutate")
+        .expect("probe case requires xray mutate step");
+
+    let (status, summary) = if xray_mutation.snapshot.outcome != "ok" {
+        (
+            CaseStatus::Skipped,
+            format!(
+                "xray baseline does not support this request in current config: {}",
+                xray_mutation.snapshot.normalized
+            ),
+        )
+    } else if steps_match(&chimera_steps, &xray_steps) {
+        (
+            CaseStatus::Passed,
+            "baseline-supported mutation matches xray baseline".to_string(),
+        )
+    } else {
+        (
+            CaseStatus::Failed,
+            format!(
+                "baseline-supported mutation diverged: chimera={} xray={}",
+                steps_normalized_summary(&chimera_steps),
+                steps_normalized_summary(&xray_steps),
+            ),
+        )
+    };
+
+    CompatCaseResult {
+        case: describe_case(case),
+        status,
+        summary,
+        xray: xray.target_result(xray_steps),
+        chimera: chimera.target_result(chimera_steps),
+    }
+}
+
+fn steps_match(
+    chimera_steps: &[CompatStepResult],
+    xray_steps: &[CompatStepResult],
+) -> bool {
+    chimera_steps.len() == xray_steps.len()
+        && chimera_steps.iter().zip(xray_steps).all(|(chimera, xray)| {
+            chimera.snapshot.normalized == xray.snapshot.normalized
+        })
+}
+
+fn steps_normalized_summary(steps: &[CompatStepResult]) -> String {
+    steps
+        .iter()
+        .map(|step| format!("{}={}", step.phase, step.snapshot.normalized))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn case_list_inbounds(chimera: &Harness, xray: &Harness) -> CompatCaseResult {
+    let case = case_def(
+        "HandlerService/ListInbounds",
+        "query",
+        CaseMode::Strict,
+        case_list_inbounds,
+    );
+    run_strict_query_case(
+        &case,
+        chimera,
+        xray,
+        "ListInbounds(is_only_tags=true)",
+        query_list_inbounds,
+    )
+}
+
+fn case_get_inbound_users(chimera: &Harness, xray: &Harness) -> CompatCaseResult {
+    let case = case_def(
+        "HandlerService/GetInboundUsers",
+        "query",
+        CaseMode::Strict,
+        case_get_inbound_users,
+    );
+    run_strict_query_case(
+        &case,
+        chimera,
+        xray,
+        "GetInboundUsers(tag=socks-grpc-e2e, email=\"\")",
+        query_get_inbound_users,
+    )
+}
+
+fn case_get_inbound_users_count(
+    chimera: &Harness,
+    xray: &Harness,
+) -> CompatCaseResult {
+    let case = case_def(
+        "HandlerService/GetInboundUsersCount",
+        "query",
+        CaseMode::Strict,
+        case_get_inbound_users_count,
+    );
+    run_strict_query_case(
+        &case,
+        chimera,
+        xray,
+        "GetInboundUsersCount(tag=socks-grpc-e2e, email=\"\")",
+        query_get_inbound_users_count,
+    )
+}
+
+fn case_list_outbounds(chimera: &Harness, xray: &Harness) -> CompatCaseResult {
+    let case = case_def(
+        "HandlerService/ListOutbounds",
+        "query",
+        CaseMode::Strict,
+        case_list_outbounds,
+    );
+    run_strict_query_case(
+        &case,
+        chimera,
+        xray,
+        "ListOutbounds()",
+        query_list_outbounds,
+    )
+}
+
+fn case_test_route(chimera: &Harness, xray: &Harness) -> CompatCaseResult {
+    let case = case_def(
+        "RoutingService/TestRoute",
+        "query",
+        CaseMode::Strict,
+        case_test_route,
+    );
+    run_strict_query_case(
+        &case,
+        chimera,
+        xray,
+        "TestRoute(inbound=socks-grpc-e2e, publish=false)",
+        query_test_route,
+    )
+}
+
+fn case_get_balancer_info(chimera: &Harness, xray: &Harness) -> CompatCaseResult {
+    let case = case_def(
+        "RoutingService/GetBalancerInfo",
+        "query",
+        CaseMode::Strict,
+        case_get_balancer_info,
+    );
+    run_strict_query_case(
+        &case,
+        chimera,
+        xray,
+        "GetBalancerInfo(tag=balancer-a)",
+        query_get_balancer_info,
+    )
+}
+
+fn case_get_stats(chimera: &Harness, xray: &Harness) -> CompatCaseResult {
+    let case = case_def(
+        "StatsService/GetStats",
+        "query",
+        CaseMode::Strict,
+        case_get_stats,
+    );
+    run_strict_query_case(
+        &case,
+        chimera,
+        xray,
+        "GetStats(name=inbound>>>non-existent>>>traffic>>>uplink, reset=false)",
+        query_get_stats,
+    )
+}
+
+fn case_get_stats_online(chimera: &Harness, xray: &Harness) -> CompatCaseResult {
+    let case = case_def(
+        "StatsService/GetStatsOnline",
+        "query",
+        CaseMode::Strict,
+        case_get_stats_online,
+    );
+    run_strict_query_case(
+        &case,
+        chimera,
+        xray,
+        "GetStatsOnline(name=inbound>>>socks-grpc-e2e>>>online, reset=false)",
+        query_get_stats_online,
+    )
+}
+
+fn case_get_stats_online_ip_list(
+    chimera: &Harness,
+    xray: &Harness,
+) -> CompatCaseResult {
+    let case = case_def(
+        "StatsService/GetStatsOnlineIpList",
+        "query",
+        CaseMode::Strict,
+        case_get_stats_online_ip_list,
+    );
+    run_strict_query_case(
+        &case,
+        chimera,
+        xray,
+        "GetStatsOnlineIpList(name=inbound>>>socks-grpc-e2e>>>online, reset=false)",
+        query_get_stats_online_ip_list,
+    )
+}
+
+fn case_get_all_online_users(chimera: &Harness, xray: &Harness) -> CompatCaseResult {
+    let case = case_def(
+        "StatsService/GetAllOnlineUsers",
+        "query",
+        CaseMode::Strict,
+        case_get_all_online_users,
+    );
+    run_strict_query_case(
+        &case,
+        chimera,
+        xray,
+        "GetAllOnlineUsers()",
+        query_get_all_online_users,
+    )
+}
+
+fn case_alter_inbound_add_user(
+    chimera: &Harness,
+    xray: &Harness,
+) -> CompatCaseResult {
+    let case = case_def(
+        "HandlerService/AlterInbound AddUser",
+        "mutation",
+        CaseMode::Strict,
+        case_alter_inbound_add_user,
+    );
+
+    let xray_steps = vec![
+        mutate_add_user_step(xray),
+        verify_get_inbound_users_step(xray, "verify-users"),
+        verify_get_inbound_users_count_step(xray, "verify-count"),
+    ];
+    let chimera_steps = vec![
+        mutate_add_user_step(chimera),
+        verify_get_inbound_users_step(chimera, "verify-users"),
+        verify_get_inbound_users_count_step(chimera, "verify-count"),
+    ];
+
+    run_mutation_case(&case, chimera, xray, xray_steps, chimera_steps)
+}
+
+fn case_alter_inbound_remove_user(
+    chimera: &Harness,
+    xray: &Harness,
+) -> CompatCaseResult {
+    let case = case_def(
+        "HandlerService/AlterInbound RemoveUser",
+        "mutation",
+        CaseMode::Strict,
+        case_alter_inbound_remove_user,
+    );
+
+    let xray_steps = vec![
+        setup_add_user_step(xray),
+        mutate_remove_user_step(xray),
+        verify_get_inbound_users_step(xray, "verify-users"),
+        verify_get_inbound_users_count_step(xray, "verify-count"),
+    ];
+    let chimera_steps = vec![
+        setup_add_user_step(chimera),
+        mutate_remove_user_step(chimera),
+        verify_get_inbound_users_step(chimera, "verify-users"),
+        verify_get_inbound_users_count_step(chimera, "verify-count"),
+    ];
+
+    run_mutation_case(&case, chimera, xray, xray_steps, chimera_steps)
+}
+
+fn case_override_balancer_set(
+    chimera: &Harness,
+    xray: &Harness,
+) -> CompatCaseResult {
+    let case = case_def(
+        "RoutingService/OverrideBalancerTarget set backup",
+        "mutation",
+        CaseMode::Strict,
+        case_override_balancer_set,
+    );
+
+    let xray_steps = vec![
+        mutate_override_balancer_step(xray, "mutate", BACKUP_TAG),
+        verify_get_balancer_info_step(xray, "verify"),
+    ];
+    let chimera_steps = vec![
+        mutate_override_balancer_step(chimera, "mutate", BACKUP_TAG),
+        verify_get_balancer_info_step(chimera, "verify"),
+    ];
+
+    run_mutation_case(&case, chimera, xray, xray_steps, chimera_steps)
+}
+
+fn case_override_balancer_clear(
+    chimera: &Harness,
+    xray: &Harness,
+) -> CompatCaseResult {
+    let case = case_def(
+        "RoutingService/OverrideBalancerTarget clear",
+        "mutation",
+        CaseMode::Strict,
+        case_override_balancer_clear,
+    );
+
+    let xray_steps = vec![
+        setup_override_balancer_step(xray),
+        mutate_override_balancer_step(xray, "mutate", ""),
+        verify_get_balancer_info_step(xray, "verify"),
+    ];
+    let chimera_steps = vec![
+        setup_override_balancer_step(chimera),
+        mutate_override_balancer_step(chimera, "mutate", ""),
+        verify_get_balancer_info_step(chimera, "verify"),
+    ];
+
+    run_mutation_case(&case, chimera, xray, xray_steps, chimera_steps)
+}
+
+fn case_add_inbound_probe(chimera: &Harness, xray: &Harness) -> CompatCaseResult {
+    let case = case_def(
+        "HandlerService/AddInbound",
+        "mutation_probe",
+        CaseMode::BaselineProbe,
+        case_add_inbound_probe,
+    );
+    let xray_steps = vec![
+        mutate_add_inbound_probe_step(xray),
+        verify_list_inbounds_step(xray, "verify"),
+    ];
+    let chimera_steps = vec![
+        mutate_add_inbound_probe_step(chimera),
+        verify_list_inbounds_step(chimera, "verify"),
+    ];
+    run_probe_case(&case, chimera, xray, xray_steps, chimera_steps)
+}
+
+fn case_remove_inbound_probe(chimera: &Harness, xray: &Harness) -> CompatCaseResult {
+    let case = case_def(
+        "HandlerService/RemoveInbound",
+        "mutation_probe",
+        CaseMode::BaselineProbe,
+        case_remove_inbound_probe,
+    );
+    let xray_steps = vec![
+        mutate_remove_inbound_probe_step(xray),
+        verify_list_inbounds_step(xray, "verify"),
+    ];
+    let chimera_steps = vec![
+        mutate_remove_inbound_probe_step(chimera),
+        verify_list_inbounds_step(chimera, "verify"),
+    ];
+    run_probe_case(&case, chimera, xray, xray_steps, chimera_steps)
+}
+
+fn case_add_outbound_probe(chimera: &Harness, xray: &Harness) -> CompatCaseResult {
+    let case = case_def(
+        "HandlerService/AddOutbound",
+        "mutation_probe",
+        CaseMode::BaselineProbe,
+        case_add_outbound_probe,
+    );
+    let xray_steps = vec![
+        mutate_add_outbound_probe_step(xray),
+        verify_list_outbounds_step(xray, "verify"),
+    ];
+    let chimera_steps = vec![
+        mutate_add_outbound_probe_step(chimera),
+        verify_list_outbounds_step(chimera, "verify"),
+    ];
+    run_probe_case(&case, chimera, xray, xray_steps, chimera_steps)
+}
+
+fn case_remove_outbound_probe(
+    chimera: &Harness,
+    xray: &Harness,
+) -> CompatCaseResult {
+    let case = case_def(
+        "HandlerService/RemoveOutbound",
+        "mutation_probe",
+        CaseMode::BaselineProbe,
+        case_remove_outbound_probe,
+    );
+    let xray_steps = vec![
+        mutate_remove_outbound_probe_step(xray),
+        verify_list_outbounds_step(xray, "verify"),
+    ];
+    let chimera_steps = vec![
+        mutate_remove_outbound_probe_step(chimera),
+        verify_list_outbounds_step(chimera, "verify"),
+    ];
+    run_probe_case(&case, chimera, xray, xray_steps, chimera_steps)
+}
+
+fn case_alter_outbound_probe(chimera: &Harness, xray: &Harness) -> CompatCaseResult {
+    let case = case_def(
+        "HandlerService/AlterOutbound",
+        "mutation_probe",
+        CaseMode::BaselineProbe,
+        case_alter_outbound_probe,
+    );
+    let xray_steps = vec![
+        mutate_alter_outbound_probe_step(xray),
+        verify_list_outbounds_step(xray, "verify"),
+    ];
+    let chimera_steps = vec![
+        mutate_alter_outbound_probe_step(chimera),
+        verify_list_outbounds_step(chimera, "verify"),
+    ];
+    run_probe_case(&case, chimera, xray, xray_steps, chimera_steps)
+}
+
+fn case_add_rule_probe(chimera: &Harness, xray: &Harness) -> CompatCaseResult {
+    let case = case_def(
+        "RoutingService/AddRule",
+        "mutation_probe",
+        CaseMode::BaselineProbe,
+        case_add_rule_probe,
+    );
+    let xray_steps = vec![
+        mutate_add_rule_probe_step(xray),
+        verify_test_route_step(xray, "verify"),
+    ];
+    let chimera_steps = vec![
+        mutate_add_rule_probe_step(chimera),
+        verify_test_route_step(chimera, "verify"),
+    ];
+    run_probe_case(&case, chimera, xray, xray_steps, chimera_steps)
+}
+
+fn case_remove_rule_probe(chimera: &Harness, xray: &Harness) -> CompatCaseResult {
+    let case = case_def(
+        "RoutingService/RemoveRule",
+        "mutation_probe",
+        CaseMode::BaselineProbe,
+        case_remove_rule_probe,
+    );
+    let xray_steps = vec![
+        mutate_remove_rule_probe_step(xray),
+        verify_test_route_step(xray, "verify"),
+    ];
+    let chimera_steps = vec![
+        mutate_remove_rule_probe_step(chimera),
+        verify_test_route_step(chimera, "verify"),
+    ];
+    run_probe_case(&case, chimera, xray, xray_steps, chimera_steps)
+}
+
+fn case_observatory_status(chimera: &Harness, xray: &Harness) -> CompatCaseResult {
+    let case = case_def(
+        "ObservatoryService/GetOutboundStatus",
+        "informational",
+        CaseMode::Informational,
+        case_observatory_status,
+    );
+    run_informational_case(
+        &case,
+        chimera,
+        xray,
+        "GetOutboundStatus()",
+        query_observatory_status,
+    )
+}
+
+fn query_list_inbounds(harness: &Harness) -> CompatSnapshot {
+    let result: Result<ListInboundsResponse, Status> = harness.unary(
         PATH_HANDLER_LIST_INBOUNDS,
         ListInboundsRequest { is_only_tags: true },
     );
-    outcome_from_result(result, |_| "ok".to_string())
+    snapshot_from_result(result, |response| {
+        let tags = response
+            .inbounds
+            .iter()
+            .map(|inbound| inbound.tag.as_str())
+            .filter(|tag| *tag != API_INBOUND_TAG)
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        format!("tags={}", join_strings(tags))
+    })
 }
 
-fn run_handler_get_inbound_users(harness: &Harness) -> RpcOutcome {
-    let result: Result<Empty, Status> = harness.unary(
+fn query_get_inbound_users(harness: &Harness) -> CompatSnapshot {
+    let result: Result<GetInboundUserResponse, Status> = harness.unary(
         PATH_HANDLER_GET_INBOUND_USERS,
         GetInboundUserRequest {
             tag: SOCKS_TAG.to_string(),
             email: String::new(),
         },
     );
-    outcome_from_result(result, |_| "ok".to_string())
+    snapshot_from_result(result, |response| {
+        let users = response
+            .users
+            .iter()
+            .map(|user| user.email.clone())
+            .collect::<BTreeSet<_>>();
+        format!("users={}", join_strings(users))
+    })
 }
 
-fn run_handler_get_inbound_users_count(harness: &Harness) -> RpcOutcome {
-    let result: Result<Empty, Status> = harness.unary(
+fn query_get_inbound_users_count(harness: &Harness) -> CompatSnapshot {
+    let result: Result<GetInboundUsersCountResponse, Status> = harness.unary(
         PATH_HANDLER_GET_INBOUND_USERS_COUNT,
         GetInboundUserRequest {
             tag: SOCKS_TAG.to_string(),
             email: String::new(),
         },
     );
-    outcome_from_result(result, |_| "ok".to_string())
+    snapshot_from_result(result, |response| format!("count={}", response.count))
 }
 
-fn run_handler_add_outbound(harness: &Harness) -> RpcOutcome {
-    let result: Result<Empty, Status> = harness.unary(
-        PATH_HANDLER_ADD_OUTBOUND,
-        AddOutboundRequest { outbound: None },
-    );
-    outcome_from_result(result, |_| "ok".to_string())
+fn query_list_outbounds(harness: &Harness) -> CompatSnapshot {
+    let result: Result<ListOutboundsResponse, Status> =
+        harness.unary(PATH_HANDLER_LIST_OUTBOUNDS, ListOutboundsRequest {});
+    snapshot_from_result(result, |response| {
+        let tags = response
+            .outbounds
+            .iter()
+            .map(|outbound| outbound.tag.as_str())
+            .filter(|tag| *tag != API_OUTBOUND_TAG)
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        format!("tags={}", join_strings(tags))
+    })
 }
 
-fn run_handler_remove_outbound(harness: &Harness) -> RpcOutcome {
-    let result: Result<Empty, Status> = harness.unary(
-        PATH_HANDLER_REMOVE_OUTBOUND,
-        RemoveOutboundRequest {
-            tag: DIRECT_TAG.to_string(),
-        },
-    );
-    outcome_from_result(result, |_| "ok".to_string())
-}
-
-fn run_handler_alter_outbound(harness: &Harness) -> RpcOutcome {
-    let result: Result<Empty, Status> = harness.unary(
-        PATH_HANDLER_ALTER_OUTBOUND,
-        AlterOutboundRequest {
-            tag: DIRECT_TAG.to_string(),
-            operation: None,
-        },
-    );
-    outcome_from_result(result, |_| "ok".to_string())
-}
-
-fn run_handler_list_outbounds(harness: &Harness) -> RpcOutcome {
-    let result: Result<Empty, Status> =
-        harness.unary(PATH_HANDLER_LIST_OUTBOUNDS, Empty {});
-    outcome_from_result(result, |_| "ok".to_string())
-}
-
-fn run_routing_subscribe_routing_stats(harness: &Harness) -> RpcOutcome {
-    let result = harness.runtime.block_on(async {
-        let mut stream = grpc_server_stream::<SubscribeRoutingStatsRequest, Empty>(
-            harness.channel.clone(),
-            PATH_ROUTING_SUBSCRIBE_ROUTING_STATS,
-            SubscribeRoutingStatsRequest {
-                field_selectors: vec!["inbound".to_string(), "outbound".to_string()],
-            },
-        )
-        .await?;
-
-        let _: Empty = grpc_unary(
-            harness.channel.clone(),
-            PATH_ROUTING_TEST_ROUTE,
-            TestRouteRequest {
-                routing_context: Some(RoutingContext {
-                    inbound_tag: SOCKS_TAG.to_string(),
-                    outbound_group_tags: Vec::new(),
-                    outbound_tag: String::new(),
-                }),
-                field_selectors: Vec::new(),
-                publish_result: true,
-            },
-        )
-        .await?;
-
-        let _event = tokio::time::timeout(IO_TIMEOUT, stream.message())
-            .await
-            .map_err(|_| {
-                Status::deadline_exceeded(
-                    "timed out waiting for routing stream event",
-                )
-            })??
-            .ok_or_else(|| Status::unavailable("routing stream closed"))?;
-
-        Ok::<(), Status>(())
-    });
-
-    outcome_from_result(result, |_| "stream-event".to_string())
-}
-
-fn run_routing_test_route(harness: &Harness) -> RpcOutcome {
-    let result: Result<Empty, Status> = harness.unary(
+fn query_test_route(harness: &Harness) -> CompatSnapshot {
+    let result: Result<RoutingContext, Status> = harness.unary(
         PATH_ROUTING_TEST_ROUTE,
         TestRouteRequest {
             routing_context: Some(RoutingContext {
@@ -1080,75 +1451,568 @@ fn run_routing_test_route(harness: &Harness) -> RpcOutcome {
             publish_result: false,
         },
     );
-    outcome_from_result(result, |_| "ok".to_string())
+    snapshot_from_result(result, |response| {
+        let groups = response
+            .outbound_group_tags
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        format!(
+            "inbound={} outbound={} groups={}",
+            response.inbound_tag,
+            response.outbound_tag,
+            join_strings(groups),
+        )
+    })
 }
 
-fn run_routing_get_balancer_info(harness: &Harness) -> RpcOutcome {
-    let result: Result<Empty, Status> = harness.unary(
+fn query_get_balancer_info(harness: &Harness) -> CompatSnapshot {
+    let result: Result<GetBalancerInfoResponse, Status> = harness.unary(
         PATH_ROUTING_GET_BALANCER_INFO,
         GetBalancerInfoRequest {
             tag: BALANCER_TAG.to_string(),
         },
     );
-    outcome_from_result(result, |_| "ok".to_string())
+    snapshot_from_result(result, |response| {
+        let override_target = response
+            .balancer
+            .as_ref()
+            .and_then(|balancer| balancer.r#override.as_ref())
+            .map(|item| item.target.as_str())
+            .unwrap_or("");
+        let targets = response
+            .balancer
+            .as_ref()
+            .and_then(|balancer| balancer.principle_target.as_ref())
+            .map(|info| info.tag.iter().cloned().collect::<BTreeSet<_>>())
+            .unwrap_or_default();
+        format!(
+            "override={} targets={}",
+            override_target,
+            join_strings(targets),
+        )
+    })
 }
 
-fn run_routing_override_balancer_target(harness: &Harness) -> RpcOutcome {
-    let set_result: Result<Empty, Status> = harness.unary(
+fn query_get_stats(harness: &Harness) -> CompatSnapshot {
+    let result: Result<GetStatsResponse, Status> = harness.unary(
+        PATH_STATS_GET_STATS,
+        GetStatsRequest {
+            name: "inbound>>>non-existent>>>traffic>>>uplink".to_string(),
+            reset: false,
+        },
+    );
+    snapshot_from_result(result, |response| match &response.stat {
+        Some(stat) => format!("stat:{}={}", stat.name, stat.value),
+        None => "stat:none".to_string(),
+    })
+}
+
+fn query_get_stats_online(harness: &Harness) -> CompatSnapshot {
+    let result: Result<GetStatsResponse, Status> = harness.unary(
+        PATH_STATS_GET_STATS_ONLINE,
+        GetStatsRequest {
+            name: format!("inbound>>>{SOCKS_TAG}>>>online"),
+            reset: false,
+        },
+    );
+    snapshot_from_result(result, |response| match &response.stat {
+        Some(stat) => format!("stat:{}={}", stat.name, stat.value),
+        None => "stat:none".to_string(),
+    })
+}
+
+fn query_get_stats_online_ip_list(harness: &Harness) -> CompatSnapshot {
+    let result: Result<GetStatsOnlineIpListResponse, Status> = harness.unary(
+        PATH_STATS_GET_STATS_ONLINE_IP_LIST,
+        GetStatsRequest {
+            name: format!("inbound>>>{SOCKS_TAG}>>>online"),
+            reset: false,
+        },
+    );
+    snapshot_from_result(result, |response| {
+        let mut ips = BTreeMap::new();
+        for (key, value) in &response.ips {
+            ips.insert(key.clone(), *value);
+        }
+        format!("name={} ips={}", response.name, format_map(ips))
+    })
+}
+
+fn query_get_all_online_users(harness: &Harness) -> CompatSnapshot {
+    let result: Result<GetAllOnlineUsersResponse, Status> =
+        harness.unary(PATH_STATS_GET_ALL_ONLINE_USERS, GetAllOnlineUsersRequest {});
+    snapshot_from_result(result, |response| {
+        let users = response.users.iter().cloned().collect::<BTreeSet<_>>();
+        format!("users={}", join_strings(users))
+    })
+}
+
+fn query_observatory_status(harness: &Harness) -> CompatSnapshot {
+    let result: Result<GetOutboundStatusResponse, Status> = harness.unary(
+        PATH_OBSERVATORY_GET_OUTBOUND_STATUS,
+        GetOutboundStatusRequest {},
+    );
+    snapshot_from_result(result, |response| {
+        let statuses = response
+            .status
+            .as_ref()
+            .map(|item| {
+                item.status
+                    .iter()
+                    .map(|status| {
+                        format!("{}:{}", status.outbound_tag, status.alive)
+                    })
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        format!("statuses={}", join_strings(statuses))
+    })
+}
+
+fn mutate_add_user_step(harness: &Harness) -> CompatStepResult {
+    grpc_step(
+        "mutate",
+        "AlterInbound(AddUserOperation)",
+        mutate_add_user(harness),
+    )
+}
+
+fn setup_add_user_step(harness: &Harness) -> CompatStepResult {
+    grpc_step(
+        "setup",
+        "AlterInbound(AddUserOperation)",
+        mutate_add_user(harness),
+    )
+}
+
+fn mutate_add_user(harness: &Harness) -> CompatSnapshot {
+    let add_operation = AddUserOperation {
+        user: Some(User {
+            level: 0,
+            email: ADDED_USER.to_string(),
+            account: Some(TypedMessage {
+                r#type: "xray.proxy.socks.Account".to_string(),
+                value: SocksAccount {
+                    username: ADDED_USER.to_string(),
+                    password: ADDED_PASSWORD.to_string(),
+                }
+                .encode_to_vec(),
+            }),
+        }),
+    };
+    let result: Result<AlterInboundResponse, Status> = harness.unary(
+        PATH_HANDLER_ALTER_INBOUND,
+        AlterInboundRequest {
+            tag: SOCKS_TAG.to_string(),
+            operation: Some(TypedMessage {
+                r#type: "xray.app.proxyman.command.AddUserOperation".to_string(),
+                value: add_operation.encode_to_vec(),
+            }),
+        },
+    );
+    snapshot_from_result(result, |_| "ok".to_string())
+}
+
+fn mutate_remove_user_step(harness: &Harness) -> CompatStepResult {
+    let remove_operation = RemoveUserOperation {
+        email: ADDED_USER.to_string(),
+    };
+    let result: Result<AlterInboundResponse, Status> = harness.unary(
+        PATH_HANDLER_ALTER_INBOUND,
+        AlterInboundRequest {
+            tag: SOCKS_TAG.to_string(),
+            operation: Some(TypedMessage {
+                r#type: "xray.app.proxyman.command.RemoveUserOperation".to_string(),
+                value: remove_operation.encode_to_vec(),
+            }),
+        },
+    );
+    grpc_step(
+        "mutate",
+        "AlterInbound(RemoveUserOperation)",
+        snapshot_from_result(result, |_| "ok".to_string()),
+    )
+}
+
+fn mutate_override_balancer_step(
+    harness: &Harness,
+    phase: &str,
+    target: &str,
+) -> CompatStepResult {
+    let result: Result<OverrideBalancerTargetResponse, Status> = harness.unary(
         PATH_ROUTING_OVERRIDE_BALANCER_TARGET,
         OverrideBalancerTargetRequest {
             balancer_tag: BALANCER_TAG.to_string(),
-            target: BACKUP_TAG.to_string(),
+            target: target.to_string(),
         },
     );
-    if let Err(status) = set_result {
-        return outcome_from_status(status);
-    }
-    let clear_result: Result<Empty, Status> = harness.unary(
-        PATH_ROUTING_OVERRIDE_BALANCER_TARGET,
-        OverrideBalancerTargetRequest {
-            balancer_tag: BALANCER_TAG.to_string(),
-            target: String::new(),
-        },
-    );
-    if let Err(status) = clear_result {
-        return outcome_from_status(status);
-    }
-    RpcOutcome {
-        code: Code::Ok,
-        detail: "set-and-clear".to_string(),
-    }
+    grpc_step(
+        phase,
+        &format!("OverrideBalancerTarget(target={target})"),
+        snapshot_from_result(result, |_| {
+            if target.is_empty() {
+                "ok:cleared".to_string()
+            } else {
+                format!("ok:{target}")
+            }
+        }),
+    )
 }
 
-fn run_routing_add_rule(harness: &Harness) -> RpcOutcome {
-    let result: Result<Empty, Status> = harness.unary(
+fn setup_override_balancer_step(harness: &Harness) -> CompatStepResult {
+    mutate_override_balancer_step(harness, "setup", BACKUP_TAG)
+}
+
+fn mutate_add_inbound_probe_step(harness: &Harness) -> CompatStepResult {
+    let result: Result<AddInboundResponse, Status> = harness.unary(
+        PATH_HANDLER_ADD_INBOUND,
+        AddInboundRequest { inbound: None },
+    );
+    grpc_step(
+        "mutate",
+        "AddInbound(inbound=None)",
+        snapshot_from_result(result, |_| "ok".to_string()),
+    )
+}
+
+fn mutate_remove_inbound_probe_step(harness: &Harness) -> CompatStepResult {
+    let result: Result<RemoveInboundResponse, Status> = harness.unary(
+        PATH_HANDLER_REMOVE_INBOUND,
+        RemoveInboundRequest {
+            tag: SOCKS_TAG.to_string(),
+        },
+    );
+    grpc_step(
+        "mutate",
+        "RemoveInbound(tag=socks-grpc-e2e)",
+        snapshot_from_result(result, |_| "ok".to_string()),
+    )
+}
+
+fn mutate_add_outbound_probe_step(harness: &Harness) -> CompatStepResult {
+    let result: Result<AddOutboundResponse, Status> = harness.unary(
+        PATH_HANDLER_ADD_OUTBOUND,
+        AddOutboundRequest { outbound: None },
+    );
+    grpc_step(
+        "mutate",
+        "AddOutbound(outbound=None)",
+        snapshot_from_result(result, |_| "ok".to_string()),
+    )
+}
+
+fn mutate_remove_outbound_probe_step(harness: &Harness) -> CompatStepResult {
+    let result: Result<RemoveOutboundResponse, Status> = harness.unary(
+        PATH_HANDLER_REMOVE_OUTBOUND,
+        RemoveOutboundRequest {
+            tag: DIRECT_TAG.to_string(),
+        },
+    );
+    grpc_step(
+        "mutate",
+        "RemoveOutbound(tag=direct)",
+        snapshot_from_result(result, |_| "ok".to_string()),
+    )
+}
+
+fn mutate_alter_outbound_probe_step(harness: &Harness) -> CompatStepResult {
+    let result: Result<AlterOutboundResponse, Status> = harness.unary(
+        PATH_HANDLER_ALTER_OUTBOUND,
+        AlterOutboundRequest {
+            tag: DIRECT_TAG.to_string(),
+            operation: None,
+        },
+    );
+    grpc_step(
+        "mutate",
+        "AlterOutbound(tag=direct, operation=None)",
+        snapshot_from_result(result, |_| "ok".to_string()),
+    )
+}
+
+fn mutate_add_rule_probe_step(harness: &Harness) -> CompatStepResult {
+    let result: Result<AddRuleResponse, Status> = harness.unary(
         PATH_ROUTING_ADD_RULE,
         AddRuleRequest {
             config: None,
             should_append: false,
         },
     );
-    outcome_from_result(result, |_| "ok".to_string())
+    grpc_step(
+        "mutate",
+        "AddRule(config=None, should_append=false)",
+        snapshot_from_result(result, |_| "ok".to_string()),
+    )
 }
 
-fn run_routing_remove_rule(harness: &Harness) -> RpcOutcome {
-    let result: Result<Empty, Status> = harness.unary(
+fn mutate_remove_rule_probe_step(harness: &Harness) -> CompatStepResult {
+    let result: Result<RemoveRuleResponse, Status> = harness.unary(
         PATH_ROUTING_REMOVE_RULE,
         RemoveRuleRequest {
             rule_tag: "rule-a".to_string(),
         },
     );
-    outcome_from_result(result, |_| "ok".to_string())
+    grpc_step(
+        "mutate",
+        "RemoveRule(rule_tag=rule-a)",
+        snapshot_from_result(result, |_| "ok".to_string()),
+    )
 }
 
-fn run_observatory_get_outbound_status(harness: &Harness) -> RpcOutcome {
-    let result: Result<Empty, Status> =
-        harness.unary(PATH_OBSERVATORY_GET_OUTBOUND_STATUS, Empty {});
-    outcome_from_result(result, |_| "ok".to_string())
+fn verify_get_inbound_users_step(
+    harness: &Harness,
+    phase: &str,
+) -> CompatStepResult {
+    grpc_step(
+        phase,
+        "GetInboundUsers(tag=socks-grpc-e2e, email=\"\")",
+        query_get_inbound_users(harness),
+    )
 }
 
-#[derive(Clone, PartialEq, prost::Message)]
-struct Empty {}
+fn verify_get_inbound_users_count_step(
+    harness: &Harness,
+    phase: &str,
+) -> CompatStepResult {
+    grpc_step(
+        phase,
+        "GetInboundUsersCount(tag=socks-grpc-e2e, email=\"\")",
+        query_get_inbound_users_count(harness),
+    )
+}
+
+fn verify_get_balancer_info_step(
+    harness: &Harness,
+    phase: &str,
+) -> CompatStepResult {
+    grpc_step(
+        phase,
+        "GetBalancerInfo(tag=balancer-a)",
+        query_get_balancer_info(harness),
+    )
+}
+
+fn verify_list_inbounds_step(harness: &Harness, phase: &str) -> CompatStepResult {
+    grpc_step(
+        phase,
+        "ListInbounds(is_only_tags=true)",
+        query_list_inbounds(harness),
+    )
+}
+
+fn verify_list_outbounds_step(harness: &Harness, phase: &str) -> CompatStepResult {
+    grpc_step(phase, "ListOutbounds()", query_list_outbounds(harness))
+}
+
+fn verify_test_route_step(harness: &Harness, phase: &str) -> CompatStepResult {
+    grpc_step(
+        phase,
+        "TestRoute(inbound=socks-grpc-e2e, publish=false)",
+        query_test_route(harness),
+    )
+}
+
+fn grpc_step(
+    phase: &str,
+    request: &str,
+    snapshot: CompatSnapshot,
+) -> CompatStepResult {
+    CompatStepResult {
+        phase: phase.to_string(),
+        request: request.to_string(),
+        snapshot,
+    }
+}
+
+fn snapshot_from_result<T>(
+    result: Result<T, Status>,
+    on_ok: impl FnOnce(&T) -> String,
+) -> CompatSnapshot {
+    match result {
+        Ok(response) => {
+            let raw = on_ok(&response);
+            CompatSnapshot {
+                outcome: "ok".to_string(),
+                grpc_code: Code::Ok.to_string(),
+                normalized: raw.clone(),
+                raw,
+            }
+        }
+        Err(status) => {
+            let raw = format!("status:{:?}:{}", status.code(), status.message());
+            CompatSnapshot {
+                outcome: "status".to_string(),
+                grpc_code: format!("{:?}", status.code()),
+                normalized: normalize_status_message(
+                    status.code(),
+                    status.message(),
+                ),
+                raw,
+            }
+        }
+    }
+}
+
+fn normalize_status_message(code: Code, message: &str) -> String {
+    let trimmed = message.trim().trim_end_matches('.');
+    let squashed = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!("status:{code:?}:{squashed}")
+}
+
+fn join_strings(values: impl IntoIterator<Item = String>) -> String {
+    let collected = values.into_iter().collect::<Vec<_>>();
+    if collected.is_empty() {
+        "[]".to_string()
+    } else {
+        format!("[{}]", collected.join(","))
+    }
+}
+
+fn format_map(values: BTreeMap<String, i64>) -> String {
+    let parts = values
+        .into_iter()
+        .map(|(key, value)| format!("{key}:{value}"))
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        "{}".to_string()
+    } else {
+        format!("{{{}}}", parts.join(","))
+    }
+}
+
+fn build_report(
+    cases: Vec<CompatCaseResult>,
+    xray_bin: String,
+    xray_version: String,
+) -> CompatReport {
+    let passed = cases
+        .iter()
+        .filter(|case| matches!(case.status, CaseStatus::Passed))
+        .count();
+    let failed = cases
+        .iter()
+        .filter(|case| matches!(case.status, CaseStatus::Failed))
+        .count();
+    let skipped = cases
+        .iter()
+        .filter(|case| matches!(case.status, CaseStatus::Skipped))
+        .count();
+    let informational = cases
+        .iter()
+        .filter(|case| matches!(case.status, CaseStatus::Informational))
+        .count();
+
+    CompatReport {
+        generated_at_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        xray_version,
+        xray_bin,
+        config_summary: vec![
+            "shared logical config: socks inbound, direct/backup outbounds, api listener, routing balancer".to_string(),
+            "query comparisons normalize away xray api plumbing tags api-in/api".to_string(),
+            "baseline probe cases are skipped when xray does not support the request in the current config".to_string(),
+        ],
+        passed,
+        failed,
+        skipped,
+        informational,
+        cases,
+    }
+}
+
+fn report_output_dir() -> PathBuf {
+    workspace_root().join("target/grpc-xray-compat")
+}
+
+fn write_report_artifacts(report: &CompatReport) -> io::Result<()> {
+    let output_dir = report_output_dir();
+    fs::create_dir_all(&output_dir)?;
+
+    let report_json = serde_json::to_string_pretty(report)
+        .map_err(|err| io::Error::other(err.to_string()))?;
+    fs::write(output_dir.join("report.json"), report_json)?;
+    fs::write(output_dir.join("report.md"), render_markdown_report(report))?;
+    Ok(())
+}
+
+fn render_markdown_report(report: &CompatReport) -> String {
+    let mut out = String::new();
+    out.push_str("# gRPC Compatibility Report\n\n");
+    out.push_str(&format!("- Xray binary: `{}`\n", report.xray_bin));
+    out.push_str(&format!(
+        "- Xray version: `{}`\n",
+        report.xray_version.trim()
+    ));
+    out.push_str(&format!(
+        "- Totals: passed={} failed={} skipped={} informational={}\n\n",
+        report.passed, report.failed, report.skipped, report.informational
+    ));
+    out.push_str("## Config Summary\n\n");
+    for item in &report.config_summary {
+        out.push_str(&format!("- {}\n", item));
+    }
+    out.push_str("\n## Case Matrix\n\n");
+    out.push_str("| Case | Category | Status | Summary |\n");
+    out.push_str("| --- | --- | --- | --- |\n");
+    for case in &report.cases {
+        out.push_str(&format!(
+            "| {} | {} | {:?} | {} |\n",
+            case.case.name,
+            case.case.category,
+            case.status,
+            escape_table_cell(&case.summary),
+        ));
+    }
+    out.push_str("\n## Details\n\n");
+    for case in &report.cases {
+        out.push_str(&format!("### {}\n\n", case.case.name));
+        out.push_str(&format!(
+            "- Status: `{:?}`\n- Category: `{}`\n- Summary: {}\n",
+            case.status, case.case.category, case.summary
+        ));
+        out.push_str(&format!(
+            "- Xray log: `{}`\n- Chimera log: `{}`\n\n",
+            case.xray.log_path, case.chimera.log_path
+        ));
+        out.push_str("| Target | Phase | Request | Snapshot |\n");
+        out.push_str("| --- | --- | --- | --- |\n");
+        for target in [&case.xray, &case.chimera] {
+            for step in &target.steps {
+                out.push_str(&format!(
+                    "| {} | {} | {} | `{}` |\n",
+                    target.target.as_str(),
+                    step.phase,
+                    escape_table_cell(&step.request),
+                    escape_table_cell(&step.snapshot.normalized),
+                ));
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn escape_table_cell(value: &str) -> String {
+    value.replace('|', "\\|").replace('\n', " ")
+}
+
+fn xray_version(xray_bin: &Path) -> String {
+    let output = Command::new(xray_bin).arg("version").output();
+    match output {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        Ok(output) => format!(
+            "failed to get version: status={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(err) => format!("failed to get version: {err}"),
+    }
+}
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct TypedMessage {
@@ -1156,6 +2020,14 @@ struct TypedMessage {
     r#type: String,
     #[prost(bytes = "vec", tag = "2")]
     value: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct Stat {
+    #[prost(string, tag = "1")]
+    name: String,
+    #[prost(int64, tag = "2")]
+    value: i64,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -1167,24 +2039,69 @@ struct GetStatsRequest {
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
-struct QueryStatsRequest {
+struct GetStatsResponse {
+    #[prost(message, optional, tag = "1")]
+    stat: Option<Stat>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct GetStatsOnlineIpListResponse {
     #[prost(string, tag = "1")]
-    pattern: String,
-    #[prost(bool, tag = "2")]
-    reset: bool,
+    name: String,
+    #[prost(map = "string, int64", tag = "2")]
+    ips: HashMap<String, i64>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct GetAllOnlineUsersRequest {}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct GetAllOnlineUsersResponse {
+    #[prost(string, repeated, tag = "1")]
+    users: Vec<String>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct InboundHandlerConfig {
+    #[prost(string, tag = "1")]
+    tag: String,
+    #[prost(message, optional, tag = "2")]
+    receiver_settings: Option<TypedMessage>,
+    #[prost(message, optional, tag = "3")]
+    proxy_settings: Option<TypedMessage>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct OutboundHandlerConfig {
+    #[prost(string, tag = "1")]
+    tag: String,
+    #[prost(message, optional, tag = "2")]
+    sender_settings: Option<TypedMessage>,
+    #[prost(message, optional, tag = "3")]
+    proxy_settings: Option<TypedMessage>,
+    #[prost(int64, tag = "4")]
+    expire: i64,
+    #[prost(string, tag = "5")]
+    comment: String,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct AddInboundRequest {
     #[prost(message, optional, tag = "1")]
-    inbound: Option<TypedMessage>,
+    inbound: Option<InboundHandlerConfig>,
 }
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct AddInboundResponse {}
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct RemoveInboundRequest {
     #[prost(string, tag = "1")]
     tag: String,
 }
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct RemoveInboundResponse {}
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct AlterInboundRequest {
@@ -1195,9 +2112,38 @@ struct AlterInboundRequest {
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
+struct AlterInboundResponse {}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct AddUserOperation {
+    #[prost(message, optional, tag = "1")]
+    user: Option<User>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct RemoveUserOperation {
+    #[prost(string, tag = "1")]
+    email: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct SocksAccount {
+    #[prost(string, tag = "1")]
+    username: String,
+    #[prost(string, tag = "2")]
+    password: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
 struct ListInboundsRequest {
     #[prost(bool, tag = "1")]
     is_only_tags: bool,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct ListInboundsResponse {
+    #[prost(message, repeated, tag = "1")]
+    inbounds: Vec<InboundHandlerConfig>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -1209,16 +2155,44 @@ struct GetInboundUserRequest {
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
+struct User {
+    #[prost(uint32, tag = "1")]
+    level: u32,
+    #[prost(string, tag = "2")]
+    email: String,
+    #[prost(message, optional, tag = "3")]
+    account: Option<TypedMessage>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct GetInboundUserResponse {
+    #[prost(message, repeated, tag = "1")]
+    users: Vec<User>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct GetInboundUsersCountResponse {
+    #[prost(int64, tag = "1")]
+    count: i64,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
 struct AddOutboundRequest {
     #[prost(message, optional, tag = "1")]
-    outbound: Option<TypedMessage>,
+    outbound: Option<OutboundHandlerConfig>,
 }
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct AddOutboundResponse {}
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct RemoveOutboundRequest {
     #[prost(string, tag = "1")]
     tag: String,
 }
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct RemoveOutboundResponse {}
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct AlterOutboundRequest {
@@ -1229,6 +2203,18 @@ struct AlterOutboundRequest {
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
+struct AlterOutboundResponse {}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct ListOutboundsRequest {}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct ListOutboundsResponse {
+    #[prost(message, repeated, tag = "1")]
+    outbounds: Vec<OutboundHandlerConfig>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
 struct RoutingContext {
     #[prost(string, tag = "1")]
     inbound_tag: String,
@@ -1236,12 +2222,6 @@ struct RoutingContext {
     outbound_group_tags: Vec<String>,
     #[prost(string, tag = "12")]
     outbound_tag: String,
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct SubscribeRoutingStatsRequest {
-    #[prost(string, repeated, tag = "1")]
-    field_selectors: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -1261,12 +2241,41 @@ struct GetBalancerInfoRequest {
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
+struct GetBalancerInfoResponse {
+    #[prost(message, optional, tag = "1")]
+    balancer: Option<BalancerMsg>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct PrincipleTargetInfo {
+    #[prost(string, repeated, tag = "1")]
+    tag: Vec<String>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct OverrideInfo {
+    #[prost(string, tag = "2")]
+    target: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct BalancerMsg {
+    #[prost(message, optional, tag = "5")]
+    r#override: Option<OverrideInfo>,
+    #[prost(message, optional, tag = "6")]
+    principle_target: Option<PrincipleTargetInfo>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
 struct OverrideBalancerTargetRequest {
     #[prost(string, tag = "1")]
     balancer_tag: String,
     #[prost(string, tag = "2")]
     target: String,
 }
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct OverrideBalancerTargetResponse {}
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct AddRuleRequest {
@@ -1277,7 +2286,36 @@ struct AddRuleRequest {
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
+struct AddRuleResponse {}
+
+#[derive(Clone, PartialEq, prost::Message)]
 struct RemoveRuleRequest {
     #[prost(string, tag = "1")]
     rule_tag: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct RemoveRuleResponse {}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct GetOutboundStatusRequest {}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct GetOutboundStatusResponse {
+    #[prost(message, optional, tag = "1")]
+    status: Option<ObservationResult>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct ObservationResult {
+    #[prost(message, repeated, tag = "1")]
+    status: Vec<OutboundStatus>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct OutboundStatus {
+    #[prost(bool, tag = "1")]
+    alive: bool,
+    #[prost(string, tag = "4")]
+    outbound_tag: String,
 }
