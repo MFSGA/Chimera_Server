@@ -1,0 +1,53 @@
+{
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "port": 39444,
+      "protocol": "vless",
+      "tag": "inbound-reality-vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "flow": "",
+            "email": "reality-user"
+          }
+        ],
+        "decryption": "none",
+        "fallbacks": []
+      },
+      "sniffing": {
+        "enabled": false
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "www.apple.com:443",
+          "xver": 0,
+          "serverNames": [
+            "www.apple.com"
+          ],
+          "privateKey": "dnprBfWdJgo5yaGClSaZ12TZW-SiD988YmjDKOhXLKI",
+          "shortIds": [
+            "4ac97aaf8b9b0356"
+          ],
+          "maxTimeDiff": 0,
+          "minClient": "",
+          "maxClient": ""
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "blocked"
+    }
+  ]
+}
