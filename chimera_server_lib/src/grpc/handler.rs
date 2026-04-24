@@ -1303,7 +1303,6 @@ mod tests {
     struct Fixture {
         runtime: RuntimeState,
         inbound_tag: String,
-        users: Vec<String>,
         outbound_tag: String,
     }
 
@@ -1351,7 +1350,6 @@ mod tests {
         Fixture {
             runtime,
             inbound_tag,
-            users: Vec::new(),
             outbound_tag,
         }
     }
