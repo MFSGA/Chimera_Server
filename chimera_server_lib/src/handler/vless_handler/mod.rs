@@ -9,6 +9,7 @@ use tracing::warn;
 use crate::{
     address::{Address, NetLocation},
     async_stream::AsyncStream,
+    config::server_config::VlessUser,
     traffic::TrafficContext,
 };
 
@@ -20,16 +21,17 @@ const SERVER_RESPONSE_HEADER: &[u8] = &[0u8, 0u8];
 
 #[derive(Debug)]
 pub struct VlessTcpHandler {
-    user_id: Box<[u8]>,
-    user_label: String,
+    users: Vec<(Box<[u8]>, String)>,
     inbound_tag: String,
 }
 
 impl VlessTcpHandler {
-    pub fn new(user_id: &str, user_label: &str, inbound_tag: &str) -> Self {
+    pub fn new(users: &[VlessUser], inbound_tag: &str) -> Self {
         Self {
-            user_id: parse_hex(user_id),
-            user_label: user_label.to_string(),
+            users: users
+                .iter()
+                .map(|user| (parse_hex(&user.user_id), user.user_label.clone()))
+                .collect(),
             inbound_tag: inbound_tag.to_string(),
         }
     }
@@ -54,19 +56,18 @@ impl TcpServerHandler for VlessTcpHandler {
             ));
         }
 
-        if self.user_id.len() != 16 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "configured VLESS user id length is {}, expected 16 bytes",
-                    self.user_id.len()
-                ),
-            ));
-        }
-
         let target_id = &prefix[1..17];
-        if self.user_id.as_ref() != target_id {
-            let expected = encode_hex(self.user_id.as_ref());
+        let matched_user = self.users.iter().find(|(user_id, _)| {
+            user_id.len() == 16 && user_id.as_ref() == target_id
+        });
+
+        let Some((_, user_label)) = matched_user else {
+            let expected = self
+                .users
+                .iter()
+                .map(|(user_id, _)| encode_hex(user_id.as_ref()))
+                .collect::<Vec<_>>()
+                .join(",");
             let got = encode_hex(target_id);
             warn!(
                 inbound_tag = %self.inbound_tag,
@@ -79,7 +80,7 @@ impl TcpServerHandler for VlessTcpHandler {
                 std::io::ErrorKind::PermissionDenied,
                 format!("invalid VLESS user id: {got}"),
             ));
-        }
+        };
 
         let addon_length = prefix[17];
 
@@ -176,7 +177,7 @@ impl TcpServerHandler for VlessTcpHandler {
             ),
             traffic_context: Some(
                 TrafficContext::new("vless")
-                    .with_identity(self.user_label.clone())
+                    .with_identity(user_label.clone())
                     .with_inbound_tag(self.inbound_tag.clone()),
             ),
         })

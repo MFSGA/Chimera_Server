@@ -82,6 +82,13 @@ pub struct SocksUser {
     pub password: String,
 }
 
+#[cfg(feature = "vless")]
+#[derive(Debug, Clone, Deserialize)]
+pub struct VlessUser {
+    pub user_id: String,
+    pub user_label: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RangeConfig {
     #[serde(default)]
@@ -164,8 +171,7 @@ impl RealityTransportConfig {
 pub enum ServerProxyConfig {
     #[cfg(feature = "vless")]
     Vless {
-        user_id: String,
-        user_label: String,
+        users: Vec<VlessUser>,
     },
     #[cfg(feature = "ws")]
     #[serde(alias = "ws")]

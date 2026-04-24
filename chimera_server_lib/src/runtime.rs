@@ -1,4 +1,9 @@
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
+
+use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::config::server_config::ServerConfig;
 
@@ -12,6 +17,7 @@ pub struct OutboundSummary {
 pub struct RuntimeState {
     inbounds: Arc<RwLock<Vec<ServerConfig>>>,
     outbounds: Arc<RwLock<Vec<OutboundSummary>>>,
+    inbound_tasks: Arc<RwLock<HashMap<String, Vec<AbortHandle>>>>,
 }
 
 impl RuntimeState {
@@ -22,6 +28,7 @@ impl RuntimeState {
         Self {
             inbounds: Arc::new(RwLock::new(inbounds)),
             outbounds: Arc::new(RwLock::new(outbounds)),
+            inbound_tasks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -72,6 +79,32 @@ impl RuntimeState {
         }
         guard.push(inbound);
         Ok(())
+    }
+
+    pub fn register_inbound_tasks(&self, tag: &str, handles: &[JoinHandle<()>]) {
+        let abort_handles = handles
+            .iter()
+            .map(JoinHandle::abort_handle)
+            .collect::<Vec<_>>();
+        self.inbound_tasks
+            .write()
+            .expect("runtime inbound tasks lock poisoned")
+            .insert(tag.to_string(), abort_handles);
+    }
+
+    pub fn abort_inbound_tasks(&self, tag: &str) {
+        let Some(handles) = self
+            .inbound_tasks
+            .write()
+            .expect("runtime inbound tasks lock poisoned")
+            .remove(tag)
+        else {
+            return;
+        };
+
+        for handle in handles {
+            handle.abort();
+        }
     }
 
     pub fn outbounds(&self) -> Vec<OutboundSummary> {
