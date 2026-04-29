@@ -42,6 +42,7 @@ const TYPE_APP_RECEIVER_CONFIG_V2RAY: &str =
 const TYPE_PROXY_SOCKS_SERVER_CONFIG: &str = "xray.proxy.socks.ServerConfig";
 const TYPE_PROXY_SOCKS_SERVER_CONFIG_V2RAY: &str =
     "v2ray.core.proxy.socks.ServerConfig";
+const TYPE_PROXY_DOKODEMO_CONFIG: &str = "xray.proxy.dokodemo.Config";
 #[cfg(feature = "vless")]
 const TYPE_PROXY_VLESS_INBOUND_CONFIG: &str = "xray.proxy.vless.inbound.Config";
 #[cfg(feature = "vless")]
@@ -58,6 +59,7 @@ const TYPE_PROXY_TROJAN_SERVER_CONFIG_V2RAY: &str =
     "v2ray.core.proxy.trojan.ServerConfig";
 const TYPE_PROXY_FREEDOM_CONFIG: &str = "xray.proxy.freedom.Config";
 const TYPE_PROXY_FREEDOM_CONFIG_V2RAY: &str = "v2ray.core.proxy.freedom.Config";
+const TYPE_PROXY_BLACKHOLE_CONFIG: &str = "xray.proxy.blackhole.Config";
 #[cfg(feature = "trojan")]
 const TYPE_PROXY_TROJAN_ACCOUNT: &str = "xray.proxy.trojan.Account";
 #[cfg(feature = "trojan")]
@@ -132,7 +134,26 @@ struct SocksServerConfigPayload {
 }
 
 #[derive(Clone, PartialEq, Message)]
+struct DokodemoConfigPayload {
+    #[prost(message, optional, tag = "1")]
+    address: Option<IpOrDomainPayload>,
+    #[prost(uint32, tag = "2")]
+    port: u32,
+    #[prost(map = "string, string", tag = "3")]
+    port_map: std::collections::HashMap<String, String>,
+    #[prost(enumeration = "proto::xray::common::net::Network", repeated, tag = "7")]
+    networks: Vec<i32>,
+    #[prost(bool, tag = "5")]
+    follow_redirect: bool,
+    #[prost(uint32, tag = "6")]
+    user_level: u32,
+}
+
+#[derive(Clone, PartialEq, Message)]
 struct FreedomConfigPayload {}
+
+#[derive(Clone, PartialEq, Message)]
+struct BlackholeConfigPayload {}
 
 #[derive(Clone, PartialEq, Message)]
 struct StreamConfigPayload {
@@ -790,7 +811,335 @@ impl HandlerServiceImpl {
         Ok(OutboundSummary {
             tag: outbound.tag,
             protocol: "freedom".to_string(),
+            proxy_settings_type: Some(proxy_settings.r#type.clone()),
+            proxy_settings_value: Some(proxy_settings.value.clone()),
         })
+    }
+
+    fn typed_message<T: Message>(
+        message_type: &str,
+        payload: T,
+    ) -> proto::xray::common::serial::TypedMessage {
+        proto::xray::common::serial::TypedMessage {
+            r#type: message_type.to_string(),
+            value: payload.encode_to_vec(),
+        }
+    }
+
+    fn encode_address(address: &Address) -> Option<IpOrDomainPayload> {
+        let address = match address {
+            Address::Ipv4(addr) => {
+                Some(ip_or_domain_payload::Address::Ip(addr.octets().to_vec()))
+            }
+            Address::Ipv6(addr) => {
+                Some(ip_or_domain_payload::Address::Ip(addr.octets().to_vec()))
+            }
+            Address::Hostname(hostname) if !hostname.is_empty() => {
+                Some(ip_or_domain_payload::Address::Domain(hostname.clone()))
+            }
+            Address::Hostname(_) => None,
+        }?;
+        Some(IpOrDomainPayload {
+            address: Some(address),
+        })
+    }
+
+    fn encode_receiver_settings(
+        &self,
+        inbound: &ServerConfig,
+        stream_settings: Option<StreamConfigPayload>,
+    ) -> proto::xray::common::serial::TypedMessage {
+        let (address, port) = match &inbound.bind_location {
+            BindLocation::Address(location) => location.components(),
+        };
+        Self::typed_message(
+            TYPE_APP_RECEIVER_CONFIG,
+            ReceiverConfigPayload {
+                port_list: Some(PortListPayload {
+                    range: vec![PortRangePayload {
+                        from: u32::from(port),
+                        to: u32::from(port),
+                    }],
+                }),
+                listen: Self::encode_address(address),
+                stream_settings,
+            },
+        )
+    }
+
+    fn encode_user_manager_protocol(
+        &self,
+        protocol: &ServerProxyConfig,
+    ) -> Option<proto::xray::common::serial::TypedMessage> {
+        match protocol {
+            #[cfg(feature = "vless")]
+            ServerProxyConfig::Vless { users } => {
+                let clients = users
+                    .iter()
+                    .map(|user| proto::xray::common::protocol::User {
+                        level: 0,
+                        email: user.user_label.clone(),
+                        account: Some(Self::typed_message(
+                            TYPE_PROXY_VLESS_ACCOUNT,
+                            VlessAccountPayload {
+                                id: user.user_id.clone(),
+                                flow: user.flow.clone(),
+                            },
+                        )),
+                    })
+                    .collect();
+                Some(Self::typed_message(
+                    TYPE_PROXY_VLESS_INBOUND_CONFIG,
+                    VlessInboundConfigPayload { clients },
+                ))
+            }
+            #[cfg(feature = "trojan")]
+            ServerProxyConfig::Trojan { users, fallbacks } => {
+                let users = users
+                    .iter()
+                    .map(|user| proto::xray::common::protocol::User {
+                        level: 0,
+                        email: user.email.clone().unwrap_or_default(),
+                        account: Some(Self::typed_message(
+                            TYPE_PROXY_TROJAN_ACCOUNT,
+                            TrojanAccountPayload {
+                                password: user.password.clone(),
+                            },
+                        )),
+                    })
+                    .collect();
+                let fallbacks = fallbacks
+                    .iter()
+                    .map(|fallback| TrojanFallbackPayload {
+                        dest: fallback.dest.to_string(),
+                    })
+                    .collect();
+                Some(Self::typed_message(
+                    TYPE_PROXY_TROJAN_SERVER_CONFIG,
+                    TrojanServerConfigPayload { users, fallbacks },
+                ))
+            }
+            ServerProxyConfig::Socks { accounts } => {
+                let accounts = accounts
+                    .iter()
+                    .map(|account| {
+                        (account.username.clone(), account.password.clone())
+                    })
+                    .collect();
+                Some(Self::typed_message(
+                    TYPE_PROXY_SOCKS_SERVER_CONFIG,
+                    SocksServerConfigPayload {
+                        auth_type: 1,
+                        accounts,
+                    },
+                ))
+            }
+            ServerProxyConfig::DokodemoDoor { config } => {
+                let (address, port) = config.target.components();
+                Some(Self::typed_message(
+                    TYPE_PROXY_DOKODEMO_CONFIG,
+                    DokodemoConfigPayload {
+                        address: Self::encode_address(address),
+                        port: u32::from(port),
+                        port_map: std::collections::HashMap::new(),
+                        networks: vec![
+                            proto::xray::common::net::Network::Tcp as i32,
+                        ],
+                        follow_redirect: config.follow_redirect,
+                        user_level: 0,
+                    },
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    fn encode_inbound_config(
+        &self,
+        inbound: &ServerConfig,
+    ) -> proto::xray::core::InboundHandlerConfig {
+        let (stream_settings, proxy_settings) =
+            self.encode_inbound_protocol_layers(&inbound.protocol);
+        proto::xray::core::InboundHandlerConfig {
+            tag: inbound.tag.clone(),
+            receiver_settings: Some(
+                self.encode_receiver_settings(inbound, stream_settings),
+            ),
+            proxy_settings,
+        }
+    }
+
+    fn encode_inbound_protocol_layers(
+        &self,
+        protocol: &ServerProxyConfig,
+    ) -> (
+        Option<StreamConfigPayload>,
+        Option<proto::xray::common::serial::TypedMessage>,
+    ) {
+        match protocol {
+            #[cfg(feature = "ws")]
+            ServerProxyConfig::Websocket { targets } => {
+                let target = match targets.as_ref() {
+                    crate::util::option::OneOrSome::One(target) => target,
+                    crate::util::option::OneOrSome::Some(targets) => {
+                        let Some(target) = targets.first() else {
+                            return (None, None);
+                        };
+                        target
+                    }
+                };
+                let mut headers =
+                    target.matching_headers.clone().unwrap_or_default();
+                let host = headers
+                    .remove("Host")
+                    .or_else(|| headers.remove("host"))
+                    .unwrap_or_default();
+                let websocket = Self::typed_message(
+                    TYPE_TRANSPORT_WEBSOCKET_CONFIG,
+                    WebsocketConfigPayload {
+                        host,
+                        path: target.matching_path.clone().unwrap_or_default(),
+                        header: headers,
+                    },
+                );
+                let (mut stream_settings, proxy_settings) =
+                    self.encode_inbound_protocol_layers(&target.protocol);
+                let settings =
+                    stream_settings.get_or_insert_with(|| StreamConfigPayload {
+                        protocol_name: "websocket".to_string(),
+                        transport_settings: Vec::new(),
+                        security_type: String::new(),
+                        security_settings: Vec::new(),
+                    });
+                settings.protocol_name = "websocket".to_string();
+                settings.transport_settings.push(TransportConfigPayload {
+                    settings: Some(websocket),
+                    protocol_name: "websocket".to_string(),
+                });
+                (stream_settings, proxy_settings)
+            }
+            #[cfg(feature = "tls")]
+            ServerProxyConfig::Tls(tls) => {
+                let (mut stream_settings, proxy_settings) =
+                    self.encode_inbound_protocol_layers(&tls.inner);
+                let settings =
+                    stream_settings.get_or_insert_with(|| StreamConfigPayload {
+                        protocol_name: "tcp".to_string(),
+                        transport_settings: Vec::new(),
+                        security_type: String::new(),
+                        security_settings: Vec::new(),
+                    });
+                settings.security_type = "tls".to_string();
+                settings.security_settings.push(Self::typed_message(
+                    TYPE_TRANSPORT_TLS_CONFIG,
+                    TlsConfigPayload {
+                        certificate: tls
+                            .certificates
+                            .iter()
+                            .map(|certificate| TlsCertificatePayload {
+                                certificate: certificate.certificate_pem.clone(),
+                                key: certificate.key_pem.clone().unwrap_or_default(),
+                                certificate_path: certificate
+                                    .certificate_path
+                                    .clone()
+                                    .unwrap_or_default(),
+                                key_path: certificate
+                                    .key_path
+                                    .clone()
+                                    .unwrap_or_default(),
+                            })
+                            .collect(),
+                        next_protocol: tls.alpn_protocols.clone(),
+                    },
+                ));
+                (stream_settings, proxy_settings)
+            }
+            #[cfg(feature = "reality")]
+            ServerProxyConfig::Reality(reality) => {
+                let (mut stream_settings, proxy_settings) =
+                    self.encode_inbound_protocol_layers(&reality.inner);
+                let settings =
+                    stream_settings.get_or_insert_with(|| StreamConfigPayload {
+                        protocol_name: "tcp".to_string(),
+                        transport_settings: Vec::new(),
+                        security_type: String::new(),
+                        security_settings: Vec::new(),
+                    });
+                settings.security_type = "reality".to_string();
+                settings.security_settings.push(Self::typed_message(
+                    TYPE_TRANSPORT_REALITY_CONFIG,
+                    RealityConfigPayload {
+                        dest: reality.dest.to_string(),
+                        server_names: reality.server_names.clone(),
+                        private_key: reality.private_key.to_vec(),
+                        min_client_ver: reality
+                            .min_client_version
+                            .map(|version| version.to_vec())
+                            .unwrap_or_default(),
+                        max_client_ver: reality
+                            .max_client_version
+                            .map(|version| version.to_vec())
+                            .unwrap_or_default(),
+                        max_time_diff: reality.max_time_diff.unwrap_or_default(),
+                        short_ids: reality
+                            .short_ids
+                            .iter()
+                            .map(|short_id| short_id.to_vec())
+                            .collect(),
+                    },
+                ));
+                (stream_settings, proxy_settings)
+            }
+            ServerProxyConfig::Xhttp { inner, .. } => {
+                let (mut stream_settings, proxy_settings) =
+                    self.encode_inbound_protocol_layers(inner);
+                let settings =
+                    stream_settings.get_or_insert_with(|| StreamConfigPayload {
+                        protocol_name: "xhttp".to_string(),
+                        transport_settings: Vec::new(),
+                        security_type: String::new(),
+                        security_settings: Vec::new(),
+                    });
+                settings.protocol_name = "xhttp".to_string();
+                (stream_settings, proxy_settings)
+            }
+            protocol => (None, self.encode_user_manager_protocol(protocol)),
+        }
+    }
+
+    fn encode_outbound_config(
+        &self,
+        outbound: &OutboundSummary,
+    ) -> proto::xray::core::OutboundHandlerConfig {
+        let proxy_settings = match (
+            outbound.proxy_settings_type.as_ref(),
+            outbound.proxy_settings_value.as_ref(),
+        ) {
+            (Some(r#type), Some(value)) => {
+                Some(proto::xray::common::serial::TypedMessage {
+                    r#type: r#type.clone(),
+                    value: value.clone(),
+                })
+            }
+            _ => match outbound.protocol.as_str() {
+                "freedom" => Some(Self::typed_message(
+                    TYPE_PROXY_FREEDOM_CONFIG,
+                    FreedomConfigPayload {},
+                )),
+                "blackhole" => Some(Self::typed_message(
+                    TYPE_PROXY_BLACKHOLE_CONFIG,
+                    BlackholeConfigPayload {},
+                )),
+                _ => None,
+            },
+        };
+        proto::xray::core::OutboundHandlerConfig {
+            tag: outbound.tag.clone(),
+            sender_settings: None,
+            proxy_settings,
+            expire: 0,
+            comment: String::new(),
+        }
     }
 
     #[cfg(feature = "trojan")]
@@ -1244,11 +1593,7 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
         let request = request.into_inner();
         let mut inbounds = Vec::new();
         for inbound in self.runtime.inbounds() {
-            let mut config = proto::xray::core::InboundHandlerConfig {
-                tag: inbound.tag.clone(),
-                receiver_settings: None,
-                proxy_settings: None,
-            };
+            let mut config = self.encode_inbound_config(&inbound);
             if request.is_only_tags {
                 config.receiver_settings = None;
                 config.proxy_settings = None;
@@ -1368,13 +1713,7 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
             .runtime
             .outbounds()
             .iter()
-            .map(|outbound| proto::xray::core::OutboundHandlerConfig {
-                tag: outbound.tag.clone(),
-                sender_settings: None,
-                proxy_settings: None,
-                expire: 0,
-                comment: String::new(),
-            })
+            .map(|outbound| self.encode_outbound_config(outbound))
             .collect();
         Ok(Response::new(
             proto::xray::app::proxyman::command::ListOutboundsResponse { outbounds },
@@ -1461,6 +1800,8 @@ mod tests {
         let outbound = OutboundSummary {
             tag: outbound_tag.clone(),
             protocol: "freedom".to_string(),
+            proxy_settings_type: None,
+            proxy_settings_value: None,
         };
 
         let runtime = RuntimeState::new(vec![inbound], vec![outbound]);
@@ -1566,7 +1907,55 @@ mod tests {
             .expect("list_inbounds failed")
             .into_inner();
         assert_eq!(response.inbounds.len(), 1);
-        assert_eq!(response.inbounds[0].tag, fixture.inbound_tag);
+        let inbound = &response.inbounds[0];
+        assert_eq!(inbound.tag, fixture.inbound_tag);
+
+        let receiver_settings = inbound
+            .receiver_settings
+            .as_ref()
+            .expect("receiver settings should be echoed");
+        assert_eq!(receiver_settings.r#type, TYPE_APP_RECEIVER_CONFIG);
+        let receiver =
+            ReceiverConfigPayload::decode(receiver_settings.value.as_slice())
+                .expect("decode receiver settings");
+        let ports = receiver.port_list.expect("receiver ports");
+        assert_eq!(ports.range.len(), 1);
+        assert_eq!(ports.range[0].from, 1080);
+        assert_eq!(ports.range[0].to, 1080);
+        assert_eq!(receiver.listen, Some(localhost_ip_payload()));
+
+        let proxy_settings = inbound
+            .proxy_settings
+            .as_ref()
+            .expect("proxy settings should be echoed");
+        assert_eq!(proxy_settings.r#type, TYPE_PROXY_SOCKS_SERVER_CONFIG);
+        let socks =
+            SocksServerConfigPayload::decode(proxy_settings.value.as_slice())
+                .expect("decode socks settings");
+        assert_eq!(socks.auth_type, 1);
+        assert_eq!(socks.accounts.len(), 1);
+        assert!(socks.accounts.values().any(|password| password == "pass-a"));
+    }
+
+    #[tokio::test]
+    async fn handler_lists_inbounds_only_tags_omits_settings() {
+        let fixture = build_fixture();
+        let service = HandlerServiceImpl::new(fixture.runtime.clone());
+
+        let response = service
+            .list_inbounds(Request::new(
+                proto::xray::app::proxyman::command::ListInboundsRequest {
+                    is_only_tags: true,
+                },
+            ))
+            .await
+            .expect("list_inbounds failed")
+            .into_inner();
+        assert_eq!(response.inbounds.len(), 1);
+        let inbound = &response.inbounds[0];
+        assert_eq!(inbound.tag, fixture.inbound_tag);
+        assert!(inbound.receiver_settings.is_none());
+        assert!(inbound.proxy_settings.is_none());
     }
 
     #[tokio::test]
@@ -1582,7 +1971,16 @@ mod tests {
             .expect("list_outbounds failed")
             .into_inner();
         assert_eq!(response.outbounds.len(), 1);
-        assert_eq!(response.outbounds[0].tag, fixture.outbound_tag);
+        let outbound = &response.outbounds[0];
+        assert_eq!(outbound.tag, fixture.outbound_tag);
+        assert!(outbound.sender_settings.is_none());
+        let proxy_settings = outbound
+            .proxy_settings
+            .as_ref()
+            .expect("proxy settings should be echoed");
+        assert_eq!(proxy_settings.r#type, TYPE_PROXY_FREEDOM_CONFIG);
+        FreedomConfigPayload::decode(proxy_settings.value.as_slice())
+            .expect("decode freedom settings");
     }
 
     #[tokio::test]
