@@ -85,6 +85,8 @@ mod tests {
                 .map(|(tag, protocol)| OutboundSummary {
                     tag: (*tag).to_string(),
                     protocol: (*protocol).to_string(),
+                    proxy_settings_type: None,
+                    proxy_settings_value: None,
                 })
                 .collect(),
         )
