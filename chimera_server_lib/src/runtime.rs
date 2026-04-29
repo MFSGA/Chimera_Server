@@ -11,6 +11,8 @@ use crate::{config::server_config::ServerConfig, routing_state::RoutingState};
 pub struct OutboundSummary {
     pub tag: String,
     pub protocol: String,
+    pub proxy_settings_type: Option<String>,
+    pub proxy_settings_value: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]

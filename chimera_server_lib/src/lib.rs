@@ -292,6 +292,8 @@ async fn start_async(opts: Options) -> Result<(), Error> {
         .map(|item| OutboundSummary {
             tag: item.tag.clone(),
             protocol: item.protocol.clone(),
+            proxy_settings_type: None,
+            proxy_settings_value: None,
         })
         .collect::<Vec<_>>();
 

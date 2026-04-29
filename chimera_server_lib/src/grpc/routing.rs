@@ -708,6 +708,8 @@ mod tests {
                 .map(|tag| OutboundSummary {
                     tag: (*tag).to_string(),
                     protocol: "freedom".to_string(),
+                    proxy_settings_type: None,
+                    proxy_settings_value: None,
                 })
                 .collect(),
         )
