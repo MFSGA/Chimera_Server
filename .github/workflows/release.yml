@@ -72,7 +72,7 @@ jobs:
           git push origin ${{ steps.version.outputs.version }}
 
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.version.outputs.version }}
           name: ${{ steps.version.outputs.version }}
@@ -103,7 +103,7 @@ jobs:
           Get-ChildItem -Path dist
 
       - name: Upload Windows binary to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.release.outputs.version }}
           files: dist/chimera_server_app-${{ needs.release.outputs.version }}-windows-x86_64.exe
