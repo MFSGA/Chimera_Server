@@ -1,0 +1,128 @@
+name: Proxy Throughput
+
+on:
+  pull_request:
+    branches: ["master"]
+    paths:
+      - "chimera_server_app/**"
+      - "chimera_server_lib/src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "bench/**"
+      - ".github/workflows/proxy-throughput.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  throughput:
+    name: Proxy Throughput (ubuntu-latest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Download xray-core
+        run: |
+          VERSION=$(cat bench/.xray-version)
+          mkdir -p xray
+          curl -L "https://github.com/XTLS/Xray-core/releases/download/$VERSION/Xray-linux-64.zip" -o /tmp/xray.zip
+          unzip -o /tmp/xray.zip -d xray/
+          chmod +x xray/xray
+          xray/xray version
+
+      - name: Build Chimera release
+        run: cargo build --release --package chimera_server_app --all-features
+
+      - name: Print environment info
+        run: |
+          echo "### Environment"
+          echo "OS: $(uname -a)"
+          echo "CPUs: $(nproc)"
+          echo "Memory: $(free -h | awk '/^Mem:/ {print $2}')"
+          echo "Rustc: $(rustc --version)"
+          echo "Cargo: $(cargo --version)"
+          echo "Chimera: $(./target/release/chimera_server_app --version 2>&1 || echo 'N/A')"
+          echo "Xray: $(./xray/xray version 2>&1 | head -1)"
+
+      - name: Run throughput tests
+        run: |
+          python3 bench/throughput.py --all --payload-size 33554432 --runs 3 \
+            --chimera-bin ./target/release/chimera_server_app \
+            --xray-bin ./xray/xray \
+            --output target/throughput-results.jsonl --verbose \
+            2>&1 | tee target/throughput-run.log
+
+      - name: Generate report
+        if: always()
+        run: |
+          ENV_JSON=$(python3 -c "import json,platform,os; print(json.dumps({'os':{'system':platform.system(),'release':platform.release(),'machine':platform.machine()},'cpu_cores':os.cpu_count()}))")
+          python3 bench/format_throughput.py target/throughput-results.jsonl \
+            --output target/throughput-report.md \
+            --env-json "$ENV_JSON" \
+            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          cat target/throughput-report.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: proxy-throughput
+          path: |
+            target/throughput-results.jsonl
+            target/throughput-report.md
+            target/throughput-run.log
+          retention-days: 90
+
+      - name: Post PR comment
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            const report = 'target/throughput-report.md';
+            let body = fs.existsSync(report)
+              ? fs.readFileSync(report, 'utf8')
+              : '## Proxy Throughput Report\n\nNo report produced.';
+            body += '\n\n[View workflow run and artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})';
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(
+              c => c.user.type === 'Bot' && c.body.includes('Proxy Throughput Report')
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body,
+              });
+            }
