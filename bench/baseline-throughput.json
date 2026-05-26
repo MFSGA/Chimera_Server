@@ -1,0 +1,20 @@
+{
+  "created_at": "2026-05-26T01:52:28Z",
+  "workflow": "proxy-throughput",
+  "chimera_commit": "b63ebcd20dfc14614faafb5c06e50ce53048766c",
+  "payload_bytes": 33554432,
+  "runs_per_scenario": 3,
+  "results": [
+    {
+      "label": "socks-direct",
+      "scenario": "tier1_socks_direct",
+      "upload_mbps": 298.23,
+      "download_mbps": 290.21,
+      "upload_stdev_mbps": 156.77,
+      "download_stdev_mbps": 51.81,
+      "runs": 3,
+      "total_bytes": 33554432,
+      "engine": "chimera"
+    }
+  ]
+}
