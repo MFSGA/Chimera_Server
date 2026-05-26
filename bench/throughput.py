@@ -326,6 +326,73 @@ class ProcManager:
         return td
 
 
+# ─── Baseline comparison ────────────────────────────────────────────────────────
+
+
+def load_baseline(path: str) -> dict:
+    """Load and return the baseline throughput JSON file."""
+    with open(path) as f:
+        return json.load(f)
+
+
+def compare_baseline(results: list[dict], baseline_path: str) -> int:
+    """Compare current results against a stored baseline.
+
+    For each result where upload_mbps dropped more than 10 % relative to the
+    baseline entry (matched by *label*), a warning is printed to stderr.
+
+    Adds ``regression_pct`` and ``baseline_upload_mbps`` fields to each
+    matched result dict.
+
+    Returns the number of regressions (results >10 % below baseline).
+    """
+    baseline = load_baseline(baseline_path)
+    baseline_by_label = {r["label"]: r for r in baseline["results"]}
+    regression_count = 0
+
+    for result in results:
+        label = result["label"]
+        bl = baseline_by_label.get(label)
+        if bl is None:
+            print(
+                f"[baseline] No baseline entry for '{label}', skipping",
+                file=sys.stderr,
+            )
+            continue
+
+        bl_upload = bl["upload_mbps"]
+        current_upload = result["upload_mbps"]
+        if bl_upload > 0:
+            regression_pct = (current_upload - bl_upload) / bl_upload * 100
+        else:
+            regression_pct = 0.0
+
+        result["regression_pct"] = round(regression_pct, 2)
+        result["baseline_upload_mbps"] = bl_upload
+
+        if regression_pct < -10:
+            regression_count += 1
+            print(
+                f"⚠️  REGRESSION: {label} upload dropped {abs(regression_pct):.1f}% "
+                f"({current_upload:.1f} vs baseline {bl_upload:.1f} Mbps)",
+                file=sys.stderr,
+            )
+
+    if regression_count > 0:
+        print(
+            f"⚠️  {regression_count} regression(s) detected "
+            "(>10% drop in upload throughput)",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "✓ All results within baseline range (threshold: 10%)",
+            file=sys.stderr,
+        )
+
+    return regression_count
+
+
 # ─── Statistics helpers ─────────────────────────────────────────────────────────
 
 
@@ -607,6 +674,13 @@ def main() -> None:
         help="Path to xray binary (default: xray; VLESS skipped if not found)",
     )
     parser.add_argument(
+        "--baseline",
+        type=str,
+        default=None,
+        help="Path to baseline-throughput.json for regression comparison",
+        metavar="PATH",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print debug logs to stderr",
@@ -660,6 +734,16 @@ def main() -> None:
         raise
 
     pm.cleanup()
+
+    # Baseline comparison (if requested)
+    if args.baseline:
+        if os.path.isfile(args.baseline):
+            compare_baseline(results, args.baseline)
+        else:
+            print(
+                f"[baseline] File '{args.baseline}' not found, skipping comparison",
+                file=sys.stderr,
+            )
 
     # Output JSON-lines
     output_lines = [json.dumps(r, ensure_ascii=False) for r in results]

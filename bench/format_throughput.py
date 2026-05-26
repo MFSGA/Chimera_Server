@@ -75,10 +75,19 @@ def fmt_mbps(value: float, stdev: float) -> str:
 
 def render_table(rows: list, lines: list) -> None:
     """Append a Markdown throughput table for *rows* to *lines*."""
-    lines += [
-        "| Transport | Payload | Runs | Upload Mbps (&plusmn;&sigma;) | Download Mbps (&plusmn;&sigma;) |",
-        "|-----------|---------|:----:|:----------------------------:|:------------------------------:|",
-    ]
+    has_change = any("regression_pct" in r for r in rows)
+
+    if has_change:
+        lines += [
+            "| Transport | Payload | Runs | Upload Mbps (&plusmn;&sigma;) | Download Mbps (&plusmn;&sigma;) | Change |",
+            "|-----------|---------|:----:|:----------------------------:|:------------------------------:|:------:|",
+        ]
+    else:
+        lines += [
+            "| Transport | Payload | Runs | Upload Mbps (&plusmn;&sigma;) | Download Mbps (&plusmn;&sigma;) |",
+            "|-----------|---------|:----:|:----------------------------:|:------------------------------:|",
+        ]
+
     for r in rows:
         label = r.get("label", "?")
         transport = label.split("-", 1)[1] if "-" in label else label
@@ -86,7 +95,19 @@ def render_table(rows: list, lines: list) -> None:
         runs = r.get("runs", 1)
         upload = fmt_mbps(r.get("upload_mbps", 0.0), r.get("upload_stdev_mbps", 0.0))
         download = fmt_mbps(r.get("download_mbps", 0.0), r.get("download_stdev_mbps", 0.0))
-        lines.append(f"| `{transport}` | {payload_mb} MB | {runs} | {upload} | {download} |")
+
+        if has_change:
+            regression_pct = r.get("regression_pct")
+            if regression_pct is not None:
+                if regression_pct < -10:
+                    change = f"**`{regression_pct:+.1f}%` ⚠\uFE0F**"
+                else:
+                    change = f"`{regression_pct:+.1f}%`"
+            else:
+                change = "—"
+            lines.append(f"| `{transport}` | {payload_mb} MB | {runs} | {upload} | {download} | {change} |")
+        else:
+            lines.append(f"| `{transport}` | {payload_mb} MB | {runs} | {upload} | {download} |")
     lines.append("")
 
 
@@ -158,6 +179,18 @@ def main() -> None:
                 )
             )
             render_table(scenario_rows, md_lines)
+
+        # Append regression summary if any result carries baseline info
+        regression_rows = [r for r in rows if "regression_pct" in r]
+        if regression_rows:
+            bad = sum(1 for r in regression_rows if r["regression_pct"] < -10)
+            if bad > 0:
+                md_lines.append(
+                    f"⚠️ **{bad} regression(s) detected (>10% upload throughput drop)**"
+                )
+            else:
+                md_lines.append("✓ All results within baseline range")
+            md_lines.append("")
 
         md_lines.append(
             f"_Ran {len(rows)} variant(s) in parallel; each direction transfers the full payload._"
