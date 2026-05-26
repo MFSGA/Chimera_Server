@@ -1,0 +1,15 @@
+{
+  "inbounds": [{
+    "listen": "127.0.0.1",
+    "port": 0,      // replaced at runtime by throughput.py
+    "protocol": "socks",
+    "settings": {
+      "auth": "noauth"
+    },
+    "tag": "socks-throughput"
+  }],
+  "outbounds": [{
+    "protocol": "freedom",
+    "tag": "direct"
+  }]
+}
