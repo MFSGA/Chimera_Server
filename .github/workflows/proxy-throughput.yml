@@ -68,6 +68,7 @@ jobs:
           python3 bench/throughput.py --all --payload-size 33554432 --runs 3 \
             --chimera-bin ./target/release/chimera_server_app \
             --xray-bin ./xray/xray \
+            --baseline bench/baseline-throughput.json \
             --output target/throughput-results.jsonl --verbose \
             2>&1 | tee target/throughput-run.log
 
