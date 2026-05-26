@@ -1,0 +1,19 @@
+{
+  "inbounds": [{
+    "listen": "127.0.0.1",
+    "port": 0,                     // replaced at runtime by throughput.py
+    "protocol": "vless",
+    "settings": {
+      "clients": [{
+        "id": "PLACEHOLDER_UUID",  // replaced at runtime by throughput.py
+        "email": "test@local"
+      }],
+      "decryption": "none"
+    },
+    "tag": "vless-throughput"
+  }],
+  "outbounds": [{
+    "protocol": "freedom",
+    "tag": "direct"
+  }]
+}
