@@ -376,8 +376,16 @@ impl TryFrom<InboudItem> for ServerConfig {
                 let config = collect_tuic_settings(settings)?;
 
                 let quic_settings = Some(ServerQuicConfig {
-                    cert: certificate.certificate_file,
-                    key: certificate.key_file,
+                    cert: certificate.certificate_file.ok_or_else(|| {
+                        Error::InvalidConfig(
+                            "tuic inbound requires certificateFile".into(),
+                        )
+                    })?,
+                    key: certificate.key_file.ok_or_else(|| {
+                        Error::InvalidConfig(
+                            "tuic inbound requires keyFile".into(),
+                        )
+                    })?,
                     alpn_protocols: NoneOrSome::Some(tls_settings.alpn),
                     client_fingerprints: NoneOrSome::None,
                 });
