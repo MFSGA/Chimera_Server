@@ -1,4 +1,6 @@
-use std::{collections::HashMap, path::PathBuf, str::FromStr};
+use std::{path::PathBuf, str::FromStr};
+
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -92,7 +94,6 @@ impl InboudItem {
     pub fn get_transport_type(&self) -> Transport {
         if self.stream_settings.is_none() {
             return Transport::Tcp;
-        } else {
         }
 
         todo!()
