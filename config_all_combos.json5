@@ -1,0 +1,540 @@
+{
+  // Chimera_Server - All protocol/transport/security combination test config
+  // Generated to exercise every valid inbound combo
+
+  "api": {
+    "listen": "127.0.0.1:9090",
+    "services": [
+      "HandlerService",
+      "LoggerService",
+      "StatsService"
+    ]
+  },
+
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": ["api-inbound"],
+        "outboundTag": "api-out"
+      }
+    ]
+  },
+
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct-out"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "api-out"
+    }
+  ],
+
+  "inbounds": [
+    // ===== Non-TLS TCP =====
+    {
+      "tag": "socks-tcp-none",
+      "protocol": "socks",
+      "listen": "0.0.0.0",
+      "port": 10000,
+      "settings": {
+        "auth": "noauth"
+      }
+    },
+    {
+      "tag": "vless-tcp-none",
+      "protocol": "vless",
+      "listen": "0.0.0.0",
+      "port": 10002,
+      "settings": {
+        "clients": [
+          {
+            "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+            "email": "test@vless-tcp-none",
+            "flow": ""
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      }
+    },
+    {
+      "tag": "trojan-tcp-none",
+      "protocol": "trojan",
+      "listen": "0.0.0.0",
+      "port": 10005,
+      "settings": {
+        "clients": [
+          {
+            "password": "chimera-test-password",
+            "email": "test@trojan-tcp-none"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      }
+    },
+    {
+      "tag": "dokodemo-tcp-none",
+      "protocol": "dokodemo-door",
+      "listen": "0.0.0.0",
+      "port": 10007,
+      "settings": {
+        "address": "8.8.8.8",
+        "port": 53,
+        "followRedirect": false
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      }
+    },
+
+    // ===== Non-TLS WebSocket =====
+    {
+      "tag": "socks-ws-none",
+      "protocol": "socks",
+      "listen": "0.0.0.0",
+      "port": 10001,
+      "settings": {
+        "auth": "noauth"
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": {
+          "host": "test.chimera.local",
+          "path": "/socks"
+        }
+      }
+    },
+    {
+      "tag": "vless-ws-none",
+      "protocol": "vless",
+      "listen": "0.0.0.0",
+      "port": 10003,
+      "settings": {
+        "clients": [
+          {
+            "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+            "email": "test@vless-ws-none",
+            "flow": ""
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": {
+          "host": "test.chimera.local",
+          "path": "/vless"
+        }
+      }
+    },
+    {
+      "tag": "trojan-ws-none",
+      "protocol": "trojan",
+      "listen": "0.0.0.0",
+      "port": 10006,
+      "settings": {
+        "clients": [
+          {
+            "password": "chimera-test-password",
+            "email": "test@trojan-ws-none"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": {
+          "host": "test.chimera.local",
+          "path": "/trojan"
+        }
+      }
+    },
+
+    // ===== Non-TLS XHTTP =====
+    {
+      "tag": "vless-xhttp-none",
+      "protocol": "vless",
+      "listen": "0.0.0.0",
+      "port": 10004,
+      "settings": {
+        "clients": [
+          {
+            "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+            "email": "test@vless-xhttp-none",
+            "flow": ""
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "none",
+        "xhttpSettings": {
+          "host": "test.chimera.local",
+          "path": "/xhttp",
+          "mode": "auto"
+        }
+      }
+    },
+
+    // ===== TLS TCP =====
+    {
+      "tag": "socks-tcp-tls",
+      "protocol": "socks",
+      "listen": "0.0.0.0",
+      "port": 20000,
+      "settings": {
+        "auth": "noauth"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "tls",
+        "tlsSettings": {
+          "alpn": ["http/1.1"],
+          "certificates": [
+            {
+              "certificateFile": "./cert/cert.pem",
+              "keyFile": "./cert/key.pem",
+              "usage": "encipherment"
+            }
+          ],
+          "minVersion": "1.2",
+          "maxVersion": "1.3"
+        }
+      }
+    },
+    {
+      "tag": "vless-tcp-tls",
+      "protocol": "vless",
+      "listen": "0.0.0.0",
+      "port": 20002,
+      "settings": {
+        "clients": [
+          {
+            "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+            "email": "test@vless-tcp-tls",
+            "flow": "xtls-rprx-vision"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "tls",
+        "tlsSettings": {
+          "alpn": ["http/1.1"],
+          "certificates": [
+            {
+              "certificateFile": "./cert/cert.pem",
+              "keyFile": "./cert/key.pem",
+              "usage": "encipherment"
+            }
+          ],
+          "minVersion": "1.2",
+          "maxVersion": "1.3"
+        }
+      }
+    },
+    {
+      "tag": "trojan-tcp-tls",
+      "protocol": "trojan",
+      "listen": "0.0.0.0",
+      "port": 20005,
+      "settings": {
+        "clients": [
+          {
+            "password": "chimera-test-password",
+            "email": "test@trojan-tcp-tls"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "tls",
+        "tlsSettings": {
+          "alpn": ["http/1.1"],
+          "certificates": [
+            {
+              "certificateFile": "./cert/cert.pem",
+              "keyFile": "./cert/key.pem",
+              "usage": "encipherment"
+            }
+          ],
+          "minVersion": "1.2",
+          "maxVersion": "1.3"
+        }
+      }
+    },
+    {
+      "tag": "dokodemo-tcp-tls",
+      "protocol": "dokodemo-door",
+      "listen": "0.0.0.0",
+      "port": 20007,
+      "settings": {
+        "address": "8.8.8.8",
+        "port": 53,
+        "followRedirect": false
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "tls",
+        "tlsSettings": {
+          "alpn": ["http/1.1"],
+          "certificates": [
+            {
+              "certificateFile": "./cert/cert.pem",
+              "keyFile": "./cert/key.pem",
+              "usage": "encipherment"
+            }
+          ],
+          "minVersion": "1.2",
+          "maxVersion": "1.3"
+        }
+      }
+    },
+
+    // ===== TLS WebSocket =====
+    {
+      "tag": "socks-ws-tls",
+      "protocol": "socks",
+      "listen": "0.0.0.0",
+      "port": 20001,
+      "settings": {
+        "auth": "noauth"
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "tls",
+        "tlsSettings": {
+          "alpn": ["http/1.1"],
+          "certificates": [
+            {
+              "certificateFile": "./cert/cert.pem",
+              "keyFile": "./cert/key.pem",
+              "usage": "encipherment"
+            }
+          ],
+          "minVersion": "1.2",
+          "maxVersion": "1.3"
+        },
+        "wsSettings": {
+          "host": "test.chimera.local",
+          "path": "/socks"
+        }
+      }
+    },
+    {
+      "tag": "vless-ws-tls",
+      "protocol": "vless",
+      "listen": "0.0.0.0",
+      "port": 20003,
+      "settings": {
+        "clients": [
+          {
+            "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+            "email": "test@vless-ws-tls",
+            "flow": ""
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "tls",
+        "tlsSettings": {
+          "alpn": ["http/1.1"],
+          "certificates": [
+            {
+              "certificateFile": "./cert/cert.pem",
+              "keyFile": "./cert/key.pem",
+              "usage": "encipherment"
+            }
+          ],
+          "minVersion": "1.2",
+          "maxVersion": "1.3"
+        },
+        "wsSettings": {
+          "host": "test.chimera.local",
+          "path": "/vless"
+        }
+      }
+    },
+    {
+      "tag": "trojan-ws-tls",
+      "protocol": "trojan",
+      "listen": "0.0.0.0",
+      "port": 20006,
+      "settings": {
+        "clients": [
+          {
+            "password": "chimera-test-password",
+            "email": "test@trojan-ws-tls"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "tls",
+        "tlsSettings": {
+          "alpn": ["http/1.1"],
+          "certificates": [
+            {
+              "certificateFile": "./cert/cert.pem",
+              "keyFile": "./cert/key.pem",
+              "usage": "encipherment"
+            }
+          ],
+          "minVersion": "1.2",
+          "maxVersion": "1.3"
+        },
+        "wsSettings": {
+          "host": "test.chimera.local",
+          "path": "/trojan"
+        }
+      }
+    },
+
+    // ===== TLS XHTTP =====
+    {
+      "tag": "vless-xhttp-tls",
+      "protocol": "vless",
+      "listen": "0.0.0.0",
+      "port": 20004,
+      "settings": {
+        "clients": [
+          {
+            "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+            "email": "test@vless-xhttp-tls",
+            "flow": ""
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "tls",
+        "tlsSettings": {
+          "alpn": ["http/1.1"],
+          "certificates": [
+            {
+              "certificateFile": "./cert/cert.pem",
+              "keyFile": "./cert/key.pem",
+              "usage": "encipherment"
+            }
+          ],
+          "minVersion": "1.2",
+          "maxVersion": "1.3"
+        },
+        "xhttpSettings": {
+          "host": "test.chimera.local",
+          "path": "/xhttp",
+          "mode": "auto"
+        }
+      }
+    },
+
+    // ===== Reality =====
+    {
+      "tag": "vless-tcp-reality",
+      "protocol": "vless",
+      "listen": "0.0.0.0",
+      "port": 30000,
+      "settings": {
+        "clients": [
+          {
+            "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+            "email": "test@vless-tcp-reality",
+            "flow": "xtls-rprx-vision"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "dest": "addons.mozilla.org:443",
+          "serverNames": ["addons.mozilla.org"],
+          "privateKey": "GtkJ2vUWma7R7cKO63Fb92zuh0tQ4SRppzCfFa3VXYo",
+          "shortIds": ["6ba85179e30d4fc2"],
+          "maxTimediff": 0,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "tag": "vless-xhttp-reality",
+      "protocol": "vless",
+      "listen": "0.0.0.0",
+      "port": 30001,
+      "settings": {
+        "clients": [
+          {
+            "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+            "email": "test@vless-xhttp-reality",
+            "flow": ""
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "reality",
+        "realitySettings": {
+          "dest": "addons.mozilla.org:443",
+          "serverNames": ["addons.mozilla.org"],
+          "privateKey": "GtkJ2vUWma7R7cKO63Fb92zuh0tQ4SRppzCfFa3VXYo",
+          "shortIds": ["6ba85179e30d4fc2"],
+          "maxTimediff": 0,
+          "fingerprint": "chrome"
+        },
+        "xhttpSettings": {
+          "host": "test.chimera.local",
+          "path": "/reality-xhttp",
+          "mode": "auto"
+        }
+      }
+    },
+
+    // ===== Hysteria2 (QUIC + mandatory TLS) =====
+    {
+      "tag": "hysteria2-quic",
+      "protocol": "hysteria2",
+      "listen": "0.0.0.0",
+      "port": 40000,
+      "settings": {
+        "clients": [
+          {
+            "id": "chimera-hy2-user",
+            "email": "test@hysteria2"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "quic",
+        "security": "tls",
+        "tlsSettings": {
+          "alpn": ["h3"],
+          "certificates": [
+            {
+              "certificateFile": "./cert/cert.pem",
+              "keyFile": "./cert/key.pem",
+              "usage": "encipherment"
+            }
+          ]
+        },
+        "hysteriaSettings": {
+          "version": 2,
+          "up": "100mbps",
+          "down": "200mbps",
+          "ignoreClientBandwidth": false
+        }
+      }
+    }
+  ]
+}
