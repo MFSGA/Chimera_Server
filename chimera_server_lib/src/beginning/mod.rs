@@ -276,7 +276,7 @@ where
 }
 
 pub async fn setup_client_stream(
-    server_stream: &mut Box<dyn AsyncStream>,
+    _server_stream: &mut Box<dyn AsyncStream>,
 
     resolver: Arc<dyn Resolver>,
     remote_location: NetLocation,

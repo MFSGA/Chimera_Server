@@ -233,12 +233,12 @@ pub fn validate(opts: Options) -> Result<(), Error> {
     routing_state::RoutingState::from_config(config.routing.as_ref())
         .map_err(Error::InvalidConfig)?;
 
-    let api_addr = resolve_api_config(
+    let resolved_api = resolve_api_config(
         api_config.as_ref(),
         routing_config.as_ref(),
         &all_inbounds,
-    )?
-    .listen_addr;
+    )?;
+    let api_addr = resolved_api.listen_addr;
 
     if let Some(mcp) = mcp_config.as_ref() {
         if let Some(listen) = mcp.listen.as_ref() {
