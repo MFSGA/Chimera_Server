@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tokio::io::AsyncWriteExt;
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::{
     async_stream::AsyncStream,
