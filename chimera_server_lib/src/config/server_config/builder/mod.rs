@@ -358,12 +358,9 @@ impl TryFrom<InboudItem> for ServerConfig {
                         "tuic inbound missing streamSettings".into(),
                     )
                 })?;
-                let tls_settings =
-                    stream_settings.tls_settings.ok_or_else(|| {
-                        Error::InvalidConfig(
-                            "tuic inbound requires tlsSettings".into(),
-                        )
-                    })?;
+                let tls_settings = stream_settings.tls_settings.ok_or_else(|| {
+                    Error::InvalidConfig("tuic inbound requires tlsSettings".into())
+                })?;
                 let certificate = tls_settings
                     .certificates
                     .get(0)
@@ -373,25 +370,14 @@ impl TryFrom<InboudItem> for ServerConfig {
                         )
                     })?
                     .clone();
-                let cert = certificate.certificate_file.ok_or_else(|| {
-                    Error::InvalidConfig(
-                        "tuic inbound currently requires certificateFile".into(),
-                    )
-                })?;
-                let key = certificate.key_file.ok_or_else(|| {
-                    Error::InvalidConfig(
-                        "tuic inbound currently requires keyFile".into(),
-                    )
-                })?;
 
-                let settings = settings.ok_or_else(|| {
-                    Error::InvalidConfig("tuic inbound requires settings".into())
-                })?;
+                let settings = settings
+                    .ok_or_else(|| Error::InvalidConfig("tuic inbound requires settings".into()))?;
                 let config = collect_tuic_settings(settings)?;
 
                 let quic_settings = Some(ServerQuicConfig {
-                    cert,
-                    key,
+                    cert: certificate.certificate_file,
+                    key: certificate.key_file,
                     alpn_protocols: NoneOrSome::Some(tls_settings.alpn),
                     client_fingerprints: NoneOrSome::None,
                 });
