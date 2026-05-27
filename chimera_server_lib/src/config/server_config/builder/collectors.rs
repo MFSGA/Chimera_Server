@@ -374,45 +374,6 @@ pub(super) fn collect_tuic_settings(
     })
 }
 
-#[cfg(feature = "tuic")]
-pub(super) fn collect_tuic_settings(
-    settings: SettingObject,
-) -> Result<TuicServerConfig, Error> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct TuicInboundSettings {
-        uuid: String,
-        password: String,
-        #[serde(default, alias = "zero_rtt_handshake")]
-        zero_rtt_handshake: bool,
-    }
-
-    let raw: TuicInboundSettings = settings.deserialize().map_err(|e| {
-        Error::InvalidConfig(format!("failed to parse tuic settings: {e}"))
-    })?;
-
-    if raw.uuid.trim().is_empty() {
-        return Err(Error::InvalidConfig(
-            "tuic settings require a non-empty uuid".into(),
-        ));
-    }
-    if raw.password.trim().is_empty() {
-        return Err(Error::InvalidConfig(
-            "tuic settings require a non-empty password".into(),
-        ));
-    }
-
-    uuid::Uuid::parse_str(raw.uuid.trim()).map_err(|e| {
-        Error::InvalidConfig(format!("invalid tuic uuid {}: {e}", raw.uuid))
-    })?;
-
-    Ok(TuicServerConfig {
-        uuid: raw.uuid,
-        password: raw.password,
-        zero_rtt_handshake: raw.zero_rtt_handshake,
-    })
-}
-
 pub(super) fn normalize_path(path: Option<String>) -> String {
     let mut normalized = path.unwrap_or_else(|| "/".to_string());
     if normalized.is_empty() {
