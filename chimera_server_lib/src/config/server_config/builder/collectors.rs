@@ -375,7 +375,9 @@ pub(super) fn collect_tuic_settings(
 }
 
 #[cfg(feature = "tuic")]
-pub(super) fn collect_tuic_settings(settings: SettingObject) -> Result<TuicServerConfig, Error> {
+pub(super) fn collect_tuic_settings(
+    settings: SettingObject,
+) -> Result<TuicServerConfig, Error> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct TuicInboundSettings {
@@ -385,9 +387,9 @@ pub(super) fn collect_tuic_settings(settings: SettingObject) -> Result<TuicServe
         zero_rtt_handshake: bool,
     }
 
-    let raw: TuicInboundSettings = settings
-        .deserialize()
-        .map_err(|e| Error::InvalidConfig(format!("failed to parse tuic settings: {e}")))?;
+    let raw: TuicInboundSettings = settings.deserialize().map_err(|e| {
+        Error::InvalidConfig(format!("failed to parse tuic settings: {e}"))
+    })?;
 
     if raw.uuid.trim().is_empty() {
         return Err(Error::InvalidConfig(
@@ -400,8 +402,9 @@ pub(super) fn collect_tuic_settings(settings: SettingObject) -> Result<TuicServe
         ));
     }
 
-    uuid::Uuid::parse_str(raw.uuid.trim())
-        .map_err(|e| Error::InvalidConfig(format!("invalid tuic uuid {}: {e}", raw.uuid)))?;
+    uuid::Uuid::parse_str(raw.uuid.trim()).map_err(|e| {
+        Error::InvalidConfig(format!("invalid tuic uuid {}: {e}", raw.uuid))
+    })?;
 
     Ok(TuicServerConfig {
         uuid: raw.uuid,
