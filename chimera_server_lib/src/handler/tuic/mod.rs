@@ -1,5 +1,3 @@
-#![cfg(feature = "tuic")]
-
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     num::NonZeroUsize,
@@ -23,8 +21,8 @@ use tracing::{debug, error, warn};
 use crate::{
     address::{Address, NetLocation},
     config::server_config::TuicServerConfig,
-    resolver::{NativeResolver, Resolver, resolve_single_address},
-    traffic::{TrafficContext, record_transfer, register_connection},
+    resolver::{resolve_single_address, NativeResolver, Resolver},
+    traffic::{record_transfer, register_connection, TrafficContext},
     util::{allocate_vec, socket::new_socket2_udp_socket_with_buffer_size},
 };
 
@@ -98,16 +96,12 @@ pub async fn run_tuic_server(
         let inbound_tag = inbound_tag.clone();
 
         let join_handle = tokio::spawn(async move {
-            let mut server_config =
-                quinn::ServerConfig::with_crypto(quic_server_config);
-            let transport =
-                Arc::get_mut(&mut server_config.transport).ok_or_else(|| {
-                    std::io::Error::other("tuic transport config already shared")
-                })?;
-            let idle_timeout =
-                Duration::from_secs(60).try_into().map_err(|err| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, err)
-                })?;
+            let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
+            let transport = Arc::get_mut(&mut server_config.transport)
+                .ok_or_else(|| std::io::Error::other("tuic transport config already shared"))?;
+            let idle_timeout = Duration::from_secs(60)
+                .try_into()
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
 
             transport
                 .max_concurrent_bidi_streams(4096_u32.into())
@@ -227,8 +221,7 @@ async fn process_connection(
     let cancel_token = CancellationToken::new();
     let udp_session_map = Arc::new(DashMap::new());
 
-    let heartbeat_loop =
-        run_heartbeat_loop(connection.clone(), cancel_token.clone());
+    let heartbeat_loop = run_heartbeat_loop(connection.clone(), cancel_token.clone());
     let bi_loop = run_bidirectional_loop(
         connection.clone(),
         resolver.clone(),
@@ -290,9 +283,7 @@ async fn auth_connection(
     let mut expected_token_bytes = [0u8; 32];
     connection
         .export_keying_material(&mut expected_token_bytes, uuid, password.as_bytes())
-        .map_err(|e| {
-            std::io::Error::other(format!("Failed to export keying material: {e:?}"))
-        })?;
+        .map_err(|e| std::io::Error::other(format!("Failed to export keying material: {e:?}")))?;
 
     loop {
         let mut recv_stream = match connection.accept_uni().await {
@@ -310,9 +301,7 @@ async fn auth_connection(
         let command_type = recv_stream.read_u8().await?;
 
         if command_type != COMMAND_TYPE_AUTHENTICATE {
-            debug!(
-                "Received command type {command_type} before auth, waiting for auth command"
-            );
+            debug!("Received command type {command_type} before auth, waiting for auth command");
             continue;
         }
 
@@ -382,9 +371,7 @@ async fn run_bidirectional_loop(
             {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                    error!(
-                        "Error parsing TCP stream header, closing connection: {e}"
-                    );
+                    error!("Error parsing TCP stream header, closing connection: {e}");
                     conn.close(0u32.into(), b"");
                 }
                 Err(e) => {
@@ -419,9 +406,9 @@ async fn process_tcp_stream(
         ));
     }
 
-    let remote_location = read_address(&mut recv).await?.ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "empty address")
-    })?;
+    let remote_location = read_address(&mut recv)
+        .await?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty address"))?;
 
     let connect_future = timeout(
         Duration::from_secs(60),
@@ -451,8 +438,7 @@ async fn process_tcp_stream(
     let _connection_guard = register_connection(Some(&context));
 
     let mut server_stream = QuicStream::from((send, recv));
-    let copy_result =
-        tokio::io::copy_bidirectional(&mut server_stream, &mut client_stream).await;
+    let copy_result = tokio::io::copy_bidirectional(&mut server_stream, &mut client_stream).await;
 
     let _ = server_stream.shutdown().await;
     let _ = client_stream.shutdown().await;
@@ -471,8 +457,7 @@ async fn connect_tcp_remote(
     remote_location: NetLocation,
 ) -> std::io::Result<tokio::net::TcpStream> {
     let target_addr = resolve_single_address(&resolver, &remote_location).await?;
-    let tcp_socket =
-        crate::util::socket::new_tcp_socket(None, target_addr.is_ipv6())?;
+    let tcp_socket = crate::util::socket::new_tcp_socket(None, target_addr.is_ipv6())?;
     let client_stream = tcp_socket.connect(target_addr).await?;
     if let Err(e) = client_stream.set_nodelay(true) {
         warn!("Failed to set TCP no-delay on client socket: {}", e);
@@ -480,9 +465,7 @@ async fn connect_tcp_remote(
     Ok(client_stream)
 }
 
-async fn read_address(
-    recv: &mut quinn::RecvStream,
-) -> std::io::Result<Option<NetLocation>> {
+async fn read_address(recv: &mut quinn::RecvStream) -> std::io::Result<Option<NetLocation>> {
     let address_type = recv.read_u8().await?;
     let address = match address_type {
         0xff => {
@@ -491,24 +474,23 @@ async fn read_address(
         0x00 => {
             let address_len = recv.read_u8().await? as usize;
             let mut address_bytes = allocate_vec(address_len);
-            recv.read_exact(&mut address_bytes).await.map_err(|err| {
-                std::io::Error::new(std::io::ErrorKind::Other, err)
-            })?;
+            recv.read_exact(&mut address_bytes)
+                .await
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
             let address_str = std::str::from_utf8(&address_bytes).map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("invalid address: {e}"),
                 )
             })?;
-            Address::from(address_str).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-            })?
+            Address::from(address_str)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
         }
         0x01 => {
             let mut ipv4_bytes = [0u8; 4];
-            recv.read_exact(&mut ipv4_bytes).await.map_err(|err| {
-                std::io::Error::new(std::io::ErrorKind::Other, err)
-            })?;
+            recv.read_exact(&mut ipv4_bytes)
+                .await
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
             Address::Ipv4(Ipv4Addr::new(
                 ipv4_bytes[0],
                 ipv4_bytes[1],
@@ -518,9 +500,9 @@ async fn read_address(
         }
         0x02 => {
             let mut ipv6_bytes = [0u8; 16];
-            recv.read_exact(&mut ipv6_bytes).await.map_err(|err| {
-                std::io::Error::new(std::io::ErrorKind::Other, err)
-            })?;
+            recv.read_exact(&mut ipv6_bytes)
+                .await
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
             let ipv6_addr = Ipv6Addr::from(ipv6_bytes);
             Address::Ipv6(ipv6_addr)
         }
@@ -689,11 +671,7 @@ impl UdpSession {
         }
     }
 
-    fn update_last_location(
-        &mut self,
-        location: NetLocation,
-        socket_addr: SocketAddr,
-    ) {
+    fn update_last_location(&mut self, location: NetLocation, socket_addr: SocketAddr) {
         self.last_location = location;
         self.last_socket_addr = socket_addr;
     }
@@ -710,26 +688,25 @@ async fn run_udp_remote_to_local_stream_loop(
     let mut loop_count: u8 = 0;
 
     loop {
-        let (payload_len, src_addr) =
-            match socket.try_recv_from(&mut buf[MAX_HEADER_LEN..]) {
-                Ok(res) => res,
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    tokio::select! {
-                        _ = cancel_token.cancelled() => {
-                            return Ok(());
-                        }
-                        result = socket.readable() => {
-                            result?;
-                            continue;
-                        }
+        let (payload_len, src_addr) = match socket.try_recv_from(&mut buf[MAX_HEADER_LEN..]) {
+            Ok(res) => res,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        return Ok(());
+                    }
+                    result = socket.readable() => {
+                        result?;
+                        continue;
                     }
                 }
-                Err(e) => {
-                    return Err(std::io::Error::other(format!(
-                        "failed to receive from UDP socket: {e}"
-                    )));
-                }
-            };
+            }
+            Err(e) => {
+                return Err(std::io::Error::other(format!(
+                    "failed to receive from UDP socket: {e}"
+                )));
+            }
+        };
 
         loop_count = loop_count.wrapping_add(1);
         if loop_count == 0 {
@@ -757,8 +734,7 @@ async fn run_udp_remote_to_local_stream_loop(
         buf[start_offset + 5] = 0;
         buf[start_offset + 6] = (payload_len >> 8) as u8;
         buf[start_offset + 7] = payload_len as u8;
-        buf[start_offset + 8..start_offset + 8 + address_bytes_len]
-            .copy_from_slice(&address_bytes);
+        buf[start_offset + 8..start_offset + 8 + address_bytes_len].copy_from_slice(&address_bytes);
 
         let mut i = start_offset;
         while i < end_offset {
@@ -777,9 +753,9 @@ async fn run_udp_remote_to_local_datagram_loop(
     client_socket: Arc<UdpSocket>,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
-    let max_datagram_size = connection.max_datagram_size().ok_or_else(|| {
-        std::io::Error::other("datagram not supported by remote endpoint")
-    })?;
+    let max_datagram_size = connection
+        .max_datagram_size()
+        .ok_or_else(|| std::io::Error::other("datagram not supported by remote endpoint"))?;
 
     let mut next_packet_id: u16 = 0;
     let mut buf = allocate_vec(65535).into_boxed_slice();
@@ -822,8 +798,7 @@ async fn run_udp_remote_to_local_datagram_loop(
         let header_overhead = 1 + 1 + 2 + 2 + 1 + 1 + 2 + address_bytes_len;
 
         if header_overhead + payload_len <= max_datagram_size {
-            let mut datagram =
-                BytesMut::with_capacity(header_overhead + payload_len);
+            let mut datagram = BytesMut::with_capacity(header_overhead + payload_len);
             datagram.put_u8(TUIC_VERSION);
             datagram.put_u8(COMMAND_TYPE_PACKET);
             datagram.extend_from_slice(&assoc_id.to_be_bytes());
@@ -834,9 +809,9 @@ async fn run_udp_remote_to_local_datagram_loop(
             datagram.extend_from_slice(&address_bytes);
             datagram.extend_from_slice(&buf[..payload_len]);
 
-            connection.send_datagram(datagram.freeze()).map_err(|e| {
-                std::io::Error::other(format!("Failed to send datagram: {e}"))
-            })?;
+            connection
+                .send_datagram(datagram.freeze())
+                .map_err(|e| std::io::Error::other(format!("Failed to send datagram: {e}")))?;
         } else {
             let first_overhead = header_overhead;
             let other_overhead = 1 + 1 + 2 + 2 + 1 + 1 + 2 + 1;
@@ -857,22 +832,18 @@ async fn run_udp_remote_to_local_datagram_loop(
                     (len, other_overhead)
                 };
 
-                let mut datagram =
-                    BytesMut::with_capacity(header_size + fragment_payload_len);
+                let mut datagram = BytesMut::with_capacity(header_size + fragment_payload_len);
                 datagram.extend_from_slice(&[TUIC_VERSION, COMMAND_TYPE_PACKET]);
                 datagram.extend_from_slice(&assoc_id.to_be_bytes());
                 datagram.extend_from_slice(&packet_id.to_be_bytes());
-                datagram
-                    .extend_from_slice(&[fragment_count as u8, fragment_id as u8]);
-                datagram
-                    .extend_from_slice(&(fragment_payload_len as u16).to_be_bytes());
+                datagram.extend_from_slice(&[fragment_count as u8, fragment_id as u8]);
+                datagram.extend_from_slice(&(fragment_payload_len as u16).to_be_bytes());
                 if fragment_id == 0 {
                     datagram.extend_from_slice(&address_bytes);
                 } else {
                     datagram.put_u8(0xff);
                 }
-                datagram
-                    .extend_from_slice(&buf[offset..offset + fragment_payload_len]);
+                datagram.extend_from_slice(&buf[offset..offset + fragment_payload_len]);
                 connection.send_datagram(datagram.freeze()).map_err(|e| {
                     std::io::Error::other(format!(
                         "Failed to send datagram fragment {fragment_id}: {e}"
@@ -995,8 +966,7 @@ async fn process_uni_stream(
         .await
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
 
-    let mut fragments: LruCache<u16, FragmentedPacket> =
-        LruCache::new(fragment_cache_size());
+    let mut fragments: LruCache<u16, FragmentedPacket> = LruCache::new(fragment_cache_size());
 
     process_udp_packet(
         connection,
@@ -1054,8 +1024,7 @@ async fn process_udp_packet(
             let remote_location = remote_location
                 .clone()
                 .ok_or_else(|| std::io::Error::other("missing initial address"))?;
-            let resolved_address =
-                resolve_single_address(resolver, &remote_location).await?;
+            let resolved_address = resolve_single_address(resolver, &remote_location).await?;
 
             let bind_addr: SocketAddr = if resolved_address.is_ipv6() {
                 SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
@@ -1065,9 +1034,10 @@ async fn process_udp_packet(
             let socket = new_udp_socket(bind_addr, None)?;
 
             let session = if is_uni_stream {
-                let send_stream = connection.open_uni().await.map_err(|err| {
-                    std::io::Error::new(std::io::ErrorKind::Other, err)
-                })?;
+                let send_stream = connection
+                    .open_uni()
+                    .await
+                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
                 UdpSession::start_with_send_stream(
                     assoc_id,
                     send_stream,
@@ -1096,13 +1066,10 @@ async fn process_udp_packet(
 
     if frag_total == 1 {
         let remote_location = remote_location.as_ref().ok_or_else(|| {
-            std::io::Error::other(
-                "ignoring packet with single fragment and no address",
-            )
+            std::io::Error::other("ignoring packet with single fragment and no address")
         })?;
 
-        let (socket_addr, is_updated) =
-            session.resolve_address(remote_location, resolver).await?;
+        let (socket_addr, is_updated) = session.resolve_address(remote_location, resolver).await?;
 
         if let Err(e) = session
             .send_socket
@@ -1185,11 +1152,10 @@ async fn process_udp_packet(
             .pop(&packet_id)
             .ok_or_else(|| std::io::Error::other("fragment cache missing"))?;
 
-        let remote_location = remote_location
-            .ok_or_else(|| std::io::Error::other("missing fragment address"))?;
+        let remote_location =
+            remote_location.ok_or_else(|| std::io::Error::other("missing fragment address"))?;
 
-        let (socket_addr, is_updated) =
-            session.resolve_address(&remote_location, resolver).await?;
+        let (socket_addr, is_updated) = session.resolve_address(&remote_location, resolver).await?;
 
         let mut complete_payload = Vec::with_capacity(packet_len);
         for frag in received.iter() {
@@ -1232,8 +1198,7 @@ async fn run_datagram_loop(
     udp_session_map: UdpSessionMap,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
-    let mut fragments: LruCache<u16, FragmentedPacket> =
-        LruCache::new(fragment_cache_size());
+    let mut fragments: LruCache<u16, FragmentedPacket> = LruCache::new(fragment_cache_size());
     let mut last_cleanup = std::time::Instant::now();
 
     loop {
@@ -1251,9 +1216,10 @@ async fn run_datagram_loop(
             last_cleanup = now;
         }
 
-        let data = connection.read_datagram().await.map_err(|err| {
-            std::io::Error::other(format!("failed to read datagram: {err}"))
-        })?;
+        let data = connection
+            .read_datagram()
+            .await
+            .map_err(|err| std::io::Error::other(format!("failed to read datagram: {err}")))?;
 
         if data.len() < 2 {
             return Err(std::io::Error::other("invalid message: too short"));
@@ -1303,46 +1269,30 @@ async fn run_datagram_loop(
                     ));
                 }
                 let address_bytes = &data[12..12 + address_len];
-                let address_str =
-                    std::str::from_utf8(address_bytes).map_err(|e| {
-                        std::io::Error::other(format!(
-                            "decode UDP message: invalid UTF-8: {e}"
-                        ))
-                    })?;
-                let address = Address::from(address_str).map_err(|e| {
-                    std::io::Error::other(format!(
-                        "decode UDP message: invalid address: {e}"
-                    ))
+                let address_str = std::str::from_utf8(address_bytes).map_err(|e| {
+                    std::io::Error::other(format!("decode UDP message: invalid UTF-8: {e}"))
                 })?;
-                let port = u16::from_be_bytes([
-                    data[12 + address_len],
-                    data[12 + address_len + 1],
-                ]);
+                let address = Address::from(address_str).map_err(|e| {
+                    std::io::Error::other(format!("decode UDP message: invalid address: {e}"))
+                })?;
+                let port = u16::from_be_bytes([data[12 + address_len], data[12 + address_len + 1]]);
                 (Some(NetLocation::new(address, port)), 12 + address_len + 2)
             }
             0x01 => {
                 if data_len < 17 + payload_size {
-                    return Err(std::io::Error::other(
-                        "decode UDP message: IPv4 too short",
-                    ));
+                    return Err(std::io::Error::other("decode UDP message: IPv4 too short"));
                 }
-                let ipv4_addr =
-                    Ipv4Addr::new(data[11], data[12], data[13], data[14]);
+                let ipv4_addr = Ipv4Addr::new(data[11], data[12], data[13], data[14]);
                 let port = u16::from_be_bytes([data[15], data[16]]);
                 (Some(NetLocation::new(Address::Ipv4(ipv4_addr), port)), 17)
             }
             0x02 => {
                 if data_len < 29 + payload_size {
-                    return Err(std::io::Error::other(
-                        "decode UDP message: IPv6 too short",
-                    ));
+                    return Err(std::io::Error::other("decode UDP message: IPv6 too short"));
                 }
-                let ipv6_bytes: [u8; 16] =
-                    data[11..27].try_into().map_err(|_| {
-                        std::io::Error::other(
-                            "decode UDP message: invalid IPv6 bytes",
-                        )
-                    })?;
+                let ipv6_bytes: [u8; 16] = data[11..27]
+                    .try_into()
+                    .map_err(|_| std::io::Error::other("decode UDP message: invalid IPv6 bytes"))?;
                 let ipv6_addr = Ipv6Addr::from(ipv6_bytes);
                 let port = u16::from_be_bytes([data[27], data[28]]);
                 (Some(NetLocation::new(Address::Ipv6(ipv6_addr), port)), 29)
@@ -1414,19 +1364,13 @@ impl AsyncWrite for QuicStream {
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.get_mut().send)
             .poll_flush(cx)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.get_mut().send)
             .poll_shutdown(cx)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
@@ -1466,8 +1410,7 @@ mod tests {
 
     #[test]
     fn serialize_address_ipv4() {
-        let location =
-            NetLocation::new(Address::Ipv4(Ipv4Addr::new(1, 2, 3, 4)), 8080);
+        let location = NetLocation::new(Address::Ipv4(Ipv4Addr::new(1, 2, 3, 4)), 8080);
         let bytes = serialize_address(&location);
         assert_eq!(bytes[0], 0x01);
         assert_eq!(&bytes[1..5], &[1, 2, 3, 4]);
