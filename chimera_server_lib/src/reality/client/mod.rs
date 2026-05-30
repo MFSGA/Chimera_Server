@@ -76,6 +76,7 @@ pub struct RealityClientConnection {
     pub(super) plaintext_read_buf: SlideBuffer,  // Decrypted application data
     pub(super) plaintext_write_buf: Vec<u8>,     // Application data to encrypt
     pub(super) received_close_notify: bool,      // Peer sent close_notify alert
+    fatal_error: Option<io::ErrorKind>, // Fatal error occurred, connection unusable
 }
 
 impl RealityClientConnection {
@@ -102,6 +103,7 @@ impl RealityClientConnection {
             plaintext_read_buf: SlideBuffer::new(PLAINTEXT_READ_BUF_CAPACITY),
             plaintext_write_buf: Vec::with_capacity(common::TLS_MAX_RECORD_SIZE),
             received_close_notify: false,
+            fatal_error: None,
         };
 
         // Generate ClientHello immediately
@@ -132,10 +134,31 @@ impl RealityClientConnection {
 
     /// Process buffered packets and advance state machine
     pub fn process_new_packets(&mut self) -> io::Result<RealityIoState> {
+        if let Some(error_kind) = self.fatal_error {
+            return Err(io::Error::new(error_kind, "connection previously failed"));
+        }
+
         if self.received_close_notify {
             return Ok(RealityIoState::new(self.plaintext_read_buf.len()));
         }
 
+        let result = self.process_new_packets_inner();
+
+        if let Err(ref err) = result {
+            match err.kind() {
+                io::ErrorKind::InvalidData
+                | io::ErrorKind::PermissionDenied
+                | io::ErrorKind::ConnectionAborted => {
+                    self.fatal_error = Some(err.kind());
+                }
+                _ => {}
+            }
+        }
+
+        result
+    }
+
+    fn process_new_packets_inner(&mut self) -> io::Result<RealityIoState> {
         loop {
             let before_state = std::mem::discriminant(&self.handshake_state);
             let before_ciphertext_len = self.ciphertext_read_buf.len();
