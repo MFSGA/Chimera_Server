@@ -171,7 +171,7 @@ pub fn construct_certificate(cert_der: &[u8]) -> Result<Vec<u8>> {
 ///
 /// # Arguments
 /// * `signing_key` - Ed25519 signing key
-/// * `handshake_hash` - SHA256 hash of all handshake messages up to this point
+/// * `handshake_hash` - Hash of all handshake messages up to this point
 pub fn construct_certificate_verify(
     signing_key: &Ed25519KeyPair,
     handshake_hash: &[u8],
