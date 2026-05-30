@@ -5,6 +5,7 @@ use aws_lc_rs::{
 use base64::engine::{Engine as _, general_purpose::URL_SAFE_NO_PAD};
 
 use super::buf_reader::BufReader;
+use super::reality_cipher_suite::CipherSuite;
 
 /// Decodes a base64url-encoded public key
 pub fn decode_public_key(encoded: &str) -> Result<[u8; 32], std::io::Error> {
@@ -446,6 +447,19 @@ pub fn extract_client_cipher_suites(
     Ok(cipher_suites)
 }
 
+/// Negotiate the first server-preferred cipher suite also offered by the client.
+pub fn negotiate_cipher_suite(
+    server_preferences: &[CipherSuite],
+    client_cipher_suite_ids: &[u16],
+) -> Option<CipherSuite> {
+    for server_suite in server_preferences {
+        if client_cipher_suite_ids.contains(&server_suite.id()) {
+            return Some(*server_suite);
+        }
+    }
+    None
+}
+
 pub fn generate_keypair() -> std::io::Result<(String, String)> {
     // Step 1: Generate 32 random bytes for private key
     let rng = SystemRandom::new();
@@ -588,5 +602,23 @@ mod tests {
 
         let cipher_suites = extract_client_cipher_suites(&record).unwrap();
         assert_eq!(cipher_suites, vec![0x1301, 0x1303]);
+    }
+
+    #[test]
+    fn test_negotiate_cipher_suite_uses_server_order() {
+        let selected = negotiate_cipher_suite(
+            &[
+                CipherSuite::AES_128_GCM_SHA256,
+                CipherSuite::CHACHA20_POLY1305_SHA256,
+            ],
+            &[0x1303, 0x1301],
+        )
+        .unwrap();
+        assert_eq!(selected, CipherSuite::AES_128_GCM_SHA256);
+
+        assert!(
+            negotiate_cipher_suite(&[CipherSuite::AES_128_GCM_SHA256], &[0x1303])
+                .is_none()
+        );
     }
 }
