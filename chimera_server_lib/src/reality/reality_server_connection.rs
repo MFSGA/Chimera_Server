@@ -147,15 +147,34 @@ impl RealityServerConnection {
             return Ok(RealityIoState::new(self.plaintext_read_buf.len()));
         }
 
-        match &self.handshake_state {
-            HandshakeState::Initial => {
-                self.process_client_hello()?;
+        loop {
+            let before_state = std::mem::discriminant(&self.handshake_state);
+            let before_ciphertext_len = self.ciphertext_read_buf.len();
+            let before_plaintext_len = self.plaintext_read_buf.len();
+
+            match &self.handshake_state {
+                HandshakeState::Initial => {
+                    self.process_client_hello()?;
+                }
+                HandshakeState::ServerHelloSent { .. } => {
+                    self.process_client_finished()?;
+                }
+                HandshakeState::Complete => {
+                    self.process_application_data()?;
+                }
             }
-            HandshakeState::ServerHelloSent { .. } => {
-                self.process_client_finished()?;
+
+            if self.received_close_notify {
+                break;
             }
-            HandshakeState::Complete => {
-                self.process_application_data()?;
+
+            let progressed = before_state
+                != std::mem::discriminant(&self.handshake_state)
+                || before_ciphertext_len != self.ciphertext_read_buf.len()
+                || before_plaintext_len != self.plaintext_read_buf.len();
+
+            if !progressed {
+                break;
             }
         }
 
