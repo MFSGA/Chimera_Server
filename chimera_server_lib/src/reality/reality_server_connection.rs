@@ -23,7 +23,6 @@ use super::reality_io_state::RealityIoState;
 use super::reality_reader_writer::{RealityReader, RealityWriter};
 use super::reality_records::{
     RecordDecryptor, RecordEncryptor, encrypt_handshake_to_records_for_suite,
-    encrypt_plaintext_to_records_for_suite,
 };
 use super::reality_tls13_keys::{
     compute_finished_verify_data_for_suite, derive_application_secrets_for_suite,
@@ -82,9 +81,9 @@ pub struct RealityServerConnection {
     handshake_state: HandshakeState,
 
     // TLS 1.3 application traffic encryption (post-handshake)
-    app_read_key: Option<Vec<u8>>,
+    app_read_key: Option<AeadKey>,
     app_read_iv: Option<Vec<u8>>,
-    app_write_key: Option<Vec<u8>>,
+    app_write_key: Option<AeadKey>,
     app_write_iv: Option<Vec<u8>>,
     read_seq: u64,
     write_seq: u64,
@@ -769,10 +768,12 @@ impl RealityServerConnection {
             )?;
 
         // Derive application traffic keys
-        let (client_app_key, client_app_iv) =
+        let (client_app_key_bytes, client_app_iv) =
             derive_traffic_keys_for_suite(&client_app_secret, cipher_suite)?;
-        let (server_app_key, server_app_iv) =
+        let (server_app_key_bytes, server_app_iv) =
             derive_traffic_keys_for_suite(&server_app_secret, cipher_suite)?;
+        let client_app_key = AeadKey::new(cipher_suite, &client_app_key_bytes)?;
+        let server_app_key = AeadKey::new(cipher_suite, &server_app_key_bytes)?;
 
         // Store application traffic keys
         self.app_read_key = Some(client_app_key);
@@ -798,15 +799,6 @@ impl RealityServerConnection {
                 (Some(key), Some(iv)) => (key, iv),
                 _ => return Ok(()), // Keys not ready yet
             };
-        let cipher_suite_id = self.cipher_suite;
-        let cipher_suite = CipherSuite::from_id(cipher_suite_id).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Invalid REALITY cipher suite in state: 0x{cipher_suite_id:04x}"),
-            )
-        })?;
-        let aead_key = AeadKey::new(cipher_suite, app_read_key)?;
-
         // Process all complete TLS records in the buffer
         while self.ciphertext_read_buf.len() >= TLS_RECORD_HEADER_SIZE {
             // Parse TLS record header
@@ -827,8 +819,11 @@ impl RealityServerConnection {
                 let ciphertext = self
                     .ciphertext_read_buf
                     .slice_mut(TLS_RECORD_HEADER_SIZE..total_record_len);
-                let mut decryptor =
-                    RecordDecryptor::new(&aead_key, app_read_iv, &mut self.read_seq);
+                let mut decryptor = RecordDecryptor::new(
+                    app_read_key,
+                    app_read_iv,
+                    &mut self.read_seq,
+                );
                 let (content_type, plaintext) = decryptor
                     .decrypt_record_in_place(ciphertext, record_len as u16)?;
 
@@ -932,23 +927,13 @@ impl RealityServerConnection {
                     }
                 };
 
-            let cipher_suite =
-                CipherSuite::from_id(self.cipher_suite).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "Invalid REALITY cipher suite in state: 0x{:04x}",
-                            self.cipher_suite
-                        ),
-                    )
-                })?;
-
-            encrypt_plaintext_to_records_for_suite(
-                cipher_suite,
-                &mut self.plaintext_write_buf,
+            let mut encryptor = RecordEncryptor::new(
                 app_write_key,
                 app_write_iv,
                 &mut self.write_seq,
+            );
+            encryptor.encrypt_app_data(
+                &mut self.plaintext_write_buf,
                 &mut self.ciphertext_write_buf,
             )?;
         }
@@ -1004,22 +989,9 @@ impl RealityServerConnection {
             }
         };
 
-        let cipher_suite = match CipherSuite::from_id(self.cipher_suite) {
-            Some(cipher_suite) => cipher_suite,
-            None => {
-                tracing::error!(
-                    "REALITY: Cannot send close_notify - invalid cipher suite 0x{:04x}",
-                    self.cipher_suite
-                );
-                return;
-            }
-        };
-
-        match AeadKey::new(cipher_suite, app_write_key).and_then(|aead_key| {
-            let mut encryptor =
-                RecordEncryptor::new(&aead_key, app_write_iv, &mut self.write_seq);
-            encryptor.encrypt_close_notify(&mut self.ciphertext_write_buf)
-        }) {
+        let mut encryptor =
+            RecordEncryptor::new(app_write_key, app_write_iv, &mut self.write_seq);
+        match encryptor.encrypt_close_notify(&mut self.ciphertext_write_buf) {
             Ok(()) => {
                 tracing::debug!("REALITY: Encrypted close_notify alert queued");
             }
