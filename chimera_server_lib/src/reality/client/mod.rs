@@ -3,10 +3,13 @@ mod process;
 
 use std::io::{self, Read, Write};
 
+use super::reality_aead::AeadKey;
 use super::reality_cipher_suite::CipherSuite;
 use super::reality_io_state::RealityIoState;
 use super::reality_reader_writer::{RealityReader, RealityWriter};
-use super::reality_records::encrypt_plaintext_to_records_for_suite;
+use super::reality_records::{
+    RecordEncryptor, encrypt_plaintext_to_records_for_suite,
+};
 use super::slide_buffer::SlideBuffer;
 use crate::reality::common::{
     self, CIPHERTEXT_READ_BUF_CAPACITY, OUTGOING_BUFFER_LIMIT,
@@ -291,14 +294,6 @@ impl RealityClientConnection {
             }
         };
 
-        // Use common helper to build encrypted close_notify alert
-        let Some(next_write_seq) = self.write_seq.checked_add(1) else {
-            tracing::error!(
-                "REALITY CLIENT: Cannot send close_notify - TLS sequence number exhausted"
-            );
-            return;
-        };
-
         let cipher_suite = match CipherSuite::from_id(self.cipher_suite) {
             Some(cipher_suite) => cipher_suite,
             None => {
@@ -310,15 +305,12 @@ impl RealityClientConnection {
             }
         };
 
-        match common::build_close_notify_alert(
-            cipher_suite,
-            app_write_key,
-            app_write_iv,
-            self.write_seq,
-        ) {
-            Ok(record) => {
-                self.write_seq = next_write_seq;
-                self.ciphertext_write_buf.extend_from_slice(&record);
+        match AeadKey::new(cipher_suite, app_write_key).and_then(|aead_key| {
+            let mut encryptor =
+                RecordEncryptor::new(&aead_key, app_write_iv, &mut self.write_seq);
+            encryptor.encrypt_close_notify(&mut self.ciphertext_write_buf)
+        }) {
+            Ok(()) => {
                 tracing::debug!(
                     "REALITY CLIENT: Encrypted close_notify alert queued"
                 );
