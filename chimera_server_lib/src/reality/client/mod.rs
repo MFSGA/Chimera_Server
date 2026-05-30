@@ -298,7 +298,19 @@ impl RealityClientConnection {
             return;
         };
 
+        let cipher_suite = match CipherSuite::from_id(self.cipher_suite) {
+            Some(cipher_suite) => cipher_suite,
+            None => {
+                tracing::error!(
+                    "REALITY CLIENT: Cannot send close_notify - invalid cipher suite 0x{:04x}",
+                    self.cipher_suite
+                );
+                return;
+            }
+        };
+
         match common::build_close_notify_alert(
+            cipher_suite,
             app_write_key,
             app_write_iv,
             self.write_seq,
