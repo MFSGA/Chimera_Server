@@ -32,7 +32,6 @@ pub struct RealityClientConfig {
 enum HandshakeState {
     /// ClientHello sent, waiting for ServerHello
     AwaitingServerHello {
-        client_hello_hash: [u8; 32],
         client_hello_bytes: Vec<u8>, // Full ClientHello handshake message
         client_private_key: [u8; 32],
         auth_key: [u8; 32], // REALITY authentication key for HMAC verification
@@ -87,7 +86,6 @@ impl RealityClientConnection {
         let mut conn = RealityClientConnection {
             config,
             handshake_state: HandshakeState::AwaitingServerHello {
-                client_hello_hash: [0u8; 32],
                 client_hello_bytes: Vec::new(),
                 client_private_key: [0u8; 32],
                 auth_key: [0u8; 32],
