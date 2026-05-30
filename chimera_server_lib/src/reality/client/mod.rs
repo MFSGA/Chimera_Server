@@ -60,7 +60,7 @@ pub struct RealityClientConnection {
     pub(super) config: RealityClientConfig,
 
     // Handshake state
-    pub(super) handshake_state: HandshakeState,
+    handshake_state: HandshakeState,
 
     // TLS 1.3 application traffic encryption (post-handshake)
     pub(super) app_read_key: Option<AeadKey>,
