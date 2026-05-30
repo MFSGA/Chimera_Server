@@ -3,9 +3,10 @@ mod process;
 
 use std::io::{self, Read, Write};
 
+use super::reality_cipher_suite::CipherSuite;
 use super::reality_io_state::RealityIoState;
 use super::reality_reader_writer::{RealityReader, RealityWriter};
-use super::reality_records::encrypt_plaintext_to_records;
+use super::reality_records::encrypt_plaintext_to_records_for_suite;
 use super::slide_buffer::SlideBuffer;
 use crate::reality::common::{
     self, CIPHERTEXT_READ_BUF_CAPACITY, PLAINTEXT_READ_BUF_CAPACITY,
@@ -229,7 +230,19 @@ impl RealityClientConnection {
                     }
                 };
 
-            encrypt_plaintext_to_records(
+            let cipher_suite =
+                CipherSuite::from_id(self.cipher_suite).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "Invalid REALITY cipher suite in state: 0x{:04x}",
+                            self.cipher_suite
+                        ),
+                    )
+                })?;
+
+            encrypt_plaintext_to_records_for_suite(
+                cipher_suite,
                 &mut self.plaintext_write_buf,
                 app_write_key,
                 app_write_iv,

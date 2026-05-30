@@ -167,7 +167,28 @@ fn make_record_header(ciphertext_len: usize) -> [u8; TLS_RECORD_HEADER_SIZE] {
 /// * `Ok(())` on success
 /// * `Err` if encryption fails
 #[inline]
+#[cfg(test)]
 pub fn encrypt_plaintext_to_records(
+    plaintext: &mut Vec<u8>,
+    app_write_key: &[u8],
+    app_write_iv: &[u8],
+    write_seq: &mut u64,
+    ciphertext_buf: &mut Vec<u8>,
+) -> io::Result<()> {
+    encrypt_plaintext_to_records_for_suite(
+        CipherSuite::AES_128_GCM_SHA256,
+        plaintext,
+        app_write_key,
+        app_write_iv,
+        write_seq,
+        ciphertext_buf,
+    )
+}
+
+/// Encrypt plaintext into TLS 1.3 application data records for a selected cipher suite.
+#[inline]
+pub(crate) fn encrypt_plaintext_to_records_for_suite(
+    cipher_suite: CipherSuite,
     plaintext: &mut Vec<u8>,
     app_write_key: &[u8],
     app_write_iv: &[u8],
@@ -178,7 +199,7 @@ pub fn encrypt_plaintext_to_records(
         return Ok(());
     }
 
-    let aead_key = AeadKey::new(CipherSuite::AES_128_GCM_SHA256, app_write_key)?;
+    let aead_key = AeadKey::new(cipher_suite, app_write_key)?;
     let mut encryptor = RecordEncryptor::new(&aead_key, app_write_iv, write_seq);
     encryptor.encrypt_app_data(plaintext, ciphertext_buf)
 }
@@ -209,7 +230,28 @@ fn checked_next_sequence(seq: u64) -> io::Result<u64> {
 /// * `Ok(())` on success
 /// * `Err` if encryption fails
 #[inline]
+#[cfg(test)]
 pub fn encrypt_handshake_to_records(
+    handshake_data: &[u8],
+    key: &[u8],
+    iv: &[u8],
+    write_seq: &mut u64,
+    ciphertext_buf: &mut Vec<u8>,
+) -> io::Result<()> {
+    encrypt_handshake_to_records_for_suite(
+        CipherSuite::AES_128_GCM_SHA256,
+        handshake_data,
+        key,
+        iv,
+        write_seq,
+        ciphertext_buf,
+    )
+}
+
+/// Encrypt handshake data into TLS 1.3 records for a selected cipher suite.
+#[inline]
+pub(crate) fn encrypt_handshake_to_records_for_suite(
+    cipher_suite: CipherSuite,
     handshake_data: &[u8],
     key: &[u8],
     iv: &[u8],
@@ -220,7 +262,7 @@ pub fn encrypt_handshake_to_records(
         return Ok(());
     }
 
-    let aead_key = AeadKey::new(CipherSuite::AES_128_GCM_SHA256, key)?;
+    let aead_key = AeadKey::new(cipher_suite, key)?;
     let mut encryptor = RecordEncryptor::new(&aead_key, iv, write_seq);
     encryptor.encrypt_handshake(handshake_data, ciphertext_buf)
 }

@@ -15,14 +15,16 @@ use super::common::{
     HANDSHAKE_TYPE_FINISHED, PLAINTEXT_READ_BUF_CAPACITY, TLS_MAX_RECORD_SIZE,
     TLS_RECORD_HEADER_SIZE, strip_content_type_with_padding,
 };
-use super::reality_aead::{decrypt_handshake_message, decrypt_tls13_record};
+use super::reality_aead::{
+    decrypt_handshake_message_for_suite, decrypt_tls13_record_for_suite,
+};
 use super::reality_auth::{decrypt_session_id, derive_auth_key, perform_ecdh};
 use super::reality_certificate::generate_hmac_certificate;
 use super::reality_cipher_suite::CipherSuite;
 use super::reality_io_state::RealityIoState;
 use super::reality_reader_writer::{RealityReader, RealityWriter};
 use super::reality_records::{
-    encrypt_handshake_to_records, encrypt_plaintext_to_records,
+    encrypt_handshake_to_records_for_suite, encrypt_plaintext_to_records_for_suite,
 };
 use super::reality_tls13_keys::{
     compute_finished_verify_data_for_suite, derive_application_secrets_for_suite,
@@ -548,7 +550,8 @@ impl RealityServerConnection {
         // Large certificates can exceed this, so we fragment like uTLS does.
         let mut handshake_ciphertext = Vec::new();
         let mut handshake_seq = 0u64;
-        encrypt_handshake_to_records(
+        encrypt_handshake_to_records_for_suite(
+            cipher_suite,
             &combined_plaintext,
             &server_hs_key,
             &server_hs_iv,
@@ -709,7 +712,8 @@ impl RealityServerConnection {
         )?;
 
         // Decrypt the Finished message (sequence number = 0 for client's first encrypted record)
-        let plaintext = decrypt_handshake_message(
+        let plaintext = decrypt_handshake_message_for_suite(
+            cipher_suite,
             &client_hs_key,
             &client_hs_iv,
             0, // Client's first encrypted record
@@ -795,6 +799,13 @@ impl RealityServerConnection {
                 (Some(key), Some(iv)) => (key, iv),
                 _ => return Ok(()), // Keys not ready yet
             };
+        let cipher_suite_id = self.cipher_suite;
+        let cipher_suite = CipherSuite::from_id(cipher_suite_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid REALITY cipher suite in state: 0x{cipher_suite_id:04x}"),
+            )
+        })?;
 
         // Process all complete TLS records in the buffer
         while self.ciphertext_read_buf.len() >= 5 {
@@ -824,7 +835,8 @@ impl RealityServerConnection {
             self.ciphertext_read_buf.consume(total_record_len);
 
             // Decrypt the application data
-            let mut plaintext = decrypt_tls13_record(
+            let mut plaintext = decrypt_tls13_record_for_suite(
+                cipher_suite,
                 app_read_key,
                 app_read_iv,
                 self.read_seq,
@@ -926,7 +938,19 @@ impl RealityServerConnection {
                     }
                 };
 
-            encrypt_plaintext_to_records(
+            let cipher_suite =
+                CipherSuite::from_id(self.cipher_suite).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "Invalid REALITY cipher suite in state: 0x{:04x}",
+                            self.cipher_suite
+                        ),
+                    )
+                })?;
+
+            encrypt_plaintext_to_records_for_suite(
+                cipher_suite,
                 &mut self.plaintext_write_buf,
                 app_write_key,
                 app_write_iv,

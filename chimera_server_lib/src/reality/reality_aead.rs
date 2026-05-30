@@ -135,7 +135,7 @@ impl AeadKey {
     }
 }
 
-fn encrypt_tls13_record_with_cipher_suite(
+pub(crate) fn encrypt_tls13_record_for_suite(
     cipher_suite: CipherSuite,
     key: &[u8],
     iv: &[u8],
@@ -151,7 +151,7 @@ fn encrypt_tls13_record_with_cipher_suite(
     )
 }
 
-fn decrypt_tls13_record_with_cipher_suite(
+pub(crate) fn decrypt_tls13_record_for_suite(
     cipher_suite: CipherSuite,
     key: &[u8],
     iv: &[u8],
@@ -185,7 +185,7 @@ pub fn encrypt_tls13_record(
     plaintext: &[u8],
     additional_data: &[u8],
 ) -> Result<Vec<u8>> {
-    encrypt_tls13_record_with_cipher_suite(
+    encrypt_tls13_record_for_suite(
         CipherSuite::AES_128_GCM_SHA256,
         key,
         iv,
@@ -206,6 +206,7 @@ pub fn encrypt_tls13_record(
 ///
 /// # Returns
 /// Plaintext data (including ContentType trailer)
+#[cfg(test)]
 pub fn decrypt_tls13_record(
     key: &[u8],
     iv: &[u8],
@@ -213,7 +214,7 @@ pub fn decrypt_tls13_record(
     ciphertext: &[u8],
     additional_data: &[u8],
 ) -> Result<Vec<u8>> {
-    decrypt_tls13_record_with_cipher_suite(
+    decrypt_tls13_record_for_suite(
         CipherSuite::AES_128_GCM_SHA256,
         key,
         iv,
@@ -226,7 +227,8 @@ pub fn decrypt_tls13_record(
 /// Decrypt TLS 1.3 handshake message
 ///
 /// Decrypts and extracts handshake message, removing ContentType trailer
-pub fn decrypt_handshake_message(
+pub(crate) fn decrypt_handshake_message_for_suite(
+    cipher_suite: CipherSuite,
     key: &[u8],
     iv: &[u8],
     sequence_number: u64,
@@ -240,7 +242,8 @@ pub fn decrypt_handshake_message(
         .extend_from_slice(&[VERSION_TLS_1_2_MAJOR, VERSION_TLS_1_2_MINOR]); // TLS 1.2
     additional_data.extend_from_slice(&record_length.to_be_bytes());
 
-    let mut plaintext = decrypt_tls13_record(
+    let mut plaintext = decrypt_tls13_record_for_suite(
+        cipher_suite,
         key,
         iv,
         sequence_number,
@@ -251,6 +254,27 @@ pub fn decrypt_handshake_message(
     let _ = strip_content_type_with_padding(&mut plaintext)?;
 
     Ok(plaintext)
+}
+
+/// Decrypt TLS 1.3 handshake message using AES-128-GCM.
+///
+/// Decrypts and extracts handshake message, removing ContentType trailer.
+#[cfg(test)]
+pub fn decrypt_handshake_message(
+    key: &[u8],
+    iv: &[u8],
+    sequence_number: u64,
+    ciphertext: &[u8],
+    record_length: u16,
+) -> Result<Vec<u8>> {
+    decrypt_handshake_message_for_suite(
+        CipherSuite::AES_128_GCM_SHA256,
+        key,
+        iv,
+        sequence_number,
+        ciphertext,
+        record_length,
+    )
 }
 
 #[cfg(test)]
