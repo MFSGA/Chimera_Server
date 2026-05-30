@@ -9,9 +9,9 @@ use super::{HandshakeState, RealityClientConnection};
 use crate::reality::reality_auth::{
     derive_auth_key, encrypt_session_id, perform_ecdh,
 };
+use crate::reality::reality_cipher_suite::DEFAULT_CIPHER_SUITES;
 use crate::reality::reality_tls13_messages::{
-    DEFAULT_ALPN_PROTOCOLS, DEFAULT_CIPHER_SUITE_IDS, construct_client_hello,
-    write_record_header,
+    DEFAULT_ALPN_PROTOCOLS, construct_client_hello, write_record_header,
 };
 
 pub(super) fn generate_client_hello(
@@ -69,12 +69,20 @@ pub(super) fn generate_client_hello(
     session_id_for_hello[0..16].copy_from_slice(&session_id_plaintext);
 
     // Build ClientHello with plaintext SessionId first
+    // Use configured cipher suites or defaults if none specified
+    let cipher_suites = if conn.config.cipher_suites.is_empty() {
+        DEFAULT_CIPHER_SUITES.to_vec()
+    } else {
+        conn.config.cipher_suites.clone()
+    };
+    let cipher_suite_ids: Vec<u16> =
+        cipher_suites.iter().map(|suite| suite.id()).collect();
     let mut client_hello = construct_client_hello(
         &client_random,
         &session_id_for_hello,
         our_public_key_bytes.as_ref(),
         &conn.config.server_name,
-        DEFAULT_CIPHER_SUITE_IDS,
+        &cipher_suite_ids,
         DEFAULT_ALPN_PROTOCOLS,
     )?;
 
