@@ -59,6 +59,12 @@ impl SlideBuffer {
         self.end - self.start
     }
 
+    /// Returns true when the buffer contains no readable data.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.start >= self.end
+    }
+
     /// Returns the remaining space available for writing.
     ///
     /// This is the space at the end of the buffer. To reclaim space
@@ -256,6 +262,7 @@ mod tests {
     fn test_new_buffer() {
         let buf = SlideBuffer::new(1024);
         assert_eq!(buf.len(), 0);
+        assert!(buf.is_empty());
         assert_eq!(buf.remaining_capacity(), 1024);
     }
 
@@ -264,6 +271,7 @@ mod tests {
         let mut buf = SlideBuffer::new(1024);
         buf.extend_from_slice(b"hello");
         assert_eq!(buf.len(), 5);
+        assert!(!buf.is_empty());
         assert_eq!(buf.as_slice(), b"hello");
         assert_eq!(buf.remaining_capacity(), 1024 - 5);
     }
@@ -283,6 +291,7 @@ mod tests {
         buf.extend_from_slice(b"hello");
         buf.consume(5);
         assert_eq!(buf.len(), 0);
+        assert!(buf.is_empty());
         assert_eq!(buf.remaining_capacity(), 1024);
     }
 
