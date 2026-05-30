@@ -18,7 +18,7 @@ use super::common::{
 use super::reality_aead::{AeadKey, decrypt_handshake_message_for_suite};
 use super::reality_auth::{decrypt_session_id, derive_auth_key, perform_ecdh};
 use super::reality_certificate::generate_hmac_certificate;
-use super::reality_cipher_suite::CipherSuite;
+use super::reality_cipher_suite::{CipherSuite, DEFAULT_CIPHER_SUITES};
 use super::reality_io_state::RealityIoState;
 use super::reality_reader_writer::{RealityReader, RealityWriter};
 use super::reality_records::{RecordDecryptor, RecordEncryptor};
@@ -52,6 +52,8 @@ pub struct RealityServerConfig {
     pub min_client_version: Option<[u8; 3]>,
     /// Maximum accepted client version (3 bytes: major.minor.patch)
     pub max_client_version: Option<[u8; 3]>,
+    /// Supported TLS 1.3 cipher suites (empty = use defaults)
+    pub cipher_suites: Vec<CipherSuite>,
 }
 
 /// Handshake state machine for REALITY server
@@ -233,17 +235,19 @@ impl RealityServerConnection {
         let client_public_key = extract_client_public_key(&client_hello)?;
         let client_cipher_suites = extract_client_cipher_suites(&client_hello)?;
 
-        // Current key schedule and AEAD paths are limited to TLS_AES_128_GCM_SHA256.
-        let cipher_suite = negotiate_cipher_suite(
-            &[CipherSuite::AES_128_GCM_SHA256],
-            &client_cipher_suites,
-        )
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Client did not offer required REALITY cipher suite: 0x1301",
-            )
-        })?;
+        let server_cipher_suites = if self.config.cipher_suites.is_empty() {
+            DEFAULT_CIPHER_SUITES
+        } else {
+            &self.config.cipher_suites
+        };
+        let cipher_suite =
+            negotiate_cipher_suite(server_cipher_suites, &client_cipher_suites)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "No common TLS 1.3 cipher suite found",
+                    )
+                })?;
         let cipher_suite_id = cipher_suite.id();
 
         tracing::debug!(
@@ -1029,6 +1033,7 @@ mod tests {
             max_time_diff: Some(60000),
             min_client_version: None,
             max_client_version: None,
+            cipher_suites: Vec::new(),
         };
 
         let conn = RealityServerConnection::new(config).unwrap();
@@ -1046,6 +1051,7 @@ mod tests {
             max_time_diff: None,
             min_client_version: None,
             max_client_version: None,
+            cipher_suites: Vec::new(),
         };
 
         let mut conn = RealityServerConnection::new(config).unwrap();
@@ -1064,6 +1070,7 @@ mod tests {
             max_time_diff: None,
             min_client_version: None,
             max_client_version: None,
+            cipher_suites: Vec::new(),
         };
         let mut conn = RealityServerConnection::new(config).unwrap();
 
@@ -1090,6 +1097,7 @@ mod tests {
             max_time_diff: None,
             min_client_version: None,
             max_client_version: None,
+            cipher_suites: Vec::new(),
         };
         let mut conn = RealityServerConnection::new(config).unwrap();
 
