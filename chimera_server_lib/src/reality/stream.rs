@@ -19,6 +19,7 @@ pub trait RealitySession {
     fn writer(&mut self) -> RealityWriter<'_>;
     fn write_tls(&mut self, wr: &mut dyn Write) -> io::Result<usize>;
     fn wants_write(&self) -> bool;
+    fn wants_read(&self) -> bool;
     fn is_handshaking(&self) -> bool;
     fn take_remaining_ciphertext(&mut self) -> Vec<u8> {
         Vec::new()
@@ -49,6 +50,10 @@ impl RealitySession for RealityServerConnection {
 
     fn wants_write(&self) -> bool {
         RealityServerConnection::wants_write(self)
+    }
+
+    fn wants_read(&self) -> bool {
+        RealityServerConnection::wants_read(self)
     }
 
     fn is_handshaking(&self) -> bool {
@@ -87,6 +92,10 @@ impl RealitySession for RealityClientConnection {
 
     fn wants_write(&self) -> bool {
         RealityClientConnection::wants_write(self)
+    }
+
+    fn wants_read(&self) -> bool {
+        RealityClientConnection::wants_read(self)
     }
 
     fn is_handshaking(&self) -> bool {
