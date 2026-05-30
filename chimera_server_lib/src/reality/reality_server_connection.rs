@@ -12,8 +12,8 @@ use super::common::{
     self, ALERT_DESC_CLOSE_NOTIFY, ALERT_LEVEL_WARNING,
     CIPHERTEXT_READ_BUF_CAPACITY, CONTENT_TYPE_ALERT, CONTENT_TYPE_APPLICATION_DATA,
     CONTENT_TYPE_CHANGE_CIPHER_SPEC, CONTENT_TYPE_HANDSHAKE,
-    HANDSHAKE_TYPE_FINISHED, PLAINTEXT_READ_BUF_CAPACITY, TLS_MAX_RECORD_SIZE,
-    TLS_RECORD_HEADER_SIZE, strip_content_type_with_padding,
+    HANDSHAKE_TYPE_FINISHED, OUTGOING_BUFFER_LIMIT, PLAINTEXT_READ_BUF_CAPACITY,
+    TLS_MAX_RECORD_SIZE, TLS_RECORD_HEADER_SIZE, strip_content_type_with_padding,
 };
 use super::reality_aead::{
     decrypt_handshake_message_for_suite, decrypt_tls13_record_for_suite,
@@ -118,9 +118,9 @@ impl RealityServerConnection {
             cipher_suite: 0,
             tls_read_buffer: Box::new([0u8; TLS_MAX_RECORD_SIZE]),
             ciphertext_read_buf: SlideBuffer::new(CIPHERTEXT_READ_BUF_CAPACITY),
-            ciphertext_write_buf: Vec::with_capacity(CIPHERTEXT_READ_BUF_CAPACITY),
+            ciphertext_write_buf: Vec::with_capacity(OUTGOING_BUFFER_LIMIT),
             plaintext_read_buf: SlideBuffer::new(PLAINTEXT_READ_BUF_CAPACITY),
-            plaintext_write_buf: Vec::with_capacity(TLS_MAX_RECORD_SIZE),
+            plaintext_write_buf: Vec::with_capacity(OUTGOING_BUFFER_LIMIT),
             received_close_notify: false,
             fatal_error: None,
         })

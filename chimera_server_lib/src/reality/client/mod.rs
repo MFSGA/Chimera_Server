@@ -9,7 +9,8 @@ use super::reality_reader_writer::{RealityReader, RealityWriter};
 use super::reality_records::encrypt_plaintext_to_records_for_suite;
 use super::slide_buffer::SlideBuffer;
 use crate::reality::common::{
-    self, CIPHERTEXT_READ_BUF_CAPACITY, PLAINTEXT_READ_BUF_CAPACITY,
+    self, CIPHERTEXT_READ_BUF_CAPACITY, OUTGOING_BUFFER_LIMIT,
+    PLAINTEXT_READ_BUF_CAPACITY,
 };
 use handshake::generate_client_hello;
 use process::{
@@ -100,9 +101,9 @@ impl RealityClientConnection {
             cipher_suite: 0,
             tls_read_buffer: Box::new([0u8; common::TLS_MAX_RECORD_SIZE]),
             ciphertext_read_buf: SlideBuffer::new(CIPHERTEXT_READ_BUF_CAPACITY),
-            ciphertext_write_buf: Vec::with_capacity(CIPHERTEXT_READ_BUF_CAPACITY),
+            ciphertext_write_buf: Vec::with_capacity(OUTGOING_BUFFER_LIMIT),
             plaintext_read_buf: SlideBuffer::new(PLAINTEXT_READ_BUF_CAPACITY),
-            plaintext_write_buf: Vec::with_capacity(common::TLS_MAX_RECORD_SIZE),
+            plaintext_write_buf: Vec::with_capacity(OUTGOING_BUFFER_LIMIT),
             received_close_notify: false,
             fatal_error: None,
         };

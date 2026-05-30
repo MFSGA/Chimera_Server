@@ -271,7 +271,7 @@ pub(crate) fn encrypt_handshake_to_records_for_suite(
 mod tests {
     use super::*;
     use crate::reality::common::{
-        CIPHERTEXT_READ_BUF_CAPACITY, TLS_MAX_RECORD_SIZE,
+        CIPHERTEXT_READ_BUF_CAPACITY, OUTGOING_BUFFER_LIMIT, TLS_MAX_RECORD_SIZE,
     };
 
     #[test]
@@ -282,6 +282,7 @@ mod tests {
         assert_eq!(TLS_RECORD_HEADER_SIZE, 5);
         assert_eq!(TLS_MAX_RECORD_SIZE, 16645); // 16640 + 5
         assert_eq!(CIPHERTEXT_READ_BUF_CAPACITY, 33290); // 2 * TLS_MAX_RECORD_SIZE
+        assert_eq!(OUTGOING_BUFFER_LIMIT, 64 * 1024);
     }
 
     #[test]
