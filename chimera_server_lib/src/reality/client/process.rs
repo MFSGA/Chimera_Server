@@ -31,16 +31,14 @@ pub(super) fn process_server_hello(
     conn: &mut RealityClientConnection,
 ) -> io::Result<()> {
     // Extract state
-    let (client_hello_hash, client_private_key, auth_key) =
-        match &conn.handshake_state {
-            HandshakeState::AwaitingServerHello {
-                client_hello_hash,
-                client_hello_bytes: _,
-                client_private_key,
-                auth_key,
-            } => (*client_hello_hash, *client_private_key, *auth_key),
-            _ => return Ok(()), // Wrong state
-        };
+    let (client_private_key, auth_key) = match &conn.handshake_state {
+        HandshakeState::AwaitingServerHello {
+            client_hello_bytes: _,
+            client_private_key,
+            auth_key,
+        } => (*client_private_key, *auth_key),
+        _ => return Ok(()), // Wrong state
+    };
 
     // Check if we have enough data for a TLS record header
     if conn.ciphertext_read_buf.len() < TLS_RECORD_HEADER_SIZE {
@@ -80,12 +78,6 @@ pub(super) fn process_server_hello(
             ),
         )
     })?;
-    if selected_suite != CipherSuite::AES_128_GCM_SHA256 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Unsupported REALITY cipher suite: 0x{cipher_suite_id:04x}"),
-        ));
-    }
     let cipher_suite = selected_suite;
     let cipher_suite_id = cipher_suite.id();
 
@@ -102,7 +94,7 @@ pub(super) fn process_server_hello(
         }
     };
 
-    let mut full_transcript = digest::Context::new(&digest::SHA256);
+    let mut full_transcript = digest::Context::new(cipher_suite.digest_algorithm());
     tracing::debug!(
         "REALITY CLIENT: Transcript includes ClientHello ({} bytes), first bytes: {:02x?}",
         client_hello_bytes.len(),
@@ -116,8 +108,14 @@ pub(super) fn process_server_hello(
     full_transcript.update(&client_hello_bytes); // Use actual ClientHello bytes, not hash!
     full_transcript.update(server_hello); // ServerHello already includes handshake header
     let server_hello_hash = full_transcript.finish();
-    let mut server_hello_hash_arr = [0u8; 32];
-    server_hello_hash_arr.copy_from_slice(server_hello_hash.as_ref());
+    let server_hello_hash_vec = server_hello_hash.as_ref().to_vec();
+
+    let client_hello_hash_vec = {
+        let mut client_transcript =
+            digest::Context::new(cipher_suite.digest_algorithm());
+        client_transcript.update(&client_hello_bytes);
+        client_transcript.finish().as_ref().to_vec()
+    };
 
     // Perform ECDH for TLS 1.3 key derivation
     let peer_public_key =
@@ -143,8 +141,8 @@ pub(super) fn process_server_hello(
     let hs_keys = derive_handshake_keys_for_suite(
         cipher_suite,
         &tls_shared_secret,
-        &client_hello_hash,
-        &server_hello_hash_arr,
+        &client_hello_hash_vec,
+        &server_hello_hash_vec,
     )?;
 
     tracing::debug!("REALITY: ServerHello processed, handshake keys derived");
@@ -385,7 +383,8 @@ pub(super) fn process_encrypted_handshake(
     if let (Some(public_key), Some(cv_offset)) =
         (ed25519_public_key, cert_verify_offset)
     {
-        let mut cv_transcript = digest::Context::new(&digest::SHA256);
+        let mut cv_transcript =
+            digest::Context::new(cipher_suite.digest_algorithm());
         cv_transcript.update(&transcript_bytes);
         cv_transcript.update(&accumulated_plaintext[..cv_offset]);
         let cv_transcript_hash = cv_transcript.finish();
@@ -415,17 +414,17 @@ pub(super) fn process_encrypted_handshake(
     }
 
     // Build handshake transcript
-    let mut handshake_transcript = digest::Context::new(&digest::SHA256);
+    let mut handshake_transcript =
+        digest::Context::new(cipher_suite.digest_algorithm());
     handshake_transcript.update(&transcript_bytes); // Contains actual ClientHello + ServerHello bytes
     handshake_transcript.update(&accumulated_plaintext[..offset]); // EncryptedExtensions + Certificate + CertificateVerify + Finished
 
     let handshake_hash = handshake_transcript.finish();
-    let mut handshake_hash_arr = [0u8; 32];
-    handshake_hash_arr.copy_from_slice(handshake_hash.as_ref());
+    let handshake_hash_vec = handshake_hash.as_ref().to_vec();
 
     tracing::info!(
         "REALITY CLIENT: Handshake hash for client Finished: {:02x?}",
-        handshake_hash_arr
+        handshake_hash_vec
     );
     tracing::info!(
         "REALITY CLIENT: Transcript bytes len={}, accumulated_plaintext len={}",
@@ -437,7 +436,7 @@ pub(super) fn process_encrypted_handshake(
     let client_verify_data = compute_finished_verify_data_for_suite(
         cipher_suite,
         &client_hs_secret,
-        &handshake_hash_arr,
+        &handshake_hash_vec,
     )?;
     tracing::info!(
         "REALITY CLIENT: Client verify data: {:02x?}",
@@ -467,7 +466,7 @@ pub(super) fn process_encrypted_handshake(
         derive_application_secrets_for_suite(
             cipher_suite,
             &master_secret,
-            &handshake_hash_arr,
+            &handshake_hash_vec,
         )?;
 
     // Derive application traffic keys
