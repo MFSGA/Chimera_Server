@@ -79,7 +79,6 @@ pub(super) fn process_server_hello(
         )
     })?;
     let cipher_suite = selected_suite;
-    let cipher_suite_id = cipher_suite.id();
 
     // Get the actual ClientHello bytes from our saved state
     let client_hello_bytes = match &conn.handshake_state {
@@ -161,7 +160,7 @@ pub(super) fn process_server_hello(
             .server_handshake_traffic_secret
             .clone(),
         master_secret: hs_keys.master_secret.clone(),
-        cipher_suite: cipher_suite_id,
+        cipher_suite,
         handshake_transcript_bytes: transcript_bytes,
         auth_key, // Pass auth_key for certificate HMAC verification
         handshake_seq: 0,
@@ -178,7 +177,7 @@ pub(super) fn process_encrypted_handshake(
         client_hs_secret,
         server_hs_secret,
         master_secret,
-        cipher_suite_id,
+        cipher_suite,
         transcript_bytes,
         auth_key,
         mut handshake_seq,
@@ -205,15 +204,6 @@ pub(super) fn process_encrypted_handshake(
         ),
         _ => return Ok(()),
     };
-
-    let cipher_suite = CipherSuite::from_id(cipher_suite_id).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "Invalid REALITY cipher suite in state: 0x{cipher_suite_id:04x}"
-            ),
-        )
-    })?;
 
     let (server_hs_key, server_hs_iv) =
         derive_traffic_keys_for_suite(&server_hs_secret, cipher_suite)?;
@@ -363,7 +353,7 @@ pub(super) fn process_encrypted_handshake(
             client_handshake_traffic_secret: client_hs_secret,
             server_handshake_traffic_secret: server_hs_secret,
             master_secret,
-            cipher_suite: cipher_suite_id,
+            cipher_suite,
             handshake_transcript_bytes: transcript_bytes,
             auth_key,
             handshake_seq,
@@ -484,7 +474,7 @@ pub(super) fn process_encrypted_handshake(
     conn.app_write_iv = Some(client_app_iv);
     conn.read_seq = 0;
     conn.write_seq = 0;
-    conn.cipher_suite = cipher_suite_id;
+    conn.cipher_suite = Some(cipher_suite);
 
     // Mark handshake complete
     conn.handshake_state = HandshakeState::Complete;
