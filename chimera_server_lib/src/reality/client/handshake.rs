@@ -120,7 +120,6 @@ pub(super) fn generate_client_hello(
 
     // Update state
     conn.handshake_state = HandshakeState::AwaitingServerHello {
-        client_hello_hash: digest_client_hello(&client_hello),
         client_hello_bytes: client_hello.clone(), // Save the actual ClientHello bytes
         client_private_key: our_private_bytes,
         auth_key, // Save auth_key for HMAC certificate verification
@@ -132,14 +131,4 @@ pub(super) fn generate_client_hello(
     );
 
     Ok(())
-}
-
-fn digest_client_hello(client_hello: &[u8]) -> [u8; 32] {
-    let mut ch_transcript =
-        aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
-    ch_transcript.update(client_hello);
-    let client_hello_hash = ch_transcript.finish();
-    let mut client_hello_hash_arr = [0u8; 32];
-    client_hello_hash_arr.copy_from_slice(client_hello_hash.as_ref());
-    client_hello_hash_arr
 }
