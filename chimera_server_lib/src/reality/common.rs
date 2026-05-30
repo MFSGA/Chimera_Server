@@ -5,7 +5,7 @@
 // - Close notify alert construction
 
 use super::reality_aead::encrypt_tls13_record;
-use std::io;
+use std::io::{self, Error, ErrorKind};
 
 // TLS ContentType values
 pub const CONTENT_TYPE_CHANGE_CIPHER_SPEC: u8 = 0x14;
@@ -77,6 +77,72 @@ pub const CIPHERTEXT_READ_BUF_CAPACITY: usize = TLS_MAX_RECORD_SIZE * 2;
 /// Buffer capacity for plaintext read
 pub const PLAINTEXT_READ_BUF_CAPACITY: usize = TLS_MAX_RECORD_SIZE * 2;
 
+/// Strip TLS 1.3 content type trailer from decrypted plaintext.
+///
+/// TLS 1.3 format: content || type_byte. This zero-allocation helper returns
+/// the content type and valid content length without mutating the input.
+#[inline]
+#[cfg(test)]
+pub fn strip_content_type_slice(plaintext: &[u8]) -> io::Result<(u8, usize)> {
+    if plaintext.is_empty() {
+        return Err(Error::new(ErrorKind::InvalidData, "Empty plaintext"));
+    }
+
+    let content_type = plaintext[plaintext.len() - 1];
+
+    if content_type != CONTENT_TYPE_HANDSHAKE
+        && content_type != CONTENT_TYPE_APPLICATION_DATA
+        && content_type != CONTENT_TYPE_ALERT
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("Invalid content type: 0x{:02x}", content_type),
+        ));
+    }
+
+    Ok((content_type, plaintext.len() - 1))
+}
+
+/// Strip TLS 1.3 content type trailer from decrypted plaintext.
+#[cfg(test)]
+pub fn strip_content_type(plaintext: &mut Vec<u8>) -> io::Result<u8> {
+    let (content_type, valid_len) = strip_content_type_slice(plaintext)?;
+    plaintext.truncate(valid_len);
+    Ok(content_type)
+}
+
+/// Strip TLS 1.3 content type trailer and optional zero padding.
+///
+/// TLS 1.3 format: content || type_byte || padding_zeros. Use this for
+/// records from external implementations that may add padding.
+pub fn strip_content_type_with_padding(plaintext: &mut Vec<u8>) -> io::Result<u8> {
+    if plaintext.is_empty() {
+        return Err(Error::new(ErrorKind::InvalidData, "Empty plaintext"));
+    }
+
+    while !plaintext.is_empty() && *plaintext.last().unwrap() == 0 {
+        plaintext.pop();
+    }
+
+    if plaintext.is_empty() {
+        return Err(Error::new(ErrorKind::InvalidData, "Plaintext is all zeros"));
+    }
+
+    let content_type = plaintext.pop().unwrap();
+
+    if content_type != CONTENT_TYPE_HANDSHAKE
+        && content_type != CONTENT_TYPE_APPLICATION_DATA
+        && content_type != CONTENT_TYPE_ALERT
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("Invalid content type: 0x{:02x}", content_type),
+        ));
+    }
+
+    Ok(content_type)
+}
+
 /// Build an encrypted close_notify alert for TLS 1.3
 ///
 /// In TLS 1.3, alerts must be encrypted like application data.
@@ -117,4 +183,48 @@ pub fn build_close_notify_alert(
     record.extend_from_slice(&ciphertext);
 
     Ok(record)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_strip_content_type_app_data() {
+        let mut plaintext = vec![0x01, 0x02, 0x03, CONTENT_TYPE_APPLICATION_DATA];
+        let content_type = strip_content_type(&mut plaintext).unwrap();
+        assert_eq!(content_type, CONTENT_TYPE_APPLICATION_DATA);
+        assert_eq!(plaintext, vec![0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn test_strip_content_type_preserves_data_zeros() {
+        let mut plaintext = vec![0x01, 0x00, 0x00, CONTENT_TYPE_APPLICATION_DATA];
+        let content_type = strip_content_type(&mut plaintext).unwrap();
+        assert_eq!(content_type, CONTENT_TYPE_APPLICATION_DATA);
+        assert_eq!(plaintext, vec![0x01, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn test_strip_with_padding_strips_only_padding_zeros() {
+        let mut plaintext =
+            vec![0x01, 0x00, CONTENT_TYPE_APPLICATION_DATA, 0x00, 0x00];
+        let content_type = strip_content_type_with_padding(&mut plaintext).unwrap();
+        assert_eq!(content_type, CONTENT_TYPE_APPLICATION_DATA);
+        assert_eq!(plaintext, vec![0x01, 0x00]);
+    }
+
+    #[test]
+    fn test_strip_with_padding_all_zeros_fails() {
+        let mut plaintext = vec![0x00, 0x00, 0x00];
+        let result = strip_content_type_with_padding(&mut plaintext);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strip_with_padding_rejects_invalid_type() {
+        let mut plaintext = vec![0x01, 0xff, 0x00];
+        let result = strip_content_type_with_padding(&mut plaintext);
+        assert!(result.is_err());
+    }
 }

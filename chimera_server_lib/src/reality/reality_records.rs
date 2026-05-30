@@ -3,7 +3,7 @@
 // Handles encrypting plaintext into TLS records, automatically splitting
 // large data into multiple records to stay within TLS 1.3 size limits.
 
-use std::io;
+use std::io::{self, Error};
 
 use super::common::{
     CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_HANDSHAKE, MAX_TLS_CIPHERTEXT_LEN,
@@ -116,7 +116,11 @@ fn encrypt_single_record(
         &tls_header,
     )?;
 
-    *write_seq += 1;
+    if let Err(err) = increment_sequence(write_seq) {
+        plaintext_with_type.pop();
+        *plaintext = plaintext_with_type;
+        return Err(err);
+    }
 
     // Append TLS record to output buffer
     ciphertext_buf.reserve(TLS_RECORD_HEADER_SIZE + ciphertext.len());
@@ -178,13 +182,21 @@ fn encrypt_chunk_with_type(
         &tls_header,
     )?;
 
-    *write_seq += 1;
+    increment_sequence(write_seq)?;
 
     // Append TLS record to output buffer
     ciphertext_buf.reserve(TLS_RECORD_HEADER_SIZE + ciphertext.len());
     ciphertext_buf.extend_from_slice(&tls_header);
     ciphertext_buf.extend_from_slice(&ciphertext);
 
+    Ok(())
+}
+
+#[inline]
+fn increment_sequence(seq: &mut u64) -> io::Result<()> {
+    *seq = seq
+        .checked_add(1)
+        .ok_or_else(|| Error::other("TLS sequence number exhausted"))?;
     Ok(())
 }
 
@@ -633,6 +645,51 @@ mod tests {
         );
         assert!(result2.is_ok());
         assert_eq!(seq, u64::MAX - 3);
+    }
+
+    #[test]
+    fn test_sequence_number_exhaustion_fails() {
+        let key = [0x15u8; 16];
+        let iv = [0x16u8; 12];
+        let mut seq = u64::MAX;
+        let mut ciphertext_buf = Vec::new();
+        let mut plaintext = vec![0x4Bu8; 100];
+
+        let result = encrypt_plaintext_to_records(
+            &mut plaintext,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exhausted"));
+        assert_eq!(seq, u64::MAX);
+        assert_eq!(plaintext, vec![0x4Bu8; 100]);
+        assert!(ciphertext_buf.is_empty());
+    }
+
+    #[test]
+    fn test_handshake_sequence_number_exhaustion_fails() {
+        let key = [0x15u8; 16];
+        let iv = [0x16u8; 12];
+        let mut seq = u64::MAX;
+        let mut ciphertext_buf = Vec::new();
+        let handshake = vec![0x16u8; 100];
+
+        let result = encrypt_handshake_to_records(
+            &handshake,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exhausted"));
+        assert_eq!(seq, u64::MAX);
+        assert!(ciphertext_buf.is_empty());
     }
 
     #[test]
