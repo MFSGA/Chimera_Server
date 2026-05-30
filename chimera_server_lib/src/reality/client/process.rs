@@ -13,6 +13,7 @@ use crate::reality::common::{
 use crate::reality::reality_aead::{
     decrypt_handshake_message, decrypt_tls13_record,
 };
+use crate::reality::reality_cipher_suite::CipherSuite;
 use crate::reality::reality_client_verify::{
     extract_certificate_der, extract_certificate_verify_signature,
     extract_ed25519_public_key, verify_certificate_hmac,
@@ -27,8 +28,6 @@ use crate::reality::reality_tls13_messages::construct_finished;
 use crate::reality::reality_util::{
     extract_server_cipher_suite, extract_server_public_key,
 };
-
-const SUPPORTED_CIPHER_SUITE: u16 = 0x1301;
 
 pub(super) fn process_server_hello(
     conn: &mut RealityClientConnection,
@@ -74,13 +73,22 @@ pub(super) fn process_server_hello(
 
     // Extract server public key from ServerHello
     let server_public_key = extract_server_public_key(&record)?;
-    let cipher_suite = extract_server_cipher_suite(&record)?;
-    if cipher_suite != SUPPORTED_CIPHER_SUITE {
+    let cipher_suite_id = extract_server_cipher_suite(&record)?;
+    let selected_suite = CipherSuite::from_id(cipher_suite_id).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Server selected unsupported cipher suite: 0x{cipher_suite_id:04x}"
+            ),
+        )
+    })?;
+    if selected_suite != CipherSuite::AES_128_GCM_SHA256 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("Unsupported REALITY cipher suite: 0x{cipher_suite:04x}"),
+            format!("Unsupported REALITY cipher suite: 0x{cipher_suite_id:04x}"),
         ));
     }
+    let cipher_suite = selected_suite.id();
 
     // Get the actual ClientHello bytes from our saved state
     let client_hello_bytes = match &conn.handshake_state {
