@@ -172,6 +172,7 @@ fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> Vec<u8> {
     hkdf_extract_with_algorithm(hmac::HMAC_SHA256, salt, ikm)
 }
 
+#[cfg(test)]
 fn cipher_suite_from_id(cipher_suite: u16) -> Result<CipherSuite> {
     CipherSuite::from_id(cipher_suite).ok_or_else(|| {
         Error::new(
@@ -287,20 +288,6 @@ pub fn derive_handshake_keys_for_suite(
     })
 }
 
-/// Derive TLS 1.3 handshake keys and master secret using TLS_AES_128_GCM_SHA256.
-pub fn derive_handshake_keys(
-    shared_secret: &[u8],
-    client_hello_hash: &[u8],
-    server_hello_hash: &[u8],
-) -> Result<Tls13HandshakeKeys> {
-    derive_handshake_keys_for_suite(
-        CipherSuite::AES_128_GCM_SHA256,
-        shared_secret,
-        client_hello_hash,
-        server_hello_hash,
-    )
-}
-
 /// Derive TLS 1.3 application traffic secrets for a selected cipher suite (Phase 2).
 ///
 /// This function must be called AFTER the server Finished message is sent,
@@ -377,18 +364,6 @@ pub fn derive_application_secrets_for_suite(
     ))
 }
 
-/// Derive TLS 1.3 application traffic secrets using TLS_AES_128_GCM_SHA256.
-pub fn derive_application_secrets(
-    master_secret: &[u8],
-    handshake_hash: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>)> {
-    derive_application_secrets_for_suite(
-        CipherSuite::AES_128_GCM_SHA256,
-        master_secret,
-        handshake_hash,
-    )
-}
-
 /// Derive traffic keys and IV from traffic secret for a selected cipher suite.
 ///
 /// # Arguments
@@ -447,6 +422,7 @@ pub fn derive_traffic_keys_for_suite(
 ///
 /// # Returns
 /// (key, iv) tuple for the suite AEAD
+#[cfg(test)]
 pub fn derive_traffic_keys(
     traffic_secret: &[u8],
     cipher_suite: u16,
@@ -487,6 +463,7 @@ pub fn compute_finished_verify_data_for_suite(
 }
 
 /// Compute "Finished" verify data using TLS_AES_128_GCM_SHA256.
+#[cfg(test)]
 pub fn compute_finished_verify_data(
     base_key: &[u8],
     handshake_hash: &[u8],

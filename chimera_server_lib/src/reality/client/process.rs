@@ -21,8 +21,8 @@ use crate::reality::reality_client_verify::{
 };
 use crate::reality::reality_records::encrypt_handshake_to_records;
 use crate::reality::reality_tls13_keys::{
-    compute_finished_verify_data, derive_application_secrets, derive_handshake_keys,
-    derive_traffic_keys,
+    compute_finished_verify_data_for_suite, derive_application_secrets_for_suite,
+    derive_handshake_keys_for_suite, derive_traffic_keys_for_suite,
 };
 use crate::reality::reality_tls13_messages::construct_finished;
 use crate::reality::reality_util::{
@@ -88,7 +88,8 @@ pub(super) fn process_server_hello(
             format!("Unsupported REALITY cipher suite: 0x{cipher_suite_id:04x}"),
         ));
     }
-    let cipher_suite = selected_suite.id();
+    let cipher_suite = selected_suite;
+    let cipher_suite_id = cipher_suite.id();
 
     // Get the actual ClientHello bytes from our saved state
     let client_hello_bytes = match &conn.handshake_state {
@@ -141,7 +142,8 @@ pub(super) fn process_server_hello(
     )?;
 
     // Derive handshake keys
-    let hs_keys = derive_handshake_keys(
+    let hs_keys = derive_handshake_keys_for_suite(
+        cipher_suite,
         &tls_shared_secret,
         &client_hello_hash,
         &server_hello_hash_arr,
@@ -163,7 +165,7 @@ pub(super) fn process_server_hello(
             .server_handshake_traffic_secret
             .clone(),
         master_secret: hs_keys.master_secret.clone(),
-        cipher_suite,
+        cipher_suite: cipher_suite_id,
         handshake_transcript_bytes: transcript_bytes,
         auth_key, // Pass auth_key for certificate HMAC verification
         handshake_seq: 0,
@@ -180,7 +182,7 @@ pub(super) fn process_encrypted_handshake(
         client_hs_secret,
         server_hs_secret,
         master_secret,
-        cipher_suite,
+        cipher_suite_id,
         transcript_bytes,
         auth_key,
         mut handshake_seq,
@@ -208,8 +210,17 @@ pub(super) fn process_encrypted_handshake(
         _ => return Ok(()),
     };
 
+    let cipher_suite = CipherSuite::from_id(cipher_suite_id).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Invalid REALITY cipher suite in state: 0x{cipher_suite_id:04x}"
+            ),
+        )
+    })?;
+
     let (server_hs_key, server_hs_iv) =
-        derive_traffic_keys(&server_hs_secret, cipher_suite)?;
+        derive_traffic_keys_for_suite(&server_hs_secret, cipher_suite)?;
 
     if handshake_seq == 0 {
         tracing::debug!(
@@ -355,7 +366,7 @@ pub(super) fn process_encrypted_handshake(
             client_handshake_traffic_secret: client_hs_secret,
             server_handshake_traffic_secret: server_hs_secret,
             master_secret,
-            cipher_suite,
+            cipher_suite: cipher_suite_id,
             handshake_transcript_bytes: transcript_bytes,
             auth_key,
             handshake_seq,
@@ -424,8 +435,11 @@ pub(super) fn process_encrypted_handshake(
     );
 
     // Generate client Finished message
-    let client_verify_data =
-        compute_finished_verify_data(&client_hs_secret, &handshake_hash_arr)?;
+    let client_verify_data = compute_finished_verify_data_for_suite(
+        cipher_suite,
+        &client_hs_secret,
+        &handshake_hash_arr,
+    )?;
     tracing::info!(
         "REALITY CLIENT: Client verify data: {:02x?}",
         client_verify_data
@@ -434,7 +448,7 @@ pub(super) fn process_encrypted_handshake(
 
     // Derive client handshake traffic keys for encryption
     let (client_hs_key, client_hs_iv) =
-        derive_traffic_keys(&client_hs_secret, cipher_suite)?;
+        derive_traffic_keys_for_suite(&client_hs_secret, cipher_suite)?;
 
     // Encrypt Finished message
     let mut client_hs_seq = 0u64;
@@ -454,13 +468,17 @@ pub(super) fn process_encrypted_handshake(
 
     // Derive application secrets
     let (client_app_secret, server_app_secret) =
-        derive_application_secrets(&master_secret, &handshake_hash_arr)?;
+        derive_application_secrets_for_suite(
+            cipher_suite,
+            &master_secret,
+            &handshake_hash_arr,
+        )?;
 
     // Derive application traffic keys
     let (client_app_key, client_app_iv) =
-        derive_traffic_keys(&client_app_secret, cipher_suite)?;
+        derive_traffic_keys_for_suite(&client_app_secret, cipher_suite)?;
     let (server_app_key, server_app_iv) =
-        derive_traffic_keys(&server_app_secret, cipher_suite)?;
+        derive_traffic_keys_for_suite(&server_app_secret, cipher_suite)?;
 
     // Store application keys
     conn.app_read_key = Some(server_app_key);
@@ -469,7 +487,7 @@ pub(super) fn process_encrypted_handshake(
     conn.app_write_iv = Some(client_app_iv);
     conn.read_seq = 0;
     conn.write_seq = 0;
-    conn.cipher_suite = cipher_suite;
+    conn.cipher_suite = cipher_suite_id;
 
     // Mark handshake complete
     conn.handshake_state = HandshakeState::Complete;
