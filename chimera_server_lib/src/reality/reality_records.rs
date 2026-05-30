@@ -10,6 +10,7 @@ use super::common::{
     MAX_TLS_CIPHERTEXT_LEN, MAX_TLS_PLAINTEXT_LEN, TLS_RECORD_HEADER_SIZE,
 };
 use super::reality_aead::AeadKey;
+#[cfg(test)]
 use super::reality_cipher_suite::CipherSuite;
 
 /// Encrypts plaintext into TLS 1.3 records.
@@ -67,7 +68,7 @@ impl<'a> RecordEncryptor<'a> {
 
     /// Encrypt handshake data into TLS 1.3 records.
     #[inline]
-    fn encrypt_handshake(
+    pub(crate) fn encrypt_handshake(
         &mut self,
         handshake_data: &[u8],
         out: &mut Vec<u8>,
@@ -322,6 +323,7 @@ pub fn encrypt_handshake_to_records(
 
 /// Encrypt handshake data into TLS 1.3 records for a selected cipher suite.
 #[inline]
+#[cfg(test)]
 pub(crate) fn encrypt_handshake_to_records_for_suite(
     cipher_suite: CipherSuite,
     handshake_data: &[u8],
