@@ -44,7 +44,7 @@ enum HandshakeState {
         client_handshake_traffic_secret: Vec<u8>,
         server_handshake_traffic_secret: Vec<u8>,
         master_secret: Vec<u8>,
-        cipher_suite: u16,
+        cipher_suite: CipherSuite,
         handshake_transcript_bytes: Vec<u8>, // Accumulated transcript for hash computation
         auth_key: [u8; 32], // REALITY authentication key for HMAC verification
         handshake_seq: u64,
@@ -69,7 +69,7 @@ pub struct RealityClientConnection {
     pub(super) app_write_iv: Option<Vec<u8>>,
     pub(super) read_seq: u64,
     pub(super) write_seq: u64,
-    pub(super) cipher_suite: u16,
+    pub(super) cipher_suite: Option<CipherSuite>,
 
     // Pre-allocated buffer for TLS read operations (reused across calls)
     pub(super) tls_read_buffer: Box<[u8; common::TLS_MAX_RECORD_SIZE]>,
@@ -99,7 +99,7 @@ impl RealityClientConnection {
             app_write_iv: None,
             read_seq: 0,
             write_seq: 0,
-            cipher_suite: 0,
+            cipher_suite: None,
             tls_read_buffer: Box::new([0u8; common::TLS_MAX_RECORD_SIZE]),
             ciphertext_read_buf: SlideBuffer::new(CIPHERTEXT_READ_BUF_CAPACITY),
             ciphertext_write_buf: Vec::with_capacity(OUTGOING_BUFFER_LIMIT),
