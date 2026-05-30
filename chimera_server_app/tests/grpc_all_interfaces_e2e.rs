@@ -982,7 +982,9 @@ fn stats_get_sys_stats_executes() {
 
 #[test]
 fn stats_get_stats_online_ip_list_returns_not_found() {
-    trace_step("==== test stats_get_stats_online_ip_list_returns_not_found start ====");
+    trace_step(
+        "==== test stats_get_stats_online_ip_list_returns_not_found start ====",
+    );
     let harness = Harness::start().expect("failed to start test harness");
     let name = format!("inbound>>>{SOCKS_TAG}>>>online");
     let result: Result<GetStatsOnlineIpListResponse, Status> = harness.unary(
@@ -1273,7 +1275,9 @@ fn handler_list_inbounds_executes() {
 
 #[test]
 fn handler_get_inbound_users_returns_not_user_manager() {
-    trace_step("==== test handler_get_inbound_users_returns_not_user_manager start ====");
+    trace_step(
+        "==== test handler_get_inbound_users_returns_not_user_manager start ====",
+    );
     let harness = Harness::start().expect("failed to start test harness");
     let result: Result<GetInboundUserResponse, Status> = harness.unary(
         PATH_HANDLER_GET_INBOUND_USERS,
@@ -1291,7 +1295,9 @@ fn handler_get_inbound_users_returns_not_user_manager() {
 
 #[test]
 fn handler_get_inbound_users_count_returns_not_user_manager() {
-    trace_step("==== test handler_get_inbound_users_count_returns_not_user_manager start ====");
+    trace_step(
+        "==== test handler_get_inbound_users_count_returns_not_user_manager start ====",
+    );
     let harness = Harness::start().expect("failed to start test harness");
     let result: Result<GetInboundUsersCountResponse, Status> = harness.unary(
         PATH_HANDLER_GET_INBOUND_USERS_COUNT,
@@ -1553,11 +1559,7 @@ fn routing_remove_rule_rejects_invalid_tag() {
             rule_tag: "nonexistent-rule".to_string(),
         },
     );
-    harness.assert_status_code(
-        result,
-        Code::NotFound,
-        "RoutingService/RemoveRule",
-    );
+    harness.assert_status_code(result, Code::NotFound, "RoutingService/RemoveRule");
 }
 
 #[test]
