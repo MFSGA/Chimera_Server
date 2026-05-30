@@ -16,7 +16,7 @@ use super::reality_cipher_suite::CipherSuite;
 ///
 /// Manages the write-side sequence number and handles record framing while
 /// reusing the per-direction AEAD key across all fragmented records.
-struct RecordEncryptor<'a> {
+pub(crate) struct RecordEncryptor<'a> {
     key: &'a AeadKey,
     iv: &'a [u8],
     seq: &'a mut u64,
@@ -24,7 +24,7 @@ struct RecordEncryptor<'a> {
 
 impl<'a> RecordEncryptor<'a> {
     #[inline]
-    fn new(key: &'a AeadKey, iv: &'a [u8], seq: &'a mut u64) -> Self {
+    pub(crate) fn new(key: &'a AeadKey, iv: &'a [u8], seq: &'a mut u64) -> Self {
         Self { key, iv, seq }
     }
 
@@ -92,6 +92,16 @@ impl<'a> RecordEncryptor<'a> {
         }
 
         Ok(())
+    }
+
+    /// Encrypt a close_notify alert into a TLS 1.3 record.
+    #[inline]
+    pub(crate) fn encrypt_close_notify(
+        &mut self,
+        out: &mut Vec<u8>,
+    ) -> io::Result<()> {
+        let mut alert = vec![0x01, 0x00];
+        self.encrypt_record_in_place(&mut alert, out, CONTENT_TYPE_ALERT)
     }
 
     /// Encrypt a single TLS 1.3 record in-place and append it to `out`.
@@ -417,6 +427,31 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert_eq!(read_seq, 1);
+    }
+
+    #[test]
+    fn test_record_encryptor_close_notify() {
+        let key = [0x77u8; 16];
+        let iv = [0x88u8; 12];
+        let aead_key = AeadKey::new(CipherSuite::AES_128_GCM_SHA256, &key).unwrap();
+        let mut write_seq = 0;
+        let mut ciphertext_buf = Vec::new();
+
+        let mut encryptor = RecordEncryptor::new(&aead_key, &iv, &mut write_seq);
+        encryptor.encrypt_close_notify(&mut ciphertext_buf).unwrap();
+
+        assert_eq!(write_seq, 1);
+        let record_len = u16::from_be_bytes([ciphertext_buf[3], ciphertext_buf[4]]);
+        let mut ciphertext = ciphertext_buf[TLS_RECORD_HEADER_SIZE..].to_vec();
+        let mut read_seq = 0;
+        let mut decryptor = RecordDecryptor::new(&aead_key, &iv, &mut read_seq);
+        let (content_type, decrypted) = decryptor
+            .decrypt_record_in_place(&mut ciphertext, record_len)
+            .unwrap();
+
+        assert_eq!(content_type, CONTENT_TYPE_ALERT);
+        assert_eq!(decrypted, &[0x01, 0x00]);
         assert_eq!(read_seq, 1);
     }
 
