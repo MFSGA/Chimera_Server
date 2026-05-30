@@ -29,7 +29,8 @@ use super::reality_tls13_keys::{
 };
 use super::reality_tls13_messages::*;
 use super::reality_util::{
-    extract_client_public_key, extract_client_random, extract_session_id_slice,
+    extract_client_cipher_suites, extract_client_public_key, extract_client_random,
+    extract_session_id_slice,
 };
 use aws_lc_rs::{
     agreement, digest,
@@ -209,6 +210,16 @@ impl RealityServerConnection {
         let client_random = extract_client_random(&client_hello)?;
         let session_id = extract_session_id_slice(&client_hello)?;
         let client_public_key = extract_client_public_key(&client_hello)?;
+        let client_cipher_suites = extract_client_cipher_suites(&client_hello)?;
+
+        // Current key schedule and AEAD paths are limited to TLS_AES_128_GCM_SHA256.
+        const CIPHER_SUITE: u16 = 0x1301;
+        if !client_cipher_suites.contains(&CIPHER_SUITE) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Client did not offer required REALITY cipher suite: 0x1301",
+            ));
+        }
 
         tracing::debug!(
             "REALITY: ClientHello received, client_random: {:?}",
@@ -387,9 +398,6 @@ impl RealityServerConnection {
         let mut server_random = [0u8; 32];
         rng.fill(&mut server_random)
             .map_err(|_| io::Error::other("RNG failed"))?;
-
-        // Step 6: Use standard cipher suite (TLS_AES_128_GCM_SHA256)
-        const CIPHER_SUITE: u16 = 0x1301;
 
         // Step 7: Build ServerHello
         let server_hello = construct_server_hello(

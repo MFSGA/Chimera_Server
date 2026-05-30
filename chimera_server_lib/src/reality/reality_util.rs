@@ -402,6 +402,50 @@ pub fn extract_server_cipher_suite(
     reader.read_u16_be()
 }
 
+/// Extract cipher suites offered by the client from ClientHello.
+///
+/// Returns cipher suite IDs in the order they appear in the ClientHello. The
+/// input includes the TLS record header.
+pub fn extract_client_cipher_suites(
+    client_hello: &[u8],
+) -> Result<Vec<u16>, std::io::Error> {
+    const TLS_HEADER_LEN: usize = 5;
+
+    if client_hello.len() < TLS_HEADER_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ClientHello too short",
+        ));
+    }
+
+    let mut reader = BufReader::new(&client_hello[TLS_HEADER_LEN..]);
+
+    let _handshake_type = reader.read_u8()?;
+    let _handshake_len = reader.read_u24_be()?;
+    let _protocol_version = reader.read_u16_be()?;
+
+    reader.skip(32)?;
+
+    let session_id_len = reader.read_u8()? as usize;
+    reader.skip(session_id_len)?;
+
+    let cipher_suites_len = reader.read_u16_be()? as usize;
+    if !cipher_suites_len.is_multiple_of(2) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid cipher suites length",
+        ));
+    }
+
+    let cipher_suites_data = reader.read_slice(cipher_suites_len)?;
+    let mut cipher_suites = Vec::with_capacity(cipher_suites_len / 2);
+    for chunk in cipher_suites_data.chunks(2) {
+        cipher_suites.push(u16::from_be_bytes([chunk[0], chunk[1]]));
+    }
+
+    Ok(cipher_suites)
+}
+
 pub fn generate_keypair() -> std::io::Result<(String, String)> {
     // Step 1: Generate 32 random bytes for private key
     let rng = SystemRandom::new();
@@ -517,5 +561,32 @@ mod tests {
 
         let cipher_suite = extract_server_cipher_suite(&record).unwrap();
         assert_eq!(cipher_suite, 0x1303);
+    }
+
+    #[test]
+    fn test_extract_client_cipher_suites() {
+        use crate::reality::common::CONTENT_TYPE_HANDSHAKE;
+        use crate::reality::reality_tls13_messages::{
+            construct_client_hello, write_record_header,
+        };
+
+        let client_random = [0x11u8; 32];
+        let session_id = [0x22u8; 32];
+        let client_public_key = [0x33u8; 32];
+        let client_hello = construct_client_hello(
+            &client_random,
+            &session_id,
+            &client_public_key,
+            "example.com",
+            &[0x1301, 0x1303],
+            &["h2"],
+        )
+        .unwrap();
+        let mut record =
+            write_record_header(CONTENT_TYPE_HANDSHAKE, client_hello.len() as u16);
+        record.extend_from_slice(&client_hello);
+
+        let cipher_suites = extract_client_cipher_suites(&record).unwrap();
+        assert_eq!(cipher_suites, vec![0x1301, 0x1303]);
     }
 }
