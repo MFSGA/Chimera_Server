@@ -14,7 +14,9 @@ use crate::reality::reality_aead::{
     decrypt_handshake_message, decrypt_tls13_record,
 };
 use crate::reality::reality_client_verify::{
-    extract_certificate_der, verify_certificate_hmac,
+    extract_certificate_der, extract_certificate_verify_signature,
+    extract_ed25519_public_key, verify_certificate_hmac,
+    verify_certificate_verify_signature,
 };
 use crate::reality::reality_records::encrypt_handshake_to_records;
 use crate::reality::reality_tls13_keys::{
@@ -294,6 +296,8 @@ pub(super) fn process_encrypted_handshake(
     let mut offset = 0;
     let mut messages_found = 0;
     let mut certificate_verified = false;
+    let mut ed25519_public_key = None;
+    let mut cert_verify_offset = None;
 
     while offset < combined_plaintext.len() && messages_found < 4 {
         // Each handshake message has: type (1 byte) + length (3 bytes) + data
@@ -340,7 +344,12 @@ pub(super) fn process_encrypted_handshake(
                 &combined_plaintext[offset..offset + 4 + msg_len],
             )?;
             verify_certificate_hmac(cert_der, &auth_key)?;
+            ed25519_public_key = Some(extract_ed25519_public_key(cert_der)?);
             certificate_verified = true;
+        }
+
+        if msg_type == HANDSHAKE_TYPE_CERTIFICATE_VERIFY {
+            cert_verify_offset = Some(offset);
         }
 
         messages_found += 1;
@@ -359,6 +368,38 @@ pub(super) fn process_encrypted_handshake(
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "REALITY handshake failed: Certificate message not received or not verified",
+        ));
+    }
+
+    let mut cert_verify_verified = false;
+    if let (Some(public_key), Some(cv_offset)) =
+        (ed25519_public_key, cert_verify_offset)
+    {
+        let mut cv_transcript = digest::Context::new(&digest::SHA256);
+        cv_transcript.update(&transcript_bytes);
+        cv_transcript.update(&combined_plaintext[..cv_offset]);
+        let cv_transcript_hash = cv_transcript.finish();
+
+        let cv_msg_len = u32::from_be_bytes([
+            0,
+            combined_plaintext[cv_offset + 1],
+            combined_plaintext[cv_offset + 2],
+            combined_plaintext[cv_offset + 3],
+        ]) as usize;
+        let cv_message = &combined_plaintext[cv_offset..cv_offset + 4 + cv_msg_len];
+        let signature = extract_certificate_verify_signature(cv_message)?;
+        verify_certificate_verify_signature(
+            &public_key,
+            &signature,
+            cv_transcript_hash.as_ref(),
+        )?;
+        cert_verify_verified = true;
+    }
+
+    if !cert_verify_verified {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "REALITY handshake failed: CertificateVerify not verified",
         ));
     }
 
