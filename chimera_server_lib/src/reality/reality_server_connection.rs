@@ -97,6 +97,7 @@ pub struct RealityServerConnection {
     plaintext_read_buf: SlideBuffer,  // Decrypted application data
     plaintext_write_buf: Vec<u8>,     // Application data to encrypt
     received_close_notify: bool,      // Peer sent close_notify alert
+    fatal_error: Option<io::ErrorKind>, // Fatal error occurred, connection unusable
 }
 
 impl RealityServerConnection {
@@ -118,6 +119,7 @@ impl RealityServerConnection {
             plaintext_read_buf: SlideBuffer::new(PLAINTEXT_READ_BUF_CAPACITY),
             plaintext_write_buf: Vec::with_capacity(TLS_MAX_RECORD_SIZE),
             received_close_notify: false,
+            fatal_error: None,
         })
     }
 
@@ -144,10 +146,31 @@ impl RealityServerConnection {
     ///
     /// Returns I/O state with available plaintext bytes and write status.
     pub fn process_new_packets(&mut self) -> io::Result<RealityIoState> {
+        if let Some(error_kind) = self.fatal_error {
+            return Err(io::Error::new(error_kind, "connection previously failed"));
+        }
+
         if self.received_close_notify {
             return Ok(RealityIoState::new(self.plaintext_read_buf.len()));
         }
 
+        let result = self.process_new_packets_inner();
+
+        if let Err(ref err) = result {
+            match err.kind() {
+                io::ErrorKind::InvalidData
+                | io::ErrorKind::PermissionDenied
+                | io::ErrorKind::ConnectionAborted => {
+                    self.fatal_error = Some(err.kind());
+                }
+                _ => {}
+            }
+        }
+
+        result
+    }
+
+    fn process_new_packets_inner(&mut self) -> io::Result<RealityIoState> {
         loop {
             let before_state = std::mem::discriminant(&self.handshake_state);
             let before_ciphertext_len = self.ciphertext_read_buf.len();
@@ -1017,6 +1040,31 @@ mod tests {
 
         assert_eq!(state.plaintext_bytes_to_read(), 0);
         assert!(!conn.wants_write());
+    }
+
+    #[test]
+    fn fatal_packet_error_is_remembered() {
+        let config = RealityServerConfig {
+            private_key: [0u8; 32],
+            short_ids: vec![[0u8; 8]],
+            dest: NetLocation::new(Address::UNSPECIFIED, 443),
+            max_time_diff: None,
+            min_client_version: None,
+            max_client_version: None,
+        };
+        let mut conn = RealityServerConnection::new(config).unwrap();
+
+        let invalid_empty_handshake =
+            [CONTENT_TYPE_HANDSHAKE, 0x03, 0x03, 0x00, 0x00];
+        conn.read_tls(&mut std::io::Cursor::new(invalid_empty_handshake))
+            .unwrap();
+
+        let first_err = conn.process_new_packets().unwrap_err();
+        assert_eq!(first_err.kind(), io::ErrorKind::InvalidData);
+
+        let second_err = conn.process_new_packets().unwrap_err();
+        assert_eq!(second_err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(second_err.to_string(), "connection previously failed");
     }
 
     #[test]
