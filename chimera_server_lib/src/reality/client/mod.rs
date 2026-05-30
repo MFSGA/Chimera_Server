@@ -73,6 +73,7 @@ pub struct RealityClientConnection {
     pub(super) ciphertext_write_buf: Vec<u8>,    // Outgoing encrypted TLS records
     pub(super) plaintext_read_buf: SlideBuffer,  // Decrypted application data
     pub(super) plaintext_write_buf: Vec<u8>,     // Application data to encrypt
+    pub(super) received_close_notify: bool,      // Peer sent close_notify alert
 }
 
 impl RealityClientConnection {
@@ -98,6 +99,7 @@ impl RealityClientConnection {
             ciphertext_write_buf: Vec::with_capacity(CIPHERTEXT_READ_BUF_CAPACITY),
             plaintext_read_buf: SlideBuffer::new(PLAINTEXT_READ_BUF_CAPACITY),
             plaintext_write_buf: Vec::with_capacity(common::TLS_MAX_RECORD_SIZE),
+            received_close_notify: false,
         };
 
         // Generate ClientHello immediately
@@ -128,6 +130,10 @@ impl RealityClientConnection {
 
     /// Process buffered packets and advance state machine
     pub fn process_new_packets(&mut self) -> io::Result<RealityIoState> {
+        if self.received_close_notify {
+            return Ok(RealityIoState::new(self.plaintext_read_buf.len()));
+        }
+
         match &self.handshake_state {
             HandshakeState::AwaitingServerHello { .. } => {
                 process_server_hello(self)?;
@@ -146,7 +152,7 @@ impl RealityClientConnection {
     /// Get a reader for accessing decrypted plaintext
     pub fn reader(&mut self) -> RealityReader<'_> {
         self.plaintext_read_buf.maybe_compact(4096);
-        RealityReader::new(&mut self.plaintext_read_buf)
+        RealityReader::new(&mut self.plaintext_read_buf, self.received_close_notify)
     }
 
     /// Get a writer for buffering plaintext to be encrypted
