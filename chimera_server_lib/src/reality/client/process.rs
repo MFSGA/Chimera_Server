@@ -8,6 +8,7 @@ use crate::reality::common::{
     CONTENT_TYPE_CHANGE_CIPHER_SPEC, HANDSHAKE_TYPE_CERTIFICATE,
     HANDSHAKE_TYPE_CERTIFICATE_VERIFY, HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS,
     HANDSHAKE_TYPE_FINISHED, TLS_RECORD_HEADER_SIZE,
+    strip_content_type_with_padding,
 };
 use crate::reality::reality_aead::{
     decrypt_handshake_message, decrypt_tls13_record,
@@ -476,18 +477,14 @@ pub(super) fn process_application_data(
 
         conn.read_seq += 1;
 
-        // TLS 1.3: Remove ContentType trailer byte
-        if !plaintext.is_empty() {
-            let content_type = plaintext.pop().unwrap();
-
-            if content_type != CONTENT_TYPE_APPLICATION_DATA
-                && content_type != CONTENT_TYPE_ALERT
-            {
-                tracing::warn!(
-                    "REALITY CLIENT: Unexpected ContentType: 0x{:02x}",
-                    content_type
-                );
-            }
+        let content_type = strip_content_type_with_padding(&mut plaintext)?;
+        if content_type != CONTENT_TYPE_APPLICATION_DATA
+            && content_type != CONTENT_TYPE_ALERT
+        {
+            tracing::warn!(
+                "REALITY CLIENT: Unexpected ContentType: 0x{:02x}",
+                content_type
+            );
         }
 
         // Compact plaintext buffer if needed before extending
