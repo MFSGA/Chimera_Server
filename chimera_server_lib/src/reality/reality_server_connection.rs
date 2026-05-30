@@ -21,9 +21,7 @@ use super::reality_certificate::generate_hmac_certificate;
 use super::reality_cipher_suite::CipherSuite;
 use super::reality_io_state::RealityIoState;
 use super::reality_reader_writer::{RealityReader, RealityWriter};
-use super::reality_records::{
-    RecordDecryptor, RecordEncryptor, encrypt_handshake_to_records_for_suite,
-};
+use super::reality_records::{RecordDecryptor, RecordEncryptor};
 use super::reality_tls13_keys::{
     compute_finished_verify_data_for_suite, derive_application_secrets_for_suite,
     derive_handshake_keys_for_suite, derive_traffic_keys_for_suite,
@@ -548,14 +546,11 @@ impl RealityServerConnection {
         // Large certificates can exceed this, so we fragment like uTLS does.
         let mut handshake_ciphertext = Vec::new();
         let mut handshake_seq = 0u64;
-        encrypt_handshake_to_records_for_suite(
-            cipher_suite,
-            &combined_plaintext,
-            &server_hs_key,
-            &server_hs_iv,
-            &mut handshake_seq,
-            &mut handshake_ciphertext,
-        )?;
+        let hs_aead_key = AeadKey::new(cipher_suite, &server_hs_key)?;
+        let mut encryptor =
+            RecordEncryptor::new(&hs_aead_key, &server_hs_iv, &mut handshake_seq);
+        encryptor
+            .encrypt_handshake(&combined_plaintext, &mut handshake_ciphertext)?;
 
         // Update transcript with server Finished (needed for client Finished verification)
         handshake_transcript.update(&server_finished);
