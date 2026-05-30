@@ -252,8 +252,9 @@ pub fn construct_finished(verify_data: &[u8]) -> Result<Vec<u8>> {
     Ok(finished)
 }
 
-/// Write TLS record header
-///
+/// Default ALPN protocols for REALITY client fingerprints.
+pub const DEFAULT_ALPN_PROTOCOLS: &[&str] = &["h2", "http/1.1"];
+
 /// Construct TLS 1.3 ClientHello message
 ///
 /// Returns handshake message bytes (without record header)
@@ -354,6 +355,24 @@ pub fn construct_client_hello(
         extensions.extend_from_slice(&[0x06, 0x01]); // rsa_pkcs1_sha512
     }
 
+    // 6. ALPN extension (type 16)
+    {
+        extensions.extend_from_slice(&[0x00, 0x10]); // Extension type: ALPN
+
+        let protocols_list_len: usize = DEFAULT_ALPN_PROTOCOLS
+            .iter()
+            .map(|protocol| 1 + protocol.len())
+            .sum();
+        let ext_len = 2 + protocols_list_len;
+        extensions.extend_from_slice(&(ext_len as u16).to_be_bytes());
+        extensions.extend_from_slice(&(protocols_list_len as u16).to_be_bytes());
+
+        for protocol in DEFAULT_ALPN_PROTOCOLS {
+            extensions.push(protocol.len() as u8);
+            extensions.extend_from_slice(protocol.as_bytes());
+        }
+    }
+
     // Write extensions length
     let extensions_length = extensions.len();
     hello[extensions_offset..extensions_offset + 2]
@@ -440,5 +459,51 @@ mod tests {
         assert_eq!(header[1], 0x03); // TLS 1.2
         assert_eq!(header[2], 0x03);
         assert_eq!(u16::from_be_bytes([header[3], header[4]]), 100);
+    }
+
+    #[test]
+    fn test_client_hello_includes_default_alpn() {
+        let client_random = [0u8; 32];
+        let session_id = [0u8; 32];
+        let client_public_key = [0u8; 32];
+
+        let hello = construct_client_hello(
+            &client_random,
+            &session_id,
+            &client_public_key,
+            "example.com",
+        )
+        .unwrap();
+
+        let mut offset = 1 + 3 + 2 + 32;
+        let session_id_len = hello[offset] as usize;
+        offset += 1 + session_id_len;
+        let cipher_suites_len =
+            u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+        offset += 2 + cipher_suites_len;
+        let compression_methods_len = hello[offset] as usize;
+        offset += 1 + compression_methods_len;
+        let extensions_len =
+            u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+        offset += 2;
+        let extensions_end = offset + extensions_len;
+
+        let mut alpn = None;
+        while offset < extensions_end {
+            let extension_type =
+                u16::from_be_bytes([hello[offset], hello[offset + 1]]);
+            let extension_len =
+                u16::from_be_bytes([hello[offset + 2], hello[offset + 3]]) as usize;
+            offset += 4;
+            if extension_type == 0x0010 {
+                alpn = Some(&hello[offset..offset + extension_len]);
+                break;
+            }
+            offset += extension_len;
+        }
+
+        let extension = alpn.expect("missing ALPN extension");
+        assert_eq!(u16::from_be_bytes([extension[0], extension[1]]), 12);
+        assert_eq!(&extension[2..], b"\x02h2\x08http/1.1");
     }
 }
