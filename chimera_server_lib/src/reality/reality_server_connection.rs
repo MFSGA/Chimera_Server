@@ -65,7 +65,7 @@ enum HandshakeState {
         handshake_hash_with_server_finished: Vec<u8>, // Hash including server Finished (for verifying client Finished)
         client_handshake_traffic_secret: Vec<u8>,
         master_secret: Vec<u8>,
-        cipher_suite: u16,
+        cipher_suite: CipherSuite,
     },
     /// Handshake complete, ready for application data
     Complete,
@@ -86,7 +86,7 @@ pub struct RealityServerConnection {
     app_write_iv: Option<Vec<u8>>,
     read_seq: u64,
     write_seq: u64,
-    cipher_suite: u16,
+    cipher_suite: Option<CipherSuite>,
 
     // Pre-allocated buffer for TLS read operations (reused across calls)
     tls_read_buffer: Box<[u8; TLS_MAX_RECORD_SIZE]>,
@@ -112,7 +112,7 @@ impl RealityServerConnection {
             app_write_iv: None,
             read_seq: 0,
             write_seq: 0,
-            cipher_suite: 0,
+            cipher_suite: None,
             tls_read_buffer: Box::new([0u8; TLS_MAX_RECORD_SIZE]),
             ciphertext_read_buf: SlideBuffer::new(CIPHERTEXT_READ_BUF_CAPACITY),
             ciphertext_write_buf: Vec::with_capacity(OUTGOING_BUFFER_LIMIT),
@@ -587,7 +587,7 @@ impl RealityServerConnection {
                 .client_handshake_traffic_secret
                 .clone(),
             master_secret: hs_keys.master_secret,
-            cipher_suite: cipher_suite_id,
+            cipher_suite,
         };
 
         Ok(())
@@ -655,7 +655,7 @@ impl RealityServerConnection {
         let (
             client_handshake_traffic_secret,
             master_secret,
-            cipher_suite_id,
+            cipher_suite,
             handshake_hash_with_server_finished,
         ) = match old_state {
             HandshakeState::ServerHelloSent {
@@ -676,13 +676,6 @@ impl RealityServerConnection {
                 ));
             }
         };
-
-        let cipher_suite = CipherSuite::from_id(cipher_suite_id).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Invalid REALITY cipher suite in state: 0x{cipher_suite_id:04x}"),
-            )
-        })?;
 
         // Extract the encrypted Finished record (copy to Vec for decryption)
         let record: Vec<u8> = self.ciphertext_read_buf[..total_record_len].to_vec();
@@ -768,7 +761,7 @@ impl RealityServerConnection {
         self.app_write_iv = Some(server_app_iv);
         self.read_seq = 0;
         self.write_seq = 0;
-        self.cipher_suite = cipher_suite_id;
+        self.cipher_suite = Some(cipher_suite);
 
         // Handshake state already set to Complete above
 
