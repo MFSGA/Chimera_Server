@@ -249,9 +249,6 @@ pub fn construct_finished(verify_data: &[u8]) -> Result<Vec<u8>> {
 /// Default ALPN protocols for REALITY client fingerprints.
 pub const DEFAULT_ALPN_PROTOCOLS: &[&str] = &["h2", "http/1.1"];
 
-/// Default TLS 1.3 cipher suite IDs offered by the REALITY client.
-pub const DEFAULT_CIPHER_SUITE_IDS: &[u16] = &[0x1301];
-
 /// Construct TLS 1.3 ClientHello message
 ///
 /// Returns handshake message bytes (without record header)
@@ -517,7 +514,7 @@ mod tests {
             &session_id,
             &client_public_key,
             "example.com",
-            DEFAULT_CIPHER_SUITE_IDS,
+            &[0x1301, 0x1302, 0x1303],
             DEFAULT_ALPN_PROTOCOLS,
         )
         .unwrap();
