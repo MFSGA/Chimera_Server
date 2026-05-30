@@ -178,6 +178,7 @@ pub(crate) fn decrypt_tls13_record_for_suite(
 ///
 /// # Returns
 /// Ciphertext with authentication tag appended
+#[cfg(test)]
 pub fn encrypt_tls13_record(
     key: &[u8],
     iv: &[u8],
