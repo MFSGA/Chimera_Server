@@ -191,7 +191,7 @@ fn cipher_suite_from_id(cipher_suite: u16) -> Result<CipherSuite> {
 /// # Arguments
 /// * `cipher_suite` - Cipher suite whose hash/HMAC algorithm drives HKDF
 /// * `shared_secret` - ECDH shared secret (32 bytes for X25519)
-/// * `client_hello_hash` - Hash of ClientHello
+/// * `client_hello_hash` - Hash of ClientHello (kept for API consistency)
 /// * `server_hello_hash` - Hash of ClientHello...ServerHello
 ///
 /// # Returns
@@ -199,7 +199,7 @@ fn cipher_suite_from_id(cipher_suite: u16) -> Result<CipherSuite> {
 pub fn derive_handshake_keys_for_suite(
     cipher_suite: CipherSuite,
     shared_secret: &[u8],
-    client_hello_hash: &[u8],
+    _client_hello_hash: &[u8],
     server_hello_hash: &[u8],
 ) -> Result<Tls13HandshakeKeys> {
     let hash_len = cipher_suite.hash_len();
@@ -216,10 +216,14 @@ pub fn derive_handshake_keys_for_suite(
             ),
         ));
     }
-    if client_hello_hash.len() != hash_len || server_hello_hash.len() != hash_len {
+    if server_hello_hash.len() != hash_len {
         return Err(Error::new(
             ErrorKind::InvalidInput,
-            format!("All hashes must be {hash_len} bytes for {cipher_suite}"),
+            format!(
+                "Hash length mismatch: {} (expected {})",
+                server_hello_hash.len(),
+                hash_len
+            ),
         ));
     }
 
@@ -631,6 +635,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(finished.len(), cipher_suite.hash_len());
+    }
+
+    #[test]
+    fn test_handshake_key_derivation_ignores_client_hello_hash_length() {
+        let cipher_suite = CipherSuite::AES_128_GCM_SHA256;
+        let shared_secret = vec![0x11u8; 32];
+        let server_hash = vec![0x33u8; cipher_suite.hash_len()];
+
+        let handshake_keys = derive_handshake_keys_for_suite(
+            cipher_suite,
+            &shared_secret,
+            &[],
+            &server_hash,
+        )
+        .unwrap();
+
+        assert_eq!(
+            handshake_keys.client_handshake_traffic_secret.len(),
+            cipher_suite.hash_len()
+        );
     }
 
     #[test]
