@@ -43,6 +43,8 @@ enum HandshakeState {
         cipher_suite: u16,
         handshake_transcript_bytes: Vec<u8>, // Accumulated transcript for hash computation
         auth_key: [u8; 32], // REALITY authentication key for HMAC verification
+        handshake_seq: u64,
+        accumulated_plaintext: Vec<u8>,
     },
     /// Handshake complete, ready for application data
     Complete,
