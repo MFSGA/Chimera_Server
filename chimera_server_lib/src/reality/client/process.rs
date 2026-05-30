@@ -11,7 +11,7 @@ use crate::reality::common::{
     TLS_RECORD_HEADER_SIZE, strip_content_type_with_padding,
 };
 use crate::reality::reality_aead::{
-    decrypt_handshake_message, decrypt_tls13_record,
+    decrypt_handshake_message_for_suite, decrypt_tls13_record_for_suite,
 };
 use crate::reality::reality_cipher_suite::CipherSuite;
 use crate::reality::reality_client_verify::{
@@ -19,7 +19,7 @@ use crate::reality::reality_client_verify::{
     extract_ed25519_public_key, verify_certificate_hmac,
     verify_certificate_verify_signature,
 };
-use crate::reality::reality_records::encrypt_handshake_to_records;
+use crate::reality::reality_records::encrypt_handshake_to_records_for_suite;
 use crate::reality::reality_tls13_keys::{
     compute_finished_verify_data_for_suite, derive_application_secrets_for_suite,
     derive_handshake_keys_for_suite, derive_traffic_keys_for_suite,
@@ -283,7 +283,8 @@ pub(super) fn process_encrypted_handshake(
         record_len
     );
 
-    let plaintext = decrypt_handshake_message(
+    let plaintext = decrypt_handshake_message_for_suite(
+        cipher_suite,
         &server_hs_key,
         &server_hs_iv,
         handshake_seq,
@@ -453,7 +454,8 @@ pub(super) fn process_encrypted_handshake(
     // Encrypt Finished message
     let mut client_hs_seq = 0u64;
     let buf_len_before = conn.ciphertext_write_buf.len();
-    encrypt_handshake_to_records(
+    encrypt_handshake_to_records_for_suite(
+        cipher_suite,
         &client_finished,
         &client_hs_key,
         &client_hs_iv,
@@ -503,6 +505,15 @@ pub(super) fn process_application_data(
         (Some(key), Some(iv)) => (key, iv),
         _ => return Ok(()),
     };
+    let cipher_suite_id = conn.cipher_suite;
+    let cipher_suite = CipherSuite::from_id(cipher_suite_id).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Invalid REALITY cipher suite in state: 0x{cipher_suite_id:04x}"
+            ),
+        )
+    })?;
 
     while conn.ciphertext_read_buf.len() >= TLS_RECORD_HEADER_SIZE {
         let record_len = conn.ciphertext_read_buf.get_u16_be(3).ok_or_else(|| {
@@ -527,7 +538,8 @@ pub(super) fn process_application_data(
             .to_vec();
         conn.ciphertext_read_buf.consume(total_record_len);
 
-        let mut plaintext = decrypt_tls13_record(
+        let mut plaintext = decrypt_tls13_record_for_suite(
+            cipher_suite,
             app_read_key,
             app_read_iv,
             conn.read_seq,
