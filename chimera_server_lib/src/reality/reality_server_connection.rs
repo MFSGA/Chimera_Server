@@ -9,8 +9,8 @@ use super::slide_buffer::SlideBuffer;
 use crate::address::{Address, NetLocation};
 
 use super::common::{
-    self, ALERT_DESC_CLOSE_NOTIFY, ALERT_LEVEL_WARNING,
-    CIPHERTEXT_READ_BUF_CAPACITY, CONTENT_TYPE_ALERT, CONTENT_TYPE_APPLICATION_DATA,
+    ALERT_DESC_CLOSE_NOTIFY, ALERT_LEVEL_WARNING, CIPHERTEXT_READ_BUF_CAPACITY,
+    CONTENT_TYPE_ALERT, CONTENT_TYPE_APPLICATION_DATA,
     CONTENT_TYPE_CHANGE_CIPHER_SPEC, CONTENT_TYPE_HANDSHAKE,
     HANDSHAKE_TYPE_FINISHED, OUTGOING_BUFFER_LIMIT, PLAINTEXT_READ_BUF_CAPACITY,
     TLS_MAX_RECORD_SIZE, TLS_RECORD_HEADER_SIZE,
@@ -22,7 +22,7 @@ use super::reality_cipher_suite::CipherSuite;
 use super::reality_io_state::RealityIoState;
 use super::reality_reader_writer::{RealityReader, RealityWriter};
 use super::reality_records::{
-    RecordDecryptor, encrypt_handshake_to_records_for_suite,
+    RecordDecryptor, RecordEncryptor, encrypt_handshake_to_records_for_suite,
     encrypt_plaintext_to_records_for_suite,
 };
 use super::reality_tls13_keys::{
@@ -1004,14 +1004,6 @@ impl RealityServerConnection {
             }
         };
 
-        // Use common helper to build encrypted close_notify alert
-        let Some(next_write_seq) = self.write_seq.checked_add(1) else {
-            tracing::error!(
-                "REALITY: Cannot send close_notify - TLS sequence number exhausted"
-            );
-            return;
-        };
-
         let cipher_suite = match CipherSuite::from_id(self.cipher_suite) {
             Some(cipher_suite) => cipher_suite,
             None => {
@@ -1023,15 +1015,12 @@ impl RealityServerConnection {
             }
         };
 
-        match common::build_close_notify_alert(
-            cipher_suite,
-            app_write_key,
-            app_write_iv,
-            self.write_seq,
-        ) {
-            Ok(record) => {
-                self.write_seq = next_write_seq;
-                self.ciphertext_write_buf.extend_from_slice(&record);
+        match AeadKey::new(cipher_suite, app_write_key).and_then(|aead_key| {
+            let mut encryptor =
+                RecordEncryptor::new(&aead_key, app_write_iv, &mut self.write_seq);
+            encryptor.encrypt_close_notify(&mut self.ciphertext_write_buf)
+        }) {
+            Ok(()) => {
                 tracing::debug!("REALITY: Encrypted close_notify alert queued");
             }
             Err(e) => {

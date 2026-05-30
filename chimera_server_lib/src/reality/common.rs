@@ -2,12 +2,8 @@
 //
 // This module provides:
 // - TLS constants (content types, alert codes, version bytes, handshake types)
-// - Close notify alert construction
 
 use std::io::{self, Error, ErrorKind};
-
-use super::reality_aead::encrypt_tls13_record_for_suite;
-use super::reality_cipher_suite::CipherSuite;
 
 // TLS ContentType values
 pub const CONTENT_TYPE_CHANGE_CIPHER_SPEC: u8 = 0x14;
@@ -148,55 +144,6 @@ pub fn strip_content_type_with_padding(plaintext: &mut Vec<u8>) -> io::Result<u8
     }
 
     Ok(content_type)
-}
-
-/// Build an encrypted close_notify alert for TLS 1.3
-///
-/// In TLS 1.3, alerts must be encrypted like application data.
-pub fn build_close_notify_alert(
-    cipher_suite: CipherSuite,
-    key: &[u8],
-    iv: &[u8],
-    seq_num: u64,
-) -> io::Result<Vec<u8>> {
-    // Build alert message: level(1) + description(0) + ContentType
-    let alert_with_type = vec![
-        ALERT_LEVEL_WARNING,
-        ALERT_DESC_CLOSE_NOTIFY,
-        CONTENT_TYPE_ALERT, // ContentType byte for TLS 1.3
-    ];
-
-    // Build TLS header with correct ciphertext length
-    let ciphertext_len = (alert_with_type.len() + 16) as u16; // plaintext + tag
-    let mut tls_header = [
-        CONTENT_TYPE_APPLICATION_DATA,
-        VERSION_TLS_1_2_MAJOR,
-        VERSION_TLS_1_2_MINOR,
-        0x00,
-        0x00, // Length will be set
-    ];
-    tls_header[3..5].copy_from_slice(&ciphertext_len.to_be_bytes());
-
-    // Encrypt the alert
-    let ciphertext = encrypt_tls13_record_for_suite(
-        cipher_suite,
-        key,
-        iv,
-        seq_num,
-        &alert_with_type,
-        &tls_header,
-    )?;
-
-    // Build complete TLS record
-    let mut record = Vec::with_capacity(5 + ciphertext.len());
-    record.push(CONTENT_TYPE_APPLICATION_DATA);
-    record.push(VERSION_TLS_1_2_MAJOR);
-    record.push(VERSION_TLS_1_2_MINOR);
-    record.push(((ciphertext.len() >> 8) & 0xff) as u8);
-    record.push((ciphertext.len() & 0xff) as u8);
-    record.extend_from_slice(&ciphertext);
-
-    Ok(record)
 }
 
 #[cfg(test)]
