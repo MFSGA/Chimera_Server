@@ -13,18 +13,17 @@ use super::common::{
     CIPHERTEXT_READ_BUF_CAPACITY, CONTENT_TYPE_ALERT, CONTENT_TYPE_APPLICATION_DATA,
     CONTENT_TYPE_CHANGE_CIPHER_SPEC, CONTENT_TYPE_HANDSHAKE,
     HANDSHAKE_TYPE_FINISHED, OUTGOING_BUFFER_LIMIT, PLAINTEXT_READ_BUF_CAPACITY,
-    TLS_MAX_RECORD_SIZE, TLS_RECORD_HEADER_SIZE, strip_content_type_with_padding,
+    TLS_MAX_RECORD_SIZE, TLS_RECORD_HEADER_SIZE,
 };
-use super::reality_aead::{
-    decrypt_handshake_message_for_suite, decrypt_tls13_record_for_suite,
-};
+use super::reality_aead::{AeadKey, decrypt_handshake_message_for_suite};
 use super::reality_auth::{decrypt_session_id, derive_auth_key, perform_ecdh};
 use super::reality_certificate::generate_hmac_certificate;
 use super::reality_cipher_suite::CipherSuite;
 use super::reality_io_state::RealityIoState;
 use super::reality_reader_writer::{RealityReader, RealityWriter};
 use super::reality_records::{
-    encrypt_handshake_to_records_for_suite, encrypt_plaintext_to_records_for_suite,
+    RecordDecryptor, encrypt_handshake_to_records_for_suite,
+    encrypt_plaintext_to_records_for_suite,
 };
 use super::reality_tls13_keys::{
     compute_finished_verify_data_for_suite, derive_application_secrets_for_suite,
@@ -806,9 +805,10 @@ impl RealityServerConnection {
                 format!("Invalid REALITY cipher suite in state: 0x{cipher_suite_id:04x}"),
             )
         })?;
+        let aead_key = AeadKey::new(cipher_suite, app_read_key)?;
 
         // Process all complete TLS records in the buffer
-        while self.ciphertext_read_buf.len() >= 5 {
+        while self.ciphertext_read_buf.len() >= TLS_RECORD_HEADER_SIZE {
             // Parse TLS record header
             let record_len =
                 self.ciphertext_read_buf.get_u16_be(3).ok_or_else(|| {
@@ -821,78 +821,72 @@ impl RealityServerConnection {
                 break; // Need more data
             }
 
-            // Copy record header for decryption AAD
-            let tls_header: [u8; TLS_RECORD_HEADER_SIZE] = [
-                self.ciphertext_read_buf[0],
-                self.ciphertext_read_buf[1],
-                self.ciphertext_read_buf[2],
-                self.ciphertext_read_buf[3],
-                self.ciphertext_read_buf[4],
-            ];
-            let ciphertext: Vec<u8> = self.ciphertext_read_buf
-                [TLS_RECORD_HEADER_SIZE..total_record_len]
-                .to_vec();
-            self.ciphertext_read_buf.consume(total_record_len);
+            let mut received_close_notify = false;
+            let mut pending_error = None;
+            {
+                let ciphertext = self
+                    .ciphertext_read_buf
+                    .slice_mut(TLS_RECORD_HEADER_SIZE..total_record_len);
+                let mut decryptor =
+                    RecordDecryptor::new(&aead_key, app_read_iv, &mut self.read_seq);
+                let (content_type, plaintext) = decryptor
+                    .decrypt_record_in_place(ciphertext, record_len as u16)?;
 
-            // Decrypt the application data
-            let mut plaintext = decrypt_tls13_record_for_suite(
-                cipher_suite,
-                app_read_key,
-                app_read_iv,
-                self.read_seq,
-                &ciphertext,
-                &tls_header,
-            )?;
+                match content_type {
+                    CONTENT_TYPE_APPLICATION_DATA => {
+                        // Compact plaintext buffer if needed before extending
+                        self.plaintext_read_buf.maybe_compact(4096);
 
-            self.read_seq += 1;
+                        // Append to plaintext buffer (without ContentType)
+                        self.plaintext_read_buf.extend_from_slice(plaintext);
+                    }
+                    CONTENT_TYPE_ALERT => {
+                        if plaintext.len() >= 2 {
+                            let alert_level = plaintext[0];
+                            let alert_desc = plaintext[1];
 
-            let content_type = strip_content_type_with_padding(&mut plaintext)?;
-            match content_type {
-                CONTENT_TYPE_APPLICATION_DATA => {
-                    // Compact plaintext buffer if needed before extending
-                    self.plaintext_read_buf.maybe_compact(4096);
-
-                    // Append to plaintext buffer (without ContentType)
-                    self.plaintext_read_buf.extend_from_slice(&plaintext);
-                }
-                CONTENT_TYPE_ALERT => {
-                    if plaintext.len() >= 2 {
-                        let alert_level = plaintext[0];
-                        let alert_desc = plaintext[1];
-
-                        if alert_desc == ALERT_DESC_CLOSE_NOTIFY {
-                            tracing::debug!("REALITY: Received close_notify alert");
-                            self.received_close_notify = true;
-                            return Ok(());
+                            if alert_desc == ALERT_DESC_CLOSE_NOTIFY {
+                                tracing::debug!(
+                                    "REALITY: Received close_notify alert"
+                                );
+                                self.received_close_notify = true;
+                                received_close_notify = true;
+                            } else if alert_level != ALERT_LEVEL_WARNING {
+                                tracing::warn!(
+                                    "REALITY: Received fatal alert: level={}, desc={}",
+                                    alert_level,
+                                    alert_desc
+                                );
+                                pending_error = Some(io::Error::new(
+                                    io::ErrorKind::ConnectionAborted,
+                                    format!("received fatal alert: {}", alert_desc),
+                                ));
+                            } else {
+                                tracing::debug!(
+                                    "REALITY: Received warning alert: desc={}",
+                                    alert_desc
+                                );
+                            }
                         }
-
-                        if alert_level != ALERT_LEVEL_WARNING {
-                            tracing::warn!(
-                                "REALITY: Received fatal alert: level={}, desc={}",
-                                alert_level,
-                                alert_desc
-                            );
-                            return Err(io::Error::new(
-                                io::ErrorKind::ConnectionAborted,
-                                format!("received fatal alert: {}", alert_desc),
-                            ));
-                        }
-
-                        tracing::debug!(
-                            "REALITY: Received warning alert: desc={}",
-                            alert_desc
-                        );
+                    }
+                    _ => {
+                        pending_error = Some(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "unexpected post-handshake content type: 0x{:02x}",
+                                content_type
+                            ),
+                        ));
                     }
                 }
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "unexpected post-handshake content type: 0x{:02x}",
-                            content_type
-                        ),
-                    ));
-                }
+            }
+            self.ciphertext_read_buf.consume(total_record_len);
+
+            if let Some(err) = pending_error {
+                return Err(err);
+            }
+            if received_close_notify {
+                return Ok(());
             }
         }
 
