@@ -25,8 +25,8 @@ use super::reality_records::{
     encrypt_handshake_to_records, encrypt_plaintext_to_records,
 };
 use super::reality_tls13_keys::{
-    compute_finished_verify_data, derive_application_secrets, derive_handshake_keys,
-    derive_traffic_keys,
+    compute_finished_verify_data_for_suite, derive_application_secrets_for_suite,
+    derive_handshake_keys_for_suite, derive_traffic_keys_for_suite,
 };
 use super::reality_tls13_messages::*;
 use super::reality_util::{
@@ -472,7 +472,8 @@ impl RealityServerConnection {
         let mut server_hello_hash_arr = [0u8; 32];
         server_hello_hash_arr.copy_from_slice(server_hello_hash.as_ref());
 
-        let hs_keys = derive_handshake_keys(
+        let hs_keys = derive_handshake_keys_for_suite(
+            cipher_suite,
             &tls_shared_secret,
             &client_hello_hash_arr,
             &server_hello_hash_arr,
@@ -512,13 +513,14 @@ impl RealityServerConnection {
         handshake_hash_arr.copy_from_slice(handshake_hash_before_finished.as_ref());
 
         // Step 13: Derive server handshake traffic keys for encryption
-        let (server_hs_key, server_hs_iv) = derive_traffic_keys(
+        let (server_hs_key, server_hs_iv) = derive_traffic_keys_for_suite(
             &hs_keys.server_handshake_traffic_secret,
-            cipher_suite_id,
+            cipher_suite,
         )?;
 
         // Step 14: Build server Finished message first (before encryption)
-        let server_verify_data = compute_finished_verify_data(
+        let server_verify_data = compute_finished_verify_data_for_suite(
+            cipher_suite,
             &hs_keys.server_handshake_traffic_secret,
             &handshake_hash_arr,
         )?;
@@ -663,7 +665,7 @@ impl RealityServerConnection {
         let (
             client_handshake_traffic_secret,
             master_secret,
-            cipher_suite,
+            cipher_suite_id,
             _handshake_hash,
             handshake_hash_with_server_finished,
         ) = match old_state {
@@ -688,14 +690,23 @@ impl RealityServerConnection {
             }
         };
 
+        let cipher_suite = CipherSuite::from_id(cipher_suite_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid REALITY cipher suite in state: 0x{cipher_suite_id:04x}"),
+            )
+        })?;
+
         // Extract the encrypted Finished record (copy to Vec for decryption)
         let record: Vec<u8> = self.ciphertext_read_buf[..total_record_len].to_vec();
         self.ciphertext_read_buf.consume(total_record_len);
         let ciphertext = &record[TLS_RECORD_HEADER_SIZE..]; // Skip TLS record header
 
         // Derive client handshake traffic keys for decryption
-        let (client_hs_key, client_hs_iv) =
-            derive_traffic_keys(&client_handshake_traffic_secret, cipher_suite)?;
+        let (client_hs_key, client_hs_iv) = derive_traffic_keys_for_suite(
+            &client_handshake_traffic_secret,
+            cipher_suite,
+        )?;
 
         // Decrypt the Finished message (sequence number = 0 for client's first encrypted record)
         let plaintext = decrypt_handshake_message(
@@ -725,7 +736,8 @@ impl RealityServerConnection {
 
         // Compute expected client Finished verify_data
         // IMPORTANT: Use hash that includes server Finished (per TLS 1.3 RFC 8446)
-        let expected_verify_data = compute_finished_verify_data(
+        let expected_verify_data = compute_finished_verify_data_for_suite(
+            cipher_suite,
             &client_handshake_traffic_secret,
             &handshake_hash_with_server_finished,
         )?;
@@ -746,16 +758,18 @@ impl RealityServerConnection {
 
         // Derive application secrets
         // IMPORTANT: Use hash that includes server Finished (per TLS 1.3 RFC 8446)
-        let (client_app_secret, server_app_secret) = derive_application_secrets(
-            &master_secret,
-            &handshake_hash_with_server_finished,
-        )?;
+        let (client_app_secret, server_app_secret) =
+            derive_application_secrets_for_suite(
+                cipher_suite,
+                &master_secret,
+                &handshake_hash_with_server_finished,
+            )?;
 
         // Derive application traffic keys
         let (client_app_key, client_app_iv) =
-            derive_traffic_keys(&client_app_secret, cipher_suite)?;
+            derive_traffic_keys_for_suite(&client_app_secret, cipher_suite)?;
         let (server_app_key, server_app_iv) =
-            derive_traffic_keys(&server_app_secret, cipher_suite)?;
+            derive_traffic_keys_for_suite(&server_app_secret, cipher_suite)?;
 
         // Store application traffic keys
         self.app_read_key = Some(client_app_key);
@@ -764,7 +778,7 @@ impl RealityServerConnection {
         self.app_write_iv = Some(server_app_iv);
         self.read_seq = 0;
         self.write_seq = 0;
-        self.cipher_suite = cipher_suite;
+        self.cipher_suite = cipher_suite_id;
 
         // Handshake state already set to Complete above
 
