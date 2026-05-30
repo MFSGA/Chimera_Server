@@ -4,12 +4,9 @@ mod process;
 use std::io::{self, Read, Write};
 
 use super::reality_aead::AeadKey;
-use super::reality_cipher_suite::CipherSuite;
 use super::reality_io_state::RealityIoState;
 use super::reality_reader_writer::{RealityReader, RealityWriter};
-use super::reality_records::{
-    RecordEncryptor, encrypt_plaintext_to_records_for_suite,
-};
+use super::reality_records::RecordEncryptor;
 use super::slide_buffer::SlideBuffer;
 use crate::reality::common::{
     self, CIPHERTEXT_READ_BUF_CAPACITY, OUTGOING_BUFFER_LIMIT,
@@ -64,9 +61,9 @@ pub struct RealityClientConnection {
     pub(super) handshake_state: HandshakeState,
 
     // TLS 1.3 application traffic encryption (post-handshake)
-    pub(super) app_read_key: Option<Vec<u8>>,
+    pub(super) app_read_key: Option<AeadKey>,
     pub(super) app_read_iv: Option<Vec<u8>>,
-    pub(super) app_write_key: Option<Vec<u8>>,
+    pub(super) app_write_key: Option<AeadKey>,
     pub(super) app_write_iv: Option<Vec<u8>>,
     pub(super) read_seq: u64,
     pub(super) write_seq: u64,
@@ -234,23 +231,13 @@ impl RealityClientConnection {
                     }
                 };
 
-            let cipher_suite =
-                CipherSuite::from_id(self.cipher_suite).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "Invalid REALITY cipher suite in state: 0x{:04x}",
-                            self.cipher_suite
-                        ),
-                    )
-                })?;
-
-            encrypt_plaintext_to_records_for_suite(
-                cipher_suite,
-                &mut self.plaintext_write_buf,
+            let mut encryptor = RecordEncryptor::new(
                 app_write_key,
                 app_write_iv,
                 &mut self.write_seq,
+            );
+            encryptor.encrypt_app_data(
+                &mut self.plaintext_write_buf,
                 &mut self.ciphertext_write_buf,
             )?;
         }
@@ -294,22 +281,9 @@ impl RealityClientConnection {
             }
         };
 
-        let cipher_suite = match CipherSuite::from_id(self.cipher_suite) {
-            Some(cipher_suite) => cipher_suite,
-            None => {
-                tracing::error!(
-                    "REALITY CLIENT: Cannot send close_notify - invalid cipher suite 0x{:04x}",
-                    self.cipher_suite
-                );
-                return;
-            }
-        };
-
-        match AeadKey::new(cipher_suite, app_write_key).and_then(|aead_key| {
-            let mut encryptor =
-                RecordEncryptor::new(&aead_key, app_write_iv, &mut self.write_seq);
-            encryptor.encrypt_close_notify(&mut self.ciphertext_write_buf)
-        }) {
+        let mut encryptor =
+            RecordEncryptor::new(app_write_key, app_write_iv, &mut self.write_seq);
+        match encryptor.encrypt_close_notify(&mut self.ciphertext_write_buf) {
             Ok(()) => {
                 tracing::debug!(
                     "REALITY CLIENT: Encrypted close_notify alert queued"
