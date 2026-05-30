@@ -12,7 +12,7 @@ use super::common::{
     self, CIPHERTEXT_READ_BUF_CAPACITY, CONTENT_TYPE_ALERT,
     CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_CHANGE_CIPHER_SPEC,
     CONTENT_TYPE_HANDSHAKE, HANDSHAKE_TYPE_FINISHED, PLAINTEXT_READ_BUF_CAPACITY,
-    TLS_MAX_RECORD_SIZE, TLS_RECORD_HEADER_SIZE,
+    TLS_MAX_RECORD_SIZE, TLS_RECORD_HEADER_SIZE, strip_content_type_with_padding,
 };
 use super::reality_aead::{decrypt_handshake_message, decrypt_tls13_record};
 use super::reality_auth::{decrypt_session_id, derive_auth_key, perform_ecdh};
@@ -758,21 +758,14 @@ impl RealityServerConnection {
 
             self.read_seq += 1;
 
-            // TLS 1.3: Remove ContentType trailer byte
-            // The last byte of the plaintext is the actual ContentType
-            if !plaintext.is_empty() {
-                let content_type = plaintext.pop().unwrap();
-
-                // For now, we only handle ApplicationData (0x17) and Alert (0x15)
-                // Alerts should be handled separately, but for now just pass through
-                if content_type != CONTENT_TYPE_APPLICATION_DATA
-                    && content_type != CONTENT_TYPE_ALERT
-                {
-                    tracing::warn!(
-                        "REALITY: Unexpected ContentType: 0x{:02x}",
-                        content_type
-                    );
-                }
+            let content_type = strip_content_type_with_padding(&mut plaintext)?;
+            if content_type != CONTENT_TYPE_APPLICATION_DATA
+                && content_type != CONTENT_TYPE_ALERT
+            {
+                tracing::warn!(
+                    "REALITY: Unexpected ContentType: 0x{:02x}",
+                    content_type
+                );
             }
 
             // Compact plaintext buffer if needed before extending

@@ -3,8 +3,7 @@
 // AES-GCM encryption for TLS 1.3 records using aws-lc-rs
 
 use super::common::{
-    CONTENT_TYPE_ALERT, CONTENT_TYPE_APPLICATION_DATA, VERSION_TLS_1_2_MAJOR,
-    VERSION_TLS_1_2_MINOR,
+    VERSION_TLS_1_2_MAJOR, VERSION_TLS_1_2_MINOR, strip_content_type_with_padding,
 };
 use aws_lc_rs::aead::{AES_128_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use std::io::{Error, ErrorKind, Result};
@@ -172,35 +171,7 @@ pub fn decrypt_handshake_message(
         &additional_data,
     )?;
 
-    // Remove ContentType trailer
-    if plaintext.is_empty() {
-        return Err(Error::new(ErrorKind::InvalidData, "Empty plaintext"));
-    }
-
-    // TLS 1.3 has format: content | type_byte | padding (zeros)
-    // We need to find the type byte by removing trailing zeros first
-
-    // Remove trailing zeros (padding)
-    while !plaintext.is_empty() && plaintext[plaintext.len() - 1] == 0 {
-        plaintext.pop();
-    }
-
-    if plaintext.is_empty() {
-        return Err(Error::new(ErrorKind::InvalidData, "Plaintext is all zeros"));
-    }
-
-    // Now the last byte should be the content type
-    let content_type = plaintext.pop().unwrap();
-
-    if content_type != 0x16
-        && content_type != CONTENT_TYPE_APPLICATION_DATA
-        && content_type != CONTENT_TYPE_ALERT
-    {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("Invalid content type: 0x{:02x}", content_type),
-        ));
-    }
+    let _ = strip_content_type_with_padding(&mut plaintext)?;
 
     Ok(plaintext)
 }
