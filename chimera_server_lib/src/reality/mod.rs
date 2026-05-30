@@ -6,6 +6,7 @@ mod common;
 mod reality_aead;
 mod reality_auth;
 mod reality_certificate;
+mod reality_cipher_suite;
 mod reality_client_verify;
 mod reality_io_state;
 mod reality_reader_writer;
@@ -24,6 +25,7 @@ pub use buf_reader::BufReader;
 pub use client::{
     RealityClientConfig, RealityClientConnection, feed_reality_client_connection,
 };
+pub use reality_cipher_suite::{CipherSuite, DEFAULT_CIPHER_SUITES};
 pub use reality_io_state::RealityIoState;
 pub use reality_reader_writer::{RealityReader, RealityWriter};
 pub use reality_server_connection::{

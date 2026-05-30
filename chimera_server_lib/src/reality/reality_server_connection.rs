@@ -18,6 +18,7 @@ use super::common::{
 use super::reality_aead::{decrypt_handshake_message, decrypt_tls13_record};
 use super::reality_auth::{decrypt_session_id, derive_auth_key, perform_ecdh};
 use super::reality_certificate::generate_hmac_certificate;
+use super::reality_cipher_suite::CipherSuite;
 use super::reality_io_state::RealityIoState;
 use super::reality_reader_writer::{RealityReader, RealityWriter};
 use super::reality_records::{
@@ -30,7 +31,7 @@ use super::reality_tls13_keys::{
 use super::reality_tls13_messages::*;
 use super::reality_util::{
     extract_client_cipher_suites, extract_client_public_key, extract_client_random,
-    extract_session_id_slice,
+    extract_session_id_slice, negotiate_cipher_suite,
 };
 use aws_lc_rs::{
     agreement, digest,
@@ -236,13 +237,17 @@ impl RealityServerConnection {
         let client_cipher_suites = extract_client_cipher_suites(&client_hello)?;
 
         // Current key schedule and AEAD paths are limited to TLS_AES_128_GCM_SHA256.
-        const CIPHER_SUITE: u16 = 0x1301;
-        if !client_cipher_suites.contains(&CIPHER_SUITE) {
-            return Err(io::Error::new(
+        let cipher_suite = negotiate_cipher_suite(
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &client_cipher_suites,
+        )
+        .ok_or_else(|| {
+            io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Client did not offer required REALITY cipher suite: 0x1301",
-            ));
-        }
+            )
+        })?;
+        let cipher_suite_id = cipher_suite.id();
 
         tracing::debug!(
             "REALITY: ClientHello received, client_random: {:?}",
@@ -426,7 +431,7 @@ impl RealityServerConnection {
         let server_hello = construct_server_hello(
             &server_random,
             session_id,
-            CIPHER_SUITE,
+            cipher_suite_id,
             our_public_key_bytes.as_ref(),
         )?;
 
@@ -509,7 +514,7 @@ impl RealityServerConnection {
         // Step 13: Derive server handshake traffic keys for encryption
         let (server_hs_key, server_hs_iv) = derive_traffic_keys(
             &hs_keys.server_handshake_traffic_secret,
-            CIPHER_SUITE,
+            cipher_suite_id,
         )?;
 
         // Step 14: Build server Finished message first (before encryption)
@@ -590,7 +595,7 @@ impl RealityServerConnection {
                 .client_handshake_traffic_secret
                 .clone(),
             master_secret: hs_keys.master_secret,
-            cipher_suite: CIPHER_SUITE,
+            cipher_suite: cipher_suite_id,
         };
 
         Ok(())
