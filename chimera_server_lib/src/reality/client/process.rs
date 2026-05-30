@@ -158,6 +158,8 @@ pub(super) fn process_server_hello(
         cipher_suite,
         handshake_transcript_bytes: transcript_bytes,
         auth_key, // Pass auth_key for certificate HMAC verification
+        handshake_seq: 0,
+        accumulated_plaintext: Vec::new(),
     };
 
     Ok(())
@@ -166,7 +168,6 @@ pub(super) fn process_server_hello(
 pub(super) fn process_encrypted_handshake(
     conn: &mut RealityClientConnection,
 ) -> io::Result<()> {
-    // Extract state - we need to preserve it across multiple calls
     let (
         client_hs_secret,
         server_hs_secret,
@@ -174,6 +175,8 @@ pub(super) fn process_encrypted_handshake(
         cipher_suite,
         transcript_bytes,
         auth_key,
+        mut handshake_seq,
+        mut accumulated_plaintext,
     ) = match &conn.handshake_state {
         HandshakeState::ProcessingHandshake {
             client_handshake_traffic_secret,
@@ -182,6 +185,8 @@ pub(super) fn process_encrypted_handshake(
             cipher_suite,
             handshake_transcript_bytes,
             auth_key,
+            handshake_seq,
+            accumulated_plaintext,
         } => (
             client_handshake_traffic_secret.clone(),
             server_handshake_traffic_secret.clone(),
@@ -189,26 +194,27 @@ pub(super) fn process_encrypted_handshake(
             *cipher_suite,
             handshake_transcript_bytes.clone(),
             *auth_key,
+            *handshake_seq,
+            accumulated_plaintext.clone(),
         ),
         _ => return Ok(()),
     };
 
-    // Derive server handshake traffic keys for decryption
     let (server_hs_key, server_hs_iv) =
         derive_traffic_keys(&server_hs_secret, cipher_suite)?;
 
-    tracing::debug!(
-        "REALITY CLIENT: Server HS key={:02x?}, iv={:02x?}",
-        &server_hs_key[..16],
-        &server_hs_iv
-    );
-
-    // Check if we have enough data for a TLS record header
-    if conn.ciphertext_read_buf.len() < TLS_RECORD_HEADER_SIZE {
-        return Ok(()); // Need more data
+    if handshake_seq == 0 {
+        tracing::debug!(
+            "REALITY CLIENT: Server HS key={:02x?}, iv={:02x?}",
+            &server_hs_key[..16],
+            &server_hs_iv
+        );
     }
 
-    // Check record type
+    if conn.ciphertext_read_buf.len() < TLS_RECORD_HEADER_SIZE {
+        return Ok(());
+    }
+
     let record_type = conn.ciphertext_read_buf[0];
     let tls_version = conn.ciphertext_read_buf.get_u16_be(1).ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidData, "Buffer too short")
@@ -224,13 +230,11 @@ pub(super) fn process_encrypted_handshake(
         record_len
     );
 
-    // Check if we have the complete record
     let total_record_len = TLS_RECORD_HEADER_SIZE + record_len;
     if conn.ciphertext_read_buf.len() < total_record_len {
-        return Ok(()); // Need more data
+        return Ok(());
     }
 
-    // Skip ChangeCipherSpec records - these are dummy in TLS 1.3
     if record_type == CONTENT_TYPE_CHANGE_CIPHER_SPEC {
         tracing::debug!(
             "REALITY CLIENT: Skipping ChangeCipherSpec record ({} bytes)",
@@ -240,7 +244,6 @@ pub(super) fn process_encrypted_handshake(
         return process_encrypted_handshake(conn);
     }
 
-    // If it's not Application Data, we have a problem
     if record_type != CONTENT_TYPE_APPLICATION_DATA {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -251,84 +254,55 @@ pub(super) fn process_encrypted_handshake(
         ));
     }
 
-    // Copy and extract the combined handshake record
     let ciphertext: Vec<u8> =
         conn.ciphertext_read_buf[TLS_RECORD_HEADER_SIZE..total_record_len].to_vec();
     conn.ciphertext_read_buf.consume(total_record_len);
 
     tracing::debug!(
-        "REALITY CLIENT: Decrypting combined handshake record - record_type=0x{:02x}, record_len={}, seq=0",
-        record_type,
+        "REALITY CLIENT: Decrypting handshake record #{} - record_len={}",
+        handshake_seq,
         record_len
     );
 
-    // Try different sequence numbers - some servers count differently
-    let mut combined_plaintext = None;
-    for seq in 0..3 {
-        match decrypt_handshake_message(
-            &server_hs_key,
-            &server_hs_iv,
-            seq,
-            &ciphertext,
-            record_len as u16,
-        ) {
-            Ok(plaintext) => {
-                combined_plaintext = Some(plaintext);
-                break;
-            }
-            Err(_) if seq < 2 => {
-                tracing::debug!(
-                    "REALITY CLIENT: Decryption failed with seq={}, trying next",
-                    seq
-                );
-                continue;
-            }
-            Err(e) => {
-                tracing::error!(
-                    "REALITY CLIENT: Failed to decrypt combined handshake with all sequence numbers: {}",
-                    e
-                );
-                return Err(e);
-            }
-        }
-    }
+    let plaintext = decrypt_handshake_message(
+        &server_hs_key,
+        &server_hs_iv,
+        handshake_seq,
+        &ciphertext,
+        record_len as u16,
+    )?;
+    handshake_seq = handshake_seq.checked_add(1).ok_or_else(|| {
+        io::Error::other("TLS handshake sequence number exhausted")
+    })?;
+    accumulated_plaintext.extend_from_slice(&plaintext);
 
-    let combined_plaintext = combined_plaintext.unwrap();
-
-    tracing::info!(
-        "REALITY CLIENT: Successfully decrypted combined handshake record ({} bytes plaintext)",
-        combined_plaintext.len()
+    tracing::debug!(
+        "REALITY CLIENT: Decrypted handshake record, accumulated {} bytes",
+        accumulated_plaintext.len()
     );
 
-    // Now parse the individual handshake messages from the combined plaintext
     let mut offset = 0;
     let mut messages_found = 0;
     let mut certificate_verified = false;
     let mut ed25519_public_key = None;
     let mut cert_verify_offset = None;
 
-    while offset < combined_plaintext.len() && messages_found < 4 {
+    while offset < accumulated_plaintext.len() && messages_found < 4 {
         // Each handshake message has: type (1 byte) + length (3 bytes) + data
-        if offset + 4 > combined_plaintext.len() {
+        if offset + 4 > accumulated_plaintext.len() {
             break;
         }
 
-        let msg_type = combined_plaintext[offset];
+        let msg_type = accumulated_plaintext[offset];
         let msg_len = u32::from_be_bytes([
             0,
-            combined_plaintext[offset + 1],
-            combined_plaintext[offset + 2],
-            combined_plaintext[offset + 3],
+            accumulated_plaintext[offset + 1],
+            accumulated_plaintext[offset + 2],
+            accumulated_plaintext[offset + 3],
         ]) as usize;
 
-        if offset + 4 + msg_len > combined_plaintext.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Invalid handshake message length: {} at offset {}",
-                    msg_len, offset
-                ),
-            ));
+        if offset + 4 + msg_len > accumulated_plaintext.len() {
+            break;
         }
 
         let msg_name = match msg_type {
@@ -349,7 +323,7 @@ pub(super) fn process_encrypted_handshake(
         // Verify HMAC signature when we encounter the Certificate message
         if msg_type == HANDSHAKE_TYPE_CERTIFICATE {
             let cert_der = extract_certificate_der(
-                &combined_plaintext[offset..offset + 4 + msg_len],
+                &accumulated_plaintext[offset..offset + 4 + msg_len],
             )?;
             verify_certificate_hmac(cert_der, &auth_key)?;
             ed25519_public_key = Some(extract_ed25519_public_key(cert_der)?);
@@ -364,12 +338,22 @@ pub(super) fn process_encrypted_handshake(
         offset += 4 + msg_len;
     }
 
-    // Check if we got all 4 messages AND the certificate was verified
-    if messages_found != 4 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Expected 4 handshake messages, found {}", messages_found),
-        ));
+    if messages_found < 4 {
+        tracing::debug!(
+            "REALITY CLIENT: Received {} of 4 handshake messages, waiting for more records",
+            messages_found
+        );
+        conn.handshake_state = HandshakeState::ProcessingHandshake {
+            client_handshake_traffic_secret: client_hs_secret,
+            server_handshake_traffic_secret: server_hs_secret,
+            master_secret,
+            cipher_suite,
+            handshake_transcript_bytes: transcript_bytes,
+            auth_key,
+            handshake_seq,
+            accumulated_plaintext,
+        };
+        return Ok(());
     }
 
     if !certificate_verified {
@@ -385,16 +369,17 @@ pub(super) fn process_encrypted_handshake(
     {
         let mut cv_transcript = digest::Context::new(&digest::SHA256);
         cv_transcript.update(&transcript_bytes);
-        cv_transcript.update(&combined_plaintext[..cv_offset]);
+        cv_transcript.update(&accumulated_plaintext[..cv_offset]);
         let cv_transcript_hash = cv_transcript.finish();
 
         let cv_msg_len = u32::from_be_bytes([
             0,
-            combined_plaintext[cv_offset + 1],
-            combined_plaintext[cv_offset + 2],
-            combined_plaintext[cv_offset + 3],
+            accumulated_plaintext[cv_offset + 1],
+            accumulated_plaintext[cv_offset + 2],
+            accumulated_plaintext[cv_offset + 3],
         ]) as usize;
-        let cv_message = &combined_plaintext[cv_offset..cv_offset + 4 + cv_msg_len];
+        let cv_message =
+            &accumulated_plaintext[cv_offset..cv_offset + 4 + cv_msg_len];
         let signature = extract_certificate_verify_signature(cv_message)?;
         verify_certificate_verify_signature(
             &public_key,
@@ -414,7 +399,7 @@ pub(super) fn process_encrypted_handshake(
     // Build handshake transcript
     let mut handshake_transcript = digest::Context::new(&digest::SHA256);
     handshake_transcript.update(&transcript_bytes); // Contains actual ClientHello + ServerHello bytes
-    handshake_transcript.update(&combined_plaintext); // EncryptedExtensions + Certificate + CertificateVerify + Finished
+    handshake_transcript.update(&accumulated_plaintext[..offset]); // EncryptedExtensions + Certificate + CertificateVerify + Finished
 
     let handshake_hash = handshake_transcript.finish();
     let mut handshake_hash_arr = [0u8; 32];
@@ -425,9 +410,9 @@ pub(super) fn process_encrypted_handshake(
         handshake_hash_arr
     );
     tracing::info!(
-        "REALITY CLIENT: Transcript bytes len={}, combined_plaintext len={}",
+        "REALITY CLIENT: Transcript bytes len={}, accumulated_plaintext len={}",
         transcript_bytes.len(),
-        combined_plaintext.len()
+        offset
     );
 
     // Generate client Finished message
