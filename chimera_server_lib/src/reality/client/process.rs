@@ -4,11 +4,11 @@ use aws_lc_rs::{agreement, digest};
 
 use super::{HandshakeState, RealityClientConnection};
 use crate::reality::common::{
-    CONTENT_TYPE_ALERT, CONTENT_TYPE_APPLICATION_DATA,
-    CONTENT_TYPE_CHANGE_CIPHER_SPEC, HANDSHAKE_TYPE_CERTIFICATE,
-    HANDSHAKE_TYPE_CERTIFICATE_VERIFY, HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS,
-    HANDSHAKE_TYPE_FINISHED, TLS_RECORD_HEADER_SIZE,
-    strip_content_type_with_padding,
+    ALERT_DESC_CLOSE_NOTIFY, ALERT_LEVEL_WARNING, CONTENT_TYPE_ALERT,
+    CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_CHANGE_CIPHER_SPEC,
+    HANDSHAKE_TYPE_CERTIFICATE, HANDSHAKE_TYPE_CERTIFICATE_VERIFY,
+    HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS, HANDSHAKE_TYPE_FINISHED,
+    TLS_RECORD_HEADER_SIZE, strip_content_type_with_padding,
 };
 use crate::reality::reality_aead::{
     decrypt_handshake_message, decrypt_tls13_record,
@@ -478,18 +478,52 @@ pub(super) fn process_application_data(
         conn.read_seq += 1;
 
         let content_type = strip_content_type_with_padding(&mut plaintext)?;
-        if content_type != CONTENT_TYPE_APPLICATION_DATA
-            && content_type != CONTENT_TYPE_ALERT
-        {
-            tracing::warn!(
-                "REALITY CLIENT: Unexpected ContentType: 0x{:02x}",
-                content_type
-            );
-        }
+        match content_type {
+            CONTENT_TYPE_APPLICATION_DATA => {
+                conn.plaintext_read_buf.maybe_compact(4096);
+                conn.plaintext_read_buf.extend_from_slice(&plaintext);
+            }
+            CONTENT_TYPE_ALERT => {
+                if plaintext.len() >= 2 {
+                    let alert_level = plaintext[0];
+                    let alert_desc = plaintext[1];
 
-        // Compact plaintext buffer if needed before extending
-        conn.plaintext_read_buf.maybe_compact(4096);
-        conn.plaintext_read_buf.extend_from_slice(&plaintext);
+                    if alert_desc == ALERT_DESC_CLOSE_NOTIFY {
+                        tracing::debug!(
+                            "REALITY CLIENT: Received close_notify alert"
+                        );
+                        conn.received_close_notify = true;
+                        return Ok(());
+                    }
+
+                    if alert_level != ALERT_LEVEL_WARNING {
+                        tracing::warn!(
+                            "REALITY CLIENT: Received fatal alert: level={}, desc={}",
+                            alert_level,
+                            alert_desc
+                        );
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            format!("received fatal alert: {}", alert_desc),
+                        ));
+                    }
+
+                    tracing::debug!(
+                        "REALITY CLIENT: Received warning alert: desc={}",
+                        alert_desc
+                    );
+                }
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unexpected post-handshake content type: 0x{:02x}",
+                        content_type
+                    ),
+                ));
+            }
+        }
     }
 
     Ok(())
