@@ -24,7 +24,11 @@ use crate::reality::reality_tls13_keys::{
     derive_traffic_keys,
 };
 use crate::reality::reality_tls13_messages::construct_finished;
-use crate::reality::reality_util::extract_server_public_key;
+use crate::reality::reality_util::{
+    extract_server_cipher_suite, extract_server_public_key,
+};
+
+const SUPPORTED_CIPHER_SUITE: u16 = 0x1301;
 
 pub(super) fn process_server_hello(
     conn: &mut RealityClientConnection,
@@ -70,6 +74,13 @@ pub(super) fn process_server_hello(
 
     // Extract server public key from ServerHello
     let server_public_key = extract_server_public_key(&record)?;
+    let cipher_suite = extract_server_cipher_suite(&record)?;
+    if cipher_suite != SUPPORTED_CIPHER_SUITE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Unsupported REALITY cipher suite: 0x{cipher_suite:04x}"),
+        ));
+    }
 
     // Get the actual ClientHello bytes from our saved state
     let client_hello_bytes = match &conn.handshake_state {
@@ -128,9 +139,6 @@ pub(super) fn process_server_hello(
         &server_hello_hash_arr,
     )?;
 
-    // Use standard cipher suite
-    const CIPHER_SUITE: u16 = 0x1301; // TLS_AES_128_GCM_SHA256
-
     tracing::debug!("REALITY: ServerHello processed, handshake keys derived");
 
     // Initialize transcript with actual ClientHello and ServerHello bytes
@@ -147,7 +155,7 @@ pub(super) fn process_server_hello(
             .server_handshake_traffic_secret
             .clone(),
         master_secret: hs_keys.master_secret.clone(),
-        cipher_suite: CIPHER_SUITE,
+        cipher_suite,
         handshake_transcript_bytes: transcript_bytes,
         auth_key, // Pass auth_key for certificate HMAC verification
     };

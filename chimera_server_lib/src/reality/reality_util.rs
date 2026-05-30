@@ -372,6 +372,36 @@ fn parse_server_keyshare_extension(data: &[u8]) -> Result<[u8; 32], std::io::Err
     ))
 }
 
+/// Extract the cipher suite selected by the server from ServerHello.
+///
+/// The input includes the TLS record header; ServerHello carries exactly one
+/// selected cipher suite after the echoed session ID.
+pub fn extract_server_cipher_suite(
+    server_hello: &[u8],
+) -> Result<u16, std::io::Error> {
+    const TLS_HEADER_LEN: usize = 5;
+
+    if server_hello.len() < TLS_HEADER_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ServerHello too short",
+        ));
+    }
+
+    let mut reader = BufReader::new(&server_hello[TLS_HEADER_LEN..]);
+
+    let _handshake_type = reader.read_u8()?;
+    let _handshake_len = reader.read_u24_be()?;
+    let _protocol_version = reader.read_u16_be()?;
+
+    reader.skip(32)?;
+
+    let session_id_len = reader.read_u8()? as usize;
+    reader.skip(session_id_len)?;
+
+    reader.read_u16_be()
+}
+
 pub fn generate_keypair() -> std::io::Result<(String, String)> {
     // Step 1: Generate 32 random bytes for private key
     let rng = SystemRandom::new();
@@ -466,5 +496,26 @@ mod tests {
 
         // Invalid base64
         assert!(decode_public_key("not-valid-base64!!!").is_err());
+    }
+
+    #[test]
+    fn test_extract_server_cipher_suite() {
+        use crate::reality::common::CONTENT_TYPE_HANDSHAKE;
+        use crate::reality::reality_tls13_messages::{
+            construct_server_hello, write_record_header,
+        };
+
+        let server_random = [0x11u8; 32];
+        let session_id = [0x22u8; 32];
+        let key_share = [0x33u8; 32];
+        let server_hello =
+            construct_server_hello(&server_random, &session_id, 0x1303, &key_share)
+                .unwrap();
+        let mut record =
+            write_record_header(CONTENT_TYPE_HANDSHAKE, server_hello.len() as u16);
+        record.extend_from_slice(&server_hello);
+
+        let cipher_suite = extract_server_cipher_suite(&record).unwrap();
+        assert_eq!(cipher_suite, 0x1303);
     }
 }
