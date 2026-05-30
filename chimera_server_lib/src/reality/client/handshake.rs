@@ -10,7 +10,8 @@ use crate::reality::reality_auth::{
     derive_auth_key, encrypt_session_id, perform_ecdh,
 };
 use crate::reality::reality_tls13_messages::{
-    construct_client_hello, write_record_header,
+    DEFAULT_ALPN_PROTOCOLS, DEFAULT_CIPHER_SUITE_IDS, construct_client_hello,
+    write_record_header,
 };
 
 pub(super) fn generate_client_hello(
@@ -73,6 +74,8 @@ pub(super) fn generate_client_hello(
         &session_id_for_hello,
         our_public_key_bytes.as_ref(),
         &conn.config.server_name,
+        DEFAULT_CIPHER_SUITE_IDS,
+        DEFAULT_ALPN_PROTOCOLS,
     )?;
 
     // Now encrypt the SessionId using the ClientHello with zeroed SessionId as AAD
