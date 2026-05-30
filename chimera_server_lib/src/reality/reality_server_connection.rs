@@ -9,10 +9,11 @@ use super::slide_buffer::SlideBuffer;
 use crate::address::{Address, NetLocation};
 
 use super::common::{
-    self, CIPHERTEXT_READ_BUF_CAPACITY, CONTENT_TYPE_ALERT,
-    CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_CHANGE_CIPHER_SPEC,
-    CONTENT_TYPE_HANDSHAKE, HANDSHAKE_TYPE_FINISHED, PLAINTEXT_READ_BUF_CAPACITY,
-    TLS_MAX_RECORD_SIZE, TLS_RECORD_HEADER_SIZE, strip_content_type_with_padding,
+    self, ALERT_DESC_CLOSE_NOTIFY, ALERT_LEVEL_WARNING,
+    CIPHERTEXT_READ_BUF_CAPACITY, CONTENT_TYPE_ALERT, CONTENT_TYPE_APPLICATION_DATA,
+    CONTENT_TYPE_CHANGE_CIPHER_SPEC, CONTENT_TYPE_HANDSHAKE,
+    HANDSHAKE_TYPE_FINISHED, PLAINTEXT_READ_BUF_CAPACITY, TLS_MAX_RECORD_SIZE,
+    TLS_RECORD_HEADER_SIZE, strip_content_type_with_padding,
 };
 use super::reality_aead::{decrypt_handshake_message, decrypt_tls13_record};
 use super::reality_auth::{decrypt_session_id, derive_auth_key, perform_ecdh};
@@ -94,6 +95,7 @@ pub struct RealityServerConnection {
     ciphertext_write_buf: Vec<u8>,    // Outgoing encrypted TLS records
     plaintext_read_buf: SlideBuffer,  // Decrypted application data
     plaintext_write_buf: Vec<u8>,     // Application data to encrypt
+    received_close_notify: bool,      // Peer sent close_notify alert
 }
 
 impl RealityServerConnection {
@@ -114,6 +116,7 @@ impl RealityServerConnection {
             ciphertext_write_buf: Vec::with_capacity(CIPHERTEXT_READ_BUF_CAPACITY),
             plaintext_read_buf: SlideBuffer::new(PLAINTEXT_READ_BUF_CAPACITY),
             plaintext_write_buf: Vec::with_capacity(TLS_MAX_RECORD_SIZE),
+            received_close_notify: false,
         })
     }
 
@@ -140,6 +143,10 @@ impl RealityServerConnection {
     ///
     /// Returns I/O state with available plaintext bytes and write status.
     pub fn process_new_packets(&mut self) -> io::Result<RealityIoState> {
+        if self.received_close_notify {
+            return Ok(RealityIoState::new(self.plaintext_read_buf.len()));
+        }
+
         match &self.handshake_state {
             HandshakeState::Initial => {
                 self.process_client_hello()?;
@@ -759,20 +766,53 @@ impl RealityServerConnection {
             self.read_seq += 1;
 
             let content_type = strip_content_type_with_padding(&mut plaintext)?;
-            if content_type != CONTENT_TYPE_APPLICATION_DATA
-                && content_type != CONTENT_TYPE_ALERT
-            {
-                tracing::warn!(
-                    "REALITY: Unexpected ContentType: 0x{:02x}",
-                    content_type
-                );
+            match content_type {
+                CONTENT_TYPE_APPLICATION_DATA => {
+                    // Compact plaintext buffer if needed before extending
+                    self.plaintext_read_buf.maybe_compact(4096);
+
+                    // Append to plaintext buffer (without ContentType)
+                    self.plaintext_read_buf.extend_from_slice(&plaintext);
+                }
+                CONTENT_TYPE_ALERT => {
+                    if plaintext.len() >= 2 {
+                        let alert_level = plaintext[0];
+                        let alert_desc = plaintext[1];
+
+                        if alert_desc == ALERT_DESC_CLOSE_NOTIFY {
+                            tracing::debug!("REALITY: Received close_notify alert");
+                            self.received_close_notify = true;
+                            return Ok(());
+                        }
+
+                        if alert_level != ALERT_LEVEL_WARNING {
+                            tracing::warn!(
+                                "REALITY: Received fatal alert: level={}, desc={}",
+                                alert_level,
+                                alert_desc
+                            );
+                            return Err(io::Error::new(
+                                io::ErrorKind::ConnectionAborted,
+                                format!("received fatal alert: {}", alert_desc),
+                            ));
+                        }
+
+                        tracing::debug!(
+                            "REALITY: Received warning alert: desc={}",
+                            alert_desc
+                        );
+                    }
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "unexpected post-handshake content type: 0x{:02x}",
+                            content_type
+                        ),
+                    ));
+                }
             }
-
-            // Compact plaintext buffer if needed before extending
-            self.plaintext_read_buf.maybe_compact(4096);
-
-            // Append to plaintext buffer (without ContentType)
-            self.plaintext_read_buf.extend_from_slice(&plaintext);
         }
 
         Ok(())
@@ -783,7 +823,7 @@ impl RealityServerConnection {
         // SlideBuffer handles compaction internally via maybe_compact()
         // Compact before returning reader if we've consumed significant data
         self.plaintext_read_buf.maybe_compact(4096);
-        RealityReader::new(&mut self.plaintext_read_buf)
+        RealityReader::new(&mut self.plaintext_read_buf, self.received_close_notify)
     }
 
     /// Get a writer for buffering plaintext to be encrypted
