@@ -255,14 +255,27 @@ pub fn construct_finished(verify_data: &[u8]) -> Result<Vec<u8>> {
 /// Default ALPN protocols for REALITY client fingerprints.
 pub const DEFAULT_ALPN_PROTOCOLS: &[&str] = &["h2", "http/1.1"];
 
+/// Default TLS 1.3 cipher suite IDs offered by the REALITY client.
+pub const DEFAULT_CIPHER_SUITE_IDS: &[u16] = &[0x1301];
+
 /// Construct TLS 1.3 ClientHello message
 ///
 /// Returns handshake message bytes (without record header)
+///
+/// # Arguments
+/// * `client_random` - 32 bytes client random
+/// * `session_id` - 32 bytes session ID
+/// * `client_public_key` - X25519 public key bytes
+/// * `server_name` - SNI hostname
+/// * `cipher_suites` - Cipher suite IDs to offer, e.g. 0x1301 for TLS_AES_128_GCM_SHA256
+/// * `alpn_protocols` - ALPN protocols to offer, e.g. "h2" and "http/1.1"
 pub fn construct_client_hello(
     client_random: &[u8; 32],
     session_id: &[u8; 32],
     client_public_key: &[u8],
     server_name: &str,
+    cipher_suites: &[u16],
+    alpn_protocols: &[&str],
 ) -> Result<Vec<u8>> {
     let mut hello = Vec::with_capacity(512);
 
@@ -284,9 +297,22 @@ pub fn construct_client_hello(
     hello.extend_from_slice(session_id);
 
     // Cipher suites
-    // Support only TLS_AES_128_GCM_SHA256 (0x1301)
-    hello.extend_from_slice(&[0x00, 0x02]); // Cipher suites length: 2 bytes
-    hello.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
+    let cipher_suites_len = cipher_suites.len().checked_mul(2).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "too many cipher suites",
+        )
+    })?;
+    let cipher_suites_len = u16::try_from(cipher_suites_len).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "too many cipher suites",
+        )
+    })?;
+    hello.extend_from_slice(&cipher_suites_len.to_be_bytes());
+    for &suite in cipher_suites {
+        hello.extend_from_slice(&suite.to_be_bytes());
+    }
 
     // Compression methods (1 method: null)
     hello.extend_from_slice(&[0x01, 0x00]);
@@ -356,18 +382,43 @@ pub fn construct_client_hello(
     }
 
     // 6. ALPN extension (type 16)
-    {
+    if !alpn_protocols.is_empty() {
         extensions.extend_from_slice(&[0x00, 0x10]); // Extension type: ALPN
 
-        let protocols_list_len: usize = DEFAULT_ALPN_PROTOCOLS
-            .iter()
-            .map(|protocol| 1 + protocol.len())
-            .sum();
+        let mut protocols_list_len = 0usize;
+        for protocol in alpn_protocols {
+            u8::try_from(protocol.len()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "ALPN protocol too long",
+                )
+            })?;
+            protocols_list_len = protocols_list_len
+                .checked_add(1 + protocol.len())
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "ALPN protocol list too long",
+                    )
+                })?;
+        }
+        u16::try_from(protocols_list_len).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ALPN protocol list too long",
+            )
+        })?;
         let ext_len = 2 + protocols_list_len;
+        let ext_len = u16::try_from(ext_len).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ALPN extension too long",
+            )
+        })?;
         extensions.extend_from_slice(&(ext_len as u16).to_be_bytes());
         extensions.extend_from_slice(&(protocols_list_len as u16).to_be_bytes());
 
-        for protocol in DEFAULT_ALPN_PROTOCOLS {
+        for protocol in alpn_protocols {
             extensions.push(protocol.len() as u8);
             extensions.extend_from_slice(protocol.as_bytes());
         }
@@ -472,6 +523,8 @@ mod tests {
             &session_id,
             &client_public_key,
             "example.com",
+            DEFAULT_CIPHER_SUITE_IDS,
+            DEFAULT_ALPN_PROTOCOLS,
         )
         .unwrap();
 
@@ -505,5 +558,55 @@ mod tests {
         let extension = alpn.expect("missing ALPN extension");
         assert_eq!(u16::from_be_bytes([extension[0], extension[1]]), 12);
         assert_eq!(&extension[2..], b"\x02h2\x08http/1.1");
+    }
+
+    #[test]
+    fn test_client_hello_uses_supplied_cipher_suites_and_alpn() {
+        let client_random = [0u8; 32];
+        let session_id = [0u8; 32];
+        let client_public_key = [0u8; 32];
+
+        let hello = construct_client_hello(
+            &client_random,
+            &session_id,
+            &client_public_key,
+            "example.com",
+            &[0x1301, 0x1303],
+            &["h2"],
+        )
+        .unwrap();
+
+        let mut offset = 1 + 3 + 2 + 32;
+        let session_id_len = hello[offset] as usize;
+        offset += 1 + session_id_len;
+        let cipher_suites_len =
+            u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+        assert_eq!(cipher_suites_len, 4);
+        assert_eq!(&hello[offset + 2..offset + 6], &[0x13, 0x01, 0x13, 0x03]);
+        offset += 2 + cipher_suites_len;
+        let compression_methods_len = hello[offset] as usize;
+        offset += 1 + compression_methods_len;
+        let extensions_len =
+            u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+        offset += 2;
+        let extensions_end = offset + extensions_len;
+
+        let mut alpn = None;
+        while offset < extensions_end {
+            let extension_type =
+                u16::from_be_bytes([hello[offset], hello[offset + 1]]);
+            let extension_len =
+                u16::from_be_bytes([hello[offset + 2], hello[offset + 3]]) as usize;
+            offset += 4;
+            if extension_type == 0x0010 {
+                alpn = Some(&hello[offset..offset + extension_len]);
+                break;
+            }
+            offset += extension_len;
+        }
+
+        let extension = alpn.expect("missing ALPN extension");
+        assert_eq!(u16::from_be_bytes([extension[0], extension[1]]), 3);
+        assert_eq!(&extension[2..], b"\x02h2");
     }
 }
