@@ -944,6 +944,19 @@ impl RealityServerConnection {
         !self.ciphertext_write_buf.is_empty() || !self.plaintext_write_buf.is_empty()
     }
 
+    /// Check if the connection wants to read more TLS data.
+    pub fn wants_read(&self) -> bool {
+        if self.received_close_notify || self.fatal_error.is_some() {
+            return false;
+        }
+
+        if self.is_handshaking() {
+            return true;
+        }
+
+        self.plaintext_read_buf.is_empty()
+    }
+
     /// Check if handshake is still in progress
     pub fn is_handshaking(&self) -> bool {
         !matches!(self.handshake_state, HandshakeState::Complete)
@@ -1033,6 +1046,7 @@ mod tests {
 
         let conn = RealityServerConnection::new(config).unwrap();
         assert!(conn.is_handshaking());
+        assert!(conn.wants_read());
         assert!(!conn.wants_write());
     }
 
@@ -1077,6 +1091,7 @@ mod tests {
         let second_err = conn.process_new_packets().unwrap_err();
         assert_eq!(second_err.kind(), io::ErrorKind::InvalidData);
         assert_eq!(second_err.to_string(), "connection previously failed");
+        assert!(!conn.wants_read());
     }
 
     #[test]
