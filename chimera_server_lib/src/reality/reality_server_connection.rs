@@ -968,13 +968,20 @@ impl RealityServerConnection {
         };
 
         // Use common helper to build encrypted close_notify alert
+        let Some(next_write_seq) = self.write_seq.checked_add(1) else {
+            tracing::error!(
+                "REALITY: Cannot send close_notify - TLS sequence number exhausted"
+            );
+            return;
+        };
+
         match common::build_close_notify_alert(
             app_write_key,
             app_write_iv,
             self.write_seq,
         ) {
             Ok(record) => {
-                self.write_seq += 1;
+                self.write_seq = next_write_seq;
                 self.ciphertext_write_buf.extend_from_slice(&record);
                 tracing::debug!("REALITY: Encrypted close_notify alert queued");
             }
