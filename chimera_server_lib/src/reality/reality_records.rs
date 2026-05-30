@@ -9,7 +9,147 @@ use super::common::{
     CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_HANDSHAKE, MAX_TLS_CIPHERTEXT_LEN,
     MAX_TLS_PLAINTEXT_LEN, TLS_RECORD_HEADER_SIZE,
 };
-use super::reality_aead::encrypt_tls13_record;
+use super::reality_aead::AeadKey;
+use super::reality_cipher_suite::CipherSuite;
+
+/// Encrypts plaintext into TLS 1.3 records.
+///
+/// Manages the write-side sequence number and handles record framing while
+/// reusing the per-direction AEAD key across all fragmented records.
+struct RecordEncryptor<'a> {
+    key: &'a AeadKey,
+    iv: &'a [u8],
+    seq: &'a mut u64,
+}
+
+impl<'a> RecordEncryptor<'a> {
+    #[inline]
+    fn new(key: &'a AeadKey, iv: &'a [u8], seq: &'a mut u64) -> Self {
+        Self { key, iv, seq }
+    }
+
+    /// Encrypt application data into TLS 1.3 records.
+    #[inline]
+    fn encrypt_app_data(
+        &mut self,
+        plaintext: &mut Vec<u8>,
+        out: &mut Vec<u8>,
+    ) -> io::Result<()> {
+        if plaintext.is_empty() {
+            return Ok(());
+        }
+
+        if plaintext.len() <= MAX_TLS_PLAINTEXT_LEN {
+            let original_len = plaintext.len();
+            if let Err(err) = self.encrypt_record_in_place(
+                plaintext,
+                out,
+                CONTENT_TYPE_APPLICATION_DATA,
+            ) {
+                plaintext.truncate(original_len);
+                return Err(err);
+            }
+        } else {
+            let total_len = plaintext.len();
+            let num_records = total_len.div_ceil(MAX_TLS_PLAINTEXT_LEN);
+            tracing::debug!(
+                "REALITY: Fragmenting {} bytes into {} TLS records (max {} bytes/record)",
+                total_len,
+                num_records,
+                MAX_TLS_PLAINTEXT_LEN
+            );
+            self.encrypt_fragmented(plaintext, out, CONTENT_TYPE_APPLICATION_DATA)?;
+        }
+
+        plaintext.clear();
+        Ok(())
+    }
+
+    /// Encrypt handshake data into TLS 1.3 records.
+    #[inline]
+    fn encrypt_handshake(
+        &mut self,
+        handshake_data: &[u8],
+        out: &mut Vec<u8>,
+    ) -> io::Result<()> {
+        if handshake_data.is_empty() {
+            return Ok(());
+        }
+
+        if handshake_data.len() <= MAX_TLS_PLAINTEXT_LEN {
+            let mut buf = handshake_data.to_vec();
+            self.encrypt_record_in_place(&mut buf, out, CONTENT_TYPE_HANDSHAKE)?;
+        } else {
+            let total_len = handshake_data.len();
+            let num_records = total_len.div_ceil(MAX_TLS_PLAINTEXT_LEN);
+            tracing::debug!(
+                "REALITY: Fragmenting {} bytes of handshake data into {} TLS records (max {} bytes/record)",
+                total_len,
+                num_records,
+                MAX_TLS_PLAINTEXT_LEN
+            );
+            self.encrypt_fragmented(handshake_data, out, CONTENT_TYPE_HANDSHAKE)?;
+        }
+
+        Ok(())
+    }
+
+    /// Encrypt a single TLS 1.3 record in-place and append it to `out`.
+    #[inline]
+    fn encrypt_record_in_place(
+        &mut self,
+        buf: &mut Vec<u8>,
+        out: &mut Vec<u8>,
+        content_type: u8,
+    ) -> io::Result<()> {
+        let next_seq = checked_next_sequence(*self.seq)?;
+
+        buf.push(content_type);
+        let ciphertext_len = buf.len() + 16;
+        debug_assert!(
+            ciphertext_len <= MAX_TLS_CIPHERTEXT_LEN,
+            "BUG: ciphertext_len {} exceeds MAX_TLS_CIPHERTEXT_LEN {}",
+            ciphertext_len,
+            MAX_TLS_CIPHERTEXT_LEN
+        );
+
+        let header = make_record_header(ciphertext_len);
+        self.key.seal_in_place(buf, self.iv, *self.seq, &header)?;
+        *self.seq = next_seq;
+
+        out.reserve(TLS_RECORD_HEADER_SIZE + buf.len());
+        out.extend_from_slice(&header);
+        out.extend_from_slice(buf);
+
+        Ok(())
+    }
+
+    /// Encrypt data larger than 16KB by fragmenting into multiple records.
+    #[inline]
+    fn encrypt_fragmented(
+        &mut self,
+        data: &[u8],
+        out: &mut Vec<u8>,
+        content_type: u8,
+    ) -> io::Result<()> {
+        for chunk in data.chunks(MAX_TLS_PLAINTEXT_LEN) {
+            let mut buf = chunk.to_vec();
+            self.encrypt_record_in_place(&mut buf, out, content_type)?;
+        }
+        Ok(())
+    }
+}
+
+#[inline]
+fn make_record_header(ciphertext_len: usize) -> [u8; TLS_RECORD_HEADER_SIZE] {
+    [
+        CONTENT_TYPE_APPLICATION_DATA,
+        0x03,
+        0x03, // TLS 1.2 version for compatibility
+        (ciphertext_len >> 8) as u8,
+        (ciphertext_len & 0xff) as u8,
+    ]
+}
 
 /// Encrypt plaintext into TLS 1.3 application data records, fragmenting if necessary.
 ///
@@ -38,166 +178,15 @@ pub fn encrypt_plaintext_to_records(
         return Ok(());
     }
 
-    // Fast path: single record (most common case, ~16KB or less)
-    if plaintext.len() <= MAX_TLS_PLAINTEXT_LEN {
-        encrypt_single_record(
-            plaintext,
-            app_write_key,
-            app_write_iv,
-            write_seq,
-            ciphertext_buf,
-        )?;
-        plaintext.clear();
-        return Ok(());
-    }
-
-    // Slow path: fragment into multiple records
-    let total_len = plaintext.len();
-    let num_records = total_len.div_ceil(MAX_TLS_PLAINTEXT_LEN);
-    tracing::debug!(
-        "REALITY: Fragmenting {} bytes into {} TLS records (max {} bytes/record)",
-        total_len,
-        num_records,
-        MAX_TLS_PLAINTEXT_LEN
-    );
-
-    let mut offset = 0;
-    while offset < plaintext.len() {
-        let chunk_end = (offset + MAX_TLS_PLAINTEXT_LEN).min(plaintext.len());
-        let chunk = &plaintext[offset..chunk_end];
-
-        encrypt_chunk_with_type(
-            chunk,
-            app_write_key,
-            app_write_iv,
-            write_seq,
-            ciphertext_buf,
-            CONTENT_TYPE_APPLICATION_DATA,
-        )?;
-        offset = chunk_end;
-    }
-
-    plaintext.clear();
-    Ok(())
-}
-
-/// Encrypt a single record where plaintext fits within MAX_TLS_PLAINTEXT_LEN.
-/// This is the fast path - we can use mem::take to avoid allocation for plaintext_with_type.
-#[inline]
-fn encrypt_single_record(
-    plaintext: &mut Vec<u8>,
-    app_write_key: &[u8],
-    app_write_iv: &[u8],
-    write_seq: &mut u64,
-    ciphertext_buf: &mut Vec<u8>,
-) -> io::Result<()> {
-    // TLS 1.3: plaintext_with_type = plaintext || ContentType
-    // Take ownership to avoid allocation, we'll restore and clear it
-    let mut plaintext_with_type = std::mem::take(plaintext);
-    plaintext_with_type.push(CONTENT_TYPE_APPLICATION_DATA);
-
-    // Ciphertext length = plaintext_with_type + GCM tag (16 bytes)
-    let ciphertext_len = (plaintext_with_type.len() + 16) as u16;
-
-    // Build TLS record header (also serves as AAD for AEAD)
-    let tls_header: [u8; TLS_RECORD_HEADER_SIZE] = [
-        CONTENT_TYPE_APPLICATION_DATA,
-        0x03,
-        0x03, // TLS 1.2 version for compatibility
-        (ciphertext_len >> 8) as u8,
-        (ciphertext_len & 0xff) as u8,
-    ];
-
-    let ciphertext = encrypt_tls13_record(
-        app_write_key,
-        app_write_iv,
-        *write_seq,
-        &plaintext_with_type,
-        &tls_header,
-    )?;
-
-    if let Err(err) = increment_sequence(write_seq) {
-        plaintext_with_type.pop();
-        *plaintext = plaintext_with_type;
-        return Err(err);
-    }
-
-    // Append TLS record to output buffer
-    ciphertext_buf.reserve(TLS_RECORD_HEADER_SIZE + ciphertext.len());
-    ciphertext_buf.extend_from_slice(&tls_header);
-    ciphertext_buf.extend_from_slice(&ciphertext);
-
-    // Restore the vec for reuse by caller (will be cleared by caller)
-    *plaintext = plaintext_with_type;
-
-    Ok(())
-}
-
-/// Encrypt a chunk of data into a single TLS 1.3 record.
-///
-/// This is the core encryption function used by both application data and handshake
-/// fragmentation. The `inner_content_type` specifies the content type byte that gets
-/// encrypted inside the record (0x17 for app data, 0x16 for handshake).
-///
-/// The outer record type is always 0x17 (ApplicationData) for TLS 1.3 encrypted records.
-#[inline]
-fn encrypt_chunk_with_type(
-    chunk: &[u8],
-    key: &[u8],
-    iv: &[u8],
-    write_seq: &mut u64,
-    ciphertext_buf: &mut Vec<u8>,
-    inner_content_type: u8,
-) -> io::Result<()> {
-    // TLS 1.3: plaintext_with_type = chunk || ContentType
-    let mut plaintext_with_type = Vec::with_capacity(chunk.len() + 1);
-    plaintext_with_type.extend_from_slice(chunk);
-    plaintext_with_type.push(inner_content_type);
-
-    // Ciphertext length = plaintext_with_type + GCM tag (16 bytes)
-    let ciphertext_len = (plaintext_with_type.len() + 16) as u16;
-
-    // Verify we don't exceed TLS 1.3 limit (this should never happen if callers fragment correctly)
-    debug_assert!(
-        (ciphertext_len as usize) <= MAX_TLS_CIPHERTEXT_LEN,
-        "BUG: ciphertext_len {} exceeds MAX_TLS_CIPHERTEXT_LEN {}",
-        ciphertext_len,
-        MAX_TLS_CIPHERTEXT_LEN
-    );
-
-    // Build TLS record header (outer type is always ApplicationData for encrypted records)
-    let tls_header: [u8; TLS_RECORD_HEADER_SIZE] = [
-        CONTENT_TYPE_APPLICATION_DATA,
-        0x03,
-        0x03, // TLS 1.2 version for compatibility
-        (ciphertext_len >> 8) as u8,
-        (ciphertext_len & 0xff) as u8,
-    ];
-
-    let ciphertext = encrypt_tls13_record(
-        key,
-        iv,
-        *write_seq,
-        &plaintext_with_type,
-        &tls_header,
-    )?;
-
-    increment_sequence(write_seq)?;
-
-    // Append TLS record to output buffer
-    ciphertext_buf.reserve(TLS_RECORD_HEADER_SIZE + ciphertext.len());
-    ciphertext_buf.extend_from_slice(&tls_header);
-    ciphertext_buf.extend_from_slice(&ciphertext);
-
-    Ok(())
+    let aead_key = AeadKey::new(CipherSuite::AES_128_GCM_SHA256, app_write_key)?;
+    let mut encryptor = RecordEncryptor::new(&aead_key, app_write_iv, write_seq);
+    encryptor.encrypt_app_data(plaintext, ciphertext_buf)
 }
 
 #[inline]
-fn increment_sequence(seq: &mut u64) -> io::Result<()> {
-    *seq = seq
-        .checked_add(1)
-        .ok_or_else(|| Error::other("TLS sequence number exhausted"))?;
-    Ok(())
+fn checked_next_sequence(seq: u64) -> io::Result<u64> {
+    seq.checked_add(1)
+        .ok_or_else(|| Error::other("TLS sequence number exhausted"))
 }
 
 /// Encrypt handshake data into TLS 1.3 records, fragmenting if necessary.
@@ -231,47 +220,9 @@ pub fn encrypt_handshake_to_records(
         return Ok(());
     }
 
-    // Check if fragmentation is needed
-    if handshake_data.len() <= MAX_TLS_PLAINTEXT_LEN {
-        // Fast path: single record (most handshakes fit in one record)
-        encrypt_chunk_with_type(
-            handshake_data,
-            key,
-            iv,
-            write_seq,
-            ciphertext_buf,
-            CONTENT_TYPE_HANDSHAKE,
-        )?;
-    } else {
-        // Slow path: fragment into multiple records (large certificates)
-        let total_len = handshake_data.len();
-        let num_records = total_len.div_ceil(MAX_TLS_PLAINTEXT_LEN);
-        tracing::debug!(
-            "REALITY: Fragmenting {} bytes of handshake data into {} TLS records (max {} bytes/record)",
-            total_len,
-            num_records,
-            MAX_TLS_PLAINTEXT_LEN
-        );
-
-        let mut offset = 0;
-        while offset < handshake_data.len() {
-            let chunk_end =
-                (offset + MAX_TLS_PLAINTEXT_LEN).min(handshake_data.len());
-            let chunk = &handshake_data[offset..chunk_end];
-
-            encrypt_chunk_with_type(
-                chunk,
-                key,
-                iv,
-                write_seq,
-                ciphertext_buf,
-                CONTENT_TYPE_HANDSHAKE,
-            )?;
-            offset = chunk_end;
-        }
-    }
-
-    Ok(())
+    let aead_key = AeadKey::new(CipherSuite::AES_128_GCM_SHA256, key)?;
+    let mut encryptor = RecordEncryptor::new(&aead_key, iv, write_seq);
+    encryptor.encrypt_handshake(handshake_data, ciphertext_buf)
 }
 
 #[cfg(test)]
