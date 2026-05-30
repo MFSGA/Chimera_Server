@@ -60,8 +60,7 @@ enum HandshakeState {
     Initial,
     /// ServerHello and encrypted handshake messages sent, waiting for client Finished
     ServerHelloSent {
-        handshake_hash: [u8; 32], // Hash before server Finished
-        handshake_hash_with_server_finished: [u8; 32], // Hash including server Finished (for verifying client Finished)
+        handshake_hash_with_server_finished: Vec<u8>, // Hash including server Finished (for verifying client Finished)
         client_handshake_traffic_secret: Vec<u8>,
         master_secret: Vec<u8>,
         cipher_suite: u16,
@@ -436,11 +435,13 @@ impl RealityServerConnection {
         // Step 8: Compute transcript hashes
         let client_hello_handshake = &client_hello[TLS_RECORD_HEADER_SIZE..]; // Skip TLS record header
 
-        let mut ch_transcript = digest::Context::new(&digest::SHA256);
+        let digest_alg = cipher_suite.digest_algorithm();
+
+        let mut ch_transcript = digest::Context::new(digest_alg);
         ch_transcript.update(client_hello_handshake);
         let client_hello_hash = ch_transcript.finish();
 
-        let mut ch_sh_transcript = digest::Context::new(&digest::SHA256);
+        let mut ch_sh_transcript = digest::Context::new(digest_alg);
         ch_sh_transcript.update(client_hello_handshake);
         ch_sh_transcript.update(&server_hello);
 
@@ -465,16 +466,11 @@ impl RealityServerConnection {
         )?;
 
         // Step 10: Derive TLS 1.3 keys
-        let mut client_hello_hash_arr = [0u8; 32];
-        client_hello_hash_arr.copy_from_slice(client_hello_hash.as_ref());
-        let mut server_hello_hash_arr = [0u8; 32];
-        server_hello_hash_arr.copy_from_slice(server_hello_hash.as_ref());
-
         let hs_keys = derive_handshake_keys_for_suite(
             cipher_suite,
             &tls_shared_secret,
-            &client_hello_hash_arr,
-            &server_hello_hash_arr,
+            client_hello_hash.as_ref(),
+            server_hello_hash.as_ref(),
         )?;
 
         // Get destination hostname for certificate
@@ -500,15 +496,11 @@ impl RealityServerConnection {
         handshake_transcript.update(&certificate);
 
         let cert_verify_hash = handshake_transcript.clone().finish();
-        let mut cert_verify_hash_arr = [0u8; 32];
-        cert_verify_hash_arr.copy_from_slice(cert_verify_hash.as_ref());
         let certificate_verify =
-            construct_certificate_verify(&signing_key, &cert_verify_hash_arr)?;
+            construct_certificate_verify(&signing_key, cert_verify_hash.as_ref())?;
         handshake_transcript.update(&certificate_verify);
 
         let handshake_hash_before_finished = handshake_transcript.clone().finish();
-        let mut handshake_hash_arr = [0u8; 32];
-        handshake_hash_arr.copy_from_slice(handshake_hash_before_finished.as_ref());
 
         // Step 13: Derive server handshake traffic keys for encryption
         let (server_hs_key, server_hs_iv) = derive_traffic_keys_for_suite(
@@ -520,7 +512,7 @@ impl RealityServerConnection {
         let server_verify_data = compute_finished_verify_data_for_suite(
             cipher_suite,
             &hs_keys.server_handshake_traffic_secret,
-            &handshake_hash_arr,
+            handshake_hash_before_finished.as_ref(),
         )?;
         let server_finished = construct_finished(&server_verify_data)?;
 
@@ -555,9 +547,6 @@ impl RealityServerConnection {
         // Update transcript with server Finished (needed for client Finished verification)
         handshake_transcript.update(&server_finished);
         let handshake_hash_with_server_finished = handshake_transcript.finish();
-        let mut handshake_hash_with_finished_arr = [0u8; 32];
-        handshake_hash_with_finished_arr
-            .copy_from_slice(handshake_hash_with_server_finished.as_ref());
 
         // Step 16: Buffer all handshake messages to write buffer
         // ServerHello (plaintext)
@@ -587,8 +576,9 @@ impl RealityServerConnection {
 
         // Step 17: Update handshake state
         self.handshake_state = HandshakeState::ServerHelloSent {
-            handshake_hash: handshake_hash_arr,
-            handshake_hash_with_server_finished: handshake_hash_with_finished_arr,
+            handshake_hash_with_server_finished: handshake_hash_with_server_finished
+                .as_ref()
+                .to_vec(),
             client_handshake_traffic_secret: hs_keys
                 .client_handshake_traffic_secret
                 .clone(),
@@ -662,20 +652,17 @@ impl RealityServerConnection {
             client_handshake_traffic_secret,
             master_secret,
             cipher_suite_id,
-            _handshake_hash,
             handshake_hash_with_server_finished,
         ) = match old_state {
             HandshakeState::ServerHelloSent {
                 client_handshake_traffic_secret,
                 master_secret,
                 cipher_suite,
-                handshake_hash,
                 handshake_hash_with_server_finished,
             } => (
                 client_handshake_traffic_secret, // moved, not cloned
                 master_secret,                   // moved, not cloned
                 cipher_suite,
-                handshake_hash,
                 handshake_hash_with_server_finished,
             ),
             _ => {
