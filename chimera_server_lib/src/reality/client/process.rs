@@ -17,9 +17,7 @@ use crate::reality::reality_client_verify::{
     extract_ed25519_public_key, verify_certificate_hmac,
     verify_certificate_verify_signature,
 };
-use crate::reality::reality_records::{
-    RecordDecryptor, encrypt_handshake_to_records_for_suite,
-};
+use crate::reality::reality_records::{RecordDecryptor, RecordEncryptor};
 use crate::reality::reality_tls13_keys::{
     compute_finished_verify_data_for_suite, derive_application_secrets_for_suite,
     derive_handshake_keys_for_suite, derive_traffic_keys_for_suite,
@@ -454,14 +452,10 @@ pub(super) fn process_encrypted_handshake(
     // Encrypt Finished message
     let mut client_hs_seq = 0u64;
     let buf_len_before = conn.ciphertext_write_buf.len();
-    encrypt_handshake_to_records_for_suite(
-        cipher_suite,
-        &client_finished,
-        &client_hs_key,
-        &client_hs_iv,
-        &mut client_hs_seq,
-        &mut conn.ciphertext_write_buf,
-    )?;
+    let hs_aead_key = AeadKey::new(cipher_suite, &client_hs_key)?;
+    let mut encryptor =
+        RecordEncryptor::new(&hs_aead_key, &client_hs_iv, &mut client_hs_seq);
+    encryptor.encrypt_handshake(&client_finished, &mut conn.ciphertext_write_buf)?;
 
     tracing::info!(
         "REALITY CLIENT: Client Finished message generated and buffered ({} bytes)",
