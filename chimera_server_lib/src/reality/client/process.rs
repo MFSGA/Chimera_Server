@@ -8,18 +8,18 @@ use crate::reality::common::{
     CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_CHANGE_CIPHER_SPEC,
     HANDSHAKE_TYPE_CERTIFICATE, HANDSHAKE_TYPE_CERTIFICATE_VERIFY,
     HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS, HANDSHAKE_TYPE_FINISHED,
-    TLS_RECORD_HEADER_SIZE, strip_content_type_with_padding,
+    TLS_RECORD_HEADER_SIZE,
 };
-use crate::reality::reality_aead::{
-    decrypt_handshake_message_for_suite, decrypt_tls13_record_for_suite,
-};
+use crate::reality::reality_aead::{AeadKey, decrypt_handshake_message_for_suite};
 use crate::reality::reality_cipher_suite::CipherSuite;
 use crate::reality::reality_client_verify::{
     extract_certificate_der, extract_certificate_verify_signature,
     extract_ed25519_public_key, verify_certificate_hmac,
     verify_certificate_verify_signature,
 };
-use crate::reality::reality_records::encrypt_handshake_to_records_for_suite;
+use crate::reality::reality_records::{
+    RecordDecryptor, encrypt_handshake_to_records_for_suite,
+};
 use crate::reality::reality_tls13_keys::{
     compute_finished_verify_data_for_suite, derive_application_secrets_for_suite,
     derive_handshake_keys_for_suite, derive_traffic_keys_for_suite,
@@ -514,6 +514,7 @@ pub(super) fn process_application_data(
             ),
         )
     })?;
+    let aead_key = AeadKey::new(cipher_suite, app_read_key)?;
 
     while conn.ciphertext_read_buf.len() >= TLS_RECORD_HEADER_SIZE {
         let record_len = conn.ciphertext_read_buf.get_u16_be(3).ok_or_else(|| {
@@ -525,76 +526,69 @@ pub(super) fn process_application_data(
             break;
         }
 
-        // Copy record header for decryption AAD
-        let tls_header: [u8; TLS_RECORD_HEADER_SIZE] = [
-            conn.ciphertext_read_buf[0],
-            conn.ciphertext_read_buf[1],
-            conn.ciphertext_read_buf[2],
-            conn.ciphertext_read_buf[3],
-            conn.ciphertext_read_buf[4],
-        ];
-        let ciphertext: Vec<u8> = conn.ciphertext_read_buf
-            [TLS_RECORD_HEADER_SIZE..total_record_len]
-            .to_vec();
-        conn.ciphertext_read_buf.consume(total_record_len);
+        let mut received_close_notify = false;
+        let mut pending_error = None;
+        {
+            let ciphertext = conn
+                .ciphertext_read_buf
+                .slice_mut(TLS_RECORD_HEADER_SIZE..total_record_len);
+            let mut decryptor =
+                RecordDecryptor::new(&aead_key, app_read_iv, &mut conn.read_seq);
+            let (content_type, plaintext) =
+                decryptor.decrypt_record_in_place(ciphertext, record_len as u16)?;
 
-        let mut plaintext = decrypt_tls13_record_for_suite(
-            cipher_suite,
-            app_read_key,
-            app_read_iv,
-            conn.read_seq,
-            &ciphertext,
-            &tls_header,
-        )?;
+            match content_type {
+                CONTENT_TYPE_APPLICATION_DATA => {
+                    conn.plaintext_read_buf.maybe_compact(4096);
+                    conn.plaintext_read_buf.extend_from_slice(plaintext);
+                }
+                CONTENT_TYPE_ALERT => {
+                    if plaintext.len() >= 2 {
+                        let alert_level = plaintext[0];
+                        let alert_desc = plaintext[1];
 
-        conn.read_seq += 1;
-
-        let content_type = strip_content_type_with_padding(&mut plaintext)?;
-        match content_type {
-            CONTENT_TYPE_APPLICATION_DATA => {
-                conn.plaintext_read_buf.maybe_compact(4096);
-                conn.plaintext_read_buf.extend_from_slice(&plaintext);
-            }
-            CONTENT_TYPE_ALERT => {
-                if plaintext.len() >= 2 {
-                    let alert_level = plaintext[0];
-                    let alert_desc = plaintext[1];
-
-                    if alert_desc == ALERT_DESC_CLOSE_NOTIFY {
-                        tracing::debug!(
-                            "REALITY CLIENT: Received close_notify alert"
-                        );
-                        conn.received_close_notify = true;
-                        return Ok(());
+                        if alert_desc == ALERT_DESC_CLOSE_NOTIFY {
+                            tracing::debug!(
+                                "REALITY CLIENT: Received close_notify alert"
+                            );
+                            conn.received_close_notify = true;
+                            received_close_notify = true;
+                        } else if alert_level != ALERT_LEVEL_WARNING {
+                            tracing::warn!(
+                                "REALITY CLIENT: Received fatal alert: level={}, desc={}",
+                                alert_level,
+                                alert_desc
+                            );
+                            pending_error = Some(io::Error::new(
+                                io::ErrorKind::ConnectionAborted,
+                                format!("received fatal alert: {}", alert_desc),
+                            ));
+                        } else {
+                            tracing::debug!(
+                                "REALITY CLIENT: Received warning alert: desc={}",
+                                alert_desc
+                            );
+                        }
                     }
-
-                    if alert_level != ALERT_LEVEL_WARNING {
-                        tracing::warn!(
-                            "REALITY CLIENT: Received fatal alert: level={}, desc={}",
-                            alert_level,
-                            alert_desc
-                        );
-                        return Err(io::Error::new(
-                            io::ErrorKind::ConnectionAborted,
-                            format!("received fatal alert: {}", alert_desc),
-                        ));
-                    }
-
-                    tracing::debug!(
-                        "REALITY CLIENT: Received warning alert: desc={}",
-                        alert_desc
-                    );
+                }
+                _ => {
+                    pending_error = Some(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "unexpected post-handshake content type: 0x{:02x}",
+                            content_type
+                        ),
+                    ));
                 }
             }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "unexpected post-handshake content type: 0x{:02x}",
-                        content_type
-                    ),
-                ));
-            }
+        }
+        conn.ciphertext_read_buf.consume(total_record_len);
+
+        if let Some(err) = pending_error {
+            return Err(err);
+        }
+        if received_close_notify {
+            return Ok(());
         }
     }
 

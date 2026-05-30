@@ -3,11 +3,11 @@
 // Handles encrypting plaintext into TLS records, automatically splitting
 // large data into multiple records to stay within TLS 1.3 size limits.
 
-use std::io::{self, Error};
+use std::io::{self, Error, ErrorKind};
 
 use super::common::{
-    CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_HANDSHAKE, MAX_TLS_CIPHERTEXT_LEN,
-    MAX_TLS_PLAINTEXT_LEN, TLS_RECORD_HEADER_SIZE,
+    CONTENT_TYPE_ALERT, CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_HANDSHAKE,
+    MAX_TLS_CIPHERTEXT_LEN, MAX_TLS_PLAINTEXT_LEN, TLS_RECORD_HEADER_SIZE,
 };
 use super::reality_aead::AeadKey;
 use super::reality_cipher_suite::CipherSuite;
@@ -137,6 +137,67 @@ impl<'a> RecordEncryptor<'a> {
             self.encrypt_record_in_place(&mut buf, out, content_type)?;
         }
         Ok(())
+    }
+}
+
+/// Decrypts TLS 1.3 records into plaintext.
+///
+/// Manages the read-side sequence number and strips the TLS 1.3 inner content
+/// type plus optional zero padding from decrypted records.
+pub(crate) struct RecordDecryptor<'a> {
+    key: &'a AeadKey,
+    iv: &'a [u8],
+    seq: &'a mut u64,
+}
+
+impl<'a> RecordDecryptor<'a> {
+    #[inline]
+    pub(crate) fn new(key: &'a AeadKey, iv: &'a [u8], seq: &'a mut u64) -> Self {
+        Self { key, iv, seq }
+    }
+
+    /// Decrypt a TLS 1.3 record in-place, returning content type and plaintext.
+    #[inline]
+    pub(crate) fn decrypt_record_in_place<'b>(
+        &mut self,
+        ciphertext: &'b mut [u8],
+        record_len: u16,
+    ) -> io::Result<(u8, &'b [u8])> {
+        let next_seq = checked_next_sequence(*self.seq)?;
+        let aad = make_record_header(record_len as usize);
+
+        let plaintext = self
+            .key
+            .open_in_place_slice(ciphertext, self.iv, *self.seq, &aad)?;
+        *self.seq = next_seq;
+
+        let mut valid_end = plaintext.len();
+        while valid_end > 0 && plaintext[valid_end - 1] == 0 {
+            valid_end -= 1;
+        }
+        if valid_end == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "Plaintext is all zeros",
+            ));
+        }
+
+        let content_type = plaintext[valid_end - 1];
+        valid_end -= 1;
+
+        if !matches!(
+            content_type,
+            CONTENT_TYPE_HANDSHAKE
+                | CONTENT_TYPE_APPLICATION_DATA
+                | CONTENT_TYPE_ALERT
+        ) {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Invalid content type: 0x{content_type:02x}"),
+            ));
+        }
+
+        Ok((content_type, &plaintext[..valid_end]))
     }
 }
 
@@ -283,6 +344,80 @@ mod tests {
         assert_eq!(TLS_MAX_RECORD_SIZE, 16645); // 16640 + 5
         assert_eq!(CIPHERTEXT_READ_BUF_CAPACITY, 33290); // 2 * TLS_MAX_RECORD_SIZE
         assert_eq!(OUTGOING_BUFFER_LIMIT, 64 * 1024);
+    }
+
+    #[test]
+    fn test_record_decryptor_round_trip_app_data() {
+        let mut plaintext = b"hello".to_vec();
+        let key = [0x11u8; 16];
+        let iv = [0x22u8; 12];
+        let mut write_seq = 0;
+        let mut ciphertext_buf = Vec::new();
+
+        encrypt_plaintext_to_records(
+            &mut plaintext,
+            &key,
+            &iv,
+            &mut write_seq,
+            &mut ciphertext_buf,
+        )
+        .unwrap();
+
+        let record_len = u16::from_be_bytes([ciphertext_buf[3], ciphertext_buf[4]]);
+        let mut ciphertext = ciphertext_buf[TLS_RECORD_HEADER_SIZE..].to_vec();
+        let aead_key = AeadKey::new(CipherSuite::AES_128_GCM_SHA256, &key).unwrap();
+        let mut read_seq = 0;
+        let mut decryptor = RecordDecryptor::new(&aead_key, &iv, &mut read_seq);
+        let (content_type, decrypted) = decryptor
+            .decrypt_record_in_place(&mut ciphertext, record_len)
+            .unwrap();
+
+        assert_eq!(content_type, CONTENT_TYPE_APPLICATION_DATA);
+        assert_eq!(decrypted, b"hello");
+        assert_eq!(read_seq, 1);
+    }
+
+    #[test]
+    fn test_record_decryptor_strips_zero_padding() {
+        let key = [0x33u8; 16];
+        let iv = [0x44u8; 12];
+        let aead_key = AeadKey::new(CipherSuite::AES_128_GCM_SHA256, &key).unwrap();
+        let mut inner = b"hello".to_vec();
+        inner.push(CONTENT_TYPE_APPLICATION_DATA);
+        inner.extend_from_slice(&[0, 0, 0]);
+        let record_len = (inner.len() + 16) as u16;
+        let aad = make_record_header(record_len as usize);
+        let mut ciphertext = aead_key.seal(&inner, &iv, 0, &aad).unwrap();
+
+        let mut read_seq = 0;
+        let mut decryptor = RecordDecryptor::new(&aead_key, &iv, &mut read_seq);
+        let (content_type, decrypted) = decryptor
+            .decrypt_record_in_place(&mut ciphertext, record_len)
+            .unwrap();
+
+        assert_eq!(content_type, CONTENT_TYPE_APPLICATION_DATA);
+        assert_eq!(decrypted, b"hello");
+        assert_eq!(read_seq, 1);
+    }
+
+    #[test]
+    fn test_record_decryptor_rejects_all_zero_plaintext() {
+        let key = [0x55u8; 16];
+        let iv = [0x66u8; 12];
+        let aead_key = AeadKey::new(CipherSuite::AES_128_GCM_SHA256, &key).unwrap();
+        let inner = [0u8; 3];
+        let record_len = (inner.len() + 16) as u16;
+        let aad = make_record_header(record_len as usize);
+        let mut ciphertext = aead_key.seal(&inner, &iv, 0, &aad).unwrap();
+
+        let mut read_seq = 0;
+        let mut decryptor = RecordDecryptor::new(&aead_key, &iv, &mut read_seq);
+        let err = decryptor
+            .decrypt_record_in_place(&mut ciphertext, record_len)
+            .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert_eq!(read_seq, 1);
     }
 
     #[test]

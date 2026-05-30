@@ -180,6 +180,12 @@ impl SlideBuffer {
             None
         }
     }
+
+    /// Get a mutable slice of readable data for in-place processing.
+    #[inline]
+    pub fn slice_mut(&mut self, range: std::ops::Range<usize>) -> &mut [u8] {
+        &mut self.data[self.start + range.start..self.start + range.end]
+    }
 }
 
 impl Read for SlideBuffer {
@@ -385,6 +391,24 @@ mod tests {
         assert_eq!(buf.get_u16_be(0), Some(0x1234));
         assert_eq!(buf.get_u16_be(2), Some(0x5678));
         assert_eq!(buf.get_u16_be(3), None);
+    }
+
+    #[test]
+    fn test_slice_mut() {
+        let mut buf = SlideBuffer::new(100);
+        buf.extend_from_slice(b"hello world");
+
+        let slice = buf.slice_mut(6..11);
+        assert_eq!(slice, b"world");
+        slice[0] = b'W';
+        slice[4] = b'D';
+
+        assert_eq!(buf.as_slice(), b"hello WorlD");
+
+        buf.consume(6);
+        let slice = buf.slice_mut(0..5);
+        slice.copy_from_slice(b"EARTH");
+        assert_eq!(buf.as_slice(), b"EARTH");
     }
 
     #[test]
