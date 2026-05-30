@@ -120,8 +120,6 @@ pub fn construct_encrypted_extensions() -> Result<Vec<u8>> {
 /// # Arguments
 /// * `cert_der` - DER-encoded certificate (with HMAC signature)
 pub fn construct_certificate(cert_der: &[u8]) -> Result<Vec<u8>> {
-    let mut certificate = Vec::new();
-
     // Certificate structure:
     // - handshake_type (1 byte) = 11
     // - length (3 bytes)
@@ -131,44 +129,40 @@ pub fn construct_certificate(cert_der: &[u8]) -> Result<Vec<u8>> {
     //     - cert_data (3 bytes length + DER)
     //     - extensions (2 bytes length, usually empty)
 
-    let mut payload = Vec::new();
+    let cert_list_len = 3 + cert_der.len() + 2;
+    let payload_len = 1 + 3 + cert_list_len;
+    let total_len = 1 + 3 + payload_len;
+
+    let mut certificate = Vec::with_capacity(total_len);
+
+    // Handshake header
+    certificate.push(HANDSHAKE_TYPE_CERTIFICATE);
+    certificate.extend_from_slice(&[
+        ((payload_len >> 16) & 0xff) as u8,
+        ((payload_len >> 8) & 0xff) as u8,
+        (payload_len & 0xff) as u8,
+    ]);
 
     // Certificate request context (empty for server certificates)
-    payload.push(0x00);
+    certificate.push(0x00);
 
-    // Certificate list
-    let mut cert_list = Vec::new();
+    // Certificate list length (3 bytes)
+    certificate.extend_from_slice(&[
+        ((cert_list_len >> 16) & 0xff) as u8,
+        ((cert_list_len >> 8) & 0xff) as u8,
+        (cert_list_len & 0xff) as u8,
+    ]);
 
-    // Certificate entry
-    // Cert data length (3 bytes)
-    cert_list.extend_from_slice(&[
+    // Certificate entry DER length (3 bytes)
+    certificate.extend_from_slice(&[
         ((cert_der.len() >> 16) & 0xff) as u8,
         ((cert_der.len() >> 8) & 0xff) as u8,
         (cert_der.len() & 0xff) as u8,
     ]);
-    cert_list.extend_from_slice(cert_der);
+    certificate.extend_from_slice(cert_der);
 
-    // Extensions (empty)
-    cert_list.extend_from_slice(&[0x00, 0x00]);
-
-    // Certificate list length (3 bytes)
-    payload.extend_from_slice(&[
-        ((cert_list.len() >> 16) & 0xff) as u8,
-        ((cert_list.len() >> 8) & 0xff) as u8,
-        (cert_list.len() & 0xff) as u8,
-    ]);
-    payload.extend_from_slice(&cert_list);
-
-    // Handshake header
-    certificate.push(HANDSHAKE_TYPE_CERTIFICATE);
-
-    // Payload length (3 bytes)
-    certificate.extend_from_slice(&[
-        ((payload.len() >> 16) & 0xff) as u8,
-        ((payload.len() >> 8) & 0xff) as u8,
-        (payload.len() & 0xff) as u8,
-    ]);
-    certificate.extend_from_slice(&payload);
+    // Certificate extensions (empty)
+    certificate.extend_from_slice(&[0x00, 0x00]);
 
     Ok(certificate)
 }
