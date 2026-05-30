@@ -30,7 +30,7 @@ impl<'a> RecordEncryptor<'a> {
 
     /// Encrypt application data into TLS 1.3 records.
     #[inline]
-    fn encrypt_app_data(
+    pub(crate) fn encrypt_app_data(
         &mut self,
         plaintext: &mut Vec<u8>,
         out: &mut Vec<u8>,
@@ -258,6 +258,7 @@ pub fn encrypt_plaintext_to_records(
 
 /// Encrypt plaintext into TLS 1.3 application data records for a selected cipher suite.
 #[inline]
+#[cfg(test)]
 pub(crate) fn encrypt_plaintext_to_records_for_suite(
     cipher_suite: CipherSuite,
     plaintext: &mut Vec<u8>,
