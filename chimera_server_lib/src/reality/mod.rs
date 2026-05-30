@@ -76,6 +76,7 @@ impl MihomoRealityOpts {
             public_key,
             short_id,
             server_name,
+            cipher_suites: Vec::new(),
         })
     }
 }

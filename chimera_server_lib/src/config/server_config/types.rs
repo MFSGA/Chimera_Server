@@ -268,6 +268,7 @@ impl RealityTransportConfig {
             max_time_diff: self.max_time_diff,
             min_client_version: self.min_client_version,
             max_client_version: self.max_client_version,
+            cipher_suites: Vec::new(),
         }
     }
 }

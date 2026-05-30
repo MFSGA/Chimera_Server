@@ -4,6 +4,7 @@ mod process;
 use std::io::{self, Read, Write};
 
 use super::reality_aead::AeadKey;
+use super::reality_cipher_suite::CipherSuite;
 use super::reality_io_state::RealityIoState;
 use super::reality_reader_writer::{RealityReader, RealityWriter};
 use super::reality_records::RecordEncryptor;
@@ -26,6 +27,8 @@ pub struct RealityClientConfig {
     pub short_id: [u8; 8],
     /// Server name for SNI
     pub server_name: String,
+    /// Supported TLS 1.3 cipher suites (empty = use defaults)
+    pub cipher_suites: Vec<CipherSuite>,
 }
 
 /// Handshake state machine for REALITY client
@@ -327,4 +330,66 @@ pub fn feed_reality_client_connection(
         i += n;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reality::reality_cipher_suite::DEFAULT_CIPHER_SUITES;
+    use crate::reality::reality_util::extract_client_cipher_suites;
+    use aws_lc_rs::{
+        agreement,
+        rand::{SecureRandom, SystemRandom},
+    };
+
+    fn test_server_public_key() -> [u8; 32] {
+        let rng = SystemRandom::new();
+        let mut private_key_bytes = [0u8; 32];
+        rng.fill(&mut private_key_bytes).unwrap();
+        let private_key = agreement::PrivateKey::from_private_key(
+            &agreement::X25519,
+            &private_key_bytes,
+        )
+        .unwrap();
+        private_key
+            .compute_public_key()
+            .unwrap()
+            .as_ref()
+            .try_into()
+            .unwrap()
+    }
+
+    #[test]
+    fn default_client_config_offers_default_cipher_suites() {
+        let conn = RealityClientConnection::new(RealityClientConfig {
+            public_key: test_server_public_key(),
+            short_id: [0u8; 8],
+            server_name: "example.com".to_string(),
+            cipher_suites: Vec::new(),
+        })
+        .unwrap();
+
+        let cipher_suites =
+            extract_client_cipher_suites(&conn.ciphertext_write_buf).unwrap();
+        let expected: Vec<u16> = DEFAULT_CIPHER_SUITES
+            .iter()
+            .map(|suite| suite.id())
+            .collect();
+        assert_eq!(cipher_suites, expected);
+    }
+
+    #[test]
+    fn client_config_uses_explicit_cipher_suites() {
+        let conn = RealityClientConnection::new(RealityClientConfig {
+            public_key: test_server_public_key(),
+            short_id: [0u8; 8],
+            server_name: "example.com".to_string(),
+            cipher_suites: vec![CipherSuite::CHACHA20_POLY1305_SHA256],
+        })
+        .unwrap();
+
+        let cipher_suites =
+            extract_client_cipher_suites(&conn.ciphertext_write_buf).unwrap();
+        assert_eq!(cipher_suites, vec![0x1303]);
+    }
 }
