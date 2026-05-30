@@ -7,6 +7,7 @@
 use std::io;
 
 use aws_lc_rs::hmac;
+use aws_lc_rs::signature::{ED25519, UnparsedPublicKey};
 use subtle::ConstantTimeEq;
 use x509_parser::certificate::X509Certificate;
 use x509_parser::prelude::FromDer;
@@ -169,6 +170,134 @@ pub fn verify_certificate_hmac(
     Ok(())
 }
 
+/// Extract the Ed25519 public key from a DER-encoded certificate.
+#[inline]
+pub fn extract_ed25519_public_key(cert_der: &[u8]) -> io::Result<[u8; 32]> {
+    let (_, cert) = X509Certificate::from_der(cert_der).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Failed to parse X.509 certificate: {}", e),
+        )
+    })?;
+
+    let spki = cert.public_key();
+    let pubkey_data: &[u8] = &spki.subject_public_key.data;
+
+    if pubkey_data.len() != 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Expected Ed25519 public key (32 bytes), got {} bytes",
+                pubkey_data.len()
+            ),
+        ));
+    }
+
+    let mut public_key = [0u8; 32];
+    public_key.copy_from_slice(pubkey_data);
+    Ok(public_key)
+}
+
+/// Parse a CertificateVerify message and extract its Ed25519 signature.
+#[inline]
+pub fn extract_certificate_verify_signature(
+    cert_verify_message: &[u8],
+) -> io::Result<Vec<u8>> {
+    if cert_verify_message.len() < 72 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "CertificateVerify message too short: {} bytes",
+                cert_verify_message.len()
+            ),
+        ));
+    }
+
+    if cert_verify_message[0] != 0x0f {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Expected CertificateVerify type (0x0f), got 0x{:02x}",
+                cert_verify_message[0]
+            ),
+        ));
+    }
+
+    let pos = 4;
+    let sig_alg =
+        u16::from_be_bytes([cert_verify_message[pos], cert_verify_message[pos + 1]]);
+    if sig_alg != 0x0807 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Unsupported signature algorithm: 0x{:04x}, expected Ed25519 (0x0807)",
+                sig_alg
+            ),
+        ));
+    }
+
+    let sig_len = u16::from_be_bytes([
+        cert_verify_message[pos + 2],
+        cert_verify_message[pos + 3],
+    ]) as usize;
+    if sig_len != 64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Invalid Ed25519 signature length: {}, expected 64", sig_len),
+        ));
+    }
+
+    let sig_start = pos + 4;
+    if sig_start + sig_len > cert_verify_message.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CertificateVerify message truncated",
+        ));
+    }
+
+    Ok(cert_verify_message[sig_start..sig_start + sig_len].to_vec())
+}
+
+/// Verify the TLS 1.3 CertificateVerify Ed25519 signature.
+///
+/// The signature covers 64 spaces, the server CertificateVerify context string,
+/// a separator byte, and the transcript hash up to but not including CertificateVerify.
+#[inline]
+pub fn verify_certificate_verify_signature(
+    public_key: &[u8; 32],
+    signature: &[u8],
+    transcript_hash: &[u8],
+) -> io::Result<()> {
+    if signature.len() != 64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Invalid signature length: {}, expected 64", signature.len()),
+        ));
+    }
+
+    let mut signed_content = Vec::with_capacity(64 + 34 + transcript_hash.len());
+    signed_content.extend_from_slice(&[0x20u8; 64]);
+    signed_content.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+    signed_content.push(0x00);
+    signed_content.extend_from_slice(transcript_hash);
+
+    let public_key = UnparsedPublicKey::new(&ED25519, public_key);
+    public_key.verify(&signed_content, signature).map_err(|_| {
+        tracing::warn!(
+            "REALITY CLIENT: CertificateVerify signature verification failed"
+        );
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "CertificateVerify signature verification failed",
+        )
+    })?;
+
+    tracing::debug!(
+        "REALITY CLIENT: CertificateVerify signature verified successfully"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +365,74 @@ mod tests {
         cert_der[sig_offset + 32..sig_offset + 64].fill(0);
 
         let result = verify_certificate_hmac(&cert_der, &auth_key);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn test_extract_certificate_verify_signature() {
+        let signature = [0xABu8; 64];
+        let payload_len = 2 + 2 + 64;
+
+        let mut message = Vec::new();
+        message.push(0x0f);
+        message.push(0x00);
+        message.push(0x00);
+        message.push(payload_len as u8);
+        message.push(0x08);
+        message.push(0x07);
+        message.push(0x00);
+        message.push(0x40);
+        message.extend_from_slice(&signature);
+
+        let result = extract_certificate_verify_signature(&message).unwrap();
+        assert_eq!(result, signature.to_vec());
+    }
+
+    #[test]
+    fn test_verify_certificate_verify_signature_valid() {
+        let key_pair = aws_lc_rs::signature::Ed25519KeyPair::generate()
+            .expect("Failed to generate Ed25519 key pair");
+        let public_key: [u8; 32] =
+            key_pair.public_key().as_ref().try_into().unwrap();
+        let transcript_hash = [0x42u8; 32];
+
+        let mut signed_content = Vec::new();
+        signed_content.extend_from_slice(&[0x20u8; 64]);
+        signed_content.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+        signed_content.push(0x00);
+        signed_content.extend_from_slice(&transcript_hash);
+
+        let signature = key_pair.sign(&signed_content);
+        verify_certificate_verify_signature(
+            &public_key,
+            signature.as_ref(),
+            &transcript_hash,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_verify_certificate_verify_signature_wrong_transcript() {
+        let key_pair = aws_lc_rs::signature::Ed25519KeyPair::generate()
+            .expect("Failed to generate Ed25519 key pair");
+        let public_key: [u8; 32] =
+            key_pair.public_key().as_ref().try_into().unwrap();
+        let transcript_hash = [0x42u8; 32];
+        let wrong_transcript_hash = [0x43u8; 32];
+
+        let mut signed_content = Vec::new();
+        signed_content.extend_from_slice(&[0x20u8; 64]);
+        signed_content.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+        signed_content.push(0x00);
+        signed_content.extend_from_slice(&transcript_hash);
+
+        let signature = key_pair.sign(&signed_content);
+        let result = verify_certificate_verify_signature(
+            &public_key,
+            signature.as_ref(),
+            &wrong_transcript_hash,
+        );
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
     }
