@@ -61,6 +61,7 @@ impl AeadKey {
     }
 
     /// Encrypt by copying plaintext into an owned buffer.
+    #[cfg(test)]
     pub(crate) fn seal(
         &self,
         plaintext: &[u8],
@@ -135,6 +136,7 @@ impl AeadKey {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn encrypt_tls13_record_for_suite(
     cipher_suite: CipherSuite,
     key: &[u8],
