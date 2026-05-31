@@ -299,6 +299,7 @@ async fn read_dest_records(
     let mut deframer = TlsDeframer::new();
     let mut records = Vec::new();
     let mut buf = vec![0u8; 8192];
+    let mut fallback_error = None;
     let mut handshake_complete = false;
 
     loop {
@@ -325,7 +326,31 @@ async fn read_dest_records(
                 break;
             }
         };
+        let should_parse_server_hello =
+            records.is_empty() && !new_records.is_empty();
         records.extend(new_records);
+
+        if should_parse_server_hello {
+            match parse_dest_server_hello(&records[0]) {
+                Ok(parsed) if parsed.is_tls13 => {
+                    tracing::debug!("REALITY dest confirmed TLS 1.3");
+                }
+                Ok(_) => {
+                    fallback_error = Some(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "REALITY dest does not support TLS 1.3",
+                    ));
+                    break;
+                }
+                Err(err) => {
+                    fallback_error = Some(io::Error::new(
+                        err.kind(),
+                        format!("REALITY failed to parse dest ServerHello: {err}"),
+                    ));
+                    break;
+                }
+            }
+        }
 
         if records.len() >= 6 {
             handshake_complete = true;
@@ -340,6 +365,7 @@ async fn read_dest_records(
     Ok(DestRecordRead {
         records,
         remaining_data: deframer.into_remaining_data(),
+        fallback_error,
         handshake_complete,
     })
 }
@@ -347,6 +373,7 @@ async fn read_dest_records(
 struct DestRecordRead {
     records: Vec<Bytes>,
     remaining_data: Bytes,
+    fallback_error: Option<io::Error>,
     handshake_complete: bool,
 }
 
@@ -439,46 +466,22 @@ pub async fn accept_reality_stream(
     let auth_result = reality_conn.validate_client_hello(&client_hello);
     let dest_read = read_dest_records(&mut dest_stream).await?;
     if !dest_read.handshake_complete {
+        let fallback_error = dest_read.fallback_error.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "REALITY dest TLS handshake incomplete, forwarding to dest",
+            )
+        });
         start_forward_to_dest(
             server_stream,
             dest_stream,
             dest_read.records,
             dest_read.remaining_data,
         );
-        return Err(io::Error::new(
-            io::ErrorKind::ConnectionReset,
-            "REALITY dest TLS handshake incomplete, forwarding to dest",
-        ));
+        return Err(fallback_error);
     }
     let dest_records = dest_read.records;
     let remaining_dest_data = dest_read.remaining_data;
-    match parse_dest_server_hello(&dest_records[0]) {
-        Ok(parsed) if parsed.is_tls13 => {}
-        Ok(_) => {
-            start_forward_to_dest(
-                server_stream,
-                dest_stream,
-                dest_records,
-                remaining_dest_data,
-            );
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("REALITY dest {} does not support TLS 1.3", config.dest),
-            ));
-        }
-        Err(err) => {
-            start_forward_to_dest(
-                server_stream,
-                dest_stream,
-                dest_records,
-                remaining_dest_data,
-            );
-            return Err(io::Error::new(
-                err.kind(),
-                format!("REALITY failed to parse dest ServerHello: {err}"),
-            ));
-        }
-    }
 
     match auth_result {
         Ok(()) => {
