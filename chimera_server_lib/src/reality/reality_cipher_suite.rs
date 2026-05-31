@@ -5,6 +5,7 @@ use aws_lc_rs::{
     digest,
     hmac::{self, HMAC_SHA256, HMAC_SHA384},
 };
+use serde::{Deserialize, Serialize};
 
 /// Default TLS 1.3 cipher suites in preference order.
 pub const DEFAULT_CIPHER_SUITES: &[CipherSuite] = &[
@@ -136,6 +137,36 @@ impl std::fmt::LowerHex for CipherSuite {
     }
 }
 
+impl Serialize for CipherSuite {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.name())
+    }
+}
+
+impl<'de> Deserialize<'de> for CipherSuite {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        let name = String::deserialize(deserializer)?;
+        Self::from_name(&name).ok_or_else(|| {
+            let valid_names = DEFAULT_CIPHER_SUITES
+                .iter()
+                .map(CipherSuite::name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            D::Error::custom(format!(
+                "invalid cipher suite '{name}', valid values are: {valid_names}"
+            ))
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +184,12 @@ mod tests {
         assert_eq!(suite.id(), 0x1302);
         assert_eq!(suite.key_len(), 32);
         assert_eq!(suite.hash_len(), 48);
+    }
+
+    #[test]
+    fn cipher_suite_deserializes_from_tls_name() {
+        let suite: CipherSuite =
+            serde_json::from_str("\"TLS_CHACHA20_POLY1305_SHA256\"").unwrap();
+        assert_eq!(suite, CipherSuite::CHACHA20_POLY1305_SHA256);
     }
 }
