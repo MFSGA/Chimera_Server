@@ -107,6 +107,116 @@ fn extract_sni_from_client_hello(client_hello: &[u8]) -> io::Result<Option<Strin
     Ok(None)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ParsedDestServerHello {
+    is_tls13: bool,
+}
+
+fn parse_dest_server_hello(
+    server_hello: &[u8],
+) -> io::Result<ParsedDestServerHello> {
+    const CONTENT_TYPE_HANDSHAKE: u8 = 0x16;
+    const HANDSHAKE_TYPE_SERVER_HELLO: u8 = 0x02;
+    const TLS_EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
+
+    if server_hello.len() < 47 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ServerHello frame too short",
+        ));
+    }
+
+    if server_hello[0] != CONTENT_TYPE_HANDSHAKE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected handshake content type",
+        ));
+    }
+    if server_hello[1] != 0x03 || server_hello[2] != 0x03 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unexpected record TLS version {}.{}",
+                server_hello[1], server_hello[2]
+            ),
+        ));
+    }
+
+    let mut reader = BufReader::new(&server_hello[5..]);
+    let handshake_type = reader.read_u8()?;
+    if handshake_type != HANDSHAKE_TYPE_SERVER_HELLO {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected ServerHello handshake type",
+        ));
+    }
+
+    let message_len = reader.read_u24_be()? as usize;
+    if server_hello[5..].len().saturating_sub(reader.position()) < message_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ServerHello message length exceeds frame",
+        ));
+    }
+
+    let version_major = reader.read_u8()?;
+    let version_minor = reader.read_u8()?;
+    if version_major != 0x03 || version_minor != 0x03 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected TLS version 3.3, got {version_major}.{version_minor}"),
+        ));
+    }
+
+    reader.skip(32)?;
+    let session_id_len = reader.read_u8()?;
+    if session_id_len > 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid session_id_len {session_id_len}, max is 32"),
+        ));
+    }
+    reader.skip(session_id_len as usize)?;
+    reader.skip(2)?; // cipher suite
+    reader.skip(1)?; // compression method
+
+    let mut is_tls13 = false;
+    if !reader.is_consumed() {
+        let extensions_len = reader.read_u16_be()? as usize;
+        if server_hello[5..].len().saturating_sub(reader.position()) < extensions_len
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "extensions length exceeds remaining data",
+            ));
+        }
+
+        let extensions_data = reader.read_slice(extensions_len)?;
+        let mut ext_reader = BufReader::new(extensions_data);
+        while !ext_reader.is_consumed() {
+            let ext_type = ext_reader.read_u16_be()?;
+            let ext_len = ext_reader.read_u16_be()? as usize;
+
+            if ext_type == TLS_EXT_SUPPORTED_VERSIONS {
+                if ext_len != 2 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "supported_versions extension should be 2 bytes, got {ext_len}"
+                        ),
+                    ));
+                }
+                let version = ext_reader.read_slice(2)?;
+                is_tls13 = version == [0x03, 0x04];
+            } else {
+                ext_reader.skip(ext_len)?;
+            }
+        }
+    }
+
+    Ok(ParsedDestServerHello { is_tls13 })
+}
+
 async fn connect_dest(
     config: &RealityTransportConfig,
 ) -> io::Result<Box<dyn AsyncStream>> {
@@ -242,6 +352,33 @@ pub async fn accept_reality_stream(
     let auth_result = reality_conn.validate_client_hello(&client_hello);
     let (dest_records, remaining_dest_data) =
         read_dest_records(&mut dest_stream).await?;
+    match parse_dest_server_hello(&dest_records[0]) {
+        Ok(parsed) if parsed.is_tls13 => {}
+        Ok(_) => {
+            start_forward_to_dest(
+                server_stream,
+                dest_stream,
+                dest_records,
+                remaining_dest_data,
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("REALITY dest {} does not support TLS 1.3", config.dest),
+            ));
+        }
+        Err(err) => {
+            start_forward_to_dest(
+                server_stream,
+                dest_stream,
+                dest_records,
+                remaining_dest_data,
+            );
+            return Err(io::Error::new(
+                err.kind(),
+                format!("REALITY failed to parse dest ServerHello: {err}"),
+            ));
+        }
+    }
 
     match auth_result {
         Ok(()) => {
@@ -364,5 +501,75 @@ impl TcpServerHandler for RealityVisionVlessServerHandler {
             &self.inbound_tag,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server_hello_with_supported_version(version: Option<[u8; 2]>) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&[0x42; 32]);
+        body.push(0); // session_id_len
+        body.extend_from_slice(&[0x13, 0x01]); // cipher suite
+        body.push(0); // compression
+
+        let mut extensions = Vec::new();
+        if let Some(version) = version {
+            extensions.extend_from_slice(&[0x00, 0x2b]);
+            extensions.extend_from_slice(&[0x00, 0x02]);
+            extensions.extend_from_slice(&version);
+        }
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+
+        let mut handshake = Vec::new();
+        handshake.push(0x02);
+        let len = body.len() as u32;
+        handshake.extend_from_slice(&[
+            ((len >> 16) & 0xff) as u8,
+            ((len >> 8) & 0xff) as u8,
+            (len & 0xff) as u8,
+        ]);
+        handshake.extend_from_slice(&body);
+
+        let mut record = Vec::new();
+        record.extend_from_slice(&[0x16, 0x03, 0x03]);
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    #[test]
+    fn parse_dest_server_hello_accepts_tls13() {
+        let parsed =
+            parse_dest_server_hello(&server_hello_with_supported_version(Some([
+                0x03, 0x04,
+            ])))
+            .unwrap();
+
+        assert!(parsed.is_tls13);
+    }
+
+    #[test]
+    fn parse_dest_server_hello_marks_tls12() {
+        let parsed =
+            parse_dest_server_hello(&server_hello_with_supported_version(None))
+                .unwrap();
+
+        assert!(!parsed.is_tls13);
+    }
+
+    #[test]
+    fn parse_dest_server_hello_rejects_wrong_content_type() {
+        let mut record = server_hello_with_supported_version(Some([0x03, 0x04]));
+        record[0] = 0x17;
+
+        let err = parse_dest_server_hello(&record).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("expected handshake content type"));
     }
 }
