@@ -181,7 +181,9 @@ impl RealityServerConnection {
                     self.process_client_hello()?;
                 }
                 HandshakeState::ServerHelloSent { .. } => {
-                    self.process_client_finished()?;
+                    if !self.process_client_finished()? {
+                        break;
+                    }
                 }
                 HandshakeState::Complete => {
                     self.process_application_data()?;
@@ -596,11 +598,13 @@ impl RealityServerConnection {
         Ok(())
     }
 
-    /// Process client's Finished message and complete handshake
-    fn process_client_finished(&mut self) -> io::Result<()> {
+    /// Process client's Finished message and complete handshake.
+    ///
+    /// Returns false when the buffered input does not yet contain a complete record.
+    fn process_client_finished(&mut self) -> io::Result<bool> {
         // Check if we have enough data for a TLS record header BEFORE extracting state
         if self.ciphertext_read_buf.len() < TLS_RECORD_HEADER_SIZE {
-            return Ok(()); // Need more data
+            return Ok(false); // Need more data
         }
 
         // Check for ChangeCipherSpec (TLS 1.3 compatibility message)
@@ -613,7 +617,7 @@ impl RealityServerConnection {
 
             // Need complete ChangeCipherSpec record
             if self.ciphertext_read_buf.len() < TLS_RECORD_HEADER_SIZE + ccs_len {
-                return Ok(()); // Need more data
+                return Ok(false); // Need more data
             }
 
             // Skip ChangeCipherSpec (compatibility message)
@@ -625,7 +629,7 @@ impl RealityServerConnection {
 
             // Check if we have the next record header
             if self.ciphertext_read_buf.len() < TLS_RECORD_HEADER_SIZE {
-                return Ok(()); // Need more data
+                return Ok(false); // Need more data
             }
         }
 
@@ -637,7 +641,7 @@ impl RealityServerConnection {
         // Check if we have the complete record
         let total_record_len = TLS_RECORD_HEADER_SIZE + record_len;
         if self.ciphertext_read_buf.len() < total_record_len {
-            return Ok(()); // Need more data
+            return Ok(false); // Need more data
         }
 
         // Verify it's ApplicationData (encrypted Finished)
@@ -770,7 +774,7 @@ impl RealityServerConnection {
 
         tracing::debug!("REALITY: Handshake complete, application keys derived");
 
-        Ok(())
+        Ok(true)
     }
 
     /// Decrypt application data using TLS 1.3 keys
