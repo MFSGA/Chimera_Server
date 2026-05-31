@@ -36,11 +36,44 @@ async fn read_client_hello(
     let len = u16::from_be_bytes([header[3], header[4]]) as usize;
     let mut body = vec![0u8; len];
     stream.read_exact(&mut body).await?;
+    validate_client_hello_body(&body)?;
 
     let mut full = Vec::with_capacity(5 + len);
     full.extend_from_slice(&header);
     full.extend_from_slice(&body);
     Ok(full)
+}
+
+fn validate_client_hello_body(body: &[u8]) -> io::Result<()> {
+    let mut reader = BufReader::new(body);
+    let handshake_type = reader.read_u8()?;
+    if handshake_type != 0x01 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected ClientHello handshake",
+        ));
+    }
+
+    let handshake_len = reader.read_u24_be()? as usize;
+    if handshake_len + 4 != body.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "client hello message length mismatch",
+        ));
+    }
+
+    let version_major = reader.read_u8()?;
+    let version_minor = reader.read_u8()?;
+    if version_major != 0x03 || !matches!(version_minor, 0x01 | 0x03) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unexpected ClientHello TLS version {version_major}.{version_minor}"
+            ),
+        ));
+    }
+
+    Ok(())
 }
 
 fn extract_sni_from_client_hello(client_hello: &[u8]) -> io::Result<Option<String>> {
@@ -693,6 +726,43 @@ mod tests {
         record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
         record.extend_from_slice(&handshake);
         record
+    }
+
+    #[test]
+    fn validate_client_hello_body_accepts_well_formed_body() {
+        let record = client_hello_with_supported_versions(&[0x03, 0x04]);
+
+        validate_client_hello_body(&record[5..]).unwrap();
+    }
+
+    #[test]
+    fn validate_client_hello_body_rejects_length_mismatch() {
+        let record = client_hello_with_supported_versions(&[0x03, 0x04]);
+        let mut body = record[5..].to_vec();
+        body[1] = 0;
+        body[2] = 0;
+        body[3] = 0;
+
+        let err = validate_client_hello_body(&body).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("length mismatch"));
+    }
+
+    #[test]
+    fn validate_client_hello_body_rejects_unexpected_legacy_version() {
+        let record = client_hello_with_supported_versions(&[0x03, 0x04]);
+        let mut body = record[5..].to_vec();
+        body[4] = 0x04;
+        body[5] = 0x04;
+
+        let err = validate_client_hello_body(&body).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("unexpected ClientHello TLS version")
+        );
     }
 
     #[test]
