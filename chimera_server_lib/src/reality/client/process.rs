@@ -165,6 +165,10 @@ pub(super) fn process_server_hello(
         auth_key, // Pass auth_key for certificate HMAC verification
         handshake_seq: 0,
         accumulated_plaintext: Vec::new(),
+        messages_found: 0,
+        certificate_verified: false,
+        ed25519_public_key: None,
+        cert_verify_offset: None,
     };
 
     Ok(())
@@ -182,6 +186,10 @@ pub(super) fn process_encrypted_handshake(
         auth_key,
         mut handshake_seq,
         mut accumulated_plaintext,
+        mut messages_found,
+        mut certificate_verified,
+        mut ed25519_public_key,
+        mut cert_verify_offset,
     ) = match &conn.handshake_state {
         HandshakeState::ProcessingHandshake {
             client_handshake_traffic_secret,
@@ -192,6 +200,10 @@ pub(super) fn process_encrypted_handshake(
             auth_key,
             handshake_seq,
             accumulated_plaintext,
+            messages_found,
+            certificate_verified,
+            ed25519_public_key,
+            cert_verify_offset,
         } => (
             client_handshake_traffic_secret.clone(),
             server_handshake_traffic_secret.clone(),
@@ -201,6 +213,10 @@ pub(super) fn process_encrypted_handshake(
             *auth_key,
             *handshake_seq,
             accumulated_plaintext.clone(),
+            *messages_found,
+            *certificate_verified,
+            *ed25519_public_key,
+            *cert_verify_offset,
         ),
         _ => return Ok(()),
     };
@@ -280,6 +296,8 @@ pub(super) fn process_encrypted_handshake(
     handshake_seq = handshake_seq.checked_add(1).ok_or_else(|| {
         io::Error::other("TLS handshake sequence number exhausted")
     })?;
+
+    let prev_accumulated_len = accumulated_plaintext.len();
     accumulated_plaintext.extend_from_slice(&plaintext);
 
     tracing::debug!(
@@ -287,11 +305,7 @@ pub(super) fn process_encrypted_handshake(
         accumulated_plaintext.len()
     );
 
-    let mut offset = 0;
-    let mut messages_found = 0;
-    let mut certificate_verified = false;
-    let mut ed25519_public_key = None;
-    let mut cert_verify_offset = None;
+    let mut offset = prev_accumulated_len;
 
     while offset < accumulated_plaintext.len() && messages_found < 4 {
         // Each handshake message has: type (1 byte) + length (3 bytes) + data
@@ -358,6 +372,10 @@ pub(super) fn process_encrypted_handshake(
             auth_key,
             handshake_seq,
             accumulated_plaintext,
+            messages_found,
+            certificate_verified,
+            ed25519_public_key,
+            cert_verify_offset,
         };
         return Ok(());
     }
