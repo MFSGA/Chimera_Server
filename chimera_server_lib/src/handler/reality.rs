@@ -384,10 +384,19 @@ fn start_forward_to_dest(
     remaining_data: Bytes,
 ) {
     tokio::spawn(async move {
+        let dest_record_count = dest_records.len();
         for record in dest_records {
             if let Err(err) = client_stream.write_all(&record).await {
                 tracing::debug!(
                     "REALITY fallback failed to forward dest record: {err}"
+                );
+                let _ =
+                    futures::join!(client_stream.shutdown(), dest_stream.shutdown());
+                return;
+            }
+            if let Err(err) = client_stream.flush().await {
+                tracing::debug!(
+                    "REALITY fallback failed to flush dest record: {err}"
                 );
                 let _ =
                     futures::join!(client_stream.shutdown(), dest_stream.shutdown());
@@ -402,6 +411,12 @@ fn start_forward_to_dest(
             let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
             return;
         }
+
+        tracing::debug!(
+            "REALITY fallback forwarded {} dest records and {} remaining bytes",
+            dest_record_count,
+            remaining_data.len()
+        );
 
         if let Err(err) = client_stream.flush().await {
             tracing::debug!("REALITY fallback failed to flush client stream: {err}");
