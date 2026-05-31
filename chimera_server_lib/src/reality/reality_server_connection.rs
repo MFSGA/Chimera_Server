@@ -545,8 +545,11 @@ impl RealityServerConnection {
         let hs_aead_key = AeadKey::new(cipher_suite, &server_hs_key)?;
         let mut encryptor =
             RecordEncryptor::new(&hs_aead_key, &server_hs_iv, &mut handshake_seq);
-        encryptor
-            .encrypt_handshake(&combined_plaintext, &mut handshake_ciphertext)?;
+        encryptor.encrypt_handshake_with_padding(
+            &combined_plaintext,
+            &mut handshake_ciphertext,
+            0,
+        )?;
 
         // Update transcript with server Finished (needed for client Finished verification)
         handshake_transcript.update(&server_finished);
