@@ -94,6 +94,7 @@ fn build_reality_layer(
         dest,
         private_key,
         short_ids,
+        cipher_suites: settings.cipher_suites.clone(),
         max_time_diff,
         min_client_version,
         max_client_version,
