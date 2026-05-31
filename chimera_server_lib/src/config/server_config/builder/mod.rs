@@ -554,6 +554,65 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "reality", feature = "vless"))]
+    #[test]
+    fn vless_reality_builder_preserves_cipher_suites() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-reality-cipher-suites",
+            "settings": {
+                "clients": [
+                    {
+                        "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+                        "email": "user@example.com"
+                    }
+                ],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "security": "reality",
+                "realitySettings": {
+                    "show": false,
+                    "dest": "www.apple.com:443",
+                    "xver": 0,
+                    "serverNames": ["www.apple.com"],
+                    "privateKey": "CAe1AlfoOhzR5zwWRYxUSUm2qdzWXM0qDJzbOWUvTno",
+                    "shortIds": ["6ba85179e30d4fc2"],
+                    "cipherSuites": [
+                        "TLS_CHACHA20_POLY1305_SHA256",
+                        "TLS_AES_128_GCM_SHA256"
+                    ],
+                    "maxTimeDiff": 0,
+                    "minClient": "",
+                    "maxClient": ""
+                }
+            }
+        }))
+        .expect("valid vless inbound item");
+
+        let config = ServerConfig::try_from(inbound)
+            .expect("vless reality inbound config should build");
+
+        match config.protocol {
+            ServerProxyConfig::Reality(reality) => {
+                assert_eq!(
+                    reality.cipher_suites,
+                    vec![
+                        crate::reality::CipherSuite::CHACHA20_POLY1305_SHA256,
+                        crate::reality::CipherSuite::AES_128_GCM_SHA256,
+                    ]
+                );
+                assert_eq!(
+                    reality.to_reality_server_config().cipher_suites,
+                    reality.cipher_suites
+                );
+            }
+            other => panic!("expected reality protocol, got {other:?}"),
+        }
+    }
+
     #[cfg(feature = "vless")]
     #[test]
     fn vless_builder_rejects_unknown_client_flow() {
