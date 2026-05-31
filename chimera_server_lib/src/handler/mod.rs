@@ -2,6 +2,8 @@ pub mod dokodemo;
 pub mod tcp;
 #[cfg(feature = "tls")]
 pub mod tls;
+#[cfg(any(feature = "reality", feature = "vless"))]
+pub mod tls_deframer;
 #[cfg(feature = "vless")]
 pub mod vless_handler;
 
