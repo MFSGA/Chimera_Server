@@ -1,15 +1,24 @@
-use std::io::{self, Cursor};
+use std::{
+    io::{self, Cursor},
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::{Instant, timeout_at};
 
 use crate::async_stream::AsyncStream;
 use crate::config::server_config::RealityTransportConfig;
 use crate::handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
+use crate::handler::tls_deframer::TlsDeframer;
 use crate::handler::vless_handler::{
     ParsedVisionUser, parse_vision_users, setup_reality_vision_server_stream,
 };
 use crate::reality::{BufReader, RealityServerConnection, RealityTlsStream};
+use crate::resolver::{NativeResolver, Resolver, resolve_single_address};
+use crate::util::socket::new_tcp_socket;
 
 async fn read_client_hello(
     stream: &mut Box<dyn AsyncStream>,
@@ -98,6 +107,103 @@ fn extract_sni_from_client_hello(client_hello: &[u8]) -> io::Result<Option<Strin
     Ok(None)
 }
 
+async fn connect_dest(
+    config: &RealityTransportConfig,
+) -> io::Result<Box<dyn AsyncStream>> {
+    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let target_addr = resolve_single_address(&resolver, &config.dest).await?;
+    let tcp_socket = new_tcp_socket(None, target_addr.is_ipv6())?;
+    let stream = tcp_socket.connect(target_addr).await?;
+    if let Err(err) = stream.set_nodelay(true) {
+        tracing::warn!("failed to set TCP no-delay on REALITY dest stream: {err}");
+    }
+    Ok(Box::new(stream))
+}
+
+async fn read_dest_records(
+    dest_stream: &mut Box<dyn AsyncStream>,
+) -> io::Result<(Vec<Bytes>, Bytes)> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut deframer = TlsDeframer::new();
+    let mut records = Vec::new();
+    let mut buf = vec![0u8; 8192];
+
+    loop {
+        let n = match timeout_at(deadline, dest_stream.read(&mut buf)).await {
+            Ok(Ok(0)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "REALITY dest closed during TLS handshake",
+                ));
+            }
+            Ok(Ok(n)) => n,
+            Ok(Err(err)) => return Err(err),
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "REALITY timed out waiting for dest TLS handshake",
+                ));
+            }
+        };
+
+        deframer.feed(&buf[..n]);
+        let new_records = deframer.next_records()?;
+        records.extend(new_records);
+
+        if records.len() >= 6 {
+            break;
+        }
+        if records.len() >= 3 && records[2].len() > 512 {
+            break;
+        }
+    }
+
+    Ok((records, deframer.into_remaining_data()))
+}
+
+fn start_forward_to_dest(
+    mut client_stream: Box<dyn AsyncStream>,
+    mut dest_stream: Box<dyn AsyncStream>,
+    dest_records: Vec<Bytes>,
+    remaining_data: Bytes,
+) {
+    tokio::spawn(async move {
+        for record in dest_records {
+            if let Err(err) = client_stream.write_all(&record).await {
+                tracing::debug!(
+                    "REALITY fallback failed to forward dest record: {err}"
+                );
+                let _ =
+                    futures::join!(client_stream.shutdown(), dest_stream.shutdown());
+                return;
+            }
+        }
+
+        if !remaining_data.is_empty()
+            && let Err(err) = client_stream.write_all(&remaining_data).await
+        {
+            tracing::debug!("REALITY fallback failed to forward dest tail: {err}");
+            let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
+            return;
+        }
+
+        if let Err(err) = client_stream.flush().await {
+            tracing::debug!("REALITY fallback failed to flush client stream: {err}");
+            let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
+            return;
+        }
+
+        let result =
+            tokio::io::copy_bidirectional(&mut client_stream, &mut dest_stream)
+                .await;
+        let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
+
+        if let Err(err) = result {
+            tracing::debug!("REALITY fallback copy ended with error: {err}");
+        }
+    });
+}
+
 pub async fn accept_reality_stream(
     mut server_stream: Box<dyn AsyncStream>,
     config: &RealityTransportConfig,
@@ -127,10 +233,35 @@ pub async fn accept_reality_stream(
         }
     }
 
+    let mut dest_stream = connect_dest(config).await?;
+    dest_stream.write_all(&client_hello).await?;
+    dest_stream.flush().await?;
+
     let mut reality_conn =
         RealityServerConnection::new(config.to_reality_server_config())?;
-    reality_conn.read_tls(&mut Cursor::new(&client_hello))?;
-    reality_conn.process_new_packets()?;
+    let auth_result = reality_conn.validate_client_hello(&client_hello);
+    let (dest_records, remaining_dest_data) =
+        read_dest_records(&mut dest_stream).await?;
+
+    match auth_result {
+        Ok(()) => {
+            reality_conn.build_server_response(dest_records)?;
+        }
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            start_forward_to_dest(
+                server_stream,
+                dest_stream,
+                dest_records,
+                remaining_dest_data,
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("REALITY auth failed, forwarding to dest: {err}"),
+            ));
+        }
+        Err(err) => return Err(err),
+    }
+    drop(dest_stream);
 
     let mut handshake_bytes = Vec::new();
     while reality_conn.wants_write() {
