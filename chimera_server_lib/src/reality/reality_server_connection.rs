@@ -60,6 +60,8 @@ pub struct RealityServerConfig {
 enum HandshakeState {
     /// Initial state, waiting for ClientHello
     Initial,
+    /// ClientHello validated, waiting to build response with dest record structure.
+    ClientHelloValidated { info: ClientHelloInfo },
     /// ServerHello and encrypted handshake messages sent, waiting for client Finished
     ServerHelloSent {
         handshake_hash_with_server_finished: Vec<u8>, // Hash including server Finished (for verifying client Finished)
@@ -69,6 +71,21 @@ enum HandshakeState {
     },
     /// Handshake complete, ready for application data
     Complete,
+}
+
+/// Information extracted from ClientHello during validation phase.
+#[derive(Clone)]
+pub struct ClientHelloInfo {
+    /// Session ID from ClientHello, echoed in ServerHello.
+    pub session_id: Vec<u8>,
+    /// Client's X25519 public key from key_share extension.
+    pub client_public_key: [u8; 32],
+    /// Derived REALITY auth key for HMAC certificate generation.
+    pub auth_key: [u8; 32],
+    /// Negotiated TLS 1.3 cipher suite.
+    pub cipher_suite: CipherSuite,
+    /// Raw ClientHello handshake bytes without the TLS record header.
+    pub client_hello_handshake: Vec<u8>,
 }
 
 /// REALITY server-side connection implementing rustls-compatible API
@@ -180,6 +197,9 @@ impl RealityServerConnection {
                 HandshakeState::Initial => {
                     self.process_client_hello()?;
                 }
+                HandshakeState::ClientHelloValidated { .. } => {
+                    self.build_server_response_internal(&[])?;
+                }
                 HandshakeState::ServerHelloSent { .. } => {
                     if !self.process_client_finished()? {
                         break;
@@ -207,7 +227,55 @@ impl RealityServerConnection {
         Ok(RealityIoState::new(self.plaintext_read_buf.len()))
     }
 
-    /// Process ClientHello message and send ServerHello
+    /// Public API: validate a complete ClientHello without building the response.
+    pub fn validate_client_hello(&mut self, client_hello: &[u8]) -> io::Result<()> {
+        if let Some(error_kind) = self.fatal_error {
+            return Err(io::Error::new(error_kind, "connection previously failed"));
+        }
+
+        if !matches!(self.handshake_state, HandshakeState::Initial) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "validate_client_hello called in wrong state",
+            ));
+        }
+
+        let result = self.process_client_hello_validation(client_hello);
+        if let Err(ref err) = result {
+            match err.kind() {
+                io::ErrorKind::InvalidData
+                | io::ErrorKind::PermissionDenied
+                | io::ErrorKind::ConnectionAborted => {
+                    self.fatal_error = Some(err.kind());
+                }
+                _ => {}
+            }
+        }
+        result
+    }
+
+    /// Public API: build a server response after `validate_client_hello`.
+    ///
+    /// `dest_records` follows shoes' template: ServerHello, CCS, then one or
+    /// more encrypted handshake records from the camouflage destination.
+    pub fn build_server_response(
+        &mut self,
+        dest_records: Vec<bytes::Bytes>,
+    ) -> io::Result<()> {
+        if !matches!(
+            self.handshake_state,
+            HandshakeState::ClientHelloValidated { .. }
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "build_server_response called in wrong state",
+            ));
+        }
+
+        self.build_server_response_internal(&dest_records)
+    }
+
+    /// Process ClientHello message and send ServerHello using the default record shape.
     fn process_client_hello(&mut self) -> io::Result<()> {
         // Need at least TLS record header (5 bytes)
         if self.ciphertext_read_buf.len() < TLS_RECORD_HEADER_SIZE {
@@ -231,11 +299,25 @@ impl RealityServerConnection {
             self.ciphertext_read_buf[..total_record_len].to_vec();
         self.ciphertext_read_buf.consume(total_record_len);
 
-        // Step 1: Extract fields from ClientHello (using slice for session_id to avoid allocation)
-        let client_random = extract_client_random(&client_hello)?;
-        let session_id = extract_session_id_slice(&client_hello)?;
-        let client_public_key = extract_client_public_key(&client_hello)?;
-        let client_cipher_suites = extract_client_cipher_suites(&client_hello)?;
+        self.process_client_hello_validation(&client_hello)?;
+        self.build_server_response_internal(&[])
+    }
+
+    fn process_client_hello_validation(
+        &mut self,
+        client_hello: &[u8],
+    ) -> io::Result<()> {
+        if client_hello.len() < TLS_RECORD_HEADER_SIZE + 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ClientHello too short",
+            ));
+        }
+
+        let client_random = extract_client_random(client_hello)?;
+        let session_id = extract_session_id_slice(client_hello)?;
+        let client_public_key = extract_client_public_key(client_hello)?;
+        let client_cipher_suites = extract_client_cipher_suites(client_hello)?;
 
         let server_cipher_suites = if self.config.cipher_suites.is_empty() {
             DEFAULT_CIPHER_SUITES
@@ -250,27 +332,23 @@ impl RealityServerConnection {
                         "No common TLS 1.3 cipher suite found",
                     )
                 })?;
-        let cipher_suite_id = cipher_suite.id();
 
         tracing::debug!(
             "REALITY: ClientHello received, client_random: {:?}",
             &client_random[..8]
         );
 
-        // Step 2: Perform ECDH to derive auth key
         let shared_secret =
             perform_ecdh(&self.config.private_key, &client_public_key).map_err(
                 |e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()),
             )?;
 
-        // Use slices directly from client_random to avoid copying
         let salt = &client_random[0..20];
         let auth_key =
             derive_auth_key(&shared_secret, salt, b"REALITY").map_err(|e| {
                 io::Error::new(io::ErrorKind::InvalidData, e.to_string())
             })?;
 
-        // Step 3: Validate session ID (contains encrypted metadata)
         if session_id.len() != 32 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -282,13 +360,9 @@ impl RealityServerConnection {
         let mut encrypted_session_id_arr = [0u8; 32];
         encrypted_session_id_arr.copy_from_slice(session_id);
 
-        // CRITICAL: Reconstruct AAD with zeros at SessionId location
-        // The AAD during encryption had zeros where the session ID would go
-        // SessionId is at offset 39 in ClientHello handshake (after type(1) + length(3) + version(2) + random(32) + sessionid_length(1))
         let client_hello_handshake = &client_hello[TLS_RECORD_HEADER_SIZE..];
         let mut aad_for_decryption = client_hello_handshake.to_vec();
         if aad_for_decryption.len() >= 39 + 32 {
-            // Replace encrypted SessionId with zeros
             aad_for_decryption[39..39 + 32].fill(0);
         }
 
@@ -305,11 +379,6 @@ impl RealityServerConnection {
             )
         })?;
 
-        // Validate session ID contents
-        // Bytes 0-2: Version
-        // Byte 3: Padding
-        // Bytes 4-7: Timestamp (uint32)
-        // Bytes 8-15: ShortId
         let client_version = &decrypted_session_id[0..3];
         let client_timestamp = u32::from_be_bytes([
             decrypted_session_id[4],
@@ -323,7 +392,6 @@ impl RealityServerConnection {
         tracing::debug!("REALITY: Client timestamp: {}", client_timestamp);
         tracing::debug!("REALITY: Client short_id: {:02x?}", client_short_id);
 
-        // Validate short ID - check if client's short_id is in the configured list
         let mut client_short_id_arr = [0u8; 8];
         client_short_id_arr.copy_from_slice(client_short_id);
         let short_id_ok = self.config.short_ids.contains(&client_short_id_arr);
@@ -339,7 +407,6 @@ impl RealityServerConnection {
             ));
         }
 
-        // Validate timestamp if max_time_diff is configured
         if let Some(max_diff_ms) = self.config.max_time_diff {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -367,7 +434,6 @@ impl RealityServerConnection {
             }
         }
 
-        // Validate client version (min)
         if let Some(min_ver) = &self.config.min_client_version {
             if client_version < &min_ver[..] {
                 tracing::warn!(
@@ -385,7 +451,6 @@ impl RealityServerConnection {
             }
         }
 
-        // Validate client version (max)
         if let Some(max_ver) = &self.config.max_client_version {
             if client_version > &max_ver[..] {
                 tracing::warn!(
@@ -410,6 +475,31 @@ impl RealityServerConnection {
             client_timestamp
         );
 
+        self.handshake_state = HandshakeState::ClientHelloValidated {
+            info: ClientHelloInfo {
+                session_id: session_id.to_vec(),
+                client_public_key,
+                auth_key,
+                cipher_suite,
+                client_hello_handshake: client_hello_handshake.to_vec(),
+            },
+        };
+
+        Ok(())
+    }
+
+    fn build_server_response_internal(
+        &mut self,
+        dest_records: &[bytes::Bytes],
+    ) -> io::Result<()> {
+        let HandshakeState::ClientHelloValidated { info } =
+            std::mem::replace(&mut self.handshake_state, HandshakeState::Initial)
+        else {
+            unreachable!()
+        };
+
+        let cipher_suite = info.cipher_suite;
+
         // Step 4: Generate our server X25519 keypair
         let rng = SystemRandom::new();
         let mut our_private_bytes = [0u8; 32];
@@ -433,22 +523,20 @@ impl RealityServerConnection {
         // Step 7: Build ServerHello
         let server_hello = construct_server_hello(
             &server_random,
-            session_id,
-            cipher_suite_id,
+            &info.session_id,
+            cipher_suite.id(),
             our_public_key_bytes.as_ref(),
         )?;
 
         // Step 8: Compute transcript hashes
-        let client_hello_handshake = &client_hello[TLS_RECORD_HEADER_SIZE..]; // Skip TLS record header
-
         let digest_alg = cipher_suite.digest_algorithm();
 
         let mut ch_transcript = digest::Context::new(digest_alg);
-        ch_transcript.update(client_hello_handshake);
+        ch_transcript.update(&info.client_hello_handshake);
         let client_hello_hash = ch_transcript.finish();
 
         let mut ch_sh_transcript = digest::Context::new(digest_alg);
-        ch_sh_transcript.update(client_hello_handshake);
+        ch_sh_transcript.update(&info.client_hello_handshake);
         ch_sh_transcript.update(&server_hello);
 
         // Clone before finalizing
@@ -458,7 +546,7 @@ impl RealityServerConnection {
         // Step 9: Perform ECDH for TLS 1.3 key derivation
         let peer_public_key = agreement::UnparsedPublicKey::new(
             &agreement::X25519,
-            &client_public_key,
+            &info.client_public_key,
         );
         let mut tls_shared_secret = [0u8; 32];
         agreement::agree(
@@ -492,7 +580,7 @@ impl RealityServerConnection {
 
         // Step 11: Generate HMAC-signed certificate
         let (cert_der, signing_key) =
-            generate_hmac_certificate(&auth_key, dest_hostname)?;
+            generate_hmac_certificate(&info.auth_key, dest_hostname)?;
 
         // Step 12: Build encrypted handshake messages
         let encrypted_extensions = construct_encrypted_extensions()?;
@@ -522,36 +610,71 @@ impl RealityServerConnection {
         )?;
         let server_finished = construct_finished(&server_verify_data)?;
 
-        // Step 15: Combine all 4 handshake messages into one plaintext buffer
-        // This is required by REALITY protocol - all 4 messages in one encrypted record
-        let mut combined_plaintext = Vec::new();
-        combined_plaintext.extend_from_slice(&encrypted_extensions);
-        combined_plaintext.extend_from_slice(&certificate);
-        combined_plaintext.extend_from_slice(&certificate_verify);
-        combined_plaintext.extend_from_slice(&server_finished);
-
-        tracing::debug!(
-            "REALITY SERVER: Combining 4 handshake messages: EE={}, Cert={}, CV={}, Fin={}, Total={}",
-            encrypted_extensions.len(),
-            certificate.len(),
-            certificate_verify.len(),
-            server_finished.len(),
-            combined_plaintext.len()
-        );
-
-        // Step 16: Encrypt the combined handshake messages, fragmenting into multiple records if needed
-        // TLS 1.3 limits records to 16,640 bytes ciphertext (16,623 bytes plaintext).
-        // Large certificates can exceed this, so we fragment like uTLS does.
+        // Step 15: Encrypt the handshake messages. With dest records, mirror
+        // shoes' REALITY shape: a large first encrypted record means combined
+        // mode, while small records mean one TLS message per record.
         let mut handshake_ciphertext = Vec::new();
         let mut handshake_seq = 0u64;
         let hs_aead_key = AeadKey::new(cipher_suite, &server_hs_key)?;
         let mut encryptor =
             RecordEncryptor::new(&hs_aead_key, &server_hs_iv, &mut handshake_seq);
-        encryptor.encrypt_handshake_with_padding(
-            &combined_plaintext,
-            &mut handshake_ciphertext,
-            0,
-        )?;
+        let dest_encrypted_records = dest_records.get(2..).unwrap_or(&[]);
+        let is_combined_mode = dest_encrypted_records
+            .first()
+            .map(|record| record.len() > 512)
+            .unwrap_or(true);
+
+        let messages: [&[u8]; 4] = [
+            &encrypted_extensions,
+            &certificate,
+            &certificate_verify,
+            &server_finished,
+        ];
+
+        if is_combined_mode {
+            let mut combined_plaintext = Vec::new();
+            for message in messages {
+                combined_plaintext.extend_from_slice(message);
+            }
+            let target_size = dest_encrypted_records
+                .first()
+                .map(|record| record.len())
+                .unwrap_or(0);
+
+            tracing::debug!(
+                "REALITY SERVER: Combined mode - EE={}, Cert={}, CV={}, Fin={}, Total={}, target={}",
+                encrypted_extensions.len(),
+                certificate.len(),
+                certificate_verify.len(),
+                server_finished.len(),
+                combined_plaintext.len(),
+                target_size
+            );
+
+            encryptor.encrypt_handshake_with_padding(
+                &combined_plaintext,
+                &mut handshake_ciphertext,
+                target_size,
+            )?;
+        } else {
+            tracing::debug!(
+                "REALITY SERVER: Separate mode - {} dest records, encrypting {} messages separately",
+                dest_encrypted_records.len(),
+                messages.len()
+            );
+
+            for (idx, message) in messages.iter().enumerate() {
+                let target_size = dest_encrypted_records
+                    .get(idx)
+                    .map(|record| record.len())
+                    .unwrap_or(0);
+                encryptor.encrypt_handshake_with_padding(
+                    message,
+                    &mut handshake_ciphertext,
+                    target_size,
+                )?;
+            }
+        }
 
         // Update transcript with server Finished (needed for client Finished verification)
         handshake_transcript.update(&server_finished);
@@ -1023,6 +1146,70 @@ pub fn feed_reality_server_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reality::{RealityClientConfig, RealityClientConnection};
+    use aws_lc_rs::{
+        agreement,
+        rand::{SecureRandom, SystemRandom},
+    };
+
+    fn test_reality_keypair() -> ([u8; 32], [u8; 32]) {
+        let rng = SystemRandom::new();
+        let mut private_key_bytes = [0u8; 32];
+        rng.fill(&mut private_key_bytes).unwrap();
+        let private_key = agreement::PrivateKey::from_private_key(
+            &agreement::X25519,
+            &private_key_bytes,
+        )
+        .unwrap();
+        let public_key_bytes: [u8; 32] = private_key
+            .compute_public_key()
+            .unwrap()
+            .as_ref()
+            .try_into()
+            .unwrap();
+        (private_key_bytes, public_key_bytes)
+    }
+
+    fn test_client_hello(server_public_key: [u8; 32]) -> Vec<u8> {
+        let mut client = RealityClientConnection::new(RealityClientConfig {
+            public_key: server_public_key,
+            short_id: [0u8; 8],
+            server_name: "example.com".to_string(),
+            cipher_suites: Vec::new(),
+        })
+        .unwrap();
+        let mut client_hello = Vec::new();
+        client.write_tls(&mut client_hello).unwrap();
+        client_hello
+    }
+
+    fn test_server_config(private_key: [u8; 32]) -> RealityServerConfig {
+        RealityServerConfig {
+            private_key,
+            short_ids: vec![[0u8; 8]],
+            dest: NetLocation::new(
+                Address::Hostname("example.com".to_string()),
+                443,
+            ),
+            max_time_diff: None,
+            min_client_version: None,
+            max_client_version: None,
+            cipher_suites: Vec::new(),
+        }
+    }
+
+    fn record_types(data: &[u8]) -> Vec<u8> {
+        let mut types = Vec::new();
+        let mut offset = 0;
+        while offset + TLS_RECORD_HEADER_SIZE <= data.len() {
+            types.push(data[offset]);
+            let len =
+                u16::from_be_bytes([data[offset + 3], data[offset + 4]]) as usize;
+            offset += TLS_RECORD_HEADER_SIZE + len;
+        }
+        assert_eq!(offset, data.len());
+        types
+    }
 
     #[test]
     fn test_reality_server_connection_creation() {
@@ -1059,6 +1246,71 @@ mod tests {
 
         assert_eq!(state.plaintext_bytes_to_read(), 0);
         assert!(!conn.wants_write());
+    }
+
+    #[test]
+    fn validate_client_hello_waits_for_response_build() {
+        let (private_key, public_key) = test_reality_keypair();
+        let mut conn =
+            RealityServerConnection::new(test_server_config(private_key)).unwrap();
+        let client_hello = test_client_hello(public_key);
+
+        conn.validate_client_hello(&client_hello).unwrap();
+
+        assert!(matches!(
+            conn.handshake_state,
+            HandshakeState::ClientHelloValidated { .. }
+        ));
+        assert!(conn.is_handshaking());
+        assert!(!conn.wants_write());
+    }
+
+    #[test]
+    fn build_server_response_uses_separate_dest_record_shape() {
+        let (private_key, public_key) = test_reality_keypair();
+        let mut conn =
+            RealityServerConnection::new(test_server_config(private_key)).unwrap();
+        let client_hello = test_client_hello(public_key);
+
+        conn.validate_client_hello(&client_hello).unwrap();
+        conn.build_server_response(vec![
+            bytes::Bytes::from_static(&[
+                CONTENT_TYPE_HANDSHAKE,
+                0x03,
+                0x03,
+                0x00,
+                0x01,
+                0x00,
+            ]),
+            bytes::Bytes::from_static(&[
+                CONTENT_TYPE_CHANGE_CIPHER_SPEC,
+                0x03,
+                0x03,
+                0x00,
+                0x01,
+                0x01,
+            ]),
+            bytes::Bytes::from(vec![CONTENT_TYPE_APPLICATION_DATA; 128]),
+            bytes::Bytes::from(vec![CONTENT_TYPE_APPLICATION_DATA; 128]),
+            bytes::Bytes::from(vec![CONTENT_TYPE_APPLICATION_DATA; 128]),
+            bytes::Bytes::from(vec![CONTENT_TYPE_APPLICATION_DATA; 128]),
+        ])
+        .unwrap();
+
+        let mut response = Vec::new();
+        conn.write_tls(&mut response).unwrap();
+
+        assert_eq!(
+            record_types(&response),
+            vec![
+                CONTENT_TYPE_HANDSHAKE,
+                CONTENT_TYPE_CHANGE_CIPHER_SPEC,
+                CONTENT_TYPE_APPLICATION_DATA,
+                CONTENT_TYPE_APPLICATION_DATA,
+                CONTENT_TYPE_APPLICATION_DATA,
+                CONTENT_TYPE_APPLICATION_DATA,
+            ]
+        );
     }
 
     #[test]
