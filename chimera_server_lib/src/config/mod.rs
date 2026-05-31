@@ -220,6 +220,8 @@ pub struct RealitySettings {
     pub private_key: String,
     pub short_ids: Vec<String>,
     pub dest: String,
+    #[serde(default, alias = "cipher_suite")]
+    pub cipher_suites: Vec<crate::reality::CipherSuite>,
     #[serde(default, alias = "maxTimediff", alias = "maxTimeDiff")]
     pub max_time_diff: Option<u64>,
     #[serde(default, alias = "minClient", alias = "minClientVer")]

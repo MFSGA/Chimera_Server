@@ -7,6 +7,8 @@ use crate::{
     config::Transport,
 };
 
+#[cfg(feature = "reality")]
+use crate::reality::CipherSuite;
 #[cfg(feature = "ws")]
 use crate::util::option::OneOrSome;
 
@@ -247,6 +249,8 @@ pub struct RealityTransportConfig {
     pub dest: NetLocation,
     pub private_key: [u8; 32],
     pub short_ids: Vec<[u8; 8]>,
+    #[serde(default, alias = "cipher_suite")]
+    pub cipher_suites: Vec<CipherSuite>,
     #[serde(default)]
     pub max_time_diff: Option<u64>,
     #[serde(default)]
@@ -268,7 +272,7 @@ impl RealityTransportConfig {
             max_time_diff: self.max_time_diff,
             min_client_version: self.min_client_version,
             max_client_version: self.max_client_version,
-            cipher_suites: Vec::new(),
+            cipher_suites: self.cipher_suites.clone(),
         }
     }
 }

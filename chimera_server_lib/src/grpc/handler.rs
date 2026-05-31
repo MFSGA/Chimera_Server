@@ -777,6 +777,7 @@ impl HandlerServiceImpl {
                     dest,
                     private_key,
                     short_ids,
+                    cipher_suites: Vec::new(),
                     max_time_diff: (reality.max_time_diff > 0)
                         .then_some(reality.max_time_diff),
                     min_client_version,
