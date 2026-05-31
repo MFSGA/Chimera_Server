@@ -107,6 +107,68 @@ fn extract_sni_from_client_hello(client_hello: &[u8]) -> io::Result<Option<Strin
     Ok(None)
 }
 
+fn client_hello_supports_tls13(client_hello: &[u8]) -> io::Result<bool> {
+    if client_hello.len() < 5 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "client hello too short for TLS header",
+        ));
+    }
+
+    let mut reader = BufReader::new(&client_hello[5..]);
+    let handshake_type = reader.read_u8()?;
+    if handshake_type != 0x01 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected handshake type {handshake_type}"),
+        ));
+    }
+
+    let _handshake_len = reader.read_u24_be()?;
+    reader.read_u16_be()?;
+    reader.skip(32)?;
+
+    let session_id_len = reader.read_u8()? as usize;
+    reader.skip(session_id_len)?;
+
+    let cipher_suites_len = reader.read_u16_be()? as usize;
+    reader.skip(cipher_suites_len)?;
+
+    let compression_len = reader.read_u8()? as usize;
+    reader.skip(compression_len)?;
+
+    if reader.is_consumed() {
+        return Ok(false);
+    }
+
+    let extensions_len = reader.read_u16_be()? as usize;
+    let extensions_end = reader.position() + extensions_len;
+    while reader.position() < extensions_end {
+        let ext_type = reader.read_u16_be()?;
+        let ext_len = reader.read_u16_be()? as usize;
+
+        if ext_type == 0x002b {
+            let version_list_len = reader.read_u8()? as usize;
+            if version_list_len % 2 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid odd version list length: 0x{version_list_len:02x}"
+                    ),
+                ));
+            }
+            let version_list = reader.read_slice(version_list_len)?;
+            return Ok(version_list
+                .chunks_exact(2)
+                .any(|version| version == [0x03, 0x04]));
+        }
+
+        reader.skip(ext_len)?;
+    }
+
+    Ok(false)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ParsedDestServerHello {
     is_tls13: bool,
@@ -347,6 +409,14 @@ pub async fn accept_reality_stream(
     dest_stream.write_all(&client_hello).await?;
     dest_stream.flush().await?;
 
+    if !client_hello_supports_tls13(&client_hello)? {
+        start_forward_to_dest(server_stream, dest_stream, vec![], Bytes::new());
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "REALITY client does not support TLS 1.3, forwarding to dest",
+        ));
+    }
+
     let mut reality_conn =
         RealityServerConnection::new(config.to_reality_server_config())?;
     let auth_result = reality_conn.validate_client_hello(&client_hello);
@@ -508,6 +578,41 @@ impl TcpServerHandler for RealityVisionVlessServerHandler {
 mod tests {
     use super::*;
 
+    fn client_hello_with_supported_versions(versions: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&[0x24; 32]);
+        body.push(0); // session_id_len
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(&[0x13, 0x01]); // cipher suite
+        body.push(1); // compression methods len
+        body.push(0); // null compression
+
+        let mut extensions = Vec::new();
+        extensions.extend_from_slice(&[0x00, 0x2b]);
+        extensions.extend_from_slice(&((versions.len() + 1) as u16).to_be_bytes());
+        extensions.push(versions.len() as u8);
+        extensions.extend_from_slice(versions);
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+
+        let mut handshake = Vec::new();
+        handshake.push(0x01);
+        let len = body.len() as u32;
+        handshake.extend_from_slice(&[
+            ((len >> 16) & 0xff) as u8,
+            ((len >> 8) & 0xff) as u8,
+            (len & 0xff) as u8,
+        ]);
+        handshake.extend_from_slice(&body);
+
+        let mut record = Vec::new();
+        record.extend_from_slice(&[0x16, 0x03, 0x03]);
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
     fn server_hello_with_supported_version(version: Option<[u8; 2]>) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&[0x03, 0x03]);
@@ -540,6 +645,30 @@ mod tests {
         record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
         record.extend_from_slice(&handshake);
         record
+    }
+
+    #[test]
+    fn client_hello_supports_tls13_when_advertised() {
+        let record = client_hello_with_supported_versions(&[0x03, 0x03, 0x03, 0x04]);
+
+        assert!(client_hello_supports_tls13(&record).unwrap());
+    }
+
+    #[test]
+    fn client_hello_does_not_support_tls13_when_missing() {
+        let record = client_hello_with_supported_versions(&[0x03, 0x03]);
+
+        assert!(!client_hello_supports_tls13(&record).unwrap());
+    }
+
+    #[test]
+    fn client_hello_rejects_odd_supported_versions_len() {
+        let record = client_hello_with_supported_versions(&[0x03]);
+
+        let err = client_hello_supports_tls13(&record).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("invalid odd version list length"));
     }
 
     #[test]
