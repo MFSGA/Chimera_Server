@@ -95,6 +95,60 @@ impl<'a> RecordEncryptor<'a> {
         Ok(())
     }
 
+    /// Encrypt handshake data with TLS 1.3 inner padding to match a target record size.
+    ///
+    /// `target_record_size` includes the 5-byte TLS record header. If it is zero,
+    /// smaller than the minimum ciphertext, or too large for one TLS record, no
+    /// padding is added.
+    #[inline]
+    pub(crate) fn encrypt_handshake_with_padding(
+        &mut self,
+        handshake_data: &[u8],
+        out: &mut Vec<u8>,
+        target_record_size: usize,
+    ) -> io::Result<()> {
+        if handshake_data.is_empty() {
+            return Ok(());
+        }
+
+        if handshake_data.len() > MAX_TLS_PLAINTEXT_LEN {
+            let chunks: Vec<_> =
+                handshake_data.chunks(MAX_TLS_PLAINTEXT_LEN).collect();
+            for (idx, chunk) in chunks.iter().enumerate() {
+                let mut buf = chunk.to_vec();
+                if idx == chunks.len() - 1 && target_record_size > 0 {
+                    self.encrypt_record_with_padding(
+                        &mut buf,
+                        out,
+                        CONTENT_TYPE_HANDSHAKE,
+                        target_record_size,
+                    )?;
+                } else {
+                    self.encrypt_record_in_place(
+                        &mut buf,
+                        out,
+                        CONTENT_TYPE_HANDSHAKE,
+                    )?;
+                }
+            }
+            return Ok(());
+        }
+
+        let mut buf = handshake_data.to_vec();
+        if target_record_size > 0 {
+            self.encrypt_record_with_padding(
+                &mut buf,
+                out,
+                CONTENT_TYPE_HANDSHAKE,
+                target_record_size,
+            )?;
+        } else {
+            self.encrypt_record_in_place(&mut buf, out, CONTENT_TYPE_HANDSHAKE)?;
+        }
+
+        Ok(())
+    }
+
     /// Encrypt a close_notify alert into a TLS 1.3 record.
     #[inline]
     pub(crate) fn encrypt_close_notify(
@@ -116,6 +170,54 @@ impl<'a> RecordEncryptor<'a> {
         let next_seq = checked_next_sequence(*self.seq)?;
 
         buf.push(content_type);
+        let ciphertext_len = buf.len() + 16;
+        debug_assert!(
+            ciphertext_len <= MAX_TLS_CIPHERTEXT_LEN,
+            "BUG: ciphertext_len {} exceeds MAX_TLS_CIPHERTEXT_LEN {}",
+            ciphertext_len,
+            MAX_TLS_CIPHERTEXT_LEN
+        );
+
+        let header = make_record_header(ciphertext_len);
+        self.key.seal_in_place(buf, self.iv, *self.seq, &header)?;
+        *self.seq = next_seq;
+
+        out.reserve(TLS_RECORD_HEADER_SIZE + buf.len());
+        out.extend_from_slice(&header);
+        out.extend_from_slice(buf);
+
+        Ok(())
+    }
+
+    /// Encrypt a single TLS 1.3 record and add zero padding after the inner content type.
+    #[inline]
+    fn encrypt_record_with_padding(
+        &mut self,
+        buf: &mut Vec<u8>,
+        out: &mut Vec<u8>,
+        content_type: u8,
+        target_record_size: usize,
+    ) -> io::Result<()> {
+        let next_seq = checked_next_sequence(*self.seq)?;
+
+        buf.push(content_type);
+
+        let current_inner_len = buf.len();
+        let target_inner_len =
+            target_record_size.saturating_sub(TLS_RECORD_HEADER_SIZE + 16);
+        if target_inner_len > current_inner_len
+            && target_inner_len <= MAX_TLS_PLAINTEXT_LEN + 1
+        {
+            let padding = target_inner_len - current_inner_len;
+            buf.resize(buf.len() + padding, 0);
+            tracing::trace!(
+                "REALITY: Added {} bytes of TLS 1.3 inner padding (target={}, current={})",
+                padding,
+                target_record_size,
+                TLS_RECORD_HEADER_SIZE + current_inner_len + 16
+            );
+        }
+
         let ciphertext_len = buf.len() + 16;
         debug_assert!(
             ciphertext_len <= MAX_TLS_CIPHERTEXT_LEN,
@@ -455,6 +557,43 @@ mod tests {
 
         assert_eq!(content_type, CONTENT_TYPE_ALERT);
         assert_eq!(decrypted, &[0x01, 0x00]);
+        assert_eq!(read_seq, 1);
+    }
+
+    #[test]
+    fn test_encrypt_handshake_with_padding_matches_target_size() {
+        let key = [0x91u8; 16];
+        let iv = [0x92u8; 12];
+        let aead_key = AeadKey::new(CipherSuite::AES_128_GCM_SHA256, &key).unwrap();
+        let mut write_seq = 0;
+        let mut ciphertext_buf = Vec::new();
+        let handshake = b"server-handshake";
+        let target_record_size = 128;
+
+        {
+            let mut encryptor = RecordEncryptor::new(&aead_key, &iv, &mut write_seq);
+            encryptor
+                .encrypt_handshake_with_padding(
+                    handshake,
+                    &mut ciphertext_buf,
+                    target_record_size,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(write_seq, 1);
+        assert_eq!(ciphertext_buf.len(), target_record_size);
+
+        let record_len = u16::from_be_bytes([ciphertext_buf[3], ciphertext_buf[4]]);
+        let mut ciphertext = ciphertext_buf[TLS_RECORD_HEADER_SIZE..].to_vec();
+        let mut read_seq = 0;
+        let mut decryptor = RecordDecryptor::new(&aead_key, &iv, &mut read_seq);
+        let (content_type, decrypted) = decryptor
+            .decrypt_record_in_place(&mut ciphertext, record_len)
+            .unwrap();
+
+        assert_eq!(content_type, CONTENT_TYPE_HANDSHAKE);
+        assert_eq!(decrypted, handshake);
         assert_eq!(read_seq, 1);
     }
 
