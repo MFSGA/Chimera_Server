@@ -51,6 +51,9 @@ pub struct MihomoRealityOpts {
     /// Placeholder accepted for compatibility; not used by the handshake.
     #[serde(rename = "spider-x", default)]
     pub spider_x: Option<String>,
+    /// TLS 1.3 cipher suites to offer. Empty means use the built-in defaults.
+    #[serde(default, alias = "cipherSuites", alias = "cipher_suites")]
+    pub cipher_suites: Vec<CipherSuite>,
 }
 
 impl MihomoRealityOpts {
@@ -76,7 +79,31 @@ impl MihomoRealityOpts {
             public_key,
             short_id,
             server_name,
-            cipher_suites: Vec::new(),
+            cipher_suites: self.cipher_suites.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mihomo_reality_opts_preserve_cipher_suites() {
+        let (_, public_key) = generate_keypair().unwrap();
+        let opts: MihomoRealityOpts = serde_json::from_value(serde_json::json!({
+            "public-key": public_key,
+            "short-id": "4ac97aaf8b9b0356",
+            "server-name": "www.apple.com",
+            "cipher-suites": ["TLS_CHACHA20_POLY1305_SHA256"]
+        }))
+        .unwrap();
+
+        let config = opts.to_client_config("fallback.example").unwrap();
+
+        assert_eq!(
+            config.cipher_suites,
+            vec![CipherSuite::CHACHA20_POLY1305_SHA256]
+        );
     }
 }
