@@ -294,11 +294,12 @@ async fn connect_dest(
 
 async fn read_dest_records(
     dest_stream: &mut Box<dyn AsyncStream>,
-) -> io::Result<(Vec<Bytes>, Bytes)> {
+) -> io::Result<DestRecordRead> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut deframer = TlsDeframer::new();
     let mut records = Vec::new();
     let mut buf = vec![0u8; 8192];
+    let mut handshake_complete = false;
 
     loop {
         let n = match timeout_at(deadline, dest_stream.read(&mut buf)).await {
@@ -311,26 +312,42 @@ async fn read_dest_records(
             Ok(Ok(n)) => n,
             Ok(Err(err)) => return Err(err),
             Err(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "REALITY timed out waiting for dest TLS handshake",
-                ));
+                tracing::debug!("REALITY timed out waiting for dest TLS handshake");
+                break;
             }
         };
 
         deframer.feed(&buf[..n]);
-        let new_records = deframer.next_records()?;
+        let new_records = match deframer.next_records() {
+            Ok(records) => records,
+            Err(err) => {
+                tracing::debug!("REALITY failed to parse dest TLS records: {err}");
+                break;
+            }
+        };
         records.extend(new_records);
 
         if records.len() >= 6 {
+            handshake_complete = true;
             break;
         }
         if records.len() >= 3 && records[2].len() > 512 {
+            handshake_complete = true;
             break;
         }
     }
 
-    Ok((records, deframer.into_remaining_data()))
+    Ok(DestRecordRead {
+        records,
+        remaining_data: deframer.into_remaining_data(),
+        handshake_complete,
+    })
+}
+
+struct DestRecordRead {
+    records: Vec<Bytes>,
+    remaining_data: Bytes,
+    handshake_complete: bool,
 }
 
 fn start_forward_to_dest(
@@ -420,8 +437,21 @@ pub async fn accept_reality_stream(
     let mut reality_conn =
         RealityServerConnection::new(config.to_reality_server_config())?;
     let auth_result = reality_conn.validate_client_hello(&client_hello);
-    let (dest_records, remaining_dest_data) =
-        read_dest_records(&mut dest_stream).await?;
+    let dest_read = read_dest_records(&mut dest_stream).await?;
+    if !dest_read.handshake_complete {
+        start_forward_to_dest(
+            server_stream,
+            dest_stream,
+            dest_read.records,
+            dest_read.remaining_data,
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "REALITY dest TLS handshake incomplete, forwarding to dest",
+        ));
+    }
+    let dest_records = dest_read.records;
+    let remaining_dest_data = dest_read.remaining_data;
     match parse_dest_server_hello(&dest_records[0]) {
         Ok(parsed) if parsed.is_tls13 => {}
         Ok(_) => {
