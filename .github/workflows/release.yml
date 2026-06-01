@@ -162,7 +162,7 @@ jobs:
           git push origin "$TAG"
 
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: ${{ steps.meta.outputs.tag }} — ${{ steps.meta.outputs.release_goal }}
@@ -208,7 +208,7 @@ jobs:
           Get-ChildItem -Path dist
 
       - name: Upload Windows binary to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.release.outputs.tag }}
           files: |
