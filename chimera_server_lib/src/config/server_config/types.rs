@@ -1,3 +1,5 @@
+use std::sync::{Arc, RwLock};
+
 use serde::Deserialize;
 
 use crate::{
@@ -80,6 +82,78 @@ pub struct TrojanFallback {
 pub struct SocksUser {
     pub username: String,
     pub password: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SocksUserStore {
+    users: Arc<RwLock<Vec<SocksUser>>>,
+    auth_required: Arc<RwLock<bool>>,
+}
+
+impl SocksUserStore {
+    pub fn new(users: Vec<SocksUser>) -> Self {
+        let auth_required = !users.is_empty();
+        Self::with_auth_required(users, auth_required)
+    }
+
+    pub fn with_auth_required(users: Vec<SocksUser>, auth_required: bool) -> Self {
+        Self {
+            users: Arc::new(RwLock::new(users)),
+            auth_required: Arc::new(RwLock::new(auth_required)),
+        }
+    }
+
+    pub fn snapshot(&self) -> Vec<SocksUser> {
+        self.users
+            .read()
+            .expect("socks users lock poisoned")
+            .clone()
+    }
+
+    pub fn auth_required(&self) -> bool {
+        *self
+            .auth_required
+            .read()
+            .expect("socks auth mode lock poisoned")
+    }
+
+    pub fn upsert(&self, user: SocksUser) {
+        *self
+            .auth_required
+            .write()
+            .expect("socks auth mode lock poisoned") = true;
+        let mut users = self.users.write().expect("socks users lock poisoned");
+        if let Some(existing) = users
+            .iter_mut()
+            .find(|existing| existing.username == user.username)
+        {
+            existing.password = user.password;
+        } else {
+            users.push(user);
+        }
+    }
+
+    pub fn remove(&self, username: &str) -> bool {
+        let mut users = self.users.write().expect("socks users lock poisoned");
+        let before = users.len();
+        users.retain(|user| user.username != username);
+        before != users.len()
+    }
+}
+
+impl From<Vec<SocksUser>> for SocksUserStore {
+    fn from(users: Vec<SocksUser>) -> Self {
+        Self::new(users)
+    }
+}
+
+impl<'de> Deserialize<'de> for SocksUserStore {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Vec::<SocksUser>::deserialize(deserializer).map(Self::new)
+    }
 }
 
 #[cfg(feature = "vless")]
@@ -233,7 +307,7 @@ pub enum ServerProxyConfig {
         inner: Box<ServerProxyConfig>,
     },
     Socks {
-        accounts: Vec<SocksUser>,
+        accounts: SocksUserStore,
     },
     DokodemoDoor {
         config: DokodemoDoorConfig,
