@@ -22,6 +22,7 @@ Output groups rows by scenario, with one table per scenario group.
 
 import argparse
 import json
+import os
 import sys
 from collections import defaultdict
 
@@ -141,15 +142,21 @@ def main() -> None:
 
     # --- Read JSON-lines ---------------------------------------------------
     rows = []
-    with open(args.results) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError as e:
-                print(f"Warning: skipping invalid JSON line: {e}", file=sys.stderr)
+    try:
+        with open(args.results) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    print(f"Warning: skipping invalid JSON line: {e}", file=sys.stderr)
+    except FileNotFoundError:
+        print(
+            f"Warning: result file not found: {args.results}; generating empty report",
+            file=sys.stderr,
+        )
 
     # --- Build Markdown ----------------------------------------------------
     if not rows:
@@ -228,6 +235,9 @@ def main() -> None:
 
     # --- Output ------------------------------------------------------------
     if args.output:
+        output_dir = os.path.dirname(args.output)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
         with open(args.output, "w") as f:
             f.write(md)
         print(f"Written to {args.output}")
