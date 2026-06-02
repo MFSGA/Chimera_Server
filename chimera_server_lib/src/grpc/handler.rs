@@ -42,6 +42,8 @@ const TYPE_APP_RECEIVER_CONFIG_V2RAY: &str =
 const TYPE_PROXY_SOCKS_SERVER_CONFIG: &str = "xray.proxy.socks.ServerConfig";
 const TYPE_PROXY_SOCKS_SERVER_CONFIG_V2RAY: &str =
     "v2ray.core.proxy.socks.ServerConfig";
+const TYPE_PROXY_SOCKS_ACCOUNT: &str = "xray.proxy.socks.Account";
+const TYPE_PROXY_SOCKS_ACCOUNT_V2RAY: &str = "v2ray.core.proxy.socks.Account";
 const TYPE_PROXY_DOKODEMO_CONFIG: &str = "xray.proxy.dokodemo.Config";
 #[cfg(feature = "vless")]
 const TYPE_PROXY_VLESS_INBOUND_CONFIG: &str = "xray.proxy.vless.inbound.Config";
@@ -131,6 +133,14 @@ struct SocksServerConfigPayload {
     auth_type: i32,
     #[prost(map = "string, string", tag = "2")]
     accounts: std::collections::HashMap<String, String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct SocksAccountPayload {
+    #[prost(string, tag = "1")]
+    username: String,
+    #[prost(string, tag = "2")]
+    password: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -459,7 +469,12 @@ impl HandlerServiceImpl {
                     .accounts
                     .into_iter()
                     .map(|(username, password)| SocksUser { username, password })
-                    .collect();
+                    .collect::<Vec<_>>();
+                let accounts =
+                    crate::config::server_config::SocksUserStore::with_auth_required(
+                        accounts,
+                        socks.auth_type != 0,
+                    );
 
                 Ok(ServerProxyConfig::Socks { accounts })
             }
@@ -920,7 +935,9 @@ impl HandlerServiceImpl {
                 ))
             }
             ServerProxyConfig::Socks { accounts } => {
-                let accounts = accounts
+                let auth_type = i32::from(accounts.auth_required());
+                let account_map = accounts
+                    .snapshot()
                     .iter()
                     .map(|account| {
                         (account.username.clone(), account.password.clone())
@@ -929,8 +946,8 @@ impl HandlerServiceImpl {
                 Some(Self::typed_message(
                     TYPE_PROXY_SOCKS_SERVER_CONFIG,
                     SocksServerConfigPayload {
-                        auth_type: 1,
-                        accounts,
+                        auth_type,
+                        accounts: account_map,
                     },
                 ))
             }
@@ -1176,6 +1193,53 @@ impl HandlerServiceImpl {
         Ok(password.to_string())
     }
 
+    fn parse_socks_user(
+        &self,
+        user: &proto::xray::common::protocol::User,
+    ) -> Result<SocksUser, Status> {
+        let account = user.account.as_ref().ok_or_else(|| {
+            Status::invalid_argument(
+                "AddUserOperation.user.account is required for socks",
+            )
+        })?;
+        let account_type = Self::parse_typed_message_type(account);
+        if account_type != TYPE_PROXY_SOCKS_ACCOUNT
+            && account_type != TYPE_PROXY_SOCKS_ACCOUNT_V2RAY
+        {
+            return Err(Status::invalid_argument(format!(
+                "unsupported socks account type: {account_type}"
+            )));
+        }
+
+        let payload = SocksAccountPayload::decode(account.value.as_slice())
+            .map_err(|err| {
+                Status::invalid_argument(format!(
+                    "invalid socks account payload: {err}"
+                ))
+            })?;
+        let username = if payload.username.trim().is_empty() {
+            user.email.trim()
+        } else {
+            payload.username.trim()
+        };
+        if username.is_empty() {
+            return Err(Status::invalid_argument(
+                "socks account username is required",
+            ));
+        }
+        let password = payload.password.trim();
+        if password.is_empty() {
+            return Err(Status::invalid_argument(
+                "socks account password is required",
+            ));
+        }
+
+        Ok(SocksUser {
+            username: username.to_string(),
+            password: password.to_string(),
+        })
+    }
+
     fn apply_add_user_to_protocol(
         &self,
         protocol: &mut ServerProxyConfig,
@@ -1221,6 +1285,10 @@ impl HandlerServiceImpl {
                         email: Some(email.to_string()),
                     });
                 }
+                Ok(true)
+            }
+            ServerProxyConfig::Socks { accounts } => {
+                accounts.upsert(self.parse_socks_user(user)?);
                 Ok(true)
             }
             #[cfg(feature = "ws")]
@@ -1283,6 +1351,7 @@ impl HandlerServiceImpl {
                 users.retain(|user| user.email.as_deref() != Some(email));
                 Ok(true)
             }
+            ServerProxyConfig::Socks { accounts } => Ok(accounts.remove(email)),
             #[cfg(feature = "ws")]
             ServerProxyConfig::Websocket { targets } => match targets.as_mut() {
                 crate::util::option::OneOrSome::One(target) => {
@@ -1406,7 +1475,13 @@ impl HandlerServiceImpl {
             ServerProxyConfig::Xhttp { inner, .. } => {
                 self.get_user_manager_identities(inner)
             }
-            ServerProxyConfig::Socks { .. } => None,
+            ServerProxyConfig::Socks { accounts } => Some(
+                accounts
+                    .snapshot()
+                    .iter()
+                    .map(|account| account.username.clone())
+                    .collect(),
+            ),
             ServerProxyConfig::DokodemoDoor { .. } => None,
         }
     }
@@ -1499,7 +1574,24 @@ impl HandlerServiceImpl {
             ServerProxyConfig::Xhttp { inner, .. } => {
                 self.get_user_manager_users(inner)
             }
-            ServerProxyConfig::Socks { .. } => None,
+            ServerProxyConfig::Socks { accounts } => Some(
+                accounts
+                    .snapshot()
+                    .iter()
+                    .map(|account| proto::xray::common::protocol::User {
+                        level: 0,
+                        email: account.username.clone(),
+                        account: Some(proto::xray::common::serial::TypedMessage {
+                            r#type: TYPE_PROXY_SOCKS_ACCOUNT.to_string(),
+                            value: SocksAccountPayload {
+                                username: account.username.clone(),
+                                password: account.password.clone(),
+                            }
+                            .encode_to_vec(),
+                        }),
+                    })
+                    .collect(),
+            ),
             ServerProxyConfig::DokodemoDoor { .. } => None,
         }
     }
@@ -1787,7 +1879,8 @@ mod tests {
             accounts: vec![SocksUser {
                 username: unique_tag("user-a"),
                 password: "pass-a".to_string(),
-            }],
+            }]
+            .into(),
         };
         let inbound = ServerConfig {
             tag: inbound_tag.clone(),
@@ -2032,7 +2125,7 @@ mod tests {
             .expect_err("expected alter_outbound to be unimplemented");
         assert_eq!(err.code(), Code::Unimplemented);
 
-        let err = service
+        let users = service
             .get_inbound_users(Request::new(
                 proto::xray::app::proxyman::command::GetInboundUserRequest {
                     tag: fixture.inbound_tag.clone(),
@@ -2040,11 +2133,12 @@ mod tests {
                 },
             ))
             .await
-            .expect_err("expected socks inbound to not be a user manager");
-        assert_eq!(err.code(), Code::Unknown);
-        assert_eq!(err.message(), ERR_PROXY_NOT_USER_MANAGER);
+            .expect("expected socks inbound users to be returned")
+            .into_inner();
+        assert_eq!(users.users.len(), 1);
+        assert!(users.users[0].email.starts_with("user-a-"));
 
-        let err = service
+        let users_count = service
             .get_inbound_users_count(Request::new(
                 proto::xray::app::proxyman::command::GetInboundUserRequest {
                     tag: fixture.inbound_tag.clone(),
@@ -2052,9 +2146,9 @@ mod tests {
                 },
             ))
             .await
-            .expect_err("expected socks inbound count to not be a user manager");
-        assert_eq!(err.code(), Code::Unknown);
-        assert_eq!(err.message(), ERR_PROXY_NOT_USER_MANAGER);
+            .expect("expected socks inbound users count to be returned")
+            .into_inner();
+        assert_eq!(users_count.count, 1);
     }
 
     #[tokio::test]
@@ -2753,7 +2847,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handler_alter_inbound_rejects_non_user_manager_inbound() {
+    async fn handler_alter_inbound_rejects_invalid_socks_user() {
         let fixture = build_fixture();
         let service = HandlerServiceImpl::new(fixture.runtime);
         let add_operation = proto::xray::app::proxyman::command::AddUserOperation {
@@ -2775,9 +2869,103 @@ mod tests {
                 },
             ))
             .await
-            .expect_err("expected non-user-manager inbound to reject alter");
-        assert_eq!(err.code(), Code::Unknown);
-        assert_eq!(err.message(), ERR_PROXY_NOT_USER_MANAGER);
+            .expect_err("expected socks add user without account to fail");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "AddUserOperation.user.account is required for socks"
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_alter_inbound_adds_and_removes_socks_users() {
+        let fixture = build_fixture();
+        let service = HandlerServiceImpl::new(fixture.runtime.clone());
+        let username = unique_tag("socks-user");
+
+        let initial_count = service
+            .get_inbound_users_count(Request::new(
+                proto::xray::app::proxyman::command::GetInboundUserRequest {
+                    tag: fixture.inbound_tag.clone(),
+                    email: String::new(),
+                },
+            ))
+            .await
+            .expect("socks get users count failed")
+            .into_inner();
+        assert_eq!(initial_count.count, 1);
+
+        let add_operation = proto::xray::app::proxyman::command::AddUserOperation {
+            user: Some(proto::xray::common::protocol::User {
+                level: 0,
+                email: username.clone(),
+                account: Some(proto::xray::common::serial::TypedMessage {
+                    r#type: TYPE_PROXY_SOCKS_ACCOUNT.to_string(),
+                    value: SocksAccountPayload {
+                        username: username.clone(),
+                        password: "added-password".to_string(),
+                    }
+                    .encode_to_vec(),
+                }),
+            }),
+        };
+        service
+            .alter_inbound(Request::new(
+                proto::xray::app::proxyman::command::AlterInboundRequest {
+                    tag: fixture.inbound_tag.clone(),
+                    operation: Some(proto::xray::common::serial::TypedMessage {
+                        r#type: TYPE_ADD_USER_OPERATION.to_string(),
+                        value: add_operation.encode_to_vec(),
+                    }),
+                },
+            ))
+            .await
+            .expect("socks add user should succeed");
+
+        let users_after_add = service
+            .get_inbound_users(Request::new(
+                proto::xray::app::proxyman::command::GetInboundUserRequest {
+                    tag: fixture.inbound_tag.clone(),
+                    email: String::new(),
+                },
+            ))
+            .await
+            .expect("socks get users after add failed")
+            .into_inner()
+            .users;
+        assert_eq!(users_after_add.len(), 2);
+        assert!(users_after_add.iter().any(|user| user.email == username));
+
+        let remove_operation =
+            proto::xray::app::proxyman::command::RemoveUserOperation {
+                email: username.clone(),
+            };
+        service
+            .alter_inbound(Request::new(
+                proto::xray::app::proxyman::command::AlterInboundRequest {
+                    tag: fixture.inbound_tag.clone(),
+                    operation: Some(proto::xray::common::serial::TypedMessage {
+                        r#type: TYPE_REMOVE_USER_OPERATION.to_string(),
+                        value: remove_operation.encode_to_vec(),
+                    }),
+                },
+            ))
+            .await
+            .expect("socks remove user should succeed");
+
+        let users_after_remove = service
+            .get_inbound_users(Request::new(
+                proto::xray::app::proxyman::command::GetInboundUserRequest {
+                    tag: fixture.inbound_tag,
+                    email: String::new(),
+                },
+            ))
+            .await
+            .expect("socks get users after remove failed")
+            .into_inner()
+            .users;
+        assert_eq!(users_after_remove.len(), 1);
+        assert!(!users_after_remove.iter().any(|user| user.email == username));
     }
 
     #[cfg(feature = "trojan")]
