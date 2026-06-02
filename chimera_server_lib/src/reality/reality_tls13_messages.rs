@@ -342,9 +342,16 @@ pub fn construct_client_hello(
     // 5. signature_algorithms extension (type 13)
     {
         extensions.extend_from_slice(&[0x00, 0x0d]); // Extension type: signature_algorithms
-        extensions.extend_from_slice(&[0x00, 0x04]); // Extension length: 4
-        extensions.extend_from_slice(&[0x00, 0x02]); // Signature algorithms length: 2
-        extensions.extend_from_slice(&[0x08, 0x07]); // ed25519
+        extensions.extend_from_slice(&[0x00, 0x12]); // Extension length: 18
+        extensions.extend_from_slice(&[0x00, 0x10]); // Signature algorithms length: 16
+        extensions.extend_from_slice(&[0x04, 0x03]); // ecdsa_secp256r1_sha256
+        extensions.extend_from_slice(&[0x08, 0x04]); // rsa_pss_rsae_sha256
+        extensions.extend_from_slice(&[0x04, 0x01]); // rsa_pkcs1_sha256
+        extensions.extend_from_slice(&[0x05, 0x03]); // ecdsa_secp384r1_sha384
+        extensions.extend_from_slice(&[0x08, 0x05]); // rsa_pss_rsae_sha384
+        extensions.extend_from_slice(&[0x05, 0x01]); // rsa_pkcs1_sha384
+        extensions.extend_from_slice(&[0x08, 0x06]); // rsa_pss_rsae_sha512
+        extensions.extend_from_slice(&[0x06, 0x01]); // rsa_pkcs1_sha512
     }
 
     // Write extensions length
