@@ -12,7 +12,9 @@ use super::super::types::TuicServerConfig;
 use super::super::types::{
     Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2ServerConfig,
 };
-use super::super::types::{RangeConfig, SocksUser, XhttpServerConfig};
+use super::super::types::{
+    RangeConfig, SocksUser, SocksUserStore, XhttpServerConfig,
+};
 
 #[cfg(feature = "trojan")]
 use crate::address::NetLocation;
@@ -228,7 +230,7 @@ pub(super) fn collect_trojan_fallbacks(
 
 pub(super) fn collect_socks_accounts(
     settings: SettingObject,
-) -> Result<Vec<SocksUser>, Error> {
+) -> Result<SocksUserStore, Error> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct SocksInboundSettings {
@@ -262,21 +264,26 @@ pub(super) fn collect_socks_accounts(
         });
 
     match auth_mode.as_str() {
-        "noauth" | "none" => Ok(vec![]),
+        "noauth" | "none" => {
+            Ok(SocksUserStore::with_auth_required(Vec::new(), false))
+        }
         "password" => {
             if socks_settings.accounts.is_empty() {
                 return Err(Error::InvalidConfig(
                     "socks inbound with password auth requires accounts".into(),
                 ));
             }
-            Ok(socks_settings
-                .accounts
-                .into_iter()
-                .map(|account| SocksUser {
-                    username: account.user,
-                    password: account.pass,
-                })
-                .collect())
+            Ok(SocksUserStore::with_auth_required(
+                socks_settings
+                    .accounts
+                    .into_iter()
+                    .map(|account| SocksUser {
+                        username: account.user,
+                        password: account.pass,
+                    })
+                    .collect(),
+                true,
+            ))
         }
         other => Err(Error::InvalidConfig(format!(
             "unsupported socks auth mode: {}",

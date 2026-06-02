@@ -4,7 +4,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::{
     address::{Address, NetLocation},
     async_stream::AsyncStream,
-    config::server_config::SocksUser,
+    config::server_config::{SocksUser, SocksUserStore},
     handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
     traffic::TrafficContext,
 };
@@ -38,12 +38,12 @@ const SUCCESS_RESPONSE: [u8; 10] = [
 
 #[derive(Debug)]
 pub struct SocksTcpServerHandler {
-    accounts: Vec<SocksUser>,
+    accounts: SocksUserStore,
     inbound_tag: String,
 }
 
 impl SocksTcpServerHandler {
-    pub fn new(accounts: Vec<SocksUser>, inbound_tag: &str) -> Self {
+    pub fn new(accounts: SocksUserStore, inbound_tag: &str) -> Self {
         Self {
             accounts,
             inbound_tag: inbound_tag.to_string(),
@@ -51,7 +51,7 @@ impl SocksTcpServerHandler {
     }
 
     fn requires_auth(&self) -> bool {
-        !self.accounts.is_empty()
+        self.accounts.auth_required()
     }
 }
 
@@ -81,7 +81,8 @@ impl TcpServerHandler for SocksTcpServerHandler {
 
         let mut identity = None;
         if method == SocksMethod::UsernamePassword {
-            identity = Some(authenticate(&self.accounts, &mut server_stream).await?)
+            let accounts = self.accounts.snapshot();
+            identity = Some(authenticate(&accounts, &mut server_stream).await?)
                 .filter(|s| !s.is_empty());
         }
 
