@@ -23,6 +23,9 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const SOCKS_TAG: &str = "socks-grpc-e2e";
+const VLESS_TAG: &str = "vless-grpc-e2e";
+const VLESS_USER_EMAIL: &str = "grpc-vless-user@example.com";
+const VLESS_USER_ID: &str = "114cb5a6-3787-4357-a5da-69b5782cb74f";
 const DIRECT_TAG: &str = "direct";
 const BACKUP_TAG: &str = "backup";
 static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -165,10 +168,10 @@ fn free_localhost_port() -> io::Result<u16> {
     Ok(port)
 }
 
-fn build_config(grpc_port: u16, socks_port: u16) -> String {
+fn build_config(grpc_port: u16, socks_port: u16, vless_port: u16) -> String {
     trace_step(format!(
-        "building integration config grpc_port={} socks_port={}",
-        grpc_port, socks_port
+        "building integration config grpc_port={} socks_port={} vless_port={}",
+        grpc_port, socks_port, vless_port
     ));
     format!(
         r#"{{
@@ -187,6 +190,24 @@ fn build_config(grpc_port: u16, socks_port: u16) -> String {
         ]
       }},
       "tag": "{SOCKS_TAG}"
+    }},
+    {{
+      "listen": "127.0.0.1",
+      "port": {vless_port},
+      "protocol": "vless",
+      "settings": {{
+        "clients": [
+          {{
+            "id": "{VLESS_USER_ID}",
+            "email": "{VLESS_USER_EMAIL}"
+          }}
+        ],
+        "decryption": "none"
+      }},
+      "streamSettings": {{
+        "network": "tcp"
+      }},
+      "tag": "{VLESS_TAG}"
     }}
   ],
   "outbounds": [
@@ -207,6 +228,15 @@ fn build_config(grpc_port: u16, socks_port: u16) -> String {
       "HandlerService",
       "RoutingService",
       "ObservatoryService"
+    ]
+  }},
+  "routing": {{
+    "domainStrategy": "AsIs",
+    "rules": [
+      {{
+        "inboundTag": ["{SOCKS_TAG}"],
+        "outboundTag": "{DIRECT_TAG}"
+      }}
     ]
   }}
 }}"#
@@ -386,12 +416,14 @@ fn grpc_services_external_end_to_end() {
         .expect("failed to acquire test lock");
     let grpc_port = free_localhost_port().expect("failed to allocate grpc port");
     let socks_port = free_localhost_port().expect("failed to allocate socks port");
+    let vless_port = free_localhost_port().expect("failed to allocate vless port");
     let grpc_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, grpc_port);
 
-    let config = build_config(grpc_port, socks_port);
+    let config = build_config(grpc_port, socks_port, vless_port);
+    println!("test config:\n{}", config);
     trace_step(format!(
-        "using grpc_addr={} socks_port={}",
-        grpc_addr, socks_port
+        "using grpc_addr={} socks_port={} vless_port={}",
+        grpc_addr, socks_port, vless_port
     ));
     let mut server =
         ServerProcess::spawn(&config).expect("failed to spawn chimera process");
@@ -470,7 +502,7 @@ fn grpc_services_external_end_to_end() {
             channel.clone(),
             PATH_HANDLER_GET_INBOUND_USERS_COUNT,
             GetInboundUserRequest {
-                tag: SOCKS_TAG.to_string(),
+                tag: VLESS_TAG.to_string(),
                 email: String::new(),
             },
         ))
