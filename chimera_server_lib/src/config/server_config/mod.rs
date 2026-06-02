@@ -12,7 +12,9 @@ pub use types::VlessUser;
 #[cfg(feature = "hysteria")]
 #[allow(unused_imports)]
 pub use types::{Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2ServerConfig};
-pub use types::{ServerConfig, ServerProxyConfig, SocksUser, XhttpServerConfig};
+pub use types::{
+    ServerConfig, ServerProxyConfig, SocksUser, SocksUserStore, XhttpServerConfig,
+};
 
 #[cfg(feature = "reality")]
 pub use types::RealityTransportConfig;
