@@ -1073,9 +1073,9 @@ fn handler_alter_inbound_without_operation_is_noop() {
 }
 
 #[test]
-fn handler_alter_inbound_add_and_remove_user_returns_not_user_manager() {
+fn handler_alter_inbound_add_and_remove_socks_user_executes() {
     trace_step(
-        "==== test handler_alter_inbound_add_and_remove_user_returns_not_user_manager start ====",
+        "==== test handler_alter_inbound_add_and_remove_socks_user_executes start ====",
     );
     let harness = Harness::start().expect("failed to start test harness");
     let added_user = "grpc-e2e-added-user";
@@ -1094,21 +1094,87 @@ fn handler_alter_inbound_add_and_remove_user_returns_not_user_manager() {
             }),
         }),
     };
-    let result: Result<AlterInboundResponse, Status> = harness.unary(
-        PATH_HANDLER_ALTER_INBOUND,
-        AlterInboundRequest {
-            tag: SOCKS_TAG.to_string(),
-            operation: Some(TypedMessage {
-                r#type: "xray.app.proxyman.command.AddUserOperation".to_string(),
-                value: add_operation.encode_to_vec(),
-            }),
-        },
+    let _: AlterInboundResponse = harness.expect_ok(
+        harness.unary(
+            PATH_HANDLER_ALTER_INBOUND,
+            AlterInboundRequest {
+                tag: SOCKS_TAG.to_string(),
+                operation: Some(TypedMessage {
+                    r#type: "xray.app.proxyman.command.AddUserOperation".to_string(),
+                    value: add_operation.encode_to_vec(),
+                }),
+            },
+        ),
+        "HandlerService/AlterInbound(add socks user)",
     );
-    harness.assert_status_code(
-        result,
-        Code::Unknown,
-        "HandlerService/AlterInbound(add user)",
+
+    let users_after_add: GetInboundUserResponse = harness.expect_ok(
+        harness.unary(
+            PATH_HANDLER_GET_INBOUND_USERS,
+            GetInboundUserRequest {
+                tag: SOCKS_TAG.to_string(),
+                email: String::new(),
+            },
+        ),
+        "HandlerService/GetInboundUsers(after socks add)",
     );
+    assert_eq!(users_after_add.users.len(), 2);
+    assert!(
+        users_after_add
+            .users
+            .iter()
+            .any(|user| user.email == added_user),
+        "expected added SOCKS user {added_user}, got {:?}; logs:\n{}",
+        users_after_add
+            .users
+            .iter()
+            .map(|user| user.email.clone())
+            .collect::<Vec<_>>(),
+        harness.logs()
+    );
+
+    let count_after_add: GetInboundUsersCountResponse = harness.expect_ok(
+        harness.unary(
+            PATH_HANDLER_GET_INBOUND_USERS_COUNT,
+            GetInboundUserRequest {
+                tag: SOCKS_TAG.to_string(),
+                email: String::new(),
+            },
+        ),
+        "HandlerService/GetInboundUsersCount(after socks add)",
+    );
+    assert_eq!(count_after_add.count, 2);
+
+    let remove_operation = RemoveUserOperation {
+        email: added_user.to_string(),
+    };
+    let _: AlterInboundResponse = harness.expect_ok(
+        harness.unary(
+            PATH_HANDLER_ALTER_INBOUND,
+            AlterInboundRequest {
+                tag: SOCKS_TAG.to_string(),
+                operation: Some(TypedMessage {
+                    r#type: "xray.app.proxyman.command.RemoveUserOperation"
+                        .to_string(),
+                    value: remove_operation.encode_to_vec(),
+                }),
+            },
+        ),
+        "HandlerService/AlterInbound(remove socks user)",
+    );
+
+    let users_after_remove: GetInboundUserResponse = harness.expect_ok(
+        harness.unary(
+            PATH_HANDLER_GET_INBOUND_USERS,
+            GetInboundUserRequest {
+                tag: SOCKS_TAG.to_string(),
+                email: String::new(),
+            },
+        ),
+        "HandlerService/GetInboundUsers(after socks remove)",
+    );
+    assert_eq!(users_after_remove.users.len(), 1);
+    assert_eq!(users_after_remove.users[0].email, TEST_USERNAME);
 }
 
 #[test]
@@ -1274,43 +1340,50 @@ fn handler_list_inbounds_executes() {
 }
 
 #[test]
-fn handler_get_inbound_users_returns_not_user_manager() {
-    trace_step(
-        "==== test handler_get_inbound_users_returns_not_user_manager start ====",
-    );
+fn handler_get_inbound_users_returns_socks_users() {
+    trace_step("==== test handler_get_inbound_users_returns_socks_users start ====");
     let harness = Harness::start().expect("failed to start test harness");
-    let result: Result<GetInboundUserResponse, Status> = harness.unary(
-        PATH_HANDLER_GET_INBOUND_USERS,
-        GetInboundUserRequest {
-            tag: SOCKS_TAG.to_string(),
-            email: String::new(),
-        },
-    );
-    harness.assert_status_code(
-        result,
-        Code::Unknown,
+    let response: GetInboundUserResponse = harness.expect_ok(
+        harness.unary(
+            PATH_HANDLER_GET_INBOUND_USERS,
+            GetInboundUserRequest {
+                tag: SOCKS_TAG.to_string(),
+                email: String::new(),
+            },
+        ),
         "HandlerService/GetInboundUsers",
     );
+    assert_eq!(response.users.len(), 1);
+    assert_eq!(response.users[0].email, TEST_USERNAME);
+
+    let account = response.users[0]
+        .account
+        .as_ref()
+        .expect("SOCKS user should include an account payload");
+    assert_eq!(account.r#type, "xray.proxy.socks.Account");
+    let decoded = SocksAccount::decode(account.value.as_slice())
+        .expect("decode socks account");
+    assert_eq!(decoded.username, TEST_USERNAME);
+    assert_eq!(decoded.password, TEST_PASSWORD);
 }
 
 #[test]
-fn handler_get_inbound_users_count_returns_not_user_manager() {
+fn handler_get_inbound_users_count_returns_socks_count() {
     trace_step(
-        "==== test handler_get_inbound_users_count_returns_not_user_manager start ====",
+        "==== test handler_get_inbound_users_count_returns_socks_count start ====",
     );
     let harness = Harness::start().expect("failed to start test harness");
-    let result: Result<GetInboundUsersCountResponse, Status> = harness.unary(
-        PATH_HANDLER_GET_INBOUND_USERS_COUNT,
-        GetInboundUserRequest {
-            tag: SOCKS_TAG.to_string(),
-            email: String::new(),
-        },
-    );
-    harness.assert_status_code(
-        result,
-        Code::Unknown,
+    let response: GetInboundUsersCountResponse = harness.expect_ok(
+        harness.unary(
+            PATH_HANDLER_GET_INBOUND_USERS_COUNT,
+            GetInboundUserRequest {
+                tag: SOCKS_TAG.to_string(),
+                email: String::new(),
+            },
+        ),
         "HandlerService/GetInboundUsersCount",
     );
+    assert_eq!(response.count, 1);
 }
 
 #[test]
