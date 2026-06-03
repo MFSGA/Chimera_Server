@@ -394,7 +394,10 @@ impl RealityServerConnection {
 
         let mut client_short_id_arr = [0u8; 8];
         client_short_id_arr.copy_from_slice(client_short_id);
-        let short_id_ok = self.config.short_ids.contains(&client_short_id_arr);
+        let short_id_ok =
+            self.config.short_ids.iter().fold(false, |acc, valid_id| {
+                acc | (client_short_id_arr.ct_eq(valid_id).unwrap_u8() == 1)
+            });
 
         if !short_id_ok {
             tracing::warn!(

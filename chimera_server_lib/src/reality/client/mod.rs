@@ -397,4 +397,30 @@ mod tests {
             extract_client_cipher_suites(&conn.ciphertext_write_buf).unwrap();
         assert_eq!(cipher_suites, vec![0x1303]);
     }
+
+    #[test]
+    fn client_hello_transcript_bytes_use_encrypted_session_id() {
+        let conn = RealityClientConnection::new(RealityClientConfig {
+            public_key: test_server_public_key(),
+            short_id: [1, 2, 3, 4, 5, 6, 7, 8],
+            server_name: "example.com".to_string(),
+            cipher_suites: Vec::new(),
+        })
+        .unwrap();
+
+        let HandshakeState::AwaitingServerHello {
+            client_hello_bytes, ..
+        } = &conn.handshake_state
+        else {
+            panic!("client should wait for ServerHello after construction");
+        };
+
+        let record_payload = &conn.ciphertext_write_buf[5..];
+        assert_eq!(client_hello_bytes.as_slice(), record_payload);
+        assert_ne!(
+            &client_hello_bytes[39..71],
+            &[0u8; 32],
+            "transcript ClientHello must retain encrypted wire SessionId",
+        );
+    }
 }
