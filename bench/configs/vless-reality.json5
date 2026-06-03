@@ -1,0 +1,36 @@
+{
+  "inbounds": [{
+    "listen": "127.0.0.1",
+    "port": 0,                     // replaced at runtime by throughput.py
+    "protocol": "vless",
+    "settings": {
+      "clients": [{
+        "id": "PLACEHOLDER_UUID",  // replaced at runtime by throughput.py
+        "flow": "",
+        "email": "test@local"
+      }],
+      "decryption": "none",
+      "fallbacks": []
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "reality",
+      "realitySettings": {
+        "show": false,
+        "dest": "www.apple.com:443",
+        "xver": 0,
+        "serverNames": ["www.apple.com"],
+        "privateKey": "CAe1AlfoOhzR5zwWRYxUSUm2qdzWXM0qDJzbOWUvTno",
+        "shortIds": ["6ba85179e30d4fc2"],
+        "maxTimeDiff": 0,
+        "minClient": "",
+        "maxClient": ""
+      }
+    },
+    "tag": "vless-reality-throughput"
+  }],
+  "outbounds": [{
+    "protocol": "freedom",
+    "tag": "direct"
+  }]
+}
