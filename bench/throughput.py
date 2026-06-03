@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Proxy throughput benchmark orchestrator for Chimera_Server.
 
-Tests two scenarios with the sync-byte protocol (0xAC barrier):
+Tests three scenarios with the sync-byte protocol (0xAC barrier):
   Tier 1 (SOCKS direct): echo server -> Chimera SOCKS inbound -> measure throughput
   Tier 2 (VLESS direct): echo server -> Chimera VLESS inbound + xray client -> measure throughput
+  Tier 3 (VLESS Reality): echo server -> Chimera VLESS+Reality inbound + xray client -> measure throughput
 
 Usage:
-  python3 bench/throughput.py [--only socks|vless|all] [--payload-size N]
+  python3 bench/throughput.py [--only socks|vless|reality|all] [--payload-size N]
       [--runs N] [--output FILE] [--chimera-bin PATH] [--xray-bin PATH]
       [--verbose]
 
@@ -43,6 +44,9 @@ import time
 PORT_RANGE = (30000, 40000)
 SYNC_BYTE = b"\xAC"
 UUID = "114cb5a6-3787-4357-a5da-69b5782cb74f"
+REALITY_SERVER_NAME = "www.apple.com"
+REALITY_PUBLIC_KEY = "oam2vVkLpUOHaCHVhLOiKAEg_M74vGueBruUabgzsks"
+REALITY_SHORT_ID = "6ba85179e30d4fc2"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.join(SCRIPT_DIR, "configs")
 
@@ -407,6 +411,13 @@ def compute_stats(values: list[float], runs: int):
     return median, stdev
 
 
+def resolve_xray_path(xray_bin: str) -> str | None:
+    """Resolve an xray binary path, returning None when it is unavailable."""
+    return shutil.which(xray_bin) if "/" not in xray_bin else (
+        xray_bin if os.path.isfile(xray_bin) else None
+    )
+
+
 # ─── Tier 1: SOCKS direct test ──────────────────────────────────────────────────
 
 
@@ -506,11 +517,7 @@ def run_vless_test(
     pm.log("=== Starting VLESS direct test ===")
 
     # Resolve xray binary
-    xray_path: str | None = (
-        shutil.which(xray_bin) if "/" not in xray_bin else (
-            xray_bin if os.path.isfile(xray_bin) else None
-        )
-    )
+    xray_path = resolve_xray_path(xray_bin)
     if xray_path is None:
         print(
             "VLESS skipped: xray not found",
@@ -629,6 +636,161 @@ def run_vless_test(
     return result
 
 
+# ─── Tier 3: VLESS Reality test ────────────────────────────────────────────────
+
+
+def run_vless_reality_test(
+    pm: ProcManager,
+    payload_size: int,
+    runs: int,
+    chimera_bin: str,
+    xray_bin: str,
+):
+    """Run the Tier 3 VLESS-Reality throughput test.
+
+    Architecture:
+      echo_server <--direct-- chimera(vless+reality-in) <--vless+reality--
+        xray <--socks5-- client
+
+    Returns None if xray binary is not found (graceful skip).
+    """
+    pm.log("=== Starting VLESS Reality test ===")
+
+    xray_path = resolve_xray_path(xray_bin)
+    if xray_path is None:
+        print(
+            "VLESS Reality skipped: xray not found",
+            file=sys.stderr,
+        )
+        return None
+
+    echo_port = alloc_port()
+    vless_port = alloc_port()
+    xray_socks_port = alloc_port()
+    pm.log(
+        f"echo_port={echo_port}  vless_reality_port={vless_port}"
+        f"  xray_socks_port={xray_socks_port}"
+    )
+
+    # 1. Start echo server (inline thread)
+    pm.start_echo_server(echo_port, payload_size)
+
+    # 2. Build chimera config from template, replacing port and UUID
+    template = os.path.join(CONFIG_DIR, "vless-reality.json5")
+    with open(template) as f:
+        config_text = f.read()
+    config_text = config_text.replace('"port": 0', f'"port": {vless_port}')
+    config_text = config_text.replace("PLACEHOLDER_UUID", UUID)
+
+    temp_dir = pm.mktemp()
+    config_path = os.path.join(temp_dir, "config.json5")
+    with open(config_path, "w") as f:
+        f.write(config_text)
+
+    # 3. Start chimera
+    pm.spawn_chimera(config_path, chimera_bin)
+
+    # 4. Wait for VLESS Reality port (Chimera's inbound)
+    if not wait_for_port("127.0.0.1", vless_port):
+        raise RuntimeError(
+            f"Chimera VLESS Reality port {vless_port} did not become ready"
+        )
+
+    # 5. Write xray client config on-the-fly
+    xray_config = {
+        "inbounds": [
+            {
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noaccount"},
+                "tag": "socks-in",
+            }
+        ],
+        "outbounds": [
+            {
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [
+                        {
+                            "address": "127.0.0.1",
+                            "port": vless_port,
+                            "users": [
+                                {
+                                    "id": UUID,
+                                    "encryption": "none",
+                                    "flow": "",
+                                }
+                            ],
+                        }
+                    ],
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "reality",
+                    "realitySettings": {
+                        "serverName": REALITY_SERVER_NAME,
+                        "fingerprint": "chrome",
+                        "publicKey": REALITY_PUBLIC_KEY,
+                        "shortId": REALITY_SHORT_ID,
+                    },
+                },
+                "tag": "out",
+            }
+        ],
+    }
+
+    xray_config_path = os.path.join(temp_dir, "xray_config.json")
+    with open(xray_config_path, "w") as f:
+        json.dump(xray_config, f, indent=2)
+
+    # 6. Start xray
+    pm.spawn_xray(xray_config_path, xray_path)
+
+    # 7. Wait for xray SOCKS port
+    if not wait_for_port("127.0.0.1", xray_socks_port):
+        raise RuntimeError(
+            f"xray SOCKS port {xray_socks_port} did not become ready"
+        )
+
+    # 8. Run throughput iterations (through xray's SOCKS port)
+    upload_results: list[float] = []
+    download_results: list[float] = []
+
+    for i in range(runs):
+        pm.log(f"  Run {i + 1}/{runs}")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(30)
+        try:
+            sock.connect(("127.0.0.1", xray_socks_port))
+            socks5_negotiate(sock)
+            socks5_connect(sock, "127.0.0.1", echo_port)
+            up, down = measure_throughput(sock, payload_size)
+            upload_results.append(up)
+            download_results.append(down)
+            pm.log(f"    upload={up:.2f} Mbps  download={down:.2f} Mbps")
+        finally:
+            sock.close()
+
+    up_median, up_stdev = compute_stats(upload_results, runs)
+    down_median, down_stdev = compute_stats(download_results, runs)
+
+    result = {
+        "label": "vless-reality",
+        "scenario": "tier3_vless_reality",
+        "upload_mbps": round(up_median, 2),
+        "download_mbps": round(down_median, 2),
+        "upload_stdev_mbps": round(up_stdev, 2),
+        "download_stdev_mbps": round(down_stdev, 2),
+        "runs": runs,
+        "total_bytes": payload_size,
+        "engine": "chimera",
+    }
+
+    pm.log(f"VLESS Reality result: {json.dumps(result)}")
+    return result
+
+
 # ─── Main ───────────────────────────────────────────────────────────────────────
 
 
@@ -638,7 +800,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--only",
-        choices=["socks", "vless", "all"],
+        choices=["socks", "vless", "reality", "all"],
         default="all",
         help="Which scenario to run (default: all)",
     )
@@ -724,6 +886,13 @@ def main() -> None:
 
         if args.only in ("vless", "all"):
             result = run_vless_test(
+                pm, args.payload_size, args.runs, chimera_bin, args.xray_bin
+            )
+            if result is not None:
+                results.append(result)
+
+        if args.only in ("reality", "all"):
+            result = run_vless_reality_test(
                 pm, args.payload_size, args.runs, chimera_bin, args.xray_bin
             )
             if result is not None:
