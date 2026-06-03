@@ -37,13 +37,14 @@ PROTOCOL_META = {
 TRANSPORT_ORDER = {
     "direct": 0,
     "tcp": 1,
-    "kcp": 2,
-    "ws": 3,
-    "tls": 4,
-    "h2": 5,
-    "grpc": 6,
-    "quic": 7,
-    "http": 8,
+    "reality": 2,
+    "kcp": 3,
+    "ws": 4,
+    "tls": 5,
+    "h2": 6,
+    "grpc": 7,
+    "quic": 8,
+    "http": 9,
 }
 
 
