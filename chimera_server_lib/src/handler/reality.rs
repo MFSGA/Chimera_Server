@@ -500,9 +500,9 @@ pub async fn accept_reality_stream(
     config: &RealityTransportConfig,
 ) -> io::Result<RealityTlsStream<Box<dyn AsyncStream>, RealityServerConnection>> {
     let client_hello = read_client_hello(&mut server_stream).await?;
+    let sni = extract_sni_from_client_hello(&client_hello)?;
 
     if !config.server_names.is_empty() {
-        let sni = extract_sni_from_client_hello(&client_hello)?;
         match sni {
             Some(name)
                 if config
