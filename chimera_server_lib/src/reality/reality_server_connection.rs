@@ -317,21 +317,6 @@ impl RealityServerConnection {
         let client_random = extract_client_random(client_hello)?;
         let session_id = extract_session_id_slice(client_hello)?;
         let client_public_key = extract_client_public_key(client_hello)?;
-        let client_cipher_suites = extract_client_cipher_suites(client_hello)?;
-
-        let server_cipher_suites = if self.config.cipher_suites.is_empty() {
-            DEFAULT_CIPHER_SUITES
-        } else {
-            &self.config.cipher_suites
-        };
-        let cipher_suite =
-            negotiate_cipher_suite(server_cipher_suites, &client_cipher_suites)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "No common TLS 1.3 cipher suite found",
-                    )
-                })?;
 
         tracing::debug!(
             "REALITY: ClientHello received, client_random: {:?}",
@@ -476,6 +461,26 @@ impl RealityServerConnection {
             client_short_id,
             client_version,
             client_timestamp
+        );
+
+        let client_cipher_suites = extract_client_cipher_suites(client_hello)?;
+        let server_cipher_suites = if self.config.cipher_suites.is_empty() {
+            DEFAULT_CIPHER_SUITES
+        } else {
+            &self.config.cipher_suites
+        };
+        let cipher_suite =
+            negotiate_cipher_suite(server_cipher_suites, &client_cipher_suites)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "No common TLS 1.3 cipher suite found",
+                    )
+                })?;
+        tracing::debug!(
+            "REALITY: Negotiated cipher suite {:?} (client offered: {:04x?})",
+            cipher_suite,
+            client_cipher_suites
         );
 
         self.handshake_state = HandshakeState::ClientHelloValidated {
@@ -1174,11 +1179,19 @@ mod tests {
     }
 
     fn test_client_hello(server_public_key: [u8; 32]) -> Vec<u8> {
+        test_client_hello_with(server_public_key, [0u8; 8], Vec::new())
+    }
+
+    fn test_client_hello_with(
+        server_public_key: [u8; 32],
+        short_id: [u8; 8],
+        cipher_suites: Vec<CipherSuite>,
+    ) -> Vec<u8> {
         let mut client = RealityClientConnection::new(RealityClientConfig {
             public_key: server_public_key,
-            short_id: [0u8; 8],
+            short_id,
             server_name: "example.com".to_string(),
-            cipher_suites: Vec::new(),
+            cipher_suites,
         })
         .unwrap();
         let mut client_hello = Vec::new();
@@ -1266,6 +1279,24 @@ mod tests {
         ));
         assert!(conn.is_handshaking());
         assert!(!conn.wants_write());
+    }
+
+    #[test]
+    fn invalid_short_id_takes_precedence_over_cipher_mismatch() {
+        let (private_key, public_key) = test_reality_keypair();
+        let mut config = test_server_config(private_key);
+        config.cipher_suites = vec![CipherSuite::AES_256_GCM_SHA384];
+        let mut conn = RealityServerConnection::new(config).unwrap();
+        let client_hello = test_client_hello_with(
+            public_key,
+            [1u8; 8],
+            vec![CipherSuite::AES_128_GCM_SHA256],
+        );
+
+        let err = conn.validate_client_hello(&client_hello).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("Invalid short_id"));
     }
 
     #[test]
