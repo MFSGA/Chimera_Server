@@ -8,7 +8,7 @@ use super::common::{
     HANDSHAKE_TYPE_SERVER_HELLO, VERSION_TLS_1_2_MAJOR, VERSION_TLS_1_2_MINOR,
 };
 use aws_lc_rs::signature::Ed25519KeyPair;
-use std::io::Result;
+use std::io::{Error, ErrorKind, Result};
 
 /// Construct ServerHello message
 ///
@@ -46,7 +46,13 @@ pub fn construct_server_hello(
     payload.extend_from_slice(server_random);
 
     // Session ID
-    payload.push(session_id.len() as u8);
+    let session_id_len = u8::try_from(session_id.len()).map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "session_id too long for ServerHello",
+        )
+    })?;
+    payload.push(session_id_len);
     payload.extend_from_slice(session_id);
 
     // Cipher suite
@@ -65,24 +71,37 @@ pub fn construct_server_hello(
 
     // key_share extension (type=51)
     let key_share_length = 2 + 2 + key_share_data.len(); // group + length + data
+    let key_share_length = u16::try_from(key_share_length).map_err(|_| {
+        Error::new(ErrorKind::InvalidInput, "key_share extension too long")
+    })?;
+    let key_share_data_len = u16::try_from(key_share_data.len()).map_err(|_| {
+        Error::new(ErrorKind::InvalidInput, "key_share data too long")
+    })?;
     extensions.extend_from_slice(&[0x00, 0x33]); // type = 51
-    extensions.extend_from_slice(&(key_share_length as u16).to_be_bytes());
+    extensions.extend_from_slice(&key_share_length.to_be_bytes());
     extensions.extend_from_slice(&[0x00, 0x1d]); // group = X25519 (0x001d)
-    extensions.extend_from_slice(&(key_share_data.len() as u16).to_be_bytes());
+    extensions.extend_from_slice(&key_share_data_len.to_be_bytes());
     extensions.extend_from_slice(key_share_data);
 
     // Extensions length
-    payload.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    let extensions_len = u16::try_from(extensions.len())
+        .map_err(|_| Error::new(ErrorKind::InvalidInput, "extensions too long"))?;
+    payload.extend_from_slice(&extensions_len.to_be_bytes());
     payload.extend_from_slice(&extensions);
 
     // Handshake header
     server_hello.push(HANDSHAKE_TYPE_SERVER_HELLO);
 
     // Payload length (3 bytes, big-endian)
+    let payload_len = u32::try_from(payload.len())
+        .map_err(|_| Error::new(ErrorKind::InvalidInput, "ServerHello too long"))?;
+    if payload_len > 0x00ff_ffff {
+        return Err(Error::new(ErrorKind::InvalidInput, "ServerHello too long"));
+    }
     let length_bytes = [
-        ((payload.len() >> 16) & 0xff) as u8,
-        ((payload.len() >> 8) & 0xff) as u8,
-        (payload.len() & 0xff) as u8,
+        ((payload_len >> 16) & 0xff) as u8,
+        ((payload_len >> 8) & 0xff) as u8,
+        (payload_len & 0xff) as u8,
     ];
     server_hello.extend_from_slice(&length_bytes);
     server_hello.extend_from_slice(&payload);
@@ -464,6 +483,34 @@ mod tests {
         assert!(result.is_ok());
         let msg = result.unwrap();
         assert_eq!(msg[0], HANDSHAKE_TYPE_SERVER_HELLO);
+    }
+
+    #[test]
+    fn construct_server_hello_rejects_too_long_session_id() {
+        let server_random = [0x42u8; 32];
+        let session_id = vec![0x99u8; 256];
+        let key_share = vec![0xAAu8; 32];
+
+        let err =
+            construct_server_hello(&server_random, &session_id, 0x1301, &key_share)
+                .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("session_id too long"));
+    }
+
+    #[test]
+    fn construct_server_hello_rejects_too_long_key_share() {
+        let server_random = [0x42u8; 32];
+        let session_id = vec![0x99u8; 32];
+        let key_share = vec![0xAAu8; u16::MAX as usize + 1];
+
+        let err =
+            construct_server_hello(&server_random, &session_id, 0x1301, &key_share)
+                .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("key_share"));
     }
 
     #[test]
