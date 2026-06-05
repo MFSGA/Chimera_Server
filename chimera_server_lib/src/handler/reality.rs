@@ -114,30 +114,46 @@ fn extract_sni_from_client_hello(client_hello: &[u8]) -> io::Result<Option<Strin
 
     let extensions_len = reader.read_u16_be()? as usize;
     let extensions_end = reader.position() + extensions_len;
+    let mut requested_server_name = None;
 
     while reader.position() < extensions_end {
         let ext_type = reader.read_u16_be()?;
         let ext_len = reader.read_u16_be()? as usize;
 
         if ext_type == 0 {
+            if requested_server_name.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "multiple server names",
+                ));
+            }
+
             // Server Name extension
             let list_len = reader.read_u16_be()? as usize;
             let list_end = reader.position() + list_len;
             while reader.position() < list_end {
                 let name_type = reader.read_u8()?;
+                if name_type != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "expected server name type to be hostname (0)",
+                    ));
+                }
                 let name_len = reader.read_u16_be()? as usize;
                 let name = reader.read_str(name_len)?;
-                if name_type == 0 {
-                    return Ok(Some(name.to_string()));
+                if requested_server_name.replace(name.to_string()).is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "multiple server names",
+                    ));
                 }
             }
-            return Ok(None);
         } else {
             reader.skip(ext_len)?;
         }
     }
 
-    Ok(None)
+    Ok(requested_server_name)
 }
 
 fn client_hello_supports_tls13(client_hello: &[u8]) -> io::Result<bool> {
@@ -659,7 +675,7 @@ impl TcpServerHandler for RealityVisionVlessServerHandler {
 mod tests {
     use super::*;
 
-    fn client_hello_with_supported_versions(versions: &[u8]) -> Vec<u8> {
+    fn client_hello_with_raw_extensions(extensions: &[u8]) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&[0x03, 0x03]);
         body.extend_from_slice(&[0x24; 32]);
@@ -669,13 +685,8 @@ mod tests {
         body.push(1); // compression methods len
         body.push(0); // null compression
 
-        let mut extensions = Vec::new();
-        extensions.extend_from_slice(&[0x00, 0x2b]);
-        extensions.extend_from_slice(&((versions.len() + 1) as u16).to_be_bytes());
-        extensions.push(versions.len() as u8);
-        extensions.extend_from_slice(versions);
         body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
-        body.extend_from_slice(&extensions);
+        body.extend_from_slice(extensions);
 
         let mut handshake = Vec::new();
         handshake.push(0x01);
@@ -692,6 +703,30 @@ mod tests {
         record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
         record.extend_from_slice(&handshake);
         record
+    }
+
+    fn client_hello_with_supported_versions(versions: &[u8]) -> Vec<u8> {
+        let mut extensions = Vec::new();
+        extensions.extend_from_slice(&[0x00, 0x2b]);
+        extensions.extend_from_slice(&((versions.len() + 1) as u16).to_be_bytes());
+        extensions.push(versions.len() as u8);
+        extensions.extend_from_slice(versions);
+
+        client_hello_with_raw_extensions(&extensions)
+    }
+
+    fn sni_extension(name_type: u8, name: &str) -> Vec<u8> {
+        let mut names = Vec::new();
+        names.push(name_type);
+        names.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        names.extend_from_slice(name.as_bytes());
+
+        let mut extension = Vec::new();
+        extension.extend_from_slice(&[0x00, 0x00]);
+        extension.extend_from_slice(&((2 + names.len()) as u16).to_be_bytes());
+        extension.extend_from_slice(&(names.len() as u16).to_be_bytes());
+        extension.extend_from_slice(&names);
+        extension
     }
 
     fn server_hello_with_supported_version(version: Option<[u8; 2]>) -> Vec<u8> {
@@ -763,6 +798,43 @@ mod tests {
             err.to_string()
                 .contains("unexpected ClientHello TLS version")
         );
+    }
+
+    #[test]
+    fn extract_sni_accepts_hostname() {
+        let record =
+            client_hello_with_raw_extensions(&sni_extension(0, "example.com"));
+
+        assert_eq!(
+            extract_sni_from_client_hello(&record).unwrap(),
+            Some("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_sni_rejects_non_hostname_name_type() {
+        let record =
+            client_hello_with_raw_extensions(&sni_extension(1, "example.com"));
+
+        let err = extract_sni_from_client_hello(&record).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("expected server name type to be hostname")
+        );
+    }
+
+    #[test]
+    fn extract_sni_rejects_multiple_server_name_extensions() {
+        let mut extensions = sni_extension(0, "example.com");
+        extensions.extend_from_slice(&sni_extension(0, "example.org"));
+        let record = client_hello_with_raw_extensions(&extensions);
+
+        let err = extract_sni_from_client_hello(&record).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("multiple server names"));
     }
 
     #[test]
