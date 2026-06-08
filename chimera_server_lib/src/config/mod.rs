@@ -29,6 +29,7 @@ pub enum Transport {
 pub enum Protocol {
     #[cfg(feature = "vless")]
     Vless,
+    #[cfg(feature = "vmess")]
     Vmess,
     #[cfg(feature = "hysteria")]
     #[serde(alias = "hysteria")]
