@@ -23,3 +23,6 @@ pub use types::{TlsCertificateConfig, TlsCertificateUsage, TlsServerConfig};
 
 #[cfg(feature = "trojan")]
 pub use types::{TrojanFallback, TrojanUser};
+
+#[cfg(feature = "vmess")]
+pub use types::VmessUser;
