@@ -23,3 +23,6 @@ pub mod reality;
 
 #[cfg(feature = "tuic")]
 pub mod tuic;
+
+#[cfg(feature = "vmess")]
+pub mod vmess;
