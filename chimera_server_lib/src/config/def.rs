@@ -39,11 +39,15 @@ impl TryFrom<PathBuf> for LiteralConfig {
                 Some("json5") => json5::from_str(&content).map_err(|e| {
                     Error::InvalidConfig(format!("Could not parse JSON5: {}", e))
                 })?,
-                Some("yaml") => {
-                    todo!()
+                Some("yaml") | Some("yml") => {
+                    serde_yaml::from_str(&content).map_err(|e| {
+                        Error::InvalidConfig(format!("Could not parse YAML: {e}"))
+                    })?
                 }
                 Some("toml") => {
-                    todo!()
+                    return Err(Error::InvalidConfig(
+                        "TOML config format is not yet supported".into(),
+                    ));
                 }
                 _ => {
                     return Err(Error::InvalidConfig(format!(
@@ -92,11 +96,16 @@ pub struct InboudItem {
 
 impl InboudItem {
     pub fn get_transport_type(&self) -> Transport {
-        if self.stream_settings.is_none() {
+        let Some(settings) = &self.stream_settings else {
             return Transport::Tcp;
-        }
+        };
 
-        todo!()
+        match settings.network.to_ascii_lowercase().as_str() {
+            "" | "tcp" => Transport::Tcp,
+            "quic" | "kcp" => Transport::Quic,
+            "udp" => Transport::Udp,
+            _ => Transport::Tcp,
+        }
     }
 }
 
