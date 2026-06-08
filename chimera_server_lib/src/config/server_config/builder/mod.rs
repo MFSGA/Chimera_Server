@@ -308,7 +308,59 @@ impl TryFrom<InboudItem> for ServerConfig {
                     quic_settings: None,
                 });
             }
-            Protocol::Vmess => todo!(),
+            #[cfg(feature = "vmess")]
+            Protocol::Vmess => {
+                let settings = settings.ok_or_else(|| {
+                    Error::InvalidConfig("vmess inbound requires clients".into())
+                })?;
+                let clients = settings.clients().ok_or_else(|| {
+                    Error::InvalidConfig("vmess inbound settings.clients is required".into())
+                })?;
+                let users: Vec<crate::config::server_config::VmessUser> = clients
+                    .into_iter()
+                    .map(|client| {
+                        let user_label = if client.email.is_empty() {
+                            client.id.clone()
+                        } else {
+                            client.email
+                        };
+                        Ok(crate::config::server_config::VmessUser {
+                            user_id: client.id,
+                            user_label,
+                            cipher: String::new(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?;
+                let mut protocol = ServerProxyConfig::Vmess { users };
+
+                #[cfg(feature = "ws")]
+                if let Some(stream_setting) = stream_settings.as_ref() {
+                    if let Some(ws_setting) = stream_setting.ws_settings.clone() {
+                        tracing::info!("use websocket");
+                        protocol = ServerProxyConfig::Websocket {
+                            targets: Box::new(OneOrSome::One(
+                                WebsocketServerConfig {
+                                    matching_path: ws_setting.path,
+                                    matching_headers: None,
+                                    protocol,
+                                },
+                            )),
+                        };
+                    }
+                }
+
+                if let Some(stream_setting) = stream_settings.as_ref() {
+                    protocol = apply_security_layers(protocol, stream_setting)?;
+                }
+
+                Ok(ServerConfig {
+                    tag,
+                    bind_location,
+                    protocol,
+                    transport: Transport::Tcp,
+                    quic_settings: None,
+                })
+            }
 
             #[cfg(feature = "trojan")]
             Protocol::Trojan => {

@@ -167,6 +167,16 @@ pub struct VlessUser {
     pub flow: String,
 }
 
+#[cfg(feature = "vmess")]
+#[derive(Debug, Clone, Deserialize)]
+pub struct VmessUser {
+    pub user_id: String,
+    #[serde(default)]
+    pub user_label: String,
+    #[serde(default)]
+    pub cipher: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RangeConfig {
     #[serde(default)]
@@ -283,6 +293,10 @@ pub enum ServerProxyConfig {
     Vless {
         users: Vec<VlessUser>,
     },
+    #[cfg(feature = "vmess")]
+    Vmess {
+        users: Vec<VmessUser>,
+    },
     #[cfg(feature = "ws")]
     #[serde(alias = "ws")]
     Websocket {
@@ -327,6 +341,8 @@ impl std::fmt::Display for ServerProxyConfig {
             match self {
                 #[cfg(feature = "vless")]
                 Self::Vless { .. } => "Vless",
+                #[cfg(feature = "vmess")]
+                Self::Vmess { .. } => "Vmess",
                 #[cfg(feature = "ws")]
                 Self::Websocket { .. } => "Websocket",
                 #[cfg(feature = "hysteria")]
