@@ -2,7 +2,7 @@ use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use clap::{Parser, Subcommand, ValueEnum};
-use rand_core::{OsRng, RngCore};
+use rand::{TryRng, rngs::SysRng};
 use std::fmt::{self, Write};
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -53,9 +53,10 @@ fn main() -> Result<()> {
 }
 
 fn generate_keypair(format: KeyFormat) -> (String, String) {
-    let mut rng = OsRng;
     let mut secret_bytes = [0u8; 32];
-    rng.fill_bytes(&mut secret_bytes);
+    SysRng
+        .try_fill_bytes(&mut secret_bytes)
+        .expect("SysRng failure");
     let secret = StaticSecret::from(secret_bytes);
     let public = PublicKey::from(&secret);
 
