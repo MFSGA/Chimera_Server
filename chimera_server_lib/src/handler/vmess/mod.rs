@@ -6,4 +6,3 @@ mod sha2;
 pub mod typed;
 pub mod vmess_stream;
 pub mod vmess_handler;
-pub use vmess_handler::VmessTcpServerHandler;

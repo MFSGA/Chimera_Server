@@ -6,6 +6,8 @@ use crate::handler::reality::{
 use crate::handler::vless_handler::{
     VisionVlessTcpHandler, VlessTcpHandler, users_require_vision,
 };
+#[cfg(feature = "vmess")]
+use crate::handler::vmess::vmess_handler::VmessTcpServerHandler;
 #[cfg(feature = "ws")]
 use crate::handler::ws::{
     WebsocketTcpServerHandler, create_websocket_server_target,
@@ -35,6 +37,22 @@ pub fn create_tcp_server_handler(
             } else {
                 Box::new(VlessTcpHandler::new(&users, inbound_tag))
             }
+        }
+
+        #[cfg(feature = "vmess")]
+        ServerProxyConfig::Vmess { users } => {
+            let n_users = users.len();
+            if n_users != 1 {
+                panic!("VmessTcpServerHandler currently requires exactly 1 user (got {n_users})");
+            }
+            let user = &users[0];
+            Box::new(VmessTcpServerHandler::new(
+                &user.cipher,
+                &user.user_id,
+                false,
+                inbound_tag,
+                &user.user_label,
+            ))
         }
 
         #[cfg(feature = "ws")]

@@ -1425,6 +1425,10 @@ impl HandlerServiceImpl {
             ServerProxyConfig::Vless { users } => {
                 Some(users.iter().map(|user| user.user_label.clone()).collect())
             }
+            #[cfg(feature = "vmess")]
+            ServerProxyConfig::Vmess { users } => {
+                Some(users.iter().map(|user| user.user_label.clone()).collect())
+            }
             #[cfg(feature = "trojan")]
             ServerProxyConfig::Trojan { users, .. } => {
                 Some(users.iter().filter_map(|user| user.email.clone()).collect())
@@ -1507,6 +1511,17 @@ impl HandlerServiceImpl {
                             }
                             .encode_to_vec(),
                         }),
+                    })
+                    .collect(),
+            ),
+            #[cfg(feature = "vmess")]
+            ServerProxyConfig::Vmess { users } => Some(
+                users
+                    .iter()
+                    .map(|user| proto::xray::common::protocol::User {
+                        level: 0,
+                        email: user.user_label.clone(),
+                        account: None,
                     })
                     .collect(),
             ),
