@@ -43,7 +43,9 @@ pub fn create_tcp_server_handler(
         ServerProxyConfig::Vmess { users } => {
             let n_users = users.len();
             if n_users != 1 {
-                panic!("VmessTcpServerHandler currently requires exactly 1 user (got {n_users})");
+                panic!(
+                    "VmessTcpServerHandler currently requires exactly 1 user (got {n_users})"
+                );
             }
             let user = &users[0];
             Box::new(VmessTcpServerHandler::new(
