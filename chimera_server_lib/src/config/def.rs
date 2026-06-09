@@ -39,11 +39,10 @@ impl TryFrom<PathBuf> for LiteralConfig {
                 Some("json5") => json5::from_str(&content).map_err(|e| {
                     Error::InvalidConfig(format!("Could not parse JSON5: {}", e))
                 })?,
-                Some("yaml") | Some("yml") => {
-                    serde_yaml::from_str(&content).map_err(|e| {
+                Some("yaml") | Some("yml") => serde_yaml::from_str(&content)
+                    .map_err(|e| {
                         Error::InvalidConfig(format!("Could not parse YAML: {e}"))
-                    })?
-                }
+                    })?,
                 Some("toml") => {
                     return Err(Error::InvalidConfig(
                         "TOML config format is not yet supported".into(),
