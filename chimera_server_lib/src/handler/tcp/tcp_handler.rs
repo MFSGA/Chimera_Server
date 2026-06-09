@@ -23,17 +23,20 @@ pub enum TcpServerSetupResult {
         connection_success_response: Option<Box<[u8]>>,
         traffic_context: Option<TrafficContext>,
     },
+    /// The handler has taken full ownership of the stream and all work is
+    /// already handled (via a spawned task). `process_stream` should
+    /// return `Ok(())` immediately.
+    AlreadyHandled,
 }
 
 impl TcpServerSetupResult {
     pub fn set_need_initial_flush(&mut self, need_initial_flush: bool) {
-        match self {
-            TcpServerSetupResult::TcpForward {
-                need_initial_flush: flush,
-                ..
-            } => {
-                *flush = need_initial_flush;
-            }
-        };
+        if let TcpServerSetupResult::TcpForward {
+            need_initial_flush: flush,
+            ..
+        } = self
+        {
+            *flush = need_initial_flush;
+        }
     }
 }

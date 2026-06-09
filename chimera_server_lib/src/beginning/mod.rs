@@ -261,6 +261,7 @@ where
             record_transfer(traffic_context, copy_result.0, copy_result.1);
             Ok(())
         }
+        TcpServerSetupResult::AlreadyHandled => Ok(()),
     }
 }
 
