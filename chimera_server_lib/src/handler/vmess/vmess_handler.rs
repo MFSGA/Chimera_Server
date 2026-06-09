@@ -41,7 +41,9 @@ impl DataCipher {
         match name {
             "" | "any" => DataCipher::Any,
             "aes-128-gcm" => DataCipher::Aes128Gcm,
-            "chacha20-poly1305" | "chacha20-ietf-poly1305" => DataCipher::ChaCha20Poly1305,
+            "chacha20-poly1305" | "chacha20-ietf-poly1305" => {
+                DataCipher::ChaCha20Poly1305
+            }
             "none" => DataCipher::None,
             _ => DataCipher::Any,
         }
@@ -78,8 +80,10 @@ impl VmessTcpServerHandler {
         user_id_bytes.extend(b"543c72c6-a176-4b12-9d69-e02fa81a5b30");
         let instruction_key: [u8; 16] = compute_md5(&user_id_bytes);
 
-        let derived_key = super::sha2::kdf(&instruction_key, &[b"AES Auth ID Encryption"]);
-        let unbound_key = UnboundCipherKey::new(&AES_128, &derived_key[0..16]).unwrap();
+        let derived_key =
+            super::sha2::kdf(&instruction_key, &[b"AES Auth ID Encryption"]);
+        let unbound_key =
+            UnboundCipherKey::new(&AES_128, &derived_key[0..16]).unwrap();
         let aead_decrypting_key = CipherDecryptingKey::ecb(unbound_key).unwrap();
 
         Self {
@@ -115,7 +119,8 @@ impl TcpServerHandler for VmessTcpServerHandler {
             })?;
 
         let checksum = super::crc32::crc32c(&aead_bytes[0..12]);
-        let expected_checksum = u32::from_be_bytes(aead_bytes[12..16].try_into().unwrap());
+        let expected_checksum =
+            u32::from_be_bytes(aead_bytes[12..16].try_into().unwrap());
 
         if checksum != expected_checksum {
             return Err(std::io::Error::new(
@@ -130,12 +135,16 @@ impl TcpServerHandler for VmessTcpServerHandler {
         if time_delta > 120 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Hash timestamp is too old ({time_secs} is {time_delta} seconds old)"),
+                format!(
+                    "Hash timestamp is too old ({time_secs} is {time_delta} seconds old)"
+                ),
             ));
         }
 
         let mut encrypted_payload_length = [0u8; 18];
-        server_stream.read_exact(&mut encrypted_payload_length).await?;
+        server_stream
+            .read_exact(&mut encrypted_payload_length)
+            .await?;
 
         let mut nonce = [0u8; 8];
         server_stream.read_exact(&mut nonce).await?;
@@ -149,7 +158,8 @@ impl TcpServerHandler for VmessTcpServerHandler {
             &[b"VMess Header AEAD Nonce_Length", &cert_hash, &nonce],
         );
 
-        let unbound_key = UnboundKey::new(&AES_128_GCM, &header_length_aead_key[0..16]).unwrap();
+        let unbound_key =
+            UnboundKey::new(&AES_128_GCM, &header_length_aead_key[0..16]).unwrap();
         let mut opening_key = OpeningKey::new(
             unbound_key,
             SingleUseNonce::new(&header_length_nonce[0..12]),
@@ -159,10 +169,13 @@ impl TcpServerHandler for VmessTcpServerHandler {
             .open_in_place(Aad::from(&cert_hash), &mut encrypted_payload_length)
             .is_err()
         {
-            return Err(std::io::Error::other("failed to open encrypted header length"));
+            return Err(std::io::Error::other(
+                "failed to open encrypted header length",
+            ));
         }
 
-        let payload_length = u16::from_be_bytes(encrypted_payload_length[0..2].try_into().unwrap());
+        let payload_length =
+            u16::from_be_bytes(encrypted_payload_length[0..2].try_into().unwrap());
 
         let header_aead_key = super::sha2::kdf(
             &self.instruction_key,
@@ -173,10 +186,12 @@ impl TcpServerHandler for VmessTcpServerHandler {
             &[b"VMess Header AEAD Nonce", &cert_hash, &nonce],
         );
 
-        let mut encrypted_header = allocate_vec(payload_length as usize + TAG_LEN).into_boxed_slice();
+        let mut encrypted_header =
+            allocate_vec(payload_length as usize + TAG_LEN).into_boxed_slice();
         server_stream.read_exact(&mut encrypted_header).await?;
 
-        let unbound_key = UnboundKey::new(&AES_128_GCM, &header_aead_key[0..16]).unwrap();
+        let unbound_key =
+            UnboundKey::new(&AES_128_GCM, &header_aead_key[0..16]).unwrap();
         let mut opening_key =
             OpeningKey::new(unbound_key, SingleUseNonce::new(&header_nonce[0..12]));
 
@@ -207,7 +222,10 @@ impl TcpServerHandler for VmessTcpServerHandler {
         if command != COMMAND_TCP {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                format!("VMess command {} is not supported (only TCP is supported)", command),
+                format!(
+                    "VMess command {} is not supported (only TCP is supported)",
+                    command
+                ),
             ));
         }
 
@@ -223,7 +241,10 @@ impl TcpServerHandler for VmessTcpServerHandler {
                 cursor += 4;
                 fnv_hasher.write(address_bytes);
                 let v4addr = Ipv4Addr::new(
-                    address_bytes[0], address_bytes[1], address_bytes[2], address_bytes[3],
+                    address_bytes[0],
+                    address_bytes[1],
+                    address_bytes[2],
+                    address_bytes[3],
                 );
                 NetLocation::new(Address::Ipv4(v4addr), port)
             }
@@ -232,16 +253,18 @@ impl TcpServerHandler for VmessTcpServerHandler {
                 cursor += 1;
                 fnv_hasher.write(&[domain_name_len]);
 
-                let domain_name_bytes = &decrypted_header[cursor..cursor + domain_name_len as usize];
+                let domain_name_bytes =
+                    &decrypted_header[cursor..cursor + domain_name_len as usize];
                 cursor += domain_name_len as usize;
                 fnv_hasher.write(domain_name_bytes);
 
-                let address_str = std::str::from_utf8(domain_name_bytes).map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("Failed to decode address: {e}"),
-                    )
-                })?;
+                let address_str =
+                    std::str::from_utf8(domain_name_bytes).map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("Failed to decode address: {e}"),
+                        )
+                    })?;
                 NetLocation::new(Address::from(address_str)?, port)
             }
             3 => {
@@ -270,19 +293,23 @@ impl TcpServerHandler for VmessTcpServerHandler {
 
         let margin_len: u8 = fixed_header[35] >> 4;
         if margin_len > 0 {
-            let margin_bytes = &decrypted_header[cursor..cursor + margin_len as usize];
+            let margin_bytes =
+                &decrypted_header[cursor..cursor + margin_len as usize];
             cursor += margin_len as usize;
             fnv_hasher.write(margin_bytes);
         }
 
         let check_bytes = &decrypted_header[cursor..cursor + 4];
 
-        let expected_check_value = u32::from_be_bytes(check_bytes[0..4].try_into().unwrap());
+        let expected_check_value =
+            u32::from_be_bytes(check_bytes[0..4].try_into().unwrap());
         let actual_check_value = fnv_hasher.finish();
         if expected_check_value != actual_check_value {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Bad fnv1a checksum, expected {expected_check_value}, got {actual_check_value}"),
+                format!(
+                    "Bad fnv1a checksum, expected {expected_check_value}, got {actual_check_value}"
+                ),
             ));
         }
 
@@ -333,7 +360,9 @@ impl TcpServerHandler for VmessTcpServerHandler {
             }
         };
 
-        if self.data_cipher != DataCipher::Any && requested_data_cipher != self.data_cipher {
+        if self.data_cipher != DataCipher::Any
+            && requested_data_cipher != self.data_cipher
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
@@ -343,64 +372,69 @@ impl TcpServerHandler for VmessTcpServerHandler {
             ));
         }
 
-        let response_header: [u8; 4] = [
-            response_authentication_v,
-            0,
-            0,
-            0,
-        ];
+        let response_header: [u8; 4] = [response_authentication_v, 0, 0, 0];
 
         let mut truncated_iv = [0u8; 16];
         let mut truncated_key = [0u8; 16];
-        truncated_iv.copy_from_slice(&super::sha2::compute_sha256(data_encryption_iv)[0..16]);
-        truncated_key.copy_from_slice(&super::sha2::compute_sha256(data_encryption_key)[0..16]);
+        truncated_iv.copy_from_slice(
+            &super::sha2::compute_sha256(data_encryption_iv)[0..16],
+        );
+        truncated_key.copy_from_slice(
+            &super::sha2::compute_sha256(data_encryption_key)[0..16],
+        );
         let response_header_iv = truncated_iv;
         let response_header_key = truncated_key;
 
         let unbound_keys = match requested_data_cipher {
-            DataCipher::Aes128Gcm => {
-                Some((
-                    UnboundKey::new(&AES_128_GCM, data_encryption_key).unwrap(),
-                    UnboundKey::new(&AES_128_GCM, &response_header_key).unwrap(),
-                ))
-            }
-            DataCipher::ChaCha20Poly1305 => {
-                Some((
-                    UnboundKey::new(&aws_lc_rs::aead::CHACHA20_POLY1305, &create_chacha_key(data_encryption_key)).unwrap(),
-                    UnboundKey::new(&aws_lc_rs::aead::CHACHA20_POLY1305, &create_chacha_key(&response_header_key)).unwrap(),
-                ))
-            }
+            DataCipher::Aes128Gcm => Some((
+                UnboundKey::new(&AES_128_GCM, data_encryption_key).unwrap(),
+                UnboundKey::new(&AES_128_GCM, &response_header_key).unwrap(),
+            )),
+            DataCipher::ChaCha20Poly1305 => Some((
+                UnboundKey::new(
+                    &aws_lc_rs::aead::CHACHA20_POLY1305,
+                    &create_chacha_key(data_encryption_key),
+                )
+                .unwrap(),
+                UnboundKey::new(
+                    &aws_lc_rs::aead::CHACHA20_POLY1305,
+                    &create_chacha_key(&response_header_key),
+                )
+                .unwrap(),
+            )),
             DataCipher::None => None,
             DataCipher::Any => unreachable!(),
         };
 
-        let data_keys = if let Some((unbound_opening_key, unbound_sealing_key)) = unbound_keys {
-            let opening_key = OpeningKey::new(
-                unbound_opening_key,
-                VmessNonceSequence::new(data_encryption_iv),
-            );
-            let sealing_key = SealingKey::new(
-                unbound_sealing_key,
-                VmessNonceSequence::new(&response_header_iv),
-            );
-            Some((opening_key, sealing_key))
-        } else {
-            None
-        };
+        let data_keys =
+            if let Some((unbound_opening_key, unbound_sealing_key)) = unbound_keys {
+                let opening_key = OpeningKey::new(
+                    unbound_opening_key,
+                    VmessNonceSequence::new(data_encryption_iv),
+                );
+                let sealing_key = SealingKey::new(
+                    unbound_sealing_key,
+                    VmessNonceSequence::new(&response_header_iv),
+                );
+                Some((opening_key, sealing_key))
+            } else {
+                None
+            };
 
-        let (read_length_shake_reader, write_length_shake_reader) = if enable_chunk_masking {
-            let mut request_hasher = Shake128::default();
-            request_hasher.update(data_encryption_iv);
-            let request_reader = request_hasher.finalize_xof();
+        let (read_length_shake_reader, write_length_shake_reader) =
+            if enable_chunk_masking {
+                let mut request_hasher = Shake128::default();
+                request_hasher.update(data_encryption_iv);
+                let request_reader = request_hasher.finalize_xof();
 
-            let mut response_hasher = Shake128::default();
-            response_hasher.update(&response_header_iv);
-            let response_reader = response_hasher.finalize_xof();
+                let mut response_hasher = Shake128::default();
+                response_hasher.update(&response_header_iv);
+                let response_reader = response_hasher.finalize_xof();
 
-            (Some(request_reader), Some(response_reader))
-        } else {
-            (None, None)
-        };
+                (Some(request_reader), Some(response_reader))
+            } else {
+                (None, None)
+            };
 
         let response_header_length_aead_key =
             super::sha2::kdf(&response_header_key, &[b"AEAD Resp Header Len Key"]);
@@ -411,13 +445,17 @@ impl TcpServerHandler for VmessTcpServerHandler {
         encrypted_response_header[1] = 4;
 
         let unbound_key =
-            UnboundKey::new(&AES_128_GCM, &response_header_length_aead_key[0..16]).unwrap();
+            UnboundKey::new(&AES_128_GCM, &response_header_length_aead_key[0..16])
+                .unwrap();
         let mut sealing_key = SealingKey::new(
             unbound_key,
             SingleUseNonce::new(&response_header_length_nonce[0..12]),
         );
         let tag = sealing_key
-            .seal_in_place_separate_tag(Aad::empty(), &mut encrypted_response_header[0..2])
+            .seal_in_place_separate_tag(
+                Aad::empty(),
+                &mut encrypted_response_header[0..2],
+            )
             .unwrap();
         encrypted_response_header[2..2 + TAG_LEN].copy_from_slice(tag.as_ref());
 
@@ -425,13 +463,15 @@ impl TcpServerHandler for VmessTcpServerHandler {
             super::sha2::kdf(&response_header_key, &[b"AEAD Resp Header Key"]);
         let response_header_nonce =
             super::sha2::kdf(&response_header_iv, &[b"AEAD Resp Header IV"]);
-        let unbound_key = UnboundKey::new(&AES_128_GCM, &response_header_aead_key[0..16]).unwrap();
+        let unbound_key =
+            UnboundKey::new(&AES_128_GCM, &response_header_aead_key[0..16]).unwrap();
         let mut sealing_key = SealingKey::new(
             unbound_key,
             SingleUseNonce::new(&response_header_nonce[0..12]),
         );
 
-        encrypted_response_header[2 + TAG_LEN..2 + TAG_LEN + 4].copy_from_slice(&response_header);
+        encrypted_response_header[2 + TAG_LEN..2 + TAG_LEN + 4]
+            .copy_from_slice(&response_header);
 
         let tag = sealing_key
             .seal_in_place_separate_tag(
