@@ -64,10 +64,10 @@ pub async fn start_servers(
     }
 
     if join_handles.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("failed to start servers at {}", &config.bind_location),
-        ));
+        return Err(std::io::Error::other(format!(
+            "failed to start servers at {}",
+            &config.bind_location
+        )));
     }
 
     Ok(join_handles)

@@ -346,10 +346,7 @@ impl HandlerServiceImpl {
         label: &str,
     ) -> Result<T, Status> {
         let message_type = Self::parse_typed_message_type(typed_message);
-        if !accepted_types
-            .iter()
-            .any(|candidate| *candidate == message_type)
-        {
+        if !accepted_types.contains(&message_type) {
             return Err(Status::invalid_argument(format!(
                 "unsupported {label} type: {message_type}"
             )));
@@ -768,10 +765,10 @@ impl HandlerServiceImpl {
                     "max_client_ver",
                 )?;
                 let mut server_names = reality.server_names;
-                if server_names.is_empty() {
-                    if let Some(hostname) = dest.address().hostname() {
-                        server_names.push(hostname.to_string());
-                    }
+                if server_names.is_empty()
+                    && let Some(hostname) = dest.address().hostname()
+                {
+                    server_names.push(hostname.to_string());
                 }
                 Ok(ServerProxyConfig::Reality(RealityTransportConfig {
                     dest,
@@ -2510,7 +2507,6 @@ mod tests {
                 });
                 (user.email, account)
             })
-            .into_iter()
             .collect::<Vec<_>>();
         assert_eq!(initial_users.len(), 2);
         assert!(

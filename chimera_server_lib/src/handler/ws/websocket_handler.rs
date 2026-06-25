@@ -49,17 +49,17 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             if !first_line.ends_with(" HTTP/1.0")
                 && !first_line.ends_with(" HTTP/1.1")
             {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("invalid http request version: {}", first_line),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "invalid http request version: {}",
+                    first_line
+                )));
             }
 
             if !first_line.starts_with("GET ") {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("invalid http request: {}", first_line),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "invalid http request: {}",
+                    first_line
+                )));
             }
 
             first_line.truncate(first_line.len() - 9);
@@ -67,13 +67,9 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             first_line.split_off(4)
         };
         debug!("request path is {}", request_path);
-        let websocket_key =
-            request_headers.remove("sec-websocket-key").ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "missing websocket key header",
-                )
-            })?;
+        let websocket_key = request_headers
+            .remove("sec-websocket-key")
+            .ok_or_else(|| std::io::Error::other("missing websocket key header"))?;
 
         'outer: for server_target in self.server_targets.iter() {
             debug!("checking server target {:?}", server_target);
@@ -83,11 +79,11 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                 handler,
             } = server_target;
             debug!("matching path is {:?} {:?}", matching_path, &request_path);
-            if let Some(path) = matching_path {
-                if path != &request_path {
-                    debug!("path not match");
-                    continue;
-                }
+            if let Some(path) = matching_path
+                && path != &request_path
+            {
+                debug!("path not match");
+                continue;
             }
             debug!("matching headers is {:?}", matching_headers);
             if let Some(headers) = matching_headers {
@@ -146,10 +142,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             return target_setup_result;
         }
 
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "No matching websocket targets",
-        ))
+        Err(std::io::Error::other("No matching websocket targets"))
     }
 }
 

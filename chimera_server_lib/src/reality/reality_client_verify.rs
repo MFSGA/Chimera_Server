@@ -374,15 +374,8 @@ mod tests {
         let signature = [0xABu8; 64];
         let payload_len = 2 + 2 + 64;
 
-        let mut message = Vec::new();
-        message.push(0x0f);
-        message.push(0x00);
-        message.push(0x00);
-        message.push(payload_len as u8);
-        message.push(0x08);
-        message.push(0x07);
-        message.push(0x00);
-        message.push(0x40);
+        let mut message =
+            vec![0x0f, 0x00, 0x00, payload_len as u8, 0x08, 0x07, 0x00, 0x40];
         message.extend_from_slice(&signature);
 
         let result = extract_certificate_verify_signature(&message).unwrap();

@@ -39,7 +39,7 @@ impl<'a> Read for RealityReader<'a> {
 
 impl<'a> BufRead for RealityReader<'a> {
     fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-        if self.buffer.len() > 0 {
+        if !self.buffer.is_empty() {
             Ok(self.buffer.as_slice())
         } else if self.received_close_notify {
             Ok(&[])

@@ -270,10 +270,7 @@ pub(crate) fn take_vless_response_header(
     }
 }
 
-pub(crate) fn bounded_write_chunk<'a>(
-    buf: &'a [u8],
-    max_content_len: usize,
-) -> &'a [u8] {
+pub(crate) fn bounded_write_chunk(buf: &[u8], max_content_len: usize) -> &[u8] {
     &buf[..buf.len().min(max_content_len)]
 }
 

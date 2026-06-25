@@ -97,33 +97,29 @@ pub(super) fn collect_hysteria2_settings(
     }
 
     if let Some(hysteria_settings) = hysteria_settings {
-        if let Some(version) = hysteria_settings.version {
-            if version != 2 {
-                return Err(Error::InvalidConfig(format!(
-                    "hysteriaSettings.version must be 2 for hysteria2 inbound (got {version})"
-                )));
-            }
+        if let Some(version) = hysteria_settings.version
+            && version != 2
+        {
+            return Err(Error::InvalidConfig(format!(
+                "hysteriaSettings.version must be 2 for hysteria2 inbound (got {version})"
+            )));
         }
 
-        if !saw_up {
-            if let Some(up) = hysteria_settings.up.clone() {
-                bandwidth.max_tx = parse_bandwidth(up).map_err(|err| {
-                    Error::InvalidConfig(format!(
-                        "invalid hysteriaSettings.up value: {}",
-                        err
-                    ))
-                })?;
-            }
+        if !saw_up && let Some(up) = hysteria_settings.up.clone() {
+            bandwidth.max_tx = parse_bandwidth(up).map_err(|err| {
+                Error::InvalidConfig(format!(
+                    "invalid hysteriaSettings.up value: {}",
+                    err
+                ))
+            })?;
         }
-        if !saw_down {
-            if let Some(down) = hysteria_settings.down.clone() {
-                bandwidth.max_rx = parse_bandwidth(down).map_err(|err| {
-                    Error::InvalidConfig(format!(
-                        "invalid hysteriaSettings.down value: {}",
-                        err
-                    ))
-                })?;
-            }
+        if !saw_down && let Some(down) = hysteria_settings.down.clone() {
+            bandwidth.max_rx = parse_bandwidth(down).map_err(|err| {
+                Error::InvalidConfig(format!(
+                    "invalid hysteriaSettings.down value: {}",
+                    err
+                ))
+            })?;
         }
     }
 

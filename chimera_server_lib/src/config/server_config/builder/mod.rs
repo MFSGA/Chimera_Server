@@ -143,13 +143,13 @@ impl TryFrom<InboudItem> for ServerConfig {
                     protocol = apply_security_layers(protocol, stream_setting)?;
                 }
 
-                return Ok(ServerConfig {
+                Ok(ServerConfig {
                     tag,
                     bind_location,
                     protocol,
                     transport: Transport::Tcp,
                     quic_settings: None,
-                });
+                })
             }
             #[cfg(feature = "hysteria")]
             Protocol::Hysteria2 => {
@@ -246,9 +246,9 @@ impl TryFrom<InboudItem> for ServerConfig {
                 }
 
                 #[cfg(feature = "ws")]
-                if !uses_xhttp {
-                    if let Some(stream_setting) = stream_settings.as_ref() {
-                        if let Some(ws_setting) = stream_setting.ws_settings.clone() {
+                if !uses_xhttp
+                    && let Some(stream_setting) = stream_settings.as_ref()
+                        && let Some(ws_setting) = stream_setting.ws_settings.clone() {
                             if uses_vision {
                                 return Err(Error::InvalidConfig(
                                     "xtls-rprx-vision does not support websocket transport"
@@ -266,8 +266,6 @@ impl TryFrom<InboudItem> for ServerConfig {
                                 )),
                             };
                         }
-                    }
-                }
 
                 if let Some(stream_setting) = stream_settings.as_ref() {
                     if uses_xhttp {
@@ -300,13 +298,13 @@ impl TryFrom<InboudItem> for ServerConfig {
                     }
                 }
 
-                return Ok(ServerConfig {
+                Ok(ServerConfig {
                     tag,
                     bind_location,
                     protocol,
                     transport: Transport::Tcp,
                     quic_settings: None,
-                });
+                })
             }
             #[cfg(feature = "vmess")]
             Protocol::Vmess => {
@@ -334,8 +332,8 @@ impl TryFrom<InboudItem> for ServerConfig {
                 let mut protocol = ServerProxyConfig::Vmess { users };
 
                 #[cfg(feature = "ws")]
-                if let Some(stream_setting) = stream_settings.as_ref() {
-                    if let Some(ws_setting) = stream_setting.ws_settings.clone() {
+                if let Some(stream_setting) = stream_settings.as_ref()
+                    && let Some(ws_setting) = stream_setting.ws_settings.clone() {
                         tracing::info!("use websocket");
                         protocol = ServerProxyConfig::Websocket {
                             targets: Box::new(OneOrSome::One(
@@ -347,7 +345,6 @@ impl TryFrom<InboudItem> for ServerConfig {
                             )),
                         };
                     }
-                }
 
                 if let Some(stream_setting) = stream_settings.as_ref() {
                     protocol = apply_security_layers(protocol, stream_setting)?;
@@ -375,8 +372,8 @@ impl TryFrom<InboudItem> for ServerConfig {
                 };
 
                 #[cfg(feature = "ws")]
-                if let Some(stream_setting) = stream_settings.as_ref() {
-                    if let Some(ws_setting) = stream_setting.ws_settings.clone() {
+                if let Some(stream_setting) = stream_settings.as_ref()
+                    && let Some(ws_setting) = stream_setting.ws_settings.clone() {
                         tracing::info!("use websocket");
                         protocol = ServerProxyConfig::Websocket {
                             targets: Box::new(OneOrSome::One(
@@ -388,7 +385,6 @@ impl TryFrom<InboudItem> for ServerConfig {
                             )),
                         };
                     }
-                }
 
                 if let Some(stream_setting) = stream_settings.as_ref() {
                     protocol = apply_security_layers(protocol, stream_setting)?;
@@ -414,8 +410,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                     Error::InvalidConfig("tuic inbound requires tlsSettings".into())
                 })?;
                 let certificate = tls_settings
-                    .certificates
-                    .get(0)
+                    .certificates.first()
                     .ok_or_else(|| {
                         Error::InvalidConfig(
                             "tuic inbound requires at least one certificate".into(),
@@ -466,8 +461,8 @@ impl TryFrom<InboudItem> for ServerConfig {
                 let mut protocol = ServerProxyConfig::Socks { accounts };
 
                 #[cfg(feature = "ws")]
-                if let Some(stream_setting) = stream_settings.as_ref() {
-                    if let Some(ws_setting) = stream_setting.ws_settings.clone() {
+                if let Some(stream_setting) = stream_settings.as_ref()
+                    && let Some(ws_setting) = stream_setting.ws_settings.clone() {
                         tracing::info!("use websocket");
                         protocol = ServerProxyConfig::Websocket {
                             targets: Box::new(OneOrSome::One(
@@ -479,7 +474,6 @@ impl TryFrom<InboudItem> for ServerConfig {
                             )),
                         };
                     }
-                }
 
                 if let Some(stream_setting) = stream_settings.as_ref() {
                     protocol = apply_security_layers(protocol, stream_setting)?;

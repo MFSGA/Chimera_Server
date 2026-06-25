@@ -1,7 +1,6 @@
 use std::net::SocketAddr;
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use tracing::debug;
 
 #[inline]
 pub fn new_tcp_socket(

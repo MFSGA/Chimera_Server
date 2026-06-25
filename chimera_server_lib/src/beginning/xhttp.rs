@@ -172,9 +172,7 @@ fn parse_listener_protocol(
             inner,
         }) => match *inner {
             ServerProxyConfig::Xhttp { config, inner } => {
-                if alpn_protocols.is_empty() {
-                    alpn_protocols.push("h2".to_string());
-                } else if !alpn_protocols.iter().any(|proto| proto == "h2") {
+                if !alpn_protocols.iter().any(|proto| proto == "h2") {
                     alpn_protocols.push("h2".to_string());
                 }
 

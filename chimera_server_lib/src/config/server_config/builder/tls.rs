@@ -84,10 +84,10 @@ fn build_reality_layer(
         parse_version_triplet(&settings.max_client_ver, "maxClientVer")?;
 
     let mut server_names = settings.server_names.clone();
-    if server_names.is_empty() {
-        if let Address::Hostname(hostname) = dest.address() {
-            server_names.push(hostname.clone());
-        }
+    if server_names.is_empty()
+        && let Address::Hostname(hostname) = dest.address()
+    {
+        server_names.push(hostname.clone());
     }
 
     Ok(ServerProxyConfig::Reality(RealityTransportConfig {

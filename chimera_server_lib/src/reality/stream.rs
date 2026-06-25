@@ -207,13 +207,13 @@ where
         // Serve already decrypted data first
         {
             let mut reader = this.session.reader();
-            if let Ok(available) = reader.fill_buf() {
-                if !available.is_empty() {
-                    let len = buf.remaining().min(available.len());
-                    buf.put_slice(&available[..len]);
-                    reader.consume(len);
-                    return Poll::Ready(Ok(()));
-                }
+            if let Ok(available) = reader.fill_buf()
+                && !available.is_empty()
+            {
+                let len = buf.remaining().min(available.len());
+                buf.put_slice(&available[..len]);
+                reader.consume(len);
+                return Poll::Ready(Ok(()));
             }
         }
 

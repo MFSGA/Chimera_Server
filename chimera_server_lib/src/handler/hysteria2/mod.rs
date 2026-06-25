@@ -27,9 +27,8 @@ pub async fn run_hysteria2_server(
 ) -> std::io::Result<()> {
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
 
-    let quic_server_config: quinn::crypto::rustls::QuicServerConfig = server_config
-        .try_into()
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+    let quic_server_config: quinn::crypto::rustls::QuicServerConfig =
+        server_config.try_into().map_err(std::io::Error::other)?;
 
     let quic_server_config = Arc::new(quic_server_config);
 
@@ -130,9 +129,7 @@ pub async fn run_hysteria2_server(
     }
 
     for join_handle in join_handles {
-        join_handle
-            .await
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+        join_handle.await.map_err(std::io::Error::other)?;
     }
     Ok(())
 }

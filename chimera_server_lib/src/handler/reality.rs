@@ -198,7 +198,7 @@ fn client_hello_supports_tls13(client_hello: &[u8]) -> io::Result<bool> {
 
         if ext_type == 0x002b {
             let version_list_len = reader.read_u8()? as usize;
-            if version_list_len % 2 != 0 {
+            if !version_list_len.is_multiple_of(2) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(

@@ -30,13 +30,10 @@ where
     stream.read_exact(&mut prefix).await?;
 
     if prefix[0] != 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!(
-                "invalid client protocol version, expected 0, got {}",
-                prefix[0]
-            ),
-        ));
+        return Err(std::io::Error::other(format!(
+            "invalid client protocol version, expected 0, got {}",
+            prefix[0]
+        )));
     }
 
     let mut user_id = [0u8; 16];
@@ -223,10 +220,7 @@ fn read_varint(data: &[u8]) -> std::io::Result<(u64, usize)> {
             return Ok((length, cursor + 1));
         }
         if cursor == 7 || cursor == data.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Varint is too long",
-            ));
+            return Err(std::io::Error::other("Varint is too long"));
         }
         cursor += 1;
     }

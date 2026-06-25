@@ -161,8 +161,8 @@ async fn negotiate_method(
     let mut methods = vec![0u8; method_len];
     stream.read_exact(&mut methods).await?;
 
-    let supports_no_auth = methods.iter().any(|&m| m == METHOD_NO_AUTH);
-    let supports_password = methods.iter().any(|&m| m == METHOD_USERNAME_PASSWORD);
+    let supports_no_auth = methods.contains(&METHOD_NO_AUTH);
+    let supports_password = methods.contains(&METHOD_USERNAME_PASSWORD);
 
     let selected = if has_accounts {
         if supports_password {
@@ -565,12 +565,7 @@ fn parse_udp_address(
             let addr = format!("{}:{}", domain_str, port)
                 .to_socket_addrs()?
                 .next()
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "domain resolution failed",
-                    )
-                })?;
+                .ok_or_else(|| std::io::Error::other("domain resolution failed"))?;
             Ok((addr, offset + 1 + 1 + domain_len + 2))
         }
         _ => Err(std::io::Error::new(

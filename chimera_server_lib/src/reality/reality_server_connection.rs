@@ -422,38 +422,38 @@ impl RealityServerConnection {
             }
         }
 
-        if let Some(min_ver) = &self.config.min_client_version {
-            if client_version < &min_ver[..] {
-                tracing::warn!(
-                    "REALITY: Client version {:?} is below minimum {:?}",
-                    client_version,
-                    min_ver
-                );
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "Client version {:?} is below minimum {:?}",
-                        client_version, min_ver
-                    ),
-                ));
-            }
+        if let Some(min_ver) = &self.config.min_client_version
+            && client_version < &min_ver[..]
+        {
+            tracing::warn!(
+                "REALITY: Client version {:?} is below minimum {:?}",
+                client_version,
+                min_ver
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "Client version {:?} is below minimum {:?}",
+                    client_version, min_ver
+                ),
+            ));
         }
 
-        if let Some(max_ver) = &self.config.max_client_version {
-            if client_version > &max_ver[..] {
-                tracing::warn!(
-                    "REALITY: Client version {:?} is above maximum {:?}",
-                    client_version,
-                    max_ver
-                );
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "Client version {:?} is above maximum {:?}",
-                        client_version, max_ver
-                    ),
-                ));
-            }
+        if let Some(max_ver) = &self.config.max_client_version
+            && client_version > &max_ver[..]
+        {
+            tracing::warn!(
+                "REALITY: Client version {:?} is above maximum {:?}",
+                client_version,
+                max_ver
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "Client version {:?} is above maximum {:?}",
+                    client_version, max_ver
+                ),
+            ));
         }
 
         tracing::info!(
