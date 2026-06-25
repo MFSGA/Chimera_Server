@@ -8,12 +8,14 @@
     in {
       devShells.${system}.default = pkgs.mkShell {
         nativeBuildInputs = with pkgs; [
-          cargo rustc rustfmt clippy cargo-watch
+          cargo rustc rustfmt clippy cargo-watch rust-analyzer
           clang llvmPackages.libclang cmake ninja gnumake pkg-config protobuf
         ];
         buildInputs = with pkgs; [ openssl ];
         LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+        PROTOC = "${pkgs.protobuf}/bin/protoc";
         RUST_BACKTRACE = "1";
+        RUST_LOG = "info";
       };
     };
 }
