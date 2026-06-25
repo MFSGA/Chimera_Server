@@ -495,6 +495,45 @@ impl TryFrom<InboudItem> for ServerConfig {
 mod tests {
     use super::*;
 
+    #[cfg(all(feature = "reality", feature = "vless"))]
+    fn vless_reality_inbound(reality_settings: serde_json::Value) -> InboudItem {
+        serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-reality-test",
+            "settings": {
+                "clients": [
+                    {
+                        "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+                        "email": "user@example.com"
+                    }
+                ],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "security": "reality",
+                "realitySettings": reality_settings
+            }
+        }))
+        .expect("valid vless reality inbound item")
+    }
+
+    #[cfg(all(feature = "reality", feature = "vless"))]
+    fn base_reality_settings() -> serde_json::Value {
+        serde_json::json!({
+            "show": false,
+            "dest": "www.apple.com:443",
+            "xver": 0,
+            "serverNames": ["www.apple.com"],
+            "privateKey": "dnprBfWdJgo5yaGClSaZ12TZW-SiD988YmjDKOhXLKI",
+            "shortIds": ["4ac97aaf8b9b0356"],
+            "maxTimeDiff": 0,
+            "minClient": "",
+            "maxClient": ""
+        })
+    }
+
     #[cfg(feature = "vless")]
     #[test]
     fn vless_builder_preserves_multiple_clients() {
@@ -657,6 +696,54 @@ mod tests {
             }
             other => panic!("expected reality protocol, got {other:?}"),
         }
+    }
+
+    #[cfg(all(feature = "reality", feature = "vless"))]
+    #[test]
+    fn vless_reality_defaults_missing_short_ids_to_zero() {
+        let mut settings = base_reality_settings();
+        settings
+            .as_object_mut()
+            .expect("reality settings object")
+            .remove("shortIds");
+
+        let config = ServerConfig::try_from(vless_reality_inbound(settings))
+            .expect("missing shortIds should use shoes-compatible default");
+
+        match config.protocol {
+            ServerProxyConfig::Reality(reality) => {
+                assert_eq!(reality.short_ids, vec![[0u8; 8]]);
+            }
+            other => panic!("expected reality protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(all(feature = "reality", feature = "vless"))]
+    #[test]
+    fn vless_reality_rejects_invalid_client_version_shape() {
+        let mut settings = base_reality_settings();
+        settings["minClient"] = serde_json::json!("1.8");
+
+        let err = ServerConfig::try_from(vless_reality_inbound(settings))
+            .expect_err("minClient without patch component should fail");
+        assert!(
+            err.to_string()
+                .contains("minClientVer must use major.minor.patch format")
+        );
+    }
+
+    #[cfg(all(feature = "reality", feature = "vless"))]
+    #[test]
+    fn vless_reality_rejects_outbound_only_settings() {
+        let mut settings = base_reality_settings();
+        settings["publicKey"] = serde_json::json!("client-side-public-key");
+
+        let err = ServerConfig::try_from(vless_reality_inbound(settings))
+            .expect_err("publicKey is not an inbound setting");
+        assert!(
+            err.to_string()
+                .contains("reality publicKey is an outbound/client setting")
+        );
     }
 
     #[cfg(feature = "vless")]

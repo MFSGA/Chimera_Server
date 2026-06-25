@@ -219,6 +219,7 @@ pub struct RealitySettings {
     #[serde(default)]
     pub server_names: Vec<String>,
     pub private_key: String,
+    #[serde(default)]
     pub short_ids: Vec<String>,
     pub dest: String,
     #[serde(default, alias = "cipher_suite")]
