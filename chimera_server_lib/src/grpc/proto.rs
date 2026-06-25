@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub mod xray {
     pub mod app {
         pub mod stats {

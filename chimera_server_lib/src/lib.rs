@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use beginning::start_servers;
 use config::{
     def::{ApiConfig, LiteralConfig},
