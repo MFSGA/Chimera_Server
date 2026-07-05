@@ -56,6 +56,7 @@ jobs:
           mkdir -p dist
           cp target/release/chimera_server_app dist/chimera_server_app-${{ steps.version.outputs.version }}-linux-x86_64
           chmod +x dist/chimera_server_app-${{ steps.version.outputs.version }}-linux-x86_64
+          (cd dist && sha256sum chimera_server_app-${{ steps.version.outputs.version }}-linux-x86_64 > chimera_server_app-${{ steps.version.outputs.version }}-linux-x86_64.sha256)
           ls -lh dist
 
       - name: Commit version bump
@@ -77,7 +78,9 @@ jobs:
           tag_name: ${{ steps.version.outputs.version }}
           name: ${{ steps.version.outputs.version }}
           generate_release_notes: true
-          files: dist/chimera_server_app-${{ steps.version.outputs.version }}-linux-x86_64
+          files: |
+            dist/chimera_server_app-${{ steps.version.outputs.version }}-linux-x86_64
+            dist/chimera_server_app-${{ steps.version.outputs.version }}-linux-x86_64.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.ADMIN_PAT }}
 
@@ -100,13 +103,17 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target\release\chimera_server_app.exe dist\chimera_server_app-${{ needs.release.outputs.version }}-windows-x86_64.exe
+          $hash = (Get-FileHash dist\chimera_server_app-${{ needs.release.outputs.version }}-windows-x86_64.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  chimera_server_app-${{ needs.release.outputs.version }}-windows-x86_64.exe" | Out-File -Encoding ascii dist\chimera_server_app-${{ needs.release.outputs.version }}-windows-x86_64.exe.sha256
           Get-ChildItem -Path dist
 
       - name: Upload Windows binary to release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.release.outputs.version }}
-          files: dist/chimera_server_app-${{ needs.release.outputs.version }}-windows-x86_64.exe
+          files: |
+            dist/chimera_server_app-${{ needs.release.outputs.version }}-windows-x86_64.exe
+            dist/chimera_server_app-${{ needs.release.outputs.version }}-windows-x86_64.exe.sha256
           generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.ADMIN_PAT }}
