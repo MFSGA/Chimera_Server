@@ -48,6 +48,8 @@ struct VlessInboundSettings {
     #[serde(default)]
     decryption: Option<String>,
     #[serde(default)]
+    flow: Option<String>,
+    #[serde(default)]
     fallbacks: Vec<serde_json::Value>,
 }
 
@@ -97,29 +99,6 @@ impl TryFrom<InboudItem> for ServerConfig {
             ))
         })?;
         let bind_location = BindLocation::Address(NetLocation::new(address, port));
-
-        #[cfg(feature = "vless")]
-        let vless_users = settings
-            .as_ref()
-            .and_then(|setting| setting.clients())
-            .map(|clients| {
-                clients
-                    .into_iter()
-                    .map(|client| {
-                        validate_vless_flow(&client.flow)?;
-                        Ok(crate::config::server_config::VlessUser {
-                            user_id: client.id.clone(),
-                            user_label: if client.email.is_empty() {
-                                client.id
-                            } else {
-                                client.email
-                            },
-                            flow: client.flow,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, Error>>()
-            })
-            .transpose()?;
 
         match protocol {
             Protocol::DokodemoDoor => {
@@ -244,12 +223,44 @@ impl TryFrom<InboudItem> for ServerConfig {
                         "vless settings.fallbacks is not supported yet".into(),
                     ));
                 }
+                let settings_flow = vless_settings
+                    .flow
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("");
+                validate_vless_flow(settings_flow)?;
 
-                let users = vless_users.clone().ok_or_else(|| {
-                    Error::InvalidConfig(
-                        "vless inbound requires at least one client".into(),
-                    )
-                })?;
+                let users = settings
+                    .as_ref()
+                    .and_then(|setting| setting.clients())
+                    .map(|clients| {
+                        clients
+                            .into_iter()
+                            .map(|client| {
+                                let flow = if client.flow.trim().is_empty() {
+                                    settings_flow.to_string()
+                                } else {
+                                    client.flow
+                                };
+                                validate_vless_flow(&flow)?;
+                                Ok(crate::config::server_config::VlessUser {
+                                    user_id: client.id.clone(),
+                                    user_label: if client.email.is_empty() {
+                                        client.id
+                                    } else {
+                                        client.email
+                                    },
+                                    flow,
+                                })
+                            })
+                            .collect::<Result<Vec<_>, Error>>()
+                    })
+                    .transpose()?
+                    .ok_or_else(|| {
+                        Error::InvalidConfig(
+                            "vless inbound requires at least one client".into(),
+                        )
+                    })?;
                 let uses_vision = has_vless_vision_flow(&users);
                 let mixes_plain_and_vision =
                     uses_vision && has_non_vision_vless_flow(&users);
@@ -802,6 +813,88 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("reality publicKey is an outbound/client setting")
+        );
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn vless_builder_inherits_settings_flow() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-settings-flow",
+            "settings": {
+                "flow": "xtls-rprx-vision",
+                "clients": [
+                    {
+                        "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+                        "email": "inherited-flow@example.com"
+                    }
+                ],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "security": "reality",
+                "realitySettings": {
+                    "show": false,
+                    "dest": "www.apple.com:443",
+                    "xver": 0,
+                    "serverNames": ["www.apple.com"],
+                    "privateKey": "dnprBfWdJgo5yaGClSaZ12TZW-SiD988YmjDKOhXLKI",
+                    "shortIds": ["4ac97aaf8b9b0356"],
+                    "maxTimeDiff": 0,
+                    "minClient": "",
+                    "maxClient": ""
+                }
+            }
+        }))
+        .expect("valid vless inbound item");
+
+        let config = ServerConfig::try_from(inbound)
+            .expect("vless inbound config should build");
+
+        match config.protocol {
+            ServerProxyConfig::Reality(reality) => match reality.inner.as_ref() {
+                ServerProxyConfig::Vless { users } => {
+                    assert_eq!(users.len(), 1);
+                    assert_eq!(users[0].flow, "xtls-rprx-vision");
+                }
+                other => {
+                    panic!("expected vless protocol inside reality, got {other:?}")
+                }
+            },
+            other => panic!("expected reality protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn vless_builder_rejects_unknown_settings_flow() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-invalid-settings-flow",
+            "settings": {
+                "flow": "xtls-rprx-vision-udp443",
+                "clients": [
+                    {
+                        "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+                        "email": "bad-settings-flow@example.com"
+                    }
+                ],
+                "decryption": "none"
+            }
+        }))
+        .expect("valid vless inbound item");
+
+        let err = ServerConfig::try_from(inbound)
+            .expect_err("unsupported vless settings flow should fail validation");
+        assert!(
+            err.to_string().contains(
+                "vless clients.flow doesn't support xtls-rprx-vision-udp443"
+            )
         );
     }
 
