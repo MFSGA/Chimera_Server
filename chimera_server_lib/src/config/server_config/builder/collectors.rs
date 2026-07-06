@@ -41,7 +41,10 @@ pub(super) fn collect_hysteria2_settings(
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Hysteria2ClientSetting {
-        id: String,
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        auth: Option<String>,
         #[serde(default)]
         email: String,
     }
@@ -62,15 +65,28 @@ pub(super) fn collect_hysteria2_settings(
     let clients = raw
         .clients
         .into_iter()
-        .map(|client| Hysteria2Client {
-            password: client.id,
-            email: if client.email.is_empty() {
-                None
-            } else {
-                Some(client.email)
-            },
+        .map(|client| {
+            let password = client
+                .auth
+                .or(client.id)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    Error::InvalidConfig(
+                        "hysteria client requires auth or id".into(),
+                    )
+                })?;
+
+            Ok(Hysteria2Client {
+                password,
+                email: if client.email.is_empty() {
+                    None
+                } else {
+                    Some(client.email)
+                },
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, Error>>()?;
 
     let mut bandwidth = Hysteria2BandwidthConfig::default();
     let mut saw_up = false;
@@ -437,5 +453,22 @@ mod tests {
         assert_eq!(config.max_each_post_bytes, 1_000_000);
         assert_eq!(config.max_buffered_posts, 30);
         assert_eq!(config.session_ttl_secs, 30);
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn collect_hysteria2_settings_accepts_xray_client_auth() {
+        let settings = SettingObject(serde_json::json!({
+            "clients": [{
+                "auth": "xray-auth-token",
+                "email": "hy@example.com"
+            }]
+        }));
+
+        let config = collect_hysteria2_settings(settings, None)
+            .expect("hysteria auth should map to password");
+        assert_eq!(config.clients.len(), 1);
+        assert_eq!(config.clients[0].password, "xray-auth-token");
+        assert_eq!(config.clients[0].email.as_deref(), Some("hy@example.com"));
     }
 }

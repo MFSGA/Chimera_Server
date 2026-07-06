@@ -95,6 +95,8 @@ pub struct XhttpRange {
 pub struct WsSettings {
     host: String,
     path: Option<String>,
+    #[serde(default)]
+    headers: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -157,6 +159,8 @@ pub struct ClientSetting {
     #[serde(default)]
     flow: String,
     id: String,
+    #[serde(default)]
+    security: Option<String>,
 }
 
 #[cfg(feature = "trojan")]
@@ -221,6 +225,7 @@ pub struct RealitySettings {
     pub private_key: String,
     #[serde(default)]
     pub short_ids: Vec<String>,
+    #[serde(alias = "target")]
     pub dest: String,
     #[serde(default, alias = "cipher_suite")]
     pub cipher_suites: Vec<crate::reality::CipherSuite>,
