@@ -15,6 +15,49 @@ use crate::util::option::OneOrSome;
 
 #[cfg(feature = "ws")]
 use super::ws::WebsocketServerConfig;
+#[cfg(feature = "ws")]
+fn websocket_server_config(
+    ws_setting: crate::config::WsSettings,
+    protocol: ServerProxyConfig,
+) -> WebsocketServerConfig {
+    let mut matching_headers = std::collections::HashMap::new();
+    let mut host = ws_setting
+        .host
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    for (key, value) in ws_setting.headers {
+        let key = key.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+        if key == "host" {
+            if host.is_none() {
+                let value = value.trim().to_string();
+                if !value.is_empty() {
+                    host = Some(value);
+                }
+            }
+        } else {
+            matching_headers.insert(key, value);
+        }
+    }
+
+    if let Some(host) = host {
+        matching_headers.insert("host".to_string(), host);
+    }
+
+    WebsocketServerConfig {
+        matching_path: ws_setting.path,
+        matching_headers: if matching_headers.is_empty() {
+            None
+        } else {
+            Some(matching_headers)
+        },
+        protocol,
+    }
+}
+
 use super::{
     quic::ServerQuicConfig,
     types::{ServerConfig, ServerProxyConfig},
@@ -309,15 +352,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                             tracing::info!("use websocket");
                             protocol = ServerProxyConfig::Websocket {
                                 targets: Box::new(OneOrSome::One(
-                                    WebsocketServerConfig {
-                                        matching_path: ws_setting.path,
-                                        matching_headers: if ws_setting.headers.is_empty() {
-                                            None
-                                        } else {
-                                            Some(ws_setting.headers)
-                                        },
-                                        protocol,
-                                    },
+                                    websocket_server_config(ws_setting, protocol),
                                 )),
                             };
                         }
@@ -395,15 +430,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                         tracing::info!("use websocket");
                         protocol = ServerProxyConfig::Websocket {
                             targets: Box::new(OneOrSome::One(
-                                WebsocketServerConfig {
-                                    matching_path: ws_setting.path,
-                                    matching_headers: if ws_setting.headers.is_empty() {
-                                        None
-                                    } else {
-                                        Some(ws_setting.headers)
-                                    },
-                                    protocol,
-                                },
+                                websocket_server_config(ws_setting, protocol),
                             )),
                         };
                     }
@@ -439,15 +466,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                         tracing::info!("use websocket");
                         protocol = ServerProxyConfig::Websocket {
                             targets: Box::new(OneOrSome::One(
-                                WebsocketServerConfig {
-                                    matching_path: ws_setting.path,
-                                    matching_headers: if ws_setting.headers.is_empty() {
-                                        None
-                                    } else {
-                                        Some(ws_setting.headers)
-                                    },
-                                    protocol,
-                                },
+                                websocket_server_config(ws_setting, protocol),
                             )),
                         };
                     }
@@ -532,15 +551,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                         tracing::info!("use websocket");
                         protocol = ServerProxyConfig::Websocket {
                             targets: Box::new(OneOrSome::One(
-                                WebsocketServerConfig {
-                                    matching_path: ws_setting.path,
-                                    matching_headers: if ws_setting.headers.is_empty() {
-                                        None
-                                    } else {
-                                        Some(ws_setting.headers)
-                                    },
-                                    protocol,
-                                },
+                                websocket_server_config(ws_setting, protocol),
                             )),
                         };
                     }
@@ -1274,7 +1285,8 @@ mod tests {
                     "host": "example.com",
                     "path": "/ws",
                     "headers": {
-                        "Host": "edge.example.com"
+                        "Host": "edge.example.com",
+                        "X-Test": "ok"
                     }
                 }
             }
@@ -1292,9 +1304,11 @@ mod tests {
                         .matching_headers
                         .expect("websocket headers should be preserved");
                     assert_eq!(
-                        headers.get("Host"),
-                        Some(&"edge.example.com".to_string())
+                        headers.get("host"),
+                        Some(&"example.com".to_string())
                     );
+                    assert_eq!(headers.get("x-test"), Some(&"ok".to_string()));
+                    assert!(!headers.contains_key("Host"));
                 }
                 OneOrSome::Some(_) => panic!("expected one websocket target"),
             },
