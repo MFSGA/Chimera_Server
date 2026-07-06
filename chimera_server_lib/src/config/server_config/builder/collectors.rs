@@ -307,6 +307,24 @@ pub(super) fn collect_socks_accounts(
 pub(super) fn collect_xhttp_settings(
     raw: XhttpSettings,
 ) -> Result<XhttpServerConfig, Error> {
+    reject_unsupported_xhttp_fields(&raw)?;
+    validate_xhttp_mode(raw.mode.as_deref())?;
+    if raw
+        .headers
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case("host"))
+    {
+        return Err(Error::InvalidConfig(
+            "xhttpSettings.headers cannot contain host; use xhttpSettings.host instead"
+                .into(),
+        ));
+    }
+    if !raw.headers.is_empty() {
+        return Err(Error::InvalidConfig(
+            "xhttpSettings.headers is not supported yet".into(),
+        ));
+    }
+
     let normalized_path = normalize_path(raw.path);
     let (min_padding, max_padding) = clamp_xhttp_range(
         raw.x_padding_bytes.unwrap_or(XhttpRange {
@@ -340,6 +358,54 @@ pub(super) fn collect_xhttp_settings(
         max_buffered_posts: raw.sc_max_buffered_posts.unwrap_or(30).max(1) as usize,
         session_ttl_secs: session_ttl_secs as u64,
     })
+}
+
+fn reject_unsupported_xhttp_fields(raw: &XhttpSettings) -> Result<(), Error> {
+    let unsupported_fields = [
+        ("extra", raw.extra.as_ref()),
+        ("downloadSettings", raw.download_settings.as_ref()),
+        ("xmux", raw.xmux.as_ref()),
+        ("noGRPCHeader", raw.no_grpc_header.as_ref()),
+        ("noSSEHeader", raw.no_sse_header.as_ref()),
+        ("serverMaxHeaderBytes", raw.server_max_header_bytes.as_ref()),
+        ("uplinkHTTPMethod", raw.uplink_http_method.as_ref()),
+        ("sessionPlacement", raw.session_placement.as_ref()),
+        ("sessionKey", raw.session_key.as_ref()),
+        ("seqPlacement", raw.seq_placement.as_ref()),
+        ("seqKey", raw.seq_key.as_ref()),
+        ("uplinkDataPlacement", raw.uplink_data_placement.as_ref()),
+        ("uplinkDataKey", raw.uplink_data_key.as_ref()),
+        ("uplinkChunkSize", raw.uplink_chunk_size.as_ref()),
+        (
+            "scMinPostsIntervalMs",
+            raw.sc_min_posts_interval_ms.as_ref(),
+        ),
+        ("xPaddingKey", raw.x_padding_key.as_ref()),
+        ("xPaddingHeader", raw.x_padding_header.as_ref()),
+        ("xPaddingPlacement", raw.x_padding_placement.as_ref()),
+        ("xPaddingMethod", raw.x_padding_method.as_ref()),
+        ("xPaddingObfsMode", raw.x_padding_obfs_mode.as_ref()),
+    ];
+
+    if let Some((field, _)) = unsupported_fields
+        .into_iter()
+        .find(|(_, value)| value.is_some())
+    {
+        return Err(Error::InvalidConfig(format!(
+            "xhttpSettings.{field} is not supported yet"
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_xhttp_mode(mode: Option<&str>) -> Result<(), Error> {
+    match mode.unwrap_or("auto").trim() {
+        "" | "auto" | "packet-up" | "stream-up" | "stream-one" => Ok(()),
+        unsupported => Err(Error::InvalidConfig(format!(
+            "unsupported xhttpSettings.mode: {unsupported}"
+        ))),
+    }
 }
 
 fn clamp_xhttp_range(
@@ -453,6 +519,88 @@ mod tests {
         assert_eq!(config.max_each_post_bytes, 1_000_000);
         assert_eq!(config.max_buffered_posts, 30);
         assert_eq!(config.session_ttl_secs, 30);
+    }
+
+    #[test]
+    fn collect_xhttp_settings_accepts_reference_modes() {
+        for mode in ["auto", "packet-up", "stream-up", "stream-one"] {
+            let settings =
+                serde_json::from_value::<XhttpSettings>(serde_json::json!({
+                    "path": "/xhttp",
+                    "mode": mode
+                }))
+                .expect("xhttp settings");
+
+            collect_xhttp_settings(settings).unwrap_or_else(|err| {
+                panic!("mode {mode} should be accepted: {err}")
+            });
+        }
+    }
+
+    #[test]
+    fn collect_xhttp_settings_rejects_unsupported_mode() {
+        let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
+            "path": "/xhttp",
+            "mode": "grpc"
+        }))
+        .expect("xhttp settings");
+
+        let err = collect_xhttp_settings(settings).expect_err("unsupported mode");
+        assert!(
+            err.to_string()
+                .contains("unsupported xhttpSettings.mode: grpc")
+        );
+    }
+
+    #[test]
+    fn collect_xhttp_settings_rejects_host_header() {
+        let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
+            "path": "/xhttp",
+            "headers": {
+                "Host": "edge.example.com"
+            }
+        }))
+        .expect("xhttp settings");
+
+        let err = collect_xhttp_settings(settings).expect_err("host header");
+        assert!(
+            err.to_string()
+                .contains("xhttpSettings.headers cannot contain host")
+        );
+    }
+
+    #[test]
+    fn collect_xhttp_settings_rejects_unsupported_headers() {
+        let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
+            "path": "/xhttp",
+            "headers": {
+                "X-Test": "ok"
+            }
+        }))
+        .expect("xhttp settings");
+
+        let err = collect_xhttp_settings(settings).expect_err("headers unsupported");
+        assert!(
+            err.to_string()
+                .contains("xhttpSettings.headers is not supported yet")
+        );
+    }
+
+    #[test]
+    fn collect_xhttp_settings_rejects_known_unsupported_fields() {
+        let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
+            "path": "/xhttp",
+            "downloadSettings": {
+                "network": "xhttp"
+            }
+        }))
+        .expect("xhttp settings");
+
+        let err = collect_xhttp_settings(settings).expect_err("unsupported field");
+        assert!(
+            err.to_string()
+                .contains("xhttpSettings.downloadSettings is not supported yet")
+        );
     }
 
     #[cfg(feature = "hysteria")]
