@@ -6,6 +6,7 @@
       "port": 11018,
       "protocol": "hysteria",
       "settings": {
+        "version": 2,
         "clients": [
           {
             "auth": "hysteria-auth-token",
@@ -17,7 +18,6 @@
         "network": "quic",
         "security": "tls",
         "hysteriaSettings": {
-          "version": 2,
           "up": "10 mbps",
           "down": "10 mbps"
         },

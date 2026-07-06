@@ -31,6 +31,8 @@ pub(super) fn collect_hysteria2_settings(
     #[serde(rename_all = "camelCase")]
     struct Hysteria2InboundSettings {
         #[serde(default)]
+        version: Option<u8>,
+        #[serde(default)]
         clients: Vec<Hysteria2ClientSetting>,
         #[serde(default)]
         bandwidth: Option<Hysteria2BandwidthSetting>,
@@ -112,12 +114,28 @@ pub(super) fn collect_hysteria2_settings(
         }
     }
 
+    if let Some(version) = raw.version
+        && version != 2
+    {
+        return Err(Error::InvalidConfig(format!(
+            "hysteria settings.version must be 2 for hysteria2 inbound (got {version})"
+        )));
+    }
+
     if let Some(hysteria_settings) = hysteria_settings {
         if let Some(version) = hysteria_settings.version
             && version != 2
         {
             return Err(Error::InvalidConfig(format!(
                 "hysteriaSettings.version must be 2 for hysteria2 inbound (got {version})"
+            )));
+        }
+        if let (Some(settings_version), Some(stream_version)) =
+            (raw.version, hysteria_settings.version)
+            && settings_version != stream_version
+        {
+            return Err(Error::InvalidConfig(format!(
+                "hysteria settings.version ({settings_version}) conflicts with hysteriaSettings.version ({stream_version})"
             )));
         }
 
@@ -618,5 +636,65 @@ mod tests {
         assert_eq!(config.clients.len(), 1);
         assert_eq!(config.clients[0].password, "xray-auth-token");
         assert_eq!(config.clients[0].email.as_deref(), Some("hy@example.com"));
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn collect_hysteria2_settings_accepts_xray_settings_version() {
+        let settings = SettingObject(serde_json::json!({
+            "version": 2,
+            "clients": [{
+                "auth": "xray-auth-token",
+                "email": "hy@example.com"
+            }]
+        }));
+
+        let config = collect_hysteria2_settings(settings, None)
+            .expect("hysteria settings.version should be accepted");
+        assert_eq!(config.clients.len(), 1);
+        assert_eq!(config.clients[0].password, "xray-auth-token");
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn collect_hysteria2_settings_rejects_non_v2_settings_version() {
+        let settings = SettingObject(serde_json::json!({
+            "version": 1,
+            "clients": [{
+                "auth": "xray-auth-token"
+            }]
+        }));
+
+        let err = collect_hysteria2_settings(settings, None)
+            .expect_err("hysteria settings.version other than 2 should fail");
+        assert!(
+            err.to_string()
+                .contains("hysteria settings.version must be 2")
+        );
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn collect_hysteria2_settings_rejects_conflicting_versions() {
+        let settings = SettingObject(serde_json::json!({
+            "version": 2,
+            "clients": [{
+                "auth": "xray-auth-token"
+            }]
+        }));
+        let stream_settings = HysteriaSettings {
+            version: Some(3),
+            congestion: None,
+            up: None,
+            down: None,
+            ignore_client_bandwidth: None,
+        };
+
+        let err = collect_hysteria2_settings(settings, Some(&stream_settings))
+            .expect_err("conflicting versions should fail");
+        assert!(
+            err.to_string()
+                .contains("hysteriaSettings.version must be 2")
+        );
     }
 }
