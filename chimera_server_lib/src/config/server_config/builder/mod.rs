@@ -226,8 +226,13 @@ impl TryFrom<InboudItem> for ServerConfig {
                 let decryption = vless_settings
                     .decryption
                     .as_deref()
-                    .unwrap_or("none")
-                    .trim()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        Error::InvalidConfig(
+                            "vless settings.decryption must be explicitly set to none".into(),
+                        )
+                    })?
                     .to_ascii_lowercase();
                 if decryption != "none" {
                     return Err(Error::InvalidConfig(format!(
@@ -1022,6 +1027,31 @@ mod tests {
             }
             other => panic!("expected reality protocol, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn vless_builder_requires_explicit_none_decryption() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "vless",
+            "tag": "vless-missing-decryption",
+            "settings": {
+                "clients": [{
+                    "id": "3ac9b383-75a1-431c-8184-106c80eb2273"
+                }]
+            }
+        }))
+        .expect("valid inbound json shape");
+
+        let err = ServerConfig::try_from(inbound)
+            .expect_err("missing vless decryption should fail");
+        assert!(
+            err.to_string().contains(
+                "vless settings.decryption must be explicitly set to none"
+            )
+        );
     }
 
     #[cfg(feature = "vless")]
