@@ -211,22 +211,32 @@ pub(super) fn collect_trojan_clients(
 }
 
 #[cfg(feature = "trojan")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TrojanInboundSettings {
+    #[serde(default)]
+    fallbacks: Vec<TrojanInboundFallback>,
+}
+
+#[cfg(feature = "trojan")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TrojanInboundFallback {
+    dest: String,
+    #[serde(default)]
+    alpn: Option<serde_json::Value>,
+    #[serde(default)]
+    path: Option<serde_json::Value>,
+    #[serde(default)]
+    r#type: Option<serde_json::Value>,
+    #[serde(default)]
+    xver: Option<serde_json::Value>,
+}
+
+#[cfg(feature = "trojan")]
 pub(super) fn collect_trojan_fallbacks(
     settings: &SettingObject,
 ) -> Result<Vec<TrojanFallback>, Error> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct TrojanInboundSettings {
-        #[serde(default)]
-        fallbacks: Vec<TrojanInboundFallback>,
-    }
-
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct TrojanInboundFallback {
-        dest: String,
-    }
-
     let trojan_settings: TrojanInboundSettings =
         settings.deserialize().map_err(|e| {
             Error::InvalidConfig(format!("failed to parse trojan settings: {e}"))
@@ -234,6 +244,7 @@ pub(super) fn collect_trojan_fallbacks(
 
     let mut fallbacks = Vec::new();
     for fallback in trojan_settings.fallbacks {
+        reject_unsupported_trojan_fallback_fields(&fallback)?;
         let dest = fallback.dest.trim();
         if dest.is_empty() {
             return Err(Error::InvalidConfig(
@@ -258,6 +269,29 @@ pub(super) fn collect_trojan_fallbacks(
     Ok(fallbacks)
 }
 
+#[cfg(feature = "trojan")]
+fn reject_unsupported_trojan_fallback_fields(
+    fallback: &TrojanInboundFallback,
+) -> Result<(), Error> {
+    let unsupported_fields = [
+        ("alpn", fallback.alpn.as_ref()),
+        ("path", fallback.path.as_ref()),
+        ("type", fallback.r#type.as_ref()),
+        ("xver", fallback.xver.as_ref()),
+    ];
+
+    if let Some((field, _)) = unsupported_fields
+        .into_iter()
+        .find(|(_, value)| value.is_some())
+    {
+        return Err(Error::InvalidConfig(format!(
+            "trojan fallback field {field} is not supported yet"
+        )));
+    }
+
+    Ok(())
+}
+
 pub(super) fn collect_socks_accounts(
     settings: SettingObject,
 ) -> Result<SocksUserStore, Error> {
@@ -268,6 +302,12 @@ pub(super) fn collect_socks_accounts(
         auth: Option<String>,
         #[serde(default)]
         accounts: Vec<SocksAccountSetting>,
+        #[serde(default)]
+        udp: Option<bool>,
+        #[serde(default)]
+        ip: Option<serde_json::Value>,
+        #[serde(default)]
+        user_level: Option<serde_json::Value>,
     }
 
     #[derive(Deserialize)]
@@ -280,6 +320,22 @@ pub(super) fn collect_socks_accounts(
         settings.deserialize().map_err(|e| {
             Error::InvalidConfig(format!("failed to parse socks settings: {}", e))
         })?;
+
+    if socks_settings.udp.unwrap_or(false) {
+        return Err(Error::InvalidConfig(
+            "socks settings.udp is not supported yet".into(),
+        ));
+    }
+    if socks_settings.ip.is_some() {
+        return Err(Error::InvalidConfig(
+            "socks settings.ip is not supported yet".into(),
+        ));
+    }
+    if socks_settings.user_level.is_some() {
+        return Err(Error::InvalidConfig(
+            "socks settings.userLevel is not supported yet".into(),
+        ));
+    }
 
     let auth_mode = socks_settings
         .auth
@@ -522,6 +578,65 @@ mod tests {
         assert!(
             matches!(err, Error::InvalidConfig(_)),
             "expected InvalidConfig"
+        );
+    }
+
+    #[test]
+    fn collect_socks_accounts_rejects_udp_until_supported() {
+        let settings = SettingObject(serde_json::json!({
+            "auth": "noauth",
+            "udp": true
+        }));
+
+        let err =
+            collect_socks_accounts(settings).expect_err("socks udp unsupported");
+        assert!(
+            err.to_string()
+                .contains("socks settings.udp is not supported yet")
+        );
+    }
+
+    #[test]
+    fn collect_socks_accounts_rejects_ip_until_supported() {
+        let settings = SettingObject(serde_json::json!({
+            "auth": "noauth",
+            "ip": "127.0.0.1"
+        }));
+
+        let err =
+            collect_socks_accounts(settings).expect_err("socks ip unsupported");
+        assert!(
+            err.to_string()
+                .contains("socks settings.ip is not supported yet")
+        );
+    }
+
+    #[test]
+    fn collect_socks_accounts_accepts_explicit_udp_false() {
+        let settings = SettingObject(serde_json::json!({
+            "auth": "noauth",
+            "udp": false
+        }));
+
+        let users = collect_socks_accounts(settings).expect("udp false is a no-op");
+        assert!(!users.auth_required());
+    }
+
+    #[cfg(feature = "trojan")]
+    #[test]
+    fn collect_trojan_fallbacks_rejects_unsupported_xray_fields() {
+        let settings = SettingObject(serde_json::json!({
+            "fallbacks": [{
+                "dest": "127.0.0.1:8080",
+                "path": "/ws"
+            }]
+        }));
+
+        let err = collect_trojan_fallbacks(&settings)
+            .expect_err("trojan fallback path unsupported");
+        assert!(
+            err.to_string()
+                .contains("trojan fallback field path is not supported yet")
         );
     }
 
