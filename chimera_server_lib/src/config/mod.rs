@@ -73,6 +73,8 @@ pub struct XhttpSettings {
     #[serde(default)]
     mode: Option<String>,
     #[serde(default)]
+    headers: std::collections::HashMap<String, String>,
+    #[serde(default)]
     x_padding_bytes: Option<XhttpRange>,
     #[serde(default)]
     sc_max_each_post_bytes: Option<XhttpRange>,
@@ -80,6 +82,46 @@ pub struct XhttpSettings {
     sc_max_buffered_posts: Option<i64>,
     #[serde(default)]
     sc_stream_up_server_secs: Option<XhttpRange>,
+    #[serde(default)]
+    extra: Option<serde_json::Value>,
+    #[serde(default)]
+    download_settings: Option<serde_json::Value>,
+    #[serde(default)]
+    xmux: Option<serde_json::Value>,
+    #[serde(default)]
+    no_grpc_header: Option<serde_json::Value>,
+    #[serde(default)]
+    no_sse_header: Option<serde_json::Value>,
+    #[serde(default)]
+    server_max_header_bytes: Option<serde_json::Value>,
+    #[serde(default)]
+    uplink_http_method: Option<serde_json::Value>,
+    #[serde(default)]
+    session_placement: Option<serde_json::Value>,
+    #[serde(default)]
+    session_key: Option<serde_json::Value>,
+    #[serde(default)]
+    seq_placement: Option<serde_json::Value>,
+    #[serde(default)]
+    seq_key: Option<serde_json::Value>,
+    #[serde(default)]
+    uplink_data_placement: Option<serde_json::Value>,
+    #[serde(default)]
+    uplink_data_key: Option<serde_json::Value>,
+    #[serde(default)]
+    uplink_chunk_size: Option<serde_json::Value>,
+    #[serde(default)]
+    sc_min_posts_interval_ms: Option<serde_json::Value>,
+    #[serde(default)]
+    x_padding_key: Option<serde_json::Value>,
+    #[serde(default)]
+    x_padding_header: Option<serde_json::Value>,
+    #[serde(default)]
+    x_padding_placement: Option<serde_json::Value>,
+    #[serde(default)]
+    x_padding_method: Option<serde_json::Value>,
+    #[serde(default)]
+    x_padding_obfs_mode: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
