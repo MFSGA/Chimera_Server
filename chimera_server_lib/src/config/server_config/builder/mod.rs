@@ -42,6 +42,16 @@ struct DokodemoDoorSettings {
 }
 
 #[cfg(feature = "vless")]
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VlessInboundSettings {
+    #[serde(default)]
+    decryption: Option<String>,
+    #[serde(default)]
+    fallbacks: Vec<serde_json::Value>,
+}
+
+#[cfg(feature = "vless")]
 fn validate_vless_flow(flow: &str) -> Result<(), Error> {
     match flow {
         "" | "xtls-rprx-vision" => Ok(()),
@@ -205,6 +215,31 @@ impl TryFrom<InboudItem> for ServerConfig {
             }
             #[cfg(feature = "vless")]
             Protocol::Vless => {
+                let vless_settings = settings
+                    .as_ref()
+                    .map(|value| value.deserialize::<VlessInboundSettings>())
+                    .transpose()
+                    .map_err(|err| {
+                        Error::InvalidConfig(format!("invalid vless settings: {err}"))
+                    })?
+                    .unwrap_or_default();
+                let decryption = vless_settings
+                    .decryption
+                    .as_deref()
+                    .unwrap_or("none")
+                    .trim()
+                    .to_ascii_lowercase();
+                if decryption != "none" {
+                    return Err(Error::InvalidConfig(format!(
+                        "vless settings.decryption must be none, got {decryption}"
+                    )));
+                }
+                if !vless_settings.fallbacks.is_empty() {
+                    return Err(Error::InvalidConfig(
+                        "vless settings.fallbacks is not supported yet".into(),
+                    ));
+                }
+
                 let users = vless_users.clone().ok_or_else(|| {
                     Error::InvalidConfig(
                         "vless inbound requires at least one client".into(),
@@ -260,7 +295,11 @@ impl TryFrom<InboudItem> for ServerConfig {
                                 targets: Box::new(OneOrSome::One(
                                     WebsocketServerConfig {
                                         matching_path: ws_setting.path,
-                                        matching_headers: None,
+                                        matching_headers: if ws_setting.headers.is_empty() {
+                                            None
+                                        } else {
+                                            Some(ws_setting.headers)
+                                        },
                                         protocol,
                                     },
                                 )),
@@ -325,7 +364,10 @@ impl TryFrom<InboudItem> for ServerConfig {
                         Ok(crate::config::server_config::VmessUser {
                             user_id: client.id,
                             user_label,
-                            cipher: String::new(),
+                            cipher: client
+                                .security
+                                .filter(|value| !value.trim().is_empty())
+                                .unwrap_or_else(|| "auto".to_string()),
                         })
                     })
                     .collect::<Result<Vec<_>, Error>>()?;
@@ -339,7 +381,11 @@ impl TryFrom<InboudItem> for ServerConfig {
                             targets: Box::new(OneOrSome::One(
                                 WebsocketServerConfig {
                                     matching_path: ws_setting.path,
-                                    matching_headers: None,
+                                    matching_headers: if ws_setting.headers.is_empty() {
+                                        None
+                                    } else {
+                                        Some(ws_setting.headers)
+                                    },
                                     protocol,
                                 },
                             )),
@@ -379,7 +425,11 @@ impl TryFrom<InboudItem> for ServerConfig {
                             targets: Box::new(OneOrSome::One(
                                 WebsocketServerConfig {
                                     matching_path: ws_setting.path,
-                                    matching_headers: None,
+                                    matching_headers: if ws_setting.headers.is_empty() {
+                                        None
+                                    } else {
+                                        Some(ws_setting.headers)
+                                    },
                                     protocol,
                                 },
                             )),
@@ -468,7 +518,11 @@ impl TryFrom<InboudItem> for ServerConfig {
                             targets: Box::new(OneOrSome::One(
                                 WebsocketServerConfig {
                                     matching_path: ws_setting.path,
-                                    matching_headers: None,
+                                    matching_headers: if ws_setting.headers.is_empty() {
+                                        None
+                                    } else {
+                                        Some(ws_setting.headers)
+                                    },
                                     protocol,
                                 },
                             )),
@@ -944,6 +998,184 @@ mod tests {
                 other => panic!("expected xhttp inside reality, got {other:?}"),
             },
             other => panic!("expected reality protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(all(feature = "reality", feature = "vless"))]
+    #[test]
+    fn reality_settings_accepts_xray_target_alias() {
+        let mut settings = base_reality_settings();
+        let settings_object =
+            settings.as_object_mut().expect("reality settings object");
+        settings_object.remove("dest");
+        settings_object.insert(
+            "target".to_string(),
+            serde_json::json!("www.example.com:8443"),
+        );
+
+        let config = ServerConfig::try_from(vless_reality_inbound(settings))
+            .expect("target alias should build reality config");
+
+        match config.protocol {
+            ServerProxyConfig::Reality(reality) => {
+                assert_eq!(reality.dest.to_string(), "www.example.com:8443");
+            }
+            other => panic!("expected reality protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn vless_builder_rejects_non_none_decryption() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10001,
+            "protocol": "vless",
+            "tag": "vless-invalid-decryption",
+            "settings": {
+                "clients": [{
+                    "id": "3ac9b383-75a1-431c-8184-106c80eb2273"
+                }],
+                "decryption": "aes-128-gcm"
+            }
+        }))
+        .expect("valid inbound json shape");
+
+        let err = ServerConfig::try_from(inbound)
+            .expect_err("non-none vless decryption should fail");
+        assert!(
+            err.to_string()
+                .contains("vless settings.decryption must be none")
+        );
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn vless_builder_rejects_fallbacks_until_implemented() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10002,
+            "protocol": "vless",
+            "tag": "vless-fallbacks",
+            "settings": {
+                "clients": [{
+                    "id": "3ac9b383-75a1-431c-8184-106c80eb2273"
+                }],
+                "decryption": "none",
+                "fallbacks": [{ "dest": "127.0.0.1:8080" }]
+            }
+        }))
+        .expect("valid inbound json shape");
+
+        let err = ServerConfig::try_from(inbound)
+            .expect_err("vless fallbacks should fail explicitly");
+        assert!(
+            err.to_string()
+                .contains("vless settings.fallbacks is not supported yet")
+        );
+    }
+
+    #[cfg(feature = "vmess")]
+    #[test]
+    fn vmess_builder_defaults_security_to_auto() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10003,
+            "protocol": "vmess",
+            "tag": "vmess-auto-security",
+            "settings": {
+                "clients": [{
+                    "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+                    "email": "vmess@example.com"
+                }]
+            }
+        }))
+        .expect("valid vmess inbound item");
+
+        let config = ServerConfig::try_from(inbound)
+            .expect("vmess inbound config should build");
+
+        match config.protocol {
+            ServerProxyConfig::Vmess { users } => {
+                assert_eq!(users[0].cipher, "auto");
+            }
+            other => panic!("expected vmess protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "vmess")]
+    #[test]
+    fn vmess_builder_preserves_client_security() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10004,
+            "protocol": "vmess",
+            "tag": "vmess-security",
+            "settings": {
+                "clients": [{
+                    "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+                    "security": "aes-128-gcm"
+                }]
+            }
+        }))
+        .expect("valid vmess inbound item");
+
+        let config = ServerConfig::try_from(inbound)
+            .expect("vmess inbound config should build");
+
+        match config.protocol {
+            ServerProxyConfig::Vmess { users } => {
+                assert_eq!(users[0].cipher, "aes-128-gcm");
+            }
+            other => panic!("expected vmess protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(all(feature = "vless", feature = "ws"))]
+    #[test]
+    fn websocket_settings_headers_enter_matching_config() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10005,
+            "protocol": "vless",
+            "tag": "vless-ws-headers",
+            "settings": {
+                "clients": [{
+                    "id": "3ac9b383-75a1-431c-8184-106c80eb2273"
+                }],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "ws",
+                "wsSettings": {
+                    "host": "example.com",
+                    "path": "/ws",
+                    "headers": {
+                        "Host": "edge.example.com"
+                    }
+                }
+            }
+        }))
+        .expect("valid vless websocket inbound item");
+
+        let config = ServerConfig::try_from(inbound)
+            .expect("vless websocket inbound config should build");
+
+        match config.protocol {
+            ServerProxyConfig::Websocket { targets } => match *targets {
+                OneOrSome::One(target) => {
+                    assert_eq!(target.matching_path.as_deref(), Some("/ws"));
+                    let headers = target
+                        .matching_headers
+                        .expect("websocket headers should be preserved");
+                    assert_eq!(
+                        headers.get("Host"),
+                        Some(&"edge.example.com".to_string())
+                    );
+                }
+                OneOrSome::Some(_) => panic!("expected one websocket target"),
+            },
+            other => panic!("expected websocket protocol, got {other:?}"),
         }
     }
 }
