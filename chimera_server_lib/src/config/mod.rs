@@ -93,7 +93,8 @@ pub struct XhttpRange {
 #[cfg(feature = "ws")]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WsSettings {
-    host: String,
+    #[serde(default)]
+    host: Option<String>,
     path: Option<String>,
     #[serde(default)]
     headers: std::collections::HashMap<String, String>,
