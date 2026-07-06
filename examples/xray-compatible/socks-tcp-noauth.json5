@@ -1,0 +1,22 @@
+{
+  "inbounds": [
+    {
+      "tag": "socks-tcp-noauth",
+      "listen": "127.0.0.1",
+      "port": 11001,
+      "protocol": "socks",
+      "settings": {
+        "auth": "noauth"
+      },
+      "streamSettings": {
+        "network": "tcp"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    }
+  ]
+}
