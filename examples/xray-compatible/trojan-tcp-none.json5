@@ -1,0 +1,28 @@
+{
+  "inbounds": [
+    {
+      "tag": "trojan-tcp-none",
+      "listen": "127.0.0.1",
+      "port": 11015,
+      "protocol": "trojan",
+      "settings": {
+        "clients": [
+          {
+            "password": "trojan-password",
+            "email": "trojan@example.com"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    }
+  ]
+}
