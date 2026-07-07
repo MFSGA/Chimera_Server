@@ -1,0 +1,38 @@
+{
+  "inbounds": [
+    {
+      "tag": "dokodemo-door-udp-routing-blackhole",
+      "listen": "127.0.0.1",
+      "port": 11021,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 5353,
+        "followRedirect": false
+      },
+      "streamSettings": {
+        "network": "udp"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    },
+    {
+      "tag": "blocked",
+      "protocol": "blackhole"
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": ["dokodemo-door-udp-routing-blackhole"],
+        "network": "udp",
+        "outboundTag": "blocked"
+      }
+    ]
+  }
+}
