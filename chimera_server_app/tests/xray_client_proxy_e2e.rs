@@ -5,17 +5,28 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Once},
+    sync::{
+        Arc, Once,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use aws_lc_rs::digest::{SHA256, digest};
-use rustls::{ServerConfig as RustlsServerConfig, crypto::CryptoProvider};
+use rustls::{
+    ClientConfig as RustlsClientConfig, DigitallySignedStruct, Error as RustlsError,
+    ServerConfig as RustlsServerConfig, SignatureScheme,
+    client::danger::{
+        HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+    },
+    crypto::CryptoProvider,
+    pki_types::{CertificateDer, ServerName, UnixTime},
+};
 use rustls_pemfile::{certs, private_key};
 use serde_json::json;
-use tokio::net::TcpListener as TokioTcpListener;
-use tokio_rustls::TlsAcceptor;
+use tokio::{io::AsyncWriteExt, net::TcpListener as TokioTcpListener};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
@@ -27,6 +38,49 @@ const REALITY_SHORT_ID: &str = "4ac97aaf8b9b0356";
 const REALITY_SERVER_NAME: &str = "www.apple.com";
 const HYSTERIA_AUTH: &str = "hysteria-auth-token";
 static RUSTLS_PROVIDER: Once = Once::new();
+
+#[derive(Debug)]
+struct AcceptTestServerCert;
+
+impl ServerCertVerifier for AcceptTestServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::ED25519,
+        ]
+    }
+}
 
 #[derive(Debug)]
 struct ChildGuard {
@@ -183,6 +237,257 @@ async fn xray_client_can_proxy_tcp_through_chimera_reality_vision() {
         domain_echo_addr.port(),
         b"reality-vision domain target",
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera as server and a plain TLS client for REALITY fallback"]
+async fn plain_tls_client_falls_back_to_reality_dest_on_sni_mismatch() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("reality-fallback-sni");
+    let reality_dest_addr = start_tls13_dest(&workspace).await;
+    let chimera_port = free_localhost_port();
+    let chimera_config_path = work_dir.join("chimera-reality-fallback-sni.json");
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "vless",
+                "tag": "chimera-reality-fallback-sni",
+                "settings": {
+                    "clients": [{
+                        "id": TEST_UUID,
+                        "email": "fallback@example.test"
+                    }],
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "reality",
+                    "realitySettings": {
+                        "dest": format!("localhost:{}", reality_dest_addr.port()),
+                        "serverNames": [REALITY_SERVER_NAME],
+                        "privateKey": REALITY_PRIVATE_KEY,
+                        "shortIds": [REALITY_SHORT_ID],
+                        "maxTimeDiff": 0
+                    }
+                }
+            }],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+
+    assert_tls_handshake_to_localhost(
+        &workspace,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera as server and ./xray as client with wrong REALITY shortId"]
+async fn xray_client_with_wrong_reality_short_id_falls_back_to_dest() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("reality-fallback-shortid");
+    let (reality_dest_addr, dest_accepts) =
+        start_tls13_dest_with_counter(&workspace).await;
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let chimera_config_path = work_dir.join("chimera-reality-fallback-shortid.json");
+    let xray_config_path = work_dir.join("xray-reality-wrong-shortid-client.json");
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "vless",
+                "tag": "chimera-reality-fallback-shortid",
+                "settings": {
+                    "clients": [{
+                        "id": TEST_UUID,
+                        "email": "fallback-shortid@example.test"
+                    }],
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "reality",
+                    "realitySettings": {
+                        "dest": format!("localhost:{}", reality_dest_addr.port()),
+                        "serverNames": [REALITY_SERVER_NAME],
+                        "privateKey": REALITY_PRIVATE_KEY,
+                        "shortIds": [REALITY_SHORT_ID],
+                        "maxTimeDiff": 0
+                    }
+                }
+            }],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }]
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "tag": "socks-in",
+                "settings": {"auth": "noauth"}
+            }],
+            "outbounds": [{
+                "tag": "to-chimera",
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": chimera_port,
+                        "users": [{
+                            "id": TEST_UUID,
+                            "encryption": "none"
+                        }]
+                    }]
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "reality",
+                    "realitySettings": {
+                        "serverName": REALITY_SERVER_NAME,
+                        "fingerprint": "chrome",
+                        "publicKey": REALITY_PUBLIC_KEY,
+                        "shortId": "1111111111111111"
+                    }
+                }
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port)));
+    xray.assert_running();
+
+    assert_socks5_echo_does_not_succeed(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port)),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, free_localhost_port())),
+    );
+    wait_for_counter(&dest_accepts, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera as server and ./xray as client with wrong REALITY SNI"]
+async fn xray_client_with_wrong_reality_sni_falls_back_to_dest() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("reality-fallback-sni-xray");
+    let (reality_dest_addr, dest_accepts) =
+        start_tls13_dest_with_counter(&workspace).await;
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let chimera_config_path =
+        work_dir.join("chimera-reality-fallback-sni-xray.json");
+    let xray_config_path = work_dir.join("xray-reality-wrong-sni-client.json");
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "vless",
+                "tag": "chimera-reality-fallback-sni-xray",
+                "settings": {
+                    "clients": [{
+                        "id": TEST_UUID,
+                        "email": "fallback-sni@example.test"
+                    }],
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "reality",
+                    "realitySettings": {
+                        "dest": format!("localhost:{}", reality_dest_addr.port()),
+                        "serverNames": [REALITY_SERVER_NAME],
+                        "privateKey": REALITY_PRIVATE_KEY,
+                        "shortIds": [REALITY_SHORT_ID],
+                        "maxTimeDiff": 0
+                    }
+                }
+            }],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }]
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "tag": "socks-in",
+                "settings": {"auth": "noauth"}
+            }],
+            "outbounds": [{
+                "tag": "to-chimera",
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": chimera_port,
+                        "users": [{
+                            "id": TEST_UUID,
+                            "encryption": "none"
+                        }]
+                    }]
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "reality",
+                    "realitySettings": {
+                        "serverName": "wrong.example.test",
+                        "fingerprint": "chrome",
+                        "publicKey": REALITY_PUBLIC_KEY,
+                        "shortId": REALITY_SHORT_ID
+                    }
+                }
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port)));
+    xray.assert_running();
+
+    assert_socks5_echo_does_not_succeed(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port)),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, free_localhost_port())),
+    );
+    wait_for_counter(&dest_accepts, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -429,7 +734,32 @@ fn start_tcp_echo_server_on(bind_addr: SocketAddr) -> SocketAddr {
     addr
 }
 
+async fn assert_tls_handshake_to_localhost(_workspace: &Path, addr: SocketAddr) {
+    install_rustls_provider();
+    let config = RustlsClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptTestServerCert))
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(config));
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect fallback target through chimera");
+    let server_name =
+        ServerName::try_from("localhost").expect("valid fallback server name");
+    let mut tls = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("fallback TLS handshake should complete");
+    tls.shutdown().await.expect("shutdown fallback TLS stream");
+}
+
 async fn start_tls13_dest(workspace: &Path) -> SocketAddr {
+    start_tls13_dest_with_counter(workspace).await.0
+}
+
+async fn start_tls13_dest_with_counter(
+    workspace: &Path,
+) -> (SocketAddr, Arc<AtomicUsize>) {
     install_rustls_provider();
     let cert_path = workspace.join("cert/cert.pem");
     let key_path = workspace.join("cert/key.pem");
@@ -451,18 +781,21 @@ async fn start_tls13_dest(workspace: &Path) -> SocketAddr {
             .await
             .expect("bind tls dest");
     let addr = listener.local_addr().expect("tls dest addr");
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let accepted_task = accepted.clone();
     tokio::spawn(async move {
         loop {
             let Ok((stream, _peer)) = listener.accept().await else {
                 break;
             };
+            accepted_task.fetch_add(1, Ordering::SeqCst);
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
                 let _ = acceptor.accept(stream).await;
             });
         }
     });
-    addr
+    (addr, accepted)
 }
 
 fn assert_socks5_echo(
@@ -495,6 +828,55 @@ fn assert_socks5_echo(
         }
     }
     assert_socks5_request_echo(socks_addr, &request, payload);
+}
+
+fn assert_socks5_echo_does_not_succeed(
+    socks_addr: SocketAddr,
+    target_addr: SocketAddr,
+) {
+    let mut stream = TcpStream::connect_timeout(&socks_addr, IO_TIMEOUT)
+        .expect("connect xray socks inbound");
+    stream
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .expect("set read timeout");
+    stream
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .expect("set write timeout");
+
+    stream.write_all(&[0x05, 0x01, 0x00]).expect("socks hello");
+    let mut hello = [0u8; 2];
+    stream.read_exact(&mut hello).expect("socks hello response");
+    assert_eq!(hello, [0x05, 0x00], "SOCKS no-auth negotiation failed");
+
+    let ip = match target_addr.ip() {
+        std::net::IpAddr::V4(ip) => ip.octets(),
+        std::net::IpAddr::V6(_) => panic!("test only uses ipv4 target"),
+    };
+    let port = target_addr.port().to_be_bytes();
+    stream
+        .write_all(&[
+            0x05, 0x01, 0x00, 0x01, ip[0], ip[1], ip[2], ip[3], port[0], port[1],
+        ])
+        .expect("socks connect request");
+
+    let mut header = [0u8; 4];
+    stream
+        .read_exact(&mut header)
+        .expect("socks response header");
+    assert_eq!(header[0], 0x05);
+    if header[1] != 0x00 {
+        return;
+    }
+    read_socks_bound_address_tail(&mut stream, header[3])
+        .expect("socks success response tail");
+
+    let payload = b"wrong short id must not echo";
+    stream.write_all(payload).expect("write tunneled payload");
+    let mut echoed = vec![0u8; payload.len()];
+    match stream.read_exact(&mut echoed) {
+        Ok(()) => assert_ne!(echoed, payload, "unexpected successful tunneled echo"),
+        Err(_) => {}
+    }
 }
 
 fn assert_socks5_domain_echo(
@@ -559,7 +941,14 @@ fn read_socks_connect_response(stream: &mut TcpStream) -> io::Result<()> {
             format!("SOCKS connect failed: header={header:02x?}"),
         ));
     }
-    match header[3] {
+    read_socks_bound_address_tail(stream, header[3])
+}
+
+fn read_socks_bound_address_tail(
+    stream: &mut TcpStream,
+    atyp: u8,
+) -> io::Result<()> {
+    match atyp {
         0x01 => {
             let mut rest = [0u8; 6];
             stream.read_exact(&mut rest)?;
@@ -593,6 +982,20 @@ fn wait_for_tcp(addr: SocketAddr) {
         thread::sleep(CONNECT_RETRY_INTERVAL);
     }
     panic!("timed out waiting for TCP listener at {addr}");
+}
+
+fn wait_for_counter(counter: &AtomicUsize, expected: usize) {
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    while Instant::now() < deadline {
+        if counter.load(Ordering::SeqCst) >= expected {
+            return;
+        }
+        thread::sleep(CONNECT_RETRY_INTERVAL);
+    }
+    panic!(
+        "timed out waiting for counter to reach {expected}; got {}",
+        counter.load(Ordering::SeqCst)
+    );
 }
 
 fn free_localhost_port() -> u16 {
