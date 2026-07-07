@@ -291,6 +291,9 @@ where
                     reader.consume(len);
                     return Poll::Ready(Ok(()));
                 }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    return Poll::Pending;
+                }
                 Err(e) => return Poll::Ready(Err(e)),
             }
         }

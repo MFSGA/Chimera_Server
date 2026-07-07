@@ -315,12 +315,16 @@ dependencies = [
 name = "chimera_server_app"
 version = "0.5.1"
 dependencies = [
+ "aws-lc-rs",
  "chimera_server_lib",
  "clap",
  "prost",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "tonic",
  "tonic-prost",
 ]
