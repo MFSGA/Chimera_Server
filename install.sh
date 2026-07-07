@@ -211,9 +211,6 @@ normalize_arch() {
         x86_64|amd64)
             printf '%s\n' "x86_64"
             ;;
-        aarch64|arm64)
-            printf '%s\n' "aarch64"
-            ;;
         *)
             die "unsupported CPU architecture for online release asset: ${machine}"
             ;;

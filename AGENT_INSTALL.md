@@ -59,7 +59,7 @@ Ask or infer these choices before running the installer:
 | Existing config file | Ask user if unknown | `--config /path/to/config.json5` |
 | Service manager | Auto-detect | omit `--manager` |
 | Enable service at boot | Yes | omit `--no-enable` |
-| Start now | Yes after config exists | `--start` |
+| Start now | Only after a valid config exists | `--start` |
 | Download geo data | Only when config needs it | `--update-geo` |
 | Roll back on failed restart | Yes | omit `--no-rollback` |
 
@@ -76,7 +76,8 @@ command -v curl || command -v wget
 uname -m
 ```
 
-Supported release architectures are `x86_64` and `aarch64`.
+Supported release architecture is currently `x86_64`. On `aarch64`, build from a local checkout
+until the release workflow publishes Linux `aarch64` assets.
 
 For local source installation, the server also needs Rust:
 
@@ -93,7 +94,7 @@ Use this when the user wants a normal server install and does not need the exact
 curl -fsSLo /tmp/chimera-install.sh \
   https://raw.githubusercontent.com/MFSGA/Chimera_Server/refs/heads/master/install.sh
 chmod +x /tmp/chimera-install.sh
-sudo /tmp/chimera-install.sh install --latest --start
+sudo /tmp/chimera-install.sh install --latest
 ```
 
 With an explicit config file:
@@ -117,7 +118,7 @@ sudo /tmp/chimera-install.sh install --version v0.3.2 --config /path/to/config.j
 The release asset name is expected to be:
 
 ```text
-chimera_server_app-<tag>-linux-<x86_64|aarch64>
+chimera_server_app-<tag>-linux-x86_64
 ```
 
 ### Step 2B: Build and Install from a Local Checkout
