@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-chimera_server_lib = { path = "../chimera_server_lib", version = "0.4.0", default-features = false }
+chimera_server_lib = { path = "../chimera_server_lib", version = "0.5.0", default-features = false }
 clap = { workspace = true }
 
 
