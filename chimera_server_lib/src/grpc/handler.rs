@@ -1642,9 +1642,14 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
             .add_inbound(inbound.clone())
             .map_err(Status::already_exists)?;
 
-        let handles = start_servers(inbound).await.map_err(|err| {
-            Status::unknown(format!("failed to start inbound handler: {err}"))
-        })?;
+        let handles =
+            start_servers(inbound, self.runtime.clone())
+                .await
+                .map_err(|err| {
+                    Status::unknown(format!(
+                        "failed to start inbound handler: {err}"
+                    ))
+                })?;
         self.runtime.register_inbound_tasks(&inbound_tag, &handles);
 
         Ok(Response::new(

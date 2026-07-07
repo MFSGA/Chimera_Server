@@ -16,6 +16,7 @@ use crate::{
         tcp_handler_util::create_tcp_server_handler,
     },
     resolver::{NativeResolver, Resolver, resolve_single_address},
+    runtime::RuntimeState,
     traffic::{record_transfer, register_connection},
     util::socket::new_tcp_socket,
 };
@@ -28,6 +29,7 @@ mod xhttp;
 
 pub async fn start_servers(
     config: ServerConfig,
+    runtime: RuntimeState,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     if is_xhttp_server_protocol(&config.protocol) {
         return xhttp::start_xhttp_server(config).await;
@@ -60,7 +62,8 @@ pub async fn start_servers(
                 return Err(e);
             }
         },
-        Transport::Udp => match start_udp_server(config.clone()).await {
+        // UDP listeners need runtime state for routing/outbound selection.
+        Transport::Udp => match start_udp_server(config.clone(), runtime).await {
             Ok(Some(handle)) => {
                 join_handles.push(handle);
             }

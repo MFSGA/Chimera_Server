@@ -389,7 +389,8 @@ async fn start_async(opts: Options) -> Result<(), Error> {
             );
             continue;
         }
-        let mut handles = start_servers(config).await?;
+        // Runtime state lets UDP listeners evaluate routing and outbound policy.
+        let mut handles = start_servers(config, runtime_state.clone()).await?;
         join_handles.append(&mut handles);
     }
 
