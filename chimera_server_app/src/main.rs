@@ -83,7 +83,8 @@ fn main() {
         log_file: None,
     }) {
         Ok(_) => {}
-        Err(_) => {
+        Err(err) => {
+            eprintln!("start error: {err}");
             exit(1);
         }
     }
