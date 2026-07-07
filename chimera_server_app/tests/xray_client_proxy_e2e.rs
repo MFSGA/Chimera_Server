@@ -2,7 +2,7 @@ use std::{
     env,
     fs::{self, File},
     io::{self, BufReader, Read, Write},
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Once},
@@ -85,6 +85,7 @@ async fn xray_client_can_proxy_tcp_through_chimera_reality_vision() {
     let workspace = workspace_root();
     let work_dir = create_test_dir("reality-vision");
     let echo_addr = start_tcp_echo_server();
+    let domain_echo_addr = start_tcp_echo_server_v6();
     let reality_dest_addr = start_tls13_dest(&workspace).await;
     let chimera_port = free_localhost_port();
     let xray_socks_port = free_localhost_port();
@@ -173,10 +174,14 @@ async fn xray_client_can_proxy_tcp_through_chimera_reality_vision() {
     wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port)));
     xray.assert_running();
 
-    assert_socks5_echo(
-        SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port)),
-        echo_addr,
-        b"reality-vision through xray client",
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    assert_socks5_echo(socks_addr, echo_addr, b"reality-vision through xray client");
+    assert_socks5_echo(socks_addr, echo_addr, &deterministic_payload(64 * 1024));
+    assert_socks5_domain_echo(
+        socks_addr,
+        "localhost",
+        domain_echo_addr.port(),
+        b"reality-vision domain target",
     );
 }
 
@@ -276,11 +281,10 @@ async fn xray_client_can_proxy_tcp_through_chimera_hysteria2() {
     wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port)));
     xray.assert_running();
 
-    assert_socks5_echo(
-        SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port)),
-        echo_addr,
-        b"hysteria2 through xray client",
-    );
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    assert_socks5_echo(socks_addr, echo_addr, b"hysteria2 through xray client");
+    assert_socks5_echo(socks_addr, echo_addr, b"hysteria2 second roundtrip");
+    assert_socks5_echo(socks_addr, echo_addr, &deterministic_payload(32 * 1024));
 }
 
 fn workspace_root() -> PathBuf {
@@ -386,11 +390,21 @@ fn start_xray(workspace: &Path, work_dir: &Path, config: &Path) -> ChildGuard {
 }
 
 fn start_tcp_echo_server() -> SocketAddr {
-    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-        .expect("bind echo server");
+    start_tcp_echo_server_on(SocketAddr::V4(SocketAddrV4::new(
+        Ipv4Addr::LOCALHOST,
+        0,
+    )))
+}
+
+fn start_tcp_echo_server_v6() -> SocketAddr {
+    start_tcp_echo_server_on(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)))
+}
+
+fn start_tcp_echo_server_on(bind_addr: SocketAddr) -> SocketAddr {
+    let listener = TcpListener::bind(bind_addr).expect("bind echo server");
     let addr = listener.local_addr().expect("echo addr");
     thread::spawn(move || {
-        for stream in listener.incoming().take(8) {
+        for stream in listener.incoming().take(16) {
             let Ok(mut stream) = stream else {
                 continue;
             };
@@ -456,6 +470,53 @@ fn assert_socks5_echo(
     target_addr: SocketAddr,
     payload: &[u8],
 ) {
+    let mut request = vec![0x05, 0x01, 0x00];
+    match target_addr.ip() {
+        std::net::IpAddr::V4(ip) => {
+            let port = target_addr.port().to_be_bytes();
+            request.extend_from_slice(&[
+                0x05,
+                0x01,
+                0x00,
+                0x01,
+                ip.octets()[0],
+                ip.octets()[1],
+                ip.octets()[2],
+                ip.octets()[3],
+                port[0],
+                port[1],
+            ]);
+        }
+        std::net::IpAddr::V6(ip) => {
+            let port = target_addr.port().to_be_bytes();
+            request.extend_from_slice(&[0x05, 0x01, 0x00, 0x04]);
+            request.extend_from_slice(&ip.octets());
+            request.extend_from_slice(&port);
+        }
+    }
+    assert_socks5_request_echo(socks_addr, &request, payload);
+}
+
+fn assert_socks5_domain_echo(
+    socks_addr: SocketAddr,
+    domain: &str,
+    port: u16,
+    payload: &[u8],
+) {
+    let domain = domain.as_bytes();
+    assert!(domain.len() <= u8::MAX as usize);
+    let mut request =
+        vec![0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x03, domain.len() as u8];
+    request.extend_from_slice(domain);
+    request.extend_from_slice(&port.to_be_bytes());
+    assert_socks5_request_echo(socks_addr, &request, payload);
+}
+
+fn assert_socks5_request_echo(
+    socks_addr: SocketAddr,
+    request: &[u8],
+    payload: &[u8],
+) {
     let mut stream = TcpStream::connect_timeout(&socks_addr, IO_TIMEOUT)
         .expect("connect xray socks inbound");
     stream
@@ -465,20 +526,13 @@ fn assert_socks5_echo(
         .set_write_timeout(Some(IO_TIMEOUT))
         .expect("set write timeout");
 
-    stream.write_all(&[0x05, 0x01, 0x00]).expect("socks hello");
+    stream.write_all(&request[..3]).expect("socks hello");
     let mut hello = [0u8; 2];
     stream.read_exact(&mut hello).expect("socks hello response");
     assert_eq!(hello, [0x05, 0x00], "SOCKS no-auth negotiation failed");
 
-    let ip = match target_addr.ip() {
-        std::net::IpAddr::V4(ip) => ip.octets(),
-        std::net::IpAddr::V6(_) => panic!("test only uses ipv4 echo target"),
-    };
-    let port = target_addr.port().to_be_bytes();
     stream
-        .write_all(&[
-            0x05, 0x01, 0x00, 0x01, ip[0], ip[1], ip[2], ip[3], port[0], port[1],
-        ])
+        .write_all(&request[3..])
         .expect("socks connect request");
     read_socks_connect_response(&mut stream).expect("socks connect response");
 
@@ -488,6 +542,12 @@ fn assert_socks5_echo(
         .read_exact(&mut echoed)
         .expect("read tunneled echo response");
     assert_eq!(echoed, payload);
+}
+
+fn deterministic_payload(len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|idx| (idx.wrapping_mul(31).wrapping_add(17) % 251) as u8)
+        .collect()
 }
 
 fn read_socks_connect_response(stream: &mut TcpStream) -> io::Result<()> {
