@@ -16,7 +16,7 @@ pub fn create_websocket_server_target(
     websocket_server_config: WebsocketServerConfig,
     inbound_tag: &str,
     rules_stack: &mut Vec<Vec<RuleConfig>>,
-) -> WebsocketServerTarget {
+) -> std::io::Result<WebsocketServerTarget> {
     let WebsocketServerConfig {
         matching_path,
         matching_headers,
@@ -32,11 +32,12 @@ pub fn create_websocket_server_target(
             .collect::<HashMap<_, _>>()
     });
 
-    let handler = create_tcp_server_handler(protocol, inbound_tag, rules_stack);
+    // Propagate nested handler construction errors instead of panicking during startup.
+    let handler = create_tcp_server_handler(protocol, inbound_tag, rules_stack)?;
 
-    WebsocketServerTarget {
+    Ok(WebsocketServerTarget {
         matching_path,
         matching_headers,
         handler,
-    }
+    })
 }
