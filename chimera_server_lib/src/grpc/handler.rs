@@ -473,7 +473,10 @@ impl HandlerServiceImpl {
                         socks.auth_type != 0,
                     );
 
-                Ok(ServerProxyConfig::Socks { accounts })
+                Ok(ServerProxyConfig::Socks {
+                    accounts,
+                    udp_enabled: false,
+                })
             }
             #[cfg(feature = "vless")]
             TYPE_PROXY_VLESS_INBOUND_CONFIG
@@ -932,7 +935,7 @@ impl HandlerServiceImpl {
                     TrojanServerConfigPayload { users, fallbacks },
                 ))
             }
-            ServerProxyConfig::Socks { accounts } => {
+            ServerProxyConfig::Socks { accounts, .. } => {
                 let auth_type = i32::from(accounts.auth_required());
                 let account_map = accounts
                     .snapshot()
@@ -1285,7 +1288,7 @@ impl HandlerServiceImpl {
                 }
                 Ok(true)
             }
-            ServerProxyConfig::Socks { accounts } => {
+            ServerProxyConfig::Socks { accounts, .. } => {
                 accounts.upsert(self.parse_socks_user(user)?);
                 Ok(true)
             }
@@ -1349,7 +1352,7 @@ impl HandlerServiceImpl {
                 users.retain(|user| user.email.as_deref() != Some(email));
                 Ok(true)
             }
-            ServerProxyConfig::Socks { accounts } => Ok(accounts.remove(email)),
+            ServerProxyConfig::Socks { accounts, .. } => Ok(accounts.remove(email)),
             #[cfg(feature = "ws")]
             ServerProxyConfig::Websocket { targets } => match targets.as_mut() {
                 crate::util::option::OneOrSome::One(target) => {
@@ -1477,7 +1480,7 @@ impl HandlerServiceImpl {
             ServerProxyConfig::Xhttp { inner, .. } => {
                 self.get_user_manager_identities(inner)
             }
-            ServerProxyConfig::Socks { accounts } => Some(
+            ServerProxyConfig::Socks { accounts, .. } => Some(
                 accounts
                     .snapshot()
                     .iter()
@@ -1587,7 +1590,7 @@ impl HandlerServiceImpl {
             ServerProxyConfig::Xhttp { inner, .. } => {
                 self.get_user_manager_users(inner)
             }
-            ServerProxyConfig::Socks { accounts } => Some(
+            ServerProxyConfig::Socks { accounts, .. } => Some(
                 accounts
                     .snapshot()
                     .iter()
@@ -1894,6 +1897,7 @@ mod tests {
                 password: "pass-a".to_string(),
             }]
             .into(),
+            udp_enabled: false,
         };
         let inbound = ServerConfig {
             tag: inbound_tag.clone(),

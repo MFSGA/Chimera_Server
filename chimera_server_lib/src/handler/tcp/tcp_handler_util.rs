@@ -138,9 +138,15 @@ pub fn create_tcp_server_handler(
                 inner_handler,
             )))
         }
-        ServerProxyConfig::Socks { accounts } => {
-            Ok(Box::new(SocksTcpServerHandler::new(accounts, inbound_tag)))
-        }
+        // SOCKS5 UDP ASSOCIATE uses this TCP handler as its control channel.
+        ServerProxyConfig::Socks {
+            accounts,
+            udp_enabled,
+        } => Ok(Box::new(SocksTcpServerHandler::new(
+            accounts,
+            inbound_tag,
+            udp_enabled,
+        ))),
         ServerProxyConfig::DokodemoDoor { config } => {
             Ok(Box::new(DokodemoDoorTcpHandler::new(config, inbound_tag)))
         }

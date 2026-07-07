@@ -45,13 +45,19 @@ const UDP_BUFFER_SIZE: usize = 2 * 1024 * 1024;
 pub struct SocksTcpServerHandler {
     accounts: SocksUserStore,
     inbound_tag: String,
+    udp_enabled: bool,
 }
 
 impl SocksTcpServerHandler {
-    pub fn new(accounts: SocksUserStore, inbound_tag: &str) -> Self {
+    pub fn new(
+        accounts: SocksUserStore,
+        inbound_tag: &str,
+        udp_enabled: bool,
+    ) -> Self {
         Self {
             accounts,
             inbound_tag: inbound_tag.to_string(),
+            udp_enabled,
         }
     }
 
@@ -124,7 +130,17 @@ impl TcpServerHandler for SocksTcpServerHandler {
                     traffic_context,
                 })
             }
-            CMD_UDP_ASSOCIATE => handle_udp_associate(server_stream).await,
+            CMD_UDP_ASSOCIATE if self.udp_enabled => {
+                handle_udp_associate(server_stream).await
+            }
+            CMD_UDP_ASSOCIATE => {
+                send_command_response(&mut server_stream, REP_COMMAND_NOT_SUPPORTED)
+                    .await?;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "socks udp associate is disabled by config",
+                ))
+            }
             _ => {
                 send_command_response(&mut server_stream, REP_COMMAND_NOT_SUPPORTED)
                     .await?;
@@ -323,7 +339,7 @@ async fn read_address_from_stream(
 
 /// Handle SOCKS5 UDP ASSOCIATE command.
 ///
-/// Takes ownership of `server_stream` for use in the spawned UDP relay task.
+/// Takes ownership of `server_stream` while the UDP relay task is active.
 async fn handle_udp_associate(
     mut server_stream: Box<dyn AsyncStream>,
 ) -> std::io::Result<TcpServerSetupResult> {
