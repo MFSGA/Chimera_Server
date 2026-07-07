@@ -38,6 +38,9 @@ jobs:
       - name: Install cargo-edit
         run: cargo install cargo-edit --locked
 
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
       - name: Bump version
         run: cargo set-version --workspace --bump ${{ github.event.inputs.version_type }}
 
@@ -51,12 +54,18 @@ jobs:
       - name: Build release binary
         run: cargo build --release --package chimera_server_app
 
+      - name: Build musl release binary
+        run: cross build --release --target x86_64-unknown-linux-musl --package chimera_server_app
+
       - name: Prepare binary artifact
         run: |
           mkdir -p dist
           cp target/release/chimera_server_app dist/chimera_server_app-${{ steps.version.outputs.version }}-linux-x86_64
+          cp target/x86_64-unknown-linux-musl/release/chimera_server_app dist/chimera_server_app-${{ steps.version.outputs.version }}-linux-x86_64-musl
           chmod +x dist/chimera_server_app-${{ steps.version.outputs.version }}-linux-x86_64
+          chmod +x dist/chimera_server_app-${{ steps.version.outputs.version }}-linux-x86_64-musl
           (cd dist && sha256sum chimera_server_app-${{ steps.version.outputs.version }}-linux-x86_64 > chimera_server_app-${{ steps.version.outputs.version }}-linux-x86_64.sha256)
+          (cd dist && sha256sum chimera_server_app-${{ steps.version.outputs.version }}-linux-x86_64-musl > chimera_server_app-${{ steps.version.outputs.version }}-linux-x86_64-musl.sha256)
           ls -lh dist
 
       - name: Commit version bump
@@ -81,6 +90,8 @@ jobs:
           files: |
             dist/chimera_server_app-${{ steps.version.outputs.version }}-linux-x86_64
             dist/chimera_server_app-${{ steps.version.outputs.version }}-linux-x86_64.sha256
+            dist/chimera_server_app-${{ steps.version.outputs.version }}-linux-x86_64-musl
+            dist/chimera_server_app-${{ steps.version.outputs.version }}-linux-x86_64-musl.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.ADMIN_PAT }}
 
