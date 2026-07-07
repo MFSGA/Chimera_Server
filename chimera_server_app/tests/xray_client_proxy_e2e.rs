@@ -25,7 +25,10 @@ use rustls::{
 };
 use rustls_pemfile::{certs, private_key};
 use serde_json::json;
-use tokio::{io::AsyncWriteExt, net::TcpListener as TokioTcpListener};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener as TokioTcpListener,
+};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -140,6 +143,7 @@ async fn xray_client_can_proxy_tcp_through_chimera_reality_vision() {
     let work_dir = create_test_dir("reality-vision");
     let echo_addr = start_tcp_echo_server();
     let domain_echo_addr = start_tcp_echo_server_v6();
+    let tls_echo_addr = start_tls_echo_server(&workspace).await;
     let reality_dest_addr = start_tls13_dest(&workspace).await;
     let chimera_port = free_localhost_port();
     let xray_socks_port = free_localhost_port();
@@ -237,6 +241,12 @@ async fn xray_client_can_proxy_tcp_through_chimera_reality_vision() {
         domain_echo_addr.port(),
         b"reality-vision domain target",
     );
+    assert_tls_echo_through_socks(
+        socks_addr,
+        tls_echo_addr,
+        b"real tls application data through reality vision",
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -735,12 +745,7 @@ fn start_tcp_echo_server_on(bind_addr: SocketAddr) -> SocketAddr {
 }
 
 async fn assert_tls_handshake_to_localhost(_workspace: &Path, addr: SocketAddr) {
-    install_rustls_provider();
-    let config = RustlsClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptTestServerCert))
-        .with_no_client_auth();
-    let connector = TlsConnector::from(Arc::new(config));
+    let connector = TlsConnector::from(Arc::new(tls_test_client_config()));
     let tcp = tokio::net::TcpStream::connect(addr)
         .await
         .expect("connect fallback target through chimera");
@@ -757,25 +762,50 @@ async fn start_tls13_dest(workspace: &Path) -> SocketAddr {
     start_tls13_dest_with_counter(workspace).await.0
 }
 
+async fn start_tls_echo_server(workspace: &Path) -> SocketAddr {
+    install_rustls_provider();
+    let acceptor = TlsAcceptor::from(Arc::new(tls_server_config(workspace)));
+    let listener =
+        TokioTcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .expect("bind tls echo server");
+    let addr = listener.local_addr().expect("tls echo addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _peer)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                loop {
+                    match tls.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if tls.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                            if tls.flush().await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
 async fn start_tls13_dest_with_counter(
     workspace: &Path,
 ) -> (SocketAddr, Arc<AtomicUsize>) {
     install_rustls_provider();
-    let cert_path = workspace.join("cert/cert.pem");
-    let key_path = workspace.join("cert/key.pem");
-    let cert_file = File::open(&cert_path).expect("open tls cert");
-    let key_file = File::open(&key_path).expect("open tls key");
-    let cert_chain = certs(&mut BufReader::new(cert_file))
-        .collect::<Result<Vec<_>, _>>()
-        .expect("parse tls certs");
-    let key = private_key(&mut BufReader::new(key_file))
-        .expect("parse tls private key")
-        .expect("tls private key present");
-    let tls_config = RustlsServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(cert_chain, key)
-        .expect("build tls server config");
-    let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+    let acceptor = TlsAcceptor::from(Arc::new(tls_server_config(workspace)));
     let listener =
         TokioTcpListener::bind(SocketAddr::from(([0u16, 0, 0, 0, 0, 0, 0, 1], 0)))
             .await
@@ -796,6 +826,128 @@ async fn start_tls13_dest_with_counter(
         }
     });
     (addr, accepted)
+}
+
+fn tls_server_config(workspace: &Path) -> RustlsServerConfig {
+    let cert_path = workspace.join("cert/cert.pem");
+    let key_path = workspace.join("cert/key.pem");
+    let cert_file = File::open(&cert_path).expect("open tls cert");
+    let key_file = File::open(&key_path).expect("open tls key");
+    let cert_chain = certs(&mut BufReader::new(cert_file))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("parse tls certs");
+    let key = private_key(&mut BufReader::new(key_file))
+        .expect("parse tls private key")
+        .expect("tls private key present");
+    RustlsServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, key)
+        .expect("build tls server config")
+}
+
+fn tls_test_client_config() -> RustlsClientConfig {
+    install_rustls_provider();
+    RustlsClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptTestServerCert))
+        .with_no_client_auth()
+}
+
+async fn assert_tls_echo_through_socks(
+    socks_addr: SocketAddr,
+    target_addr: SocketAddr,
+    payload: &[u8],
+) {
+    let tcp = connect_socks5_tcp(socks_addr, target_addr).await;
+    let connector = TlsConnector::from(Arc::new(tls_test_client_config()));
+    let server_name =
+        ServerName::try_from("localhost").expect("valid TLS echo server name");
+    let mut tls = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("TLS echo handshake through socks");
+    tls.write_all(payload)
+        .await
+        .expect("write TLS echo payload");
+    tls.flush().await.expect("flush TLS echo payload");
+    let mut echoed = vec![0u8; payload.len()];
+    tls.read_exact(&mut echoed)
+        .await
+        .expect("read TLS echo payload");
+    assert_eq!(echoed, payload);
+    tls.shutdown().await.expect("shutdown TLS echo stream");
+}
+
+async fn connect_socks5_tcp(
+    socks_addr: SocketAddr,
+    target_addr: SocketAddr,
+) -> tokio::net::TcpStream {
+    let mut stream = tokio::net::TcpStream::connect(socks_addr)
+        .await
+        .expect("connect xray socks inbound");
+    stream
+        .write_all(&[0x05, 0x01, 0x00])
+        .await
+        .expect("socks hello");
+    let mut hello = [0u8; 2];
+    stream
+        .read_exact(&mut hello)
+        .await
+        .expect("socks hello response");
+    assert_eq!(hello, [0x05, 0x00], "SOCKS no-auth negotiation failed");
+
+    let mut request = vec![0x05, 0x01, 0x00];
+    match target_addr.ip() {
+        std::net::IpAddr::V4(ip) => {
+            request.push(0x01);
+            request.extend_from_slice(&ip.octets());
+        }
+        std::net::IpAddr::V6(ip) => {
+            request.push(0x04);
+            request.extend_from_slice(&ip.octets());
+        }
+    }
+    request.extend_from_slice(&target_addr.port().to_be_bytes());
+    stream
+        .write_all(&request)
+        .await
+        .expect("socks connect request");
+
+    let mut header = [0u8; 4];
+    stream
+        .read_exact(&mut header)
+        .await
+        .expect("socks connect response header");
+    assert_eq!(header[0], 0x05);
+    assert_eq!(header[1], 0x00, "SOCKS connect failed: {header:02x?}");
+    read_async_socks_bound_address_tail(&mut stream, header[3]).await;
+    stream
+}
+
+async fn read_async_socks_bound_address_tail(
+    stream: &mut tokio::net::TcpStream,
+    atyp: u8,
+) {
+    match atyp {
+        0x01 => {
+            let mut rest = [0u8; 6];
+            stream.read_exact(&mut rest).await.expect("socks ipv4 tail");
+        }
+        0x03 => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).await.expect("socks domain len");
+            let mut rest = vec![0u8; len[0] as usize + 2];
+            stream
+                .read_exact(&mut rest)
+                .await
+                .expect("socks domain tail");
+        }
+        0x04 => {
+            let mut rest = [0u8; 18];
+            stream.read_exact(&mut rest).await.expect("socks ipv6 tail");
+        }
+        atyp => panic!("unsupported SOCKS address type {atyp:#x}"),
+    }
 }
 
 fn assert_socks5_echo(
