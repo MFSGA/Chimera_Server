@@ -9,8 +9,7 @@ use super::slide_buffer::SlideBuffer;
 ///
 /// Mirrors rustls::Reader behavior for fill_buf():
 /// - Ok(data) when data is available
-/// - Ok(&[]) when close_notify received (clean EOF)
-/// - Err(WouldBlock) when no data and connection is still active
+/// - Ok(&[]) when no data is currently available, including clean EOF
 pub struct RealityReader<'a> {
     buffer: &'a mut SlideBuffer,
     received_close_notify: bool,
@@ -41,10 +40,8 @@ impl<'a> BufRead for RealityReader<'a> {
     fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
         if !self.buffer.is_empty() {
             Ok(self.buffer.as_slice())
-        } else if self.received_close_notify {
-            Ok(&[])
         } else {
-            Err(std::io::ErrorKind::WouldBlock.into())
+            Ok(&[])
         }
     }
 
@@ -121,12 +118,11 @@ mod tests {
     }
 
     #[test]
-    fn test_reality_crypto_reader_empty_would_block() {
+    fn test_reality_crypto_reader_empty_returns_empty_slice() {
         let mut buffer = SlideBuffer::new(1024);
         let mut reader = RealityReader::new(&mut buffer, false);
-        let result = reader.fill_buf();
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        let result = reader.fill_buf().unwrap();
+        assert!(result.is_empty());
     }
 
     #[test]
