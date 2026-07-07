@@ -196,7 +196,17 @@ fn api_inbound_uses_tls(protocol: &ServerProxyConfig) -> bool {
 
 pub fn start(opts: Options) -> Result<(), Error> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let rt = match opts.rt.as_ref().unwrap_or(&TokioRuntime::MultiThread) {
+
+    let Options {
+        config,
+        config_format,
+        cwd,
+        rt,
+        log_file,
+    } = opts;
+    let config = config.try_parse(config_format)?;
+
+    let rt = match rt.as_ref().unwrap_or(&TokioRuntime::MultiThread) {
         TokioRuntime::MultiThread => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?,
@@ -206,7 +216,7 @@ pub fn start(opts: Options) -> Result<(), Error> {
     };
 
     rt.block_on(async {
-        match start_async(opts).await {
+        match start_async(config, cwd.as_deref(), log_file.as_deref()).await {
             Err(e) => {
                 eprintln!("start error: {}", e);
                 Err(e)
@@ -273,15 +283,13 @@ pub fn validate(opts: Options) -> Result<(), Error> {
     Ok(())
 }
 
-async fn start_async(opts: Options) -> Result<(), Error> {
-    // 1. config parse
-    let config = opts.config.try_parse(opts.config_format)?;
+async fn start_async(
+    config: LiteralConfig,
+    cwd: Option<&str>,
+    log_file: Option<&str>,
+) -> Result<(), Error> {
     //  todo: log mod
-    log::init(
-        config.log.as_ref(),
-        opts.cwd.as_deref(),
-        opts.log_file.as_deref(),
-    )?;
+    log::init(config.log.as_ref(), cwd, log_file)?;
     // 2. api config
     let api_config = config.api.clone();
     let mcp_config = config.mcp.clone();
