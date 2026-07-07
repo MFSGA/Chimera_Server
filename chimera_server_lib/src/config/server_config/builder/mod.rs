@@ -181,13 +181,13 @@ impl TryFrom<InboudItem> for ServerConfig {
                     settings.network.trim().to_ascii_lowercase()
                 }) {
                     Some(network) if network == "udp" => {
-                        if let Some(stream_setting) = stream_settings.as_ref() {
-                            if stream_setting.security.as_deref().unwrap_or("none") != "none" {
-                                return Err(Error::InvalidConfig(
-                                    "dokodemo-door udp transport does not support streamSettings.security"
-                                        .into(),
-                                ));
-                            }
+                        if let Some(stream_setting) = stream_settings.as_ref()
+                            && stream_setting.security.as_deref().unwrap_or("none") != "none"
+                        {
+                            return Err(Error::InvalidConfig(
+                                "dokodemo-door udp transport does not support streamSettings.security"
+                                    .into(),
+                            ));
                         }
                         Transport::Udp
                     }
