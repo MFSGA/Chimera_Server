@@ -80,7 +80,7 @@ pub async fn start_xhttp_server(
         listener_config.inner,
         &tag,
         &mut rules_stack,
-    ));
+    )?);
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
     let state = Arc::new(AppState::new(
         listener_config.xhttp_config,

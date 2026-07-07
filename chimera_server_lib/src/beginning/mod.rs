@@ -107,7 +107,7 @@ pub async fn start_tcp_server(
     let mut rules_stack = vec![];
 
     let tcp_handler: Arc<Box<dyn TcpServerHandler>> =
-        Arc::new(create_tcp_server_handler(protocol, &tag, &mut rules_stack));
+        Arc::new(create_tcp_server_handler(protocol, &tag, &mut rules_stack)?);
     tracing::debug!("TCP handler: {:?}", tcp_handler);
 
     let listener = match bind_location {
