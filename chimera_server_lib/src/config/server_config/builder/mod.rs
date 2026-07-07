@@ -177,15 +177,39 @@ impl TryFrom<InboudItem> for ServerConfig {
                     },
                 };
 
-                if let Some(stream_setting) = stream_settings.as_ref() {
-                    protocol = apply_security_layers(protocol, stream_setting)?;
-                }
+                let transport = match stream_settings.as_ref().map(|settings| {
+                    settings.network.trim().to_ascii_lowercase()
+                }) {
+                    Some(network) if network == "udp" => {
+                        if let Some(stream_setting) = stream_settings.as_ref() {
+                            if stream_setting.security.as_deref().unwrap_or("none") != "none" {
+                                return Err(Error::InvalidConfig(
+                                    "dokodemo-door udp transport does not support streamSettings.security"
+                                        .into(),
+                                ));
+                            }
+                        }
+                        Transport::Udp
+                    }
+                    Some(network) if network.is_empty() || network == "tcp" => {
+                        if let Some(stream_setting) = stream_settings.as_ref() {
+                            protocol = apply_security_layers(protocol, stream_setting)?;
+                        }
+                        Transport::Tcp
+                    }
+                    Some(network) => {
+                        return Err(Error::InvalidConfig(format!(
+                            "dokodemo-door streamSettings.network={network} is not supported"
+                        )));
+                    }
+                    None => Transport::Tcp,
+                };
 
                 Ok(ServerConfig {
                     tag,
                     bind_location,
                     protocol,
-                    transport: Transport::Tcp,
+                    transport,
                     quic_settings: None,
                 })
             }
@@ -625,6 +649,59 @@ mod tests {
             .expect_err("shadowsocks inbound is planned but unsupported");
         assert!(err.to_string().contains(
             "protocol=shadowsocks is recognized but not supported in this stage"
+        ));
+    }
+
+    #[test]
+    fn dokodemo_door_udp_network_builds_udp_transport() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "dokodemo-door",
+            "tag": "dokodemo-udp",
+            "settings": {
+                "address": "127.0.0.1",
+                "port": 5353
+            },
+            "streamSettings": {
+                "network": "udp"
+            }
+        }))
+        .expect("valid dokodemo udp inbound item");
+
+        let config =
+            ServerConfig::try_from(inbound).expect("dokodemo udp should build");
+        assert_eq!(config.transport, Transport::Udp);
+        match config.protocol {
+            ServerProxyConfig::DokodemoDoor { config } => {
+                assert_eq!(config.target.port(), 5353);
+            }
+            other => panic!("expected dokodemo-door, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dokodemo_door_rejects_udp_security_layers() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "dokodemo-door",
+            "tag": "dokodemo-udp-tls",
+            "settings": {
+                "address": "127.0.0.1",
+                "port": 5353
+            },
+            "streamSettings": {
+                "network": "udp",
+                "security": "tls"
+            }
+        }))
+        .expect("valid dokodemo udp inbound item");
+
+        let err = ServerConfig::try_from(inbound)
+            .expect_err("udp security layers should be rejected");
+        assert!(err.to_string().contains(
+            "dokodemo-door udp transport does not support streamSettings.security"
         ));
     }
 

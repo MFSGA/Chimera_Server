@@ -2,6 +2,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use quic::start_quic_server;
 use tokio::{io::AsyncWriteExt, task::JoinHandle, time::timeout};
+use udp::start_udp_server;
 
 use crate::{
     address::{BindLocation, NetLocation},
@@ -22,6 +23,7 @@ use crate::{
 use tracing::{error, info};
 
 mod quic;
+mod udp;
 mod xhttp;
 
 pub async fn start_servers(
@@ -58,12 +60,18 @@ pub async fn start_servers(
                 return Err(e);
             }
         },
-        Transport::Udp => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "transport=udp is not supported as a listener transport yet",
-            ));
-        }
+        Transport::Udp => match start_udp_server(config.clone()).await {
+            Ok(Some(handle)) => {
+                join_handles.push(handle);
+            }
+            Ok(None) => (),
+            Err(e) => {
+                for join_handle in join_handles {
+                    join_handle.abort();
+                }
+                return Err(e);
+            }
+        },
     }
 
     if join_handles.is_empty() {
