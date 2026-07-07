@@ -5,7 +5,12 @@ use std::{
     time::Duration,
 };
 
-use tokio::{net::UdpSocket, task::JoinHandle, time::timeout};
+use tokio::{
+    net::UdpSocket,
+    sync::{Mutex, mpsc},
+    task::JoinHandle,
+    time::{Instant, sleep},
+};
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -18,13 +23,36 @@ use crate::{
 };
 
 const UDP_BUFFER_SIZE: usize = 64 * 1024;
-const UDP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
-// Keep the first UDP routing step intentionally limited to direct and drop outbounds.
+const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const UDP_SESSION_CHANNEL_CAPACITY: usize = 64;
+// Keep UDP routing intentionally limited to direct and drop outbounds for now.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum UdpOutboundAction {
     Freedom { tag: Option<String> },
     Blackhole { tag: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct UdpSessionKey {
+    client_addr: SocketAddr,
+    target_addr: SocketAddr,
+    outbound_tag: Option<String>,
+}
+
+#[derive(Debug)]
+struct UdpRelayState {
+    server_socket: Arc<UdpSocket>,
+    sessions: Mutex<HashMap<UdpSessionKey, mpsc::Sender<Vec<u8>>>>,
+}
+
+impl UdpRelayState {
+    fn new(server_socket: Arc<UdpSocket>) -> Self {
+        Self {
+            server_socket,
+            sessions: Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 pub async fn start_udp_server(
@@ -98,19 +126,21 @@ async fn run_dokodemo_udp_server(
     inbound_tag: String,
     runtime: RuntimeState,
 ) -> std::io::Result<()> {
+    let relay_state = Arc::new(UdpRelayState::new(socket));
     let mut recv_buf = vec![0u8; UDP_BUFFER_SIZE];
 
     loop {
-        let (len, client_addr) = socket.recv_from(&mut recv_buf).await?;
+        let (len, client_addr) =
+            relay_state.server_socket.recv_from(&mut recv_buf).await?;
         let payload = recv_buf[..len].to_vec();
-        let server_socket = socket.clone();
         let target_location = config.target.clone();
         let inbound_tag = inbound_tag.clone();
         let runtime = runtime.clone();
+        let relay_state = relay_state.clone();
 
         tokio::spawn(async move {
             if let Err(err) = relay_dokodemo_udp_datagram(
-                server_socket,
+                relay_state,
                 client_addr,
                 target_addr,
                 target_location,
@@ -130,7 +160,7 @@ async fn run_dokodemo_udp_server(
 }
 
 async fn relay_dokodemo_udp_datagram(
-    server_socket: Arc<UdpSocket>,
+    relay_state: Arc<UdpRelayState>,
     client_addr: SocketAddr,
     target_addr: SocketAddr,
     target_location: NetLocation,
@@ -146,11 +176,9 @@ async fn relay_dokodemo_udp_datagram(
         &target_location,
     )?;
 
-    let traffic_context = Some(
-        TrafficContext::new("dokodemo-door")
-            .with_inbound_tag(inbound_tag)
-            .with_client_ip(client_addr.ip()),
-    );
+    let traffic_context = TrafficContext::new("dokodemo-door")
+        .with_inbound_tag(inbound_tag)
+        .with_client_ip(client_addr.ip());
 
     match outbound_action {
         UdpOutboundAction::Blackhole { tag } => {
@@ -158,59 +186,171 @@ async fn relay_dokodemo_udp_datagram(
                 "dokodemo-door udp packet from {} to {} dropped by blackhole outbound {}",
                 client_addr, target_location, tag
             );
-            record_transfer(traffic_context, payload.len() as u64, 0);
+            record_transfer(Some(traffic_context), payload.len() as u64, 0);
             Ok(())
         }
         UdpOutboundAction::Freedom { tag } => {
-            let bind_addr = if target_addr.is_ipv6() {
-                SocketAddr::from(([0u16; 8], 0))
-            } else {
-                SocketAddr::from(([0, 0, 0, 0], 0))
-            };
-            let outbound_socket = UdpSocket::bind(bind_addr).await?;
-
-            outbound_socket.send_to(&payload, target_addr).await?;
-
-            let mut response_buf = vec![0u8; UDP_BUFFER_SIZE];
-            let (response_len, response_addr) = match timeout(
-                UDP_RESPONSE_TIMEOUT,
-                outbound_socket.recv_from(&mut response_buf),
-            )
-            .await
-            {
-                Ok(Ok(result)) => result,
-                Ok(Err(err)) => return Err(err),
-                Err(_) => {
-                    warn!(
-                        "dokodemo-door udp response from {} timed out for client {}",
-                        target_location, client_addr
-                    );
-                    return Ok(());
-                }
-            };
-
-            let response = &response_buf[..response_len];
-            server_socket.send_to(response, client_addr).await?;
-
-            record_transfer(
-                traffic_context,
-                payload.len() as u64,
-                response_len as u64,
-            );
-
-            debug!(
-                "dokodemo-door udp relay {} -> {} -> {} via {} completed: upload {} bytes, download {} bytes",
+            let key = UdpSessionKey {
                 client_addr,
+                target_addr,
+                outbound_tag: tag.clone(),
+            };
+            let sender = freedom_udp_session_sender(
+                relay_state,
+                key,
                 target_location,
-                response_addr,
-                tag.as_deref().unwrap_or("implicit-freedom"),
-                payload.len(),
-                response_len
-            );
+                tag,
+                traffic_context,
+            )
+            .await?;
 
-            Ok(())
+            sender.send(payload).await.map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "dokodemo-door udp session closed before payload was sent",
+                )
+            })
         }
     }
+}
+
+async fn freedom_udp_session_sender(
+    relay_state: Arc<UdpRelayState>,
+    key: UdpSessionKey,
+    target_location: NetLocation,
+    outbound_tag: Option<String>,
+    traffic_context: TrafficContext,
+) -> std::io::Result<mpsc::Sender<Vec<u8>>> {
+    if let Some(sender) = relay_state.sessions.lock().await.get(&key).cloned() {
+        return Ok(sender);
+    }
+
+    let bind_addr = if key.target_addr.is_ipv6() {
+        SocketAddr::from(([0u16; 8], 0))
+    } else {
+        SocketAddr::from(([0, 0, 0, 0], 0))
+    };
+    let outbound_socket = UdpSocket::bind(bind_addr).await?;
+    let (sender, receiver) = mpsc::channel(UDP_SESSION_CHANNEL_CAPACITY);
+
+    let mut sessions = relay_state.sessions.lock().await;
+    if let Some(existing) = sessions.get(&key).cloned() {
+        return Ok(existing);
+    }
+    sessions.insert(key.clone(), sender.clone());
+    drop(sessions);
+
+    tokio::spawn(run_freedom_udp_session(
+        relay_state,
+        key,
+        target_location,
+        outbound_tag,
+        traffic_context,
+        outbound_socket,
+        receiver,
+    ));
+
+    Ok(sender)
+}
+
+async fn run_freedom_udp_session(
+    relay_state: Arc<UdpRelayState>,
+    key: UdpSessionKey,
+    target_location: NetLocation,
+    outbound_tag: Option<String>,
+    traffic_context: TrafficContext,
+    outbound_socket: UdpSocket,
+    mut receiver: mpsc::Receiver<Vec<u8>>,
+) {
+    let outbound_label = outbound_tag.as_deref().unwrap_or("implicit-freedom");
+    let mut idle = Box::pin(sleep(UDP_SESSION_IDLE_TIMEOUT));
+
+    loop {
+        let mut response_buf = vec![0u8; UDP_BUFFER_SIZE];
+        tokio::select! {
+            _ = idle.as_mut() => {
+                debug!(
+                    "dokodemo-door udp session {} -> {} via {} expired after {:?}",
+                    key.client_addr,
+                    target_location,
+                    outbound_label,
+                    UDP_SESSION_IDLE_TIMEOUT
+                );
+                break;
+            }
+            maybe_payload = receiver.recv() => {
+                let Some(payload) = maybe_payload else {
+                    break;
+                };
+                match outbound_socket.send_to(&payload, key.target_addr).await {
+                    Ok(sent) => {
+                        record_transfer(Some(traffic_context.clone()), sent as u64, 0);
+                        idle.as_mut().reset(Instant::now() + UDP_SESSION_IDLE_TIMEOUT);
+                    }
+                    Err(err) => {
+                        debug!(
+                            "dokodemo-door udp send {} -> {} via {} failed: {}",
+                            key.client_addr,
+                            target_location,
+                            outbound_label,
+                            err
+                        );
+                        break;
+                    }
+                }
+            }
+            response = outbound_socket.recv_from(&mut response_buf) => {
+                let (response_len, response_addr) = match response {
+                    Ok(result) => result,
+                    Err(err) => {
+                        debug!(
+                            "dokodemo-door udp recv from {} via {} failed: {}",
+                            target_location,
+                            outbound_label,
+                            err
+                        );
+                        break;
+                    }
+                };
+
+                if response_addr != key.target_addr {
+                    warn!(
+                        "dokodemo-door udp ignored response from unexpected {} for target {}",
+                        response_addr,
+                        target_location
+                    );
+                    continue;
+                }
+
+                let response = &response_buf[..response_len];
+                match relay_state.server_socket.send_to(response, key.client_addr).await {
+                    Ok(sent) => {
+                        record_transfer(Some(traffic_context.clone()), 0, sent as u64);
+                        idle.as_mut().reset(Instant::now() + UDP_SESSION_IDLE_TIMEOUT);
+                        debug!(
+                            "dokodemo-door udp relay {} <- {} via {} forwarded {} bytes",
+                            key.client_addr,
+                            target_location,
+                            outbound_label,
+                            sent
+                        );
+                    }
+                    Err(err) => {
+                        debug!(
+                            "dokodemo-door udp response to {} from {} via {} failed: {}",
+                            key.client_addr,
+                            target_location,
+                            outbound_label,
+                            err
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    relay_state.sessions.lock().await.remove(&key);
 }
 
 fn select_udp_outbound(
@@ -290,9 +430,8 @@ mod tests {
     use crate::{
         address::{Address, NetLocation},
         config::{
-            Transport,
             rule::{NetworkListConfig, RoutingConfig, RuleConfig},
-            server_config::{DokodemoDoorConfig, ServerConfig, ServerProxyConfig},
+            server_config::DokodemoDoorConfig,
         },
         routing_state::RoutingState,
         runtime::OutboundSummary,
@@ -362,6 +501,143 @@ mod tests {
                 .expect("relay response timeout")
                 .expect("client receive");
         assert_eq!(&response[..len], b"ping");
+
+        echo_task.await.expect("echo task finished");
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn dokodemo_udp_reuses_session_for_same_flow() {
+        let echo_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind echo socket");
+        let echo_addr = echo_socket.local_addr().expect("echo addr");
+        let (peer_tx, mut peer_rx) = mpsc::channel(2);
+        let echo_task = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            for _ in 0..2 {
+                let (len, peer) =
+                    echo_socket.recv_from(&mut buf).await.expect("echo recv");
+                peer_tx.send(peer).await.expect("record peer");
+                echo_socket
+                    .send_to(&buf[..len], peer)
+                    .await
+                    .expect("echo send");
+            }
+        });
+
+        let server_socket = Arc::new(
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("bind dokodemo socket"),
+        );
+        let server_addr = server_socket.local_addr().expect("dokodemo addr");
+        let target = NetLocation::from_ip_addr(echo_addr.ip(), echo_addr.port());
+        let server_task = tokio::spawn(run_dokodemo_udp_server(
+            server_socket,
+            DokodemoDoorConfig {
+                target: target.clone(),
+                follow_redirect: false,
+            },
+            echo_addr,
+            "dokodemo-udp-test".into(),
+            runtime_with_outbounds(vec![outbound("direct", "freedom")]),
+        ));
+
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind client socket");
+        let mut response = [0u8; 32];
+
+        client
+            .send_to(b"one", server_addr)
+            .await
+            .expect("client send one");
+        let (len, _) =
+            timeout(Duration::from_secs(5), client.recv_from(&mut response))
+                .await
+                .expect("relay response one timeout")
+                .expect("client receive one");
+        assert_eq!(&response[..len], b"one");
+
+        client
+            .send_to(b"two", server_addr)
+            .await
+            .expect("client send two");
+        let (len, _) =
+            timeout(Duration::from_secs(5), client.recv_from(&mut response))
+                .await
+                .expect("relay response two timeout")
+                .expect("client receive two");
+        assert_eq!(&response[..len], b"two");
+
+        let first_peer = peer_rx.recv().await.expect("first outbound peer");
+        let second_peer = peer_rx.recv().await.expect("second outbound peer");
+        assert_eq!(first_peer, second_peer);
+
+        echo_task.await.expect("echo task finished");
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn dokodemo_udp_session_forwards_multiple_responses() {
+        let echo_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind echo socket");
+        let echo_addr = echo_socket.local_addr().expect("echo addr");
+        let echo_task = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let (_len, peer) =
+                echo_socket.recv_from(&mut buf).await.expect("echo recv");
+            echo_socket
+                .send_to(b"first", peer)
+                .await
+                .expect("send first");
+            echo_socket
+                .send_to(b"second", peer)
+                .await
+                .expect("send second");
+        });
+
+        let server_socket = Arc::new(
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("bind dokodemo socket"),
+        );
+        let server_addr = server_socket.local_addr().expect("dokodemo addr");
+        let target = NetLocation::from_ip_addr(echo_addr.ip(), echo_addr.port());
+        let server_task = tokio::spawn(run_dokodemo_udp_server(
+            server_socket,
+            DokodemoDoorConfig {
+                target: target.clone(),
+                follow_redirect: false,
+            },
+            echo_addr,
+            "dokodemo-udp-test".into(),
+            runtime_with_outbounds(vec![outbound("direct", "freedom")]),
+        ));
+
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind client socket");
+        client
+            .send_to(b"request", server_addr)
+            .await
+            .expect("client send");
+
+        let mut response = [0u8; 32];
+        let (len, _) =
+            timeout(Duration::from_secs(5), client.recv_from(&mut response))
+                .await
+                .expect("first relay response timeout")
+                .expect("client receive first");
+        assert_eq!(&response[..len], b"first");
+        let (len, _) =
+            timeout(Duration::from_secs(5), client.recv_from(&mut response))
+                .await
+                .expect("second relay response timeout")
+                .expect("client receive second");
+        assert_eq!(&response[..len], b"second");
 
         echo_task.await.expect("echo task finished");
         server_task.abort();
