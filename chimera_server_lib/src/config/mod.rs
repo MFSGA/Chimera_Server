@@ -43,6 +43,9 @@ pub enum Protocol {
     TuicV5,
     Xhttp,
     Socks,
+    Http,
+    Mixed,
+    Shadowsocks,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

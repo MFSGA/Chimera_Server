@@ -118,6 +118,12 @@ fn has_non_vision_vless_flow(
     users.iter().any(|user| user.flow != "xtls-rprx-vision")
 }
 
+fn planned_unsupported_protocol_error(protocol: &str) -> Error {
+    Error::InvalidConfig(format!(
+        "protocol={protocol} is recognized but not supported in this stage"
+    ))
+}
+
 impl TryFrom<InboudItem> for ServerConfig {
     type Error = Error;
 
@@ -538,6 +544,12 @@ impl TryFrom<InboudItem> for ServerConfig {
                 ))
             }
 
+            Protocol::Http => Err(planned_unsupported_protocol_error("http")),
+            Protocol::Mixed => Err(planned_unsupported_protocol_error("mixed")),
+            Protocol::Shadowsocks => {
+                Err(planned_unsupported_protocol_error("shadowsocks"))
+            }
+
             Protocol::Socks => {
                 let settings = settings.ok_or_else(|| {
                     Error::InvalidConfig("socks inbound requires settings".into())
@@ -575,6 +587,43 @@ impl TryFrom<InboudItem> for ServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn inbound_for_protocol(protocol: &str) -> InboudItem {
+        serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": protocol,
+            "tag": format!("{protocol}-planned")
+        }))
+        .expect("valid inbound item")
+    }
+
+    #[test]
+    fn planned_http_inbound_returns_clear_unsupported_error() {
+        let err = ServerConfig::try_from(inbound_for_protocol("http"))
+            .expect_err("http inbound is planned but unsupported");
+        assert!(err.to_string().contains(
+            "protocol=http is recognized but not supported in this stage"
+        ));
+    }
+
+    #[test]
+    fn planned_mixed_inbound_returns_clear_unsupported_error() {
+        let err = ServerConfig::try_from(inbound_for_protocol("mixed"))
+            .expect_err("mixed inbound is planned but unsupported");
+        assert!(err.to_string().contains(
+            "protocol=mixed is recognized but not supported in this stage"
+        ));
+    }
+
+    #[test]
+    fn planned_shadowsocks_inbound_returns_clear_unsupported_error() {
+        let err = ServerConfig::try_from(inbound_for_protocol("shadowsocks"))
+            .expect_err("shadowsocks inbound is planned but unsupported");
+        assert!(err.to_string().contains(
+            "protocol=shadowsocks is recognized but not supported in this stage"
+        ));
+    }
 
     #[cfg(all(feature = "reality", feature = "vless"))]
     fn vless_reality_inbound(reality_settings: serde_json::Value) -> InboudItem {
