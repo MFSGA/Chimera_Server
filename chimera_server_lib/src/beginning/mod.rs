@@ -59,7 +59,10 @@ pub async fn start_servers(
             }
         },
         Transport::Udp => {
-            panic!("unsupported transport type: udp");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "transport=udp is not supported as a listener transport yet",
+            ));
         }
     }
 

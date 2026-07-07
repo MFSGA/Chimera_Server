@@ -327,6 +327,8 @@ pub enum ServerProxyConfig {
     },
     Socks {
         accounts: SocksUserStore,
+        #[serde(default)]
+        udp_enabled: bool,
     },
     DokodemoDoor {
         config: DokodemoDoorConfig,

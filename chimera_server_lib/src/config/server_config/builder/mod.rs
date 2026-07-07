@@ -65,7 +65,7 @@ use super::{
 
 #[cfg(feature = "hysteria")]
 use collectors::collect_hysteria2_settings;
-use collectors::{collect_socks_accounts, collect_xhttp_settings};
+use collectors::{collect_socks_settings, collect_xhttp_settings};
 
 #[cfg(feature = "tuic")]
 use collectors::collect_tuic_settings;
@@ -554,8 +554,11 @@ impl TryFrom<InboudItem> for ServerConfig {
                 let settings = settings.ok_or_else(|| {
                     Error::InvalidConfig("socks inbound requires settings".into())
                 })?;
-                let accounts = collect_socks_accounts(settings)?;
-                let mut protocol = ServerProxyConfig::Socks { accounts };
+                let (accounts, udp_enabled) = collect_socks_settings(settings)?;
+                let mut protocol = ServerProxyConfig::Socks {
+                    accounts,
+                    udp_enabled,
+                };
 
                 #[cfg(feature = "ws")]
                 if let Some(stream_setting) = stream_settings.as_ref()

@@ -292,9 +292,9 @@ fn reject_unsupported_trojan_fallback_fields(
     Ok(())
 }
 
-pub(super) fn collect_socks_accounts(
+pub(super) fn collect_socks_settings(
     settings: SettingObject,
-) -> Result<SocksUserStore, Error> {
+) -> Result<(SocksUserStore, bool), Error> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct SocksInboundSettings {
@@ -321,11 +321,8 @@ pub(super) fn collect_socks_accounts(
             Error::InvalidConfig(format!("failed to parse socks settings: {}", e))
         })?;
 
-    if socks_settings.udp.unwrap_or(false) {
-        return Err(Error::InvalidConfig(
-            "socks settings.udp is not supported yet".into(),
-        ));
-    }
+    // SOCKS UDP is implemented through UDP ASSOCIATE on the TCP control stream.
+    let udp_enabled = socks_settings.udp.unwrap_or(false);
     if socks_settings.ip.is_some() {
         return Err(Error::InvalidConfig(
             "socks settings.ip is not supported yet".into(),
@@ -350,25 +347,29 @@ pub(super) fn collect_socks_accounts(
         });
 
     match auth_mode.as_str() {
-        "noauth" | "none" => {
-            Ok(SocksUserStore::with_auth_required(Vec::new(), false))
-        }
+        "noauth" | "none" => Ok((
+            SocksUserStore::with_auth_required(Vec::new(), false),
+            udp_enabled,
+        )),
         "password" => {
             if socks_settings.accounts.is_empty() {
                 return Err(Error::InvalidConfig(
                     "socks inbound with password auth requires accounts".into(),
                 ));
             }
-            Ok(SocksUserStore::with_auth_required(
-                socks_settings
-                    .accounts
-                    .into_iter()
-                    .map(|account| SocksUser {
-                        username: account.user,
-                        password: account.pass,
-                    })
-                    .collect(),
-                true,
+            Ok((
+                SocksUserStore::with_auth_required(
+                    socks_settings
+                        .accounts
+                        .into_iter()
+                        .map(|account| SocksUser {
+                            username: account.user,
+                            password: account.pass,
+                        })
+                        .collect(),
+                    true,
+                ),
+                udp_enabled,
             ))
         }
         other => Err(Error::InvalidConfig(format!(
@@ -582,18 +583,16 @@ mod tests {
     }
 
     #[test]
-    fn collect_socks_accounts_rejects_udp_until_supported() {
+    fn collect_socks_settings_accepts_udp_true() {
         let settings = SettingObject(serde_json::json!({
             "auth": "noauth",
             "udp": true
         }));
 
-        let err =
-            collect_socks_accounts(settings).expect_err("socks udp unsupported");
-        assert!(
-            err.to_string()
-                .contains("socks settings.udp is not supported yet")
-        );
+        let (users, udp_enabled) =
+            collect_socks_settings(settings).expect("socks udp should be accepted");
+        assert!(!users.auth_required());
+        assert!(udp_enabled);
     }
 
     #[test]
@@ -604,7 +603,7 @@ mod tests {
         }));
 
         let err =
-            collect_socks_accounts(settings).expect_err("socks ip unsupported");
+            collect_socks_settings(settings).expect_err("socks ip unsupported");
         assert!(
             err.to_string()
                 .contains("socks settings.ip is not supported yet")
@@ -618,8 +617,10 @@ mod tests {
             "udp": false
         }));
 
-        let users = collect_socks_accounts(settings).expect("udp false is a no-op");
+        let (users, udp_enabled) =
+            collect_socks_settings(settings).expect("udp false is a no-op");
         assert!(!users.auth_required());
+        assert!(!udp_enabled);
     }
 
     #[cfg(feature = "trojan")]
