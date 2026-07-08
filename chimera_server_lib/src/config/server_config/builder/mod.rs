@@ -111,13 +111,6 @@ fn has_vless_vision_flow(users: &[crate::config::server_config::VlessUser]) -> b
     users.iter().any(|user| user.flow == "xtls-rprx-vision")
 }
 
-#[cfg(feature = "vless")]
-fn has_non_vision_vless_flow(
-    users: &[crate::config::server_config::VlessUser],
-) -> bool {
-    users.iter().any(|user| user.flow != "xtls-rprx-vision")
-}
-
 fn planned_unsupported_protocol_error(protocol: &str) -> Error {
     Error::InvalidConfig(format!(
         "protocol={protocol} is recognized but not supported in this stage"
@@ -335,8 +328,6 @@ impl TryFrom<InboudItem> for ServerConfig {
                         )
                     })?;
                 let uses_vision = has_vless_vision_flow(&users);
-                let mixes_plain_and_vision =
-                    uses_vision && has_non_vision_vless_flow(&users);
 
                 let mut protocol = ServerProxyConfig::Vless { users };
                 let uses_xhttp = stream_settings
@@ -350,12 +341,6 @@ impl TryFrom<InboudItem> for ServerConfig {
                     .to_ascii_lowercase();
 
                 if uses_vision {
-                    if mixes_plain_and_vision {
-                        return Err(Error::InvalidConfig(
-                            "xtls-rprx-vision users cannot share one inbound with plain vless users"
-                                .into(),
-                        ));
-                    }
                     if uses_xhttp {
                         return Err(Error::InvalidConfig(
                             "xtls-rprx-vision does not support xhttp transport".into(),
@@ -1098,7 +1083,7 @@ mod tests {
 
     #[cfg(feature = "vless")]
     #[test]
-    fn vless_builder_rejects_mixed_plain_and_vision_users() {
+    fn vless_builder_accepts_mixed_plain_and_vision_users() {
         let inbound: InboudItem = serde_json::from_value(serde_json::json!({
             "listen": "127.0.0.1",
             "port": 443,
@@ -1135,11 +1120,9 @@ mod tests {
         }))
         .expect("valid vless inbound item");
 
-        let err = ServerConfig::try_from(inbound)
-            .expect_err("mixed plain and vision users should fail");
-        assert!(err.to_string().contains(
-            "xtls-rprx-vision users cannot share one inbound with plain vless users"
-        ));
+        let server_config = ServerConfig::try_from(inbound)
+            .expect("mixed plain and vision users should build");
+        assert_eq!(server_config.tag, "vless-mixed-flow-users");
     }
 
     #[cfg(all(feature = "vless", feature = "ws"))]
