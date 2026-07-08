@@ -171,7 +171,7 @@ async fn xray_client_can_proxy_tcp_through_chimera_reality_vision() {
                     "network": "tcp",
                     "security": "reality",
                     "realitySettings": {
-                        "dest": format!("localhost:{}", reality_dest_addr.port()),
+                        "dest": format!("127.0.0.1:{}", reality_dest_addr.port()),
                         "serverNames": [REALITY_SERVER_NAME],
                         "privateKey": REALITY_PRIVATE_KEY,
                         "shortIds": [REALITY_SHORT_ID],
@@ -277,7 +277,7 @@ async fn plain_tls_client_falls_back_to_reality_dest_on_sni_mismatch() {
                     "network": "tcp",
                     "security": "reality",
                     "realitySettings": {
-                        "dest": format!("localhost:{}", reality_dest_addr.port()),
+                        "dest": format!("127.0.0.1:{}", reality_dest_addr.port()),
                         "serverNames": [REALITY_SERVER_NAME],
                         "privateKey": REALITY_PRIVATE_KEY,
                         "shortIds": [REALITY_SHORT_ID],
@@ -334,7 +334,7 @@ async fn xray_client_with_wrong_reality_short_id_falls_back_to_dest() {
                     "network": "tcp",
                     "security": "reality",
                     "realitySettings": {
-                        "dest": format!("localhost:{}", reality_dest_addr.port()),
+                        "dest": format!("127.0.0.1:{}", reality_dest_addr.port()),
                         "serverNames": [REALITY_SERVER_NAME],
                         "privateKey": REALITY_PRIVATE_KEY,
                         "shortIds": [REALITY_SHORT_ID],
@@ -433,7 +433,7 @@ async fn xray_client_with_wrong_reality_sni_falls_back_to_dest() {
                     "network": "tcp",
                     "security": "reality",
                     "realitySettings": {
-                        "dest": format!("localhost:{}", reality_dest_addr.port()),
+                        "dest": format!("127.0.0.1:{}", reality_dest_addr.port()),
                         "serverNames": [REALITY_SERVER_NAME],
                         "privateKey": REALITY_PRIVATE_KEY,
                         "shortIds": [REALITY_SHORT_ID],
@@ -597,9 +597,20 @@ async fn xray_client_can_proxy_tcp_through_chimera_hysteria2() {
     xray.assert_running();
 
     let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
-    assert_socks5_echo(socks_addr, echo_addr, b"hysteria2 through xray client");
-    assert_socks5_echo(socks_addr, echo_addr, b"hysteria2 second roundtrip");
-    assert_socks5_echo(socks_addr, echo_addr, &deterministic_payload(32 * 1024));
+    assert_socks5_echo_async(
+        socks_addr,
+        echo_addr,
+        b"hysteria2 through xray client",
+    )
+    .await;
+    assert_socks5_echo_async(socks_addr, echo_addr, b"hysteria2 second roundtrip")
+        .await;
+    assert_socks5_echo_async(
+        socks_addr,
+        echo_addr,
+        &deterministic_payload(32 * 1024),
+    )
+    .await;
 }
 
 fn workspace_root() -> PathBuf {
@@ -807,7 +818,7 @@ async fn start_tls13_dest_with_counter(
     install_rustls_provider();
     let acceptor = TlsAcceptor::from(Arc::new(tls_server_config(workspace)));
     let listener =
-        TokioTcpListener::bind(SocketAddr::from(([0u16, 0, 0, 0, 0, 0, 0, 1], 0)))
+        TokioTcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .await
             .expect("bind tls dest");
     let addr = listener.local_addr().expect("tls dest addr");
@@ -851,6 +862,25 @@ fn tls_test_client_config() -> RustlsClientConfig {
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AcceptTestServerCert))
         .with_no_client_auth()
+}
+
+async fn assert_socks5_echo_async(
+    socks_addr: SocketAddr,
+    target_addr: SocketAddr,
+    payload: &[u8],
+) {
+    let mut stream = connect_socks5_tcp(socks_addr, target_addr).await;
+    stream
+        .write_all(payload)
+        .await
+        .expect("write async tunneled payload");
+    stream.flush().await.expect("flush async tunneled payload");
+    let mut echoed = vec![0u8; payload.len()];
+    tokio::time::timeout(IO_TIMEOUT, stream.read_exact(&mut echoed))
+        .await
+        .expect("async tunneled echo timeout")
+        .expect("read async tunneled echo response");
+    assert_eq!(echoed, payload);
 }
 
 async fn assert_tls_echo_through_socks(
@@ -1072,10 +1102,38 @@ fn assert_socks5_request_echo(
 
     stream.write_all(payload).expect("write tunneled payload");
     let mut echoed = vec![0u8; payload.len()];
-    stream
-        .read_exact(&mut echoed)
+    read_exact_with_deadline(&mut stream, &mut echoed)
         .expect("read tunneled echo response");
     assert_eq!(echoed, payload);
+}
+
+fn read_exact_with_deadline(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+) -> io::Result<()> {
+    let deadline = Instant::now() + IO_TIMEOUT;
+    let mut read = 0;
+    while read < buf.len() {
+        match stream.read(&mut buf[read..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "EOF while reading tunneled data",
+                ));
+            }
+            Ok(n) => read += n,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) && Instant::now() < deadline =>
+            {
+                thread::sleep(CONNECT_RETRY_INTERVAL);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 fn deterministic_payload(len: usize) -> Vec<u8> {

@@ -92,9 +92,11 @@ fn build_reality_layer(
         ))
     })?;
 
-    if !matches!(dest.address(), Address::Hostname(_)) {
+    if !matches!(dest.address(), Address::Hostname(_))
+        && settings.server_names.is_empty()
+    {
         return Err(Error::InvalidConfig(
-            "reality.dest must be a hostname (ip addresses are not supported)"
+            "reality.dest may be an ip address only when realitySettings.serverNames is explicitly configured"
                 .into(),
         ));
     }

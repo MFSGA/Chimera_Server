@@ -1241,6 +1241,48 @@ mod tests {
 
     #[cfg(all(feature = "reality", feature = "vless"))]
     #[test]
+    fn reality_settings_accepts_ip_dest_with_explicit_server_names() {
+        let mut settings = base_reality_settings();
+        let settings_object =
+            settings.as_object_mut().expect("reality settings object");
+        settings_object
+            .insert("dest".to_string(), serde_json::json!("127.0.0.1:9443"));
+        settings_object.insert(
+            "serverNames".to_string(),
+            serde_json::json!(["www.apple.com"]),
+        );
+
+        let config = ServerConfig::try_from(vless_reality_inbound(settings))
+            .expect("ip dest with explicit serverNames should build reality config");
+
+        match config.protocol {
+            ServerProxyConfig::Reality(reality) => {
+                assert_eq!(reality.dest.to_string(), "127.0.0.1:9443");
+                assert_eq!(reality.server_names, vec!["www.apple.com".to_string()]);
+            }
+            other => panic!("expected reality protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(all(feature = "reality", feature = "vless"))]
+    #[test]
+    fn reality_settings_rejects_ip_dest_without_explicit_server_names() {
+        let mut settings = base_reality_settings();
+        let settings_object =
+            settings.as_object_mut().expect("reality settings object");
+        settings_object
+            .insert("dest".to_string(), serde_json::json!("127.0.0.1:9443"));
+        settings_object.remove("serverNames");
+
+        let err = ServerConfig::try_from(vless_reality_inbound(settings))
+            .expect_err("ip dest without serverNames should fail");
+        assert!(err.to_string().contains(
+            "reality.dest may be an ip address only when realitySettings.serverNames is explicitly configured"
+        ));
+    }
+
+    #[cfg(all(feature = "reality", feature = "vless"))]
+    #[test]
     fn reality_settings_accepts_xray_target_alias() {
         let mut settings = base_reality_settings();
         let settings_object =
