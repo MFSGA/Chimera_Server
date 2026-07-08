@@ -432,16 +432,12 @@ impl RealityServerConnection {
             && client_version < &min_ver[..]
         {
             tracing::warn!(
-                "REALITY: Client version {:?} is below minimum {:?}",
-                client_version,
-                min_ver
+                configured_min_version_len = min_ver.len(),
+                "REALITY: Client version is below minimum"
             );
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!(
-                    "Client version {:?} is below minimum {:?}",
-                    client_version, min_ver
-                ),
+                "Client version is below minimum",
             ));
         }
 
@@ -449,16 +445,12 @@ impl RealityServerConnection {
             && client_version > &max_ver[..]
         {
             tracing::warn!(
-                "REALITY: Client version {:?} is above maximum {:?}",
-                client_version,
-                max_ver
+                configured_max_version_len = max_ver.len(),
+                "REALITY: Client version is above maximum"
             );
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!(
-                    "Client version {:?} is above maximum {:?}",
-                    client_version, max_ver
-                ),
+                "Client version is above maximum",
             ));
         }
 
