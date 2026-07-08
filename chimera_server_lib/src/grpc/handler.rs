@@ -346,10 +346,7 @@ impl HandlerServiceImpl {
         label: &str,
     ) -> Result<T, Status> {
         let message_type = Self::parse_typed_message_type(typed_message);
-        if !accepted_types
-            .iter()
-            .any(|candidate| *candidate == message_type)
-        {
+        if !accepted_types.contains(&message_type) {
             return Err(Status::invalid_argument(format!(
                 "unsupported {label} type: {message_type}"
             )));
@@ -476,7 +473,10 @@ impl HandlerServiceImpl {
                         socks.auth_type != 0,
                     );
 
-                Ok(ServerProxyConfig::Socks { accounts })
+                Ok(ServerProxyConfig::Socks {
+                    accounts,
+                    udp_enabled: false,
+                })
             }
             #[cfg(feature = "vless")]
             TYPE_PROXY_VLESS_INBOUND_CONFIG
@@ -768,10 +768,10 @@ impl HandlerServiceImpl {
                     "max_client_ver",
                 )?;
                 let mut server_names = reality.server_names;
-                if server_names.is_empty() {
-                    if let Some(hostname) = dest.address().hostname() {
-                        server_names.push(hostname.to_string());
-                    }
+                if server_names.is_empty()
+                    && let Some(hostname) = dest.address().hostname()
+                {
+                    server_names.push(hostname.to_string());
                 }
                 Ok(ServerProxyConfig::Reality(RealityTransportConfig {
                     dest,
@@ -935,7 +935,7 @@ impl HandlerServiceImpl {
                     TrojanServerConfigPayload { users, fallbacks },
                 ))
             }
-            ServerProxyConfig::Socks { accounts } => {
+            ServerProxyConfig::Socks { accounts, .. } => {
                 let auth_type = i32::from(accounts.auth_required());
                 let account_map = accounts
                     .snapshot()
@@ -1288,7 +1288,7 @@ impl HandlerServiceImpl {
                 }
                 Ok(true)
             }
-            ServerProxyConfig::Socks { accounts } => {
+            ServerProxyConfig::Socks { accounts, .. } => {
                 accounts.upsert(self.parse_socks_user(user)?);
                 Ok(true)
             }
@@ -1352,7 +1352,7 @@ impl HandlerServiceImpl {
                 users.retain(|user| user.email.as_deref() != Some(email));
                 Ok(true)
             }
-            ServerProxyConfig::Socks { accounts } => Ok(accounts.remove(email)),
+            ServerProxyConfig::Socks { accounts, .. } => Ok(accounts.remove(email)),
             #[cfg(feature = "ws")]
             ServerProxyConfig::Websocket { targets } => match targets.as_mut() {
                 crate::util::option::OneOrSome::One(target) => {
@@ -1480,7 +1480,7 @@ impl HandlerServiceImpl {
             ServerProxyConfig::Xhttp { inner, .. } => {
                 self.get_user_manager_identities(inner)
             }
-            ServerProxyConfig::Socks { accounts } => Some(
+            ServerProxyConfig::Socks { accounts, .. } => Some(
                 accounts
                     .snapshot()
                     .iter()
@@ -1590,7 +1590,7 @@ impl HandlerServiceImpl {
             ServerProxyConfig::Xhttp { inner, .. } => {
                 self.get_user_manager_users(inner)
             }
-            ServerProxyConfig::Socks { accounts } => Some(
+            ServerProxyConfig::Socks { accounts, .. } => Some(
                 accounts
                     .snapshot()
                     .iter()
@@ -1642,9 +1642,14 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
             .add_inbound(inbound.clone())
             .map_err(Status::already_exists)?;
 
-        let handles = start_servers(inbound).await.map_err(|err| {
-            Status::unknown(format!("failed to start inbound handler: {err}"))
-        })?;
+        let handles =
+            start_servers(inbound, self.runtime.clone())
+                .await
+                .map_err(|err| {
+                    Status::unknown(format!(
+                        "failed to start inbound handler: {err}"
+                    ))
+                })?;
         self.runtime.register_inbound_tasks(&inbound_tag, &handles);
 
         Ok(Response::new(
@@ -1897,6 +1902,7 @@ mod tests {
                 password: "pass-a".to_string(),
             }]
             .into(),
+            udp_enabled: false,
         };
         let inbound = ServerConfig {
             tag: inbound_tag.clone(),
@@ -2262,7 +2268,7 @@ mod tests {
             account: Some(proto::xray::common::serial::TypedMessage {
                 r#type: TYPE_PROXY_VLESS_ACCOUNT.to_string(),
                 value: VlessAccountPayload {
-                    id: "11111111-1111-1111-1111-111111111111".to_string(),
+                    id: "5df5643d-4e28-4399-bb9e-22014a2d3246".to_string(),
                     flow: String::new(),
                 }
                 .encode_to_vec(),
@@ -2353,7 +2359,7 @@ mod tests {
                                     assert_eq!(users.len(), 1);
                                     assert_eq!(
                                         users[0].user_id,
-                                        "11111111-1111-1111-1111-111111111111"
+                                        "5df5643d-4e28-4399-bb9e-22014a2d3246"
                                     );
                                     assert_eq!(
                                         users[0].user_label,
@@ -2474,12 +2480,12 @@ mod tests {
             protocol: ServerProxyConfig::Vless {
                 users: vec![
                     VlessUser {
-                        user_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                        user_id: "5df5643d-4e28-4399-bb9e-22014a2d3246".to_string(),
                         user_label: "first-user@example.com".to_string(),
                         flow: String::new(),
                     },
                     VlessUser {
-                        user_id: "22222222-2222-2222-2222-222222222222".to_string(),
+                        user_id: "4571894c-7ece-4b27-a734-746330d1a984".to_string(),
                         user_label: "second-user@example.com".to_string(),
                         flow: "xtls-rprx-vision".to_string(),
                     },
@@ -2510,7 +2516,6 @@ mod tests {
                 });
                 (user.email, account)
             })
-            .into_iter()
             .collect::<Vec<_>>();
         assert_eq!(initial_users.len(), 2);
         assert!(
@@ -2556,7 +2561,7 @@ mod tests {
                 account: Some(proto::xray::common::serial::TypedMessage {
                     r#type: TYPE_PROXY_VLESS_ACCOUNT.to_string(),
                     value: VlessAccountPayload {
-                        id: "33333333-3333-3333-3333-333333333333".to_string(),
+                        id: "9199ca5b-1850-4ae6-a4fa-fd6384073692".to_string(),
                         flow: String::new(),
                     }
                     .encode_to_vec(),
@@ -2668,7 +2673,7 @@ mod tests {
     async fn handler_node_style_flow_on_empty_vless_inbound() {
         let inbound_tag = unique_tag("debug-vless");
         let username = unique_tag("debug-user");
-        let user_id = "33333333-3333-4333-8333-333333333333".to_string();
+        let user_id = "218b98f5-df92-43f9-8880-3be70912d79c".to_string();
 
         let inbound = ServerConfig {
             tag: inbound_tag.clone(),

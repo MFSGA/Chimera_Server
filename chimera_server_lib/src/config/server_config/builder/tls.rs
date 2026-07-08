@@ -13,6 +13,9 @@ use super::super::types::{
 use crate::address::{Address, NetLocation};
 
 #[cfg(feature = "reality")]
+const DEFAULT_REALITY_SHORT_ID: &str = "0000000000000000";
+
+#[cfg(feature = "reality")]
 fn parse_version_triplet(
     value: &Option<String>,
     field: &str,
@@ -21,13 +24,17 @@ fn parse_version_triplet(
         None => Ok(None),
         Some(text) if text.trim().is_empty() => Ok(None),
         Some(text) => {
-            let mut parts = [0u8; 3];
-            for (idx, part) in text
-                .split('.')
-                .filter(|s| !s.is_empty())
-                .take(3)
-                .enumerate()
+            let components = text.split('.').collect::<Vec<_>>();
+            if components.len() != 3
+                || components.iter().any(|component| component.is_empty())
             {
+                return Err(Error::InvalidConfig(format!(
+                    "{field} must use major.minor.patch format"
+                )));
+            }
+
+            let mut parts = [0u8; 3];
+            for (idx, part) in components.iter().enumerate() {
                 parts[idx] = part.parse::<u8>().map_err(|_| {
                     Error::InvalidConfig(format!("invalid {field} value: {text}"))
                 })?;
@@ -38,6 +45,37 @@ fn parse_version_triplet(
 }
 
 #[cfg(feature = "reality")]
+fn ensure_reality_inbound_supported_fields(
+    settings: &crate::config::RealitySettings,
+) -> Result<(), Error> {
+    if settings.public_key.is_some() {
+        return Err(Error::InvalidConfig(
+            "reality publicKey is an outbound/client setting and is not valid for inbound realitySettings"
+                .into(),
+        ));
+    }
+    if settings.fingerprint.is_some() {
+        return Err(Error::InvalidConfig(
+            "reality fingerprint is an outbound/client setting and is not valid for inbound realitySettings"
+                .into(),
+        ));
+    }
+    if settings.spider_x.is_some() {
+        return Err(Error::InvalidConfig(
+            "reality spiderX is an outbound/client setting and is not valid for inbound realitySettings"
+                .into(),
+        ));
+    }
+    if settings.xver.unwrap_or_default() != 0 {
+        return Err(Error::InvalidConfig(
+            "reality xver values other than 0 are not supported yet".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "reality")]
 fn build_reality_layer(
     protocol: ServerProxyConfig,
     stream_settings: &StreamSettings,
@@ -45,6 +83,7 @@ fn build_reality_layer(
     let settings = stream_settings.reality_settings.as_ref().ok_or_else(|| {
         Error::InvalidConfig("reality inbound requires realitySettings".into())
     })?;
+    ensure_reality_inbound_supported_fields(settings)?;
 
     let dest = NetLocation::from_str(&settings.dest, Some(443)).map_err(|_| {
         Error::InvalidConfig(format!(
@@ -53,9 +92,11 @@ fn build_reality_layer(
         ))
     })?;
 
-    if !matches!(dest.address(), Address::Hostname(_)) {
+    if !matches!(dest.address(), Address::Hostname(_))
+        && settings.server_names.is_empty()
+    {
         return Err(Error::InvalidConfig(
-            "reality.dest must be a hostname (ip addresses are not supported)"
+            "reality.dest may be an ip address only when realitySettings.serverNames is explicitly configured"
                 .into(),
         ));
     }
@@ -64,8 +105,16 @@ fn build_reality_layer(
         Error::InvalidConfig(format!("invalid reality privateKey: {err}"))
     })?;
 
-    let short_ids = settings
-        .short_ids
+    let configured_short_ids = if settings.short_ids.is_empty() {
+        vec![DEFAULT_REALITY_SHORT_ID]
+    } else {
+        settings
+            .short_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    };
+    let short_ids = configured_short_ids
         .iter()
         .map(|short_id| {
             decode_short_id(short_id).map_err(|err| {
@@ -84,10 +133,10 @@ fn build_reality_layer(
         parse_version_triplet(&settings.max_client_ver, "maxClientVer")?;
 
     let mut server_names = settings.server_names.clone();
-    if server_names.is_empty() {
-        if let Address::Hostname(hostname) = dest.address() {
-            server_names.push(hostname.clone());
-        }
+    if server_names.is_empty()
+        && let Address::Hostname(hostname) = dest.address()
+    {
+        server_names.push(hostname.clone());
     }
 
     Ok(ServerProxyConfig::Reality(RealityTransportConfig {

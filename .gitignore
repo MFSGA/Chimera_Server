@@ -1,4 +1,6 @@
 /target
+__pycache__/
+*.py[cod]
 *.ps1
 # set the test config file
 # config.json*
@@ -8,9 +10,15 @@ cert/
 
 config.json5
 
+.omo/
+.vscode/
+
 docs
 
 deploy/
+deploy/**/.generated/
 
 geo*
 xray
+
+.direnv/

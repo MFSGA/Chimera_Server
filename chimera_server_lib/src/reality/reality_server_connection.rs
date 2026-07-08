@@ -44,8 +44,10 @@ pub struct RealityServerConfig {
     pub private_key: [u8; 32],
     /// List of valid short IDs for authentication (8 bytes each)
     pub short_ids: Vec<[u8; 8]>,
-    /// Destination server for certificate generation
+    /// Destination server used for REALITY handshake mirroring.
     pub dest: NetLocation,
+    /// Server names accepted by the inbound and used for certificate generation.
+    pub server_names: Vec<String>,
     /// Maximum allowed time difference in milliseconds (None = no check)
     pub max_time_diff: Option<u64>,
     /// Minimum accepted client version (3 bytes: major.minor.patch)
@@ -319,8 +321,8 @@ impl RealityServerConnection {
         let client_public_key = extract_client_public_key(client_hello)?;
 
         tracing::debug!(
-            "REALITY: ClientHello received, client_random: {:?}",
-            &client_random[..8]
+            client_random_len = client_random.len(),
+            "REALITY: ClientHello received"
         );
 
         let shared_secret =
@@ -373,9 +375,11 @@ impl RealityServerConnection {
         ]) as u64;
         let client_short_id = &decrypted_session_id[8..16];
 
-        tracing::debug!("REALITY: Client version: {:?}", client_version);
-        tracing::debug!("REALITY: Client timestamp: {}", client_timestamp);
-        tracing::debug!("REALITY: Client short_id: {:02x?}", client_short_id);
+        tracing::debug!(
+            client_version_len = client_version.len(),
+            has_client_timestamp = true,
+            "REALITY: Client session metadata decrypted"
+        );
 
         let mut client_short_id_arr = [0u8; 8];
         client_short_id_arr.copy_from_slice(client_short_id);
@@ -386,12 +390,12 @@ impl RealityServerConnection {
 
         if !short_id_ok {
             tracing::warn!(
-                "REALITY: Client short_id {:02x?} not in configured list",
-                client_short_id
+                configured_short_ids = self.config.short_ids.len(),
+                "REALITY: Client short_id not in configured list"
             );
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("Invalid short_id: {:02x?}", client_short_id),
+                "Invalid short_id",
             ));
         }
 
@@ -422,45 +426,43 @@ impl RealityServerConnection {
             }
         }
 
-        if let Some(min_ver) = &self.config.min_client_version {
-            if client_version < &min_ver[..] {
-                tracing::warn!(
-                    "REALITY: Client version {:?} is below minimum {:?}",
-                    client_version,
-                    min_ver
-                );
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "Client version {:?} is below minimum {:?}",
-                        client_version, min_ver
-                    ),
-                ));
-            }
+        if let Some(min_ver) = &self.config.min_client_version
+            && client_version < &min_ver[..]
+        {
+            tracing::warn!(
+                "REALITY: Client version {:?} is below minimum {:?}",
+                client_version,
+                min_ver
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "Client version {:?} is below minimum {:?}",
+                    client_version, min_ver
+                ),
+            ));
         }
 
-        if let Some(max_ver) = &self.config.max_client_version {
-            if client_version > &max_ver[..] {
-                tracing::warn!(
-                    "REALITY: Client version {:?} is above maximum {:?}",
-                    client_version,
-                    max_ver
-                );
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "Client version {:?} is above maximum {:?}",
-                        client_version, max_ver
-                    ),
-                ));
-            }
+        if let Some(max_ver) = &self.config.max_client_version
+            && client_version > &max_ver[..]
+        {
+            tracing::warn!(
+                "REALITY: Client version {:?} is above maximum {:?}",
+                client_version,
+                max_ver
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "Client version {:?} is above maximum {:?}",
+                    client_version, max_ver
+                ),
+            ));
         }
 
         tracing::info!(
-            "REALITY: Client authentication successful - short_id: {:02x?}, version: {:?}, timestamp: {}",
-            client_short_id,
-            client_version,
-            client_timestamp
+            client_version_len = client_version.len(),
+            "REALITY: Client authentication successful"
         );
 
         let client_cipher_suites = extract_client_cipher_suites(client_hello)?;
@@ -478,9 +480,9 @@ impl RealityServerConnection {
                     )
                 })?;
         tracing::debug!(
-            "REALITY: Negotiated cipher suite {:?} (client offered: {:04x?})",
-            cipher_suite,
-            client_cipher_suites
+            ?cipher_suite,
+            client_cipher_suite_count = client_cipher_suites.len(),
+            "REALITY: Negotiated cipher suite"
         );
 
         self.handshake_state = HandshakeState::ClientHelloValidated {
@@ -575,20 +577,28 @@ impl RealityServerConnection {
             server_hello_hash.as_ref(),
         )?;
 
-        // Get destination hostname for certificate
-        let dest_hostname = match self.config.dest.address() {
-            Address::Hostname(h) => h.as_str(),
-            _ => {
-                return Err(io::Error::new(
+        // Use the first configured server name for the generated certificate.
+        // When dest is an IP address, config validation requires an explicit
+        // serverNames list so the REALITY certificate still has a hostname.
+        let cert_hostname = self
+            .config
+            .server_names
+            .first()
+            .map(String::as_str)
+            .or_else(|| match self.config.dest.address() {
+                Address::Hostname(hostname) => Some(hostname.as_str()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "REALITY requires a hostname destination",
-                ));
-            }
-        };
+                    "REALITY requires a hostname serverName for certificate generation",
+                )
+            })?;
 
         // Step 11: Generate HMAC-signed certificate
         let (cert_der, signing_key) =
-            generate_hmac_certificate(&info.auth_key, dest_hostname)?;
+            generate_hmac_certificate(&info.auth_key, cert_hostname)?;
 
         // Step 12: Build encrypted handshake messages
         let encrypted_extensions = construct_encrypted_extensions()?;
@@ -1207,6 +1217,7 @@ mod tests {
                 Address::Hostname("example.com".to_string()),
                 443,
             ),
+            server_names: vec!["example.com".to_string()],
             max_time_diff: None,
             min_client_version: None,
             max_client_version: None,
@@ -1233,6 +1244,7 @@ mod tests {
             private_key: [0u8; 32],
             short_ids: vec![[0u8; 8]],
             dest: NetLocation::new(Address::UNSPECIFIED, 443),
+            server_names: vec!["example.com".to_string()],
             max_time_diff: Some(60000),
             min_client_version: None,
             max_client_version: None,
@@ -1251,6 +1263,7 @@ mod tests {
             private_key: [0u8; 32],
             short_ids: vec![[0u8; 8]],
             dest: NetLocation::new(Address::UNSPECIFIED, 443),
+            server_names: vec!["example.com".to_string()],
             max_time_diff: None,
             min_client_version: None,
             max_client_version: None,
@@ -1353,6 +1366,7 @@ mod tests {
             private_key: [0u8; 32],
             short_ids: vec![[0u8; 8]],
             dest: NetLocation::new(Address::UNSPECIFIED, 443),
+            server_names: vec!["example.com".to_string()],
             max_time_diff: None,
             min_client_version: None,
             max_client_version: None,
@@ -1380,6 +1394,7 @@ mod tests {
             private_key: [0u8; 32],
             short_ids: vec![[0u8; 8]],
             dest: NetLocation::new(Address::UNSPECIFIED, 443),
+            server_names: vec!["example.com".to_string()],
             max_time_diff: None,
             min_client_version: None,
             max_client_version: None,

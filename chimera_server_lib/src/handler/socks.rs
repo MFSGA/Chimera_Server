@@ -45,13 +45,19 @@ const UDP_BUFFER_SIZE: usize = 2 * 1024 * 1024;
 pub struct SocksTcpServerHandler {
     accounts: SocksUserStore,
     inbound_tag: String,
+    udp_enabled: bool,
 }
 
 impl SocksTcpServerHandler {
-    pub fn new(accounts: SocksUserStore, inbound_tag: &str) -> Self {
+    pub fn new(
+        accounts: SocksUserStore,
+        inbound_tag: &str,
+        udp_enabled: bool,
+    ) -> Self {
         Self {
             accounts,
             inbound_tag: inbound_tag.to_string(),
+            udp_enabled,
         }
     }
 
@@ -124,7 +130,17 @@ impl TcpServerHandler for SocksTcpServerHandler {
                     traffic_context,
                 })
             }
-            CMD_UDP_ASSOCIATE => handle_udp_associate(server_stream).await,
+            CMD_UDP_ASSOCIATE if self.udp_enabled => {
+                handle_udp_associate(server_stream).await
+            }
+            CMD_UDP_ASSOCIATE => {
+                send_command_response(&mut server_stream, REP_COMMAND_NOT_SUPPORTED)
+                    .await?;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "socks udp associate is disabled by config",
+                ))
+            }
             _ => {
                 send_command_response(&mut server_stream, REP_COMMAND_NOT_SUPPORTED)
                     .await?;
@@ -161,8 +177,8 @@ async fn negotiate_method(
     let mut methods = vec![0u8; method_len];
     stream.read_exact(&mut methods).await?;
 
-    let supports_no_auth = methods.iter().any(|&m| m == METHOD_NO_AUTH);
-    let supports_password = methods.iter().any(|&m| m == METHOD_USERNAME_PASSWORD);
+    let supports_no_auth = methods.contains(&METHOD_NO_AUTH);
+    let supports_password = methods.contains(&METHOD_USERNAME_PASSWORD);
 
     let selected = if has_accounts {
         if supports_password {
@@ -323,7 +339,7 @@ async fn read_address_from_stream(
 
 /// Handle SOCKS5 UDP ASSOCIATE command.
 ///
-/// Takes ownership of `server_stream` for use in the spawned UDP relay task.
+/// Takes ownership of `server_stream` while the UDP relay task is active.
 async fn handle_udp_associate(
     mut server_stream: Box<dyn AsyncStream>,
 ) -> std::io::Result<TcpServerSetupResult> {
@@ -565,12 +581,7 @@ fn parse_udp_address(
             let addr = format!("{}:{}", domain_str, port)
                 .to_socket_addrs()?
                 .next()
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "domain resolution failed",
-                    )
-                })?;
+                .ok_or_else(|| std::io::Error::other("domain resolution failed"))?;
             Ok((addr, offset + 1 + 1 + domain_len + 2))
         }
         _ => Err(std::io::Error::new(

@@ -77,7 +77,7 @@ impl VmessTcpServerHandler {
         user_label: &str,
     ) -> Self {
         let mut user_id_bytes = parse_uuid(user_id);
-        user_id_bytes.extend(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
+        user_id_bytes.extend(b"543c72c6-a176-4b12-9d69-e02fa81a5b30");
         let instruction_key: [u8; 16] = compute_md5(&user_id_bytes);
 
         let derived_key =

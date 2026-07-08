@@ -31,7 +31,7 @@ const BACKUP_TAG: &str = "backup";
 const TEST_USERNAME: &str = "grpc-e2e-user";
 const TEST_PASSWORD: &str = "grpc-e2e-pass";
 const VLESS_ADDED_USER_EMAIL: &str = "grpc-vless-added-user@example.com";
-const VLESS_ADDED_USER_ID: &str = "7f7f0d6e-1b98-4700-9f5f-22644193f520";
+const VLESS_ADDED_USER_ID: &str = "081bcfc5-cb51-4400-bed9-f3f3ecf48e3b";
 
 const PATH_STATS_GET_STATS: &str = "/xray.app.stats.command.StatsService/GetStats";
 const PATH_STATS_GET_STATS_ONLINE: &str =

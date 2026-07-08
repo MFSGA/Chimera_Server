@@ -93,7 +93,7 @@ mod tests {
         let (_, public_key) = generate_keypair().unwrap();
         let opts: MihomoRealityOpts = serde_json::from_value(serde_json::json!({
             "public-key": public_key,
-            "short-id": "6ba85179e30d4fc2",
+            "short-id": "4ac97aaf8b9b0356",
             "server-name": "www.apple.com",
             "cipher-suites": ["TLS_CHACHA20_POLY1305_SHA256"]
         }))

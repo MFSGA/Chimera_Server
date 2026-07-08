@@ -43,10 +43,10 @@ import time
 
 PORT_RANGE = (30000, 40000)
 SYNC_BYTE = b"\xAC"
-UUID = "114cb5a6-3787-4357-a5da-69b5782cb74f"
+UUID = "3ac9b383-75a1-431c-8184-106c80eb2273"
 REALITY_SERVER_NAME = "www.apple.com"
-REALITY_PUBLIC_KEY = "oam2vVkLpUOHaCHVhLOiKAEg_M74vGueBruUabgzsks"
-REALITY_SHORT_ID = "6ba85179e30d4fc2"
+REALITY_PUBLIC_KEY = "lpaMu0U01fKbRO9mgkSiOArWZz4V0TRW7pR543Pm9Xg"
+REALITY_SHORT_ID = "4ac97aaf8b9b0356"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.join(SCRIPT_DIR, "configs")
 

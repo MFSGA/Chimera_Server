@@ -15,6 +15,49 @@ use crate::util::option::OneOrSome;
 
 #[cfg(feature = "ws")]
 use super::ws::WebsocketServerConfig;
+#[cfg(feature = "ws")]
+fn websocket_server_config(
+    ws_setting: crate::config::WsSettings,
+    protocol: ServerProxyConfig,
+) -> WebsocketServerConfig {
+    let mut matching_headers = std::collections::HashMap::new();
+    let mut host = ws_setting
+        .host
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    for (key, value) in ws_setting.headers {
+        let key = key.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+        if key == "host" {
+            if host.is_none() {
+                let value = value.trim().to_string();
+                if !value.is_empty() {
+                    host = Some(value);
+                }
+            }
+        } else {
+            matching_headers.insert(key, value);
+        }
+    }
+
+    if let Some(host) = host {
+        matching_headers.insert("host".to_string(), host);
+    }
+
+    WebsocketServerConfig {
+        matching_path: ws_setting.path,
+        matching_headers: if matching_headers.is_empty() {
+            None
+        } else {
+            Some(matching_headers)
+        },
+        protocol,
+    }
+}
+
 use super::{
     quic::ServerQuicConfig,
     types::{ServerConfig, ServerProxyConfig},
@@ -22,7 +65,7 @@ use super::{
 
 #[cfg(feature = "hysteria")]
 use collectors::collect_hysteria2_settings;
-use collectors::{collect_socks_accounts, collect_xhttp_settings};
+use collectors::{collect_socks_settings, collect_xhttp_settings};
 
 #[cfg(feature = "tuic")]
 use collectors::collect_tuic_settings;
@@ -39,6 +82,18 @@ struct DokodemoDoorSettings {
     port: Option<u16>,
     #[serde(default)]
     follow_redirect: bool,
+}
+
+#[cfg(feature = "vless")]
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VlessInboundSettings {
+    #[serde(default)]
+    decryption: Option<String>,
+    #[serde(default)]
+    flow: Option<String>,
+    #[serde(default)]
+    fallbacks: Vec<serde_json::Value>,
 }
 
 #[cfg(feature = "vless")]
@@ -61,6 +116,12 @@ fn has_non_vision_vless_flow(
     users: &[crate::config::server_config::VlessUser],
 ) -> bool {
     users.iter().any(|user| user.flow != "xtls-rprx-vision")
+}
+
+fn planned_unsupported_protocol_error(protocol: &str) -> Error {
+    Error::InvalidConfig(format!(
+        "protocol={protocol} is recognized but not supported in this stage"
+    ))
 }
 
 impl TryFrom<InboudItem> for ServerConfig {
@@ -87,29 +148,6 @@ impl TryFrom<InboudItem> for ServerConfig {
             ))
         })?;
         let bind_location = BindLocation::Address(NetLocation::new(address, port));
-
-        #[cfg(feature = "vless")]
-        let vless_users = settings
-            .as_ref()
-            .and_then(|setting| setting.clients())
-            .map(|clients| {
-                clients
-                    .into_iter()
-                    .map(|client| {
-                        validate_vless_flow(&client.flow)?;
-                        Ok(crate::config::server_config::VlessUser {
-                            user_id: client.id.clone(),
-                            user_label: if client.email.is_empty() {
-                                client.id
-                            } else {
-                                client.email
-                            },
-                            flow: client.flow,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, Error>>()
-            })
-            .transpose()?;
 
         match protocol {
             Protocol::DokodemoDoor => {
@@ -139,17 +177,41 @@ impl TryFrom<InboudItem> for ServerConfig {
                     },
                 };
 
-                if let Some(stream_setting) = stream_settings.as_ref() {
-                    protocol = apply_security_layers(protocol, stream_setting)?;
-                }
+                let transport = match stream_settings.as_ref().map(|settings| {
+                    settings.network.trim().to_ascii_lowercase()
+                }) {
+                    Some(network) if network == "udp" => {
+                        if let Some(stream_setting) = stream_settings.as_ref()
+                            && stream_setting.security.as_deref().unwrap_or("none") != "none"
+                        {
+                            return Err(Error::InvalidConfig(
+                                "dokodemo-door udp transport does not support streamSettings.security"
+                                    .into(),
+                            ));
+                        }
+                        Transport::Udp
+                    }
+                    Some(network) if network.is_empty() || network == "tcp" => {
+                        if let Some(stream_setting) = stream_settings.as_ref() {
+                            protocol = apply_security_layers(protocol, stream_setting)?;
+                        }
+                        Transport::Tcp
+                    }
+                    Some(network) => {
+                        return Err(Error::InvalidConfig(format!(
+                            "dokodemo-door streamSettings.network={network} is not supported"
+                        )));
+                    }
+                    None => Transport::Tcp,
+                };
 
-                return Ok(ServerConfig {
+                Ok(ServerConfig {
                     tag,
                     bind_location,
                     protocol,
-                    transport: Transport::Tcp,
+                    transport,
                     quic_settings: None,
-                });
+                })
             }
             #[cfg(feature = "hysteria")]
             Protocol::Hysteria2 => {
@@ -205,11 +267,73 @@ impl TryFrom<InboudItem> for ServerConfig {
             }
             #[cfg(feature = "vless")]
             Protocol::Vless => {
-                let users = vless_users.clone().ok_or_else(|| {
-                    Error::InvalidConfig(
-                        "vless inbound requires at least one client".into(),
-                    )
-                })?;
+                let vless_settings = settings
+                    .as_ref()
+                    .map(|value| value.deserialize::<VlessInboundSettings>())
+                    .transpose()
+                    .map_err(|err| {
+                        Error::InvalidConfig(format!("invalid vless settings: {err}"))
+                    })?
+                    .unwrap_or_default();
+                let decryption = vless_settings
+                    .decryption
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        Error::InvalidConfig(
+                            "vless settings.decryption must be explicitly set to none".into(),
+                        )
+                    })?
+                    .to_ascii_lowercase();
+                if decryption != "none" {
+                    return Err(Error::InvalidConfig(format!(
+                        "vless settings.decryption must be none, got {decryption}"
+                    )));
+                }
+                if !vless_settings.fallbacks.is_empty() {
+                    return Err(Error::InvalidConfig(
+                        "vless settings.fallbacks is not supported yet".into(),
+                    ));
+                }
+                let settings_flow = vless_settings
+                    .flow
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("");
+                validate_vless_flow(settings_flow)?;
+
+                let users = settings
+                    .as_ref()
+                    .and_then(|setting| setting.clients())
+                    .map(|clients| {
+                        clients
+                            .into_iter()
+                            .map(|client| {
+                                let flow = if client.flow.trim().is_empty() {
+                                    settings_flow.to_string()
+                                } else {
+                                    client.flow
+                                };
+                                validate_vless_flow(&flow)?;
+                                Ok(crate::config::server_config::VlessUser {
+                                    user_id: client.id.clone(),
+                                    user_label: if client.email.is_empty() {
+                                        client.id
+                                    } else {
+                                        client.email
+                                    },
+                                    flow,
+                                })
+                            })
+                            .collect::<Result<Vec<_>, Error>>()
+                    })
+                    .transpose()?
+                    .ok_or_else(|| {
+                        Error::InvalidConfig(
+                            "vless inbound requires at least one client".into(),
+                        )
+                    })?;
                 let uses_vision = has_vless_vision_flow(&users);
                 let mixes_plain_and_vision =
                     uses_vision && has_non_vision_vless_flow(&users);
@@ -246,9 +370,9 @@ impl TryFrom<InboudItem> for ServerConfig {
                 }
 
                 #[cfg(feature = "ws")]
-                if !uses_xhttp {
-                    if let Some(stream_setting) = stream_settings.as_ref() {
-                        if let Some(ws_setting) = stream_setting.ws_settings.clone() {
+                if !uses_xhttp
+                    && let Some(stream_setting) = stream_settings.as_ref()
+                        && let Some(ws_setting) = stream_setting.ws_settings.clone() {
                             if uses_vision {
                                 return Err(Error::InvalidConfig(
                                     "xtls-rprx-vision does not support websocket transport"
@@ -258,16 +382,10 @@ impl TryFrom<InboudItem> for ServerConfig {
                             tracing::info!("use websocket");
                             protocol = ServerProxyConfig::Websocket {
                                 targets: Box::new(OneOrSome::One(
-                                    WebsocketServerConfig {
-                                        matching_path: ws_setting.path,
-                                        matching_headers: None,
-                                        protocol,
-                                    },
+                                    websocket_server_config(ws_setting, protocol),
                                 )),
                             };
                         }
-                    }
-                }
 
                 if let Some(stream_setting) = stream_settings.as_ref() {
                     if uses_xhttp {
@@ -300,13 +418,13 @@ impl TryFrom<InboudItem> for ServerConfig {
                     }
                 }
 
-                return Ok(ServerConfig {
+                Ok(ServerConfig {
                     tag,
                     bind_location,
                     protocol,
                     transport: Transport::Tcp,
                     quic_settings: None,
-                });
+                })
             }
             #[cfg(feature = "vmess")]
             Protocol::Vmess => {
@@ -327,27 +445,25 @@ impl TryFrom<InboudItem> for ServerConfig {
                         Ok(crate::config::server_config::VmessUser {
                             user_id: client.id,
                             user_label,
-                            cipher: String::new(),
+                            cipher: client
+                                .security
+                                .filter(|value| !value.trim().is_empty())
+                                .unwrap_or_else(|| "auto".to_string()),
                         })
                     })
                     .collect::<Result<Vec<_>, Error>>()?;
                 let mut protocol = ServerProxyConfig::Vmess { users };
 
                 #[cfg(feature = "ws")]
-                if let Some(stream_setting) = stream_settings.as_ref() {
-                    if let Some(ws_setting) = stream_setting.ws_settings.clone() {
+                if let Some(stream_setting) = stream_settings.as_ref()
+                    && let Some(ws_setting) = stream_setting.ws_settings.clone() {
                         tracing::info!("use websocket");
                         protocol = ServerProxyConfig::Websocket {
                             targets: Box::new(OneOrSome::One(
-                                WebsocketServerConfig {
-                                    matching_path: ws_setting.path,
-                                    matching_headers: None,
-                                    protocol,
-                                },
+                                websocket_server_config(ws_setting, protocol),
                             )),
                         };
                     }
-                }
 
                 if let Some(stream_setting) = stream_settings.as_ref() {
                     protocol = apply_security_layers(protocol, stream_setting)?;
@@ -375,20 +491,15 @@ impl TryFrom<InboudItem> for ServerConfig {
                 };
 
                 #[cfg(feature = "ws")]
-                if let Some(stream_setting) = stream_settings.as_ref() {
-                    if let Some(ws_setting) = stream_setting.ws_settings.clone() {
+                if let Some(stream_setting) = stream_settings.as_ref()
+                    && let Some(ws_setting) = stream_setting.ws_settings.clone() {
                         tracing::info!("use websocket");
                         protocol = ServerProxyConfig::Websocket {
                             targets: Box::new(OneOrSome::One(
-                                WebsocketServerConfig {
-                                    matching_path: ws_setting.path,
-                                    matching_headers: None,
-                                    protocol,
-                                },
+                                websocket_server_config(ws_setting, protocol),
                             )),
                         };
                     }
-                }
 
                 if let Some(stream_setting) = stream_settings.as_ref() {
                     protocol = apply_security_layers(protocol, stream_setting)?;
@@ -414,8 +525,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                     Error::InvalidConfig("tuic inbound requires tlsSettings".into())
                 })?;
                 let certificate = tls_settings
-                    .certificates
-                    .get(0)
+                    .certificates.first()
                     .ok_or_else(|| {
                         Error::InvalidConfig(
                             "tuic inbound requires at least one certificate".into(),
@@ -458,28 +568,32 @@ impl TryFrom<InboudItem> for ServerConfig {
                 ))
             }
 
+            Protocol::Http => Err(planned_unsupported_protocol_error("http")),
+            Protocol::Mixed => Err(planned_unsupported_protocol_error("mixed")),
+            Protocol::Shadowsocks => {
+                Err(planned_unsupported_protocol_error("shadowsocks"))
+            }
+
             Protocol::Socks => {
                 let settings = settings.ok_or_else(|| {
                     Error::InvalidConfig("socks inbound requires settings".into())
                 })?;
-                let accounts = collect_socks_accounts(settings)?;
-                let mut protocol = ServerProxyConfig::Socks { accounts };
+                let (accounts, udp_enabled) = collect_socks_settings(settings)?;
+                let mut protocol = ServerProxyConfig::Socks {
+                    accounts,
+                    udp_enabled,
+                };
 
                 #[cfg(feature = "ws")]
-                if let Some(stream_setting) = stream_settings.as_ref() {
-                    if let Some(ws_setting) = stream_setting.ws_settings.clone() {
+                if let Some(stream_setting) = stream_settings.as_ref()
+                    && let Some(ws_setting) = stream_setting.ws_settings.clone() {
                         tracing::info!("use websocket");
                         protocol = ServerProxyConfig::Websocket {
                             targets: Box::new(OneOrSome::One(
-                                WebsocketServerConfig {
-                                    matching_path: ws_setting.path,
-                                    matching_headers: None,
-                                    protocol,
-                                },
+                                websocket_server_config(ws_setting, protocol),
                             )),
                         };
                     }
-                }
 
                 if let Some(stream_setting) = stream_settings.as_ref() {
                     protocol = apply_security_layers(protocol, stream_setting)?;
@@ -501,6 +615,135 @@ impl TryFrom<InboudItem> for ServerConfig {
 mod tests {
     use super::*;
 
+    fn inbound_for_protocol(protocol: &str) -> InboudItem {
+        serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": protocol,
+            "tag": format!("{protocol}-planned")
+        }))
+        .expect("valid inbound item")
+    }
+
+    #[test]
+    fn planned_http_inbound_returns_clear_unsupported_error() {
+        let err = ServerConfig::try_from(inbound_for_protocol("http"))
+            .expect_err("http inbound is planned but unsupported");
+        assert!(err.to_string().contains(
+            "protocol=http is recognized but not supported in this stage"
+        ));
+    }
+
+    #[test]
+    fn planned_mixed_inbound_returns_clear_unsupported_error() {
+        let err = ServerConfig::try_from(inbound_for_protocol("mixed"))
+            .expect_err("mixed inbound is planned but unsupported");
+        assert!(err.to_string().contains(
+            "protocol=mixed is recognized but not supported in this stage"
+        ));
+    }
+
+    #[test]
+    fn planned_shadowsocks_inbound_returns_clear_unsupported_error() {
+        let err = ServerConfig::try_from(inbound_for_protocol("shadowsocks"))
+            .expect_err("shadowsocks inbound is planned but unsupported");
+        assert!(err.to_string().contains(
+            "protocol=shadowsocks is recognized but not supported in this stage"
+        ));
+    }
+
+    #[test]
+    fn dokodemo_door_udp_network_builds_udp_transport() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "dokodemo-door",
+            "tag": "dokodemo-udp",
+            "settings": {
+                "address": "127.0.0.1",
+                "port": 5353
+            },
+            "streamSettings": {
+                "network": "udp"
+            }
+        }))
+        .expect("valid dokodemo udp inbound item");
+
+        let config =
+            ServerConfig::try_from(inbound).expect("dokodemo udp should build");
+        assert_eq!(config.transport, Transport::Udp);
+        match config.protocol {
+            ServerProxyConfig::DokodemoDoor { config } => {
+                assert_eq!(config.target.port(), 5353);
+            }
+            other => panic!("expected dokodemo-door, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dokodemo_door_rejects_udp_security_layers() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "dokodemo-door",
+            "tag": "dokodemo-udp-tls",
+            "settings": {
+                "address": "127.0.0.1",
+                "port": 5353
+            },
+            "streamSettings": {
+                "network": "udp",
+                "security": "tls"
+            }
+        }))
+        .expect("valid dokodemo udp inbound item");
+
+        let err = ServerConfig::try_from(inbound)
+            .expect_err("udp security layers should be rejected");
+        assert!(err.to_string().contains(
+            "dokodemo-door udp transport does not support streamSettings.security"
+        ));
+    }
+
+    #[cfg(all(feature = "reality", feature = "vless"))]
+    fn vless_reality_inbound(reality_settings: serde_json::Value) -> InboudItem {
+        serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-reality-test",
+            "settings": {
+                "clients": [
+                    {
+                        "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+                        "email": "user@example.com"
+                    }
+                ],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "security": "reality",
+                "realitySettings": reality_settings
+            }
+        }))
+        .expect("valid vless reality inbound item")
+    }
+
+    #[cfg(all(feature = "reality", feature = "vless"))]
+    fn base_reality_settings() -> serde_json::Value {
+        serde_json::json!({
+            "show": false,
+            "dest": "www.apple.com:443",
+            "xver": 0,
+            "serverNames": ["www.apple.com"],
+            "privateKey": "dnprBfWdJgo5yaGClSaZ12TZW-SiD988YmjDKOhXLKI",
+            "shortIds": ["4ac97aaf8b9b0356"],
+            "maxTimeDiff": 0,
+            "minClient": "",
+            "maxClient": ""
+        })
+    }
+
     #[cfg(feature = "vless")]
     #[test]
     fn vless_builder_preserves_multiple_clients() {
@@ -512,11 +755,11 @@ mod tests {
             "settings": {
                 "clients": [
                     {
-                        "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+                        "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
                         "email": "user-a@example.com"
                     },
                     {
-                        "id": "9d2d3c52-a386-4f2f-a507-0ca29f8d13f0",
+                        "id": "e041e73e-a0a0-49f5-9754-6401aa621fb7",
                         "email": "user-b@example.com"
                     }
                 ],
@@ -531,10 +774,10 @@ mod tests {
         match config.protocol {
             ServerProxyConfig::Vless { users } => {
                 assert_eq!(users.len(), 2);
-                assert_eq!(users[0].user_id, "114cb5a6-3787-4357-a5da-69b5782cb74f");
+                assert_eq!(users[0].user_id, "3ac9b383-75a1-431c-8184-106c80eb2273");
                 assert_eq!(users[0].user_label, "user-a@example.com");
                 assert_eq!(users[0].flow, "");
-                assert_eq!(users[1].user_id, "9d2d3c52-a386-4f2f-a507-0ca29f8d13f0");
+                assert_eq!(users[1].user_id, "e041e73e-a0a0-49f5-9754-6401aa621fb7");
                 assert_eq!(users[1].user_label, "user-b@example.com");
                 assert_eq!(users[1].flow, "");
             }
@@ -553,7 +796,7 @@ mod tests {
             "settings": {
                 "clients": [
                     {
-                        "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+                        "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
                         "email": "vision-user@example.com",
                         "flow": "xtls-rprx-vision"
                     }
@@ -567,8 +810,8 @@ mod tests {
                     "dest": "www.apple.com:443",
                     "xver": 0,
                     "serverNames": ["www.apple.com"],
-                    "privateKey": "CAe1AlfoOhzR5zwWRYxUSUm2qdzWXM0qDJzbOWUvTno",
-                    "shortIds": ["6ba85179e30d4fc2"],
+                    "privateKey": "dnprBfWdJgo5yaGClSaZ12TZW-SiD988YmjDKOhXLKI",
+                    "shortIds": ["4ac97aaf8b9b0356"],
                     "maxTimeDiff": 0,
                     "minClient": "",
                     "maxClient": ""
@@ -617,7 +860,7 @@ mod tests {
             "settings": {
                 "clients": [
                     {
-                        "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+                        "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
                         "email": "user@example.com"
                     }
                 ],
@@ -630,8 +873,8 @@ mod tests {
                     "dest": "www.apple.com:443",
                     "xver": 0,
                     "serverNames": ["www.apple.com"],
-                    "privateKey": "CAe1AlfoOhzR5zwWRYxUSUm2qdzWXM0qDJzbOWUvTno",
-                    "shortIds": ["6ba85179e30d4fc2"],
+                    "privateKey": "dnprBfWdJgo5yaGClSaZ12TZW-SiD988YmjDKOhXLKI",
+                    "shortIds": ["4ac97aaf8b9b0356"],
                     "cipherSuites": [
                         "TLS_CHACHA20_POLY1305_SHA256",
                         "TLS_AES_128_GCM_SHA256"
@@ -665,6 +908,136 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "reality", feature = "vless"))]
+    #[test]
+    fn vless_reality_defaults_missing_short_ids_to_zero() {
+        let mut settings = base_reality_settings();
+        settings
+            .as_object_mut()
+            .expect("reality settings object")
+            .remove("shortIds");
+
+        let config = ServerConfig::try_from(vless_reality_inbound(settings))
+            .expect("missing shortIds should use shoes-compatible default");
+
+        match config.protocol {
+            ServerProxyConfig::Reality(reality) => {
+                assert_eq!(reality.short_ids, vec![[0u8; 8]]);
+            }
+            other => panic!("expected reality protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(all(feature = "reality", feature = "vless"))]
+    #[test]
+    fn vless_reality_rejects_invalid_client_version_shape() {
+        let mut settings = base_reality_settings();
+        settings["minClient"] = serde_json::json!("1.8");
+
+        let err = ServerConfig::try_from(vless_reality_inbound(settings))
+            .expect_err("minClient without patch component should fail");
+        assert!(
+            err.to_string()
+                .contains("minClientVer must use major.minor.patch format")
+        );
+    }
+
+    #[cfg(all(feature = "reality", feature = "vless"))]
+    #[test]
+    fn vless_reality_rejects_outbound_only_settings() {
+        let mut settings = base_reality_settings();
+        settings["publicKey"] = serde_json::json!("client-side-public-key");
+
+        let err = ServerConfig::try_from(vless_reality_inbound(settings))
+            .expect_err("publicKey is not an inbound setting");
+        assert!(
+            err.to_string()
+                .contains("reality publicKey is an outbound/client setting")
+        );
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn vless_builder_inherits_settings_flow() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-settings-flow",
+            "settings": {
+                "flow": "xtls-rprx-vision",
+                "clients": [
+                    {
+                        "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+                        "email": "inherited-flow@example.com"
+                    }
+                ],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "security": "reality",
+                "realitySettings": {
+                    "show": false,
+                    "dest": "www.apple.com:443",
+                    "xver": 0,
+                    "serverNames": ["www.apple.com"],
+                    "privateKey": "dnprBfWdJgo5yaGClSaZ12TZW-SiD988YmjDKOhXLKI",
+                    "shortIds": ["4ac97aaf8b9b0356"],
+                    "maxTimeDiff": 0,
+                    "minClient": "",
+                    "maxClient": ""
+                }
+            }
+        }))
+        .expect("valid vless inbound item");
+
+        let config = ServerConfig::try_from(inbound)
+            .expect("vless inbound config should build");
+
+        match config.protocol {
+            ServerProxyConfig::Reality(reality) => match reality.inner.as_ref() {
+                ServerProxyConfig::Vless { users } => {
+                    assert_eq!(users.len(), 1);
+                    assert_eq!(users[0].flow, "xtls-rprx-vision");
+                }
+                other => {
+                    panic!("expected vless protocol inside reality, got {other:?}")
+                }
+            },
+            other => panic!("expected reality protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn vless_builder_rejects_unknown_settings_flow() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-invalid-settings-flow",
+            "settings": {
+                "flow": "xtls-rprx-vision-udp443",
+                "clients": [
+                    {
+                        "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+                        "email": "bad-settings-flow@example.com"
+                    }
+                ],
+                "decryption": "none"
+            }
+        }))
+        .expect("valid vless inbound item");
+
+        let err = ServerConfig::try_from(inbound)
+            .expect_err("unsupported vless settings flow should fail validation");
+        assert!(
+            err.to_string().contains(
+                "vless clients.flow doesn't support xtls-rprx-vision-udp443"
+            )
+        );
+    }
+
     #[cfg(feature = "vless")]
     #[test]
     fn vless_builder_rejects_unknown_client_flow() {
@@ -676,7 +1049,7 @@ mod tests {
             "settings": {
                 "clients": [
                     {
-                        "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+                        "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
                         "email": "bad-flow@example.com",
                         "flow": "xtls-rprx-vision-udp443"
                     }
@@ -706,7 +1079,7 @@ mod tests {
             "settings": {
                 "clients": [
                     {
-                        "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+                        "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
                         "email": "vision-user@example.com",
                         "flow": "xtls-rprx-vision"
                     }
@@ -734,11 +1107,11 @@ mod tests {
             "settings": {
                 "clients": [
                     {
-                        "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+                        "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
                         "email": "plain-user@example.com"
                     },
                     {
-                        "id": "9d2d3c52-a386-4f2f-a507-0ca29f8d13f0",
+                        "id": "e041e73e-a0a0-49f5-9754-6401aa621fb7",
                         "email": "vision-user@example.com",
                         "flow": "xtls-rprx-vision"
                     }
@@ -752,8 +1125,8 @@ mod tests {
                     "dest": "www.apple.com:443",
                     "xver": 0,
                     "serverNames": ["www.apple.com"],
-                    "privateKey": "CAe1AlfoOhzR5zwWRYxUSUm2qdzWXM0qDJzbOWUvTno",
-                    "shortIds": ["6ba85179e30d4fc2"],
+                    "privateKey": "dnprBfWdJgo5yaGClSaZ12TZW-SiD988YmjDKOhXLKI",
+                    "shortIds": ["4ac97aaf8b9b0356"],
                     "maxTimeDiff": 0,
                     "minClient": "",
                     "maxClient": ""
@@ -780,7 +1153,7 @@ mod tests {
             "settings": {
                 "clients": [
                     {
-                        "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+                        "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
                         "email": "vision-user@example.com",
                         "flow": "xtls-rprx-vision"
                     }
@@ -822,7 +1195,7 @@ mod tests {
             "settings": {
                 "clients": [
                     {
-                        "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+                        "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
                         "email": "user@example.com"
                     }
                 ],
@@ -836,8 +1209,8 @@ mod tests {
                     "dest": "www.apple.com:443",
                     "xver": 0,
                     "serverNames": ["www.apple.com"],
-                    "privateKey": "CAe1AlfoOhzR5zwWRYxUSUm2qdzWXM0qDJzbOWUvTno",
-                    "shortIds": ["6ba85179e30d4fc2"],
+                    "privateKey": "dnprBfWdJgo5yaGClSaZ12TZW-SiD988YmjDKOhXLKI",
+                    "shortIds": ["4ac97aaf8b9b0356"],
                     "maxTimeDiff": 0,
                     "minClient": "",
                     "maxClient": ""
@@ -863,6 +1236,254 @@ mod tests {
                 other => panic!("expected xhttp inside reality, got {other:?}"),
             },
             other => panic!("expected reality protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(all(feature = "reality", feature = "vless"))]
+    #[test]
+    fn reality_settings_accepts_ip_dest_with_explicit_server_names() {
+        let mut settings = base_reality_settings();
+        let settings_object =
+            settings.as_object_mut().expect("reality settings object");
+        settings_object
+            .insert("dest".to_string(), serde_json::json!("127.0.0.1:9443"));
+        settings_object.insert(
+            "serverNames".to_string(),
+            serde_json::json!(["www.apple.com"]),
+        );
+
+        let config = ServerConfig::try_from(vless_reality_inbound(settings))
+            .expect("ip dest with explicit serverNames should build reality config");
+
+        match config.protocol {
+            ServerProxyConfig::Reality(reality) => {
+                assert_eq!(reality.dest.to_string(), "127.0.0.1:9443");
+                assert_eq!(reality.server_names, vec!["www.apple.com".to_string()]);
+            }
+            other => panic!("expected reality protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(all(feature = "reality", feature = "vless"))]
+    #[test]
+    fn reality_settings_rejects_ip_dest_without_explicit_server_names() {
+        let mut settings = base_reality_settings();
+        let settings_object =
+            settings.as_object_mut().expect("reality settings object");
+        settings_object
+            .insert("dest".to_string(), serde_json::json!("127.0.0.1:9443"));
+        settings_object.remove("serverNames");
+
+        let err = ServerConfig::try_from(vless_reality_inbound(settings))
+            .expect_err("ip dest without serverNames should fail");
+        assert!(err.to_string().contains(
+            "reality.dest may be an ip address only when realitySettings.serverNames is explicitly configured"
+        ));
+    }
+
+    #[cfg(all(feature = "reality", feature = "vless"))]
+    #[test]
+    fn reality_settings_accepts_xray_target_alias() {
+        let mut settings = base_reality_settings();
+        let settings_object =
+            settings.as_object_mut().expect("reality settings object");
+        settings_object.remove("dest");
+        settings_object.insert(
+            "target".to_string(),
+            serde_json::json!("www.example.com:8443"),
+        );
+
+        let config = ServerConfig::try_from(vless_reality_inbound(settings))
+            .expect("target alias should build reality config");
+
+        match config.protocol {
+            ServerProxyConfig::Reality(reality) => {
+                assert_eq!(reality.dest.to_string(), "www.example.com:8443");
+            }
+            other => panic!("expected reality protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn vless_builder_requires_explicit_none_decryption() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "vless",
+            "tag": "vless-missing-decryption",
+            "settings": {
+                "clients": [{
+                    "id": "3ac9b383-75a1-431c-8184-106c80eb2273"
+                }]
+            }
+        }))
+        .expect("valid inbound json shape");
+
+        let err = ServerConfig::try_from(inbound)
+            .expect_err("missing vless decryption should fail");
+        assert!(
+            err.to_string().contains(
+                "vless settings.decryption must be explicitly set to none"
+            )
+        );
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn vless_builder_rejects_non_none_decryption() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10001,
+            "protocol": "vless",
+            "tag": "vless-invalid-decryption",
+            "settings": {
+                "clients": [{
+                    "id": "3ac9b383-75a1-431c-8184-106c80eb2273"
+                }],
+                "decryption": "aes-128-gcm"
+            }
+        }))
+        .expect("valid inbound json shape");
+
+        let err = ServerConfig::try_from(inbound)
+            .expect_err("non-none vless decryption should fail");
+        assert!(
+            err.to_string()
+                .contains("vless settings.decryption must be none")
+        );
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn vless_builder_rejects_fallbacks_until_implemented() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10002,
+            "protocol": "vless",
+            "tag": "vless-fallbacks",
+            "settings": {
+                "clients": [{
+                    "id": "3ac9b383-75a1-431c-8184-106c80eb2273"
+                }],
+                "decryption": "none",
+                "fallbacks": [{ "dest": "127.0.0.1:8080" }]
+            }
+        }))
+        .expect("valid inbound json shape");
+
+        let err = ServerConfig::try_from(inbound)
+            .expect_err("vless fallbacks should fail explicitly");
+        assert!(
+            err.to_string()
+                .contains("vless settings.fallbacks is not supported yet")
+        );
+    }
+
+    #[cfg(feature = "vmess")]
+    #[test]
+    fn vmess_builder_defaults_security_to_auto() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10003,
+            "protocol": "vmess",
+            "tag": "vmess-auto-security",
+            "settings": {
+                "clients": [{
+                    "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+                    "email": "vmess@example.com"
+                }]
+            }
+        }))
+        .expect("valid vmess inbound item");
+
+        let config = ServerConfig::try_from(inbound)
+            .expect("vmess inbound config should build");
+
+        match config.protocol {
+            ServerProxyConfig::Vmess { users } => {
+                assert_eq!(users[0].cipher, "auto");
+            }
+            other => panic!("expected vmess protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "vmess")]
+    #[test]
+    fn vmess_builder_preserves_client_security() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10004,
+            "protocol": "vmess",
+            "tag": "vmess-security",
+            "settings": {
+                "clients": [{
+                    "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+                    "security": "aes-128-gcm"
+                }]
+            }
+        }))
+        .expect("valid vmess inbound item");
+
+        let config = ServerConfig::try_from(inbound)
+            .expect("vmess inbound config should build");
+
+        match config.protocol {
+            ServerProxyConfig::Vmess { users } => {
+                assert_eq!(users[0].cipher, "aes-128-gcm");
+            }
+            other => panic!("expected vmess protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(all(feature = "vless", feature = "ws"))]
+    #[test]
+    fn websocket_settings_headers_enter_matching_config() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10005,
+            "protocol": "vless",
+            "tag": "vless-ws-headers",
+            "settings": {
+                "clients": [{
+                    "id": "3ac9b383-75a1-431c-8184-106c80eb2273"
+                }],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "ws",
+                "wsSettings": {
+                    "host": "example.com",
+                    "path": "/ws",
+                    "headers": {
+                        "Host": "edge.example.com",
+                        "X-Test": "ok"
+                    }
+                }
+            }
+        }))
+        .expect("valid vless websocket inbound item");
+
+        let config = ServerConfig::try_from(inbound)
+            .expect("vless websocket inbound config should build");
+
+        match config.protocol {
+            ServerProxyConfig::Websocket { targets } => match *targets {
+                OneOrSome::One(target) => {
+                    assert_eq!(target.matching_path.as_deref(), Some("/ws"));
+                    let headers = target
+                        .matching_headers
+                        .expect("websocket headers should be preserved");
+                    assert_eq!(
+                        headers.get("host"),
+                        Some(&"example.com".to_string())
+                    );
+                    assert_eq!(headers.get("x-test"), Some(&"ok".to_string()));
+                    assert!(!headers.contains_key("Host"));
+                }
+                OneOrSome::Some(_) => panic!("expected one websocket target"),
+            },
+            other => panic!("expected websocket protocol, got {other:?}"),
         }
     }
 }

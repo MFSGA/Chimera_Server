@@ -44,10 +44,10 @@ const ADDED_OUTBOUND_TAG: &str = "grpc-e2e-added-outbound";
 const VLESS_TAG: &str = "vless-grpc-e2e";
 const VLESS_USER_A_EMAIL: &str = "vless-user-a@example.com";
 const VLESS_USER_B_EMAIL: &str = "vless-user-b@example.com";
-const VLESS_USER_A_ID: &str = "114cb5a6-3787-4357-a5da-69b5782cb74f";
-const VLESS_USER_B_ID: &str = "9d2d3c52-a386-4f2f-a507-0ca29f8d13f0";
+const VLESS_USER_A_ID: &str = "3ac9b383-75a1-431c-8184-106c80eb2273";
+const VLESS_USER_B_ID: &str = "e041e73e-a0a0-49f5-9754-6401aa621fb7";
 const VLESS_ADDED_USER_EMAIL: &str = "vless-added-user@example.com";
-const VLESS_ADDED_USER_ID: &str = "f7b11076-5a8d-4f86-b03c-c57dcf0fd5f4";
+const VLESS_ADDED_USER_ID: &str = "b189e879-7097-4a1b-a2f2-7a6e6f5dba4b";
 
 const PATH_STATS_GET_STATS: &str = "/xray.app.stats.command.StatsService/GetStats";
 const PATH_STATS_GET_STATS_ONLINE: &str =

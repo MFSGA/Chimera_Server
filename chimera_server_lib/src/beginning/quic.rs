@@ -75,7 +75,7 @@ pub async fn start_quic_server(
         }))),
 
         _other => {
-            let _ = {};
+            {};
             todo!()
         }
     }

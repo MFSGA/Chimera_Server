@@ -53,18 +53,14 @@ impl Default for LogConfig {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum LogLevel {
+    #[default]
     Debug,
     Info,
     Warning,
     Error,
     None,
-}
-
-impl Default for LogLevel {
-    fn default() -> Self {
-        LogLevel::Debug
-    }
 }
 
 impl LogLevel {
@@ -203,10 +199,10 @@ fn parse_destination(
                 LogDestination::Stderr
             } else {
                 let mut path = PathBuf::from(entry);
-                if let Some(root) = base {
-                    if path.is_relative() {
-                        path = root.join(path);
-                    }
+                if let Some(root) = base
+                    && path.is_relative()
+                {
+                    path = root.join(path);
                 }
                 LogDestination::Path(path)
             }
@@ -228,19 +224,19 @@ impl LogDestination {
 
     fn make_writer(&self) -> io::Result<BoxMakeWriter> {
         match self {
-            LogDestination::None => Ok(BoxMakeWriter::new(|| io::sink())),
-            LogDestination::Stdout => Ok(BoxMakeWriter::new(|| io::stdout())),
-            LogDestination::Stderr => Ok(BoxMakeWriter::new(|| io::stderr())),
+            LogDestination::None => Ok(BoxMakeWriter::new(io::sink)),
+            LogDestination::Stdout => Ok(BoxMakeWriter::new(io::stdout)),
+            LogDestination::Stderr => Ok(BoxMakeWriter::new(io::stderr)),
             LogDestination::Path(path) => create_file_writer(path),
         }
     }
 }
 
 fn create_file_writer(path: &Path) -> io::Result<BoxMakeWriter> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
 
     let file = OpenOptions::new().create(true).append(true).open(path)?;

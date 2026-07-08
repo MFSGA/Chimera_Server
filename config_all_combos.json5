@@ -1,6 +1,6 @@
 {
   // Chimera_Server - All protocol/transport/security combination test config
-  // Generated to exercise every valid inbound combo
+  // Generated to exercise every valid inbound combo that currently validates
 
   "api": {
     "listen": "127.0.0.1:9090",
@@ -52,11 +52,12 @@
       "settings": {
         "clients": [
           {
-            "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
             "email": "test@vless-tcp-none",
             "flow": ""
           }
-        ]
+        ],
+        "decryption": "none"
       },
       "streamSettings": {
         "network": "tcp",
@@ -123,11 +124,12 @@
       "settings": {
         "clients": [
           {
-            "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
             "email": "test@vless-ws-none",
             "flow": ""
           }
-        ]
+        ],
+        "decryption": "none"
       },
       "streamSettings": {
         "network": "ws",
@@ -170,11 +172,12 @@
       "settings": {
         "clients": [
           {
-            "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
             "email": "test@vless-xhttp-none",
             "flow": ""
           }
-        ]
+        ],
+        "decryption": "none"
       },
       "streamSettings": {
         "network": "xhttp",
@@ -221,11 +224,12 @@
       "settings": {
         "clients": [
           {
-            "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
             "email": "test@vless-tcp-tls",
             "flow": "xtls-rprx-vision"
           }
-        ]
+        ],
+        "decryption": "none"
       },
       "streamSettings": {
         "network": "tcp",
@@ -340,11 +344,12 @@
       "settings": {
         "clients": [
           {
-            "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
             "email": "test@vless-ws-tls",
             "flow": ""
           }
-        ]
+        ],
+        "decryption": "none"
       },
       "streamSettings": {
         "network": "ws",
@@ -411,11 +416,12 @@
       "settings": {
         "clients": [
           {
-            "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
             "email": "test@vless-xhttp-tls",
             "flow": ""
           }
-        ]
+        ],
+        "decryption": "none"
       },
       "streamSettings": {
         "network": "xhttp",
@@ -449,11 +455,12 @@
       "settings": {
         "clients": [
           {
-            "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
             "email": "test@vless-tcp-reality",
             "flow": "xtls-rprx-vision"
           }
-        ]
+        ],
+        "decryption": "none"
       },
       "streamSettings": {
         "network": "tcp",
@@ -461,10 +468,9 @@
         "realitySettings": {
           "dest": "addons.mozilla.org:443",
           "serverNames": ["addons.mozilla.org"],
-          "privateKey": "GtkJ2vUWma7R7cKO63Fb92zuh0tQ4SRppzCfFa3VXYo",
-          "shortIds": ["6ba85179e30d4fc2"],
-          "maxTimediff": 0,
-          "fingerprint": "chrome"
+          "privateKey": "wHyg5tTbJM1gQsEVmd5Tp6US24dTuz8miowGDVaP6Iw",
+          "shortIds": ["4ac97aaf8b9b0356"],
+          "maxTimeDiff": 0
         }
       }
     },
@@ -476,11 +482,12 @@
       "settings": {
         "clients": [
           {
-            "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
             "email": "test@vless-xhttp-reality",
             "flow": ""
           }
-        ]
+        ],
+        "decryption": "none"
       },
       "streamSettings": {
         "network": "xhttp",
@@ -488,10 +495,9 @@
         "realitySettings": {
           "dest": "addons.mozilla.org:443",
           "serverNames": ["addons.mozilla.org"],
-          "privateKey": "GtkJ2vUWma7R7cKO63Fb92zuh0tQ4SRppzCfFa3VXYo",
-          "shortIds": ["6ba85179e30d4fc2"],
-          "maxTimediff": 0,
-          "fingerprint": "chrome"
+          "privateKey": "wHyg5tTbJM1gQsEVmd5Tp6US24dTuz8miowGDVaP6Iw",
+          "shortIds": ["4ac97aaf8b9b0356"],
+          "maxTimeDiff": 0
         },
         "xhttpSettings": {
           "host": "test.chimera.local",

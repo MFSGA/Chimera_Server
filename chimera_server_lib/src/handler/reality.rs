@@ -156,6 +156,33 @@ fn extract_sni_from_client_hello(client_hello: &[u8]) -> io::Result<Option<Strin
     Ok(requested_server_name)
 }
 
+fn validate_reality_sni(
+    server_names: &[String],
+    sni: Option<&str>,
+) -> io::Result<()> {
+    if server_names.is_empty() {
+        return Ok(());
+    }
+
+    match sni {
+        Some(name)
+            if server_names
+                .iter()
+                .any(|expected| expected.eq_ignore_ascii_case(name)) =>
+        {
+            Ok(())
+        }
+        Some(name) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("SNI {name} not allowed for REALITY inbound"),
+        )),
+        None => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "REALITY inbound requires an SNI value",
+        )),
+    }
+}
+
 fn client_hello_supports_tls13(client_hello: &[u8]) -> io::Result<bool> {
     if client_hello.len() < 5 {
         return Err(io::Error::new(
@@ -198,7 +225,7 @@ fn client_hello_supports_tls13(client_hello: &[u8]) -> io::Result<bool> {
 
         if ext_type == 0x002b {
             let version_list_len = reader.read_u8()? as usize;
-            if version_list_len % 2 != 0 {
+            if !version_list_len.is_multiple_of(2) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -412,11 +439,7 @@ async fn read_dest_records(
             }
         }
 
-        if records.len() >= 6 {
-            handshake_complete = true;
-            break;
-        }
-        if records.len() >= 3 && records[2].len() > 512 {
+        if dest_handshake_looks_complete(&records) {
             handshake_complete = true;
             break;
         }
@@ -435,6 +458,16 @@ struct DestRecordRead {
     remaining_data: Bytes,
     fallback_error: Option<io::Error>,
     handshake_complete: bool,
+}
+
+fn dest_handshake_looks_complete(records: &[Bytes]) -> bool {
+    const MIN_COMPLETE_TLS13_RECORDS: usize = 6;
+    const LARGE_CERTIFICATE_RECORD_MIN_LEN: usize = 512;
+
+    records.len() >= MIN_COMPLETE_TLS13_RECORDS
+        || records
+            .get(2)
+            .is_some_and(|record| record.len() > LARGE_CERTIFICATE_RECORD_MIN_LEN)
 }
 
 fn start_forward_to_dest(
@@ -502,33 +535,26 @@ pub async fn accept_reality_stream(
     let client_hello = read_client_hello(&mut server_stream).await?;
     let sni = extract_sni_from_client_hello(&client_hello)?;
 
-    if !config.server_names.is_empty() {
-        match sni {
-            Some(name)
-                if config
-                    .server_names
-                    .iter()
-                    .any(|expected| expected.eq_ignore_ascii_case(&name)) => {}
-            Some(name) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!("SNI {name} not allowed for REALITY inbound"),
-                ));
-            }
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "REALITY inbound requires an SNI value",
-                ));
-            }
-        }
-    }
-
     let mut dest_stream = connect_dest(config).await?;
     dest_stream.write_all(&client_hello).await?;
     dest_stream.flush().await?;
 
+    if let Err(err) = validate_reality_sni(&config.server_names, sni.as_deref()) {
+        tracing::warn!(
+            sni = sni.as_deref().unwrap_or("<none>"),
+            dest = %config.dest,
+            "REALITY SNI validation failed, forwarding to dest: {err}"
+        );
+        start_forward_to_dest(server_stream, dest_stream, vec![], Bytes::new());
+        return Err(err);
+    }
+
     if !client_hello_supports_tls13(&client_hello)? {
+        tracing::warn!(
+            sni = sni.as_deref().unwrap_or("<none>"),
+            dest = %config.dest,
+            "REALITY client does not support TLS 1.3, forwarding to dest"
+        );
         start_forward_to_dest(server_stream, dest_stream, vec![], Bytes::new());
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -547,6 +573,12 @@ pub async fn accept_reality_stream(
                 "REALITY dest TLS handshake incomplete, forwarding to dest",
             )
         });
+        tracing::warn!(
+            sni = sni.as_deref().unwrap_or("<none>"),
+            dest = %config.dest,
+            records = dest_read.records.len(),
+            "REALITY dest TLS handshake incomplete, forwarding to dest: {fallback_error}"
+        );
         start_forward_to_dest(
             server_stream,
             dest_stream,
@@ -563,6 +595,11 @@ pub async fn accept_reality_stream(
             reality_conn.build_server_response(dest_records)?;
         }
         Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            tracing::warn!(
+                sni = sni.as_deref().unwrap_or("<none>"),
+                dest = %config.dest,
+                "REALITY auth failed, forwarding to dest: {err}"
+            );
             start_forward_to_dest(
                 server_stream,
                 dest_stream,
@@ -849,6 +886,34 @@ mod tests {
     }
 
     #[test]
+    fn validate_reality_sni_accepts_matching_name_case_insensitive() {
+        let server_names = vec!["Example.COM".to_string()];
+
+        validate_reality_sni(&server_names, Some("example.com")).unwrap();
+    }
+
+    #[test]
+    fn validate_reality_sni_rejects_mismatch() {
+        let server_names = vec!["example.com".to_string()];
+
+        let err =
+            validate_reality_sni(&server_names, Some("probe.example")).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("not allowed"));
+    }
+
+    #[test]
+    fn validate_reality_sni_rejects_missing_when_names_are_configured() {
+        let server_names = vec!["example.com".to_string()];
+
+        let err = validate_reality_sni(&server_names, None).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("requires an SNI"));
+    }
+
+    #[test]
     fn client_hello_supports_tls13_when_advertised() {
         let record = client_hello_with_supported_versions(&[0x03, 0x03, 0x03, 0x04]);
 
@@ -916,5 +981,36 @@ mod tests {
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("expected handshake content type"));
+    }
+
+    #[test]
+    fn dest_handshake_looks_complete_after_six_records() {
+        let records = vec![Bytes::from_static(b"r"); 6];
+
+        assert!(dest_handshake_looks_complete(&records));
+    }
+
+    #[test]
+    fn dest_handshake_looks_complete_for_large_certificate_record() {
+        let records = vec![
+            Bytes::from_static(b"server-hello"),
+            Bytes::from_static(b"encrypted-extensions"),
+            Bytes::from(vec![0u8; 513]),
+        ];
+
+        assert!(dest_handshake_looks_complete(&records));
+    }
+
+    #[test]
+    fn dest_handshake_looks_incomplete_for_short_record_prefix() {
+        let records = vec![
+            Bytes::from_static(b"server-hello"),
+            Bytes::from_static(b"encrypted-extensions"),
+            Bytes::from(vec![0u8; 512]),
+            Bytes::from_static(b"partial"),
+            Bytes::from_static(b"partial"),
+        ];
+
+        assert!(!dest_handshake_looks_complete(&records));
     }
 }
