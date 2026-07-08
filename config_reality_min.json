@@ -14,7 +14,7 @@
       "settings": {
         "clients": [
           {
-            "id": "114cb5a6-3787-4357-a5da-69b5782cb74f",
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
             "flow": "",
             "email": "reality-user"
           }
@@ -32,9 +32,9 @@
           "serverNames": [
             "www.apple.com"
           ],
-          "privateKey": "CAe1AlfoOhzR5zwWRYxUSUm2qdzWXM0qDJzbOWUvTno",
+          "privateKey": "dnprBfWdJgo5yaGClSaZ12TZW-SiD988YmjDKOhXLKI",
           "shortIds": [
-            "6ba85179e30d4fc2"
+            "4ac97aaf8b9b0356"
           ],
           "maxTimeDiff": 0,
           "minClient": "",

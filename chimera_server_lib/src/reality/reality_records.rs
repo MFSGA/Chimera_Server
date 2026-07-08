@@ -887,9 +887,8 @@ mod tests {
     #[test]
     fn test_encrypt_large_500kb() {
         // 500KB = 512000 bytes, requires 32 records (512000 / 16384 = 31.25)
-        let size = 512000;
-        let expected_records =
-            (size + MAX_TLS_PLAINTEXT_LEN - 1) / MAX_TLS_PLAINTEXT_LEN;
+        let size: usize = 512000;
+        let expected_records = size.div_ceil(MAX_TLS_PLAINTEXT_LEN);
         assert_eq!(expected_records, 32); // Verify our math
 
         let mut plaintext = vec![0x4Au8; size];
@@ -1189,9 +1188,8 @@ mod tests {
 
     #[test]
     fn test_app_data_256kb_stress() {
-        let size = 256 * 1024;
-        let expected_records =
-            (size + MAX_TLS_PLAINTEXT_LEN - 1) / MAX_TLS_PLAINTEXT_LEN;
+        let size: usize = 256 * 1024;
+        let expected_records = size.div_ceil(MAX_TLS_PLAINTEXT_LEN);
         assert_eq!(expected_records, 16);
 
         let mut plaintext = vec![0xFFu8; size];
@@ -1596,8 +1594,7 @@ mod tests {
         assert!(result.is_ok());
 
         // 50000 / 16384 = 3.01 -> 4 records
-        let expected_records =
-            (50000 + MAX_TLS_PLAINTEXT_LEN - 1) / MAX_TLS_PLAINTEXT_LEN;
+        let expected_records = 50000_usize.div_ceil(MAX_TLS_PLAINTEXT_LEN);
         assert_eq!(expected_records, 4);
         assert_eq!(seq, 4);
 
@@ -2131,9 +2128,8 @@ mod tests {
     #[test]
     fn test_handshake_256kb_stress_test() {
         // 256KB handshake data (extreme case)
-        let size = 256 * 1024;
-        let expected_records =
-            (size + MAX_TLS_PLAINTEXT_LEN - 1) / MAX_TLS_PLAINTEXT_LEN;
+        let size: usize = 256 * 1024;
+        let expected_records = size.div_ceil(MAX_TLS_PLAINTEXT_LEN);
         assert_eq!(expected_records, 16); // 262144 / 16384 = 15.77 -> 16
 
         let handshake_data = vec![0x16u8; size];

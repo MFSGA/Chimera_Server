@@ -279,6 +279,7 @@ impl RealityTransportConfig {
             private_key: self.private_key,
             short_ids: self.short_ids.clone(),
             dest: self.dest.clone(),
+            server_names: self.server_names.clone(),
             max_time_diff: self.max_time_diff,
             min_client_version: self.min_client_version,
             max_client_version: self.max_client_version,
@@ -327,6 +328,8 @@ pub enum ServerProxyConfig {
     },
     Socks {
         accounts: SocksUserStore,
+        #[serde(default)]
+        udp_enabled: bool,
     },
     DokodemoDoor {
         config: DokodemoDoorConfig,

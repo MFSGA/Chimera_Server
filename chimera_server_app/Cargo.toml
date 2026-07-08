@@ -5,15 +5,19 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-chimera_server_lib = { path = "../chimera_server_lib", version = "*", default-features = false }
+chimera_server_lib = { path = "../chimera_server_lib", version = "0.5.2", default-features = false }
 clap = { workspace = true }
 
 
 [dev-dependencies]
+aws-lc-rs = { workspace = true }
 prost = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tokio-rustls = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
 

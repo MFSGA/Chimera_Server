@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use beginning::start_servers;
 use config::{
     def::{ApiConfig, LiteralConfig},
@@ -194,7 +196,17 @@ fn api_inbound_uses_tls(protocol: &ServerProxyConfig) -> bool {
 
 pub fn start(opts: Options) -> Result<(), Error> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let rt = match opts.rt.as_ref().unwrap_or(&TokioRuntime::MultiThread) {
+
+    let Options {
+        config,
+        config_format,
+        cwd,
+        rt,
+        log_file,
+    } = opts;
+    let config = config.try_parse(config_format)?;
+
+    let rt = match rt.as_ref().unwrap_or(&TokioRuntime::MultiThread) {
         TokioRuntime::MultiThread => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?,
@@ -204,7 +216,7 @@ pub fn start(opts: Options) -> Result<(), Error> {
     };
 
     rt.block_on(async {
-        match start_async(opts).await {
+        match start_async(config, cwd.as_deref(), log_file.as_deref()).await {
             Err(e) => {
                 eprintln!("start error: {}", e);
                 Err(e)
@@ -240,28 +252,26 @@ pub fn validate(opts: Options) -> Result<(), Error> {
     )?;
     let api_addr = resolved_api.listen_addr;
 
-    if let Some(mcp) = mcp_config.as_ref() {
-        if let Some(listen) = mcp.listen.as_ref() {
-            let _ = listen.parse::<std::net::SocketAddr>().map_err(|err| {
-                Error::InvalidConfig(format!(
-                    "invalid mcp.listen {}: {}",
-                    listen, err
-                ))
-            })?;
-            let _ = mcp.update_interval_ms.max(100);
-        }
+    if let Some(mcp) = mcp_config.as_ref()
+        && let Some(listen) = mcp.listen.as_ref()
+    {
+        let _ = listen.parse::<std::net::SocketAddr>().map_err(|err| {
+            Error::InvalidConfig(format!("invalid mcp.listen {}: {}", listen, err))
+        })?;
+        let _ = mcp.update_interval_ms.max(100);
     }
 
     let mut any_server = !all_inbounds.is_empty();
-    if let Some(api) = api_config.as_ref() {
-        if api_addr.is_some() && !api.services.is_empty() {
-            any_server = true;
-        }
+    if let Some(api) = api_config.as_ref()
+        && api_addr.is_some()
+        && !api.services.is_empty()
+    {
+        any_server = true;
     }
-    if let Some(mcp) = mcp_config.as_ref() {
-        if mcp.listen.as_ref().is_some() {
-            any_server = true;
-        }
+    if let Some(mcp) = mcp_config.as_ref()
+        && mcp.listen.as_ref().is_some()
+    {
+        any_server = true;
     }
 
     if !any_server {
@@ -273,15 +283,13 @@ pub fn validate(opts: Options) -> Result<(), Error> {
     Ok(())
 }
 
-async fn start_async(opts: Options) -> Result<(), Error> {
-    // 1. config parse
-    let config = opts.config.try_parse(opts.config_format)?;
+async fn start_async(
+    config: LiteralConfig,
+    cwd: Option<&str>,
+    log_file: Option<&str>,
+) -> Result<(), Error> {
     //  todo: log mod
-    log::init(
-        config.log.as_ref(),
-        opts.cwd.as_deref(),
-        opts.log_file.as_deref(),
-    )?;
+    log::init(config.log.as_ref(), cwd, log_file)?;
     // 2. api config
     let api_config = config.api.clone();
     let mcp_config = config.mcp.clone();
@@ -317,13 +325,13 @@ async fn start_async(opts: Options) -> Result<(), Error> {
     let api_addr = resolved_api.listen_addr;
     let skip_inbound_tag = resolved_api.inbound.map(|inbound| inbound.tag.clone());
     if api_config.is_some() {
-        if let Some(inbound) = resolved_api.inbound {
-            if api_inbound_uses_tls(&inbound.protocol) {
-                tracing::warn!(
-                    "api inbound {} uses tls settings, but local grpc currently listens without tls",
-                    inbound.tag
-                );
-            }
+        if let Some(inbound) = resolved_api.inbound
+            && api_inbound_uses_tls(&inbound.protocol)
+        {
+            tracing::warn!(
+                "api inbound {} uses tls settings, but local grpc currently listens without tls",
+                inbound.tag
+            );
         }
         if api_addr.is_none() {
             tracing::warn!("api is configured but no listen address was resolved");
@@ -332,21 +340,21 @@ async fn start_async(opts: Options) -> Result<(), Error> {
 
     let mut join_handles = Vec::with_capacity(all_inbounds.len() * 2 + 1);
     #[cfg(feature = "api")]
-    if let Some(api) = api_config.as_ref() {
-        if let Some(listen) = api_addr {
-            if !api.services.is_empty() {
-                let grpc_handle = grpc::start_grpc_server(
-                    grpc::GrpcServerConfig {
-                        listen,
-                        services: api.services.clone(),
-                    },
-                    runtime_state.clone(),
-                )
-                .await?;
-                join_handles.push(grpc_handle);
-            } else {
-                tracing::warn!("api is configured but no services are enabled");
-            }
+    if let Some(api) = api_config.as_ref()
+        && let Some(listen) = api_addr
+    {
+        if !api.services.is_empty() {
+            let grpc_handle = grpc::start_grpc_server(
+                grpc::GrpcServerConfig {
+                    listen,
+                    services: api.services.clone(),
+                },
+                runtime_state.clone(),
+            )
+            .await?;
+            join_handles.push(grpc_handle);
+        } else {
+            tracing::warn!("api is configured but no services are enabled");
         }
     }
 
@@ -389,7 +397,8 @@ async fn start_async(opts: Options) -> Result<(), Error> {
             );
             continue;
         }
-        let mut handles = start_servers(config).await?;
+        // Runtime state lets UDP listeners evaluate routing and outbound policy.
+        let mut handles = start_servers(config, runtime_state.clone()).await?;
         join_handles.append(&mut handles);
     }
 
