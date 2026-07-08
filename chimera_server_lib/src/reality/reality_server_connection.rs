@@ -119,6 +119,10 @@ pub struct RealityServerConnection {
     fatal_error: Option<io::ErrorKind>, // Fatal error occurred, connection unusable
 }
 
+fn max_time_diff_secs(max_diff_ms: u64) -> u64 {
+    max_diff_ms.div_ceil(1000)
+}
+
 impl RealityServerConnection {
     /// Create a new REALITY server connection
     pub fn new(config: RealityServerConfig) -> io::Result<Self> {
@@ -406,7 +410,7 @@ impl RealityServerConnection {
                 .as_secs();
 
             let time_diff_secs = now.abs_diff(client_timestamp);
-            let max_diff_secs = max_diff_ms / 1000;
+            let max_diff_secs = max_time_diff_secs(max_diff_ms);
 
             if time_diff_secs > max_diff_secs {
                 tracing::warn!(
@@ -1356,6 +1360,15 @@ mod tests {
                 CONTENT_TYPE_APPLICATION_DATA,
             ]
         );
+    }
+
+    #[test]
+    fn max_time_diff_millis_rounds_up_to_seconds() {
+        assert_eq!(max_time_diff_secs(1), 1);
+        assert_eq!(max_time_diff_secs(999), 1);
+        assert_eq!(max_time_diff_secs(1000), 1);
+        assert_eq!(max_time_diff_secs(1001), 2);
+        assert_eq!(max_time_diff_secs(60_000), 60);
     }
 
     #[test]
