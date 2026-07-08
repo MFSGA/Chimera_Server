@@ -119,6 +119,10 @@ pub struct RealityServerConnection {
     fatal_error: Option<io::ErrorKind>, // Fatal error occurred, connection unusable
 }
 
+fn max_time_diff_secs(max_diff_ms: u64) -> u64 {
+    max_diff_ms.div_ceil(1000)
+}
+
 impl RealityServerConnection {
     /// Create a new REALITY server connection
     pub fn new(config: RealityServerConfig) -> io::Result<Self> {
@@ -406,15 +410,13 @@ impl RealityServerConnection {
                 .as_secs();
 
             let time_diff_secs = now.abs_diff(client_timestamp);
-            let max_diff_secs = max_diff_ms / 1000;
+            let max_diff_secs = max_time_diff_secs(max_diff_ms);
 
             if time_diff_secs > max_diff_secs {
                 tracing::warn!(
-                    "REALITY: Client timestamp {} differs from server {} by {} seconds (max: {} seconds)",
-                    client_timestamp,
-                    now,
                     time_diff_secs,
-                    max_diff_secs
+                    max_diff_secs,
+                    "REALITY: Client timestamp outside allowed skew"
                 );
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -430,16 +432,12 @@ impl RealityServerConnection {
             && client_version < &min_ver[..]
         {
             tracing::warn!(
-                "REALITY: Client version {:?} is below minimum {:?}",
-                client_version,
-                min_ver
+                configured_min_version_len = min_ver.len(),
+                "REALITY: Client version is below minimum"
             );
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!(
-                    "Client version {:?} is below minimum {:?}",
-                    client_version, min_ver
-                ),
+                "Client version is below minimum",
             ));
         }
 
@@ -447,16 +445,12 @@ impl RealityServerConnection {
             && client_version > &max_ver[..]
         {
             tracing::warn!(
-                "REALITY: Client version {:?} is above maximum {:?}",
-                client_version,
-                max_ver
+                configured_max_version_len = max_ver.len(),
+                "REALITY: Client version is above maximum"
             );
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!(
-                    "Client version {:?} is above maximum {:?}",
-                    client_version, max_ver
-                ),
+                "Client version is above maximum",
             ));
         }
 
@@ -1358,6 +1352,15 @@ mod tests {
                 CONTENT_TYPE_APPLICATION_DATA,
             ]
         );
+    }
+
+    #[test]
+    fn max_time_diff_millis_rounds_up_to_seconds() {
+        assert_eq!(max_time_diff_secs(1), 1);
+        assert_eq!(max_time_diff_secs(999), 1);
+        assert_eq!(max_time_diff_secs(1000), 1);
+        assert_eq!(max_time_diff_secs(1001), 2);
+        assert_eq!(max_time_diff_secs(60_000), 60);
     }
 
     #[test]
