@@ -410,11 +410,9 @@ impl RealityServerConnection {
 
             if time_diff_secs > max_diff_secs {
                 tracing::warn!(
-                    "REALITY: Client timestamp {} differs from server {} by {} seconds (max: {} seconds)",
-                    client_timestamp,
-                    now,
                     time_diff_secs,
-                    max_diff_secs
+                    max_diff_secs,
+                    "REALITY: Client timestamp outside allowed skew"
                 );
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
