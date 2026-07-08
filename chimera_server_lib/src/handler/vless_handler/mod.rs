@@ -24,8 +24,7 @@ use super::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use vision_pad::{pad_with_command, pad_with_uuid_and_command};
 use vision_unpad::{UnpadCommand, VisionUnpadder};
 
-pub(crate) use vision::{ParsedVisionUser, parse_vision_users};
-pub use vision::{VisionVlessTcpHandler, setup_reality_vision_server_stream};
+pub use vision::{VisionVlessTcpHandler, setup_reality_mixed_vless_server_stream};
 
 const SERVER_RESPONSE_HEADER: &[u8] = &[0u8, 0u8];
 

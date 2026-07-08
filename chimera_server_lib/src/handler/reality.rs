@@ -11,11 +11,10 @@ use tokio::time::{Instant, timeout_at};
 
 use crate::async_stream::AsyncStream;
 use crate::config::server_config::RealityTransportConfig;
+use crate::config::server_config::VlessUser;
 use crate::handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::handler::tls_deframer::TlsDeframer;
-use crate::handler::vless_handler::{
-    ParsedVisionUser, parse_vision_users, setup_reality_vision_server_stream,
-};
+use crate::handler::vless_handler::setup_reality_mixed_vless_server_stream;
 use crate::reality::{BufReader, RealityServerConnection, RealityTlsStream};
 use crate::resolver::{NativeResolver, Resolver, resolve_single_address};
 use crate::util::socket::new_tcp_socket;
@@ -684,19 +683,19 @@ impl TcpServerHandler for RealityServerHandler {
 #[derive(Debug)]
 pub struct RealityVisionVlessServerHandler {
     transport_config: RealityTransportConfig,
-    users: Vec<ParsedVisionUser>,
+    users: Vec<VlessUser>,
     inbound_tag: String,
 }
 
 impl RealityVisionVlessServerHandler {
     pub fn new(
         config: RealityTransportConfig,
-        users: Vec<crate::config::server_config::VlessUser>,
+        users: Vec<VlessUser>,
         inbound_tag: &str,
     ) -> Self {
         Self {
             transport_config: config,
-            users: parse_vision_users(&users),
+            users,
             inbound_tag: inbound_tag.to_string(),
         }
     }
@@ -710,7 +709,7 @@ impl TcpServerHandler for RealityVisionVlessServerHandler {
     ) -> io::Result<TcpServerSetupResult> {
         let tls_stream =
             accept_reality_stream(server_stream, &self.transport_config).await?;
-        setup_reality_vision_server_stream(
+        setup_reality_mixed_vless_server_stream(
             tls_stream,
             &self.users,
             &self.inbound_tag,

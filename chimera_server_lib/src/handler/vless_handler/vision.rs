@@ -14,7 +14,7 @@ use super::protocol::{
 };
 use super::reality_vision_stream::RealityVisionServerStream;
 use super::vision_stream::VisionServerStream;
-use super::{encode_hex, parse_hex};
+use super::{SERVER_RESPONSE_HEADER, encode_hex, parse_hex};
 
 pub(crate) type ParsedVisionUser = (Box<[u8]>, String);
 
@@ -30,6 +30,95 @@ impl VisionVlessTcpHandler {
             users: parse_vision_users(users),
             inbound_tag: inbound_tag.to_string(),
         }
+    }
+}
+
+pub async fn setup_reality_mixed_vless_server_stream(
+    mut tls_stream: RealityTlsStream<Box<dyn AsyncStream>, RealityServerConnection>,
+    users: &[VlessUser],
+    inbound_tag: &str,
+) -> std::io::Result<TcpServerSetupResult> {
+    let ParsedVlessHeader {
+        user_id,
+        flow: request_flow,
+        command,
+        remote_location,
+    } = read_request_header(&mut tls_stream).await?;
+
+    let user = find_matching_vless_user(users, &user_id, inbound_tag)?;
+    let user_label = user.user_label.clone();
+
+    match request_flow.as_str() {
+        "" => {
+            if user.flow == XTLS_VISION_FLOW {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "client flow is empty but account requires xtls-rprx-vision",
+                ));
+            }
+            if command != COMMAND_TCP {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "UDP was requested",
+                ));
+            }
+
+            Ok(TcpServerSetupResult::TcpForward {
+                remote_location,
+                stream: Box::new(tls_stream),
+                need_initial_flush: true,
+                connection_success_response: Some(
+                    SERVER_RESPONSE_HEADER.to_vec().into_boxed_slice(),
+                ),
+                traffic_context: Some(
+                    TrafficContext::new("vless")
+                        .with_identity(user_label)
+                        .with_inbound_tag(inbound_tag.to_string()),
+                ),
+            })
+        }
+        XTLS_VISION_FLOW => {
+            if user.flow != XTLS_VISION_FLOW {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("account is not allowed to use flow {XTLS_VISION_FLOW}"),
+                ));
+            }
+            if command != COMMAND_TCP {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "xtls-rprx-vision currently supports only TCP requests",
+                ));
+            }
+
+            let (tcp, mut session) = tls_stream.into_inner();
+            let initial_plaintext =
+                RealityVisionServerStream::<
+                    Box<dyn AsyncStream>,
+                    RealityServerConnection,
+                >::drain_plaintext_from_session(&mut session)?;
+
+            Ok(TcpServerSetupResult::TcpForward {
+                remote_location,
+                stream: Box::new(RealityVisionServerStream::new(
+                    tcp,
+                    session,
+                    user_id,
+                    &initial_plaintext,
+                )?),
+                need_initial_flush: false,
+                connection_success_response: None,
+                traffic_context: Some(
+                    TrafficContext::new("vless")
+                        .with_identity(user_label)
+                        .with_inbound_tag(inbound_tag.to_string()),
+                ),
+            })
+        }
+        other => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unknown request flow {other}"),
+        )),
     }
 }
 
@@ -109,6 +198,39 @@ pub(crate) fn parse_vision_users(users: &[VlessUser]) -> Vec<ParsedVisionUser> {
         .iter()
         .map(|user| (parse_hex(&user.user_id), user.user_label.clone()))
         .collect()
+}
+
+fn find_matching_vless_user<'a>(
+    users: &'a [VlessUser],
+    user_id: &[u8; 16],
+    inbound_tag: &str,
+) -> std::io::Result<&'a VlessUser> {
+    let matched_user = users.iter().find(|user| {
+        let stored_user_id = parse_hex(&user.user_id);
+        stored_user_id.len() == 16 && stored_user_id.as_ref() == user_id.as_slice()
+    });
+
+    let Some(user) = matched_user else {
+        let expected = users
+            .iter()
+            .map(|user| encode_hex(parse_hex(&user.user_id).as_ref()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let got = encode_hex(user_id);
+        warn!(
+            inbound_tag = %inbound_tag,
+            expected = %expected,
+            got = %got,
+            "VLESS inbound rejected request with mismatched user id"
+        );
+
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("invalid VLESS user id: {got}"),
+        ));
+    };
+
+    Ok(user)
 }
 
 fn find_matching_user_label(
