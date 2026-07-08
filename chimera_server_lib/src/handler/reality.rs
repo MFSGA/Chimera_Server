@@ -439,11 +439,7 @@ async fn read_dest_records(
             }
         }
 
-        if records.len() >= 6 {
-            handshake_complete = true;
-            break;
-        }
-        if records.len() >= 3 && records[2].len() > 512 {
+        if dest_handshake_looks_complete(&records) {
             handshake_complete = true;
             break;
         }
@@ -462,6 +458,16 @@ struct DestRecordRead {
     remaining_data: Bytes,
     fallback_error: Option<io::Error>,
     handshake_complete: bool,
+}
+
+fn dest_handshake_looks_complete(records: &[Bytes]) -> bool {
+    const MIN_COMPLETE_TLS13_RECORDS: usize = 6;
+    const LARGE_CERTIFICATE_RECORD_MIN_LEN: usize = 512;
+
+    records.len() >= MIN_COMPLETE_TLS13_RECORDS
+        || records
+            .get(2)
+            .is_some_and(|record| record.len() > LARGE_CERTIFICATE_RECORD_MIN_LEN)
 }
 
 fn start_forward_to_dest(
@@ -975,5 +981,36 @@ mod tests {
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("expected handshake content type"));
+    }
+
+    #[test]
+    fn dest_handshake_looks_complete_after_six_records() {
+        let records = vec![Bytes::from_static(b"r"); 6];
+
+        assert!(dest_handshake_looks_complete(&records));
+    }
+
+    #[test]
+    fn dest_handshake_looks_complete_for_large_certificate_record() {
+        let records = vec![
+            Bytes::from_static(b"server-hello"),
+            Bytes::from_static(b"encrypted-extensions"),
+            Bytes::from(vec![0u8; 513]),
+        ];
+
+        assert!(dest_handshake_looks_complete(&records));
+    }
+
+    #[test]
+    fn dest_handshake_looks_incomplete_for_short_record_prefix() {
+        let records = vec![
+            Bytes::from_static(b"server-hello"),
+            Bytes::from_static(b"encrypted-extensions"),
+            Bytes::from(vec![0u8; 512]),
+            Bytes::from_static(b"partial"),
+            Bytes::from_static(b"partial"),
+        ];
+
+        assert!(!dest_handshake_looks_complete(&records));
     }
 }
