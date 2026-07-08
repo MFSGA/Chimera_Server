@@ -321,8 +321,8 @@ impl RealityServerConnection {
         let client_public_key = extract_client_public_key(client_hello)?;
 
         tracing::debug!(
-            "REALITY: ClientHello received, client_random: {:?}",
-            &client_random[..8]
+            client_random_len = client_random.len(),
+            "REALITY: ClientHello received"
         );
 
         let shared_secret =
@@ -375,9 +375,11 @@ impl RealityServerConnection {
         ]) as u64;
         let client_short_id = &decrypted_session_id[8..16];
 
-        tracing::debug!("REALITY: Client version: {:?}", client_version);
-        tracing::debug!("REALITY: Client timestamp: {}", client_timestamp);
-        tracing::debug!("REALITY: Client short_id: {:02x?}", client_short_id);
+        tracing::debug!(
+            client_version_len = client_version.len(),
+            has_client_timestamp = true,
+            "REALITY: Client session metadata decrypted"
+        );
 
         let mut client_short_id_arr = [0u8; 8];
         client_short_id_arr.copy_from_slice(client_short_id);
@@ -388,12 +390,12 @@ impl RealityServerConnection {
 
         if !short_id_ok {
             tracing::warn!(
-                "REALITY: Client short_id {:02x?} not in configured list",
-                client_short_id
+                configured_short_ids = self.config.short_ids.len(),
+                "REALITY: Client short_id not in configured list"
             );
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("Invalid short_id: {:02x?}", client_short_id),
+                "Invalid short_id",
             ));
         }
 
@@ -459,10 +461,8 @@ impl RealityServerConnection {
         }
 
         tracing::info!(
-            "REALITY: Client authentication successful - short_id: {:02x?}, version: {:?}, timestamp: {}",
-            client_short_id,
-            client_version,
-            client_timestamp
+            client_version_len = client_version.len(),
+            "REALITY: Client authentication successful"
         );
 
         let client_cipher_suites = extract_client_cipher_suites(client_hello)?;
@@ -480,9 +480,9 @@ impl RealityServerConnection {
                     )
                 })?;
         tracing::debug!(
-            "REALITY: Negotiated cipher suite {:?} (client offered: {:04x?})",
-            cipher_suite,
-            client_cipher_suites
+            ?cipher_suite,
+            client_cipher_suite_count = client_cipher_suites.len(),
+            "REALITY: Negotiated cipher suite"
         );
 
         self.handshake_state = HandshakeState::ClientHelloValidated {
