@@ -2,7 +2,12 @@ use serde::Deserialize;
 
 use crate::{
     Error,
-    config::{HysteriaSettings, SettingObject, XhttpRange, XhttpSettings},
+    config::{SettingObject, XhttpRange, XhttpSettings},
+};
+
+#[cfg(feature = "hysteria")]
+use crate::{
+    config::HysteriaSettings,
     util::bandwidth::{BandwidthValue, parse_bandwidth},
 };
 
