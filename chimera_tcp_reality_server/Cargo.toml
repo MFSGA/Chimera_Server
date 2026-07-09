@@ -1,0 +1,19 @@
+[package]
+name = "chimera_tcp_reality_server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chimera_server_lib = { path = "../chimera_server_lib", version = "*", default-features = false, features = [
+    "vless",
+    "reality",
+    "traffic",
+] }
+clap = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+
+[features]
+default = ["tcp-reality"]
+tcp-reality = []
