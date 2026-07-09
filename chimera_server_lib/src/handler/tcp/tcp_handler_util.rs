@@ -26,6 +26,7 @@ use crate::{
 
 use super::tcp_handler::TcpServerHandler;
 
+#[allow(clippy::only_used_in_recursion)]
 pub fn create_tcp_server_handler(
     server_proxy_config: ServerProxyConfig,
     inbound_tag: &str,
@@ -155,6 +156,7 @@ pub fn create_tcp_server_handler(
             "Xhttp server should not be served via TCP handler",
         )),
 
+        #[allow(unreachable_patterns)]
         unknown_config => Err(Error::new(
             ErrorKind::InvalidInput,
             format!("Unsupported TCP proxy config: {unknown_config:?}"),

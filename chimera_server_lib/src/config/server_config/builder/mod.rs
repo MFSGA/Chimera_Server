@@ -7,8 +7,10 @@ use crate::{
     Error,
     address::{Address, BindLocation, NetLocation},
     config::{Protocol, Transport, def::InboudItem},
-    util::option::NoneOrSome,
 };
+
+#[cfg(any(feature = "hysteria", feature = "tuic"))]
+use crate::util::option::NoneOrSome;
 
 #[cfg(feature = "ws")]
 use crate::util::option::OneOrSome;
@@ -58,10 +60,9 @@ fn websocket_server_config(
     }
 }
 
-use super::{
-    quic::ServerQuicConfig,
-    types::{ServerConfig, ServerProxyConfig},
-};
+#[cfg(any(feature = "hysteria", feature = "tuic"))]
+use super::quic::ServerQuicConfig;
+use super::types::{ServerConfig, ServerProxyConfig};
 
 #[cfg(feature = "hysteria")]
 use collectors::collect_hysteria2_settings;

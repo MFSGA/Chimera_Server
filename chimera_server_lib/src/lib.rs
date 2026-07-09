@@ -1,13 +1,14 @@
 #![allow(dead_code)]
 
 use beginning::start_servers;
-use config::{
-    def::{ApiConfig, LiteralConfig},
-    rule::RoutingConfig,
+pub use beginning::start_tcp_server;
+use config::{def::ApiConfig, rule::RoutingConfig};
+pub use config::{
+    def::LiteralConfig,
     server_config::{ServerConfig, ServerProxyConfig},
 };
 pub use config_loader::{ConfigFormat, resolve_config_source};
-use runtime::{OutboundSummary, RuntimeState};
+pub use runtime::{OutboundSummary, RuntimeState};
 use std::net::SocketAddr;
 use std::time::Duration;
 use thiserror::Error;
@@ -89,6 +90,45 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("invalid config: {0}")]
     InvalidConfig(String),
+}
+
+pub struct ServerRuntime {
+    pub inbounds: Vec<ServerConfig>,
+    pub runtime_state: RuntimeState,
+}
+
+pub fn prepare_server_runtime(
+    config: LiteralConfig,
+    cwd: Option<&str>,
+    log_file: Option<&str>,
+) -> Result<ServerRuntime, Error> {
+    let inbounds = prepare_server_inbounds(config, cwd, log_file)?;
+    let runtime_state = RuntimeState::new(inbounds.clone(), Vec::new());
+
+    Ok(ServerRuntime {
+        inbounds,
+        runtime_state,
+    })
+}
+
+pub fn prepare_server_inbounds(
+    config: LiteralConfig,
+    cwd: Option<&str>,
+    log_file: Option<&str>,
+) -> Result<Vec<ServerConfig>, Error> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    log::init(config.log.as_ref(), cwd, log_file)?;
+
+    config
+        .inbounds
+        .into_iter()
+        .map(ServerConfig::try_from)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+pub fn is_tcp_reality_server(config: &ServerConfig) -> bool {
+    matches!(config.transport, crate::config::Transport::Tcp)
+        && matches!(config.protocol, ServerProxyConfig::Reality(_))
 }
 
 #[derive(Default)]
@@ -185,9 +225,9 @@ fn is_api_inbound_protocol(protocol: &ServerProxyConfig) -> bool {
     }
 }
 
-fn api_inbound_uses_tls(protocol: &ServerProxyConfig) -> bool {
+fn api_inbound_uses_tls(_protocol: &ServerProxyConfig) -> bool {
     #[cfg(feature = "tls")]
-    if matches!(protocol, ServerProxyConfig::Tls(_)) {
+    if matches!(_protocol, ServerProxyConfig::Tls(_)) {
         return true;
     }
 
@@ -359,12 +399,12 @@ async fn start_async(
     }
 
     #[cfg(not(feature = "api"))]
-    if let Some(api) = api_config.as_ref() {
-        if !api.services.is_empty() {
-            tracing::warn!(
-                "api services configured but the \"api\" feature is disabled; grpc support is unavailable"
-            );
-        }
+    if let Some(api) = api_config.as_ref()
+        && !api.services.is_empty()
+    {
+        tracing::warn!(
+            "api services configured but the \"api\" feature is disabled; grpc support is unavailable"
+        );
     }
 
     if let Some(mcp) = mcp_config.as_ref() {
