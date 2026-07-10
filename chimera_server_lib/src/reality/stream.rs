@@ -24,6 +24,7 @@ pub trait RealitySession {
     fn take_remaining_ciphertext(&mut self) -> Vec<u8> {
         Vec::new()
     }
+    fn enable_vision_direct_transition(&mut self) {}
     fn send_close_notify(&mut self);
 }
 
@@ -62,6 +63,10 @@ impl RealitySession for RealityServerConnection {
 
     fn take_remaining_ciphertext(&mut self) -> Vec<u8> {
         RealityServerConnection::take_remaining_ciphertext(self)
+    }
+
+    fn enable_vision_direct_transition(&mut self) {
+        RealityServerConnection::enable_vision_direct_transition(self)
     }
 
     fn send_close_notify(&mut self) {
@@ -324,9 +329,8 @@ where
         let n = writer.write(buf)?;
 
         match this.drain_all_writes(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(n)),
+            Poll::Ready(Ok(())) | Poll::Pending => Poll::Ready(Ok(n)),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
         }
     }
 

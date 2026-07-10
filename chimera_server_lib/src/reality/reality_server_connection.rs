@@ -117,6 +117,7 @@ pub struct RealityServerConnection {
     plaintext_write_buf: Vec<u8>,     // Application data to encrypt
     received_close_notify: bool,      // Peer sent close_notify alert
     fatal_error: Option<io::ErrorKind>, // Fatal error occurred, connection unusable
+    vision_direct_transition: bool,
 }
 
 fn max_time_diff_secs(max_diff_ms: u64) -> u64 {
@@ -143,6 +144,7 @@ impl RealityServerConnection {
             plaintext_write_buf: Vec::with_capacity(OUTGOING_BUFFER_LIMIT),
             received_close_notify: false,
             fatal_error: None,
+            vision_direct_transition: false,
         })
     }
 
@@ -217,6 +219,15 @@ impl RealityServerConnection {
             }
 
             if self.received_close_notify {
+                break;
+            }
+
+            // Do not let the outer progress loop immediately process another
+            // record in Vision mode. The plaintext may contain Direct, making
+            // every following buffered byte xray's rawInput rather than TLS.
+            if self.vision_direct_transition
+                && before_plaintext_len != self.plaintext_read_buf.len()
+            {
                 break;
             }
 
@@ -1004,6 +1015,12 @@ impl RealityServerConnection {
             if received_close_notify {
                 return Ok(());
             }
+            // xray may append raw inner-TLS bytes immediately after the outer
+            // record carrying Vision Direct. Return after one outer record so
+            // VisionReader can inspect the command before we touch rawInput.
+            if self.vision_direct_transition {
+                return Ok(());
+            }
         }
 
         Ok(())
@@ -1097,6 +1114,11 @@ impl RealityServerConnection {
         let pending = self.ciphertext_read_buf.as_slice().to_vec();
         self.ciphertext_read_buf.consume(pending.len());
         pending
+    }
+
+    /// Preserve record boundaries while a Vision stream may switch to raw TCP.
+    pub fn enable_vision_direct_transition(&mut self) {
+        self.vision_direct_transition = true;
     }
 
     /// Queue a close notification alert
