@@ -91,6 +91,9 @@ pub async fn setup_reality_mixed_vless_server_stream(
                 ));
             }
 
+            // xray's server parses the VLESS header through REALITY first, then
+            // installs Vision at the body boundary. Keep already decrypted body
+            // bytes so a coalesced request header + first Vision block is not lost.
             let (tcp, mut session) = tls_stream.into_inner();
             let initial_plaintext =
                 RealityVisionServerStream::<

@@ -15,6 +15,7 @@ mod reality_vision_stream;
 mod vision;
 mod vision_pad;
 mod vision_stream;
+mod vision_tls;
 mod vision_unpad;
 
 use self::protocol::{
@@ -207,31 +208,6 @@ pub(crate) fn looks_like_tls_record(data: &[u8]) -> bool {
         && matches!(data[2], 0x01..=0x03)
 }
 
-pub(crate) fn contains_tls_application_data(data: &[u8]) -> bool {
-    let mut cursor = 0usize;
-    while cursor + 5 <= data.len() {
-        let content_type = data[cursor];
-        let version_major = data[cursor + 1];
-        let version_minor = data[cursor + 2];
-        let payload_len =
-            u16::from_be_bytes([data[cursor + 3], data[cursor + 4]]) as usize;
-        if version_major != 0x03 || !(0x01..=0x03).contains(&version_minor) {
-            return false;
-        }
-
-        let end = cursor + 5 + payload_len;
-        if end > data.len() {
-            return false;
-        }
-        if content_type == 0x17 {
-            return true;
-        }
-        cursor = end;
-    }
-
-    false
-}
-
 pub(crate) fn drain_pending_read(
     pending_read: &mut BytesMut,
     buf: &mut ReadBuf<'_>,
@@ -306,9 +282,8 @@ pub(crate) fn unpad_into_pending_read(
 mod tests {
     use super::{
         XTLS_VISION_FLOW, append_plaintext_to_read_buf, bounded_write_chunk,
-        contains_tls_application_data, drain_pending_read, looks_like_tls_record,
-        queue_padded_packet, take_vless_response_header, unpad_into_pending_read,
-        validate_request_flow,
+        drain_pending_read, looks_like_tls_record, queue_padded_packet,
+        take_vless_response_header, unpad_into_pending_read, validate_request_flow,
     };
     use crate::handler::vless_handler::vision_unpad::{
         UnpadCommand, VisionUnpadder,
@@ -345,12 +320,6 @@ mod tests {
     #[test]
     fn looks_like_tls_record_accepts_tls_header() {
         assert!(looks_like_tls_record(&[0x16, 0x03, 0x03, 0x00, 0x10]));
-    }
-
-    #[test]
-    fn contains_tls_application_data_detects_app_record() {
-        let record = [0x17, 0x03, 0x03, 0x00, 0x02, 0x01, 0x02];
-        assert!(contains_tls_application_data(&record));
     }
 
     #[test]
