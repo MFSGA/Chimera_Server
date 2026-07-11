@@ -48,7 +48,10 @@ pub fn parse_config_source(
 }
 
 fn is_external_config_source(source: &str) -> bool {
-    source == "stdin:" || source.starts_with("http+unix://")
+    source == "stdin:"
+        || source.starts_with("http://")
+        || source.starts_with("https://")
+        || source.starts_with("http+unix://")
 }
 
 fn load_external_config_source(source: &str) -> Result<String, Error> {
@@ -61,10 +64,33 @@ fn load_external_config_source(source: &str) -> Result<String, Error> {
         _ if source.starts_with("http+unix://") => {
             fetch_unix_socket_http_content(source)
         }
+        _ if source.starts_with("http://") || source.starts_with("https://") => {
+            fetch_http_content(source)
+        }
         _ => Err(Error::InvalidConfig(format!(
             "unsupported external config source: {source}"
         ))),
     }
+}
+
+fn fetch_http_content(target: &str) -> Result<String, Error> {
+    let response = reqwest::blocking::get(target).map_err(|err| {
+        Error::InvalidConfig(format!(
+            "could not fetch config source {target}: {err}"
+        ))
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(Error::InvalidConfig(format!(
+            "unexpected HTTP status code from config source {target}: {status}"
+        )));
+    }
+
+    response.text().map_err(|err| {
+        Error::InvalidConfig(format!(
+            "config source {target} did not contain valid UTF-8 text: {err}"
+        ))
+    })
 }
 
 fn parse_config_content(
@@ -272,7 +298,8 @@ fn expand_env_placeholders(input: &str) -> Result<String, Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_chunked_body, expand_env_placeholders, parse_unix_socket_target,
+        decode_chunked_body, expand_env_placeholders, is_external_config_source,
+        parse_unix_socket_target,
     };
 
     #[test]
@@ -311,6 +338,16 @@ mod tests {
             decode_chunked_body(body).expect("chunk decoding should succeed");
 
         assert_eq!(decoded, b"hello world");
+    }
+
+    #[test]
+    fn treats_http_urls_as_external_sources() {
+        assert!(is_external_config_source(
+            "https://example.com/chimera/config.json5"
+        ));
+        assert!(is_external_config_source(
+            "http://127.0.0.1:8080/config.json"
+        ));
     }
 
     use std::path::PathBuf;
