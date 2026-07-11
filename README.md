@@ -31,6 +31,20 @@ cargo run --package chimera_server_app -- --config path/to/config.json5
 
 4. 如需热重载，可使用仓库中的 `start.sh` 或 `start_server.ps1`；运行前建议先检查脚本中的环境假设。
 
+### 让 Agent 安装到服务器
+如果你希望 Codex、Claude Code、Cursor 或其他 LLM agent 帮你把当前项目的二进制安装到 Linux
+服务器，可以直接把下面这段提示发给 agent：
+
+```text
+Install Chimera Server on this Linux server by following the full guide here:
+https://raw.githubusercontent.com/MFSGA/Chimera_Server/refs/heads/master/AGENT_INSTALL.md
+Use the release installer unless I explicitly ask you to build from source. Verify the install before
+you finish, and do not overwrite an existing /usr/local/etc/chimera/config.json5.
+```
+
+完整流程见 [Agent 安装指南](AGENT_INSTALL.md)。该指南会引导 agent 选择 GitHub Release
+安装或本地源码构建，调用仓库中的 `install.sh`，并完成服务注册、配置校验、状态检查、回滚和卸载说明。
+
 ### CLI 工具
 `chimera_cli` 提供了一个辅助二进制 `chimera-cli`，用于对齐 `xray x25519` 的使用方式。
 在工作区根目录执行：
@@ -45,6 +59,7 @@ cargo run -p chimera_cli -- x25519 --count 1 --format base64
 - 配置文件沿用 xray-core 的整体结构，目前重点支持 `inbounds` 数组及相关协议/传输设置。
 - 解析器会尽量对齐上游字段名和默认值，以便已有 xray-core 配置可以较低成本迁移过来。
 - 当前更推荐使用 `json5` 配置；仓库中的 `examples/` 目录提供了多个可参考示例。
+- 当前协议和配置兼容边界见 [兼容性矩阵](COMPATIBILITY.md)；未列为稳定支持的组合应先按实验能力评估。
 
 ### 入站示例
 ```json
@@ -74,12 +89,12 @@ cargo run -p chimera_cli -- x25519 --count 1 --format base64
 ### 示例配置
 仓库当前包含以下示例配置，可作为起点：
 
-- `examples/01-api.json5`
-- `examples/02_trojan_ws_tls_30919.json5`
-- `examples/03_vless_ws_tls_36050.json5`
-- `examples/04_vless_tcp_50584.json5`
-- `examples/05_vless_ws_56321.json5`
-- `examples/06-hysteria-43210.json5`
+- `examples/xray-compatible/vless-tcp-none.json5`
+- `examples/xray-compatible/vless-ws-tls.json5`
+- `examples/xray-compatible/vmess-tcp-none.json5`
+- `examples/xray-compatible/trojan-tcp-tls.json5`
+- `examples/xray-compatible/socks-tcp-noauth.json5`
+- `examples/xray-compatible/hysteria-quic-tls.json5`
 
 ### 开发命令
 ```bash
