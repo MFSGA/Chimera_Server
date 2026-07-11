@@ -185,10 +185,7 @@ impl RoutingServiceImpl {
         typed_message: &proto::xray::common::serial::TypedMessage,
     ) -> Result<RouterConfigPayload, Status> {
         let message_type = Self::parse_typed_message_type(typed_message);
-        if ![TYPE_ROUTER_CONFIG, TYPE_ROUTER_CONFIG_V2RAY]
-            .iter()
-            .any(|candidate| *candidate == message_type)
-        {
+        if ![TYPE_ROUTER_CONFIG, TYPE_ROUTER_CONFIG_V2RAY].contains(&message_type) {
             return Err(Status::invalid_argument(format!(
                 "unsupported routing rule config type: {message_type}"
             )));
@@ -213,10 +210,10 @@ impl RoutingServiceImpl {
             .read()
             .expect("routing balancer overrides lock poisoned");
         for group_tag in group_tags {
-            if let Some(target) = overrides.get(group_tag) {
-                if self.has_outbound_tag(target) {
-                    return Ok((target.clone(), vec![group_tag.clone()]));
-                }
+            if let Some(target) = overrides.get(group_tag)
+                && self.has_outbound_tag(target)
+            {
+                return Ok((target.clone(), vec![group_tag.clone()]));
             }
         }
         drop(overrides);
