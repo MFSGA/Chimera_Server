@@ -2,6 +2,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use quic::start_quic_server;
 use tokio::{io::AsyncWriteExt, task::JoinHandle, time::timeout};
+use udp::start_udp_server;
 
 use crate::{
     address::{BindLocation, NetLocation},
@@ -15,6 +16,7 @@ use crate::{
         tcp_handler_util::create_tcp_server_handler,
     },
     resolver::{NativeResolver, Resolver, resolve_single_address},
+    runtime::RuntimeState,
     traffic::{record_transfer, register_connection},
     util::socket::new_tcp_socket,
 };
@@ -22,10 +24,12 @@ use crate::{
 use tracing::{error, info};
 
 mod quic;
+mod udp;
 mod xhttp;
 
 pub async fn start_servers(
     config: ServerConfig,
+    runtime: RuntimeState,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     if is_xhttp_server_protocol(&config.protocol) {
         return xhttp::start_xhttp_server(config).await;
@@ -58,16 +62,26 @@ pub async fn start_servers(
                 return Err(e);
             }
         },
-        Transport::Udp => {
-            panic!("unsupported transport type: udp");
-        }
+        // UDP listeners need runtime state for routing/outbound selection.
+        Transport::Udp => match start_udp_server(config.clone(), runtime).await {
+            Ok(Some(handle)) => {
+                join_handles.push(handle);
+            }
+            Ok(None) => (),
+            Err(e) => {
+                for join_handle in join_handles {
+                    join_handle.abort();
+                }
+                return Err(e);
+            }
+        },
     }
 
     if join_handles.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("failed to start servers at {}", &config.bind_location),
-        ));
+        return Err(std::io::Error::other(format!(
+            "failed to start servers at {}",
+            &config.bind_location
+        )));
     }
 
     Ok(join_handles)
@@ -107,7 +121,7 @@ pub async fn start_tcp_server(
     let mut rules_stack = vec![];
 
     let tcp_handler: Arc<Box<dyn TcpServerHandler>> =
-        Arc::new(create_tcp_server_handler(protocol, &tag, &mut rules_stack));
+        Arc::new(create_tcp_server_handler(protocol, &tag, &mut rules_stack)?);
     tracing::debug!("TCP handler: {:?}", tcp_handler);
 
     let listener = match bind_location {

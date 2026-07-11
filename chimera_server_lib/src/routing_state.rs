@@ -183,15 +183,13 @@ impl RoutingState {
                 }
             }
         }
-        if targets.is_empty() {
-            if let Some(fallback_tag) = balancer.fallback_tag.as_ref() {
-                if outbounds
-                    .iter()
-                    .any(|outbound| outbound.tag == *fallback_tag)
-                {
-                    targets.push(fallback_tag.clone());
-                }
-            }
+        if targets.is_empty()
+            && let Some(fallback_tag) = balancer.fallback_tag.as_ref()
+            && outbounds
+                .iter()
+                .any(|outbound| outbound.tag == *fallback_tag)
+        {
+            targets.push(fallback_tag.clone());
         }
         targets
     }
@@ -208,10 +206,10 @@ impl RoutingState {
                 .any(|outbound| outbound.tag == *tag)
                 .then(|| (tag.clone(), Vec::new())),
             RuleTarget::Balancer(balancer_tag) => {
-                if let Some(target) = balancer_overrides.get(balancer_tag) {
-                    if outbounds.iter().any(|outbound| outbound.tag == *target) {
-                        return Some((target.clone(), vec![balancer_tag.clone()]));
-                    }
+                if let Some(target) = balancer_overrides.get(balancer_tag)
+                    && outbounds.iter().any(|outbound| outbound.tag == *target)
+                {
+                    return Some((target.clone(), vec![balancer_tag.clone()]));
                 }
                 self.balancer_targets(balancer_tag, outbounds)
                     .into_iter()
@@ -328,7 +326,7 @@ fn parse_cidr_matcher(value: &str) -> Result<CidrMatcher, String> {
     let Some((ip, prefix)) = value
         .split_once('/')
         .map(|(ip, prefix)| (ip, Some(prefix)))
-        .or_else(|| Some((value, None)))
+        .or(Some((value, None)))
     else {
         return Err("invalid cidr rule".into());
     };

@@ -43,15 +43,10 @@ impl NetLocation {
 
         let address = Address::from(address_str)?;
         if expect_ipv6 && !address.is_ipv6() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Invalid location",
-            ));
+            return Err(std::io::Error::other("Invalid location"));
         }
 
-        let port = port.ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "No port")
-        })?;
+        let port = port.ok_or_else(|| std::io::Error::other("No port"))?;
 
         Ok(Self { address, port })
     }
@@ -92,9 +87,7 @@ impl NetLocation {
             Address::Hostname(ref d) => format!("{}:{}", d, self.port)
                 .to_socket_addrs()?
                 .next()
-                .ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::Other, "Lookup failed")
-                }),
+                .ok_or_else(|| std::io::Error::other("Lookup failed")),
         }
     }
 
@@ -181,16 +174,15 @@ impl Address {
             }
         }
 
-        if possible_ipv4 && dots == 3 {
-            if let Ok(addr) = s.parse::<Ipv4Addr>() {
-                return Ok(Address::Ipv4(addr));
-            }
+        if possible_ipv4
+            && dots == 3
+            && let Ok(addr) = s.parse::<Ipv4Addr>()
+        {
+            return Ok(Address::Ipv4(addr));
         }
 
-        if possible_ipv6 {
-            if let Ok(addr) = s.parse::<Ipv6Addr>() {
-                return Ok(Address::Ipv6(addr));
-            }
+        if possible_ipv6 && let Ok(addr) = s.parse::<Ipv6Addr>() {
+            return Ok(Address::Ipv6(addr));
         }
 
         if possible_hostname {
