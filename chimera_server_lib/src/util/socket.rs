@@ -1,7 +1,6 @@
 use std::net::SocketAddr;
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use tracing::debug;
 
 #[inline]
 pub fn new_tcp_socket(
@@ -76,13 +75,13 @@ pub fn new_socket2_udp_socket_with_buffer_size(
         panic!("Cannot support reuse sockets");
     }
 
-    if let Some(ref interface) = bind_interface {
+    if let Some(ref _interface) = bind_interface {
         #[cfg(any(
             target_os = "android",
             target_os = "fuchsia",
             target_os = "linux"
         ))]
-        socket.bind_device(Some(interface.as_bytes()))?;
+        socket.bind_device(Some(_interface.as_bytes()))?;
 
         // This should be handled during config validation.
         #[cfg(not(any(
