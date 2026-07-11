@@ -1,0 +1,48 @@
+{
+  "log": { "level": "debug" },
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": 19443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "ddc7fa8f-72a2-4353-959b-b3a8fa290b77",
+            "email": "local@test"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "localhost",
+          "minVersion": "1.2",
+          "maxVersion": "1.3",
+          "alpn": ["h2"],
+          "certificates": [
+            {
+              "certificateFile": "/home/si/Desktop/mfsga/Chimera_Server/deploy/xray-xhttp/.generated/local-ready/server.crt",
+              "keyFile": "/home/si/Desktop/mfsga/Chimera_Server/deploy/xray-xhttp/.generated/local-ready/server.key"
+            }
+          ]
+        },
+        "xhttpSettings": {
+          "host": "localhost",
+          "path": "/chimera-xhttp-ddc7fa8f",
+          "xPaddingBytes": { "from": 100, "to": 1000 },
+          "scMaxEachPostBytes": { "from": 1000000, "to": 1000000 },
+          "scMaxBufferedPosts": 30,
+          "scStreamUpServerSecs": { "from": 20, "to": 80 }
+        }
+      },
+      "tag": "xhttp-in"
+    }
+  ],
+  "outbounds": [
+    { "protocol": "freedom", "settings": {}, "tag": "direct" },
+    { "protocol": "blackhole", "settings": {}, "tag": "block" }
+  ]
+}
