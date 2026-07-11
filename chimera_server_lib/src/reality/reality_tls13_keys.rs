@@ -44,7 +44,7 @@ pub fn hkdf_expand(
         let key = hmac::Key::new(hmac_algorithm, prk);
         let mut ctx = hmac::Context::with_key(&key);
 
-        tracing::debug!(
+        tracing::trace!(
             "HKDF iteration {}: prev_len={}, info_len={}",
             i,
             prev.len(),
@@ -56,10 +56,10 @@ pub fn hkdf_expand(
         ctx.update(&[i as u8]);
         let tag = ctx.sign();
 
-        tracing::debug!(
-            "HKDF iteration {}: output={:02x?}",
+        tracing::trace!(
+            "HKDF iteration {} complete: output_len={}",
             i,
-            &tag.as_ref()[..tag.as_ref().len().min(16)]
+            tag.as_ref().len()
         );
 
         prev = tag.as_ref().to_vec();
@@ -88,8 +88,8 @@ fn hkdf_expand_label_with_algorithm(
     context: &[u8],
     length: usize,
 ) -> Result<Vec<u8>> {
-    tracing::debug!(
-        "DEBUG hkdf_expand_label: secret len={}, label={:?}, context len={}, length={}",
+    tracing::trace!(
+        "HKDF expand label: secret_len={}, label={:?}, context_len={}, length={}",
         secret.len(),
         std::str::from_utf8(label).unwrap_or("<binary>"),
         context.len(),
@@ -116,7 +116,7 @@ fn hkdf_expand_label_with_algorithm(
     hkdf_label.push(context.len() as u8);
     hkdf_label.extend_from_slice(context);
 
-    tracing::debug!("HKDF_LABEL_BYTES: {:02x?}", hkdf_label);
+    tracing::trace!("HKDF label constructed: len={}", hkdf_label.len());
 
     hkdf_expand(hmac_algorithm, secret, &hkdf_label, length)
 }
@@ -283,7 +283,10 @@ pub fn derive_handshake_keys_for_suite(
     let master_secret =
         hkdf_extract_with_algorithm(hmac_algorithm, &derived_secret_2, &zero_salt);
 
-    tracing::debug!("  master_secret: {:?}", &master_secret[..8]);
+    tracing::trace!(
+        "TLS13 handshake master secret derived: len={}",
+        master_secret.len()
+    );
 
     Ok(Tls13HandshakeKeys {
         client_handshake_traffic_secret,
@@ -323,9 +326,9 @@ pub fn derive_application_secrets_for_suite(
         "TLS13 DEBUG: Deriving application secrets (Phase 2) with {}...",
         cipher_suite
     );
-    tracing::info!(
-        "  handshake_hash (with Finished): {:?}",
-        &handshake_hash[..8]
+    tracing::debug!(
+        "TLS13 application secret input: handshake_hash_len={}",
+        handshake_hash.len()
     );
 
     // Client Application Traffic Secret
@@ -337,12 +340,8 @@ pub fn derive_application_secrets_for_suite(
     )?;
 
     tracing::debug!(
-        "  client_app_traffic: {:?}",
-        &client_application_traffic_secret[..8]
-    );
-    tracing::info!(
-        "DERIVE_APP_SECRETS: ClientAppSecret(full)={:02x?}",
-        client_application_traffic_secret
+        "TLS13 client application traffic secret derived: len={}",
+        client_application_traffic_secret.len()
     );
 
     // Server Application Traffic Secret
@@ -354,12 +353,8 @@ pub fn derive_application_secrets_for_suite(
     )?;
 
     tracing::debug!(
-        "  server_app_traffic: {:?}",
-        &server_application_traffic_secret[..8]
-    );
-    tracing::info!(
-        "DERIVE_APP_SECRETS: ServerAppSecret(full)={:02x?}",
-        server_application_traffic_secret
+        "TLS13 server application traffic secret derived: len={}",
+        server_application_traffic_secret.len()
     );
 
     Ok((
@@ -392,7 +387,10 @@ pub fn derive_traffic_keys_for_suite(
         iv_length,
         hash_len
     );
-    tracing::debug!("TRAFFIC_KEY_DERIVE: traffic_secret={:02x?}", traffic_secret);
+    tracing::trace!(
+        "TRAFFIC_KEY_DERIVE: traffic_secret_len={}",
+        traffic_secret.len()
+    );
 
     // key = HKDF-Expand-Label(Secret, "key", "", key_length)
     let key = hkdf_expand_label_with_algorithm(
@@ -412,8 +410,11 @@ pub fn derive_traffic_keys_for_suite(
         iv_length,
     )?;
 
-    tracing::info!("TRAFFIC_KEY_DERIVE: key={:02x?}", key);
-    tracing::info!("TRAFFIC_KEY_DERIVE: iv={:02x?}", iv);
+    tracing::debug!(
+        "TRAFFIC_KEY_DERIVE: key and iv derived (key_len={}, iv_len={})",
+        key.len(),
+        iv.len()
+    );
 
     Ok((key, iv))
 }
