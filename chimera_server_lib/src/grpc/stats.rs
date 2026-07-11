@@ -99,25 +99,25 @@ impl StatsServiceImpl {
         match online {
             OnlineKey::Inbound(tag) => {
                 for entry in entries {
-                    if entry.inbound_tag.as_deref() == Some(&tag) {
-                        if let Some(ip) = entry.client_ip {
-                            if is_ignored_online_ip(ip) {
-                                continue;
-                            }
-                            ips.insert(ip.to_string());
+                    if entry.inbound_tag.as_deref() == Some(&tag)
+                        && let Some(ip) = entry.client_ip
+                    {
+                        if is_ignored_online_ip(ip) {
+                            continue;
                         }
+                        ips.insert(ip.to_string());
                     }
                 }
             }
             OnlineKey::User(identity) => {
                 for entry in entries {
-                    if entry.identity.as_deref() == Some(&identity) {
-                        if let Some(ip) = entry.client_ip {
-                            if is_ignored_online_ip(ip) {
-                                continue;
-                            }
-                            ips.insert(ip.to_string());
+                    if entry.identity.as_deref() == Some(&identity)
+                        && let Some(ip) = entry.client_ip
+                    {
+                        if is_ignored_online_ip(ip) {
+                            continue;
                         }
+                        ips.insert(ip.to_string());
                     }
                 }
             }
@@ -234,9 +234,10 @@ impl StatsServiceImpl {
                     snapshot.sys = sys.saturating_mul(1024);
                 }
             }
-            return snapshot;
+            snapshot
         }
 
+        #[cfg(not(target_os = "linux"))]
         snapshot
     }
 }
