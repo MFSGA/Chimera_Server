@@ -50,10 +50,10 @@ pub async fn resolve_single_address(
 ) -> std::io::Result<SocketAddr> {
     let resolve_results = resolver.resolve_location(location).await?;
     if resolve_results.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("could not resolve location: {}", location),
-        ));
+        return Err(std::io::Error::other(format!(
+            "could not resolve location: {}",
+            location
+        )));
     }
     Ok(resolve_results[0])
 }
