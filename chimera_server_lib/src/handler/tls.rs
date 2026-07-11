@@ -29,6 +29,7 @@ pub struct TlsServerHandler {
 }
 
 impl TlsServerHandler {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         certificates: Vec<TlsCertificateConfig>,
         alpn_protocols: Vec<String>,
