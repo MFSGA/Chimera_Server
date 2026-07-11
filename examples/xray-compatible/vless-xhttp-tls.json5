@@ -1,0 +1,42 @@
+{
+  "inbounds": [
+    {
+      "tag": "vless-xhttp-tls",
+      "listen": "127.0.0.1",
+      "port": 11010,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "email": "vless-xhttp-tls@example.com"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "tls",
+        "xhttpSettings": {
+          "host": "example.com",
+          "path": "/xhttp-tls"
+        },
+        "tlsSettings": {
+          "serverName": "example.com",
+          "certificates": [
+            {
+              "certificateFile": "cert/server.crt",
+              "keyFile": "cert/server.key"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    }
+  ]
+}

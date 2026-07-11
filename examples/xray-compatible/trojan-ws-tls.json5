@@ -1,0 +1,41 @@
+{
+  "inbounds": [
+    {
+      "tag": "trojan-ws-tls",
+      "listen": "127.0.0.1",
+      "port": 11017,
+      "protocol": "trojan",
+      "settings": {
+        "clients": [
+          {
+            "password": "trojan-password",
+            "email": "trojan-ws-tls@example.com"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "tls",
+        "wsSettings": {
+          "host": "example.com",
+          "path": "/trojan-ws-tls"
+        },
+        "tlsSettings": {
+          "serverName": "example.com",
+          "certificates": [
+            {
+              "certificateFile": "cert/server.crt",
+              "keyFile": "cert/server.key"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    }
+  ]
+}

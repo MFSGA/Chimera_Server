@@ -1,0 +1,42 @@
+{
+  "inbounds": [
+    {
+      "tag": "vmess-ws-tls",
+      "listen": "127.0.0.1",
+      "port": 11014,
+      "protocol": "vmess",
+      "settings": {
+        "clients": [
+          {
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "email": "vmess-ws-tls@example.com",
+            "security": "aes-128-gcm"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "tls",
+        "wsSettings": {
+          "host": "example.com",
+          "path": "/vmess-ws-tls"
+        },
+        "tlsSettings": {
+          "serverName": "example.com",
+          "certificates": [
+            {
+              "certificateFile": "cert/server.crt",
+              "keyFile": "cert/server.key"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    }
+  ]
+}
