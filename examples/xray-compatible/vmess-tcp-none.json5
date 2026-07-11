@@ -1,0 +1,29 @@
+{
+  "inbounds": [
+    {
+      "tag": "vmess-tcp-none",
+      "listen": "127.0.0.1",
+      "port": 11012,
+      "protocol": "vmess",
+      "settings": {
+        "clients": [
+          {
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "email": "vmess@example.com",
+            "security": "auto"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    }
+  ]
+}

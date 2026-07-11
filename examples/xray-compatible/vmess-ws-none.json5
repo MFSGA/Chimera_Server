@@ -1,0 +1,33 @@
+{
+  "inbounds": [
+    {
+      "tag": "vmess-ws-none",
+      "listen": "127.0.0.1",
+      "port": 11013,
+      "protocol": "vmess",
+      "settings": {
+        "clients": [
+          {
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "email": "vmess-ws@example.com",
+            "security": "auto"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": {
+          "host": "example.com",
+          "path": "/vmess-ws"
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    }
+  ]
+}
