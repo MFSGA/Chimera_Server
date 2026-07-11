@@ -1,0 +1,24 @@
+{
+  "inbounds": [
+    {
+      "tag": "dokodemo-door-udp",
+      "listen": "127.0.0.1",
+      "port": 11020,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 5353,
+        "followRedirect": false
+      },
+      "streamSettings": {
+        "network": "udp"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    }
+  ]
+}

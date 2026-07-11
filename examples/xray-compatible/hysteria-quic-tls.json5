@@ -1,0 +1,42 @@
+{
+  "inbounds": [
+    {
+      "tag": "hysteria-quic-tls",
+      "listen": "127.0.0.1",
+      "port": 11018,
+      "protocol": "hysteria",
+      "settings": {
+        "version": 2,
+        "clients": [
+          {
+            "auth": "hysteria-auth-token",
+            "email": "hy@example.com"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "quic",
+        "security": "tls",
+        "hysteriaSettings": {
+          "up": "10 mbps",
+          "down": "10 mbps"
+        },
+        "tlsSettings": {
+          "alpn": ["h3"],
+          "certificates": [
+            {
+              "certificateFile": "cert/server.crt",
+              "keyFile": "cert/server.key"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    }
+  ]
+}

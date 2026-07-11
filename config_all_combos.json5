@@ -1,6 +1,6 @@
 {
   // Chimera_Server - All protocol/transport/security combination test config
-  // Generated to exercise every valid inbound combo
+  // Generated to exercise every valid inbound combo that currently validates
 
   "api": {
     "listen": "127.0.0.1:9090",
@@ -56,7 +56,8 @@
             "email": "test@vless-tcp-none",
             "flow": ""
           }
-        ]
+        ],
+        "decryption": "none"
       },
       "streamSettings": {
         "network": "tcp",
@@ -127,7 +128,8 @@
             "email": "test@vless-ws-none",
             "flow": ""
           }
-        ]
+        ],
+        "decryption": "none"
       },
       "streamSettings": {
         "network": "ws",
@@ -174,7 +176,8 @@
             "email": "test@vless-xhttp-none",
             "flow": ""
           }
-        ]
+        ],
+        "decryption": "none"
       },
       "streamSettings": {
         "network": "xhttp",
@@ -225,7 +228,8 @@
             "email": "test@vless-tcp-tls",
             "flow": "xtls-rprx-vision"
           }
-        ]
+        ],
+        "decryption": "none"
       },
       "streamSettings": {
         "network": "tcp",
@@ -344,7 +348,8 @@
             "email": "test@vless-ws-tls",
             "flow": ""
           }
-        ]
+        ],
+        "decryption": "none"
       },
       "streamSettings": {
         "network": "ws",
@@ -415,7 +420,8 @@
             "email": "test@vless-xhttp-tls",
             "flow": ""
           }
-        ]
+        ],
+        "decryption": "none"
       },
       "streamSettings": {
         "network": "xhttp",
@@ -453,7 +459,8 @@
             "email": "test@vless-tcp-reality",
             "flow": "xtls-rprx-vision"
           }
-        ]
+        ],
+        "decryption": "none"
       },
       "streamSettings": {
         "network": "tcp",
@@ -463,8 +470,7 @@
           "serverNames": ["addons.mozilla.org"],
           "privateKey": "wHyg5tTbJM1gQsEVmd5Tp6US24dTuz8miowGDVaP6Iw",
           "shortIds": ["4ac97aaf8b9b0356"],
-          "maxTimediff": 0,
-          "fingerprint": "chrome"
+          "maxTimeDiff": 0
         }
       }
     },
@@ -480,7 +486,8 @@
             "email": "test@vless-xhttp-reality",
             "flow": ""
           }
-        ]
+        ],
+        "decryption": "none"
       },
       "streamSettings": {
         "network": "xhttp",
@@ -490,8 +497,7 @@
           "serverNames": ["addons.mozilla.org"],
           "privateKey": "wHyg5tTbJM1gQsEVmd5Tp6US24dTuz8miowGDVaP6Iw",
           "shortIds": ["4ac97aaf8b9b0356"],
-          "maxTimediff": 0,
-          "fingerprint": "chrome"
+          "maxTimeDiff": 0
         },
         "xhttpSettings": {
           "host": "test.chimera.local",

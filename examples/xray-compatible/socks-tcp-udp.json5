@@ -1,0 +1,23 @@
+{
+  "inbounds": [
+    {
+      "tag": "socks-tcp-udp",
+      "listen": "127.0.0.1",
+      "port": 11019,
+      "protocol": "socks",
+      "settings": {
+        "auth": "noauth",
+        "udp": true
+      },
+      "streamSettings": {
+        "network": "tcp"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    }
+  ]
+}

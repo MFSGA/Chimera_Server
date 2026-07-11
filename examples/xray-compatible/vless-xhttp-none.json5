@@ -1,0 +1,33 @@
+{
+  "inbounds": [
+    {
+      "tag": "vless-xhttp-none",
+      "listen": "127.0.0.1",
+      "port": 11009,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "email": "vless-xhttp@example.com"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "none",
+        "xhttpSettings": {
+          "host": "example.com",
+          "path": "/xhttp"
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    }
+  ]
+}
