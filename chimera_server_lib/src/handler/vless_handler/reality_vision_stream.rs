@@ -1,11 +1,12 @@
 use std::{
     io::{self, BufRead, Write},
     pin::Pin,
-    task::{Context, Poll},
+    task::{Context, Poll, ready},
 };
 
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tracing::debug;
 
 use crate::{
     async_stream::{AsyncPing, AsyncStream},
@@ -13,13 +14,14 @@ use crate::{
 };
 
 use super::{
-    append_plaintext_to_read_buf, bounded_write_chunk,
-    contains_tls_application_data, drain_pending_read, queue_padded_packet,
-    take_vless_response_header, unpad_into_pending_read,
+    append_plaintext_to_read_buf, bounded_write_chunk, drain_pending_read,
+    queue_padded_packet, take_vless_response_header, unpad_into_pending_read,
+    vision_tls::{VisionTlsState, is_complete_tls_application_data},
     vision_unpad::{UnpadCommand, VisionUnpadder},
 };
 
 const COMMAND_CONTINUE: u8 = 0x00;
+const COMMAND_END: u8 = 0x01;
 const COMMAND_DIRECT: u8 = 0x02;
 const MAX_WRITE_CONTENT_LEN: usize = 16 * 1024;
 
@@ -33,6 +35,8 @@ enum ReadMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WriteMode {
     Padding,
+    Plain,
+    PendingDirect,
     Direct,
 }
 
@@ -41,6 +45,7 @@ pub struct RealityVisionServerStream<IO, S> {
     session: S,
     user_uuid: [u8; 16],
     unpadder: VisionUnpadder,
+    tls_state: VisionTlsState,
     read_mode: ReadMode,
     write_mode: WriteMode,
     first_write: bool,
@@ -69,15 +74,17 @@ where
 {
     pub fn new(
         tcp: IO,
-        session: S,
+        mut session: S,
         user_uuid: [u8; 16],
         initial_plaintext: &[u8],
     ) -> io::Result<Self> {
+        session.enable_vision_direct_transition();
         let mut stream = Self {
             tcp,
             session,
             user_uuid,
             unpadder: VisionUnpadder::new(user_uuid),
+            tls_state: VisionTlsState::default(),
             read_mode: ReadMode::Padding,
             write_mode: WriteMode::Padding,
             first_write: true,
@@ -168,13 +175,33 @@ where
         enter_direct: bool,
     ) -> Poll<io::Result<usize>> {
         match self.flush_pending_write_padding(cx) {
-            Poll::Ready(Ok(())) | Poll::Pending => {
+            Poll::Ready(Ok(())) => {
                 if enter_direct {
                     self.write_mode = WriteMode::Direct;
                 }
                 Poll::Ready(Ok(written_len))
             }
+            Poll::Pending => {
+                if enter_direct {
+                    self.write_mode = WriteMode::PendingDirect;
+                }
+                Poll::Ready(Ok(written_len))
+            }
             Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+        }
+    }
+
+    fn poll_complete_pending_direct(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.flush_pending_write_padding(cx) {
+            Poll::Ready(Ok(())) => {
+                self.write_mode = WriteMode::Direct;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => Poll::Pending,
         }
     }
 
@@ -190,17 +217,22 @@ where
     }
 
     fn handle_padded_read(&mut self, padded: &[u8]) -> io::Result<()> {
-        match unpad_into_pending_read(
+        let previous_len = self.pending_read.len();
+        let command = unpad_into_pending_read(
             &mut self.unpadder,
             &mut self.pending_read,
             padded,
-        )? {
-            Some(UnpadCommand::Continue) | None => Ok(()),
+        )?;
+        match command {
+            Some(UnpadCommand::Continue) | None => {}
             Some(UnpadCommand::End) => {
+                debug!("VLESS Vision uplink padding ended; keeping REALITY");
                 self.read_mode = ReadMode::Plain;
-                Ok(())
             }
             Some(UnpadCommand::Direct) => {
+                // xray's VisionReader drains both decrypted input and rawInput
+                // before unwrapping REALITY. These bytes precede future raw TCP
+                // reads and must remain in this exact order for xray clients.
                 let leftover =
                     Self::drain_plaintext_from_session(&mut self.session)?;
                 if !leftover.is_empty() {
@@ -210,10 +242,17 @@ where
                 if !raw_leftover.is_empty() {
                     self.pending_read.extend_from_slice(&raw_leftover);
                 }
+                debug!(
+                    buffered_plaintext = leftover.len(),
+                    buffered_raw = raw_leftover.len(),
+                    "VLESS Vision uplink switched to direct TCP"
+                );
                 self.read_mode = ReadMode::Direct;
-                Ok(())
             }
         }
+        let observed = self.pending_read[previous_len..].to_vec();
+        self.tls_state.observe(&observed);
+        Ok(())
     }
 
     fn queue_vless_response_if_needed(&mut self) -> io::Result<()> {
@@ -246,6 +285,15 @@ where
 
         if self.is_read_eof {
             return Poll::Ready(Ok(Vec::new()));
+        }
+
+        // In Vision mode REALITY intentionally decrypts one outer record at a
+        // time. Process an already-buffered record before polling the socket;
+        // this lets a Direct command claim all following bytes as rawInput.
+        let io_state = self.session.process_new_packets()?;
+        let buffered = self.process_new_packets(io_state)?;
+        if !buffered.is_empty() {
+            return Poll::Ready(Ok(buffered));
         }
 
         let mut adapter = SyncReadAdapter {
@@ -335,6 +383,19 @@ where
 
         match this.write_mode {
             WriteMode::Direct => return Pin::new(&mut this.tcp).poll_write(cx, buf),
+            WriteMode::Plain => {
+                match this.flush_pending_write_padding(cx) {
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Pending => return Poll::Pending,
+                }
+                let written = this.session.writer().write(buf)?;
+                return this.poll_complete_padded_write(cx, written, false);
+            }
+            WriteMode::PendingDirect => {
+                ready!(this.poll_complete_pending_direct(cx))?;
+                return Pin::new(&mut this.tcp).poll_write(cx, buf);
+            }
             WriteMode::Padding => {}
         }
 
@@ -352,9 +413,25 @@ where
             return Poll::Ready(Ok(0));
         }
 
-        if contains_tls_application_data(chunk) {
-            this.queue_padded_write(chunk, COMMAND_DIRECT);
-            this.poll_complete_padded_write(cx, chunk.len(), true)
+        this.tls_state.observe(chunk);
+        if this.tls_state.is_tls && is_complete_tls_application_data(chunk) {
+            // Match xray-core: only a supported inner TLS 1.3 session receives
+            // Direct. TLS 1.2 and CCM_8 end padding but stay inside REALITY.
+            if this.tls_state.enable_direct {
+                debug!("VLESS Vision downlink queued Direct command");
+                this.queue_padded_write(chunk, COMMAND_DIRECT);
+                this.poll_complete_padded_write(cx, chunk.len(), true)
+            } else {
+                debug!("VLESS Vision downlink queued End command");
+                this.queue_padded_write(chunk, COMMAND_END);
+                this.write_mode = WriteMode::Plain;
+                this.poll_complete_padded_write(cx, chunk.len(), false)
+            }
+        } else if this.tls_state.should_end_padding_for_compatibility() {
+            debug!("VLESS Vision downlink ended padding by compatibility limit");
+            this.queue_padded_write(chunk, COMMAND_END);
+            this.write_mode = WriteMode::Plain;
+            this.poll_complete_padded_write(cx, chunk.len(), false)
         } else {
             this.queue_padded_write(chunk, COMMAND_CONTINUE);
             this.poll_complete_padded_write(cx, chunk.len(), false)
@@ -368,6 +445,11 @@ where
         let this = self.get_mut();
         match this.write_mode {
             WriteMode::Direct => Pin::new(&mut this.tcp).poll_flush(cx),
+            WriteMode::Plain => this.poll_flush_padding_mode(cx),
+            WriteMode::PendingDirect => {
+                ready!(this.poll_complete_pending_direct(cx))?;
+                Pin::new(&mut this.tcp).poll_flush(cx)
+            }
             WriteMode::Padding => this.poll_flush_padding_mode(cx),
         }
     }
@@ -377,6 +459,15 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        match this.write_mode {
+            WriteMode::Padding | WriteMode::Plain => {
+                ready!(this.flush_pending_write_padding(cx))?;
+            }
+            WriteMode::PendingDirect => {
+                ready!(this.poll_complete_pending_direct(cx))?;
+            }
+            WriteMode::Direct => {}
+        }
         Pin::new(&mut this.tcp).poll_shutdown(cx)
     }
 }
