@@ -94,23 +94,21 @@ pub(super) fn generate_client_hello(
     // SessionId is at offset 39 in ClientHello handshake
     client_hello[39..71].fill(0);
 
-    tracing::debug!("REALITY CLIENT: Encrypting SessionId");
-    tracing::debug!("  auth_key={:02x?}", &auth_key);
-    tracing::debug!("  nonce={:02x?}", nonce);
-    tracing::debug!("  plaintext={:02x?}", &session_id_plaintext);
     tracing::debug!(
-        "  aad_len={} (ClientHello with zero SessionId)",
+        "REALITY CLIENT: Encrypting SessionId (auth_key_len={}, nonce_len={}, plaintext_len={}, aad_len={})",
+        auth_key.len(),
+        nonce.len(),
+        session_id_plaintext.len(),
         client_hello.len()
     );
-    tracing::debug!("  aad[0..4]={:02x?}", &client_hello[0..4]);
 
     let encrypted_session_id =
         encrypt_session_id(&session_id_plaintext, &auth_key, nonce, &client_hello)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
     tracing::debug!(
-        "REALITY CLIENT: Encrypted SessionId={:02x?}",
-        &encrypted_session_id
+        "REALITY CLIENT: Encrypted SessionId generated (len={})",
+        encrypted_session_id.len()
     );
 
     // Replace the zeros with the encrypted SessionId

@@ -44,8 +44,10 @@ pub struct RealityServerConfig {
     pub private_key: [u8; 32],
     /// List of valid short IDs for authentication (8 bytes each)
     pub short_ids: Vec<[u8; 8]>,
-    /// Destination server for certificate generation
+    /// Destination server used for REALITY handshake mirroring.
     pub dest: NetLocation,
+    /// Server names accepted by the inbound and used for certificate generation.
+    pub server_names: Vec<String>,
     /// Maximum allowed time difference in milliseconds (None = no check)
     pub max_time_diff: Option<u64>,
     /// Minimum accepted client version (3 bytes: major.minor.patch)
@@ -115,6 +117,11 @@ pub struct RealityServerConnection {
     plaintext_write_buf: Vec<u8>,     // Application data to encrypt
     received_close_notify: bool,      // Peer sent close_notify alert
     fatal_error: Option<io::ErrorKind>, // Fatal error occurred, connection unusable
+    vision_direct_transition: bool,
+}
+
+fn max_time_diff_secs(max_diff_ms: u64) -> u64 {
+    max_diff_ms.div_ceil(1000)
 }
 
 impl RealityServerConnection {
@@ -137,6 +144,7 @@ impl RealityServerConnection {
             plaintext_write_buf: Vec::with_capacity(OUTGOING_BUFFER_LIMIT),
             received_close_notify: false,
             fatal_error: None,
+            vision_direct_transition: false,
         })
     }
 
@@ -211,6 +219,15 @@ impl RealityServerConnection {
             }
 
             if self.received_close_notify {
+                break;
+            }
+
+            // Do not let the outer progress loop immediately process another
+            // record in Vision mode. The plaintext may contain Direct, making
+            // every following buffered byte xray's rawInput rather than TLS.
+            if self.vision_direct_transition
+                && before_plaintext_len != self.plaintext_read_buf.len()
+            {
                 break;
             }
 
@@ -319,8 +336,8 @@ impl RealityServerConnection {
         let client_public_key = extract_client_public_key(client_hello)?;
 
         tracing::debug!(
-            "REALITY: ClientHello received, client_random: {:?}",
-            &client_random[..8]
+            client_random_len = client_random.len(),
+            "REALITY: ClientHello received"
         );
 
         let shared_secret =
@@ -373,9 +390,11 @@ impl RealityServerConnection {
         ]) as u64;
         let client_short_id = &decrypted_session_id[8..16];
 
-        tracing::debug!("REALITY: Client version: {:?}", client_version);
-        tracing::debug!("REALITY: Client timestamp: {}", client_timestamp);
-        tracing::debug!("REALITY: Client short_id: {:02x?}", client_short_id);
+        tracing::debug!(
+            client_version_len = client_version.len(),
+            has_client_timestamp = true,
+            "REALITY: Client session metadata decrypted"
+        );
 
         let mut client_short_id_arr = [0u8; 8];
         client_short_id_arr.copy_from_slice(client_short_id);
@@ -386,12 +405,12 @@ impl RealityServerConnection {
 
         if !short_id_ok {
             tracing::warn!(
-                "REALITY: Client short_id {:02x?} not in configured list",
-                client_short_id
+                configured_short_ids = self.config.short_ids.len(),
+                "REALITY: Client short_id not in configured list"
             );
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("Invalid short_id: {:02x?}", client_short_id),
+                "Invalid short_id",
             ));
         }
 
@@ -402,15 +421,13 @@ impl RealityServerConnection {
                 .as_secs();
 
             let time_diff_secs = now.abs_diff(client_timestamp);
-            let max_diff_secs = max_diff_ms / 1000;
+            let max_diff_secs = max_time_diff_secs(max_diff_ms);
 
             if time_diff_secs > max_diff_secs {
                 tracing::warn!(
-                    "REALITY: Client timestamp {} differs from server {} by {} seconds (max: {} seconds)",
-                    client_timestamp,
-                    now,
                     time_diff_secs,
-                    max_diff_secs
+                    max_diff_secs,
+                    "REALITY: Client timestamp outside allowed skew"
                 );
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -422,45 +439,35 @@ impl RealityServerConnection {
             }
         }
 
-        if let Some(min_ver) = &self.config.min_client_version {
-            if client_version < &min_ver[..] {
-                tracing::warn!(
-                    "REALITY: Client version {:?} is below minimum {:?}",
-                    client_version,
-                    min_ver
-                );
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "Client version {:?} is below minimum {:?}",
-                        client_version, min_ver
-                    ),
-                ));
-            }
+        if let Some(min_ver) = &self.config.min_client_version
+            && client_version < &min_ver[..]
+        {
+            tracing::warn!(
+                configured_min_version_len = min_ver.len(),
+                "REALITY: Client version is below minimum"
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Client version is below minimum",
+            ));
         }
 
-        if let Some(max_ver) = &self.config.max_client_version {
-            if client_version > &max_ver[..] {
-                tracing::warn!(
-                    "REALITY: Client version {:?} is above maximum {:?}",
-                    client_version,
-                    max_ver
-                );
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "Client version {:?} is above maximum {:?}",
-                        client_version, max_ver
-                    ),
-                ));
-            }
+        if let Some(max_ver) = &self.config.max_client_version
+            && client_version > &max_ver[..]
+        {
+            tracing::warn!(
+                configured_max_version_len = max_ver.len(),
+                "REALITY: Client version is above maximum"
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Client version is above maximum",
+            ));
         }
 
         tracing::info!(
-            "REALITY: Client authentication successful - short_id: {:02x?}, version: {:?}, timestamp: {}",
-            client_short_id,
-            client_version,
-            client_timestamp
+            client_version_len = client_version.len(),
+            "REALITY: Client authentication successful"
         );
 
         let client_cipher_suites = extract_client_cipher_suites(client_hello)?;
@@ -478,9 +485,9 @@ impl RealityServerConnection {
                     )
                 })?;
         tracing::debug!(
-            "REALITY: Negotiated cipher suite {:?} (client offered: {:04x?})",
-            cipher_suite,
-            client_cipher_suites
+            ?cipher_suite,
+            client_cipher_suite_count = client_cipher_suites.len(),
+            "REALITY: Negotiated cipher suite"
         );
 
         self.handshake_state = HandshakeState::ClientHelloValidated {
@@ -575,20 +582,28 @@ impl RealityServerConnection {
             server_hello_hash.as_ref(),
         )?;
 
-        // Get destination hostname for certificate
-        let dest_hostname = match self.config.dest.address() {
-            Address::Hostname(h) => h.as_str(),
-            _ => {
-                return Err(io::Error::new(
+        // Use the first configured server name for the generated certificate.
+        // When dest is an IP address, config validation requires an explicit
+        // serverNames list so the REALITY certificate still has a hostname.
+        let cert_hostname = self
+            .config
+            .server_names
+            .first()
+            .map(String::as_str)
+            .or_else(|| match self.config.dest.address() {
+                Address::Hostname(hostname) => Some(hostname.as_str()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "REALITY requires a hostname destination",
-                ));
-            }
-        };
+                    "REALITY requires a hostname serverName for certificate generation",
+                )
+            })?;
 
         // Step 11: Generate HMAC-signed certificate
         let (cert_der, signing_key) =
-            generate_hmac_certificate(&info.auth_key, dest_hostname)?;
+            generate_hmac_certificate(&info.auth_key, cert_hostname)?;
 
         // Step 12: Build encrypted handshake messages
         let encrypted_extensions = construct_encrypted_extensions()?;
@@ -1000,6 +1015,12 @@ impl RealityServerConnection {
             if received_close_notify {
                 return Ok(());
             }
+            // xray may append raw inner-TLS bytes immediately after the outer
+            // record carrying Vision Direct. Return after one outer record so
+            // VisionReader can inspect the command before we touch rawInput.
+            if self.vision_direct_transition {
+                return Ok(());
+            }
         }
 
         Ok(())
@@ -1093,6 +1114,11 @@ impl RealityServerConnection {
         let pending = self.ciphertext_read_buf.as_slice().to_vec();
         self.ciphertext_read_buf.consume(pending.len());
         pending
+    }
+
+    /// Preserve record boundaries while a Vision stream may switch to raw TCP.
+    pub fn enable_vision_direct_transition(&mut self) {
+        self.vision_direct_transition = true;
     }
 
     /// Queue a close notification alert
@@ -1207,6 +1233,7 @@ mod tests {
                 Address::Hostname("example.com".to_string()),
                 443,
             ),
+            server_names: vec!["example.com".to_string()],
             max_time_diff: None,
             min_client_version: None,
             max_client_version: None,
@@ -1233,6 +1260,7 @@ mod tests {
             private_key: [0u8; 32],
             short_ids: vec![[0u8; 8]],
             dest: NetLocation::new(Address::UNSPECIFIED, 443),
+            server_names: vec!["example.com".to_string()],
             max_time_diff: Some(60000),
             min_client_version: None,
             max_client_version: None,
@@ -1251,6 +1279,7 @@ mod tests {
             private_key: [0u8; 32],
             short_ids: vec![[0u8; 8]],
             dest: NetLocation::new(Address::UNSPECIFIED, 443),
+            server_names: vec!["example.com".to_string()],
             max_time_diff: None,
             min_client_version: None,
             max_client_version: None,
@@ -1348,11 +1377,21 @@ mod tests {
     }
 
     #[test]
+    fn max_time_diff_millis_rounds_up_to_seconds() {
+        assert_eq!(max_time_diff_secs(1), 1);
+        assert_eq!(max_time_diff_secs(999), 1);
+        assert_eq!(max_time_diff_secs(1000), 1);
+        assert_eq!(max_time_diff_secs(1001), 2);
+        assert_eq!(max_time_diff_secs(60_000), 60);
+    }
+
+    #[test]
     fn fatal_packet_error_is_remembered() {
         let config = RealityServerConfig {
             private_key: [0u8; 32],
             short_ids: vec![[0u8; 8]],
             dest: NetLocation::new(Address::UNSPECIFIED, 443),
+            server_names: vec!["example.com".to_string()],
             max_time_diff: None,
             min_client_version: None,
             max_client_version: None,
@@ -1380,6 +1419,7 @@ mod tests {
             private_key: [0u8; 32],
             short_ids: vec![[0u8; 8]],
             dest: NetLocation::new(Address::UNSPECIFIED, 443),
+            server_names: vec!["example.com".to_string()],
             max_time_diff: None,
             min_client_version: None,
             max_client_version: None,
