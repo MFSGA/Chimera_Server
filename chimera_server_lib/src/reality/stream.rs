@@ -24,6 +24,7 @@ pub trait RealitySession {
     fn take_remaining_ciphertext(&mut self) -> Vec<u8> {
         Vec::new()
     }
+    fn enable_vision_direct_transition(&mut self) {}
     fn send_close_notify(&mut self);
 }
 
@@ -62,6 +63,10 @@ impl RealitySession for RealityServerConnection {
 
     fn take_remaining_ciphertext(&mut self) -> Vec<u8> {
         RealityServerConnection::take_remaining_ciphertext(self)
+    }
+
+    fn enable_vision_direct_transition(&mut self) {
+        RealityServerConnection::enable_vision_direct_transition(self)
     }
 
     fn send_close_notify(&mut self) {
@@ -207,13 +212,13 @@ where
         // Serve already decrypted data first
         {
             let mut reader = this.session.reader();
-            if let Ok(available) = reader.fill_buf() {
-                if !available.is_empty() {
-                    let len = buf.remaining().min(available.len());
-                    buf.put_slice(&available[..len]);
-                    reader.consume(len);
-                    return Poll::Ready(Ok(()));
-                }
+            if let Ok(available) = reader.fill_buf()
+                && !available.is_empty()
+            {
+                let len = buf.remaining().min(available.len());
+                buf.put_slice(&available[..len]);
+                reader.consume(len);
+                return Poll::Ready(Ok(()));
             }
         }
 
@@ -291,6 +296,9 @@ where
                     reader.consume(len);
                     return Poll::Ready(Ok(()));
                 }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    return Poll::Pending;
+                }
                 Err(e) => return Poll::Ready(Err(e)),
             }
         }
@@ -321,9 +329,8 @@ where
         let n = writer.write(buf)?;
 
         match this.drain_all_writes(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(n)),
+            Poll::Ready(Ok(())) | Poll::Pending => Poll::Ready(Ok(n)),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
         }
     }
 

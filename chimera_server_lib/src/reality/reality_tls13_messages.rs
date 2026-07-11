@@ -425,7 +425,7 @@ pub fn construct_client_hello(
                 "ALPN extension too long",
             )
         })?;
-        extensions.extend_from_slice(&(ext_len as u16).to_be_bytes());
+        extensions.extend_from_slice(&ext_len.to_be_bytes());
         extensions.extend_from_slice(&(protocols_list_len as u16).to_be_bytes());
 
         for protocol in alpn_protocols {
