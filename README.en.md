@@ -77,12 +77,12 @@ and `hex` output.
 ```
 
 ## Example Configs
-- `examples/01-api.json5`
-- `examples/02_trojan_ws_tls_30919.json5`
-- `examples/03_vless_ws_tls_36050.json5`
-- `examples/04_vless_tcp_50584.json5`
-- `examples/05_vless_ws_56321.json5`
-- `examples/06-hysteria-43210.json5`
+- `examples/xray-compatible/vless-tcp-none.json5`
+- `examples/xray-compatible/vless-ws-tls.json5`
+- `examples/xray-compatible/vmess-tcp-none.json5`
+- `examples/xray-compatible/trojan-tcp-tls.json5`
+- `examples/xray-compatible/socks-tcp-noauth.json5`
+- `examples/xray-compatible/hysteria-quic-tls.json5`
 
 ## Development Commands
 ```bash
