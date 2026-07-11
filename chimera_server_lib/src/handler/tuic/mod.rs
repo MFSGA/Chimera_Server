@@ -71,9 +71,8 @@ pub async fn run_tuic_server(
 ) -> std::io::Result<()> {
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
 
-    let quic_server_config: quinn::crypto::rustls::QuicServerConfig = server_config
-        .try_into()
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+    let quic_server_config: quinn::crypto::rustls::QuicServerConfig =
+        server_config.try_into().map_err(std::io::Error::other)?;
     let quic_server_config = Arc::new(quic_server_config);
 
     let identity = Arc::new(config.uuid.clone());
@@ -173,9 +172,7 @@ pub async fn run_tuic_server(
     }
 
     for join_handle in join_handles {
-        join_handle
-            .await
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))??;
+        join_handle.await.map_err(std::io::Error::other)??;
     }
 
     Ok(())
@@ -197,8 +194,7 @@ async fn process_connection(
             .map_err(|_| std::io::Error::other("failed to enable 0-RTT"))?;
         connection
     } else {
-        conn.await
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?
+        conn.await.map_err(std::io::Error::other)?
     };
 
     match timeout(
@@ -296,7 +292,7 @@ async fn auth_connection(
         let mut recv_stream = match connection.accept_uni().await {
             Ok(stream) => stream,
             Err(err) => {
-                return Err(std::io::Error::new(std::io::ErrorKind::Other, err));
+                return Err(std::io::Error::other(err));
             }
         };
         let tuic_version = recv_stream.read_u8().await?;
@@ -318,7 +314,7 @@ async fn auth_connection(
         recv_stream
             .read_exact(&mut specified_uuid)
             .await
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+            .map_err(std::io::Error::other)?;
         if specified_uuid.as_slice() != uuid {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -330,7 +326,7 @@ async fn auth_connection(
         recv_stream
             .read_exact(&mut token_bytes)
             .await
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+            .map_err(std::io::Error::other)?;
         if token_bytes != expected_token_bytes {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -489,9 +485,9 @@ async fn read_address(
         0x00 => {
             let address_len = recv.read_u8().await? as usize;
             let mut address_bytes = allocate_vec(address_len);
-            recv.read_exact(&mut address_bytes).await.map_err(|err| {
-                std::io::Error::new(std::io::ErrorKind::Other, err)
-            })?;
+            recv.read_exact(&mut address_bytes)
+                .await
+                .map_err(std::io::Error::other)?;
             let address_str = std::str::from_utf8(&address_bytes).map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -504,9 +500,9 @@ async fn read_address(
         }
         0x01 => {
             let mut ipv4_bytes = [0u8; 4];
-            recv.read_exact(&mut ipv4_bytes).await.map_err(|err| {
-                std::io::Error::new(std::io::ErrorKind::Other, err)
-            })?;
+            recv.read_exact(&mut ipv4_bytes)
+                .await
+                .map_err(std::io::Error::other)?;
             Address::Ipv4(Ipv4Addr::new(
                 ipv4_bytes[0],
                 ipv4_bytes[1],
@@ -516,9 +512,9 @@ async fn read_address(
         }
         0x02 => {
             let mut ipv6_bytes = [0u8; 16];
-            recv.read_exact(&mut ipv6_bytes).await.map_err(|err| {
-                std::io::Error::new(std::io::ErrorKind::Other, err)
-            })?;
+            recv.read_exact(&mut ipv6_bytes)
+                .await
+                .map_err(std::io::Error::other)?;
             let ipv6_addr = Ipv6Addr::from(ipv6_bytes);
             Address::Ipv6(ipv6_addr)
         }
@@ -533,7 +529,7 @@ async fn read_address(
     let mut port_bytes = [0u8; 2];
     recv.read_exact(&mut port_bytes)
         .await
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+        .map_err(std::io::Error::other)?;
     let port = u16::from_be_bytes(port_bytes);
 
     Ok(Some(NetLocation::new(address, port)))
@@ -991,7 +987,7 @@ async fn process_uni_stream(
     recv_stream
         .read_exact(&mut payload_fragment)
         .await
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+        .map_err(std::io::Error::other)?;
 
     let mut fragments: LruCache<u16, FragmentedPacket> =
         LruCache::new(fragment_cache_size());
@@ -1063,9 +1059,8 @@ async fn process_udp_packet(
             let socket = new_udp_socket(bind_addr, None)?;
 
             let session = if is_uni_stream {
-                let send_stream = connection.open_uni().await.map_err(|err| {
-                    std::io::Error::new(std::io::ErrorKind::Other, err)
-                })?;
+                let send_stream =
+                    connection.open_uni().await.map_err(std::io::Error::other)?;
                 UdpSession::start_with_send_stream(
                     assoc_id,
                     send_stream,
@@ -1409,7 +1404,7 @@ impl AsyncWrite for QuicStream {
     ) -> Poll<std::io::Result<usize>> {
         Pin::new(&mut self.get_mut().send)
             .poll_write(cx, buf)
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
+            .map_err(std::io::Error::other)
     }
 
     fn poll_flush(
@@ -1418,7 +1413,7 @@ impl AsyncWrite for QuicStream {
     ) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.get_mut().send)
             .poll_flush(cx)
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
+            .map_err(std::io::Error::other)
     }
 
     fn poll_shutdown(
@@ -1427,7 +1422,7 @@ impl AsyncWrite for QuicStream {
     ) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.get_mut().send)
             .poll_shutdown(cx)
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
+            .map_err(std::io::Error::other)
     }
 }
 

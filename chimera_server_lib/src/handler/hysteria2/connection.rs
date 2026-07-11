@@ -210,7 +210,7 @@ async fn drive_tcp_streams(
             }
             Err(quinn::ConnectionError::ApplicationClosed { .. }) => return Ok(()),
             Err(err) => {
-                return Err(Error::new(ErrorKind::Other, err));
+                return Err(Error::other(err));
             }
         }
     }
@@ -279,7 +279,7 @@ impl TcpRequest {
         stream
             .read_exact(&mut address_bytes)
             .await
-            .map_err(|err| Error::new(ErrorKind::Other, err))?;
+            .map_err(Error::other)?;
         let address = String::from_utf8(address_bytes)
             .map_err(|err| Error::new(ErrorKind::InvalidData, err))?;
         let target = NetLocation::from_str(&address, None)?;
@@ -339,7 +339,7 @@ impl AsyncWrite for QuicStream {
     ) -> Poll<std::io::Result<usize>> {
         Pin::new(&mut self.get_mut().send)
             .poll_write(cx, buf)
-            .map_err(|err| Error::new(ErrorKind::Other, err))
+            .map_err(Error::other)
     }
 
     fn poll_flush(
@@ -348,7 +348,7 @@ impl AsyncWrite for QuicStream {
     ) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.get_mut().send)
             .poll_flush(cx)
-            .map_err(|err| Error::new(ErrorKind::Other, err))
+            .map_err(Error::other)
     }
 
     fn poll_shutdown(
@@ -357,7 +357,7 @@ impl AsyncWrite for QuicStream {
     ) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.get_mut().send)
             .poll_shutdown(cx)
-            .map_err(|err| Error::new(ErrorKind::Other, err))
+            .map_err(Error::other)
     }
 }
 
@@ -457,7 +457,7 @@ async fn send_auth_success(
         .header(PADDING_HEADER, &padding)
         .header(http::header::CONTENT_LENGTH, "0")
         .body(())
-        .map_err(|err| Error::new(ErrorKind::Other, err))?;
+        .map_err(Error::other)?;
     stream.send_response(response).await.map_err(map_h3_error)?;
     stream.finish().await.map_err(map_h3_error)
 }
@@ -470,7 +470,7 @@ async fn send_simple_response(
         .status(status)
         .header(http::header::CONTENT_LENGTH, "0")
         .body(())
-        .map_err(|err| Error::new(ErrorKind::Other, err))?;
+        .map_err(Error::other)?;
     stream.send_response(response).await.map_err(map_h3_error)?;
     stream.finish().await.map_err(map_h3_error)
 }
@@ -485,15 +485,12 @@ fn map_h3_error<E>(err: E) -> std::io::Error
 where
     E: std::error::Error + Send + Sync + 'static,
 {
-    Error::new(ErrorKind::Other, err)
+    Error::other(err)
 }
 
 async fn read_varint(stream: &mut quinn::RecvStream) -> std::io::Result<u64> {
     let mut first = [0u8; 1];
-    stream
-        .read_exact(&mut first)
-        .await
-        .map_err(|err| Error::new(ErrorKind::Other, err))?;
+    stream.read_exact(&mut first).await.map_err(Error::other)?;
     let prefix = first[0] >> 6;
     let mut value = (first[0] & 0x3f) as u64;
     let remaining = match prefix {
@@ -509,7 +506,7 @@ async fn read_varint(stream: &mut quinn::RecvStream) -> std::io::Result<u64> {
         stream
             .read_exact(&mut buf[..remaining])
             .await
-            .map_err(|err| Error::new(ErrorKind::Other, err))?;
+            .map_err(Error::other)?;
         for &byte in &buf[..remaining] {
             value = (value << 8) | u64::from(byte);
         }
@@ -531,7 +528,7 @@ async fn skip_padding(
         stream
             .read_exact(&mut scratch[..take])
             .await
-            .map_err(|err| Error::new(ErrorKind::Other, err))?;
+            .map_err(Error::other)?;
         len -= take;
     }
     Ok(())
@@ -548,14 +545,8 @@ async fn send_tcp_response(
     push_varint(&mut buf, message_bytes.len() as u64)?;
     buf.extend_from_slice(message_bytes);
     push_varint(&mut buf, 0)?;
-    stream
-        .write_all(&buf)
-        .await
-        .map_err(|err| Error::new(ErrorKind::Other, err))?;
-    stream
-        .flush()
-        .await
-        .map_err(|err| Error::new(ErrorKind::Other, err))
+    stream.write_all(&buf).await.map_err(Error::other)?;
+    stream.flush().await.map_err(Error::other)
 }
 
 async fn drive_udp_datagrams(
@@ -569,7 +560,7 @@ async fn drive_udp_datagrams(
             Ok(data) => data,
             Err(quinn::ConnectionError::ApplicationClosed { .. })
             | Err(quinn::ConnectionError::ConnectionClosed { .. }) => return Ok(()),
-            Err(err) => return Err(Error::new(ErrorKind::Other, err)),
+            Err(err) => return Err(Error::other(err)),
         };
 
         if data.len() < 9 {
@@ -706,10 +697,8 @@ async fn drive_udp_datagrams(
             } = session.fragments.remove(&packet_id).unwrap();
 
             let mut assembled = BytesMut::with_capacity(packet_len);
-            for fragment in received.into_iter() {
-                if let Some(bytes) = fragment {
-                    assembled.extend_from_slice(&bytes);
-                }
+            for bytes in received.into_iter().flatten() {
+                assembled.extend_from_slice(&bytes);
             }
 
             if remembered_location != session.last_location {
@@ -795,9 +784,9 @@ async fn run_udp_remote_to_local_loop(
     connection: quinn::Connection,
     socket: Arc<UdpSocket>,
 ) -> std::io::Result<()> {
-    let max_datagram_size = connection.max_datagram_size().ok_or_else(|| {
-        Error::new(ErrorKind::Other, "peer does not support datagrams")
-    })? as usize;
+    let max_datagram_size = connection
+        .max_datagram_size()
+        .ok_or_else(|| Error::other("peer does not support datagrams"))?;
 
     let mut next_packet_id: u16 = 0;
     let mut buf = vec![0u8; 65535];
@@ -805,10 +794,10 @@ async fn run_udp_remote_to_local_loop(
     loop {
         let (payload_len, src_addr) =
             socket.recv_from(&mut buf).await.map_err(|err| {
-                Error::new(
-                    ErrorKind::Other,
-                    format!("failed to receive hysteria2 UDP payload: {}", err),
-                )
+                Error::other(format!(
+                    "failed to receive hysteria2 UDP payload: {}",
+                    err
+                ))
             })?;
 
         let address_bytes = Bytes::from(src_addr.to_string().into_bytes());
@@ -844,10 +833,9 @@ async fn run_udp_remote_to_local_loop(
 
             connection
                 .send_datagram(datagram.freeze())
-                .map_err(|err| Error::new(ErrorKind::Other, err))?;
+                .map_err(Error::other)?;
         } else {
-            let fragment_count =
-                (payload_len + available_payload - 1) / available_payload;
+            let fragment_count = payload_len.div_ceil(available_payload);
             if fragment_count > u8::MAX as usize {
                 warn!(
                     "hysteria2 UDP packet too large to fragment ({} fragments)",
@@ -872,7 +860,7 @@ async fn run_udp_remote_to_local_loop(
 
                 connection
                     .send_datagram(datagram.freeze())
-                    .map_err(|err| Error::new(ErrorKind::Other, err))?;
+                    .map_err(Error::other)?;
             }
         }
 

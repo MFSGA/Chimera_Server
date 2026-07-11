@@ -183,8 +183,7 @@ impl BrutalState {
         if lost_bytes == 0 {
             return;
         }
-        let loss_count =
-            (lost_bytes + self.max_datagram_size - 1) / self.max_datagram_size;
+        let loss_count = lost_bytes.div_ceil(self.max_datagram_size);
         self.record(now, 0, loss_count);
     }
 
