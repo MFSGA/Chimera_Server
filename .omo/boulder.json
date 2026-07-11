@@ -1,0 +1,143 @@
+{
+  "schema_version": 2,
+  "active_work_id": "proxy-throughput-workflow-defdce01",
+  "works": {
+    "proxy-throughput-workflow-defdce01": {
+      "work_id": "proxy-throughput-workflow-defdce01",
+      "active_plan": "/home/si/Desktop/mfsga/Chimera_Server/.omo/plans/proxy-throughput-workflow.md",
+      "plan_name": "proxy-throughput-workflow",
+      "status": "completed",
+      "started_at": "2026-05-25T16:32:34.458Z",
+      "updated_at": "2026-05-26T02:02:15.358Z",
+      "session_ids": [
+        "ses_1a02b51f8ffeR9DsMLCN6XxtMY"
+      ],
+      "session_origins": {
+        "ses_1a02b51f8ffeR9DsMLCN6XxtMY": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {
+        "todo:1": {
+          "task_key": "todo:1",
+          "task_label": "1",
+          "task_title": "Baseline comparison: if `bench/baseline-throughput.json` exists → compare; if missing → skip",
+          "session_id": "ses_19dffd24effetEauWuDwAi0FDO",
+          "agent": "Sisyphus-Junior",
+          "category": "deep",
+          "started_at": "2026-05-26T01:39:37.156Z",
+          "ended_at": "2026-05-26T01:59:37.927Z",
+          "elapsed_ms": 1200771,
+          "status": "completed",
+          "updated_at": "2026-05-26T01:59:37.927Z"
+        },
+        "todo:6": {
+          "task_key": "todo:6",
+          "task_label": "6",
+          "task_title": "**Create bench/throughput.py — Main test orchestrator**",
+          "session_id": "ses_19e0ddc91ffeglMoKCQNroPI2U",
+          "agent": "Sisyphus-Junior",
+          "category": "unspecified-high",
+          "updated_at": "2026-05-26T01:49:18.132Z",
+          "started_at": "2026-05-26T01:48:39.038Z",
+          "status": "completed",
+          "ended_at": "2026-05-26T01:49:18.132Z",
+          "elapsed_ms": 39094
+        },
+        "todo:7": {
+          "task_key": "todo:7",
+          "task_label": "7",
+          "task_title": "**Create bench/baseline-throughput.json — Initial baseline (after test run)**",
+          "session_id": "ses_19e06e97dffeILs1pYyK5sk7nc",
+          "agent": "Sisyphus-Junior",
+          "category": "unspecified-high",
+          "updated_at": "2026-05-26T01:52:53.348Z",
+          "started_at": "2026-05-26T01:50:43.057Z",
+          "status": "completed",
+          "ended_at": "2026-05-26T01:52:53.348Z",
+          "elapsed_ms": 130291
+        },
+        "final-wave:f1": {
+          "task_key": "final-wave:f1",
+          "task_label": "F1",
+          "task_title": "**Plan Compliance Audit** — `oracle`",
+          "session_id": "ses_19dfd583affehO6Ju6GbdnVX0a",
+          "agent": "oracle",
+          "started_at": "2026-05-26T01:56:07.249Z",
+          "status": "completed",
+          "updated_at": "2026-05-26T02:01:14.030Z",
+          "ended_at": "2026-05-26T02:01:14.029Z",
+          "elapsed_ms": 306780
+        }
+      },
+      "ended_at": "2026-05-26T02:02:15.358Z",
+      "elapsed_ms": 34180900
+    }
+  },
+  "active_plan": "/home/si/Desktop/mfsga/Chimera_Server/.omo/plans/proxy-throughput-workflow.md",
+  "started_at": "2026-05-25T16:32:34.458Z",
+  "status": "completed",
+  "updated_at": "2026-05-26T02:02:15.358Z",
+  "session_ids": [
+    "ses_1a02b51f8ffeR9DsMLCN6XxtMY"
+  ],
+  "session_origins": {
+    "ses_1a02b51f8ffeR9DsMLCN6XxtMY": "direct"
+  },
+  "plan_name": "proxy-throughput-workflow",
+  "task_sessions": {
+    "todo:1": {
+      "task_key": "todo:1",
+      "task_label": "1",
+      "task_title": "Baseline comparison: if `bench/baseline-throughput.json` exists → compare; if missing → skip",
+      "session_id": "ses_19dffd24effetEauWuDwAi0FDO",
+      "agent": "Sisyphus-Junior",
+      "category": "deep",
+      "started_at": "2026-05-26T01:39:37.156Z",
+      "ended_at": "2026-05-26T01:59:37.927Z",
+      "elapsed_ms": 1200771,
+      "status": "completed",
+      "updated_at": "2026-05-26T01:59:37.927Z"
+    },
+    "todo:6": {
+      "task_key": "todo:6",
+      "task_label": "6",
+      "task_title": "**Create bench/throughput.py — Main test orchestrator**",
+      "session_id": "ses_19e0ddc91ffeglMoKCQNroPI2U",
+      "agent": "Sisyphus-Junior",
+      "category": "unspecified-high",
+      "updated_at": "2026-05-26T01:49:18.132Z",
+      "started_at": "2026-05-26T01:48:39.038Z",
+      "status": "completed",
+      "ended_at": "2026-05-26T01:49:18.132Z",
+      "elapsed_ms": 39094
+    },
+    "todo:7": {
+      "task_key": "todo:7",
+      "task_label": "7",
+      "task_title": "**Create bench/baseline-throughput.json — Initial baseline (after test run)**",
+      "session_id": "ses_19e06e97dffeILs1pYyK5sk7nc",
+      "agent": "Sisyphus-Junior",
+      "category": "unspecified-high",
+      "updated_at": "2026-05-26T01:52:53.348Z",
+      "started_at": "2026-05-26T01:50:43.057Z",
+      "status": "completed",
+      "ended_at": "2026-05-26T01:52:53.348Z",
+      "elapsed_ms": 130291
+    },
+    "final-wave:f1": {
+      "task_key": "final-wave:f1",
+      "task_label": "F1",
+      "task_title": "**Plan Compliance Audit** — `oracle`",
+      "session_id": "ses_19dfd583affehO6Ju6GbdnVX0a",
+      "agent": "oracle",
+      "started_at": "2026-05-26T01:56:07.249Z",
+      "status": "completed",
+      "updated_at": "2026-05-26T02:01:14.030Z",
+      "ended_at": "2026-05-26T02:01:14.029Z",
+      "elapsed_ms": 306780
+    }
+  },
+  "agent": "atlas",
+  "ended_at": "2026-05-26T02:02:15.358Z",
+  "elapsed_ms": 34180900
+}

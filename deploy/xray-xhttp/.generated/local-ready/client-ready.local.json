@@ -1,0 +1,52 @@
+{
+  "log": {
+    "loglevel": "debug"
+  },
+  "inbounds": [
+    {
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "port": 10809,
+      "protocol": "socks",
+      "settings": {
+        "auth": "noauth",
+        "udp": true
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "proxy",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "127.0.0.1",
+            "port": 19443,
+            "users": [
+              {
+                "id": "ddc7fa8f-72a2-4353-959b-b3a8fa290b77",
+                "encryption": "none"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "localhost",
+          "pinnedPeerCertSha256": "08ea79c41b164ab1c06e67e775a6e92ca849b08d98744c58e021769e5a57edf1",
+          "verifyPeerCertByName": "localhost",
+          "alpn": ["h2"]
+        },
+        "xhttpSettings": {
+          "host": "localhost",
+          "path": "/chimera-xhttp-ddc7fa8f",
+          "mode": "auto"
+        }
+      }
+    }
+  ]
+}

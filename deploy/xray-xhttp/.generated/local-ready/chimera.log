@@ -1,0 +1,436 @@
+warning: /home/si/Desktop/mfsga/Chimera_Server/Cargo.toml: unused manifest key: workspace.package.name
+warning: unused import: `ServerProxyConfig`
+  --> chimera_server_lib/src/beginning/quic.rs:13:23
+   |
+13 |         ServerConfig, ServerProxyConfig, quic::ServerQuicConfig,
+   |                       ^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `config::InternalConfig`
+ --> chimera_server_lib/src/config/internal/mod.rs:3:9
+  |
+3 | pub use config::InternalConfig;
+  |         ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `collections::HashMap`
+ --> chimera_server_lib/src/config/def.rs:1:11
+  |
+1 | use std::{collections::HashMap, path::PathBuf, str::FromStr};
+  |           ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `SupportedFileType`
+ --> chimera_server_lib/src/config/def.rs:8:54
+  |
+8 | use super::{Protocol, SettingObject, StreamSettings, SupportedFileType, Transport};
+  |                                                      ^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `BandwidthValue`, `HysteriaSettings`, and `parse_bandwidth`
+ --> chimera_server_lib/src/config/server_config/builder/collectors.rs:5:14
+  |
+5 |     config::{HysteriaSettings, SettingObject, XhttpRange, XhttpSettings},
+  |              ^^^^^^^^^^^^^^^^
+6 |     util::bandwidth::{BandwidthValue, parse_bandwidth},
+  |                       ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^
+
+warning: unused imports: `Address` and `NetLocation`
+  --> chimera_server_lib/src/config/server_config/builder/tls.rs:11:22
+   |
+11 | use crate::address::{Address, NetLocation};
+   |                      ^^^^^^^  ^^^^^^^^^^^
+
+warning: unused import: `util::option::NoneOrSome`
+ --> chimera_server_lib/src/config/server_config/builder/mod.rs:8:5
+  |
+8 |     util::option::NoneOrSome,
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `quic::ServerQuicConfig`
+  --> chimera_server_lib/src/config/server_config/builder/mod.rs:17:5
+   |
+17 |     quic::ServerQuicConfig,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `NetLocation`
+ --> chimera_server_lib/src/config/server_config/types.rs:4:29
+  |
+4 |     address::{BindLocation, NetLocation},
+  |                             ^^^^^^^^^^^
+
+warning: unused import: `std::collections::BTreeSet`
+ --> chimera_server_lib/src/util/rustls_util.rs:1:5
+  |
+1 | use std::collections::BTreeSet;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `tracing::debug`
+ --> chimera_server_lib/src/util/socket.rs:4:5
+  |
+4 | use tracing::debug;
+  |     ^^^^^^^^^^^^^^
+
+warning: irrefutable `if let` pattern
+   --> chimera_server_lib/src/lib.rs:226:24
+    |
+226 |                       if let crate::address::BindLocation::Address(addr) =
+    |  ________________________^
+227 | |                         &inbound.bind_location
+    | |______________________________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: unused variable: `tag`
+  --> chimera_server_lib/src/beginning/quic.rs:22:9
+   |
+22 |         tag,
+   |         ^^^ help: try ignoring the field: `tag: _`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `bind_address`
+  --> chimera_server_lib/src/beginning/quic.rs:30:9
+   |
+30 |     let bind_address = match bind_location {
+   |         ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_bind_address`
+
+warning: unused variable: `server_config`
+  --> chimera_server_lib/src/beginning/quic.rs:49:9
+   |
+49 |     let server_config = Arc::new(create_server_config(
+   |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_server_config`
+
+warning: unused variable: `server_stream`
+   --> chimera_server_lib/src/beginning/mod.rs:272:5
+    |
+272 |     server_stream: &mut Box<dyn AsyncStream>,
+    |     ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_server_stream`
+
+warning: unused variable: `c`
+ --> chimera_server_lib/src/config/internal/config.rs:8:17
+  |
+8 |     fn try_from(c: LiteralConfig) -> Result<Self, Self::Error> {
+  |                 ^ help: if this is intentional, prefix it with an underscore: `_c`
+
+warning: unreachable pattern
+  --> chimera_server_lib/src/handler/tcp/tcp_handler_util.rs:87:9
+   |
+87 |         unknown_config => {
+   |         ^^^^^^^^^^^^^^ no value can reach this
+   |
+note: multiple earlier patterns match some of the same values
+  --> chimera_server_lib/src/handler/tcp/tcp_handler_util.rs:87:9
+   |
+27 | /         ServerProxyConfig::Vless {
+28 | |             user_id,
+29 | |             user_label,
+30 | |         } => Box::new(VlessTcpHandler::new(&user_id, &user_label, inbound_tag)),
+   | |_________- matches some of the same values
+...
+52 |           ServerProxyConfig::Tls(tls_config) => {
+   |           ---------------------------------- matches some of the same values
+...
+80 |           ServerProxyConfig::Socks { accounts } => {
+   |           ------------------------------------- matches some of the same values
+...
+83 |           ServerProxyConfig::Xhttp { .. } => {
+   |           ------------------------------- matches some of the same values
+...
+87 |           unknown_config => {
+   |           ^^^^^^^^^^^^^^ collectively making this unreachable
+   = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `runtime_state`
+   --> chimera_server_lib/src/lib.rs:206:9
+    |
+206 |     let runtime_state = RuntimeState::new(all_inbounds.clone(), outbounds);
+    |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_runtime_state`
+
+warning: irrefutable `if let` pattern
+   --> chimera_server_lib/src/lib.rs:136:24
+    |
+136 |                       if let crate::address::BindLocation::Address(addr) =
+    |  ________________________^
+137 | |                         &inbound.bind_location
+    | |______________________________________________^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+
+warning: associated items `UNSPECIFIED`, `from_ip_addr`, `components`, `unwrap_components`, and `to_socket_addr_nonblocking` are never used
+   --> chimera_server_lib/src/address/mod.rs:25:15
+    |
+ 24 | impl NetLocation {
+    | ---------------- associated items in this implementation
+ 25 |     pub const UNSPECIFIED: Self = NetLocation::new(Address::UNSPECIFIED, 0);
+    |               ^^^^^^^^^^^
+...
+ 59 |     pub fn from_ip_addr(ip: IpAddr, port: u16) -> Self {
+    |            ^^^^^^^^^^^^
+...
+ 67 |     pub fn components(&self) -> (&Address, u16) {
+    |            ^^^^^^^^^^
+...
+ 71 |     pub fn unwrap_components(self) -> (Address, u16) {
+    |            ^^^^^^^^^^^^^^^^^
+...
+101 |     pub fn to_socket_addr_nonblocking(&self) -> Option<SocketAddr> {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated items `UNSPECIFIED`, `is_hostname`, and `hostname` are never used
+   --> chimera_server_lib/src/address/mod.rs:156:15
+    |
+155 | impl Address {
+    | ------------ associated items in this implementation
+156 |     pub const UNSPECIFIED: Self = Address::Ipv4(Ipv4Addr::UNSPECIFIED);
+    |               ^^^^^^^^^^^
+...
+210 |     pub fn is_hostname(&self) -> bool {
+    |            ^^^^^^^^^^^
+...
+214 |     pub fn hostname(&self) -> Option<&str> {
+    |            ^^^^^^^^
+
+warning: methods `supports_ping` and `poll_write_ping` are never used
+  --> chimera_server_lib/src/async_stream.rs:14:8
+   |
+13 | pub trait AsyncPing {
+   |           --------- methods in this trait
+14 |     fn supports_ping(&self) -> bool;
+   |        ^^^^^^^^^^^^^
+15 |
+16 |     fn poll_write_ping(
+   |        ^^^^^^^^^^^^^^^
+
+warning: enum `SupportedFileType` is never used
+  --> chimera_server_lib/src/config/mod.rs:13:10
+   |
+13 | pub enum SupportedFileType {
+   |          ^^^^^^^^^^^^^^^^^
+
+warning: struct `InternalConfig` is never constructed
+ --> chimera_server_lib/src/config/internal/config.rs:3:12
+  |
+3 | pub struct InternalConfig {}
+  |            ^^^^^^^^^^^^^^
+
+warning: fields `tag` and `protocol` are never read
+ --> chimera_server_lib/src/runtime.rs:7:9
+  |
+6 | pub struct OutboundSummary {
+  |            --------------- fields in this struct
+7 |     pub tag: String,
+  |         ^^^
+8 |     pub protocol: String,
+  |         ^^^^^^^^
+  |
+  = note: `OutboundSummary` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: fields `inbounds` and `outbounds` are never read
+  --> chimera_server_lib/src/runtime.rs:13:5
+   |
+12 | pub struct RuntimeState {
+   |            ------------ fields in this struct
+13 |     inbounds: Arc<RwLock<Vec<ServerConfig>>>,
+   |     ^^^^^^^^
+14 |     outbounds: Arc<RwLock<Vec<OutboundSummary>>>,
+   |     ^^^^^^^^^
+   |
+   = note: `RuntimeState` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: methods `inbounds`, `inbound_by_tag`, `with_inbound_mut`, and `outbounds` are never used
+  --> chimera_server_lib/src/runtime.rs:28:12
+   |
+17 | impl RuntimeState {
+   | ----------------- methods in this implementation
+...
+28 |     pub fn inbounds(&self) -> Vec<ServerConfig> {
+   |            ^^^^^^^^
+...
+35 |     pub fn inbound_by_tag(&self, tag: &str) -> Option<ServerConfig> {
+   |            ^^^^^^^^^^^^^^
+...
+44 |     pub fn with_inbound_mut<R, F>(&self, tag: &str, mutator: F) -> Option<R>
+   |            ^^^^^^^^^^^^^^^^
+...
+56 |     pub fn outbounds(&self) -> Vec<OutboundSummary> {
+   |            ^^^^^^^^^
+
+warning: fields `cfg`, `cwd`, and `override_error_target` are never read
+   --> chimera_server_lib/src/log.rs:155:5
+    |
+154 | struct LogState {
+    |        -------- fields in this struct
+155 |     cfg: LogConfig,
+    |     ^^^
+156 |     cwd: Option<String>,
+    |     ^^^
+157 |     override_error_target: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `LogState` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: function `restart` is never used
+   --> chimera_server_lib/src/log.rs:177:8
+    |
+177 | pub fn restart() -> Result<(), Error> {
+    |        ^^^^^^^
+
+warning: method `set_need_initial_flush` is never used
+  --> chimera_server_lib/src/handler/tcp/tcp_handler.rs:29:12
+   |
+28 | impl TcpServerSetupResult {
+   | ------------------------- method in this implementation
+29 |     pub fn set_need_initial_flush(&mut self, need_initial_flush: bool) {
+   |            ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `BUFFER_SIZE` is never used
+ --> chimera_server_lib/src/util/line_reader.rs:7:7
+  |
+7 | const BUFFER_SIZE: usize = 32768;
+  |       ^^^^^^^^^^^
+
+warning: struct `LineReader` is never constructed
+ --> chimera_server_lib/src/util/line_reader.rs:9:12
+  |
+9 | pub struct LineReader {
+  |            ^^^^^^^^^^
+
+warning: multiple associated items are never used
+   --> chimera_server_lib/src/util/line_reader.rs:16:12
+    |
+ 15 | impl LineReader {
+    | --------------- associated items in this implementation
+ 16 |     pub fn new() -> Self {
+    |            ^^^
+...
+ 24 |     pub async fn read_line(
+    |                  ^^^^^^^^^
+...
+ 38 |     pub async fn read_line_bytes(
+    |                  ^^^^^^^^^^^^^^^
+...
+ 68 |     async fn read(
+    |              ^^^^
+...
+104 |     fn is_cache_full(&self) -> bool {
+    |        ^^^^^^^^^^^^^
+...
+108 |     fn reset_buf_offset(&mut self) {
+    |        ^^^^^^^^^^^^^^^^
+...
+117 |     pub fn unparsed_data(&self) -> &[u8] {
+    |            ^^^^^^^^^^^^^
+
+warning: enum `OneOrSome` is never used
+ --> chimera_server_lib/src/util/option.rs:5:10
+  |
+5 | pub enum OneOrSome<T> {
+  |          ^^^^^^^^^
+
+warning: function `validate_non_empty` is never used
+  --> chimera_server_lib/src/util/option.rs:11:4
+   |
+11 | fn validate_non_empty<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+   |    ^^^^^^^^^^^^^^^^^^
+
+warning: method `into_vec` is never used
+  --> chimera_server_lib/src/util/option.rs:27:12
+   |
+26 | impl<T> OneOrSome<T> {
+   | -------------------- method in this implementation
+27 |     pub fn into_vec(self) -> Vec<T> {
+   |            ^^^^^^^^
+
+warning: method `is_unspecified` is never used
+  --> chimera_server_lib/src/util/option.rs:47:12
+   |
+46 | impl<T> NoneOrSome<T> {
+   | --------------------- method in this implementation
+47 |     pub fn is_unspecified(&self) -> bool {
+   |            ^^^^^^^^^^^^^^
+
+warning: function `new_socket2_udp_socket` is never used
+  --> chimera_server_lib/src/util/socket.rs:36:8
+   |
+36 | pub fn new_socket2_udp_socket(
+   |        ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `new_socket2_udp_socket_with_buffer_size` is never used
+  --> chimera_server_lib/src/util/socket.rs:51:8
+   |
+51 | pub fn new_socket2_udp_socket_with_buffer_size(
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `BYTE` is never used
+ --> chimera_server_lib/src/util/bandwidth.rs:3:7
+  |
+3 | const BYTE: u64 = 1;
+  |       ^^^^
+
+warning: constant `KILOBYTE` is never used
+ --> chimera_server_lib/src/util/bandwidth.rs:4:7
+  |
+4 | const KILOBYTE: u64 = BYTE * 1_000;
+  |       ^^^^^^^^
+
+warning: constant `MEGABYTE` is never used
+ --> chimera_server_lib/src/util/bandwidth.rs:5:7
+  |
+5 | const MEGABYTE: u64 = KILOBYTE * 1_000;
+  |       ^^^^^^^^
+
+warning: constant `GIGABYTE` is never used
+ --> chimera_server_lib/src/util/bandwidth.rs:6:7
+  |
+6 | const GIGABYTE: u64 = MEGABYTE * 1_000;
+  |       ^^^^^^^^
+
+warning: constant `TERABYTE` is never used
+ --> chimera_server_lib/src/util/bandwidth.rs:7:7
+  |
+7 | const TERABYTE: u64 = GIGABYTE * 1_000;
+  |       ^^^^^^^^
+
+warning: function `parse_bandwidth` is never used
+  --> chimera_server_lib/src/util/bandwidth.rs:16:8
+   |
+16 | pub fn parse_bandwidth(value: BandwidthValue) -> Result<u64, String> {
+   |        ^^^^^^^^^^^^^^^
+
+warning: function `parse_bandwidth_string` is never used
+  --> chimera_server_lib/src/util/bandwidth.rs:23:4
+   |
+23 | fn parse_bandwidth_string(input: &str) -> Result<u64, String> {
+   |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `scale_bandwidth` is never used
+  --> chimera_server_lib/src/util/bandwidth.rs:50:4
+   |
+50 | fn scale_bandwidth(value: u64, unit: u64) -> Result<u64, String> {
+   |    ^^^^^^^^^^^^^^^
+
+warning: struct `PrefixedStream` is never constructed
+  --> chimera_server_lib/src/util/prefixed_stream.rs:10:12
+   |
+10 | pub struct PrefixedStream {
+   |            ^^^^^^^^^^^^^^
+
+warning: associated items `new` and `remaining_prefix` are never used
+  --> chimera_server_lib/src/util/prefixed_stream.rs:17:12
+   |
+16 | impl PrefixedStream {
+   | ------------------- associated items in this implementation
+17 |     pub fn new(prefix: Vec<u8>, inner: Box<dyn AsyncStream>) -> Self {
+   |            ^^^
+...
+25 |     fn remaining_prefix(&self) -> &[u8] {
+   |        ^^^^^^^^^^^^^^^^
+
+warning: `chimera_server_lib` (lib) generated 50 warnings (run `cargo fix --lib -p chimera_server_lib` to apply 17 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running `/home/si/shared/target/debug/chimera_server_app --config /home/si/Desktop/mfsga/Chimera_Server/deploy/xray-xhttp/.generated/local-ready/server-ready.local.json`
+[2m2026-03-08T18:15:15.126722Z[0m [31mERROR[0m [2mchimera_server_lib::beginning::xhttp[0m[2m:[0m xhttp logical stream 127.0.0.1:40584 failed: failed to setup server stream: early eof
