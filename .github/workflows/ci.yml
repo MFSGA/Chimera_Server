@@ -73,8 +73,7 @@ jobs:
     name: ${{ matrix.release-name || matrix.target || 'Unknown' }}
     runs-on: ${{ matrix.os || 'ubuntu-latest' }}
     strategy:
-      # todo: changed to false to test all combinations
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           # Example
@@ -131,7 +130,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ matrix.toolchain || env.RUST_TOOLCHAIN || 'nightly' }}
+          toolchain: ${{ matrix.toolchain || env.RUST_TOOLCHAIN || 'stable' }}
           targets: ${{ matrix.build-std && 'x86_64-unknown-linux-gnu' || matrix.target }}
           components: ${{ matrix.components || matrix.build-std && 'rustfmt,clippy,rust-src' || 'rustfmt,clippy' }}
 
