@@ -73,8 +73,7 @@ jobs:
     name: ${{ matrix.release-name || matrix.target || 'Unknown' }}
     runs-on: ${{ matrix.os || 'ubuntu-latest' }}
     strategy:
-      # todo: changed to false to test all combinations
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           # Example
