@@ -2,7 +2,10 @@ const TLS_APPLICATION_DATA: u8 = 0x17;
 const TLS_HANDSHAKE: u8 = 0x16;
 const TLS_CLIENT_HELLO: u8 = 0x01;
 const TLS_SERVER_HELLO: u8 = 0x02;
-const TLS_AES_128_CCM_8_SHA256: u16 = 0x1305;
+const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
+const TLS_AES_256_GCM_SHA384: u16 = 0x1302;
+const TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
+const TLS_AES_128_CCM_SHA256: u16 = 0x1304;
 const TLS13_SUPPORTED_VERSION: &[u8] = &[0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
 
 #[derive(Debug)]
@@ -85,10 +88,19 @@ impl VisionTlsState {
             .windows(TLS13_SUPPORTED_VERSION.len())
             .any(|window| window == TLS13_SUPPORTED_VERSION);
 
-        self.enable_direct = is_tls13
-            && cipher.is_some_and(|value| value != TLS_AES_128_CCM_8_SHA256);
+        self.enable_direct = is_tls13 && cipher.is_some_and(supports_xtls_cipher);
         self.packets_left = 0;
     }
+}
+
+fn supports_xtls_cipher(cipher: u16) -> bool {
+    matches!(
+        cipher,
+        TLS_AES_128_GCM_SHA256
+            | TLS_AES_256_GCM_SHA384
+            | TLS_CHACHA20_POLY1305_SHA256
+            | TLS_AES_128_CCM_SHA256
+    )
 }
 
 /// xray-core only ends padding at a MultiBuffer boundary containing complete
@@ -132,10 +144,18 @@ mod tests {
     }
 
     #[test]
-    fn enables_direct_for_supported_tls13() {
-        let mut state = VisionTlsState::default();
-        state.observe(&server_hello(0x1301, true));
-        assert!(state.enable_direct);
+    fn xray_tls13_cipher_matrix() {
+        for cipher in [0x1301, 0x1302, 0x1303, 0x1304] {
+            let mut state = VisionTlsState::default();
+            state.observe(&server_hello(cipher, true));
+            assert!(state.enable_direct, "cipher {cipher:#06x}");
+        }
+
+        for cipher in [0x1305, 0x0a0a, 0xc02f] {
+            let mut state = VisionTlsState::default();
+            state.observe(&server_hello(cipher, true));
+            assert!(!state.enable_direct, "cipher {cipher:#06x}");
+        }
     }
 
     #[test]
@@ -149,14 +169,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_ccm8_and_tls12_for_direct() {
-        let mut ccm8 = VisionTlsState::default();
-        ccm8.observe(&server_hello(0x1305, true));
-        assert!(!ccm8.enable_direct);
-
+    fn rejects_tls12_and_non_tls_for_direct() {
         let mut tls12 = VisionTlsState::default();
         tls12.observe(&server_hello(0xc02f, false));
         assert!(!tls12.enable_direct);
+
+        let mut plaintext = VisionTlsState::default();
+        plaintext.observe(b"GET / HTTP/1.1\r\n");
+        assert!(!plaintext.is_tls);
+        assert!(!plaintext.enable_direct);
     }
 
     #[test]
