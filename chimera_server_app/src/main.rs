@@ -7,6 +7,11 @@ use clap::{Parser, ValueEnum};
 extern crate chimera_server_lib as chimera;
 
 #[derive(Parser)]
+#[command(
+    name = "chimera-server",
+    version,
+    about = "Chimera network service core"
+)]
 struct Cli {
     directory: Option<PathBuf>,
     #[clap(
@@ -117,4 +122,29 @@ fn normalize_legacy_flag(arg: &str) -> Option<String> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::{Cli, normalize_legacy_flag};
+
+    #[test]
+    fn cli_exposes_stable_name_and_version() {
+        let command = Cli::command();
+
+        assert_eq!(command.get_name(), "chimera-server");
+        assert_eq!(command.get_version(), Some(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn legacy_xray_style_flags_are_normalized() {
+        assert_eq!(
+            normalize_legacy_flag("-config=/tmp/config.json"),
+            Some("--config=/tmp/config.json".to_string())
+        );
+        assert_eq!(normalize_legacy_flag("-check"), Some("--check".to_string()));
+        assert_eq!(normalize_legacy_flag("--check"), None);
+    }
 }
