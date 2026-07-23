@@ -1,5 +1,7 @@
 use tonic::{Request, Response, Status};
 
+#[cfg(feature = "hysteria")]
+use crate::config::server_config::Hysteria2Client;
 #[cfg(feature = "reality")]
 use crate::config::server_config::RealityTransportConfig;
 #[cfg(feature = "tls")]
@@ -45,6 +47,8 @@ const TYPE_PROXY_SOCKS_SERVER_CONFIG_V2RAY: &str =
 const TYPE_PROXY_SOCKS_ACCOUNT: &str = "xray.proxy.socks.Account";
 const TYPE_PROXY_SOCKS_ACCOUNT_V2RAY: &str = "v2ray.core.proxy.socks.Account";
 const TYPE_PROXY_DOKODEMO_CONFIG: &str = "xray.proxy.dokodemo.Config";
+#[cfg(feature = "hysteria")]
+const TYPE_PROXY_HYSTERIA_ACCOUNT: &str = "xray.proxy.hysteria.account.Account";
 #[cfg(feature = "vless")]
 const TYPE_PROXY_VLESS_INBOUND_CONFIG: &str = "xray.proxy.vless.inbound.Config";
 #[cfg(feature = "vless")]
@@ -85,6 +89,13 @@ const TYPE_TRANSPORT_REALITY_CONFIG: &str = "xray.transport.internet.reality.Con
 struct TrojanAccountPayload {
     #[prost(string, tag = "1")]
     password: String,
+}
+
+#[cfg(feature = "hysteria")]
+#[derive(Clone, PartialEq, Message)]
+struct HysteriaAccountPayload {
+    #[prost(string, tag = "1")]
+    auth: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1241,6 +1252,48 @@ impl HandlerServiceImpl {
         })
     }
 
+    #[cfg(feature = "hysteria")]
+    fn parse_hysteria_client(
+        &self,
+        user: &proto::xray::common::protocol::User,
+    ) -> Result<Hysteria2Client, Status> {
+        let email = user.email.trim();
+        if email.is_empty() {
+            return Err(Status::invalid_argument(
+                "hysteria account email is required",
+            ));
+        }
+        let account = user.account.as_ref().ok_or_else(|| {
+            Status::invalid_argument(
+                "AddUserOperation.user.account is required for hysteria",
+            )
+        })?;
+        let account_type = Self::parse_typed_message_type(account);
+        if account_type != TYPE_PROXY_HYSTERIA_ACCOUNT {
+            return Err(Status::invalid_argument(format!(
+                "unsupported hysteria account type: {account_type}"
+            )));
+        }
+
+        let payload = HysteriaAccountPayload::decode(account.value.as_slice())
+            .map_err(|err| {
+                Status::invalid_argument(format!(
+                    "invalid hysteria account payload: {err}"
+                ))
+            })?;
+        let auth = payload.auth.trim();
+        if auth.is_empty() {
+            return Err(Status::invalid_argument(
+                "hysteria account auth is required",
+            ));
+        }
+
+        Ok(Hysteria2Client {
+            password: auth.to_string(),
+            email: Some(email.to_string()),
+        })
+    }
+
     fn apply_add_user_to_protocol(
         &self,
         protocol: &mut ServerProxyConfig,
@@ -1285,6 +1338,20 @@ impl HandlerServiceImpl {
                         password,
                         email: Some(email.to_string()),
                     });
+                }
+                Ok(true)
+            }
+            #[cfg(feature = "hysteria")]
+            ServerProxyConfig::Hysteria2 { config } => {
+                let client = self.parse_hysteria_client(user)?;
+                if let Some(existing) = config
+                    .clients
+                    .iter_mut()
+                    .find(|existing| existing.email == client.email)
+                {
+                    existing.password = client.password;
+                } else {
+                    config.clients.push(client);
                 }
                 Ok(true)
             }
@@ -1351,6 +1418,14 @@ impl HandlerServiceImpl {
             ServerProxyConfig::Trojan { users, .. } => {
                 users.retain(|user| user.email.as_deref() != Some(email));
                 Ok(true)
+            }
+            #[cfg(feature = "hysteria")]
+            ServerProxyConfig::Hysteria2 { config } => {
+                let before = config.clients.len();
+                config
+                    .clients
+                    .retain(|client| client.email.as_deref() != Some(email));
+                Ok(before != config.clients.len())
             }
             ServerProxyConfig::Socks { accounts, .. } => Ok(accounts.remove(email)),
             #[cfg(feature = "ws")]
@@ -1547,8 +1622,24 @@ impl HandlerServiceImpl {
                 config
                     .clients
                     .iter()
-                    .filter_map(|client| client.email.clone())
-                    .map(|email| self.build_user(email))
+                    .filter_map(|client| {
+                        client.email.clone().map(|email| {
+                            proto::xray::common::protocol::User {
+                                level: 0,
+                                email,
+                                account: Some(
+                                    proto::xray::common::serial::TypedMessage {
+                                        r#type: TYPE_PROXY_HYSTERIA_ACCOUNT
+                                            .to_string(),
+                                        value: HysteriaAccountPayload {
+                                            auth: client.password.clone(),
+                                        }
+                                        .encode_to_vec(),
+                                    },
+                                ),
+                            }
+                        })
+                    })
                     .collect(),
             ),
             #[cfg(feature = "tuic")]
@@ -1870,6 +1961,10 @@ mod tests {
     use crate::config::server_config::TrojanUser;
     #[cfg(feature = "vless")]
     use crate::config::server_config::VlessUser;
+    #[cfg(feature = "hysteria")]
+    use crate::config::server_config::{
+        Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2ServerConfig,
+    };
     use crate::{
         address::{Address, BindLocation, NetLocation},
         config::{
@@ -3134,6 +3229,112 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate == &email)
         );
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[tokio::test]
+    async fn handler_alter_inbound_adds_and_removes_hysteria_users() {
+        let inbound_tag = unique_tag("hysteria-inbound");
+        let inbound = ServerConfig {
+            tag: inbound_tag.clone(),
+            bind_location: BindLocation::Address(NetLocation::new(
+                Address::Ipv4(Ipv4Addr::LOCALHOST),
+                1093,
+            )),
+            protocol: ServerProxyConfig::Hysteria2 {
+                config: Hysteria2ServerConfig {
+                    clients: vec![Hysteria2Client {
+                        password: "initial-auth".to_string(),
+                        email: Some("initial-user".to_string()),
+                    }],
+                    bandwidth: Hysteria2BandwidthConfig::default(),
+                    ignore_client_bandwidth: false,
+                },
+            },
+            transport: Transport::Quic,
+            quic_settings: None,
+        };
+        let runtime = RuntimeState::new(vec![inbound], Vec::new());
+        let service = HandlerServiceImpl::new(runtime);
+        let email = unique_tag("hysteria-user");
+        let auth = "added-auth";
+
+        let add_operation = proto::xray::app::proxyman::command::AddUserOperation {
+            user: Some(proto::xray::common::protocol::User {
+                level: 0,
+                email: email.clone(),
+                account: Some(proto::xray::common::serial::TypedMessage {
+                    r#type: TYPE_PROXY_HYSTERIA_ACCOUNT.to_string(),
+                    value: HysteriaAccountPayload {
+                        auth: auth.to_string(),
+                    }
+                    .encode_to_vec(),
+                }),
+            }),
+        };
+        service
+            .alter_inbound(Request::new(
+                proto::xray::app::proxyman::command::AlterInboundRequest {
+                    tag: inbound_tag.clone(),
+                    operation: Some(proto::xray::common::serial::TypedMessage {
+                        r#type: TYPE_ADD_USER_OPERATION.to_string(),
+                        value: add_operation.encode_to_vec(),
+                    }),
+                },
+            ))
+            .await
+            .expect("hysteria add user should succeed");
+
+        let users_after_add = service
+            .get_inbound_users(Request::new(
+                proto::xray::app::proxyman::command::GetInboundUserRequest {
+                    tag: inbound_tag.clone(),
+                    email: email.clone(),
+                },
+            ))
+            .await
+            .expect("hysteria get users after add failed")
+            .into_inner()
+            .users;
+        assert_eq!(users_after_add.len(), 1);
+        let account = users_after_add[0]
+            .account
+            .as_ref()
+            .expect("hysteria user should include an account");
+        assert_eq!(account.r#type, TYPE_PROXY_HYSTERIA_ACCOUNT);
+        let account = HysteriaAccountPayload::decode(account.value.as_slice())
+            .expect("decode hysteria account");
+        assert_eq!(account.auth, auth);
+
+        let remove_operation =
+            proto::xray::app::proxyman::command::RemoveUserOperation {
+                email: email.clone(),
+            };
+        service
+            .alter_inbound(Request::new(
+                proto::xray::app::proxyman::command::AlterInboundRequest {
+                    tag: inbound_tag.clone(),
+                    operation: Some(proto::xray::common::serial::TypedMessage {
+                        r#type: TYPE_REMOVE_USER_OPERATION.to_string(),
+                        value: remove_operation.encode_to_vec(),
+                    }),
+                },
+            ))
+            .await
+            .expect("hysteria remove user should succeed");
+
+        let users_after_remove = service
+            .get_inbound_users(Request::new(
+                proto::xray::app::proxyman::command::GetInboundUserRequest {
+                    tag: inbound_tag,
+                    email,
+                },
+            ))
+            .await
+            .expect("hysteria get users after remove failed")
+            .into_inner()
+            .users;
+        assert!(users_after_remove.is_empty());
     }
 
     #[tokio::test]
