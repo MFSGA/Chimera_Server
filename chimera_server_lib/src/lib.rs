@@ -378,7 +378,8 @@ async fn start_async(
         }
     }
 
-    let mut join_handles = Vec::with_capacity(all_inbounds.len() * 2 + 1);
+    let mut join_handles = Vec::with_capacity(3);
+    let mut has_started_server = false;
     #[cfg(feature = "api")]
     if let Some(api) = api_config.as_ref()
         && let Some(listen) = api_addr
@@ -393,6 +394,7 @@ async fn start_async(
             )
             .await?;
             join_handles.push(grpc_handle);
+            has_started_server = true;
         } else {
             tracing::warn!("api is configured but no services are enabled");
         }
@@ -423,6 +425,7 @@ async fn start_async(
             })
             .await?;
             join_handles.push(mcp_handle);
+            has_started_server = true;
         } else {
             tracing::warn!("mcp is configured but no listen address was resolved");
         }
@@ -438,16 +441,19 @@ async fn start_async(
             continue;
         }
         // Runtime state lets UDP listeners evaluate routing and outbound policy.
-        let mut handles = start_servers(config, runtime_state.clone()).await?;
-        join_handles.append(&mut handles);
+        let inbound_tag = config.tag.clone();
+        let handles = start_servers(config, runtime_state.clone()).await?;
+        runtime_state.register_inbound_tasks(&inbound_tag, &handles);
+        has_started_server = true;
     }
 
-    if join_handles.is_empty() {
+    if !has_started_server {
         return Err(Error::InvalidConfig(
             "no servers started; check inbounds/api configuration".into(),
         ));
     }
 
+    join_handles.push(tokio::spawn(std::future::pending()));
     let result = futures::future::select_all(join_handles).await.0;
     match result {
         Ok(()) => Err(Error::Io(std::io::Error::other(

@@ -1642,14 +1642,15 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
             .add_inbound(inbound.clone())
             .map_err(Status::already_exists)?;
 
-        let handles =
-            start_servers(inbound, self.runtime.clone())
-                .await
-                .map_err(|err| {
-                    Status::unknown(format!(
-                        "failed to start inbound handler: {err}"
-                    ))
-                })?;
+        let handles = match start_servers(inbound, self.runtime.clone()).await {
+            Ok(handles) => handles,
+            Err(err) => {
+                self.runtime.remove_inbound(&inbound_tag);
+                return Err(Status::unknown(format!(
+                    "failed to start inbound handler: {err}"
+                )));
+            }
+        };
         self.runtime.register_inbound_tasks(&inbound_tag, &handles);
 
         Ok(Response::new(
@@ -1691,6 +1692,23 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
             return Err(Status::not_found("inbound not found"));
         };
         result?;
+
+        if self.runtime.abort_inbound_tasks(&request.tag) {
+            tokio::task::yield_now().await;
+            let inbound = self
+                .runtime
+                .inbound_by_tag(&request.tag)
+                .ok_or_else(|| Status::not_found("inbound not found"))?;
+            let handles = start_servers(inbound, self.runtime.clone())
+                .await
+                .map_err(|err| {
+                    Status::unknown(format!(
+                        "failed to restart inbound handler: {err}"
+                    ))
+                })?;
+            self.runtime.register_inbound_tasks(&request.tag, &handles);
+        }
+
         Ok(Response::new(
             proto::xray::app::proxyman::command::AlterInboundResponse {},
         ))
@@ -2674,19 +2692,24 @@ mod tests {
         let inbound_tag = unique_tag("debug-vless");
         let username = unique_tag("debug-user");
         let user_id = "218b98f5-df92-43f9-8880-3be70912d79c".to_string();
+        let inbound_port = free_localhost_port();
 
         let inbound = ServerConfig {
             tag: inbound_tag.clone(),
             bind_location: BindLocation::Address(NetLocation::new(
                 Address::Ipv4(Ipv4Addr::LOCALHOST),
-                12080,
+                inbound_port,
             )),
             protocol: ServerProxyConfig::Vless { users: vec![] },
             transport: Transport::Tcp,
             quic_settings: None,
         };
-        let runtime = RuntimeState::new(vec![inbound], Vec::new());
-        let service = HandlerServiceImpl::new(runtime);
+        let runtime = RuntimeState::new(vec![inbound.clone()], Vec::new());
+        let handles = start_servers(inbound, runtime.clone())
+            .await
+            .expect("start empty vless inbound");
+        runtime.register_inbound_tasks(&inbound_tag, &handles);
+        let service = HandlerServiceImpl::new(runtime.clone());
 
         let users_before_add = service
             .get_inbound_users(Request::new(
@@ -2739,6 +2762,9 @@ mod tests {
             ))
             .await
             .expect("node-style add user should succeed");
+        tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, inbound_port))
+            .await
+            .expect("vless listener should remain available after adding a user");
 
         let users_after_add = service
             .get_inbound_users(Request::new(
@@ -2792,6 +2818,9 @@ mod tests {
             ))
             .await
             .expect("node-style remove user should succeed");
+        tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, inbound_port))
+            .await
+            .expect("vless listener should remain available after removing a user");
 
         let users_after_remove = service
             .get_inbound_users(Request::new(
@@ -2809,7 +2838,7 @@ mod tests {
         let count_after_remove = service
             .get_inbound_users_count(Request::new(
                 proto::xray::app::proxyman::command::GetInboundUserRequest {
-                    tag: inbound_tag,
+                    tag: inbound_tag.clone(),
                     email: String::new(),
                 },
             ))
@@ -2817,6 +2846,7 @@ mod tests {
             .expect("empty vless get users count after remove failed")
             .into_inner();
         assert_eq!(count_after_remove.count, 0);
+        runtime.abort_inbound_tasks(&inbound_tag);
     }
 
     #[tokio::test]

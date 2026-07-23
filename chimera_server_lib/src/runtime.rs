@@ -96,19 +96,21 @@ impl RuntimeState {
             .insert(tag.to_string(), abort_handles);
     }
 
-    pub fn abort_inbound_tasks(&self, tag: &str) {
+    pub fn abort_inbound_tasks(&self, tag: &str) -> bool {
         let Some(handles) = self
             .inbound_tasks
             .write()
             .expect("runtime inbound tasks lock poisoned")
             .remove(tag)
         else {
-            return;
+            return false;
         };
 
         for handle in handles {
             handle.abort();
         }
+
+        true
     }
 
     pub fn outbounds(&self) -> Vec<OutboundSummary> {
