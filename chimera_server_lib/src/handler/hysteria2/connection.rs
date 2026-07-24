@@ -28,8 +28,12 @@ use tracing::{debug, warn};
 use crate::{
     address::NetLocation,
     config::server_config::{Hysteria2Client, Hysteria2ServerConfig},
+    outbound::connect_tcp_outbound,
     resolver::{Resolver, resolve_single_address},
-    traffic::{TrafficContext, record_transfer, register_connection},
+    runtime::RuntimeState,
+    traffic::{
+        MeteredStream, TrafficContext, TrafficDirection, register_connection,
+    },
 };
 
 const AUTH_PATH: &str = "/auth";
@@ -61,6 +65,7 @@ pub async fn process_hysteria2_connection(
     tx_bps: Arc<AtomicU64>,
     connection: quinn::Connection,
     inbound_tag: Arc<String>,
+    runtime: RuntimeState,
 ) -> std::io::Result<()> {
     let h3_quinn_connection = h3_quinn::Connection::new(connection.clone());
     let mut h3_conn = h3::server::Connection::new(h3_quinn_connection)
@@ -83,7 +88,8 @@ pub async fn process_hysteria2_connection(
                 connection.clone(),
                 resolver.clone(),
                 &auth_ctx,
-                inbound_tag.clone()
+                inbound_tag.clone(),
+                runtime.clone(),
             ),
             drive_udp_datagrams(connection, resolver.clone()),
         )
@@ -94,6 +100,7 @@ pub async fn process_hysteria2_connection(
             resolver.clone(),
             &auth_ctx,
             inbound_tag.clone(),
+            runtime,
         )
         .await
     };
@@ -185,14 +192,16 @@ async fn drive_tcp_streams(
     resolver: Arc<dyn Resolver>,
     auth_ctx: &AuthContext,
     inbound_tag: Arc<String>,
+    runtime: RuntimeState,
 ) -> std::io::Result<()> {
-    let peer_ip = connection.remote_address().ip();
+    let peer_addr = connection.remote_address();
     loop {
         match connection.accept_bi().await {
             Ok((send, recv)) => {
                 let resolver = resolver.clone();
                 let client = auth_ctx.client.clone();
                 let inbound_tag = inbound_tag.clone();
+                let runtime = runtime.clone();
                 tokio::spawn(async move {
                     if let Err(err) = handle_tcp_stream(
                         send,
@@ -200,7 +209,8 @@ async fn drive_tcp_streams(
                         resolver,
                         client,
                         inbound_tag,
-                        peer_ip,
+                        peer_addr,
+                        runtime,
                     )
                     .await
                     {
@@ -222,17 +232,26 @@ async fn handle_tcp_stream(
     resolver: Arc<dyn Resolver>,
     client: Hysteria2Client,
     inbound_tag: Arc<String>,
-    peer_ip: std::net::IpAddr,
+    peer_addr: SocketAddr,
+    runtime: RuntimeState,
 ) -> std::io::Result<()> {
     let request = TcpRequest::read(&mut recv).await?;
-    let target = if request.target.address().is_hostname() {
-        resolve_single_address(&resolver, &request.target).await?
-    } else {
-        request.target.to_socket_addr()?
-    };
-
-    let tcp_stream = match tokio::net::TcpStream::connect(target).await {
-        Ok(stream) => stream,
+    let context_identity = client.email.clone().unwrap_or(client.password.clone());
+    let connection = match connect_tcp_outbound(
+        &resolver,
+        &request.target,
+        &runtime,
+        inbound_tag.as_str(),
+        &context_identity,
+        peer_addr,
+    )
+    .await
+    {
+        Ok(Some(connection)) => connection,
+        Ok(None) => {
+            let _ = send.finish();
+            return Ok(());
+        }
         Err(err) => {
             warn!("failed to connect to {}: {}", request.target, err);
             let _ = send_tcp_response(&mut send, TCP_ERROR_STATUS, "connect failed")
@@ -244,13 +263,15 @@ async fn handle_tcp_stream(
 
     send_tcp_response(&mut send, TCP_SUCCESS_STATUS, "").await?;
 
-    let context_identity = client.email.clone().unwrap_or(client.password.clone());
-    let context = TrafficContext::new("hysteria2")
+    let mut context = TrafficContext::new("hysteria2")
         .with_identity(context_identity)
         .with_inbound_tag((*inbound_tag).clone())
-        .with_client_ip(peer_ip);
+        .with_client_ip(peer_addr.ip());
+    if let Some(tag) = connection.outbound_tag {
+        context = context.with_outbound_tag(tag);
+    }
 
-    proxy_tcp(send, recv, tcp_stream, context).await
+    proxy_tcp(send, recv, connection.stream, context).await
 }
 
 struct TcpRequest {
@@ -301,15 +322,19 @@ async fn proxy_tcp(
     context: TrafficContext,
 ) -> std::io::Result<()> {
     let _connection_guard = register_connection(Some(&context));
-    let mut quic_stream = QuicStream { send, recv };
-    let mut tcp_stream = tcp_stream;
+    let mut quic_stream = MeteredStream::new(
+        QuicStream { send, recv },
+        Some(context.clone()),
+        TrafficDirection::Upload,
+    );
+    let mut tcp_stream =
+        MeteredStream::new(tcp_stream, Some(context), TrafficDirection::Download);
     match tokio::io::copy_bidirectional(&mut quic_stream, &mut tcp_stream).await {
         Ok((client_to_server, server_to_client)) => {
             debug!(
                 "hysteria2 tcp stream forwarded {} bytes client->server and {} bytes server->client",
                 client_to_server, server_to_client
             );
-            record_transfer(Some(context), client_to_server, server_to_client);
             Ok(())
         }
         Err(err) => Err(err),

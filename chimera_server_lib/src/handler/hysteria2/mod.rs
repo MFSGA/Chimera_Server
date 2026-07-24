@@ -11,6 +11,7 @@ use quinn::congestion::BbrConfig;
 use crate::{
     config::server_config::Hysteria2ServerConfig,
     resolver::{NativeResolver, Resolver},
+    runtime::RuntimeState,
     util::socket::new_socket2_udp_socket,
 };
 
@@ -24,6 +25,7 @@ pub async fn run_hysteria2_server(
     server_config: Arc<rustls::ServerConfig>,
     config: Hysteria2ServerConfig,
     inbound_tag: String,
+    runtime: RuntimeState,
 ) -> std::io::Result<()> {
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
 
@@ -42,6 +44,7 @@ pub async fn run_hysteria2_server(
         let resolver = resolver.clone();
         let config = config.clone();
         let inbound_tag = inbound_tag.clone();
+        let runtime = runtime.clone();
 
         let base_transport = build_transport_config()?;
         let mut base_server_config =
@@ -67,6 +70,7 @@ pub async fn run_hysteria2_server(
                 let cloned_resolver = resolver.clone();
                 let config = config.clone();
                 let inbound_tag = inbound_tag.clone();
+                let runtime = runtime.clone();
                 let tx_bps = Arc::new(AtomicU64::new(0));
 
                 let mut transport = match build_transport_config() {
@@ -117,6 +121,7 @@ pub async fn run_hysteria2_server(
                         tx_bps,
                         connection,
                         Arc::new(inbound_tag),
+                        runtime,
                     )
                     .await
                     {

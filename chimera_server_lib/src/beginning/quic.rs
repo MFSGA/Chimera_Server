@@ -7,8 +7,6 @@ use tokio::task::JoinHandle;
 #[cfg(any(feature = "hysteria", feature = "tuic"))]
 use tracing::info;
 
-#[cfg(not(any(feature = "hysteria", feature = "tuic")))]
-use crate::config::server_config::ServerConfig;
 #[cfg(feature = "hysteria")]
 use crate::handler::hysteria2::run_hysteria2_server;
 #[cfg(feature = "tuic")]
@@ -19,11 +17,15 @@ use crate::{
     config::server_config::{
         ServerConfig, ServerProxyConfig, quic::ServerQuicConfig,
     },
+    runtime::RuntimeState,
     util::rustls_util::create_server_config,
 };
+#[cfg(not(any(feature = "hysteria", feature = "tuic")))]
+use crate::{config::server_config::ServerConfig, runtime::RuntimeState};
 
 pub async fn start_quic_server(
     config: ServerConfig,
+    runtime: RuntimeState,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     #[cfg(any(feature = "hysteria", feature = "tuic"))]
     {
@@ -71,6 +73,7 @@ pub async fn start_quic_server(
                         server_config,
                         config,
                         tag,
+                        runtime,
                     )
                     .await
                     {
@@ -84,9 +87,14 @@ pub async fn start_quic_server(
             #[cfg(feature = "tuic")]
             ServerProxyConfig::TuicV5 { config } => {
                 Ok(Some(tokio::spawn(async move {
-                    if let Err(err) =
-                        run_tuic_server(bind_address, server_config, config, tag)
-                            .await
+                    if let Err(err) = run_tuic_server(
+                        bind_address,
+                        server_config,
+                        config,
+                        tag,
+                        runtime,
+                    )
+                    .await
                     {
                         tracing::error!("tuic server stopped with error: {}", err);
                     }
@@ -102,7 +110,7 @@ pub async fn start_quic_server(
 
     #[cfg(not(any(feature = "hysteria", feature = "tuic")))]
     {
-        let _ = config;
+        let _ = (config, runtime);
         Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "QUIC server support is disabled in this build",
