@@ -11,9 +11,12 @@ use crate::{
         Transport,
         server_config::{ServerConfig, ServerProxyConfig},
     },
-    handler::tcp::{
-        tcp_handler::{TcpServerHandler, TcpServerSetupResult},
-        tcp_handler_util::create_tcp_server_handler,
+    handler::{
+        socks::run_udp_relay,
+        tcp::{
+            tcp_handler::{TcpServerHandler, TcpServerSetupResult},
+            tcp_handler_util::create_tcp_server_handler,
+        },
     },
     outbound::connect_tcp_outbound,
     resolver::{NativeResolver, Resolver, resolve_single_address},
@@ -316,6 +319,15 @@ where
                 remote_location, copy_result.0, copy_result.1
             );
             Ok(())
+        }
+        TcpServerSetupResult::UdpAssociate {
+            stream,
+            socket,
+            traffic_context,
+        } => {
+            let traffic_context = traffic_context
+                .map(|context| context.with_client_ip(peer_addr.ip()));
+            run_udp_relay(socket, stream, resolver, runtime, traffic_context).await
         }
         TcpServerSetupResult::AlreadyHandled => Ok(()),
     }
