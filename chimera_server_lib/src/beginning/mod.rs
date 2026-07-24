@@ -1,11 +1,15 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use quic::start_quic_server;
 use tokio::{io::AsyncWriteExt, task::JoinHandle, time::timeout};
 use udp::start_udp_server;
 
 use crate::{
-    address::{BindLocation, NetLocation},
+    address::{Address, BindLocation, NetLocation},
     async_stream::AsyncStream,
     config::{
         Transport,
@@ -16,6 +20,7 @@ use crate::{
         tcp_handler_util::create_tcp_server_handler,
     },
     resolver::{NativeResolver, Resolver, resolve_single_address},
+    routing_state::RoutingInput,
     runtime::RuntimeState,
     traffic::{record_transfer, register_connection},
     util::socket::new_tcp_socket,
@@ -32,24 +37,26 @@ pub async fn start_servers(
     runtime: RuntimeState,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     if is_xhttp_server_protocol(&config.protocol) {
-        return xhttp::start_xhttp_server(config).await;
+        return xhttp::start_xhttp_server(config, runtime).await;
     }
 
     let mut join_handles = Vec::with_capacity(3);
 
     match config.transport {
-        Transport::Tcp => match start_tcp_server(config.clone()).await {
-            Ok(Some(handle)) => {
-                join_handles.push(handle);
-            }
-            Ok(None) => (),
-            Err(e) => {
-                for join_handle in join_handles {
-                    join_handle.abort();
+        Transport::Tcp => {
+            match start_tcp_server_with_runtime(config.clone(), runtime).await {
+                Ok(Some(handle)) => {
+                    join_handles.push(handle);
                 }
-                return Err(e);
+                Ok(None) => (),
+                Err(e) => {
+                    for join_handle in join_handles {
+                        join_handle.abort();
+                    }
+                    return Err(e);
+                }
             }
-        },
+        }
         Transport::Quic => match start_quic_server(config.clone()).await {
             Ok(Some(handle)) => {
                 join_handles.push(handle);
@@ -108,6 +115,14 @@ fn is_xhttp_server_protocol(protocol: &ServerProxyConfig) -> bool {
 pub async fn start_tcp_server(
     config: ServerConfig,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
+    let runtime = RuntimeState::new(vec![config.clone()], Vec::new());
+    start_tcp_server_with_runtime(config, runtime).await
+}
+
+async fn start_tcp_server_with_runtime(
+    config: ServerConfig,
+    runtime: RuntimeState,
+) -> std::io::Result<Option<JoinHandle<()>>> {
     let ServerConfig {
         tag,
         bind_location,
@@ -132,7 +147,7 @@ pub async fn start_tcp_server(
     };
 
     Ok(Some(tokio::spawn(async move {
-        if let Err(err) = run_tcp_server(listener, tcp_handler).await {
+        if let Err(err) = run_tcp_server(listener, tcp_handler, runtime).await {
             error!("TCP server stopped with error: {}", err);
         }
     })))
@@ -141,6 +156,7 @@ pub async fn start_tcp_server(
 async fn run_tcp_server(
     listener: tokio::net::TcpListener,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
+    runtime: RuntimeState,
 ) -> std::io::Result<()> {
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
 
@@ -157,10 +173,12 @@ async fn run_tcp_server(
         }
         let cloned_cache = resolver.clone();
         let cloned_handler = server_handler.clone();
+        let runtime = runtime.clone();
 
         tokio::spawn(async move {
             if let Err(e) =
-                process_stream(stream, cloned_handler, cloned_cache, addr).await
+                process_stream(stream, cloned_handler, cloned_cache, addr, runtime)
+                    .await
             {
                 error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
             } else {
@@ -180,6 +198,7 @@ pub(super) async fn process_stream<AS>(
 
     resolver: Arc<dyn Resolver>,
     peer_addr: SocketAddr,
+    runtime: RuntimeState,
 ) -> std::io::Result<()>
 where
     AS: AsyncStream + 'static,
@@ -213,46 +232,58 @@ where
             connection_success_response,
             traffic_context,
         } => {
-            let traffic_context = traffic_context
+            let mut traffic_context = traffic_context
                 .map(|context| context.with_client_ip(peer_addr.ip()));
-            let _connection_guard = register_connection(traffic_context.as_ref());
+            let inbound_tag = traffic_context
+                .as_ref()
+                .and_then(|context| context.inbound_tag.as_deref())
+                .unwrap_or_default()
+                .to_string();
 
             let setup_client_stream_future = timeout(
                 Duration::from_secs(60),
-                setup_client_stream(
-                    &mut server_stream,
+                setup_routed_client_stream(
                     resolver,
                     remote_location.clone(),
+                    &runtime,
+                    &inbound_tag,
+                    peer_addr,
                 ),
             );
 
-            let mut client_stream = match setup_client_stream_future.await {
-                Ok(Ok(Some(s))) => s,
-                Ok(Ok(None)) => {
-                    let _ = server_stream.shutdown().await;
-                    return Ok(());
-                }
-                Ok(Err(e)) => {
-                    let _ = server_stream.shutdown().await;
-                    return Err(std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "failed to setup client stream to {}: {}",
-                            remote_location, e
-                        ),
-                    ));
-                }
-                Err(elapsed) => {
-                    let _ = server_stream.shutdown().await;
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!(
-                            "client setup to {} timed out: {}",
-                            remote_location, elapsed
-                        ),
-                    ));
-                }
-            };
+            let (mut client_stream, outbound_tag) =
+                match setup_client_stream_future.await {
+                    Ok(Ok(Some(result))) => result,
+                    Ok(Ok(None)) => {
+                        let _ = server_stream.shutdown().await;
+                        return Ok(());
+                    }
+                    Ok(Err(e)) => {
+                        let _ = server_stream.shutdown().await;
+                        return Err(std::io::Error::new(
+                            e.kind(),
+                            format!(
+                                "failed to setup client stream to {}: {}",
+                                remote_location, e
+                            ),
+                        ));
+                    }
+                    Err(elapsed) => {
+                        let _ = server_stream.shutdown().await;
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "client setup to {} timed out: {}",
+                                remote_location, elapsed
+                            ),
+                        ));
+                    }
+                };
+            if let Some(tag) = outbound_tag {
+                traffic_context =
+                    traffic_context.map(|context| context.with_outbound_tag(tag));
+            }
+            let _connection_guard = register_connection(traffic_context.as_ref());
 
             if let Some(data) = connection_success_response {
                 server_stream.write_all(&data).await?;
@@ -290,14 +321,55 @@ where
     server_handler.setup_server_stream(server_stream).await
 }
 
-pub async fn setup_client_stream(
-    _server_stream: &mut Box<dyn AsyncStream>,
-
+async fn setup_routed_client_stream(
     resolver: Arc<dyn Resolver>,
     remote_location: NetLocation,
-) -> std::io::Result<Option<Box<dyn AsyncStream>>> {
+    runtime: &RuntimeState,
+    inbound_tag: &str,
+    peer_addr: SocketAddr,
+) -> std::io::Result<Option<(Box<dyn AsyncStream>, Option<String>)>> {
     let target_addr = resolve_single_address(&resolver, &remote_location).await?;
+    let route_input = RoutingInput {
+        inbound_tag: inbound_tag.to_string(),
+        network: 2,
+        source_ips: vec![encode_ip(peer_addr.ip())],
+        target_ips: vec![encode_ip(target_addr.ip())],
+        source_port: peer_addr.port() as u32,
+        target_port: target_addr.port() as u32,
+        target_domain: target_domain(&remote_location),
+        ..RoutingInput::default()
+    };
+    let selected = runtime.select_outbound(&route_input);
+    let outbound_tag = match selected {
+        None => None,
+        Some(outbound)
+            if outbound.protocol.trim().eq_ignore_ascii_case("freedom") =>
+        {
+            Some(outbound.tag)
+        }
+        Some(outbound)
+            if outbound.protocol.trim().eq_ignore_ascii_case("blackhole") =>
+        {
+            return Ok(None);
+        }
+        Some(outbound) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "tcp outbound {} uses unsupported protocol {}",
+                    outbound.tag, outbound.protocol
+                ),
+            ));
+        }
+    };
 
+    let client_stream = connect_tcp_target(target_addr).await?;
+    Ok(Some((client_stream, outbound_tag)))
+}
+
+async fn connect_tcp_target(
+    target_addr: SocketAddr,
+) -> std::io::Result<Box<dyn AsyncStream>> {
     let tcp_socket = new_tcp_socket(None, target_addr.is_ipv6())?;
     let client_stream = tcp_socket.connect(target_addr).await?;
 
@@ -305,5 +377,28 @@ pub async fn setup_client_stream(
         error!("Failed to set TCP no-delay on client socket: {}", e);
     }
 
-    Ok(Some(Box::new(client_stream)))
+    Ok(Box::new(client_stream))
+}
+
+fn encode_ip(ip: IpAddr) -> Vec<u8> {
+    match ip {
+        IpAddr::V4(ip) => ip.octets().to_vec(),
+        IpAddr::V6(ip) => ip.octets().to_vec(),
+    }
+}
+
+fn target_domain(target_location: &NetLocation) -> String {
+    match target_location.address() {
+        Address::Hostname(hostname) => hostname.clone(),
+        _ => String::new(),
+    }
+}
+
+pub async fn setup_client_stream(
+    _server_stream: &mut Box<dyn AsyncStream>,
+    resolver: Arc<dyn Resolver>,
+    remote_location: NetLocation,
+) -> std::io::Result<Option<Box<dyn AsyncStream>>> {
+    let target_addr = resolve_single_address(&resolver, &remote_location).await?;
+    connect_tcp_target(target_addr).await.map(Some)
 }

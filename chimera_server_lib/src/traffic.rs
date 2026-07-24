@@ -15,6 +15,7 @@ mod traffic_noop {
         pub protocol: &'static str,
         pub identity: Option<String>,
         pub inbound_tag: Option<String>,
+        pub outbound_tag: Option<String>,
         pub client_ip: Option<IpAddr>,
     }
 
@@ -24,6 +25,7 @@ mod traffic_noop {
                 protocol,
                 identity: None,
                 inbound_tag: None,
+                outbound_tag: None,
                 client_ip: None,
             }
         }
@@ -35,6 +37,11 @@ mod traffic_noop {
 
         pub fn with_inbound_tag(mut self, tag: impl Into<String>) -> Self {
             self.inbound_tag = Some(tag.into());
+            self
+        }
+
+        pub fn with_outbound_tag(mut self, tag: impl Into<String>) -> Self {
+            self.outbound_tag = Some(tag.into());
             self
         }
 
@@ -50,6 +57,7 @@ mod traffic_noop {
                 protocol: "unknown",
                 identity: None,
                 inbound_tag: None,
+                outbound_tag: None,
                 client_ip: None,
             }
         }
@@ -68,6 +76,7 @@ mod traffic_noop {
         pub per_protocol: HashMap<String, TransferTotals>,
         pub per_identity: HashMap<(String, String), TransferTotals>,
         pub per_inbound: HashMap<String, TransferTotals>,
+        pub per_outbound: HashMap<String, TransferTotals>,
         pub per_inbound_user: HashMap<(String, String), TransferTotals>,
     }
 

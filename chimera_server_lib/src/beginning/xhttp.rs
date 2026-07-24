@@ -42,6 +42,7 @@ use crate::{
         tcp_handler::TcpServerHandler, tcp_handler_util::create_tcp_server_handler,
     },
     resolver::{NativeResolver, Resolver},
+    runtime::RuntimeState,
 };
 #[cfg(feature = "reality")]
 use crate::{
@@ -61,6 +62,7 @@ type ResponseBody = UnsyncBoxBody<Bytes, Infallible>;
 
 pub async fn start_xhttp_server(
     config: ServerConfig,
+    runtime: RuntimeState,
 ) -> std::io::Result<Vec<tokio::task::JoinHandle<()>>> {
     let ServerConfig {
         tag,
@@ -86,6 +88,7 @@ pub async fn start_xhttp_server(
         listener_config.xhttp_config,
         server_handler,
         resolver,
+        runtime,
     ));
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     let security = listener_config.security.clone();
@@ -264,6 +267,7 @@ struct AppState {
     max_each_post_bytes: usize,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
     resolver: Arc<dyn Resolver>,
+    runtime: RuntimeState,
     sessions: SessionStore,
 }
 
@@ -272,6 +276,7 @@ impl AppState {
         config: XhttpServerConfig,
         server_handler: Arc<Box<dyn TcpServerHandler>>,
         resolver: Arc<dyn Resolver>,
+        runtime: RuntimeState,
     ) -> Self {
         Self {
             host: config.host,
@@ -281,6 +286,7 @@ impl AppState {
             max_each_post_bytes: config.max_each_post_bytes,
             server_handler,
             resolver,
+            runtime,
             sessions: SessionStore::new(
                 Duration::from_secs(config.session_ttl_secs),
                 config.max_buffered_posts,
@@ -502,6 +508,7 @@ fn spawn_handler_stream(
             state.server_handler.clone(),
             state.resolver.clone(),
             peer_addr,
+            state.runtime.clone(),
         )
         .await
         {

@@ -58,6 +58,16 @@ impl StatsServiceImpl {
                 totals.download_bytes as i64,
             );
         }
+        for (tag, totals) in snapshot.per_outbound {
+            stats.insert(
+                format!("outbound>>>{}>>>traffic>>>uplink", tag),
+                totals.upload_bytes as i64,
+            );
+            stats.insert(
+                format!("outbound>>>{}>>>traffic>>>downlink", tag),
+                totals.download_bytes as i64,
+            );
+        }
         let mut user_totals: HashMap<String, traffic::TransferTotals> =
             HashMap::new();
         for ((_, identity), totals) in snapshot.per_inbound_user {
@@ -697,6 +707,35 @@ mod tests {
         assert_eq!(stats.len(), 2);
         assert_eq!(stats[&name_inbound(&tag, "uplink")], 7);
         assert_eq!(stats[&name_inbound(&tag, "downlink")], 11);
+    }
+
+    #[tokio::test]
+    async fn stats_query_outbound_traffic() {
+        let service = StatsServiceImpl::new();
+        let tag = unique_tag("outbound");
+        let context = TrafficContext::new("test")
+            .with_outbound_tag(&tag)
+            .with_identity("outbound-user");
+        traffic::record_transfer(Some(context), 17, 29);
+
+        let response = service
+            .query_stats(Request::new(
+                proto::xray::app::stats::command::QueryStatsRequest {
+                    pattern: format!("outbound>>>{tag}>>>"),
+                    reset: false,
+                },
+            ))
+            .await
+            .expect("query outbound stats failed")
+            .into_inner();
+        let stats = response
+            .stat
+            .into_iter()
+            .map(|stat| (stat.name, stat.value))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(stats[&format!("outbound>>>{tag}>>>traffic>>>uplink")], 17);
+        assert_eq!(stats[&format!("outbound>>>{tag}>>>traffic>>>downlink")], 29);
     }
 
     #[tokio::test]
