@@ -1544,6 +1544,9 @@ fn new_udp_socket(
 }
 
 #[cfg(test)]
+mod e2e_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tokio::time::timeout;
