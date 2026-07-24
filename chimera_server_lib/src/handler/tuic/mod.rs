@@ -21,11 +21,15 @@ use tracing::{debug, error};
 use crate::{
     address::{Address, NetLocation},
     config::server_config::TuicServerConfig,
-    outbound::connect_tcp_outbound,
+    outbound::{
+        DirectOutboundAction, connect_tcp_outbound, connection_routing_input,
+        select_direct_outbound,
+    },
     resolver::{NativeResolver, Resolver, resolve_single_address},
     runtime::RuntimeState,
     traffic::{
-        MeteredStream, TrafficContext, TrafficDirection, register_connection,
+        ConnectionGuard, MeteredStream, TrafficContext, TrafficDirection,
+        record_transfer, register_connection,
     },
     util::{allocate_vec, socket::new_socket2_udp_socket_with_buffer_size},
 };
@@ -65,6 +69,21 @@ struct TuicConnectionContext {
     identity: Arc<String>,
     inbound_tag: Arc<String>,
     runtime: RuntimeState,
+}
+
+#[derive(Clone)]
+struct TuicFlowContext {
+    connection: TuicConnectionContext,
+    peer_addr: SocketAddr,
+}
+
+impl TuicFlowContext {
+    fn traffic_context(&self) -> TrafficContext {
+        TrafficContext::new("tuic")
+            .with_identity((*self.connection.identity).clone())
+            .with_inbound_tag((*self.connection.inbound_tag).clone())
+            .with_client_ip(self.peer_addr.ip())
+    }
 }
 
 fn fragment_cache_size() -> NonZeroUsize {
@@ -230,24 +249,33 @@ async fn process_connection(
         }
     }
 
+    let context = TuicFlowContext {
+        connection: context,
+        peer_addr: connection.remote_address(),
+    };
     let cancel_token = CancellationToken::new();
     let udp_session_map = Arc::new(DashMap::new());
 
     let heartbeat_loop =
         run_heartbeat_loop(connection.clone(), cancel_token.clone());
-    let bi_loop =
-        run_bidirectional_loop(connection.clone(), resolver.clone(), context);
+    let bi_loop = run_bidirectional_loop(
+        connection.clone(),
+        resolver.clone(),
+        context.clone(),
+    );
     let uni_loop = run_unidirectional_loop(
         connection.clone(),
         resolver.clone(),
         udp_session_map.clone(),
         cancel_token.clone(),
+        context.clone(),
     );
     let datagram_loop = run_datagram_loop(
         connection.clone(),
         resolver.clone(),
         udp_session_map.clone(),
         cancel_token.clone(),
+        context.clone(),
     );
 
     let result = tokio::try_join!(heartbeat_loop, bi_loop, uni_loop, datagram_loop);
@@ -349,9 +377,8 @@ async fn auth_connection(
 async fn run_bidirectional_loop(
     connection: quinn::Connection,
     resolver: Arc<dyn Resolver>,
-    context: TuicConnectionContext,
+    context: TuicFlowContext,
 ) -> std::io::Result<()> {
-    let peer_addr = connection.remote_address();
     loop {
         let (send_stream, recv_stream) = match connection.accept_bi().await {
             Ok(s) => s,
@@ -370,14 +397,8 @@ async fn run_bidirectional_loop(
         let resolver = resolver.clone();
         let context = context.clone();
         tokio::spawn(async move {
-            match process_tcp_stream(
-                resolver,
-                send_stream,
-                recv_stream,
-                peer_addr,
-                context,
-            )
-            .await
+            match process_tcp_stream(resolver, send_stream, recv_stream, context)
+                .await
             {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
@@ -399,8 +420,7 @@ async fn process_tcp_stream(
     resolver: Arc<dyn Resolver>,
     send: quinn::SendStream,
     mut recv: quinn::RecvStream,
-    peer_addr: SocketAddr,
-    context: TuicConnectionContext,
+    context: TuicFlowContext,
 ) -> std::io::Result<()> {
     let tuic_version = recv.read_u8().await?;
     if tuic_version != TUIC_VERSION {
@@ -426,10 +446,10 @@ async fn process_tcp_stream(
         connect_tcp_outbound(
             &resolver,
             &remote_location,
-            &context.runtime,
-            context.inbound_tag.as_str(),
-            context.identity.as_str(),
-            peer_addr,
+            &context.connection.runtime,
+            context.connection.inbound_tag.as_str(),
+            context.connection.identity.as_str(),
+            context.peer_addr,
         ),
     );
 
@@ -450,10 +470,7 @@ async fn process_tcp_stream(
         }
     };
 
-    let mut context = TrafficContext::new("tuic")
-        .with_identity((*context.identity).clone())
-        .with_inbound_tag((*context.inbound_tag).clone())
-        .with_client_ip(peer_addr.ip());
+    let mut context = context.traffic_context();
     if let Some(tag) = connection.outbound_tag {
         context = context.with_outbound_tag(tag);
     }
@@ -598,6 +615,9 @@ struct UdpSession {
     last_socket_addr: SocketAddr,
     last_activity: std::time::Instant,
     cancel_token: CancellationToken,
+    base_context: TrafficContext,
+    response_contexts: Arc<DashMap<SocketAddr, TrafficContext>>,
+    _connection_guard: ConnectionGuard,
 }
 
 struct FragmentedPacket {
@@ -616,8 +636,11 @@ impl UdpSession {
         initial_location: NetLocation,
         initial_socket_addr: SocketAddr,
         parent_cancel_token: &CancellationToken,
+        base_context: TrafficContext,
     ) -> Self {
         let session_cancel_token = parent_cancel_token.child_token();
+        let response_contexts = Arc::new(DashMap::new());
+        let connection_guard = register_connection(Some(&base_context));
 
         let session = UdpSession {
             send_socket: client_socket.clone(),
@@ -625,6 +648,9 @@ impl UdpSession {
             last_socket_addr: initial_socket_addr,
             last_activity: std::time::Instant::now(),
             cancel_token: session_cancel_token.clone(),
+            base_context: base_context.clone(),
+            response_contexts: response_contexts.clone(),
+            _connection_guard: connection_guard,
         };
 
         tokio::spawn(async move {
@@ -633,6 +659,8 @@ impl UdpSession {
                 send_stream,
                 client_socket,
                 session_cancel_token,
+                response_contexts,
+                base_context,
             )
             .await
             {
@@ -650,8 +678,11 @@ impl UdpSession {
         initial_location: NetLocation,
         initial_socket_addr: SocketAddr,
         parent_cancel_token: &CancellationToken,
+        base_context: TrafficContext,
     ) -> Self {
         let session_cancel_token = parent_cancel_token.child_token();
+        let response_contexts = Arc::new(DashMap::new());
+        let connection_guard = register_connection(Some(&base_context));
 
         let session = UdpSession {
             send_socket: client_socket.clone(),
@@ -659,6 +690,9 @@ impl UdpSession {
             last_socket_addr: initial_socket_addr,
             last_activity: std::time::Instant::now(),
             cancel_token: session_cancel_token.clone(),
+            base_context: base_context.clone(),
+            response_contexts: response_contexts.clone(),
+            _connection_guard: connection_guard,
         };
 
         tokio::spawn(async move {
@@ -667,6 +701,8 @@ impl UdpSession {
                 connection,
                 client_socket,
                 session_cancel_token,
+                response_contexts,
+                base_context,
             )
             .await
             {
@@ -705,6 +741,8 @@ async fn run_udp_remote_to_local_stream_loop(
     mut send_stream: quinn::SendStream,
     socket: Arc<UdpSocket>,
     cancel_token: CancellationToken,
+    response_contexts: Arc<DashMap<SocketAddr, TrafficContext>>,
+    fallback_context: TrafficContext,
 ) -> std::io::Result<()> {
     let mut next_packet_id: u16 = 0;
     let mut buf = allocate_vec(MAX_HEADER_LEN + 65535).into_boxed_slice();
@@ -739,6 +777,10 @@ async fn run_udp_remote_to_local_stream_loop(
 
         let packet_id = next_packet_id;
         next_packet_id = next_packet_id.wrapping_add(1);
+        let traffic_context = response_contexts
+            .get(&src_addr)
+            .map(|entry| entry.value().clone())
+            .unwrap_or_else(|| fallback_context.clone());
 
         let address_bytes = serialize_socket_addr(&src_addr);
         let address_bytes_len = address_bytes.len();
@@ -769,6 +811,7 @@ async fn run_udp_remote_to_local_stream_loop(
                 .map_err(std::io::Error::other)?;
             i += count;
         }
+        record_transfer(Some(traffic_context), 0, payload_len as u64);
     }
 }
 
@@ -777,6 +820,8 @@ async fn run_udp_remote_to_local_datagram_loop(
     connection: quinn::Connection,
     client_socket: Arc<UdpSocket>,
     cancel_token: CancellationToken,
+    response_contexts: Arc<DashMap<SocketAddr, TrafficContext>>,
+    fallback_context: TrafficContext,
 ) -> std::io::Result<()> {
     let max_datagram_size = connection.max_datagram_size().ok_or_else(|| {
         std::io::Error::other("datagram not supported by remote endpoint")
@@ -814,6 +859,10 @@ async fn run_udp_remote_to_local_datagram_loop(
 
         let packet_id = next_packet_id;
         next_packet_id = next_packet_id.wrapping_add(1);
+        let traffic_context = response_contexts
+            .get(&src_addr)
+            .map(|entry| entry.value().clone())
+            .unwrap_or_else(|| fallback_context.clone());
 
         let address_bytes = serialize_socket_addr(&src_addr);
         let address_bytes_len = address_bytes.len();
@@ -882,6 +931,7 @@ async fn run_udp_remote_to_local_datagram_loop(
                 offset += fragment_payload_len;
             }
         }
+        record_transfer(Some(traffic_context), 0, payload_len as u64);
     }
 }
 
@@ -890,6 +940,7 @@ async fn run_unidirectional_loop(
     resolver: Arc<dyn Resolver>,
     udp_session_map: UdpSessionMap,
     cancel_token: CancellationToken,
+    context: TuicFlowContext,
 ) -> std::io::Result<()> {
     let cleanup_session_map = udp_session_map.clone();
     let cleanup_cancel_token = cancel_token.clone();
@@ -933,6 +984,7 @@ async fn run_unidirectional_loop(
         let resolver = resolver.clone();
         let udp_session_map = udp_session_map.clone();
         let cancel_token = cancel_token.clone();
+        let context = context.clone();
         tokio::spawn(async move {
             match process_uni_stream(
                 &connection,
@@ -940,6 +992,7 @@ async fn run_unidirectional_loop(
                 recv_stream,
                 udp_session_map,
                 cancel_token,
+                context,
             )
             .await
             {
@@ -960,6 +1013,7 @@ async fn process_uni_stream(
     mut recv_stream: quinn::RecvStream,
     udp_session_map: UdpSessionMap,
     cancel_token: CancellationToken,
+    context: TuicFlowContext,
 ) -> std::io::Result<()> {
     let tuic_version = recv_stream.read_u8().await?;
     if tuic_version != TUIC_VERSION {
@@ -1012,6 +1066,7 @@ async fn process_uni_stream(
         &payload_fragment,
         true,
         &cancel_token,
+        &context,
     )
     .await
 }
@@ -1030,6 +1085,7 @@ async fn process_udp_packet(
     payload_fragment: &[u8],
     is_uni_stream: bool,
     cancel_token: &CancellationToken,
+    context: &TuicFlowContext,
 ) -> std::io::Result<()> {
     if frag_total == 0 {
         return Err(std::io::Error::other(
@@ -1064,6 +1120,7 @@ async fn process_udp_packet(
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
             };
             let socket = new_udp_socket(bind_addr, None)?;
+            let base_context = context.traffic_context();
 
             let session = if is_uni_stream {
                 let send_stream =
@@ -1075,6 +1132,7 @@ async fn process_udp_packet(
                     remote_location,
                     resolved_address,
                     cancel_token,
+                    base_context.clone(),
                 )
             } else {
                 UdpSession::start_with_datagram(
@@ -1084,6 +1142,7 @@ async fn process_udp_packet(
                     remote_location,
                     resolved_address,
                     cancel_token,
+                    base_context,
                 )
             };
 
@@ -1094,34 +1153,13 @@ async fn process_udp_packet(
         }
     };
 
-    if frag_total == 1 {
-        let remote_location = remote_location.as_ref().ok_or_else(|| {
+    let (remote_location, complete_payload) = if frag_total == 1 {
+        let remote_location = remote_location.ok_or_else(|| {
             std::io::Error::other(
                 "ignoring packet with single fragment and no address",
             )
         })?;
-
-        let (socket_addr, is_updated) =
-            session.resolve_address(remote_location, resolver).await?;
-
-        if let Err(e) = session
-            .send_socket
-            .send_to(payload_fragment, socket_addr)
-            .await
-        {
-            error!("Failed to forward UDP payload for session {assoc_id}: {e}");
-            drop(session);
-            udp_session_map.remove(&assoc_id);
-            return Ok(());
-        }
-
-        drop(session);
-        if let Some(mut session) = udp_session_map.get_mut(&assoc_id) {
-            session.last_activity = std::time::Instant::now();
-            if is_updated {
-                session.update_last_location(remote_location.clone(), socket_addr);
-            }
-        }
+        (remote_location, Bytes::copy_from_slice(payload_fragment))
     } else {
         let is_new = !fragments.contains(&packet_id);
 
@@ -1188,10 +1226,7 @@ async fn process_udp_packet(
         let remote_location = remote_location
             .ok_or_else(|| std::io::Error::other("missing fragment address"))?;
 
-        let (socket_addr, is_updated) =
-            session.resolve_address(&remote_location, resolver).await?;
-
-        let mut complete_payload = Vec::with_capacity(packet_len);
+        let mut complete_payload = BytesMut::with_capacity(packet_len);
         for frag in received.iter() {
             match frag.as_ref() {
                 Some(bytes) => complete_payload.extend_from_slice(bytes),
@@ -1202,28 +1237,85 @@ async fn process_udp_packet(
                 }
             }
         }
+        (remote_location, complete_payload.freeze())
+    };
 
-        if let Err(e) = session
-            .send_socket
-            .send_to(&complete_payload, socket_addr)
-            .await
-        {
-            error!("Failed to forward UDP payload for session {assoc_id}: {e}");
-            drop(session);
-            udp_session_map.remove(&assoc_id);
-            return Ok(());
-        }
+    let (socket_addr, is_updated) =
+        session.resolve_address(&remote_location, resolver).await?;
+    let keep_session = forward_udp_payload(
+        &session,
+        context,
+        assoc_id,
+        &remote_location,
+        socket_addr,
+        &complete_payload,
+    )
+    .await?;
 
-        drop(session);
-        if let Some(mut session) = udp_session_map.get_mut(&assoc_id) {
-            session.last_activity = std::time::Instant::now();
-            if is_updated {
-                session.update_last_location(remote_location.clone(), socket_addr);
-            }
+    drop(session);
+    if !keep_session {
+        udp_session_map.remove(&assoc_id);
+        return Ok(());
+    }
+    if let Some(mut session) = udp_session_map.get_mut(&assoc_id) {
+        session.last_activity = std::time::Instant::now();
+        if is_updated {
+            session.update_last_location(remote_location, socket_addr);
         }
     }
 
     Ok(())
+}
+
+async fn forward_udp_payload(
+    session: &UdpSession,
+    context: &TuicFlowContext,
+    assoc_id: u16,
+    remote_location: &NetLocation,
+    socket_addr: SocketAddr,
+    payload: &[u8],
+) -> std::io::Result<bool> {
+    let route_input = connection_routing_input(
+        context.connection.inbound_tag.as_str(),
+        context.connection.identity.as_str(),
+        3,
+        context.peer_addr,
+        socket_addr,
+        remote_location,
+    );
+    let action =
+        select_direct_outbound(&context.connection.runtime, &route_input, "udp")?;
+    let mut traffic_context = session.base_context.clone();
+
+    match action {
+        DirectOutboundAction::Blackhole { tag } => {
+            traffic_context = traffic_context.with_outbound_tag(tag.clone());
+            record_transfer(Some(traffic_context), payload.len() as u64, 0);
+            debug!(
+                "TUIC UDP payload for session {} dropped by blackhole outbound {}",
+                assoc_id, tag
+            );
+            return Ok(true);
+        }
+        DirectOutboundAction::Freedom { tag: Some(tag) } => {
+            traffic_context = traffic_context.with_outbound_tag(tag);
+        }
+        DirectOutboundAction::Freedom { tag: None } => {}
+    }
+
+    session
+        .response_contexts
+        .insert(socket_addr, traffic_context.clone());
+    match session.send_socket.send_to(payload, socket_addr).await {
+        Ok(sent) => {
+            record_transfer(Some(traffic_context), sent as u64, 0);
+            Ok(true)
+        }
+        Err(err) => {
+            error!("Failed to forward UDP payload for session {assoc_id}: {err}");
+            Ok(false)
+        }
+    }
 }
 
 async fn run_datagram_loop(
@@ -1231,6 +1323,7 @@ async fn run_datagram_loop(
     resolver: Arc<dyn Resolver>,
     udp_session_map: UdpSessionMap,
     cancel_token: CancellationToken,
+    context: TuicFlowContext,
 ) -> std::io::Result<()> {
     let mut fragments: LruCache<u16, FragmentedPacket> =
         LruCache::new(fragment_cache_size());
@@ -1374,6 +1467,7 @@ async fn run_datagram_loop(
             payload_fragment,
             false,
             &cancel_token,
+            &context,
         )
         .await
         {
@@ -1452,6 +1546,12 @@ fn new_udp_socket(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::timeout;
+
+    use crate::{
+        runtime::OutboundSummary,
+        traffic::{register_connection, snapshot},
+    };
 
     #[test]
     fn serialize_address_hostname() {
@@ -1472,5 +1572,78 @@ mod tests {
         assert_eq!(bytes[0], 0x01);
         assert_eq!(&bytes[1..5], &[1, 2, 3, 4]);
         assert_eq!(&bytes[5..7], &8080u16.to_be_bytes());
+    }
+
+    #[tokio::test]
+    async fn udp_forward_uses_selected_outbound_and_records_upload() {
+        let outbound_tag = "tuic-udp-test-direct";
+        let runtime = RuntimeState::new(
+            Vec::new(),
+            vec![OutboundSummary {
+                tag: outbound_tag.into(),
+                protocol: "freedom".into(),
+                proxy_settings_type: None,
+                proxy_settings_value: None,
+            }],
+        );
+        let context = TuicFlowContext {
+            connection: TuicConnectionContext {
+                identity: Arc::new("tuic-test-user".into()),
+                inbound_tag: Arc::new("tuic-test-in".into()),
+                runtime,
+            },
+            peer_addr: "127.0.0.1:12345".parse().unwrap(),
+        };
+        let target = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let location = NetLocation::from_ip_addr(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            target_addr.port(),
+        );
+        let base_context = context.traffic_context();
+        let connection_guard = register_connection(Some(&base_context));
+        let session = UdpSession {
+            send_socket: Arc::new(
+                UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap(),
+            ),
+            last_location: location.clone(),
+            last_socket_addr: target_addr,
+            last_activity: std::time::Instant::now(),
+            cancel_token: CancellationToken::new(),
+            base_context,
+            response_contexts: Arc::new(DashMap::new()),
+            _connection_guard: connection_guard,
+        };
+        let before = snapshot()
+            .per_outbound
+            .get(outbound_tag)
+            .map(|totals| totals.upload_bytes)
+            .unwrap_or_default();
+        let payload = b"tuic UDP accounting";
+
+        assert!(
+            forward_udp_payload(
+                &session,
+                &context,
+                7,
+                &location,
+                target_addr,
+                payload,
+            )
+            .await
+            .unwrap()
+        );
+
+        let mut received = [0u8; 64];
+        let (len, _) =
+            timeout(Duration::from_secs(1), target.recv_from(&mut received))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(&received[..len], payload);
+        let response_context = session.response_contexts.get(&target_addr).unwrap();
+        assert_eq!(response_context.outbound_tag.as_deref(), Some(outbound_tag));
+        let after = snapshot().per_outbound[outbound_tag].upload_bytes;
+        assert_eq!(after - before, payload.len() as u64);
     }
 }
