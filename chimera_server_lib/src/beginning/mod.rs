@@ -22,7 +22,7 @@ use crate::{
     resolver::{NativeResolver, Resolver, resolve_single_address},
     routing_state::RoutingInput,
     runtime::RuntimeState,
-    traffic::{record_transfer, register_connection},
+    traffic::{MeteredStream, TrafficDirection, register_connection},
     util::socket::new_tcp_socket,
 };
 
@@ -251,7 +251,7 @@ where
                 ),
             );
 
-            let (mut client_stream, outbound_tag) =
+            let (client_stream, outbound_tag) =
                 match setup_client_stream_future.await {
                     Ok(Ok(Some(result))) => result,
                     Ok(Ok(None)) => {
@@ -284,6 +284,16 @@ where
                     traffic_context.map(|context| context.with_outbound_tag(tag));
             }
             let _connection_guard = register_connection(traffic_context.as_ref());
+            let mut server_stream = MeteredStream::new(
+                server_stream,
+                traffic_context.clone(),
+                TrafficDirection::Upload,
+            );
+            let mut client_stream = MeteredStream::new(
+                client_stream,
+                traffic_context,
+                TrafficDirection::Download,
+            );
 
             if let Some(data) = connection_success_response {
                 server_stream.write_all(&data).await?;
@@ -303,7 +313,6 @@ where
                 "tcp forward to {} completed: client->remote {} bytes, remote->client {} bytes",
                 remote_location, copy_result.0, copy_result.1
             );
-            record_transfer(traffic_context, copy_result.0, copy_result.1);
             Ok(())
         }
         TcpServerSetupResult::AlreadyHandled => Ok(()),
