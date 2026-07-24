@@ -293,6 +293,7 @@ struct RealityConfigPayload {
 #[derive(Clone)]
 pub(super) struct HandlerServiceImpl {
     runtime: RuntimeState,
+    mutation_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 enum AlterInboundOperation {
@@ -303,7 +304,10 @@ enum AlterInboundOperation {
 
 impl HandlerServiceImpl {
     fn new(runtime: RuntimeState) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            mutation_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        }
     }
 
     fn parse_alter_inbound_operation(
@@ -1383,6 +1387,9 @@ impl HandlerServiceImpl {
             ServerProxyConfig::Reality(reality) => {
                 self.apply_add_user_to_protocol(reality.inner.as_mut(), user)
             }
+            ServerProxyConfig::Xhttp { inner, .. } => {
+                self.apply_add_user_to_protocol(inner.as_mut(), user)
+            }
             _ => Ok(false),
         }
     }
@@ -1452,7 +1459,51 @@ impl HandlerServiceImpl {
             ServerProxyConfig::Reality(reality) => {
                 self.apply_remove_user_from_protocol(reality.inner.as_mut(), email)
             }
+            ServerProxyConfig::Xhttp { inner, .. } => {
+                self.apply_remove_user_from_protocol(inner.as_mut(), email)
+            }
             _ => Ok(false),
+        }
+    }
+
+    fn detached_inbound(inbound: &ServerConfig) -> ServerConfig {
+        let mut detached = inbound.clone();
+        Self::detach_socks_user_stores(&mut detached.protocol);
+        detached
+    }
+
+    fn detach_socks_user_stores(protocol: &mut ServerProxyConfig) {
+        match protocol {
+            ServerProxyConfig::Socks { accounts, .. } => {
+                *accounts =
+                    crate::config::server_config::SocksUserStore::with_auth_required(
+                        accounts.snapshot(),
+                        accounts.auth_required(),
+                    );
+            }
+            #[cfg(feature = "ws")]
+            ServerProxyConfig::Websocket { targets } => match targets.as_mut() {
+                crate::util::option::OneOrSome::One(target) => {
+                    Self::detach_socks_user_stores(&mut target.protocol);
+                }
+                crate::util::option::OneOrSome::Some(targets) => {
+                    for target in targets {
+                        Self::detach_socks_user_stores(&mut target.protocol);
+                    }
+                }
+            },
+            #[cfg(feature = "tls")]
+            ServerProxyConfig::Tls(tls) => {
+                Self::detach_socks_user_stores(tls.inner.as_mut());
+            }
+            #[cfg(feature = "reality")]
+            ServerProxyConfig::Reality(reality) => {
+                Self::detach_socks_user_stores(reality.inner.as_mut());
+            }
+            ServerProxyConfig::Xhttp { inner, .. } => {
+                Self::detach_socks_user_stores(inner.as_mut());
+            }
+            _ => {}
         }
     }
 
@@ -1723,6 +1774,7 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
         Response<proto::xray::app::proxyman::command::AddInboundResponse>,
         Status,
     > {
+        let _mutation_guard = self.mutation_lock.lock().await;
         let request = request.into_inner();
         let inbound = request
             .inbound
@@ -1756,6 +1808,7 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
         Response<proto::xray::app::proxyman::command::RemoveInboundResponse>,
         Status,
     > {
+        let _mutation_guard = self.mutation_lock.lock().await;
         let request = request.into_inner();
         let Some(_) = self.runtime.remove_inbound(&request.tag) else {
             return Err(Status::not_found("inbound not found"));
@@ -1773,31 +1826,54 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
         Response<proto::xray::app::proxyman::command::AlterInboundResponse>,
         Status,
     > {
+        let _mutation_guard = self.mutation_lock.lock().await;
         let request = request.into_inner();
         let operation = self.parse_alter_inbound_operation(request.operation)?;
-        let result = self.runtime.with_inbound_mut(&request.tag, |inbound| {
-            self.apply_alter_inbound_operation(inbound, operation)
-        });
+        if matches!(&operation, AlterInboundOperation::Noop) {
+            return Ok(Response::new(
+                proto::xray::app::proxyman::command::AlterInboundResponse {},
+            ));
+        }
 
-        let Some(result) = result else {
+        let Some(current) = self.runtime.inbound_by_tag(&request.tag) else {
             return Err(Status::not_found("inbound not found"));
         };
-        result?;
+        let original = Self::detached_inbound(&current);
+        let mut updated = Self::detached_inbound(&current);
+        self.apply_alter_inbound_operation(&mut updated, operation)?;
+        self.runtime
+            .with_inbound_mut(&request.tag, |inbound| *inbound = updated.clone())
+            .ok_or_else(|| Status::not_found("inbound not found"))?;
 
         if self.runtime.abort_inbound_tasks(&request.tag) {
             tokio::task::yield_now().await;
-            let inbound = self
-                .runtime
-                .inbound_by_tag(&request.tag)
-                .ok_or_else(|| Status::not_found("inbound not found"))?;
-            let handles = start_servers(inbound, self.runtime.clone())
-                .await
-                .map_err(|err| {
-                    Status::unknown(format!(
-                        "failed to restart inbound handler: {err}"
-                    ))
-                })?;
-            self.runtime.register_inbound_tasks(&request.tag, &handles);
+            match start_servers(updated, self.runtime.clone()).await {
+                Ok(handles) => {
+                    self.runtime.register_inbound_tasks(&request.tag, &handles);
+                }
+                Err(start_error) => {
+                    self.runtime
+                        .with_inbound_mut(&request.tag, |inbound| {
+                            *inbound = original.clone()
+                        })
+                        .ok_or_else(|| Status::not_found("inbound not found"))?;
+                    tokio::task::yield_now().await;
+                    let rollback =
+                        start_servers(original, self.runtime.clone()).await;
+                    return match rollback {
+                        Ok(handles) => {
+                            self.runtime
+                                .register_inbound_tasks(&request.tag, &handles);
+                            Err(Status::unknown(format!(
+                                "failed to restart inbound handler: {start_error}; previous inbound restored"
+                            )))
+                        }
+                        Err(rollback_error) => Err(Status::unknown(format!(
+                            "failed to restart inbound handler: {start_error}; rollback failed: {rollback_error}"
+                        ))),
+                    };
+                }
+            }
         }
 
         Ok(Response::new(
@@ -1885,6 +1961,7 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
         Response<proto::xray::app::proxyman::command::AddOutboundResponse>,
         Status,
     > {
+        let _mutation_guard = self.mutation_lock.lock().await;
         let request = request.into_inner();
         let outbound = request
             .outbound
@@ -1905,6 +1982,7 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
         Response<proto::xray::app::proxyman::command::RemoveOutboundResponse>,
         Status,
     > {
+        let _mutation_guard = self.mutation_lock.lock().await;
         let request = request.into_inner();
         let Some(_) = self.runtime.remove_outbound(&request.tag) else {
             return Err(Status::not_found("outbound not found"));
@@ -1969,7 +2047,7 @@ mod tests {
         address::{Address, BindLocation, NetLocation},
         config::{
             Transport,
-            server_config::{ServerConfig, SocksUser},
+            server_config::{ServerConfig, SocksUser, XhttpServerConfig},
         },
         runtime::OutboundSummary,
     };
@@ -2118,6 +2196,175 @@ mod tests {
                 comment: String::new(),
             }),
         }
+    }
+
+    fn build_socks_add_user_operation(
+        username: &str,
+    ) -> proto::xray::common::serial::TypedMessage {
+        let operation = proto::xray::app::proxyman::command::AddUserOperation {
+            user: Some(proto::xray::common::protocol::User {
+                level: 0,
+                email: username.to_string(),
+                account: Some(proto::xray::common::serial::TypedMessage {
+                    r#type: TYPE_PROXY_SOCKS_ACCOUNT.to_string(),
+                    value: SocksAccountPayload {
+                        username: username.to_string(),
+                        password: "new-password".to_string(),
+                    }
+                    .encode_to_vec(),
+                }),
+            }),
+        };
+        proto::xray::common::serial::TypedMessage {
+            r#type: TYPE_ADD_USER_OPERATION.to_string(),
+            value: operation.encode_to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_alter_inbound_rolls_back_config_when_restart_fails() {
+        let occupied = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let inbound_tag = unique_tag("rollback-inbound");
+        let original_username = unique_tag("original-user");
+        let inbound = ServerConfig {
+            tag: inbound_tag.clone(),
+            bind_location: BindLocation::Address(NetLocation::new(
+                Address::Ipv4(Ipv4Addr::LOCALHOST),
+                port,
+            )),
+            protocol: ServerProxyConfig::Socks {
+                accounts: vec![SocksUser {
+                    username: original_username.clone(),
+                    password: "original-password".to_string(),
+                }]
+                .into(),
+                udp_enabled: false,
+            },
+            transport: Transport::Tcp,
+            quic_settings: None,
+        };
+        let runtime = RuntimeState::new(vec![inbound], Vec::new());
+        let placeholder_task = tokio::spawn(std::future::pending::<()>());
+        runtime.register_inbound_tasks(&inbound_tag, &[placeholder_task]);
+        let service = HandlerServiceImpl::new(runtime.clone());
+        let added_username = unique_tag("failed-user");
+
+        let error = service
+            .alter_inbound(Request::new(
+                proto::xray::app::proxyman::command::AlterInboundRequest {
+                    tag: inbound_tag.clone(),
+                    operation: Some(build_socks_add_user_operation(&added_username)),
+                },
+            ))
+            .await
+            .expect_err("occupied listener should fail both restart attempts");
+
+        assert_eq!(error.code(), Code::Unknown);
+        assert!(error.message().contains("rollback failed"));
+        let restored = runtime.inbound_by_tag(&inbound_tag).unwrap();
+        let ServerProxyConfig::Socks { accounts, .. } = restored.protocol else {
+            panic!("expected socks inbound");
+        };
+        let users = accounts.snapshot();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].username, original_username);
+        assert!(!users.iter().any(|user| user.username == added_username));
+    }
+
+    #[tokio::test]
+    async fn handler_empty_alter_keeps_registered_listener() {
+        let fixture = build_fixture();
+        let placeholder_task = tokio::spawn(std::future::pending::<()>());
+        fixture
+            .runtime
+            .register_inbound_tasks(&fixture.inbound_tag, &[placeholder_task]);
+        let service = HandlerServiceImpl::new(fixture.runtime.clone());
+
+        service
+            .alter_inbound(Request::new(
+                proto::xray::app::proxyman::command::AlterInboundRequest {
+                    tag: fixture.inbound_tag.clone(),
+                    operation: None,
+                },
+            ))
+            .await
+            .expect("empty operation should be idempotent");
+
+        assert!(fixture.runtime.abort_inbound_tasks(&fixture.inbound_tag));
+    }
+
+    #[cfg(feature = "vless")]
+    #[tokio::test]
+    async fn handler_alter_inbound_reaches_xhttp_inner_users() {
+        let inbound_tag = unique_tag("xhttp-vless-inbound");
+        let inbound = ServerConfig {
+            tag: inbound_tag.clone(),
+            bind_location: BindLocation::Address(NetLocation::new(
+                Address::Ipv4(Ipv4Addr::LOCALHOST),
+                free_localhost_port(),
+            )),
+            protocol: ServerProxyConfig::Xhttp {
+                config: XhttpServerConfig {
+                    host: None,
+                    path: "/control".to_string(),
+                    min_padding: 0,
+                    max_padding: 0,
+                    max_each_post_bytes: 1_000_000,
+                    max_buffered_posts: 30,
+                    session_ttl_secs: 30,
+                },
+                inner: Box::new(ServerProxyConfig::Vless { users: Vec::new() }),
+            },
+            transport: Transport::Tcp,
+            quic_settings: None,
+        };
+        let runtime = RuntimeState::new(vec![inbound], Vec::new());
+        let service = HandlerServiceImpl::new(runtime);
+        let email = unique_tag("xhttp-user");
+        let operation = proto::xray::app::proxyman::command::AddUserOperation {
+            user: Some(proto::xray::common::protocol::User {
+                level: 0,
+                email: email.clone(),
+                account: Some(proto::xray::common::serial::TypedMessage {
+                    r#type: TYPE_PROXY_VLESS_ACCOUNT.to_string(),
+                    value: VlessAccountPayload {
+                        id: "9199ca5b-1850-4ae6-a4fa-fd6384073692".to_string(),
+                        flow: String::new(),
+                    }
+                    .encode_to_vec(),
+                }),
+            }),
+        };
+
+        service
+            .alter_inbound(Request::new(
+                proto::xray::app::proxyman::command::AlterInboundRequest {
+                    tag: inbound_tag.clone(),
+                    operation: Some(proto::xray::common::serial::TypedMessage {
+                        r#type: TYPE_ADD_USER_OPERATION.to_string(),
+                        value: operation.encode_to_vec(),
+                    }),
+                },
+            ))
+            .await
+            .expect("xhttp add user should reach inner protocol");
+        let users = service
+            .get_inbound_users(Request::new(
+                proto::xray::app::proxyman::command::GetInboundUserRequest {
+                    tag: inbound_tag,
+                    email: String::new(),
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .users;
+
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].email, email);
     }
 
     #[tokio::test]
