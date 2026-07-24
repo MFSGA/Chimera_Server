@@ -18,7 +18,7 @@ use crate::{
     config::server_config::{DokodemoDoorConfig, ServerConfig, ServerProxyConfig},
     resolver::{NativeResolver, Resolver, resolve_single_address},
     routing_state::RoutingInput,
-    runtime::{OutboundSummary, RuntimeState},
+    runtime::RuntimeState,
     traffic::{TrafficContext, record_transfer},
 };
 
@@ -182,6 +182,7 @@ async fn relay_dokodemo_udp_datagram(
 
     match outbound_action {
         UdpOutboundAction::Blackhole { tag } => {
+            let traffic_context = traffic_context.with_outbound_tag(tag.clone());
             debug!(
                 "dokodemo-door udp packet from {} to {} dropped by blackhole outbound {}",
                 client_addr, target_location, tag
@@ -190,6 +191,10 @@ async fn relay_dokodemo_udp_datagram(
             Ok(())
         }
         UdpOutboundAction::Freedom { tag } => {
+            let traffic_context = match &tag {
+                Some(tag) => traffic_context.with_outbound_tag(tag.clone()),
+                None => traffic_context,
+            };
             let key = UdpSessionKey {
                 client_addr,
                 target_addr,
@@ -360,7 +365,6 @@ fn select_udp_outbound(
     target_addr: SocketAddr,
     target_location: &NetLocation,
 ) -> std::io::Result<UdpOutboundAction> {
-    let outbounds = runtime.outbounds();
     let route_input = RoutingInput {
         inbound_tag: inbound_tag.to_string(),
         network: 3,
@@ -372,11 +376,7 @@ fn select_udp_outbound(
         ..RoutingInput::default()
     };
 
-    let selected = runtime
-        .routing()
-        .route(&route_input, &outbounds, &HashMap::new())
-        .and_then(|route| outbound_by_tag(&outbounds, &route.outbound_tag))
-        .or_else(|| outbounds.first().cloned());
+    let selected = runtime.select_outbound(&route_input);
 
     let Some(outbound) = selected else {
         return Ok(UdpOutboundAction::Freedom { tag: None });
@@ -395,16 +395,6 @@ fn select_udp_outbound(
             ),
         )),
     }
-}
-
-fn outbound_by_tag(
-    outbounds: &[OutboundSummary],
-    tag: &str,
-) -> Option<OutboundSummary> {
-    outbounds
-        .iter()
-        .find(|outbound| outbound.tag == tag)
-        .cloned()
 }
 
 fn encode_ip(ip: IpAddr) -> Vec<u8> {
