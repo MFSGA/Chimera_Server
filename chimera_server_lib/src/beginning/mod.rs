@@ -1,15 +1,11 @@
-use std::{
-    net::{IpAddr, SocketAddr},
-    sync::Arc,
-    time::Duration,
-};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use quic::start_quic_server;
 use tokio::{io::AsyncWriteExt, task::JoinHandle, time::timeout};
 use udp::start_udp_server;
 
 use crate::{
-    address::{Address, BindLocation, NetLocation},
+    address::{BindLocation, NetLocation},
     async_stream::AsyncStream,
     config::{
         Transport,
@@ -19,8 +15,8 @@ use crate::{
         tcp_handler::{TcpServerHandler, TcpServerSetupResult},
         tcp_handler_util::create_tcp_server_handler,
     },
+    outbound::connect_tcp_outbound,
     resolver::{NativeResolver, Resolver, resolve_single_address},
-    routing_state::RoutingInput,
     runtime::RuntimeState,
     traffic::{MeteredStream, TrafficDirection, register_connection},
     util::socket::new_tcp_socket,
@@ -57,7 +53,7 @@ pub async fn start_servers(
                 }
             }
         }
-        Transport::Quic => match start_quic_server(config.clone()).await {
+        Transport::Quic => match start_quic_server(config.clone(), runtime).await {
             Ok(Some(handle)) => {
                 join_handles.push(handle);
             }
@@ -239,6 +235,11 @@ where
                 .and_then(|context| context.inbound_tag.as_deref())
                 .unwrap_or_default()
                 .to_string();
+            let user = traffic_context
+                .as_ref()
+                .and_then(|context| context.identity.as_deref())
+                .unwrap_or_default()
+                .to_string();
 
             let setup_client_stream_future = timeout(
                 Duration::from_secs(60),
@@ -247,6 +248,7 @@ where
                     remote_location.clone(),
                     &runtime,
                     &inbound_tag,
+                    &user,
                     peer_addr,
                 ),
             );
@@ -335,45 +337,26 @@ async fn setup_routed_client_stream(
     remote_location: NetLocation,
     runtime: &RuntimeState,
     inbound_tag: &str,
+    user: &str,
     peer_addr: SocketAddr,
 ) -> std::io::Result<Option<(Box<dyn AsyncStream>, Option<String>)>> {
-    let target_addr = resolve_single_address(&resolver, &remote_location).await?;
-    let route_input = RoutingInput {
-        inbound_tag: inbound_tag.to_string(),
-        network: 2,
-        source_ips: vec![encode_ip(peer_addr.ip())],
-        target_ips: vec![encode_ip(target_addr.ip())],
-        source_port: peer_addr.port() as u32,
-        target_port: target_addr.port() as u32,
-        target_domain: target_domain(&remote_location),
-        ..RoutingInput::default()
-    };
-    let selected = runtime.select_outbound(&route_input);
-    let outbound_tag = match selected {
-        None => None,
-        Some(outbound)
-            if outbound.protocol.trim().eq_ignore_ascii_case("freedom") =>
-        {
-            Some(outbound.tag)
-        }
-        Some(outbound)
-            if outbound.protocol.trim().eq_ignore_ascii_case("blackhole") =>
-        {
-            return Ok(None);
-        }
-        Some(outbound) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "tcp outbound {} uses unsupported protocol {}",
-                    outbound.tag, outbound.protocol
-                ),
-            ));
-        }
-    };
-
-    let client_stream = connect_tcp_target(target_addr).await?;
-    Ok(Some((client_stream, outbound_tag)))
+    connect_tcp_outbound(
+        &resolver,
+        &remote_location,
+        runtime,
+        inbound_tag,
+        user,
+        peer_addr,
+    )
+    .await
+    .map(|connection| {
+        connection.map(|connection| {
+            (
+                Box::new(connection.stream) as Box<dyn AsyncStream>,
+                connection.outbound_tag,
+            )
+        })
+    })
 }
 
 async fn connect_tcp_target(
@@ -387,20 +370,6 @@ async fn connect_tcp_target(
     }
 
     Ok(Box::new(client_stream))
-}
-
-fn encode_ip(ip: IpAddr) -> Vec<u8> {
-    match ip {
-        IpAddr::V4(ip) => ip.octets().to_vec(),
-        IpAddr::V6(ip) => ip.octets().to_vec(),
-    }
-}
-
-fn target_domain(target_location: &NetLocation) -> String {
-    match target_location.address() {
-        Address::Hostname(hostname) => hostname.clone(),
-        _ => String::new(),
-    }
 }
 
 pub async fn setup_client_stream(

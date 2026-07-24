@@ -29,6 +29,8 @@ mod grpc;
 
 mod mcp;
 
+mod outbound;
+
 mod runtime;
 
 #[cfg(feature = "reality")]

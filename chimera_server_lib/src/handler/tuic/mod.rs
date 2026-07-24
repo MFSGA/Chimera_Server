@@ -16,13 +16,17 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 use crate::{
     address::{Address, NetLocation},
     config::server_config::TuicServerConfig,
+    outbound::connect_tcp_outbound,
     resolver::{NativeResolver, Resolver, resolve_single_address},
-    traffic::{TrafficContext, record_transfer, register_connection},
+    runtime::RuntimeState,
+    traffic::{
+        MeteredStream, TrafficContext, TrafficDirection, register_connection,
+    },
     util::{allocate_vec, socket::new_socket2_udp_socket_with_buffer_size},
 };
 
@@ -56,6 +60,13 @@ const MAX_QUIC_ENDPOINTS: usize = 1;
 
 type UdpSessionMap = Arc<DashMap<u16, UdpSession>>;
 
+#[derive(Clone)]
+struct TuicConnectionContext {
+    identity: Arc<String>,
+    inbound_tag: Arc<String>,
+    runtime: RuntimeState,
+}
+
 fn fragment_cache_size() -> NonZeroUsize {
     // MAX_FRAGMENT_CACHE_SIZE is a positive constant; fall back to 1 if changed.
     NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE)
@@ -68,6 +79,7 @@ pub async fn run_tuic_server(
     server_config: Arc<rustls::ServerConfig>,
     config: TuicServerConfig,
     inbound_tag: String,
+    runtime: RuntimeState,
 ) -> std::io::Result<()> {
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
 
@@ -82,7 +94,11 @@ pub async fn run_tuic_server(
     let uuid = Arc::new(uuid);
     let password: Arc<str> = Arc::from(config.password);
     let zero_rtt_handshake = config.zero_rtt_handshake;
-    let inbound_tag = Arc::new(inbound_tag);
+    let connection_context = TuicConnectionContext {
+        identity,
+        inbound_tag: Arc::new(inbound_tag),
+        runtime,
+    };
 
     let mut join_handles = Vec::with_capacity(MAX_QUIC_ENDPOINTS);
 
@@ -90,9 +106,8 @@ pub async fn run_tuic_server(
         let quic_server_config = quic_server_config.clone();
         let resolver = resolver.clone();
         let uuid = uuid.clone();
-        let identity = identity.clone();
         let password = password.clone();
-        let inbound_tag = inbound_tag.clone();
+        let connection_context = connection_context.clone();
 
         let join_handle = tokio::spawn(async move {
             let mut server_config =
@@ -145,9 +160,8 @@ pub async fn run_tuic_server(
             while let Some(conn) = endpoint.accept().await {
                 let resolver = resolver.clone();
                 let uuid = uuid.clone();
-                let identity = identity.clone();
                 let password = password.clone();
-                let inbound_tag = inbound_tag.clone();
+                let connection_context = connection_context.clone();
                 tokio::spawn(async move {
                     if let Err(e) = process_connection(
                         resolver,
@@ -155,8 +169,7 @@ pub async fn run_tuic_server(
                         password,
                         conn,
                         zero_rtt_handshake,
-                        identity,
-                        inbound_tag,
+                        connection_context,
                     )
                     .await
                     {
@@ -184,8 +197,7 @@ async fn process_connection(
     password: Arc<str>,
     conn: quinn::Incoming,
     zero_rtt_handshake: bool,
-    identity: Arc<String>,
-    inbound_tag: Arc<String>,
+    context: TuicConnectionContext,
 ) -> std::io::Result<()> {
     let connection = if zero_rtt_handshake {
         let connecting = conn.accept().map_err(std::io::Error::other)?;
@@ -223,12 +235,8 @@ async fn process_connection(
 
     let heartbeat_loop =
         run_heartbeat_loop(connection.clone(), cancel_token.clone());
-    let bi_loop = run_bidirectional_loop(
-        connection.clone(),
-        resolver.clone(),
-        identity.clone(),
-        inbound_tag.clone(),
-    );
+    let bi_loop =
+        run_bidirectional_loop(connection.clone(), resolver.clone(), context);
     let uni_loop = run_unidirectional_loop(
         connection.clone(),
         resolver.clone(),
@@ -341,10 +349,9 @@ async fn auth_connection(
 async fn run_bidirectional_loop(
     connection: quinn::Connection,
     resolver: Arc<dyn Resolver>,
-    identity: Arc<String>,
-    inbound_tag: Arc<String>,
+    context: TuicConnectionContext,
 ) -> std::io::Result<()> {
-    let peer_ip = connection.remote_address().ip();
+    let peer_addr = connection.remote_address();
     loop {
         let (send_stream, recv_stream) = match connection.accept_bi().await {
             Ok(s) => s,
@@ -361,16 +368,14 @@ async fn run_bidirectional_loop(
 
         let conn = connection.clone();
         let resolver = resolver.clone();
-        let identity = identity.clone();
-        let inbound_tag = inbound_tag.clone();
+        let context = context.clone();
         tokio::spawn(async move {
             match process_tcp_stream(
                 resolver,
                 send_stream,
                 recv_stream,
-                identity,
-                inbound_tag,
-                peer_ip,
+                peer_addr,
+                context,
             )
             .await
             {
@@ -394,9 +399,8 @@ async fn process_tcp_stream(
     resolver: Arc<dyn Resolver>,
     send: quinn::SendStream,
     mut recv: quinn::RecvStream,
-    identity: Arc<String>,
-    inbound_tag: Arc<String>,
-    peer_ip: std::net::IpAddr,
+    peer_addr: SocketAddr,
+    context: TuicConnectionContext,
 ) -> std::io::Result<()> {
     let tuic_version = recv.read_u8().await?;
     if tuic_version != TUIC_VERSION {
@@ -419,11 +423,19 @@ async fn process_tcp_stream(
 
     let connect_future = timeout(
         Duration::from_secs(60),
-        connect_tcp_remote(resolver.clone(), remote_location.clone()),
+        connect_tcp_outbound(
+            &resolver,
+            &remote_location,
+            &context.runtime,
+            context.inbound_tag.as_str(),
+            context.identity.as_str(),
+            peer_addr,
+        ),
     );
 
-    let mut client_stream = match connect_future.await {
-        Ok(Ok(s)) => s,
+    let connection = match connect_future.await {
+        Ok(Ok(Some(connection))) => connection,
+        Ok(Ok(None)) => return Ok(()),
         Ok(Err(e)) => {
             return Err(std::io::Error::new(
                 e.kind(),
@@ -438,13 +450,25 @@ async fn process_tcp_stream(
         }
     };
 
-    let context = TrafficContext::new("tuic")
-        .with_identity((*identity).clone())
-        .with_inbound_tag((*inbound_tag).clone())
-        .with_client_ip(peer_ip);
+    let mut context = TrafficContext::new("tuic")
+        .with_identity((*context.identity).clone())
+        .with_inbound_tag((*context.inbound_tag).clone())
+        .with_client_ip(peer_addr.ip());
+    if let Some(tag) = connection.outbound_tag {
+        context = context.with_outbound_tag(tag);
+    }
     let _connection_guard = register_connection(Some(&context));
 
-    let mut server_stream = QuicStream::from((send, recv));
+    let mut server_stream = MeteredStream::new(
+        QuicStream::from((send, recv)),
+        Some(context.clone()),
+        TrafficDirection::Upload,
+    );
+    let mut client_stream = MeteredStream::new(
+        connection.stream,
+        Some(context),
+        TrafficDirection::Download,
+    );
     let copy_result =
         tokio::io::copy_bidirectional(&mut server_stream, &mut client_stream).await;
 
@@ -452,26 +476,9 @@ async fn process_tcp_stream(
     let _ = client_stream.shutdown().await;
 
     match copy_result {
-        Ok((client_to_server, server_to_client)) => {
-            record_transfer(Some(context), client_to_server, server_to_client);
-            Ok(())
-        }
+        Ok(_) => Ok(()),
         Err(err) => Err(err),
     }
-}
-
-async fn connect_tcp_remote(
-    resolver: Arc<dyn Resolver>,
-    remote_location: NetLocation,
-) -> std::io::Result<tokio::net::TcpStream> {
-    let target_addr = resolve_single_address(&resolver, &remote_location).await?;
-    let tcp_socket =
-        crate::util::socket::new_tcp_socket(None, target_addr.is_ipv6())?;
-    let client_stream = tcp_socket.connect(target_addr).await?;
-    if let Err(e) = client_stream.set_nodelay(true) {
-        warn!("Failed to set TCP no-delay on client socket: {}", e);
-    }
-    Ok(client_stream)
 }
 
 async fn read_address(
