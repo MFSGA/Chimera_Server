@@ -1,4 +1,4 @@
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -9,7 +9,12 @@ use crate::{
     async_stream::AsyncStream,
     config::server_config::{SocksUser, SocksUserStore},
     handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
-    traffic::TrafficContext,
+    outbound::{
+        DirectOutboundAction, connection_routing_input, select_direct_outbound,
+    },
+    resolver::{Resolver, resolve_single_address},
+    runtime::RuntimeState,
+    traffic::{TrafficContext, record_transfer, register_connection},
 };
 
 const SOCKS_VERSION: u8 = 0x05;
@@ -108,17 +113,17 @@ impl TcpServerHandler for SocksTcpServerHandler {
 
         let command = server_stream.read_u8().await?;
 
+        let traffic_context = Some(match identity {
+            Some(id) => TrafficContext::new("socks")
+                .with_identity(id)
+                .with_inbound_tag(self.inbound_tag.clone()),
+            None => TrafficContext::new("socks")
+                .with_inbound_tag(self.inbound_tag.clone()),
+        });
+
         match command {
             CMD_CONNECT => {
                 let remote_location = read_socks_address(&mut server_stream).await?;
-
-                let traffic_context = Some(match identity {
-                    Some(id) => TrafficContext::new("socks")
-                        .with_identity(id)
-                        .with_inbound_tag(self.inbound_tag.clone()),
-                    None => TrafficContext::new("socks")
-                        .with_inbound_tag(self.inbound_tag.clone()),
-                });
 
                 Ok(TcpServerSetupResult::TcpForward {
                     remote_location,
@@ -131,7 +136,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
                 })
             }
             CMD_UDP_ASSOCIATE if self.udp_enabled => {
-                handle_udp_associate(server_stream).await
+                handle_udp_associate(server_stream, traffic_context).await
             }
             CMD_UDP_ASSOCIATE => {
                 send_command_response(&mut server_stream, REP_COMMAND_NOT_SUPPORTED)
@@ -342,6 +347,7 @@ async fn read_address_from_stream(
 /// Takes ownership of `server_stream` while the UDP relay task is active.
 async fn handle_udp_associate(
     mut server_stream: Box<dyn AsyncStream>,
+    traffic_context: Option<TrafficContext>,
 ) -> std::io::Result<TcpServerSetupResult> {
     // Read client's hint address (RSV + ATYP + DST.ADDR + DST.PORT) - we ignore this per RFC
     let _client_hint = read_socks_address(&mut server_stream).await?;
@@ -366,14 +372,11 @@ async fn handle_udp_associate(
     server_stream.write_all(&response).await?;
     server_stream.flush().await?;
 
-    let udp_socket = Arc::new(udp_socket);
-    tokio::spawn(async move {
-        if let Err(e) = run_udp_relay(udp_socket, server_stream).await {
-            tracing::debug!("SOCKS5 UDP ASSOCIATE ended: {}", e);
-        }
-    });
-
-    Ok(TcpServerSetupResult::AlreadyHandled)
+    Ok(TcpServerSetupResult::UdpAssociate {
+        stream: server_stream,
+        socket: Arc::new(udp_socket),
+        traffic_context,
+    })
 }
 
 /// Build a SOCKS5 UDP ASSOCIATE success response.
@@ -403,11 +406,15 @@ fn build_udp_associate_response(bound_addr: SocketAddr) -> Vec<u8> {
 /// 3. Monitors the TCP connection for termination
 ///
 /// When the TCP connection closes, the UDP relay is terminated.
-async fn run_udp_relay(
+pub(crate) async fn run_udp_relay(
     udp_socket: Arc<tokio::net::UdpSocket>,
     mut tcp_stream: Box<dyn AsyncStream>,
+    resolver: Arc<dyn Resolver>,
+    runtime: RuntimeState,
+    traffic_context: Option<TrafficContext>,
 ) -> std::io::Result<()> {
     let udp_socket_clone = udp_socket.clone();
+    let _connection_guard = register_connection(traffic_context.as_ref());
 
     let mut tcp_monitor = tokio::spawn(async move {
         let mut buf = [0u8; 1024];
@@ -440,19 +447,65 @@ async fn run_udp_relay(
         }
 
         let _rsv = &data[0..2];
-        let frag = data[3];
+        let frag = data[2];
 
         // We don't support fragmentation; per RFC 1928, drop FRAG != 0
         if frag != 0 {
             continue;
         }
 
-        let (target_addr, payload_offset) = match parse_udp_address(data, 4) {
-            Ok((addr, offset)) => (addr, offset),
+        let (target_location, payload_offset) = match parse_udp_address(data, 3) {
+            Ok((location, offset)) => (location, offset),
             Err(_) => continue,
         };
 
         let payload = &data[payload_offset..];
+        let target_addr =
+            match resolve_single_address(&resolver, &target_location).await {
+                Ok(addr) => addr,
+                Err(error) => {
+                    tracing::warn!(
+                        "SOCKS5 UDP relay: failed to resolve target: {}",
+                        error
+                    );
+                    continue;
+                }
+            };
+        let inbound_tag = traffic_context
+            .as_ref()
+            .and_then(|context| context.inbound_tag.as_deref())
+            .unwrap_or_default();
+        let identity = traffic_context
+            .as_ref()
+            .and_then(|context| context.identity.as_deref())
+            .unwrap_or_default();
+        let route_input = connection_routing_input(
+            inbound_tag,
+            identity,
+            3,
+            client_addr,
+            target_addr,
+            &target_location,
+        );
+        let action = select_direct_outbound(&runtime, &route_input, "udp")?;
+        let mut datagram_context = traffic_context.clone();
+        match action {
+            DirectOutboundAction::Blackhole { tag } => {
+                datagram_context = datagram_context
+                    .map(|context| context.with_outbound_tag(tag.clone()));
+                record_transfer(datagram_context, payload.len() as u64, 0);
+                tracing::debug!(
+                    "SOCKS5 UDP payload dropped by blackhole outbound {}",
+                    tag
+                );
+                continue;
+            }
+            DirectOutboundAction::Freedom { tag: Some(tag) } => {
+                datagram_context =
+                    datagram_context.map(|context| context.with_outbound_tag(tag));
+            }
+            DirectOutboundAction::Freedom { tag: None } => {}
+        }
 
         // Forward payload to target
         let target_socket = match create_udp_socket_for_target(&target_addr) {
@@ -460,9 +513,14 @@ async fn run_udp_relay(
             Err(_) => continue,
         };
 
-        if let Err(e) = target_socket.send_to(payload, target_addr).await {
-            tracing::warn!("SOCKS5 UDP relay: failed to send to target: {}", e);
-            continue;
+        match target_socket.send_to(payload, target_addr).await {
+            Ok(sent) => {
+                record_transfer(datagram_context.clone(), sent as u64, 0);
+            }
+            Err(e) => {
+                tracing::warn!("SOCKS5 UDP relay: failed to send to target: {}", e);
+                continue;
+            }
         }
 
         // Receive response
@@ -483,6 +541,8 @@ async fn run_udp_relay(
                         "SOCKS5 UDP relay: failed to send response to client: {}",
                         e
                     );
+                } else {
+                    record_transfer(datagram_context, 0, resp_len as u64);
                 }
             }
             Err(e) => {
@@ -496,11 +556,11 @@ async fn run_udp_relay(
 }
 
 /// Parse a SOCKS5 UDP address starting at `offset` in `data`.
-/// Returns (target SocketAddr, offset after the address+port).
+/// Returns (target location, offset after the address+port).
 fn parse_udp_address(
     data: &[u8],
     offset: usize,
-) -> std::io::Result<(SocketAddr, usize)> {
+) -> std::io::Result<(NetLocation, usize)> {
     if offset >= data.len() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -525,7 +585,7 @@ fn parse_udp_address(
             );
             let port = u16::from_be_bytes([data[offset + 5], data[offset + 6]]);
             Ok((
-                SocketAddr::new(std::net::IpAddr::V4(ip), port),
+                NetLocation::new(Address::Ipv4(ip), port),
                 offset + 1 + 4 + 2,
             ))
         }
@@ -548,7 +608,7 @@ fn parse_udp_address(
             );
             let port = u16::from_be_bytes([data[offset + 17], data[offset + 18]]);
             Ok((
-                SocketAddr::new(std::net::IpAddr::V6(ip), port),
+                NetLocation::new(Address::Ipv6(ip), port),
                 offset + 1 + 16 + 2,
             ))
         }
@@ -577,12 +637,10 @@ fn parse_udp_address(
                 data[offset + 2 + domain_len],
                 data[offset + 2 + domain_len + 1],
             ]);
-            // Resolve domain to IP
-            let addr = format!("{}:{}", domain_str, port)
-                .to_socket_addrs()?
-                .next()
-                .ok_or_else(|| std::io::Error::other("domain resolution failed"))?;
-            Ok((addr, offset + 1 + 1 + domain_len + 2))
+            Ok((
+                NetLocation::new(Address::from(domain_str)?, port),
+                offset + 1 + 1 + domain_len + 2,
+            ))
         }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -652,4 +710,142 @@ async fn send_command_response(
     response[1] = reply;
     response[3] = ADDR_TYPE_IPV4;
     stream.write_all(&response).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        time::Duration,
+    };
+
+    use tokio::{
+        net::{TcpListener, TcpStream, UdpSocket},
+        time::timeout,
+    };
+
+    use super::*;
+    use crate::{
+        resolver::NativeResolver,
+        runtime::OutboundSummary,
+        traffic::{active_connections, snapshot},
+    };
+
+    #[tokio::test]
+    async fn udp_relay_routes_and_records_live_user_traffic() {
+        let inbound_tag = "socks-udp-e2e-in";
+        let outbound_tag = "socks-udp-e2e-out";
+        let identity = "socks-udp-e2e-user";
+        let payload = b"socks-udp-e2e";
+        let before = snapshot();
+
+        let echo_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let echo_addr = echo_socket.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            let mut buf = [0u8; 128];
+            let (len, peer) = echo_socket.recv_from(&mut buf).await.unwrap();
+            echo_socket.send_to(&buf[..len], peer).await.unwrap();
+        });
+
+        let relay_socket =
+            Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let relay_addr = relay_socket.local_addr().unwrap();
+        let control_listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let control_addr = control_listener.local_addr().unwrap();
+        let client_control = TcpStream::connect(control_addr).await.unwrap();
+        let (server_control, _) = control_listener.accept().await.unwrap();
+
+        let runtime = RuntimeState::new(
+            Vec::new(),
+            vec![OutboundSummary {
+                tag: outbound_tag.into(),
+                protocol: "freedom".into(),
+                proxy_settings_type: None,
+                proxy_settings_value: None,
+            }],
+        );
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let client_ip: IpAddr = "203.0.113.19".parse().unwrap();
+        let traffic_context = TrafficContext::new("socks")
+            .with_identity(identity)
+            .with_inbound_tag(inbound_tag)
+            .with_client_ip(client_ip);
+        let relay_task = tokio::spawn(run_udp_relay(
+            relay_socket,
+            Box::new(server_control),
+            resolver,
+            runtime,
+            Some(traffic_context),
+        ));
+
+        let client_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let mut request = vec![0, 0, 0, ADDR_TYPE_IPV4];
+        let IpAddr::V4(echo_ip) = echo_addr.ip() else {
+            unreachable!("test echo socket must use IPv4");
+        };
+        request.extend_from_slice(&echo_ip.octets());
+        request.extend_from_slice(&echo_addr.port().to_be_bytes());
+        request.extend_from_slice(payload);
+        client_socket.send_to(&request, relay_addr).await.unwrap();
+
+        let mut response = [0u8; 128];
+        let (response_len, _) = timeout(
+            Duration::from_secs(2),
+            client_socket.recv_from(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&response[10..response_len], payload);
+        assert!(active_connections().iter().any(|entry| {
+            entry.inbound_tag.as_deref() == Some(inbound_tag)
+                && entry.identity.as_deref() == Some(identity)
+                && entry.client_ip == Some(client_ip)
+        }));
+
+        let after = snapshot();
+        let before_inbound = before
+            .per_inbound
+            .get(inbound_tag)
+            .cloned()
+            .unwrap_or_default();
+        let after_inbound = after.per_inbound.get(inbound_tag).unwrap();
+        assert_eq!(
+            after_inbound.upload_bytes - before_inbound.upload_bytes,
+            payload.len() as u64
+        );
+        assert_eq!(
+            after_inbound.download_bytes - before_inbound.download_bytes,
+            payload.len() as u64
+        );
+        let outbound = after.per_outbound.get(outbound_tag).unwrap();
+        let before_outbound = before
+            .per_outbound
+            .get(outbound_tag)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            outbound.upload_bytes - before_outbound.upload_bytes,
+            payload.len() as u64
+        );
+        assert_eq!(
+            outbound.download_bytes - before_outbound.download_bytes,
+            payload.len() as u64
+        );
+        let user = after
+            .per_inbound_user
+            .get(&(inbound_tag.into(), identity.into()))
+            .unwrap();
+        assert_eq!(user.upload_bytes, payload.len() as u64);
+        assert_eq!(user.download_bytes, payload.len() as u64);
+
+        drop(client_control);
+        timeout(Duration::from_secs(2), relay_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        echo_task.await.unwrap();
+    }
 }

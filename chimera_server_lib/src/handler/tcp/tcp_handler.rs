@@ -1,6 +1,7 @@
-use std::fmt::Debug;
+use std::{fmt::Debug, sync::Arc};
 
 use async_trait::async_trait;
+use tokio::net::UdpSocket;
 
 use crate::{
     address::NetLocation, async_stream::AsyncStream, traffic::TrafficContext,
@@ -21,6 +22,11 @@ pub enum TcpServerSetupResult {
         need_initial_flush: bool,
 
         connection_success_response: Option<Box<[u8]>>,
+        traffic_context: Option<TrafficContext>,
+    },
+    UdpAssociate {
+        stream: Box<dyn AsyncStream>,
+        socket: Arc<UdpSocket>,
         traffic_context: Option<TrafficContext>,
     },
     /// The handler has taken full ownership of the stream and all work is
