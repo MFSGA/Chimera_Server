@@ -27,7 +27,7 @@ use rustls_pemfile::{certs, private_key};
 use serde_json::json;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener as TokioTcpListener,
+    net::{TcpListener as TokioTcpListener, UdpSocket as TokioUdpSocket},
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -502,10 +502,11 @@ async fn xray_client_with_wrong_reality_sni_falls_back_to_dest() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts Chimera as server and ./xray as client for hysteria2"]
-async fn xray_client_can_proxy_tcp_through_chimera_hysteria2() {
+async fn xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2() {
     let workspace = workspace_root();
     let work_dir = create_test_dir("hysteria2");
     let echo_addr = start_tcp_echo_server();
+    let udp_echo_addr = start_udp_echo_server().await;
     let chimera_port = free_localhost_port();
     let xray_socks_port = free_localhost_port();
     let cert_path = workspace.join("cert/cert.pem");
@@ -562,7 +563,7 @@ async fn xray_client_can_proxy_tcp_through_chimera_hysteria2() {
                 "port": xray_socks_port,
                 "protocol": "socks",
                 "tag": "socks-in",
-                "settings": {"auth": "noauth"}
+                "settings": {"auth": "noauth", "udp": true}
             }],
             "outbounds": [{
                 "tag": "to-chimera",
@@ -609,6 +610,12 @@ async fn xray_client_can_proxy_tcp_through_chimera_hysteria2() {
         socks_addr,
         echo_addr,
         &deterministic_payload(32 * 1024),
+    )
+    .await;
+    assert_socks5_udp_echo(
+        socks_addr,
+        udp_echo_addr,
+        b"hysteria2 UDP through xray client",
     )
     .await;
 }
@@ -755,6 +762,22 @@ fn start_tcp_echo_server_on(bind_addr: SocketAddr) -> SocketAddr {
     addr
 }
 
+async fn start_udp_echo_server() -> SocketAddr {
+    let socket = TokioUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind UDP echo server");
+    let addr = socket.local_addr().expect("UDP echo addr");
+    tokio::spawn(async move {
+        let mut buf = [0u8; 65535];
+        while let Ok((len, peer)) = socket.recv_from(&mut buf).await {
+            if socket.send_to(&buf[..len], peer).await.is_err() {
+                break;
+            }
+        }
+    });
+    addr
+}
+
 async fn assert_tls_handshake_to_localhost(_workspace: &Path, addr: SocketAddr) {
     let connector = TlsConnector::from(Arc::new(tls_test_client_config()));
     let tcp = tokio::net::TcpStream::connect(addr)
@@ -883,6 +906,65 @@ async fn assert_socks5_echo_async(
     assert_eq!(echoed, payload);
 }
 
+async fn assert_socks5_udp_echo(
+    socks_addr: SocketAddr,
+    target_addr: SocketAddr,
+    payload: &[u8],
+) {
+    let mut control = tokio::net::TcpStream::connect(socks_addr)
+        .await
+        .expect("connect xray SOCKS UDP control");
+    control
+        .write_all(&[0x05, 0x01, 0x00])
+        .await
+        .expect("SOCKS UDP hello");
+    let mut hello = [0u8; 2];
+    control
+        .read_exact(&mut hello)
+        .await
+        .expect("SOCKS UDP hello response");
+    assert_eq!(hello, [0x05, 0x00]);
+
+    control
+        .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+        .expect("SOCKS UDP associate request");
+    let mut header = [0u8; 4];
+    control
+        .read_exact(&mut header)
+        .await
+        .expect("SOCKS UDP associate response");
+    assert_eq!(header[1], 0x00, "SOCKS UDP associate failed");
+    let mut relay_addr =
+        read_async_socks_bound_address(&mut control, header[3]).await;
+    if relay_addr.ip().is_unspecified() {
+        relay_addr.set_ip(socks_addr.ip());
+    }
+
+    let udp = TokioUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind SOCKS UDP client");
+    let target_ip = match target_addr.ip() {
+        std::net::IpAddr::V4(ip) => ip,
+        std::net::IpAddr::V6(_) => panic!("SOCKS UDP E2E target must be IPv4"),
+    };
+    let mut request = vec![0x00, 0x00, 0x00, 0x01];
+    request.extend_from_slice(&target_ip.octets());
+    request.extend_from_slice(&target_addr.port().to_be_bytes());
+    request.extend_from_slice(payload);
+    udp.send_to(&request, relay_addr)
+        .await
+        .expect("send SOCKS UDP payload");
+
+    let mut response = vec![0u8; payload.len() + 64];
+    let (len, _) = tokio::time::timeout(IO_TIMEOUT, udp.recv_from(&mut response))
+        .await
+        .expect("SOCKS UDP echo timeout")
+        .expect("receive SOCKS UDP echo");
+    let payload_offset = socks_udp_payload_offset(&response[..len]);
+    assert_eq!(&response[payload_offset..len], payload);
+}
+
 async fn assert_tls_echo_through_socks(
     socks_addr: SocketAddr,
     target_addr: SocketAddr,
@@ -950,33 +1032,56 @@ async fn connect_socks5_tcp(
         .expect("socks connect response header");
     assert_eq!(header[0], 0x05);
     assert_eq!(header[1], 0x00, "SOCKS connect failed: {header:02x?}");
-    read_async_socks_bound_address_tail(&mut stream, header[3]).await;
+    let _ = read_async_socks_bound_address(&mut stream, header[3]).await;
     stream
 }
 
-async fn read_async_socks_bound_address_tail(
+async fn read_async_socks_bound_address(
     stream: &mut tokio::net::TcpStream,
     atyp: u8,
-) {
-    match atyp {
+) -> SocketAddr {
+    let ip = match atyp {
         0x01 => {
-            let mut rest = [0u8; 6];
-            stream.read_exact(&mut rest).await.expect("socks ipv4 tail");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).await.expect("socks ipv4");
+            std::net::IpAddr::V4(Ipv4Addr::from(bytes))
         }
         0x03 => {
             let mut len = [0u8; 1];
             stream.read_exact(&mut len).await.expect("socks domain len");
-            let mut rest = vec![0u8; len[0] as usize + 2];
-            stream
-                .read_exact(&mut rest)
+            let mut domain = vec![0u8; len[0] as usize];
+            stream.read_exact(&mut domain).await.expect("socks domain");
+            let domain = String::from_utf8(domain).expect("socks domain utf8");
+            tokio::net::lookup_host((domain.as_str(), 0))
                 .await
-                .expect("socks domain tail");
+                .expect("resolve socks bound domain")
+                .next()
+                .expect("socks bound domain address")
+                .ip()
         }
         0x04 => {
-            let mut rest = [0u8; 18];
-            stream.read_exact(&mut rest).await.expect("socks ipv6 tail");
+            let mut bytes = [0u8; 16];
+            stream.read_exact(&mut bytes).await.expect("socks ipv6");
+            std::net::IpAddr::V6(Ipv6Addr::from(bytes))
         }
         atyp => panic!("unsupported SOCKS address type {atyp:#x}"),
+    };
+    let mut port = [0u8; 2];
+    stream
+        .read_exact(&mut port)
+        .await
+        .expect("socks bound port");
+    SocketAddr::new(ip, u16::from_be_bytes(port))
+}
+
+fn socks_udp_payload_offset(packet: &[u8]) -> usize {
+    assert!(packet.len() >= 4, "SOCKS UDP packet too short");
+    assert_eq!(&packet[..3], &[0x00, 0x00, 0x00]);
+    match packet[3] {
+        0x01 => 10,
+        0x03 => 7 + packet.get(4).copied().unwrap_or_default() as usize,
+        0x04 => 22,
+        atyp => panic!("unsupported SOCKS UDP address type {atyp:#x}"),
     }
 }
 

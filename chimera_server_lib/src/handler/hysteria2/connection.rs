@@ -5,7 +5,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     task::{Context, Poll},
@@ -28,11 +28,15 @@ use tracing::{debug, warn};
 use crate::{
     address::NetLocation,
     config::server_config::{Hysteria2Client, Hysteria2ServerConfig},
-    outbound::connect_tcp_outbound,
+    outbound::{
+        DirectOutboundAction, connect_tcp_outbound, connection_routing_input,
+        select_direct_outbound,
+    },
     resolver::{Resolver, resolve_single_address},
     runtime::RuntimeState,
     traffic::{
-        MeteredStream, TrafficContext, TrafficDirection, register_connection,
+        ConnectionGuard, MeteredStream, TrafficContext, TrafficDirection,
+        record_transfer, register_connection,
     },
 };
 
@@ -91,7 +95,13 @@ pub async fn process_hysteria2_connection(
                 inbound_tag.clone(),
                 runtime.clone(),
             ),
-            drive_udp_datagrams(connection, resolver.clone()),
+            drive_udp_datagrams(
+                connection,
+                resolver.clone(),
+                &auth_ctx,
+                inbound_tag,
+                runtime,
+            ),
         )
         .map(|_| ())
     } else {
@@ -577,8 +587,21 @@ async fn send_tcp_response(
 async fn drive_udp_datagrams(
     connection: quinn::Connection,
     resolver: Arc<dyn Resolver>,
+    auth_ctx: &AuthContext,
+    inbound_tag: Arc<String>,
+    runtime: RuntimeState,
 ) -> std::io::Result<()> {
     let mut sessions: HashMap<u32, UdpSession> = HashMap::new();
+    let peer_addr = connection.remote_address();
+    let identity = auth_ctx
+        .client
+        .email
+        .clone()
+        .unwrap_or(auth_ctx.client.password.clone());
+    let base_context = TrafficContext::new("hysteria2")
+        .with_identity(identity.clone())
+        .with_inbound_tag((*inbound_tag).clone())
+        .with_client_ip(peer_addr.ip());
 
     loop {
         let data = match connection.read_datagram().await {
@@ -648,6 +671,7 @@ async fn drive_udp_datagrams(
                     remote_location.clone(),
                     resolver.clone(),
                     connection.clone(),
+                    base_context.clone(),
                 )
                 .await?;
                 entry.insert(session)
@@ -736,15 +760,57 @@ async fn drive_udp_datagrams(
             assembled.freeze()
         };
 
-        if let Err(err) = session
+        let route_input = connection_routing_input(
+            inbound_tag.as_str(),
+            &identity,
+            3,
+            peer_addr,
+            session.last_socket_addr,
+            &session.last_location,
+        );
+        let action = select_direct_outbound(&runtime, &route_input, "udp")?;
+        let mut traffic_context = session.base_context.clone();
+
+        match action {
+            DirectOutboundAction::Blackhole { tag } => {
+                traffic_context = traffic_context.with_outbound_tag(tag.clone());
+                record_transfer(
+                    Some(traffic_context),
+                    complete_payload.len() as u64,
+                    0,
+                );
+                debug!(
+                    "hysteria2 UDP payload for session {} dropped by blackhole outbound {}",
+                    session_id, tag
+                );
+                continue;
+            }
+            DirectOutboundAction::Freedom { tag: Some(tag) } => {
+                traffic_context = traffic_context.with_outbound_tag(tag);
+            }
+            DirectOutboundAction::Freedom { tag: None } => {}
+        }
+
+        session
+            .response_contexts
+            .write()
+            .expect("hysteria2 UDP contexts lock poisoned")
+            .insert(session.last_socket_addr, traffic_context.clone());
+
+        match session
             .socket
             .send_to(complete_payload.as_ref(), session.last_socket_addr)
             .await
         {
-            warn!(
-                "Failed to forward hysteria2 UDP payload for session {}: {}",
-                session_id, err
-            );
+            Ok(sent) => {
+                record_transfer(Some(traffic_context), sent as u64, 0);
+            }
+            Err(err) => {
+                warn!(
+                    "Failed to forward hysteria2 UDP payload for session {}: {}",
+                    session_id, err
+                );
+            }
         }
     }
 }
@@ -754,6 +820,9 @@ struct UdpSession {
     fragments: HashMap<u16, FragmentedPacket>,
     last_location: NetLocation,
     last_socket_addr: SocketAddr,
+    base_context: TrafficContext,
+    response_contexts: Arc<RwLock<HashMap<SocketAddr, TrafficContext>>>,
+    _connection_guard: ConnectionGuard,
 }
 
 struct FragmentedPacket {
@@ -769,6 +838,7 @@ async fn create_udp_session(
     remote_location: NetLocation,
     resolver: Arc<dyn Resolver>,
     connection: quinn::Connection,
+    base_context: TrafficContext,
 ) -> std::io::Result<UdpSession> {
     let remote_addr = resolve_single_address(&resolver, &remote_location).await?;
     let bind_addr: SocketAddr = if remote_addr.is_ipv6() {
@@ -780,12 +850,18 @@ async fn create_udp_session(
     let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
     let socket_for_task = socket.clone();
     let connection_for_task = connection.clone();
+    let response_contexts = Arc::new(RwLock::new(HashMap::new()));
+    let contexts_for_task = response_contexts.clone();
+    let fallback_context = base_context.clone();
+    let connection_guard = register_connection(Some(&base_context));
 
     tokio::spawn(async move {
         if let Err(err) = run_udp_remote_to_local_loop(
             session_id,
             connection_for_task,
             socket_for_task,
+            contexts_for_task,
+            fallback_context,
         )
         .await
         {
@@ -801,6 +877,9 @@ async fn create_udp_session(
         fragments: HashMap::new(),
         last_location: remote_location,
         last_socket_addr: remote_addr,
+        base_context,
+        response_contexts,
+        _connection_guard: connection_guard,
     })
 }
 
@@ -808,6 +887,8 @@ async fn run_udp_remote_to_local_loop(
     session_id: u32,
     connection: quinn::Connection,
     socket: Arc<UdpSocket>,
+    response_contexts: Arc<RwLock<HashMap<SocketAddr, TrafficContext>>>,
+    fallback_context: TrafficContext,
 ) -> std::io::Result<()> {
     let max_datagram_size = connection
         .max_datagram_size()
@@ -824,6 +905,12 @@ async fn run_udp_remote_to_local_loop(
                     err
                 ))
             })?;
+        let traffic_context = response_contexts
+            .read()
+            .expect("hysteria2 UDP contexts lock poisoned")
+            .get(&src_addr)
+            .cloned()
+            .unwrap_or_else(|| fallback_context.clone());
 
         let address_bytes = Bytes::from(src_addr.to_string().into_bytes());
         let mut address_len_buf = Vec::with_capacity(8);
@@ -889,6 +976,7 @@ async fn run_udp_remote_to_local_loop(
             }
         }
 
+        record_transfer(Some(traffic_context), 0, payload_len as u64);
         next_packet_id = next_packet_id.wrapping_add(1);
     }
 }
