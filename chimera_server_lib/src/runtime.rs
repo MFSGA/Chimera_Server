@@ -5,7 +5,10 @@ use std::{
 
 use tokio::task::{AbortHandle, JoinHandle};
 
-use crate::{config::server_config::ServerConfig, routing_state::RoutingState};
+use crate::{
+    config::server_config::ServerConfig,
+    routing_state::{RoutingInput, RoutingState},
+};
 
 #[derive(Debug, Clone)]
 pub struct OutboundSummary {
@@ -118,6 +121,19 @@ impl RuntimeState {
             .read()
             .expect("runtime outbounds lock poisoned")
             .clone()
+    }
+
+    pub fn select_outbound(&self, input: &RoutingInput) -> Option<OutboundSummary> {
+        let outbounds = self.outbounds();
+        self.routing()
+            .route(input, &outbounds, &HashMap::new())
+            .and_then(|route| {
+                outbounds
+                    .iter()
+                    .find(|outbound| outbound.tag == route.outbound_tag)
+                    .cloned()
+            })
+            .or_else(|| outbounds.first().cloned())
     }
 
     pub fn remove_outbound(&self, tag: &str) -> Option<OutboundSummary> {

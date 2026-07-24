@@ -13,6 +13,7 @@ pub struct TrafficContext {
     pub protocol: &'static str,
     pub identity: Option<String>,
     pub inbound_tag: Option<String>,
+    pub outbound_tag: Option<String>,
     pub client_ip: Option<IpAddr>,
 }
 
@@ -22,6 +23,7 @@ impl TrafficContext {
             protocol,
             identity: None,
             inbound_tag: None,
+            outbound_tag: None,
             client_ip: None,
         }
     }
@@ -33,6 +35,11 @@ impl TrafficContext {
 
     pub fn with_inbound_tag(mut self, tag: impl Into<String>) -> Self {
         self.inbound_tag = Some(tag.into());
+        self
+    }
+
+    pub fn with_outbound_tag(mut self, tag: impl Into<String>) -> Self {
+        self.outbound_tag = Some(tag.into());
         self
     }
 
@@ -48,6 +55,7 @@ impl Default for TrafficContext {
             protocol: "unknown",
             identity: None,
             inbound_tag: None,
+            outbound_tag: None,
             client_ip: None,
         }
     }
@@ -74,6 +82,7 @@ pub struct TrafficSnapshot {
     pub per_protocol: HashMap<String, TransferTotals>,
     pub per_identity: HashMap<(String, String), TransferTotals>,
     pub per_inbound: HashMap<String, TransferTotals>,
+    pub per_outbound: HashMap<String, TransferTotals>,
     pub per_inbound_user: HashMap<(String, String), TransferTotals>,
 }
 
@@ -83,6 +92,7 @@ struct StatsInner {
     per_protocol: HashMap<String, TransferTotals>,
     per_identity: HashMap<(String, String), TransferTotals>,
     per_inbound: HashMap<String, TransferTotals>,
+    per_outbound: HashMap<String, TransferTotals>,
     per_inbound_user: HashMap<(String, String), TransferTotals>,
 }
 
@@ -92,6 +102,7 @@ impl StatsInner {
 
         let identity = context.identity.clone();
         let inbound_tag = context.inbound_tag.clone();
+        let outbound_tag = context.outbound_tag.clone();
 
         let protocol_entry = self
             .per_protocol
@@ -115,6 +126,11 @@ impl StatsInner {
                 entry.accumulate(upload, download);
             }
         }
+
+        if let Some(tag) = outbound_tag {
+            let outbound_entry = self.per_outbound.entry(tag).or_default();
+            outbound_entry.accumulate(upload, download);
+        }
     }
 
     fn snapshot(&self) -> TrafficSnapshot {
@@ -123,6 +139,7 @@ impl StatsInner {
             per_protocol: self.per_protocol.clone(),
             per_identity: self.per_identity.clone(),
             per_inbound: self.per_inbound.clone(),
+            per_outbound: self.per_outbound.clone(),
             per_inbound_user: self.per_inbound_user.clone(),
         }
     }
