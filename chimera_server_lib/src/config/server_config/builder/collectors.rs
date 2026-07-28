@@ -207,9 +207,7 @@ pub(super) fn collect_trojan_clients(
             }
             Ok(TrojanUser {
                 password: client.password,
-                email: client.email.and_then(|value| {
-                    if value.is_empty() { None } else { Some(value) }
-                }),
+                email: client.email.filter(|value| !value.is_empty()),
             })
         })
         .collect()
