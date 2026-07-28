@@ -91,5 +91,3 @@ full = [
 ]
 
 default = ["full"]
-
-# default = ["trojan", "ws", "tls"]

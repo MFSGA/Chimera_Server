@@ -1,3 +1,4 @@
+// TODO: remove this once WIP modules stabilize and dead code is pruned
 #![allow(dead_code)]
 
 use beginning::start_servers;
