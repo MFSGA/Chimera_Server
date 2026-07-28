@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.7.1"
 edition = "2024"
 authors = ["chimera_rust@proton.me"]
 license = "LGPL-3.0-or-later"
@@ -17,7 +17,7 @@ license = "LGPL-3.0-or-later"
 
 
 [profile.release]
-opt-level = "s"
+opt-level = 3
 codegen-units = 1
 lto = true
 strip = true
