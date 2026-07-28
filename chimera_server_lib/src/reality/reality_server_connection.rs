@@ -510,7 +510,10 @@ impl RealityServerConnection {
         let HandshakeState::ClientHelloValidated { info } =
             std::mem::replace(&mut self.handshake_state, HandshakeState::Initial)
         else {
-            unreachable!()
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "build_server_response_internal called without ClientHelloValidated state",
+            ));
         };
 
         let cipher_suite = info.cipher_suite;
