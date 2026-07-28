@@ -208,7 +208,7 @@ fn parse_listener_protocol(
                     &key_bytes,
                     &alpn_protocols,
                     &[],
-                );
+                )?;
 
                 Ok(XhttpListenerConfig {
                     xhttp_config: config,

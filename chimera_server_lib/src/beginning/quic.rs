@@ -62,7 +62,7 @@ pub async fn start_quic_server(
             &key_bytes,
             &alpn_protocols.into_vec(),
             &client_fingerprints.into_vec(),
-        ));
+        )?);
 
         match protocol {
             #[cfg(feature = "hysteria")]
