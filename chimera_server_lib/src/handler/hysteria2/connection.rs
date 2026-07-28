@@ -528,7 +528,13 @@ async fn read_varint(stream: &mut quinn::RecvStream) -> std::io::Result<u64> {
     stream.read_exact(&mut first).await.map_err(Error::other)?;
     let prefix = first[0] >> 6;
     let mut value = (first[0] & 0x3f) as u64;
-    let remaining = match prefix {
+    if prefix > 3 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("invalid hysteria2 varint prefix: {prefix}"),
+        ));
+    }
+    let remaining: usize = match prefix {
         0 => 0,
         1 => 1,
         2 => 3,
@@ -991,8 +997,14 @@ fn decode_varint_from_slice(data: &[u8]) -> std::io::Result<(usize, usize)> {
 
     let first = data[0];
     let prefix = first >> 6;
+    if prefix > 3 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("invalid hysteria2 varint prefix in datagram: {prefix}"),
+        ));
+    }
     let bytes = match prefix {
-        0 => 1,
+        0 => 1usize,
         1 => 2,
         2 => 4,
         3 => 8,
