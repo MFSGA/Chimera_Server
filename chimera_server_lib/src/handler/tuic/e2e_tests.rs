@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use bytes::BytesMut;
 use tokio::{
@@ -105,9 +105,10 @@ async fn start_test_connection() -> (
     let server_addr = probe.local_addr().unwrap();
     drop(probe);
 
-    let cert_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../cert");
-    let cert_bytes = std::fs::read(cert_dir.join("cert.pem")).unwrap();
-    let key_bytes = std::fs::read(cert_dir.join("key.pem")).unwrap();
+    let generated_cert =
+        rcgen::generate_simple_self_signed(["localhost".to_string()]).unwrap();
+    let cert_bytes = generated_cert.cert.pem().into_bytes();
+    let key_bytes = generated_cert.signing_key.serialize_pem().into_bytes();
     let server_config = Arc::new(
         create_server_config(&cert_bytes, &key_bytes, &["h3".into()], &[])
             .expect("create server config for e2e test"),
