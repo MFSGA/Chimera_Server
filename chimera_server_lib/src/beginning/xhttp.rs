@@ -108,21 +108,22 @@ pub async fn start_xhttp_server(
             let security = security.clone();
             tokio::spawn(async move {
                 let stream: Box<dyn AsyncStream> = Box::new(stream);
-                let wrapped_stream = match security {
-                    XhttpSecurityLayer::None => Ok(stream),
-                    #[cfg(feature = "tls")]
-                    XhttpSecurityLayer::Tls(acceptor) => {
-                        acceptor.accept(stream).await.map(|tls_stream| {
-                            Box::new(tls_stream) as Box<dyn AsyncStream>
-                        })
-                    }
-                    #[cfg(feature = "reality")]
-                    XhttpSecurityLayer::Reality(config) => {
-                        accept_reality_stream(stream, &config)
-                            .await
-                            .map(|stream| Box::new(stream) as Box<dyn AsyncStream>)
-                    }
-                };
+                let wrapped_stream: std::io::Result<Box<dyn AsyncStream>> =
+                    match security {
+                        XhttpSecurityLayer::None => Ok(stream),
+                        #[cfg(feature = "tls")]
+                        XhttpSecurityLayer::Tls(acceptor) => {
+                            acceptor.accept(stream).await.map(|tls_stream| {
+                                Box::new(tls_stream) as Box<dyn AsyncStream>
+                            })
+                        }
+                        #[cfg(feature = "reality")]
+                        XhttpSecurityLayer::Reality(config) => {
+                            accept_reality_stream(stream, &config).await.map(
+                                |stream| Box::new(stream) as Box<dyn AsyncStream>,
+                            )
+                        }
+                    };
 
                 match wrapped_stream {
                     Ok(stream) => {

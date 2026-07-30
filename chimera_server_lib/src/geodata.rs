@@ -22,8 +22,8 @@ impl GeodataStore {
             .map_err(|error| format!("failed to decode xray geoip data: {error}"))?;
         let mut entries = HashMap::new();
         for entry in list.entry {
-            validate_geoip(&entry)?;
-            insert_unique(&mut entries, entry.code.clone(), entry, "geoip")?;
+            validate_geoip_code(&entry)?;
+            insert_first(&mut entries, entry.code.clone(), entry, "geoip")?;
         }
         self.geo_ips = entries;
         Ok(())
@@ -36,7 +36,7 @@ impl GeodataStore {
         let mut entries = HashMap::new();
         for entry in list.entry {
             validate_geosite(&entry)?;
-            insert_unique(&mut entries, entry.code.clone(), entry, "geosite")?;
+            insert_first(&mut entries, entry.code.clone(), entry, "geosite")?;
         }
         self.geo_sites = entries;
         Ok(())
@@ -89,6 +89,7 @@ impl GeodataStore {
         let entry = self.geoip(code).ok_or_else(|| {
             format!("xray geoip entry not found: {}", normalize_code(code))
         })?;
+        validate_geoip(entry)?;
         entry
             .cidr
             .iter()
@@ -137,7 +138,7 @@ impl GeodataStore {
         let entry = self.geosite(code).ok_or_else(|| {
             format!("xray geosite entry not found: {}", normalize_code(code))
         })?;
-        entry
+        Ok(entry
             .domain
             .iter()
             .filter(|domain| {
@@ -148,10 +149,13 @@ impl GeodataStore {
                         .any(|attribute| attribute.key == *expected)
                 })
             })
-            .map(|domain| {
-                let domain_type = proto::domain::Type::try_from(domain.r#type)
-                    .expect("xray geosite domain type validated during load");
-                Ok(match domain_type {
+            .filter_map(|domain| {
+                if domain.value.is_empty() {
+                    return None;
+                }
+                let domain_type =
+                    proto::domain::Type::try_from(domain.r#type).ok()?;
+                Some(match domain_type {
                     proto::domain::Type::Substr => domain.value.clone(),
                     proto::domain::Type::Regex => {
                         format!("regexp:{}", domain.value)
@@ -164,7 +168,7 @@ impl GeodataStore {
                     }
                 })
             })
-            .collect()
+            .collect())
     }
 
     pub(crate) fn expand_geosite_file(
@@ -229,26 +233,28 @@ fn normalize_code(code: &str) -> String {
     code.trim().to_ascii_uppercase()
 }
 
-fn insert_unique<T>(
+fn insert_first<T>(
     entries: &mut HashMap<String, T>,
     code: String,
     value: T,
     kind: &str,
 ) -> Result<(), String> {
-    let normalized = normalize_code(&code);
-    if normalized.is_empty() {
+    if code.trim().is_empty() {
         return Err(format!("xray {kind} entry code is required"));
     }
-    if entries.insert(normalized.clone(), value).is_some() {
-        return Err(format!("duplicate xray {kind} entry code {normalized}"));
+    entries.entry(code).or_insert(value);
+    Ok(())
+}
+
+fn validate_geoip_code(entry: &proto::GeoIp) -> Result<(), String> {
+    if normalize_code(&entry.code).is_empty() {
+        return Err("xray geoip entry code is required".into());
     }
     Ok(())
 }
 
 fn validate_geoip(entry: &proto::GeoIp) -> Result<(), String> {
-    if normalize_code(&entry.code).is_empty() {
-        return Err("xray geoip entry code is required".into());
-    }
+    validate_geoip_code(entry)?;
     for cidr in &entry.cidr {
         let max_prefix = match cidr.ip.len() {
             4 => 32,
@@ -274,20 +280,6 @@ fn validate_geosite(entry: &proto::GeoSite) -> Result<(), String> {
     if normalize_code(&entry.code).is_empty() {
         return Err("xray geosite entry code is required".into());
     }
-    for domain in &entry.domain {
-        proto::domain::Type::try_from(domain.r#type).map_err(|_| {
-            format!(
-                "xray geosite {} contains unknown domain type {}",
-                entry.code, domain.r#type
-            )
-        })?;
-        if domain.value.is_empty() {
-            return Err(format!(
-                "xray geosite {} contains an empty domain value",
-                entry.code
-            ));
-        }
-    }
     Ok(())
 }
 
@@ -304,11 +296,11 @@ mod tests {
     }
 
     #[test]
-    fn geoip_codes_are_case_insensitive_and_cidrs_are_preserved() {
+    fn geoip_lookup_normalizes_requested_code_and_preserves_cidrs() {
         let mut store = GeodataStore::default();
         store
             .load_geoip_bytes(&encode_geoip(vec![proto::GeoIp {
-                code: "Cn".into(),
+                code: "CN".into(),
                 cidr: vec![proto::Cidr {
                     ip: vec![203, 0, 113, 0],
                     prefix: 24,
@@ -318,7 +310,7 @@ mod tests {
             .expect("load xray geoip fixture");
 
         let entry = store.geoip(" cn ").expect("case-insensitive geoip code");
-        assert_eq!(entry.code, "Cn");
+        assert_eq!(entry.code, "CN");
         assert!(entry.reverse_match);
         assert_eq!(entry.cidr[0].ip, vec![203, 0, 113, 0]);
         assert_eq!(entry.cidr[0].prefix, 24);
@@ -351,42 +343,51 @@ mod tests {
     }
 
     #[test]
-    fn malformed_geoip_cidr_is_rejected_without_replacing_old_data() {
+    fn malformed_unreferenced_geoip_does_not_block_valid_code() {
         let mut store = GeodataStore::default();
         store
-            .load_geoip_bytes(&encode_geoip(vec![proto::GeoIp {
-                code: "OLD".into(),
-                cidr: vec![],
-                reverse_match: false,
-            }]))
-            .expect("load old geoip data");
+            .load_geoip_bytes(&encode_geoip(vec![
+                proto::GeoIp {
+                    code: "GOOD".into(),
+                    cidr: vec![proto::Cidr {
+                        ip: vec![203, 0, 113, 0],
+                        prefix: 24,
+                    }],
+                    reverse_match: false,
+                },
+                proto::GeoIp {
+                    code: "BROKEN".into(),
+                    cidr: vec![proto::Cidr {
+                        ip: vec![1, 2, 3],
+                        prefix: 24,
+                    }],
+                    reverse_match: false,
+                },
+            ]))
+            .expect("unreferenced malformed geoip entry must not reject file");
 
+        assert_eq!(
+            store
+                .expand_geoip("good", false)
+                .expect("valid geoip code must still expand"),
+            vec!["203.0.113.0/24"]
+        );
         let error = store
-            .load_geoip_bytes(&encode_geoip(vec![proto::GeoIp {
-                code: "BROKEN".into(),
-                cidr: vec![proto::Cidr {
-                    ip: vec![1, 2, 3],
-                    prefix: 24,
-                }],
-                reverse_match: false,
-            }]))
-            .expect_err("invalid geoip CIDR must be rejected");
-
+            .expand_geoip("broken", false)
+            .expect_err("referencing malformed geoip code must fail");
         assert!(error.contains("invalid IP length 3"));
-        assert!(store.geoip("OLD").is_some());
-        assert!(store.geoip("BROKEN").is_none());
     }
 
     #[test]
-    fn duplicate_codes_are_rejected_case_insensitively() {
+    fn duplicate_codes_use_the_first_exact_match() {
         let mut store = GeodataStore::default();
-        let error = store
+        store
             .load_geosite_bytes(&encode_geosite(vec![
                 proto::GeoSite {
-                    code: "test".into(),
+                    code: "TEST".into(),
                     domain: vec![proto::Domain {
                         r#type: proto::domain::Type::Full as i32,
-                        value: "a.example".into(),
+                        value: "first.example".into(),
                         attribute: vec![],
                     }],
                 },
@@ -394,15 +395,19 @@ mod tests {
                     code: "TEST".into(),
                     domain: vec![proto::Domain {
                         r#type: proto::domain::Type::Full as i32,
-                        value: "b.example".into(),
+                        value: "second.example".into(),
                         attribute: vec![],
                     }],
                 },
             ]))
-            .expect_err("duplicate geosite codes must be rejected");
+            .expect("duplicate geosite code should keep first entry");
 
-        assert!(error.contains("duplicate xray geosite entry code TEST"));
-        assert!(store.geosite("test").is_none());
+        assert_eq!(
+            store
+                .expand_geosite("test", &[])
+                .expect("expand first duplicate entry"),
+            vec!["full:first.example"]
+        );
     }
 
     #[test]

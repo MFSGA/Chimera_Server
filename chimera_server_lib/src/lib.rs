@@ -25,6 +25,8 @@ mod config;
 
 mod config_loader;
 
+mod geodata;
+
 #[cfg(feature = "api")]
 mod grpc;
 
@@ -48,6 +50,8 @@ mod routing_state;
 pub mod traffic;
 
 mod util;
+
+mod xudp_registry;
 
 #[allow(clippy::large_enum_variant)]
 pub enum ConfigType {
@@ -130,8 +134,16 @@ pub fn prepare_server_inbounds(
 }
 
 pub fn is_tcp_reality_server(config: &ServerConfig) -> bool {
-    matches!(config.transport, crate::config::Transport::Tcp)
-        && matches!(config.protocol, ServerProxyConfig::Reality(_))
+    #[cfg(feature = "reality")]
+    {
+        matches!(config.transport, crate::config::Transport::Tcp)
+            && matches!(config.protocol, ServerProxyConfig::Reality(_))
+    }
+    #[cfg(not(feature = "reality"))]
+    {
+        let _ = config;
+        false
+    }
 }
 
 #[derive(Default)]

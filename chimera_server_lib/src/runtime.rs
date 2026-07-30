@@ -124,16 +124,29 @@ impl RuntimeState {
     }
 
     pub fn select_outbound(&self, input: &RoutingInput) -> Option<OutboundSummary> {
+        self.select_outbound_checked(input).ok().flatten()
+    }
+
+    pub(crate) fn select_outbound_checked(
+        &self,
+        input: &RoutingInput,
+    ) -> Result<Option<OutboundSummary>, String> {
         let outbounds = self.outbounds();
-        self.routing()
-            .route(input, &outbounds, &HashMap::new())
-            .and_then(|route| {
-                outbounds
-                    .iter()
-                    .find(|outbound| outbound.tag == route.outbound_tag)
-                    .cloned()
+        let Some(route) = self.routing().route(input, &outbounds, &HashMap::new())
+        else {
+            return Ok(outbounds.first().cloned());
+        };
+        if let Some(error) = route.resolution_error {
+            return Err(error);
+        }
+        outbounds
+            .iter()
+            .find(|outbound| outbound.tag == route.outbound_tag)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| {
+                format!("routing selected missing outbound {}", route.outbound_tag)
             })
-            .or_else(|| outbounds.first().cloned())
     }
 
     pub fn remove_outbound(&self, tag: &str) -> Option<OutboundSummary> {

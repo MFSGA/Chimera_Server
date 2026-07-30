@@ -88,7 +88,11 @@ pub(crate) fn select_direct_outbound(
     input: &RoutingInput,
     network_name: &str,
 ) -> std::io::Result<DirectOutboundAction> {
-    let Some(outbound) = runtime.select_outbound(input) else {
+    let Some(outbound) =
+        runtime.select_outbound_checked(input).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
+        })?
+    else {
         return Ok(DirectOutboundAction::Freedom { tag: None });
     };
 
@@ -118,7 +122,7 @@ fn encode_ip(ip: IpAddr) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::{
-        config::rule::{RoutingConfig, RuleConfig},
+        config::rule::{BalancerConfig, RoutingConfig, RuleConfig},
         routing_state::RoutingState,
         runtime::OutboundSummary,
     };
@@ -154,6 +158,75 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "tcp outbound proxy uses unsupported protocol vmess"
+        );
+    }
+
+    #[test]
+    fn direct_outbound_rejects_missing_routed_outbound() {
+        let runtime =
+            RuntimeState::new(Vec::new(), vec![outbound("direct", "freedom")]);
+        runtime.replace_routing(
+            RoutingState::from_config(Some(&RoutingConfig {
+                rules: vec![RuleConfig {
+                    inbound_tag: vec!["test".into()],
+                    outbound_tag: Some("missing".into()),
+                    ..RuleConfig::default()
+                }],
+                ..RoutingConfig::default()
+            }))
+            .expect("missing outbound routing rule should compile"),
+        );
+
+        let error = select_direct_outbound(
+            &runtime,
+            &RoutingInput {
+                inbound_tag: "test".into(),
+                ..RoutingInput::default()
+            },
+            "tcp",
+        )
+        .expect_err("missing routed outbound must fail closed");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("missing outbound missing"));
+    }
+
+    #[test]
+    fn direct_outbound_rejects_empty_balancer_without_falling_back() {
+        let runtime =
+            RuntimeState::new(Vec::new(), vec![outbound("direct", "freedom")]);
+        runtime.replace_routing(
+            RoutingState::from_config(Some(&RoutingConfig {
+                rules: vec![RuleConfig {
+                    inbound_tag: vec!["test".into()],
+                    balancer_tag: Some("empty".into()),
+                    ..RuleConfig::default()
+                }],
+                balancers: vec![BalancerConfig {
+                    tag: "empty".into(),
+                    outbound_selector: vec!["missing-prefix".into()],
+                    fallback_tag: None,
+                }],
+                ..RoutingConfig::default()
+            }))
+            .expect("empty balancer routing rule should compile"),
+        );
+
+        let error = select_direct_outbound(
+            &runtime,
+            &RoutingInput {
+                inbound_tag: "test".into(),
+                ..RoutingInput::default()
+            },
+            "tcp",
+        )
+        .expect_err("empty routed balancer must fail closed");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            error
+                .to_string()
+                .contains("balancer empty has no available outbound")
         );
     }
 

@@ -10,6 +10,7 @@ use super::super::types::ServerProxyConfig;
 use super::super::types::{
     TlsCertificateConfig, TlsCertificateUsage, TlsServerConfig,
 };
+#[cfg(feature = "reality")]
 use crate::address::{Address, NetLocation};
 
 #[cfg(feature = "reality")]
