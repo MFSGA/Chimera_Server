@@ -32,6 +32,9 @@ pub fn create_tcp_server_handler(
     inbound_tag: &str,
     rules_stack: &mut Vec<Vec<RuleConfig>>,
 ) -> Result<Box<dyn TcpServerHandler>> {
+    #[cfg(not(any(feature = "ws", feature = "tls", feature = "reality")))]
+    let _ = rules_stack;
+
     match server_proxy_config {
         #[cfg(feature = "vless")]
         ServerProxyConfig::Vless { users } => {
@@ -44,22 +47,16 @@ pub fn create_tcp_server_handler(
 
         #[cfg(feature = "vmess")]
         ServerProxyConfig::Vmess { users } => {
-            let n_users = users.len();
-            if n_users != 1 {
+            if users.is_empty() {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
-                    format!(
-                        "VmessTcpServerHandler currently requires exactly 1 user (got {n_users})"
-                    ),
+                    "VmessTcpServerHandler requires at least 1 user",
                 ));
             }
-            let user = &users[0];
             Ok(Box::new(VmessTcpServerHandler::new(
-                &user.cipher,
-                &user.user_id,
-                false,
+                users,
+                true,
                 inbound_tag,
-                &user.user_label,
             )))
         }
 
@@ -175,8 +172,8 @@ mod tests {
 
     #[cfg(feature = "vmess")]
     #[test]
-    fn vmess_tcp_handler_rejects_multiple_users_without_panicking() {
-        let err = create_tcp_server_handler(
+    fn vmess_tcp_handler_accepts_multiple_users() {
+        let handler = create_tcp_server_handler(
             ServerProxyConfig::Vmess {
                 users: vec![
                     crate::config::server_config::VmessUser {
@@ -193,11 +190,23 @@ mod tests {
             },
             "vmess-multi",
             &mut Vec::new(),
+        );
+
+        assert!(handler.is_ok());
+    }
+
+    #[cfg(feature = "vmess")]
+    #[test]
+    fn vmess_tcp_handler_rejects_empty_user_list() {
+        let err = create_tcp_server_handler(
+            ServerProxyConfig::Vmess { users: Vec::new() },
+            "vmess-empty",
+            &mut Vec::new(),
         )
-        .expect_err("multiple vmess users should return an error");
+        .expect_err("empty vmess users should return an error");
 
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        assert!(err.to_string().contains("requires exactly 1 user (got 2)"));
+        assert!(err.to_string().contains("requires at least 1 user"));
     }
 
     #[test]

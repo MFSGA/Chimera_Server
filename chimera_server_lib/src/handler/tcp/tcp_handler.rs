@@ -4,15 +4,34 @@ use async_trait::async_trait;
 use tokio::net::UdpSocket;
 
 use crate::{
-    address::NetLocation, async_stream::AsyncStream, traffic::TrafficContext,
+    address::NetLocation,
+    async_stream::{AsyncMessageStream, AsyncStream, AsyncTargetedMessageStream},
+    traffic::TrafficContext,
 };
+
+#[derive(Debug, Clone, Default)]
+pub struct TcpServerConnectionContext {
+    pub original_destination: Option<NetLocation>,
+}
 
 #[async_trait]
 pub trait TcpServerHandler: Send + Sync + Debug {
+    fn requires_original_destination(&self) -> bool {
+        false
+    }
+
     async fn setup_server_stream(
         &self,
         server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult>;
+
+    async fn setup_server_stream_with_context(
+        &self,
+        server_stream: Box<dyn AsyncStream>,
+        _context: TcpServerConnectionContext,
+    ) -> std::io::Result<TcpServerSetupResult> {
+        self.setup_server_stream(server_stream).await
+    }
 }
 
 pub enum TcpServerSetupResult {
@@ -27,6 +46,19 @@ pub enum TcpServerSetupResult {
     UdpAssociate {
         stream: Box<dyn AsyncStream>,
         socket: Arc<UdpSocket>,
+        traffic_context: Option<TrafficContext>,
+    },
+    BidirectionalUdp {
+        remote_location: NetLocation,
+        stream: Box<dyn AsyncMessageStream>,
+        traffic_context: Option<TrafficContext>,
+    },
+    MultiDirectionalUdp {
+        stream: Box<dyn AsyncTargetedMessageStream>,
+        traffic_context: Option<TrafficContext>,
+    },
+    SessionBasedUdp {
+        stream: Box<dyn crate::async_stream::AsyncSessionMessageStream>,
         traffic_context: Option<TrafficContext>,
     },
     /// The handler has taken full ownership of the stream and all work is

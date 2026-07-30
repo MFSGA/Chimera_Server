@@ -15,6 +15,8 @@ pub mod hysteria2;
 
 #[cfg(feature = "trojan")]
 pub mod trojan;
+#[cfg(feature = "trojan")]
+pub(crate) mod trojan_udp;
 
 pub mod socks;
 
@@ -26,3 +28,6 @@ pub mod tuic;
 
 #[cfg(feature = "vmess")]
 pub mod vmess;
+
+#[cfg(any(feature = "vless", feature = "vmess"))]
+pub(crate) mod xudp;
