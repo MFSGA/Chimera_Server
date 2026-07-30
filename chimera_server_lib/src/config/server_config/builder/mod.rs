@@ -66,7 +66,9 @@ use super::types::{ServerConfig, ServerProxyConfig};
 
 #[cfg(feature = "hysteria")]
 use collectors::collect_hysteria2_settings;
-use collectors::{collect_socks_settings, collect_xhttp_settings};
+use collectors::collect_socks_settings;
+#[cfg(feature = "vless")]
+use collectors::collect_xhttp_settings;
 
 #[cfg(feature = "tuic")]
 use collectors::collect_tuic_settings;

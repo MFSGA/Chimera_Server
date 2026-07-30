@@ -1,5 +1,7 @@
 #![cfg(feature = "vless")]
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use bytes::{Buf, BytesMut};
 use tokio::io::ReadBuf;
@@ -7,21 +9,29 @@ use tracing::warn;
 
 use crate::{
     async_stream::AsyncStream, config::server_config::VlessUser,
-    traffic::TrafficContext,
+    resolver::NativeResolver, traffic::TrafficContext,
 };
 
 pub(crate) mod protocol;
 mod reality_vision_stream;
+mod udp_stream;
 mod vision;
 mod vision_pad;
 mod vision_stream;
 mod vision_tls;
 mod vision_unpad;
 
-use self::protocol::{
-    COMMAND_TCP, ParsedVlessHeader, XTLS_VISION_FLOW, read_request_header,
+use self::{
+    protocol::{
+        COMMAND_MUX, COMMAND_TCP, ParsedVlessHeader, XTLS_VISION_FLOW,
+        read_request_header,
+    },
+    udp_stream::VlessUdpStream,
 };
-use super::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
+use super::{
+    tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
+    xudp::message_stream::XudpMessageStream,
+};
 use vision_pad::{pad_with_command, pad_with_uuid_and_command};
 use vision_unpad::{UnpadCommand, VisionUnpadder};
 
@@ -97,36 +107,40 @@ impl TcpServerHandler for VlessTcpHandler {
 
         validate_request_flow(configured_flow, &request_flow, command)?;
 
+        let traffic_context = Some(
+            TrafficContext::new("vless")
+                .with_identity(user_label.clone())
+                .with_inbound_tag(self.inbound_tag.clone()),
+        );
+
         match command {
-            COMMAND_TCP => {}
-            protocol::COMMAND_UDP => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "UDP was requested",
-                ));
-            }
-            unknown_protocol_type => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Unknown requested protocol: {}", unknown_protocol_type),
-                ));
-            }
+            COMMAND_TCP => Ok(TcpServerSetupResult::TcpForward {
+                remote_location,
+                stream: server_stream,
+                need_initial_flush: true,
+                connection_success_response: Some(
+                    SERVER_RESPONSE_HEADER.to_vec().into_boxed_slice(),
+                ),
+                traffic_context,
+            }),
+            protocol::COMMAND_UDP => Ok(TcpServerSetupResult::BidirectionalUdp {
+                remote_location,
+                stream: Box::new(VlessUdpStream::new(server_stream)),
+                traffic_context,
+            }),
+            COMMAND_MUX => Ok(TcpServerSetupResult::SessionBasedUdp {
+                stream: Box::new(XudpMessageStream::with_write_prefix(
+                    server_stream,
+                    Arc::new(NativeResolver::new()),
+                    SERVER_RESPONSE_HEADER.to_vec(),
+                )),
+                traffic_context,
+            }),
+            unknown_protocol_type => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Unknown requested protocol: {unknown_protocol_type}"),
+            )),
         }
-
-        Ok(TcpServerSetupResult::TcpForward {
-            remote_location,
-            stream: server_stream,
-            need_initial_flush: true,
-
-            connection_success_response: Some(
-                SERVER_RESPONSE_HEADER.to_vec().into_boxed_slice(),
-            ),
-            traffic_context: Some(
-                TrafficContext::new("vless")
-                    .with_identity(user_label.clone())
-                    .with_inbound_tag(self.inbound_tag.clone()),
-            ),
-        })
     }
 }
 
@@ -280,16 +294,551 @@ pub(crate) fn unpad_into_pending_read(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        XTLS_VISION_FLOW, append_plaintext_to_read_buf, bounded_write_chunk,
-        drain_pending_read, looks_like_tls_record, queue_padded_packet,
-        take_vless_response_header, unpad_into_pending_read, validate_request_flow,
+    use std::{
+        future::poll_fn,
+        net::{Ipv4Addr, SocketAddr},
+        pin::Pin,
+        sync::Arc,
+        task::{Context, Poll},
+        time::Duration,
     };
-    use crate::handler::vless_handler::vision_unpad::{
-        UnpadCommand, VisionUnpadder,
+
+    use bytes::{Buf, BufMut, BytesMut};
+    use tokio::{
+        io::{
+            AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream,
+            ReadBuf, duplex,
+        },
+        net::UdpSocket,
+        time::timeout,
     };
-    use bytes::BytesMut;
-    use tokio::io::ReadBuf;
+
+    use crate::{
+        address::{Address, NetLocation},
+        async_stream::{AsyncPing, AsyncStream},
+        beginning::udp::{run_bidirectional_udp, run_session_based_udp},
+        config::server_config::VlessUser,
+        handler::{
+            tcp::tcp_handler::TcpServerSetupResult,
+            vless_handler::vision_unpad::{UnpadCommand, VisionUnpadder},
+            xudp::frame::{
+                FrameMetadata, FrameOption, SessionStatus, TargetNetwork,
+            },
+        },
+        resolver::NativeResolver,
+        runtime::RuntimeState,
+    };
+
+    use super::*;
+
+    struct TestStream(DuplexStream);
+
+    impl AsyncRead for TestStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buffer)
+        }
+    }
+
+    impl AsyncWrite for TestStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buffer)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    impl AsyncPing for TestStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for TestStream {}
+
+    fn plain_vless_handler(user_id: &str, user_label: &str) -> VlessTcpHandler {
+        VlessTcpHandler::new(
+            &[VlessUser {
+                user_id: user_id.into(),
+                user_label: user_label.into(),
+                flow: String::new(),
+            }],
+            "vless-test",
+        )
+    }
+
+    fn build_plain_vless_request(user_id: &str, command: u8) -> Vec<u8> {
+        let mut request = vec![0];
+        request.extend_from_slice(&parse_hex(user_id));
+        request.push(0);
+        request.push(command);
+        if command != COMMAND_MUX {
+            request.extend_from_slice(&443u16.to_be_bytes());
+            request.push(1);
+            request.extend_from_slice(&[127, 0, 0, 1]);
+        }
+        request
+    }
+
+    #[tokio::test]
+    async fn tcp_request_returns_success_response_and_traffic_context() {
+        let user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
+        let handler = plain_vless_handler(user_id, "vless-tcp-user");
+        let request = build_plain_vless_request(user_id, COMMAND_TCP);
+        let (mut client, server) = duplex(1024);
+        client
+            .write_all(&request)
+            .await
+            .expect("write VLESS TCP request");
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("VLESS TCP handshake must succeed");
+
+        let TcpServerSetupResult::TcpForward {
+            remote_location,
+            need_initial_flush,
+            connection_success_response,
+            traffic_context,
+            ..
+        } = result
+        else {
+            panic!("VLESS TCP handshake returned a non-TCP result");
+        };
+        assert_eq!(
+            remote_location,
+            NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 443)
+        );
+        assert!(need_initial_flush);
+        assert_eq!(
+            connection_success_response.as_deref(),
+            Some(SERVER_RESPONSE_HEADER)
+        );
+        let context = traffic_context.expect("VLESS TCP context must exist");
+        assert_eq!(context.identity.as_deref(), Some("vless-tcp-user"));
+        assert_eq!(context.inbound_tag.as_deref(), Some("vless-test"));
+    }
+
+    #[tokio::test]
+    async fn unknown_user_is_rejected_with_permission_denied() {
+        let configured_user = "3ac9b383-75a1-431c-8184-106c80eb2273";
+        let request_user = "e041e73e-a0a0-49f5-9754-6401aa621fb7";
+        let handler = plain_vless_handler(configured_user, "configured-user");
+        let request = build_plain_vless_request(request_user, COMMAND_TCP);
+        let (mut client, server) = duplex(1024);
+        client
+            .write_all(&request)
+            .await
+            .expect("write unknown-user VLESS request");
+
+        let error = match handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+        {
+            Ok(_) => panic!("unknown VLESS user must be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("invalid VLESS user id"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_unknown_command_is_rejected() {
+        let user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
+        let handler = plain_vless_handler(user_id, "unknown-command-user");
+        let request = build_plain_vless_request(user_id, 0xff);
+        let (mut client, server) = duplex(1024);
+        client
+            .write_all(&request)
+            .await
+            .expect("write unknown-command VLESS request");
+
+        let error = match handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+        {
+            Ok(_) => panic!("unknown VLESS command must be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("Unknown requested protocol"));
+    }
+
+    #[tokio::test]
+    async fn udp_request_returns_framed_bidirectional_stream() {
+        let user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
+        let handler = VlessTcpHandler::new(
+            &[VlessUser {
+                user_id: user_id.into(),
+                user_label: "vless-udp-user".into(),
+                flow: String::new(),
+            }],
+            "vless-udp",
+        );
+        let mut request = vec![0];
+        request.extend_from_slice(&parse_hex(user_id));
+        request.push(0);
+        request.push(protocol::COMMAND_UDP);
+        request.extend_from_slice(&53u16.to_be_bytes());
+        request.push(1);
+        request.extend_from_slice(&[127, 0, 0, 1]);
+        request.extend_from_slice(&[0, 4]);
+        request.extend_from_slice(b"ping");
+
+        let (mut client, server) = duplex(1024);
+        client
+            .write_all(&request)
+            .await
+            .expect("write VLESS UDP request");
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("VLESS UDP handshake should succeed");
+
+        let TcpServerSetupResult::BidirectionalUdp {
+            remote_location,
+            mut stream,
+            traffic_context,
+        } = result
+        else {
+            panic!("VLESS UDP handshake returned a non-UDP result");
+        };
+        assert_eq!(
+            remote_location,
+            NetLocation::new(Address::Ipv4(std::net::Ipv4Addr::LOCALHOST), 53)
+        );
+        let context = traffic_context.expect("VLESS traffic context should exist");
+        assert_eq!(context.identity.as_deref(), Some("vless-udp-user"));
+        assert_eq!(context.inbound_tag.as_deref(), Some("vless-udp"));
+
+        let mut payload = [0u8; 16];
+        let payload_length = poll_fn(|cx| {
+            let mut read_buffer = ReadBuf::new(&mut payload);
+            match Pin::new(&mut *stream).poll_read_message(cx, &mut read_buffer) {
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buffer.filled().len())),
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                Poll::Pending => Poll::Pending,
+            }
+        })
+        .await
+        .expect("read VLESS UDP payload");
+        assert_eq!(&payload[..payload_length], b"ping");
+
+        poll_fn(|cx| Pin::new(&mut *stream).poll_write_message(cx, b"pong"))
+            .await
+            .expect("write VLESS UDP response");
+        let mut response = [0u8; 8];
+        client
+            .read_exact(&mut response)
+            .await
+            .expect("read VLESS UDP response");
+        assert_eq!(&response, &[0, 0, 0, 4, b'p', b'o', b'n', b'g']);
+    }
+
+    #[tokio::test]
+    async fn udp_request_roundtrips_through_runtime() {
+        let echo_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind UDP echo socket");
+        let echo_address = echo_socket.local_addr().expect("UDP echo address");
+        let echo_task = tokio::spawn(async move {
+            let mut buffer = [0u8; 128];
+            let (length, peer) = echo_socket
+                .recv_from(&mut buffer)
+                .await
+                .expect("receive UDP echo request");
+            echo_socket
+                .send_to(&buffer[..length], peer)
+                .await
+                .expect("send UDP echo response");
+        });
+
+        let user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
+        let handler = VlessTcpHandler::new(
+            &[VlessUser {
+                user_id: user_id.into(),
+                user_label: "vless-runtime-user".into(),
+                flow: String::new(),
+            }],
+            "vless-runtime-udp",
+        );
+        let mut request = vec![0];
+        request.extend_from_slice(&parse_hex(user_id));
+        request.push(0);
+        request.push(protocol::COMMAND_UDP);
+        request.extend_from_slice(&echo_address.port().to_be_bytes());
+        request.push(1);
+        request.extend_from_slice(&[127, 0, 0, 1]);
+        request.extend_from_slice(&[0, 4]);
+        request.extend_from_slice(b"ping");
+
+        let (mut client, server) = duplex(1024);
+        client
+            .write_all(&request)
+            .await
+            .expect("write VLESS UDP request");
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("VLESS UDP handshake should succeed");
+        let TcpServerSetupResult::BidirectionalUdp {
+            remote_location,
+            stream,
+            traffic_context,
+        } = result
+        else {
+            panic!("VLESS UDP handshake returned a non-UDP result");
+        };
+
+        let relay_task = tokio::spawn(run_bidirectional_udp(
+            stream,
+            remote_location,
+            Arc::new(NativeResolver::new()),
+            RuntimeState::new(Vec::new(), Vec::new()),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 43123)),
+            traffic_context,
+        ));
+
+        let mut response = [0u8; 8];
+        timeout(Duration::from_secs(5), client.read_exact(&mut response))
+            .await
+            .expect("VLESS UDP runtime response timeout")
+            .expect("read VLESS UDP runtime response");
+        assert_eq!(&response, &[0, 0, 0, 4, b'p', b'i', b'n', b'g']);
+
+        echo_task.await.expect("UDP echo task should finish");
+        relay_task.abort();
+    }
+
+    #[tokio::test]
+    async fn fragmented_mux_header_preserves_first_xudp_frame() {
+        let user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
+        let handler = VlessTcpHandler::new(
+            &[VlessUser {
+                user_id: user_id.into(),
+                user_label: "fragmented-xudp-user".into(),
+                flow: String::new(),
+            }],
+            "vless-fragmented-xudp",
+        );
+        let target = SocketAddr::from((Ipv4Addr::LOCALHOST, 5353));
+        let mut request = vec![0];
+        request.extend_from_slice(&parse_hex(user_id));
+        request.push(0);
+        request.push(COMMAND_MUX);
+        let mut frame = BytesMut::new();
+        FrameMetadata {
+            session_id: 42,
+            status: SessionStatus::New,
+            option: FrameOption::default().with_data(),
+            target: Some(NetLocation::from_ip_addr(target.ip(), target.port())),
+            network: Some(TargetNetwork::Udp),
+            global_id: None,
+        }
+        .encode(&mut frame)
+        .expect("encode fragmented VLESS XUDP frame");
+        frame.put_u16(4);
+        frame.extend_from_slice(b"ping");
+        request.extend_from_slice(&frame);
+
+        let (mut client, server) = duplex(1);
+        let writer = tokio::spawn(async move {
+            for byte in request {
+                client
+                    .write_all(&[byte])
+                    .await
+                    .expect("write fragmented VLESS MUX byte");
+                tokio::task::yield_now().await;
+            }
+        });
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("fragmented VLESS MUX handshake must succeed");
+        let TcpServerSetupResult::SessionBasedUdp {
+            mut stream,
+            traffic_context,
+        } = result
+        else {
+            panic!("fragmented VLESS MUX returned a non-session result");
+        };
+        let mut payload = [0u8; 16];
+        let (message, length) = poll_fn(|cx| {
+            let mut read_buffer = ReadBuf::new(&mut payload);
+            match Pin::new(&mut *stream)
+                .poll_read_session_message(cx, &mut read_buffer)
+            {
+                Poll::Ready(Ok(message)) => {
+                    Poll::Ready(Ok((message, read_buffer.filled().len())))
+                }
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                Poll::Pending => Poll::Pending,
+            }
+        })
+        .await
+        .expect("read first fragmented VLESS XUDP message");
+
+        let crate::async_stream::SessionMessage::Data {
+            session_id,
+            target: actual_target,
+            global_id,
+            is_new,
+        } = message
+        else {
+            panic!("fragmented VLESS XUDP first frame decoded as End");
+        };
+        assert_eq!(session_id, 42);
+        assert_eq!(actual_target, target);
+        assert_eq!(global_id, None);
+        assert!(is_new);
+        assert_eq!(&payload[..length], b"ping");
+        let context = traffic_context.expect("fragmented VLESS XUDP context");
+        assert_eq!(context.identity.as_deref(), Some("fragmented-xudp-user"));
+        writer.await.expect("fragmented VLESS MUX writer task");
+    }
+
+    #[tokio::test]
+    async fn mux_request_roundtrips_xudp_through_runtime() {
+        let echo_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind VLESS XUDP echo socket");
+        let echo_address =
+            echo_socket.local_addr().expect("VLESS XUDP echo address");
+        let echo_task = tokio::spawn(async move {
+            let mut buffer = [0u8; 128];
+            let (length, peer) = echo_socket
+                .recv_from(&mut buffer)
+                .await
+                .expect("receive VLESS XUDP echo request");
+            echo_socket
+                .send_to(&buffer[..length], peer)
+                .await
+                .expect("send VLESS XUDP echo response");
+        });
+
+        let user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
+        let handler = VlessTcpHandler::new(
+            &[VlessUser {
+                user_id: user_id.into(),
+                user_label: "vless-xudp-user".into(),
+                flow: String::new(),
+            }],
+            "vless-xudp",
+        );
+        let mut request = vec![0];
+        request.extend_from_slice(&parse_hex(user_id));
+        request.push(0);
+        request.push(COMMAND_MUX);
+        let mut xudp_frame = BytesMut::new();
+        FrameMetadata {
+            session_id: 41,
+            status: SessionStatus::New,
+            option: FrameOption::default().with_data(),
+            target: Some(NetLocation::from_ip_addr(
+                echo_address.ip(),
+                echo_address.port(),
+            )),
+            network: Some(TargetNetwork::Udp),
+            global_id: None,
+        }
+        .encode(&mut xudp_frame)
+        .expect("encode VLESS XUDP request metadata");
+        xudp_frame.put_u16(4);
+        xudp_frame.extend_from_slice(b"ping");
+        request.extend_from_slice(&xudp_frame);
+
+        let (mut client, server) = duplex(4096);
+        client
+            .write_all(&request)
+            .await
+            .expect("write VLESS XUDP request");
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("VLESS MUX handshake should succeed");
+        let TcpServerSetupResult::SessionBasedUdp {
+            stream,
+            traffic_context,
+        } = result
+        else {
+            panic!("VLESS MUX handshake returned a non-session result");
+        };
+        let context = traffic_context
+            .as_ref()
+            .expect("VLESS XUDP traffic context should exist");
+        assert_eq!(context.identity.as_deref(), Some("vless-xudp-user"));
+        assert_eq!(context.inbound_tag.as_deref(), Some("vless-xudp"));
+
+        let relay_task = tokio::spawn(run_session_based_udp(
+            stream,
+            RuntimeState::new(Vec::new(), Vec::new()),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 43141)),
+            traffic_context,
+        ));
+
+        let mut response_header = [0u8; 2];
+        timeout(
+            Duration::from_secs(5),
+            client.read_exact(&mut response_header),
+        )
+        .await
+        .expect("VLESS response header timeout")
+        .expect("read VLESS response header");
+        assert_eq!(response_header, [0, 0]);
+
+        let mut metadata_length = [0u8; 2];
+        client
+            .read_exact(&mut metadata_length)
+            .await
+            .expect("read XUDP response metadata length");
+        let metadata_size = u16::from_be_bytes(metadata_length) as usize;
+        let mut response = BytesMut::from(&metadata_length[..]);
+        response.resize(2 + metadata_size + 2 + 4, 0);
+        client
+            .read_exact(&mut response[2..])
+            .await
+            .expect("read XUDP response frame");
+        let metadata = FrameMetadata::decode(&mut response)
+            .expect("decode VLESS XUDP response")
+            .expect("complete VLESS XUDP response");
+        assert_eq!(metadata.session_id, 41);
+        assert_eq!(metadata.status, SessionStatus::Keep);
+        assert_eq!(metadata.network, Some(TargetNetwork::Udp));
+        assert_eq!(response.get_u16(), 4);
+        assert_eq!(&response[..], b"ping");
+
+        echo_task.await.expect("VLESS XUDP echo task should finish");
+        relay_task.abort();
+    }
 
     #[test]
     fn validate_request_flow_allows_plain_vless() {
@@ -308,6 +857,26 @@ mod tests {
         let err = validate_request_flow(XTLS_VISION_FLOW, "", 1)
             .expect_err("vision account should require client flow");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn validate_request_flow_rejects_unknown_flow() {
+        let error = validate_request_flow("", "unknown-flow", COMMAND_TCP)
+            .expect_err("unknown VLESS flow must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("unknown request flow"));
+    }
+
+    #[test]
+    fn validate_request_flow_rejects_vision_for_udp_before_handler_selection() {
+        let error = validate_request_flow(
+            XTLS_VISION_FLOW,
+            XTLS_VISION_FLOW,
+            protocol::COMMAND_UDP,
+        )
+        .expect_err("Vision VLESS UDP must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("only TCP"));
     }
 
     #[test]

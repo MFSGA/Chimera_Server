@@ -1,7 +1,10 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use async_trait::async_trait;
-use aws_lc_rs::digest::{SHA224, digest};
+use aws_lc_rs::{
+    constant_time::verify_slices_are_equal,
+    digest::{SHA224, digest},
+};
 use tokio::io::AsyncReadExt;
 
 use crate::{
@@ -12,6 +15,8 @@ use crate::{
     traffic::TrafficContext,
     util::prefixed_stream::PrefixedStream,
 };
+
+use super::trojan_udp::TrojanUdpStream;
 
 const CMD_CONNECT: u8 = 0x01;
 const CMD_UDP_ASSOCIATE: u8 = 0x03;
@@ -71,7 +76,7 @@ impl TcpServerHandler for TrojanTcpHandler {
         &self,
         mut server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
-        if !self.fallbacks.is_empty() {
+        if let Some(fallback) = self.fallbacks.first() {
             let mut prefix = Vec::with_capacity(512);
             let password_line = match read_line_crlf_with_prefix(
                 &mut server_stream,
@@ -82,41 +87,20 @@ impl TcpServerHandler for TrojanTcpHandler {
             {
                 Ok(line) => line,
                 Err(_) => {
-                    return Ok(TcpServerSetupResult::TcpForward {
-                        remote_location: self.fallbacks[0].dest.clone(),
-                        stream: Box::new(PrefixedStream::new(prefix, server_stream)),
-                        need_initial_flush: false,
-                        connection_success_response: None,
-                        traffic_context: None,
-                    });
+                    return Ok(fallback_forward(fallback, prefix, server_stream));
                 }
             };
 
-            if password_line.len() != 56 {
-                return Ok(TcpServerSetupResult::TcpForward {
-                    remote_location: self.fallbacks[0].dest.clone(),
-                    stream: Box::new(PrefixedStream::new(prefix, server_stream)),
-                    need_initial_flush: false,
-                    connection_success_response: None,
-                    traffic_context: None,
-                });
-            }
-
-            if self
-                .credentials
-                .iter()
-                .all(|cred| cred.password_hash.as_ref() != password_line.as_slice())
+            if password_line.len() != 56
+                || self.credentials.iter().all(|credential| {
+                    !credential_matches(credential, &password_line)
+                })
             {
-                return Ok(TcpServerSetupResult::TcpForward {
-                    remote_location: self.fallbacks[0].dest.clone(),
-                    stream: Box::new(PrefixedStream::new(prefix, server_stream)),
-                    need_initial_flush: false,
-                    connection_success_response: None,
-                    traffic_context: None,
-                });
+                return Ok(fallback_forward(fallback, prefix, server_stream));
             }
 
-            // Auth looks valid; hand off to the standard Trojan parser with bytes replayed.
+            // Authentication looks valid. Replay the complete prefix into the regular
+            // Trojan parser so successful requests follow the same parsing path.
             server_stream = Box::new(PrefixedStream::new(prefix, server_stream));
         }
 
@@ -135,7 +119,7 @@ impl TcpServerHandler for TrojanTcpHandler {
         let credential = self
             .credentials
             .iter()
-            .find(|cred| cred.password_hash.as_ref() == password_line.as_slice())
+            .find(|credential| credential_matches(credential, &password_line))
             .ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -144,14 +128,7 @@ impl TcpServerHandler for TrojanTcpHandler {
             })?;
 
         let command = server_stream.read_u8().await?;
-        if command == CMD_UDP_ASSOCIATE {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "UDP associate command is not supported",
-            ));
-        }
-
-        if command != CMD_CONNECT {
+        if !matches!(command, CMD_CONNECT | CMD_UDP_ASSOCIATE) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("unsupported trojan command: {}", command),
@@ -174,6 +151,13 @@ impl TcpServerHandler for TrojanTcpHandler {
                 .with_identity(label.clone())
                 .with_inbound_tag(self.inbound_tag.clone())
         });
+
+        if command == CMD_UDP_ASSOCIATE {
+            return Ok(TcpServerSetupResult::MultiDirectionalUdp {
+                stream: Box::new(TrojanUdpStream::new(server_stream)),
+                traffic_context,
+            });
+        }
 
         Ok(TcpServerSetupResult::TcpForward {
             remote_location,
@@ -310,6 +294,24 @@ async fn read_location(
     }
 }
 
+fn fallback_forward(
+    fallback: &TrojanFallback,
+    prefix: Vec<u8>,
+    stream: Box<dyn AsyncStream>,
+) -> TcpServerSetupResult {
+    TcpServerSetupResult::TcpForward {
+        remote_location: fallback.dest.clone(),
+        stream: Box::new(PrefixedStream::new(prefix, stream)),
+        need_initial_flush: false,
+        connection_success_response: None,
+        traffic_context: None,
+    }
+}
+
+fn credential_matches(credential: &TrojanCredential, password_line: &[u8]) -> bool {
+    verify_slices_are_equal(credential.password_hash.as_ref(), password_line).is_ok()
+}
+
 fn create_password_hash(password: &str) -> Box<[u8]> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let digest = digest(&SHA224, password.as_bytes());
@@ -320,4 +322,397 @@ fn create_password_hash(password: &str) -> Box<[u8]> {
         hex_bytes.push(HEX[(byte & 0x0f) as usize]);
     }
     hex_bytes.into_boxed_slice()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    use tokio::io::{
+        AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf,
+        duplex,
+    };
+
+    use crate::async_stream::AsyncPing;
+
+    use super::*;
+
+    struct TestStream(DuplexStream);
+
+    impl AsyncRead for TestStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buffer)
+        }
+    }
+
+    impl AsyncWrite for TestStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buffer)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    impl AsyncPing for TestStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for TestStream {}
+
+    fn handler_with_fallbacks(password: &str, ports: &[u16]) -> TrojanTcpHandler {
+        TrojanTcpHandler::new(
+            vec![TrojanUser {
+                password: password.into(),
+                email: Some("fallback-user".into()),
+            }],
+            ports
+                .iter()
+                .map(|port| TrojanFallback {
+                    dest: NetLocation::new(
+                        Address::Ipv4(Ipv4Addr::LOCALHOST),
+                        *port,
+                    ),
+                })
+                .collect(),
+            "trojan-fallback",
+        )
+    }
+
+    async fn run_fallback_request(
+        handler: &TrojanTcpHandler,
+        request: &[u8],
+    ) -> (NetLocation, Vec<u8>) {
+        let (mut client, server) = duplex(4096);
+        client
+            .write_all(request)
+            .await
+            .expect("write fallback request");
+        client.shutdown().await.expect("close fallback request");
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("fallback request should be accepted");
+        match result {
+            TcpServerSetupResult::TcpForward {
+                remote_location,
+                mut stream,
+                traffic_context,
+                ..
+            } => {
+                assert!(traffic_context.is_none());
+                let mut replayed = Vec::new();
+                stream
+                    .read_to_end(&mut replayed)
+                    .await
+                    .expect("read replayed fallback bytes");
+                (remote_location, replayed)
+            }
+            _ => panic!("fallback request returned a non-TCP result"),
+        }
+    }
+
+    fn build_trojan_request(
+        password: &str,
+        command: u8,
+        address_type: u8,
+        address_payload: &[u8],
+        port: u16,
+    ) -> Vec<u8> {
+        let mut request = create_password_hash(password).into_vec();
+        request.extend_from_slice(&CRLF);
+        request.push(command);
+        request.push(address_type);
+        request.extend_from_slice(address_payload);
+        request.extend_from_slice(&port.to_be_bytes());
+        request.extend_from_slice(&CRLF);
+        request
+    }
+
+    #[tokio::test]
+    async fn partial_valid_password_line_replays_every_prefix_to_fallback() {
+        let password = "trojan-password";
+        let handler = handler_with_fallbacks(password, &[8080]);
+        let mut password_line = create_password_hash(password).into_vec();
+        password_line.extend_from_slice(&CRLF);
+
+        for prefix_length in 0..password_line.len() {
+            let (_, replayed) =
+                run_fallback_request(&handler, &password_line[..prefix_length])
+                    .await;
+            assert_eq!(
+                replayed,
+                password_line[..prefix_length],
+                "password prefix length {prefix_length}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_request_truncations_do_not_fallback_or_panic() {
+        let password = "trojan-password";
+        let handler = handler_with_fallbacks(password, &[8080]);
+        let full_request = build_trojan_request(
+            password,
+            CMD_CONNECT,
+            ADDR_TYPE_IPV6,
+            &Ipv6Addr::LOCALHOST.octets(),
+            443,
+        );
+        let authenticated_prefix_length = create_password_hash(password).len() + 2;
+
+        for prefix_length in authenticated_prefix_length..full_request.len() {
+            let (mut client, server) = duplex(1024);
+            client
+                .write_all(&full_request[..prefix_length])
+                .await
+                .expect("write truncated authenticated Trojan request");
+            client
+                .shutdown()
+                .await
+                .expect("close truncated authenticated Trojan request");
+
+            let error = match handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+            {
+                Ok(_) => panic!(
+                    "authenticated Trojan prefix {prefix_length} must not fallback"
+                ),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::InvalidData
+                ),
+                "prefix {prefix_length}: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_parses_address_matrix_and_multi_user_identity() {
+        let password_a = "trojan-password-a";
+        let password_b = "trojan-password-b";
+        let handler = TrojanTcpHandler::new(
+            vec![
+                TrojanUser {
+                    password: password_a.into(),
+                    email: Some("trojan-user-a".into()),
+                },
+                TrojanUser {
+                    password: password_b.into(),
+                    email: Some("trojan-user-b".into()),
+                },
+            ],
+            Vec::new(),
+            "trojan-connect",
+        );
+        let ipv6 = Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 3, 4, 5, 6);
+        let cases = [
+            (
+                password_a,
+                "trojan-user-a",
+                ADDR_TYPE_IPV4,
+                Ipv4Addr::LOCALHOST.octets().to_vec(),
+                NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 80),
+                80,
+            ),
+            (
+                password_b,
+                "trojan-user-b",
+                ADDR_TYPE_IPV6,
+                ipv6.octets().to_vec(),
+                NetLocation::new(Address::Ipv6(ipv6), 443),
+                443,
+            ),
+            (
+                password_a,
+                "trojan-user-a",
+                ADDR_TYPE_DOMAIN_NAME,
+                [vec![12], b"example.test".to_vec()].concat(),
+                NetLocation::new(Address::from("example.test").unwrap(), 8443),
+                8443,
+            ),
+        ];
+
+        for (
+            password,
+            expected_identity,
+            address_type,
+            address_payload,
+            expected_target,
+            port,
+        ) in cases
+        {
+            let request = build_trojan_request(
+                password,
+                CMD_CONNECT,
+                address_type,
+                &address_payload,
+                port,
+            );
+            let (mut client, server) = duplex(1024);
+            client
+                .write_all(&request)
+                .await
+                .expect("write Trojan CONNECT request");
+
+            let result = handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+                .expect("Trojan CONNECT handshake must succeed");
+            let TcpServerSetupResult::TcpForward {
+                remote_location,
+                traffic_context,
+                ..
+            } = result
+            else {
+                panic!("Trojan CONNECT returned a non-TCP result");
+            };
+            assert_eq!(remote_location, expected_target);
+            let context =
+                traffic_context.expect("Trojan CONNECT context must exist");
+            assert_eq!(context.identity.as_deref(), Some(expected_identity));
+            assert_eq!(context.inbound_tag.as_deref(), Some("trojan-connect"));
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_protocol_replays_complete_prefix_to_first_fallback() {
+        let handler = handler_with_fallbacks("trojan-password", &[8080, 8081]);
+        let request = b"GET /health HTTP/1.1\r\nHost: example.test\r\n\r\nbody";
+
+        let (destination, replayed) = run_fallback_request(&handler, request).await;
+
+        assert_eq!(
+            destination,
+            NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 8080)
+        );
+        assert_eq!(replayed, request);
+    }
+
+    #[tokio::test]
+    async fn invalid_user_replays_hash_and_remaining_payload() {
+        let handler = handler_with_fallbacks("trojan-password", &[8080]);
+        let mut request = vec![b'a'; 56];
+        request.extend_from_slice(&CRLF);
+        request.extend_from_slice(b"payload-after-invalid-user");
+
+        let (_, replayed) = run_fallback_request(&handler, &request).await;
+
+        assert_eq!(replayed, request);
+    }
+
+    #[tokio::test]
+    async fn overlong_first_line_replays_consumed_and_unread_bytes() {
+        let handler = handler_with_fallbacks("trojan-password", &[8080]);
+        let mut request = vec![b'x'; MAX_PASSWORD_LINE];
+        request.extend_from_slice(b"remaining-body");
+
+        let (_, replayed) = run_fallback_request(&handler, &request).await;
+
+        assert_eq!(replayed, request);
+    }
+
+    #[tokio::test]
+    async fn valid_user_with_invalid_command_does_not_fallback() {
+        let password = "trojan-password";
+        let handler = handler_with_fallbacks(password, &[8080]);
+        let mut request = create_password_hash(password).into_vec();
+        request.extend_from_slice(&CRLF);
+        request.push(0x7f);
+
+        let (mut client, server) = duplex(1024);
+        client
+            .write_all(&request)
+            .await
+            .expect("write Trojan request");
+        client.shutdown().await.expect("close Trojan request");
+        let error = match handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+        {
+            Ok(_) => panic!("valid authentication with invalid command must fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("unsupported trojan command"));
+    }
+
+    #[tokio::test]
+    async fn udp_associate_returns_multi_directional_stream() {
+        let password = "trojan-password";
+        let handler = TrojanTcpHandler::new(
+            vec![TrojanUser {
+                password: password.into(),
+                email: Some("udp-user".into()),
+            }],
+            Vec::new(),
+            "trojan-udp",
+        );
+        let mut request = create_password_hash(password).into_vec();
+        request.extend_from_slice(&CRLF);
+        request.push(CMD_UDP_ASSOCIATE);
+        request.push(ADDR_TYPE_IPV4);
+        request.extend_from_slice(&Ipv4Addr::LOCALHOST.octets());
+        request.extend_from_slice(&53u16.to_be_bytes());
+        request.extend_from_slice(&CRLF);
+
+        let (mut client, server) = duplex(1024);
+        client
+            .write_all(&request)
+            .await
+            .expect("write Trojan request");
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("Trojan UDP handshake should succeed");
+
+        match result {
+            TcpServerSetupResult::MultiDirectionalUdp {
+                traffic_context, ..
+            } => {
+                let context = traffic_context.expect("Trojan context should exist");
+                assert_eq!(context.identity.as_deref(), Some("udp-user"));
+                assert_eq!(context.inbound_tag.as_deref(), Some("trojan-udp"));
+            }
+            _ => panic!("Trojan UDP handshake returned a non-UDP result"),
+        }
+    }
 }

@@ -1,8 +1,13 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use quic::start_quic_server;
+#[cfg(target_os = "linux")]
+use socket2::SockRef;
 use tokio::{io::AsyncWriteExt, task::JoinHandle, time::timeout};
-use udp::start_udp_server;
+use udp::{
+    run_bidirectional_udp, run_multi_directional_udp, run_session_based_udp,
+    start_udp_server,
+};
 
 use crate::{
     address::{BindLocation, NetLocation},
@@ -14,7 +19,9 @@ use crate::{
     handler::{
         socks::run_udp_relay,
         tcp::{
-            tcp_handler::{TcpServerHandler, TcpServerSetupResult},
+            tcp_handler::{
+                TcpServerConnectionContext, TcpServerHandler, TcpServerSetupResult,
+            },
             tcp_handler_util::create_tcp_server_handler,
         },
     },
@@ -28,7 +35,7 @@ use crate::{
 use tracing::{error, info};
 
 mod quic;
-mod udp;
+pub(crate) mod udp;
 mod xhttp;
 
 pub async fn start_servers(
@@ -175,9 +182,30 @@ async fn run_tcp_server(
         let runtime = runtime.clone();
 
         tokio::spawn(async move {
-            if let Err(e) =
-                process_stream(stream, cloned_handler, cloned_cache, addr, runtime)
-                    .await
+            let connection_context = match tcp_server_connection_context(
+                &stream,
+                cloned_handler.as_ref().as_ref(),
+            ) {
+                Ok(context) => context,
+                Err(error) => {
+                    error!(
+                        "{}:{} failed to read original destination: {}",
+                        addr.ip(),
+                        addr.port(),
+                        error
+                    );
+                    return;
+                }
+            };
+            if let Err(e) = process_stream_with_context(
+                stream,
+                cloned_handler,
+                cloned_cache,
+                addr,
+                runtime,
+                connection_context,
+            )
+            .await
             {
                 error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
             } else {
@@ -191,10 +219,55 @@ async fn run_tcp_server(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn tcp_server_connection_context(
+    stream: &tokio::net::TcpStream,
+    server_handler: &dyn TcpServerHandler,
+) -> std::io::Result<TcpServerConnectionContext> {
+    if !server_handler.requires_original_destination() {
+        return Ok(TcpServerConnectionContext::default());
+    }
+
+    let socket = SockRef::from(stream);
+    let original_destination = if stream.local_addr()?.is_ipv6() {
+        socket.original_dst_v6()?
+    } else {
+        socket.original_dst_v4()?
+    };
+    let original_destination =
+        original_destination.as_socket().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "SO_ORIGINAL_DST returned a non-IP socket address",
+            )
+        })?;
+
+    Ok(TcpServerConnectionContext {
+        original_destination: Some(NetLocation::from_ip_addr(
+            original_destination.ip(),
+            original_destination.port(),
+        )),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tcp_server_connection_context(
+    _stream: &tokio::net::TcpStream,
+    server_handler: &dyn TcpServerHandler,
+) -> std::io::Result<TcpServerConnectionContext> {
+    if server_handler.requires_original_destination() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "dokodemo-door followRedirect is supported only on Linux",
+        ));
+    }
+
+    Ok(TcpServerConnectionContext::default())
+}
+
 pub(super) async fn process_stream<AS>(
     stream: AS,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
-
     resolver: Arc<dyn Resolver>,
     peer_addr: SocketAddr,
     runtime: RuntimeState,
@@ -202,9 +275,31 @@ pub(super) async fn process_stream<AS>(
 where
     AS: AsyncStream + 'static,
 {
+    process_stream_with_context(
+        stream,
+        server_handler,
+        resolver,
+        peer_addr,
+        runtime,
+        TcpServerConnectionContext::default(),
+    )
+    .await
+}
+
+async fn process_stream_with_context<AS>(
+    stream: AS,
+    server_handler: Arc<Box<dyn TcpServerHandler>>,
+    resolver: Arc<dyn Resolver>,
+    peer_addr: SocketAddr,
+    runtime: RuntimeState,
+    connection_context: TcpServerConnectionContext,
+) -> std::io::Result<()>
+where
+    AS: AsyncStream + 'static,
+{
     let setup_server_stream_future = timeout(
         Duration::from_secs(60),
-        setup_server_stream(stream, server_handler),
+        setup_server_stream(stream, server_handler, connection_context),
     );
     tracing::info!("prepare to setup server stream");
     let setup_result = match setup_server_stream_future.await {
@@ -329,6 +424,40 @@ where
                 .map(|context| context.with_client_ip(peer_addr.ip()));
             run_udp_relay(socket, stream, resolver, runtime, traffic_context).await
         }
+        TcpServerSetupResult::BidirectionalUdp {
+            remote_location,
+            stream,
+            traffic_context,
+        } => {
+            run_bidirectional_udp(
+                stream,
+                remote_location,
+                resolver,
+                runtime,
+                peer_addr,
+                traffic_context,
+            )
+            .await
+        }
+        TcpServerSetupResult::MultiDirectionalUdp {
+            stream,
+            traffic_context,
+        } => {
+            run_multi_directional_udp(
+                stream,
+                resolver,
+                runtime,
+                peer_addr,
+                traffic_context,
+            )
+            .await
+        }
+        TcpServerSetupResult::SessionBasedUdp {
+            stream,
+            traffic_context,
+        } => {
+            run_session_based_udp(stream, runtime, peer_addr, traffic_context).await
+        }
         TcpServerSetupResult::AlreadyHandled => Ok(()),
     }
 }
@@ -336,12 +465,15 @@ where
 async fn setup_server_stream<AS>(
     stream: AS,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
+    connection_context: TcpServerConnectionContext,
 ) -> std::io::Result<TcpServerSetupResult>
 where
     AS: AsyncStream + 'static,
 {
     let server_stream = Box::new(stream);
-    server_handler.setup_server_stream(server_stream).await
+    server_handler
+        .setup_server_stream_with_context(server_stream, connection_context)
+        .await
 }
 
 async fn setup_routed_client_stream(
@@ -391,4 +523,54 @@ pub async fn setup_client_stream(
 ) -> std::io::Result<Option<Box<dyn AsyncStream>>> {
     let target_addr = resolve_single_address(&resolver, &remote_location).await?;
     connect_tcp_target(target_addr).await.map(Some)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use tokio::net::{TcpListener, TcpStream};
+
+    use crate::{
+        address::{Address, NetLocation},
+        config::server_config::DokodemoDoorConfig,
+        handler::dokodemo::DokodemoDoorTcpHandler,
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn original_destination_matches_tcp_listener() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind original-destination listener");
+        let listener_addr = listener.local_addr().expect("listener address");
+        let connect_task = tokio::spawn(async move {
+            TcpStream::connect(listener_addr)
+                .await
+                .expect("connect original-destination listener")
+        });
+        let (server_stream, _) = listener
+            .accept()
+            .await
+            .expect("accept original-destination connection");
+        let _client_stream = connect_task.await.expect("connect task finished");
+        let handler = DokodemoDoorTcpHandler::new(
+            DokodemoDoorConfig {
+                target: NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 1),
+                follow_redirect: true,
+            },
+            "dokodemo-original-destination",
+        );
+
+        let context = tcp_server_connection_context(&server_stream, &handler)
+            .expect("read SO_ORIGINAL_DST from accepted TCP connection");
+        assert_eq!(
+            context.original_destination,
+            Some(NetLocation::from_ip_addr(
+                listener_addr.ip(),
+                listener_addr.port(),
+            ))
+        );
+    }
 }
