@@ -13,7 +13,7 @@ use crate::{
         BalancerConfig, NetworkListConfig, PortListConfig, PortRangeConfig,
         RuleConfig,
     },
-    routing_state::RoutingInput,
+    routing_state::{DomainStrategy, RoutingInput},
     runtime::RuntimeState,
 };
 
@@ -277,6 +277,9 @@ impl RoutingServiceImpl {
                 .expect("routing balancer overrides lock poisoned"),
         );
         if let Some(route) = route {
+            if let Some(error) = route.resolution_error {
+                return Err(Status::unknown(error));
+            }
             return Ok((route.outbound_tag, route.outbound_group_tags));
         }
 
@@ -358,7 +361,22 @@ fn filter_routing_context(
 
 fn convert_router_config(
     config: RouterConfigPayload,
-) -> Result<(Vec<RuleConfig>, Vec<BalancerConfig>), Status> {
+) -> Result<(DomainStrategy, Vec<RuleConfig>, Vec<BalancerConfig>), Status> {
+    let domain_strategy =
+        match RouterDomainStrategyPayload::try_from(config.domain_strategy) {
+            Ok(RouterDomainStrategyPayload::AsIs) => DomainStrategy::AsIs,
+            Ok(RouterDomainStrategyPayload::IpIfNonMatch) => {
+                DomainStrategy::IpIfNonMatch
+            }
+            Ok(RouterDomainStrategyPayload::IpOnDemand) => {
+                DomainStrategy::IpOnDemand
+            }
+            Err(_) => {
+                return Err(Status::invalid_argument(
+                    "unsupported routing domain strategy",
+                ));
+            }
+        };
     let rules = config
         .rule
         .into_iter()
@@ -374,7 +392,7 @@ fn convert_router_config(
                 .then_some(balancer.fallback_tag),
         })
         .collect::<Vec<_>>();
-    Ok((rules, balancers))
+    Ok((domain_strategy, rules, balancers))
 }
 
 fn convert_rule_payload(rule: RoutingRulePayload) -> Result<RuleConfig, Status> {
@@ -442,15 +460,13 @@ fn convert_geo_ip_payloads(
 ) -> Result<Vec<String>, Status> {
     let mut values = Vec::new();
     for entry in entries {
-        if entry.reverse_match {
-            return Err(Status::invalid_argument(
-                "reverse geoip routing rules are not supported",
-            ));
-        }
         if !entry.country_code.is_empty() && entry.cidr.is_empty() {
-            return Err(Status::invalid_argument(
-                "geoip country code routing rules are not supported",
+            values.push(format!(
+                "geoip:{}{}",
+                if entry.reverse_match { "!" } else { "" },
+                entry.country_code
             ));
+            continue;
         }
         for cidr in entry.cidr {
             let ip = match cidr.ip.as_slice() {
@@ -465,7 +481,11 @@ fn convert_geo_ip_payloads(
                     ));
                 }
             };
-            values.push(format!("{ip}/{}", cidr.prefix));
+            values.push(format!(
+                "{}{ip}/{}",
+                if entry.reverse_match { "!" } else { "" },
+                cidr.prefix
+            ));
         }
     }
     Ok(values)
@@ -635,11 +655,16 @@ impl proto::xray::app::router::command::routing_service_server::RoutingService
         let config = request
             .config
             .ok_or_else(|| Status::invalid_argument("routing config is required"))?;
-        let (rules, balancers) =
+        let (domain_strategy, rules, balancers) =
             convert_router_config(self.decode_router_config(&config)?)?;
         self.runtime
             .with_routing_mut(|routing| {
-                routing.merge(rules, balancers, request.should_append)
+                routing.merge_with_domain_strategy(
+                    rules,
+                    balancers,
+                    request.should_append,
+                    Some(domain_strategy),
+                )
             })
             .map_err(Status::invalid_argument)?;
         Ok(Response::new(
@@ -690,6 +715,7 @@ mod tests {
 
     use crate::{
         config::rule::{BalancerConfig, RuleConfig},
+        geodata::{GeodataStore, proto as geodata_proto},
         routing_state::RoutingState,
         runtime::OutboundSummary,
     };
@@ -720,6 +746,29 @@ mod tests {
         runtime.replace_routing(
             RoutingState::from_parts(rules, balancers)
                 .expect("routing state should build"),
+        );
+    }
+
+    fn install_geoip_fixture(runtime: &RuntimeState) {
+        let mut geodata = GeodataStore::default();
+        geodata
+            .load_geoip_bytes(
+                &geodata_proto::GeoIpList {
+                    entry: vec![geodata_proto::GeoIp {
+                        code: "TEST".into(),
+                        cidr: vec![geodata_proto::Cidr {
+                            ip: vec![203, 0, 113, 0],
+                            prefix: 24,
+                        }],
+                        reverse_match: false,
+                    }],
+                }
+                .encode_to_vec(),
+            )
+            .expect("load gRPC geoip fixture");
+        runtime.replace_routing(
+            RoutingState::from_parts_with_geodata(vec![], vec![], geodata)
+                .expect("install gRPC geodata routing state"),
         );
     }
 
@@ -880,6 +929,334 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn routing_add_rule_applies_ip_on_demand_strategy() {
+        let runtime = build_runtime(&["ip", "domain"]);
+        let service = RoutingServiceImpl::new(runtime);
+        let router_config = RouterConfigPayload {
+            domain_strategy: RouterDomainStrategyPayload::IpOnDemand as i32,
+            rule: vec![
+                RoutingRulePayload {
+                    target_tag: Some(routing_rule_payload::TargetTag::Tag(
+                        "ip".into(),
+                    )),
+                    rule_tag: "ip-rule".into(),
+                    geoip: vec![GeoIpPayload {
+                        country_code: String::new(),
+                        cidr: vec![CidrPayload {
+                            ip: vec![203, 0, 113, 7],
+                            prefix: 32,
+                        }],
+                        reverse_match: false,
+                    }],
+                    ..RoutingRulePayload::default()
+                },
+                RoutingRulePayload {
+                    target_tag: Some(routing_rule_payload::TargetTag::Tag(
+                        "domain".into(),
+                    )),
+                    rule_tag: "domain-rule".into(),
+                    domain: vec![DomainPayload {
+                        r#type: DomainTypePayload::Full as i32,
+                        value: "example.com".into(),
+                    }],
+                    ..RoutingRulePayload::default()
+                },
+            ],
+            balancing_rule: vec![],
+        };
+
+        service
+            .add_rule(Request::new(
+                proto::xray::app::router::command::AddRuleRequest {
+                    config: Some(encode_router_config(router_config)),
+                    should_append: false,
+                },
+            ))
+            .await
+            .expect("IPOnDemand add_rule should succeed");
+
+        let matched = service
+            .test_route(Request::new(
+                proto::xray::app::router::command::TestRouteRequest {
+                    routing_context: Some(
+                        proto::xray::app::router::command::RoutingContext {
+                            target_domain: "example.com".into(),
+                            target_i_ps: vec![vec![203, 0, 113, 7]],
+                            ..Default::default()
+                        },
+                    ),
+                    field_selectors: vec![],
+                    publish_result: false,
+                },
+            ))
+            .await
+            .expect("IPOnDemand test_route should match")
+            .into_inner();
+        assert_eq!(matched.outbound_tag, "ip");
+    }
+
+    #[tokio::test]
+    async fn routing_add_rule_rejects_unknown_strategy_without_mutation() {
+        let runtime = build_runtime(&["direct"]);
+        install_rules(
+            &runtime,
+            vec![RuleConfig {
+                inbound_tag: vec!["existing".into()],
+                outbound_tag: Some("direct".into()),
+                ..RuleConfig::default()
+            }],
+            vec![],
+        );
+        let service = RoutingServiceImpl::new(runtime.clone());
+        let router_config = RouterConfigPayload {
+            domain_strategy: 99,
+            rule: vec![RoutingRulePayload {
+                target_tag: Some(routing_rule_payload::TargetTag::Tag(
+                    "direct".into(),
+                )),
+                rule_tag: "replacement".into(),
+                inbound_tag: vec!["replacement".into()],
+                ..RoutingRulePayload::default()
+            }],
+            balancing_rule: vec![],
+        };
+
+        let error = service
+            .add_rule(Request::new(
+                proto::xray::app::router::command::AddRuleRequest {
+                    config: Some(encode_router_config(router_config)),
+                    should_append: false,
+                },
+            ))
+            .await
+            .expect_err("unknown routing strategy must be rejected");
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(
+            error
+                .message()
+                .contains("unsupported routing domain strategy")
+        );
+
+        assert!(
+            runtime
+                .routing()
+                .route(
+                    &RoutingInput {
+                        inbound_tag: "existing".into(),
+                        ..RoutingInput::default()
+                    },
+                    &runtime.outbounds(),
+                    &HashMap::new(),
+                )
+                .is_some(),
+            "existing routing state must survive rejected strategy"
+        );
+        assert!(
+            runtime
+                .routing()
+                .route(
+                    &RoutingInput {
+                        inbound_tag: "replacement".into(),
+                        ..RoutingInput::default()
+                    },
+                    &runtime.outbounds(),
+                    &HashMap::new(),
+                )
+                .is_none(),
+            "rejected replacement rule must not be installed"
+        );
+    }
+
+    #[tokio::test]
+    async fn routing_add_rule_resolves_geoip_country_code_from_loaded_data() {
+        let runtime = build_runtime(&["direct"]);
+        install_geoip_fixture(&runtime);
+        let service = RoutingServiceImpl::new(runtime);
+        let router_config = RouterConfigPayload {
+            domain_strategy: RouterDomainStrategyPayload::IpOnDemand as i32,
+            rule: vec![RoutingRulePayload {
+                target_tag: Some(routing_rule_payload::TargetTag::Tag(
+                    "direct".into(),
+                )),
+                rule_tag: "geoip-country".into(),
+                geoip: vec![GeoIpPayload {
+                    country_code: "test".into(),
+                    cidr: vec![],
+                    reverse_match: false,
+                }],
+                ..RoutingRulePayload::default()
+            }],
+            balancing_rule: vec![],
+        };
+
+        service
+            .add_rule(Request::new(
+                proto::xray::app::router::command::AddRuleRequest {
+                    config: Some(encode_router_config(router_config)),
+                    should_append: false,
+                },
+            ))
+            .await
+            .expect("GeoIP country add_rule should succeed");
+
+        for (ip, expected_match) in
+            [(vec![203, 0, 113, 42], true), (vec![192, 0, 2, 42], false)]
+        {
+            let result = service
+                .test_route(Request::new(
+                    proto::xray::app::router::command::TestRouteRequest {
+                        routing_context: Some(
+                            proto::xray::app::router::command::RoutingContext {
+                                target_i_ps: vec![ip],
+                                ..Default::default()
+                            },
+                        ),
+                        field_selectors: vec![],
+                        publish_result: false,
+                    },
+                ))
+                .await;
+            assert_eq!(result.is_ok(), expected_match);
+        }
+    }
+
+    #[tokio::test]
+    async fn routing_add_rule_supports_reverse_geoip_cidrs() {
+        let runtime = build_runtime(&["direct"]);
+        let service = RoutingServiceImpl::new(runtime);
+        let router_config = RouterConfigPayload {
+            domain_strategy: RouterDomainStrategyPayload::IpOnDemand as i32,
+            rule: vec![RoutingRulePayload {
+                target_tag: Some(routing_rule_payload::TargetTag::Tag(
+                    "direct".into(),
+                )),
+                rule_tag: "reverse-geoip".into(),
+                geoip: vec![GeoIpPayload {
+                    country_code: String::new(),
+                    cidr: vec![CidrPayload {
+                        ip: vec![10, 0, 0, 0],
+                        prefix: 8,
+                    }],
+                    reverse_match: true,
+                }],
+                ..RoutingRulePayload::default()
+            }],
+            balancing_rule: vec![],
+        };
+
+        service
+            .add_rule(Request::new(
+                proto::xray::app::router::command::AddRuleRequest {
+                    config: Some(encode_router_config(router_config)),
+                    should_append: false,
+                },
+            ))
+            .await
+            .expect("reverse GeoIP add_rule should succeed");
+
+        for (ip, expected_match) in
+            [(vec![10, 1, 2, 3], false), (vec![192, 0, 2, 9], true)]
+        {
+            let result = service
+                .test_route(Request::new(
+                    proto::xray::app::router::command::TestRouteRequest {
+                        routing_context: Some(
+                            proto::xray::app::router::command::RoutingContext {
+                                target_i_ps: vec![ip],
+                                ..Default::default()
+                            },
+                        ),
+                        field_selectors: vec![],
+                        publish_result: false,
+                    },
+                ))
+                .await;
+            assert_eq!(result.is_ok(), expected_match);
+        }
+    }
+
+    #[tokio::test]
+    async fn routing_test_route_reports_empty_balancer_error() {
+        let runtime = build_runtime(&["direct"]);
+        install_rules(
+            &runtime,
+            vec![RuleConfig {
+                inbound_tag: vec!["test".into()],
+                balancer_tag: Some("empty".into()),
+                ..RuleConfig::default()
+            }],
+            vec![BalancerConfig {
+                tag: "empty".into(),
+                outbound_selector: vec!["missing-prefix".into()],
+                fallback_tag: None,
+            }],
+        );
+        let service = RoutingServiceImpl::new(runtime);
+
+        let error = service
+            .test_route(Request::new(
+                proto::xray::app::router::command::TestRouteRequest {
+                    routing_context: Some(
+                        proto::xray::app::router::command::RoutingContext {
+                            inbound_tag: "test".into(),
+                            ..Default::default()
+                        },
+                    ),
+                    field_selectors: vec![],
+                    publish_result: false,
+                },
+            ))
+            .await
+            .expect_err("empty balancer must fail test_route");
+
+        assert_eq!(error.code(), Code::Unknown);
+        assert!(
+            error
+                .message()
+                .contains("balancer empty has no available outbound")
+        );
+    }
+
+    #[tokio::test]
+    async fn routing_test_route_uses_balancer_fallback_and_group_tag() {
+        let runtime = build_runtime(&["direct"]);
+        install_rules(
+            &runtime,
+            vec![RuleConfig {
+                inbound_tag: vec!["test".into()],
+                balancer_tag: Some("auto".into()),
+                ..RuleConfig::default()
+            }],
+            vec![BalancerConfig {
+                tag: "auto".into(),
+                outbound_selector: vec!["missing-prefix".into()],
+                fallback_tag: Some("direct".into()),
+            }],
+        );
+        let service = RoutingServiceImpl::new(runtime);
+
+        let matched = service
+            .test_route(Request::new(
+                proto::xray::app::router::command::TestRouteRequest {
+                    routing_context: Some(
+                        proto::xray::app::router::command::RoutingContext {
+                            inbound_tag: "test".into(),
+                            ..Default::default()
+                        },
+                    ),
+                    field_selectors: vec![],
+                    publish_result: false,
+                },
+            ))
+            .await
+            .expect("balancer fallback should route")
+            .into_inner();
+
+        assert_eq!(matched.outbound_tag, "direct");
+        assert_eq!(matched.outbound_group_tags, vec!["auto"]);
     }
 
     #[tokio::test]

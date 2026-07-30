@@ -23,6 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "proto/common/serial/typed_message.proto",
                 "proto/common/protocol/user.proto",
                 "proto/common/net/network.proto",
+                "proto/common/geodata/geodat.proto",
             ],
             &[proto_root],
         )?;
