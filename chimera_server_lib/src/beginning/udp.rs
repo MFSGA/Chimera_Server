@@ -1603,7 +1603,7 @@ fn bind_location_to_socket_addr(
 async fn run_dokodemo_udp_server(
     socket: Arc<UdpSocket>,
     config: DokodemoDoorConfig,
-    target_addr: SocketAddr,
+    target_addr: Option<SocketAddr>,
     inbound_tag: String,
     runtime: RuntimeState,
 ) -> std::io::Result<()> {
@@ -1611,10 +1611,40 @@ async fn run_dokodemo_udp_server(
     let mut recv_buf = vec![0u8; UDP_BUFFER_SIZE];
 
     loop {
-        let (len, client_addr) =
-            relay_state.server_socket.recv_from(&mut recv_buf).await?;
+        let (len, client_addr, datagram_target, target_location) =
+            if config.follow_redirect {
+                #[cfg(target_os = "linux")]
+                {
+                    let (len, client_addr, original_destination) =
+                        recv_udp_with_original_destination(
+                            &relay_state.server_socket,
+                            &mut recv_buf,
+                        )
+                        .await?;
+                    (
+                        len,
+                        client_addr,
+                        original_destination,
+                        NetLocation::from_ip_addr(
+                            original_destination.ip(),
+                            original_destination.port(),
+                        ),
+                    )
+                }
+                #[cfg(not(target_os = "linux"))]
+                unreachable!("non-Linux followRedirect returned before receive loop")
+            } else {
+                let (len, client_addr) =
+                    relay_state.server_socket.recv_from(&mut recv_buf).await?;
+                let target_addr = target_addr.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "dokodemo-door UDP fixed target is unavailable",
+                    )
+                })?;
+                (len, client_addr, target_addr, config.target.clone())
+            };
         let payload = recv_buf[..len].to_vec();
-        let target_location = config.target.clone();
         let inbound_tag = inbound_tag.clone();
         let runtime = runtime.clone();
         let relay_state = relay_state.clone();
@@ -1623,7 +1653,7 @@ async fn run_dokodemo_udp_server(
             if let Err(err) = relay_dokodemo_udp_datagram(
                 relay_state,
                 client_addr,
-                target_addr,
+                datagram_target,
                 target_location,
                 inbound_tag,
                 runtime,
