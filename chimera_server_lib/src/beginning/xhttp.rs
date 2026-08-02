@@ -375,7 +375,9 @@ impl AppState {
         };
         let seq = match self.seq_placement {
             XhttpPlacement::Path => next_path_value(),
-            XhttpPlacement::Query => query_value(request.uri().query(), &self.seq_key),
+            XhttpPlacement::Query => {
+                query_value(request.uri().query(), &self.seq_key)
+            }
             XhttpPlacement::Header => header_value(request.headers(), &self.seq_key),
             XhttpPlacement::Cookie => cookie_value(request.headers(), &self.seq_key),
         };
@@ -442,12 +444,7 @@ async fn handle_request(
     let is_downlink_method = request.method() == Method::GET;
     let is_uplink_method =
         request.method().as_str() == state.uplink_http_method.as_str();
-    let response = match (
-        is_downlink_method,
-        is_uplink_method,
-        session_id,
-        seq,
-    ) {
+    let response = match (is_downlink_method, is_uplink_method, session_id, seq) {
         (true, _, Some(session_id), None)
             if matches!(
                 state.mode,
@@ -583,11 +580,7 @@ async fn handle_stream_down(
         }
     });
 
-    stream_response(
-        StatusCode::OK,
-        body_stream.boxed(),
-        state.no_sse_header,
-    )
+    stream_response(StatusCode::OK, body_stream.boxed(), state.no_sse_header)
 }
 
 async fn handle_packet_up(
@@ -606,10 +599,7 @@ async fn handle_packet_up(
         state.uplink_data_placement,
         XhttpDataPlacement::Auto | XhttpDataPlacement::Header
     ) {
-        match decode_chunked_header_payload(
-            &parts.headers,
-            &state.uplink_data_key,
-        ) {
+        match decode_chunked_header_payload(&parts.headers, &state.uplink_data_key) {
             Ok(payload) => payload,
             Err(_) => return simple_response(StatusCode::BAD_REQUEST),
         }
@@ -620,10 +610,7 @@ async fn handle_packet_up(
         state.uplink_data_placement,
         XhttpDataPlacement::Auto | XhttpDataPlacement::Cookie
     ) {
-        match decode_chunked_cookie_payload(
-            &parts.headers,
-            &state.uplink_data_key,
-        ) {
+        match decode_chunked_cookie_payload(&parts.headers, &state.uplink_data_key) {
             Ok(payload) => payload,
             Err(_) => return simple_response(StatusCode::BAD_REQUEST),
         }

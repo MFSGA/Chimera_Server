@@ -12,15 +12,15 @@ pub use types::TuicServerConfig;
 #[cfg(feature = "vless")]
 pub use types::{VlessFallback, VlessUser};
 
+#[cfg(feature = "grpc_transport")]
+pub use types::GrpcServerConfig;
 #[cfg(feature = "hysteria")]
 #[allow(unused_imports)]
 pub use types::{Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2ServerConfig};
 pub use types::{
-    ServerConfig, ServerProxyConfig, SocksUser, SocksUserStore,
-    XhttpDataPlacement, XhttpMode, XhttpPlacement, XhttpServerConfig,
+    ServerConfig, ServerProxyConfig, SocksUser, SocksUserStore, XhttpDataPlacement,
+    XhttpMode, XhttpPlacement, XhttpServerConfig,
 };
-#[cfg(feature = "grpc_transport")]
-pub use types::GrpcServerConfig;
 
 #[cfg(feature = "reality")]
 pub use types::RealityTransportConfig;

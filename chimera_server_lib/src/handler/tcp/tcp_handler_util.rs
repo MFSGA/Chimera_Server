@@ -10,12 +10,12 @@ use crate::handler::mixed::MixedTcpServerHandler;
 use crate::handler::reality::{
     RealityServerHandler, RealityVisionVlessServerHandler,
 };
+#[cfg(feature = "shadowsocks")]
+use crate::handler::shadowsocks::ShadowsocksTcpServerHandler;
 #[cfg(feature = "vless")]
 use crate::handler::vless_handler::{
     VisionVlessTcpHandler, VlessTcpHandler, users_require_vision,
 };
-#[cfg(feature = "shadowsocks")]
-use crate::handler::shadowsocks::ShadowsocksTcpServerHandler;
 #[cfg(feature = "vmess")]
 use crate::handler::vmess::vmess_handler::VmessTcpServerHandler;
 #[cfg(feature = "ws")]
@@ -203,11 +203,8 @@ pub fn create_tcp_server_handler(
         }
         #[cfg(feature = "httpupgrade")]
         ServerProxyConfig::HttpUpgrade(config) => {
-            let inner = create_tcp_server_handler(
-                *config.inner,
-                inbound_tag,
-                rules_stack,
-            )?;
+            let inner =
+                create_tcp_server_handler(*config.inner, inbound_tag, rules_stack)?;
             Ok(Box::new(HttpUpgradeTcpServerHandler::new(
                 config.host,
                 config.path,

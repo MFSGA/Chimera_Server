@@ -415,8 +415,7 @@ fn fallback_forward(
     prefix: Vec<u8>,
     stream: Box<dyn AsyncStream>,
 ) -> TcpServerSetupResult {
-    let stream: Box<dyn AsyncStream> =
-        Box::new(PrefixedStream::new(prefix, stream));
+    let stream: Box<dyn AsyncStream> = Box::new(PrefixedStream::new(prefix, stream));
     if fallback.xver == 0 {
         TcpServerSetupResult::TcpForward {
             remote_location: fallback.dest.clone(),

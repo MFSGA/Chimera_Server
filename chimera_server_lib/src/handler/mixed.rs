@@ -35,16 +35,8 @@ impl MixedTcpServerHandler {
             })
             .collect();
         Self {
-            http: HttpTcpServerHandler::new(
-                http_accounts,
-                false,
-                inbound_tag,
-            ),
-            socks: SocksTcpServerHandler::new(
-                accounts,
-                inbound_tag,
-                udp_enabled,
-            ),
+            http: HttpTcpServerHandler::new(http_accounts, false, inbound_tag),
+            socks: SocksTcpServerHandler::new(accounts, inbound_tag, udp_enabled),
         }
     }
 }
@@ -56,10 +48,8 @@ impl TcpServerHandler for MixedTcpServerHandler {
         mut server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
         let first = server_stream.read_u8().await?;
-        let stream: Box<dyn AsyncStream> = Box::new(PrefixedStream::new(
-            vec![first],
-            server_stream,
-        ));
+        let stream: Box<dyn AsyncStream> =
+            Box::new(PrefixedStream::new(vec![first], server_stream));
         if first == SOCKS5_VERSION {
             self.socks.setup_server_stream(stream).await
         } else {
@@ -182,9 +172,7 @@ mod tests {
         client.read_exact(&mut selected).await.unwrap();
         assert_eq!(selected, [5, 0]);
         client
-            .write_all(&[
-                5, 1, 0, 1, 127, 0, 0, 1, 0, 80,
-            ])
+            .write_all(&[5, 1, 0, 1, 127, 0, 0, 1, 0, 80])
             .await
             .unwrap();
         let result = setup.await.unwrap().unwrap();
