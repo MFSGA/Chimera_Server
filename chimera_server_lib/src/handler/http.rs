@@ -131,10 +131,9 @@ impl TcpServerHandler for HttpTcpServerHandler {
                         format!("invalid HTTP CONNECT authority {target}: {error}"),
                     )
                 })?;
-            let response =
-                format!("{version} 200 Connection established\r\n\r\n")
-                    .into_bytes()
-                    .into_boxed_slice();
+            let response = format!("{version} 200 Connection established\r\n\r\n")
+                .into_bytes()
+                .into_boxed_slice();
             return Ok(TcpServerSetupResult::TcpForward {
                 remote_location,
                 stream: server_stream,
@@ -158,14 +157,13 @@ impl TcpServerHandler for HttpTcpServerHandler {
                     "transparent HTTP request requires a Host header",
                 )
             })?;
-            let remote_location = NetLocation::from_str(host, Some(80)).map_err(
-                |error| {
+            let remote_location =
+                NetLocation::from_str(host, Some(80)).map_err(|error| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         format!("invalid HTTP Host header {host}: {error}"),
                     )
-                },
-            )?;
+                })?;
             (remote_location, target.to_string())
         } else {
             return Err(std::io::Error::new(
@@ -174,8 +172,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
             ));
         };
 
-        let mut initial_request =
-            format!("{method} {origin_target} {version}\r\n");
+        let mut initial_request = format!("{method} {origin_target} {version}\r\n");
         for line in forwarded_headers {
             initial_request.push_str(&line);
             initial_request.push_str("\r\n");
@@ -225,14 +222,13 @@ fn parse_absolute_http_target(
             "HTTP absolute URI is missing an authority",
         ));
     }
-    let remote_location = NetLocation::from_str(authority, Some(80)).map_err(
-        |error| {
+    let remote_location =
+        NetLocation::from_str(authority, Some(80)).map_err(|error| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("invalid HTTP absolute URI authority {authority}: {error}"),
             )
-        },
-    )?;
+        })?;
     Ok((remote_location, path))
 }
 
@@ -360,7 +356,8 @@ mod tests {
     #[tokio::test]
     async fn connect_preserves_early_tunnel_bytes() {
         let handler = HttpTcpServerHandler::new(Vec::new(), false, "http-in");
-        let request = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\nearly";
+        let request =
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\nearly";
         let (mut client, server) = duplex(1024);
         client.write_all(request).await.unwrap();
 
@@ -419,10 +416,7 @@ mod tests {
         else {
             panic!("HTTP CONNECT returned non-TCP result");
         };
-        assert_eq!(
-            traffic_context.unwrap().identity.as_deref(),
-            Some("alice")
-        );
+        assert_eq!(traffic_context.unwrap().identity.as_deref(), Some("alice"));
     }
 
     #[tokio::test]
@@ -464,10 +458,7 @@ mod tests {
         };
         assert_eq!(remote_location.to_string(), "example.com:8080");
         assert!(connection_success_response.is_none());
-        assert_eq!(
-            traffic_context.unwrap().identity.as_deref(),
-            Some("alice")
-        );
+        assert_eq!(traffic_context.unwrap().identity.as_deref(), Some("alice"));
         let mut forwarded = Vec::new();
         stream.read_to_end(&mut forwarded).await.unwrap();
         assert_eq!(

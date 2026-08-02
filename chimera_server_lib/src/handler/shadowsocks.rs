@@ -10,28 +10,24 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use aes::{Aes128, Aes256};
 use aes::cipher::{Block, BlockDecrypt, BlockEncrypt, KeyInit};
+use aes::{Aes128, Aes256};
 use async_trait::async_trait;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use aws_lc_rs::{
     aead::{
-        AES_128_GCM, AES_256_GCM, Aad, Algorithm, BoundKey,
-        CHACHA20_POLY1305, LessSafeKey, NONCE_LEN, Nonce, NonceSequence,
-        OpeningKey, SealingKey, UnboundKey,
+        AES_128_GCM, AES_256_GCM, Aad, Algorithm, BoundKey, CHACHA20_POLY1305,
+        LessSafeKey, NONCE_LEN, Nonce, NonceSequence, OpeningKey, SealingKey,
+        UnboundKey,
     },
     error::Unspecified,
     rand::{SecureRandom, SystemRandom},
 };
-use chacha20poly1305::{
-    XChaCha20Poly1305, XNonce,
-    aead::AeadInPlace as _,
-};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce, aead::AeadInPlace as _};
 use md5::{Digest, Md5};
 use tokio::{
     io::{
-        AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream,
-        ReadBuf,
+        AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf,
     },
     sync::oneshot,
     task,
@@ -261,22 +257,18 @@ struct UdpReplayState {
 }
 
 impl UdpReplayState {
-    fn check_and_insert(
-        &mut self,
-        session_id: [u8; 8],
-        packet_id: u64,
-    ) -> bool {
+    fn check_and_insert(&mut self, session_id: [u8; 8], packet_id: u64) -> bool {
         let now = Instant::now();
-        self.sessions.retain(|_, session| {
-            now.duration_since(session.last_seen) < SALT_TTL
-        });
-        let session = self.sessions.entry(session_id).or_insert_with(|| {
-            UdpReplaySession {
-                last_seen: now,
-                highest_packet_id: packet_id,
-                packet_ids: HashSet::new(),
-            }
-        });
+        self.sessions
+            .retain(|_, session| now.duration_since(session.last_seen) < SALT_TTL);
+        let session =
+            self.sessions
+                .entry(session_id)
+                .or_insert_with(|| UdpReplaySession {
+                    last_seen: now,
+                    highest_packet_id: packet_id,
+                    packet_ids: HashSet::new(),
+                });
         if packet_id.saturating_add(1024) < session.highest_packet_id
             || !session.packet_ids.insert(packet_id)
         {
@@ -313,9 +305,7 @@ impl ShadowsocksUdpUserCodec {
             ShadowsocksKeyMaterial::Legacy(master_key) => {
                 ShadowsocksUdpMode::Legacy {
                     master_key,
-                    salt_checker: Arc::new(Mutex::new(
-                        TimedSaltChecker::default(),
-                    )),
+                    salt_checker: Arc::new(Mutex::new(TimedSaltChecker::default())),
                 }
             }
             ShadowsocksKeyMaterial::Aead2022(psk)
@@ -492,9 +482,9 @@ impl ShadowsocksUdpUserCodec {
         master_key: &[u8],
     ) -> io::Result<Vec<u8>> {
         let mut salt = vec![0u8; self.cipher.salt_len];
-        SystemRandom::new()
-            .fill(&mut salt)
-            .map_err(|_| io::Error::other("failed to generate Shadowsocks UDP salt"))?;
+        SystemRandom::new().fill(&mut salt).map_err(|_| {
+            io::Error::other("failed to generate Shadowsocks UDP salt")
+        })?;
         let session_key =
             derive_session_key(master_key, &salt, self.cipher.key_len())?;
         let unbound_key = UnboundKey::new(self.cipher.algorithm, &session_key)
@@ -504,7 +494,9 @@ impl ShadowsocksUdpUserCodec {
         plaintext.extend_from_slice(payload);
         let tag = sealing
             .seal_in_place_separate_tag(Aad::empty(), &mut plaintext)
-            .map_err(|_| io::Error::other("failed to encrypt Shadowsocks UDP packet"))?;
+            .map_err(|_| {
+                io::Error::other("failed to encrypt Shadowsocks UDP packet")
+            })?;
         let mut packet = Vec::with_capacity(salt.len() + plaintext.len() + TAG_LEN);
         packet.extend_from_slice(&salt);
         packet.extend_from_slice(&plaintext);
@@ -530,9 +522,7 @@ impl ShadowsocksUdpUserCodec {
         let mut client_session_id = [0u8; 8];
         client_session_id.copy_from_slice(&separate_header[..8]);
         let packet_id = u64::from_be_bytes(
-            separate_header[8..16]
-                .try_into()
-                .expect("packet id length"),
+            separate_header[8..16].try_into().expect("packet id length"),
         );
 
         let session_key = derive_aead2022_session_key(
@@ -627,7 +617,9 @@ impl ShadowsocksUdpUserCodec {
         body.extend_from_slice(&encode_socks_location(source)?);
         body.extend_from_slice(payload);
         key.seal_in_place_append_tag(nonce, Aad::empty(), &mut body)
-            .map_err(|_| io::Error::other("failed to seal Shadowsocks 2022 UDP body"))?;
+            .map_err(|_| {
+                io::Error::other("failed to seal Shadowsocks 2022 UDP body")
+            })?;
 
         aes_encrypt_block(psk, &mut separate_header)?;
         let mut packet = Vec::with_capacity(16 + body.len());
@@ -672,9 +664,8 @@ impl ShadowsocksUdpUserCodec {
         }
         let mut client_session_id = [0u8; 8];
         client_session_id.copy_from_slice(&body[..8]);
-        let packet_id = u64::from_be_bytes(
-            body[8..16].try_into().expect("packet id length"),
-        );
+        let packet_id =
+            u64::from_be_bytes(body[8..16].try_into().expect("packet id length"));
         validate_aead2022_timestamp(u64::from_be_bytes(
             body[17..25].try_into().expect("timestamp length"),
         ))?;
@@ -920,9 +911,7 @@ impl ShadowsocksTcpServerHandler {
                 Ok(ShadowsocksServerUser {
                     cipher,
                     key,
-                    salt_checker: Arc::new(Mutex::new(
-                        TimedSaltChecker::default(),
-                    )),
+                    salt_checker: Arc::new(Mutex::new(TimedSaltChecker::default())),
                     identity: user.email,
                 })
             })
@@ -938,8 +927,7 @@ impl ShadowsocksTcpServerHandler {
                     "Shadowsocks EIH users must use the identity AES method",
                 ));
             }
-        } else if users.len() > 1
-            && users.iter().any(|user| user.key.is_aead2022())
+        } else if users.len() > 1 && users.iter().any(|user| user.key.is_aead2022())
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -987,10 +975,8 @@ impl TcpServerHandler for ShadowsocksTcpServerHandler {
                         "unknown Shadowsocks EIH TCP user",
                     )
                 })?;
-            server_stream = Box::new(PrefixedStream::new(
-                salt.to_vec(),
-                server_stream,
-            ));
+            server_stream =
+                Box::new(PrefixedStream::new(salt.to_vec(), server_stream));
             user_index
         } else if self.users.len() == 1 {
             0
@@ -1039,7 +1025,9 @@ impl TcpServerHandler for ShadowsocksTcpServerHandler {
             if padding_len > 900 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("invalid Shadowsocks 2022 padding length: {padding_len}"),
+                    format!(
+                        "invalid Shadowsocks 2022 padding length: {padding_len}"
+                    ),
                 ));
             }
             if padding_len > 0 {
@@ -1047,16 +1035,14 @@ impl TcpServerHandler for ShadowsocksTcpServerHandler {
                 plaintext.read_exact(&mut padding).await?;
             }
         }
-        let traffic_context = Some(
-            if user.identity.is_empty() {
-                TrafficContext::new("shadowsocks")
-                    .with_inbound_tag(self.inbound_tag.clone())
-            } else {
-                TrafficContext::new("shadowsocks")
-                    .with_identity(user.identity.clone())
-                    .with_inbound_tag(self.inbound_tag.clone())
-            },
-        );
+        let traffic_context = Some(if user.identity.is_empty() {
+            TrafficContext::new("shadowsocks")
+                .with_inbound_tag(self.inbound_tag.clone())
+        } else {
+            TrafficContext::new("shadowsocks")
+                .with_identity(user.identity.clone())
+                .with_inbound_tag(self.inbound_tag.clone())
+        });
         Ok(TcpServerSetupResult::TcpForward {
             remote_location,
             stream: Box::new(plaintext),
@@ -1067,10 +1053,7 @@ impl TcpServerHandler for ShadowsocksTcpServerHandler {
     }
 }
 
-fn legacy_tcp_probe_matches(
-    user: &ShadowsocksServerUser,
-    prefix: &[u8],
-) -> bool {
+fn legacy_tcp_probe_matches(user: &ShadowsocksServerUser, prefix: &[u8]) -> bool {
     let ShadowsocksKeyMaterial::Legacy(master_key) = &user.key else {
         return false;
     };
@@ -1084,13 +1067,12 @@ fn legacy_tcp_probe_matches(
     else {
         return false;
     };
-    let Ok(unbound_key) = UnboundKey::new(user.cipher.algorithm, &session_key) else {
+    let Ok(unbound_key) = UnboundKey::new(user.cipher.algorithm, &session_key)
+    else {
         return false;
     };
-    let mut opening_key =
-        OpeningKey::new(unbound_key, IncreasingSequence::new());
-    let mut encrypted_length =
-        prefix[user.cipher.salt_len..length_end].to_vec();
+    let mut opening_key = OpeningKey::new(unbound_key, IncreasingSequence::new());
+    let mut encrypted_length = prefix[user.cipher.salt_len..length_end].to_vec();
     if opening_key
         .open_in_place(Aad::empty(), &mut encrypted_length)
         .is_err()
@@ -1228,7 +1210,9 @@ where
     if variable_len == 0 || variable_len > MAX_AEAD2022_VARIABLE_HEADER_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("invalid Shadowsocks 2022 variable header length: {variable_len}"),
+            format!(
+                "invalid Shadowsocks 2022 variable header length: {variable_len}"
+            ),
         ));
     }
 
@@ -1316,10 +1300,14 @@ where
     fixed_header.extend_from_slice(&(first_len as u16).to_be_bytes());
     let fixed_tag = sealing_key
         .seal_in_place_separate_tag(Aad::empty(), &mut fixed_header)
-        .map_err(|_| io::Error::other("failed to encrypt Shadowsocks 2022 response header"))?;
+        .map_err(|_| {
+            io::Error::other("failed to encrypt Shadowsocks 2022 response header")
+        })?;
     let first_tag = sealing_key
         .seal_in_place_separate_tag(Aad::empty(), &mut first_payload)
-        .map_err(|_| io::Error::other("failed to encrypt Shadowsocks 2022 first response"))?;
+        .map_err(|_| {
+            io::Error::other("failed to encrypt Shadowsocks 2022 first response")
+        })?;
 
     encrypted.write_all(&salt).await?;
     encrypted.write_all(&fixed_header).await?;
@@ -1415,7 +1403,9 @@ where
         let mut payload = buffer[..read].to_vec();
         let payload_tag = sealing_key
             .seal_in_place_separate_tag(Aad::empty(), &mut payload)
-            .map_err(|_| io::Error::other("failed to encrypt Shadowsocks payload"))?;
+            .map_err(|_| {
+                io::Error::other("failed to encrypt Shadowsocks payload")
+            })?;
         encrypted.write_all(&length).await?;
         encrypted.write_all(length_tag.as_ref()).await?;
         encrypted.write_all(&payload).await?;
@@ -1538,7 +1528,9 @@ where
         let mut payload = buffer[..read].to_vec();
         let payload_tag = sealing_key
             .seal_in_place_separate_tag(Aad::empty(), &mut payload)
-            .map_err(|_| io::Error::other("failed to encrypt Shadowsocks payload"))?;
+            .map_err(|_| {
+                io::Error::other("failed to encrypt Shadowsocks payload")
+            })?;
         encrypted.write_all(&payload).await?;
         encrypted.write_all(payload_tag.as_ref()).await?;
         encrypted.flush().await?;
@@ -1752,7 +1744,10 @@ impl NonceSequence for IncreasingSequence {
 
 fn parse_socks_location_slice(data: &[u8]) -> io::Result<(NetLocation, usize)> {
     let address_type = *data.first().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::UnexpectedEof, "missing Shadowsocks address type")
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "missing Shadowsocks address type",
+        )
     })?;
     match address_type {
         1 => {
@@ -1762,7 +1757,8 @@ fn parse_socks_location_slice(data: &[u8]) -> io::Result<(NetLocation, usize)> {
                     "truncated Shadowsocks IPv4 address",
                 ));
             }
-            let address = std::net::Ipv4Addr::new(data[1], data[2], data[3], data[4]);
+            let address =
+                std::net::Ipv4Addr::new(data[1], data[2], data[3], data[4]);
             let port = u16::from_be_bytes([data[5], data[6]]);
             Ok((NetLocation::new(Address::Ipv4(address), port), 7))
         }
@@ -1779,15 +1775,20 @@ fn parse_socks_location_slice(data: &[u8]) -> io::Result<(NetLocation, usize)> {
                     "truncated Shadowsocks domain address",
                 ));
             }
-            let domain = std::str::from_utf8(&data[2..2 + length]).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid Shadowsocks domain: {error}"),
-                )
-            })?;
+            let domain =
+                std::str::from_utf8(&data[2..2 + length]).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid Shadowsocks domain: {error}"),
+                    )
+                })?;
             let port_offset = 2 + length;
-            let port = u16::from_be_bytes([data[port_offset], data[port_offset + 1]]);
-            Ok((NetLocation::new(Address::from(domain)?, port), port_offset + 2))
+            let port =
+                u16::from_be_bytes([data[port_offset], data[port_offset + 1]]);
+            Ok((
+                NetLocation::new(Address::from(domain)?, port),
+                port_offset + 2,
+            ))
         }
         4 => {
             if data.len() < 19 {
@@ -1845,10 +1846,7 @@ where
             let mut address = [0u8; 4];
             stream.read_exact(&mut address).await?;
             let port = stream.read_u16().await?;
-            Ok(NetLocation::new(
-                Address::Ipv4(address.into()),
-                port,
-            ))
+            Ok(NetLocation::new(Address::Ipv4(address.into()), port))
         }
         3 => {
             let length = stream.read_u8().await? as usize;
@@ -1873,10 +1871,7 @@ where
             let mut address = [0u8; 16];
             stream.read_exact(&mut address).await?;
             let port = stream.read_u16().await?;
-            Ok(NetLocation::new(
-                Address::Ipv6(address.into()),
-                port,
-            ))
+            Ok(NetLocation::new(Address::Ipv6(address.into()), port))
         }
         address_type => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1955,8 +1950,8 @@ mod tests {
         assert_eq!(
             derive_master_key("password", 16),
             vec![
-                0x5f, 0x4d, 0xcc, 0x3b, 0x5a, 0xa7, 0x65, 0xd6, 0x1d,
-                0x83, 0x27, 0xde, 0xb8, 0x82, 0xcf, 0x99,
+                0x5f, 0x4d, 0xcc, 0x3b, 0x5a, 0xa7, 0x65, 0xd6, 0x1d, 0x83, 0x27,
+                0xde, 0xb8, 0x82, 0xcf, 0x99,
             ]
         );
     }
@@ -1964,27 +1959,19 @@ mod tests {
     #[test]
     fn cipher_aliases_match_xray_names() {
         assert_eq!(
-            ShadowsocksCipher::parse("aead_aes_128_gcm")
-                .unwrap()
-                .name,
+            ShadowsocksCipher::parse("aead_aes_128_gcm").unwrap().name,
             "aes-128-gcm"
         );
         assert_eq!(
-            ShadowsocksCipher::parse("chacha20-poly1305")
-                .unwrap()
-                .name,
+            ShadowsocksCipher::parse("chacha20-poly1305").unwrap().name,
             "chacha20-ietf-poly1305"
         );
     }
 
     #[test]
     fn aead2022_udp_derives_key_from_eight_byte_session_id() {
-        let key = derive_aead2022_session_key(
-            b"0123456789abcdef",
-            b"session!",
-            16,
-        )
-        .expect("derive 2022 UDP session key");
+        let key = derive_aead2022_session_key(b"0123456789abcdef", b"session!", 16)
+            .expect("derive 2022 UDP session key");
         assert_eq!(key.len(), 16);
     }
 

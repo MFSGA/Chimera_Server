@@ -283,8 +283,7 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<Vec<u8>>> {
         loop {
-            let existing =
-                Self::drain_plaintext_from_session(&mut self.session)?;
+            let existing = Self::drain_plaintext_from_session(&mut self.session)?;
             if !existing.is_empty() {
                 return Poll::Ready(Ok(existing));
             }

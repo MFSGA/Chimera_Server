@@ -180,9 +180,7 @@ where
                 )));
             }
 
-            this.lock_state()
-                .deframer
-                .feed(&this.scratch[..filled_len]);
+            this.lock_state().deframer.feed(&this.scratch[..filled_len]);
         }
     }
 }
@@ -239,7 +237,8 @@ pub(crate) struct RustlsVisionSession {
 
 impl std::fmt::Debug for RustlsVisionSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RustlsVisionSession").finish_non_exhaustive()
+        f.debug_struct("RustlsVisionSession")
+            .finish_non_exhaustive()
     }
 }
 
