@@ -87,11 +87,10 @@ pub async fn process_hysteria2_connection(
                 Error::other(format!("hysteria2 authentication failed: {err}"))
             })?;
 
-    let http3_task = tokio::spawn(async move {
-        if let Err(err) = drain_http3_requests(h3_conn).await {
-            debug!("HTTP/3 request loop ended: {}", err);
-        }
-    });
+    // Keep the H3 driver alive because dropping it closes the underlying QUIC
+    // connection. Do not poll it after authentication: Hysteria2 TCP requests
+    // are raw QUIC bidi streams and would otherwise race with h3_conn.accept().
+    let _h3_conn = h3_conn;
 
     let proxy_result = if auth_ctx.udp_enabled {
         tokio::try_join!(
@@ -103,26 +102,28 @@ pub async fn process_hysteria2_connection(
                 runtime.clone(),
             ),
             drive_udp_datagrams(
-                connection,
+                connection.clone(),
                 resolver.clone(),
                 &auth_ctx,
                 inbound_tag,
                 runtime,
             ),
+            drain_unidirectional_streams(connection),
         )
         .map(|_| ())
     } else {
-        drive_tcp_streams(
-            connection,
-            resolver.clone(),
-            &auth_ctx,
-            inbound_tag.clone(),
-            runtime,
+        tokio::try_join!(
+            drive_tcp_streams(
+                connection.clone(),
+                resolver.clone(),
+                &auth_ctx,
+                inbound_tag.clone(),
+                runtime,
+            ),
+            drain_unidirectional_streams(connection),
         )
-        .await
+        .map(|_| ())
     };
-
-    let _ = http3_task.await;
 
     proxy_result
 }
@@ -195,25 +196,23 @@ async fn auth_hysteria2_connection(
     }
 }
 
-async fn drain_http3_requests(
-    mut h3_conn: h3::server::Connection<h3_quinn::Connection, Bytes>,
+async fn drain_unidirectional_streams(
+    connection: quinn::Connection,
 ) -> std::io::Result<()> {
-    while let Some(resolver) = h3_conn.accept().await.map_err(map_h3_error)? {
-        let (req, mut stream) =
-            resolver.resolve_request().await.map_err(map_h3_error)?;
-        debug!(
-            "received non-auth hysteria2 request: {} {}",
-            req.method(),
-            req.uri()
-        );
-        if let Err(err) =
-            send_simple_response(&mut stream, StatusCode::NOT_FOUND).await
-        {
-            warn!("failed to respond to HTTP/3 request: {}", err);
-            break;
+    loop {
+        match connection.accept_uni().await {
+            Ok(mut stream) => {
+                let _ = stream.stop(0_u32.into());
+            }
+            Err(quinn::ConnectionError::ApplicationClosed { .. })
+            | Err(quinn::ConnectionError::ConnectionClosed(_)) => return Ok(()),
+            Err(err) => {
+                return Err(Error::other(format!(
+                    "hysteria2 unidirectional stream loop failed: {err}"
+                )));
+            }
         }
     }
-    Ok(())
 }
 
 async fn drive_tcp_streams(
