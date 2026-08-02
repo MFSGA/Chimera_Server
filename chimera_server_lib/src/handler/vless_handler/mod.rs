@@ -8,12 +8,18 @@ use tokio::io::ReadBuf;
 use tracing::warn;
 
 use crate::{
-    async_stream::AsyncStream, config::server_config::VlessUser,
-    resolver::NativeResolver, traffic::TrafficContext,
+    async_stream::AsyncStream,
+    config::server_config::{VlessFallback, VlessUser},
+    resolver::NativeResolver,
+    traffic::TrafficContext,
+    util::prefixed_stream::PrefixedStream,
 };
 
+mod fallback;
 pub(crate) mod protocol;
 mod reality_vision_stream;
+#[cfg(feature = "tls")]
+mod tls_vision;
 mod udp_stream;
 mod vision;
 mod vision_pad;
@@ -22,6 +28,10 @@ mod vision_tls;
 mod vision_unpad;
 
 use self::{
+    fallback::{
+        extend_prefix_for_path, read_vless_auth_prefix, select_vless_fallback,
+        vless_fallback_result,
+    },
     protocol::{
         COMMAND_MUX, COMMAND_TCP, ParsedVlessHeader, XTLS_VISION_FLOW,
         read_request_header,
@@ -29,24 +39,41 @@ use self::{
     udp_stream::VlessUdpStream,
 };
 use super::{
-    tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
+    tcp::tcp_handler::{
+        TcpServerConnectionContext, TcpServerHandler, TcpServerSetupResult,
+    },
     xudp::message_stream::XudpMessageStream,
 };
 use vision_pad::{pad_with_command, pad_with_uuid_and_command};
 use vision_unpad::{UnpadCommand, VisionUnpadder};
 
 pub use vision::{VisionVlessTcpHandler, setup_reality_mixed_vless_server_stream};
+#[cfg(feature = "tls")]
+pub(crate) use tls_vision::VisionRecordIo;
+#[cfg(feature = "tls")]
+pub(crate) use vision::{
+    ParsedVisionUser, parse_vision_users, setup_tls_vision_server_stream,
+};
 
 const SERVER_RESPONSE_HEADER: &[u8] = &[0u8, 0u8];
 
 #[derive(Debug)]
 pub struct VlessTcpHandler {
     users: Vec<(Box<[u8]>, String, String)>,
+    fallbacks: Vec<VlessFallback>,
     inbound_tag: String,
 }
 
 impl VlessTcpHandler {
     pub fn new(users: &[VlessUser], inbound_tag: &str) -> Self {
+        Self::new_with_fallbacks(users, &[], inbound_tag)
+    }
+
+    pub fn new_with_fallbacks(
+        users: &[VlessUser],
+        fallbacks: &[VlessFallback],
+        inbound_tag: &str,
+    ) -> Self {
         Self {
             users: users
                 .iter()
@@ -58,6 +85,7 @@ impl VlessTcpHandler {
                     )
                 })
                 .collect(),
+            fallbacks: fallbacks.to_vec(),
             inbound_tag: inbound_tag.to_string(),
         }
     }
@@ -67,12 +95,54 @@ pub fn users_require_vision(users: &[VlessUser]) -> bool {
     users.iter().any(|user| user.flow == XTLS_VISION_FLOW)
 }
 
-#[async_trait]
-impl TcpServerHandler for VlessTcpHandler {
-    async fn setup_server_stream(
+impl VlessTcpHandler {
+    async fn setup_server_stream_with_metadata(
         &self,
         mut server_stream: Box<dyn AsyncStream>,
+        server_name: &str,
+        alpn: &str,
     ) -> std::io::Result<TcpServerSetupResult> {
+        if !self.fallbacks.is_empty() {
+            let (mut prefix, candidate) =
+                read_vless_auth_prefix(&mut server_stream).await;
+            let authenticated = candidate.is_some_and(|candidate| {
+                self.users.iter().any(|(stored_user_id, _, _)| {
+                    stored_user_id.len() == 16
+                        && stored_user_id.as_ref() == candidate.as_slice()
+                })
+            });
+            if !authenticated {
+                extend_prefix_for_path(
+                    &mut server_stream,
+                    &mut prefix,
+                    &self.fallbacks,
+                )
+                .await;
+                let fallback = select_vless_fallback(
+                    &self.fallbacks,
+                    server_name,
+                    alpn,
+                    &prefix,
+                )
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "no VLESS fallback matched the unauthenticated request",
+                    )
+                })?;
+                return Ok(vless_fallback_result(
+                    fallback,
+                    prefix,
+                    server_stream,
+                ));
+            }
+
+            // Authentication is now established. Replay the prefix into the
+            // regular parser; all later malformed fields must fail rather than
+            // being disguised as unauthenticated fallback traffic.
+            server_stream = Box::new(PrefixedStream::new(prefix, server_stream));
+        }
+
         let ParsedVlessHeader {
             user_id,
             flow: request_flow,
@@ -141,6 +211,30 @@ impl TcpServerHandler for VlessTcpHandler {
                 format!("Unknown requested protocol: {unknown_protocol_type}"),
             )),
         }
+    }
+}
+
+#[async_trait]
+impl TcpServerHandler for VlessTcpHandler {
+    async fn setup_server_stream(
+        &self,
+        server_stream: Box<dyn AsyncStream>,
+    ) -> std::io::Result<TcpServerSetupResult> {
+        self.setup_server_stream_with_metadata(server_stream, "", "")
+            .await
+    }
+
+    async fn setup_server_stream_with_context(
+        &self,
+        server_stream: Box<dyn AsyncStream>,
+        context: TcpServerConnectionContext,
+    ) -> std::io::Result<TcpServerSetupResult> {
+        self.setup_server_stream_with_metadata(
+            server_stream,
+            context.server_name.as_deref().unwrap_or(""),
+            context.alpn_protocol.as_deref().unwrap_or(""),
+        )
+        .await
     }
 }
 
@@ -317,7 +411,7 @@ mod tests {
         address::{Address, NetLocation},
         async_stream::{AsyncPing, AsyncStream},
         beginning::udp::{run_bidirectional_udp, run_session_based_udp},
-        config::server_config::VlessUser,
+        config::server_config::{VlessFallback, VlessUser},
         handler::{
             tcp::tcp_handler::TcpServerSetupResult,
             vless_handler::vision_unpad::{UnpadCommand, VisionUnpadder},
@@ -390,6 +484,30 @@ mod tests {
                 flow: String::new(),
             }],
             "vless-test",
+        )
+    }
+
+    fn fallback_vless_handler(
+        user_id: &str,
+        fallback_port: u16,
+    ) -> VlessTcpHandler {
+        VlessTcpHandler::new_with_fallbacks(
+            &[VlessUser {
+                user_id: user_id.into(),
+                user_label: "fallback-user".into(),
+                flow: String::new(),
+            }],
+            &[VlessFallback {
+                name: String::new(),
+                alpn: String::new(),
+                path: String::new(),
+                dest: NetLocation::new(
+                    Address::Ipv4(Ipv4Addr::LOCALHOST),
+                    fallback_port,
+                ),
+                xver: 0,
+            }],
+            "vless-fallback-test",
         )
     }
 
@@ -468,6 +586,81 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(error.to_string().contains("invalid VLESS user id"));
+    }
+
+    #[tokio::test]
+    async fn unknown_user_falls_back_and_replays_complete_prefix() {
+        let configured_user = "3ac9b383-75a1-431c-8184-106c80eb2273";
+        let request_user = "e041e73e-a0a0-49f5-9754-6401aa621fb7";
+        let handler = fallback_vless_handler(configured_user, 8080);
+        let mut request = vec![0];
+        request.extend_from_slice(&parse_hex(request_user));
+        request.extend_from_slice(b"GET / HTTP/1.1\r\n\r\n");
+        let (mut client, server) = duplex(1024);
+        client.write_all(&request).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("unknown user should select fallback");
+        let TcpServerSetupResult::TcpForward {
+            remote_location,
+            mut stream,
+            traffic_context,
+            ..
+        } = result
+        else {
+            panic!("fallback returned a non-TCP result");
+        };
+        assert_eq!(remote_location.port(), 8080);
+        assert!(traffic_context.is_none());
+        let mut replayed = Vec::new();
+        stream.read_to_end(&mut replayed).await.unwrap();
+        assert_eq!(replayed, request);
+    }
+
+    #[tokio::test]
+    async fn truncated_unauthenticated_prefix_is_replayed_to_fallback() {
+        let handler = fallback_vless_handler(
+            "3ac9b383-75a1-431c-8184-106c80eb2273",
+            8081,
+        );
+        let request = b"GET /";
+        let (mut client, server) = duplex(1024);
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("truncated unauthenticated prefix should fallback");
+        let TcpServerSetupResult::TcpForward { mut stream, .. } = result else {
+            panic!("fallback returned a non-TCP result");
+        };
+        let mut replayed = Vec::new();
+        stream.read_to_end(&mut replayed).await.unwrap();
+        assert_eq!(replayed, request);
+    }
+
+    #[tokio::test]
+    async fn authenticated_truncation_does_not_fallback() {
+        let user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
+        let handler = fallback_vless_handler(user_id, 8082);
+        let mut request = vec![0];
+        request.extend_from_slice(&parse_hex(user_id));
+        let (mut client, server) = duplex(1024);
+        client.write_all(&request).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let error = match handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+        {
+            Ok(_) => panic!("authenticated truncation must not fallback"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[tokio::test]

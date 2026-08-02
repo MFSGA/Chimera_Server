@@ -14,9 +14,6 @@ use super::super::types::{
 use crate::address::{Address, NetLocation};
 
 #[cfg(feature = "reality")]
-const DEFAULT_REALITY_SHORT_ID: &str = "0000000000000000";
-
-#[cfg(feature = "reality")]
 fn parse_version_triplet(
     value: &Option<String>,
     field: &str,
@@ -106,15 +103,16 @@ fn build_reality_layer(
         Error::InvalidConfig(format!("invalid reality privateKey: {err}"))
     })?;
 
-    let configured_short_ids = if settings.short_ids.is_empty() {
-        vec![DEFAULT_REALITY_SHORT_ID]
-    } else {
-        settings
-            .short_ids
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-    };
+    if settings.short_ids.is_empty() {
+        return Err(Error::InvalidConfig(
+            "reality inbound requires at least one shortId".into(),
+        ));
+    }
+    let configured_short_ids = settings
+        .short_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
     let short_ids = configured_short_ids
         .iter()
         .map(|short_id| {
@@ -129,7 +127,8 @@ fn build_reality_layer(
     // Keep xray-core style behavior: maxTimeDiff = 0 means disabled.
     let max_time_diff = settings.max_time_diff.filter(|diff| *diff > 0);
     let min_client_version =
-        parse_version_triplet(&settings.min_client_ver, "minClientVer")?;
+        parse_version_triplet(&settings.min_client_ver, "minClientVer")?
+            .or(Some([26, 3, 27]));
     let max_client_version =
         parse_version_triplet(&settings.max_client_ver, "maxClientVer")?;
 
@@ -259,9 +258,10 @@ pub(super) fn apply_security_layers(
     let security = stream_settings
         .security
         .as_deref()
-        .map(|value| value.to_ascii_lowercase());
+        .map(|value| value.trim().to_ascii_lowercase());
 
     match security.as_deref() {
+        None | Some("") | Some("none") => Ok(protocol),
         #[cfg(feature = "tls")]
         Some("tls") => build_tls_layer(protocol, stream_settings),
         #[cfg(not(feature = "tls"))]
@@ -274,6 +274,8 @@ pub(super) fn apply_security_layers(
         Some("reality") => Err(Error::InvalidConfig(
             "reality security layer requires the reality feature".into(),
         )),
-        _ => Ok(protocol),
+        Some(unsupported) => Err(Error::InvalidConfig(format!(
+            "unsupported streamSettings.security={unsupported}"
+        ))),
     }
 }

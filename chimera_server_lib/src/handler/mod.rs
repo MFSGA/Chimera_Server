@@ -1,4 +1,10 @@
 pub mod dokodemo;
+#[cfg(feature = "http")]
+pub mod http;
+#[cfg(feature = "httpupgrade")]
+pub mod httpupgrade;
+#[cfg(feature = "mixed")]
+pub mod mixed;
 pub mod tcp;
 #[cfg(feature = "tls")]
 pub mod tls;
@@ -22,6 +28,8 @@ pub mod socks;
 
 #[cfg(feature = "reality")]
 pub mod reality;
+#[cfg(feature = "shadowsocks")]
+pub mod shadowsocks;
 
 #[cfg(feature = "tuic")]
 pub mod tuic;

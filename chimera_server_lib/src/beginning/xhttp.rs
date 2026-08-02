@@ -11,6 +11,7 @@ use std::{
     task::{Context, Poll},
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use futures::StreamExt;
 use http_body_util::{BodyExt, Empty, StreamBody, combinators::UnsyncBoxBody};
@@ -37,7 +38,10 @@ use tracing::{debug, error};
 use crate::{
     address::BindLocation,
     async_stream::{AsyncPing, AsyncStream},
-    config::server_config::{ServerConfig, ServerProxyConfig, XhttpServerConfig},
+    config::server_config::{
+        ServerConfig, ServerProxyConfig, XhttpDataPlacement, XhttpMode,
+        XhttpPlacement, XhttpServerConfig,
+    },
     handler::tcp::{
         tcp_handler::TcpServerHandler, tcp_handler_util::create_tcp_server_handler,
     },
@@ -261,11 +265,20 @@ async fn serve_http_connection<IO>(
 
 #[derive(Clone)]
 struct AppState {
+    mode: XhttpMode,
     host: Option<String>,
     base_path: String,
     min_padding: usize,
     max_padding: usize,
     max_each_post_bytes: usize,
+    no_sse_header: bool,
+    uplink_http_method: String,
+    session_placement: XhttpPlacement,
+    session_key: String,
+    seq_placement: XhttpPlacement,
+    seq_key: String,
+    uplink_data_placement: XhttpDataPlacement,
+    uplink_data_key: String,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
     resolver: Arc<dyn Resolver>,
     runtime: RuntimeState,
@@ -280,11 +293,20 @@ impl AppState {
         runtime: RuntimeState,
     ) -> Self {
         Self {
+            mode: config.mode,
             host: config.host,
             base_path: normalize_base_path(config.path),
             min_padding: config.min_padding,
             max_padding: config.max_padding,
             max_each_post_bytes: config.max_each_post_bytes,
+            no_sse_header: config.no_sse_header,
+            uplink_http_method: config.uplink_http_method,
+            session_placement: config.session_placement,
+            session_key: config.session_key,
+            seq_placement: config.seq_placement,
+            seq_key: config.seq_key,
+            uplink_data_placement: config.uplink_data_placement,
+            uplink_data_key: config.uplink_data_key,
             server_handler,
             resolver,
             runtime,
@@ -308,6 +330,56 @@ impl AppState {
             }
             _ => false,
         }
+    }
+
+    fn extract_meta(
+        &self,
+        request: &Request<Incoming>,
+    ) -> (Option<String>, Option<String>) {
+        let trimmed_base_path = self.base_path.trim_end_matches('/');
+        let path_tail = if request.uri().path() == trimmed_base_path {
+            ""
+        } else {
+            request
+                .uri()
+                .path()
+                .strip_prefix(&self.base_path)
+                .unwrap_or("")
+        };
+        let path_segments = path_tail
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        let mut path_index = 0usize;
+        let mut next_path_value = || {
+            let value = path_segments
+                .get(path_index)
+                .map(|value| (*value).to_string());
+            if value.is_some() {
+                path_index += 1;
+            }
+            value
+        };
+
+        let session_id = match self.session_placement {
+            XhttpPlacement::Path => next_path_value(),
+            XhttpPlacement::Query => {
+                query_value(request.uri().query(), &self.session_key)
+            }
+            XhttpPlacement::Header => {
+                header_value(request.headers(), &self.session_key)
+            }
+            XhttpPlacement::Cookie => {
+                cookie_value(request.headers(), &self.session_key)
+            }
+        };
+        let seq = match self.seq_placement {
+            XhttpPlacement::Path => next_path_value(),
+            XhttpPlacement::Query => query_value(request.uri().query(), &self.seq_key),
+            XhttpPlacement::Header => header_value(request.headers(), &self.seq_key),
+            XhttpPlacement::Cookie => cookie_value(request.headers(), &self.seq_key),
+        };
+        (session_id, seq)
     }
 
     fn validate_padding(
@@ -365,22 +437,43 @@ async fn handle_request(
         );
         return Ok(simple_response(StatusCode::NOT_FOUND));
     }
-    let (session_id, seq) = extract_meta_path(&path, &state.base_path);
+    let (session_id, seq) = state.extract_meta(&request);
 
-    let response = match *request.method() {
-        Method::GET => match session_id {
-            Some(session_id) if seq.is_none() => {
-                handle_stream_down(state, session_id, peer_addr).await
-            }
-            _ => simple_response(StatusCode::METHOD_NOT_ALLOWED),
-        },
-        Method::POST => match (session_id, seq) {
-            (None, None) => handle_stream_one(request, state, peer_addr).await,
-            (Some(session_id), Some(seq)) => {
-                handle_packet_up(request, state, session_id, seq, peer_addr).await
-            }
-            _ => simple_response(StatusCode::METHOD_NOT_ALLOWED),
-        },
+    let is_downlink_method = request.method() == Method::GET;
+    let is_uplink_method =
+        request.method().as_str() == state.uplink_http_method.as_str();
+    let response = match (
+        is_downlink_method,
+        is_uplink_method,
+        session_id,
+        seq,
+    ) {
+        (true, _, Some(session_id), None)
+            if matches!(
+                state.mode,
+                XhttpMode::Auto | XhttpMode::PacketUp | XhttpMode::StreamUp
+            ) =>
+        {
+            handle_stream_down(state, session_id, peer_addr).await
+        }
+        (_, true, None, None)
+            if matches!(
+                state.mode,
+                XhttpMode::Auto | XhttpMode::StreamOne | XhttpMode::StreamUp
+            ) =>
+        {
+            handle_stream_one(request, state, peer_addr).await
+        }
+        (_, true, Some(session_id), None)
+            if matches!(state.mode, XhttpMode::Auto | XhttpMode::StreamUp) =>
+        {
+            handle_stream_up(request, state, session_id, peer_addr).await
+        }
+        (_, true, Some(session_id), Some(seq))
+            if matches!(state.mode, XhttpMode::Auto | XhttpMode::PacketUp) =>
+        {
+            handle_packet_up(request, state, session_id, seq, peer_addr).await
+        }
         _ => simple_response(StatusCode::METHOD_NOT_ALLOWED),
     };
 
@@ -416,7 +509,45 @@ async fn handle_stream_one(
         let _ = upload_writer.shutdown().await;
     });
 
-    reader_response(StatusCode::OK, client_download)
+    reader_response(StatusCode::OK, client_download, state.no_sse_header)
+}
+
+async fn handle_stream_up(
+    request: Request<Incoming>,
+    state: Arc<AppState>,
+    session_id: String,
+    peer_addr: std::net::SocketAddr,
+) -> Response<ResponseBody> {
+    let session = state.sessions.get_or_create(&session_id);
+    if let Some(stream) = session.take_handler_stream().await {
+        spawn_handler_stream(stream, state.clone(), peer_addr);
+    }
+
+    let mut body = request.into_body();
+    let mut upload_state = session.upload.lock().await;
+    while let Some(frame_result) = body.frame().await {
+        let frame = match frame_result {
+            Ok(frame) => frame,
+            Err(_) => {
+                state.sessions.remove(&session_id).await;
+                return simple_response(StatusCode::BAD_REQUEST);
+            }
+        };
+        if let Some(chunk) = frame.data_ref()
+            && let Err(error) = upload_state.writer.write_all(chunk).await
+        {
+            error!("xhttp stream-up write failed: {}", error);
+            state.sessions.remove(&session_id).await;
+            return simple_response(StatusCode::BAD_GATEWAY);
+        }
+    }
+    if let Err(error) = upload_state.writer.shutdown().await {
+        error!("xhttp stream-up shutdown failed: {}", error);
+        state.sessions.remove(&session_id).await;
+        return simple_response(StatusCode::BAD_GATEWAY);
+    }
+
+    simple_response(StatusCode::OK)
 }
 
 async fn handle_stream_down(
@@ -452,7 +583,11 @@ async fn handle_stream_down(
         }
     });
 
-    stream_response(StatusCode::OK, body_stream.boxed())
+    stream_response(
+        StatusCode::OK,
+        body_stream.boxed(),
+        state.no_sse_header,
+    )
 }
 
 async fn handle_packet_up(
@@ -466,13 +601,65 @@ async fn handle_packet_up(
         return simple_response(StatusCode::BAD_REQUEST);
     };
 
-    let collected = match request.into_body().collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => return simple_response(StatusCode::BAD_REQUEST),
+    let (parts, body) = request.into_parts();
+    let header_payload = if matches!(
+        state.uplink_data_placement,
+        XhttpDataPlacement::Auto | XhttpDataPlacement::Header
+    ) {
+        match decode_chunked_header_payload(
+            &parts.headers,
+            &state.uplink_data_key,
+        ) {
+            Ok(payload) => payload,
+            Err(_) => return simple_response(StatusCode::BAD_REQUEST),
+        }
+    } else {
+        Vec::new()
     };
-    if collected.len() > state.max_each_post_bytes {
+    let cookie_payload = if matches!(
+        state.uplink_data_placement,
+        XhttpDataPlacement::Auto | XhttpDataPlacement::Cookie
+    ) {
+        match decode_chunked_cookie_payload(
+            &parts.headers,
+            &state.uplink_data_key,
+        ) {
+            Ok(payload) => payload,
+            Err(_) => return simple_response(StatusCode::BAD_REQUEST),
+        }
+    } else {
+        Vec::new()
+    };
+    let body_payload = if matches!(
+        state.uplink_data_placement,
+        XhttpDataPlacement::Auto | XhttpDataPlacement::Body
+    ) {
+        match body.collect().await {
+            Ok(collected) => collected.to_bytes().to_vec(),
+            Err(_) => return simple_response(StatusCode::BAD_REQUEST),
+        }
+    } else {
+        Vec::new()
+    };
+
+    let payload = match state.uplink_data_placement {
+        XhttpDataPlacement::Auto => {
+            let mut payload = Vec::with_capacity(
+                header_payload.len() + cookie_payload.len() + body_payload.len(),
+            );
+            payload.extend_from_slice(&header_payload);
+            payload.extend_from_slice(&cookie_payload);
+            payload.extend_from_slice(&body_payload);
+            payload
+        }
+        XhttpDataPlacement::Body => body_payload,
+        XhttpDataPlacement::Header => header_payload,
+        XhttpDataPlacement::Cookie => cookie_payload,
+    };
+    if payload.len() > state.max_each_post_bytes {
         return simple_response(StatusCode::PAYLOAD_TOO_LARGE);
     }
+    let collected = Bytes::from(payload);
 
     let session = state.sessions.get_or_create(&session_id);
     if let Some(stream) = session.take_handler_stream().await {
@@ -521,6 +708,7 @@ fn spawn_handler_stream(
 fn reader_response(
     status: StatusCode,
     reader: DuplexStream,
+    no_sse_header: bool,
 ) -> Response<ResponseBody> {
     let body_stream = ReaderStream::new(reader).filter_map(|result| async move {
         match result {
@@ -531,18 +719,25 @@ fn reader_response(
             }
         }
     });
-    stream_response(status, body_stream.boxed())
+    stream_response(status, body_stream.boxed(), no_sse_header)
 }
 
-fn stream_response<S>(status: StatusCode, body_stream: S) -> Response<ResponseBody>
+fn stream_response<S>(
+    status: StatusCode,
+    body_stream: S,
+    no_sse_header: bool,
+) -> Response<ResponseBody>
 where
     S: futures::Stream<Item = Result<Frame<Bytes>, Infallible>> + Send + 'static,
 {
-    Response::builder()
+    let mut response = Response::builder()
         .status(status)
-        .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(header::CACHE_CONTROL, "no-store")
-        .header("x-accel-buffering", "no")
+        .header("x-accel-buffering", "no");
+    if !no_sse_header {
+        response = response.header(header::CONTENT_TYPE, "text/event-stream");
+    }
+    response
         .body(BodyExt::boxed_unsync(StreamBody::new(body_stream)))
         .unwrap_or_else(|_| simple_response(StatusCode::INTERNAL_SERVER_ERROR))
 }
@@ -766,20 +961,71 @@ fn normalize_base_path(mut path: String) -> String {
     path
 }
 
-fn extract_meta_path(
-    request_path: &str,
-    base_path: &str,
-) -> (Option<String>, Option<String>) {
-    let trimmed_base_path = base_path.trim_end_matches('/');
-    if request_path == trimmed_base_path {
-        return (None, None);
-    }
+fn query_value(query: Option<&str>, key: &str) -> Option<String> {
+    query?.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name == key && !value.is_empty()).then(|| value.to_string())
+    })
+}
 
-    let tail = &request_path[base_path.len()..];
-    let mut segments = tail.split('/').filter(|segment| !segment.is_empty());
-    let session_id = segments.next().map(ToOwned::to_owned);
-    let seq = segments.next().map(ToOwned::to_owned);
-    (session_id, seq)
+fn header_value(headers: &hyper::HeaderMap, key: &str) -> Option<String> {
+    headers
+        .get(key)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn cookie_value(headers: &hyper::HeaderMap, key: &str) -> Option<String> {
+    headers.get_all(header::COOKIE).iter().find_map(|value| {
+        let value = value.to_str().ok()?;
+        value.split(';').find_map(|cookie| {
+            let (name, value) = cookie.trim().split_once('=')?;
+            (name == key && !value.is_empty()).then(|| value.to_string())
+        })
+    })
+}
+
+fn decode_chunked_header_payload(
+    headers: &hyper::HeaderMap,
+    key: &str,
+) -> std::io::Result<Vec<u8>> {
+    let mut encoded = String::new();
+    for index in 0usize.. {
+        let header_name = format!("{key}-{index}");
+        let Some(chunk) = header_value(headers, &header_name) else {
+            break;
+        };
+        encoded.push_str(&chunk);
+    }
+    decode_xhttp_payload(&encoded)
+}
+
+fn decode_chunked_cookie_payload(
+    headers: &hyper::HeaderMap,
+    key: &str,
+) -> std::io::Result<Vec<u8>> {
+    let mut encoded = String::new();
+    for index in 0usize.. {
+        let cookie_name = format!("{key}_{index}");
+        let Some(chunk) = cookie_value(headers, &cookie_name) else {
+            break;
+        };
+        encoded.push_str(&chunk);
+    }
+    decode_xhttp_payload(&encoded)
+}
+
+fn decode_xhttp_payload(encoded: &str) -> std::io::Result<Vec<u8>> {
+    if encoded.is_empty() {
+        return Ok(Vec::new());
+    }
+    URL_SAFE_NO_PAD.decode(encoded).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid XHTTP uplink payload encoding: {error}"),
+        )
+    })
 }
 
 fn matches_base_path(request_path: &str, base_path: &str) -> bool {

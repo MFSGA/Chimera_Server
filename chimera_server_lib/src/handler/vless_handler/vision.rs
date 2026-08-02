@@ -3,16 +3,23 @@ use tracing::warn;
 
 use crate::{
     async_stream::AsyncStream,
-    config::server_config::VlessUser,
+    config::server_config::{VlessFallback, VlessUser},
     handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
     reality::{RealityServerConnection, RealityTlsStream},
     traffic::TrafficContext,
 };
 
+use super::fallback::{
+    extend_prefix_for_path, read_vless_auth_prefix, select_vless_fallback,
+    vless_fallback_result,
+};
 use super::protocol::{
     COMMAND_TCP, ParsedVlessHeader, XTLS_VISION_FLOW, read_request_header,
+    read_request_header_after_auth,
 };
 use super::reality_vision_stream::RealityVisionServerStream;
+#[cfg(feature = "tls")]
+use super::tls_vision::{RustlsVisionSession, VisionRecordIo};
 use super::vision_stream::VisionServerStream;
 use super::{SERVER_RESPONSE_HEADER, encode_hex, parse_hex};
 
@@ -36,14 +43,46 @@ impl VisionVlessTcpHandler {
 pub async fn setup_reality_mixed_vless_server_stream(
     mut tls_stream: RealityTlsStream<Box<dyn AsyncStream>, RealityServerConnection>,
     users: &[VlessUser],
+    fallbacks: &[VlessFallback],
     inbound_tag: &str,
 ) -> std::io::Result<TcpServerSetupResult> {
+    let header = if !fallbacks.is_empty() {
+        let (mut prefix, candidate) = read_vless_auth_prefix(&mut tls_stream).await;
+        let authenticated = candidate.is_some_and(|candidate| {
+            users.iter().any(|user| {
+                let parsed = parse_hex(&user.user_id);
+                parsed.len() == 16 && parsed.as_ref() == candidate.as_slice()
+            })
+        });
+        if !authenticated {
+            extend_prefix_for_path(&mut tls_stream, &mut prefix, fallbacks).await;
+            let fallback = select_vless_fallback(fallbacks, "", "", &prefix)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "no VLESS fallback matched the unauthenticated REALITY request",
+                    )
+                })?;
+            return Ok(vless_fallback_result(
+                fallback,
+                prefix,
+                Box::new(tls_stream),
+            ));
+        }
+        read_request_header_after_auth(
+            &mut tls_stream,
+            candidate.expect("authenticated candidate must exist"),
+        )
+        .await?
+    } else {
+        read_request_header(&mut tls_stream).await?
+    };
     let ParsedVlessHeader {
         user_id,
         flow: request_flow,
         command,
         remote_location,
-    } = read_request_header(&mut tls_stream).await?;
+    } = header;
 
     let user = find_matching_vless_user(users, &user_id, inbound_tag)?;
     let user_label = user.user_label.clone();
@@ -125,17 +164,139 @@ pub async fn setup_reality_mixed_vless_server_stream(
     }
 }
 
-pub async fn setup_reality_vision_server_stream(
-    mut tls_stream: RealityTlsStream<Box<dyn AsyncStream>, RealityServerConnection>,
+#[cfg(feature = "tls")]
+pub async fn setup_tls_vision_server_stream(
+    mut tls_stream: tokio_rustls::server::TlsStream<
+        VisionRecordIo<Box<dyn AsyncStream>>,
+    >,
     users: &[ParsedVisionUser],
+    fallbacks: &[VlessFallback],
     inbound_tag: &str,
 ) -> std::io::Result<TcpServerSetupResult> {
+    let (server_name, alpn) = {
+        let connection = tls_stream.get_ref().1;
+        let server_name = connection.server_name().unwrap_or("").to_string();
+        let alpn = connection
+            .alpn_protocol()
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .unwrap_or("")
+            .to_string();
+        (server_name, alpn)
+    };
+    let header = if !fallbacks.is_empty() {
+        let (mut prefix, candidate) = read_vless_auth_prefix(&mut tls_stream).await;
+        let authenticated = candidate.is_some_and(|candidate| {
+            users.iter().any(|(stored_user_id, _)| {
+                stored_user_id.len() == 16
+                    && stored_user_id.as_ref() == candidate.as_slice()
+            })
+        });
+        if !authenticated {
+            extend_prefix_for_path(&mut tls_stream, &mut prefix, fallbacks).await;
+            let fallback = select_vless_fallback(
+                fallbacks,
+                &server_name,
+                &alpn,
+                &prefix,
+            )
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no VLESS fallback matched the unauthenticated TLS request",
+                )
+            })?;
+            return Ok(vless_fallback_result(
+                fallback,
+                prefix,
+                Box::new(tls_stream),
+            ));
+        }
+        read_request_header_after_auth(
+            &mut tls_stream,
+            candidate.expect("authenticated candidate must exist"),
+        )
+        .await?
+    } else {
+        read_request_header(&mut tls_stream).await?
+    };
     let ParsedVlessHeader {
         user_id,
         flow: request_flow,
         command,
         remote_location,
-    } = read_request_header(&mut tls_stream).await?;
+    } = header;
+
+    let user_label = find_matching_user_label(users, &user_id, inbound_tag)?;
+    validate_vision_request_flow(&request_flow, command)?;
+
+    let (io, connection) = tls_stream.into_inner();
+    let mut session = io.session(connection);
+    let initial_plaintext = RealityVisionServerStream::<
+        VisionRecordIo<Box<dyn AsyncStream>>,
+        RustlsVisionSession,
+    >::drain_plaintext_from_session(&mut session)?;
+
+    Ok(TcpServerSetupResult::TcpForward {
+        remote_location,
+        stream: Box::new(RealityVisionServerStream::new(
+            io,
+            session,
+            user_id,
+            &initial_plaintext,
+        )?),
+        need_initial_flush: false,
+        connection_success_response: None,
+        traffic_context: Some(
+            TrafficContext::new("vless")
+                .with_identity(user_label)
+                .with_inbound_tag(inbound_tag.to_string()),
+        ),
+    })
+}
+
+pub async fn setup_reality_vision_server_stream(
+    mut tls_stream: RealityTlsStream<Box<dyn AsyncStream>, RealityServerConnection>,
+    users: &[ParsedVisionUser],
+    fallbacks: &[VlessFallback],
+    inbound_tag: &str,
+) -> std::io::Result<TcpServerSetupResult> {
+    let header = if !fallbacks.is_empty() {
+        let (mut prefix, candidate) = read_vless_auth_prefix(&mut tls_stream).await;
+        let authenticated = candidate.is_some_and(|candidate| {
+            users.iter().any(|(stored_user_id, _)| {
+                stored_user_id.len() == 16
+                    && stored_user_id.as_ref() == candidate.as_slice()
+            })
+        });
+        if !authenticated {
+            extend_prefix_for_path(&mut tls_stream, &mut prefix, fallbacks).await;
+            let fallback = select_vless_fallback(fallbacks, "", "", &prefix)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "no VLESS fallback matched the unauthenticated REALITY Vision request",
+                    )
+                })?;
+            return Ok(vless_fallback_result(
+                fallback,
+                prefix,
+                Box::new(tls_stream),
+            ));
+        }
+        read_request_header_after_auth(
+            &mut tls_stream,
+            candidate.expect("authenticated candidate must exist"),
+        )
+        .await?
+    } else {
+        read_request_header(&mut tls_stream).await?
+    };
+    let ParsedVlessHeader {
+        user_id,
+        flow: request_flow,
+        command,
+        remote_location,
+    } = header;
 
     let user_label = find_matching_user_label(users, &user_id, inbound_tag)?;
     validate_vision_request_flow(&request_flow, command)?;

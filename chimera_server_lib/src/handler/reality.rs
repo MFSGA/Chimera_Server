@@ -11,7 +11,7 @@ use tokio::time::{Instant, timeout_at};
 
 use crate::async_stream::AsyncStream;
 use crate::config::server_config::RealityTransportConfig;
-use crate::config::server_config::VlessUser;
+use crate::config::server_config::{VlessFallback, VlessUser};
 use crate::handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::handler::tls_deframer::TlsDeframer;
 use crate::handler::vless_handler::setup_reality_mixed_vless_server_stream;
@@ -684,6 +684,7 @@ impl TcpServerHandler for RealityServerHandler {
 pub struct RealityVisionVlessServerHandler {
     transport_config: RealityTransportConfig,
     users: Vec<VlessUser>,
+    fallbacks: Vec<VlessFallback>,
     inbound_tag: String,
 }
 
@@ -691,11 +692,13 @@ impl RealityVisionVlessServerHandler {
     pub fn new(
         config: RealityTransportConfig,
         users: Vec<VlessUser>,
+        fallbacks: Vec<VlessFallback>,
         inbound_tag: &str,
     ) -> Self {
         Self {
             transport_config: config,
             users,
+            fallbacks,
             inbound_tag: inbound_tag.to_string(),
         }
     }
@@ -712,6 +715,7 @@ impl TcpServerHandler for RealityVisionVlessServerHandler {
         setup_reality_mixed_vless_server_stream(
             tls_stream,
             &self.users,
+            &self.fallbacks,
             &self.inbound_tag,
         )
         .await

@@ -542,7 +542,10 @@ impl HandlerServiceImpl {
             .iter()
             .map(|client| self.parse_vless_user(client))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(ServerProxyConfig::Vless { users })
+        Ok(ServerProxyConfig::Vless {
+            users,
+            fallbacks: Vec::new(),
+        })
     }
 
     #[cfg(feature = "vless")]
@@ -606,7 +609,13 @@ impl HandlerServiceImpl {
                     "invalid trojan fallback dest {dest}: {err}"
                 ))
             })?;
-            fallbacks.push(crate::config::server_config::TrojanFallback { dest });
+            fallbacks.push(crate::config::server_config::TrojanFallback {
+                name: String::new(),
+                alpn: String::new(),
+                path: String::new(),
+                dest,
+                xver: 0,
+            });
         }
 
         Ok(ServerProxyConfig::Trojan { users, fallbacks })
@@ -904,7 +913,7 @@ impl HandlerServiceImpl {
     ) -> Option<proto::xray::common::serial::TypedMessage> {
         match protocol {
             #[cfg(feature = "vless")]
-            ServerProxyConfig::Vless { users } => {
+            ServerProxyConfig::Vless { users, .. } => {
                 let clients = users
                     .iter()
                     .map(|user| proto::xray::common::protocol::User {
@@ -1305,7 +1314,7 @@ impl HandlerServiceImpl {
     ) -> Result<bool, Status> {
         match protocol {
             #[cfg(feature = "vless")]
-            ServerProxyConfig::Vless { users } => {
+            ServerProxyConfig::Vless { users, .. } => {
                 let user = self.parse_vless_user(user)?;
                 if let Some(existing) = users
                     .iter_mut()
@@ -1416,7 +1425,7 @@ impl HandlerServiceImpl {
     ) -> Result<bool, Status> {
         match protocol {
             #[cfg(feature = "vless")]
-            ServerProxyConfig::Vless { users } => {
+            ServerProxyConfig::Vless { users, .. } => {
                 let before = users.len();
                 users.retain(|user| user.user_label != email);
                 Ok(before != users.len())
@@ -1548,7 +1557,7 @@ impl HandlerServiceImpl {
     ) -> Option<Vec<String>> {
         match protocol {
             #[cfg(feature = "vless")]
-            ServerProxyConfig::Vless { users } => {
+            ServerProxyConfig::Vless { users, .. } => {
                 Some(users.iter().map(|user| user.user_label.clone()).collect())
             }
             #[cfg(feature = "vmess")]
@@ -1606,6 +1615,14 @@ impl HandlerServiceImpl {
             ServerProxyConfig::Xhttp { inner, .. } => {
                 self.get_user_manager_identities(inner)
             }
+            #[cfg(feature = "httpupgrade")]
+            ServerProxyConfig::HttpUpgrade(config) => {
+                self.get_user_manager_identities(&config.inner)
+            }
+            #[cfg(feature = "grpc_transport")]
+            ServerProxyConfig::Grpc(config) => {
+                self.get_user_manager_identities(&config.inner)
+            }
             ServerProxyConfig::Socks { accounts, .. } => Some(
                 accounts
                     .snapshot()
@@ -1613,6 +1630,12 @@ impl HandlerServiceImpl {
                     .map(|account| account.username.clone())
                     .collect(),
             ),
+            #[cfg(feature = "http")]
+            ServerProxyConfig::Http { .. } => None,
+            #[cfg(feature = "mixed")]
+            ServerProxyConfig::Mixed { .. } => None,
+            #[cfg(feature = "shadowsocks")]
+            ServerProxyConfig::Shadowsocks { .. } => None,
             ServerProxyConfig::DokodemoDoor { .. } => None,
         }
     }
@@ -1623,7 +1646,7 @@ impl HandlerServiceImpl {
     ) -> Option<Vec<proto::xray::common::protocol::User>> {
         match protocol {
             #[cfg(feature = "vless")]
-            ServerProxyConfig::Vless { users } => Some(
+            ServerProxyConfig::Vless { users, .. } => Some(
                 users
                     .iter()
                     .map(|user| proto::xray::common::protocol::User {
@@ -1732,6 +1755,14 @@ impl HandlerServiceImpl {
             ServerProxyConfig::Xhttp { inner, .. } => {
                 self.get_user_manager_users(inner)
             }
+            #[cfg(feature = "httpupgrade")]
+            ServerProxyConfig::HttpUpgrade(config) => {
+                self.get_user_manager_users(&config.inner)
+            }
+            #[cfg(feature = "grpc_transport")]
+            ServerProxyConfig::Grpc(config) => {
+                self.get_user_manager_users(&config.inner)
+            }
             ServerProxyConfig::Socks { accounts, .. } => Some(
                 accounts
                     .snapshot()
@@ -1750,6 +1781,12 @@ impl HandlerServiceImpl {
                     })
                     .collect(),
             ),
+            #[cfg(feature = "http")]
+            ServerProxyConfig::Http { .. } => None,
+            #[cfg(feature = "mixed")]
+            ServerProxyConfig::Mixed { .. } => None,
+            #[cfg(feature = "shadowsocks")]
+            ServerProxyConfig::Shadowsocks { .. } => None,
             ServerProxyConfig::DokodemoDoor { .. } => None,
         }
     }
@@ -2308,6 +2345,7 @@ mod tests {
             )),
             protocol: ServerProxyConfig::Xhttp {
                 config: XhttpServerConfig {
+                    mode: crate::config::server_config::XhttpMode::Auto,
                     host: None,
                     path: "/control".to_string(),
                     min_padding: 0,
@@ -2315,8 +2353,24 @@ mod tests {
                     max_each_post_bytes: 1_000_000,
                     max_buffered_posts: 30,
                     session_ttl_secs: 30,
+                    no_grpc_header: false,
+                    no_sse_header: false,
+                    uplink_http_method: "POST".into(),
+                    min_posts_interval_ms: (30, 30),
+                    session_placement:
+                        crate::config::server_config::XhttpPlacement::Path,
+                    session_key: String::new(),
+                    seq_placement:
+                        crate::config::server_config::XhttpPlacement::Path,
+                    seq_key: String::new(),
+                    uplink_data_placement:
+                        crate::config::server_config::XhttpDataPlacement::Auto,
+                    uplink_data_key: "X-Data".into(),
                 },
-                inner: Box::new(ServerProxyConfig::Vless { users: Vec::new() }),
+                inner: Box::new(ServerProxyConfig::Vless {
+                    users: Vec::new(),
+                    fallbacks: Vec::new(),
+                }),
             },
             transport: Transport::Tcp,
             quic_settings: None,
@@ -2715,7 +2769,7 @@ mod tests {
                                 Some("example.com")
                             );
                             match &target.protocol {
-                                ServerProxyConfig::Vless { users } => {
+                                ServerProxyConfig::Vless { users, .. } => {
                                     assert_eq!(users.len(), 1);
                                     assert_eq!(
                                         users[0].user_id,
@@ -2850,6 +2904,7 @@ mod tests {
                         flow: "xtls-rprx-vision".to_string(),
                     },
                 ],
+                fallbacks: Vec::new(),
             },
             transport: Transport::Tcp,
             quic_settings: None,
@@ -3042,7 +3097,10 @@ mod tests {
                 Address::Ipv4(Ipv4Addr::LOCALHOST),
                 inbound_port,
             )),
-            protocol: ServerProxyConfig::Vless { users: vec![] },
+            protocol: ServerProxyConfig::Vless {
+                users: vec![],
+                fallbacks: Vec::new(),
+            },
             transport: Transport::Tcp,
             quic_settings: None,
         };
