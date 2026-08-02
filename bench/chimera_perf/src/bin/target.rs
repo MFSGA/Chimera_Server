@@ -1,9 +1,10 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use chimera_perf::{
     pattern::PatternStream,
     protocol::{ACK_LEN, Ack, DOWNLOAD_READY, READY_LEN, REQUEST_LEN, Request},
+    tls::{self, BenchIo, BoxedBenchIo},
 };
 use clap::Parser;
 use tokio::{
@@ -15,6 +16,9 @@ use tokio::{
 #[derive(Debug, Parser)]
 #[command(about = "Streaming target for Chimera throughput benchmarks")]
 struct Args {
+    #[arg(long, default_value = "payload")]
+    name: String,
+
     #[arg(long, default_value = "127.0.0.1:52080")]
     listen: SocketAddr,
 
@@ -26,6 +30,15 @@ struct Args {
 
     #[arg(long, default_value_t = 1)]
     worker_threads: usize,
+
+    #[arg(long)]
+    tcp_nodelay: bool,
+
+    #[arg(long, requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+
+    #[arg(long, requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -48,28 +61,52 @@ fn main() -> Result<()> {
 }
 
 async fn run(args: Args) -> Result<()> {
+    let tls_config = match (&args.tls_cert, &args.tls_key) {
+        (Some(cert), Some(key)) => Some(Arc::new(tls::server_config(cert, key)?)),
+        (None, None) => None,
+        _ => unreachable!("clap enforces paired TLS certificate and key"),
+    };
     let listener = TcpListener::bind(args.listen)
         .await
         .with_context(|| format!("bind benchmark target on {}", args.listen))?;
     let local_addr = listener.local_addr()?;
-    eprintln!("chimera-perf target listening on {local_addr}");
+    eprintln!(
+        "chimera-perf target {} listening on {local_addr}",
+        args.name,
+    );
 
     let semaphore = Arc::new(Semaphore::new(args.max_connections));
     loop {
         let (stream, peer) = listener.accept().await?;
         let permit = semaphore.clone().acquire_owned().await?;
+        let name = args.name.clone();
         let buffer_size = args.buffer_size;
+        let tcp_nodelay = args.tcp_nodelay;
+        let tls_config = tls_config.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(error) = handle_connection(stream, buffer_size).await {
-                eprintln!("target connection {peer} failed: {error:#}");
+            if let Err(error) =
+                handle_connection(stream, buffer_size, tcp_nodelay, tls_config).await
+            {
+                eprintln!(
+                    "target {name} {local_addr} connection {peer} failed: {error:#}"
+                );
             }
         });
     }
 }
 
-async fn handle_connection(mut stream: TcpStream, buffer_size: usize) -> Result<()> {
-    stream.set_nodelay(true)?;
+async fn handle_connection(
+    stream: TcpStream,
+    buffer_size: usize,
+    tcp_nodelay: bool,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> Result<()> {
+    stream.set_nodelay(tcp_nodelay)?;
+    let mut stream: BoxedBenchIo = match tls_config {
+        Some(config) => tls::accept(stream, config).await?,
+        None => tls::plain(stream),
+    };
 
     let mut request_bytes = [0_u8; REQUEST_LEN];
     stream.read_exact(&mut request_bytes).await?;
@@ -93,7 +130,7 @@ async fn handle_connection(mut stream: TcpStream, buffer_size: usize) -> Result<
 }
 
 async fn receive_upload(
-    stream: &mut TcpStream,
+    stream: &mut dyn BenchIo,
     request: Request,
     buffer_size: usize,
 ) -> Result<()> {
@@ -117,7 +154,7 @@ async fn receive_upload(
 }
 
 async fn send_download(
-    stream: &mut TcpStream,
+    stream: &mut dyn BenchIo,
     request: Request,
     buffer_size: usize,
 ) -> Result<()> {
