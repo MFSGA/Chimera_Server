@@ -8,6 +8,7 @@ use std::{
     sync::{
         Arc, Once,
         atomic::{AtomicUsize, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -245,6 +246,406 @@ async fn xray_client_can_proxy_tcp_through_chimera_reality_vision() {
         socks_addr,
         tls_echo_addr,
         b"real tls application data through reality vision",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera and verifies unauthenticated VLESS fallback replay"]
+async fn unauthenticated_plain_tcp_reaches_vless_fallback() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("vless-fallback");
+    let default_fallback_addr = start_tcp_marker_echo_server(b"default:");
+    let path_fallback_addr = start_tcp_marker_echo_server(b"path:");
+    let proxy_v1_addr = start_proxy_protocol_marker_echo_server(1, b"proxy-v1:");
+    let proxy_v2_addr = start_proxy_protocol_marker_echo_server(2, b"proxy-v2:");
+    let chimera_port = free_localhost_port();
+    let chimera_config_path = work_dir.join("chimera-vless-fallback.json");
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "vless",
+                "tag": "chimera-vless-fallback",
+                "settings": {
+                    "clients": [{
+                        "id": TEST_UUID,
+                        "email": "fallback@example.test"
+                    }],
+                    "decryption": "none",
+                    "fallbacks": [{
+                        "dest": default_fallback_addr.to_string()
+                    }, {
+                        "path": "/fallback",
+                        "dest": path_fallback_addr.to_string()
+                    }, {
+                        "path": "/proxy-v1",
+                        "dest": proxy_v1_addr.to_string(),
+                        "xver": 1
+                    }, {
+                        "path": "/proxy-v2",
+                        "dest": proxy_v2_addr.to_string(),
+                        "xver": 2
+                    }]
+                }
+            }],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    let chimera_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port));
+    wait_for_tcp(chimera_addr);
+    chimera.assert_running();
+
+    for (path, marker) in [
+        ("/fallback?query=1", b"path:".as_slice()),
+        ("/proxy-v1", b"proxy-v1:".as_slice()),
+        ("/proxy-v2", b"proxy-v2:".as_slice()),
+        ("/other", b"default:".as_slice()),
+    ] {
+        let payload = format!(
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        let mut stream =
+            TcpStream::connect(chimera_addr).expect("connect VLESS fallback");
+        stream
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .expect("set fallback read timeout");
+        stream
+            .write_all(payload.as_bytes())
+            .expect("write fallback payload");
+        let mut response = vec![0u8; marker.len() + payload.len()];
+        stream
+            .read_exact(&mut response)
+            .expect("read fallback marker and replay response");
+        let mut expected = marker.to_vec();
+        expected.extend_from_slice(payload.as_bytes());
+        assert_eq!(response, expected);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera and verifies TLS Vision VLESS fallback replay"]
+async fn unauthenticated_tls_payload_reaches_vless_vision_fallback() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("vless-tls-vision-fallback");
+    let default_fallback_addr = start_tcp_marker_echo_server(b"default:");
+    let name_fallback_addr = start_tcp_marker_echo_server(b"name:");
+    let alpn_fallback_addr = start_tcp_marker_echo_server(b"alpn:");
+    let path_fallback_addr = start_tcp_marker_echo_server(b"path:");
+    let chimera_port = free_localhost_port();
+    let cert_path = workspace.join("cert/cert.pem");
+    let key_path = workspace.join("cert/key.pem");
+    let chimera_config_path =
+        work_dir.join("chimera-vless-tls-vision-fallback.json");
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "vless",
+                "tag": "chimera-vless-tls-vision-fallback",
+                "settings": {
+                    "clients": [{
+                        "id": TEST_UUID,
+                        "email": "vision-fallback@example.test",
+                        "flow": "xtls-rprx-vision"
+                    }],
+                    "decryption": "none",
+                    "fallbacks": [{
+                        "dest": default_fallback_addr.to_string()
+                    }, {
+                        "name": "localhost",
+                        "dest": name_fallback_addr.to_string()
+                    }, {
+                        "name": "localhost",
+                        "alpn": "h2",
+                        "dest": alpn_fallback_addr.to_string()
+                    }, {
+                        "name": "localhost",
+                        "alpn": "h2",
+                        "path": "/vision-fallback",
+                        "dest": path_fallback_addr.to_string()
+                    }]
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "alpn": ["h2", "http/1.1"],
+                        "certificates": [{
+                            "certificateFile": cert_path,
+                            "keyFile": key_path
+                        }]
+                    }
+                }
+            }],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    let chimera_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port));
+    wait_for_tcp(chimera_addr);
+    chimera.assert_running();
+
+    for (server_name, use_h2, path, marker) in [
+        ("localhost", true, "/vision-fallback?query=1", b"path:".as_slice()),
+        ("localhost", true, "/other", b"alpn:".as_slice()),
+        ("localhost", false, "/other", b"name:".as_slice()),
+        ("other.test", false, "/other", b"default:".as_slice()),
+    ] {
+        let mut client_config = tls_test_client_config();
+        if use_h2 {
+            client_config.alpn_protocols = vec![b"h2".to_vec()];
+        }
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let tcp = tokio::net::TcpStream::connect(chimera_addr)
+            .await
+            .expect("connect TLS VLESS fallback");
+        let server_name = ServerName::try_from(server_name).unwrap();
+        let mut tls = connector
+            .connect(server_name, tcp)
+            .await
+            .expect("establish outer TLS");
+        let payload = format!(
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        tls.write_all(payload.as_bytes())
+            .await
+            .expect("write fallback request");
+        tls.flush().await.expect("flush fallback request");
+        let mut response = vec![0u8; marker.len() + payload.len()];
+        tls.read_exact(&mut response)
+            .await
+            .expect("read TLS fallback marker and replay response");
+        let mut expected = marker.to_vec();
+        expected.extend_from_slice(payload.as_bytes());
+        assert_eq!(response, expected);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera and verifies Trojan TLS fallback selection"]
+async fn unauthenticated_tls_payload_reaches_trojan_fallback_rules() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("trojan-tls-fallback");
+    let default_addr = start_tcp_marker_echo_server(b"default:");
+    let name_addr = start_tcp_marker_echo_server(b"name:");
+    let alpn_addr = start_proxy_protocol_marker_echo_server(1, b"alpn-v1:");
+    let path_addr = start_proxy_protocol_marker_echo_server(2, b"path-v2:");
+    let chimera_port = free_localhost_port();
+    let cert_path = workspace.join("cert/cert.pem");
+    let key_path = workspace.join("cert/key.pem");
+    let config_path = work_dir.join("chimera-trojan-tls-fallback.json");
+
+    write_json(
+        &config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "trojan",
+                "tag": "chimera-trojan-tls-fallback",
+                "settings": {
+                    "clients": [{
+                        "password": "trojan-fallback-password",
+                        "email": "trojan-fallback@example.test"
+                    }],
+                    "fallbacks": [{
+                        "dest": default_addr.to_string()
+                    }, {
+                        "name": "localhost",
+                        "dest": name_addr.to_string()
+                    }, {
+                        "name": "localhost",
+                        "alpn": "h2",
+                        "dest": alpn_addr.to_string(),
+                        "xver": 1
+                    }, {
+                        "name": "localhost",
+                        "alpn": "h2",
+                        "path": "/trojan-fallback",
+                        "dest": path_addr.to_string(),
+                        "xver": 2
+                    }]
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "alpn": ["h2", "http/1.1"],
+                        "certificates": [{
+                            "certificateFile": cert_path,
+                            "keyFile": key_path
+                        }]
+                    }
+                }
+            }],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &config_path);
+    let chimera_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port));
+    wait_for_tcp(chimera_addr);
+    chimera.assert_running();
+
+    for (server_name, use_h2, path, marker) in [
+        ("localhost", true, "/trojan-fallback?query=1", b"path-v2:".as_slice()),
+        ("localhost", true, "/other", b"alpn-v1:".as_slice()),
+        ("localhost", false, "/other", b"name:".as_slice()),
+        ("other.test", false, "/other", b"default:".as_slice()),
+    ] {
+        let mut client_config = tls_test_client_config();
+        if use_h2 {
+            client_config.alpn_protocols = vec![b"h2".to_vec()];
+        }
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let tcp = tokio::net::TcpStream::connect(chimera_addr)
+            .await
+            .expect("connect Trojan TLS fallback");
+        let server_name = ServerName::try_from(server_name).unwrap();
+        let mut tls = connector
+            .connect(server_name, tcp)
+            .await
+            .expect("establish Trojan outer TLS");
+        let payload = format!(
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        tls.write_all(payload.as_bytes())
+            .await
+            .expect("write Trojan fallback request");
+        tls.flush().await.expect("flush Trojan fallback request");
+        let mut response = vec![0u8; marker.len() + payload.len()];
+        tls.read_exact(&mut response)
+            .await
+            .expect("read Trojan fallback marker and replay response");
+        let mut expected = marker.to_vec();
+        expected.extend_from_slice(payload.as_bytes());
+        assert_eq!(response, expected);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera as server and ./xray as client for tcp+tls+vision"]
+async fn xray_client_can_proxy_tcp_through_chimera_tls_vision() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("tls-vision");
+    let echo_addr = start_tcp_echo_server();
+    let tls_echo_addr = start_tls_echo_server(&workspace).await;
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let cert_path = workspace.join("cert/cert.pem");
+    let key_path = workspace.join("cert/key.pem");
+    let pinned_peer_cert_sha256 = first_cert_sha256_hex(&cert_path);
+
+    let chimera_config_path = work_dir.join("chimera-tls-vision.json");
+    let xray_config_path = work_dir.join("xray-tls-vision-client.json");
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "vless",
+                "tag": "chimera-tls-vision",
+                "settings": {
+                    "clients": [{
+                        "id": TEST_UUID,
+                        "flow": "xtls-rprx-vision",
+                        "email": "tls-vision@example.test"
+                    }],
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "certificates": [{
+                            "certificateFile": cert_path,
+                            "keyFile": key_path
+                        }]
+                    }
+                }
+            }],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }]
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "tag": "socks-in",
+                "settings": {"auth": "noauth"}
+            }],
+            "outbounds": [{
+                "tag": "to-chimera",
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": chimera_port,
+                        "users": [{
+                            "id": TEST_UUID,
+                            "encryption": "none",
+                            "flow": "xtls-rprx-vision"
+                        }]
+                    }]
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "pinnedPeerCertSha256": pinned_peer_cert_sha256
+                    }
+                }
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port)));
+    xray.assert_running();
+
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    assert_socks5_echo(socks_addr, echo_addr, b"tls-vision through xray client");
+    assert_socks5_echo(socks_addr, echo_addr, &deterministic_payload(64 * 1024));
+    assert_tls_echo_through_socks(
+        socks_addr,
+        tls_echo_addr,
+        b"real tls application data through tls vision direct",
     )
     .await;
 }
@@ -501,6 +902,861 @@ async fn xray_client_with_wrong_reality_sni_falls_back_to_dest() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera HTTP and Mixed inbounds"]
+async fn http_and_mixed_inbounds_proxy_tcp() {
+    let workspace = workspace_root();
+    let echo_addr = start_tcp_echo_server();
+    let (absolute_target, absolute_request) = start_http_capture_server();
+    let (transparent_target, transparent_request) = start_http_capture_server();
+
+    let http_work_dir = create_test_dir("http-inbound");
+    let http_port = free_localhost_port();
+    let transparent_http_port = free_localhost_port();
+    let http_config_path = http_work_dir.join("chimera-http.json");
+    write_json(
+        &http_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": http_port,
+                "protocol": "http",
+                "tag": "http-in",
+                "settings": {
+                    "accounts": [{
+                        "user": "alice",
+                        "pass": "secret"
+                    }]
+                }
+            }, {
+                "listen": "127.0.0.1",
+                "port": transparent_http_port,
+                "protocol": "http",
+                "tag": "http-transparent-in",
+                "settings": {
+                    "allowTransparent": true
+                }
+            }],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }]
+        }),
+    );
+    let mut http =
+        start_chimera(&workspace, &http_work_dir, &http_config_path);
+    let http_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, http_port));
+    let transparent_http_addr =
+        SocketAddr::from((Ipv4Addr::LOCALHOST, transparent_http_port));
+    wait_for_tcp(http_addr);
+    wait_for_tcp(transparent_http_addr);
+    http.assert_running();
+    assert_http_connect_echo(
+        http_addr,
+        echo_addr,
+        Some("YWxpY2U6c2VjcmV0"),
+        b"HTTP CONNECT through Chimera",
+    );
+    assert_http_forward_response(
+        http_addr,
+        &format!(
+            "GET http://{absolute_target}/absolute?q=1 HTTP/1.1\r\n\
+             Host: {absolute_target}\r\n\
+             Proxy-Authorization: Basic YWxpY2U6c2VjcmV0\r\n\
+             Proxy-Connection: keep-alive\r\n\r\n"
+        ),
+    );
+    let absolute_request = absolute_request
+        .recv_timeout(IO_TIMEOUT)
+        .expect("capture absolute-form forwarded request");
+    assert!(
+        absolute_request.starts_with("GET /absolute?q=1 HTTP/1.1\r\n")
+    );
+    assert!(!absolute_request.to_ascii_lowercase().contains("proxy-"));
+    assert!(absolute_request.contains("Connection: close\r\n"));
+
+    assert_http_forward_response(
+        transparent_http_addr,
+        &format!(
+            "GET /transparent HTTP/1.1\r\nHost: {transparent_target}\r\n\r\n"
+        ),
+    );
+    let transparent_request = transparent_request
+        .recv_timeout(IO_TIMEOUT)
+        .expect("capture transparent forwarded request");
+    assert!(transparent_request.starts_with("GET /transparent HTTP/1.1\r\n"));
+    assert!(transparent_request.contains(&format!("Host: {transparent_target}\r\n")));
+    drop(http);
+
+    let mixed_work_dir = create_test_dir("mixed-inbound");
+    let mixed_port = free_localhost_port();
+    let mixed_config_path = mixed_work_dir.join("chimera-mixed.json");
+    write_json(
+        &mixed_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": mixed_port,
+                "protocol": "mixed",
+                "tag": "mixed-in",
+                "settings": {
+                    "auth": "noauth",
+                    "udp": false
+                }
+            }],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }]
+        }),
+    );
+    let mut mixed =
+        start_chimera(&workspace, &mixed_work_dir, &mixed_config_path);
+    let mixed_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, mixed_port));
+    wait_for_tcp(mixed_addr);
+    mixed.assert_running();
+    assert_http_connect_echo(
+        mixed_addr,
+        echo_addr,
+        None,
+        b"HTTP through mixed inbound",
+    );
+    assert_socks5_echo(
+        mixed_addr,
+        echo_addr,
+        b"SOCKS5 through mixed inbound",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera and ./xray for legacy Shadowsocks AEAD TCP"]
+async fn xray_client_can_proxy_tcp_through_chimera_shadowsocks() {
+    let workspace = workspace_root();
+    let echo_addr = start_tcp_echo_server();
+    let udp_echo_addr = start_udp_echo_server().await;
+
+    for method in [
+        "aes-128-gcm",
+        "aes-256-gcm",
+        "chacha20-ietf-poly1305",
+    ] {
+        let work_dir = create_test_dir(&format!("shadowsocks-{method}"));
+        let chimera_port = free_localhost_port();
+        let xray_socks_port = free_localhost_port();
+        let chimera_config_path = work_dir.join("chimera-shadowsocks.json");
+        let xray_config_path = work_dir.join("xray-shadowsocks-client.json");
+
+        write_json(
+            &chimera_config_path,
+            json!({
+                "inbounds": [{
+                    "listen": "127.0.0.1",
+                    "port": chimera_port,
+                    "protocol": "shadowsocks",
+                    "tag": format!("chimera-ss-{method}"),
+                    "settings": {
+                        "method": method,
+                        "password": "chimera-shadow-password",
+                        "email": format!("{method}@example.test"),
+                        "network": "tcp,udp"
+                    }
+                }],
+                "outbounds": [{
+                    "tag": "direct",
+                    "protocol": "freedom"
+                }]
+            }),
+        );
+        write_json(
+            &xray_config_path,
+            json!({
+                "log": {"loglevel": "warning"},
+                "inbounds": [{
+                    "listen": "127.0.0.1",
+                    "port": xray_socks_port,
+                    "protocol": "socks",
+                    "tag": "socks-in",
+                    "settings": {"auth": "noauth", "udp": true}
+                }],
+                "outbounds": [{
+                    "tag": "to-chimera",
+                    "protocol": "shadowsocks",
+                    "settings": {
+                        "servers": [{
+                            "address": "127.0.0.1",
+                            "port": chimera_port,
+                            "method": method,
+                            "password": "chimera-shadow-password"
+                        }]
+                    },
+                    "streamSettings": {
+                        "network": "tcp",
+                        "security": "none"
+                    }
+                }]
+            }),
+        );
+
+        let mut chimera =
+            start_chimera(&workspace, &work_dir, &chimera_config_path);
+        wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+        chimera.assert_running();
+        let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+        wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port)));
+        xray.assert_running();
+
+        let socks_addr =
+            SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+        assert_socks5_echo(
+            socks_addr,
+            echo_addr,
+            format!("Shadowsocks {method} through Xray").as_bytes(),
+        );
+        assert_socks5_echo(
+            socks_addr,
+            echo_addr,
+            &deterministic_payload(64 * 1024),
+        );
+        assert_socks5_udp_echo(
+            socks_addr,
+            udp_echo_addr,
+            format!("Shadowsocks UDP {method}").as_bytes(),
+        )
+        .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts one multi-user Chimera Shadowsocks inbound and two Xray clients"]
+async fn xray_clients_can_use_multiple_legacy_shadowsocks_users() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("shadowsocks-multi-user");
+    let echo_addr = start_tcp_echo_server();
+    let udp_echo_addr = start_udp_echo_server().await;
+    let chimera_port = free_localhost_port();
+    let chimera_config_path = work_dir.join("chimera-shadowsocks-multi.json");
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "shadowsocks",
+                "tag": "chimera-ss-multi",
+                "settings": {
+                    "clients": [{
+                        "method": "aes-128-gcm",
+                        "password": "multi-user-aes-password",
+                        "email": "aes-user@example.test"
+                    }, {
+                        "method": "chacha20-ietf-poly1305",
+                        "password": "multi-user-chacha-password",
+                        "email": "chacha-user@example.test"
+                    }],
+                    "network": "tcp,udp"
+                }
+            }],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }]
+        }),
+    );
+
+    let mut chimera =
+        start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+
+    for (method, password) in [
+        ("aes-128-gcm", "multi-user-aes-password"),
+        (
+            "chacha20-ietf-poly1305",
+            "multi-user-chacha-password",
+        ),
+    ] {
+        let client_dir = create_test_dir(&format!("ss-multi-client-{method}"));
+        let xray_socks_port = free_localhost_port();
+        let xray_config_path = client_dir.join("xray-client.json");
+        write_json(
+            &xray_config_path,
+            json!({
+                "log": {"loglevel": "warning"},
+                "inbounds": [{
+                    "listen": "127.0.0.1",
+                    "port": xray_socks_port,
+                    "protocol": "socks",
+                    "tag": "socks-in",
+                    "settings": {"auth": "noauth", "udp": true}
+                }],
+                "outbounds": [{
+                    "tag": "to-chimera",
+                    "protocol": "shadowsocks",
+                    "settings": {
+                        "servers": [{
+                            "address": "127.0.0.1",
+                            "port": chimera_port,
+                            "method": method,
+                            "password": password
+                        }]
+                    }
+                }]
+            }),
+        );
+
+        let mut xray =
+            start_xray(&workspace, &client_dir, &xray_config_path);
+        let socks_addr =
+            SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+        wait_for_tcp(socks_addr);
+        xray.assert_running();
+        assert_socks5_echo(
+            socks_addr,
+            echo_addr,
+            format!("multi-user {method}").as_bytes(),
+        );
+        assert_socks5_echo(
+            socks_addr,
+            echo_addr,
+            &deterministic_payload(64 * 1024),
+        );
+        assert_socks5_udp_echo(
+            socks_addr,
+            udp_echo_addr,
+            format!("multi-user UDP {method}").as_bytes(),
+        )
+        .await;
+        drop(xray);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts one multi-user Shadowsocks 2022 EIH inbound and two Xray clients"]
+async fn xray_clients_can_use_shadowsocks_2022_eih_users() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("shadowsocks-2022-eih");
+    let echo_addr = start_tcp_echo_server();
+    let udp_echo_addr = start_udp_echo_server().await;
+    let chimera_port = free_localhost_port();
+    let server_psk = "AAECAwQFBgcICQoLDA0ODw==";
+    let users = [
+        ("EBESExQVFhcYGRobHB0eHw==", "eih-a@example.test"),
+        ("ICEiIyQlJicoKSorLC0uLw==", "eih-b@example.test"),
+    ];
+    let chimera_config_path = work_dir.join("chimera-shadowsocks-eih.json");
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "shadowsocks",
+                "tag": "chimera-ss-2022-eih",
+                "settings": {
+                    "method": "2022-blake3-aes-128-gcm",
+                    "password": server_psk,
+                    "clients": users
+                        .iter()
+                        .map(|(password, email)| json!({
+                            "password": password,
+                            "email": email
+                        }))
+                        .collect::<Vec<_>>(),
+                    "network": "tcp,udp"
+                }
+            }],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }]
+        }),
+    );
+
+    let mut chimera =
+        start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+
+    for (index, (user_psk, _email)) in users.iter().enumerate() {
+        let client_dir = create_test_dir(&format!("ss-2022-eih-client-{index}"));
+        let xray_socks_port = free_localhost_port();
+        let xray_config_path = client_dir.join("xray-client.json");
+        write_json(
+            &xray_config_path,
+            json!({
+                "log": {"loglevel": "warning"},
+                "inbounds": [{
+                    "listen": "127.0.0.1",
+                    "port": xray_socks_port,
+                    "protocol": "socks",
+                    "tag": "socks-in",
+                    "settings": {"auth": "noauth", "udp": true}
+                }],
+                "outbounds": [{
+                    "tag": "to-chimera",
+                    "protocol": "shadowsocks",
+                    "settings": {
+                        "servers": [{
+                            "address": "127.0.0.1",
+                            "port": chimera_port,
+                            "method": "2022-blake3-aes-128-gcm",
+                            "password": format!("{server_psk}:{user_psk}")
+                        }]
+                    }
+                }]
+            }),
+        );
+
+        let mut xray =
+            start_xray(&workspace, &client_dir, &xray_config_path);
+        let socks_addr =
+            SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+        wait_for_tcp(socks_addr);
+        xray.assert_running();
+        assert_socks5_echo(
+            socks_addr,
+            echo_addr,
+            format!("EIH TCP user {index}").as_bytes(),
+        );
+        assert_socks5_echo(
+            socks_addr,
+            echo_addr,
+            &deterministic_payload(64 * 1024),
+        );
+        assert_socks5_udp_echo(
+            socks_addr,
+            udp_echo_addr,
+            format!("EIH UDP user {index}").as_bytes(),
+        )
+        .await;
+        drop(xray);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera and ./xray for Shadowsocks 2022 TCP and AES UDP"]
+async fn xray_client_can_proxy_tcp_and_aes_udp_through_chimera_shadowsocks_2022() {
+    let workspace = workspace_root();
+    let echo_addr = start_tcp_echo_server();
+    let udp_echo_addr = start_udp_echo_server().await;
+
+    for (method, key) in [
+        ("2022-blake3-aes-128-gcm", "AAECAwQFBgcICQoLDA0ODw=="),
+        (
+            "2022-blake3-aes-256-gcm",
+            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+        ),
+        (
+            "2022-blake3-chacha20-poly1305",
+            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+        ),
+    ] {
+        let supports_udp = true;
+        let network = "tcp,udp";
+        let work_dir = create_test_dir(&format!("shadowsocks-2022-{method}"));
+        let chimera_port = free_localhost_port();
+        let xray_socks_port = free_localhost_port();
+        let chimera_config_path = work_dir.join("chimera-shadowsocks-2022.json");
+        let xray_config_path = work_dir.join("xray-shadowsocks-2022-client.json");
+
+        write_json(
+            &chimera_config_path,
+            json!({
+                "inbounds": [{
+                    "listen": "127.0.0.1",
+                    "port": chimera_port,
+                    "protocol": "shadowsocks",
+                    "tag": format!("chimera-ss-2022-{method}"),
+                    "settings": {
+                        "method": method,
+                        "password": key,
+                        "email": format!("{method}@example.test"),
+                        "network": network
+                    }
+                }],
+                "outbounds": [{
+                    "tag": "direct",
+                    "protocol": "freedom"
+                }]
+            }),
+        );
+        write_json(
+            &xray_config_path,
+            json!({
+                "log": {"loglevel": "warning"},
+                "inbounds": [{
+                    "listen": "127.0.0.1",
+                    "port": xray_socks_port,
+                    "protocol": "socks",
+                    "tag": "socks-in",
+                    "settings": {"auth": "noauth", "udp": true}
+                }],
+                "outbounds": [{
+                    "tag": "to-chimera",
+                    "protocol": "shadowsocks",
+                    "settings": {
+                        "servers": [{
+                            "address": "127.0.0.1",
+                            "port": chimera_port,
+                            "method": method,
+                            "password": key
+                        }]
+                    },
+                    "streamSettings": {
+                        "network": "tcp",
+                        "security": "none"
+                    }
+                }]
+            }),
+        );
+
+        let mut chimera =
+            start_chimera(&workspace, &work_dir, &chimera_config_path);
+        wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+        chimera.assert_running();
+        let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+        wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port)));
+        xray.assert_running();
+
+        let socks_addr =
+            SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+        assert_socks5_echo(
+            socks_addr,
+            echo_addr,
+            format!("Shadowsocks 2022 {method} through Xray").as_bytes(),
+        );
+        assert_socks5_echo(
+            socks_addr,
+            echo_addr,
+            &deterministic_payload(64 * 1024),
+        );
+        if supports_udp {
+            assert_socks5_udp_echo(
+                socks_addr,
+                udp_echo_addr,
+                format!("Shadowsocks 2022 UDP {method}").as_bytes(),
+            )
+            .await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera and ./xray for VLESS gRPC h2c"]
+async fn xray_client_can_proxy_tcp_through_chimera_grpc() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("grpc-vless");
+    let echo_addr = start_tcp_echo_server();
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let chimera_config_path = work_dir.join("chimera-grpc.json");
+    let xray_config_path = work_dir.join("xray-grpc-client.json");
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "vless",
+                "tag": "chimera-grpc-vless",
+                "settings": {
+                    "clients": [{
+                        "id": TEST_UUID,
+                        "email": "grpc@example.test"
+                    }],
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "grpc",
+                    "security": "none",
+                    "grpcSettings": {
+                        "serviceName": "chimera.GunService"
+                    }
+                }
+            }],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }]
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "tag": "socks-in",
+                "settings": {"auth": "noauth"}
+            }],
+            "outbounds": [{
+                "tag": "to-chimera",
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": chimera_port,
+                        "users": [{
+                            "id": TEST_UUID,
+                            "encryption": "none"
+                        }]
+                    }]
+                },
+                "streamSettings": {
+                    "network": "grpc",
+                    "security": "none",
+                    "grpcSettings": {
+                        "serviceName": "chimera.GunService"
+                    }
+                }
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+    assert_socks5_echo(socks_addr, echo_addr, b"VLESS gRPC h2c through Xray");
+    assert_socks5_echo(
+        socks_addr,
+        echo_addr,
+        &deterministic_payload(64 * 1024),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera and ./xray for VLESS HTTPUpgrade"]
+async fn xray_client_can_proxy_tcp_through_chimera_httpupgrade() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("httpupgrade-vless");
+    let echo_addr = start_tcp_echo_server();
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let chimera_config_path = work_dir.join("chimera-httpupgrade.json");
+    let xray_config_path = work_dir.join("xray-httpupgrade-client.json");
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "vless",
+                "tag": "chimera-httpupgrade-vless",
+                "settings": {
+                    "clients": [{
+                        "id": TEST_UUID,
+                        "email": "httpupgrade@example.test"
+                    }],
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "httpupgrade",
+                    "security": "none",
+                    "httpupgradeSettings": {
+                        "host": "localhost",
+                        "path": "/upgrade"
+                    }
+                }
+            }],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }]
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "tag": "socks-in",
+                "settings": {"auth": "noauth"}
+            }],
+            "outbounds": [{
+                "tag": "to-chimera",
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": chimera_port,
+                        "users": [{
+                            "id": TEST_UUID,
+                            "encryption": "none"
+                        }]
+                    }]
+                },
+                "streamSettings": {
+                    "network": "httpupgrade",
+                    "security": "none",
+                    "httpupgradeSettings": {
+                        "host": "localhost",
+                        "path": "/upgrade"
+                    }
+                }
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+    assert_socks5_echo(
+        socks_addr,
+        echo_addr,
+        b"VLESS HTTPUpgrade through Xray",
+    );
+    assert_socks5_echo(
+        socks_addr,
+        echo_addr,
+        &deterministic_payload(64 * 1024),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera and ./xray for each supported XHTTP upload mode"]
+async fn xray_client_can_proxy_tcp_through_chimera_xhttp_modes() {
+    let workspace = workspace_root();
+    let echo_addr = start_tcp_echo_server();
+
+    for (
+        case_name,
+        mode,
+        uplink_http_method,
+        session_placement,
+        seq_placement,
+        uplink_data_placement,
+    ) in [
+        ("stream-one", "stream-one", "PATCH", "header", "header", "body"),
+        ("packet-header", "packet-up", "POST", "header", "query", "header"),
+        ("packet-cookie", "packet-up", "POST", "cookie", "header", "cookie"),
+        ("stream-up", "stream-up", "PUT", "cookie", "header", "body"),
+    ] {
+        let no_sse_header = mode == "stream-one";
+        let work_dir = create_test_dir(&format!("xhttp-{case_name}"));
+        let chimera_port = free_localhost_port();
+        let xray_socks_port = free_localhost_port();
+        let chimera_config_path = work_dir.join("chimera-xhttp.json");
+        let xray_config_path = work_dir.join("xray-xhttp-client.json");
+
+        write_json(
+            &chimera_config_path,
+            json!({
+                "inbounds": [{
+                    "listen": "127.0.0.1",
+                    "port": chimera_port,
+                    "protocol": "vless",
+                    "tag": format!("chimera-xhttp-{case_name}"),
+                    "settings": {
+                        "clients": [{
+                            "id": TEST_UUID,
+                            "email": format!("xhttp-{case_name}@example.test")
+                        }],
+                        "decryption": "none"
+                    },
+                    "streamSettings": {
+                        "network": "xhttp",
+                        "security": "none",
+                        "xhttpSettings": {
+                            "path": "/xhttp",
+                            "mode": mode,
+                            "uplinkHTTPMethod": uplink_http_method,
+                            "noGRPCHeader": true,
+                            "noSSEHeader": no_sse_header,
+                            "scMinPostsIntervalMs": {"from": 1, "to": 1},
+                            "sessionPlacement": session_placement,
+                            "seqPlacement": seq_placement,
+                            "uplinkDataPlacement": uplink_data_placement
+                        }
+                    }
+                }],
+                "outbounds": [{
+                    "tag": "direct",
+                    "protocol": "freedom"
+                }]
+            }),
+        );
+        write_json(
+            &xray_config_path,
+            json!({
+                "log": {"loglevel": "warning"},
+                "inbounds": [{
+                    "listen": "127.0.0.1",
+                    "port": xray_socks_port,
+                    "protocol": "socks",
+                    "tag": "socks-in",
+                    "settings": {"auth": "noauth"}
+                }],
+                "outbounds": [{
+                    "tag": "to-chimera",
+                    "protocol": "vless",
+                    "settings": {
+                        "vnext": [{
+                            "address": "127.0.0.1",
+                            "port": chimera_port,
+                            "users": [{
+                                "id": TEST_UUID,
+                                "encryption": "none"
+                            }]
+                        }]
+                    },
+                    "streamSettings": {
+                        "network": "xhttp",
+                        "security": "none",
+                        "xhttpSettings": {
+                            "path": "/xhttp",
+                            "mode": mode,
+                            "uplinkHTTPMethod": uplink_http_method,
+                            "noGRPCHeader": true,
+                            "sessionPlacement": session_placement,
+                            "seqPlacement": seq_placement,
+                            "uplinkDataPlacement": uplink_data_placement
+                        }
+                    }
+                }]
+            }),
+        );
+
+        let mut chimera =
+            start_chimera(&workspace, &work_dir, &chimera_config_path);
+        wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+        chimera.assert_running();
+
+        let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+        wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port)));
+        xray.assert_running();
+
+        let socks_addr =
+            SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+        assert_socks5_echo(
+            socks_addr,
+            echo_addr,
+            format!("xhttp {case_name} through xray client").as_bytes(),
+        );
+        assert_socks5_echo(
+            socks_addr,
+            echo_addr,
+            &deterministic_payload(64 * 1024),
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts Chimera as server and ./xray as client for hysteria2"]
 async fn xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2() {
     let workspace = workspace_root();
@@ -731,6 +1987,150 @@ fn start_tcp_echo_server() -> SocketAddr {
 
 fn start_tcp_echo_server_v6() -> SocketAddr {
     start_tcp_echo_server_on(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)))
+}
+
+fn start_http_capture_server() -> (SocketAddr, mpsc::Receiver<String>) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .expect("bind HTTP capture server");
+    let addr = listener.local_addr().expect("HTTP capture addr");
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+        let mut request = Vec::with_capacity(1024);
+        while !request.ends_with(b"\r\n\r\n") && request.len() < 32 * 1024 {
+            let mut byte = [0u8; 1];
+            if stream.read_exact(&mut byte).is_err() {
+                return;
+            }
+            request.push(byte[0]);
+        }
+        let request = String::from_utf8_lossy(&request).into_owned();
+        let _ = sender.send(request);
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        );
+    });
+    (addr, receiver)
+}
+
+fn start_tcp_marker_echo_server(marker: &'static [u8]) -> SocketAddr {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .expect("bind marker echo server");
+    let addr = listener.local_addr().expect("marker echo addr");
+    thread::spawn(move || {
+        for stream in listener.incoming().take(16) {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+            let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+            thread::spawn(move || {
+                let mut first = true;
+                let mut buf = [0u8; 4096];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if first {
+                                first = false;
+                                if stream.write_all(marker).is_err() {
+                                    break;
+                                }
+                            }
+                            if stream.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+fn start_proxy_protocol_marker_echo_server(
+    version: u8,
+    marker: &'static [u8],
+) -> SocketAddr {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .expect("bind PROXY protocol echo server");
+    let addr = listener.local_addr().expect("PROXY protocol echo addr");
+    thread::spawn(move || {
+        for stream in listener.incoming().take(16) {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+            let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+            thread::spawn(move || {
+                match version {
+                    1 => {
+                        let mut header = Vec::with_capacity(96);
+                        while header.len() < 108 {
+                            let mut byte = [0u8; 1];
+                            if stream.read_exact(&mut byte).is_err() {
+                                return;
+                            }
+                            header.push(byte[0]);
+                            if header.ends_with(b"\r\n") {
+                                break;
+                            }
+                        }
+                        let Ok(header) = std::str::from_utf8(&header) else {
+                            return;
+                        };
+                        assert!(header.starts_with("PROXY TCP4 127.0.0.1 127.0.0.1 "));
+                    }
+                    2 => {
+                        let mut header = [0u8; 16];
+                        if stream.read_exact(&mut header).is_err() {
+                            return;
+                        }
+                        assert_eq!(&header[..12], b"\r\n\r\n\0\r\nQUIT\n");
+                        assert_eq!(header[12], 0x21);
+                        assert_eq!(header[13], 0x11);
+                        let address_len =
+                            u16::from_be_bytes([header[14], header[15]]) as usize;
+                        let mut address = vec![0u8; address_len];
+                        if stream.read_exact(&mut address).is_err() {
+                            return;
+                        }
+                        assert_eq!(address_len, 12);
+                        assert_eq!(&address[..4], &[127, 0, 0, 1]);
+                        assert_eq!(&address[4..8], &[127, 0, 0, 1]);
+                    }
+                    other => panic!("unsupported test PROXY protocol version {other}"),
+                }
+
+                let mut first = true;
+                let mut buf = [0u8; 4096];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if first {
+                                first = false;
+                                if stream.write_all(marker).is_err() {
+                                    break;
+                                }
+                            }
+                            if stream.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+    });
+    addr
 }
 
 fn start_tcp_echo_server_on(bind_addr: SocketAddr) -> SocketAddr {
@@ -1083,6 +2483,84 @@ fn socks_udp_payload_offset(packet: &[u8]) -> usize {
         0x04 => 22,
         atyp => panic!("unsupported SOCKS UDP address type {atyp:#x}"),
     }
+}
+
+fn assert_http_forward_response(
+    proxy_addr: SocketAddr,
+    request: &str,
+) {
+    let mut stream = TcpStream::connect_timeout(&proxy_addr, IO_TIMEOUT)
+        .expect("connect HTTP forward proxy inbound");
+    stream
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .expect("set HTTP forward read timeout");
+    stream
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .expect("set HTTP forward write timeout");
+    stream
+        .write_all(request.as_bytes())
+        .expect("write HTTP forward request");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("read HTTP forward response");
+    let response = String::from_utf8_lossy(&response);
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(response.ends_with("ok"), "{response}");
+}
+
+fn assert_http_connect_echo(
+    proxy_addr: SocketAddr,
+    target_addr: SocketAddr,
+    proxy_authorization: Option<&str>,
+    payload: &[u8],
+) {
+    let mut stream = TcpStream::connect_timeout(&proxy_addr, IO_TIMEOUT)
+        .expect("connect HTTP proxy inbound");
+    stream
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .expect("set HTTP proxy read timeout");
+    stream
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .expect("set HTTP proxy write timeout");
+
+    let mut request = format!(
+        "CONNECT {target_addr} HTTP/1.1\r\nHost: {target_addr}\r\n"
+    );
+    if let Some(value) = proxy_authorization {
+        request.push_str("Proxy-Authorization: Basic ");
+        request.push_str(value);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .expect("write HTTP CONNECT request");
+
+    let mut response = Vec::new();
+    let mut byte = [0u8; 1];
+    while !response.ends_with(b"\r\n\r\n") {
+        stream
+            .read_exact(&mut byte)
+            .expect("read HTTP CONNECT response");
+        response.push(byte[0]);
+        assert!(response.len() <= 4096, "HTTP CONNECT response too large");
+    }
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("HTTP/1.1 200")
+            || response.starts_with("HTTP/1.0 200"),
+        "unexpected HTTP CONNECT response: {response}"
+    );
+
+    stream
+        .write_all(payload)
+        .expect("write HTTP CONNECT tunnel payload");
+    let mut echoed = vec![0u8; payload.len()];
+    stream
+        .read_exact(&mut echoed)
+        .expect("read HTTP CONNECT tunnel echo");
+    assert_eq!(echoed, payload);
 }
 
 fn assert_socks5_echo(
