@@ -26,7 +26,7 @@ pub async fn read_request_header<S>(
 where
     S: AsyncRead + Unpin,
 {
-    let mut prefix = [0u8; 18];
+    let mut prefix = [0u8; 17];
     stream.read_exact(&mut prefix).await?;
 
     if prefix[0] != 0 {
@@ -41,8 +41,17 @@ where
 
     let mut user_id = [0u8; 16];
     user_id.copy_from_slice(&prefix[1..17]);
+    read_request_header_after_auth(stream, user_id).await
+}
 
-    let addon_length = prefix[17];
+pub async fn read_request_header_after_auth<S>(
+    stream: &mut S,
+    user_id: [u8; 16],
+) -> std::io::Result<ParsedVlessHeader>
+where
+    S: AsyncRead + Unpin,
+{
+    let addon_length = stream.read_u8().await?;
     let flow = if addon_length > 0 {
         read_addons(stream, addon_length).await?
     } else {

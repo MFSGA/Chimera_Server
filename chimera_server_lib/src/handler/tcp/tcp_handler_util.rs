@@ -1,5 +1,11 @@
 use std::io::{Error, ErrorKind, Result};
 
+#[cfg(feature = "http")]
+use crate::handler::http::HttpTcpServerHandler;
+#[cfg(feature = "httpupgrade")]
+use crate::handler::httpupgrade::HttpUpgradeTcpServerHandler;
+#[cfg(feature = "mixed")]
+use crate::handler::mixed::MixedTcpServerHandler;
 #[cfg(feature = "reality")]
 use crate::handler::reality::{
     RealityServerHandler, RealityVisionVlessServerHandler,
@@ -8,6 +14,8 @@ use crate::handler::reality::{
 use crate::handler::vless_handler::{
     VisionVlessTcpHandler, VlessTcpHandler, users_require_vision,
 };
+#[cfg(feature = "shadowsocks")]
+use crate::handler::shadowsocks::ShadowsocksTcpServerHandler;
 #[cfg(feature = "vmess")]
 use crate::handler::vmess::vmess_handler::VmessTcpServerHandler;
 #[cfg(feature = "ws")]
@@ -37,11 +45,15 @@ pub fn create_tcp_server_handler(
 
     match server_proxy_config {
         #[cfg(feature = "vless")]
-        ServerProxyConfig::Vless { users } => {
+        ServerProxyConfig::Vless { users, fallbacks } => {
             if users_require_vision(&users) {
                 Ok(Box::new(VisionVlessTcpHandler::new(&users, inbound_tag)))
             } else {
-                Ok(Box::new(VlessTcpHandler::new(&users, inbound_tag)))
+                Ok(Box::new(VlessTcpHandler::new_with_fallbacks(
+                    &users,
+                    &fallbacks,
+                    inbound_tag,
+                )))
             }
         }
 
@@ -91,6 +103,24 @@ pub fn create_tcp_server_handler(
                 server_name,
                 inner,
             } = tls_config;
+            #[cfg(feature = "vless")]
+            if let ServerProxyConfig::Vless { users, fallbacks } = inner.as_ref()
+                && users_require_vision(users)
+            {
+                return Ok(Box::new(TlsServerHandler::new_vision_vless(
+                    certificates,
+                    alpn_protocols,
+                    enable_session_resumption,
+                    reject_unknown_sni,
+                    min_version,
+                    max_version,
+                    server_name,
+                    users,
+                    fallbacks,
+                    inbound_tag,
+                )?));
+            }
+
             let inner_handler =
                 create_tcp_server_handler(*inner, inbound_tag, rules_stack)?;
             let tls_handler = TlsServerHandler::new(
@@ -108,20 +138,21 @@ pub fn create_tcp_server_handler(
         #[cfg(feature = "reality")]
         ServerProxyConfig::Reality(reality_config) => {
             #[cfg(feature = "vless")]
-            let vision_users = match reality_config.inner.as_ref() {
-                ServerProxyConfig::Vless { users }
+            let vision_config = match reality_config.inner.as_ref() {
+                ServerProxyConfig::Vless { users, fallbacks }
                     if users_require_vision(users) =>
                 {
-                    Some(users.clone())
+                    Some((users.clone(), fallbacks.clone()))
                 }
                 _ => None,
             };
 
             #[cfg(feature = "vless")]
-            if let Some(users) = vision_users {
+            if let Some((users, fallbacks)) = vision_config {
                 return Ok(Box::new(RealityVisionVlessServerHandler::new(
                     reality_config,
                     users,
+                    fallbacks,
                     inbound_tag,
                 )));
             }
@@ -136,6 +167,28 @@ pub fn create_tcp_server_handler(
                 inner_handler,
             )))
         }
+        #[cfg(feature = "shadowsocks")]
+        ServerProxyConfig::Shadowsocks { users, identity } => Ok(Box::new(
+            ShadowsocksTcpServerHandler::new(users, identity, inbound_tag)?,
+        )),
+        #[cfg(feature = "http")]
+        ServerProxyConfig::Http {
+            accounts,
+            allow_transparent,
+        } => Ok(Box::new(HttpTcpServerHandler::new(
+            accounts,
+            allow_transparent,
+            inbound_tag,
+        ))),
+        #[cfg(feature = "mixed")]
+        ServerProxyConfig::Mixed {
+            accounts,
+            udp_enabled,
+        } => Ok(Box::new(MixedTcpServerHandler::new(
+            accounts,
+            udp_enabled,
+            inbound_tag,
+        ))),
         // SOCKS5 UDP ASSOCIATE uses this TCP handler as its control channel.
         ServerProxyConfig::Socks {
             accounts,
@@ -147,6 +200,19 @@ pub fn create_tcp_server_handler(
         ))),
         ServerProxyConfig::DokodemoDoor { config } => {
             Ok(Box::new(DokodemoDoorTcpHandler::new(config, inbound_tag)))
+        }
+        #[cfg(feature = "httpupgrade")]
+        ServerProxyConfig::HttpUpgrade(config) => {
+            let inner = create_tcp_server_handler(
+                *config.inner,
+                inbound_tag,
+                rules_stack,
+            )?;
+            Ok(Box::new(HttpUpgradeTcpServerHandler::new(
+                config.host,
+                config.path,
+                inner,
+            )))
         }
         ServerProxyConfig::Xhttp { .. } => Err(Error::new(
             ErrorKind::InvalidInput,
@@ -214,6 +280,7 @@ mod tests {
         let err = create_tcp_server_handler(
             ServerProxyConfig::Xhttp {
                 config: XhttpServerConfig {
+                    mode: crate::config::server_config::XhttpMode::Auto,
                     host: Some("example.com".into()),
                     path: "/xhttp".into(),
                     min_padding: 0,
@@ -221,6 +288,19 @@ mod tests {
                     max_each_post_bytes: 1_000_000,
                     max_buffered_posts: 30,
                     session_ttl_secs: 30,
+                    no_grpc_header: false,
+                    no_sse_header: false,
+                    uplink_http_method: "POST".into(),
+                    min_posts_interval_ms: (30, 30),
+                    session_placement:
+                        crate::config::server_config::XhttpPlacement::Path,
+                    session_key: String::new(),
+                    seq_placement:
+                        crate::config::server_config::XhttpPlacement::Path,
+                    seq_key: String::new(),
+                    uplink_data_placement:
+                        crate::config::server_config::XhttpDataPlacement::Auto,
+                    uplink_data_key: "X-Data".into(),
                 },
                 inner: Box::new(ServerProxyConfig::DokodemoDoor {
                     config: DokodemoDoorConfig {

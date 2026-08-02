@@ -169,6 +169,7 @@ mod tests {
                 Box::new(TestStream(server)),
                 TcpServerConnectionContext {
                     original_destination: Some(original_destination.clone()),
+                    ..TcpServerConnectionContext::default()
                 },
             )
             .await

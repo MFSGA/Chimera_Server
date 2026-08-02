@@ -20,12 +20,32 @@ use tokio_rustls::{
 use crate::{
     async_stream::AsyncStream,
     config::server_config::{TlsCertificateConfig, TlsCertificateUsage},
-    handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
+    handler::tcp::tcp_handler::{
+        TcpServerConnectionContext, TcpServerHandler, TcpServerSetupResult,
+    },
 };
+#[cfg(feature = "vless")]
+use crate::{
+    config::server_config::{VlessFallback, VlessUser},
+    handler::vless_handler::{
+        ParsedVisionUser, VisionRecordIo, parse_vision_users,
+        setup_tls_vision_server_stream,
+    },
+};
+
+enum TlsInner {
+    Handler(Box<dyn TcpServerHandler>),
+    #[cfg(feature = "vless")]
+    VisionVless {
+        users: Vec<ParsedVisionUser>,
+        fallbacks: Vec<VlessFallback>,
+        inbound_tag: String,
+    },
+}
 
 pub struct TlsServerHandler {
     acceptor: TlsAcceptor,
-    inner: Box<dyn TcpServerHandler>,
+    inner: TlsInner,
 }
 
 impl TlsServerHandler {
@@ -49,7 +69,38 @@ impl TlsServerHandler {
         )?;
         Ok(Self {
             acceptor: TlsAcceptor::from(Arc::new(config)),
-            inner,
+            inner: TlsInner::Handler(inner),
+        })
+    }
+
+    #[cfg(feature = "vless")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_vision_vless(
+        certificates: Vec<TlsCertificateConfig>,
+        alpn_protocols: Vec<String>,
+        enable_session_resumption: bool,
+        _reject_unknown_sni: bool,
+        min_version: Option<String>,
+        max_version: Option<String>,
+        _server_name: Option<String>,
+        users: &[VlessUser],
+        fallbacks: &[VlessFallback],
+        inbound_tag: &str,
+    ) -> io::Result<Self> {
+        let config = build_server_config(
+            &certificates,
+            &alpn_protocols,
+            enable_session_resumption,
+            min_version.as_deref(),
+            max_version.as_deref(),
+        )?;
+        Ok(Self {
+            acceptor: TlsAcceptor::from(Arc::new(config)),
+            inner: TlsInner::VisionVless {
+                users: parse_vision_users(users),
+                fallbacks: fallbacks.to_vec(),
+                inbound_tag: inbound_tag.to_string(),
+            },
         })
     }
 }
@@ -66,8 +117,50 @@ impl TcpServerHandler for TlsServerHandler {
         &self,
         server_stream: Box<dyn AsyncStream>,
     ) -> io::Result<TcpServerSetupResult> {
-        let tls_stream = self.acceptor.accept(server_stream).await?;
-        self.inner.setup_server_stream(Box::new(tls_stream)).await
+        self.setup_server_stream_with_context(
+            server_stream,
+            TcpServerConnectionContext::default(),
+        )
+        .await
+    }
+
+    async fn setup_server_stream_with_context(
+        &self,
+        server_stream: Box<dyn AsyncStream>,
+        mut context: TcpServerConnectionContext,
+    ) -> io::Result<TcpServerSetupResult> {
+        match &self.inner {
+            TlsInner::Handler(inner) => {
+                let tls_stream = self.acceptor.accept(server_stream).await?;
+                let connection = tls_stream.get_ref().1;
+                context.server_name = connection.server_name().map(ToOwned::to_owned);
+                context.alpn_protocol = connection
+                    .alpn_protocol()
+                    .and_then(|value| std::str::from_utf8(value).ok())
+                    .map(ToOwned::to_owned);
+                inner
+                    .setup_server_stream_with_context(Box::new(tls_stream), context)
+                    .await
+            }
+            #[cfg(feature = "vless")]
+            TlsInner::VisionVless {
+                users,
+                fallbacks,
+                inbound_tag,
+            } => {
+                let tls_stream = self
+                    .acceptor
+                    .accept(VisionRecordIo::new(server_stream))
+                    .await?;
+                setup_tls_vision_server_stream(
+                    tls_stream,
+                    users,
+                    fallbacks,
+                    inbound_tag,
+                )
+                .await
+            }
+        }
     }
 }
 
