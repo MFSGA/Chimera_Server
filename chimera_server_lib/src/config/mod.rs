@@ -20,6 +20,7 @@ pub enum SupportedFileType {
 
 pub enum Transport {
     Tcp,
+    TcpAndUdp,
     Quic,
     Udp,
 }
@@ -59,11 +60,53 @@ pub struct StreamSettings {
     xhttp_settings: Option<XhttpSettings>,
     #[cfg(feature = "ws")]
     ws_settings: Option<WsSettings>,
+    #[cfg(feature = "httpupgrade")]
+    #[serde(alias = "httpupgradeSettings")]
+    httpupgrade_settings: Option<HttpUpgradeSettings>,
+    #[cfg(feature = "grpc_transport")]
+    #[serde(alias = "grpcSettings")]
+    grpc_settings: Option<GrpcSettings>,
     #[serde(alias = "hysteriaSettings")]
     hysteria_settings: Option<HysteriaSettings>,
     #[cfg(feature = "reality")]
     #[serde(alias = "realitySettings")]
     reality_settings: Option<RealitySettings>,
+}
+
+#[cfg(feature = "grpc_transport")]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrpcSettings {
+    #[serde(default)]
+    service_name: Option<String>,
+    #[serde(default)]
+    multi_mode: bool,
+    #[serde(default)]
+    authority: Option<String>,
+    #[serde(default)]
+    idle_timeout: u32,
+    #[serde(default)]
+    health_check_timeout: u32,
+    #[serde(default)]
+    permit_without_stream: bool,
+    #[serde(default)]
+    initial_windows_size: u32,
+}
+
+#[cfg(feature = "httpupgrade")]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpUpgradeSettings {
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    header: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    accept_proxy_protocol: bool,
+    #[serde(default)]
+    ed: u32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -91,30 +134,34 @@ pub struct XhttpSettings {
     download_settings: Option<serde_json::Value>,
     #[serde(default)]
     xmux: Option<serde_json::Value>,
-    #[serde(default)]
-    no_grpc_header: Option<serde_json::Value>,
-    #[serde(default)]
-    no_sse_header: Option<serde_json::Value>,
+    #[serde(default, rename = "noGRPCHeader")]
+    no_grpc_header: Option<bool>,
+    #[serde(default, rename = "noSSEHeader")]
+    no_sse_header: Option<bool>,
     #[serde(default)]
     server_max_header_bytes: Option<serde_json::Value>,
+    #[serde(default, rename = "uplinkHTTPMethod")]
+    uplink_http_method: Option<String>,
+    #[serde(
+        default,
+        rename = "sessionIDPlacement",
+        alias = "sessionPlacement"
+    )]
+    session_placement: Option<String>,
+    #[serde(default, rename = "sessionIDKey", alias = "sessionKey")]
+    session_key: Option<String>,
     #[serde(default)]
-    uplink_http_method: Option<serde_json::Value>,
+    seq_placement: Option<String>,
     #[serde(default)]
-    session_placement: Option<serde_json::Value>,
+    seq_key: Option<String>,
     #[serde(default)]
-    session_key: Option<serde_json::Value>,
+    uplink_data_placement: Option<String>,
     #[serde(default)]
-    seq_placement: Option<serde_json::Value>,
-    #[serde(default)]
-    seq_key: Option<serde_json::Value>,
-    #[serde(default)]
-    uplink_data_placement: Option<serde_json::Value>,
-    #[serde(default)]
-    uplink_data_key: Option<serde_json::Value>,
+    uplink_data_key: Option<String>,
     #[serde(default)]
     uplink_chunk_size: Option<serde_json::Value>,
     #[serde(default)]
-    sc_min_posts_interval_ms: Option<serde_json::Value>,
+    sc_min_posts_interval_ms: Option<XhttpRange>,
     #[serde(default)]
     x_padding_key: Option<serde_json::Value>,
     #[serde(default)]

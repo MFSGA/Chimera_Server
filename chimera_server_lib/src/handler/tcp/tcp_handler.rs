@@ -12,6 +12,9 @@ use crate::{
 #[derive(Debug, Clone, Default)]
 pub struct TcpServerConnectionContext {
     pub original_destination: Option<NetLocation>,
+    pub local_addr: Option<std::net::SocketAddr>,
+    pub server_name: Option<String>,
+    pub alpn_protocol: Option<String>,
 }
 
 #[async_trait]
@@ -43,9 +46,16 @@ pub enum TcpServerSetupResult {
         connection_success_response: Option<Box<[u8]>>,
         traffic_context: Option<TrafficContext>,
     },
+    TcpFallback {
+        remote_location: NetLocation,
+        stream: Box<dyn AsyncStream>,
+        proxy_protocol_version: u8,
+        traffic_context: Option<TrafficContext>,
+    },
     UdpAssociate {
         stream: Box<dyn AsyncStream>,
         socket: Arc<UdpSocket>,
+        client_udp_port_hint: Option<u16>,
         traffic_context: Option<TrafficContext>,
     },
     BidirectionalUdp {

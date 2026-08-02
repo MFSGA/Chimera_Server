@@ -11,7 +11,9 @@ use crate::{
     address::{Address, NetLocation},
     async_stream::AsyncStream,
     config::server_config::{TrojanFallback, TrojanUser},
-    handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
+    handler::tcp::tcp_handler::{
+        TcpServerConnectionContext, TcpServerHandler, TcpServerSetupResult,
+    },
     traffic::TrafficContext,
     util::prefixed_stream::PrefixedStream,
 };
@@ -70,13 +72,14 @@ impl TrojanTcpHandler {
     }
 }
 
-#[async_trait]
-impl TcpServerHandler for TrojanTcpHandler {
-    async fn setup_server_stream(
+impl TrojanTcpHandler {
+    async fn setup_server_stream_with_metadata(
         &self,
         mut server_stream: Box<dyn AsyncStream>,
+        server_name: &str,
+        alpn: &str,
     ) -> std::io::Result<TcpServerSetupResult> {
-        if let Some(fallback) = self.fallbacks.first() {
+        if !self.fallbacks.is_empty() {
             let mut prefix = Vec::with_capacity(512);
             let password_line = match read_line_crlf_with_prefix(
                 &mut server_stream,
@@ -87,6 +90,18 @@ impl TcpServerHandler for TrojanTcpHandler {
             {
                 Ok(line) => line,
                 Err(_) => {
+                    let fallback = select_trojan_fallback(
+                        &self.fallbacks,
+                        server_name,
+                        alpn,
+                        &prefix,
+                    )
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "no Trojan fallback matched the unauthenticated request",
+                        )
+                    })?;
                     return Ok(fallback_forward(fallback, prefix, server_stream));
                 }
             };
@@ -96,6 +111,18 @@ impl TcpServerHandler for TrojanTcpHandler {
                     !credential_matches(credential, &password_line)
                 })
             {
+                let fallback = select_trojan_fallback(
+                    &self.fallbacks,
+                    server_name,
+                    alpn,
+                    &prefix,
+                )
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "no Trojan fallback matched the unauthenticated request",
+                    )
+                })?;
                 return Ok(fallback_forward(fallback, prefix, server_stream));
             }
 
@@ -166,6 +193,30 @@ impl TcpServerHandler for TrojanTcpHandler {
             connection_success_response: None,
             traffic_context,
         })
+    }
+}
+
+#[async_trait]
+impl TcpServerHandler for TrojanTcpHandler {
+    async fn setup_server_stream(
+        &self,
+        server_stream: Box<dyn AsyncStream>,
+    ) -> std::io::Result<TcpServerSetupResult> {
+        self.setup_server_stream_with_metadata(server_stream, "", "")
+            .await
+    }
+
+    async fn setup_server_stream_with_context(
+        &self,
+        server_stream: Box<dyn AsyncStream>,
+        context: TcpServerConnectionContext,
+    ) -> std::io::Result<TcpServerSetupResult> {
+        self.setup_server_stream_with_metadata(
+            server_stream,
+            context.server_name.as_deref().unwrap_or(""),
+            context.alpn_protocol.as_deref().unwrap_or(""),
+        )
+        .await
     }
 }
 
@@ -294,17 +345,90 @@ async fn read_location(
     }
 }
 
+fn select_trojan_fallback<'a>(
+    fallbacks: &'a [TrojanFallback],
+    server_name: &str,
+    alpn: &str,
+    prefix: &[u8],
+) -> Option<&'a TrojanFallback> {
+    let server_name = server_name.trim().to_ascii_lowercase();
+    let alpn = alpn.trim().to_ascii_lowercase();
+    let path = extract_http_path(prefix).unwrap_or_default();
+    let mut selected: Option<(&TrojanFallback, (u8, usize, u8, u8))> = None;
+    for fallback in fallbacks {
+        let name_score = if fallback.name.is_empty() {
+            0
+        } else if server_name == fallback.name {
+            2
+        } else if !server_name.is_empty() && server_name.contains(&fallback.name) {
+            1
+        } else {
+            continue;
+        };
+        if !fallback.alpn.is_empty() && fallback.alpn != alpn {
+            continue;
+        }
+        if !fallback.path.is_empty() && fallback.path != path {
+            continue;
+        }
+        let score = (
+            name_score,
+            fallback.name.len(),
+            u8::from(!fallback.alpn.is_empty()),
+            u8::from(!fallback.path.is_empty()),
+        );
+        if selected
+            .as_ref()
+            .is_none_or(|(_, selected_score)| score >= *selected_score)
+        {
+            selected = Some((fallback, score));
+        }
+    }
+    selected.map(|(fallback, _)| fallback)
+}
+
+fn extract_http_path(prefix: &[u8]) -> Option<String> {
+    let line_end = prefix
+        .iter()
+        .position(|byte| matches!(byte, b'\r' | b'\n'))
+        .unwrap_or(prefix.len());
+    let line = std::str::from_utf8(&prefix[..line_end]).ok()?;
+    let mut parts = line.split_whitespace();
+    let method = parts.next()?;
+    let target = parts.next()?;
+    let version = parts.next()?;
+    if method.is_empty()
+        || method.len() >= 8
+        || !target.starts_with('/')
+        || !version.starts_with("HTTP/")
+    {
+        return None;
+    }
+    Some(target.split(['?', '#']).next()?.to_string())
+}
+
 fn fallback_forward(
     fallback: &TrojanFallback,
     prefix: Vec<u8>,
     stream: Box<dyn AsyncStream>,
 ) -> TcpServerSetupResult {
-    TcpServerSetupResult::TcpForward {
-        remote_location: fallback.dest.clone(),
-        stream: Box::new(PrefixedStream::new(prefix, stream)),
-        need_initial_flush: false,
-        connection_success_response: None,
-        traffic_context: None,
+    let stream: Box<dyn AsyncStream> =
+        Box::new(PrefixedStream::new(prefix, stream));
+    if fallback.xver == 0 {
+        TcpServerSetupResult::TcpForward {
+            remote_location: fallback.dest.clone(),
+            stream,
+            need_initial_flush: false,
+            connection_success_response: None,
+            traffic_context: None,
+        }
+    } else {
+        TcpServerSetupResult::TcpFallback {
+            remote_location: fallback.dest.clone(),
+            stream,
+            proxy_protocol_version: fallback.xver,
+            traffic_context: None,
+        }
     }
 }
 
@@ -400,10 +524,14 @@ mod tests {
             ports
                 .iter()
                 .map(|port| TrojanFallback {
+                    name: String::new(),
+                    alpn: String::new(),
+                    path: String::new(),
                     dest: NetLocation::new(
                         Address::Ipv4(Ipv4Addr::LOCALHOST),
                         *port,
                     ),
+                    xver: 0,
                 })
                 .collect(),
             "trojan-fallback",
@@ -442,6 +570,39 @@ mod tests {
             }
             _ => panic!("fallback request returned a non-TCP result"),
         }
+    }
+
+    fn fallback_rule(
+        name: &str,
+        alpn: &str,
+        path: &str,
+        port: u16,
+    ) -> TrojanFallback {
+        TrojanFallback {
+            name: name.into(),
+            alpn: alpn.into(),
+            path: path.into(),
+            dest: NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), port),
+            xver: 0,
+        }
+    }
+
+    #[test]
+    fn fallback_selection_prefers_name_then_alpn_then_path() {
+        let fallbacks = vec![
+            fallback_rule("", "", "", 8080),
+            fallback_rule("example.com", "", "", 8081),
+            fallback_rule("example.com", "h2", "", 8082),
+            fallback_rule("example.com", "h2", "/api", 8083),
+        ];
+        let selected = select_trojan_fallback(
+            &fallbacks,
+            "edge.example.com",
+            "h2",
+            b"GET /api?q=1 HTTP/1.1\r\n",
+        )
+        .expect("matching Trojan fallback");
+        assert_eq!(selected.dest.port(), 8083);
     }
 
     fn build_trojan_request(
@@ -613,7 +774,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_protocol_replays_complete_prefix_to_first_fallback() {
+    async fn duplicate_default_fallback_uses_last_definition() {
         let handler = handler_with_fallbacks("trojan-password", &[8080, 8081]);
         let request = b"GET /health HTTP/1.1\r\nHost: example.test\r\n\r\nbody";
 
@@ -621,7 +782,7 @@ mod tests {
 
         assert_eq!(
             destination,
-            NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 8080)
+            NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 8081)
         );
         assert_eq!(replayed, request);
     }

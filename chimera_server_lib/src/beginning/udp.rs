@@ -12,7 +12,7 @@ use tokio::{
     net::UdpSocket,
     sync::{Mutex, Notify, RwLock, mpsc, oneshot},
     task::JoinHandle,
-    time::{Instant, sleep},
+    time::{Instant, sleep, timeout},
 };
 use tracing::{debug, error, info, warn};
 
@@ -21,6 +21,8 @@ use crate::util::socket::{
     enable_udp_original_destination, new_socket2_udp_socket,
     recv_udp_with_original_destination,
 };
+#[cfg(feature = "shadowsocks")]
+use crate::handler::shadowsocks::ShadowsocksUdpCodec;
 
 use crate::{
     address::{Address, BindLocation, NetLocation},
@@ -1520,12 +1522,23 @@ pub async fn start_udp_server(
     } = config;
 
     let dokodemo_config = match protocol {
+        #[cfg(feature = "shadowsocks")]
+        ServerProxyConfig::Shadowsocks { users, identity } => {
+            return start_shadowsocks_udp_server(
+                bind_location,
+                tag,
+                users,
+                identity,
+                runtime,
+            )
+            .await;
+        }
         ServerProxyConfig::DokodemoDoor { config } => config,
         other => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "transport=udp only supports dokodemo-door in this stage (got {other})"
+                    "transport=udp supports dokodemo-door and shadowsocks in this stage (got {other})"
                 ),
             ));
         }
@@ -1600,13 +1613,148 @@ fn bind_location_to_socket_addr(
     }
 }
 
+#[cfg(feature = "shadowsocks")]
+async fn start_shadowsocks_udp_server(
+    bind_location: BindLocation,
+    inbound_tag: String,
+    users: Vec<crate::config::server_config::ShadowsocksUser>,
+    identity: Option<crate::config::server_config::ShadowsocksServerIdentity>,
+    runtime: RuntimeState,
+) -> std::io::Result<Option<JoinHandle<()>>> {
+    let bind_addr = bind_location_to_socket_addr(&bind_location)?;
+    let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
+    let codec = Arc::new(ShadowsocksUdpCodec::new(users, identity)?);
+    info!("Starting Shadowsocks UDP server at {}", bind_location);
+
+    Ok(Some(tokio::spawn(async move {
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let mut buffer = vec![0u8; UDP_BUFFER_SIZE];
+        loop {
+            let (len, client_addr) = match socket.recv_from(&mut buffer).await {
+                Ok(value) => value,
+                Err(error) => {
+                    error!("Shadowsocks UDP receive failed: {error}");
+                    break;
+                }
+            };
+            let packet = buffer[..len].to_vec();
+            let socket = socket.clone();
+            let codec = codec.clone();
+            let runtime = runtime.clone();
+            let resolver = resolver.clone();
+            let inbound_tag = inbound_tag.clone();
+            tokio::spawn(async move {
+                if let Err(error) = relay_shadowsocks_udp_packet(
+                    socket,
+                    codec,
+                    resolver,
+                    runtime,
+                    inbound_tag,
+                    client_addr,
+                    packet,
+                )
+                .await
+                {
+                    debug!(
+                        "Shadowsocks UDP packet from {} failed: {}",
+                        client_addr, error
+                    );
+                }
+            });
+        }
+    })))
+}
+
+#[cfg(feature = "shadowsocks")]
+async fn relay_shadowsocks_udp_packet(
+    server_socket: Arc<UdpSocket>,
+    codec: Arc<ShadowsocksUdpCodec>,
+    resolver: Arc<dyn Resolver>,
+    runtime: RuntimeState,
+    inbound_tag: String,
+    client_addr: SocketAddr,
+    packet: Vec<u8>,
+) -> std::io::Result<()> {
+    let request = codec.decrypt_packet(&packet)?;
+    let target_addr =
+        resolve_single_address(&resolver, &request.target_location).await?;
+    let outbound_action = select_udp_outbound(
+        &runtime,
+        &inbound_tag,
+        client_addr,
+        target_addr,
+        &request.target_location,
+    )?;
+    let mut traffic_context = TrafficContext::new("shadowsocks")
+        .with_inbound_tag(inbound_tag)
+        .with_client_ip(client_addr.ip());
+    if !request.identity.is_empty() {
+        traffic_context = traffic_context.with_identity(request.identity.clone());
+    }
+
+    match outbound_action {
+        UdpOutboundAction::Blackhole { tag } => {
+            traffic_context = traffic_context.with_outbound_tag(tag);
+            record_transfer(
+                Some(traffic_context),
+                request.payload.len() as u64,
+                0,
+            );
+            Ok(())
+        }
+        UdpOutboundAction::Freedom { tag } => {
+            if let Some(tag) = tag {
+                traffic_context = traffic_context.with_outbound_tag(tag);
+            }
+            let bind_addr = if target_addr.is_ipv6() {
+                SocketAddr::from(([0u16; 8], 0))
+            } else {
+                SocketAddr::from(([0, 0, 0, 0], 0))
+            };
+            let outbound = UdpSocket::bind(bind_addr).await?;
+            let sent = outbound.send_to(&request.payload, target_addr).await?;
+            record_transfer(Some(traffic_context.clone()), sent as u64, 0);
+
+            let mut response = vec![0u8; UDP_BUFFER_SIZE];
+            let (response_len, response_addr) = timeout(
+                UDP_SESSION_IDLE_TIMEOUT,
+                outbound.recv_from(&mut response),
+            )
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Shadowsocks UDP response timed out",
+                )
+            })??;
+            let source = NetLocation::from_ip_addr(
+                response_addr.ip(),
+                response_addr.port(),
+            );
+            let encrypted = codec.encrypt_packet(
+                &request,
+                &source,
+                &response[..response_len],
+            )?;
+            server_socket.send_to(&encrypted, client_addr).await?;
+            record_transfer(
+                Some(traffic_context),
+                0,
+                response_len as u64,
+            );
+            Ok(())
+        }
+    }
+}
+
 async fn run_dokodemo_udp_server(
     socket: Arc<UdpSocket>,
     config: DokodemoDoorConfig,
-    target_addr: Option<SocketAddr>,
+    target_addr: impl Into<Option<SocketAddr>> + Send,
     inbound_tag: String,
     runtime: RuntimeState,
 ) -> std::io::Result<()> {
+    let target_addr = target_addr.into();
     let relay_state = Arc::new(UdpRelayState::new(socket));
     let mut recv_buf = vec![0u8; UDP_BUFFER_SIZE];
 
@@ -1950,7 +2098,10 @@ mod tests {
         address::{Address, NetLocation},
         async_stream::{AsyncPing, AsyncStream},
         config::{
-            rule::{BalancerConfig, NetworkListConfig, RoutingConfig, RuleConfig},
+            rule::{
+                BalancerConfig, NetworkListConfig, PortListConfig, PortRangeConfig,
+                RoutingConfig, RuleConfig,
+            },
             server_config::DokodemoDoorConfig,
         },
         handler::{
@@ -3187,6 +3338,97 @@ mod tests {
         assert_eq!(&response[..len], b"vmess-udp-message");
         echo_task.await.expect("UDP echo task finished");
         relay_task.abort();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dokodemo_udp_follow_redirect_routes_by_original_destination() {
+        let observation = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind fixed-target observation socket");
+        let observation_addr = observation
+            .local_addr()
+            .expect("fixed-target observation address");
+
+        let socket = new_socket2_udp_socket(
+            false,
+            None,
+            Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+            false,
+        )
+        .expect("bind followRedirect UDP socket");
+        enable_udp_original_destination(&socket, false)
+            .expect("enable UDP original destination");
+        let server_addr = socket
+            .local_addr()
+            .expect("followRedirect UDP listener address")
+            .as_socket()
+            .expect("followRedirect listener must use IP address");
+        let socket: std::net::UdpSocket = socket.into();
+        let server_socket = Arc::new(
+            UdpSocket::from_std(socket)
+                .expect("convert followRedirect UDP listener"),
+        );
+
+        let runtime = runtime_with_outbounds(vec![
+            outbound("direct", "freedom"),
+            outbound("blocked", "blackhole"),
+        ]);
+        runtime.replace_routing(
+            RoutingState::from_config(Some(&RoutingConfig {
+                rules: vec![RuleConfig {
+                    network: NetworkListConfig(vec!["udp".into()]),
+                    port: PortListConfig(vec![PortRangeConfig {
+                        from: server_addr.port(),
+                        to: server_addr.port(),
+                    }]),
+                    outbound_tag: Some("blocked".into()),
+                    ..RuleConfig::default()
+                }],
+                ..RoutingConfig::default()
+            }))
+            .expect("build original-destination routing rule"),
+        );
+
+        let server_task = tokio::spawn(run_dokodemo_udp_server(
+            server_socket,
+            DokodemoDoorConfig {
+                target: NetLocation::from_ip_addr(
+                    observation_addr.ip(),
+                    observation_addr.port(),
+                ),
+                follow_redirect: true,
+            },
+            None::<SocketAddr>,
+            "dokodemo-follow-redirect".into(),
+            runtime,
+        ));
+
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind followRedirect UDP client");
+        client
+            .send_to(b"must-use-original-destination", server_addr)
+            .await
+            .expect("send followRedirect UDP datagram");
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !server_task.is_finished(),
+            "followRedirect receive loop must remain active"
+        );
+        let mut buffer = [0u8; 64];
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                observation.recv_from(&mut buffer)
+            )
+            .await
+            .is_err(),
+            "fixed config target must not receive a followRedirect datagram"
+        );
+
+        server_task.abort();
     }
 
     #[tokio::test]

@@ -349,9 +349,12 @@ async fn handle_udp_associate(
     mut server_stream: Box<dyn AsyncStream>,
     traffic_context: Option<TrafficContext>,
 ) -> std::io::Result<TcpServerSetupResult> {
-    // Read client's hint address (RSV + ATYP + DST.ADDR + DST.PORT) - we ignore this per RFC
-    let _client_hint = read_socks_address(&mut server_stream).await?;
-    tracing::debug!("SOCKS5 UDP ASSOCIATE: client hint = {:?}", _client_hint);
+    // The TCP peer address is authoritative. A non-zero hint port narrows the
+    // UDP endpoint immediately; port zero is learned from the first datagram.
+    let client_hint = read_socks_address(&mut server_stream).await?;
+    let client_udp_port_hint =
+        (client_hint.port() != 0).then_some(client_hint.port());
+    tracing::debug!("SOCKS5 UDP ASSOCIATE: client hint = {:?}", client_hint);
 
     let udp_bind_addr = SocketAddr::from(([0, 0, 0, 0], 0u16));
     let udp_socket = crate::util::socket::new_socket2_udp_socket_with_buffer_size(
@@ -375,6 +378,7 @@ async fn handle_udp_associate(
     Ok(TcpServerSetupResult::UdpAssociate {
         stream: server_stream,
         socket: Arc::new(udp_socket),
+        client_udp_port_hint,
         traffic_context,
     })
 }
@@ -411,6 +415,8 @@ pub(crate) async fn run_udp_relay(
     mut tcp_stream: Box<dyn AsyncStream>,
     resolver: Arc<dyn Resolver>,
     runtime: RuntimeState,
+    tcp_peer_addr: SocketAddr,
+    client_udp_port_hint: Option<u16>,
     traffic_context: Option<TrafficContext>,
 ) -> std::io::Result<()> {
     let udp_socket_clone = udp_socket.clone();
@@ -427,6 +433,8 @@ pub(crate) async fn run_udp_relay(
     });
 
     let mut recv_buf = vec![0u8; UDP_BUFFER_SIZE];
+    let mut client_endpoint = client_udp_port_hint
+        .map(|port| SocketAddr::new(tcp_peer_addr.ip(), port));
 
     loop {
         let (len, client_addr) = tokio::select! {
@@ -439,6 +447,28 @@ pub(crate) async fn run_udp_relay(
             }
         };
 
+        if client_addr.ip() != tcp_peer_addr.ip() {
+            tracing::warn!(
+                "SOCKS5 UDP relay ignored datagram from {} outside TCP peer {}",
+                client_addr,
+                tcp_peer_addr
+            );
+            continue;
+        }
+        match client_endpoint {
+            Some(expected) if expected != client_addr => {
+                tracing::warn!(
+                    "SOCKS5 UDP relay ignored datagram from unexpected endpoint {}; expected {}",
+                    client_addr,
+                    expected
+                );
+                continue;
+            }
+            None => client_endpoint = Some(client_addr),
+            Some(_) => {}
+        }
+        let response_endpoint = client_endpoint
+            .expect("SOCKS5 UDP endpoint set after validation");
         let data = &recv_buf[..len];
 
         // Parse SOCKS5 UDP request header: RSV(2) + FRAG(1) + ATYP(1) + DST.ADDR + DST.PORT(2)
@@ -534,7 +564,7 @@ pub(crate) async fn run_udp_relay(
                 socks5_response.extend_from_slice(resp_data);
 
                 if let Err(e) = udp_socket_clone
-                    .send_to(&socks5_response, client_addr)
+                    .send_to(&socks5_response, response_endpoint)
                     .await
                 {
                     tracing::warn!(
@@ -776,6 +806,8 @@ mod tests {
             Box::new(server_control),
             resolver,
             runtime,
+            client_control.local_addr().unwrap(),
+            None,
             Some(traffic_context),
         ));
 

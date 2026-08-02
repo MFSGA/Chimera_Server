@@ -18,11 +18,12 @@ use super::super::types::{
     Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2ServerConfig,
 };
 use super::super::types::{
-    RangeConfig, SocksUser, SocksUserStore, XhttpServerConfig,
+    RangeConfig, SocksUser, SocksUserStore, XhttpDataPlacement, XhttpMode,
+    XhttpPlacement, XhttpServerConfig,
 };
 
 #[cfg(feature = "trojan")]
-use crate::address::NetLocation;
+use crate::address::{Address, NetLocation};
 
 #[cfg(feature = "trojan")]
 use super::super::types::{TrojanFallback, TrojanUser};
@@ -225,15 +226,17 @@ struct TrojanInboundSettings {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TrojanInboundFallback {
-    dest: String,
+    dest: serde_json::Value,
     #[serde(default)]
-    alpn: Option<serde_json::Value>,
+    name: Option<String>,
     #[serde(default)]
-    path: Option<serde_json::Value>,
+    alpn: Option<String>,
     #[serde(default)]
-    r#type: Option<serde_json::Value>,
+    path: Option<String>,
     #[serde(default)]
-    xver: Option<serde_json::Value>,
+    r#type: Option<String>,
+    #[serde(default)]
+    xver: Option<u8>,
 }
 
 #[cfg(feature = "trojan")]
@@ -247,52 +250,99 @@ pub(super) fn collect_trojan_fallbacks(
 
     let mut fallbacks = Vec::new();
     for fallback in trojan_settings.fallbacks {
-        reject_unsupported_trojan_fallback_fields(&fallback)?;
-        let dest = fallback.dest.trim();
-        if dest.is_empty() {
+        let fallback_type = fallback
+            .r#type
+            .as_deref()
+            .unwrap_or("tcp")
+            .trim()
+            .to_ascii_lowercase();
+        if !matches!(fallback_type.as_str(), "" | "tcp") {
+            return Err(Error::InvalidConfig(format!(
+                "trojan fallback type={fallback_type} is not supported yet"
+            )));
+        }
+        let name = fallback
+            .name
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let alpn = fallback
+            .alpn
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let path = fallback.path.unwrap_or_default().trim().to_string();
+        if !path.is_empty() && !path.starts_with('/') {
             return Err(Error::InvalidConfig(
-                "trojan fallback dest cannot be empty".into(),
+                "trojan fallback path must be empty or start with /".into(),
             ));
         }
-
-        // dest-only mode: require explicit host:port (no port-only, no unix)
-        if dest.find(':').is_none() {
-            return Err(Error::InvalidConfig(
-                "trojan fallback dest must be host:port".into(),
-            ));
+        let xver = fallback.xver.unwrap_or(0);
+        if xver > 2 {
+            return Err(Error::InvalidConfig(format!(
+                "trojan fallback xver must be 0, 1, or 2; got {xver}"
+            )));
         }
-
-        let net_location = NetLocation::from_str(dest, None).map_err(|e| {
-            Error::InvalidConfig(format!("invalid trojan fallback dest {dest}: {e}"))
-        })?;
-
-        fallbacks.push(TrojanFallback { dest: net_location });
+        let dest = parse_trojan_fallback_dest(fallback.dest)?;
+        fallbacks.push(TrojanFallback {
+            name,
+            alpn,
+            path,
+            dest,
+            xver,
+        });
     }
 
     Ok(fallbacks)
 }
 
 #[cfg(feature = "trojan")]
-fn reject_unsupported_trojan_fallback_fields(
-    fallback: &TrojanInboundFallback,
-) -> Result<(), Error> {
-    let unsupported_fields = [
-        ("alpn", fallback.alpn.as_ref()),
-        ("path", fallback.path.as_ref()),
-        ("type", fallback.r#type.as_ref()),
-        ("xver", fallback.xver.as_ref()),
-    ];
-
-    if let Some((field, _)) = unsupported_fields
-        .into_iter()
-        .find(|(_, value)| value.is_some())
-    {
-        return Err(Error::InvalidConfig(format!(
-            "trojan fallback field {field} is not supported yet"
-        )));
+fn parse_trojan_fallback_dest(value: serde_json::Value) -> Result<NetLocation, Error> {
+    let local_port = |port: u16| {
+        NetLocation::new(Address::Ipv4(std::net::Ipv4Addr::LOCALHOST), port)
+    };
+    match value {
+        serde_json::Value::Number(number) => {
+            let port = number
+                .as_u64()
+                .and_then(|port| u16::try_from(port).ok())
+                .filter(|port| *port != 0)
+                .ok_or_else(|| {
+                    Error::InvalidConfig(
+                        "trojan fallback numeric dest must be a port from 1 to 65535"
+                            .into(),
+                    )
+                })?;
+            Ok(local_port(port))
+        }
+        serde_json::Value::String(value) => {
+            let dest = value.trim();
+            if dest.is_empty() {
+                return Err(Error::InvalidConfig(
+                    "trojan fallback dest cannot be empty".into(),
+                ));
+            }
+            if let Ok(port) = dest.parse::<u16>()
+                && port != 0
+            {
+                return Ok(local_port(port));
+            }
+            if dest.starts_with('/') || dest.starts_with('@') {
+                return Err(Error::InvalidConfig(
+                    "trojan fallback Unix socket destinations are not supported yet"
+                        .into(),
+                ));
+            }
+            NetLocation::from_str(dest, None).map_err(|error| {
+                Error::InvalidConfig(format!(
+                    "invalid trojan fallback dest {dest}: {error}"
+                ))
+            })
+        }
+        _ => Err(Error::InvalidConfig(
+            "trojan fallback dest must be a port number or host:port string".into(),
+        )),
     }
-
-    Ok(())
 }
 
 pub(super) fn collect_socks_settings(
@@ -386,7 +436,44 @@ pub(super) fn collect_xhttp_settings(
     raw: XhttpSettings,
 ) -> Result<XhttpServerConfig, Error> {
     reject_unsupported_xhttp_fields(&raw)?;
-    validate_xhttp_mode(raw.mode.as_deref())?;
+    let mode = parse_xhttp_mode(raw.mode.as_deref())?;
+    let uplink_http_method =
+        normalize_xhttp_uplink_method(raw.uplink_http_method.as_deref(), mode)?;
+    let min_posts_interval_ms = clamp_xhttp_range(
+        raw.sc_min_posts_interval_ms
+            .clone()
+            .unwrap_or(XhttpRange { from: 30, to: 30 }),
+        30,
+        30,
+    );
+    let session_placement = parse_xhttp_placement(
+        raw.session_placement.as_deref(),
+        "sessionPlacement",
+    )?;
+    let seq_placement =
+        parse_xhttp_placement(raw.seq_placement.as_deref(), "seqPlacement")?;
+    let session_key = normalize_xhttp_meta_key(
+        raw.session_key.as_deref(),
+        session_placement,
+        "X-Session",
+        "x_session",
+        "sessionKey",
+    )?;
+    let seq_key = normalize_xhttp_meta_key(
+        raw.seq_key.as_deref(),
+        seq_placement,
+        "X-Seq",
+        "x_seq",
+        "seqKey",
+    )?;
+    let uplink_data_placement = parse_xhttp_data_placement(
+        raw.uplink_data_placement.as_deref(),
+        mode,
+    )?;
+    let uplink_data_key = normalize_xhttp_data_key(
+        raw.uplink_data_key.as_deref(),
+        uplink_data_placement,
+    );
     if raw
         .headers
         .keys()
@@ -428,6 +515,7 @@ pub(super) fn collect_xhttp_settings(
     );
 
     Ok(XhttpServerConfig {
+        mode,
         host: raw.host.map(|h| h.to_ascii_lowercase()),
         path: normalized_path,
         min_padding,
@@ -435,6 +523,16 @@ pub(super) fn collect_xhttp_settings(
         max_each_post_bytes,
         max_buffered_posts: raw.sc_max_buffered_posts.unwrap_or(30).max(1) as usize,
         session_ttl_secs: session_ttl_secs as u64,
+        no_grpc_header: raw.no_grpc_header.unwrap_or(false),
+        no_sse_header: raw.no_sse_header.unwrap_or(false),
+        uplink_http_method,
+        min_posts_interval_ms,
+        session_placement,
+        session_key,
+        seq_placement,
+        seq_key,
+        uplink_data_placement,
+        uplink_data_key,
     })
 }
 
@@ -443,21 +541,8 @@ fn reject_unsupported_xhttp_fields(raw: &XhttpSettings) -> Result<(), Error> {
         ("extra", raw.extra.as_ref()),
         ("downloadSettings", raw.download_settings.as_ref()),
         ("xmux", raw.xmux.as_ref()),
-        ("noGRPCHeader", raw.no_grpc_header.as_ref()),
-        ("noSSEHeader", raw.no_sse_header.as_ref()),
         ("serverMaxHeaderBytes", raw.server_max_header_bytes.as_ref()),
-        ("uplinkHTTPMethod", raw.uplink_http_method.as_ref()),
-        ("sessionPlacement", raw.session_placement.as_ref()),
-        ("sessionKey", raw.session_key.as_ref()),
-        ("seqPlacement", raw.seq_placement.as_ref()),
-        ("seqKey", raw.seq_key.as_ref()),
-        ("uplinkDataPlacement", raw.uplink_data_placement.as_ref()),
-        ("uplinkDataKey", raw.uplink_data_key.as_ref()),
         ("uplinkChunkSize", raw.uplink_chunk_size.as_ref()),
-        (
-            "scMinPostsIntervalMs",
-            raw.sc_min_posts_interval_ms.as_ref(),
-        ),
         ("xPaddingKey", raw.x_padding_key.as_ref()),
         ("xPaddingHeader", raw.x_padding_header.as_ref()),
         ("xPaddingPlacement", raw.x_padding_placement.as_ref()),
@@ -477,9 +562,126 @@ fn reject_unsupported_xhttp_fields(raw: &XhttpSettings) -> Result<(), Error> {
     Ok(())
 }
 
-fn validate_xhttp_mode(mode: Option<&str>) -> Result<(), Error> {
+fn parse_xhttp_data_placement(
+    placement: Option<&str>,
+    mode: XhttpMode,
+) -> Result<XhttpDataPlacement, Error> {
+    let placement = match placement
+        .unwrap_or("auto")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "auto" => XhttpDataPlacement::Auto,
+        "body" => XhttpDataPlacement::Body,
+        "header" => XhttpDataPlacement::Header,
+        "cookie" => XhttpDataPlacement::Cookie,
+        unsupported => {
+            return Err(Error::InvalidConfig(format!(
+                "unsupported xhttpSettings.uplinkDataPlacement: {unsupported}"
+            )));
+        }
+    };
+    if matches!(placement, XhttpDataPlacement::Header | XhttpDataPlacement::Cookie)
+        && mode != XhttpMode::PacketUp
+    {
+        let value = match placement {
+            XhttpDataPlacement::Header => "header",
+            XhttpDataPlacement::Cookie => "cookie",
+            _ => unreachable!(),
+        };
+        return Err(Error::InvalidConfig(format!(
+            "xhttpSettings.uplinkDataPlacement={value} requires mode=packet-up"
+        )));
+    }
+    Ok(placement)
+}
+
+fn normalize_xhttp_data_key(
+    key: Option<&str>,
+    placement: XhttpDataPlacement,
+) -> String {
+    let key = key.unwrap_or("").trim();
+    if !key.is_empty() {
+        return key.to_string();
+    }
+    match placement {
+        XhttpDataPlacement::Body => String::new(),
+        XhttpDataPlacement::Cookie => "x_data".to_string(),
+        XhttpDataPlacement::Auto | XhttpDataPlacement::Header => {
+            "X-Data".to_string()
+        }
+    }
+}
+
+fn parse_xhttp_placement(
+    placement: Option<&str>,
+    field: &str,
+) -> Result<XhttpPlacement, Error> {
+    match placement.unwrap_or("path").trim().to_ascii_lowercase().as_str() {
+        "" | "path" => Ok(XhttpPlacement::Path),
+        "query" => Ok(XhttpPlacement::Query),
+        "header" => Ok(XhttpPlacement::Header),
+        "cookie" => Ok(XhttpPlacement::Cookie),
+        unsupported => Err(Error::InvalidConfig(format!(
+            "unsupported xhttpSettings.{field}: {unsupported}"
+        ))),
+    }
+}
+
+fn normalize_xhttp_meta_key(
+    key: Option<&str>,
+    placement: XhttpPlacement,
+    default_header: &str,
+    default_query_cookie: &str,
+    field: &str,
+) -> Result<String, Error> {
+    let key = key.unwrap_or("").trim();
+    let normalized = if key.is_empty() {
+        match placement {
+            XhttpPlacement::Path => String::new(),
+            XhttpPlacement::Header => default_header.to_string(),
+            XhttpPlacement::Query | XhttpPlacement::Cookie => {
+                default_query_cookie.to_string()
+            }
+        }
+    } else {
+        key.to_string()
+    };
+    if placement == XhttpPlacement::Header
+        && http::header::HeaderName::from_bytes(normalized.as_bytes()).is_err()
+    {
+        return Err(Error::InvalidConfig(format!(
+            "invalid xhttpSettings.{field} header name: {normalized}"
+        )));
+    }
+    Ok(normalized)
+}
+
+fn normalize_xhttp_uplink_method(
+    method: Option<&str>,
+    mode: XhttpMode,
+) -> Result<String, Error> {
+    let method = method.unwrap_or("POST").trim().to_ascii_uppercase();
+    if method.is_empty() || http::Method::from_bytes(method.as_bytes()).is_err() {
+        return Err(Error::InvalidConfig(format!(
+            "invalid xhttpSettings.uplinkHTTPMethod: {method}"
+        )));
+    }
+    if method == "GET" && mode != XhttpMode::PacketUp {
+        return Err(Error::InvalidConfig(
+            "xhttpSettings.uplinkHTTPMethod=GET requires mode=packet-up".into(),
+        ));
+    }
+    Ok(method)
+}
+
+fn parse_xhttp_mode(mode: Option<&str>) -> Result<XhttpMode, Error> {
     match mode.unwrap_or("auto").trim() {
-        "" | "auto" | "packet-up" | "stream-up" | "stream-one" => Ok(()),
+        "" | "auto" => Ok(XhttpMode::Auto),
+        "packet-up" => Ok(XhttpMode::PacketUp),
+        "stream-up" => Ok(XhttpMode::StreamUp),
+        "stream-one" => Ok(XhttpMode::StreamOne),
         unsupported => Err(Error::InvalidConfig(format!(
             "unsupported xhttpSettings.mode: {unsupported}"
         ))),
@@ -628,20 +830,45 @@ mod tests {
 
     #[cfg(feature = "trojan")]
     #[test]
-    fn collect_trojan_fallbacks_rejects_unsupported_xray_fields() {
+    fn collect_trojan_fallbacks_preserves_xray_fields() {
         let settings = SettingObject(serde_json::json!({
             "fallbacks": [{
-                "dest": "127.0.0.1:8080",
-                "path": "/ws"
+                "name": "EXAMPLE.COM",
+                "alpn": "H2",
+                "dest": 8080,
+                "path": "/ws",
+                "type": "tcp",
+                "xver": 2
             }]
         }));
 
-        let err = collect_trojan_fallbacks(&settings)
-            .expect_err("trojan fallback path unsupported");
-        assert!(
-            err.to_string()
-                .contains("trojan fallback field path is not supported yet")
-        );
+        let fallbacks = collect_trojan_fallbacks(&settings)
+            .expect("Trojan fallback fields should build");
+        assert_eq!(fallbacks.len(), 1);
+        assert_eq!(fallbacks[0].name, "example.com");
+        assert_eq!(fallbacks[0].alpn, "h2");
+        assert_eq!(fallbacks[0].path, "/ws");
+        assert_eq!(fallbacks[0].dest.to_string(), "127.0.0.1:8080");
+        assert_eq!(fallbacks[0].xver, 2);
+    }
+
+    #[cfg(feature = "trojan")]
+    #[test]
+    fn collect_trojan_fallbacks_rejects_invalid_type_path_and_xver() {
+        for (field, value, expected) in [
+            ("type", serde_json::json!("unix"), "trojan fallback type=unix is not supported yet"),
+            ("path", serde_json::json!("ws"), "trojan fallback path must be empty or start with /"),
+            ("xver", serde_json::json!(3), "trojan fallback xver must be 0, 1, or 2; got 3"),
+        ] {
+            let mut fallback = serde_json::json!({"dest": 8080});
+            fallback[field] = value;
+            let settings = SettingObject(serde_json::json!({
+                "fallbacks": [fallback]
+            }));
+            let error = collect_trojan_fallbacks(&settings)
+                .expect_err("invalid Trojan fallback field must fail");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     #[test]
@@ -652,15 +879,31 @@ mod tests {
         .expect("xhttp settings");
 
         let config = collect_xhttp_settings(settings).expect("valid xhttp settings");
+        assert_eq!(config.mode, XhttpMode::Auto);
         assert_eq!(config.path, "/xhttp");
         assert_eq!(config.max_each_post_bytes, 1_000_000);
         assert_eq!(config.max_buffered_posts, 30);
         assert_eq!(config.session_ttl_secs, 30);
+        assert!(!config.no_grpc_header);
+        assert!(!config.no_sse_header);
+        assert_eq!(config.uplink_http_method, "POST");
+        assert_eq!(config.min_posts_interval_ms, (30, 30));
+        assert_eq!(config.session_placement, XhttpPlacement::Path);
+        assert!(config.session_key.is_empty());
+        assert_eq!(config.seq_placement, XhttpPlacement::Path);
+        assert!(config.seq_key.is_empty());
+        assert_eq!(config.uplink_data_placement, XhttpDataPlacement::Auto);
+        assert_eq!(config.uplink_data_key, "X-Data");
     }
 
     #[test]
     fn collect_xhttp_settings_accepts_reference_modes() {
-        for mode in ["auto", "packet-up", "stream-up", "stream-one"] {
+        for (mode, expected) in [
+            ("auto", XhttpMode::Auto),
+            ("packet-up", XhttpMode::PacketUp),
+            ("stream-up", XhttpMode::StreamUp),
+            ("stream-one", XhttpMode::StreamOne),
+        ] {
             let settings =
                 serde_json::from_value::<XhttpSettings>(serde_json::json!({
                     "path": "/xhttp",
@@ -668,10 +911,114 @@ mod tests {
                 }))
                 .expect("xhttp settings");
 
-            collect_xhttp_settings(settings).unwrap_or_else(|err| {
+            let config = collect_xhttp_settings(settings).unwrap_or_else(|err| {
                 panic!("mode {mode} should be accepted: {err}")
             });
+            assert_eq!(config.mode, expected);
         }
+    }
+
+    #[test]
+    fn collect_xhttp_settings_accepts_reference_header_and_method_options() {
+        let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
+            "path": "/xhttp",
+            "mode": "stream-one",
+            "noGRPCHeader": true,
+            "noSSEHeader": true,
+            "uplinkHTTPMethod": "patch",
+            "scMinPostsIntervalMs": {"from": 40, "to": 60},
+            "sessionPlacement": "header",
+            "seqPlacement": "query"
+        }))
+        .expect("xhttp settings");
+
+        let config = collect_xhttp_settings(settings)
+            .expect("supported XHTTP header and method options");
+        assert!(config.no_grpc_header);
+        assert!(config.no_sse_header);
+        assert_eq!(config.uplink_http_method, "PATCH");
+        assert_eq!(config.min_posts_interval_ms, (40, 60));
+        assert_eq!(config.session_placement, XhttpPlacement::Header);
+        assert_eq!(config.session_key, "X-Session");
+        assert_eq!(config.seq_placement, XhttpPlacement::Query);
+        assert_eq!(config.seq_key, "x_seq");
+    }
+
+    #[test]
+    fn collect_xhttp_settings_accepts_packet_up_header_data() {
+        let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
+            "path": "/xhttp",
+            "mode": "packet-up",
+            "uplinkDataPlacement": "header"
+        }))
+        .expect("xhttp settings");
+
+        let config = collect_xhttp_settings(settings)
+            .expect("packet-up header data should be supported");
+        assert_eq!(config.uplink_data_placement, XhttpDataPlacement::Header);
+        assert_eq!(config.uplink_data_key, "X-Data");
+    }
+
+    #[test]
+    fn collect_xhttp_settings_accepts_packet_up_cookie_data() {
+        let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
+            "path": "/xhttp",
+            "mode": "packet-up",
+            "uplinkDataPlacement": "cookie"
+        }))
+        .expect("xhttp settings");
+
+        let config = collect_xhttp_settings(settings)
+            .expect("packet-up cookie data should be supported");
+        assert_eq!(config.uplink_data_placement, XhttpDataPlacement::Cookie);
+        assert_eq!(config.uplink_data_key, "x_data");
+    }
+
+    #[test]
+    fn collect_xhttp_settings_rejects_header_data_outside_packet_up() {
+        let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
+            "path": "/xhttp",
+            "mode": "stream-up",
+            "uplinkDataPlacement": "header"
+        }))
+        .expect("xhttp settings");
+
+        let error = collect_xhttp_settings(settings)
+            .expect_err("header data must require packet-up");
+        assert!(error.to_string().contains(
+            "xhttpSettings.uplinkDataPlacement=header requires mode=packet-up"
+        ));
+    }
+
+    #[test]
+    fn collect_xhttp_settings_rejects_unknown_meta_placement() {
+        let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
+            "path": "/xhttp",
+            "sessionPlacement": "fragment"
+        }))
+        .expect("xhttp settings");
+
+        let error = collect_xhttp_settings(settings)
+            .expect_err("unknown session placement must fail");
+        assert!(error.to_string().contains(
+            "unsupported xhttpSettings.sessionPlacement: fragment"
+        ));
+    }
+
+    #[test]
+    fn collect_xhttp_settings_rejects_get_outside_packet_up() {
+        let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
+            "path": "/xhttp",
+            "mode": "stream-one",
+            "uplinkHTTPMethod": "GET"
+        }))
+        .expect("xhttp settings");
+
+        let error = collect_xhttp_settings(settings)
+            .expect_err("GET uplink must be packet-up only");
+        assert!(error.to_string().contains(
+            "xhttpSettings.uplinkHTTPMethod=GET requires mode=packet-up"
+        ));
     }
 
     #[test]
