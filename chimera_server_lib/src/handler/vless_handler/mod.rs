@@ -44,7 +44,7 @@ use super::{
     },
     xudp::message_stream::XudpMessageStream,
 };
-use vision_pad::{pad_with_command, pad_with_uuid_and_command};
+use vision_pad::{append_with_command, append_with_uuid_and_command};
 use vision_unpad::{UnpadCommand, VisionUnpadder};
 
 #[cfg(feature = "tls")]
@@ -359,15 +359,21 @@ pub(crate) fn queue_padded_packet(
     user_uuid: &[u8; 16],
     content: &[u8],
     command: u8,
-) {
+) -> std::io::Result<()> {
     let is_tls = looks_like_tls_record(content);
-    let packet = if *first_write {
+    if *first_write {
+        append_with_uuid_and_command(
+            pending_write,
+            content,
+            user_uuid,
+            command,
+            is_tls,
+        )?;
         *first_write = false;
-        pad_with_uuid_and_command(content, user_uuid, command, is_tls)
     } else {
-        pad_with_command(content, command, is_tls)
-    };
-    pending_write.extend_from_slice(&packet);
+        append_with_command(pending_write, content, command, is_tls)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn unpad_into_pending_read(
@@ -1103,7 +1109,8 @@ mod tests {
         let uuid = [9u8; 16];
         let mut padded = BytesMut::new();
         let mut first_write = true;
-        queue_padded_packet(&mut padded, &mut first_write, &uuid, b"ping", 0);
+        queue_padded_packet(&mut padded, &mut first_write, &uuid, b"ping", 0)
+            .unwrap();
 
         let mut pending = BytesMut::new();
         let mut unpadder = VisionUnpadder::new(uuid);

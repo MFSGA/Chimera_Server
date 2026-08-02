@@ -130,14 +130,14 @@ impl VisionServerStream {
         }
     }
 
-    fn queue_padded_write(&mut self, content: &[u8]) {
+    fn queue_padded_write(&mut self, content: &[u8]) -> io::Result<()> {
         queue_padded_packet(
             &mut self.pending_write,
             &mut self.first_write,
             &self.user_uuid,
             content,
             COMMAND_CONTINUE,
-        );
+        )
     }
 }
 
@@ -224,7 +224,9 @@ impl AsyncWrite for VisionServerStream {
             return Poll::Ready(Ok(0));
         }
 
-        this.queue_padded_write(chunk);
+        if let Err(error) = this.queue_padded_write(chunk) {
+            return Poll::Ready(Err(error));
+        }
 
         this.poll_complete_buffered_write(cx, chunk.len())
     }
@@ -271,7 +273,7 @@ mod tests {
     fn vision_pad_roundtrip_with_continue_command() {
         let uuid = [7u8; 16];
         let payload = b"hello over vision";
-        let padded = pad_with_uuid_and_command(payload, &uuid, 0, false);
+        let padded = pad_with_uuid_and_command(payload, &uuid, 0, false).unwrap();
 
         let mut unpadder = VisionUnpadder::new(uuid);
         let result = unpadder

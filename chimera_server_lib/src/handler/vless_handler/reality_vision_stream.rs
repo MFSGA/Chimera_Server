@@ -254,8 +254,8 @@ where
                 self.read_mode = ReadMode::Direct;
             }
         }
-        let observed = self.pending_read[previous_len..].to_vec();
-        self.tls_state.observe_uplink(&observed);
+        self.tls_state
+            .observe_uplink(&self.pending_read[previous_len..]);
         Ok(())
     }
 
@@ -268,14 +268,14 @@ where
         Ok(())
     }
 
-    fn queue_padded_write(&mut self, content: &[u8], command: u8) {
+    fn queue_padded_write(&mut self, content: &[u8], command: u8) -> io::Result<()> {
         queue_padded_packet(
             &mut self.pending_write,
             &mut self.first_write,
             &self.user_uuid,
             content,
             command,
-        );
+        )
     }
 
     fn read_from_session_or_tcp(
@@ -433,21 +433,29 @@ where
             // Direct. TLS 1.2 and CCM_8 end padding but stay inside REALITY.
             if this.tls_state.enable_direct {
                 debug!("VLESS Vision downlink queued Direct command");
-                this.queue_padded_write(chunk, COMMAND_DIRECT);
+                if let Err(error) = this.queue_padded_write(chunk, COMMAND_DIRECT) {
+                    return Poll::Ready(Err(error));
+                }
                 this.poll_complete_padded_write(cx, chunk.len(), true)
             } else {
                 debug!("VLESS Vision downlink queued End command");
-                this.queue_padded_write(chunk, COMMAND_END);
+                if let Err(error) = this.queue_padded_write(chunk, COMMAND_END) {
+                    return Poll::Ready(Err(error));
+                }
                 this.write_mode = WriteMode::Plain;
                 this.poll_complete_padded_write(cx, chunk.len(), false)
             }
         } else if this.tls_state.should_end_padding_for_compatibility() {
             debug!("VLESS Vision downlink ended padding by compatibility limit");
-            this.queue_padded_write(chunk, COMMAND_END);
+            if let Err(error) = this.queue_padded_write(chunk, COMMAND_END) {
+                return Poll::Ready(Err(error));
+            }
             this.write_mode = WriteMode::Plain;
             this.poll_complete_padded_write(cx, chunk.len(), false)
         } else {
-            this.queue_padded_write(chunk, COMMAND_CONTINUE);
+            if let Err(error) = this.queue_padded_write(chunk, COMMAND_CONTINUE) {
+                return Poll::Ready(Err(error));
+            }
             this.poll_complete_padded_write(cx, chunk.len(), false)
         }
     }
