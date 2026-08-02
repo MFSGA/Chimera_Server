@@ -310,9 +310,7 @@ async fn unauthenticated_plain_tcp_reaches_vless_fallback() {
         ("/proxy-v2", b"proxy-v2:".as_slice()),
         ("/other", b"default:".as_slice()),
     ] {
-        let payload = format!(
-            "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n"
-        );
+        let payload = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
         let mut stream =
             TcpStream::connect(chimera_addr).expect("connect VLESS fallback");
         stream
@@ -403,7 +401,12 @@ async fn unauthenticated_tls_payload_reaches_vless_vision_fallback() {
     chimera.assert_running();
 
     for (server_name, use_h2, path, marker) in [
-        ("localhost", true, "/vision-fallback?query=1", b"path:".as_slice()),
+        (
+            "localhost",
+            true,
+            "/vision-fallback?query=1",
+            b"path:".as_slice(),
+        ),
         ("localhost", true, "/other", b"alpn:".as_slice()),
         ("localhost", false, "/other", b"name:".as_slice()),
         ("other.test", false, "/other", b"default:".as_slice()),
@@ -421,9 +424,7 @@ async fn unauthenticated_tls_payload_reaches_vless_vision_fallback() {
             .connect(server_name, tcp)
             .await
             .expect("establish outer TLS");
-        let payload = format!(
-            "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n"
-        );
+        let payload = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
         tls.write_all(payload.as_bytes())
             .await
             .expect("write fallback request");
@@ -509,7 +510,12 @@ async fn unauthenticated_tls_payload_reaches_trojan_fallback_rules() {
     chimera.assert_running();
 
     for (server_name, use_h2, path, marker) in [
-        ("localhost", true, "/trojan-fallback?query=1", b"path-v2:".as_slice()),
+        (
+            "localhost",
+            true,
+            "/trojan-fallback?query=1",
+            b"path-v2:".as_slice(),
+        ),
         ("localhost", true, "/other", b"alpn-v1:".as_slice()),
         ("localhost", false, "/other", b"name:".as_slice()),
         ("other.test", false, "/other", b"default:".as_slice()),
@@ -527,9 +533,7 @@ async fn unauthenticated_tls_payload_reaches_trojan_fallback_rules() {
             .connect(server_name, tcp)
             .await
             .expect("establish Trojan outer TLS");
-        let payload = format!(
-            "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n"
-        );
+        let payload = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
         tls.write_all(payload.as_bytes())
             .await
             .expect("write Trojan fallback request");
@@ -942,8 +946,7 @@ async fn http_and_mixed_inbounds_proxy_tcp() {
             }]
         }),
     );
-    let mut http =
-        start_chimera(&workspace, &http_work_dir, &http_config_path);
+    let mut http = start_chimera(&workspace, &http_work_dir, &http_config_path);
     let http_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, http_port));
     let transparent_http_addr =
         SocketAddr::from((Ipv4Addr::LOCALHOST, transparent_http_port));
@@ -968,23 +971,21 @@ async fn http_and_mixed_inbounds_proxy_tcp() {
     let absolute_request = absolute_request
         .recv_timeout(IO_TIMEOUT)
         .expect("capture absolute-form forwarded request");
-    assert!(
-        absolute_request.starts_with("GET /absolute?q=1 HTTP/1.1\r\n")
-    );
+    assert!(absolute_request.starts_with("GET /absolute?q=1 HTTP/1.1\r\n"));
     assert!(!absolute_request.to_ascii_lowercase().contains("proxy-"));
     assert!(absolute_request.contains("Connection: close\r\n"));
 
     assert_http_forward_response(
         transparent_http_addr,
-        &format!(
-            "GET /transparent HTTP/1.1\r\nHost: {transparent_target}\r\n\r\n"
-        ),
+        &format!("GET /transparent HTTP/1.1\r\nHost: {transparent_target}\r\n\r\n"),
     );
     let transparent_request = transparent_request
         .recv_timeout(IO_TIMEOUT)
         .expect("capture transparent forwarded request");
     assert!(transparent_request.starts_with("GET /transparent HTTP/1.1\r\n"));
-    assert!(transparent_request.contains(&format!("Host: {transparent_target}\r\n")));
+    assert!(
+        transparent_request.contains(&format!("Host: {transparent_target}\r\n"))
+    );
     drop(http);
 
     let mixed_work_dir = create_test_dir("mixed-inbound");
@@ -1009,8 +1010,7 @@ async fn http_and_mixed_inbounds_proxy_tcp() {
             }]
         }),
     );
-    let mut mixed =
-        start_chimera(&workspace, &mixed_work_dir, &mixed_config_path);
+    let mut mixed = start_chimera(&workspace, &mixed_work_dir, &mixed_config_path);
     let mixed_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, mixed_port));
     wait_for_tcp(mixed_addr);
     mixed.assert_running();
@@ -1020,11 +1020,7 @@ async fn http_and_mixed_inbounds_proxy_tcp() {
         None,
         b"HTTP through mixed inbound",
     );
-    assert_socks5_echo(
-        mixed_addr,
-        echo_addr,
-        b"SOCKS5 through mixed inbound",
-    );
+    assert_socks5_echo(mixed_addr, echo_addr, b"SOCKS5 through mixed inbound");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1034,11 +1030,7 @@ async fn xray_client_can_proxy_tcp_through_chimera_shadowsocks() {
     let echo_addr = start_tcp_echo_server();
     let udp_echo_addr = start_udp_echo_server().await;
 
-    for method in [
-        "aes-128-gcm",
-        "aes-256-gcm",
-        "chacha20-ietf-poly1305",
-    ] {
+    for method in ["aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305"] {
         let work_dir = create_test_dir(&format!("shadowsocks-{method}"));
         let chimera_port = free_localhost_port();
         let xray_socks_port = free_localhost_port();
@@ -1096,26 +1088,20 @@ async fn xray_client_can_proxy_tcp_through_chimera_shadowsocks() {
             }),
         );
 
-        let mut chimera =
-            start_chimera(&workspace, &work_dir, &chimera_config_path);
+        let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
         wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
         chimera.assert_running();
         let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
         wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port)));
         xray.assert_running();
 
-        let socks_addr =
-            SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+        let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
         assert_socks5_echo(
             socks_addr,
             echo_addr,
             format!("Shadowsocks {method} through Xray").as_bytes(),
         );
-        assert_socks5_echo(
-            socks_addr,
-            echo_addr,
-            &deterministic_payload(64 * 1024),
-        );
+        assert_socks5_echo(socks_addr, echo_addr, &deterministic_payload(64 * 1024));
         assert_socks5_udp_echo(
             socks_addr,
             udp_echo_addr,
@@ -1163,17 +1149,13 @@ async fn xray_clients_can_use_multiple_legacy_shadowsocks_users() {
         }),
     );
 
-    let mut chimera =
-        start_chimera(&workspace, &work_dir, &chimera_config_path);
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
     wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
     chimera.assert_running();
 
     for (method, password) in [
         ("aes-128-gcm", "multi-user-aes-password"),
-        (
-            "chacha20-ietf-poly1305",
-            "multi-user-chacha-password",
-        ),
+        ("chacha20-ietf-poly1305", "multi-user-chacha-password"),
     ] {
         let client_dir = create_test_dir(&format!("ss-multi-client-{method}"));
         let xray_socks_port = free_localhost_port();
@@ -1204,10 +1186,8 @@ async fn xray_clients_can_use_multiple_legacy_shadowsocks_users() {
             }),
         );
 
-        let mut xray =
-            start_xray(&workspace, &client_dir, &xray_config_path);
-        let socks_addr =
-            SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+        let mut xray = start_xray(&workspace, &client_dir, &xray_config_path);
+        let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
         wait_for_tcp(socks_addr);
         xray.assert_running();
         assert_socks5_echo(
@@ -1215,11 +1195,7 @@ async fn xray_clients_can_use_multiple_legacy_shadowsocks_users() {
             echo_addr,
             format!("multi-user {method}").as_bytes(),
         );
-        assert_socks5_echo(
-            socks_addr,
-            echo_addr,
-            &deterministic_payload(64 * 1024),
-        );
+        assert_socks5_echo(socks_addr, echo_addr, &deterministic_payload(64 * 1024));
         assert_socks5_udp_echo(
             socks_addr,
             udp_echo_addr,
@@ -1273,8 +1249,7 @@ async fn xray_clients_can_use_shadowsocks_2022_eih_users() {
         }),
     );
 
-    let mut chimera =
-        start_chimera(&workspace, &work_dir, &chimera_config_path);
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
     wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
     chimera.assert_running();
 
@@ -1308,10 +1283,8 @@ async fn xray_clients_can_use_shadowsocks_2022_eih_users() {
             }),
         );
 
-        let mut xray =
-            start_xray(&workspace, &client_dir, &xray_config_path);
-        let socks_addr =
-            SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+        let mut xray = start_xray(&workspace, &client_dir, &xray_config_path);
+        let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
         wait_for_tcp(socks_addr);
         xray.assert_running();
         assert_socks5_echo(
@@ -1319,11 +1292,7 @@ async fn xray_clients_can_use_shadowsocks_2022_eih_users() {
             echo_addr,
             format!("EIH TCP user {index}").as_bytes(),
         );
-        assert_socks5_echo(
-            socks_addr,
-            echo_addr,
-            &deterministic_payload(64 * 1024),
-        );
+        assert_socks5_echo(socks_addr, echo_addr, &deterministic_payload(64 * 1024));
         assert_socks5_udp_echo(
             socks_addr,
             udp_echo_addr,
@@ -1411,26 +1380,20 @@ async fn xray_client_can_proxy_tcp_and_aes_udp_through_chimera_shadowsocks_2022(
             }),
         );
 
-        let mut chimera =
-            start_chimera(&workspace, &work_dir, &chimera_config_path);
+        let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
         wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
         chimera.assert_running();
         let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
         wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port)));
         xray.assert_running();
 
-        let socks_addr =
-            SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+        let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
         assert_socks5_echo(
             socks_addr,
             echo_addr,
             format!("Shadowsocks 2022 {method} through Xray").as_bytes(),
         );
-        assert_socks5_echo(
-            socks_addr,
-            echo_addr,
-            &deterministic_payload(64 * 1024),
-        );
+        assert_socks5_echo(socks_addr, echo_addr, &deterministic_payload(64 * 1024));
         if supports_udp {
             assert_socks5_udp_echo(
                 socks_addr,
@@ -1525,11 +1488,7 @@ async fn xray_client_can_proxy_tcp_through_chimera_grpc() {
     wait_for_tcp(socks_addr);
     xray.assert_running();
     assert_socks5_echo(socks_addr, echo_addr, b"VLESS gRPC h2c through Xray");
-    assert_socks5_echo(
-        socks_addr,
-        echo_addr,
-        &deterministic_payload(64 * 1024),
-    );
+    assert_socks5_echo(socks_addr, echo_addr, &deterministic_payload(64 * 1024));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1616,16 +1575,8 @@ async fn xray_client_can_proxy_tcp_through_chimera_httpupgrade() {
     let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
     wait_for_tcp(socks_addr);
     xray.assert_running();
-    assert_socks5_echo(
-        socks_addr,
-        echo_addr,
-        b"VLESS HTTPUpgrade through Xray",
-    );
-    assert_socks5_echo(
-        socks_addr,
-        echo_addr,
-        &deterministic_payload(64 * 1024),
-    );
+    assert_socks5_echo(socks_addr, echo_addr, b"VLESS HTTPUpgrade through Xray");
+    assert_socks5_echo(socks_addr, echo_addr, &deterministic_payload(64 * 1024));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1957,7 +1908,9 @@ fn start_proxy_protocol_marker_echo_server(
                         let Ok(header) = std::str::from_utf8(&header) else {
                             return;
                         };
-                        assert!(header.starts_with("PROXY TCP4 127.0.0.1 127.0.0.1 "));
+                        assert!(
+                            header.starts_with("PROXY TCP4 127.0.0.1 127.0.0.1 ")
+                        );
                     }
                     2 => {
                         let mut header = [0u8; 16];
@@ -1977,7 +1930,9 @@ fn start_proxy_protocol_marker_echo_server(
                         assert_eq!(&address[..4], &[127, 0, 0, 1]);
                         assert_eq!(&address[4..8], &[127, 0, 0, 1]);
                     }
-                    other => panic!("unsupported test PROXY protocol version {other}"),
+                    other => {
+                        panic!("unsupported test PROXY protocol version {other}")
+                    }
                 }
 
                 let mut first = true;
@@ -2357,10 +2312,7 @@ fn socks_udp_payload_offset(packet: &[u8]) -> usize {
     }
 }
 
-fn assert_http_forward_response(
-    proxy_addr: SocketAddr,
-    request: &str,
-) {
+fn assert_http_forward_response(proxy_addr: SocketAddr, request: &str) {
     let mut stream = TcpStream::connect_timeout(&proxy_addr, IO_TIMEOUT)
         .expect("connect HTTP forward proxy inbound");
     stream
@@ -2396,9 +2348,8 @@ fn assert_http_connect_echo(
         .set_write_timeout(Some(IO_TIMEOUT))
         .expect("set HTTP proxy write timeout");
 
-    let mut request = format!(
-        "CONNECT {target_addr} HTTP/1.1\r\nHost: {target_addr}\r\n"
-    );
+    let mut request =
+        format!("CONNECT {target_addr} HTTP/1.1\r\nHost: {target_addr}\r\n");
     if let Some(value) = proxy_authorization {
         request.push_str("Proxy-Authorization: Basic ");
         request.push_str(value);
@@ -2420,8 +2371,7 @@ fn assert_http_connect_echo(
     }
     let response = String::from_utf8_lossy(&response);
     assert!(
-        response.starts_with("HTTP/1.1 200")
-            || response.starts_with("HTTP/1.0 200"),
+        response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200"),
         "unexpected HTTP CONNECT response: {response}"
     );
 

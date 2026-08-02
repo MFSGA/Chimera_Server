@@ -70,7 +70,9 @@ pub async fn start_servers(
             }
         }
         Transport::TcpAndUdp => {
-            match start_tcp_server_with_runtime(config.clone(), runtime.clone()).await {
+            match start_tcp_server_with_runtime(config.clone(), runtime.clone())
+                .await
+            {
                 Ok(Some(handle)) => join_handles.push(handle),
                 Ok(None) => {}
                 Err(error) => return Err(error),
@@ -690,10 +692,7 @@ mod tests {
         let destination: SocketAddr = "198.51.100.20:443".parse().unwrap();
         let header = build_proxy_protocol_header(1, source, Some(destination))
             .expect("build PROXY v1 header");
-        assert_eq!(
-            header,
-            b"PROXY TCP4 192.0.2.10 198.51.100.20 12345 443\r\n"
-        );
+        assert_eq!(header, b"PROXY TCP4 192.0.2.10 198.51.100.20 12345 443\r\n");
     }
 
     #[test]

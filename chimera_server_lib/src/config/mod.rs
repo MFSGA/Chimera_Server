@@ -142,11 +142,7 @@ pub struct XhttpSettings {
     server_max_header_bytes: Option<serde_json::Value>,
     #[serde(default, rename = "uplinkHTTPMethod")]
     uplink_http_method: Option<String>,
-    #[serde(
-        default,
-        rename = "sessionIDPlacement",
-        alias = "sessionPlacement"
-    )]
+    #[serde(default, rename = "sessionIDPlacement", alias = "sessionPlacement")]
     session_placement: Option<String>,
     #[serde(default, rename = "sessionIDKey", alias = "sessionKey")]
     session_key: Option<String>,

@@ -6,8 +6,7 @@ use tokio::{
 };
 
 use crate::{
-    async_stream::AsyncStream,
-    config::server_config::VlessFallback,
+    async_stream::AsyncStream, config::server_config::VlessFallback,
     handler::tcp::tcp_handler::TcpServerSetupResult,
     util::prefixed_stream::PrefixedStream,
 };
@@ -113,8 +112,7 @@ pub(crate) fn vless_fallback_result(
     prefix: Vec<u8>,
     stream: Box<dyn AsyncStream>,
 ) -> TcpServerSetupResult {
-    let stream: Box<dyn AsyncStream> =
-        Box::new(PrefixedStream::new(prefix, stream));
+    let stream: Box<dyn AsyncStream> = Box::new(PrefixedStream::new(prefix, stream));
     if fallback.xver == 0 {
         TcpServerSetupResult::TcpForward {
             remote_location: fallback.dest.clone(),
@@ -167,7 +165,10 @@ mod tests {
             name: name.into(),
             alpn: alpn.into(),
             path: path.into(),
-            dest: NetLocation::new(Address::Ipv4(std::net::Ipv4Addr::LOCALHOST), port),
+            dest: NetLocation::new(
+                Address::Ipv4(std::net::Ipv4Addr::LOCALHOST),
+                port,
+            ),
             xver: 0,
         }
     }

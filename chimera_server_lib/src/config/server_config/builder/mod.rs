@@ -94,12 +94,10 @@ fn apply_grpc_layer(
         settings.permit_without_stream,
         settings.initial_windows_size,
     );
-    Ok(ServerProxyConfig::Grpc(
-        super::types::GrpcServerConfig {
-            service_name,
-            inner: Box::new(protocol),
-        },
-    ))
+    Ok(ServerProxyConfig::Grpc(super::types::GrpcServerConfig {
+        service_name,
+        inner: Box::new(protocol),
+    }))
 }
 
 #[cfg(not(feature = "grpc_transport"))]
@@ -120,24 +118,21 @@ fn apply_httpupgrade_layer(
     protocol: ServerProxyConfig,
     stream_settings: &crate::config::StreamSettings,
 ) -> Result<ServerProxyConfig, Error> {
-    if !stream_settings
-        .network
-        .eq_ignore_ascii_case("httpupgrade")
-    {
+    if !stream_settings.network.eq_ignore_ascii_case("httpupgrade") {
         return Ok(protocol);
     }
-    let settings = stream_settings
-        .httpupgrade_settings
-        .clone()
-        .ok_or_else(|| {
-            Error::InvalidConfig(
-                "httpupgrade inbound requires httpupgradeSettings".into(),
-            )
-        })?;
+    let settings =
+        stream_settings
+            .httpupgrade_settings
+            .clone()
+            .ok_or_else(|| {
+                Error::InvalidConfig(
+                    "httpupgrade inbound requires httpupgradeSettings".into(),
+                )
+            })?;
     if settings.accept_proxy_protocol {
         return Err(Error::InvalidConfig(
-            "httpupgradeSettings.acceptProxyProtocol is not supported yet"
-                .into(),
+            "httpupgradeSettings.acceptProxyProtocol is not supported yet".into(),
         ));
     }
     if settings.ed != 0 {
@@ -145,11 +140,7 @@ fn apply_httpupgrade_layer(
             "httpupgradeSettings.ed is not supported yet".into(),
         ));
     }
-    let path = settings
-        .path
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+    let path = settings.path.unwrap_or_default().trim().to_string();
     let path = if path.is_empty() {
         "/".to_string()
     } else if path.starts_with('/') {
@@ -176,10 +167,7 @@ fn apply_httpupgrade_layer(
     protocol: ServerProxyConfig,
     stream_settings: &crate::config::StreamSettings,
 ) -> Result<ServerProxyConfig, Error> {
-    if stream_settings
-        .network
-        .eq_ignore_ascii_case("httpupgrade")
-    {
+    if stream_settings.network.eq_ignore_ascii_case("httpupgrade") {
         return Err(Error::InvalidConfig(
             "httpupgrade transport requires the httpupgrade feature".into(),
         ));
@@ -305,8 +293,8 @@ fn collect_vless_fallbacks(
     values
         .into_iter()
         .map(|value| {
-            let fallback: VlessInboundFallback =
-                serde_json::from_value(value).map_err(|error| {
+            let fallback: VlessInboundFallback = serde_json::from_value(value)
+                .map_err(|error| {
                     Error::InvalidConfig(format!(
                         "invalid vless fallback settings: {error}"
                     ))
@@ -427,11 +415,14 @@ fn has_vless_vision_flow(users: &[crate::config::server_config::VlessUser]) -> b
 #[cfg(feature = "shadowsocks")]
 fn collect_shadowsocks_users(
     settings: Option<crate::config::SettingObject>,
-) -> Result<(
-    Vec<crate::config::server_config::ShadowsocksUser>,
-    Option<crate::config::server_config::ShadowsocksServerIdentity>,
-    Transport,
-), Error> {
+) -> Result<
+    (
+        Vec<crate::config::server_config::ShadowsocksUser>,
+        Option<crate::config::server_config::ShadowsocksServerIdentity>,
+        Transport,
+    ),
+    Error,
+> {
     let settings = settings.ok_or_else(|| {
         Error::InvalidConfig("shadowsocks inbound requires settings".into())
     })?;
@@ -444,8 +435,8 @@ fn collect_shadowsocks_users(
         })?;
     let transport = shadowsocks_transport(raw.network.as_ref())?;
     let accounts = raw.clients.or(raw.users);
-    let is_aead2022_multi = accounts.is_some()
-        && raw.method.starts_with("2022-blake3-");
+    let is_aead2022_multi =
+        accounts.is_some() && raw.method.starts_with("2022-blake3-");
 
     let (users, identity) = if let Some(accounts) = accounts {
         if accounts.is_empty() {
@@ -463,11 +454,10 @@ fn collect_shadowsocks_users(
                         .into(),
                 ));
             }
-            let identity =
-                crate::config::server_config::ShadowsocksServerIdentity {
-                    method: raw.method.clone(),
-                    password: raw.password.clone(),
-                };
+            let identity = crate::config::server_config::ShadowsocksServerIdentity {
+                method: raw.method.clone(),
+                password: raw.password.clone(),
+            };
             crate::handler::shadowsocks::validate_user(
                 &crate::config::server_config::ShadowsocksUser {
                     method: identity.method.clone(),
@@ -2305,11 +2295,13 @@ mod tests {
         }))
         .expect("valid inbound json shape");
 
-        let error = ServerConfig::try_from(inbound)
-            .expect_err("xver=3 must be rejected");
-        assert!(error.to_string().contains(
-            "vless fallback xver must be 0, 1, or 2; got 3"
-        ));
+        let error =
+            ServerConfig::try_from(inbound).expect_err("xver=3 must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("vless fallback xver must be 0, 1, or 2; got 3")
+        );
     }
 
     #[cfg(feature = "vless")]

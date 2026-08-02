@@ -47,13 +47,13 @@ use super::{
 use vision_pad::{pad_with_command, pad_with_uuid_and_command};
 use vision_unpad::{UnpadCommand, VisionUnpadder};
 
-pub use vision::{VisionVlessTcpHandler, setup_reality_mixed_vless_server_stream};
 #[cfg(feature = "tls")]
 pub(crate) use tls_vision::VisionRecordIo;
 #[cfg(feature = "tls")]
 pub(crate) use vision::{
     ParsedVisionUser, parse_vision_users, setup_tls_vision_server_stream,
 };
+pub use vision::{VisionVlessTcpHandler, setup_reality_mixed_vless_server_stream};
 
 const SERVER_RESPONSE_HEADER: &[u8] = &[0u8, 0u8];
 
@@ -130,11 +130,7 @@ impl VlessTcpHandler {
                         "no VLESS fallback matched the unauthenticated request",
                     )
                 })?;
-                return Ok(vless_fallback_result(
-                    fallback,
-                    prefix,
-                    server_stream,
-                ));
+                return Ok(vless_fallback_result(fallback, prefix, server_stream));
             }
 
             // Authentication is now established. Replay the prefix into the
@@ -487,10 +483,7 @@ mod tests {
         )
     }
 
-    fn fallback_vless_handler(
-        user_id: &str,
-        fallback_port: u16,
-    ) -> VlessTcpHandler {
+    fn fallback_vless_handler(user_id: &str, fallback_port: u16) -> VlessTcpHandler {
         VlessTcpHandler::new_with_fallbacks(
             &[VlessUser {
                 user_id: user_id.into(),
@@ -622,10 +615,8 @@ mod tests {
 
     #[tokio::test]
     async fn truncated_unauthenticated_prefix_is_replayed_to_fallback() {
-        let handler = fallback_vless_handler(
-            "3ac9b383-75a1-431c-8184-106c80eb2273",
-            8081,
-        );
+        let handler =
+            fallback_vless_handler("3ac9b383-75a1-431c-8184-106c80eb2273", 8081);
         let request = b"GET /";
         let (mut client, server) = duplex(1024);
         client.write_all(request).await.unwrap();

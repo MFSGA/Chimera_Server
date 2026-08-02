@@ -433,8 +433,8 @@ pub(crate) async fn run_udp_relay(
     });
 
     let mut recv_buf = vec![0u8; UDP_BUFFER_SIZE];
-    let mut client_endpoint = client_udp_port_hint
-        .map(|port| SocketAddr::new(tcp_peer_addr.ip(), port));
+    let mut client_endpoint =
+        client_udp_port_hint.map(|port| SocketAddr::new(tcp_peer_addr.ip(), port));
 
     loop {
         let (len, client_addr) = tokio::select! {
@@ -467,8 +467,8 @@ pub(crate) async fn run_udp_relay(
             None => client_endpoint = Some(client_addr),
             Some(_) => {}
         }
-        let response_endpoint = client_endpoint
-            .expect("SOCKS5 UDP endpoint set after validation");
+        let response_endpoint =
+            client_endpoint.expect("SOCKS5 UDP endpoint set after validation");
         let data = &recv_buf[..len];
 
         // Parse SOCKS5 UDP request header: RSV(2) + FRAG(1) + ATYP(1) + DST.ADDR + DST.PORT(2)
