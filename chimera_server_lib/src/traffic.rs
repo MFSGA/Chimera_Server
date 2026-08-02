@@ -12,7 +12,7 @@ use std::{
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::async_stream::{AsyncPing, AsyncStream};
+use crate::async_stream::{AsyncPing, AsyncStream, RawTcpRelayState};
 
 #[derive(Clone, Copy)]
 pub enum TrafficDirection {
@@ -99,7 +99,16 @@ impl<S: AsyncPing + Unpin> AsyncPing for MeteredStream<S> {
     }
 }
 
-impl<S: AsyncStream> AsyncStream for MeteredStream<S> {}
+impl<S: AsyncStream> AsyncStream for MeteredStream<S> {
+    fn raw_tcp_relay_state(&self) -> RawTcpRelayState {
+        self.inner.raw_tcp_relay_state()
+    }
+
+    #[cfg(unix)]
+    fn raw_tcp_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.inner.raw_tcp_fd()
+    }
+}
 
 /// No-op implementations when the "traffic" feature is disabled.
 #[cfg(not(feature = "traffic"))]
