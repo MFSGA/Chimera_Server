@@ -342,44 +342,52 @@ where
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
-        if drain_pending_read(&mut this.pending_read, buf) {
-            return Poll::Ready(Ok(()));
-        }
-
-        match this.read_mode {
-            ReadMode::Direct => return Pin::new(&mut this.tcp).poll_read(cx, buf),
-            ReadMode::Plain => {
-                let plaintext = match this.read_from_session_or_tcp(cx) {
-                    Poll::Ready(Ok(v)) => v,
-                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                    Poll::Pending => return Poll::Pending,
-                };
-                if plaintext.is_empty() {
-                    return Poll::Ready(Ok(()));
-                }
-                append_plaintext_to_read_buf(
-                    &mut this.pending_read,
-                    buf,
-                    &plaintext,
-                );
+        loop {
+            if drain_pending_read(&mut this.pending_read, buf) {
                 return Poll::Ready(Ok(()));
             }
-            ReadMode::Padding => {}
+
+            match this.read_mode {
+                ReadMode::Direct => {
+                    return Pin::new(&mut this.tcp).poll_read(cx, buf);
+                }
+                ReadMode::Plain => {
+                    let plaintext = match this.read_from_session_or_tcp(cx) {
+                        Poll::Ready(Ok(v)) => v,
+                        Poll::Ready(Err(err)) => {
+                            return Poll::Ready(Err(err));
+                        }
+                        Poll::Pending => return Poll::Pending,
+                    };
+                    if plaintext.is_empty() {
+                        return Poll::Ready(Ok(()));
+                    }
+                    append_plaintext_to_read_buf(
+                        &mut this.pending_read,
+                        buf,
+                        &plaintext,
+                    );
+                    return Poll::Ready(Ok(()));
+                }
+                ReadMode::Padding => {}
+            }
+
+            let plaintext = match this.read_from_session_or_tcp(cx) {
+                Poll::Ready(Ok(v)) => v,
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            };
+            if plaintext.is_empty() {
+                return Poll::Ready(Ok(()));
+            }
+
+            this.handle_padded_read(&plaintext)?;
+            // A REALITY plaintext chunk may contain only part of a Vision
+            // frame. Returning Ready with an empty ReadBuf would signal EOF to
+            // the relay and close a live TLS session. Keep polling until the
+            // unpadder yields content, a mode transition exposes raw bytes,
+            // the socket becomes pending, or a real TCP EOF is observed.
         }
-
-        let plaintext = match this.read_from_session_or_tcp(cx) {
-            Poll::Ready(Ok(v)) => v,
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-            Poll::Pending => return Poll::Pending,
-        };
-        if plaintext.is_empty() {
-            return Poll::Ready(Ok(()));
-        }
-
-        this.handle_padded_read(&plaintext)?;
-        let _ = drain_pending_read(&mut this.pending_read, buf);
-
-        Poll::Ready(Ok(()))
     }
 }
 
