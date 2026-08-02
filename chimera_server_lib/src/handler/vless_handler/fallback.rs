@@ -16,6 +16,9 @@ const AUTH_PREFIX_LEN: usize = 17;
 const PATH_INSPECTION_LIMIT: usize = 64;
 const PATH_READ_GRACE: Duration = Duration::from_millis(20);
 
+type FallbackScore = (u8, usize, u8, u8);
+type FallbackSelection<'a> = Option<(&'a VlessFallback, FallbackScore)>;
+
 pub(crate) async fn read_vless_auth_prefix<S>(
     stream: &mut S,
 ) -> (Vec<u8>, Option<[u8; 16]>)
@@ -71,7 +74,7 @@ pub(crate) fn select_vless_fallback<'a>(
     let alpn = alpn.trim().to_ascii_lowercase();
     let path = extract_http_path(prefix).unwrap_or_default();
 
-    let mut selected: Option<(&VlessFallback, (u8, usize, u8, u8))> = None;
+    let mut selected: FallbackSelection<'_> = None;
     for fallback in fallbacks {
         let name_score = if fallback.name.is_empty() {
             0

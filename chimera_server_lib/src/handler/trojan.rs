@@ -28,6 +28,9 @@ const ADDR_TYPE_IPV6: u8 = 0x04;
 const MAX_PASSWORD_LINE: usize = 128;
 const CRLF: [u8; 2] = [0x0d, 0x0a];
 
+type FallbackScore = (u8, usize, u8, u8);
+type FallbackSelection<'a> = Option<(&'a TrojanFallback, FallbackScore)>;
+
 #[derive(Debug, Clone)]
 struct TrojanCredential {
     password_hash: Box<[u8]>,
@@ -354,7 +357,7 @@ fn select_trojan_fallback<'a>(
     let server_name = server_name.trim().to_ascii_lowercase();
     let alpn = alpn.trim().to_ascii_lowercase();
     let path = extract_http_path(prefix).unwrap_or_default();
-    let mut selected: Option<(&TrojanFallback, (u8, usize, u8, u8))> = None;
+    let mut selected: FallbackSelection<'_> = None;
     for fallback in fallbacks {
         let name_score = if fallback.name.is_empty() {
             0
