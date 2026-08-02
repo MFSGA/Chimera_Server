@@ -28,7 +28,9 @@ use crate::{
     outbound::connect_tcp_outbound,
     resolver::{NativeResolver, Resolver, resolve_single_address},
     runtime::RuntimeState,
-    traffic::{MeteredStream, TrafficDirection, register_connection},
+    traffic::{
+        MeteredStream, TrafficDirection, record_transfer, register_connection,
+    },
     util::{prefixed_stream::PrefixedStream, socket::new_tcp_socket},
 };
 
@@ -517,6 +519,7 @@ where
                     traffic_context.map(|context| context.with_outbound_tag(tag));
             }
             let _connection_guard = register_connection(traffic_context.as_ref());
+            let relay_traffic_context = traffic_context.clone();
             let mut server_stream = MeteredStream::new(
                 server_stream,
                 traffic_context.clone(),
@@ -541,10 +544,19 @@ where
             let (_, _) =
                 futures::join!(server_stream.shutdown(), client_stream.shutdown());
             let copy_result = copy_result?;
+            record_transfer(
+                relay_traffic_context,
+                copy_result.bypassed_left_to_right,
+                copy_result.bypassed_right_to_left,
+            );
 
             info!(
+                bypassed_upload = copy_result.bypassed_left_to_right,
+                bypassed_download = copy_result.bypassed_right_to_left,
                 "tcp forward to {} completed: client->remote {} bytes, remote->client {} bytes",
-                remote_location, copy_result.0, copy_result.1
+                remote_location,
+                copy_result.left_to_right,
+                copy_result.right_to_left,
             );
             Ok(())
         }
