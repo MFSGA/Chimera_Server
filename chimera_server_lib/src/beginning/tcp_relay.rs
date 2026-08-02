@@ -24,7 +24,7 @@ const ENV_RELAY_BACKEND: &str = "CHIMERA_TCP_RELAY_BACKEND";
 const ENV_SPLICE_PIPE_SIZE: &str = "CHIMERA_TCP_SPLICE_PIPE_SIZE";
 #[cfg(target_os = "linux")]
 const ENV_AUTO_MAX_CONNECTIONS: &str = "CHIMERA_TCP_AUTO_MAX_CONNECTIONS";
-const DEFAULT_COPY_BUFFER_SIZE: usize = 8 * 1024;
+const DEFAULT_COPY_BUFFER_SIZE: usize = 32 * 1024;
 const MIN_COPY_BUFFER_SIZE: usize = 4 * 1024;
 const MAX_COPY_BUFFER_SIZE: usize = 1024 * 1024;
 const MAX_STEPS_PER_POLL: usize = 16;
@@ -1096,8 +1096,8 @@ mod tests {
     }
 
     #[test]
-    fn default_matches_tokio_copy_bidirectional_default() {
-        assert_eq!(parse_copy_buffer_size(None).unwrap(), 8 * 1024);
+    fn default_uses_measured_thirty_two_kibibyte_buffer() {
+        assert_eq!(parse_copy_buffer_size(None).unwrap(), 32 * 1024);
     }
 
     #[test]
