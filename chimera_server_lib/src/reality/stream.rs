@@ -13,10 +13,17 @@ use crate::async_stream::{AsyncPing, AsyncStream};
 
 /// Minimal trait that both REALITY server and client connections satisfy.
 pub trait RealitySession {
+    type Reader<'a>: BufRead
+    where
+        Self: 'a;
+    type Writer<'a>: Write
+    where
+        Self: 'a;
+
     fn read_tls(&mut self, rd: &mut dyn Read) -> io::Result<usize>;
     fn process_new_packets(&mut self) -> io::Result<RealityIoState>;
-    fn reader(&mut self) -> RealityReader<'_>;
-    fn writer(&mut self) -> RealityWriter<'_>;
+    fn reader(&mut self) -> Self::Reader<'_>;
+    fn writer(&mut self) -> Self::Writer<'_>;
     fn write_tls(&mut self, wr: &mut dyn Write) -> io::Result<usize>;
     fn wants_write(&self) -> bool;
     fn wants_read(&self) -> bool;
@@ -29,6 +36,9 @@ pub trait RealitySession {
 }
 
 impl RealitySession for RealityServerConnection {
+    type Reader<'a> = RealityReader<'a>;
+    type Writer<'a> = RealityWriter<'a>;
+
     fn read_tls(&mut self, rd: &mut dyn Read) -> io::Result<usize> {
         RealityServerConnection::read_tls(self, rd)
     }
@@ -75,6 +85,9 @@ impl RealitySession for RealityServerConnection {
 }
 
 impl RealitySession for RealityClientConnection {
+    type Reader<'a> = RealityReader<'a>;
+    type Writer<'a> = RealityWriter<'a>;
+
     fn read_tls(&mut self, rd: &mut dyn Read) -> io::Result<usize> {
         RealityClientConnection::read_tls(self, rd)
     }
@@ -325,8 +338,10 @@ where
             }
         }
 
-        let mut writer = this.session.writer();
-        let n = writer.write(buf)?;
+        let n = {
+            let mut writer = this.session.writer();
+            writer.write(buf)?
+        };
 
         match this.drain_all_writes(cx) {
             Poll::Ready(Ok(())) | Poll::Pending => Poll::Ready(Ok(n)),

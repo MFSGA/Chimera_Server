@@ -60,8 +60,137 @@ fn websocket_server_config(
     }
 }
 
+#[cfg(feature = "grpc_transport")]
+fn apply_grpc_layer(
+    protocol: ServerProxyConfig,
+    stream_settings: &crate::config::StreamSettings,
+) -> Result<ServerProxyConfig, Error> {
+    if !stream_settings.network.eq_ignore_ascii_case("grpc") {
+        return Ok(protocol);
+    }
+    let settings = stream_settings.grpc_settings.clone().ok_or_else(|| {
+        Error::InvalidConfig("grpc inbound requires grpcSettings".into())
+    })?;
+    if settings.multi_mode {
+        return Err(Error::InvalidConfig(
+            "grpcSettings.multiMode is not supported yet".into(),
+        ));
+    }
+    let service_name = settings
+        .service_name
+        .unwrap_or_else(|| "GunService".to_string())
+        .trim_matches('/')
+        .trim()
+        .to_string();
+    if service_name.is_empty() {
+        return Err(Error::InvalidConfig(
+            "grpcSettings.serviceName cannot be empty".into(),
+        ));
+    }
+    let _ = (
+        settings.authority,
+        settings.idle_timeout,
+        settings.health_check_timeout,
+        settings.permit_without_stream,
+        settings.initial_windows_size,
+    );
+    Ok(ServerProxyConfig::Grpc(
+        super::types::GrpcServerConfig {
+            service_name,
+            inner: Box::new(protocol),
+        },
+    ))
+}
+
+#[cfg(not(feature = "grpc_transport"))]
+fn apply_grpc_layer(
+    protocol: ServerProxyConfig,
+    stream_settings: &crate::config::StreamSettings,
+) -> Result<ServerProxyConfig, Error> {
+    if stream_settings.network.eq_ignore_ascii_case("grpc") {
+        return Err(Error::InvalidConfig(
+            "grpc transport requires the grpc_transport feature".into(),
+        ));
+    }
+    Ok(protocol)
+}
+
+#[cfg(feature = "httpupgrade")]
+fn apply_httpupgrade_layer(
+    protocol: ServerProxyConfig,
+    stream_settings: &crate::config::StreamSettings,
+) -> Result<ServerProxyConfig, Error> {
+    if !stream_settings
+        .network
+        .eq_ignore_ascii_case("httpupgrade")
+    {
+        return Ok(protocol);
+    }
+    let settings = stream_settings
+        .httpupgrade_settings
+        .clone()
+        .ok_or_else(|| {
+            Error::InvalidConfig(
+                "httpupgrade inbound requires httpupgradeSettings".into(),
+            )
+        })?;
+    if settings.accept_proxy_protocol {
+        return Err(Error::InvalidConfig(
+            "httpupgradeSettings.acceptProxyProtocol is not supported yet"
+                .into(),
+        ));
+    }
+    if settings.ed != 0 {
+        return Err(Error::InvalidConfig(
+            "httpupgradeSettings.ed is not supported yet".into(),
+        ));
+    }
+    let path = settings
+        .path
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let path = if path.is_empty() {
+        "/".to_string()
+    } else if path.starts_with('/') {
+        path
+    } else {
+        format!("/{path}")
+    };
+    let host = settings
+        .host
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    // Xray's server uses host/path for validation. Custom headers are a
+    // client-side request construction option and do not alter inbound matching.
+    let _ = settings.header;
+    Ok(ServerProxyConfig::HttpUpgrade(HttpUpgradeServerConfig {
+        host,
+        path,
+        inner: Box::new(protocol),
+    }))
+}
+
+#[cfg(not(feature = "httpupgrade"))]
+fn apply_httpupgrade_layer(
+    protocol: ServerProxyConfig,
+    stream_settings: &crate::config::StreamSettings,
+) -> Result<ServerProxyConfig, Error> {
+    if stream_settings
+        .network
+        .eq_ignore_ascii_case("httpupgrade")
+    {
+        return Err(Error::InvalidConfig(
+            "httpupgrade transport requires the httpupgrade feature".into(),
+        ));
+    }
+    Ok(protocol)
+}
+
 #[cfg(any(feature = "hysteria", feature = "tuic"))]
 use super::quic::ServerQuicConfig;
+#[cfg(feature = "httpupgrade")]
+use super::types::HttpUpgradeServerConfig;
 use super::types::{ServerConfig, ServerProxyConfig};
 
 #[cfg(feature = "hysteria")]
@@ -75,6 +204,60 @@ use collectors::collect_tuic_settings;
 #[cfg(feature = "trojan")]
 use collectors::{collect_trojan_clients, collect_trojan_fallbacks};
 use tls::apply_security_layers;
+
+#[cfg(feature = "shadowsocks")]
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShadowsocksInboundSettings {
+    #[serde(default)]
+    method: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    level: u32,
+    #[serde(default)]
+    users: Option<Vec<ShadowsocksAccountSetting>>,
+    #[serde(default)]
+    clients: Option<Vec<ShadowsocksAccountSetting>>,
+    #[serde(default)]
+    network: Option<serde_json::Value>,
+}
+
+#[cfg(feature = "shadowsocks")]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShadowsocksAccountSetting {
+    #[serde(default)]
+    method: String,
+    password: String,
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    level: u32,
+}
+
+#[cfg(feature = "http")]
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HttpInboundSettings {
+    #[serde(default)]
+    users: Option<Vec<HttpAccountSetting>>,
+    #[serde(default)]
+    accounts: Option<Vec<HttpAccountSetting>>,
+    #[serde(default)]
+    allow_transparent: bool,
+    #[serde(default)]
+    user_level: u32,
+}
+
+#[cfg(feature = "http")]
+#[derive(Debug, Deserialize)]
+struct HttpAccountSetting {
+    user: String,
+    pass: String,
+}
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,6 +283,133 @@ struct VlessInboundSettings {
 }
 
 #[cfg(feature = "vless")]
+#[derive(Debug, Deserialize)]
+struct VlessInboundFallback {
+    dest: serde_json::Value,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    alpn: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default, rename = "type")]
+    fallback_type: Option<String>,
+    #[serde(default)]
+    xver: Option<u8>,
+}
+
+#[cfg(feature = "vless")]
+fn collect_vless_fallbacks(
+    values: Vec<serde_json::Value>,
+) -> Result<Vec<crate::config::server_config::VlessFallback>, Error> {
+    values
+        .into_iter()
+        .map(|value| {
+            let fallback: VlessInboundFallback =
+                serde_json::from_value(value).map_err(|error| {
+                    Error::InvalidConfig(format!(
+                        "invalid vless fallback settings: {error}"
+                    ))
+                })?;
+            let fallback_type = fallback
+                .fallback_type
+                .as_deref()
+                .unwrap_or("tcp")
+                .trim()
+                .to_ascii_lowercase();
+            if !matches!(fallback_type.as_str(), "" | "tcp") {
+                return Err(Error::InvalidConfig(format!(
+                    "vless fallback type={fallback_type} is not supported yet"
+                )));
+            }
+
+            let name = fallback
+                .name
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            let alpn = fallback
+                .alpn
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            let path = fallback.path.unwrap_or_default().trim().to_string();
+            if !path.is_empty() && !path.starts_with('/') {
+                return Err(Error::InvalidConfig(
+                    "vless fallback path must be empty or start with /".into(),
+                ));
+            }
+
+            let xver = fallback.xver.unwrap_or(0);
+            if xver > 2 {
+                return Err(Error::InvalidConfig(format!(
+                    "vless fallback xver must be 0, 1, or 2; got {xver}"
+                )));
+            }
+            let dest = parse_vless_fallback_dest(fallback.dest)?;
+            Ok(crate::config::server_config::VlessFallback {
+                name,
+                alpn,
+                path,
+                dest,
+                xver,
+            })
+        })
+        .collect()
+}
+
+#[cfg(feature = "vless")]
+fn parse_vless_fallback_dest(
+    value: serde_json::Value,
+) -> Result<NetLocation, Error> {
+    let local_port = |port: u16| {
+        NetLocation::new(Address::Ipv4(std::net::Ipv4Addr::LOCALHOST), port)
+    };
+    match value {
+        serde_json::Value::Number(number) => {
+            let port = number
+                .as_u64()
+                .and_then(|port| u16::try_from(port).ok())
+                .filter(|port| *port != 0)
+                .ok_or_else(|| {
+                    Error::InvalidConfig(
+                        "vless fallback numeric dest must be a port from 1 to 65535"
+                            .into(),
+                    )
+                })?;
+            Ok(local_port(port))
+        }
+        serde_json::Value::String(value) => {
+            let dest = value.trim();
+            if dest.is_empty() {
+                return Err(Error::InvalidConfig(
+                    "vless fallback dest cannot be empty".into(),
+                ));
+            }
+            if let Ok(port) = dest.parse::<u16>()
+                && port != 0
+            {
+                return Ok(local_port(port));
+            }
+            if dest.starts_with('/') || dest.starts_with('@') {
+                return Err(Error::InvalidConfig(
+                    "vless fallback Unix socket destinations are not supported yet"
+                        .into(),
+                ));
+            }
+            NetLocation::from_str(dest, None).map_err(|error| {
+                Error::InvalidConfig(format!(
+                    "invalid vless fallback dest {dest}: {error}"
+                ))
+            })
+        }
+        _ => Err(Error::InvalidConfig(
+            "vless fallback dest must be a port number or host:port string".into(),
+        )),
+    }
+}
+
+#[cfg(feature = "vless")]
 fn validate_vless_flow(flow: &str) -> Result<(), Error> {
     match flow {
         "" | "xtls-rprx-vision" => Ok(()),
@@ -112,6 +422,199 @@ fn validate_vless_flow(flow: &str) -> Result<(), Error> {
 #[cfg(feature = "vless")]
 fn has_vless_vision_flow(users: &[crate::config::server_config::VlessUser]) -> bool {
     users.iter().any(|user| user.flow == "xtls-rprx-vision")
+}
+
+#[cfg(feature = "shadowsocks")]
+fn collect_shadowsocks_users(
+    settings: Option<crate::config::SettingObject>,
+) -> Result<(
+    Vec<crate::config::server_config::ShadowsocksUser>,
+    Option<crate::config::server_config::ShadowsocksServerIdentity>,
+    Transport,
+), Error> {
+    let settings = settings.ok_or_else(|| {
+        Error::InvalidConfig("shadowsocks inbound requires settings".into())
+    })?;
+    let raw = settings
+        .deserialize::<ShadowsocksInboundSettings>()
+        .map_err(|error| {
+            Error::InvalidConfig(format!(
+                "invalid shadowsocks inbound settings: {error}"
+            ))
+        })?;
+    let transport = shadowsocks_transport(raw.network.as_ref())?;
+    let accounts = raw.clients.or(raw.users);
+    let is_aead2022_multi = accounts.is_some()
+        && raw.method.starts_with("2022-blake3-");
+
+    let (users, identity) = if let Some(accounts) = accounts {
+        if accounts.is_empty() {
+            return Err(Error::InvalidConfig(
+                "shadowsocks users cannot be empty".into(),
+            ));
+        }
+        if is_aead2022_multi {
+            if !matches!(
+                raw.method.as_str(),
+                "2022-blake3-aes-128-gcm" | "2022-blake3-aes-256-gcm"
+            ) {
+                return Err(Error::InvalidConfig(
+                    "Shadowsocks 2022 multi-user EIH supports only AES-128-GCM and AES-256-GCM"
+                        .into(),
+                ));
+            }
+            let identity =
+                crate::config::server_config::ShadowsocksServerIdentity {
+                    method: raw.method.clone(),
+                    password: raw.password.clone(),
+                };
+            crate::handler::shadowsocks::validate_user(
+                &crate::config::server_config::ShadowsocksUser {
+                    method: identity.method.clone(),
+                    password: identity.password.clone(),
+                    email: String::new(),
+                },
+            )
+            .map_err(|error| Error::InvalidConfig(error.to_string()))?;
+            let users = accounts
+                .into_iter()
+                .map(|user| {
+                    if user.level != 0 {
+                        return Err(Error::InvalidConfig(
+                            "shadowsocks user level is not supported yet".into(),
+                        ));
+                    }
+                    if !user.method.trim().is_empty() {
+                        return Err(Error::InvalidConfig(
+                            "Shadowsocks 2022 EIH users must omit method".into(),
+                        ));
+                    }
+                    Ok(crate::config::server_config::ShadowsocksUser {
+                        method: raw.method.clone(),
+                        password: user.password,
+                        email: user.email,
+                    })
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            (users, Some(identity))
+        } else {
+            let users = accounts
+                .into_iter()
+                .map(|user| {
+                    if user.level != 0 {
+                        return Err(Error::InvalidConfig(
+                            "shadowsocks user level is not supported yet".into(),
+                        ));
+                    }
+                    Ok(crate::config::server_config::ShadowsocksUser {
+                        method: user.method,
+                        password: user.password,
+                        email: user.email,
+                    })
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            (users, None)
+        }
+    } else {
+        if raw.level != 0 {
+            return Err(Error::InvalidConfig(
+                "shadowsocks settings.level is not supported yet".into(),
+            ));
+        }
+        (
+            vec![crate::config::server_config::ShadowsocksUser {
+                method: raw.method,
+                password: raw.password,
+                email: raw.email,
+            }],
+            None,
+        )
+    };
+
+    for user in &users {
+        crate::handler::shadowsocks::validate_user(user)
+            .map_err(|error| Error::InvalidConfig(error.to_string()))?;
+    }
+    Ok((users, identity, transport))
+}
+
+#[cfg(feature = "shadowsocks")]
+fn shadowsocks_transport(
+    network: Option<&serde_json::Value>,
+) -> Result<Transport, Error> {
+    let Some(network) = network else {
+        return Ok(Transport::Tcp);
+    };
+    let values = match network {
+        serde_json::Value::String(value) => value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>(),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(|value| {
+                value.as_str().map(str::to_string).ok_or_else(|| {
+                    Error::InvalidConfig(
+                        "shadowsocks settings.network must contain strings".into(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => {
+            return Err(Error::InvalidConfig(
+                "shadowsocks settings.network must be a string or string array"
+                    .into(),
+            ));
+        }
+    };
+    let tcp = values.iter().any(|value| value.eq_ignore_ascii_case("tcp"));
+    let udp = values.iter().any(|value| value.eq_ignore_ascii_case("udp"));
+    if values.is_empty() || (tcp && !udp && values.len() == 1) {
+        return Ok(Transport::Tcp);
+    }
+    if udp && !tcp && values.len() == 1 {
+        return Ok(Transport::Udp);
+    }
+    if tcp && udp && values.len() == 2 {
+        return Ok(Transport::TcpAndUdp);
+    }
+    Err(Error::InvalidConfig(format!(
+        "unsupported shadowsocks network list: {}",
+        values.join(",")
+    )))
+}
+
+#[cfg(feature = "http")]
+fn collect_http_settings(
+    settings: Option<crate::config::SettingObject>,
+) -> Result<(Vec<crate::config::server_config::HttpUser>, bool), Error> {
+    let raw = settings
+        .map(|settings| settings.deserialize::<HttpInboundSettings>())
+        .transpose()
+        .map_err(|error| {
+            Error::InvalidConfig(format!("invalid http inbound settings: {error}"))
+        })?
+        .unwrap_or_default();
+
+    if raw.user_level != 0 {
+        return Err(Error::InvalidConfig(
+            "http settings.userLevel is not supported yet".into(),
+        ));
+    }
+
+    let accounts = raw.accounts.or(raw.users).unwrap_or_default();
+    Ok((
+        accounts
+            .into_iter()
+            .map(|account| crate::config::server_config::HttpUser {
+                username: account.user,
+                password: account.pass,
+            })
+            .collect(),
+        raw.allow_transparent,
+    ))
 }
 
 fn planned_unsupported_protocol_error(protocol: &str) -> Error {
@@ -187,8 +690,16 @@ impl TryFrom<InboudItem> for ServerConfig {
                         }
                         Transport::Udp
                     }
-                    Some(network) if network.is_empty() || network == "tcp" => {
+                    Some(network)
+                        if network.is_empty()
+                            || network == "tcp"
+                            || network == "httpupgrade"
+                            || network == "grpc" =>
+                    {
                         if let Some(stream_setting) = stream_settings.as_ref() {
+                            protocol =
+                                apply_httpupgrade_layer(protocol, stream_setting)?;
+                            protocol = apply_grpc_layer(protocol, stream_setting)?;
                             protocol = apply_security_layers(protocol, stream_setting)?;
                         }
                         Transport::Tcp
@@ -287,11 +798,8 @@ impl TryFrom<InboudItem> for ServerConfig {
                         "vless settings.decryption must be none, got {decryption}"
                     )));
                 }
-                if !vless_settings.fallbacks.is_empty() {
-                    return Err(Error::InvalidConfig(
-                        "vless settings.fallbacks is not supported yet".into(),
-                    ));
-                }
+                let fallbacks =
+                    collect_vless_fallbacks(vless_settings.fallbacks)?;
                 let settings_flow = vless_settings
                     .flow
                     .as_deref()
@@ -332,7 +840,10 @@ impl TryFrom<InboudItem> for ServerConfig {
                     })?;
                 let uses_vision = has_vless_vision_flow(&users);
 
-                let mut protocol = ServerProxyConfig::Vless { users };
+                let mut protocol = ServerProxyConfig::Vless {
+                    users,
+                    fallbacks,
+                };
                 let uses_xhttp = stream_settings
                     .as_ref()
                     .map(|settings| settings.network.eq_ignore_ascii_case("xhttp"))
@@ -402,6 +913,20 @@ impl TryFrom<InboudItem> for ServerConfig {
                             }
                         }
                     } else {
+                        if uses_vision
+                            && matches!(
+                                stream_setting.network.to_ascii_lowercase().as_str(),
+                                "httpupgrade" | "grpc"
+                            )
+                        {
+                            return Err(Error::InvalidConfig(
+                                "xtls-rprx-vision does not support httpupgrade or grpc transport"
+                                    .into(),
+                            ));
+                        }
+                        protocol =
+                            apply_httpupgrade_layer(protocol, stream_setting)?;
+                        protocol = apply_grpc_layer(protocol, stream_setting)?;
                         protocol = apply_security_layers(protocol, stream_setting)?;
                     }
                 }
@@ -454,6 +979,8 @@ impl TryFrom<InboudItem> for ServerConfig {
                     }
 
                 if let Some(stream_setting) = stream_settings.as_ref() {
+                    protocol = apply_httpupgrade_layer(protocol, stream_setting)?;
+                    protocol = apply_grpc_layer(protocol, stream_setting)?;
                     protocol = apply_security_layers(protocol, stream_setting)?;
                 }
 
@@ -490,6 +1017,8 @@ impl TryFrom<InboudItem> for ServerConfig {
                     }
 
                 if let Some(stream_setting) = stream_settings.as_ref() {
+                    protocol = apply_httpupgrade_layer(protocol, stream_setting)?;
+                    protocol = apply_grpc_layer(protocol, stream_setting)?;
                     protocol = apply_security_layers(protocol, stream_setting)?;
                 }
 
@@ -556,11 +1085,156 @@ impl TryFrom<InboudItem> for ServerConfig {
                 ))
             }
 
-            Protocol::Http => Err(planned_unsupported_protocol_error("http")),
-            Protocol::Mixed => Err(planned_unsupported_protocol_error("mixed")),
-            Protocol::Shadowsocks => {
-                Err(planned_unsupported_protocol_error("shadowsocks"))
+            #[cfg(feature = "http")]
+            Protocol::Http => {
+                let (accounts, allow_transparent) =
+                    collect_http_settings(settings)?;
+                let mut protocol = ServerProxyConfig::Http {
+                    accounts,
+                    allow_transparent,
+                };
+
+                #[cfg(feature = "ws")]
+                if let Some(stream_setting) = stream_settings.as_ref()
+                    && let Some(ws_setting) = stream_setting.ws_settings.clone()
+                {
+                    protocol = ServerProxyConfig::Websocket {
+                        targets: Box::new(OneOrSome::One(
+                            websocket_server_config(ws_setting, protocol),
+                        )),
+                    };
+                }
+
+                if let Some(stream_setting) = stream_settings.as_ref() {
+                    let network = stream_setting.network.trim().to_ascii_lowercase();
+                    if !matches!(
+                        network.as_str(),
+                        "" | "tcp" | "ws" | "websocket" | "httpupgrade" | "grpc"
+                    ) {
+                        return Err(Error::InvalidConfig(format!(
+                            "http inbound streamSettings.network={network} is not supported"
+                        )));
+                    }
+                    protocol = apply_httpupgrade_layer(protocol, stream_setting)?;
+                    protocol = apply_grpc_layer(protocol, stream_setting)?;
+                    protocol = apply_security_layers(protocol, stream_setting)?;
+                }
+
+                Ok(ServerConfig {
+                    tag,
+                    bind_location,
+                    protocol,
+                    transport: Transport::Tcp,
+                    quic_settings: None,
+                })
             }
+            #[cfg(not(feature = "http"))]
+            Protocol::Http => Err(Error::InvalidConfig(
+                "http inbound requires the http feature".into(),
+            )),
+            #[cfg(feature = "mixed")]
+            Protocol::Mixed => {
+                let settings = settings.unwrap_or_else(|| {
+                    crate::config::SettingObject(serde_json::json!({}))
+                });
+                let (accounts, udp_enabled) = collect_socks_settings(settings)?;
+                let mut protocol = ServerProxyConfig::Mixed {
+                    accounts,
+                    udp_enabled,
+                };
+
+                #[cfg(feature = "ws")]
+                if let Some(stream_setting) = stream_settings.as_ref()
+                    && let Some(ws_setting) = stream_setting.ws_settings.clone()
+                {
+                    protocol = ServerProxyConfig::Websocket {
+                        targets: Box::new(OneOrSome::One(
+                            websocket_server_config(ws_setting, protocol),
+                        )),
+                    };
+                }
+
+                if let Some(stream_setting) = stream_settings.as_ref() {
+                    let network = stream_setting.network.trim().to_ascii_lowercase();
+                    if !matches!(
+                        network.as_str(),
+                        "" | "tcp" | "ws" | "websocket" | "httpupgrade" | "grpc"
+                    ) {
+                        return Err(Error::InvalidConfig(format!(
+                            "mixed inbound streamSettings.network={network} is not supported"
+                        )));
+                    }
+                    protocol = apply_httpupgrade_layer(protocol, stream_setting)?;
+                    protocol = apply_grpc_layer(protocol, stream_setting)?;
+                    protocol = apply_security_layers(protocol, stream_setting)?;
+                }
+
+                Ok(ServerConfig {
+                    tag,
+                    bind_location,
+                    protocol,
+                    transport: Transport::Tcp,
+                    quic_settings: None,
+                })
+            }
+            #[cfg(not(feature = "mixed"))]
+            Protocol::Mixed => Err(Error::InvalidConfig(
+                "mixed inbound requires the mixed feature".into(),
+            )),
+            #[cfg(feature = "shadowsocks")]
+            Protocol::Shadowsocks => {
+                let (users, identity, transport) =
+                    collect_shadowsocks_users(settings)?;
+                let mut protocol =
+                    ServerProxyConfig::Shadowsocks { users, identity };
+
+                if !matches!(transport, Transport::Tcp)
+                    && stream_settings.is_some()
+                {
+                    return Err(Error::InvalidConfig(
+                        "shadowsocks UDP listeners do not support streamSettings"
+                            .into(),
+                    ));
+                }
+
+                #[cfg(feature = "ws")]
+                if let Some(stream_setting) = stream_settings.as_ref()
+                    && let Some(ws_setting) = stream_setting.ws_settings.clone()
+                {
+                    protocol = ServerProxyConfig::Websocket {
+                        targets: Box::new(OneOrSome::One(
+                            websocket_server_config(ws_setting, protocol),
+                        )),
+                    };
+                }
+
+                if let Some(stream_setting) = stream_settings.as_ref() {
+                    let network = stream_setting.network.trim().to_ascii_lowercase();
+                    if !matches!(
+                        network.as_str(),
+                        "" | "tcp" | "ws" | "websocket" | "httpupgrade" | "grpc"
+                    ) {
+                        return Err(Error::InvalidConfig(format!(
+                            "shadowsocks inbound streamSettings.network={network} is not supported"
+                        )));
+                    }
+                    protocol = apply_httpupgrade_layer(protocol, stream_setting)?;
+                    protocol = apply_grpc_layer(protocol, stream_setting)?;
+                    protocol = apply_security_layers(protocol, stream_setting)?;
+                }
+
+                Ok(ServerConfig {
+                    tag,
+                    bind_location,
+                    protocol,
+                    transport,
+                    quic_settings: None,
+                })
+            }
+            #[cfg(not(feature = "shadowsocks"))]
+            Protocol::Shadowsocks => Err(Error::InvalidConfig(
+                "shadowsocks inbound requires the shadowsocks feature".into(),
+            )),
 
             Protocol::Socks => {
                 let settings = settings.ok_or_else(|| {
@@ -584,6 +1258,8 @@ impl TryFrom<InboudItem> for ServerConfig {
                     }
 
                 if let Some(stream_setting) = stream_settings.as_ref() {
+                    protocol = apply_httpupgrade_layer(protocol, stream_setting)?;
+                    protocol = apply_grpc_layer(protocol, stream_setting)?;
                     protocol = apply_security_layers(protocol, stream_setting)?;
                 }
 
@@ -613,31 +1289,188 @@ mod tests {
         .expect("valid inbound item")
     }
 
+    #[cfg(feature = "http")]
     #[test]
-    fn planned_http_inbound_returns_clear_unsupported_error() {
-        let err = ServerConfig::try_from(inbound_for_protocol("http"))
-            .expect_err("http inbound is planned but unsupported");
-        assert!(err.to_string().contains(
-            "protocol=http is recognized but not supported in this stage"
-        ));
+    fn http_inbound_builds_without_accounts() {
+        let config = ServerConfig::try_from(inbound_for_protocol("http"))
+            .expect("HTTP CONNECT inbound should build");
+        match config.protocol {
+            ServerProxyConfig::Http {
+                accounts,
+                allow_transparent,
+            } => {
+                assert!(accounts.is_empty());
+                assert!(!allow_transparent);
+            }
+            other => panic!("expected http protocol, got {other:?}"),
+        }
     }
 
+    #[cfg(feature = "http")]
     #[test]
-    fn planned_mixed_inbound_returns_clear_unsupported_error() {
-        let err = ServerConfig::try_from(inbound_for_protocol("mixed"))
-            .expect_err("mixed inbound is planned but unsupported");
-        assert!(err.to_string().contains(
-            "protocol=mixed is recognized but not supported in this stage"
-        ));
+    fn http_inbound_preserves_allow_transparent() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "http",
+            "tag": "http-transparent",
+            "settings": {
+                "allowTransparent": true
+            }
+        }))
+        .expect("valid HTTP transparent inbound");
+        let config = ServerConfig::try_from(inbound)
+            .expect("transparent HTTP inbound should build");
+        match config.protocol {
+            ServerProxyConfig::Http {
+                allow_transparent,
+                ..
+            } => assert!(allow_transparent),
+            other => panic!("expected http protocol, got {other:?}"),
+        }
     }
 
+    #[cfg(feature = "mixed")]
     #[test]
-    fn planned_shadowsocks_inbound_returns_clear_unsupported_error() {
-        let err = ServerConfig::try_from(inbound_for_protocol("shadowsocks"))
-            .expect_err("shadowsocks inbound is planned but unsupported");
-        assert!(err.to_string().contains(
-            "protocol=shadowsocks is recognized but not supported in this stage"
-        ));
+    fn mixed_inbound_builds_with_noauth_defaults() {
+        let config = ServerConfig::try_from(inbound_for_protocol("mixed"))
+            .expect("mixed inbound should build");
+        match config.protocol {
+            ServerProxyConfig::Mixed {
+                accounts,
+                udp_enabled,
+            } => {
+                assert!(!accounts.auth_required());
+                assert!(accounts.snapshot().is_empty());
+                assert!(!udp_enabled);
+            }
+            other => panic!("expected mixed protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "shadowsocks")]
+    #[test]
+    fn shadowsocks_inbound_builds_legacy_tcp() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "shadowsocks",
+            "tag": "ss-in",
+            "settings": {
+                "method": "aes-128-gcm",
+                "password": "secret",
+                "email": "ss@example.test",
+                "network": "tcp"
+            }
+        }))
+        .expect("valid shadowsocks inbound");
+        let config = ServerConfig::try_from(inbound)
+            .expect("legacy Shadowsocks TCP should build");
+        match config.protocol {
+            ServerProxyConfig::Shadowsocks { users, identity } => {
+                assert!(identity.is_none());
+                assert_eq!(users.len(), 1);
+                assert_eq!(users[0].method, "aes-128-gcm");
+                assert_eq!(users[0].password, "secret");
+                assert_eq!(users[0].email, "ss@example.test");
+            }
+            other => panic!("expected shadowsocks protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "shadowsocks")]
+    #[test]
+    fn shadowsocks_inbound_preserves_multiple_legacy_users() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "shadowsocks",
+            "tag": "ss-multi-user",
+            "settings": {
+                "clients": [{
+                    "method": "aes-128-gcm",
+                    "password": "secret-a",
+                    "email": "a@example.test"
+                }, {
+                    "method": "chacha20-ietf-poly1305",
+                    "password": "secret-b",
+                    "email": "b@example.test"
+                }],
+                "network": "tcp,udp"
+            }
+        }))
+        .expect("valid Shadowsocks multi-user inbound");
+        let config = ServerConfig::try_from(inbound)
+            .expect("legacy Shadowsocks multi-user should build");
+        match config.protocol {
+            ServerProxyConfig::Shadowsocks { users, identity } => {
+                assert!(identity.is_none());
+                assert_eq!(users.len(), 2);
+                assert_eq!(users[0].email, "a@example.test");
+                assert_eq!(users[1].email, "b@example.test");
+            }
+            other => panic!("expected shadowsocks protocol, got {other:?}"),
+        }
+        assert_eq!(config.transport, Transport::TcpAndUdp);
+    }
+
+    #[cfg(feature = "shadowsocks")]
+    #[test]
+    fn shadowsocks_inbound_preserves_2022_multi_user_eih() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "shadowsocks",
+            "tag": "ss-2022-multi-user",
+            "settings": {
+                "method": "2022-blake3-aes-128-gcm",
+                "password": "AAECAwQFBgcICQoLDA0ODw==",
+                "clients": [{
+                    "password": "EBESExQVFhcYGRobHB0eHw==",
+                    "email": "user-a@example.test"
+                }, {
+                    "password": "ICEiIyQlJicoKSorLC0uLw==",
+                    "email": "user-b@example.test"
+                }],
+                "network": "tcp,udp"
+            }
+        }))
+        .expect("valid Shadowsocks 2022 multi-user shape");
+        let config = ServerConfig::try_from(inbound)
+            .expect("2022 multi-user EIH should build");
+        match config.protocol {
+            ServerProxyConfig::Shadowsocks { users, identity } => {
+                assert_eq!(users.len(), 2);
+                assert_eq!(users[0].method, "2022-blake3-aes-128-gcm");
+                assert_eq!(users[0].email, "user-a@example.test");
+                assert_eq!(users[1].email, "user-b@example.test");
+                let identity = identity.expect("server EIH identity");
+                assert_eq!(identity.method, "2022-blake3-aes-128-gcm");
+                assert_eq!(identity.password, "AAECAwQFBgcICQoLDA0ODw==");
+            }
+            other => panic!("expected shadowsocks protocol, got {other:?}"),
+        }
+        assert_eq!(config.transport, Transport::TcpAndUdp);
+    }
+
+    #[cfg(feature = "shadowsocks")]
+    #[test]
+    fn shadowsocks_inbound_builds_tcp_and_udp_transport() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "shadowsocks",
+            "tag": "ss-udp",
+            "settings": {
+                "method": "aes-128-gcm",
+                "password": "secret",
+                "network": "tcp,udp"
+            }
+        }))
+        .expect("valid shadowsocks inbound shape");
+        let config = ServerConfig::try_from(inbound)
+            .expect("Shadowsocks TCP+UDP should build");
+        assert_eq!(config.transport, Transport::TcpAndUdp);
     }
 
     #[test]
@@ -760,7 +1593,7 @@ mod tests {
             .expect("vless inbound config should build");
 
         match config.protocol {
-            ServerProxyConfig::Vless { users } => {
+            ServerProxyConfig::Vless { users, .. } => {
                 assert_eq!(users.len(), 2);
                 assert_eq!(users[0].user_id, "3ac9b383-75a1-431c-8184-106c80eb2273");
                 assert_eq!(users[0].user_label, "user-a@example.com");
@@ -813,7 +1646,7 @@ mod tests {
 
         match config.protocol {
             ServerProxyConfig::Reality(reality) => match reality.inner.as_ref() {
-                ServerProxyConfig::Vless { users } => {
+                ServerProxyConfig::Vless { users, .. } => {
                     assert_eq!(users.len(), 1);
                     assert_eq!(users[0].flow, "xtls-rprx-vision");
                 }
@@ -823,13 +1656,13 @@ mod tests {
             },
             #[cfg(feature = "tls")]
             ServerProxyConfig::Tls(tls) => match tls.inner.as_ref() {
-                ServerProxyConfig::Vless { users } => {
+                ServerProxyConfig::Vless { users, .. } => {
                     assert_eq!(users.len(), 1);
                     assert_eq!(users[0].flow, "xtls-rprx-vision");
                 }
                 other => panic!("expected vless protocol inside tls, got {other:?}"),
             },
-            ServerProxyConfig::Vless { users } => {
+            ServerProxyConfig::Vless { users, .. } => {
                 assert_eq!(users.len(), 1);
                 assert_eq!(users[0].flow, "xtls-rprx-vision");
             }
@@ -880,6 +1713,7 @@ mod tests {
 
         match config.protocol {
             ServerProxyConfig::Reality(reality) => {
+                assert_eq!(reality.min_client_version, Some([26, 3, 27]));
                 assert_eq!(
                     reality.cipher_suites,
                     vec![
@@ -898,22 +1732,19 @@ mod tests {
 
     #[cfg(all(feature = "reality", feature = "vless"))]
     #[test]
-    fn vless_reality_defaults_missing_short_ids_to_zero() {
+    fn vless_reality_rejects_missing_short_ids() {
         let mut settings = base_reality_settings();
         settings
             .as_object_mut()
             .expect("reality settings object")
             .remove("shortIds");
 
-        let config = ServerConfig::try_from(vless_reality_inbound(settings))
-            .expect("missing shortIds should use shoes-compatible default");
-
-        match config.protocol {
-            ServerProxyConfig::Reality(reality) => {
-                assert_eq!(reality.short_ids, vec![[0u8; 8]]);
-            }
-            other => panic!("expected reality protocol, got {other:?}"),
-        }
+        let err = ServerConfig::try_from(vless_reality_inbound(settings))
+            .expect_err("xray-compatible REALITY inbound requires shortIds");
+        assert!(
+            err.to_string()
+                .contains("reality inbound requires at least one shortId")
+        );
     }
 
     #[cfg(all(feature = "reality", feature = "vless"))]
@@ -984,7 +1815,7 @@ mod tests {
 
         match config.protocol {
             ServerProxyConfig::Reality(reality) => match reality.inner.as_ref() {
-                ServerProxyConfig::Vless { users } => {
+                ServerProxyConfig::Vless { users, .. } => {
                     assert_eq!(users.len(), 1);
                     assert_eq!(users[0].flow, "xtls-rprx-vision");
                 }
@@ -1342,7 +2173,35 @@ mod tests {
 
     #[cfg(feature = "vless")]
     #[test]
-    fn vless_builder_rejects_fallbacks_until_implemented() {
+    fn vless_builder_rejects_unknown_stream_security() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10002,
+            "protocol": "vless",
+            "tag": "vless-unknown-security",
+            "settings": {
+                "clients": [{
+                    "id": "3ac9b383-75a1-431c-8184-106c80eb2273"
+                }],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "definitely-not-a-security-layer"
+            }
+        }))
+        .expect("valid inbound json shape");
+
+        let err = ServerConfig::try_from(inbound)
+            .expect_err("unknown stream security must not downgrade to plaintext");
+        assert!(err.to_string().contains(
+            "unsupported streamSettings.security=definitely-not-a-security-layer"
+        ));
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn vless_builder_accepts_dest_only_fallback() {
         let inbound: InboudItem = serde_json::from_value(serde_json::json!({
             "listen": "127.0.0.1",
             "port": 10002,
@@ -1353,17 +2212,144 @@ mod tests {
                     "id": "3ac9b383-75a1-431c-8184-106c80eb2273"
                 }],
                 "decryption": "none",
-                "fallbacks": [{ "dest": "127.0.0.1:8080" }]
+                "fallbacks": [{ "dest": "127.0.0.1:8080", "xver": 0 }]
             }
         }))
         .expect("valid inbound json shape");
 
-        let err = ServerConfig::try_from(inbound)
-            .expect_err("vless fallbacks should fail explicitly");
-        assert!(
-            err.to_string()
-                .contains("vless settings.fallbacks is not supported yet")
-        );
+        let config = ServerConfig::try_from(inbound)
+            .expect("dest-only VLESS fallback should build");
+        match config.protocol {
+            ServerProxyConfig::Vless { fallbacks, .. } => {
+                assert_eq!(fallbacks.len(), 1);
+                assert_eq!(fallbacks[0].dest.to_string(), "127.0.0.1:8080");
+            }
+            other => panic!("expected vless protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn vless_builder_accepts_numeric_fallback_port() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10002,
+            "protocol": "vless",
+            "tag": "vless-numeric-fallback",
+            "settings": {
+                "clients": [{
+                    "id": "3ac9b383-75a1-431c-8184-106c80eb2273"
+                }],
+                "decryption": "none",
+                "fallbacks": [{ "dest": 8081 }]
+            }
+        }))
+        .expect("valid inbound json shape");
+
+        let config = ServerConfig::try_from(inbound)
+            .expect("numeric VLESS fallback port should build");
+        match config.protocol {
+            ServerProxyConfig::Vless { fallbacks, .. } => {
+                assert_eq!(fallbacks[0].dest.to_string(), "127.0.0.1:8081");
+            }
+            other => panic!("expected vless protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn vless_builder_preserves_fallback_xver() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10002,
+            "protocol": "vless",
+            "tag": "vless-fallback-xver",
+            "settings": {
+                "clients": [{
+                    "id": "3ac9b383-75a1-431c-8184-106c80eb2273"
+                }],
+                "decryption": "none",
+                "fallbacks": [
+                    { "dest": 8081, "xver": 1 },
+                    { "dest": 8082, "xver": 2 }
+                ]
+            }
+        }))
+        .expect("valid inbound json shape");
+
+        let config = ServerConfig::try_from(inbound)
+            .expect("PROXY protocol fallback versions should build");
+        match config.protocol {
+            ServerProxyConfig::Vless { fallbacks, .. } => {
+                assert_eq!(fallbacks[0].xver, 1);
+                assert_eq!(fallbacks[1].xver, 2);
+            }
+            other => panic!("expected vless protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn vless_builder_rejects_unknown_fallback_xver() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10002,
+            "protocol": "vless",
+            "tag": "vless-fallback-xver-invalid",
+            "settings": {
+                "clients": [{
+                    "id": "3ac9b383-75a1-431c-8184-106c80eb2273"
+                }],
+                "decryption": "none",
+                "fallbacks": [{ "dest": 8081, "xver": 3 }]
+            }
+        }))
+        .expect("valid inbound json shape");
+
+        let error = ServerConfig::try_from(inbound)
+            .expect_err("xver=3 must be rejected");
+        assert!(error.to_string().contains(
+            "vless fallback xver must be 0, 1, or 2; got 3"
+        ));
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn vless_builder_preserves_fallback_match_fields() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10002,
+            "protocol": "vless",
+            "tag": "vless-fallback-path",
+            "settings": {
+                "clients": [{
+                    "id": "3ac9b383-75a1-431c-8184-106c80eb2273"
+                }],
+                "decryption": "none",
+                "fallbacks": [{
+                    "name": "EXAMPLE.COM",
+                    "alpn": "H2",
+                    "dest": "127.0.0.1:8080",
+                    "path": "/fallback",
+                    "type": "tcp",
+                    "xver": 0
+                }]
+            }
+        }))
+        .expect("valid inbound json shape");
+
+        let config = ServerConfig::try_from(inbound)
+            .expect("VLESS fallback match fields should build");
+        match config.protocol {
+            ServerProxyConfig::Vless { fallbacks, .. } => {
+                assert_eq!(fallbacks.len(), 1);
+                assert_eq!(fallbacks[0].name, "example.com");
+                assert_eq!(fallbacks[0].alpn, "h2");
+                assert_eq!(fallbacks[0].path, "/fallback");
+                assert_eq!(fallbacks[0].xver, 0);
+            }
+            other => panic!("expected vless protocol, got {other:?}"),
+        }
     }
 
     #[cfg(feature = "vmess")]

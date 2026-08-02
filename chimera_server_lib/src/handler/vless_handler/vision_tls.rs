@@ -1,3 +1,6 @@
+use bytes::BytesMut;
+use tracing::debug;
+
 const TLS_APPLICATION_DATA: u8 = 0x17;
 const TLS_HANDSHAKE: u8 = 0x16;
 const TLS_CLIENT_HELLO: u8 = 0x01;
@@ -14,7 +17,8 @@ pub(crate) struct VisionTlsState {
     pub(crate) is_tls: bool,
     pub(crate) is_tls12_or_above: bool,
     pub(crate) enable_direct: bool,
-    server_hello_len: Option<usize>,
+    uplink_records: BytesMut,
+    downlink_records: BytesMut,
     server_hello: Vec<u8>,
 }
 
@@ -25,7 +29,8 @@ impl Default for VisionTlsState {
             is_tls: false,
             is_tls12_or_above: false,
             enable_direct: false,
-            server_hello_len: None,
+            uplink_records: BytesMut::new(),
+            downlink_records: BytesMut::new(),
             server_hello: Vec::new(),
         }
     }
@@ -35,37 +40,83 @@ impl VisionTlsState {
     /// Mirrors xray-core's shared TrafficState filter. Both the uplink reader
     /// and downlink writer feed this state so ClientHello and ServerHello can
     /// jointly decide whether the inner TLS stream is safe to penetrate.
-    pub(crate) fn observe(&mut self, data: &[u8]) {
+    pub(crate) fn observe_uplink(&mut self, data: &[u8]) {
+        self.observe_records(data, false);
+    }
+
+    pub(crate) fn observe_downlink(&mut self, data: &[u8]) {
+        self.observe_records(data, true);
+    }
+
+    fn observe_records(&mut self, data: &[u8], downlink: bool) {
         if data.is_empty() || self.packets_left == 0 {
             return;
         }
-        self.packets_left -= 1;
 
-        if data.len() >= 6
-            && data[0] == TLS_HANDSHAKE
-            && data[1] == 0x03
-            && data[5] == TLS_CLIENT_HELLO
-        {
-            self.is_tls = true;
+        if downlink {
+            self.downlink_records.extend_from_slice(data);
+        } else {
+            self.uplink_records.extend_from_slice(data);
         }
 
-        if self.server_hello_len.is_none()
-            && data.len() >= 6
-            && data[..3] == [TLS_HANDSHAKE, 0x03, 0x03]
-            && data[5] == TLS_SERVER_HELLO
-        {
-            self.is_tls = true;
-            self.is_tls12_or_above = true;
-            self.server_hello_len =
-                Some(u16::from_be_bytes([data[3], data[4]]) as usize + 5);
-        }
+        loop {
+            let record = {
+                let pending = if downlink {
+                    &mut self.downlink_records
+                } else {
+                    &mut self.uplink_records
+                };
+                if pending.len() < 5 {
+                    return;
+                }
+                if !(0x14..=0x18).contains(&pending[0])
+                    || pending[1] != 0x03
+                    || !(0x01..=0x03).contains(&pending[2])
+                {
+                    self.packets_left = self.packets_left.saturating_sub(1);
+                    pending.clear();
+                    return;
+                }
 
-        if let Some(expected_len) = self.server_hello_len {
-            let remaining = expected_len.saturating_sub(self.server_hello.len());
-            self.server_hello
-                .extend_from_slice(&data[..data.len().min(remaining)]);
-            if self.server_hello.len() == expected_len {
+                let record_len =
+                    5 + u16::from_be_bytes([pending[3], pending[4]]) as usize;
+                if pending.len() < record_len {
+                    return;
+                }
+                pending.split_to(record_len)
+            };
+            self.packets_left = self.packets_left.saturating_sub(1);
+            debug!(
+                direction = if downlink { "downlink" } else { "uplink" },
+                record_len = record.len(),
+                content_type = record.first().copied().unwrap_or_default(),
+                handshake_type = record.get(5).copied(),
+                packets_left = self.packets_left,
+                "VLESS Vision inspected inner TLS record"
+            );
+
+            if record.len() >= 6
+                && record[0] == TLS_HANDSHAKE
+                && record[5] == TLS_CLIENT_HELLO
+                && !downlink
+            {
+                self.is_tls = true;
+            }
+
+            if record.len() >= 6
+                && record[..3] == [TLS_HANDSHAKE, 0x03, 0x03]
+                && record[5] == TLS_SERVER_HELLO
+                && downlink
+            {
+                self.is_tls = true;
+                self.is_tls12_or_above = true;
+                self.server_hello.clear();
+                self.server_hello.extend_from_slice(&record);
                 self.finish_server_hello();
+            }
+
+            if self.packets_left == 0 {
+                return;
             }
         }
     }
@@ -147,13 +198,13 @@ mod tests {
     fn xray_tls13_cipher_matrix() {
         for cipher in [0x1301, 0x1302, 0x1303, 0x1304] {
             let mut state = VisionTlsState::default();
-            state.observe(&server_hello(cipher, true));
+            state.observe_downlink(&server_hello(cipher, true));
             assert!(state.enable_direct, "cipher {cipher:#06x}");
         }
 
         for cipher in [0x1305, 0x0a0a, 0xc02f] {
             let mut state = VisionTlsState::default();
-            state.observe(&server_hello(cipher, true));
+            state.observe_downlink(&server_hello(cipher, true));
             assert!(!state.enable_direct, "cipher {cipher:#06x}");
         }
     }
@@ -162,20 +213,22 @@ mod tests {
     fn collects_a_fragmented_server_hello() {
         let record = server_hello(0x1301, true);
         let mut state = VisionTlsState::default();
-        state.observe(&record[..50]);
+        state.observe_downlink(&record[..3]);
         assert!(!state.enable_direct);
-        state.observe(&record[50..]);
+        state.observe_downlink(&record[3..50]);
+        assert!(!state.enable_direct);
+        state.observe_downlink(&record[50..]);
         assert!(state.enable_direct);
     }
 
     #[test]
     fn rejects_tls12_and_non_tls_for_direct() {
         let mut tls12 = VisionTlsState::default();
-        tls12.observe(&server_hello(0xc02f, false));
+        tls12.observe_downlink(&server_hello(0xc02f, false));
         assert!(!tls12.enable_direct);
 
         let mut plaintext = VisionTlsState::default();
-        plaintext.observe(b"GET / HTTP/1.1\r\n");
+        plaintext.observe_uplink(b"GET / HTTP/1.1\r\n");
         assert!(!plaintext.is_tls);
         assert!(!plaintext.enable_direct);
     }

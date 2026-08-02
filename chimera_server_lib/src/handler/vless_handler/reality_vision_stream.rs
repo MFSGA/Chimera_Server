@@ -122,7 +122,11 @@ where
         let mut plaintext = Vec::with_capacity(capacity);
         let mut reader = session.reader();
         loop {
-            let chunk = reader.fill_buf()?;
+            let chunk = match reader.fill_buf() {
+                Ok(chunk) => chunk,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            };
             if chunk.is_empty() {
                 break;
             }
@@ -251,7 +255,7 @@ where
             }
         }
         let observed = self.pending_read[previous_len..].to_vec();
-        self.tls_state.observe(&observed);
+        self.tls_state.observe_uplink(&observed);
         Ok(())
     }
 
@@ -278,40 +282,51 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<Vec<u8>>> {
-        let existing = Self::drain_plaintext_from_session(&mut self.session)?;
-        if !existing.is_empty() {
-            return Poll::Ready(Ok(existing));
-        }
-
-        if self.is_read_eof {
-            return Poll::Ready(Ok(Vec::new()));
-        }
-
-        // In Vision mode REALITY intentionally decrypts one outer record at a
-        // time. Process an already-buffered record before polling the socket;
-        // this lets a Direct command claim all following bytes as rawInput.
-        let io_state = self.session.process_new_packets()?;
-        let buffered = self.process_new_packets(io_state)?;
-        if !buffered.is_empty() {
-            return Poll::Ready(Ok(buffered));
-        }
-
-        let mut adapter = SyncReadAdapter {
-            io: &mut self.tcp,
-            cx,
-        };
-        match self.session.read_tls(&mut adapter) {
-            Ok(0) => {
-                self.is_read_eof = true;
-                Poll::Ready(Ok(Vec::new()))
+        loop {
+            let existing =
+                Self::drain_plaintext_from_session(&mut self.session)?;
+            if !existing.is_empty() {
+                return Poll::Ready(Ok(existing));
             }
-            Ok(_) => {
-                let io_state = self.session.process_new_packets()?;
-                let plaintext = self.process_new_packets(io_state)?;
-                Poll::Ready(Ok(plaintext))
+
+            if self.is_read_eof {
+                return Poll::Ready(Ok(Vec::new()));
             }
-            Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
-            Err(err) => Poll::Ready(Err(err)),
+
+            // In Vision mode REALITY intentionally decrypts one outer record at
+            // a time. Process an already-buffered record before polling the
+            // socket; this lets a Direct command claim all following bytes as
+            // rawInput.
+            let io_state = self.session.process_new_packets()?;
+            let buffered = self.process_new_packets(io_state)?;
+            if !buffered.is_empty() {
+                return Poll::Ready(Ok(buffered));
+            }
+
+            let mut adapter = SyncReadAdapter {
+                io: &mut self.tcp,
+                cx,
+            };
+            match self.session.read_tls(&mut adapter) {
+                Ok(0) => {
+                    self.is_read_eof = true;
+                    return Poll::Ready(Ok(Vec::new()));
+                }
+                Ok(_) => {
+                    let io_state = self.session.process_new_packets()?;
+                    let plaintext = self.process_new_packets(io_state)?;
+                    if !plaintext.is_empty() {
+                        return Poll::Ready(Ok(plaintext));
+                    }
+                    // TLS post-handshake and control records may produce no
+                    // application plaintext. They are not EOF; continue until
+                    // data, socket readiness, or the actual TCP end is seen.
+                }
+                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    return Poll::Pending;
+                }
+                Err(err) => return Poll::Ready(Err(err)),
+            }
         }
     }
 }
@@ -413,7 +428,7 @@ where
             return Poll::Ready(Ok(0));
         }
 
-        this.tls_state.observe(chunk);
+        this.tls_state.observe_downlink(chunk);
         if this.tls_state.is_tls && is_complete_tls_application_data(chunk) {
             // Match xray-core: only a supported inner TLS 1.3 session receives
             // Direct. TLS 1.2 and CCM_8 end padding but stay inside REALITY.

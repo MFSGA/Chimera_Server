@@ -5,20 +5,27 @@ mod types;
 pub mod ws;
 
 pub use types::DokodemoDoorConfig;
+#[cfg(feature = "http")]
+pub use types::HttpUser;
 #[cfg(feature = "tuic")]
 pub use types::TuicServerConfig;
 #[cfg(feature = "vless")]
-pub use types::VlessUser;
+pub use types::{VlessFallback, VlessUser};
 
 #[cfg(feature = "hysteria")]
 #[allow(unused_imports)]
 pub use types::{Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2ServerConfig};
 pub use types::{
-    ServerConfig, ServerProxyConfig, SocksUser, SocksUserStore, XhttpServerConfig,
+    ServerConfig, ServerProxyConfig, SocksUser, SocksUserStore,
+    XhttpDataPlacement, XhttpMode, XhttpPlacement, XhttpServerConfig,
 };
+#[cfg(feature = "grpc_transport")]
+pub use types::GrpcServerConfig;
 
 #[cfg(feature = "reality")]
 pub use types::RealityTransportConfig;
+#[cfg(feature = "shadowsocks")]
+pub use types::{ShadowsocksServerIdentity, ShadowsocksUser};
 #[cfg(feature = "tls")]
 pub use types::{TlsCertificateConfig, TlsCertificateUsage, TlsServerConfig};
 

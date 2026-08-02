@@ -1,0 +1,564 @@
+use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+
+use crate::{
+    address::NetLocation,
+    async_stream::AsyncStream,
+    config::server_config::HttpUser,
+    handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
+    traffic::TrafficContext,
+    util::prefixed_stream::PrefixedStream,
+};
+
+const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
+const MAX_HEADER_BYTES: usize = 16 * 1024;
+
+#[derive(Debug)]
+pub struct HttpTcpServerHandler {
+    accounts: Vec<HttpUser>,
+    allow_transparent: bool,
+    inbound_tag: String,
+}
+
+impl HttpTcpServerHandler {
+    pub fn new(
+        accounts: Vec<HttpUser>,
+        allow_transparent: bool,
+        inbound_tag: &str,
+    ) -> Self {
+        Self {
+            accounts,
+            allow_transparent,
+            inbound_tag: inbound_tag.to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl TcpServerHandler for HttpTcpServerHandler {
+    async fn setup_server_stream(
+        &self,
+        mut server_stream: Box<dyn AsyncStream>,
+    ) -> std::io::Result<TcpServerSetupResult> {
+        let request_line =
+            read_http_line(&mut server_stream, MAX_REQUEST_LINE_BYTES).await?;
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or_default();
+        let target = parts.next().unwrap_or_default();
+        let version = parts.next().unwrap_or_default();
+        if parts.next().is_some()
+            || method.is_empty()
+            || target.is_empty()
+            || !matches!(version, "HTTP/1.0" | "HTTP/1.1")
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid HTTP proxy request line: {request_line}"),
+            ));
+        }
+
+        let mut header_bytes = 0usize;
+        let mut authenticated_user = None;
+        let mut host_header = None;
+        let mut forwarded_headers = Vec::new();
+        loop {
+            let line = read_http_line(&mut server_stream, MAX_HEADER_BYTES).await?;
+            header_bytes = header_bytes.saturating_add(line.len() + 2);
+            if header_bytes > MAX_HEADER_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HTTP proxy headers exceed 16384 bytes",
+                ));
+            }
+            if line.is_empty() {
+                break;
+            }
+
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            let name = name.trim();
+            let value = value.trim();
+            if name.eq_ignore_ascii_case("proxy-authorization") {
+                authenticated_user = self.authenticate_basic(value);
+                continue;
+            }
+            if name.eq_ignore_ascii_case("proxy-connection")
+                || name.eq_ignore_ascii_case("connection")
+            {
+                continue;
+            }
+            if name.eq_ignore_ascii_case("host") {
+                host_header = Some(value.to_string());
+            }
+            forwarded_headers.push(line);
+        }
+
+        if !self.accounts.is_empty() && authenticated_user.is_none() {
+            let response = format!(
+                "{version} 407 Proxy Authentication Required\r\n\
+                 Proxy-Authenticate: Basic realm=\"proxy\"\r\n\
+                 Content-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
+            );
+            server_stream.write_all(response.as_bytes()).await?;
+            server_stream.flush().await?;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "missing or invalid HTTP proxy authentication",
+            ));
+        }
+
+        let traffic_context = Some(
+            authenticated_user
+                .map(|identity| {
+                    TrafficContext::new("http")
+                        .with_identity(identity)
+                        .with_inbound_tag(self.inbound_tag.clone())
+                })
+                .unwrap_or_else(|| {
+                    TrafficContext::new("http")
+                        .with_inbound_tag(self.inbound_tag.clone())
+                }),
+        );
+
+        if method.eq_ignore_ascii_case("CONNECT") {
+            let remote_location =
+                NetLocation::from_str(target, None).map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid HTTP CONNECT authority {target}: {error}"),
+                    )
+                })?;
+            let response =
+                format!("{version} 200 Connection established\r\n\r\n")
+                    .into_bytes()
+                    .into_boxed_slice();
+            return Ok(TcpServerSetupResult::TcpForward {
+                remote_location,
+                stream: server_stream,
+                need_initial_flush: true,
+                connection_success_response: Some(response),
+                traffic_context,
+            });
+        }
+
+        let (remote_location, origin_target) = if target.starts_with("http://") {
+            parse_absolute_http_target(target)?
+        } else if target.starts_with("https://") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "HTTPS absolute-form requests must use CONNECT",
+            ));
+        } else if self.allow_transparent && target.starts_with('/') {
+            let host = host_header.as_deref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "transparent HTTP request requires a Host header",
+                )
+            })?;
+            let remote_location = NetLocation::from_str(host, Some(80)).map_err(
+                |error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid HTTP Host header {host}: {error}"),
+                    )
+                },
+            )?;
+            (remote_location, target.to_string())
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "HTTP proxy request must use an absolute http:// URI unless allowTransparent is enabled",
+            ));
+        };
+
+        let mut initial_request =
+            format!("{method} {origin_target} {version}\r\n");
+        for line in forwarded_headers {
+            initial_request.push_str(&line);
+            initial_request.push_str("\r\n");
+        }
+        initial_request.push_str("Connection: close\r\n\r\n");
+
+        Ok(TcpServerSetupResult::TcpForward {
+            remote_location,
+            stream: Box::new(PrefixedStream::new(
+                initial_request.into_bytes(),
+                server_stream,
+            )),
+            need_initial_flush: false,
+            connection_success_response: None,
+            traffic_context,
+        })
+    }
+}
+
+fn parse_absolute_http_target(
+    target: &str,
+) -> std::io::Result<(NetLocation, String)> {
+    let remainder = target.strip_prefix("http://").ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "HTTP proxy target must start with http://",
+        )
+    })?;
+    let split = remainder
+        .char_indices()
+        .find_map(|(index, value)| matches!(value, '/' | '?').then_some(index));
+    let (authority, path) = match split {
+        Some(index) => {
+            let tail = &remainder[index..];
+            let path = if tail.starts_with('?') {
+                format!("/{tail}")
+            } else {
+                tail.to_string()
+            };
+            (&remainder[..index], path)
+        }
+        None => (remainder, "/".to_string()),
+    };
+    if authority.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "HTTP absolute URI is missing an authority",
+        ));
+    }
+    let remote_location = NetLocation::from_str(authority, Some(80)).map_err(
+        |error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid HTTP absolute URI authority {authority}: {error}"),
+            )
+        },
+    )?;
+    Ok((remote_location, path))
+}
+
+impl HttpTcpServerHandler {
+    fn authenticate_basic(&self, value: &str) -> Option<String> {
+        let mut parts = value.split_whitespace();
+        let scheme = parts.next()?;
+        let token = parts.next()?;
+        if parts.next().is_some() || !scheme.eq_ignore_ascii_case("basic") {
+            return None;
+        }
+        let decoded = BASE64.decode(token).ok()?;
+        let decoded = std::str::from_utf8(&decoded).ok()?;
+        let (username, password) = decoded.split_once(':')?;
+        self.accounts
+            .iter()
+            .find(|account| {
+                account.username == username && account.password == password
+            })
+            .map(|account| account.username.clone())
+    }
+}
+
+async fn read_http_line<S>(
+    stream: &mut S,
+    max_bytes: usize,
+) -> std::io::Result<String>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut line = Vec::new();
+    loop {
+        let byte = stream.read_u8().await?;
+        line.push(byte);
+        if line.len() > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP proxy line is too long",
+            ));
+        }
+        if line.ends_with(b"\r\n") {
+            line.truncate(line.len() - 2);
+            return String::from_utf8(line).map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("HTTP proxy line is not UTF-8: {error}"),
+                )
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use tokio::io::{
+        AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf,
+        duplex,
+    };
+
+    use crate::{
+        async_stream::{AsyncPing, AsyncStream},
+        config::server_config::HttpUser,
+        handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
+    };
+
+    use super::HttpTcpServerHandler;
+
+    struct TestStream(DuplexStream);
+
+    impl AsyncRead for TestStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for TestStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+        }
+    }
+
+    impl AsyncPing for TestStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for TestStream {}
+
+    #[tokio::test]
+    async fn connect_preserves_early_tunnel_bytes() {
+        let handler = HttpTcpServerHandler::new(Vec::new(), false, "http-in");
+        let request = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\nearly";
+        let (mut client, server) = duplex(1024);
+        client.write_all(request).await.unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("CONNECT should succeed");
+        let TcpServerSetupResult::TcpForward {
+            remote_location,
+            mut stream,
+            connection_success_response,
+            traffic_context,
+            ..
+        } = result
+        else {
+            panic!("HTTP CONNECT returned non-TCP result");
+        };
+        assert_eq!(remote_location.to_string(), "example.com:443");
+        assert_eq!(
+            connection_success_response.as_deref(),
+            Some(b"HTTP/1.1 200 Connection established\r\n\r\n".as_slice())
+        );
+        assert_eq!(
+            traffic_context.unwrap().inbound_tag.as_deref(),
+            Some("http-in")
+        );
+        let mut early = [0u8; 5];
+        stream.read_exact(&mut early).await.unwrap();
+        assert_eq!(&early, b"early");
+    }
+
+    #[tokio::test]
+    async fn basic_auth_sets_user_identity() {
+        let handler = HttpTcpServerHandler::new(
+            vec![HttpUser {
+                username: "alice".into(),
+                password: "secret".into(),
+            }],
+            false,
+            "http-auth",
+        );
+        let token = BASE64.encode("alice:secret");
+        let request = format!(
+            "CONNECT 127.0.0.1:80 HTTP/1.1\r\nProxy-Authorization: Basic {token}\r\n\r\n"
+        );
+        let (mut client, server) = duplex(1024);
+        client.write_all(request.as_bytes()).await.unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("authenticated CONNECT should succeed");
+        let TcpServerSetupResult::TcpForward {
+            traffic_context, ..
+        } = result
+        else {
+            panic!("HTTP CONNECT returned non-TCP result");
+        };
+        assert_eq!(
+            traffic_context.unwrap().identity.as_deref(),
+            Some("alice")
+        );
+    }
+
+    #[tokio::test]
+    async fn absolute_form_request_is_rewritten_and_proxy_headers_are_removed() {
+        let handler = HttpTcpServerHandler::new(
+            vec![HttpUser {
+                username: "alice".into(),
+                password: "secret".into(),
+            }],
+            false,
+            "http-forward",
+        );
+        let token = BASE64.encode("alice:secret");
+        let request = format!(
+            "POST http://example.com:8080/upload?q=1 HTTP/1.1\r\n\
+             Host: example.com:8080\r\n\
+             Proxy-Authorization: Basic {token}\r\n\
+             Proxy-Connection: keep-alive\r\n\
+             Connection: keep-alive\r\n\
+             X-Test: forwarded\r\n\r\nbody"
+        );
+        let (mut client, server) = duplex(4096);
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("absolute-form HTTP proxy request should succeed");
+        let TcpServerSetupResult::TcpForward {
+            remote_location,
+            mut stream,
+            connection_success_response,
+            traffic_context,
+            ..
+        } = result
+        else {
+            panic!("HTTP forward returned non-TCP result");
+        };
+        assert_eq!(remote_location.to_string(), "example.com:8080");
+        assert!(connection_success_response.is_none());
+        assert_eq!(
+            traffic_context.unwrap().identity.as_deref(),
+            Some("alice")
+        );
+        let mut forwarded = Vec::new();
+        stream.read_to_end(&mut forwarded).await.unwrap();
+        assert_eq!(
+            String::from_utf8(forwarded).unwrap(),
+            "POST /upload?q=1 HTTP/1.1\r\n\
+             Host: example.com:8080\r\n\
+             X-Test: forwarded\r\n\
+             Connection: close\r\n\r\nbody"
+        );
+    }
+
+    #[tokio::test]
+    async fn transparent_origin_form_uses_host_header() {
+        let handler =
+            HttpTcpServerHandler::new(Vec::new(), true, "http-transparent");
+        let request = b"GET /health HTTP/1.1\r\nHost: example.com:8081\r\n\r\n";
+        let (mut client, server) = duplex(2048);
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("transparent HTTP request should succeed");
+        let TcpServerSetupResult::TcpForward {
+            remote_location,
+            mut stream,
+            ..
+        } = result
+        else {
+            panic!("transparent HTTP returned non-TCP result");
+        };
+        assert_eq!(remote_location.to_string(), "example.com:8081");
+        let mut forwarded = Vec::new();
+        stream.read_to_end(&mut forwarded).await.unwrap();
+        assert_eq!(
+            String::from_utf8(forwarded).unwrap(),
+            "GET /health HTTP/1.1\r\n\
+             Host: example.com:8081\r\n\
+             Connection: close\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn origin_form_requires_allow_transparent() {
+        let handler = HttpTcpServerHandler::new(Vec::new(), false, "http-proxy");
+        let (mut client, server) = duplex(1024);
+        client
+            .write_all(b"GET /health HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+
+        let error = match handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+        {
+            Ok(_) => panic!("origin-form request must require transparent mode"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("allowTransparent"));
+    }
+
+    #[tokio::test]
+    async fn missing_auth_returns_407() {
+        let handler = HttpTcpServerHandler::new(
+            vec![HttpUser {
+                username: "alice".into(),
+                password: "secret".into(),
+            }],
+            false,
+            "http-auth",
+        );
+        let (mut client, server) = duplex(2048);
+        client
+            .write_all(b"CONNECT 127.0.0.1:80 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+
+        let error = match handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+        {
+            Ok(_) => panic!("missing auth must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let mut response = vec![0u8; 256];
+        let len = client.read(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response[..len]);
+        assert!(response.starts_with("HTTP/1.1 407"));
+        assert!(response.contains("Proxy-Authenticate: Basic"));
+    }
+}

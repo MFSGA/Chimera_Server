@@ -77,7 +77,34 @@ pub struct TrojanUser {
 #[cfg(feature = "trojan")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct TrojanFallback {
+    pub name: String,
+    pub alpn: String,
+    pub path: String,
     pub dest: NetLocation,
+    pub xver: u8,
+}
+
+#[cfg(feature = "http")]
+#[derive(Debug, Clone, Deserialize)]
+pub struct HttpUser {
+    pub username: String,
+    pub password: String,
+}
+
+#[cfg(feature = "shadowsocks")]
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShadowsocksUser {
+    pub method: String,
+    pub password: String,
+    #[serde(default)]
+    pub email: String,
+}
+
+#[cfg(feature = "shadowsocks")]
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShadowsocksServerIdentity {
+    pub method: String,
+    pub password: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -160,6 +187,16 @@ impl<'de> Deserialize<'de> for SocksUserStore {
 
 #[cfg(feature = "vless")]
 #[derive(Debug, Clone, Deserialize)]
+pub struct VlessFallback {
+    pub name: String,
+    pub alpn: String,
+    pub path: String,
+    pub dest: NetLocation,
+    pub xver: u8,
+}
+
+#[cfg(feature = "vless")]
+#[derive(Debug, Clone, Deserialize)]
 pub struct VlessUser {
     pub user_id: String,
     pub user_label: String,
@@ -204,8 +241,48 @@ impl RangeConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum XhttpMode {
+    Auto,
+    PacketUp,
+    StreamUp,
+    StreamOne,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum XhttpPlacement {
+    Path,
+    Query,
+    Header,
+    Cookie,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum XhttpDataPlacement {
+    Auto,
+    Body,
+    Header,
+    Cookie,
+}
+
+#[cfg(feature = "grpc_transport")]
+#[derive(Debug, Clone, Deserialize)]
+pub struct GrpcServerConfig {
+    pub service_name: String,
+    pub inner: Box<ServerProxyConfig>,
+}
+
+#[cfg(feature = "httpupgrade")]
+#[derive(Debug, Clone, Deserialize)]
+pub struct HttpUpgradeServerConfig {
+    pub host: Option<String>,
+    pub path: String,
+    pub inner: Box<ServerProxyConfig>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct XhttpServerConfig {
+    pub mode: XhttpMode,
     pub host: Option<String>,
     pub path: String,
     pub min_padding: usize,
@@ -213,6 +290,16 @@ pub struct XhttpServerConfig {
     pub max_each_post_bytes: usize,
     pub max_buffered_posts: usize,
     pub session_ttl_secs: u64,
+    pub no_grpc_header: bool,
+    pub no_sse_header: bool,
+    pub uplink_http_method: String,
+    pub min_posts_interval_ms: (usize, usize),
+    pub session_placement: XhttpPlacement,
+    pub session_key: String,
+    pub seq_placement: XhttpPlacement,
+    pub seq_key: String,
+    pub uplink_data_placement: XhttpDataPlacement,
+    pub uplink_data_key: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -293,6 +380,8 @@ pub enum ServerProxyConfig {
     #[cfg(feature = "vless")]
     Vless {
         users: Vec<VlessUser>,
+        #[serde(default)]
+        fallbacks: Vec<VlessFallback>,
     },
     #[cfg(feature = "vmess")]
     Vmess {
@@ -325,6 +414,27 @@ pub enum ServerProxyConfig {
     Xhttp {
         config: XhttpServerConfig,
         inner: Box<ServerProxyConfig>,
+    },
+    #[cfg(feature = "httpupgrade")]
+    HttpUpgrade(HttpUpgradeServerConfig),
+    #[cfg(feature = "grpc_transport")]
+    Grpc(GrpcServerConfig),
+    #[cfg(feature = "http")]
+    Http {
+        accounts: Vec<HttpUser>,
+        #[serde(default)]
+        allow_transparent: bool,
+    },
+    #[cfg(feature = "mixed")]
+    Mixed {
+        accounts: SocksUserStore,
+        #[serde(default)]
+        udp_enabled: bool,
+    },
+    #[cfg(feature = "shadowsocks")]
+    Shadowsocks {
+        users: Vec<ShadowsocksUser>,
+        identity: Option<ShadowsocksServerIdentity>,
     },
     Socks {
         accounts: SocksUserStore,
@@ -359,6 +469,16 @@ impl std::fmt::Display for ServerProxyConfig {
                 #[cfg(feature = "tls")]
                 Self::Tls(_) => "Tls",
                 Self::Xhttp { .. } => "Xhttp",
+                #[cfg(feature = "httpupgrade")]
+                Self::HttpUpgrade(_) => "HttpUpgrade",
+                #[cfg(feature = "grpc_transport")]
+                Self::Grpc(_) => "Grpc",
+                #[cfg(feature = "http")]
+                Self::Http { .. } => "Http",
+                #[cfg(feature = "mixed")]
+                Self::Mixed { .. } => "Mixed",
+                #[cfg(feature = "shadowsocks")]
+                Self::Shadowsocks { .. } => "Shadowsocks",
                 Self::Socks { .. } => "Socks",
                 Self::DokodemoDoor { .. } => "DokodemoDoor",
             }

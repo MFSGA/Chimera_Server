@@ -284,7 +284,10 @@ fn socket_addr_from_v6(address: &libc::sockaddr_in6) -> SocketAddr {
 
 #[cfg(all(test, target_os = "linux"))]
 mod original_destination_tests {
-    use std::{net::Ipv4Addr, time::Duration};
+    use std::{
+        net::{Ipv4Addr, Ipv6Addr},
+        time::Duration,
+    };
 
     use tokio::{net::UdpSocket, time::timeout};
 
@@ -331,6 +334,56 @@ mod original_destination_tests {
         .expect("receive UDP original destination");
 
         assert_eq!(&buffer[..length], b"original-dst");
+        assert_eq!(source, client_addr);
+        assert_eq!(original_destination, listener_addr);
+    }
+
+    #[tokio::test]
+    async fn recvmsg_returns_ipv6_original_destination() {
+        let socket = match new_socket2_udp_socket(
+            true,
+            None,
+            Some(SocketAddr::from((Ipv6Addr::LOCALHOST, 0))),
+            false,
+        ) {
+            Ok(socket) => socket,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::AddrNotAvailable | io::ErrorKind::Unsupported
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("bind IPv6 original-destination socket: {error}"),
+        };
+        enable_udp_original_destination(&socket, true)
+            .expect("enable IPV6_RECVORIGDSTADDR");
+        let listener_addr = socket
+            .local_addr()
+            .expect("read IPv6 UDP listener address")
+            .as_socket()
+            .expect("IPv6 UDP listener must use IP address");
+        let listener = tokio_udp_socket(socket);
+        let client = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0))
+            .await
+            .expect("bind IPv6 UDP client");
+        let client_addr = client.local_addr().expect("read IPv6 UDP client address");
+        client
+            .send_to(b"ipv6-original-dst", listener_addr)
+            .await
+            .expect("send IPv6 UDP test datagram");
+
+        let mut buffer = [0u8; 64];
+        let (length, source, original_destination) = timeout(
+            Duration::from_secs(1),
+            recv_udp_with_original_destination(&listener, &mut buffer),
+        )
+        .await
+        .expect("IPv6 original-destination receive timed out")
+        .expect("receive IPv6 UDP original destination");
+
+        assert_eq!(&buffer[..length], b"ipv6-original-dst");
         assert_eq!(source, client_addr);
         assert_eq!(original_destination, listener_addr);
     }

@@ -29,11 +29,13 @@ use crate::{
     resolver::{NativeResolver, Resolver, resolve_single_address},
     runtime::RuntimeState,
     traffic::{MeteredStream, TrafficDirection, register_connection},
-    util::socket::new_tcp_socket,
+    util::{prefixed_stream::PrefixedStream, socket::new_tcp_socket},
 };
 
 use tracing::{error, info};
 
+#[cfg(feature = "grpc_transport")]
+mod grpc_transport;
 mod quic;
 pub(crate) mod udp;
 mod xhttp;
@@ -44,6 +46,10 @@ pub async fn start_servers(
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     if is_xhttp_server_protocol(&config.protocol) {
         return xhttp::start_xhttp_server(config, runtime).await;
+    }
+    #[cfg(feature = "grpc_transport")]
+    if is_grpc_server_protocol(&config.protocol) {
+        return grpc_transport::start_grpc_server(config, runtime).await;
     }
 
     let mut join_handles = Vec::with_capacity(3);
@@ -60,6 +66,23 @@ pub async fn start_servers(
                         join_handle.abort();
                     }
                     return Err(e);
+                }
+            }
+        }
+        Transport::TcpAndUdp => {
+            match start_tcp_server_with_runtime(config.clone(), runtime.clone()).await {
+                Ok(Some(handle)) => join_handles.push(handle),
+                Ok(None) => {}
+                Err(error) => return Err(error),
+            }
+            match start_udp_server(config.clone(), runtime).await {
+                Ok(Some(handle)) => join_handles.push(handle),
+                Ok(None) => {}
+                Err(error) => {
+                    for join_handle in join_handles {
+                        join_handle.abort();
+                    }
+                    return Err(error);
                 }
             }
         }
@@ -98,6 +121,22 @@ pub async fn start_servers(
     }
 
     Ok(join_handles)
+}
+
+#[cfg(feature = "grpc_transport")]
+fn is_grpc_server_protocol(protocol: &ServerProxyConfig) -> bool {
+    match protocol {
+        ServerProxyConfig::Grpc(_) => true,
+        #[cfg(feature = "tls")]
+        ServerProxyConfig::Tls(tls_config) => {
+            matches!(tls_config.inner.as_ref(), ServerProxyConfig::Grpc(_))
+        }
+        #[cfg(feature = "reality")]
+        ServerProxyConfig::Reality(reality_config) => {
+            matches!(reality_config.inner.as_ref(), ServerProxyConfig::Grpc(_))
+        }
+        _ => false,
+    }
 }
 
 fn is_xhttp_server_protocol(protocol: &ServerProxyConfig) -> bool {
@@ -224,8 +263,13 @@ fn tcp_server_connection_context(
     stream: &tokio::net::TcpStream,
     server_handler: &dyn TcpServerHandler,
 ) -> std::io::Result<TcpServerConnectionContext> {
+    let local_addr = stream.local_addr()?;
     if !server_handler.requires_original_destination() {
-        return Ok(TcpServerConnectionContext::default());
+        return Ok(TcpServerConnectionContext {
+            original_destination: None,
+            local_addr: Some(local_addr),
+            ..TcpServerConnectionContext::default()
+        });
     }
 
     let socket = SockRef::from(stream);
@@ -247,12 +291,14 @@ fn tcp_server_connection_context(
             original_destination.ip(),
             original_destination.port(),
         )),
+        local_addr: Some(local_addr),
+        ..TcpServerConnectionContext::default()
     })
 }
 
 #[cfg(not(target_os = "linux"))]
 fn tcp_server_connection_context(
-    _stream: &tokio::net::TcpStream,
+    stream: &tokio::net::TcpStream,
     server_handler: &dyn TcpServerHandler,
 ) -> std::io::Result<TcpServerConnectionContext> {
     if server_handler.requires_original_destination() {
@@ -262,7 +308,68 @@ fn tcp_server_connection_context(
         ));
     }
 
-    Ok(TcpServerConnectionContext::default())
+    Ok(TcpServerConnectionContext {
+        original_destination: None,
+        local_addr: Some(stream.local_addr()?),
+        ..TcpServerConnectionContext::default()
+    })
+}
+
+fn build_proxy_protocol_header(
+    version: u8,
+    source: SocketAddr,
+    destination: Option<SocketAddr>,
+) -> std::io::Result<Vec<u8>> {
+    match version {
+        1 => {
+            let Some(destination) = destination else {
+                return Ok(b"PROXY UNKNOWN\r\n".to_vec());
+            };
+            let family = match (source.ip(), destination.ip()) {
+                (std::net::IpAddr::V4(_), std::net::IpAddr::V4(_)) => "TCP4",
+                (std::net::IpAddr::V6(_), std::net::IpAddr::V6(_)) => "TCP6",
+                _ => return Ok(b"PROXY UNKNOWN\r\n".to_vec()),
+            };
+            Ok(format!(
+                "PROXY {family} {} {} {} {}\r\n",
+                source.ip(),
+                destination.ip(),
+                source.port(),
+                destination.port()
+            )
+            .into_bytes())
+        }
+        2 => {
+            let mut header = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+            let Some(destination) = destination else {
+                header.extend_from_slice(&[0x20, 0x00, 0x00, 0x00]);
+                return Ok(header);
+            };
+            match (source.ip(), destination.ip()) {
+                (std::net::IpAddr::V4(source_ip), std::net::IpAddr::V4(dest_ip)) => {
+                    header.extend_from_slice(&[0x21, 0x11, 0x00, 0x0c]);
+                    header.extend_from_slice(&source_ip.octets());
+                    header.extend_from_slice(&dest_ip.octets());
+                }
+                (std::net::IpAddr::V6(source_ip), std::net::IpAddr::V6(dest_ip)) => {
+                    header.extend_from_slice(&[0x21, 0x21, 0x00, 0x24]);
+                    header.extend_from_slice(&source_ip.octets());
+                    header.extend_from_slice(&dest_ip.octets());
+                }
+                _ => {
+                    header.extend_from_slice(&[0x20, 0x00, 0x00, 0x00]);
+                    return Ok(header);
+                }
+            }
+            header.extend_from_slice(&source.port().to_be_bytes());
+            header.extend_from_slice(&destination.port().to_be_bytes());
+            Ok(header)
+        }
+        other => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unsupported PROXY protocol version {other}"),
+        )),
+    }
 }
 
 pub(super) async fn process_stream<AS>(
@@ -297,6 +404,7 @@ async fn process_stream_with_context<AS>(
 where
     AS: AsyncStream + 'static,
 {
+    let local_addr = connection_context.local_addr;
     let setup_server_stream_future = timeout(
         Duration::from_secs(60),
         setup_server_stream(stream, server_handler, connection_context),
@@ -316,6 +424,28 @@ where
                 format!("server setup timed out: {}", elapsed),
             ));
         }
+    };
+    let setup_result = match setup_result {
+        TcpServerSetupResult::TcpFallback {
+            remote_location,
+            stream,
+            proxy_protocol_version,
+            traffic_context,
+        } => {
+            let prefix = build_proxy_protocol_header(
+                proxy_protocol_version,
+                peer_addr,
+                local_addr,
+            )?;
+            TcpServerSetupResult::TcpForward {
+                remote_location,
+                stream: Box::new(PrefixedStream::new(prefix, stream)),
+                need_initial_flush: false,
+                connection_success_response: None,
+                traffic_context,
+            }
+        }
+        other => other,
     };
 
     match setup_result {
@@ -415,14 +545,27 @@ where
             );
             Ok(())
         }
+        TcpServerSetupResult::TcpFallback { .. } => {
+            unreachable!("fallback result must be normalized before forwarding")
+        }
         TcpServerSetupResult::UdpAssociate {
             stream,
             socket,
+            client_udp_port_hint,
             traffic_context,
         } => {
             let traffic_context = traffic_context
                 .map(|context| context.with_client_ip(peer_addr.ip()));
-            run_udp_relay(socket, stream, resolver, runtime, traffic_context).await
+            run_udp_relay(
+                socket,
+                stream,
+                resolver,
+                runtime,
+                peer_addr,
+                client_udp_port_hint,
+                traffic_context,
+            )
+            .await
         }
         TcpServerSetupResult::BidirectionalUdp {
             remote_location,
@@ -525,12 +668,14 @@ pub async fn setup_client_stream(
     connect_tcp_target(target_addr).await.map(Some)
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
+    #[cfg(target_os = "linux")]
     use tokio::net::{TcpListener, TcpStream};
 
+    #[cfg(target_os = "linux")]
     use crate::{
         address::{Address, NetLocation},
         config::server_config::DokodemoDoorConfig,
@@ -539,6 +684,50 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn proxy_protocol_v1_encodes_ipv4_addresses_and_ports() {
+        let source: SocketAddr = "192.0.2.10:12345".parse().unwrap();
+        let destination: SocketAddr = "198.51.100.20:443".parse().unwrap();
+        let header = build_proxy_protocol_header(1, source, Some(destination))
+            .expect("build PROXY v1 header");
+        assert_eq!(
+            header,
+            b"PROXY TCP4 192.0.2.10 198.51.100.20 12345 443\r\n"
+        );
+    }
+
+    #[test]
+    fn proxy_protocol_v2_encodes_ipv4_addresses_and_ports() {
+        let source: SocketAddr = "192.0.2.10:12345".parse().unwrap();
+        let destination: SocketAddr = "198.51.100.20:443".parse().unwrap();
+        let header = build_proxy_protocol_header(2, source, Some(destination))
+            .expect("build PROXY v2 header");
+        let mut expected = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+        expected.extend_from_slice(&[0x21, 0x11, 0x00, 0x0c]);
+        expected.extend_from_slice(&[192, 0, 2, 10]);
+        expected.extend_from_slice(&[198, 51, 100, 20]);
+        expected.extend_from_slice(&12345u16.to_be_bytes());
+        expected.extend_from_slice(&443u16.to_be_bytes());
+        assert_eq!(header, expected);
+    }
+
+    #[test]
+    fn proxy_protocol_uses_unknown_or_local_for_mixed_families() {
+        let source = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 12345);
+        let destination = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 443);
+        assert_eq!(
+            build_proxy_protocol_header(1, source, Some(destination)).unwrap(),
+            b"PROXY UNKNOWN\r\n"
+        );
+        let mut expected = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+        expected.extend_from_slice(&[0x20, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            build_proxy_protocol_header(2, source, Some(destination)).unwrap(),
+            expected
+        );
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn original_destination_matches_tcp_listener() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
