@@ -773,16 +773,16 @@ impl ShadowsocksUdpCodec {
             .map(ShadowsocksUdpUserCodec::new)
             .collect::<io::Result<Vec<_>>>()?;
         let identity = identity.map(parse_identity_key).transpose()?;
-        if let Some(identity) = &identity {
-            if users.iter().any(|user| {
+        if let Some(identity) = &identity
+            && users.iter().any(|user| {
                 user.cipher.name != identity.cipher.name
                     || user.aead2022_psk().is_none()
-            }) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Shadowsocks EIH users must use the identity AES method",
-                ));
-            }
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Shadowsocks EIH users must use the identity AES method",
+            ));
         }
         Ok(Self { users, identity })
     }
