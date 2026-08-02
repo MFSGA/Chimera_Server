@@ -37,6 +37,7 @@ use tracing::{error, info};
 #[cfg(feature = "grpc_transport")]
 mod grpc_transport;
 mod quic;
+mod tcp_relay;
 pub(crate) mod udp;
 mod xhttp;
 
@@ -531,7 +532,7 @@ where
                 server_stream.write_all(&data).await?;
             }
 
-            let copy_result = tokio::io::copy_bidirectional(
+            let copy_result = tcp_relay::copy_bidirectional(
                 &mut server_stream,
                 &mut client_stream,
             )
