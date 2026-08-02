@@ -74,11 +74,18 @@ pub async fn process_hysteria2_connection(
     let h3_quinn_connection = h3_quinn::Connection::new(connection.clone());
     let mut h3_conn = h3::server::Connection::new(h3_quinn_connection)
         .await
-        .map_err(map_h3_error)?;
+        .map_err(|err| {
+            Error::other(format!("hysteria2 H3 driver creation failed: {err}"))
+        })?;
+    debug!("hysteria2 QUIC established");
+    debug!("hysteria2 H3 driver created");
 
     let auth_ctx =
         auth_hysteria2_connection(&mut h3_conn, config.as_ref(), tx_bps.clone())
-            .await?;
+            .await
+            .map_err(|err| {
+                Error::other(format!("hysteria2 authentication failed: {err}"))
+            })?;
 
     let http3_task = tokio::spawn(async move {
         if let Err(err) = drain_http3_requests(h3_conn).await {
@@ -129,7 +136,12 @@ async fn auth_hysteria2_connection(
         match h3_conn.accept().await.map_err(map_h3_error)? {
             Some(resolver) => {
                 let (req, mut stream) =
-                    resolver.resolve_request().await.map_err(map_h3_error)?;
+                    resolver.resolve_request().await.map_err(|err| {
+                        Error::other(format!(
+                            "hysteria2 auth resolve_request failed: {err}"
+                        ))
+                    })?;
+                debug!(method = %req.method(), uri = %req.uri(), "hysteria2 auth request received");
                 match validate_auth_request(req, config.clients.as_ref()) {
                     Ok(auth_info) => {
                         let (actual_tx, response_rx, response_rx_auto) =
@@ -138,13 +150,20 @@ async fn auth_hysteria2_connection(
                                 auth_info.client_rx_limit,
                             );
                         tx_bps.store(actual_tx, Ordering::Relaxed);
+                        debug!(status = SUCCESS_STATUS, "hysteria2 auth accepted");
                         send_auth_success(
                             &mut stream,
                             true,
                             response_rx,
                             response_rx_auto,
                         )
-                        .await?;
+                        .await
+                        .map_err(|err| {
+                            Error::other(format!(
+                                "hysteria2 auth response failed: {err}"
+                            ))
+                        })?;
+                        debug!("hysteria2 auth response finished");
                         return Ok(AuthContext {
                             client: auth_info.client,
                             udp_enabled: true,

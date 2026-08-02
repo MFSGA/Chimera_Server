@@ -1323,8 +1323,7 @@ mod tests {
             .expect("transparent HTTP inbound should build");
         match config.protocol {
             ServerProxyConfig::Http {
-                allow_transparent,
-                ..
+                allow_transparent, ..
             } => assert!(allow_transparent),
             other => panic!("expected http protocol, got {other:?}"),
         }
