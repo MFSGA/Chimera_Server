@@ -16,6 +16,7 @@ use chimera_perf::{
     },
     socks::connect_via_socks5,
     stats::{coefficient_of_variation, median, percentile},
+    tls::{self, BenchIo, BoxedBenchIo},
 };
 use clap::Parser;
 use serde::Serialize;
@@ -59,6 +60,15 @@ struct Args {
 
     #[arg(long)]
     full_verify: bool,
+
+    #[arg(long)]
+    inner_tls: bool,
+
+    #[arg(long)]
+    tcp_nodelay: bool,
+
+    #[arg(long, default_value = "benchmark.local")]
+    tls_server_name: String,
 
     #[arg(long, default_value_t = 120)]
     timeout_secs: u64,
@@ -111,6 +121,8 @@ struct RunResult<'a> {
     download_bytes_per_connection: u64,
     buffer_size: usize,
     full_verify: bool,
+    inner_tls: bool,
+    tcp_nodelay: bool,
     upload_mbps: f64,
     download_mbps: f64,
     upload_connection_p50_mbps: f64,
@@ -136,6 +148,8 @@ struct Summary<'a> {
     download_bytes_per_connection: u64,
     buffer_size: usize,
     full_verify: bool,
+    inner_tls: bool,
+    tcp_nodelay: bool,
     upload_median_mbps: f64,
     upload_p99_mbps: f64,
     upload_cv: f64,
@@ -203,6 +217,8 @@ async fn run(args: Args) -> Result<()> {
         download_bytes_per_connection: args.download_bytes,
         buffer_size: args.buffer_size,
         full_verify: args.full_verify,
+        inner_tls: args.inner_tls,
+        tcp_nodelay: args.tcp_nodelay,
         upload_median_mbps: round(median(&upload_runs)),
         upload_p99_mbps: round(percentile(&upload_runs, 99.0)),
         upload_cv: round(coefficient_of_variation(&upload_runs)),
@@ -273,6 +289,9 @@ async fn run_once(
         let download_len = args.download_bytes;
         let buffer_size = args.buffer_size;
         let full_verify = args.full_verify;
+        let inner_tls = args.inner_tls;
+        let tcp_nodelay = args.tcp_nodelay;
+        let tls_server_name = args.tls_server_name.clone();
         let timeout_duration = Duration::from_secs(args.timeout_secs);
         let seed = 0x4348_494d_4552_4100_u64
             ^ ((run_index as u64) << 32)
@@ -290,6 +309,9 @@ async fn run_once(
                     download_len,
                     buffer_size,
                     full_verify,
+                    inner_tls,
+                    tcp_nodelay,
+                    &tls_server_name,
                     seed,
                     upload_barrier,
                     download_barrier,
@@ -320,49 +342,69 @@ async fn run_connection(
     download_len: u64,
     buffer_size: usize,
     full_verify: bool,
+    inner_tls: bool,
+    tcp_nodelay: bool,
+    tls_server_name: &str,
     seed: u64,
     upload_barrier: Arc<Barrier>,
     download_barrier: Arc<Barrier>,
 ) -> Result<ConnectionResult> {
-    let mut stream = match socks5 {
-        Some(proxy) => connect_via_socks5(proxy, target_host, target_port).await?,
-        None => TcpStream::connect(target)
-            .await
-            .with_context(|| format!("connect benchmark target {target}"))?,
-    };
-    stream.set_nodelay(true)?;
-
-    let request = Request {
-        flags: if full_verify { FLAG_FULL_VERIFY } else { 0 },
-        upload_len,
-        download_len,
-        seed,
-    };
-    let request_bytes = request.encode();
-    debug_assert_eq!(request_bytes.len(), REQUEST_LEN);
-    stream.write_all(&request_bytes).await?;
+    let setup = setup_connection(
+        target,
+        target_host,
+        target_port,
+        socks5,
+        inner_tls,
+        tcp_nodelay,
+        tls_server_name,
+    )
+    .await;
 
     upload_barrier.wait().await;
-    let upload_started = Instant::now();
-    send_pattern(&mut stream, upload_len, seed, buffer_size, full_verify).await?;
-    stream.flush().await?;
-    let mut ack_bytes = [0_u8; ACK_LEN];
-    stream.read_exact(&mut ack_bytes).await?;
-    let ack = Ack::decode(&ack_bytes)?;
-    if ack.status != 0 {
-        bail!(
-            "benchmark target rejected upload with status {}",
-            ack.status
-        );
+    let mut stream = match setup {
+        Ok(stream) => stream,
+        Err(error) => {
+            download_barrier.wait().await;
+            return Err(error);
+        }
+    };
+
+    let upload_result = async {
+        let request = Request {
+            flags: if full_verify { FLAG_FULL_VERIFY } else { 0 },
+            upload_len,
+            download_len,
+            seed,
+        };
+        let request_bytes = request.encode();
+        debug_assert_eq!(request_bytes.len(), REQUEST_LEN);
+        stream.write_all(&request_bytes).await?;
+
+        let upload_started = Instant::now();
+        send_pattern(&mut *stream, upload_len, seed, buffer_size, full_verify)
+            .await?;
+        stream.flush().await?;
+        let mut ack_bytes = [0_u8; ACK_LEN];
+        stream.read_exact(&mut ack_bytes).await?;
+        let ack = Ack::decode(&ack_bytes)?;
+        if ack.status != 0 {
+            bail!(
+                "benchmark target rejected upload with status {}",
+                ack.status
+            );
+        }
+        Ok::<_, anyhow::Error>(upload_started.elapsed().as_secs_f64())
     }
-    let upload_seconds = upload_started.elapsed().as_secs_f64();
+    .await;
 
     download_barrier.wait().await;
+    let upload_seconds = upload_result?;
+
     let download_started = Instant::now();
     stream.write_all(&DOWNLOAD_READY).await?;
     stream.flush().await?;
     receive_pattern(
-        &mut stream,
+        &mut *stream,
         download_len,
         seed ^ u64::MAX,
         buffer_size,
@@ -377,8 +419,33 @@ async fn run_connection(
     })
 }
 
+async fn setup_connection(
+    target: &str,
+    target_host: &str,
+    target_port: u16,
+    socks5: Option<SocketAddr>,
+    inner_tls: bool,
+    tcp_nodelay: bool,
+    tls_server_name: &str,
+) -> Result<BoxedBenchIo> {
+    let stream = match socks5 {
+        Some(proxy) => {
+            connect_via_socks5(proxy, target_host, target_port, tcp_nodelay).await?
+        }
+        None => TcpStream::connect(target)
+            .await
+            .with_context(|| format!("connect benchmark target {target}"))?,
+    };
+    stream.set_nodelay(tcp_nodelay)?;
+    if inner_tls {
+        tls::connect(stream, tls_server_name).await
+    } else {
+        Ok(tls::plain(stream))
+    }
+}
+
 async fn send_pattern(
-    stream: &mut TcpStream,
+    stream: &mut dyn BenchIo,
     length: u64,
     seed: u64,
     buffer_size: usize,
@@ -402,7 +469,7 @@ async fn send_pattern(
 }
 
 async fn receive_pattern(
-    stream: &mut TcpStream,
+    stream: &mut dyn BenchIo,
     length: u64,
     seed: u64,
     buffer_size: usize,
@@ -468,6 +535,8 @@ fn build_run_result<'a>(
         download_bytes_per_connection: args.download_bytes,
         buffer_size: args.buffer_size,
         full_verify: args.full_verify,
+        inner_tls: args.inner_tls,
+        tcp_nodelay: args.tcp_nodelay,
         upload_mbps: round(mbps(
             args.upload_bytes.saturating_mul(args.concurrency as u64),
             upload_seconds,

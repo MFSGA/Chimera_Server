@@ -10,11 +10,12 @@ pub async fn connect_via_socks5(
     proxy: SocketAddr,
     target_host: &str,
     target_port: u16,
+    tcp_nodelay: bool,
 ) -> Result<TcpStream> {
     let mut stream = TcpStream::connect(proxy)
         .await
         .with_context(|| format!("connect SOCKS5 proxy {proxy}"))?;
-    stream.set_nodelay(true)?;
+    stream.set_nodelay(tcp_nodelay)?;
 
     stream.write_all(&[0x05, 0x01, 0x00]).await?;
     let mut method = [0_u8; 2];
