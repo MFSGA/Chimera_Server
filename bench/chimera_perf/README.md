@@ -62,6 +62,83 @@ bench/chimera_perf/target/release/generator \
 
 Use `--full-verify` for correctness runs. Throughput runs may omit it, but the result records always state whether full verification was enabled.
 
+## REALITY + Vision Direct workload
+
+A plaintext target exercises Vision `END`, not Vision `DIRECT`. Performance claims about the raw fast path therefore require a real inner TLS connection.
+
+Start a local TLS decoy for the REALITY handshake:
+
+```bash
+bench/chimera_perf/target/release/decoy \
+  --listen 127.0.0.1:52081 \
+  --cert cert/cert.pem \
+  --key cert/key.pem
+```
+
+Start the streaming payload target with TLS enabled:
+
+```bash
+bench/chimera_perf/target/release/target \
+  --listen 127.0.0.1:52080 \
+  --tls-cert cert/cert.pem \
+  --tls-key cert/key.pem \
+  --tcp-nodelay
+```
+
+Start Chimera Server and the bundled Xray client with:
+
+```bash
+CHIMERA_TCP_RELAY_BACKEND=auto \
+CHIMERA_TCP_COPY_BUFFER_SIZE=65536 \
+CHIMERA_TCP_SPLICE_PIPE_SIZE=65536 \
+CHIMERA_TCP_AUTO_MAX_CONNECTIONS=8 \
+  target/release/chimera_server_app \
+  --config bench/configs/vless-reality-vision-perf-server.json
+
+./xray run -c bench/configs/vless-reality-vision-perf-xray.json
+```
+
+Then run the generator through Xray SOCKS with a real inner TLS session:
+
+```bash
+bench/chimera_perf/target/release/generator \
+  --target 127.0.0.1:52080 \
+  --socks5 127.0.0.1:52101 \
+  --inner-tls \
+  --tcp-nodelay \
+  --label reality-vision-auto-c1 \
+  --upload-bytes 4294967296 \
+  --download-bytes 4294967296 \
+  --warmup 3 \
+  --runs 10 \
+  --max-cv 0.03 \
+  --output bench/results/reality-vision-auto-c1.jsonl
+```
+
+The target and generator support `--worker-threads` so each process can be pinned to a controlled CPU set with `taskset`.
+
+## Relay backends
+
+`CHIMERA_TCP_RELAY_BACKEND` accepts:
+
+- `handoff`: safe general-purpose path. It uses the handoff barrier, then continues with userspace copy.
+- `auto`: Linux low-concurrency optimization. It uses downlink splice only while the number of active auto-relay connections is at or below `CHIMERA_TCP_AUTO_MAX_CONNECTIONS`; otherwise it falls back to handoff.
+- `splice-downlink`: always splice target-to-client traffic while keeping client-to-target traffic in userspace. This mirrors the currently enabled direction in Xray.
+- `splice`: experimental full bidirectional splice. It is retained for diagnostics and must not be selected as a production default without new data.
+- `copy`: legacy direct Tokio bidirectional copy, retained only as a control. It does not provide the handoff flush barrier required by REALITY Vision.
+
+`CHIMERA_TCP_SPLICE_PIPE_SIZE` accepts 4096 through 1048576 bytes. The current measured default is 65536 bytes. Increasing it to 262144 bytes reduced throughput in the recorded high-concurrency experiment.
+
+External-process E2E suites should be run with one test thread:
+
+```bash
+cargo test -p chimera_server_app \
+  --test chimera_client_reality_vision_e2e \
+  -- --ignored --test-threads=1
+```
+
+This prevents multiple test runtimes from racing while starting Chimera Client subprocesses.
+
 ## Required experiment discipline
 
 - Build every compared binary in release mode using the same toolchain.

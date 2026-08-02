@@ -1,0 +1,35 @@
+{
+  "log": {"loglevel": "none", "access": "none", "error": "none"},
+  "inbounds": [{
+    "listen": "127.0.0.1",
+    "port": 52101,
+    "protocol": "socks",
+    "tag": "socks-in",
+    "settings": {"auth": "noauth", "udp": false}
+  }],
+  "outbounds": [{
+    "tag": "to-chimera",
+    "protocol": "vless",
+    "settings": {
+      "vnext": [{
+        "address": "127.0.0.1",
+        "port": 52100,
+        "users": [{
+          "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+          "encryption": "none",
+          "flow": "xtls-rprx-vision"
+        }]
+      }]
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "reality",
+      "realitySettings": {
+        "serverName": "www.apple.com",
+        "fingerprint": "chrome",
+        "publicKey": "lpaMu0U01fKbRO9mgkSiOArWZz4V0TRW7pR543Pm9Xg",
+        "shortId": "4ac97aaf8b9b0356"
+      }
+    }
+  }]
+}

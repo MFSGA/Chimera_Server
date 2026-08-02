@@ -1,0 +1,31 @@
+{
+  "log": {"loglevel": "warning"},
+  "inbounds": [{
+    "listen": "127.0.0.1",
+    "port": 52100,
+    "protocol": "vless",
+    "tag": "vless-reality-vision-perf",
+    "settings": {
+      "clients": [{
+        "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+        "email": "perf@local",
+        "flow": "xtls-rprx-vision"
+      }],
+      "decryption": "none"
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "reality",
+      "realitySettings": {
+        "dest": "127.0.0.1:52081",
+        "serverNames": ["www.apple.com"],
+        "privateKey": "dnprBfWdJgo5yaGClSaZ12TZW-SiD988YmjDKOhXLKI",
+        "shortIds": ["4ac97aaf8b9b0356"],
+        "maxTimeDiff": 0,
+        "minClientVer": "26.2.6",
+        "maxClientVer": "26.2.6"
+      }
+    }
+  }],
+  "outbounds": [{"protocol": "freedom", "tag": "direct"}]
+}
