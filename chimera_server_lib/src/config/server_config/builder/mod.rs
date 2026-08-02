@@ -1702,7 +1702,7 @@ mod tests {
 
         match config.protocol {
             ServerProxyConfig::Reality(reality) => {
-                assert_eq!(reality.min_client_version, Some([26, 3, 27]));
+                assert_eq!(reality.min_client_version, None);
                 assert_eq!(
                     reality.cipher_suites,
                     vec![
