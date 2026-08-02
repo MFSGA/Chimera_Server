@@ -297,7 +297,9 @@ pub(super) fn collect_trojan_fallbacks(
 }
 
 #[cfg(feature = "trojan")]
-fn parse_trojan_fallback_dest(value: serde_json::Value) -> Result<NetLocation, Error> {
+fn parse_trojan_fallback_dest(
+    value: serde_json::Value,
+) -> Result<NetLocation, Error> {
     let local_port = |port: u16| {
         NetLocation::new(Address::Ipv4(std::net::Ipv4Addr::LOCALHOST), port)
     };
@@ -446,10 +448,8 @@ pub(super) fn collect_xhttp_settings(
         30,
         30,
     );
-    let session_placement = parse_xhttp_placement(
-        raw.session_placement.as_deref(),
-        "sessionPlacement",
-    )?;
+    let session_placement =
+        parse_xhttp_placement(raw.session_placement.as_deref(), "sessionPlacement")?;
     let seq_placement =
         parse_xhttp_placement(raw.seq_placement.as_deref(), "seqPlacement")?;
     let session_key = normalize_xhttp_meta_key(
@@ -466,10 +466,8 @@ pub(super) fn collect_xhttp_settings(
         "x_seq",
         "seqKey",
     )?;
-    let uplink_data_placement = parse_xhttp_data_placement(
-        raw.uplink_data_placement.as_deref(),
-        mode,
-    )?;
+    let uplink_data_placement =
+        parse_xhttp_data_placement(raw.uplink_data_placement.as_deref(), mode)?;
     let uplink_data_key = normalize_xhttp_data_key(
         raw.uplink_data_key.as_deref(),
         uplink_data_placement,
@@ -582,8 +580,10 @@ fn parse_xhttp_data_placement(
             )));
         }
     };
-    if matches!(placement, XhttpDataPlacement::Header | XhttpDataPlacement::Cookie)
-        && mode != XhttpMode::PacketUp
+    if matches!(
+        placement,
+        XhttpDataPlacement::Header | XhttpDataPlacement::Cookie
+    ) && mode != XhttpMode::PacketUp
     {
         let value = match placement {
             XhttpDataPlacement::Header => "header",
@@ -618,7 +618,12 @@ fn parse_xhttp_placement(
     placement: Option<&str>,
     field: &str,
 ) -> Result<XhttpPlacement, Error> {
-    match placement.unwrap_or("path").trim().to_ascii_lowercase().as_str() {
+    match placement
+        .unwrap_or("path")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "" | "path" => Ok(XhttpPlacement::Path),
         "query" => Ok(XhttpPlacement::Query),
         "header" => Ok(XhttpPlacement::Header),
@@ -856,9 +861,21 @@ mod tests {
     #[test]
     fn collect_trojan_fallbacks_rejects_invalid_type_path_and_xver() {
         for (field, value, expected) in [
-            ("type", serde_json::json!("unix"), "trojan fallback type=unix is not supported yet"),
-            ("path", serde_json::json!("ws"), "trojan fallback path must be empty or start with /"),
-            ("xver", serde_json::json!(3), "trojan fallback xver must be 0, 1, or 2; got 3"),
+            (
+                "type",
+                serde_json::json!("unix"),
+                "trojan fallback type=unix is not supported yet",
+            ),
+            (
+                "path",
+                serde_json::json!("ws"),
+                "trojan fallback path must be empty or start with /",
+            ),
+            (
+                "xver",
+                serde_json::json!(3),
+                "trojan fallback xver must be 0, 1, or 2; got 3",
+            ),
         ] {
             let mut fallback = serde_json::json!({"dest": 8080});
             fallback[field] = value;
@@ -1000,9 +1017,11 @@ mod tests {
 
         let error = collect_xhttp_settings(settings)
             .expect_err("unknown session placement must fail");
-        assert!(error.to_string().contains(
-            "unsupported xhttpSettings.sessionPlacement: fragment"
-        ));
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported xhttpSettings.sessionPlacement: fragment")
+        );
     }
 
     #[test]
@@ -1016,9 +1035,11 @@ mod tests {
 
         let error = collect_xhttp_settings(settings)
             .expect_err("GET uplink must be packet-up only");
-        assert!(error.to_string().contains(
-            "xhttpSettings.uplinkHTTPMethod=GET requires mode=packet-up"
-        ));
+        assert!(
+            error.to_string().contains(
+                "xhttpSettings.uplinkHTTPMethod=GET requires mode=packet-up"
+            )
+        );
     }
 
     #[test]

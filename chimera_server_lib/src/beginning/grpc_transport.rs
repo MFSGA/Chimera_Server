@@ -22,9 +22,7 @@ use hyper_util::{
     server::conn::auto,
 };
 use tokio::{
-    io::{
-        AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex,
-    },
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex},
     task::JoinHandle,
 };
 #[cfg(feature = "tls")]
@@ -78,8 +76,7 @@ pub(super) async fn start_grpc_server(
         protocol,
         ..
     } = config;
-    let (grpc_config, inner_protocol, security) =
-        parse_listener_protocol(protocol)?;
+    let (grpc_config, inner_protocol, security) = parse_listener_protocol(protocol)?;
     let mut rules_stack = Vec::new();
     let server_handler: Arc<Box<dyn TcpServerHandler>> = Arc::new(
         create_tcp_server_handler(inner_protocol, &tag, &mut rules_stack)?,
@@ -229,18 +226,15 @@ fn parse_listener_protocol(
                     ));
                 }
             };
-            let server_config = create_server_config(
-                &cert_bytes,
-                &key_bytes,
-                &alpn_protocols,
-                &[],
-            )?;
+            let server_config =
+                create_server_config(&cert_bytes, &key_bytes, &alpn_protocols, &[])?;
             let inner = (*config.inner).clone();
             Ok((config, inner, GrpcSecurity::Tls(Arc::new(server_config))))
         }
         #[cfg(feature = "reality")]
         ServerProxyConfig::Reality(reality_config) => {
-            let ServerProxyConfig::Grpc(config) = reality_config.inner.as_ref() else {
+            let ServerProxyConfig::Grpc(config) = reality_config.inner.as_ref()
+            else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "REALITY gRPC listener requires Grpc as the inner protocol",
@@ -278,10 +272,7 @@ async fn serve_grpc_connection<IO>(
             peer_addr,
         )
     });
-    if let Err(error) = builder
-        .serve_connection(TokioIo::new(io), service)
-        .await
-    {
+    if let Err(error) = builder.serve_connection(TokioIo::new(io), service).await {
         debug!("gRPC transport connection {peer_addr} ended: {error}");
     }
 }

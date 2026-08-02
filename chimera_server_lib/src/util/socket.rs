@@ -166,7 +166,7 @@ fn recv_udp_with_original_destination_once(
     message.msg_iov = ptr::from_mut(&mut iov);
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = control.len();
+    message.msg_controllen = control.len() as _;
 
     // SAFETY: all pointers in `message` refer to live writable storage above.
     let length = unsafe { libc::recvmsg(fd, &mut message, 0) };
@@ -232,7 +232,7 @@ fn original_destination_from_message(
         let header = unsafe { &*control };
         if header.cmsg_level == libc::SOL_IP
             && header.cmsg_type == libc::IP_ORIGDSTADDR
-            && header.cmsg_len >= ipv4_control_len
+            && (header.cmsg_len as usize) >= ipv4_control_len
         {
             // SAFETY: the length check guarantees a complete sockaddr_in.
             let address = unsafe {
@@ -244,7 +244,7 @@ fn original_destination_from_message(
         }
         if header.cmsg_level == libc::SOL_IPV6
             && header.cmsg_type == libc::IPV6_ORIGDSTADDR
-            && header.cmsg_len >= ipv6_control_len
+            && (header.cmsg_len as usize) >= ipv6_control_len
         {
             // SAFETY: the length check guarantees a complete sockaddr_in6.
             let address = unsafe {

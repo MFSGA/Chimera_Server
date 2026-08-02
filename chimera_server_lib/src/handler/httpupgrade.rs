@@ -36,10 +36,7 @@ impl HttpUpgradeTcpServerHandler {
         }
     }
 
-    async fn upgrade(
-        &self,
-        stream: &mut Box<dyn AsyncStream>,
-    ) -> io::Result<()> {
+    async fn upgrade(&self, stream: &mut Box<dyn AsyncStream>) -> io::Result<()> {
         let request = timeout(HANDSHAKE_TIMEOUT, read_http_header(stream))
             .await
             .map_err(|_| {
@@ -122,9 +119,7 @@ impl TcpServerHandler for HttpUpgradeTcpServerHandler {
     }
 }
 
-async fn read_http_header(
-    stream: &mut Box<dyn AsyncStream>,
-) -> io::Result<Vec<u8>> {
+async fn read_http_header(stream: &mut Box<dyn AsyncStream>) -> io::Result<Vec<u8>> {
     let mut header = Vec::with_capacity(512);
     while header.len() < MAX_HEADER_BYTES {
         let byte = stream.read_u8().await?;
@@ -172,10 +167,7 @@ fn parse_request(
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
-        headers.insert(
-            name.trim().to_ascii_lowercase(),
-            value.trim().to_string(),
-        );
+        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
     }
     Ok((method, target, version, headers))
 }
@@ -216,8 +208,8 @@ mod tests {
 
     use async_trait::async_trait;
     use tokio::io::{
-        AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream,
-        ReadBuf, duplex,
+        AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf,
+        duplex,
     };
 
     use crate::{

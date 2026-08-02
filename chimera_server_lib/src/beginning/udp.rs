@@ -16,13 +16,13 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
+#[cfg(feature = "shadowsocks")]
+use crate::handler::shadowsocks::ShadowsocksUdpCodec;
 #[cfg(target_os = "linux")]
 use crate::util::socket::{
     enable_udp_original_destination, new_socket2_udp_socket,
     recv_udp_with_original_destination,
 };
-#[cfg(feature = "shadowsocks")]
-use crate::handler::shadowsocks::ShadowsocksUdpCodec;
 
 use crate::{
     address::{Address, BindLocation, NetLocation},
@@ -1695,11 +1695,7 @@ async fn relay_shadowsocks_udp_packet(
     match outbound_action {
         UdpOutboundAction::Blackhole { tag } => {
             traffic_context = traffic_context.with_outbound_tag(tag);
-            record_transfer(
-                Some(traffic_context),
-                request.payload.len() as u64,
-                0,
-            );
+            record_transfer(Some(traffic_context), request.payload.len() as u64, 0);
             Ok(())
         }
         UdpOutboundAction::Freedom { tag } => {
@@ -1716,32 +1712,24 @@ async fn relay_shadowsocks_udp_packet(
             record_transfer(Some(traffic_context.clone()), sent as u64, 0);
 
             let mut response = vec![0u8; UDP_BUFFER_SIZE];
-            let (response_len, response_addr) = timeout(
-                UDP_SESSION_IDLE_TIMEOUT,
-                outbound.recv_from(&mut response),
-            )
-            .await
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "Shadowsocks UDP response timed out",
-                )
-            })??;
-            let source = NetLocation::from_ip_addr(
-                response_addr.ip(),
-                response_addr.port(),
-            );
+            let (response_len, response_addr) =
+                timeout(UDP_SESSION_IDLE_TIMEOUT, outbound.recv_from(&mut response))
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "Shadowsocks UDP response timed out",
+                        )
+                    })??;
+            let source =
+                NetLocation::from_ip_addr(response_addr.ip(), response_addr.port());
             let encrypted = codec.encrypt_packet(
                 &request,
                 &source,
                 &response[..response_len],
             )?;
             server_socket.send_to(&encrypted, client_addr).await?;
-            record_transfer(
-                Some(traffic_context),
-                0,
-                response_len as u64,
-            );
+            record_transfer(Some(traffic_context), 0, response_len as u64);
             Ok(())
         }
     }

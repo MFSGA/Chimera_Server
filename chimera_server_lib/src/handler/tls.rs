@@ -133,7 +133,8 @@ impl TcpServerHandler for TlsServerHandler {
             TlsInner::Handler(inner) => {
                 let tls_stream = self.acceptor.accept(server_stream).await?;
                 let connection = tls_stream.get_ref().1;
-                context.server_name = connection.server_name().map(ToOwned::to_owned);
+                context.server_name =
+                    connection.server_name().map(ToOwned::to_owned);
                 context.alpn_protocol = connection
                     .alpn_protocol()
                     .and_then(|value| std::str::from_utf8(value).ok())
