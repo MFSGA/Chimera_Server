@@ -9,7 +9,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::debug;
 
 use crate::{
-    async_stream::{AsyncPing, AsyncStream},
+    async_stream::{AsyncPing, AsyncStream, RawTcpRelayState},
     reality::{RealityIoState, RealitySession, SyncReadAdapter, SyncWriteAdapter},
 };
 
@@ -516,4 +516,28 @@ where
     IO: AsyncStream,
     S: RealitySession + Unpin + Send,
 {
+    fn raw_tcp_relay_state(&self) -> RawTcpRelayState {
+        match self.tcp.raw_tcp_relay_state() {
+            RawTcpRelayState::Unavailable => RawTcpRelayState::Unavailable,
+            RawTcpRelayState::Pending | RawTcpRelayState::Ready => {
+                if self.read_mode == ReadMode::Direct
+                    && self.write_mode == WriteMode::Direct
+                    && self.pending_read.is_empty()
+                    && self.pending_write.is_empty()
+                    && !self.session.wants_write()
+                {
+                    RawTcpRelayState::Ready
+                } else {
+                    RawTcpRelayState::Pending
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn raw_tcp_fd(&self) -> Option<std::os::fd::RawFd> {
+        (self.raw_tcp_relay_state() == RawTcpRelayState::Ready)
+            .then(|| self.tcp.raw_tcp_fd())
+            .flatten()
+    }
 }

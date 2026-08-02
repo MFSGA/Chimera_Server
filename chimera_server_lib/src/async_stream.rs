@@ -4,6 +4,9 @@ use std::{
     task::{Context, Poll},
 };
 
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd};
+
 use crate::address::NetLocation;
 
 use tokio::{
@@ -52,7 +55,23 @@ pub trait AsyncShutdownMessage {
     ) -> Poll<std::io::Result<()>>;
 }
 
-pub trait AsyncStream: AsyncRead + AsyncWrite + AsyncPing + Unpin + Send {}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawTcpRelayState {
+    Unavailable,
+    Pending,
+    Ready,
+}
+
+pub trait AsyncStream: AsyncRead + AsyncWrite + AsyncPing + Unpin + Send {
+    fn raw_tcp_relay_state(&self) -> RawTcpRelayState {
+        RawTcpRelayState::Unavailable
+    }
+
+    #[cfg(unix)]
+    fn raw_tcp_fd(&self) -> Option<RawFd> {
+        None
+    }
+}
 
 pub trait AsyncMessageStream:
     AsyncReadMessage
@@ -155,7 +174,16 @@ impl AsyncPing for TcpStream {
     }
 }
 
-impl AsyncStream for TcpStream {}
+impl AsyncStream for TcpStream {
+    fn raw_tcp_relay_state(&self) -> RawTcpRelayState {
+        RawTcpRelayState::Ready
+    }
+
+    #[cfg(unix)]
+    fn raw_tcp_fd(&self) -> Option<RawFd> {
+        Some(self.as_raw_fd())
+    }
+}
 
 impl AsyncPing for UdpSocket {
     fn supports_ping(&self) -> bool {
@@ -237,7 +265,16 @@ impl<T: ?Sized + AsyncStream> AsyncPing for Box<T> {
     }
 }
 
-impl<T: ?Sized + AsyncStream> AsyncStream for Box<T> {}
+impl<T: ?Sized + AsyncStream> AsyncStream for Box<T> {
+    fn raw_tcp_relay_state(&self) -> RawTcpRelayState {
+        (**self).raw_tcp_relay_state()
+    }
+
+    #[cfg(unix)]
+    fn raw_tcp_fd(&self) -> Option<RawFd> {
+        (**self).raw_tcp_fd()
+    }
+}
 
 #[cfg(feature = "tls")]
 impl<S> AsyncPing for TlsStream<S>
