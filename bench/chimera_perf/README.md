@@ -89,7 +89,7 @@ Start Chimera Server and the bundled Xray client with:
 
 ```bash
 CHIMERA_TCP_RELAY_BACKEND=auto \
-CHIMERA_TCP_COPY_BUFFER_SIZE=65536 \
+CHIMERA_TCP_COPY_BUFFER_SIZE=32768 \
 CHIMERA_TCP_SPLICE_PIPE_SIZE=65536 \
 CHIMERA_TCP_AUTO_MAX_CONNECTIONS=8 \
   target/release/chimera_server_app \
@@ -126,6 +126,8 @@ The target and generator support `--worker-threads` so each process can be pinne
 - `splice-downlink`: always splice target-to-client traffic while keeping client-to-target traffic in userspace. This mirrors the currently enabled direction in Xray.
 - `splice`: experimental full bidirectional splice. It is retained for diagnostics and must not be selected as a production default without new data.
 - `copy`: legacy direct Tokio bidirectional copy, retained only as a control. It does not provide the handoff flush barrier required by REALITY Vision.
+
+`CHIMERA_TCP_COPY_BUFFER_SIZE` accepts 4096 through 1048576 bytes. The measured production default is 32768 bytes: it preserved the 64 KiB candidate's 64-connection throughput while reducing peak RSS, and it was dramatically faster than 8 KiB for a single long flow.
 
 `CHIMERA_TCP_SPLICE_PIPE_SIZE` accepts 4096 through 1048576 bytes. The current measured default is 65536 bytes. Increasing it to 262144 bytes reduced throughput in the recorded high-concurrency experiment.
 
