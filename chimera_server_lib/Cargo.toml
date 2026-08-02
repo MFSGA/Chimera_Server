@@ -58,6 +58,9 @@ http = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 md-5 = { workspace = true, optional = true }
+blake3 = { workspace = true, optional = true }
+aes = { workspace = true, optional = true }
+chacha20poly1305 = { workspace = true, optional = true }
 sha3 = { workspace = true, optional = true }
 rcgen = { workspace = true, optional = true }
 subtle = { version = "2", optional = true }
@@ -73,10 +76,15 @@ rcgen = { workspace = true }
 
 [features]
 hysteria = []
+http = []
+mixed = ["http"]
+httpupgrade = []
+grpc_transport = []
 trojan = []
 ws = []
 tls = []
 reality = ["rcgen", "subtle", "x509-parser"]
+shadowsocks = ["md-5", "blake3", "aes", "chacha20poly1305"]
 vless = []
 vmess = ["md-5", "sha3"]
 tuic = ["dashmap", "lru", "uuid"]
@@ -85,10 +93,15 @@ api = ["tonic", "tonic-prost", "prost-types", "tokio-stream"]
 
 full = [
     "hysteria",
+    "http",
+    "mixed",
+    "httpupgrade",
+    "grpc_transport",
     "trojan",
     "ws",
     "tls",
     "reality",
+    "shadowsocks",
     "vless",
     "vmess",
     "tuic",
