@@ -32,24 +32,46 @@ impl proto::xray::core::app::observatory::command::observatory_service_server::O
             .unwrap_or_default()
             .as_secs() as i64;
 
+        let observations = self.runtime.outbound_observations();
         let status = self
             .runtime
             .outbounds()
             .iter()
-            .map(
-                |outbound| proto::xray::core::app::observatory::OutboundStatus {
-                    alive: false,
-                    delay: 0,
-                    last_error_reason: format!(
-                        "observatory probe for protocol {} is not implemented",
-                        outbound.protocol
+            .map(|outbound| {
+                let observation = observations.get(&outbound.tag);
+                proto::xray::core::app::observatory::OutboundStatus {
+                    alive: observation.is_some_and(|status| status.alive),
+                    delay: observation.map_or(0, |status| status.delay_ms),
+                    last_error_reason: observation.map_or_else(
+                        || format!(
+                            "outbound {} has not been observed yet",
+                            outbound.tag
+                        ),
+                        |status| status.last_error_reason.clone(),
                     ),
                     outbound_tag: outbound.tag.clone(),
-                    last_seen_time: 0,
-                    last_try_time: now,
-                    health_ping: None,
-                },
-            )
+                    last_seen_time: observation
+                        .map_or(0, |status| status.last_seen_time),
+                    last_try_time: observation.map_or(now, |status| status.last_try_time),
+                    health_ping: observation.and_then(|status| {
+                        (status.health_all > 0).then(|| {
+                            let millis_to_nanos = |value: i64| {
+                                value.saturating_mul(1_000_000)
+                            };
+                            proto::xray::core::app::observatory::HealthPingMeasurementResult {
+                                all: status.health_all,
+                                fail: status.health_fail,
+                                deviation: millis_to_nanos(
+                                    status.health_deviation_ms,
+                                ),
+                                average: millis_to_nanos(status.health_average_ms),
+                                max: millis_to_nanos(status.health_max_ms),
+                                min: millis_to_nanos(status.health_min_ms),
+                            }
+                        })
+                    }),
+                }
+            })
             .collect();
 
         Ok(Response::new(
@@ -72,7 +94,7 @@ pub(super) fn build_service(
 
 #[cfg(test)]
 mod tests {
-    use crate::runtime::OutboundSummary;
+    use crate::{routing_state::OutboundObservation, runtime::OutboundSummary};
 
     use super::proto::xray::core::app::observatory::command::observatory_service_server::ObservatoryService;
     use super::*;
@@ -94,10 +116,25 @@ mod tests {
 
     #[tokio::test]
     async fn observatory_returns_outbound_status() {
-        let service = ObservatoryServiceImpl::new(build_runtime(&[
-            ("direct", "freedom"),
-            ("block", "blackhole"),
-        ]));
+        let runtime =
+            build_runtime(&[("direct", "freedom"), ("block", "blackhole")]);
+        runtime.record_outbound_observation(
+            "direct",
+            OutboundObservation {
+                alive: true,
+                delay_ms: 27,
+                last_seen_time: 123,
+                last_try_time: 124,
+                health_all: 10,
+                health_fail: 2,
+                health_deviation_ms: 3,
+                health_average_ms: 7,
+                health_max_ms: 11,
+                health_min_ms: 4,
+                ..OutboundObservation::default()
+            },
+        );
+        let service = ObservatoryServiceImpl::new(runtime);
         let response = service
             .get_outbound_status(Request::new(
                 proto::xray::core::app::observatory::command::GetOutboundStatusRequest::default(),
@@ -110,11 +147,22 @@ mod tests {
         assert_eq!(status.len(), 2);
         assert_eq!(status[0].outbound_tag, "direct");
         assert_eq!(status[1].outbound_tag, "block");
-        assert!(!status[0].alive);
+        assert!(status[0].alive);
+        assert_eq!(status[0].delay, 27);
+        assert_eq!(status[0].last_seen_time, 123);
+        assert_eq!(status[0].last_try_time, 124);
+        let health = status[0].health_ping.as_ref().expect("health ping missing");
+        assert_eq!(health.all, 10);
+        assert_eq!(health.fail, 2);
+        assert_eq!(health.deviation, 3_000_000);
+        assert_eq!(health.average, 7_000_000);
+        assert_eq!(health.max, 11_000_000);
+        assert_eq!(health.min, 4_000_000);
+        assert!(!status[1].alive);
         assert!(
-            status[0]
+            status[1]
                 .last_error_reason
-                .contains("observatory probe for protocol freedom")
+                .contains("has not been observed yet")
         );
     }
 

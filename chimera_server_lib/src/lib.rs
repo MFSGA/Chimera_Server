@@ -45,6 +45,7 @@ mod handler;
 
 mod resolver;
 
+mod routing_observer;
 mod routing_process;
 mod routing_state;
 mod routing_webhook;
@@ -293,6 +294,11 @@ pub fn validate(opts: Options) -> Result<(), Error> {
     let api_config = config.api.clone();
     let mcp_config = config.mcp.clone();
     let routing_config = config.routing.clone();
+    routing_observer::validate_observatory_config(
+        config.observatory.as_ref(),
+        config.burst_observatory.as_ref(),
+    )
+    .map_err(Error::InvalidConfig)?;
 
     let all_inbounds = config
         .inbounds
@@ -351,6 +357,13 @@ async fn start_async(
     let api_config = config.api.clone();
     let mcp_config = config.mcp.clone();
     let routing_config = config.routing.clone();
+    let observatory_config = config.observatory.clone();
+    let burst_observatory_config = config.burst_observatory.clone();
+    routing_observer::validate_observatory_config(
+        observatory_config.as_ref(),
+        burst_observatory_config.as_ref(),
+    )
+    .map_err(Error::InvalidConfig)?;
     let outbounds = config
         .outbounds
         .iter()
@@ -395,8 +408,18 @@ async fn start_async(
         }
     }
 
-    let mut join_handles = Vec::with_capacity(3);
+    let mut join_handles = Vec::with_capacity(4);
     let mut has_started_server = false;
+    if let Some(observer) = routing_observer::start_observer(
+        runtime_state.clone(),
+        observatory_config,
+        burst_observatory_config,
+    )
+    .map_err(Error::InvalidConfig)?
+    {
+        join_handles.push(observer);
+        has_started_server = true;
+    }
     #[cfg(feature = "api")]
     if let Some(api) = api_config.as_ref()
         && let Some(listen) = api_addr
