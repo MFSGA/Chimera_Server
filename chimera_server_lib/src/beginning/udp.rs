@@ -37,6 +37,7 @@ use crate::{
         DirectOutboundAction, connection_routing_input, select_direct_outbound,
     },
     resolver::{NativeResolver, Resolver, resolve_single_address},
+    routing_process::enrich_routing_input,
     routing_state::RoutingInput,
     runtime::RuntimeState,
     traffic::{TrafficContext, record_transfer, register_connection},
@@ -1686,7 +1687,8 @@ async fn relay_shadowsocks_udp_packet(
         client_addr,
         target_addr,
         &request.target_location,
-    )?;
+    )
+    .await?;
     let mut traffic_context = TrafficContext::new("shadowsocks")
         .with_inbound_tag(inbound_tag)
         .with_client_ip(client_addr.ip());
@@ -1823,7 +1825,8 @@ async fn relay_dokodemo_udp_datagram(
         client_addr,
         target_addr,
         &target_location,
-    )?;
+    )
+    .await?;
 
     let traffic_context = TrafficContext::new("dokodemo-door")
         .with_inbound_tag(inbound_tag)
@@ -2007,14 +2010,14 @@ async fn run_freedom_udp_session(
     relay_state.sessions.lock().await.remove(&key);
 }
 
-fn select_udp_outbound(
+async fn select_udp_outbound(
     runtime: &RuntimeState,
     inbound_tag: &str,
     client_addr: SocketAddr,
     target_addr: SocketAddr,
     target_location: &NetLocation,
 ) -> std::io::Result<UdpOutboundAction> {
-    let route_input = RoutingInput {
+    let mut route_input = RoutingInput {
         inbound_tag: inbound_tag.to_string(),
         network: 3,
         source_ips: vec![encode_ip(client_addr.ip())],
@@ -2024,6 +2027,9 @@ fn select_udp_outbound(
         target_domain: target_domain(target_location),
         ..RoutingInput::default()
     };
+    if runtime.routing().requires_process_lookup() {
+        enrich_routing_input(&mut route_input).await;
+    }
 
     let selected =
         runtime
@@ -3622,8 +3628,8 @@ mod tests {
         server_task.abort();
     }
 
-    #[test]
-    fn udp_routing_selects_blackhole_outbound() {
+    #[tokio::test]
+    async fn udp_routing_selects_blackhole_outbound() {
         let runtime = runtime_with_outbounds(vec![
             outbound("direct", "freedom"),
             outbound("blocked", "blackhole"),
@@ -3648,6 +3654,7 @@ mod tests {
             SocketAddr::from((Ipv4Addr::LOCALHOST, 53)),
             &NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::LOCALHOST), 53),
         )
+        .await
         .expect("outbound selection should succeed");
 
         assert_eq!(
@@ -3658,8 +3665,56 @@ mod tests {
         );
     }
 
-    #[test]
-    fn udp_routing_defaults_to_first_outbound() {
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn udp_routing_selects_outbound_by_local_process() {
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind process routing UDP client");
+        let client_addr = client.local_addr().expect("UDP client address");
+        let process_name = std::env::current_exe()
+            .expect("current executable")
+            .file_name()
+            .expect("current executable name")
+            .to_string_lossy()
+            .into_owned();
+        let runtime = runtime_with_outbounds(vec![
+            outbound("direct", "freedom"),
+            outbound("blocked", "blackhole"),
+        ]);
+        runtime.replace_routing(
+            RoutingState::from_config(Some(&RoutingConfig {
+                rules: vec![RuleConfig {
+                    process: vec![process_name],
+                    network: NetworkListConfig(vec!["udp".into()]),
+                    outbound_tag: Some("blocked".into()),
+                    ..RuleConfig::default()
+                }],
+                ..RoutingConfig::default()
+            }))
+            .expect("UDP process routing should build"),
+        );
+
+        let action = select_udp_outbound(
+            &runtime,
+            "dokodemo-udp",
+            client_addr,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 53)),
+            &NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::LOCALHOST), 53),
+        )
+        .await
+        .expect("UDP process routing should succeed");
+
+        assert_eq!(
+            action,
+            UdpOutboundAction::Blackhole {
+                tag: "blocked".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_routing_defaults_to_first_outbound() {
         let runtime = runtime_with_outbounds(vec![outbound("direct", "freedom")]);
 
         let action = select_udp_outbound(
@@ -3669,6 +3724,7 @@ mod tests {
             SocketAddr::from((Ipv4Addr::LOCALHOST, 53)),
             &NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::LOCALHOST), 53),
         )
+        .await
         .expect("outbound selection should succeed");
 
         assert_eq!(
@@ -3679,8 +3735,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn udp_routing_rejects_missing_routed_outbound() {
+    #[tokio::test]
+    async fn udp_routing_rejects_missing_routed_outbound() {
         let runtime = runtime_with_outbounds(vec![outbound("direct", "freedom")]);
         runtime.replace_routing(
             RoutingState::from_config(Some(&RoutingConfig {
@@ -3702,14 +3758,15 @@ mod tests {
             SocketAddr::from((Ipv4Addr::LOCALHOST, 53)),
             &NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::LOCALHOST), 53),
         )
+        .await
         .expect_err("missing routed UDP outbound must fail closed");
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("missing outbound missing"));
     }
 
-    #[test]
-    fn udp_routing_rejects_empty_balancer_without_falling_back() {
+    #[tokio::test]
+    async fn udp_routing_rejects_empty_balancer_without_falling_back() {
         let runtime = runtime_with_outbounds(vec![outbound("direct", "freedom")]);
         runtime.replace_routing(
             RoutingState::from_config(Some(&RoutingConfig {
@@ -3722,6 +3779,7 @@ mod tests {
                 balancers: vec![BalancerConfig {
                     tag: "empty".into(),
                     outbound_selector: vec!["missing-prefix".into()],
+                    strategy: Default::default(),
                     fallback_tag: None,
                     strategy: Default::default(),
                 }],
@@ -3737,6 +3795,7 @@ mod tests {
             SocketAddr::from((Ipv4Addr::LOCALHOST, 53)),
             &NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::LOCALHOST), 53),
         )
+        .await
         .expect_err("empty routed UDP balancer must fail closed");
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
@@ -3747,8 +3806,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn udp_routing_rejects_unsupported_outbound_protocol() {
+    #[tokio::test]
+    async fn udp_routing_rejects_unsupported_outbound_protocol() {
         let runtime = runtime_with_outbounds(vec![outbound("proxy", "vmess")]);
 
         let err = select_udp_outbound(
@@ -3758,6 +3817,7 @@ mod tests {
             SocketAddr::from((Ipv4Addr::LOCALHOST, 53)),
             &NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::LOCALHOST), 53),
         )
+        .await
         .expect_err("unsupported udp outbound protocol should fail");
 
         assert!(

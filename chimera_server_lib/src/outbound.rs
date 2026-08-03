@@ -1,6 +1,7 @@
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use tracing::warn;
@@ -8,7 +9,8 @@ use tracing::warn;
 use crate::{
     address::{Address, NetLocation},
     resolver::{Resolver, resolve_single_address},
-    routing_state::RoutingInput,
+    routing_process::enrich_routing_input,
+    routing_state::{OutboundObservation, RoutingInput},
     runtime::RuntimeState,
     util::socket::new_tcp_socket,
 };
@@ -65,6 +67,9 @@ pub(crate) async fn connect_tcp_outbound_with_vless_route(
         remote_location,
     );
     route_input.vless_route = vless_route;
+    if runtime.routing().requires_process_lookup() {
+        enrich_routing_input(&mut route_input).await;
+    }
 
     let outbound_tag = match select_direct_outbound(runtime, &route_input, "tcp")? {
         DirectOutboundAction::Freedom { tag } => tag,
@@ -72,7 +77,42 @@ pub(crate) async fn connect_tcp_outbound_with_vless_route(
     };
 
     let tcp_socket = new_tcp_socket(None, target_addr.is_ipv6())?;
-    let stream = tcp_socket.connect(target_addr).await?;
+    let started = Instant::now();
+    let attempted_at = unix_time_secs();
+    let stream = match tcp_socket.connect(target_addr).await {
+        Ok(stream) => {
+            if let Some(tag) = outbound_tag.as_deref() {
+                runtime.record_outbound_observation(
+                    tag,
+                    OutboundObservation {
+                        alive: true,
+                        delay_ms: started.elapsed().as_millis().min(i64::MAX as u128)
+                            as i64,
+                        last_seen_time: attempted_at,
+                        last_try_time: attempted_at,
+                        ..OutboundObservation::default()
+                    },
+                );
+            }
+            stream
+        }
+        Err(error) => {
+            if let Some(tag) = outbound_tag.as_deref() {
+                runtime.record_outbound_observation(
+                    tag,
+                    OutboundObservation {
+                        alive: false,
+                        delay_ms: started.elapsed().as_millis().min(i64::MAX as u128)
+                            as i64,
+                        last_error_reason: error.to_string(),
+                        last_try_time: attempted_at,
+                        ..OutboundObservation::default()
+                    },
+                );
+            }
+            return Err(error);
+        }
+    };
     if let Err(err) = stream.set_nodelay(true) {
         warn!("Failed to set TCP no-delay on client socket: {}", err);
     }
@@ -141,6 +181,14 @@ pub(crate) fn select_direct_outbound(
     }
 }
 
+fn unix_time_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(i64::MAX as u64) as i64
+}
+
 fn encode_ip(ip: IpAddr) -> Vec<u8> {
     match ip {
         IpAddr::V4(ip) => ip.octets().to_vec(),
@@ -153,6 +201,7 @@ mod tests {
     use super::*;
     use crate::{
         config::rule::{BalancerConfig, RoutingConfig, RuleConfig},
+        resolver::NativeResolver,
         routing_state::RoutingState,
         runtime::OutboundSummary,
     };
@@ -235,8 +284,8 @@ mod tests {
                 balancers: vec![BalancerConfig {
                     tag: "empty".into(),
                     outbound_selector: vec!["missing-prefix".into()],
-                    fallback_tag: None,
                     strategy: Default::default(),
+                    fallback_tag: None,
                 }],
                 ..RoutingConfig::default()
             }))
@@ -298,5 +347,131 @@ mod tests {
         );
         assert_eq!(input.source_port, 12345);
         assert_eq!(input.target_domain, "example.com");
+    }
+
+    #[tokio::test]
+    async fn tcp_outbound_records_successful_observation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind observed target");
+        let target_addr = listener.local_addr().expect("observed target address");
+        let runtime =
+            RuntimeState::new(Vec::new(), vec![outbound("direct", "freedom")]);
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let target = NetLocation::from_ip_addr(target_addr.ip(), target_addr.port());
+
+        let connection = connect_tcp_outbound(
+            &resolver,
+            &target,
+            &runtime,
+            "observed-in",
+            "",
+            "127.0.0.1:12345".parse().unwrap(),
+        )
+        .await
+        .expect("observed connection should succeed");
+        assert!(connection.is_some());
+
+        let observations = runtime.outbound_observations();
+        let status = observations.get("direct").expect("observation missing");
+        assert!(status.alive);
+        assert!(status.last_seen_time > 0);
+        assert_eq!(status.last_error_reason, "");
+    }
+
+    #[tokio::test]
+    async fn tcp_outbound_records_failed_observation() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("reserve failed target port");
+        let target_addr = listener.local_addr().expect("failed target address");
+        drop(listener);
+        let runtime =
+            RuntimeState::new(Vec::new(), vec![outbound("direct", "freedom")]);
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let target = NetLocation::from_ip_addr(target_addr.ip(), target_addr.port());
+
+        if connect_tcp_outbound(
+            &resolver,
+            &target,
+            &runtime,
+            "observed-in",
+            "",
+            "127.0.0.1:12345".parse().unwrap(),
+        )
+        .await
+        .is_ok()
+        {
+            panic!("connection to released port should fail");
+        }
+
+        let observations = runtime.outbound_observations();
+        let status = observations
+            .get("direct")
+            .expect("failure observation missing");
+        assert!(!status.alive);
+        assert!(status.last_try_time > 0);
+        assert!(!status.last_error_reason.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tcp_outbound_routes_by_local_process() {
+        let inbound_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind process routing inbound listener");
+        let client = tokio::net::TcpStream::connect(
+            inbound_listener.local_addr().expect("inbound address"),
+        );
+        let (client, accepted) = tokio::join!(client, inbound_listener.accept());
+        let _client = client.expect("connect local process client");
+        let (_accepted, source_addr) =
+            accepted.expect("accept local process client");
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind process routing target");
+        let target_addr = target_listener.local_addr().expect("target address");
+        let process_name = std::env::current_exe()
+            .expect("current executable")
+            .file_name()
+            .expect("current executable name")
+            .to_string_lossy()
+            .into_owned();
+
+        let runtime = RuntimeState::new(
+            Vec::new(),
+            vec![
+                outbound("direct", "freedom"),
+                outbound("blocked", "blackhole"),
+            ],
+        );
+        runtime.replace_routing(
+            RoutingState::from_config(Some(&RoutingConfig {
+                rules: vec![RuleConfig {
+                    process: vec![process_name],
+                    outbound_tag: Some("blocked".into()),
+                    ..RuleConfig::default()
+                }],
+                ..RoutingConfig::default()
+            }))
+            .expect("process routing should build"),
+        );
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let target = NetLocation::from_ip_addr(target_addr.ip(), target_addr.port());
+
+        let connection = connect_tcp_outbound(
+            &resolver,
+            &target,
+            &runtime,
+            "process-in",
+            "",
+            source_addr,
+        )
+        .await
+        .expect("process-routed outbound selection should succeed");
+
+        assert!(
+            connection.is_none(),
+            "process route should select blackhole"
+        );
     }
 }
