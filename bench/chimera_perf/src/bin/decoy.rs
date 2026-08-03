@@ -61,8 +61,7 @@ async fn run(args: Args) -> Result<()> {
                     let mut byte = [0_u8; 1];
                     let _ = tls.read(&mut byte).await;
                 }
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::UnexpectedEof => {}
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {}
                 Err(error) => {
                     eprintln!(
                         "decoy {local_addr} connection {peer} ended during TLS: {error}"
