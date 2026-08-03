@@ -131,6 +131,21 @@ The target and generator support `--worker-threads` so each process can be pinne
 
 `CHIMERA_TCP_SPLICE_PIPE_SIZE` accepts 4096 through 1048576 bytes. The current measured default is 65536 bytes. Increasing it to 262144 bytes reduced throughput in the recorded high-concurrency experiment.
 
+Completed TCP-forward logs include three structured relay-attribution fields:
+
+- `relay_backend`: the configured backend (`copy`, `handoff`, `splice`, `splice-downlink`, or `auto`);
+- `relay_path`: the path that actually carried the steady-state connection (`userspace-copy`, `splice`, or `splice-downlink`);
+- `relay_fallback`: `none` when the configured fast path was used, otherwise the reason it continued with userspace copy.
+
+Current fallback values are:
+
+- `direct-not-reached`: the connection completed before both streams reached the raw Direct barrier;
+- `auto-connection-limit`: `auto` exceeded `CHIMERA_TCP_AUTO_MAX_CONNECTIONS` or the limit was set to zero;
+- `missing-left-tcp-fd`, `missing-right-tcp-fd`, or `missing-tcp-fds`: the stream wrappers could not expose the required raw TCP descriptors;
+- `splice-initialization`: pipe or splice-direction initialization failed and the connection safely continued with userspace copy.
+
+These fields make `auto` suitable for controlled production observation: operators can aggregate actual splice hit rate and fallback causes instead of assuming the configured backend was used.
+
 External-process E2E suites should be run with one test thread:
 
 ```bash
