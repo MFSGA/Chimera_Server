@@ -141,6 +141,49 @@ cargo test -p chimera_server_app \
 
 This prevents multiple test runtimes from racing while starting Chimera Client subprocesses.
 
+## Duration-based soak and process leak monitoring
+
+The generator can continue measured runs for a minimum wall-clock duration while preserving the existing `--runs` contract. Both conditions must be satisfied before it stops.
+
+Use `--monitor-pid` to sample a long-running target or proxy process after every measured run. The final summary records start/end/peak fd count, RSS, HWM, and thread count without retaining every sample in memory. Use `--emit-every-runs` to keep long-run JSON output bounded; the first and final measured runs are always emitted.
+
+Example one-hour REALITY + Vision soak:
+
+```bash
+server_pid=$(pgrep -n chimera_server_app)
+
+bench/chimera_perf/target/release/generator \
+  --target 127.0.0.1:52080 \
+  --socks5 127.0.0.1:52101 \
+  --inner-tls \
+  --tcp-nodelay \
+  --full-verify \
+  --label reality-vision-handoff-soak-1h \
+  --upload-bytes 67108864 \
+  --download-bytes 67108864 \
+  --concurrency 16 \
+  --warmup 3 \
+  --runs 1 \
+  --duration-secs 3600 \
+  --monitor-pid "$server_pid" \
+  --cooldown-secs 10 \
+  --max-fd-delta 0 \
+  --max-rss-delta-kib 65536 \
+  --emit-every-runs 100 \
+  --output bench/results/reality-vision-handoff-soak-1h.jsonl
+```
+
+For a 24-hour run, change `--duration-secs` to `86400`. The summary fields most relevant to leak detection are:
+
+- `monitored_process.fd_delta`;
+- `monitored_process.vm_rss_delta_kib`;
+- `monitored_process.max_fd_count`;
+- `monitored_process.max_vm_rss_kib` and `max_vm_hwm_kib`;
+- `monitored_process.max_threads`;
+- `completed_connections` and total transferred bytes.
+
+A non-zero final fd delta is not automatically a leak if connections remain active at sampling time. `--cooldown-secs` delays the final process snapshot after the measured duration so completed connections and allocator caches can settle. `--max-fd-delta` and `--max-rss-delta-kib` make the run fail after emitting its summary when the configured growth gate is exceeded.
+
 ## Relay microbenchmark and io_uring gate
 
 `relay_probe` is a short-lived, single-direction TCP relay process. Unlike the full server, it exits after every experiment, so `strace -c` can collect reliable syscall counts even when host ptrace policy prevents attaching to an existing process.
