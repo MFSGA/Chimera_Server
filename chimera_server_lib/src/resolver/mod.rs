@@ -353,6 +353,74 @@ fn cached_result_to_io(result: CachedLookupResult) -> io::Result<Vec<SocketAddr>
     result.map_err(|error| error.to_io())
 }
 
+/// Resolver that tries multiple upstreams in order until one returns addresses.
+#[derive(Clone)]
+pub struct CompositeResolver {
+    resolvers: Vec<Arc<dyn Resolver>>,
+}
+
+impl CompositeResolver {
+    pub fn new(resolvers: Vec<Arc<dyn Resolver>>) -> Self {
+        Self { resolvers }
+    }
+}
+
+impl Resolver for CompositeResolver {
+    fn resolve_location(
+        &self,
+        location: &NetLocation,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send>> {
+        let resolvers = self.resolvers.clone();
+        let location = location.clone();
+        Box::pin(async move {
+            let mut last_error = None;
+            for (index, resolver) in resolvers.iter().enumerate() {
+                match resolver.resolve_location(&location).await {
+                    Ok(addresses) if !addresses.is_empty() => {
+                        if index > 0 {
+                            debug!(
+                                resolver_index = index,
+                                destination = %location,
+                                "DNS lookup succeeded after resolver fallback"
+                            );
+                        }
+                        return Ok(addresses);
+                    }
+                    Ok(_) => {
+                        debug!(
+                            resolver_index = index,
+                            destination = %location,
+                            "DNS resolver returned no addresses"
+                        );
+                        last_error = Some(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!(
+                                "DNS resolver #{index} returned no addresses for {location}"
+                            ),
+                        ));
+                    }
+                    Err(error) => {
+                        debug!(
+                            resolver_index = index,
+                            destination = %location,
+                            error = %error,
+                            "DNS resolver failed; trying the next resolver"
+                        );
+                        last_error = Some(error);
+                    }
+                }
+            }
+
+            Err(last_error.unwrap_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "no DNS resolvers configured",
+                )
+            }))
+        })
+    }
+}
+
 /// Resolver wrapper that bounds each upstream query with a hard timeout.
 #[derive(Clone)]
 pub struct TimeoutResolver {
@@ -496,10 +564,22 @@ mod tests {
         }
 
         fn failing() -> Self {
+            Self::failing_with("test DNS failure")
+        }
+
+        fn failing_with(message: &str) -> Self {
             Self {
                 calls: Arc::new(AtomicUsize::new(0)),
                 delay: Duration::ZERO,
-                response: Err((io::ErrorKind::NotFound, "test DNS failure".into())),
+                response: Err((io::ErrorKind::NotFound, message.into())),
+            }
+        }
+
+        fn empty() -> Self {
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+                delay: Duration::ZERO,
+                response: Ok(Vec::new()),
             }
         }
     }
@@ -531,6 +611,64 @@ mod tests {
             negative_ttl: Duration::from_secs(30),
             max_entries: 16,
         }
+    }
+
+    #[tokio::test]
+    async fn composite_stops_after_first_success() {
+        let first = CountingResolver::successful(Duration::ZERO);
+        let first_calls = first.calls.clone();
+        let second = CountingResolver::successful(Duration::ZERO);
+        let second_calls = second.calls.clone();
+        let resolver =
+            CompositeResolver::new(vec![Arc::new(first), Arc::new(second)]);
+
+        let addresses = resolver.resolve_location(&domain_location()).await.unwrap();
+
+        assert_eq!(addresses, vec!["192.0.2.1:443".parse().unwrap()]);
+        assert_eq!(first_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(second_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn composite_falls_back_after_error() {
+        let first = CountingResolver::failing();
+        let first_calls = first.calls.clone();
+        let second = CountingResolver::successful(Duration::ZERO);
+        let second_calls = second.calls.clone();
+        let resolver =
+            CompositeResolver::new(vec![Arc::new(first), Arc::new(second)]);
+
+        assert!(resolver.resolve_location(&domain_location()).await.is_ok());
+        assert_eq!(first_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(second_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn composite_falls_back_after_empty_result() {
+        let first = CountingResolver::empty();
+        let first_calls = first.calls.clone();
+        let second = CountingResolver::successful(Duration::ZERO);
+        let resolver =
+            CompositeResolver::new(vec![Arc::new(first), Arc::new(second)]);
+
+        assert!(resolver.resolve_location(&domain_location()).await.is_ok());
+        assert_eq!(first_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn composite_returns_last_error_when_all_fail() {
+        let resolver = CompositeResolver::new(vec![
+            Arc::new(CountingResolver::failing_with("first failure")),
+            Arc::new(CountingResolver::failing_with("last failure")),
+        ]);
+
+        let error = resolver
+            .resolve_location(&domain_location())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(error.to_string(), "last failure");
     }
 
     #[tokio::test]
