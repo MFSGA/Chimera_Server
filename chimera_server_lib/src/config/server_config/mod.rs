@@ -1,4 +1,5 @@
 mod builder;
+pub(crate) use builder::collect_xhttp_settings_from_json;
 pub mod quic;
 mod types;
 #[cfg(feature = "ws")]
@@ -19,7 +20,8 @@ pub use types::GrpcServerConfig;
 pub use types::{Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2ServerConfig};
 pub use types::{
     ServerConfig, ServerProxyConfig, SocksUser, SocksUserStore, XhttpDataPlacement,
-    XhttpMode, XhttpPlacement, XhttpServerConfig,
+    XhttpMode, XhttpPaddingMethod, XhttpPaddingPlacement, XhttpPlacement,
+    XhttpServerConfig,
 };
 
 #[cfg(feature = "reality")]

@@ -19,7 +19,7 @@ use super::super::types::{
 };
 use super::super::types::{
     RangeConfig, SocksUser, SocksUserStore, XhttpDataPlacement, XhttpMode,
-    XhttpPlacement, XhttpServerConfig,
+    XhttpPaddingMethod, XhttpPaddingPlacement, XhttpPlacement, XhttpServerConfig,
 };
 
 #[cfg(feature = "trojan")]
@@ -437,8 +437,9 @@ pub(super) fn collect_socks_settings(
 pub(super) fn collect_xhttp_settings(
     raw: XhttpSettings,
 ) -> Result<XhttpServerConfig, Error> {
-    reject_unsupported_xhttp_fields(&raw)?;
+    let raw = apply_xhttp_extra(raw)?;
     let mode = parse_xhttp_mode(raw.mode.as_deref())?;
+    validate_xhttp_client_fields(&raw, mode)?;
     let uplink_http_method =
         normalize_xhttp_uplink_method(raw.uplink_http_method.as_deref(), mode)?;
     let min_posts_interval_ms = clamp_xhttp_range(
@@ -482,13 +483,20 @@ pub(super) fn collect_xhttp_settings(
                 .into(),
         ));
     }
-    if !raw.headers.is_empty() {
+    if raw
+        .x_padding_bytes
+        .as_ref()
+        .is_some_and(|range| range.from <= 0 || range.to <= 0)
+    {
         return Err(Error::InvalidConfig(
-            "xhttpSettings.headers is not supported yet".into(),
+            "xhttpSettings.xPaddingBytes cannot be disabled".into(),
         ));
     }
-
-    let normalized_path = normalize_path(raw.path);
+    let normalized_path = normalize_path(
+        raw.path,
+        session_placement == XhttpPlacement::Path
+            || seq_placement == XhttpPlacement::Path,
+    );
     let (min_padding, max_padding) = clamp_xhttp_range(
         raw.x_padding_bytes.unwrap_or(XhttpRange {
             from: 100,
@@ -497,6 +505,37 @@ pub(super) fn collect_xhttp_settings(
         100,
         1000,
     );
+    let padding_obfs_mode = raw.x_padding_obfs_mode.unwrap_or(false);
+    let padding_key = raw
+        .x_padding_key
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "x_padding".to_string());
+    let padding_header = raw
+        .x_padding_header
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "X-Padding".to_string());
+    let padding_placement =
+        parse_xhttp_padding_placement(raw.x_padding_placement.as_deref())?;
+    let padding_method =
+        parse_xhttp_padding_method(raw.x_padding_method.as_deref())?;
+    if matches!(
+        padding_placement,
+        XhttpPaddingPlacement::Header | XhttpPaddingPlacement::QueryInHeader
+    ) && http::header::HeaderName::from_bytes(padding_header.as_bytes()).is_err()
+    {
+        return Err(Error::InvalidConfig(format!(
+            "invalid xhttpSettings.xPaddingHeader: {padding_header}"
+        )));
+    }
+    let server_max_header_bytes = match raw.server_max_header_bytes.unwrap_or(0) {
+        value if value < 0 => {
+            return Err(Error::InvalidConfig(
+                "xhttpSettings.serverMaxHeaderBytes cannot be negative".into(),
+            ));
+        }
+        0 => 8192,
+        value => value as usize,
+    };
     let (_, max_each_post_bytes) = clamp_xhttp_range(
         raw.sc_max_each_post_bytes.unwrap_or(XhttpRange {
             from: 1_000_000,
@@ -505,11 +544,11 @@ pub(super) fn collect_xhttp_settings(
         1_000_000,
         1_000_000,
     );
-    let (_, session_ttl_secs) = clamp_xhttp_range(
+    let stream_up_server_secs = clamp_xhttp_range(
         raw.sc_stream_up_server_secs
-            .unwrap_or(XhttpRange { from: 30, to: 30 }),
-        30,
-        30,
+            .unwrap_or(XhttpRange { from: 20, to: 80 }),
+        20,
+        80,
     );
 
     Ok(XhttpServerConfig {
@@ -520,7 +559,14 @@ pub(super) fn collect_xhttp_settings(
         max_padding,
         max_each_post_bytes,
         max_buffered_posts: raw.sc_max_buffered_posts.unwrap_or(30).max(1) as usize,
-        session_ttl_secs: session_ttl_secs as u64,
+        session_ttl_secs: 30,
+        stream_up_server_secs,
+        server_max_header_bytes,
+        padding_obfs_mode,
+        padding_key,
+        padding_header,
+        padding_placement,
+        padding_method,
         no_grpc_header: raw.no_grpc_header.unwrap_or(false),
         no_sse_header: raw.no_sse_header.unwrap_or(false),
         uplink_http_method,
@@ -534,30 +580,149 @@ pub(super) fn collect_xhttp_settings(
     })
 }
 
-fn reject_unsupported_xhttp_fields(raw: &XhttpSettings) -> Result<(), Error> {
-    let unsupported_fields = [
-        ("extra", raw.extra.as_ref()),
-        ("downloadSettings", raw.download_settings.as_ref()),
-        ("xmux", raw.xmux.as_ref()),
-        ("serverMaxHeaderBytes", raw.server_max_header_bytes.as_ref()),
-        ("uplinkChunkSize", raw.uplink_chunk_size.as_ref()),
-        ("xPaddingKey", raw.x_padding_key.as_ref()),
-        ("xPaddingHeader", raw.x_padding_header.as_ref()),
-        ("xPaddingPlacement", raw.x_padding_placement.as_ref()),
-        ("xPaddingMethod", raw.x_padding_method.as_ref()),
-        ("xPaddingObfsMode", raw.x_padding_obfs_mode.as_ref()),
-    ];
+fn apply_xhttp_extra(mut raw: XhttpSettings) -> Result<XhttpSettings, Error> {
+    let Some(extra_value) = raw.extra.take() else {
+        return Ok(raw);
+    };
 
-    if let Some((field, _)) = unsupported_fields
-        .into_iter()
-        .find(|(_, value)| value.is_some())
-    {
-        return Err(Error::InvalidConfig(format!(
-            "xhttpSettings.{field} is not supported yet"
-        )));
+    let outer_host = raw.host.take();
+    let outer_path = raw.path.take();
+    let outer_mode = raw.mode.take();
+    let mut extra =
+        serde_json::from_value::<XhttpSettings>(extra_value).map_err(|error| {
+            Error::InvalidConfig(format!(
+                "failed to parse xhttpSettings.extra: {error}"
+            ))
+        })?;
+    extra.host = outer_host;
+    extra.path = outer_path;
+    extra.mode = outer_mode;
+    extra.extra = None;
+    Ok(extra)
+}
+
+fn validate_xhttp_client_fields(
+    raw: &XhttpSettings,
+    mode: XhttpMode,
+) -> Result<(), Error> {
+    if raw.download_settings.is_some() && mode == XhttpMode::StreamOne {
+        return Err(Error::InvalidConfig(
+            "xhttpSettings.downloadSettings cannot be used with mode=stream-one"
+                .into(),
+        ));
     }
 
+    if let Some(value) = raw.uplink_chunk_size.as_ref() {
+        serde_json::from_value::<XhttpRange>(value.clone()).map_err(|error| {
+            Error::InvalidConfig(format!(
+                "invalid xhttpSettings.uplinkChunkSize: {error}"
+            ))
+        })?;
+    }
+
+    if let Some(value) = raw.xmux.as_ref() {
+        #[derive(Deserialize, Default)]
+        #[serde(rename_all = "camelCase")]
+        struct XmuxInput {
+            #[serde(default)]
+            max_concurrency: Option<XhttpRange>,
+            #[serde(default)]
+            max_connections: Option<XhttpRange>,
+        }
+
+        let xmux =
+            serde_json::from_value::<XmuxInput>(value.clone()).map_err(|error| {
+                Error::InvalidConfig(format!("invalid xhttpSettings.xmux: {error}"))
+            })?;
+        if xmux
+            .max_connections
+            .as_ref()
+            .is_some_and(|range| range.to > 0)
+            && xmux
+                .max_concurrency
+                .as_ref()
+                .is_some_and(|range| range.to > 0)
+        {
+            return Err(Error::InvalidConfig(
+                "xhttpSettings.xmux.maxConnections cannot be specified together with maxConcurrency"
+                    .into(),
+            ));
+        }
+    }
+
+    validate_xhttp_session_id(raw)
+}
+
+fn validate_xhttp_session_id(raw: &XhttpSettings) -> Result<(), Error> {
+    let Some(configured_table) = raw
+        .session_id_table
+        .as_deref()
+        .filter(|table| !table.is_empty())
+    else {
+        return Ok(());
+    };
+    let table =
+        predefined_session_id_table(configured_table).unwrap_or(configured_table);
+    if !table.is_ascii() {
+        return Err(Error::InvalidConfig(
+            "xhttpSettings.sessionIDTable must contain only ASCII characters".into(),
+        ));
+    }
+
+    let length = raw
+        .session_id_length
+        .clone()
+        .unwrap_or(XhttpRange { from: 0, to: 0 });
+    let room = xhttp_session_id_room(table.len(), length.from, length.to);
+    if room < 2_147_483_648 {
+        return Err(Error::InvalidConfig(
+            "xhttpSettings.sessionIDTable or sessionIDLength is too small".into(),
+        ));
+    }
+    if length.from <= 0 {
+        return Err(Error::InvalidConfig(
+            "xhttpSettings.sessionIDLength.from must be greater than 0".into(),
+        ));
+    }
     Ok(())
+}
+
+fn predefined_session_id_table(name: &str) -> Option<&'static str> {
+    match name {
+        "ALPHABET" => Some("ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+        "Alphabet" => Some("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"),
+        "BASE36" => Some("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+        "Base62" => {
+            Some("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+        }
+        "HEX" => Some("0123456789ABCDEF"),
+        "alphabet" => Some("abcdefghijklmnopqrstuvwxyz"),
+        "base36" => Some("0123456789abcdefghijklmnopqrstuvwxyz"),
+        "hex" => Some("0123456789abcdef"),
+        "number" => Some("0123456789"),
+        _ => None,
+    }
+}
+
+fn xhttp_session_id_room(table_size: usize, from: i32, to: i32) -> u128 {
+    const REQUIRED_ROOM: u128 = 2_147_483_648;
+    if table_size == 0 || from <= 0 || to < from {
+        return 0;
+    }
+
+    let base = table_size as u128;
+    let mut total = 0u128;
+    for length in from..=to {
+        let mut term = 1u128;
+        for _ in 0..length {
+            term = term.saturating_mul(base).min(REQUIRED_ROOM);
+        }
+        total = total.saturating_add(term).min(REQUIRED_ROOM);
+        if total >= REQUIRED_ROOM {
+            return REQUIRED_ROOM;
+        }
+    }
+    total
 }
 
 fn parse_xhttp_data_placement(
@@ -614,6 +779,42 @@ fn normalize_xhttp_data_key(
     }
 }
 
+fn parse_xhttp_padding_placement(
+    placement: Option<&str>,
+) -> Result<XhttpPaddingPlacement, Error> {
+    match placement
+        .unwrap_or("queryInHeader")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "cookie" => Ok(XhttpPaddingPlacement::Cookie),
+        "header" => Ok(XhttpPaddingPlacement::Header),
+        "query" => Ok(XhttpPaddingPlacement::Query),
+        "" | "queryinheader" => Ok(XhttpPaddingPlacement::QueryInHeader),
+        unsupported => Err(Error::InvalidConfig(format!(
+            "unsupported xhttpSettings.xPaddingPlacement: {unsupported}"
+        ))),
+    }
+}
+
+fn parse_xhttp_padding_method(
+    method: Option<&str>,
+) -> Result<XhttpPaddingMethod, Error> {
+    match method
+        .unwrap_or("repeat-x")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "repeat-x" => Ok(XhttpPaddingMethod::RepeatX),
+        "tokenish" => Ok(XhttpPaddingMethod::Tokenish),
+        unsupported => Err(Error::InvalidConfig(format!(
+            "unsupported xhttpSettings.xPaddingMethod: {unsupported}"
+        ))),
+    }
+}
+
 fn parse_xhttp_placement(
     placement: Option<&str>,
     field: &str,
@@ -667,8 +868,13 @@ fn normalize_xhttp_uplink_method(
     method: Option<&str>,
     mode: XhttpMode,
 ) -> Result<String, Error> {
-    let method = method.unwrap_or("POST").trim().to_ascii_uppercase();
-    if method.is_empty() || http::Method::from_bytes(method.as_bytes()).is_err() {
+    let method = method.unwrap_or("").trim();
+    let method = if method.is_empty() {
+        "POST".to_string()
+    } else {
+        method.to_ascii_uppercase()
+    };
+    if http::Method::from_bytes(method.as_bytes()).is_err() {
         return Err(Error::InvalidConfig(format!(
             "invalid xhttpSettings.uplinkHTTPMethod: {method}"
         )));
@@ -744,16 +950,22 @@ pub(super) fn collect_tuic_settings(
     })
 }
 
-pub(super) fn normalize_path(path: Option<String>) -> String {
-    let mut normalized = path.unwrap_or_else(|| "/".to_string());
+pub(super) fn normalize_path(
+    path: Option<String>,
+    require_trailing_slash: bool,
+) -> String {
+    let configured = path.unwrap_or_else(|| "/".to_string());
+    let mut normalized = configured
+        .split_once('?')
+        .map_or(configured.clone(), |(path, _)| path.to_string());
     if normalized.is_empty() {
         normalized = "/".to_string();
     }
     if !normalized.starts_with('/') {
         normalized.insert(0, '/');
     }
-    if normalized.len() > 1 {
-        normalized = normalized.trim_end_matches('/').to_string();
+    if require_trailing_slash && !normalized.ends_with('/') {
+        normalized.push('/');
     }
     normalized
 }
@@ -891,16 +1103,26 @@ mod tests {
     #[test]
     fn collect_xhttp_settings_applies_reference_defaults() {
         let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
-            "path": "/xhttp/"
+            "path": "/xhttp/?ed=2048"
         }))
         .expect("xhttp settings");
 
         let config = collect_xhttp_settings(settings).expect("valid xhttp settings");
         assert_eq!(config.mode, XhttpMode::Auto);
-        assert_eq!(config.path, "/xhttp");
+        assert_eq!(config.path, "/xhttp/");
         assert_eq!(config.max_each_post_bytes, 1_000_000);
         assert_eq!(config.max_buffered_posts, 30);
         assert_eq!(config.session_ttl_secs, 30);
+        assert_eq!(config.stream_up_server_secs, (20, 80));
+        assert_eq!(config.server_max_header_bytes, 8192);
+        assert!(!config.padding_obfs_mode);
+        assert_eq!(config.padding_key, "x_padding");
+        assert_eq!(config.padding_header, "X-Padding");
+        assert_eq!(
+            config.padding_placement,
+            XhttpPaddingPlacement::QueryInHeader
+        );
+        assert_eq!(config.padding_method, XhttpPaddingMethod::RepeatX);
         assert!(!config.no_grpc_header);
         assert!(!config.no_sse_header);
         assert_eq!(config.uplink_http_method, "POST");
@@ -911,6 +1133,67 @@ mod tests {
         assert!(config.seq_key.is_empty());
         assert_eq!(config.uplink_data_placement, XhttpDataPlacement::Auto);
         assert_eq!(config.uplink_data_key, "X-Data");
+    }
+
+    #[test]
+    fn collect_xhttp_settings_accepts_padding_obfuscation_and_header_limit() {
+        let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
+            "path": "/xhttp",
+            "xPaddingObfsMode": true,
+            "xPaddingKey": "pad",
+            "xPaddingHeader": "X-Custom-Pad",
+            "xPaddingPlacement": "cookie",
+            "xPaddingMethod": "tokenish",
+            "xPaddingBytes": {"from": 64, "to": 128},
+            "serverMaxHeaderBytes": 32768,
+            "scStreamUpServerSecs": {"from": 5, "to": 10}
+        }))
+        .expect("xhttp settings");
+
+        let config = collect_xhttp_settings(settings)
+            .expect("custom XHTTP padding settings should be supported");
+        assert!(config.padding_obfs_mode);
+        assert_eq!(config.padding_key, "pad");
+        assert_eq!(config.padding_header, "X-Custom-Pad");
+        assert_eq!(config.padding_placement, XhttpPaddingPlacement::Cookie);
+        assert_eq!(config.padding_method, XhttpPaddingMethod::Tokenish);
+        assert_eq!((config.min_padding, config.max_padding), (64, 128));
+        assert_eq!(config.server_max_header_bytes, 32768);
+        assert_eq!(config.stream_up_server_secs, (5, 10));
+    }
+
+    #[test]
+    fn collect_xhttp_settings_rejects_invalid_padding_configuration() {
+        for (field, field_value, expected) in [
+            (
+                "xPaddingBytes",
+                serde_json::json!({"from": 0, "to": 100}),
+                "xPaddingBytes cannot be disabled",
+            ),
+            (
+                "xPaddingPlacement",
+                serde_json::json!("fragment"),
+                "unsupported xhttpSettings.xPaddingPlacement",
+            ),
+            (
+                "xPaddingMethod",
+                serde_json::json!("random"),
+                "unsupported xhttpSettings.xPaddingMethod",
+            ),
+            (
+                "serverMaxHeaderBytes",
+                serde_json::json!(-1),
+                "serverMaxHeaderBytes cannot be negative",
+            ),
+        ] {
+            let mut settings_value = serde_json::json!({"path": "/xhttp"});
+            settings_value[field] = field_value;
+            let settings = serde_json::from_value::<XhttpSettings>(settings_value)
+                .expect("xhttp settings should deserialize");
+            let error = collect_xhttp_settings(settings)
+                .expect_err("invalid XHTTP padding setting must fail");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     #[test]
@@ -1075,7 +1358,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_xhttp_settings_rejects_unsupported_headers() {
+    fn collect_xhttp_settings_accepts_client_request_headers() {
         let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
             "path": "/xhttp",
             "headers": {
@@ -1084,28 +1367,104 @@ mod tests {
         }))
         .expect("xhttp settings");
 
-        let err = collect_xhttp_settings(settings).expect_err("headers unsupported");
-        assert!(
-            err.to_string()
-                .contains("xhttpSettings.headers is not supported yet")
+        collect_xhttp_settings(settings)
+            .expect("server should accept client-side XHTTP request headers");
+    }
+
+    #[test]
+    fn collect_xhttp_settings_accepts_shared_client_only_fields() {
+        let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
+            "path": "/xhttp",
+            "mode": "packet-up",
+            "downloadSettings": {"network": "xhttp"},
+            "xmux": {
+                "maxConnections": {"from": 2, "to": 3},
+                "hMaxRequestTimes": {"from": 100, "to": 200}
+            },
+            "uplinkChunkSize": {"from": 1024, "to": 2048},
+            "sessionIDTable": "Base62",
+            "sessionIDLength": {"from": 6, "to": 8}
+        }))
+        .expect("xhttp settings");
+
+        collect_xhttp_settings(settings).expect(
+            "server should accept valid XHTTP fields consumed by the client",
         );
     }
 
     #[test]
-    fn collect_xhttp_settings_rejects_known_unsupported_fields() {
+    fn collect_xhttp_settings_applies_extra_with_outer_identity_fields() {
         let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
-            "path": "/xhttp",
-            "downloadSettings": {
-                "network": "xhttp"
+            "host": "outer.example",
+            "path": "/outer",
+            "mode": "packet-up",
+            "extra": {
+                "host": "ignored.example",
+                "path": "/ignored",
+                "mode": "stream-one",
+                "uplinkDataPlacement": "cookie",
+                "xPaddingObfsMode": true,
+                "xPaddingPlacement": "header",
+                "xPaddingMethod": "tokenish"
             }
         }))
         .expect("xhttp settings");
 
-        let err = collect_xhttp_settings(settings).expect_err("unsupported field");
-        assert!(
-            err.to_string()
-                .contains("xhttpSettings.downloadSettings is not supported yet")
-        );
+        let config = collect_xhttp_settings(settings)
+            .expect("xhttpSettings.extra should overlay non-identity fields");
+        assert_eq!(config.host.as_deref(), Some("outer.example"));
+        assert_eq!(config.path, "/outer/");
+        assert_eq!(config.mode, XhttpMode::PacketUp);
+        assert_eq!(config.uplink_data_placement, XhttpDataPlacement::Cookie);
+        assert!(config.padding_obfs_mode);
+        assert_eq!(config.padding_placement, XhttpPaddingPlacement::Header);
+        assert_eq!(config.padding_method, XhttpPaddingMethod::Tokenish);
+    }
+
+    #[test]
+    fn collect_xhttp_settings_rejects_invalid_shared_client_fields() {
+        for (settings_value, expected) in [
+            (
+                serde_json::json!({
+                    "path": "/xhttp",
+                    "mode": "stream-one",
+                    "downloadSettings": {"network": "xhttp"}
+                }),
+                "downloadSettings cannot be used with mode=stream-one",
+            ),
+            (
+                serde_json::json!({
+                    "path": "/xhttp",
+                    "xmux": {
+                        "maxConnections": {"from": 1, "to": 1},
+                        "maxConcurrency": {"from": 1, "to": 1}
+                    }
+                }),
+                "maxConnections cannot be specified together with maxConcurrency",
+            ),
+            (
+                serde_json::json!({
+                    "path": "/xhttp",
+                    "sessionIDTable": "number",
+                    "sessionIDLength": {"from": 1, "to": 8}
+                }),
+                "sessionIDTable or sessionIDLength is too small",
+            ),
+            (
+                serde_json::json!({
+                    "path": "/xhttp",
+                    "sessionIDTable": "表格",
+                    "sessionIDLength": {"from": 10, "to": 10}
+                }),
+                "sessionIDTable must contain only ASCII characters",
+            ),
+        ] {
+            let settings = serde_json::from_value::<XhttpSettings>(settings_value)
+                .expect("xhttp settings should deserialize");
+            let error = collect_xhttp_settings(settings)
+                .expect_err("invalid shared XHTTP field must fail");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     #[cfg(feature = "hysteria")]

@@ -139,13 +139,17 @@ pub struct XhttpSettings {
     #[serde(default, rename = "noSSEHeader")]
     no_sse_header: Option<bool>,
     #[serde(default)]
-    server_max_header_bytes: Option<serde_json::Value>,
+    server_max_header_bytes: Option<i32>,
     #[serde(default, rename = "uplinkHTTPMethod")]
     uplink_http_method: Option<String>,
     #[serde(default, rename = "sessionIDPlacement", alias = "sessionPlacement")]
     session_placement: Option<String>,
     #[serde(default, rename = "sessionIDKey", alias = "sessionKey")]
     session_key: Option<String>,
+    #[serde(default, rename = "sessionIDTable")]
+    session_id_table: Option<String>,
+    #[serde(default, rename = "sessionIDLength")]
+    session_id_length: Option<XhttpRange>,
     #[serde(default)]
     seq_placement: Option<String>,
     #[serde(default)]
@@ -159,15 +163,15 @@ pub struct XhttpSettings {
     #[serde(default)]
     sc_min_posts_interval_ms: Option<XhttpRange>,
     #[serde(default)]
-    x_padding_key: Option<serde_json::Value>,
+    x_padding_key: Option<String>,
     #[serde(default)]
-    x_padding_header: Option<serde_json::Value>,
+    x_padding_header: Option<String>,
     #[serde(default)]
-    x_padding_placement: Option<serde_json::Value>,
+    x_padding_placement: Option<String>,
     #[serde(default)]
-    x_padding_method: Option<serde_json::Value>,
+    x_padding_method: Option<String>,
     #[serde(default)]
-    x_padding_obfs_mode: Option<serde_json::Value>,
+    x_padding_obfs_mode: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
