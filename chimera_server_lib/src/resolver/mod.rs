@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     io,
     net::SocketAddr,
@@ -421,6 +421,93 @@ impl Resolver for CompositeResolver {
     }
 }
 
+/// Address-family ordering applied to resolver results.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AddressFamilyPreference {
+    #[default]
+    Preserve,
+    Ipv4First,
+    Ipv6First,
+}
+
+/// Removes unusable and duplicate addresses, then optionally interleaves IPv4
+/// and IPv6 candidates. The first family follows `preference`.
+pub fn normalize_resolved_addresses(
+    addresses: Vec<SocketAddr>,
+    preference: AddressFamilyPreference,
+) -> Vec<SocketAddr> {
+    let mut seen = HashSet::with_capacity(addresses.len());
+    let unique = addresses
+        .into_iter()
+        .filter(|address| !address.ip().is_unspecified())
+        .filter(|address| seen.insert(*address))
+        .collect::<Vec<_>>();
+
+    if preference == AddressFamilyPreference::Preserve {
+        return unique;
+    }
+
+    let mut ipv4 = unique
+        .iter()
+        .copied()
+        .filter(SocketAddr::is_ipv4)
+        .collect::<VecDeque<_>>();
+    let mut ipv6 = unique
+        .iter()
+        .copied()
+        .filter(SocketAddr::is_ipv6)
+        .collect::<VecDeque<_>>();
+    let mut ordered = Vec::with_capacity(unique.len());
+
+    while !ipv4.is_empty() || !ipv6.is_empty() {
+        let (first, second) = match preference {
+            AddressFamilyPreference::Ipv4First => (&mut ipv4, &mut ipv6),
+            AddressFamilyPreference::Ipv6First => (&mut ipv6, &mut ipv4),
+            AddressFamilyPreference::Preserve => unreachable!(),
+        };
+        if let Some(address) = first.pop_front() {
+            ordered.push(address);
+        }
+        if let Some(address) = second.pop_front() {
+            ordered.push(address);
+        }
+    }
+    ordered
+}
+
+/// Resolver wrapper that normalizes and orders returned socket addresses.
+#[derive(Clone)]
+pub struct AddressOrderingResolver {
+    inner: Arc<dyn Resolver>,
+    preference: AddressFamilyPreference,
+}
+
+impl AddressOrderingResolver {
+    pub fn new(
+        inner: Arc<dyn Resolver>,
+        preference: AddressFamilyPreference,
+    ) -> Self {
+        Self { inner, preference }
+    }
+}
+
+impl Resolver for AddressOrderingResolver {
+    fn resolve_location(
+        &self,
+        location: &NetLocation,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send>> {
+        let inner = self.inner.clone();
+        let preference = self.preference;
+        let location = location.clone();
+        Box::pin(async move {
+            inner
+                .resolve_location(&location)
+                .await
+                .map(|addresses| normalize_resolved_addresses(addresses, preference))
+        })
+    }
+}
+
 /// Resolver wrapper that bounds each upstream query with a hard timeout.
 #[derive(Clone)]
 pub struct TimeoutResolver {
@@ -497,8 +584,12 @@ impl NativeResolver {
             })
             .clone();
         let system: Arc<dyn Resolver> = Arc::new(SystemResolver);
+        let normalized: Arc<dyn Resolver> = Arc::new(AddressOrderingResolver::new(
+            system,
+            AddressFamilyPreference::Preserve,
+        ));
         let bounded: Arc<dyn Resolver> =
-            Arc::new(TimeoutResolver::new(system, DEFAULT_LOOKUP_TIMEOUT));
+            Arc::new(TimeoutResolver::new(normalized, DEFAULT_LOOKUP_TIMEOUT));
         Self {
             cached: CachedResolver::with_cache(bounded, cache),
         }
@@ -611,6 +702,51 @@ mod tests {
             negative_ttl: Duration::from_secs(30),
             max_entries: 16,
         }
+    }
+
+    #[test]
+    fn address_normalization_preserves_unique_usable_addresses() {
+        let ipv4: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let ipv6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+
+        assert_eq!(
+            normalize_resolved_addresses(
+                vec!["0.0.0.0:443".parse().unwrap(), ipv6, ipv4, ipv6,],
+                AddressFamilyPreference::Preserve,
+            ),
+            vec![ipv6, ipv4]
+        );
+    }
+
+    #[test]
+    fn address_normalization_interleaves_ipv4_first() {
+        let ipv4_a: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let ipv4_b: SocketAddr = "192.0.2.2:443".parse().unwrap();
+        let ipv6_a: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let ipv6_b: SocketAddr = "[2001:db8::2]:443".parse().unwrap();
+
+        assert_eq!(
+            normalize_resolved_addresses(
+                vec![ipv6_a, ipv6_b, ipv4_a, ipv4_b],
+                AddressFamilyPreference::Ipv4First,
+            ),
+            vec![ipv4_a, ipv6_a, ipv4_b, ipv6_b]
+        );
+    }
+
+    #[test]
+    fn address_normalization_interleaves_ipv6_first() {
+        let ipv4: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let ipv6_a: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let ipv6_b: SocketAddr = "[2001:db8::2]:443".parse().unwrap();
+
+        assert_eq!(
+            normalize_resolved_addresses(
+                vec![ipv4, ipv6_a, ipv6_b],
+                AddressFamilyPreference::Ipv6First,
+            ),
+            vec![ipv6_a, ipv4, ipv6_b]
+        );
     }
 
     #[tokio::test]
