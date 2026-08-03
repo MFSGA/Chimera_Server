@@ -21,7 +21,10 @@ use crate::{
     beginning::start_servers,
     config::{
         Transport,
-        server_config::{ServerConfig, ServerProxyConfig, SocksUser},
+        server_config::{
+            ServerConfig, ServerProxyConfig, SocksUser,
+            collect_xhttp_settings_from_json,
+        },
     },
     runtime::{OutboundSummary, RuntimeState},
 };
@@ -76,6 +79,10 @@ const TYPE_TRANSPORT_WEBSOCKET_CONFIG: &str =
 #[cfg(feature = "ws")]
 const TYPE_TRANSPORT_WEBSOCKET_CONFIG_V2RAY: &str =
     "v2ray.core.transport.internet.websocket.Config";
+const TYPE_TRANSPORT_SPLITHTTP_CONFIG: &str =
+    "xray.transport.internet.splithttp.Config";
+const TYPE_TRANSPORT_SPLITHTTP_CONFIG_V2RAY: &str =
+    "v2ray.core.transport.internet.splithttp.Config";
 #[cfg(feature = "tls")]
 const TYPE_TRANSPORT_TLS_CONFIG: &str = "xray.transport.internet.tls.Config";
 #[cfg(feature = "tls")]
@@ -236,6 +243,149 @@ struct TrojanServerConfigPayload {
 struct TrojanFallbackPayload {
     #[prost(string, tag = "5")]
     dest: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct XhttpRangePayload {
+    #[prost(int32, tag = "1")]
+    from: i32,
+    #[prost(int32, tag = "2")]
+    to: i32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct XhttpXmuxPayload {
+    #[prost(message, optional, tag = "1")]
+    max_concurrency: Option<XhttpRangePayload>,
+    #[prost(message, optional, tag = "2")]
+    max_connections: Option<XhttpRangePayload>,
+    #[prost(message, optional, tag = "3")]
+    c_max_reuse_times: Option<XhttpRangePayload>,
+    #[prost(message, optional, tag = "4")]
+    h_max_request_times: Option<XhttpRangePayload>,
+    #[prost(message, optional, tag = "5")]
+    h_max_reusable_secs: Option<XhttpRangePayload>,
+    #[prost(int64, tag = "6")]
+    h_keep_alive_period: i64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct XhttpConfigPayload {
+    #[prost(string, tag = "1")]
+    host: String,
+    #[prost(string, tag = "2")]
+    path: String,
+    #[prost(string, tag = "3")]
+    mode: String,
+    #[prost(map = "string, string", tag = "4")]
+    headers: std::collections::HashMap<String, String>,
+    #[prost(message, optional, tag = "5")]
+    x_padding_bytes: Option<XhttpRangePayload>,
+    #[prost(bool, tag = "6")]
+    no_grpc_header: bool,
+    #[prost(bool, tag = "7")]
+    no_sse_header: bool,
+    #[prost(message, optional, tag = "8")]
+    sc_max_each_post_bytes: Option<XhttpRangePayload>,
+    #[prost(message, optional, tag = "9")]
+    sc_min_posts_interval_ms: Option<XhttpRangePayload>,
+    #[prost(int64, tag = "10")]
+    sc_max_buffered_posts: i64,
+    #[prost(message, optional, tag = "11")]
+    sc_stream_up_server_secs: Option<XhttpRangePayload>,
+    #[prost(message, optional, tag = "12")]
+    xmux: Option<XhttpXmuxPayload>,
+    #[prost(message, optional, tag = "13")]
+    download_settings: Option<StreamConfigPayload>,
+    #[prost(bool, tag = "14")]
+    x_padding_obfs_mode: bool,
+    #[prost(string, tag = "15")]
+    x_padding_key: String,
+    #[prost(string, tag = "16")]
+    x_padding_header: String,
+    #[prost(string, tag = "17")]
+    x_padding_placement: String,
+    #[prost(string, tag = "18")]
+    x_padding_method: String,
+    #[prost(string, tag = "19")]
+    uplink_http_method: String,
+    #[prost(string, tag = "20")]
+    session_id_placement: String,
+    #[prost(string, tag = "21")]
+    session_id_key: String,
+    #[prost(string, tag = "22")]
+    seq_placement: String,
+    #[prost(string, tag = "23")]
+    seq_key: String,
+    #[prost(string, tag = "24")]
+    uplink_data_placement: String,
+    #[prost(string, tag = "25")]
+    uplink_data_key: String,
+    #[prost(message, optional, tag = "26")]
+    uplink_chunk_size: Option<XhttpRangePayload>,
+    #[prost(int32, tag = "27")]
+    server_max_header_bytes: i32,
+    #[prost(string, tag = "28")]
+    session_id_table: String,
+    #[prost(message, optional, tag = "29")]
+    session_id_length: Option<XhttpRangePayload>,
+}
+
+fn xhttp_range_json(range: Option<XhttpRangePayload>) -> serde_json::Value {
+    range.map_or(
+        serde_json::Value::Null,
+        |range| serde_json::json!({"from": range.from, "to": range.to}),
+    )
+}
+
+fn xhttp_xmux_json(xmux: Option<XhttpXmuxPayload>) -> serde_json::Value {
+    xmux.map_or(serde_json::Value::Null, |xmux| {
+        serde_json::json!({
+            "maxConcurrency": xhttp_range_json(xmux.max_concurrency),
+            "maxConnections": xhttp_range_json(xmux.max_connections),
+            "cMaxReuseTimes": xhttp_range_json(xmux.c_max_reuse_times),
+            "hMaxRequestTimes": xhttp_range_json(xmux.h_max_request_times),
+            "hMaxReusableSecs": xhttp_range_json(xmux.h_max_reusable_secs),
+            "hKeepAlivePeriod": xmux.h_keep_alive_period,
+        })
+    })
+}
+
+fn xhttp_config_json(config: XhttpConfigPayload) -> serde_json::Value {
+    let sc_max_buffered_posts =
+        (config.sc_max_buffered_posts != 0).then_some(config.sc_max_buffered_posts);
+    let download_settings = config.download_settings.map(|_| serde_json::json!({}));
+    serde_json::json!({
+        "host": config.host,
+        "path": config.path,
+        "mode": config.mode,
+        "headers": config.headers,
+        "xPaddingBytes": xhttp_range_json(config.x_padding_bytes),
+        "noGRPCHeader": config.no_grpc_header,
+        "noSSEHeader": config.no_sse_header,
+        "scMaxEachPostBytes": xhttp_range_json(config.sc_max_each_post_bytes),
+        "scMinPostsIntervalMs": xhttp_range_json(config.sc_min_posts_interval_ms),
+        "scMaxBufferedPosts": sc_max_buffered_posts,
+        "scStreamUpServerSecs": xhttp_range_json(config.sc_stream_up_server_secs),
+        "xmux": xhttp_xmux_json(config.xmux),
+        "downloadSettings": download_settings,
+        "xPaddingObfsMode": config.x_padding_obfs_mode,
+        "xPaddingKey": config.x_padding_key,
+        "xPaddingHeader": config.x_padding_header,
+        "xPaddingPlacement": config.x_padding_placement,
+        "xPaddingMethod": config.x_padding_method,
+        "uplinkHTTPMethod": config.uplink_http_method,
+        "sessionIDPlacement": config.session_id_placement,
+        "sessionIDKey": config.session_id_key,
+        "seqPlacement": config.seq_placement,
+        "seqKey": config.seq_key,
+        "uplinkDataPlacement": config.uplink_data_placement,
+        "uplinkDataKey": config.uplink_data_key,
+        "uplinkChunkSize": xhttp_range_json(config.uplink_chunk_size),
+        "serverMaxHeaderBytes": config.server_max_header_bytes,
+        "sessionIDTable": config.session_id_table,
+        "sessionIDLength": xhttp_range_json(config.session_id_length),
+    })
 }
 
 #[cfg(feature = "ws")]
@@ -669,10 +819,40 @@ impl HandlerServiceImpl {
                     })),
                 };
             }
-            "xhttp" => {
-                return Err(Status::invalid_argument(
-                    "xhttp AddInbound is not supported yet",
-                ));
+            "xhttp" | "splithttp" => {
+                let transport = stream_settings
+                    .transport_settings
+                    .iter()
+                    .find_map(|item| {
+                        let name = item.protocol_name.trim().to_ascii_lowercase();
+                        (name == "xhttp" || name == "splithttp")
+                            .then_some(item.settings.as_ref())
+                            .flatten()
+                    })
+                    .ok_or_else(|| {
+                        Status::invalid_argument(
+                            "xhttp transport settings are required",
+                        )
+                    })?;
+                let xhttp = self.decode_typed_message::<XhttpConfigPayload>(
+                    transport,
+                    &[
+                        TYPE_TRANSPORT_SPLITHTTP_CONFIG,
+                        TYPE_TRANSPORT_SPLITHTTP_CONFIG_V2RAY,
+                    ],
+                    "xhttp transport settings",
+                )?;
+                let config =
+                    collect_xhttp_settings_from_json(xhttp_config_json(xhttp))
+                        .map_err(|error| {
+                            Status::invalid_argument(format!(
+                                "invalid xhttp transport settings: {error}"
+                            ))
+                        })?;
+                protocol = ServerProxyConfig::Xhttp {
+                    config,
+                    inner: Box::new(protocol),
+                };
             }
             unsupported => {
                 return Err(Status::invalid_argument(format!(
@@ -2353,6 +2533,15 @@ mod tests {
                     max_each_post_bytes: 1_000_000,
                     max_buffered_posts: 30,
                     session_ttl_secs: 30,
+                    stream_up_server_secs: (20, 80),
+                    server_max_header_bytes: 8192,
+                    padding_obfs_mode: false,
+                    padding_key: "x_padding".into(),
+                    padding_header: "X-Padding".into(),
+                    padding_placement:
+                        crate::config::server_config::XhttpPaddingPlacement::QueryInHeader,
+                    padding_method:
+                        crate::config::server_config::XhttpPaddingMethod::RepeatX,
                     no_grpc_header: false,
                     no_sse_header: false,
                     uplink_http_method: "POST".into(),
@@ -2669,6 +2858,199 @@ mod tests {
                 | std::io::ErrorKind::ConnectionAborted
                 | std::io::ErrorKind::TimedOut
         ));
+    }
+
+    #[cfg(feature = "vless")]
+    #[tokio::test]
+    async fn handler_adds_and_removes_xhttp_inbound() {
+        let fixture = build_fixture();
+        let service = HandlerServiceImpl::new(fixture.runtime.clone());
+        let tag = unique_tag("dynamic-xhttp");
+        let port = free_localhost_port();
+        let user = proto::xray::common::protocol::User {
+            level: 0,
+            email: "dynamic-xhttp@example.com".to_string(),
+            account: Some(proto::xray::common::serial::TypedMessage {
+                r#type: TYPE_PROXY_VLESS_ACCOUNT.to_string(),
+                value: VlessAccountPayload {
+                    id: "5df5643d-4e28-4399-bb9e-22014a2d3246".to_string(),
+                    flow: String::new(),
+                }
+                .encode_to_vec(),
+            }),
+        };
+        let request = proto::xray::app::proxyman::command::AddInboundRequest {
+            inbound: Some(proto::xray::core::InboundHandlerConfig {
+                tag: tag.clone(),
+                receiver_settings: Some(build_receiver_settings(
+                    port,
+                    Some(StreamConfigPayload {
+                        protocol_name: "xhttp".to_string(),
+                        transport_settings: vec![TransportConfigPayload {
+                            protocol_name: "xhttp".to_string(),
+                            settings: Some(
+                                proto::xray::common::serial::TypedMessage {
+                                    r#type: TYPE_TRANSPORT_SPLITHTTP_CONFIG
+                                        .to_string(),
+                                    value: XhttpConfigPayload {
+                                        path: "/dynamic".to_string(),
+                                        mode: "stream-one".to_string(),
+                                        ..Default::default()
+                                    }
+                                    .encode_to_vec(),
+                                },
+                            ),
+                        }],
+                        security_type: String::new(),
+                        security_settings: Vec::new(),
+                    }),
+                )),
+                proxy_settings: Some(proto::xray::common::serial::TypedMessage {
+                    r#type: TYPE_PROXY_VLESS_INBOUND_CONFIG.to_string(),
+                    value: VlessInboundConfigPayload {
+                        clients: vec![user],
+                    }
+                    .encode_to_vec(),
+                }),
+            }),
+        };
+
+        service
+            .add_inbound(Request::new(request))
+            .await
+            .expect("dynamic XHTTP AddInbound should start");
+        assert!(fixture.runtime.inbound_by_tag(&tag).is_some());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let connection = tokio::net::TcpStream::connect(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            port,
+        ))
+        .await
+        .expect("dynamic XHTTP listener should accept TCP connections");
+        drop(connection);
+
+        service
+            .remove_inbound(Request::new(
+                proto::xray::app::proxyman::command::RemoveInboundRequest {
+                    tag: tag.clone(),
+                },
+            ))
+            .await
+            .expect("dynamic XHTTP RemoveInbound should stop listener");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(fixture.runtime.inbound_by_tag(&tag).is_none());
+        let error = tokio::net::TcpStream::connect(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            port,
+        ))
+        .await
+        .expect_err("removed XHTTP listener should reject connections");
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::TimedOut
+        ));
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn handler_parse_add_inbound_supports_vless_xhttp() {
+        let fixture = build_fixture();
+        let service = HandlerServiceImpl::new(fixture.runtime);
+        let user = proto::xray::common::protocol::User {
+            level: 0,
+            email: "xhttp-user@example.com".to_string(),
+            account: Some(proto::xray::common::serial::TypedMessage {
+                r#type: TYPE_PROXY_VLESS_ACCOUNT.to_string(),
+                value: VlessAccountPayload {
+                    id: "5df5643d-4e28-4399-bb9e-22014a2d3246".to_string(),
+                    flow: String::new(),
+                }
+                .encode_to_vec(),
+            }),
+        };
+        let inbound = proto::xray::core::InboundHandlerConfig {
+            tag: unique_tag("vless-xhttp"),
+            receiver_settings: Some(build_receiver_settings(
+                2080,
+                Some(StreamConfigPayload {
+                    protocol_name: "xhttp".to_string(),
+                    transport_settings: vec![TransportConfigPayload {
+                        protocol_name: "splithttp".to_string(),
+                        settings: Some(proto::xray::common::serial::TypedMessage {
+                            r#type: TYPE_TRANSPORT_SPLITHTTP_CONFIG.to_string(),
+                            value: XhttpConfigPayload {
+                                path: "/dynamic?ed=2048".to_string(),
+                                mode: "packet-up".to_string(),
+                                x_padding_obfs_mode: true,
+                                x_padding_key: "pad".to_string(),
+                                x_padding_header: "X-Dynamic-Pad".to_string(),
+                                x_padding_placement: "header".to_string(),
+                                x_padding_method: "tokenish".to_string(),
+                                session_id_placement: "header".to_string(),
+                                seq_placement: "query".to_string(),
+                                uplink_data_placement: "cookie".to_string(),
+                                server_max_header_bytes: 65_536,
+                                session_id_table: "Base62".to_string(),
+                                session_id_length: Some(XhttpRangePayload {
+                                    from: 6,
+                                    to: 8,
+                                }),
+                                ..Default::default()
+                            }
+                            .encode_to_vec(),
+                        }),
+                    }],
+                    security_type: String::new(),
+                    security_settings: Vec::new(),
+                }),
+            )),
+            proxy_settings: Some(proto::xray::common::serial::TypedMessage {
+                r#type: TYPE_PROXY_VLESS_INBOUND_CONFIG.to_string(),
+                value: VlessInboundConfigPayload {
+                    clients: vec![user],
+                }
+                .encode_to_vec(),
+            }),
+        };
+
+        let parsed = service
+            .parse_add_inbound(inbound)
+            .expect("vless xhttp inbound should parse");
+        match parsed.protocol {
+            ServerProxyConfig::Xhttp { config, inner } => {
+                assert_eq!(config.path, "/dynamic");
+                assert_eq!(
+                    config.mode,
+                    crate::config::server_config::XhttpMode::PacketUp
+                );
+                assert!(config.padding_obfs_mode);
+                assert_eq!(config.padding_key, "pad");
+                assert_eq!(config.padding_header, "X-Dynamic-Pad");
+                assert_eq!(config.server_max_header_bytes, 65_536);
+                assert_eq!(
+                    config.session_placement,
+                    crate::config::server_config::XhttpPlacement::Header
+                );
+                assert_eq!(
+                    config.seq_placement,
+                    crate::config::server_config::XhttpPlacement::Query
+                );
+                assert_eq!(
+                    config.uplink_data_placement,
+                    crate::config::server_config::XhttpDataPlacement::Cookie
+                );
+                match inner.as_ref() {
+                    ServerProxyConfig::Vless { users, .. } => {
+                        assert_eq!(users.len(), 1);
+                        assert_eq!(users[0].user_label, "xhttp-user@example.com");
+                    }
+                    other => panic!("unexpected XHTTP inner protocol: {other:?}"),
+                }
+            }
+            other => panic!("unexpected dynamic inbound protocol: {other:?}"),
+        }
     }
 
     #[cfg(all(feature = "vless", feature = "ws", feature = "tls"))]
