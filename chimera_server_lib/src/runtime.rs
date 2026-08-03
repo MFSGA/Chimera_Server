@@ -4,15 +4,21 @@ use std::{
     time::Duration,
 };
 
+use tokio::{
+    sync::broadcast,
+    task::JoinHandle,
+};
+
 use crate::{
     config::{def::PolicyConfig, server_config::ServerConfig},
-    routing_state::{RoutingInput, RoutingState},
+    routing_state::{
+        OutboundObservation, RouteMatch, RoutingEvent, RoutingInput, RoutingState,
+    },
     user_domain::{
-        UserDomainAccessFailure, UserDomainAccessRevision, UserDomainAccessStatus,
-        UserDomainAccessStore, parse_publication,
+        parse_publication, UserDomainAccessFailure, UserDomainAccessRevision,
+        UserDomainAccessStatus, UserDomainAccessStore,
     },
 };
-use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone)]
 pub struct OutboundSummary {
@@ -30,6 +36,8 @@ pub struct RuntimeState {
     routing: Arc<RwLock<RoutingState>>,
     policy: Arc<RwLock<PolicyConfig>>,
     user_domain_access: UserDomainAccessStore,
+    balancer_overrides: Arc<RwLock<HashMap<String, String>>>,
+    routing_events: broadcast::Sender<RoutingEvent>,
 }
 
 impl RuntimeState {
@@ -37,6 +45,7 @@ impl RuntimeState {
         inbounds: Vec<ServerConfig>,
         outbounds: Vec<OutboundSummary>,
     ) -> Self {
+        let (routing_events, _) = broadcast::channel(256);
         Self {
             inbounds: Arc::new(RwLock::new(inbounds)),
             outbounds: Arc::new(RwLock::new(outbounds)),
@@ -44,6 +53,8 @@ impl RuntimeState {
             routing: Arc::new(RwLock::new(RoutingState::default())),
             policy: Arc::new(RwLock::new(PolicyConfig::default())),
             user_domain_access: UserDomainAccessStore::default(),
+            balancer_overrides: Arc::new(RwLock::new(HashMap::new())),
+            routing_events,
         }
     }
 
@@ -161,21 +172,81 @@ impl RuntimeState {
         input: &RoutingInput,
     ) -> Result<Option<OutboundSummary>, String> {
         let outbounds = self.outbounds();
-        let Some(route) = self.routing().route(input, &outbounds, &HashMap::new())
-        else {
-            return Ok(outbounds.first().cloned());
+        let overrides = self.balancer_overrides();
+        let Some(route) = self.routing().route(input, &outbounds, &overrides) else {
+            let selected = outbounds.first().cloned();
+            if let Some(outbound) = selected.as_ref() {
+                self.publish_routing_event(RoutingEvent {
+                    input: input.clone(),
+                    route: RouteMatch {
+                        outbound_tag: outbound.tag.clone(),
+                        outbound_group_tags: Vec::new(),
+                        rule_tag: String::new(),
+                        resolution_error: None,
+                    },
+                });
+            }
+            return Ok(selected);
         };
-        if let Some(error) = route.resolution_error {
+        if let Some(error) = route.resolution_error.clone() {
             return Err(error);
         }
-        outbounds
+        let selected = outbounds
             .iter()
             .find(|outbound| outbound.tag == route.outbound_tag)
             .cloned()
-            .map(Some)
             .ok_or_else(|| {
                 format!("routing selected missing outbound {}", route.outbound_tag)
-            })
+            })?;
+        self.publish_routing_event(RoutingEvent {
+            input: input.clone(),
+            route,
+        });
+        Ok(Some(selected))
+    }
+
+    pub(crate) fn subscribe_routing_events(
+        &self,
+    ) -> broadcast::Receiver<RoutingEvent> {
+        self.routing_events.subscribe()
+    }
+
+    pub(crate) fn publish_routing_event(&self, event: RoutingEvent) {
+        let _ = self.routing_events.send(event);
+    }
+
+    pub(crate) fn balancer_overrides(&self) -> HashMap<String, String> {
+        self.balancer_overrides
+            .read()
+            .expect("runtime balancer overrides lock poisoned")
+            .clone()
+    }
+
+    pub(crate) fn balancer_override(&self, tag: &str) -> Option<String> {
+        self.balancer_overrides
+            .read()
+            .expect("runtime balancer overrides lock poisoned")
+            .get(tag)
+            .cloned()
+    }
+
+    pub(crate) fn set_balancer_override(
+        &self,
+        balancer_tag: impl Into<String>,
+        outbound_tag: impl Into<String>,
+    ) {
+        self.balancer_overrides
+            .write()
+            .expect("runtime balancer overrides lock poisoned")
+            .insert(balancer_tag.into(), outbound_tag.into());
+    }
+
+    pub(crate) fn remove_balancer_override(&self, tag: &str) -> bool {
+        self.balancer_overrides
+            .write()
+            .expect("runtime balancer overrides lock poisoned")
+            .remove(tag)
+            .is_some()
     }
 
     pub fn remove_outbound(&self, tag: &str) -> Option<OutboundSummary> {
@@ -206,8 +277,25 @@ impl RuntimeState {
             .clone()
     }
 
-    pub fn replace_routing(&self, routing: RoutingState) {
-        *self.routing.write().expect("runtime routing lock poisoned") = routing;
+    pub fn replace_routing(&self, mut routing: RoutingState) {
+        let mut current =
+            self.routing.write().expect("runtime routing lock poisoned");
+        routing.inherit_observations_from(&current);
+        *current = routing;
+    }
+
+    pub(crate) fn record_outbound_observation(
+        &self,
+        tag: impl Into<String>,
+        observation: OutboundObservation,
+    ) {
+        self.routing().record_observation(tag, observation);
+    }
+
+    pub(crate) fn outbound_observations(
+        &self,
+    ) -> HashMap<String, OutboundObservation> {
+        self.routing().observations()
     }
 
     pub fn with_routing_mut<R, F>(&self, mutator: F) -> R

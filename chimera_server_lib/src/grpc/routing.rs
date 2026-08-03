@@ -265,6 +265,9 @@ impl RoutingServiceImpl {
                 target_domain: context.target_domain.clone(),
                 protocol: context.protocol.clone(),
                 user: context.user.clone(),
+                process_id: 0,
+                process_name: String::new(),
+                process_path: String::new(),
                 attributes: context.attributes.clone(),
                 local_ips: context.local_i_ps.clone(),
                 local_port: context.local_port,
@@ -388,6 +391,7 @@ fn convert_router_config(
         .map(|balancer| BalancerConfig {
             tag: balancer.tag,
             outbound_selector: balancer.outbound_selector,
+            strategy: Default::default(),
             fallback_tag: (!balancer.fallback_tag.is_empty())
                 .then_some(balancer.fallback_tag),
         })
@@ -439,6 +443,8 @@ fn convert_rule_payload(rule: RoutingRulePayload) -> Result<RuleConfig, Status> 
         attrs: rule.attributes,
         local_ip: convert_geo_ip_payloads(rule.local_geoip)?,
         local_port: convert_port_list(rule.local_port_list),
+        process: Vec::new(),
+        webhook: None,
     })
 }
 
