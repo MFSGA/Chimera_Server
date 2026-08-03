@@ -55,6 +55,30 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     runs: usize,
 
+    /// Continue measured runs until both --runs and this duration are satisfied.
+    #[arg(long)]
+    duration_secs: Option<u64>,
+
+    /// Sample fd/RSS/thread counters from this process after every measured run.
+    #[arg(long)]
+    monitor_pid: Option<u32>,
+
+    /// Wait before the final monitored-process snapshot to let connections and allocators settle.
+    #[arg(long, default_value_t = 0)]
+    cooldown_secs: u64,
+
+    /// Fail when the monitored process ends with more than this many additional fds.
+    #[arg(long)]
+    max_fd_delta: Option<usize>,
+
+    /// Fail when final monitored-process RSS grows by more than this many KiB.
+    #[arg(long)]
+    max_rss_delta_kib: Option<u64>,
+
+    /// Emit one measured run record every N runs; the final run is always emitted.
+    #[arg(long, default_value_t = 1)]
+    emit_every_runs: usize,
+
     #[arg(long, default_value_t = 64 * 1024)]
     buffer_size: usize,
 
@@ -105,6 +129,42 @@ struct HostMetadata {
     build_profile: &'static str,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ProcessSnapshot {
+    pid: u32,
+    fd_count: usize,
+    vm_rss_kib: Option<u64>,
+    vm_hwm_kib: Option<u64>,
+    threads: Option<u64>,
+}
+
+#[derive(Debug)]
+struct ProcessMonitorAccumulator {
+    start: ProcessSnapshot,
+    end: ProcessSnapshot,
+    samples: usize,
+    max_fd_count: usize,
+    max_vm_rss_kib: Option<u64>,
+    max_vm_hwm_kib: Option<u64>,
+    max_threads: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProcessMonitorSummary {
+    pid: u32,
+    samples: usize,
+    start_fd_count: usize,
+    end_fd_count: usize,
+    max_fd_count: usize,
+    fd_delta: i64,
+    start_vm_rss_kib: Option<u64>,
+    end_vm_rss_kib: Option<u64>,
+    max_vm_rss_kib: Option<u64>,
+    vm_rss_delta_kib: Option<i64>,
+    max_vm_hwm_kib: Option<u64>,
+    max_threads: Option<u64>,
+}
+
 #[derive(Debug, Serialize)]
 struct RunResult<'a> {
     schema_version: u32,
@@ -129,6 +189,8 @@ struct RunResult<'a> {
     upload_connection_p99_mbps: f64,
     download_connection_p50_mbps: f64,
     download_connection_p99_mbps: f64,
+    soak_elapsed_seconds: Option<f64>,
+    monitored_process: Option<ProcessSnapshot>,
     host: &'a HostMetadata,
 }
 
@@ -143,6 +205,14 @@ struct Summary<'a> {
     socks5: Option<String>,
     runs: usize,
     warmup_runs: usize,
+    requested_duration_seconds: Option<u64>,
+    cooldown_seconds: u64,
+    max_fd_delta_allowed: Option<usize>,
+    max_rss_delta_kib_allowed: Option<u64>,
+    measured_elapsed_seconds: f64,
+    completed_connections: usize,
+    total_upload_bytes: u64,
+    total_download_bytes: u64,
     concurrency: usize,
     upload_bytes_per_connection: u64,
     download_bytes_per_connection: u64,
@@ -156,6 +226,7 @@ struct Summary<'a> {
     download_median_mbps: f64,
     download_p99_mbps: f64,
     download_cv: f64,
+    monitored_process: Option<ProcessMonitorSummary>,
     host: &'a HostMetadata,
 }
 
@@ -184,20 +255,75 @@ async fn run(args: Args) -> Result<()> {
     for warmup_index in 0..args.warmup {
         let results =
             run_once(&args, &target_host, target_port, warmup_index).await?;
-        let record = build_run_result(&args, &host, warmup_index, true, &results);
+        let record =
+            build_run_result(&args, &host, warmup_index, true, &results, None, None);
         emit_json(&record, &mut output)?;
     }
+
+    let measured_started = Instant::now();
+    let mut process_monitor = match args.monitor_pid {
+        Some(pid) => {
+            Some(ProcessMonitorAccumulator::new(read_process_snapshot(pid)?))
+        }
+        None => None,
+    };
 
     let mut upload_runs = Vec::with_capacity(args.runs);
     let mut download_runs = Vec::with_capacity(args.runs);
-    for run_index in 0..args.runs {
+    let mut run_index = 0_usize;
+    while should_continue_measurement(
+        run_index,
+        args.runs,
+        measured_started.elapsed(),
+        args.duration_secs,
+    ) {
         let results = run_once(&args, &target_host, target_port, run_index).await?;
-        let record = build_run_result(&args, &host, run_index, false, &results);
+        let monitored_process = match args.monitor_pid {
+            Some(pid) => {
+                let snapshot = read_process_snapshot(pid)?;
+                if let Some(monitor) = process_monitor.as_mut() {
+                    monitor.observe(&snapshot);
+                }
+                Some(snapshot)
+            }
+            None => None,
+        };
+        let record = build_run_result(
+            &args,
+            &host,
+            run_index,
+            false,
+            &results,
+            Some(round(measured_started.elapsed().as_secs_f64())),
+            monitored_process,
+        );
         upload_runs.push(record.upload_mbps);
         download_runs.push(record.download_mbps);
-        emit_json(&record, &mut output)?;
+        let completed_runs = run_index.saturating_add(1);
+        let final_run = !should_continue_measurement(
+            completed_runs,
+            args.runs,
+            measured_started.elapsed(),
+            args.duration_secs,
+        );
+        if run_index.is_multiple_of(args.emit_every_runs) || final_run {
+            emit_json(&record, &mut output)?;
+        }
+        run_index = completed_runs;
     }
 
+    let measured_elapsed_seconds = measured_started.elapsed().as_secs_f64();
+    if args.cooldown_secs > 0 {
+        tokio::time::sleep(Duration::from_secs(args.cooldown_secs)).await;
+        if let (Some(pid), Some(monitor)) =
+            (args.monitor_pid, process_monitor.as_mut())
+        {
+            monitor.observe(&read_process_snapshot(pid)?);
+        }
+    }
+    let completed_connections = run_index.saturating_mul(args.concurrency);
+    let completed_connections_u64 =
+        u64::try_from(completed_connections).unwrap_or(u64::MAX);
     let summary = Summary {
         schema_version: 1,
         record_type: "summary",
@@ -210,8 +336,20 @@ async fn run(args: Args) -> Result<()> {
         },
         target: &args.target,
         socks5: args.socks5.map(|address| address.to_string()),
-        runs: args.runs,
+        runs: run_index,
         warmup_runs: args.warmup,
+        requested_duration_seconds: args.duration_secs,
+        cooldown_seconds: args.cooldown_secs,
+        max_fd_delta_allowed: args.max_fd_delta,
+        max_rss_delta_kib_allowed: args.max_rss_delta_kib,
+        measured_elapsed_seconds: round(measured_elapsed_seconds),
+        completed_connections,
+        total_upload_bytes: args
+            .upload_bytes
+            .saturating_mul(completed_connections_u64),
+        total_download_bytes: args
+            .download_bytes
+            .saturating_mul(completed_connections_u64),
         concurrency: args.concurrency,
         upload_bytes_per_connection: args.upload_bytes,
         download_bytes_per_connection: args.download_bytes,
@@ -225,12 +363,20 @@ async fn run(args: Args) -> Result<()> {
         download_median_mbps: round(median(&download_runs)),
         download_p99_mbps: round(percentile(&download_runs, 99.0)),
         download_cv: round(coefficient_of_variation(&download_runs)),
+        monitored_process: process_monitor
+            .as_ref()
+            .map(ProcessMonitorAccumulator::summary),
         host: &host,
     };
     emit_json(&summary, &mut output)?;
     if let Some(writer) = output.as_mut() {
         writer.flush()?;
     }
+    enforce_process_growth_limits(
+        summary.monitored_process.as_ref(),
+        args.max_fd_delta,
+        args.max_rss_delta_kib,
+    )?;
     if let Some(max_cv) = args.max_cv
         && (summary.upload_cv > max_cv || summary.download_cv > max_cv)
     {
@@ -250,6 +396,19 @@ fn validate_args(args: &Args) -> Result<()> {
     }
     if args.runs == 0 {
         bail!("--runs must be greater than zero");
+    }
+    if args.duration_secs == Some(0) {
+        bail!("--duration-secs must be greater than zero");
+    }
+    if args.emit_every_runs == 0 {
+        bail!("--emit-every-runs must be greater than zero");
+    }
+    if args.monitor_pid.is_none()
+        && (args.cooldown_secs > 0
+            || args.max_fd_delta.is_some()
+            || args.max_rss_delta_kib.is_some())
+    {
+        bail!("--cooldown-secs and process growth limits require --monitor-pid");
     }
     if args.buffer_size == 0 {
         bail!("--buffer-size must be greater than zero");
@@ -498,6 +657,8 @@ fn build_run_result<'a>(
     run_index: usize,
     warmup: bool,
     results: &[ConnectionResult],
+    soak_elapsed_seconds: Option<f64>,
+    monitored_process: Option<ProcessSnapshot>,
 ) -> RunResult<'a> {
     let upload_seconds = results
         .iter()
@@ -552,8 +713,144 @@ fn build_run_result<'a>(
             &download_connection_mbps,
             99.0,
         )),
+        soak_elapsed_seconds,
+        monitored_process,
         host,
     }
+}
+
+fn should_continue_measurement(
+    completed_runs: usize,
+    minimum_runs: usize,
+    elapsed: Duration,
+    duration_secs: Option<u64>,
+) -> bool {
+    completed_runs < minimum_runs
+        || duration_secs
+            .is_some_and(|seconds| elapsed < Duration::from_secs(seconds))
+}
+
+fn read_process_snapshot(pid: u32) -> Result<ProcessSnapshot> {
+    let fd_path = format!("/proc/{pid}/fd");
+    let fd_count = fs::read_dir(&fd_path)
+        .with_context(|| format!("read monitored process fd directory {fd_path}"))?
+        .try_fold(0_usize, |count, entry| {
+            entry.map(|_| count.saturating_add(1))
+        })?;
+    let status_path = format!("/proc/{pid}/status");
+    let status = fs::read_to_string(&status_path)
+        .with_context(|| format!("read monitored process status {status_path}"))?;
+
+    Ok(ProcessSnapshot {
+        pid,
+        fd_count,
+        vm_rss_kib: parse_status_number(&status, "VmRSS:"),
+        vm_hwm_kib: parse_status_number(&status, "VmHWM:"),
+        threads: parse_status_number(&status, "Threads:"),
+    })
+}
+
+fn parse_status_number(status: &str, key: &str) -> Option<u64> {
+    status.lines().find_map(|line| {
+        line.strip_prefix(key)?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    })
+}
+
+impl ProcessMonitorAccumulator {
+    fn new(snapshot: ProcessSnapshot) -> Self {
+        Self {
+            start: snapshot.clone(),
+            end: snapshot.clone(),
+            samples: 1,
+            max_fd_count: snapshot.fd_count,
+            max_vm_rss_kib: snapshot.vm_rss_kib,
+            max_vm_hwm_kib: snapshot.vm_hwm_kib,
+            max_threads: snapshot.threads,
+        }
+    }
+
+    fn observe(&mut self, snapshot: &ProcessSnapshot) {
+        debug_assert_eq!(snapshot.pid, self.start.pid);
+        self.end = snapshot.clone();
+        self.samples = self.samples.saturating_add(1);
+        self.max_fd_count = self.max_fd_count.max(snapshot.fd_count);
+        self.max_vm_rss_kib = max_optional(self.max_vm_rss_kib, snapshot.vm_rss_kib);
+        self.max_vm_hwm_kib = max_optional(self.max_vm_hwm_kib, snapshot.vm_hwm_kib);
+        self.max_threads = max_optional(self.max_threads, snapshot.threads);
+    }
+
+    fn summary(&self) -> ProcessMonitorSummary {
+        ProcessMonitorSummary {
+            pid: self.start.pid,
+            samples: self.samples,
+            start_fd_count: self.start.fd_count,
+            end_fd_count: self.end.fd_count,
+            max_fd_count: self.max_fd_count,
+            fd_delta: signed_usize_delta(self.end.fd_count, self.start.fd_count),
+            start_vm_rss_kib: self.start.vm_rss_kib,
+            end_vm_rss_kib: self.end.vm_rss_kib,
+            max_vm_rss_kib: self.max_vm_rss_kib,
+            vm_rss_delta_kib: signed_optional_delta(
+                self.end.vm_rss_kib,
+                self.start.vm_rss_kib,
+            ),
+            max_vm_hwm_kib: self.max_vm_hwm_kib,
+            max_threads: self.max_threads,
+        }
+    }
+}
+
+fn max_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn signed_usize_delta(end: usize, start: usize) -> i64 {
+    let end = i64::try_from(end).unwrap_or(i64::MAX);
+    let start = i64::try_from(start).unwrap_or(i64::MAX);
+    end.saturating_sub(start)
+}
+
+fn signed_optional_delta(end: Option<u64>, start: Option<u64>) -> Option<i64> {
+    let (end, start) = (end?, start?);
+    let end = i64::try_from(end).unwrap_or(i64::MAX);
+    let start = i64::try_from(start).unwrap_or(i64::MAX);
+    Some(end.saturating_sub(start))
+}
+
+fn enforce_process_growth_limits(
+    monitor: Option<&ProcessMonitorSummary>,
+    max_fd_delta: Option<usize>,
+    max_rss_delta_kib: Option<u64>,
+) -> Result<()> {
+    let Some(monitor) = monitor else {
+        return Ok(());
+    };
+    if let Some(limit) = max_fd_delta {
+        let growth = usize::try_from(monitor.fd_delta.max(0)).unwrap_or(usize::MAX);
+        if growth > limit {
+            bail!("monitored process fd growth {growth} exceeds limit {limit}");
+        }
+    }
+    if let Some(limit) = max_rss_delta_kib {
+        let growth = monitor
+            .vm_rss_delta_kib
+            .and_then(|delta| u64::try_from(delta.max(0)).ok())
+            .unwrap_or(0);
+        if growth > limit {
+            bail!(
+                "monitored process RSS growth {growth} KiB exceeds limit {limit} KiB"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn split_host_port(value: &str) -> Result<(String, u16)> {
@@ -656,6 +953,7 @@ fn emit_json<T: Serialize>(
     if let Some(writer) = output.as_mut() {
         writer.write_all(line.as_bytes())?;
         writer.write_all(b"\n")?;
+        writer.flush()?;
     }
     Ok(())
 }
@@ -701,5 +999,115 @@ mod tests {
             split_host_port("[::1]:443").unwrap(),
             ("::1".to_owned(), 443)
         );
+    }
+
+    #[test]
+    fn duration_is_a_lower_bound_after_minimum_runs() {
+        assert!(should_continue_measurement(
+            0,
+            2,
+            Duration::from_secs(100),
+            Some(10),
+        ));
+        assert!(should_continue_measurement(
+            2,
+            2,
+            Duration::from_secs(9),
+            Some(10),
+        ));
+        assert!(!should_continue_measurement(
+            2,
+            2,
+            Duration::from_secs(10),
+            Some(10),
+        ));
+        assert!(!should_continue_measurement(2, 2, Duration::ZERO, None,));
+    }
+
+    #[test]
+    fn parses_linux_process_status_numbers() {
+        let status =
+            "Name:\ttest\nVmHWM:\t  4096 kB\nVmRSS:\t  3072 kB\nThreads:\t7\n";
+        assert_eq!(parse_status_number(status, "VmHWM:"), Some(4096));
+        assert_eq!(parse_status_number(status, "VmRSS:"), Some(3072));
+        assert_eq!(parse_status_number(status, "Threads:"), Some(7));
+        assert_eq!(parse_status_number(status, "Missing:"), None);
+    }
+
+    #[test]
+    fn summarizes_process_growth_and_peaks() {
+        let samples = [
+            ProcessSnapshot {
+                pid: 42,
+                fd_count: 10,
+                vm_rss_kib: Some(1000),
+                vm_hwm_kib: Some(1200),
+                threads: Some(2),
+            },
+            ProcessSnapshot {
+                pid: 42,
+                fd_count: 14,
+                vm_rss_kib: Some(1600),
+                vm_hwm_kib: Some(1700),
+                threads: Some(4),
+            },
+            ProcessSnapshot {
+                pid: 42,
+                fd_count: 11,
+                vm_rss_kib: Some(1100),
+                vm_hwm_kib: Some(1700),
+                threads: Some(3),
+            },
+        ];
+        let mut monitor = ProcessMonitorAccumulator::new(samples[0].clone());
+        monitor.observe(&samples[1]);
+        monitor.observe(&samples[2]);
+        let summary = monitor.summary();
+        assert_eq!(summary.pid, 42);
+        assert_eq!(summary.samples, 3);
+        assert_eq!(summary.max_fd_count, 14);
+        assert_eq!(summary.fd_delta, 1);
+        assert_eq!(summary.max_vm_rss_kib, Some(1600));
+        assert_eq!(summary.vm_rss_delta_kib, Some(100));
+        assert_eq!(summary.max_vm_hwm_kib, Some(1700));
+        assert_eq!(summary.max_threads, Some(4));
+    }
+
+    #[test]
+    fn process_growth_limits_are_enforced_after_cooldown() {
+        let mut summary = ProcessMonitorSummary {
+            pid: 42,
+            samples: 3,
+            start_fd_count: 10,
+            end_fd_count: 10,
+            max_fd_count: 14,
+            fd_delta: 0,
+            start_vm_rss_kib: Some(1000),
+            end_vm_rss_kib: Some(1100),
+            max_vm_rss_kib: Some(1600),
+            vm_rss_delta_kib: Some(100),
+            max_vm_hwm_kib: Some(1700),
+            max_threads: Some(4),
+        };
+        enforce_process_growth_limits(Some(&summary), Some(0), Some(100)).unwrap();
+
+        summary.fd_delta = 2;
+        assert!(
+            enforce_process_growth_limits(Some(&summary), Some(1), None).is_err()
+        );
+        summary.fd_delta = -1;
+        summary.vm_rss_delta_kib = Some(101);
+        assert!(
+            enforce_process_growth_limits(Some(&summary), None, Some(100)).is_err()
+        );
+        assert!(enforce_process_growth_limits(None, Some(0), Some(0)).is_ok());
+    }
+
+    #[test]
+    fn reads_current_process_snapshot() {
+        let snapshot = read_process_snapshot(std::process::id()).unwrap();
+        assert_eq!(snapshot.pid, std::process::id());
+        assert!(snapshot.fd_count > 0);
+        assert!(snapshot.threads.is_some_and(|threads| threads > 0));
     }
 }
