@@ -20,6 +20,7 @@ use crate::address::NetLocation;
 const DEFAULT_POSITIVE_TTL: Duration = Duration::from_secs(60);
 const DEFAULT_NEGATIVE_TTL: Duration = Duration::from_secs(5);
 const DEFAULT_MAX_CACHE_ENTRIES: usize = 4096;
+const DEFAULT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub trait Resolver: Send + Sync {
     fn resolve_location(
@@ -44,6 +45,18 @@ impl Default for ResolverCacheOptions {
             max_entries: DEFAULT_MAX_CACHE_ENTRIES,
         }
     }
+}
+
+/// Point-in-time counters for resolver cache behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResolverCacheStats {
+    pub cache_entries: usize,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub coalesced_waiters: u64,
+    pub upstream_lookups: u64,
+    pub upstream_failures: u64,
+    pub evictions: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +95,12 @@ struct ResolverCache {
     options: ResolverCacheOptions,
     entries: Mutex<HashMap<NetLocation, CacheEntry>>,
     next_lookup_id: AtomicU64,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
+    coalesced_waiters: AtomicU64,
+    upstream_lookups: AtomicU64,
+    upstream_failures: AtomicU64,
+    evictions: AtomicU64,
 }
 
 impl ResolverCache {
@@ -93,6 +112,12 @@ impl ResolverCache {
             },
             entries: Mutex::new(HashMap::new()),
             next_lookup_id: AtomicU64::new(1),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
+            coalesced_waiters: AtomicU64::new(0),
+            upstream_lookups: AtomicU64::new(0),
+            upstream_failures: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
         }
     }
 
@@ -109,9 +134,11 @@ impl ResolverCache {
         if let Some(entry) = entries.get(location) {
             match entry {
                 CacheEntry::Ready { expires_at, result } if *expires_at > now => {
+                    self.cache_hits.fetch_add(1, Ordering::Relaxed);
                     return CacheDecision::Ready(result.clone());
                 }
                 CacheEntry::InFlight { sender, .. } => {
+                    self.coalesced_waiters.fetch_add(1, Ordering::Relaxed);
                     return CacheDecision::Wait(sender.subscribe());
                 }
                 CacheEntry::Ready { .. } => {}
@@ -130,6 +157,7 @@ impl ResolverCache {
             })
         {
             entries.remove(&key);
+            self.evictions.fetch_add(1, Ordering::Relaxed);
         }
 
         let id = self.next_lookup_id.fetch_add(1, Ordering::Relaxed);
@@ -141,6 +169,8 @@ impl ResolverCache {
                 sender: sender.clone(),
             },
         );
+        self.cache_misses.fetch_add(1, Ordering::Relaxed);
+        self.upstream_lookups.fetch_add(1, Ordering::Relaxed);
         CacheDecision::Resolve { id, sender }
     }
 
@@ -151,6 +181,9 @@ impl ResolverCache {
         sender: &watch::Sender<Option<CachedLookupResult>>,
         result: CachedLookupResult,
     ) {
+        if result.is_err() {
+            self.upstream_failures.fetch_add(1, Ordering::Relaxed);
+        }
         let _ = sender.send(Some(result.clone()));
         let ttl = if result.is_ok() {
             self.options.positive_ttl
@@ -167,6 +200,18 @@ impl ResolverCache {
                     result,
                 },
             );
+        }
+    }
+
+    fn stats(&self) -> ResolverCacheStats {
+        ResolverCacheStats {
+            cache_entries: self.entries().len(),
+            cache_hits: self.cache_hits.load(Ordering::Relaxed),
+            cache_misses: self.cache_misses.load(Ordering::Relaxed),
+            coalesced_waiters: self.coalesced_waiters.load(Ordering::Relaxed),
+            upstream_lookups: self.upstream_lookups.load(Ordering::Relaxed),
+            upstream_failures: self.upstream_failures.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
         }
     }
 
@@ -248,6 +293,10 @@ impl CachedResolver {
     fn with_cache(inner: Arc<dyn Resolver>, cache: Arc<ResolverCache>) -> Self {
         Self { inner, cache }
     }
+
+    pub fn stats(&self) -> ResolverCacheStats {
+        self.cache.stats()
+    }
 }
 
 impl Resolver for CachedResolver {
@@ -304,6 +353,41 @@ fn cached_result_to_io(result: CachedLookupResult) -> io::Result<Vec<SocketAddr>
     result.map_err(|error| error.to_io())
 }
 
+/// Resolver wrapper that bounds each upstream query with a hard timeout.
+#[derive(Clone)]
+pub struct TimeoutResolver {
+    inner: Arc<dyn Resolver>,
+    timeout: Duration,
+}
+
+impl TimeoutResolver {
+    pub fn new(inner: Arc<dyn Resolver>, timeout: Duration) -> Self {
+        Self { inner, timeout }
+    }
+}
+
+impl Resolver for TimeoutResolver {
+    fn resolve_location(
+        &self,
+        location: &NetLocation,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send>> {
+        let inner = self.inner.clone();
+        let timeout = self.timeout;
+        let location = location.clone();
+        Box::pin(async move {
+            match tokio::time::timeout(timeout, inner.resolve_location(&location))
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("DNS lookup for {location} timed out after {timeout:?}"),
+                )),
+            }
+        })
+    }
+}
+
 struct SystemResolver;
 
 impl Resolver for SystemResolver {
@@ -344,9 +428,16 @@ impl NativeResolver {
                 Arc::new(ResolverCache::new(ResolverCacheOptions::default()))
             })
             .clone();
+        let system: Arc<dyn Resolver> = Arc::new(SystemResolver);
+        let bounded: Arc<dyn Resolver> =
+            Arc::new(TimeoutResolver::new(system, DEFAULT_LOOKUP_TIMEOUT));
         Self {
-            cached: CachedResolver::with_cache(Arc::new(SystemResolver), cache),
+            cached: CachedResolver::with_cache(bounded, cache),
         }
+    }
+
+    pub fn stats(&self) -> ResolverCacheStats {
+        self.cached.stats()
     }
 }
 
@@ -455,6 +546,16 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            resolver.stats(),
+            ResolverCacheStats {
+                cache_entries: 1,
+                cache_hits: 1,
+                cache_misses: 1,
+                upstream_lookups: 1,
+                ..ResolverCacheStats::default()
+            }
+        );
     }
 
     #[tokio::test]
@@ -479,6 +580,44 @@ mod tests {
             assert_eq!(task.await.unwrap(), vec!["192.0.2.1:443".parse().unwrap()]);
         }
 
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let stats = resolver.stats();
+        assert_eq!(stats.upstream_lookups, 1);
+        assert_eq!(stats.coalesced_waiters + stats.cache_hits, 15);
+    }
+
+    #[tokio::test]
+    async fn negatively_caches_upstream_errors() {
+        let upstream = CountingResolver::failing();
+        let calls = upstream.calls.clone();
+        let resolver =
+            CachedResolver::with_options(Arc::new(upstream), test_options());
+        let location = domain_location();
+
+        let first = resolver.resolve_location(&location).await.unwrap_err();
+        let second = resolver.resolve_location(&location).await.unwrap_err();
+
+        assert_eq!(first.kind(), io::ErrorKind::NotFound);
+        assert_eq!(second.kind(), io::ErrorKind::NotFound);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(resolver.stats().cache_hits, 1);
+        assert_eq!(resolver.stats().upstream_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn times_out_slow_upstream_lookups() {
+        let upstream = CountingResolver::successful(Duration::from_millis(50));
+        let calls = upstream.calls.clone();
+        let resolver =
+            TimeoutResolver::new(Arc::new(upstream), Duration::from_millis(5));
+
+        let error = resolver
+            .resolve_location(&domain_location())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("timed out"));
         assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
