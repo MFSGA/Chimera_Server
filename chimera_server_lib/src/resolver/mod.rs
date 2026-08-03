@@ -338,6 +338,18 @@ impl Resolver for CachedResolver {
                         let result = inner
                             .resolve_location(&location)
                             .await
+                            .and_then(|addresses| {
+                                if addresses.is_empty() {
+                                    Err(io::Error::new(
+                                        io::ErrorKind::NotFound,
+                                        format!(
+                                            "DNS lookup returned no addresses for {location}"
+                                        ),
+                                    ))
+                                } else {
+                                    Ok(addresses)
+                                }
+                            })
                             .map_err(CachedLookupError::from_io);
                         let return_value = result.clone();
                         guard.complete(result);
@@ -858,6 +870,25 @@ mod tests {
         let stats = resolver.stats();
         assert_eq!(stats.upstream_lookups, 1);
         assert_eq!(stats.coalesced_waiters + stats.cache_hits, 15);
+    }
+
+    #[tokio::test]
+    async fn negatively_caches_empty_results() {
+        let upstream = CountingResolver::empty();
+        let calls = upstream.calls.clone();
+        let resolver =
+            CachedResolver::with_options(Arc::new(upstream), test_options());
+        let location = domain_location();
+
+        let first = resolver.resolve_location(&location).await.unwrap_err();
+        let second = resolver.resolve_location(&location).await.unwrap_err();
+
+        assert_eq!(first.kind(), io::ErrorKind::NotFound);
+        assert_eq!(second.kind(), io::ErrorKind::NotFound);
+        assert!(first.to_string().contains("returned no addresses"));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(resolver.stats().cache_hits, 1);
+        assert_eq!(resolver.stats().upstream_failures, 1);
     }
 
     #[tokio::test]
