@@ -52,16 +52,45 @@ pub struct RuleConfig {
     pub local_ip: Vec<String>,
     #[serde(default)]
     pub local_port: PortListConfig,
+    #[serde(default, deserialize_with = "deserialize_string_list")]
+    pub process: Vec<String>,
+    #[serde(default)]
+    pub webhook: Option<WebhookRuleConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookRuleConfig {
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub deduplication: u32,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct BalancerConfig {
     pub tag: String,
-    #[serde(default, deserialize_with = "deserialize_string_list")]
+    #[serde(
+        default,
+        alias = "selector",
+        deserialize_with = "deserialize_string_list"
+    )]
     pub outbound_selector: Vec<String>,
     #[serde(default)]
+    pub strategy: BalancerStrategyConfig,
+    #[serde(default)]
     pub fallback_tag: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct BalancerStrategyConfig {
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub settings: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -190,4 +219,35 @@ fn split_csv_values(value: &str) -> Vec<String> {
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xray_balancer_selector_and_strategy_fields_are_deserialized() {
+        let config: RoutingConfig = serde_json::from_value(serde_json::json!({
+            "balancers": [{
+                "tag": "round",
+                "selector": ["direct", "backup"],
+                "strategy": {
+                    "type": "roundRobin",
+                    "settings": {"ignored": true}
+                },
+                "fallbackTag": "direct"
+            }]
+        }))
+        .expect("Xray balancer JSON should deserialize");
+
+        let balancer = config.balancers.first().expect("balancer missing");
+        assert_eq!(balancer.tag, "round");
+        assert_eq!(balancer.outbound_selector, vec!["direct", "backup"]);
+        assert_eq!(balancer.strategy.kind, "roundRobin");
+        assert_eq!(
+            balancer.strategy.settings,
+            Some(serde_json::json!({"ignored": true}))
+        );
+        assert_eq!(balancer.fallback_tag.as_deref(), Some("direct"));
+    }
 }
