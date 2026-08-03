@@ -141,6 +141,60 @@ cargo test -p chimera_server_app \
 
 This prevents multiple test runtimes from racing while starting Chimera Client subprocesses.
 
+## Relay microbenchmark and io_uring gate
+
+`relay_probe` is a short-lived, single-direction TCP relay process. Unlike the full server, it exits after every experiment, so `strace -c` can collect reliable syscall counts even when host ptrace policy prevents attaching to an existing process.
+
+Build it with:
+
+```bash
+cargo build --manifest-path bench/chimera_perf/Cargo.toml \
+  --release --bin relay_probe
+```
+
+Compare the three candidates:
+
+```bash
+for backend in copy splice uring-splice; do
+  taskset -c 0,2,4 \
+    bench/chimera_perf/target/release/relay_probe \
+    --backend "$backend" \
+    --bytes 1073741824 \
+    --chunk-size 65536 \
+    --uring-batch-depth 64 \
+    --warmup 2 \
+    --runs 10
+done
+```
+
+Run correctness with full payload verification:
+
+```bash
+bench/chimera_perf/target/release/relay_probe \
+  --backend uring-splice \
+  --bytes 67108864 \
+  --chunk-size 65536 \
+  --uring-batch-depth 64 \
+  --warmup 1 \
+  --runs 2 \
+  --verify
+```
+
+Collect syscall counts:
+
+```bash
+strace -f -c \
+  -e trace=read,write,recvfrom,sendto,splice,io_uring_setup,io_uring_enter,io_uring_register,futex \
+  bench/chimera_perf/target/release/relay_probe \
+  --backend uring-splice \
+  --bytes 268435456 \
+  --uring-batch-depth 64 \
+  --warmup 0 \
+  --runs 1
+```
+
+The io_uring implementation is intentionally benchmark-only. It must not be connected to the production relay until it beats ordinary splice in throughput and CPU/GiB with acceptable variance. The current measured candidate does not meet that gate.
+
 ## Required experiment discipline
 
 - Build every compared binary in release mode using the same toolchain.
