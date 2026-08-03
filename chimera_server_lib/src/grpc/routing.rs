@@ -1197,6 +1197,7 @@ mod tests {
             vec![BalancerConfig {
                 tag: "empty".into(),
                 outbound_selector: vec!["missing-prefix".into()],
+                strategy: Default::default(),
                 fallback_tag: None,
                 strategy: Default::default(),
             }],
@@ -1240,6 +1241,7 @@ mod tests {
             vec![BalancerConfig {
                 tag: "auto".into(),
                 outbound_selector: vec!["missing-prefix".into()],
+                strategy: Default::default(),
                 fallback_tag: Some("direct".into()),
                 strategy: Default::default(),
             }],
@@ -1276,6 +1278,7 @@ mod tests {
             vec![BalancerConfig {
                 tag: "balancer-a".into(),
                 outbound_selector: vec!["back".into(), "direct".into()],
+                strategy: Default::default(),
                 fallback_tag: None,
                 strategy: Default::default(),
             }],
