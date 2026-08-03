@@ -60,6 +60,75 @@ enum RelayBackend {
     Auto,
 }
 
+impl RelayBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Copy => "copy",
+            Self::Handoff => "handoff",
+            #[cfg(target_os = "linux")]
+            Self::Splice => "splice",
+            #[cfg(target_os = "linux")]
+            Self::SpliceDownlink => "splice-downlink",
+            #[cfg(target_os = "linux")]
+            Self::Auto => "auto",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayEffectivePath {
+    UserspaceCopy,
+    #[cfg(target_os = "linux")]
+    Splice,
+    #[cfg(target_os = "linux")]
+    SpliceDownlink,
+}
+
+impl RelayEffectivePath {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::UserspaceCopy => "userspace-copy",
+            #[cfg(target_os = "linux")]
+            Self::Splice => "splice",
+            #[cfg(target_os = "linux")]
+            Self::SpliceDownlink => "splice-downlink",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayFallbackReason {
+    DirectNotReached,
+    #[cfg(target_os = "linux")]
+    AutoConnectionLimit,
+    #[cfg(target_os = "linux")]
+    MissingLeftTcpFd,
+    #[cfg(target_os = "linux")]
+    MissingRightTcpFd,
+    #[cfg(target_os = "linux")]
+    MissingTcpFds,
+    #[cfg(target_os = "linux")]
+    SpliceInitialization,
+}
+
+impl RelayFallbackReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectNotReached => "direct-not-reached",
+            #[cfg(target_os = "linux")]
+            Self::AutoConnectionLimit => "auto-connection-limit",
+            #[cfg(target_os = "linux")]
+            Self::MissingLeftTcpFd => "missing-left-tcp-fd",
+            #[cfg(target_os = "linux")]
+            Self::MissingRightTcpFd => "missing-right-tcp-fd",
+            #[cfg(target_os = "linux")]
+            Self::MissingTcpFds => "missing-tcp-fds",
+            #[cfg(target_os = "linux")]
+            Self::SpliceInitialization => "splice-initialization",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreludeOutcome {
     Complete {
@@ -78,19 +147,43 @@ pub(crate) struct TcpRelayResult {
     pub(crate) right_to_left: u64,
     pub(crate) bypassed_left_to_right: u64,
     pub(crate) bypassed_right_to_left: u64,
+    configured_backend: RelayBackend,
+    effective_path: RelayEffectivePath,
+    fallback_reason: Option<RelayFallbackReason>,
 }
 
 impl TcpRelayResult {
-    fn userspace(left_to_right: u64, right_to_left: u64) -> Self {
+    fn userspace(
+        configured_backend: RelayBackend,
+        left_to_right: u64,
+        right_to_left: u64,
+    ) -> Self {
         Self {
             left_to_right,
             right_to_left,
             bypassed_left_to_right: 0,
             bypassed_right_to_left: 0,
+            configured_backend,
+            effective_path: RelayEffectivePath::UserspaceCopy,
+            fallback_reason: None,
         }
     }
 
+    fn userspace_fallback(
+        configured_backend: RelayBackend,
+        fallback_reason: RelayFallbackReason,
+        left_to_right: u64,
+        right_to_left: u64,
+    ) -> Self {
+        let mut result =
+            Self::userspace(configured_backend, left_to_right, right_to_left);
+        result.fallback_reason = Some(fallback_reason);
+        result
+    }
+
     fn with_bypassed(
+        configured_backend: RelayBackend,
+        effective_path: RelayEffectivePath,
         prelude_left_to_right: u64,
         prelude_right_to_left: u64,
         bypassed_left_to_right: u64,
@@ -103,7 +196,22 @@ impl TcpRelayResult {
                 .saturating_add(bypassed_right_to_left),
             bypassed_left_to_right,
             bypassed_right_to_left,
+            configured_backend,
+            effective_path,
+            fallback_reason: None,
         }
+    }
+
+    pub(crate) fn configured_backend(&self) -> &'static str {
+        self.configured_backend.as_str()
+    }
+
+    pub(crate) fn effective_path(&self) -> &'static str {
+        self.effective_path.as_str()
+    }
+
+    pub(crate) fn fallback_reason(&self) -> Option<&'static str> {
+        self.fallback_reason.map(RelayFallbackReason::as_str)
     }
 }
 
@@ -125,7 +233,11 @@ where
             let (left_to_right, right_to_left) =
                 tokio::io::copy_bidirectional_with_sizes(left, right, size, size)
                     .await?;
-            Ok(TcpRelayResult::userspace(left_to_right, right_to_left))
+            Ok(TcpRelayResult::userspace(
+                RelayBackend::Copy,
+                left_to_right,
+                right_to_left,
+            ))
         }
         RelayBackend::Handoff => {
             relay_after_handoff_with_userspace_copy(left, right, size).await
@@ -136,7 +248,14 @@ where
         }
         #[cfg(target_os = "linux")]
         RelayBackend::SpliceDownlink => {
-            relay_after_handoff_with_downlink_splice(left, right, size, None).await
+            relay_after_handoff_with_downlink_splice(
+                left,
+                right,
+                size,
+                RelayBackend::SpliceDownlink,
+                None,
+            )
+            .await
         }
         #[cfg(target_os = "linux")]
         RelayBackend::Auto => {
@@ -144,6 +263,7 @@ where
                 left,
                 right,
                 size,
+                RelayBackend::Auto,
                 Some(configured_auto_max_connections()),
             )
             .await
@@ -164,7 +284,12 @@ where
         PreludeOutcome::Complete {
             left_to_right,
             right_to_left,
-        } => Ok(TcpRelayResult::userspace(left_to_right, right_to_left)),
+        } => Ok(TcpRelayResult::userspace_fallback(
+            RelayBackend::Handoff,
+            RelayFallbackReason::DirectNotReached,
+            left_to_right,
+            right_to_left,
+        )),
         PreludeOutcome::RawReady {
             left_to_right,
             right_to_left,
@@ -178,6 +303,7 @@ where
                 )
                 .await?;
             Ok(TcpRelayResult::userspace(
+                RelayBackend::Handoff,
                 left_to_right.saturating_add(remaining_left_to_right),
                 right_to_left.saturating_add(remaining_right_to_left),
             ))
@@ -199,7 +325,12 @@ where
         PreludeOutcome::Complete {
             left_to_right,
             right_to_left,
-        } => Ok(TcpRelayResult::userspace(left_to_right, right_to_left)),
+        } => Ok(TcpRelayResult::userspace_fallback(
+            RelayBackend::Splice,
+            RelayFallbackReason::DirectNotReached,
+            left_to_right,
+            right_to_left,
+        )),
         PreludeOutcome::RawReady {
             left_to_right,
             right_to_left,
@@ -212,6 +343,8 @@ where
                     left,
                     right,
                     buffer_size,
+                    RelayBackend::Splice,
+                    RelayFallbackReason::MissingLeftTcpFd,
                     left_to_right,
                     right_to_left,
                 )
@@ -225,6 +358,8 @@ where
                     left,
                     right,
                     buffer_size,
+                    RelayBackend::Splice,
+                    RelayFallbackReason::MissingRightTcpFd,
                     left_to_right,
                     right_to_left,
                 )
@@ -243,6 +378,8 @@ where
                         left,
                         right,
                         buffer_size,
+                        RelayBackend::Splice,
+                        RelayFallbackReason::SpliceInitialization,
                         left_to_right,
                         right_to_left,
                     )
@@ -253,6 +390,8 @@ where
             let (bypassed_left_to_right, bypassed_right_to_left) =
                 splice.run().await?;
             Ok(TcpRelayResult::with_bypassed(
+                RelayBackend::Splice,
+                RelayEffectivePath::Splice,
                 left_to_right,
                 right_to_left,
                 bypassed_left_to_right,
@@ -267,6 +406,7 @@ async fn relay_after_handoff_with_downlink_splice<A, B>(
     left: &mut A,
     right: &mut B,
     buffer_size: usize,
+    configured_backend: RelayBackend,
     auto_connection_limit: Option<usize>,
 ) -> io::Result<TcpRelayResult>
 where
@@ -277,7 +417,12 @@ where
         PreludeOutcome::Complete {
             left_to_right,
             right_to_left,
-        } => Ok(TcpRelayResult::userspace(left_to_right, right_to_left)),
+        } => Ok(TcpRelayResult::userspace_fallback(
+            configured_backend,
+            RelayFallbackReason::DirectNotReached,
+            left_to_right,
+            right_to_left,
+        )),
         PreludeOutcome::RawReady {
             left_to_right,
             right_to_left,
@@ -289,6 +434,8 @@ where
                     left,
                     right,
                     buffer_size,
+                    configured_backend,
+                    RelayFallbackReason::AutoConnectionLimit,
                     left_to_right,
                     right_to_left,
                 )
@@ -305,6 +452,8 @@ where
                     left,
                     right,
                     buffer_size,
+                    configured_backend,
+                    RelayFallbackReason::MissingTcpFds,
                     left_to_right,
                     right_to_left,
                 )
@@ -323,6 +472,8 @@ where
                         left,
                         right,
                         buffer_size,
+                        configured_backend,
+                        RelayFallbackReason::SpliceInitialization,
                         left_to_right,
                         right_to_left,
                     )
@@ -335,6 +486,8 @@ where
                 downlink.run(),
             )?;
             Ok(TcpRelayResult::with_bypassed(
+                configured_backend,
+                RelayEffectivePath::SpliceDownlink,
                 left_to_right.saturating_add(remaining_left_to_right),
                 right_to_left,
                 0,
@@ -365,6 +518,8 @@ async fn continue_userspace_copy<A, B>(
     left: &mut A,
     right: &mut B,
     buffer_size: usize,
+    configured_backend: RelayBackend,
+    fallback_reason: RelayFallbackReason,
     prelude_left_to_right: u64,
     prelude_right_to_left: u64,
 ) -> io::Result<TcpRelayResult>
@@ -379,7 +534,9 @@ where
         buffer_size,
     )
     .await?;
-    Ok(TcpRelayResult::userspace(
+    Ok(TcpRelayResult::userspace_fallback(
+        configured_backend,
+        fallback_reason,
         prelude_left_to_right.saturating_add(left_to_right),
         prelude_right_to_left.saturating_add(right_to_left),
     ))
@@ -1212,6 +1369,52 @@ mod tests {
             );
         }
         assert!(parse_relay_backend(Some("unknown")).is_err());
+    }
+
+    #[test]
+    fn relay_result_reports_configured_and_effective_paths() {
+        let handoff = TcpRelayResult::userspace(RelayBackend::Handoff, 11, 22);
+        assert_eq!(handoff.configured_backend(), "handoff");
+        assert_eq!(handoff.effective_path(), "userspace-copy");
+        assert_eq!(handoff.fallback_reason(), None);
+
+        let incomplete = TcpRelayResult::userspace_fallback(
+            RelayBackend::Handoff,
+            RelayFallbackReason::DirectNotReached,
+            33,
+            44,
+        );
+        assert_eq!(incomplete.configured_backend(), "handoff");
+        assert_eq!(incomplete.effective_path(), "userspace-copy");
+        assert_eq!(incomplete.fallback_reason(), Some("direct-not-reached"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relay_result_reports_auto_splice_and_limit_fallback() {
+        let spliced = TcpRelayResult::with_bypassed(
+            RelayBackend::Auto,
+            RelayEffectivePath::SpliceDownlink,
+            10,
+            20,
+            0,
+            30,
+        );
+        assert_eq!(spliced.configured_backend(), "auto");
+        assert_eq!(spliced.effective_path(), "splice-downlink");
+        assert_eq!(spliced.fallback_reason(), None);
+        assert_eq!(spliced.left_to_right, 10);
+        assert_eq!(spliced.right_to_left, 50);
+
+        let limited = TcpRelayResult::userspace_fallback(
+            RelayBackend::Auto,
+            RelayFallbackReason::AutoConnectionLimit,
+            40,
+            50,
+        );
+        assert_eq!(limited.configured_backend(), "auto");
+        assert_eq!(limited.effective_path(), "userspace-copy");
+        assert_eq!(limited.fallback_reason(), Some("auto-connection-limit"),);
     }
 
     #[tokio::test]
