@@ -23,6 +23,10 @@ pub struct LiteralConfig {
     pub policy: Option<PolicyConfig>,
     #[serde(default)]
     pub routing: Option<RoutingConfig>,
+    #[serde(default)]
+    pub observatory: Option<ObservatoryConfig>,
+    #[serde(default, rename = "burstObservatory")]
+    pub burst_observatory: Option<BurstObservatoryConfig>,
     // mcp settings
     pub mcp: Option<McpConfig>,
 }
@@ -125,6 +129,45 @@ pub struct ApiConfig {
     pub services: Vec<String>,
     #[serde(default)]
     pub listen: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservatoryConfig {
+    #[serde(default)]
+    pub subject_selector: Vec<String>,
+    #[serde(default)]
+    pub probe_url: String,
+    #[serde(default)]
+    pub probe_interval: Option<Value>,
+    #[serde(default)]
+    pub enable_concurrency: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BurstObservatoryConfig {
+    #[serde(default)]
+    pub subject_selector: Vec<String>,
+    #[serde(default)]
+    pub ping_config: Option<HealthPingConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthPingConfig {
+    #[serde(default)]
+    pub destination: String,
+    #[serde(default)]
+    pub connectivity: String,
+    #[serde(default)]
+    pub interval: Option<Value>,
+    #[serde(default, alias = "samplingCount")]
+    pub sampling: Option<usize>,
+    #[serde(default)]
+    pub timeout: Option<Value>,
+    #[serde(default)]
+    pub http_method: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -384,5 +427,40 @@ mod tests {
             config.inbounds.first().map(|inbound| &inbound.protocol),
             Some(Protocol::Tunnel)
         ));
+    }
+
+    #[test]
+    fn parses_burst_observatory_ping_config() {
+        let config = r#"
+        {
+          "inbounds": [],
+          "outbounds": [{
+            "protocol": "freedom",
+            "settings": {},
+            "tag": "direct"
+          }],
+          "burstObservatory": {
+            "subjectSelector": ["direct"],
+            "pingConfig": {
+              "destination": "http://127.0.0.1:8080/generate_204",
+              "connectivity": "http://127.0.0.1:8080/connectivity",
+              "interval": "15s",
+              "sampling": 6,
+              "timeout": "2s",
+              "httpMethod": "GET"
+            }
+          }
+        }
+        "#
+        .parse::<LiteralConfig>()
+        .expect("burstObservatory should parse");
+
+        let burst = config.burst_observatory.expect("burstObservatory missing");
+        assert_eq!(burst.subject_selector, vec!["direct"]);
+        let ping = burst.ping_config.expect("pingConfig missing");
+        assert_eq!(ping.destination, "http://127.0.0.1:8080/generate_204");
+        assert_eq!(ping.connectivity, "http://127.0.0.1:8080/connectivity");
+        assert_eq!(ping.sampling, Some(6));
+        assert_eq!(ping.http_method, "GET");
     }
 }
