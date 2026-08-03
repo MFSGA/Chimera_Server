@@ -551,6 +551,9 @@ where
             );
 
             info!(
+                relay_backend = copy_result.configured_backend(),
+                relay_path = copy_result.effective_path(),
+                relay_fallback = copy_result.fallback_reason().unwrap_or("none"),
                 bypassed_upload = copy_result.bypassed_left_to_right,
                 bypassed_download = copy_result.bypassed_right_to_left,
                 "tcp forward to {} completed: client->remote {} bytes, remote->client {} bytes",
