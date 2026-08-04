@@ -1,7 +1,9 @@
 #![cfg(all(test, feature = "user_domain_access"))]
 
+#[cfg(unix)]
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::{
-    fs,
+    fs::{self, File},
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -391,6 +393,73 @@ fn persistence_failure_preserves_active_revision() {
     assert_eq!(decision(&runtime, "stable.example"), AccessAction::Allow);
     assert_eq!(decision(&runtime, "new.example"), AccessAction::Reject);
     assert_eq!(runtime.user_domain_access_revision().unwrap().version, 1);
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn oversized_persisted_store_is_rejected_before_parsing() {
+    let directory = temporary_path("oversized-store");
+    fs::create_dir_all(&directory).unwrap();
+    let store = directory.join("policy.json");
+    File::create(&store)
+        .unwrap()
+        .set_len(crate::runtime::USER_DOMAIN_ACCESS_STORE_MAX_BYTES + 1)
+        .unwrap();
+
+    let error = crate::runtime::load_user_domain_access_store(&store)
+        .expect_err("oversized store must be rejected");
+    assert!(error.contains("exceeds maximum size"));
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn symbolic_link_store_is_rejected_without_replacing_active_policy() {
+    let directory = temporary_path("symlink-store");
+    fs::create_dir_all(&directory).unwrap();
+    let target = directory.join("target.json");
+    fs::write(&target, b"{}\n").unwrap();
+    let store = directory.join("policy.json");
+    symlink(&target, &store).unwrap();
+
+    let error = crate::runtime::load_user_domain_access_store(&store)
+        .expect_err("symbolic link store must be rejected on load");
+    assert!(error.contains("must not be a symbolic link"));
+
+    let runtime = RuntimeState::new(Vec::new(), Vec::new());
+    runtime
+        .install_user_domain_access(config(1, "stable.example"))
+        .unwrap();
+    runtime.configure_user_domain_access_store(store).unwrap();
+    let error = runtime
+        .install_user_domain_access(config(2, "new.example"))
+        .expect_err("symbolic link store must be rejected on persist");
+    assert!(error.contains("must not be a symbolic link"));
+    assert_eq!(runtime.user_domain_access_revision().unwrap().version, 1);
+    assert_eq!(decision(&runtime, "stable.example"), AccessAction::Allow);
+    assert_eq!(decision(&runtime, "new.example"), AccessAction::Reject);
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn persisted_store_is_not_accessible_to_group_or_other_users() {
+    let directory = temporary_path("store-permissions");
+    let store = directory.join("policy.json");
+    let runtime = RuntimeState::new(Vec::new(), Vec::new());
+    runtime
+        .configure_user_domain_access_store(store.clone())
+        .unwrap();
+    runtime
+        .install_user_domain_access(config(1, "private.example"))
+        .unwrap();
+
+    let mode = fs::metadata(&store).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode & 0o077, 0, "group/other permissions must be empty");
+    assert_eq!(mode & 0o600, 0o600, "owner must retain read/write access");
 
     fs::remove_dir_all(directory).unwrap();
 }

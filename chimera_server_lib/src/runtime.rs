@@ -5,11 +5,13 @@ use std::{
 
 #[cfg(feature = "user_domain_access")]
 use serde::{Deserialize, Serialize};
+#[cfg(all(feature = "user_domain_access", unix))]
+use std::os::unix::fs::OpenOptionsExt;
 #[cfg(feature = "user_domain_access")]
 use std::{
     collections::VecDeque,
     fs::{self, File, OpenOptions},
-    io::{BufWriter, Write},
+    io::{BufWriter, Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -52,6 +54,8 @@ pub(crate) const fn user_domain_access_history_limit() -> usize {
 static USER_DOMAIN_ACCESS_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "user_domain_access")]
 const USER_DOMAIN_ACCESS_STORE_FORMAT_VERSION: u32 = 1;
+#[cfg(feature = "user_domain_access")]
+pub(crate) const USER_DOMAIN_ACCESS_STORE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 #[cfg(feature = "user_domain_access")]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -971,21 +975,95 @@ impl UserDomainAccessMetrics {
 }
 
 #[cfg(feature = "user_domain_access")]
+fn validate_user_domain_access_store_file_type(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), String> {
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "user-domain access store {} must not be a symbolic link",
+            path.display()
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(format!(
+            "user-domain access store {} must be a regular file",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "user_domain_access")]
+fn validate_user_domain_access_store_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), String> {
+    validate_user_domain_access_store_file_type(path, metadata)?;
+    if metadata.len() > USER_DOMAIN_ACCESS_STORE_MAX_BYTES {
+        return Err(format!(
+            "user-domain access store {} exceeds maximum size of {} bytes",
+            path.display(),
+            USER_DOMAIN_ACCESS_STORE_MAX_BYTES
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "user_domain_access")]
 pub(crate) fn load_user_domain_access_store(
     path: &Path,
 ) -> Result<Option<LoadedUserDomainAccessStore>, String> {
-    let content = match fs::read_to_string(path) {
-        Ok(content) => content,
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(None);
         }
         Err(error) => {
             return Err(format!(
-                "failed to read user-domain access store {}: {error}",
+                "failed to inspect user-domain access store {}: {error}",
                 path.display()
             ));
         }
     };
+    validate_user_domain_access_store_metadata(path, &metadata)?;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(path).map_err(|error| {
+        format!(
+            "failed to open user-domain access store {}: {error}",
+            path.display()
+        )
+    })?;
+    validate_user_domain_access_store_metadata(
+        path,
+        &file.metadata().map_err(|error| {
+            format!(
+                "failed to inspect opened user-domain access store {}: {error}",
+                path.display()
+            )
+        })?,
+    )?;
+    let mut content = String::new();
+    Read::by_ref(&mut file)
+        .take(USER_DOMAIN_ACCESS_STORE_MAX_BYTES + 1)
+        .read_to_string(&mut content)
+        .map_err(|error| {
+            format!(
+                "failed to read user-domain access store {}: {error}",
+                path.display()
+            )
+        })?;
+    if content.len() as u64 > USER_DOMAIN_ACCESS_STORE_MAX_BYTES {
+        return Err(format!(
+            "user-domain access store {} exceeds maximum size of {} bytes",
+            path.display(),
+            USER_DOMAIN_ACCESS_STORE_MAX_BYTES
+        ));
+    }
     let stored = serde_json::from_str::<StoredUserDomainAccess>(&content).map_err(
         |error| {
             format!(
@@ -1080,6 +1158,23 @@ fn persist_user_domain_access_config(
         current: config.clone(),
         history: history.to_vec(),
     };
+    let mut serialized = serde_json::to_vec_pretty(&envelope).map_err(|error| {
+        format!(
+            "failed to serialize user-domain access store {}: {error}",
+            path.display()
+        )
+    })?;
+    serialized.push(b'\n');
+    if serialized.len() as u64 > USER_DOMAIN_ACCESS_STORE_MAX_BYTES {
+        return Err(format!(
+            "user-domain access store {} would exceed maximum size of {} bytes",
+            path.display(),
+            USER_DOMAIN_ACCESS_STORE_MAX_BYTES
+        ));
+    }
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        validate_user_domain_access_store_file_type(path, &metadata)?;
+    }
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty());
@@ -1106,26 +1201,20 @@ fn persist_user_domain_access_config(
         directory.join(format!(".{file_name}.tmp-{}-{counter}", std::process::id()));
 
     let result = (|| -> Result<(), String> {
-        let file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)
-            .map_err(|error| {
-                format!(
-                    "failed to create user-domain access temporary store {}: {error}",
-                    temporary.display()
-                )
-            })?;
-        let mut writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(&mut writer, &envelope).map_err(|error| {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options.open(&temporary).map_err(|error| {
             format!(
-                "failed to serialize user-domain access store {}: {error}",
+                "failed to create user-domain access temporary store {}: {error}",
                 temporary.display()
             )
         })?;
-        writer.write_all(b"\n").map_err(|error| {
+        let mut writer = BufWriter::new(file);
+        writer.write_all(&serialized).map_err(|error| {
             format!(
-                "failed to finalize user-domain access store {}: {error}",
+                "failed to write user-domain access store {}: {error}",
                 temporary.display()
             )
         })?;
