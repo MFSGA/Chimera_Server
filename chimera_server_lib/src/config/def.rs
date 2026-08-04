@@ -137,6 +137,10 @@ pub struct UserDomainAccessStoreConfig {
     pub require_signature: bool,
     #[serde(default)]
     pub trusted_signing_keys: Vec<UserDomainAccessSigningKeyConfig>,
+    #[serde(default)]
+    pub tls_probe_timeout_millis: Option<u64>,
+    #[serde(default)]
+    pub tls_probe_max_bytes: Option<usize>,
 }
 
 #[cfg(feature = "user_domain_access")]

@@ -389,11 +389,6 @@ fn build_proxy_protocol_header(
 }
 
 #[cfg(feature = "user_domain_access")]
-const TLS_ACCESS_SNIFF_TIMEOUT: Duration = Duration::from_millis(5);
-#[cfg(feature = "user_domain_access")]
-const TLS_ACCESS_SNIFF_LIMIT: usize = 65_536;
-
-#[cfg(feature = "user_domain_access")]
 async fn enrich_tls_access_metadata(
     mut stream: Box<dyn AsyncStream>,
     traffic_context: &mut Option<TrafficContext>,
@@ -416,13 +411,14 @@ async fn enrich_tls_access_metadata(
         return Ok(stream);
     }
 
-    let deadline = Instant::now() + TLS_ACCESS_SNIFF_TIMEOUT;
+    let probe_config = runtime.user_domain_access_tls_probe_config();
+    let deadline = Instant::now() + probe_config.timeout;
     let mut captured = Vec::new();
     let mut timed_out = false;
     let inspection = loop {
         match inspect_client_hello(&captured) {
             ClientHelloInspection::Incomplete
-                if captured.len() < TLS_ACCESS_SNIFF_LIMIT =>
+                if captured.len() < probe_config.max_bytes =>
             {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -430,7 +426,11 @@ async fn enrich_tls_access_metadata(
                     break ClientHelloInspection::Incomplete;
                 }
                 let mut buffer = [0u8; 4096];
-                match timeout(remaining, stream.read(&mut buffer)).await {
+                let read_limit =
+                    buffer.len().min(probe_config.max_bytes - captured.len());
+                match timeout(remaining, stream.read(&mut buffer[..read_limit]))
+                    .await
+                {
                     Ok(Ok(0)) => break ClientHelloInspection::Incomplete,
                     Ok(Ok(length)) => captured.extend_from_slice(&buffer[..length]),
                     Ok(Err(error)) => return Err(error),
@@ -1426,6 +1426,68 @@ mod tests {
         assert_eq!(stats.tls_probe_attempts, 1);
         assert_eq!(stats.tls_sni_found, 1);
         assert_eq!(stats.tls_captured_bytes, expected.len() as u64);
+    }
+
+    #[cfg(feature = "user_domain_access")]
+    #[tokio::test]
+    async fn tls_probe_capture_limit_is_strict_and_all_bytes_are_replayed() {
+        let config =
+            serde_json::from_value::<UserDomainAccessConfig>(serde_json::json!({
+                "defaultAction": "allow",
+                "users": []
+            }))
+            .expect("policy config should parse");
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        runtime
+            .configure_user_domain_access_tls_probe(Some(50), Some(1_024))
+            .expect("TLS probe config should install");
+        runtime.replace_user_domain_access(Some(
+            UserDomainAccessPolicy::compile(config).expect("policy should compile"),
+        ));
+
+        let remote =
+            NetLocation::new(Address::Ipv4(Ipv4Addr::new(192, 0, 2, 1)), 443);
+        let mut context = Some(TrafficContext::new("vless").with_access_target(
+            "192.0.2.1",
+            443,
+            AccessTransport::Tcp,
+        ));
+        let mut expected = vec![0x16, 0x03, 0x03, 0xff, 0xff];
+        expected.resize(2_048, 0);
+        let (mut client, server) = duplex(4_096);
+        client
+            .write_all(&expected)
+            .await
+            .expect("write incomplete oversized ClientHello record");
+
+        let mut stream = enrich_tls_access_metadata(
+            Box::new(AccessTestStream(server)),
+            &mut context,
+            &remote,
+            &runtime,
+        )
+        .await
+        .expect("bounded TLS probe should return a replay stream");
+        let mut replayed = vec![0u8; expected.len()];
+        stream
+            .read_exact(&mut replayed)
+            .await
+            .expect("read captured and unread TLS bytes");
+        assert_eq!(replayed, expected);
+
+        let stats = runtime.user_domain_access_stats();
+        assert_eq!(stats.tls_probe_attempts, 1);
+        assert_eq!(
+            stats.tls_sni_found
+                + stats.tls_ech_detected
+                + stats.tls_not_tls
+                + stats.tls_incomplete
+                + stats.tls_malformed
+                + stats.tls_no_server_name,
+            1
+        );
+        assert_eq!(stats.tls_captured_bytes, 1_024);
+        assert_eq!(stats.tls_timeouts, 0);
     }
 
     #[cfg(feature = "user_domain_access")]

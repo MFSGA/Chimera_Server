@@ -14,6 +14,7 @@ use std::{
     io::{BufWriter, Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
 #[cfg(feature = "user_domain_access")]
 use uuid::Uuid;
@@ -56,6 +57,18 @@ static USER_DOMAIN_ACCESS_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const USER_DOMAIN_ACCESS_STORE_FORMAT_VERSION: u32 = 1;
 #[cfg(feature = "user_domain_access")]
 pub(crate) const USER_DOMAIN_ACCESS_STORE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(feature = "user_domain_access")]
+const USER_DOMAIN_ACCESS_TLS_PROBE_DEFAULT_TIMEOUT_MILLIS: u64 = 5;
+#[cfg(feature = "user_domain_access")]
+const USER_DOMAIN_ACCESS_TLS_PROBE_MIN_TIMEOUT_MILLIS: u64 = 1;
+#[cfg(feature = "user_domain_access")]
+const USER_DOMAIN_ACCESS_TLS_PROBE_MAX_TIMEOUT_MILLIS: u64 = 100;
+#[cfg(feature = "user_domain_access")]
+const USER_DOMAIN_ACCESS_TLS_PROBE_DEFAULT_MAX_BYTES: usize = 65_536;
+#[cfg(feature = "user_domain_access")]
+const USER_DOMAIN_ACCESS_TLS_PROBE_MIN_BYTES: usize = 1_024;
+#[cfg(feature = "user_domain_access")]
+const USER_DOMAIN_ACCESS_TLS_PROBE_MAX_BYTES: usize = 262_144;
 
 #[cfg(feature = "user_domain_access")]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +115,25 @@ struct UserDomainAccessRevision {
     info: UserDomainAccessRevisionInfo,
     policy: Arc<UserDomainAccessPolicy>,
     config: Option<Arc<UserDomainAccessConfig>>,
+}
+
+#[cfg(feature = "user_domain_access")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserDomainAccessTlsProbeConfig {
+    pub timeout: Duration,
+    pub max_bytes: usize,
+}
+
+#[cfg(feature = "user_domain_access")]
+impl Default for UserDomainAccessTlsProbeConfig {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_millis(
+                USER_DOMAIN_ACCESS_TLS_PROBE_DEFAULT_TIMEOUT_MILLIS,
+            ),
+            max_bytes: USER_DOMAIN_ACCESS_TLS_PROBE_DEFAULT_MAX_BYTES,
+        }
+    }
 }
 
 #[cfg(feature = "user_domain_access")]
@@ -184,6 +216,7 @@ struct UserDomainAccessRuntimeState {
     store_path: Option<PathBuf>,
     expected_target_node_uuid: Option<Uuid>,
     signature_verifier: UserDomainAccessSignatureVerifier,
+    tls_probe: UserDomainAccessTlsProbeConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -508,6 +541,17 @@ impl RuntimeState {
         self.user_domain_access_metrics.snapshot()
     }
 
+    /// Returns the effective node-local TLS ClientHello probe settings.
+    #[cfg(feature = "user_domain_access")]
+    pub fn user_domain_access_tls_probe_config(
+        &self,
+    ) -> UserDomainAccessTlsProbeConfig {
+        self.user_domain_access
+            .read()
+            .expect("runtime user-domain access lock poisoned")
+            .tls_probe
+    }
+
     /// Returns metadata for the active user-domain access revision.
     #[cfg(feature = "user_domain_access")]
     pub fn user_domain_access_revision(
@@ -571,6 +615,55 @@ impl RuntimeState {
             );
         }
         state.signature_verifier = verifier;
+        Ok(())
+    }
+
+    /// Configures bounded TLS ClientHello probing before policy installation.
+    #[cfg(feature = "user_domain_access")]
+    pub fn configure_user_domain_access_tls_probe(
+        &self,
+        timeout_millis: Option<u64>,
+        max_bytes: Option<usize>,
+    ) -> Result<(), String> {
+        let timeout_millis = timeout_millis
+            .unwrap_or(USER_DOMAIN_ACCESS_TLS_PROBE_DEFAULT_TIMEOUT_MILLIS);
+        if !(USER_DOMAIN_ACCESS_TLS_PROBE_MIN_TIMEOUT_MILLIS
+            ..=USER_DOMAIN_ACCESS_TLS_PROBE_MAX_TIMEOUT_MILLIS)
+            .contains(&timeout_millis)
+        {
+            return Err(format!(
+                "user-domain access TLS probe timeout must be between {} and {} milliseconds",
+                USER_DOMAIN_ACCESS_TLS_PROBE_MIN_TIMEOUT_MILLIS,
+                USER_DOMAIN_ACCESS_TLS_PROBE_MAX_TIMEOUT_MILLIS
+            ));
+        }
+        let max_bytes =
+            max_bytes.unwrap_or(USER_DOMAIN_ACCESS_TLS_PROBE_DEFAULT_MAX_BYTES);
+        if !(USER_DOMAIN_ACCESS_TLS_PROBE_MIN_BYTES
+            ..=USER_DOMAIN_ACCESS_TLS_PROBE_MAX_BYTES)
+            .contains(&max_bytes)
+        {
+            return Err(format!(
+                "user-domain access TLS probe max bytes must be between {} and {}",
+                USER_DOMAIN_ACCESS_TLS_PROBE_MIN_BYTES,
+                USER_DOMAIN_ACCESS_TLS_PROBE_MAX_BYTES
+            ));
+        }
+
+        let mut state = self
+            .user_domain_access
+            .write()
+            .expect("runtime user-domain access lock poisoned");
+        if state.current.is_some() || !state.history.is_empty() {
+            return Err(
+                "user-domain access TLS probe must be configured before policy installation"
+                    .into(),
+            );
+        }
+        state.tls_probe = UserDomainAccessTlsProbeConfig {
+            timeout: Duration::from_millis(timeout_millis),
+            max_bytes,
+        };
         Ok(())
     }
 
@@ -717,10 +810,12 @@ impl RuntimeState {
         let store_path = state.store_path.take();
         let expected_target_node_uuid = state.expected_target_node_uuid.take();
         let signature_verifier = state.signature_verifier.clone();
+        let tls_probe = state.tls_probe;
         *state = UserDomainAccessRuntimeState::default();
         state.store_path = store_path;
         state.expected_target_node_uuid = expected_target_node_uuid;
         state.signature_verifier = signature_verifier;
+        state.tls_probe = tls_probe;
         if let Some(policy) = policy {
             state.current = Some(UserDomainAccessRevision {
                 info: UserDomainAccessRevisionInfo {

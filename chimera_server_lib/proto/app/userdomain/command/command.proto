@@ -61,6 +61,8 @@ message GetPolicyStatusRequest {}
 message GetPolicyStatusResponse {
   RevisionInfo revision = 1;
   DecisionStats stats = 2;
+  uint64 tls_probe_timeout_millis = 3;
+  uint64 tls_probe_max_bytes = 4;
 }
 
 service UserDomainAccessService {

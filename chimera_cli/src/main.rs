@@ -123,6 +123,8 @@ async fn run_user_domain_command(
             let output = json!({
                 "revision": response.revision.as_ref().map(revision_json),
                 "stats": response.stats.as_ref().map(stats_json),
+                "tlsProbeTimeoutMillis": response.tls_probe_timeout_millis,
+                "tlsProbeMaxBytes": response.tls_probe_max_bytes,
             });
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
@@ -368,6 +370,10 @@ struct GetPolicyStatusResponse {
     revision: Option<RevisionInfo>,
     #[prost(message, optional, tag = "2")]
     stats: Option<DecisionStats>,
+    #[prost(uint64, tag = "3")]
+    tls_probe_timeout_millis: u64,
+    #[prost(uint64, tag = "4")]
+    tls_probe_max_bytes: u64,
 }
 
 #[cfg(test)]

@@ -118,6 +118,7 @@ impl proto::chimera::app::userdomain::command::user_domain_access_service_server
         Response<proto::chimera::app::userdomain::command::GetPolicyStatusResponse>,
         Status,
     > {
+        let tls_probe = self.runtime.user_domain_access_tls_probe_config();
         Ok(Response::new(
             proto::chimera::app::userdomain::command::GetPolicyStatusResponse {
                 revision: self
@@ -127,6 +128,8 @@ impl proto::chimera::app::userdomain::command::user_domain_access_service_server
                 stats: Some(stats_to_proto(
                     self.runtime.user_domain_access_stats(),
                 )),
+                tls_probe_timeout_millis: tls_probe.timeout.as_millis() as u64,
+                tls_probe_max_bytes: tls_probe.max_bytes as u64,
             },
         ))
     }
@@ -275,6 +278,9 @@ mod tests {
     #[tokio::test]
     async fn applies_reports_and_rolls_back_policy_revisions() {
         let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        runtime
+            .configure_user_domain_access_tls_probe(Some(12), Some(8_192))
+            .expect("TLS probe config should install");
         let service = UserDomainAccessServiceImpl::new(runtime.clone());
 
         service
@@ -302,6 +308,8 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(status.revision.expect("revision missing").version, 2);
+        assert_eq!(status.tls_probe_timeout_millis, 12);
+        assert_eq!(status.tls_probe_max_bytes, 8_192);
         let stats = status.stats.expect("stats missing");
         assert_eq!(stats.apply_succeeded, 2);
         assert_eq!(stats.apply_failed, 0);

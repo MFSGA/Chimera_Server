@@ -159,6 +159,15 @@ fn build_user_domain_access_signature_verifier(
 }
 
 #[cfg(feature = "user_domain_access")]
+fn user_domain_access_tls_probe_settings(
+    store: Option<&config::def::UserDomainAccessStoreConfig>,
+) -> (Option<u64>, Option<usize>) {
+    store
+        .map(|store| (store.tls_probe_timeout_millis, store.tls_probe_max_bytes))
+        .unwrap_or_default()
+}
+
+#[cfg(feature = "user_domain_access")]
 #[derive(Debug)]
 struct InitialUserDomainAccess {
     config: Option<user_domain_access::UserDomainAccessConfig>,
@@ -263,6 +272,10 @@ pub fn prepare_server_runtime(
             config.user_domain_access_store.as_ref(),
         )?;
     #[cfg(feature = "user_domain_access")]
+    let user_domain_access_tls_probe = user_domain_access_tls_probe_settings(
+        config.user_domain_access_store.as_ref(),
+    );
+    #[cfg(feature = "user_domain_access")]
     let user_domain_access_store = resolve_user_domain_access_store_path(
         config.user_domain_access_store.as_ref(),
         cwd,
@@ -278,6 +291,13 @@ pub fn prepare_server_runtime(
     runtime_state
         .configure_user_domain_access_signature_verifier(
             user_domain_access_signature_verifier,
+        )
+        .map_err(Error::InvalidConfig)?;
+    #[cfg(feature = "user_domain_access")]
+    runtime_state
+        .configure_user_domain_access_tls_probe(
+            user_domain_access_tls_probe.0,
+            user_domain_access_tls_probe.1,
         )
         .map_err(Error::InvalidConfig)?;
     #[cfg(feature = "user_domain_access")]
@@ -507,6 +527,10 @@ pub fn validate(opts: Options) -> Result<(), Error> {
                 build_user_domain_access_signature_verifier(store_config)?,
             )
             .map_err(Error::InvalidConfig)?;
+        let tls_probe = user_domain_access_tls_probe_settings(store_config);
+        validation_state
+            .configure_user_domain_access_tls_probe(tls_probe.0, tls_probe.1)
+            .map_err(Error::InvalidConfig)?;
         if let Some(node_uuid) =
             store_config.and_then(|store| store.node_uuid.as_deref())
         {
@@ -602,6 +626,10 @@ async fn start_async(
             config.user_domain_access_store.as_ref(),
         )?;
     #[cfg(feature = "user_domain_access")]
+    let user_domain_access_tls_probe = user_domain_access_tls_probe_settings(
+        config.user_domain_access_store.as_ref(),
+    );
+    #[cfg(feature = "user_domain_access")]
     let user_domain_access_store = resolve_user_domain_access_store_path(
         config.user_domain_access_store.as_ref(),
         cwd,
@@ -633,6 +661,13 @@ async fn start_async(
     runtime_state
         .configure_user_domain_access_signature_verifier(
             user_domain_access_signature_verifier,
+        )
+        .map_err(Error::InvalidConfig)?;
+    #[cfg(feature = "user_domain_access")]
+    runtime_state
+        .configure_user_domain_access_tls_probe(
+            user_domain_access_tls_probe.0,
+            user_domain_access_tls_probe.1,
         )
         .map_err(Error::InvalidConfig)?;
     #[cfg(feature = "user_domain_access")]

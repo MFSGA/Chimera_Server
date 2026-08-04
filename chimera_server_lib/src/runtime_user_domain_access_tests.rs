@@ -139,6 +139,43 @@ fn required_signatures_are_verified_before_runtime_replacement() {
 }
 
 #[test]
+fn tls_probe_configuration_uses_safe_defaults_and_bounds() {
+    let runtime = RuntimeState::new(Vec::new(), Vec::new());
+    let defaults = runtime.user_domain_access_tls_probe_config();
+    assert_eq!(defaults.timeout.as_millis(), 5);
+    assert_eq!(defaults.max_bytes, 65_536);
+
+    runtime
+        .configure_user_domain_access_tls_probe(Some(12), Some(8_192))
+        .expect("valid TLS probe settings should install");
+    let configured = runtime.user_domain_access_tls_probe_config();
+    assert_eq!(configured.timeout.as_millis(), 12);
+    assert_eq!(configured.max_bytes, 8_192);
+
+    assert!(
+        runtime
+            .configure_user_domain_access_tls_probe(Some(0), Some(8_192))
+            .is_err()
+    );
+    assert!(
+        runtime
+            .configure_user_domain_access_tls_probe(Some(101), Some(8_192))
+            .is_err()
+    );
+    assert!(
+        runtime
+            .configure_user_domain_access_tls_probe(Some(5), Some(1_023))
+            .is_err()
+    );
+    assert!(
+        runtime
+            .configure_user_domain_access_tls_probe(Some(5), Some(262_145))
+            .is_err()
+    );
+    assert_eq!(runtime.user_domain_access_tls_probe_config(), configured);
+}
+
+#[test]
 fn installs_only_strictly_newer_revisions() {
     let runtime = RuntimeState::new(Vec::new(), Vec::new());
     let first = runtime
