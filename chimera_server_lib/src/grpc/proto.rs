@@ -1,5 +1,15 @@
 #![allow(dead_code)]
 
+pub mod chimera {
+    pub mod app {
+        pub mod userdomain {
+            pub mod command {
+                tonic::include_proto!("chimera.app.userdomain.command");
+            }
+        }
+    }
+}
+
 pub mod xray {
     pub mod app {
         pub mod stats {

@@ -378,7 +378,12 @@ dependencies = [
  "anyhow",
  "base64",
  "clap",
+ "prost",
  "rand 0.10.1",
+ "serde_json",
+ "tokio",
+ "tonic",
+ "tonic-prost",
  "x25519-dalek",
 ]
 

@@ -5,6 +5,8 @@ use tokio_stream::wrappers::TcpListenerStream;
 
 use crate::runtime::RuntimeState;
 
+#[cfg(feature = "user_domain_access")]
+use super::user_domain_access;
 use super::{handler, logger, observatory, routing, stats};
 
 #[derive(Debug, Clone)]
@@ -65,6 +67,16 @@ pub async fn start_grpc_server(
             builder.take(),
             router.take(),
             observatory::build_service(runtime.clone()),
+        ));
+        service_count += 1;
+    }
+
+    #[cfg(feature = "user_domain_access")]
+    if has_service(&config.services, "UserDomainAccessService") {
+        router = Some(add_service(
+            builder.take(),
+            router.take(),
+            user_domain_access::build_service(runtime.clone()),
         ));
         service_count += 1;
     }
