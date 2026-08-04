@@ -13,8 +13,10 @@ use rustls::{
 #[cfg(feature = "tls")]
 use tokio_rustls::TlsConnector;
 
-#[cfg(any(feature = "tls", test))]
+#[cfg(any(feature = "tls", feature = "grpc_transport", test))]
 use crate::address::Address;
+#[cfg(feature = "grpc_transport")]
+use crate::beginning::GrpcClientConfig;
 #[cfg(feature = "httpupgrade")]
 use crate::handler::httpupgrade::HttpUpgradeClientConfig;
 #[cfg(feature = "ws")]
@@ -54,6 +56,8 @@ enum OutboundProtocolConfig {
     Websocket(WebsocketClientConfig),
     #[cfg(feature = "httpupgrade")]
     HttpUpgrade(HttpUpgradeClientConfig),
+    #[cfg(feature = "grpc_transport")]
+    Grpc(GrpcClientConfig),
 }
 
 #[cfg(feature = "tls")]
@@ -91,12 +95,17 @@ impl OutboundTransportConfig {
                         "outbound {outbound_tag} provides httpupgradeSettings without network=httpupgrade"
                     ));
                 }
+                if has_grpc_settings(stream) {
+                    return Err(format!(
+                        "outbound {outbound_tag} provides grpcSettings without network=grpc"
+                    ));
+                }
                 OutboundProtocolConfig::Tcp
             }
             "ws" | "websocket" => {
-                if has_httpupgrade_settings(stream) {
+                if has_httpupgrade_settings(stream) || has_grpc_settings(stream) {
                     return Err(format!(
-                        "outbound {outbound_tag} provides httpupgradeSettings with network=ws"
+                        "outbound {outbound_tag} provides incompatible transport settings with network=ws"
                     ));
                 }
                 #[cfg(feature = "ws")]
@@ -113,9 +122,9 @@ impl OutboundTransportConfig {
                 }
             }
             "httpupgrade" => {
-                if has_websocket_settings(stream) {
+                if has_websocket_settings(stream) || has_grpc_settings(stream) {
                     return Err(format!(
-                        "outbound {outbound_tag} provides wsSettings with network=httpupgrade"
+                        "outbound {outbound_tag} provides incompatible transport settings with network=httpupgrade"
                     ));
                 }
                 #[cfg(feature = "httpupgrade")]
@@ -131,6 +140,26 @@ impl OutboundTransportConfig {
                     ));
                 }
             }
+            "grpc" => {
+                if has_websocket_settings(stream) || has_httpupgrade_settings(stream)
+                {
+                    return Err(format!(
+                        "outbound {outbound_tag} provides incompatible transport settings with network=grpc"
+                    ));
+                }
+                #[cfg(feature = "grpc_transport")]
+                {
+                    compile_grpc_transport(server, stream, outbound_tag)
+                        .map(OutboundProtocolConfig::Grpc)?
+                }
+                #[cfg(not(feature = "grpc_transport"))]
+                {
+                    let _ = server;
+                    return Err(format!(
+                        "outbound {outbound_tag} requires the grpc_transport feature"
+                    ));
+                }
+            }
             other => {
                 return Err(format!(
                     "outbound {outbound_tag} uses unsupported network {other}"
@@ -141,7 +170,7 @@ impl OutboundTransportConfig {
             server,
             stream,
             outbound_tag,
-            protocol_requires_http1(&protocol),
+            protocol_required_alpn(&protocol),
             protocol_supports_reality(&protocol),
         )?;
         Ok(Self { security, protocol })
@@ -201,6 +230,8 @@ impl OutboundTransportConfig {
             OutboundProtocolConfig::HttpUpgrade(config) => {
                 config.connect(stream).await
             }
+            #[cfg(feature = "grpc_transport")]
+            OutboundProtocolConfig::Grpc(config) => config.connect(stream).await,
         }
     }
 
@@ -229,27 +260,44 @@ impl OutboundTransportConfig {
     pub(crate) fn is_httpupgrade(&self) -> bool {
         matches!(self.protocol, OutboundProtocolConfig::HttpUpgrade(_))
     }
+
+    #[cfg(all(test, feature = "grpc_transport"))]
+    pub(crate) fn is_grpc(&self) -> bool {
+        matches!(self.protocol, OutboundProtocolConfig::Grpc(_))
+    }
 }
 
-fn protocol_requires_http1(protocol: &OutboundProtocolConfig) -> bool {
+fn protocol_required_alpn(
+    protocol: &OutboundProtocolConfig,
+) -> Option<&'static [u8]> {
     match protocol {
-        OutboundProtocolConfig::Tcp => false,
+        OutboundProtocolConfig::Tcp => None,
         #[cfg(feature = "ws")]
-        OutboundProtocolConfig::Websocket(_) => true,
+        OutboundProtocolConfig::Websocket(_) => Some(b"http/1.1"),
         #[cfg(feature = "httpupgrade")]
-        OutboundProtocolConfig::HttpUpgrade(_) => true,
+        OutboundProtocolConfig::HttpUpgrade(_) => Some(b"http/1.1"),
+        #[cfg(feature = "grpc_transport")]
+        OutboundProtocolConfig::Grpc(_) => Some(b"h2"),
     }
 }
 
 fn protocol_supports_reality(protocol: &OutboundProtocolConfig) -> bool {
-    matches!(protocol, OutboundProtocolConfig::Tcp)
+    match protocol {
+        OutboundProtocolConfig::Tcp => true,
+        #[cfg(feature = "grpc_transport")]
+        OutboundProtocolConfig::Grpc(_) => true,
+        #[cfg(feature = "ws")]
+        OutboundProtocolConfig::Websocket(_) => false,
+        #[cfg(feature = "httpupgrade")]
+        OutboundProtocolConfig::HttpUpgrade(_) => false,
+    }
 }
 
 fn compile_security_transport(
     server: &NetLocation,
     stream: Option<&OutboundStreamSettings>,
     outbound_tag: &str,
-    requires_http1: bool,
+    required_alpn: Option<&'static [u8]>,
     supports_reality: bool,
 ) -> Result<OutboundSecurityConfig, String> {
     let security = stream
@@ -279,12 +327,12 @@ fn compile_security_transport(
             }
             #[cfg(feature = "tls")]
             {
-                compile_tls_transport(server, stream, outbound_tag, requires_http1)
+                compile_tls_transport(server, stream, outbound_tag, required_alpn)
                     .map(OutboundSecurityConfig::Tls)
             }
             #[cfg(not(feature = "tls"))]
             {
-                let _ = (server, requires_http1, supports_reality);
+                let _ = (server, required_alpn, supports_reality);
                 Err(format!("outbound {outbound_tag} requires the tls feature"))
             }
         }
@@ -306,7 +354,7 @@ fn compile_security_transport(
             }
             #[cfg(not(feature = "reality"))]
             {
-                let _ = (server, requires_http1, supports_reality);
+                let _ = (server, required_alpn, supports_reality);
                 Err(format!(
                     "outbound {outbound_tag} requires the reality feature"
                 ))
@@ -339,6 +387,56 @@ fn has_httpupgrade_settings(stream: Option<&OutboundStreamSettings>) -> bool {
     {
         let _ = stream;
         false
+    }
+}
+
+fn has_grpc_settings(stream: Option<&OutboundStreamSettings>) -> bool {
+    #[cfg(feature = "grpc_transport")]
+    {
+        stream.is_some_and(|stream| stream.grpc_settings.is_some())
+    }
+    #[cfg(not(feature = "grpc_transport"))]
+    {
+        let _ = stream;
+        false
+    }
+}
+
+#[cfg(feature = "grpc_transport")]
+fn compile_grpc_transport(
+    server: &NetLocation,
+    stream: Option<&OutboundStreamSettings>,
+    outbound_tag: &str,
+) -> Result<GrpcClientConfig, String> {
+    let security = stream
+        .and_then(|stream| stream.security.as_deref())
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let tls_server_name = if security == "tls" {
+        stream
+            .and_then(|stream| stream.tls_settings.as_ref())
+            .and_then(|settings| settings.server_name.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    } else {
+        None
+    };
+    let fallback_authority = tls_server_name
+        .map(str::to_string)
+        .unwrap_or_else(|| authority_for_server(server));
+    GrpcClientConfig::compile(
+        stream.and_then(|stream| stream.grpc_settings.as_ref()),
+        &fallback_authority,
+        outbound_tag,
+    )
+}
+
+#[cfg(feature = "grpc_transport")]
+fn authority_for_server(server: &NetLocation) -> String {
+    match server.address() {
+        Address::Ipv6(address) => format!("[{address}]"),
+        address => address.to_string(),
     }
 }
 
@@ -496,7 +594,7 @@ fn compile_tls_transport(
     server: &NetLocation,
     stream: Option<&OutboundStreamSettings>,
     outbound_tag: &str,
-    requires_http1: bool,
+    required_alpn: Option<&'static [u8]>,
 ) -> Result<TlsOutboundTransportConfig, String> {
     let settings = stream
         .and_then(|stream| stream.tls_settings.as_ref())
@@ -636,8 +734,13 @@ fn compile_tls_transport(
             Ok(protocol)
         })
         .collect::<Result<Vec<_>, String>>()?;
-    if requires_http1 && client_config.alpn_protocols.is_empty() {
-        client_config.alpn_protocols.push(b"http/1.1".to_vec());
+    if let Some(required_alpn) = required_alpn
+        && !client_config
+            .alpn_protocols
+            .iter()
+            .any(|protocol| protocol.as_slice() == required_alpn)
+    {
+        client_config.alpn_protocols.push(required_alpn.to_vec());
     }
     if !settings.enable_session_resumption {
         client_config.resumption = Resumption::disabled();
@@ -704,6 +807,8 @@ fn tls_versions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "grpc_transport")]
+    use crate::config::def::OutboundGrpcSettings;
     #[cfg(feature = "httpupgrade")]
     use crate::config::def::OutboundHttpUpgradeSettings;
     #[cfg(feature = "reality")]
@@ -737,6 +842,8 @@ mod tests {
             ws_settings: None,
             #[cfg(feature = "httpupgrade")]
             httpupgrade_settings: None,
+            #[cfg(feature = "grpc_transport")]
+            grpc_settings: None,
         };
         assert!(
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
@@ -763,11 +870,110 @@ mod tests {
             }),
             #[cfg(feature = "httpupgrade")]
             httpupgrade_settings: None,
+            #[cfg(feature = "grpc_transport")]
+            grpc_settings: None,
         };
         let transport =
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
                 .expect("WebSocket settings should compile");
         assert!(transport.is_websocket());
+    }
+
+    #[cfg(feature = "grpc_transport")]
+    #[test]
+    fn grpc_compiles_as_an_http2_application_transport() {
+        let server =
+            NetLocation::new(Address::Hostname("proxy.example".into()), 443);
+        let stream = OutboundStreamSettings {
+            network: "grpc".into(),
+            security: None,
+            tls_settings: None,
+            #[cfg(feature = "reality")]
+            reality_settings: None,
+            #[cfg(feature = "ws")]
+            ws_settings: None,
+            #[cfg(feature = "httpupgrade")]
+            httpupgrade_settings: None,
+            grpc_settings: Some(OutboundGrpcSettings {
+                service_name: Some("chimera-grpc".into()),
+                ..OutboundGrpcSettings::default()
+            }),
+        };
+        let transport =
+            OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
+                .expect("gRPC settings should compile");
+        assert!(transport.is_grpc());
+    }
+
+    #[cfg(all(feature = "tls", feature = "grpc_transport"))]
+    #[test]
+    fn tls_grpc_composes_security_and_http2_layers() {
+        let generated =
+            rcgen::generate_simple_self_signed(["proxy.example".to_string()])
+                .unwrap();
+        let server =
+            NetLocation::new(Address::Hostname("proxy.example".into()), 443);
+        let stream = OutboundStreamSettings {
+            network: "grpc".into(),
+            security: Some("tls".into()),
+            tls_settings: Some(OutboundTlsSettings {
+                server_name: Some("proxy.example".into()),
+                disable_system_root: true,
+                certificates: vec![crate::config::def::OutboundTlsCertificate {
+                    certificate: vec![generated.cert.pem()],
+                    usage: Some("verify".into()),
+                    ..crate::config::def::OutboundTlsCertificate::default()
+                }],
+                ..OutboundTlsSettings::default()
+            }),
+            #[cfg(feature = "reality")]
+            reality_settings: None,
+            #[cfg(feature = "ws")]
+            ws_settings: None,
+            #[cfg(feature = "httpupgrade")]
+            httpupgrade_settings: None,
+            grpc_settings: Some(OutboundGrpcSettings {
+                service_name: Some("chimera-grpc".into()),
+                ..OutboundGrpcSettings::default()
+            }),
+        };
+        let transport =
+            OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
+                .expect("TLS and gRPC should compose");
+        assert!(transport.is_tls());
+        assert!(transport.is_grpc());
+    }
+
+    #[cfg(all(feature = "reality", feature = "grpc_transport"))]
+    #[test]
+    fn reality_grpc_composes_security_and_http2_layers() {
+        let (_, public_key) = crate::reality::generate_keypair().unwrap();
+        let server =
+            NetLocation::new(Address::Hostname("proxy.example".into()), 443);
+        let stream = OutboundStreamSettings {
+            network: "grpc".into(),
+            security: Some("reality".into()),
+            tls_settings: None,
+            reality_settings: Some(OutboundRealitySettings {
+                server_name: Some("cover.example".into()),
+                public_key: Some(public_key),
+                short_id: Some("4ac97aaf8b9b0356".into()),
+                ..OutboundRealitySettings::default()
+            }),
+            #[cfg(feature = "ws")]
+            ws_settings: None,
+            #[cfg(feature = "httpupgrade")]
+            httpupgrade_settings: None,
+            grpc_settings: Some(OutboundGrpcSettings {
+                service_name: Some("chimera-grpc".into()),
+                ..OutboundGrpcSettings::default()
+            }),
+        };
+        let transport =
+            OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
+                .expect("REALITY and gRPC should compose");
+        assert!(transport.is_reality());
+        assert!(transport.is_grpc());
     }
 
     #[cfg(feature = "httpupgrade")]
@@ -788,6 +994,8 @@ mod tests {
                 path: Some("proxy".into()),
                 ..OutboundHttpUpgradeSettings::default()
             }),
+            #[cfg(feature = "grpc_transport")]
+            grpc_settings: None,
         };
         let transport =
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
@@ -824,6 +1032,8 @@ mod tests {
                 path: Some("/proxy".into()),
                 ..OutboundHttpUpgradeSettings::default()
             }),
+            #[cfg(feature = "grpc_transport")]
+            grpc_settings: None,
         };
         let transport =
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
@@ -862,6 +1072,8 @@ mod tests {
             ws_settings: None,
             #[cfg(feature = "httpupgrade")]
             httpupgrade_settings: None,
+            #[cfg(feature = "grpc_transport")]
+            grpc_settings: None,
         };
         let transport =
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
@@ -898,6 +1110,8 @@ mod tests {
             }),
             #[cfg(feature = "httpupgrade")]
             httpupgrade_settings: None,
+            #[cfg(feature = "grpc_transport")]
+            grpc_settings: None,
         };
         let transport =
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
@@ -925,6 +1139,8 @@ mod tests {
             ws_settings: Some(OutboundWebsocketSettings::default()),
             #[cfg(feature = "httpupgrade")]
             httpupgrade_settings: None,
+            #[cfg(feature = "grpc_transport")]
+            grpc_settings: None,
         };
         assert!(
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
@@ -955,6 +1171,8 @@ mod tests {
             ws_settings: None,
             #[cfg(feature = "httpupgrade")]
             httpupgrade_settings: None,
+            #[cfg(feature = "grpc_transport")]
+            grpc_settings: None,
         };
 
         let transport =
@@ -982,6 +1200,8 @@ mod tests {
             ws_settings: None,
             #[cfg(feature = "httpupgrade")]
             httpupgrade_settings: None,
+            #[cfg(feature = "grpc_transport")]
+            grpc_settings: None,
         };
         assert!(
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
@@ -1017,6 +1237,8 @@ mod tests {
             ws_settings: None,
             #[cfg(feature = "httpupgrade")]
             httpupgrade_settings: None,
+            #[cfg(feature = "grpc_transport")]
+            grpc_settings: None,
         };
         assert!(
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")

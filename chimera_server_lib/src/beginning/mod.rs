@@ -49,6 +49,8 @@ use tracing::{error, info};
 
 #[cfg(feature = "grpc_transport")]
 mod grpc_transport;
+#[cfg(feature = "grpc_transport")]
+pub(crate) use grpc_transport::GrpcClientConfig;
 mod quic;
 mod tcp_relay;
 pub(crate) mod udp;

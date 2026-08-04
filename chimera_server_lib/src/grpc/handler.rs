@@ -1144,6 +1144,8 @@ impl HandlerServiceImpl {
                     ws_settings: None,
                     #[cfg(feature = "httpupgrade")]
                     httpupgrade_settings: None,
+                    #[cfg(feature = "grpc_transport")]
+                    grpc_settings: None,
                 });
                 "vless"
             }

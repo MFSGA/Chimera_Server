@@ -360,6 +360,8 @@ mod tests {
                 ws_settings: None,
                 #[cfg(feature = "httpupgrade")]
                 httpupgrade_settings: None,
+                #[cfg(feature = "grpc_transport")]
+                grpc_settings: None,
             }),
             proxy_settings_type: None,
             proxy_settings_value: None,

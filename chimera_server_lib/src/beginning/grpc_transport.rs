@@ -14,6 +14,7 @@ use http_body_util::{BodyExt, Empty, StreamBody, combinators::UnsyncBoxBody};
 use hyper::{
     Method, Request, Response, StatusCode,
     body::{Frame, Incoming},
+    client::conn::http2,
     header,
     service::service_fn,
 };
@@ -33,7 +34,10 @@ use tracing::{debug, error, info};
 use crate::{
     address::BindLocation,
     async_stream::{AsyncPing, AsyncStream},
-    config::server_config::{GrpcServerConfig, ServerConfig, ServerProxyConfig},
+    config::{
+        def::OutboundGrpcSettings,
+        server_config::{GrpcServerConfig, ServerConfig, ServerProxyConfig},
+    },
     handler::tcp::{
         tcp_handler::TcpServerHandler, tcp_handler_util::create_tcp_server_handler,
     },
@@ -56,6 +60,250 @@ const GRPC_PIPE_CAPACITY: usize = 64 * 1024;
 const MAX_GRPC_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
 type ResponseBody = UnsyncBoxBody<Bytes, Infallible>;
+type ClientRequestBody = UnsyncBoxBody<Bytes, io::Error>;
+
+#[derive(Debug, Clone)]
+pub(crate) struct GrpcClientConfig {
+    authority: String,
+    service_path: String,
+    user_agent: Option<header::HeaderValue>,
+}
+
+impl GrpcClientConfig {
+    pub(crate) fn compile(
+        settings: Option<&OutboundGrpcSettings>,
+        fallback_authority: &str,
+        outbound_tag: &str,
+    ) -> Result<Self, String> {
+        let settings = settings.cloned().unwrap_or_default();
+        if settings.multi_mode {
+            return Err(format!(
+                "outbound {outbound_tag} gRPC multiMode is not supported yet"
+            ));
+        }
+        if settings.idle_timeout != 0
+            || settings.health_check_timeout != 0
+            || settings.permit_without_stream
+        {
+            return Err(format!(
+                "outbound {outbound_tag} gRPC keepalive settings are not supported yet"
+            ));
+        }
+        if settings.initial_windows_size != 0 {
+            return Err(format!(
+                "outbound {outbound_tag} gRPC initialWindowsSize is not supported yet"
+            ));
+        }
+
+        let service_name = settings
+            .service_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("GunService");
+        if service_name.starts_with('/') {
+            return Err(format!(
+                "outbound {outbound_tag} gRPC custom method paths are not supported yet"
+            ));
+        }
+        let service_name = percent_encode_path_segment(service_name);
+        let service_path = format!("/{service_name}/Tun");
+
+        let authority = settings
+            .authority
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(fallback_authority)
+            .to_string();
+        authority
+            .parse::<http::uri::Authority>()
+            .map_err(|error| {
+                format!(
+                    "outbound {outbound_tag} has invalid gRPC authority {authority}: {error}"
+                )
+            })?;
+
+        let user_agent = settings
+            .user_agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(header::HeaderValue::from_str)
+            .transpose()
+            .map_err(|error| {
+                format!(
+                    "outbound {outbound_tag} has invalid gRPC userAgent: {error}"
+                )
+            })?;
+
+        Ok(Self {
+            authority,
+            service_path,
+            user_agent,
+        })
+    }
+
+    pub(crate) async fn connect(
+        &self,
+        stream: Box<dyn AsyncStream>,
+    ) -> io::Result<Box<dyn AsyncStream>> {
+        let (logical_stream, transport_stream) = duplex(GRPC_PIPE_CAPACITY);
+        let (upload_reader, download_writer) = tokio::io::split(transport_stream);
+        let upload_stream =
+            ReaderStream::new(upload_reader).filter_map(|result| async move {
+                match result {
+                    Ok(data) if !data.is_empty() => {
+                        Some(Ok(Frame::data(encode_grpc_hunk(&data))))
+                    }
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            });
+        let body: ClientRequestBody =
+            BodyExt::boxed_unsync(StreamBody::new(upload_stream));
+
+        let (mut sender, connection) = http2::handshake::<_, _, ClientRequestBody>(
+            TokioExecutor::new(),
+            TokioIo::new(stream),
+        )
+        .await
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                format!("outbound gRPC HTTP/2 handshake failed: {error}"),
+            )
+        })?;
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                debug!("outbound gRPC HTTP/2 connection ended: {error}");
+            }
+        });
+
+        let uri = format!("http://{}{}", self.authority, self.service_path);
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/grpc")
+            .header(header::TE, "trailers")
+            .header("grpc-encoding", "identity")
+            .header("grpc-accept-encoding", "identity");
+        if let Some(user_agent) = &self.user_agent {
+            request = request.header(header::USER_AGENT, user_agent);
+        }
+        let request = request.body(body).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("failed to build outbound gRPC request: {error}"),
+            )
+        })?;
+        tokio::spawn(async move {
+            let mut download_writer = download_writer;
+            let result = async {
+                let response =
+                    sender.send_request(request).await.map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            format!("outbound gRPC request failed: {error}"),
+                        )
+                    })?;
+                validate_grpc_response(&response)?;
+                let mut body = response.into_body();
+                decode_response_body(&mut body, &mut download_writer).await
+            }
+            .await;
+            if let Err(error) = result {
+                debug!("outbound gRPC response failed: {error}");
+                let _ = download_writer.shutdown().await;
+            }
+        });
+
+        Ok(Box::new(GrpcLogicalStream(logical_stream)))
+    }
+}
+
+fn percent_encode_path_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+        {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
+fn validate_grpc_response(response: &Response<Incoming>) -> io::Result<()> {
+    if response.status() != StatusCode::OK {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!("outbound gRPC returned HTTP status {}", response.status()),
+        ));
+    }
+    if !response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/grpc"))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "outbound gRPC response has invalid content-type",
+        ));
+    }
+    validate_grpc_status(response.headers())
+}
+
+fn validate_grpc_status(headers: &hyper::HeaderMap) -> io::Result<()> {
+    let Some(status) = headers.get("grpc-status") else {
+        return Ok(());
+    };
+    if status.as_bytes() == b"0" {
+        return Ok(());
+    }
+    let message = headers
+        .get("grpc-message")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown gRPC error");
+    Err(io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        format!(
+            "outbound gRPC status {}: {message}",
+            status.to_str().unwrap_or("invalid")
+        ),
+    ))
+}
+
+async fn decode_response_body(
+    body: &mut Incoming,
+    writer: &mut tokio::io::WriteHalf<DuplexStream>,
+) -> io::Result<()> {
+    let mut buffered = BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|error| {
+            io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+        })?;
+        if let Some(data) = frame.data_ref() {
+            buffered.extend_from_slice(data);
+            while let Some(payload) = decode_grpc_hunk(&mut buffered)? {
+                writer.write_all(&payload).await?;
+            }
+        }
+        if let Some(trailers) = frame.trailers_ref() {
+            validate_grpc_status(trailers)?;
+        }
+    }
+    if !buffered.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated outbound gRPC message",
+        ));
+    }
+    writer.shutdown().await
+}
 
 #[derive(Debug)]
 enum GrpcSecurity {
@@ -530,8 +778,89 @@ impl AsyncStream for GrpcLogicalStream {}
 #[cfg(test)]
 mod tests {
     use bytes::BytesMut;
+    use hyper::server::conn::http2;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
-    use super::{decode_grpc_hunk, encode_grpc_hunk};
+    use super::*;
+
+    #[test]
+    fn client_config_uses_xray_defaults_and_rejects_unsupported_modes() {
+        let config = GrpcClientConfig::compile(None, "proxy.example", "proxy")
+            .expect("default gRPC settings should compile");
+        assert_eq!(config.authority, "proxy.example");
+        assert_eq!(config.service_path, "/GunService/Tun");
+
+        let settings = OutboundGrpcSettings {
+            multi_mode: true,
+            ..OutboundGrpcSettings::default()
+        };
+        assert!(
+            GrpcClientConfig::compile(Some(&settings), "proxy.example", "proxy")
+                .unwrap_err()
+                .contains("multiMode")
+        );
+
+        let settings = OutboundGrpcSettings {
+            service_name: Some("/custom/Tun".into()),
+            ..OutboundGrpcSettings::default()
+        };
+        assert!(
+            GrpcClientConfig::compile(Some(&settings), "proxy.example", "proxy")
+                .unwrap_err()
+                .contains("custom method paths")
+        );
+    }
+
+    #[tokio::test]
+    async fn client_logical_stream_round_trips_through_http2_hunks() {
+        let (client_io, server_io) = duplex(128 * 1024);
+        let server_task = tokio::spawn(async move {
+            let service = service_fn(|request: Request<Incoming>| async move {
+                assert_eq!(request.method(), Method::POST);
+                assert_eq!(request.uri().path(), "/echo-service/Tun");
+                assert_eq!(
+                    request
+                        .headers()
+                        .get(header::USER_AGENT)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("chimera-test")
+                );
+                let (response_stream, echo_stream) = duplex(GRPC_PIPE_CAPACITY);
+                let (reader, _) = tokio::io::split(response_stream);
+                let (_, writer) = tokio::io::split(echo_stream);
+                let mut body = request.into_body();
+                tokio::spawn(async move {
+                    decode_request_body(&mut body, writer).await.unwrap();
+                });
+                Ok::<_, Infallible>(grpc_stream_response(reader))
+            });
+            http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(server_io), service)
+                .await
+                .unwrap();
+        });
+
+        let settings = OutboundGrpcSettings {
+            service_name: Some("echo-service".into()),
+            user_agent: Some("chimera-test".into()),
+            ..OutboundGrpcSettings::default()
+        };
+        let config =
+            GrpcClientConfig::compile(Some(&settings), "proxy.example", "proxy")
+                .unwrap();
+        let mut stream = config
+            .connect(Box::new(GrpcLogicalStream(client_io)))
+            .await
+            .expect("gRPC client should connect");
+        let payload = b"gRPC logical payload";
+        stream.write_all(payload).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut response = vec![0u8; payload.len()];
+        stream.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, payload);
+        stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
 
     #[test]
     fn hunk_round_trip_handles_large_payload() {

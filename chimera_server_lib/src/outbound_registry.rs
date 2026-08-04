@@ -66,7 +66,7 @@ pub(crate) enum OutboundConnectorKind {
     Freedom,
     Blackhole,
     #[cfg(feature = "vless")]
-    VlessTcp(VlessTcpOutboundConfig),
+    VlessTcp(Box<VlessTcpOutboundConfig>),
     Unsupported {
         protocol: Arc<str>,
     },
@@ -189,7 +189,7 @@ impl OutboundConnectorKind {
             "freedom" => Ok(Self::Freedom),
             "blackhole" => Ok(Self::Blackhole),
             #[cfg(feature = "vless")]
-            "vless" => compile_vless_tcp(summary).map(Self::VlessTcp),
+            "vless" => compile_vless_tcp(summary).map(Box::new).map(Self::VlessTcp),
             "" => Err(format!(
                 "outbound {} protocol must not be empty",
                 summary.tag
@@ -309,6 +309,8 @@ mod tests {
                 ws_settings: None,
                 #[cfg(feature = "httpupgrade")]
                 httpupgrade_settings: None,
+                #[cfg(feature = "grpc_transport")]
+                grpc_settings: None,
             }),
             proxy_settings_type: None,
             proxy_settings_value: None,
@@ -383,16 +385,16 @@ mod tests {
             assert!(error.contains(expected), "unexpected error: {error}");
         }
 
-        let mut grpc = literal_vless(serde_json::json!({
+        let mut xhttp = literal_vless(serde_json::json!({
             "address": "127.0.0.1",
             "port": 443,
             "id": id
         }));
-        grpc.stream_settings.as_mut().unwrap().network = "grpc".into();
+        xhttp.stream_settings.as_mut().unwrap().network = "xhttp".into();
         assert!(
-            OutboundConnectorKind::compile(&grpc, true)
+            OutboundConnectorKind::compile(&xhttp, true)
                 .unwrap_err()
-                .contains("unsupported network grpc")
+                .contains("unsupported network xhttp")
         );
 
         let mut reality = literal_vless(serde_json::json!({

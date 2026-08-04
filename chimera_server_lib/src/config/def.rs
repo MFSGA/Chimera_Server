@@ -149,6 +149,31 @@ pub struct OutboundStreamSettings {
     #[cfg(feature = "httpupgrade")]
     #[serde(default, alias = "httpUpgradeSettings")]
     pub httpupgrade_settings: Option<OutboundHttpUpgradeSettings>,
+    #[cfg(feature = "grpc_transport")]
+    #[serde(default, alias = "grpcSettings")]
+    pub grpc_settings: Option<OutboundGrpcSettings>,
+}
+
+#[cfg(feature = "grpc_transport")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OutboundGrpcSettings {
+    #[serde(default)]
+    pub authority: Option<String>,
+    #[serde(default)]
+    pub service_name: Option<String>,
+    #[serde(default)]
+    pub multi_mode: bool,
+    #[serde(default)]
+    pub idle_timeout: u32,
+    #[serde(default)]
+    pub health_check_timeout: u32,
+    #[serde(default)]
+    pub permit_without_stream: bool,
+    #[serde(default)]
+    pub initial_windows_size: u32,
+    #[serde(default)]
+    pub user_agent: Option<String>,
 }
 
 #[cfg(feature = "httpupgrade")]
