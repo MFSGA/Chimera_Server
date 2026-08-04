@@ -25,6 +25,7 @@ use tokio::{
 use crate::user_domain_access::{
     AccessAction, AccessDecision, AccessDecisionReason, EnforcementMode,
     UserDomainAccessConfig, UserDomainAccessPolicy,
+    UserDomainAccessSignatureVerifier,
 };
 use crate::{
     config::server_config::ServerConfig,
@@ -60,6 +61,8 @@ pub struct UserDomainAccessRevisionInfo {
     pub source_backend_version: Option<Arc<str>>,
     pub target_node_uuid: Option<Arc<str>>,
     pub checksum: Option<Arc<str>>,
+    pub signature_algorithm: Option<Arc<str>>,
+    pub signing_key_id: Option<Arc<str>>,
 }
 
 #[cfg(feature = "user_domain_access")]
@@ -176,6 +179,7 @@ struct UserDomainAccessRuntimeState {
     highest_seen_version: u64,
     store_path: Option<PathBuf>,
     expected_target_node_uuid: Option<Uuid>,
+    signature_verifier: UserDomainAccessSignatureVerifier,
 }
 
 #[derive(Debug, Clone)]
@@ -546,6 +550,26 @@ impl RuntimeState {
         Ok(())
     }
 
+    /// Configures node-local trusted signing keys before policy installation.
+    #[cfg(feature = "user_domain_access")]
+    pub fn configure_user_domain_access_signature_verifier(
+        &self,
+        verifier: UserDomainAccessSignatureVerifier,
+    ) -> Result<(), String> {
+        let mut state = self
+            .user_domain_access
+            .write()
+            .expect("runtime user-domain access lock poisoned");
+        if state.current.is_some() || !state.history.is_empty() {
+            return Err(
+                "user-domain access signature verifier must be configured before policy installation"
+                    .into(),
+            );
+        }
+        state.signature_verifier = verifier;
+        Ok(())
+    }
+
     /// Restores persisted replay protection and rollback history before installing the current revision.
     #[cfg(feature = "user_domain_access")]
     pub(crate) fn restore_user_domain_access_persisted_state(
@@ -590,6 +614,10 @@ impl RuntimeState {
                 &info,
                 state.expected_target_node_uuid,
             )?;
+            state
+                .signature_verifier
+                .verify(&config)
+                .map_err(|error| error.to_string())?;
             let policy = Arc::new(
                 UserDomainAccessPolicy::compile(config.clone())
                     .map_err(|error| error.to_string())?,
@@ -613,6 +641,15 @@ impl RuntimeState {
         &self,
         config: UserDomainAccessConfig,
     ) -> Result<UserDomainAccessRevisionInfo, String> {
+        let signature_verifier = self
+            .user_domain_access
+            .read()
+            .expect("runtime user-domain access lock poisoned")
+            .signature_verifier
+            .clone();
+        signature_verifier
+            .verify(&config)
+            .map_err(|error| error.to_string())?;
         let info = revision_info_from_config(&config);
         let policy = Arc::new(
             UserDomainAccessPolicy::compile(config.clone())
@@ -675,9 +712,11 @@ impl RuntimeState {
             .expect("runtime user-domain access lock poisoned");
         let store_path = state.store_path.take();
         let expected_target_node_uuid = state.expected_target_node_uuid.take();
+        let signature_verifier = state.signature_verifier.clone();
         *state = UserDomainAccessRuntimeState::default();
         state.store_path = store_path;
         state.expected_target_node_uuid = expected_target_node_uuid;
+        state.signature_verifier = signature_verifier;
         if let Some(policy) = policy {
             state.current = Some(UserDomainAccessRevision {
                 info: UserDomainAccessRevisionInfo {
@@ -686,6 +725,8 @@ impl RuntimeState {
                     source_backend_version: None,
                     target_node_uuid: None,
                     checksum: None,
+                    signature_algorithm: None,
+                    signing_key_id: None,
                 },
                 policy: Arc::new(policy),
                 config: None,
@@ -1136,6 +1177,10 @@ fn revision_info_from_config(
             .map(Arc::from),
         target_node_uuid: config.target_node_uuid.as_deref().map(Arc::from),
         checksum: config.checksum.as_deref().map(Arc::from),
+        signature_algorithm: config
+            .signature_algorithm
+            .map(|_| Arc::<str>::from("ed25519")),
+        signing_key_id: config.signing_key_id.as_deref().map(Arc::from),
     }
 }
 

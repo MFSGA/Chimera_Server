@@ -8,6 +8,8 @@ message RevisionInfo {
   string target_node_uuid = 3;
   string checksum = 4;
   string source_backend_version = 5;
+  string signature_algorithm = 6;
+  string signing_key_id = 7;
 }
 
 message DecisionStats {

@@ -192,6 +192,8 @@ fn revision_json(revision: &RevisionInfo) -> Value {
         "sourceBackendVersion": revision.source_backend_version,
         "targetNodeUuid": revision.target_node_uuid,
         "checksum": revision.checksum,
+        "signatureAlgorithm": revision.signature_algorithm,
+        "signingKeyId": revision.signing_key_id,
     })
 }
 
@@ -273,6 +275,10 @@ struct RevisionInfo {
     checksum: String,
     #[prost(string, tag = "5")]
     source_backend_version: String,
+    #[prost(string, tag = "6")]
+    signature_algorithm: String,
+    #[prost(string, tag = "7")]
+    signing_key_id: String,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -388,9 +394,13 @@ mod tests {
             target_node_uuid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
             checksum: "sha256:test".into(),
             source_backend_version: "backend-42".into(),
+            signature_algorithm: "ed25519".into(),
+            signing_key_id: "release-key".into(),
         };
         let value = revision_json(&revision);
         assert_eq!(value["version"], 7);
         assert_eq!(value["sourceBackendVersion"], "backend-42");
+        assert_eq!(value["signatureAlgorithm"], "ed25519");
+        assert_eq!(value["signingKeyId"], "release-key");
     }
 }

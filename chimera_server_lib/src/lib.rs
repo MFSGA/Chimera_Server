@@ -143,6 +143,22 @@ fn resolve_user_domain_access_store_path(
 }
 
 #[cfg(feature = "user_domain_access")]
+fn build_user_domain_access_signature_verifier(
+    store: Option<&config::def::UserDomainAccessStoreConfig>,
+) -> Result<user_domain_access::UserDomainAccessSignatureVerifier, Error> {
+    let require_signature = store.is_some_and(|store| store.require_signature);
+    let keys = store
+        .into_iter()
+        .flat_map(|store| store.trusted_signing_keys.iter())
+        .map(|key| (key.key_id.clone(), key.public_key.clone()));
+    user_domain_access::UserDomainAccessSignatureVerifier::from_base64_keys(
+        require_signature,
+        keys,
+    )
+    .map_err(|error| Error::InvalidConfig(error.to_string()))
+}
+
+#[cfg(feature = "user_domain_access")]
 #[derive(Debug)]
 struct InitialUserDomainAccess {
     config: Option<user_domain_access::UserDomainAccessConfig>,
@@ -242,6 +258,11 @@ pub fn prepare_server_runtime(
         .as_ref()
         .and_then(|store| store.node_uuid.clone());
     #[cfg(feature = "user_domain_access")]
+    let user_domain_access_signature_verifier =
+        build_user_domain_access_signature_verifier(
+            config.user_domain_access_store.as_ref(),
+        )?;
+    #[cfg(feature = "user_domain_access")]
     let user_domain_access_store = resolve_user_domain_access_store_path(
         config.user_domain_access_store.as_ref(),
         cwd,
@@ -253,6 +274,12 @@ pub fn prepare_server_runtime(
     )?;
     let inbounds = prepare_server_inbounds(config, cwd, log_file)?;
     let runtime_state = RuntimeState::new(inbounds.clone(), Vec::new());
+    #[cfg(feature = "user_domain_access")]
+    runtime_state
+        .configure_user_domain_access_signature_verifier(
+            user_domain_access_signature_verifier,
+        )
+        .map_err(Error::InvalidConfig)?;
     #[cfg(feature = "user_domain_access")]
     if let Some(path) = user_domain_access_store {
         runtime_state
@@ -475,6 +502,11 @@ pub fn validate(opts: Options) -> Result<(), Error> {
             store_path.as_deref(),
         )?;
         let validation_state = RuntimeState::new(Vec::new(), Vec::new());
+        validation_state
+            .configure_user_domain_access_signature_verifier(
+                build_user_domain_access_signature_verifier(store_config)?,
+            )
+            .map_err(Error::InvalidConfig)?;
         if let Some(node_uuid) =
             store_config.and_then(|store| store.node_uuid.as_deref())
         {
@@ -565,6 +597,11 @@ async fn start_async(
         .as_ref()
         .and_then(|store| store.node_uuid.clone());
     #[cfg(feature = "user_domain_access")]
+    let user_domain_access_signature_verifier =
+        build_user_domain_access_signature_verifier(
+            config.user_domain_access_store.as_ref(),
+        )?;
+    #[cfg(feature = "user_domain_access")]
     let user_domain_access_store = resolve_user_domain_access_store_path(
         config.user_domain_access_store.as_ref(),
         cwd,
@@ -592,6 +629,12 @@ async fn start_async(
         .collect::<Result<Vec<_>, _>>()?;
 
     let runtime_state = RuntimeState::new(all_inbounds.clone(), outbounds);
+    #[cfg(feature = "user_domain_access")]
+    runtime_state
+        .configure_user_domain_access_signature_verifier(
+            user_domain_access_signature_verifier,
+        )
+        .map_err(Error::InvalidConfig)?;
     #[cfg(feature = "user_domain_access")]
     if let Some(path) = user_domain_access_store {
         runtime_state

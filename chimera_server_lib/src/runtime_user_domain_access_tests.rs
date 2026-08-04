@@ -6,11 +6,15 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+
 use crate::{
     RuntimeState,
     user_domain_access::{
-        AccessAction, AccessTarget, EnforcementMode, UserDomainAccessConfig,
-        user_domain_access_checksum,
+        AccessAction, AccessTarget, EnforcementMode, PolicySignatureAlgorithm,
+        UserDomainAccessConfig, UserDomainAccessSignatureVerifier,
+        user_domain_access_checksum, user_domain_access_signature_payload,
     },
 };
 
@@ -52,6 +56,25 @@ fn config(version: u64, domain: &str) -> UserDomainAccessConfig {
     config
 }
 
+fn signed_config(
+    key_pair: &Ed25519KeyPair,
+    version: u64,
+    domain: &str,
+) -> UserDomainAccessConfig {
+    let mut config = config(version, domain);
+    config.signature_algorithm = Some(PolicySignatureAlgorithm::Ed25519);
+    config.signing_key_id = Some("release-key".into());
+    config.signature = None;
+    config.checksum = Some(
+        user_domain_access_checksum(&config)
+            .expect("signed revision checksum should compute"),
+    );
+    let payload = user_domain_access_signature_payload(&config)
+        .expect("signed revision payload should compute");
+    config.signature = Some(STANDARD.encode(key_pair.sign(&payload).as_ref()));
+    config
+}
+
 fn decision(runtime: &RuntimeState, domain: &str) -> AccessAction {
     let policy = runtime
         .user_domain_access()
@@ -61,6 +84,56 @@ fn decision(runtime: &RuntimeState, domain: &str) -> AccessAction {
         .expect("valid user UUID");
     let target = AccessTarget::classify(Some(domain)).expect("valid domain");
     policy.decide(user, &target).action
+}
+
+#[test]
+fn required_signatures_are_verified_before_runtime_replacement() {
+    let key_pair = Ed25519KeyPair::generate().expect("generate Ed25519 key");
+    let verifier = UserDomainAccessSignatureVerifier::from_base64_keys(
+        true,
+        [(
+            "release-key".into(),
+            STANDARD.encode(key_pair.public_key().as_ref()),
+        )],
+    )
+    .expect("signature verifier should configure");
+    let runtime = RuntimeState::new(Vec::new(), Vec::new());
+    runtime
+        .configure_user_domain_access_signature_verifier(verifier)
+        .expect("signature verifier should install");
+
+    let error = runtime
+        .install_user_domain_access(config(1, "unsigned.example"))
+        .expect_err("unsigned revision must be rejected");
+    assert!(error.contains("signature is required"));
+    assert!(runtime.user_domain_access_revision().is_none());
+
+    let signed = signed_config(&key_pair, 1, "signed.example");
+    let revision = runtime
+        .install_user_domain_access(signed.clone())
+        .expect("valid signed revision should install");
+    assert_eq!(revision.signing_key_id.as_deref(), Some("release-key"));
+    assert_eq!(revision.signature_algorithm.as_deref(), Some("ed25519"));
+
+    let mut tampered = signed;
+    tampered.version = 2;
+    tampered.users[0].rules[0].domain = "tampered.example".into();
+    tampered.checksum = Some(
+        user_domain_access_checksum(&tampered)
+            .expect("tampered checksum should recompute"),
+    );
+    let error = runtime
+        .install_user_domain_access(tampered)
+        .expect_err("stale signature must reject tampered revision");
+    assert!(error.contains("signature verification failed"));
+    assert_eq!(
+        runtime
+            .user_domain_access_revision()
+            .expect("signed revision should remain active")
+            .version,
+        1
+    );
+    assert_eq!(decision(&runtime, "signed.example"), AccessAction::Allow);
 }
 
 #[test]

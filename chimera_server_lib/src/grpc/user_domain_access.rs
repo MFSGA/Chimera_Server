@@ -135,6 +135,8 @@ impl proto::chimera::app::userdomain::command::user_domain_access_service_server
 fn map_install_error(error: String) -> Status {
     if error.contains("not newer than highest installed version") {
         Status::failed_precondition(error)
+    } else if error.contains("signature") || error.contains("signing key") {
+        Status::permission_denied(error)
     } else {
         Status::invalid_argument(error)
     }
@@ -158,6 +160,16 @@ fn revision_to_proto(
         checksum: revision.checksum.as_deref().unwrap_or_default().to_string(),
         source_backend_version: revision
             .source_backend_version
+            .as_deref()
+            .unwrap_or_default()
+            .to_string(),
+        signature_algorithm: revision
+            .signature_algorithm
+            .as_deref()
+            .unwrap_or_default()
+            .to_string(),
+        signing_key_id: revision
+            .signing_key_id
             .as_deref()
             .unwrap_or_default()
             .to_string(),
@@ -213,9 +225,14 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
     use super::proto::chimera::app::userdomain::command::user_domain_access_service_server::UserDomainAccessService;
     use super::*;
-    use crate::user_domain_access::user_domain_access_checksum;
+    use crate::user_domain_access::{
+        UserDomainAccessSignatureVerifier, user_domain_access_checksum,
+    };
 
     fn temporary_store_path() -> std::path::PathBuf {
         let nonce = SystemTime::now()
@@ -402,6 +419,45 @@ mod tests {
         assert_eq!(replay.code(), tonic::Code::FailedPrecondition);
 
         fs::remove_file(store).expect("temporary store should be removed");
+    }
+
+    #[tokio::test]
+    async fn unsigned_apply_is_permission_denied_when_signatures_are_required() {
+        let key_pair = Ed25519KeyPair::generate().expect("generate Ed25519 key");
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        runtime
+            .configure_user_domain_access_signature_verifier(
+                UserDomainAccessSignatureVerifier::from_base64_keys(
+                    true,
+                    [(
+                        "release-key".into(),
+                        STANDARD.encode(key_pair.public_key().as_ref()),
+                    )],
+                )
+                .expect("signature verifier should configure"),
+            )
+            .expect("signature verifier should install");
+        let service = UserDomainAccessServiceImpl::new(runtime);
+
+        let error = service
+            .apply_policy(Request::new(
+                proto::chimera::app::userdomain::command::ApplyPolicyRequest {
+                    json_config: json(1, "unsigned.example"),
+                },
+            ))
+            .await
+            .expect_err("unsigned policy must be denied");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+
+        let status = service
+            .get_policy_status(Request::new(
+                proto::chimera::app::userdomain::command::GetPolicyStatusRequest {},
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(status.revision.is_none());
+        assert_eq!(status.stats.expect("stats missing").apply_failed, 1);
     }
 
     #[tokio::test]

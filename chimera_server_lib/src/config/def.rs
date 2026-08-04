@@ -133,6 +133,18 @@ pub struct UserDomainAccessStoreConfig {
     pub path: String,
     #[serde(default)]
     pub node_uuid: Option<String>,
+    #[serde(default)]
+    pub require_signature: bool,
+    #[serde(default)]
+    pub trusted_signing_keys: Vec<UserDomainAccessSigningKeyConfig>,
+}
+
+#[cfg(feature = "user_domain_access")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UserDomainAccessSigningKeyConfig {
+    pub key_id: String,
+    pub public_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

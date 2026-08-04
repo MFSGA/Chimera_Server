@@ -7,7 +7,11 @@ use std::{
     sync::Arc,
 };
 
-use aws_lc_rs::digest::{SHA224, SHA256, digest};
+use aws_lc_rs::{
+    digest::{SHA224, SHA256, digest},
+    signature::{ED25519, UnparsedPublicKey},
+};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -68,6 +72,13 @@ pub enum EnforcementMode {
     Disabled,
 }
 
+/// Supported publication signature algorithm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicySignatureAlgorithm {
+    Ed25519,
+}
+
 /// Default behavior for a user's policy when no domain rule matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -99,6 +110,12 @@ pub struct UserDomainAccessConfig {
     pub target_node_uuid: Option<String>,
     #[serde(default)]
     pub checksum: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_algorithm: Option<PolicySignatureAlgorithm>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
     #[serde(default)]
     pub default_action: AccessAction,
     #[serde(default, skip_serializing_if = "enforcement_mode_is_enforce")]
@@ -109,6 +126,119 @@ pub struct UserDomainAccessConfig {
 
 fn enforcement_mode_is_enforce(value: &EnforcementMode) -> bool {
     *value == EnforcementMode::Enforce
+}
+
+/// Node-local trusted signing keys used to authenticate policy publications.
+#[derive(Clone, Default)]
+pub struct UserDomainAccessSignatureVerifier {
+    require_signature: bool,
+    trusted_keys: HashMap<Arc<str>, [u8; 32]>,
+}
+
+impl fmt::Debug for UserDomainAccessSignatureVerifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UserDomainAccessSignatureVerifier")
+            .field("require_signature", &self.require_signature)
+            .field("trusted_key_count", &self.trusted_keys.len())
+            .finish()
+    }
+}
+
+impl UserDomainAccessSignatureVerifier {
+    /// Builds a verifier from node-local base64-encoded raw Ed25519 public keys.
+    pub fn from_base64_keys<I>(
+        require_signature: bool,
+        keys: I,
+    ) -> Result<Self, AccessPolicyError>
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        let mut trusted_keys = HashMap::new();
+        for (key_id, public_key) in keys {
+            let key_id = key_id.trim();
+            if key_id.is_empty() || key_id.len() > 128 {
+                return Err(AccessPolicyError::InvalidTrustedSigningKey {
+                    key_id: key_id.to_string(),
+                    reason: "key ID must contain 1 to 128 bytes".into(),
+                });
+            }
+            let decoded = STANDARD.decode(public_key.trim()).map_err(|error| {
+                AccessPolicyError::InvalidTrustedSigningKey {
+                    key_id: key_id.to_string(),
+                    reason: format!("public key is not valid base64: {error}"),
+                }
+            })?;
+            let public_key: [u8; 32] =
+                decoded.try_into().map_err(|decoded: Vec<u8>| {
+                    AccessPolicyError::InvalidTrustedSigningKey {
+                        key_id: key_id.to_string(),
+                        reason: format!(
+                            "Ed25519 public key must contain 32 bytes, got {}",
+                            decoded.len()
+                        ),
+                    }
+                })?;
+            if trusted_keys
+                .insert(Arc::<str>::from(key_id), public_key)
+                .is_some()
+            {
+                return Err(AccessPolicyError::DuplicateTrustedSigningKey(
+                    key_id.to_string(),
+                ));
+            }
+        }
+        if require_signature && trusted_keys.is_empty() {
+            return Err(AccessPolicyError::InvalidTrustedSigningKey {
+                key_id: String::new(),
+                reason: "requireSignature needs at least one trusted signing key"
+                    .into(),
+            });
+        }
+        Ok(Self {
+            require_signature,
+            trusted_keys,
+        })
+    }
+
+    /// Verifies publication integrity and authenticity before policy compilation.
+    pub fn verify(
+        &self,
+        config: &UserDomainAccessConfig,
+    ) -> Result<(), AccessPolicyError> {
+        validate_signature_metadata(config)?;
+        let Some(signature) = config.signature.as_deref() else {
+            if self.require_signature {
+                return Err(AccessPolicyError::SignatureRequired);
+            }
+            return Ok(());
+        };
+        let key_id = config.signing_key_id.as_deref().ok_or_else(|| {
+            AccessPolicyError::InvalidSignatureMetadata(
+                "signed policy is missing signingKeyId".into(),
+            )
+        })?;
+        let public_key = self.trusted_keys.get(key_id).ok_or_else(|| {
+            AccessPolicyError::UnknownSigningKey(key_id.to_string())
+        })?;
+        let signature = STANDARD.decode(signature.trim()).map_err(|error| {
+            AccessPolicyError::InvalidPolicySignature(format!(
+                "signature is not valid base64: {error}"
+            ))
+        })?;
+        if signature.len() != 64 {
+            return Err(AccessPolicyError::InvalidPolicySignature(format!(
+                "Ed25519 signature must contain 64 bytes, got {}",
+                signature.len()
+            )));
+        }
+        let payload = user_domain_access_signature_payload(config)?;
+        UnparsedPublicKey::new(&ED25519, public_key)
+            .verify(&payload, &signature)
+            .map_err(|_| AccessPolicyError::SignatureVerificationFailed {
+                key_id: key_id.to_string(),
+            })
+    }
 }
 
 /// Literal configuration for one backend user.
@@ -804,6 +934,7 @@ fn validate_publication_metadata(
             }
         })?;
     }
+    validate_signature_metadata(config)?;
     if let Some(actual) = config.checksum.as_deref() {
         let expected = user_domain_access_checksum(config)?;
         if !actual.eq_ignore_ascii_case(&expected) {
@@ -816,6 +947,37 @@ fn validate_publication_metadata(
     Ok(())
 }
 
+fn validate_signature_metadata(
+    config: &UserDomainAccessConfig,
+) -> Result<(), AccessPolicyError> {
+    match (
+        config.signature_algorithm,
+        config.signing_key_id.as_deref(),
+        config.signature.as_deref(),
+    ) {
+        (None, None, None) => Ok(()),
+        (Some(_), Some(key_id), Some(signature)) => {
+            let key_id = key_id.trim();
+            if key_id.is_empty() || key_id.len() > 128 {
+                return Err(AccessPolicyError::InvalidSignatureMetadata(
+                    "signingKeyId must contain 1 to 128 bytes".into(),
+                ));
+            }
+            let signature = signature.trim();
+            if signature.is_empty() || signature.len() > 256 {
+                return Err(AccessPolicyError::InvalidSignatureMetadata(
+                    "signature must contain 1 to 256 bytes".into(),
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(AccessPolicyError::InvalidSignatureMetadata(
+            "signatureAlgorithm, signingKeyId and signature must be supplied together"
+                .into(),
+        )),
+    }
+}
+
 /// Computes the canonical SHA-256 checksum used by policy publications.
 pub fn user_domain_access_checksum(
     config: &UserDomainAccessConfig,
@@ -825,11 +987,27 @@ pub fn user_domain_access_checksum(
     })?;
     if let serde_json::Value::Object(object) = &mut value {
         object.remove("checksum");
+        object.remove("signature");
     }
     let mut canonical = Vec::new();
     write_canonical_json(&value, &mut canonical)?;
     let checksum = digest(&SHA256, &canonical);
     Ok(format!("sha256:{}", encode_lower_hex(checksum.as_ref())))
+}
+
+/// Returns the canonical bytes authenticated by the publication signature.
+pub fn user_domain_access_signature_payload(
+    config: &UserDomainAccessConfig,
+) -> Result<Vec<u8>, AccessPolicyError> {
+    let mut value = serde_json::to_value(config).map_err(|error| {
+        AccessPolicyError::ChecksumSerialization(error.to_string())
+    })?;
+    if let serde_json::Value::Object(object) = &mut value {
+        object.remove("signature");
+    }
+    let mut canonical = Vec::new();
+    write_canonical_json(&value, &mut canonical)?;
+    Ok(canonical)
 }
 
 fn write_canonical_json(
@@ -1006,6 +1184,20 @@ pub enum AccessPolicyError {
         "user-domain access checksum mismatch: expected {expected}, got {actual}"
     )]
     ChecksumMismatch { expected: String, actual: String },
+    #[error("invalid policy signature metadata: {0}")]
+    InvalidSignatureMetadata(String),
+    #[error("policy signature is required by node configuration")]
+    SignatureRequired,
+    #[error("unknown policy signing key {0}")]
+    UnknownSigningKey(String),
+    #[error("invalid policy signature: {0}")]
+    InvalidPolicySignature(String),
+    #[error("policy signature verification failed for key {key_id}")]
+    SignatureVerificationFailed { key_id: String },
+    #[error("invalid trusted signing key {key_id}: {reason}")]
+    InvalidTrustedSigningKey { key_id: String, reason: String },
+    #[error("duplicate trusted signing key ID {0}")]
+    DuplicateTrustedSigningKey(String),
     #[error("Hysteria2 protocol identity password must not be empty")]
     InvalidHysteria2Identity,
     #[error(
@@ -1057,6 +1249,8 @@ pub enum AccessPolicyError {
 
 #[cfg(test)]
 mod tests {
+    use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
+
     use super::*;
 
     const USER_A: &str = "11111111-1111-4111-8111-111111111111";
@@ -1612,6 +1806,79 @@ mod tests {
         assert!(matches!(
             UserDomainAccessPolicy::compile(config),
             Err(AccessPolicyError::ChecksumMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn ed25519_signatures_authenticate_policy_publications() {
+        let key_pair = Ed25519KeyPair::generate().expect("generate Ed25519 key");
+        let public_key = STANDARD.encode(key_pair.public_key().as_ref());
+        let verifier = UserDomainAccessSignatureVerifier::from_base64_keys(
+            true,
+            [("release-key".into(), public_key)],
+        )
+        .expect("trusted signing key should parse");
+        let mut config =
+            serde_json::from_value::<UserDomainAccessConfig>(serde_json::json!({
+                "version": 10,
+                "signatureAlgorithm": "ed25519",
+                "signingKeyId": "release-key",
+                "defaultAction": "reject",
+                "users": [{
+                    "userUuid": USER_A,
+                    "mode": "allowlist",
+                    "unknownTargetAction": "reject",
+                    "rules": [{
+                        "domain": "signed.example",
+                        "match": "exact",
+                        "action": "allow"
+                    }]
+                }]
+            }))
+            .expect("signed config should parse");
+        config.checksum = Some(
+            user_domain_access_checksum(&config)
+                .expect("signed checksum should compute"),
+        );
+        let payload = user_domain_access_signature_payload(&config)
+            .expect("signature payload should compute");
+        config.signature = Some(STANDARD.encode(key_pair.sign(&payload).as_ref()));
+
+        verifier
+            .verify(&config)
+            .expect("valid signature should verify");
+        UserDomainAccessPolicy::compile(config.clone())
+            .expect("valid signed policy should compile");
+
+        let mut tampered = config.clone();
+        tampered.users[0].rules[0].domain = "tampered.example".into();
+        assert!(matches!(
+            verifier.verify(&tampered),
+            Err(AccessPolicyError::SignatureVerificationFailed { .. })
+        ));
+
+        let unknown_key = UserDomainAccessSignatureVerifier::from_base64_keys(
+            true,
+            [(
+                "other-key".into(),
+                STANDARD.encode(key_pair.public_key().as_ref()),
+            )],
+        )
+        .expect("alternate verifier should parse");
+        assert!(matches!(
+            unknown_key.verify(&config),
+            Err(AccessPolicyError::UnknownSigningKey(key)) if key == "release-key"
+        ));
+
+        let unsigned =
+            serde_json::from_value::<UserDomainAccessConfig>(serde_json::json!({
+                "defaultAction": "allow",
+                "users": []
+            }))
+            .unwrap();
+        assert!(matches!(
+            verifier.verify(&unsigned),
+            Err(AccessPolicyError::SignatureRequired)
         ));
     }
 
