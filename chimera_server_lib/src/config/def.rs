@@ -121,9 +121,23 @@ impl InboudItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OutboundItem {
     pub protocol: String,
     pub tag: String,
+    #[serde(default)]
+    pub settings: Option<serde_json::Value>,
+    #[serde(default)]
+    pub stream_settings: Option<OutboundStreamSettings>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutboundStreamSettings {
+    #[serde(default)]
+    pub network: String,
+    #[serde(default)]
+    pub security: Option<String>,
 }
 
 #[cfg(feature = "user_domain_access")]

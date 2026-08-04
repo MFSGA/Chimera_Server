@@ -29,6 +29,7 @@ use tracing::{debug, warn};
 use crate::user_domain_access::hysteria2_password_identity;
 use crate::{
     address::NetLocation,
+    async_stream::AsyncStream,
     config::server_config::{Hysteria2Client, Hysteria2ServerConfig},
     outbound::{
         DirectOutboundAction, connect_tcp_outbound, connection_routing_input,
@@ -400,7 +401,7 @@ impl TcpRequest {
 async fn proxy_tcp(
     send: quinn::SendStream,
     recv: quinn::RecvStream,
-    tcp_stream: tokio::net::TcpStream,
+    tcp_stream: Box<dyn AsyncStream>,
     context: TrafficContext,
 ) -> std::io::Result<()> {
     let _connection_guard = register_connection(Some(&context));

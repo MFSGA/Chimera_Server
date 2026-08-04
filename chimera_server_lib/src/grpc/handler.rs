@@ -8,8 +8,6 @@ use crate::config::server_config::RealityTransportConfig;
 use crate::config::server_config::TlsServerConfig;
 #[cfg(feature = "trojan")]
 use crate::config::server_config::TrojanUser;
-#[cfg(feature = "vless")]
-use crate::config::server_config::VlessUser;
 #[cfg(feature = "ws")]
 use crate::config::server_config::ws::WebsocketServerConfig;
 #[cfg(feature = "tls")]
@@ -27,6 +25,11 @@ use crate::{
         },
     },
     runtime::{OutboundSummary, RuntimeState},
+};
+#[cfg(feature = "vless")]
+use crate::{
+    config::{def::OutboundStreamSettings, server_config::VlessUser},
+    outbound_registry::OutboundConnectorKind,
 };
 use prost::Message;
 
@@ -61,6 +64,11 @@ const TYPE_PROXY_VLESS_INBOUND_CONFIG_V2RAY: &str =
 const TYPE_PROXY_VLESS_ACCOUNT: &str = "xray.proxy.vless.Account";
 #[cfg(feature = "vless")]
 const TYPE_PROXY_VLESS_ACCOUNT_V2RAY: &str = "v2ray.core.proxy.vless.Account";
+#[cfg(feature = "vless")]
+const TYPE_PROXY_VLESS_OUTBOUND_CONFIG: &str = "xray.proxy.vless.outbound.Config";
+#[cfg(feature = "vless")]
+const TYPE_PROXY_VLESS_OUTBOUND_CONFIG_V2RAY: &str =
+    "v2ray.core.proxy.vless.outbound.Config";
 #[cfg(feature = "trojan")]
 const TYPE_PROXY_TROJAN_SERVER_CONFIG: &str = "xray.proxy.trojan.ServerConfig";
 #[cfg(feature = "trojan")]
@@ -218,6 +226,26 @@ struct VlessAccountPayload {
     id: String,
     #[prost(string, tag = "2")]
     flow: String,
+    #[prost(string, tag = "3")]
+    encryption: String,
+}
+
+#[cfg(feature = "vless")]
+#[derive(Clone, PartialEq, Message)]
+struct VlessOutboundConfigPayload {
+    #[prost(message, optional, tag = "1")]
+    vnext: Option<VlessServerEndpointPayload>,
+}
+
+#[cfg(feature = "vless")]
+#[derive(Clone, PartialEq, Message)]
+struct VlessServerEndpointPayload {
+    #[prost(message, optional, tag = "1")]
+    address: Option<IpOrDomainPayload>,
+    #[prost(uint32, tag = "2")]
+    port: u32,
+    #[prost(message, optional, tag = "3")]
+    user: Option<proto::xray::common::protocol::User>,
 }
 
 #[cfg(feature = "vless")]
@@ -1024,6 +1052,8 @@ impl HandlerServiceImpl {
         let proxy_settings = outbound.proxy_settings.as_ref().ok_or_else(|| {
             Status::invalid_argument("outbound.proxy_settings is required")
         })?;
+        let mut literal_settings = None;
+        let mut stream_settings = None;
         let protocol = match Self::parse_typed_message_type(proxy_settings) {
             TYPE_PROXY_FREEDOM_CONFIG | TYPE_PROXY_FREEDOM_CONFIG_V2RAY => {
                 let _ = self.decode_typed_message::<FreedomConfigPayload>(
@@ -1044,6 +1074,72 @@ impl HandlerServiceImpl {
                 )?;
                 "blackhole"
             }
+            #[cfg(feature = "vless")]
+            TYPE_PROXY_VLESS_OUTBOUND_CONFIG
+            | TYPE_PROXY_VLESS_OUTBOUND_CONFIG_V2RAY => {
+                if outbound.sender_settings.is_some() {
+                    return Err(Status::invalid_argument(
+                        "plain VLESS outbound does not accept sender_settings yet",
+                    ));
+                }
+                let config = self
+                    .decode_typed_message::<VlessOutboundConfigPayload>(
+                        proxy_settings,
+                        &[
+                            TYPE_PROXY_VLESS_OUTBOUND_CONFIG,
+                            TYPE_PROXY_VLESS_OUTBOUND_CONFIG_V2RAY,
+                        ],
+                        "outbound proxy settings",
+                    )?;
+                let vnext = config.vnext.ok_or_else(|| {
+                    Status::invalid_argument("VLESS outbound vnext is required")
+                })?;
+                if vnext.address.is_none() {
+                    return Err(Status::invalid_argument(
+                        "VLESS outbound server address is required",
+                    ));
+                }
+                let address = self.parse_address(vnext.address)?;
+                let port = u16::try_from(vnext.port).map_err(|_| {
+                    Status::invalid_argument(
+                        "VLESS outbound server port must fit in u16",
+                    )
+                })?;
+                if port == 0 {
+                    return Err(Status::invalid_argument(
+                        "VLESS outbound server port must not be zero",
+                    ));
+                }
+                let user = vnext.user.ok_or_else(|| {
+                    Status::invalid_argument("VLESS outbound user is required")
+                })?;
+                let account = user.account.as_ref().ok_or_else(|| {
+                    Status::invalid_argument(
+                        "VLESS outbound user account is required",
+                    )
+                })?;
+                let account = self.decode_typed_message::<VlessAccountPayload>(
+                    account,
+                    &[TYPE_PROXY_VLESS_ACCOUNT, TYPE_PROXY_VLESS_ACCOUNT_V2RAY],
+                    "VLESS outbound account",
+                )?;
+                literal_settings = Some(serde_json::json!({
+                    "vnext": [{
+                        "address": address.to_string(),
+                        "port": port,
+                        "users": [{
+                            "id": account.id,
+                            "flow": account.flow,
+                            "encryption": account.encryption
+                        }]
+                    }]
+                }));
+                stream_settings = Some(OutboundStreamSettings {
+                    network: "tcp".into(),
+                    security: Some("none".into()),
+                });
+                "vless"
+            }
             unsupported => {
                 return Err(Status::invalid_argument(format!(
                     "unsupported outbound proxy settings type: {unsupported}"
@@ -1053,6 +1149,8 @@ impl HandlerServiceImpl {
         Ok(OutboundSummary {
             tag: outbound.tag,
             protocol: protocol.to_string(),
+            settings: literal_settings,
+            stream_settings,
             proxy_settings_type: Some(proxy_settings.r#type.clone()),
             proxy_settings_value: Some(proxy_settings.value.clone()),
         })
@@ -1126,6 +1224,7 @@ impl HandlerServiceImpl {
                             VlessAccountPayload {
                                 id: user.user_id.clone(),
                                 flow: user.flow.clone(),
+                                encryption: String::new(),
                             },
                         )),
                     })
@@ -1374,6 +1473,42 @@ impl HandlerServiceImpl {
                     TYPE_PROXY_BLACKHOLE_CONFIG,
                     BlackholeConfigPayload {},
                 )),
+                #[cfg(feature = "vless")]
+                "vless" => self.runtime.outbound_connector(&outbound.tag).and_then(
+                    |connector| match connector.as_ref() {
+                        OutboundConnectorKind::VlessTcp(config) => {
+                            Some(Self::typed_message(
+                                TYPE_PROXY_VLESS_OUTBOUND_CONFIG,
+                                VlessOutboundConfigPayload {
+                                    vnext: Some(VlessServerEndpointPayload {
+                                        address: Self::encode_address(
+                                            config.server.address(),
+                                        ),
+                                        port: u32::from(config.server.port()),
+                                        user: Some(
+                                            proto::xray::common::protocol::User {
+                                                level: 0,
+                                                email: String::new(),
+                                                account: Some(Self::typed_message(
+                                                    TYPE_PROXY_VLESS_ACCOUNT,
+                                                    VlessAccountPayload {
+                                                        id: uuid::Uuid::from_bytes(
+                                                            config.user_uuid,
+                                                        )
+                                                        .to_string(),
+                                                        flow: String::new(),
+                                                        encryption: "none".into(),
+                                                    },
+                                                )),
+                                            },
+                                        ),
+                                    }),
+                                },
+                            ))
+                        }
+                        _ => None,
+                    },
+                ),
                 _ => None,
             },
         };
@@ -1859,6 +1994,7 @@ impl HandlerServiceImpl {
                             value: VlessAccountPayload {
                                 id: user.user_id.clone(),
                                 flow: user.flow.clone(),
+                                encryption: String::new(),
                             }
                             .encode_to_vec(),
                         }),
@@ -2206,9 +2342,13 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
             .outbound
             .ok_or_else(|| Status::invalid_argument("outbound is required"))?;
         let outbound = self.parse_add_outbound(outbound)?;
-        self.runtime
-            .add_outbound(outbound)
-            .map_err(Status::already_exists)?;
+        self.runtime.add_outbound(outbound).map_err(|error| {
+            if error.contains("already exists") {
+                Status::already_exists(error)
+            } else {
+                Status::invalid_argument(error)
+            }
+        })?;
         Ok(Response::new(
             proto::xray::app::proxyman::command::AddOutboundResponse {},
         ))
@@ -2346,6 +2486,8 @@ mod tests {
         let outbound = OutboundSummary {
             tag: outbound_tag.clone(),
             protocol: "freedom".to_string(),
+            settings: None,
+            stream_settings: None,
             proxy_settings_type: None,
             proxy_settings_value: None,
         };
@@ -2428,6 +2570,43 @@ mod tests {
             tag,
             TYPE_PROXY_FREEDOM_CONFIG,
             FreedomConfigPayload {}.encode_to_vec(),
+        )
+    }
+
+    #[cfg(feature = "vless")]
+    fn build_add_vless_outbound_request(
+        tag: &str,
+        user_id: &str,
+        flow: &str,
+    ) -> proto::xray::app::proxyman::command::AddOutboundRequest {
+        let account = proto::xray::common::protocol::User {
+            level: 0,
+            email: "outbound@example.com".into(),
+            account: Some(proto::xray::common::serial::TypedMessage {
+                r#type: TYPE_PROXY_VLESS_ACCOUNT.into(),
+                value: VlessAccountPayload {
+                    id: user_id.into(),
+                    flow: flow.into(),
+                    encryption: "none".into(),
+                }
+                .encode_to_vec(),
+            }),
+        };
+        build_typed_add_outbound_request(
+            tag,
+            TYPE_PROXY_VLESS_OUTBOUND_CONFIG,
+            VlessOutboundConfigPayload {
+                vnext: Some(VlessServerEndpointPayload {
+                    address: Some(IpOrDomainPayload {
+                        address: Some(ip_or_domain_payload::Address::Domain(
+                            "proxy.example".into(),
+                        )),
+                    }),
+                    port: 443,
+                    user: Some(account),
+                }),
+            }
+            .encode_to_vec(),
         )
     }
 
@@ -2611,6 +2790,7 @@ mod tests {
                     value: VlessAccountPayload {
                         id: "9199ca5b-1850-4ae6-a4fa-fd6384073692".to_string(),
                         flow: String::new(),
+                        encryption: String::new(),
                     }
                     .encode_to_vec(),
                 }),
@@ -2768,7 +2948,7 @@ mod tests {
         let error = service
             .add_outbound(Request::new(build_typed_add_outbound_request(
                 &unsupported_tag,
-                "xray.proxy.vless.outbound.Config",
+                "xray.proxy.vmess.outbound.Config",
                 Vec::new(),
             )))
             .await
@@ -2781,6 +2961,100 @@ mod tests {
         );
         assert_eq!(runtime.outbounds().len(), before.len());
         assert!(runtime.outbound_connector(&unsupported_tag).is_none());
+    }
+
+    #[cfg(feature = "vless")]
+    #[tokio::test]
+    async fn handler_installs_plain_vless_and_rejects_unsupported_variants_atomically()
+     {
+        let fixture = build_fixture();
+        let runtime = fixture.runtime.clone();
+        let service = HandlerServiceImpl::new(runtime.clone());
+        let user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
+        let tag = unique_tag("vless-outbound");
+
+        service
+            .add_outbound(Request::new(build_add_vless_outbound_request(
+                &tag, user_id, "",
+            )))
+            .await
+            .expect("plain VLESS outbound should install");
+        let connector = runtime
+            .outbound_connector(&tag)
+            .expect("VLESS connector should be registered");
+        let OutboundConnectorKind::VlessTcp(config) = connector.as_ref() else {
+            panic!("expected a VLESS TCP connector");
+        };
+        assert_eq!(config.server.to_string(), "proxy.example:443");
+        assert_eq!(
+            config.user_uuid,
+            uuid::Uuid::parse_str(user_id).unwrap().into_bytes()
+        );
+        let listed = service
+            .list_outbounds(Request::new(
+                proto::xray::app::proxyman::command::ListOutboundsRequest {},
+            ))
+            .await
+            .expect("VLESS outbound should be listable")
+            .into_inner();
+        let listed = listed
+            .outbounds
+            .iter()
+            .find(|outbound| outbound.tag == tag)
+            .expect("listed VLESS outbound missing");
+        let proxy_settings = listed
+            .proxy_settings
+            .as_ref()
+            .expect("listed VLESS proxy settings missing");
+        assert_eq!(proxy_settings.r#type, TYPE_PROXY_VLESS_OUTBOUND_CONFIG);
+        let listed_config =
+            VlessOutboundConfigPayload::decode(proxy_settings.value.as_slice())
+                .expect("listed VLESS config should decode");
+        let listed_account = listed_config
+            .vnext
+            .and_then(|server| server.user)
+            .and_then(|user| user.account)
+            .expect("listed VLESS account missing");
+        let listed_account =
+            VlessAccountPayload::decode(listed_account.value.as_slice())
+                .expect("listed VLESS account should decode");
+        assert_eq!(listed_account.id, user_id);
+        assert_eq!(listed_account.encryption, "none");
+
+        let before = runtime.outbounds().len();
+        let invalid_flow_tag = unique_tag("vless-flow");
+        let invalid_flow = service
+            .add_outbound(Request::new(build_add_vless_outbound_request(
+                &invalid_flow_tag,
+                user_id,
+                "xtls-rprx-vision",
+            )))
+            .await
+            .expect_err("Vision is outside the plain VLESS outbound slice");
+        assert_eq!(invalid_flow.code(), Code::InvalidArgument);
+        assert!(invalid_flow.message().contains("does not support flow"));
+        assert_eq!(runtime.outbounds().len(), before);
+        assert!(runtime.outbound_connector(&invalid_flow_tag).is_none());
+
+        let sender_tag = unique_tag("vless-sender");
+        let mut request = build_add_vless_outbound_request(&sender_tag, user_id, "");
+        request.outbound.as_mut().unwrap().sender_settings =
+            Some(proto::xray::common::serial::TypedMessage {
+                r#type: "xray.app.proxyman.SenderConfig".into(),
+                value: Vec::new(),
+            });
+        let sender_error = service
+            .add_outbound(Request::new(request))
+            .await
+            .expect_err("sender settings must fail until transport pipeline exists");
+        assert_eq!(sender_error.code(), Code::InvalidArgument);
+        assert!(
+            sender_error
+                .message()
+                .contains("does not accept sender_settings")
+        );
+        assert_eq!(runtime.outbounds().len(), before);
+        assert!(runtime.outbound_connector(&sender_tag).is_none());
     }
 
     #[tokio::test]
@@ -2957,6 +3231,7 @@ mod tests {
                 value: VlessAccountPayload {
                     id: "5df5643d-4e28-4399-bb9e-22014a2d3246".to_string(),
                     flow: String::new(),
+                    encryption: String::new(),
                 }
                 .encode_to_vec(),
             }),
@@ -3048,6 +3323,7 @@ mod tests {
                 value: VlessAccountPayload {
                     id: "5df5643d-4e28-4399-bb9e-22014a2d3246".to_string(),
                     flow: String::new(),
+                    encryption: String::new(),
                 }
                 .encode_to_vec(),
             }),
@@ -3148,6 +3424,7 @@ mod tests {
                 value: VlessAccountPayload {
                     id: "5df5643d-4e28-4399-bb9e-22014a2d3246".to_string(),
                     flow: String::new(),
+                    encryption: String::new(),
                 }
                 .encode_to_vec(),
             }),
@@ -3442,6 +3719,7 @@ mod tests {
                     value: VlessAccountPayload {
                         id: "9199ca5b-1850-4ae6-a4fa-fd6384073692".to_string(),
                         flow: String::new(),
+                        encryption: String::new(),
                     }
                     .encode_to_vec(),
                 }),
@@ -3609,6 +3887,7 @@ mod tests {
                     value: VlessAccountPayload {
                         id: user_id.clone(),
                         flow: String::new(),
+                        encryption: String::new(),
                     }
                     .encode_to_vec(),
                 }),

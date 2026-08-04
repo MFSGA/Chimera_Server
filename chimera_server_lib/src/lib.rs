@@ -36,6 +36,8 @@ mod mcp;
 
 mod outbound;
 mod outbound_registry;
+#[cfg(feature = "vless")]
+mod vless_outbound;
 
 mod runtime;
 #[cfg(all(test, feature = "user_domain_access"))]
@@ -260,6 +262,8 @@ fn compile_outbound_summaries(
         .map(|item| OutboundSummary {
             tag: item.tag.clone(),
             protocol: item.protocol.clone(),
+            settings: item.settings.clone(),
+            stream_settings: item.stream_settings.clone(),
             proxy_settings_type: None,
             proxy_settings_value: None,
         })
@@ -918,10 +922,14 @@ mod tests {
             OutboundItem {
                 protocol: " Freedom ".into(),
                 tag: " direct ".into(),
+                settings: None,
+                stream_settings: None,
             },
             OutboundItem {
                 protocol: "blackhole".into(),
                 tag: "blocked".into(),
+                settings: None,
+                stream_settings: None,
             },
         ])
         .expect("supported static outbounds should compile");
@@ -941,22 +949,24 @@ mod tests {
         let unsupported = compile_outbound_summaries(&[OutboundItem {
             protocol: "vless".into(),
             tag: "proxy".into(),
+            settings: None,
+            stream_settings: None,
         }])
         .expect_err("unsupported static outbound must fail closed");
-        assert!(
-            unsupported
-                .to_string()
-                .contains("unsupported protocol vless")
-        );
+        assert!(unsupported.to_string().contains("requires settings"));
 
         let duplicate = compile_outbound_summaries(&[
             OutboundItem {
                 protocol: "freedom".into(),
                 tag: "same".into(),
+                settings: None,
+                stream_settings: None,
             },
             OutboundItem {
                 protocol: "blackhole".into(),
                 tag: "same".into(),
+                settings: None,
+                stream_settings: None,
             },
         ])
         .expect_err("duplicate static outbound tags must fail closed");

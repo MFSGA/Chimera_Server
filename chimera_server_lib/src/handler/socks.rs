@@ -934,6 +934,8 @@ mod tests {
             vec![OutboundSummary {
                 tag: outbound_tag.into(),
                 protocol: "freedom".into(),
+                settings: None,
+                stream_settings: None,
                 proxy_settings_type: None,
                 proxy_settings_value: None,
             }],

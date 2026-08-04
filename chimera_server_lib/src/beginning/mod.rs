@@ -989,12 +989,7 @@ async fn setup_routed_client_stream(
     )
     .await
     .map(|connection| {
-        connection.map(|connection| {
-            (
-                Box::new(connection.stream) as Box<dyn AsyncStream>,
-                connection.outbound_tag,
-            )
-        })
+        connection.map(|connection| (connection.stream, connection.outbound_tag))
     })
 }
 

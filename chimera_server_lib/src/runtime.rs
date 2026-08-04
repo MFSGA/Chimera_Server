@@ -42,6 +42,8 @@ use crate::{
 pub struct OutboundSummary {
     pub tag: String,
     pub protocol: String,
+    pub settings: Option<serde_json::Value>,
+    pub stream_settings: Option<crate::config::def::OutboundStreamSettings>,
     pub proxy_settings_type: Option<String>,
     pub proxy_settings_value: Option<Vec<u8>>,
 }

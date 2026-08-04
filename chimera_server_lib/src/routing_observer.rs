@@ -589,6 +589,8 @@ mod tests {
         OutboundSummary {
             tag: tag.into(),
             protocol: protocol.into(),
+            settings: None,
+            stream_settings: None,
             proxy_settings_type: None,
             proxy_settings_value: None,
         }

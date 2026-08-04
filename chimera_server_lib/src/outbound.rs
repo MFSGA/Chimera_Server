@@ -4,10 +4,14 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+use tokio::io::AsyncWriteExt;
 use tracing::warn;
 
+#[cfg(feature = "vless")]
+use crate::vless_outbound::{VlessTcpOutboundStream, encode_vless_tcp_request};
 use crate::{
     address::{Address, NetLocation},
+    async_stream::AsyncStream,
     outbound_registry::OutboundConnectorKind,
     resolver::{Resolver, resolve_single_address},
     routing_process::enrich_routing_input,
@@ -23,7 +27,7 @@ pub(crate) enum DirectOutboundAction {
 }
 
 pub(crate) struct TcpOutboundConnection {
-    pub stream: tokio::net::TcpStream,
+    pub stream: Box<dyn AsyncStream>,
     pub outbound_tag: Option<String>,
 }
 
@@ -48,45 +52,55 @@ pub(crate) async fn connect_tcp_outbound(
         enrich_routing_input(&mut route_input).await;
     }
 
-    let outbound_tag = match select_direct_outbound(runtime, &route_input, "tcp")? {
-        DirectOutboundAction::Freedom { tag } => tag,
-        DirectOutboundAction::Blackhole { .. } => return Ok(None),
+    let selected = select_outbound_connector(runtime, &route_input)?;
+    let (outbound_tag, connector) = match selected {
+        Some((tag, connector)) => (Some(tag), Some(connector)),
+        None => (None, None),
     };
 
-    let tcp_socket = new_tcp_socket(None, target_addr.is_ipv6())?;
+    let (connect_location, vless_request) = match connector.as_deref() {
+        None | Some(OutboundConnectorKind::Freedom) => {
+            (remote_location.clone(), None)
+        }
+        Some(OutboundConnectorKind::Blackhole) => return Ok(None),
+        #[cfg(feature = "vless")]
+        Some(OutboundConnectorKind::VlessTcp(config)) => (
+            config.server.clone(),
+            Some(encode_vless_tcp_request(
+                &config.user_uuid,
+                remote_location,
+            )?),
+        ),
+        Some(OutboundConnectorKind::Unsupported { protocol }) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "tcp outbound {} uses unsupported protocol {}",
+                    outbound_tag.as_deref().unwrap_or("<implicit>"),
+                    protocol
+                ),
+            ));
+        }
+    };
+    let connect_addr = if vless_request.is_some() {
+        resolve_single_address(resolver, &connect_location).await?
+    } else {
+        target_addr
+    };
+
+    let tcp_socket = new_tcp_socket(None, connect_addr.is_ipv6())?;
     let started = Instant::now();
     let attempted_at = unix_time_secs();
-    let stream = match tcp_socket.connect(target_addr).await {
-        Ok(stream) => {
-            if let Some(tag) = outbound_tag.as_deref() {
-                runtime.record_outbound_observation(
-                    tag,
-                    OutboundObservation {
-                        alive: true,
-                        delay_ms: started.elapsed().as_millis().min(i64::MAX as u128)
-                            as i64,
-                        last_seen_time: attempted_at,
-                        last_try_time: attempted_at,
-                        ..OutboundObservation::default()
-                    },
-                );
-            }
-            stream
-        }
+    let mut stream = match tcp_socket.connect(connect_addr).await {
+        Ok(stream) => stream,
         Err(error) => {
-            if let Some(tag) = outbound_tag.as_deref() {
-                runtime.record_outbound_observation(
-                    tag,
-                    OutboundObservation {
-                        alive: false,
-                        delay_ms: started.elapsed().as_millis().min(i64::MAX as u128)
-                            as i64,
-                        last_error_reason: error.to_string(),
-                        last_try_time: attempted_at,
-                        ..OutboundObservation::default()
-                    },
-                );
-            }
+            record_tcp_outbound_failure(
+                runtime,
+                outbound_tag.as_deref(),
+                started,
+                attempted_at,
+                &error,
+            );
             return Err(error);
         }
     };
@@ -94,6 +108,38 @@ pub(crate) async fn connect_tcp_outbound(
         warn!("Failed to set TCP no-delay on client socket: {}", err);
     }
 
+    let stream: Box<dyn AsyncStream> = if let Some(request) = vless_request {
+        if let Err(error) = stream.write_all(&request).await {
+            record_tcp_outbound_failure(
+                runtime,
+                outbound_tag.as_deref(),
+                started,
+                attempted_at,
+                &error,
+            );
+            return Err(error);
+        }
+        #[cfg(feature = "vless")]
+        {
+            Box::new(VlessTcpOutboundStream::new(Box::new(stream)))
+        }
+        #[cfg(not(feature = "vless"))]
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "VLESS outbound feature is disabled",
+            ));
+        }
+    } else {
+        Box::new(stream)
+    };
+
+    record_tcp_outbound_success(
+        runtime,
+        outbound_tag.as_deref(),
+        started,
+        attempted_at,
+    );
     Ok(Some(TcpOutboundConnection {
         stream,
         outbound_tag,
@@ -124,42 +170,98 @@ pub(crate) fn connection_routing_input(
     }
 }
 
-pub(crate) fn select_direct_outbound(
+fn select_outbound_connector(
     runtime: &RuntimeState,
     input: &RoutingInput,
-    network_name: &str,
-) -> std::io::Result<DirectOutboundAction> {
+) -> std::io::Result<Option<(String, Arc<OutboundConnectorKind>)>> {
     let Some(outbound) =
         runtime.select_outbound_checked(input).map_err(|error| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
         })?
     else {
-        return Ok(DirectOutboundAction::Freedom { tag: None });
+        return Ok(None);
     };
     let connector = runtime.outbound_connector(&outbound.tag).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "{} outbound {} is missing from the runtime registry",
-                network_name, outbound.tag
+                "routed outbound {} is missing from the runtime registry",
+                outbound.tag
             ),
         )
     })?;
+    Ok(Some((outbound.tag, connector)))
+}
+
+pub(crate) fn select_direct_outbound(
+    runtime: &RuntimeState,
+    input: &RoutingInput,
+    network_name: &str,
+) -> std::io::Result<DirectOutboundAction> {
+    let Some((tag, connector)) = select_outbound_connector(runtime, input)? else {
+        return Ok(DirectOutboundAction::Freedom { tag: None });
+    };
 
     match connector.as_ref() {
-        OutboundConnectorKind::Freedom => Ok(DirectOutboundAction::Freedom {
-            tag: Some(outbound.tag),
-        }),
-        OutboundConnectorKind::Blackhole => {
-            Ok(DirectOutboundAction::Blackhole { tag: outbound.tag })
+        OutboundConnectorKind::Freedom => {
+            Ok(DirectOutboundAction::Freedom { tag: Some(tag) })
         }
+        OutboundConnectorKind::Blackhole => {
+            Ok(DirectOutboundAction::Blackhole { tag })
+        }
+        #[cfg(feature = "vless")]
+        OutboundConnectorKind::VlessTcp(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{network_name} outbound {tag} does not support UDP yet"),
+        )),
         OutboundConnectorKind::Unsupported { protocol } => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
                 "{} outbound {} uses unsupported protocol {}",
-                network_name, outbound.tag, protocol
+                network_name, tag, protocol
             ),
         )),
+    }
+}
+
+fn record_tcp_outbound_success(
+    runtime: &RuntimeState,
+    outbound_tag: Option<&str>,
+    started: Instant,
+    attempted_at: i64,
+) {
+    if let Some(tag) = outbound_tag {
+        runtime.record_outbound_observation(
+            tag,
+            OutboundObservation {
+                alive: true,
+                delay_ms: started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+                last_seen_time: attempted_at,
+                last_try_time: attempted_at,
+                ..OutboundObservation::default()
+            },
+        );
+    }
+}
+
+fn record_tcp_outbound_failure(
+    runtime: &RuntimeState,
+    outbound_tag: Option<&str>,
+    started: Instant,
+    attempted_at: i64,
+    error: &std::io::Error,
+) {
+    if let Some(tag) = outbound_tag {
+        runtime.record_outbound_observation(
+            tag,
+            OutboundObservation {
+                alive: false,
+                delay_ms: started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+                last_error_reason: error.to_string(),
+                last_try_time: attempted_at,
+                ..OutboundObservation::default()
+            },
+        );
     }
 }
 
@@ -180,21 +282,155 @@ fn encode_ip(ip: IpAddr) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use std::{future::Future, io, pin::Pin};
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
     use super::*;
     use crate::{
-        config::rule::{BalancerConfig, RoutingConfig, RuleConfig},
+        config::{
+            def::OutboundStreamSettings,
+            rule::{BalancerConfig, RoutingConfig, RuleConfig},
+        },
         resolver::NativeResolver,
         routing_state::RoutingState,
         runtime::OutboundSummary,
     };
 
+    struct FixedResolver;
+
+    impl Resolver for FixedResolver {
+        fn resolve_location(
+            &self,
+            location: &NetLocation,
+        ) -> Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send>>
+        {
+            let result = match location.address() {
+                Address::Ipv4(address) => {
+                    SocketAddr::new(IpAddr::V4(*address), location.port())
+                }
+                Address::Ipv6(address) => {
+                    SocketAddr::new(IpAddr::V6(*address), location.port())
+                }
+                Address::Hostname(_) => SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 9)),
+                    location.port(),
+                ),
+            };
+            Box::pin(async move { Ok(vec![result]) })
+        }
+    }
+
     fn outbound(tag: &str, protocol: &str) -> OutboundSummary {
         OutboundSummary {
             tag: tag.into(),
             protocol: protocol.into(),
+            settings: None,
+            stream_settings: None,
             proxy_settings_type: None,
             proxy_settings_value: None,
         }
+    }
+
+    #[cfg(feature = "vless")]
+    fn vless_outbound(
+        tag: &str,
+        server: SocketAddr,
+        user_id: &str,
+    ) -> OutboundSummary {
+        OutboundSummary {
+            tag: tag.into(),
+            protocol: "vless".into(),
+            settings: Some(serde_json::json!({
+                "vnext": [{
+                    "address": server.ip().to_string(),
+                    "port": server.port(),
+                    "users": [{
+                        "id": user_id,
+                        "flow": "",
+                        "encryption": "none"
+                    }]
+                }]
+            })),
+            stream_settings: Some(OutboundStreamSettings {
+                network: "tcp".into(),
+                security: Some("none".into()),
+            }),
+            proxy_settings_type: None,
+            proxy_settings_value: None,
+        }
+    }
+
+    #[cfg(feature = "vless")]
+    #[tokio::test]
+    async fn vless_plain_tcp_outbound_preserves_target_and_relays_payload() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
+        let expected_uuid = uuid::Uuid::parse_str(user_id).unwrap().into_bytes();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut prefix = [0u8; 19];
+            stream.read_exact(&mut prefix).await.unwrap();
+            assert_eq!(prefix[0], 0);
+            assert_eq!(&prefix[1..17], &expected_uuid);
+            assert_eq!(prefix[17], 0);
+            assert_eq!(prefix[18], 1);
+
+            let port = stream.read_u16().await.unwrap();
+            assert_eq!(port, 443);
+            assert_eq!(stream.read_u8().await.unwrap(), 2);
+            let domain_length = stream.read_u8().await.unwrap();
+            let mut domain = vec![0u8; usize::from(domain_length)];
+            stream.read_exact(&mut domain).await.unwrap();
+            assert_eq!(&domain, b"target.example");
+
+            let mut payload = [0u8; 4];
+            stream.read_exact(&mut payload).await.unwrap();
+            assert_eq!(&payload, b"ping");
+            stream.write_all(&[0, 0]).await.unwrap();
+            stream.write_all(b"pong").await.unwrap();
+        });
+
+        let runtime = RuntimeState::try_new(
+            Vec::new(),
+            vec![vless_outbound("proxy", server_addr, user_id)],
+        )
+        .expect("VLESS outbound should compile");
+        runtime.replace_routing(
+            RoutingState::from_config(Some(&RoutingConfig {
+                rules: vec![RuleConfig {
+                    inbound_tag: vec!["test".into()],
+                    outbound_tag: Some("proxy".into()),
+                    ..RuleConfig::default()
+                }],
+                ..RoutingConfig::default()
+            }))
+            .unwrap(),
+        );
+        let resolver: Arc<dyn Resolver> = Arc::new(FixedResolver);
+        let target =
+            NetLocation::new(Address::Hostname("target.example".into()), 443);
+        let mut connection = connect_tcp_outbound(
+            &resolver,
+            &target,
+            &runtime,
+            "test",
+            "user",
+            "198.51.100.7:12345".parse().unwrap(),
+        )
+        .await
+        .expect("VLESS connection should succeed")
+        .expect("VLESS outbound must not be blackholed");
+        assert_eq!(connection.outbound_tag.as_deref(), Some("proxy"));
+        connection.stream.write_all(b"ping").await.unwrap();
+        let mut response = [0u8; 4];
+        connection.stream.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"pong");
+        server.await.unwrap();
     }
 
     #[test]

@@ -886,6 +886,8 @@ mod tests {
                 .map(|tag| OutboundSummary {
                     tag: (*tag).to_string(),
                     protocol: "freedom".to_string(),
+                    settings: None,
+                    stream_settings: None,
                     proxy_settings_type: None,
                     proxy_settings_value: None,
                 })

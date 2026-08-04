@@ -118,6 +118,8 @@ async fn start_test_connection() -> (
         vec![OutboundSummary {
             tag: TEST_OUTBOUND.into(),
             protocol: "freedom".into(),
+            settings: None,
+            stream_settings: None,
             proxy_settings_type: None,
             proxy_settings_value: None,
         }],
