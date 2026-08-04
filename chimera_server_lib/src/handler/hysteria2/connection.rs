@@ -25,6 +25,8 @@ use tokio::{
 };
 use tracing::{debug, warn};
 
+#[cfg(feature = "user_domain_access")]
+use crate::user_domain_access::hysteria2_password_identity;
 use crate::{
     address::NetLocation,
     config::server_config::{Hysteria2Client, Hysteria2ServerConfig},
@@ -35,8 +37,8 @@ use crate::{
     resolver::{Resolver, resolve_single_address},
     runtime::RuntimeState,
     traffic::{
-        ConnectionGuard, MeteredStream, TrafficContext, TrafficDirection,
-        record_transfer, register_connection,
+        AccessTransport, ConnectionGuard, MeteredStream, TrafficContext,
+        TrafficDirection, record_transfer, register_connection,
     },
 };
 
@@ -51,6 +53,40 @@ const MAX_ADDRESS_LEN: usize = 1024;
 const PADDING_SCRATCH_LEN: usize = 1024;
 const TCP_SUCCESS_STATUS: u8 = 0x00;
 const TCP_ERROR_STATUS: u8 = 0x01;
+
+fn hysteria2_routing_identity(client: &Hysteria2Client) -> String {
+    client
+        .email
+        .clone()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            #[cfg(feature = "user_domain_access")]
+            {
+                hysteria2_password_identity(&client.password)
+            }
+            #[cfg(not(feature = "user_domain_access"))]
+            {
+                client.password.clone()
+            }
+        })
+}
+
+fn hysteria2_traffic_context(
+    client: &Hysteria2Client,
+    inbound_tag: &str,
+    peer_addr: SocketAddr,
+) -> TrafficContext {
+    let mut context = TrafficContext::new("hysteria2")
+        .with_identity(hysteria2_routing_identity(client))
+        .with_inbound_tag(inbound_tag.to_string())
+        .with_client_ip(peer_addr.ip());
+    #[cfg(feature = "user_domain_access")]
+    {
+        context = context
+            .with_protocol_identity(hysteria2_password_identity(&client.password));
+    }
+    context
+}
 
 #[derive(Clone)]
 struct AuthContext {
@@ -92,7 +128,7 @@ pub async fn process_hysteria2_connection(
     // are raw QUIC bidi streams and would otherwise race with h3_conn.accept().
     let _h3_conn = h3_conn;
 
-    let proxy_result = if auth_ctx.udp_enabled {
+    if auth_ctx.udp_enabled {
         tokio::try_join!(
             drive_tcp_streams(
                 connection.clone(),
@@ -123,9 +159,7 @@ pub async fn process_hysteria2_connection(
             drain_unidirectional_streams(connection),
         )
         .map(|_| ())
-    };
-
-    proxy_result
+    }
 }
 
 async fn auth_hysteria2_connection(
@@ -264,13 +298,37 @@ async fn handle_tcp_stream(
     runtime: RuntimeState,
 ) -> std::io::Result<()> {
     let request = TcpRequest::read(&mut recv).await?;
-    let context_identity = client.email.clone().unwrap_or(client.password.clone());
+    let mut context =
+        hysteria2_traffic_context(&client, inbound_tag.as_str(), peer_addr)
+            .with_access_target(
+                request.target.address().to_string(),
+                request.target.port(),
+                AccessTransport::Quic,
+            );
+    #[cfg(feature = "user_domain_access")]
+    match crate::beginning::enforce_user_domain_access(
+        &runtime,
+        Some(&context),
+        &request.target,
+    ) {
+        Ok(Some(user_uuid)) => {
+            context.set_user_uuid(user_uuid.to_string());
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let _ = send_tcp_response(&mut send, TCP_ERROR_STATUS, "access denied")
+                .await;
+            let _ = send.finish();
+            return Err(error);
+        }
+    }
+
     let connection = match connect_tcp_outbound(
         &resolver,
         &request.target,
         &runtime,
         inbound_tag.as_str(),
-        &context_identity,
+        context.routing_identity().unwrap_or_default(),
         peer_addr,
     )
     .await
@@ -291,10 +349,6 @@ async fn handle_tcp_stream(
 
     send_tcp_response(&mut send, TCP_SUCCESS_STATUS, "").await?;
 
-    let mut context = TrafficContext::new("hysteria2")
-        .with_identity(context_identity)
-        .with_inbound_tag((*inbound_tag).clone())
-        .with_client_ip(peer_addr.ip());
     if let Some(tag) = connection.outbound_tag {
         context = context.with_outbound_tag(tag);
     }
@@ -617,15 +671,8 @@ async fn drive_udp_datagrams(
 ) -> std::io::Result<()> {
     let mut sessions: HashMap<u32, UdpSession> = HashMap::new();
     let peer_addr = connection.remote_address();
-    let identity = auth_ctx
-        .client
-        .email
-        .clone()
-        .unwrap_or(auth_ctx.client.password.clone());
-    let base_context = TrafficContext::new("hysteria2")
-        .with_identity(identity.clone())
-        .with_inbound_tag((*inbound_tag).clone())
-        .with_client_ip(peer_addr.ip());
+    let base_context =
+        hysteria2_traffic_context(&auth_ctx.client, inbound_tag.as_str(), peer_addr);
 
     loop {
         let data = match connection.read_datagram().await {
@@ -687,6 +734,31 @@ async fn drive_udp_datagrams(
             }
         };
 
+        let mut packet_context = base_context.clone().with_access_target(
+            remote_location.address().to_string(),
+            remote_location.port(),
+            AccessTransport::Quic,
+        );
+        #[cfg(feature = "user_domain_access")]
+        match crate::beginning::enforce_user_domain_access(
+            &runtime,
+            Some(&packet_context),
+            &remote_location,
+        ) {
+            Ok(Some(user_uuid)) => {
+                packet_context.set_user_uuid(user_uuid.to_string());
+            }
+            Ok(None) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                debug!(
+                    "Hysteria2 UDP target {} rejected by user-domain access policy",
+                    remote_location
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+
         let session = match sessions.entry(session_id) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
@@ -695,7 +767,7 @@ async fn drive_udp_datagrams(
                     remote_location.clone(),
                     resolver.clone(),
                     connection.clone(),
-                    base_context.clone(),
+                    packet_context.clone(),
                 )
                 .await?;
                 entry.insert(session)
@@ -786,14 +858,14 @@ async fn drive_udp_datagrams(
 
         let route_input = connection_routing_input(
             inbound_tag.as_str(),
-            &identity,
+            packet_context.routing_identity().unwrap_or_default(),
             3,
             peer_addr,
             session.last_socket_addr,
             &session.last_location,
         );
         let action = select_direct_outbound(&runtime, &route_input, "udp")?;
-        let mut traffic_context = session.base_context.clone();
+        let mut traffic_context = packet_context;
 
         match action {
             DirectOutboundAction::Blackhole { tag } => {
@@ -1078,4 +1150,43 @@ fn push_varint(buf: &mut Vec<u8>, value: u64) -> std::io::Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn password_only_context_does_not_expose_plaintext() {
+        let client = Hysteria2Client {
+            password: "super-secret".into(),
+            email: None,
+        };
+        let context = hysteria2_traffic_context(
+            &client,
+            "hysteria-test",
+            "127.0.0.1:12345".parse().unwrap(),
+        );
+        let expected = hysteria2_password_identity(&client.password);
+        assert_eq!(context.identity.as_deref(), Some(expected.as_str()));
+        assert_eq!(context.protocol_identity(), Some(expected.as_str()));
+        assert!(!expected.contains(&client.password));
+        assert_eq!(context.inbound_tag.as_deref(), Some("hysteria-test"));
+    }
+
+    #[test]
+    fn email_is_display_identity_but_password_hash_is_policy_identity() {
+        let client = Hysteria2Client {
+            password: "super-secret".into(),
+            email: Some("user@example.com".into()),
+        };
+        let context = hysteria2_traffic_context(
+            &client,
+            "hysteria-test",
+            "127.0.0.1:12345".parse().unwrap(),
+        );
+        let expected = hysteria2_password_identity(&client.password);
+        assert_eq!(context.identity.as_deref(), Some("user@example.com"));
+        assert_eq!(context.protocol_identity(), Some(expected.as_str()));
+    }
 }

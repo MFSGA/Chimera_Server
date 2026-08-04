@@ -28,8 +28,8 @@ use crate::{
     resolver::{NativeResolver, Resolver, resolve_single_address},
     runtime::RuntimeState,
     traffic::{
-        ConnectionGuard, MeteredStream, TrafficContext, TrafficDirection,
-        record_transfer, register_connection,
+        AccessTransport, ConnectionGuard, MeteredStream, TrafficContext,
+        TrafficDirection, record_transfer, register_connection,
     },
     util::{allocate_vec, socket::new_socket2_udp_socket_with_buffer_size},
 };
@@ -81,6 +81,7 @@ impl TuicFlowContext {
     fn traffic_context(&self) -> TrafficContext {
         TrafficContext::new("tuic")
             .with_identity((*self.connection.identity).clone())
+            .with_protocol_identity((*self.connection.identity).clone())
             .with_inbound_tag((*self.connection.inbound_tag).clone())
             .with_client_ip(self.peer_addr.ip())
     }
@@ -441,6 +442,25 @@ async fn process_tcp_stream(
         std::io::Error::new(std::io::ErrorKind::InvalidData, "empty address")
     })?;
 
+    let mut traffic_context = context.traffic_context().with_access_target(
+        remote_location.address().to_string(),
+        remote_location.port(),
+        AccessTransport::Quic,
+    );
+    #[cfg(feature = "user_domain_access")]
+    match crate::beginning::enforce_user_domain_access(
+        &context.connection.runtime,
+        Some(&traffic_context),
+        &remote_location,
+    ) {
+        Ok(Some(user_uuid)) => {
+            traffic_context.set_user_uuid(user_uuid.to_string());
+        }
+        Ok(None) => {}
+        Err(error) => return Err(error),
+    }
+
+    let routing_identity = traffic_context.routing_identity().unwrap_or_default();
     let connect_future = timeout(
         Duration::from_secs(60),
         connect_tcp_outbound(
@@ -448,7 +468,7 @@ async fn process_tcp_stream(
             &remote_location,
             &context.connection.runtime,
             context.connection.inbound_tag.as_str(),
-            context.connection.identity.as_str(),
+            routing_identity,
             context.peer_addr,
         ),
     );
@@ -470,20 +490,19 @@ async fn process_tcp_stream(
         }
     };
 
-    let mut context = context.traffic_context();
     if let Some(tag) = connection.outbound_tag {
-        context = context.with_outbound_tag(tag);
+        traffic_context = traffic_context.with_outbound_tag(tag);
     }
-    let _connection_guard = register_connection(Some(&context));
+    let _connection_guard = register_connection(Some(&traffic_context));
 
     let mut server_stream = MeteredStream::new(
         QuicStream::from((send, recv)),
-        Some(context.clone()),
+        Some(traffic_context.clone()),
         TrafficDirection::Upload,
     );
     let mut client_stream = MeteredStream::new(
         connection.stream,
-        Some(context),
+        Some(traffic_context),
         TrafficDirection::Download,
     );
     let copy_result =
@@ -1240,11 +1259,37 @@ async fn process_udp_packet(
         (remote_location, complete_payload.freeze())
     };
 
+    let mut traffic_context = session.base_context.clone().with_access_target(
+        remote_location.address().to_string(),
+        remote_location.port(),
+        AccessTransport::Quic,
+    );
+    #[cfg(feature = "user_domain_access")]
+    match crate::beginning::enforce_user_domain_access(
+        &context.connection.runtime,
+        Some(&traffic_context),
+        &remote_location,
+    ) {
+        Ok(Some(user_uuid)) => {
+            traffic_context.set_user_uuid(user_uuid.to_string());
+        }
+        Ok(None) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            debug!(
+                "TUIC UDP target {} rejected by user-domain access policy",
+                remote_location
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    }
+
     let (socket_addr, is_updated) =
         session.resolve_address(&remote_location, resolver).await?;
     let keep_session = forward_udp_payload(
         &session,
         context,
+        traffic_context,
         assoc_id,
         &remote_location,
         socket_addr,
@@ -1270,6 +1315,7 @@ async fn process_udp_packet(
 async fn forward_udp_payload(
     session: &UdpSession,
     context: &TuicFlowContext,
+    mut traffic_context: TrafficContext,
     assoc_id: u16,
     remote_location: &NetLocation,
     socket_addr: SocketAddr,
@@ -1277,7 +1323,7 @@ async fn forward_udp_payload(
 ) -> std::io::Result<bool> {
     let route_input = connection_routing_input(
         context.connection.inbound_tag.as_str(),
-        context.connection.identity.as_str(),
+        traffic_context.routing_identity().unwrap_or_default(),
         3,
         context.peer_addr,
         socket_addr,
@@ -1285,7 +1331,6 @@ async fn forward_udp_payload(
     );
     let action =
         select_direct_outbound(&context.connection.runtime, &route_input, "udp")?;
-    let mut traffic_context = session.base_context.clone();
 
     match action {
         DirectOutboundAction::Blackhole { tag } => {
@@ -1628,6 +1673,11 @@ mod tests {
             forward_udp_payload(
                 &session,
                 &context,
+                context.traffic_context().with_access_target(
+                    location.address().to_string(),
+                    location.port(),
+                    AccessTransport::Quic,
+                ),
                 7,
                 &location,
                 target_addr,

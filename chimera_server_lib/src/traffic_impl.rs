@@ -2,16 +2,19 @@ use std::{
     collections::HashMap,
     net::IpAddr,
     sync::{
-        OnceLock, RwLock,
+        Arc, OnceLock, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::SystemTime,
 };
 
+use super::{AccessContext, AccessIdentity, AccessTransport};
+
 #[derive(Debug, Clone)]
 pub struct TrafficContext {
     pub protocol: &'static str,
     pub identity: Option<String>,
+    pub access_context: Option<Arc<AccessContext>>,
     pub inbound_tag: Option<String>,
     pub outbound_tag: Option<String>,
     pub client_ip: Option<IpAddr>,
@@ -22,6 +25,7 @@ impl TrafficContext {
         Self {
             protocol,
             identity: None,
+            access_context: None,
             inbound_tag: None,
             outbound_tag: None,
             client_ip: None,
@@ -31,6 +35,93 @@ impl TrafficContext {
     pub fn with_identity(mut self, identity: impl Into<String>) -> Self {
         self.identity = Some(identity.into());
         self
+    }
+
+    fn access_context_mut(&mut self) -> &mut AccessContext {
+        if self.access_context.is_none() {
+            self.access_context = Some(Arc::new(AccessContext::default()));
+        }
+        Arc::make_mut(
+            self.access_context
+                .as_mut()
+                .expect("access context initialized"),
+        )
+    }
+
+    pub fn access_context(&self) -> Option<&AccessContext> {
+        self.access_context.as_deref()
+    }
+
+    pub fn with_user_uuid(mut self, user_uuid: impl Into<String>) -> Self {
+        self.access_context_mut().identity =
+            Some(AccessIdentity::UserUuid(user_uuid.into()));
+        self
+    }
+
+    pub fn with_protocol_identity(
+        mut self,
+        protocol_identity: impl Into<String>,
+    ) -> Self {
+        self.access_context_mut().identity =
+            Some(AccessIdentity::Protocol(protocol_identity.into()));
+        self
+    }
+
+    pub fn with_access_target(
+        mut self,
+        host: impl Into<String>,
+        port: u16,
+        transport: AccessTransport,
+    ) -> Self {
+        let context = self.access_context_mut();
+        context.target_host = Some(host.into());
+        context.target_port = Some(port);
+        context.transport = transport;
+        self
+    }
+
+    pub fn with_access_sni(mut self, sni: impl Into<String>) -> Self {
+        self.access_context_mut().sni = Some(sni.into());
+        self
+    }
+
+    pub fn set_access_sni(&mut self, sni: impl Into<String>) {
+        self.access_context_mut().sni = Some(sni.into());
+    }
+
+    pub fn mark_tls_ech(&mut self) {
+        let context = self.access_context_mut();
+        context.tls_ech = true;
+        context.sni = None;
+    }
+
+    pub fn with_access_http_host(mut self, host: impl Into<String>) -> Self {
+        self.access_context_mut().http_host = Some(host.into());
+        self
+    }
+
+    pub fn user_uuid(&self) -> Option<&str> {
+        match self.access_context()?.identity.as_ref() {
+            Some(AccessIdentity::UserUuid(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn protocol_identity(&self) -> Option<&str> {
+        match self.access_context()?.identity.as_ref() {
+            Some(AccessIdentity::Protocol(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Returns the stable backend UUID when available, otherwise the protocol display identity.
+    pub fn routing_identity(&self) -> Option<&str> {
+        self.user_uuid().or(self.identity.as_deref())
+    }
+
+    pub fn set_user_uuid(&mut self, user_uuid: impl Into<String>) {
+        self.access_context_mut().identity =
+            Some(AccessIdentity::UserUuid(user_uuid.into()));
     }
 
     pub fn with_inbound_tag(mut self, tag: impl Into<String>) -> Self {
@@ -54,6 +145,7 @@ impl Default for TrafficContext {
         Self {
             protocol: "unknown",
             identity: None,
+            access_context: None,
             inbound_tag: None,
             outbound_tag: None,
             client_ip: None,

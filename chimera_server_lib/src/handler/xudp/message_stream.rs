@@ -36,7 +36,7 @@ enum IncomingMessage {
     Data {
         session_id: u16,
         payload: Vec<u8>,
-        target: SocketAddr,
+        target: NetLocation,
         global_id: Option<[u8; 8]>,
         is_new: bool,
     },
@@ -80,12 +80,12 @@ impl XudpMessageStream {
 
     pub(crate) fn with_write_prefix(
         stream: Box<dyn AsyncStream>,
-        resolver: Arc<dyn Resolver>,
+        _resolver: Arc<dyn Resolver>,
         write_prefix: Vec<u8>,
     ) -> Self {
         let (reader, writer) = split(stream);
         let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
-        let reader_task = tokio::spawn(run_reader(reader, resolver, sender));
+        let reader_task = tokio::spawn(run_reader(reader, sender));
         Self {
             receiver,
             writer,
@@ -344,11 +344,8 @@ impl AsyncPing for XudpMessageStream {
 
 impl AsyncSessionMessageStream for XudpMessageStream {}
 
-async fn run_reader<R>(
-    mut reader: R,
-    resolver: Arc<dyn Resolver>,
-    sender: mpsc::Sender<IncomingResult>,
-) where
+async fn run_reader<R>(mut reader: R, sender: mpsc::Sender<IncomingResult>)
+where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut buffer = BytesMut::with_capacity(READ_CHUNK_SIZE);
@@ -368,18 +365,7 @@ async fn run_reader<R>(
                 global_id,
                 is_new,
             })) => {
-                let resolved =
-                    resolver
-                        .resolve_location(&target)
-                        .await
-                        .and_then(|addresses| {
-                            addresses.into_iter().next().ok_or_else(|| {
-                                std::io::Error::other(format!(
-                                    "could not resolve XUDP target: {target}"
-                                ))
-                            })
-                        });
-                let result = resolved.map(|target| IncomingMessage::Data {
+                let result = Ok(IncomingMessage::Data {
                     session_id,
                     payload,
                     target,
@@ -627,6 +613,10 @@ mod tests {
     use std::{
         future::{Future, poll_fn},
         net::Ipv4Addr,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
     };
 
     use tokio::{
@@ -640,11 +630,32 @@ mod tests {
         async_stream::{AsyncReadSessionMessage, AsyncWriteSessionMessage},
         beginning::udp::run_session_based_udp,
         runtime::RuntimeState,
+        traffic::TrafficContext,
+        user_domain_access::UserDomainAccessConfig,
     };
 
     use super::*;
 
     struct StaticResolver;
+
+    struct CountingResolver {
+        calls: Arc<AtomicU64>,
+    }
+
+    impl Resolver for CountingResolver {
+        fn resolve_location(
+            &self,
+            _location: &NetLocation,
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>
+        {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async {
+                Err(std::io::Error::other(
+                    "counting resolver should not be called",
+                ))
+            })
+        }
+    }
 
     impl Resolver for StaticResolver {
         fn resolve_location(
@@ -1533,10 +1544,77 @@ mod tests {
                 .expect("read XUDP message");
             assert_eq!(&buffer[..length], expected);
             assert_eq!(session_id, 17);
-            assert_eq!(target, SocketAddr::from((Ipv4Addr::LOCALHOST, 53)));
+            assert_eq!(
+                target,
+                NetLocation::new(Address::from("example.test").unwrap(), 53)
+            );
             assert_eq!(actual_global_id, Some(global_id));
             assert_eq!(is_new, expected_is_new);
         }
+    }
+
+    #[cfg(feature = "user_domain_access")]
+    #[tokio::test]
+    async fn policy_rejects_xudp_domain_before_dns_resolution() {
+        let target =
+            NetLocation::new(Address::Hostname("blocked.example".into()), 53);
+        let frame =
+            encode_data_frame(SessionStatus::New, 19, Some(target), b"blocked");
+        let (mut client, server) = duplex(4096);
+        client.write_all(&frame).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let stream = XudpMessageStream::new(
+            Box::new(TestStream(server)),
+            Arc::new(StaticResolver),
+        );
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let config: UserDomainAccessConfig =
+            serde_json::from_value(serde_json::json!({
+                "version": 1,
+                "defaultAction": "reject",
+                "users": [{
+                    "userUuid": "11111111-1111-4111-8111-111111111111",
+                    "protocolIdentity": {
+                        "vlessUuid": "22222222-2222-4222-8222-222222222222"
+                    },
+                    "mode": "allowlist",
+                    "unknownTargetAction": "reject",
+                    "rules": [{
+                        "domain": "allowed.example",
+                        "match": "exact",
+                        "action": "allow"
+                    }]
+                }]
+            }))
+            .unwrap();
+        runtime.install_user_domain_access(config).unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
+        let context = TrafficContext::new("vless")
+            .with_protocol_identity("22222222-2222-4222-8222-222222222222")
+            .with_inbound_tag("vless-xudp");
+
+        timeout(
+            Duration::from_secs(1),
+            run_session_based_udp(
+                Box::new(stream),
+                Arc::new(CountingResolver {
+                    calls: Arc::clone(&calls),
+                }),
+                runtime.clone(),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 43029)),
+                Some(context),
+            ),
+        )
+        .await
+        .expect("XUDP relay should stop after input EOF")
+        .expect("policy rejection should not fail the XUDP association");
+
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        let stats = runtime.user_domain_access_stats();
+        assert_eq!(stats.evaluations, 1);
+        assert_eq!(stats.rejected, 1);
+        assert_eq!(stats.allowlist_miss, 1);
     }
 
     #[tokio::test]
@@ -1599,6 +1677,7 @@ mod tests {
         );
         let relay_task = tokio::spawn(run_session_based_udp(
             Box::new(stream),
+            Arc::new(StaticResolver),
             RuntimeState::new(Vec::new(), Vec::new()),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 43024)),
             None,
@@ -1686,6 +1765,7 @@ mod tests {
         );
         let relay_task = tokio::spawn(run_session_based_udp(
             Box::new(stream),
+            Arc::new(StaticResolver),
             RuntimeState::new(Vec::new(), Vec::new()),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 43025)),
             None,
@@ -1799,6 +1879,7 @@ mod tests {
         );
         let relay_task = tokio::spawn(run_session_based_udp(
             Box::new(stream),
+            Arc::new(StaticResolver),
             RuntimeState::new(Vec::new(), Vec::new()),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 43023)),
             None,

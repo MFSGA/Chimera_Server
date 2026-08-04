@@ -14,7 +14,7 @@ use crate::{
     handler::tcp::tcp_handler::{
         TcpServerConnectionContext, TcpServerHandler, TcpServerSetupResult,
     },
-    traffic::TrafficContext,
+    traffic::{AccessTransport, TrafficContext},
     util::prefixed_stream::PrefixedStream,
 };
 
@@ -53,14 +53,7 @@ impl TrojanTcpHandler {
         let credentials = users
             .into_iter()
             .map(|user| {
-                let identity =
-                    user.email.filter(|value| !value.is_empty()).or_else(|| {
-                        if user.password.is_empty() {
-                            None
-                        } else {
-                            Some(user.password.clone())
-                        }
-                    });
+                let identity = user.email.filter(|value| !value.is_empty());
                 TrojanCredential {
                     password_hash: create_password_hash(&user.password),
                     identity,
@@ -176,11 +169,29 @@ impl TrojanTcpHandler {
             ));
         }
 
-        let traffic_context = credential.identity.as_ref().map(|label| {
-            TrafficContext::new("trojan")
-                .with_identity(label.clone())
-                .with_inbound_tag(self.inbound_tag.clone())
-        });
+        let protocol_identity = String::from_utf8(password_line).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Trojan password hash is not valid ASCII",
+            )
+        })?;
+        let transport = if command == CMD_UDP_ASSOCIATE {
+            AccessTransport::Udp
+        } else {
+            AccessTransport::Tcp
+        };
+        let mut traffic_context = TrafficContext::new("trojan")
+            .with_protocol_identity(protocol_identity)
+            .with_access_target(
+                remote_location.address().to_string(),
+                remote_location.port(),
+                transport,
+            )
+            .with_inbound_tag(self.inbound_tag.clone());
+        if let Some(label) = credential.identity.as_ref() {
+            traffic_context = traffic_context.with_identity(label.clone());
+        }
+        let traffic_context = Some(traffic_context);
 
         if command == CMD_UDP_ASSOCIATE {
             return Ok(TcpServerSetupResult::MultiDirectionalUdp {
@@ -771,6 +782,23 @@ mod tests {
             let context =
                 traffic_context.expect("Trojan CONNECT context must exist");
             assert_eq!(context.identity.as_deref(), Some(expected_identity));
+            let expected_protocol_identity = create_password_hash(password);
+            assert_eq!(
+                context.protocol_identity(),
+                Some(
+                    std::str::from_utf8(&expected_protocol_identity)
+                        .expect("Trojan hash must be ASCII")
+                )
+            );
+            let access =
+                context.access_context().expect("access context must exist");
+            let expected_target_host = expected_target.address().to_string();
+            assert_eq!(
+                access.target_host.as_deref(),
+                Some(expected_target_host.as_str())
+            );
+            assert_eq!(access.target_port, Some(port));
+            assert_eq!(access.transport, AccessTransport::Tcp);
             assert_eq!(context.inbound_tag.as_deref(), Some("trojan-connect"));
         }
     }
@@ -873,6 +901,11 @@ mod tests {
             } => {
                 let context = traffic_context.expect("Trojan context should exist");
                 assert_eq!(context.identity.as_deref(), Some("udp-user"));
+                let access =
+                    context.access_context().expect("access context must exist");
+                assert_eq!(access.target_host.as_deref(), Some("127.0.0.1"));
+                assert_eq!(access.target_port, Some(53));
+                assert_eq!(access.transport, AccessTransport::Udp);
                 assert_eq!(context.inbound_tag.as_deref(), Some("trojan-udp"));
             }
             _ => panic!("Trojan UDP handshake returned a non-UDP result"),

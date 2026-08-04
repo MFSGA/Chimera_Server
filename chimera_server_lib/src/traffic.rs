@@ -14,6 +14,35 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::async_stream::{AsyncPing, AsyncStream, RawTcpRelayState};
 
+/// Identity metadata used by per-user access policy evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccessIdentity {
+    UserUuid(String),
+    Protocol(String),
+}
+
+/// Transport carrying the policy-controlled connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AccessTransport {
+    Tcp,
+    Udp,
+    Quic,
+    #[default]
+    Unknown,
+}
+
+/// Shared access-control metadata assembled by inbound handlers.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AccessContext {
+    pub identity: Option<AccessIdentity>,
+    pub target_host: Option<String>,
+    pub target_port: Option<u16>,
+    pub sni: Option<String>,
+    pub tls_ech: bool,
+    pub http_host: Option<String>,
+    pub transport: AccessTransport,
+}
+
 #[derive(Clone, Copy)]
 pub enum TrafficDirection {
     Upload,
@@ -113,12 +142,15 @@ impl<S: AsyncStream> AsyncStream for MeteredStream<S> {
 /// No-op implementations when the "traffic" feature is disabled.
 #[cfg(not(feature = "traffic"))]
 mod traffic_noop {
-    use std::{collections::HashMap, net::IpAddr, time::SystemTime};
+    use std::{collections::HashMap, net::IpAddr, sync::Arc, time::SystemTime};
+
+    use super::{AccessContext, AccessIdentity, AccessTransport};
 
     #[derive(Debug, Clone)]
     pub struct TrafficContext {
         pub protocol: &'static str,
         pub identity: Option<String>,
+        pub access_context: Option<Arc<AccessContext>>,
         pub inbound_tag: Option<String>,
         pub outbound_tag: Option<String>,
         pub client_ip: Option<IpAddr>,
@@ -129,6 +161,7 @@ mod traffic_noop {
             Self {
                 protocol,
                 identity: None,
+                access_context: None,
                 inbound_tag: None,
                 outbound_tag: None,
                 client_ip: None,
@@ -138,6 +171,93 @@ mod traffic_noop {
         pub fn with_identity(mut self, identity: impl Into<String>) -> Self {
             self.identity = Some(identity.into());
             self
+        }
+
+        fn access_context_mut(&mut self) -> &mut AccessContext {
+            if self.access_context.is_none() {
+                self.access_context = Some(Arc::new(AccessContext::default()));
+            }
+            Arc::make_mut(
+                self.access_context
+                    .as_mut()
+                    .expect("access context initialized"),
+            )
+        }
+
+        pub fn access_context(&self) -> Option<&AccessContext> {
+            self.access_context.as_deref()
+        }
+
+        pub fn with_user_uuid(mut self, user_uuid: impl Into<String>) -> Self {
+            self.access_context_mut().identity =
+                Some(AccessIdentity::UserUuid(user_uuid.into()));
+            self
+        }
+
+        pub fn with_protocol_identity(
+            mut self,
+            protocol_identity: impl Into<String>,
+        ) -> Self {
+            self.access_context_mut().identity =
+                Some(AccessIdentity::Protocol(protocol_identity.into()));
+            self
+        }
+
+        pub fn with_access_target(
+            mut self,
+            host: impl Into<String>,
+            port: u16,
+            transport: AccessTransport,
+        ) -> Self {
+            let context = self.access_context_mut();
+            context.target_host = Some(host.into());
+            context.target_port = Some(port);
+            context.transport = transport;
+            self
+        }
+
+        pub fn with_access_sni(mut self, sni: impl Into<String>) -> Self {
+            self.access_context_mut().sni = Some(sni.into());
+            self
+        }
+
+        pub fn set_access_sni(&mut self, sni: impl Into<String>) {
+            self.access_context_mut().sni = Some(sni.into());
+        }
+
+        pub fn mark_tls_ech(&mut self) {
+            let context = self.access_context_mut();
+            context.tls_ech = true;
+            context.sni = None;
+        }
+
+        pub fn with_access_http_host(mut self, host: impl Into<String>) -> Self {
+            self.access_context_mut().http_host = Some(host.into());
+            self
+        }
+
+        pub fn user_uuid(&self) -> Option<&str> {
+            match self.access_context()?.identity.as_ref() {
+                Some(AccessIdentity::UserUuid(value)) => Some(value),
+                _ => None,
+            }
+        }
+
+        pub fn protocol_identity(&self) -> Option<&str> {
+            match self.access_context()?.identity.as_ref() {
+                Some(AccessIdentity::Protocol(value)) => Some(value),
+                _ => None,
+            }
+        }
+
+        /// Returns the stable backend UUID when available, otherwise the protocol display identity.
+        pub fn routing_identity(&self) -> Option<&str> {
+            self.user_uuid().or(self.identity.as_deref())
+        }
+
+        pub fn set_user_uuid(&mut self, user_uuid: impl Into<String>) {
+            self.access_context_mut().identity =
+                Some(AccessIdentity::UserUuid(user_uuid.into()));
         }
 
         pub fn with_inbound_tag(mut self, tag: impl Into<String>) -> Self {
@@ -161,6 +281,7 @@ mod traffic_noop {
             Self {
                 protocol: "unknown",
                 identity: None,
+                access_context: None,
                 inbound_tag: None,
                 outbound_tag: None,
                 client_ip: None,
@@ -237,6 +358,21 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+
+    #[test]
+    fn routing_identity_prefers_stable_backend_uuid() {
+        let context = TrafficContext::new("test")
+            .with_identity("protocol-user")
+            .with_protocol_identity("protocol-credential");
+        assert_eq!(context.routing_identity(), Some("protocol-user"));
+
+        let context = context.with_user_uuid("11111111-1111-4111-8111-111111111111");
+        assert_eq!(
+            context.routing_identity(),
+            Some("11111111-1111-4111-8111-111111111111")
+        );
+        assert_eq!(context.identity.as_deref(), Some("protocol-user"));
+    }
 
     #[tokio::test]
     async fn metered_stream_records_bytes_before_stream_closes() {

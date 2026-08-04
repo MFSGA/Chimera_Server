@@ -7,7 +7,7 @@ use crate::{
     async_stream::AsyncStream,
     config::server_config::HttpUser,
     handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
-    traffic::TrafficContext,
+    traffic::{AccessTransport, TrafficContext},
     util::prefixed_stream::PrefixedStream,
 };
 
@@ -110,19 +110,6 @@ impl TcpServerHandler for HttpTcpServerHandler {
             ));
         }
 
-        let traffic_context = Some(
-            authenticated_user
-                .map(|identity| {
-                    TrafficContext::new("http")
-                        .with_identity(identity)
-                        .with_inbound_tag(self.inbound_tag.clone())
-                })
-                .unwrap_or_else(|| {
-                    TrafficContext::new("http")
-                        .with_inbound_tag(self.inbound_tag.clone())
-                }),
-        );
-
         if method.eq_ignore_ascii_case("CONNECT") {
             let remote_location =
                 NetLocation::from_str(target, None).map_err(|error| {
@@ -134,6 +121,11 @@ impl TcpServerHandler for HttpTcpServerHandler {
             let response = format!("{version} 200 Connection established\r\n\r\n")
                 .into_bytes()
                 .into_boxed_slice();
+            let traffic_context = Some(self.build_traffic_context(
+                authenticated_user.as_deref(),
+                &remote_location,
+                host_header.as_deref(),
+            ));
             return Ok(TcpServerSetupResult::TcpForward {
                 remote_location,
                 stream: server_stream,
@@ -179,6 +171,11 @@ impl TcpServerHandler for HttpTcpServerHandler {
         }
         initial_request.push_str("Connection: close\r\n\r\n");
 
+        let traffic_context = Some(self.build_traffic_context(
+            authenticated_user.as_deref(),
+            &remote_location,
+            host_header.as_deref(),
+        ));
         Ok(TcpServerSetupResult::TcpForward {
             remote_location,
             stream: Box::new(PrefixedStream::new(
@@ -233,6 +230,30 @@ fn parse_absolute_http_target(
 }
 
 impl HttpTcpServerHandler {
+    fn build_traffic_context(
+        &self,
+        authenticated_user: Option<&str>,
+        remote_location: &NetLocation,
+        host_header: Option<&str>,
+    ) -> TrafficContext {
+        let mut context = TrafficContext::new("http")
+            .with_access_target(
+                remote_location.address().to_string(),
+                remote_location.port(),
+                AccessTransport::Tcp,
+            )
+            .with_inbound_tag(self.inbound_tag.clone());
+        if let Some(username) = authenticated_user {
+            context = context
+                .with_identity(username.to_string())
+                .with_protocol_identity(username.to_string());
+        }
+        if let Some(host) = host_header.and_then(normalize_http_host) {
+            context = context.with_access_http_host(host);
+        }
+        context
+    }
+
     fn authenticate_basic(&self, value: &str) -> Option<String> {
         let mut parts = value.split_whitespace();
         let scheme = parts.next()?;
@@ -250,6 +271,12 @@ impl HttpTcpServerHandler {
             })
             .map(|account| account.username.clone())
     }
+}
+
+fn normalize_http_host(value: &str) -> Option<String> {
+    NetLocation::from_str(value.trim(), Some(80))
+        .ok()
+        .map(|location| location.address().to_string())
 }
 
 async fn read_http_line<S>(
@@ -298,6 +325,7 @@ mod tests {
         async_stream::{AsyncPing, AsyncStream},
         config::server_config::HttpUser,
         handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
+        traffic::AccessTransport,
     };
 
     use super::HttpTcpServerHandler;
@@ -380,10 +408,13 @@ mod tests {
             connection_success_response.as_deref(),
             Some(b"HTTP/1.1 200 Connection established\r\n\r\n".as_slice())
         );
-        assert_eq!(
-            traffic_context.unwrap().inbound_tag.as_deref(),
-            Some("http-in")
-        );
+        let context = traffic_context.expect("HTTP context must exist");
+        assert_eq!(context.inbound_tag.as_deref(), Some("http-in"));
+        let access = context.access_context().expect("access context must exist");
+        assert_eq!(access.target_host.as_deref(), Some("example.com"));
+        assert_eq!(access.target_port, Some(443));
+        assert_eq!(access.http_host.as_deref(), Some("example.com"));
+        assert_eq!(access.transport, AccessTransport::Tcp);
         let mut early = [0u8; 5];
         stream.read_exact(&mut early).await.unwrap();
         assert_eq!(&early, b"early");
@@ -416,7 +447,13 @@ mod tests {
         else {
             panic!("HTTP CONNECT returned non-TCP result");
         };
-        assert_eq!(traffic_context.unwrap().identity.as_deref(), Some("alice"));
+        let context = traffic_context.expect("HTTP auth context must exist");
+        assert_eq!(context.identity.as_deref(), Some("alice"));
+        assert_eq!(context.protocol_identity(), Some("alice"));
+        let access = context.access_context().expect("access context must exist");
+        assert_eq!(access.target_host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(access.target_port, Some(80));
+        assert_eq!(access.transport, AccessTransport::Tcp);
     }
 
     #[tokio::test]
@@ -458,7 +495,13 @@ mod tests {
         };
         assert_eq!(remote_location.to_string(), "example.com:8080");
         assert!(connection_success_response.is_none());
-        assert_eq!(traffic_context.unwrap().identity.as_deref(), Some("alice"));
+        let context = traffic_context.expect("HTTP forward context must exist");
+        assert_eq!(context.identity.as_deref(), Some("alice"));
+        assert_eq!(context.protocol_identity(), Some("alice"));
+        let access = context.access_context().expect("access context must exist");
+        assert_eq!(access.target_host.as_deref(), Some("example.com"));
+        assert_eq!(access.target_port, Some(8080));
+        assert_eq!(access.http_host.as_deref(), Some("example.com"));
         let mut forwarded = Vec::new();
         stream.read_to_end(&mut forwarded).await.unwrap();
         assert_eq!(

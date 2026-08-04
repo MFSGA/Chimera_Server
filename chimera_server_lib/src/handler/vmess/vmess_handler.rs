@@ -30,7 +30,7 @@ use crate::handler::{
     xudp::message_stream::XudpMessageStream,
 };
 use crate::resolver::NativeResolver;
-use crate::traffic::TrafficContext;
+use crate::traffic::{AccessTransport, TrafficContext};
 use crate::util::allocate_vec;
 
 const TAG_LEN: usize = 16;
@@ -67,6 +67,7 @@ struct VmessServerUser {
     data_cipher: DataCipher,
     instruction_key: [u8; 16],
     aead_decrypting_key: CipherDecryptingKey,
+    user_id: String,
     user_label: String,
 }
 
@@ -84,6 +85,7 @@ impl VmessServerUser {
             data_cipher: DataCipher::from_name(&user.cipher),
             instruction_key,
             aead_decrypting_key,
+            user_id: user.user_id,
             user_label: user.user_label,
         }
     }
@@ -216,6 +218,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
         let user = self.authenticate_user(&cert_hash)?;
         let instruction_key = user.instruction_key;
         let data_cipher = user.data_cipher.clone();
+        let user_id = user.user_id.clone();
         let user_label = user.user_label.clone();
 
         let mut encrypted_payload_length = [0u8; 18];
@@ -605,9 +608,20 @@ impl TcpServerHandler for VmessTcpServerHandler {
             Some(prefix_bytes),
             None,
         );
+        let access_transport = if command == COMMAND_TCP {
+            AccessTransport::Tcp
+        } else {
+            AccessTransport::Udp
+        };
         let traffic_context = Some(
             TrafficContext::new("vmess")
                 .with_identity(user_label)
+                .with_protocol_identity(user_id)
+                .with_access_target(
+                    remote_location.address().to_string(),
+                    remote_location.port(),
+                    access_transport,
+                )
                 .with_inbound_tag(self.inbound_tag.clone()),
         );
 
@@ -1617,7 +1631,10 @@ mod tests {
             panic!("fragmented VMess XUDP first frame decoded as End");
         };
         assert_eq!(session_id, 43);
-        assert_eq!(actual_target, target);
+        assert_eq!(
+            actual_target,
+            NetLocation::from_ip_addr(target.ip(), target.port())
+        );
         assert_eq!(global_id, None);
         assert!(is_new);
         assert_eq!(&payload[..length], b"ping");
@@ -1694,6 +1711,7 @@ mod tests {
 
         let relay_task = tokio::spawn(run_session_based_udp(
             stream,
+            Arc::new(NativeResolver::new()),
             RuntimeState::new(Vec::new(), Vec::new()),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 43152)),
             traffic_context,

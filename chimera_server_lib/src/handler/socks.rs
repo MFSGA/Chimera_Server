@@ -14,7 +14,9 @@ use crate::{
     },
     resolver::{Resolver, resolve_single_address},
     runtime::RuntimeState,
-    traffic::{TrafficContext, record_transfer, register_connection},
+    traffic::{
+        AccessTransport, TrafficContext, record_transfer, register_connection,
+    },
 };
 
 const SOCKS_VERSION: u8 = 0x05;
@@ -113,17 +115,22 @@ impl TcpServerHandler for SocksTcpServerHandler {
 
         let command = server_stream.read_u8().await?;
 
-        let traffic_context = Some(match identity {
-            Some(id) => TrafficContext::new("socks")
-                .with_identity(id)
-                .with_inbound_tag(self.inbound_tag.clone()),
-            None => TrafficContext::new("socks")
-                .with_inbound_tag(self.inbound_tag.clone()),
-        });
+        let mut traffic_context =
+            TrafficContext::new("socks").with_inbound_tag(self.inbound_tag.clone());
+        if let Some(id) = identity.as_deref() {
+            traffic_context = traffic_context
+                .with_identity(id.to_string())
+                .with_protocol_identity(id.to_string());
+        }
 
         match command {
             CMD_CONNECT => {
                 let remote_location = read_socks_address(&mut server_stream).await?;
+                let traffic_context = Some(traffic_context.with_access_target(
+                    remote_location.address().to_string(),
+                    remote_location.port(),
+                    AccessTransport::Tcp,
+                ));
 
                 Ok(TcpServerSetupResult::TcpForward {
                     remote_location,
@@ -136,7 +143,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
                 })
             }
             CMD_UDP_ASSOCIATE if self.udp_enabled => {
-                handle_udp_associate(server_stream, traffic_context).await
+                handle_udp_associate(server_stream, Some(traffic_context)).await
             }
             CMD_UDP_ASSOCIATE => {
                 send_command_response(&mut server_stream, REP_COMMAND_NOT_SUPPORTED)
@@ -490,6 +497,34 @@ pub(crate) async fn run_udp_relay(
         };
 
         let payload = &data[payload_offset..];
+        let mut datagram_context = traffic_context.clone().map(|context| {
+            context.with_access_target(
+                target_location.address().to_string(),
+                target_location.port(),
+                AccessTransport::Udp,
+            )
+        });
+        #[cfg(feature = "user_domain_access")]
+        match crate::beginning::enforce_user_domain_access(
+            &runtime,
+            datagram_context.as_ref(),
+            &target_location,
+        ) {
+            Ok(Some(user_uuid)) => {
+                if let Some(context) = datagram_context.as_mut() {
+                    context.set_user_uuid(user_uuid.to_string());
+                }
+            }
+            Ok(None) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                tracing::debug!(
+                    "SOCKS5 UDP target {} rejected by user-domain access policy",
+                    target_location
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
         let target_addr =
             match resolve_single_address(&resolver, &target_location).await {
                 Ok(addr) => addr,
@@ -505,9 +540,9 @@ pub(crate) async fn run_udp_relay(
             .as_ref()
             .and_then(|context| context.inbound_tag.as_deref())
             .unwrap_or_default();
-        let identity = traffic_context
+        let identity = datagram_context
             .as_ref()
-            .and_then(|context| context.identity.as_deref())
+            .and_then(TrafficContext::routing_identity)
             .unwrap_or_default();
         let route_input = connection_routing_input(
             inbound_tag,
@@ -518,7 +553,6 @@ pub(crate) async fn run_udp_relay(
             &target_location,
         );
         let action = select_direct_outbound(&runtime, &route_input, "udp")?;
-        let mut datagram_context = traffic_context.clone();
         match action {
             DirectOutboundAction::Blackhole { tag } => {
                 datagram_context = datagram_context
@@ -745,7 +779,11 @@ async fn send_command_response(
 #[cfg(test)]
 mod tests {
     use std::{
-        net::{IpAddr, Ipv4Addr},
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
         time::Duration,
     };
 
@@ -759,7 +797,112 @@ mod tests {
         resolver::NativeResolver,
         runtime::OutboundSummary,
         traffic::{active_connections, snapshot},
+        user_domain_access::UserDomainAccessConfig,
     };
+
+    struct CountingResolver {
+        calls: Arc<AtomicU64>,
+    }
+
+    impl Resolver for CountingResolver {
+        fn resolve_location(
+            &self,
+            _location: &NetLocation,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = std::io::Result<Vec<SocketAddr>>>
+                    + Send,
+            >,
+        > {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async {
+                Err(std::io::Error::other(
+                    "counting resolver should not be called",
+                ))
+            })
+        }
+    }
+
+    #[cfg(feature = "user_domain_access")]
+    #[tokio::test]
+    async fn udp_policy_rejects_domain_before_dns_resolution() {
+        let relay_socket =
+            Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let relay_addr = relay_socket.local_addr().unwrap();
+        let control_listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let control_addr = control_listener.local_addr().unwrap();
+        let client_control = TcpStream::connect(control_addr).await.unwrap();
+        let (server_control, _) = control_listener.accept().await.unwrap();
+
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let policy: UserDomainAccessConfig =
+            serde_json::from_value(serde_json::json!({
+                "version": 1,
+                "defaultAction": "reject",
+                "users": [{
+                    "userUuid": "11111111-1111-4111-8111-111111111111",
+                    "protocolIdentity": {
+                        "socksUsername": "autumn"
+                    },
+                    "mode": "allowlist",
+                    "unknownTargetAction": "reject",
+                    "rules": [{
+                        "domain": "allowed.example",
+                        "match": "exact",
+                        "action": "allow"
+                    }]
+                }]
+            }))
+            .unwrap();
+        runtime.install_user_domain_access(policy).unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
+        let traffic_context = TrafficContext::new("socks")
+            .with_identity("autumn")
+            .with_protocol_identity("autumn")
+            .with_inbound_tag("socks-policy");
+        let relay_task = tokio::spawn(run_udp_relay(
+            relay_socket,
+            Box::new(server_control),
+            Arc::new(CountingResolver {
+                calls: Arc::clone(&calls),
+            }),
+            runtime.clone(),
+            client_control.local_addr().unwrap(),
+            None,
+            Some(traffic_context),
+        ));
+
+        let client_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let domain = b"blocked.example";
+        let mut request = vec![0, 0, 0, ADDR_TYPE_DOMAIN, domain.len() as u8];
+        request.extend_from_slice(domain);
+        request.extend_from_slice(&53u16.to_be_bytes());
+        request.extend_from_slice(b"blocked");
+        client_socket.send_to(&request, relay_addr).await.unwrap();
+
+        let mut response = [0u8; 64];
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                client_socket.recv_from(&mut response)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        let stats = runtime.user_domain_access_stats();
+        assert_eq!(stats.evaluations, 1);
+        assert_eq!(stats.rejected, 1);
+        assert_eq!(stats.allowlist_miss, 1);
+
+        drop(client_control);
+        timeout(Duration::from_secs(2), relay_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn udp_relay_routes_and_records_live_user_traffic() {

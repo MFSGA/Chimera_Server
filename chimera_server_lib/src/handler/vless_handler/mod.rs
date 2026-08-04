@@ -11,7 +11,7 @@ use crate::{
     async_stream::AsyncStream,
     config::server_config::{VlessFallback, VlessUser},
     resolver::NativeResolver,
-    traffic::TrafficContext,
+    traffic::{AccessTransport, TrafficContext},
     util::prefixed_stream::PrefixedStream,
 };
 
@@ -59,7 +59,7 @@ const SERVER_RESPONSE_HEADER: &[u8] = &[0u8, 0u8];
 
 #[derive(Debug)]
 pub struct VlessTcpHandler {
-    users: Vec<(Box<[u8]>, String, String)>,
+    users: Vec<(Box<[u8]>, String, String, String)>,
     fallbacks: Vec<VlessFallback>,
     inbound_tag: String,
 }
@@ -82,6 +82,7 @@ impl VlessTcpHandler {
                         parse_hex(&user.user_id),
                         user.user_label.clone(),
                         user.flow.clone(),
+                        user.user_id.clone(),
                     )
                 })
                 .collect(),
@@ -106,7 +107,7 @@ impl VlessTcpHandler {
             let (mut prefix, candidate) =
                 read_vless_auth_prefix(&mut server_stream).await;
             let authenticated = candidate.is_some_and(|candidate| {
-                self.users.iter().any(|(stored_user_id, _, _)| {
+                self.users.iter().any(|(stored_user_id, _, _, _)| {
                     stored_user_id.len() == 16
                         && stored_user_id.as_ref() == candidate.as_slice()
                 })
@@ -145,16 +146,16 @@ impl VlessTcpHandler {
             command,
             remote_location,
         } = read_request_header(&mut server_stream).await?;
-        let matched_user = self.users.iter().find(|(stored_user_id, _, _)| {
+        let matched_user = self.users.iter().find(|(stored_user_id, _, _, _)| {
             stored_user_id.len() == 16
                 && stored_user_id.as_ref() == user_id.as_slice()
         });
 
-        let Some((_, user_label, configured_flow)) = matched_user else {
+        let Some((_, user_label, configured_flow, user_uuid)) = matched_user else {
             let expected = self
                 .users
                 .iter()
-                .map(|(user_id, _, _)| encode_hex(user_id.as_ref()))
+                .map(|(user_id, _, _, _)| encode_hex(user_id.as_ref()))
                 .collect::<Vec<_>>()
                 .join(",");
             let got = encode_hex(&user_id);
@@ -173,9 +174,20 @@ impl VlessTcpHandler {
 
         validate_request_flow(configured_flow, &request_flow, command)?;
 
+        let access_transport = if command == COMMAND_TCP {
+            AccessTransport::Tcp
+        } else {
+            AccessTransport::Udp
+        };
         let traffic_context = Some(
             TrafficContext::new("vless")
                 .with_identity(user_label.clone())
+                .with_protocol_identity(user_uuid.clone())
+                .with_access_target(
+                    remote_location.address().to_string(),
+                    remote_location.port(),
+                    access_transport,
+                )
                 .with_inbound_tag(self.inbound_tag.clone()),
         );
 
@@ -560,6 +572,12 @@ mod tests {
         );
         let context = traffic_context.expect("VLESS TCP context must exist");
         assert_eq!(context.identity.as_deref(), Some("vless-tcp-user"));
+        assert_eq!(context.protocol_identity(), Some(user_id));
+        assert!(context.user_uuid().is_none());
+        let access = context.access_context().expect("access context must exist");
+        assert_eq!(access.target_host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(access.target_port, Some(443));
+        assert_eq!(access.transport, AccessTransport::Tcp);
         assert_eq!(context.inbound_tag.as_deref(), Some("vless-test"));
     }
 
@@ -907,7 +925,10 @@ mod tests {
             panic!("fragmented VLESS XUDP first frame decoded as End");
         };
         assert_eq!(session_id, 42);
-        assert_eq!(actual_target, target);
+        assert_eq!(
+            actual_target,
+            NetLocation::from_ip_addr(target.ip(), target.port())
+        );
         assert_eq!(global_id, None);
         assert!(is_new);
         assert_eq!(&payload[..length], b"ping");
@@ -990,6 +1011,7 @@ mod tests {
 
         let relay_task = tokio::spawn(run_session_based_udp(
             stream,
+            Arc::new(NativeResolver::new()),
             RuntimeState::new(Vec::new(), Vec::new()),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 43141)),
             traffic_context,

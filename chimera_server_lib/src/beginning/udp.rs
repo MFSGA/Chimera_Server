@@ -7,12 +7,14 @@ use std::{
     time::Duration,
 };
 
+#[cfg(any(test, feature = "shadowsocks"))]
+use tokio::time::timeout;
 use tokio::{
     io::ReadBuf,
     net::UdpSocket,
     sync::{Mutex, Notify, RwLock, mpsc, oneshot},
     task::JoinHandle,
-    time::{Instant, sleep, timeout},
+    time::{Instant, sleep},
 };
 use tracing::{debug, error, info, warn};
 
@@ -38,7 +40,9 @@ use crate::{
     routing_process::enrich_routing_input,
     routing_state::RoutingInput,
     runtime::RuntimeState,
-    traffic::{TrafficContext, record_transfer, register_connection},
+    traffic::{
+        AccessTransport, TrafficContext, record_transfer, register_connection,
+    },
     xudp_registry::{XUDP_GLOBAL_REATTACH_TTL, XudpGlobalRegistry},
 };
 
@@ -239,6 +243,24 @@ pub(crate) async fn run_bidirectional_udp(
     peer_addr: SocketAddr,
     traffic_context: Option<TrafficContext>,
 ) -> std::io::Result<()> {
+    let traffic_context = traffic_context.map(|context| {
+        context.with_access_target(
+            remote_location.address().to_string(),
+            remote_location.port(),
+            AccessTransport::Udp,
+        )
+    });
+    #[cfg(feature = "user_domain_access")]
+    let traffic_context = match super::enforce_user_domain_access(
+        &runtime,
+        traffic_context.as_ref(),
+        &remote_location,
+    ) {
+        Ok(Some(user_uuid)) => traffic_context
+            .map(|context| context.with_user_uuid(user_uuid.to_string())),
+        Ok(None) => traffic_context,
+        Err(error) => return Err(error),
+    };
     let target_addr = resolve_single_address(&resolver, &remote_location).await?;
     let inbound_tag = traffic_context
         .as_ref()
@@ -246,7 +268,7 @@ pub(crate) async fn run_bidirectional_udp(
         .unwrap_or_default();
     let identity = traffic_context
         .as_ref()
-        .and_then(|context| context.identity.as_deref())
+        .and_then(TrafficContext::routing_identity)
         .unwrap_or_default();
     let route_input = connection_routing_input(
         inbound_tag,
@@ -313,11 +335,6 @@ pub(crate) async fn run_multi_directional_udp(
         .and_then(|context| context.inbound_tag.as_deref())
         .unwrap_or_default()
         .to_string();
-    let identity = traffic_context
-        .as_ref()
-        .and_then(|context| context.identity.as_deref())
-        .unwrap_or_default()
-        .to_string();
     let _connection_guard = register_connection(traffic_context.as_ref());
     let (response_sender, mut response_receiver) =
         mpsc::channel::<TargetedUdpResponse>(UDP_SESSION_CHANNEL_CAPACITY);
@@ -335,6 +352,31 @@ pub(crate) async fn run_multi_directional_udp(
                     }
                     Err(error) => break Err(error),
                 };
+                let packet_context = traffic_context.clone().map(|context| {
+                    context.with_access_target(
+                        target_location.address().to_string(),
+                        target_location.port(),
+                        AccessTransport::Udp,
+                    )
+                });
+                #[cfg(feature = "user_domain_access")]
+                let packet_context = match super::enforce_user_domain_access(
+                    &runtime,
+                    packet_context.as_ref(),
+                    &target_location,
+                ) {
+                    Ok(Some(user_uuid)) => packet_context
+                        .map(|context| context.with_user_uuid(user_uuid.to_string())),
+                    Ok(None) => packet_context,
+                    Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                        debug!(
+                            "targeted udp packet to {} rejected by user-domain access policy",
+                            target_location
+                        );
+                        continue;
+                    }
+                    Err(error) => break Err(error),
+                };
                 let payload = client_buffer[..payload_length].to_vec();
                 let target_addr = match resolve_single_address(&resolver, &target_location).await {
                     Ok(target_addr) => target_addr,
@@ -346,9 +388,13 @@ pub(crate) async fn run_multi_directional_udp(
                         continue;
                     }
                 };
+                let identity = packet_context
+                    .as_ref()
+                    .and_then(TrafficContext::routing_identity)
+                    .unwrap_or_default();
                 let route_input = connection_routing_input(
                     &inbound_tag,
-                    &identity,
+                    identity,
                     3,
                     peer_addr,
                     target_addr,
@@ -361,7 +407,7 @@ pub(crate) async fn run_multi_directional_udp(
 
                 match action {
                     DirectOutboundAction::Blackhole { tag } => {
-                        let packet_context = traffic_context
+                        let packet_context = packet_context
                             .clone()
                             .map(|context| context.with_outbound_tag(tag.clone()));
                         record_transfer(packet_context, payload_length as u64, 0);
@@ -372,10 +418,10 @@ pub(crate) async fn run_multi_directional_udp(
                     }
                     DirectOutboundAction::Freedom { tag } => {
                         let packet_context = match &tag {
-                            Some(tag) => traffic_context
+                            Some(tag) => packet_context
                                 .clone()
                                 .map(|context| context.with_outbound_tag(tag.clone())),
-                            None => traffic_context.clone(),
+                            None => packet_context.clone(),
                         };
                         let key = TargetedUdpSessionKey {
                             target_addr,
@@ -442,6 +488,7 @@ pub(crate) async fn run_multi_directional_udp(
 
 pub(crate) async fn run_session_based_udp(
     mut server_stream: Box<dyn AsyncSessionMessageStream>,
+    resolver: Arc<dyn Resolver>,
     runtime: RuntimeState,
     peer_addr: SocketAddr,
     traffic_context: Option<TrafficContext>,
@@ -451,11 +498,6 @@ pub(crate) async fn run_session_based_udp(
     let inbound_tag = traffic_context
         .as_ref()
         .and_then(|context| context.inbound_tag.as_deref())
-        .unwrap_or_default()
-        .to_string();
-    let identity = traffic_context
-        .as_ref()
-        .and_then(|context| context.identity.as_deref())
         .unwrap_or_default()
         .to_string();
     let _connection_guard = register_connection(traffic_context.as_ref());
@@ -470,7 +512,7 @@ pub(crate) async fn run_session_based_udp(
             request = read_session_message(&mut *server_stream, &mut client_buffer) => {
                 let (
                     session_id,
-                    target_addr,
+                    target_location,
                     global_id,
                     is_new,
                     payload_length,
@@ -481,7 +523,13 @@ pub(crate) async fn run_session_based_udp(
                         global_id,
                         is_new,
                     }, payload_length)) => {
-                        (session_id, target, global_id, is_new, payload_length)
+                        (
+                            session_id,
+                            target,
+                            global_id,
+                            is_new,
+                            payload_length,
+                        )
                     }
                     Ok((SessionMessage::End { session_id }, _)) => {
                         expire_session_udp_worker(&mut sessions, session_id).await;
@@ -496,12 +544,54 @@ pub(crate) async fn run_session_based_udp(
                 if is_new && sessions.contains_key(&session_id) {
                     expire_session_udp_worker(&mut sessions, session_id).await;
                 }
+                let packet_context = traffic_context.clone().map(|context| {
+                    context.with_access_target(
+                        target_location.address().to_string(),
+                        target_location.port(),
+                        AccessTransport::Udp,
+                    )
+                });
+                #[cfg(feature = "user_domain_access")]
+                let packet_context = match super::enforce_user_domain_access(
+                    &runtime,
+                    packet_context.as_ref(),
+                    &target_location,
+                ) {
+                    Ok(Some(user_uuid)) => packet_context
+                        .map(|context| context.with_user_uuid(user_uuid.to_string())),
+                    Ok(None) => packet_context,
+                    Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                        debug!(
+                            "session udp packet {} to {} rejected by user-domain access policy",
+                            session_id, target_location
+                        );
+                        continue;
+                    }
+                    Err(error) => break Err(error),
+                };
+                let target_addr = match resolve_single_address(
+                    &resolver,
+                    &target_location,
+                )
+                .await
+                {
+                    Ok(target_addr) => target_addr,
+                    Err(error) => {
+                        warn!(
+                            "session udp failed to resolve {}: {}",
+                            target_location, error
+                        );
+                        continue;
+                    }
+                };
                 let payload = client_buffer[..payload_length].to_vec();
-                let target_location =
-                    NetLocation::from_ip_addr(target_addr.ip(), target_addr.port());
+                let identity = packet_context
+                    .as_ref()
+                    .and_then(TrafficContext::routing_identity)
+                    .unwrap_or_default();
                 let route_input = connection_routing_input(
                     &inbound_tag,
-                    &identity,
+                    identity,
                     3,
                     peer_addr,
                     target_addr,
@@ -514,7 +604,7 @@ pub(crate) async fn run_session_based_udp(
 
                 match action {
                     DirectOutboundAction::Blackhole { tag } => {
-                        let packet_context = traffic_context
+                        let packet_context = packet_context
                             .clone()
                             .map(|context| context.with_outbound_tag(tag.clone()));
                         record_transfer(packet_context, payload_length as u64, 0);
@@ -525,10 +615,10 @@ pub(crate) async fn run_session_based_udp(
                     }
                     DirectOutboundAction::Freedom { tag } => {
                         let packet_context = match &tag {
-                            Some(tag) => traffic_context
+                            Some(tag) => packet_context
                                 .clone()
                                 .map(|context| context.with_outbound_tag(tag.clone())),
-                            None => traffic_context.clone(),
+                            None => packet_context.clone(),
                         };
                         let key = TargetedUdpSessionKey {
                             target_addr,
@@ -2074,7 +2164,10 @@ mod tests {
     use std::{
         net::Ipv4Addr,
         pin::Pin,
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
         task::{Context, Poll},
     };
 
@@ -2105,7 +2198,7 @@ mod tests {
                 message_stream::XudpMessageStream,
             },
         },
-        resolver::NativeResolver,
+        resolver::{NativeResolver, Resolver},
         routing_state::RoutingState,
         runtime::OutboundSummary,
     };
@@ -2163,6 +2256,29 @@ mod tests {
 
     impl AsyncStream for TestStream {}
 
+    struct CountingResolver {
+        calls: Arc<AtomicU64>,
+    }
+
+    impl Resolver for CountingResolver {
+        fn resolve_location(
+            &self,
+            _location: &NetLocation,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<Output = std::io::Result<Vec<SocketAddr>>>
+                    + Send,
+            >,
+        > {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async {
+                Err(std::io::Error::other(
+                    "counting resolver should not be called",
+                ))
+            })
+        }
+    }
+
     fn runtime_with_outbounds(outbounds: Vec<OutboundSummary>) -> RuntimeState {
         RuntimeState::new(Vec::new(), outbounds)
     }
@@ -2174,6 +2290,62 @@ mod tests {
             proxy_settings_type: None,
             proxy_settings_value: None,
         }
+    }
+
+    #[cfg(feature = "user_domain_access")]
+    #[tokio::test]
+    async fn bidirectional_udp_policy_rejects_before_dns_resolution() {
+        let runtime = runtime_with_outbounds(Vec::new());
+        let config = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "defaultAction": "reject",
+            "users": [{
+                "userUuid": "11111111-1111-4111-8111-111111111111",
+                "protocolIdentity": {
+                    "vlessUuid": "22222222-2222-4222-8222-222222222222"
+                },
+                "mode": "allowlist",
+                "unknownTargetAction": "reject",
+                "rules": [{
+                    "domain": "allowed.example",
+                    "match": "exact",
+                    "action": "allow"
+                }]
+            }]
+        }))
+        .expect("policy config should parse");
+        runtime
+            .install_user_domain_access(config)
+            .expect("policy should install");
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let resolver = Arc::new(CountingResolver {
+            calls: Arc::clone(&calls),
+        });
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind test UDP socket");
+        let context = TrafficContext::new("vless")
+            .with_protocol_identity("22222222-2222-4222-8222-222222222222")
+            .with_inbound_tag("vless-udp");
+
+        let error = run_bidirectional_udp(
+            Box::new(socket),
+            NetLocation::new(Address::Hostname("blocked.example".into()), 53),
+            resolver,
+            runtime.clone(),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 40000)),
+            Some(context),
+        )
+        .await
+        .expect_err("blocked UDP target must be rejected");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        let stats = runtime.user_domain_access_stats();
+        assert_eq!(stats.evaluations, 1);
+        assert_eq!(stats.rejected, 1);
+        assert_eq!(stats.allowlist_miss, 1);
     }
 
     #[test]
@@ -2241,6 +2413,7 @@ mod tests {
         );
         let relay = tokio::spawn(run_session_based_udp(
             Box::new(stream),
+            Arc::new(NativeResolver::new()),
             runtime_with_outbounds(vec![outbound("blocked", "blackhole")]),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 43115)),
             None,
@@ -2293,6 +2466,7 @@ mod tests {
         );
         let relay = tokio::spawn(run_session_based_udp(
             Box::new(stream),
+            Arc::new(NativeResolver::new()),
             runtime_with_outbounds(vec![outbound("proxy", "vmess")]),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 43116)),
             None,

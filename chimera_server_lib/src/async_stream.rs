@@ -101,11 +101,11 @@ pub trait AsyncWriteSourcedMessage {
     ) -> Poll<std::io::Result<()>>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionMessage {
     Data {
         session_id: u16,
-        target: SocketAddr,
+        target: NetLocation,
         global_id: Option<[u8; 8]>,
         is_new: bool,
     },
