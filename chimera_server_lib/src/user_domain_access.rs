@@ -18,6 +18,9 @@ use uuid::Uuid;
 
 const MAX_DOMAIN_LENGTH: usize = 253;
 const MAX_LABEL_LENGTH: usize = 63;
+const MAX_USERS: usize = 100_000;
+const MAX_RULES_PER_USER: usize = 10_000;
+const MAX_TOTAL_RULES: usize = 1_000_000;
 const DEFAULT_RULE_PRIORITY: u32 = 100;
 
 /// Stable backend user identifier used by the access policy engine.
@@ -497,6 +500,10 @@ impl UserDomainAccessPolicy {
         config: UserDomainAccessConfig,
     ) -> Result<Self, AccessPolicyError> {
         validate_publication_metadata(&config)?;
+        validate_policy_scale(
+            config.users.len(),
+            config.users.iter().map(|user| user.rules.len()),
+        )?;
         let mut users = HashMap::with_capacity(config.users.len());
         let mut vless_identities = HashMap::with_capacity(config.users.len());
         let mut vmess_identities = HashMap::with_capacity(config.users.len());
@@ -905,6 +912,47 @@ fn insert_named_identity(
     Ok(())
 }
 
+fn validate_policy_scale<I>(
+    user_count: usize,
+    rule_counts: I,
+) -> Result<(), AccessPolicyError>
+where
+    I: IntoIterator<Item = usize>,
+{
+    if user_count > MAX_USERS {
+        return Err(AccessPolicyError::PolicyLimitExceeded {
+            resource: "users",
+            limit: MAX_USERS,
+            actual: user_count,
+        });
+    }
+    let mut total_rules = 0usize;
+    for rule_count in rule_counts {
+        if rule_count > MAX_RULES_PER_USER {
+            return Err(AccessPolicyError::PolicyLimitExceeded {
+                resource: "rules per user",
+                limit: MAX_RULES_PER_USER,
+                actual: rule_count,
+            });
+        }
+        total_rules = total_rules.checked_add(rule_count).ok_or(
+            AccessPolicyError::PolicyLimitExceeded {
+                resource: "total rules",
+                limit: MAX_TOTAL_RULES,
+                actual: usize::MAX,
+            },
+        )?;
+        if total_rules > MAX_TOTAL_RULES {
+            return Err(AccessPolicyError::PolicyLimitExceeded {
+                resource: "total rules",
+                limit: MAX_TOTAL_RULES,
+                actual: total_rules,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_publication_metadata(
     config: &UserDomainAccessConfig,
 ) -> Result<(), AccessPolicyError> {
@@ -1170,6 +1218,14 @@ pub enum AccessPolicyError {
     },
     #[error("duplicate user-domain policy for {0}")]
     DuplicateUser(UserId),
+    #[error(
+        "user-domain access policy exceeds {resource} limit: {actual} > {limit}"
+    )]
+    PolicyLimitExceeded {
+        resource: &'static str,
+        limit: usize,
+        actual: usize,
+    },
     #[error("invalid publication metadata {field}: {reason}")]
     InvalidPublicationMetadata { field: &'static str, reason: String },
     #[error("invalid target node UUID {value}: {source}")]
@@ -1276,6 +1332,73 @@ mod tests {
             NormalizedDomain::parse("BÜCHER.Example.").unwrap().as_str(),
             "xn--bcher-kva.example"
         );
+    }
+
+    #[test]
+    fn policy_scale_limits_are_checked_before_compilation() {
+        validate_policy_scale(MAX_USERS, std::iter::repeat_n(0, MAX_USERS))
+            .expect("maximum user count should be accepted");
+        assert!(matches!(
+            validate_policy_scale(MAX_USERS + 1, std::iter::empty()),
+            Err(AccessPolicyError::PolicyLimitExceeded {
+                resource: "users",
+                ..
+            })
+        ));
+        assert!(matches!(
+            validate_policy_scale(1, [MAX_RULES_PER_USER + 1]),
+            Err(AccessPolicyError::PolicyLimitExceeded {
+                resource: "rules per user",
+                ..
+            })
+        ));
+        validate_policy_scale(100, [MAX_RULES_PER_USER; 100])
+            .expect("maximum total rule count should be accepted");
+        assert!(matches!(
+            validate_policy_scale(101, [MAX_RULES_PER_USER; 101]),
+            Err(AccessPolicyError::PolicyLimitExceeded {
+                resource: "total rules",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn generated_ascii_domain_normalization_is_idempotent() {
+        for index in 0..1_000 {
+            let input = format!("API-{index}.Example.COM.");
+            let normalized = NormalizedDomain::parse(&input).unwrap();
+            assert_eq!(
+                NormalizedDomain::parse(normalized.as_str()).unwrap(),
+                normalized
+            );
+        }
+    }
+
+    #[test]
+    fn checksum_ignores_signature_but_signature_payload_authenticates_checksum() {
+        let mut config =
+            serde_json::from_value::<UserDomainAccessConfig>(serde_json::json!({
+                "version": 12,
+                "signatureAlgorithm": "ed25519",
+                "signingKeyId": "release-key",
+                "signature": "first-signature",
+                "defaultAction": "allow",
+                "users": []
+            }))
+            .unwrap();
+        let first_checksum = user_domain_access_checksum(&config).unwrap();
+        config.signature = Some("second-signature".into());
+        assert_eq!(
+            user_domain_access_checksum(&config).unwrap(),
+            first_checksum
+        );
+
+        config.checksum = Some(first_checksum);
+        let first_payload = user_domain_access_signature_payload(&config).unwrap();
+        config.checksum = Some("sha256:different".into());
+        let second_payload = user_domain_access_signature_payload(&config).unwrap();
+        assert_ne!(first_payload, second_payload);
     }
 
     #[test]
