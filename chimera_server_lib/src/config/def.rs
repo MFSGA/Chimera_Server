@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[cfg(feature = "user_domain_access")]
+use crate::user_domain_access::UserDomainAccessConfig;
 use crate::{Error, log::LogConfig};
 
 use super::{
@@ -23,6 +25,12 @@ pub struct LiteralConfig {
     pub policy: Option<PolicyConfig>,
     #[serde(default)]
     pub routing: Option<RoutingConfig>,
+    #[cfg(feature = "user_domain_access")]
+    #[serde(default, rename = "userDomainAccess")]
+    pub user_domain_access: Option<UserDomainAccessConfig>,
+    #[cfg(feature = "user_domain_access")]
+    #[serde(default, rename = "userDomainAccessStore")]
+    pub user_domain_access_store: Option<UserDomainAccessStoreConfig>,
     #[serde(default)]
     pub observatory: Option<ObservatoryConfig>,
     #[serde(default, rename = "burstObservatory")]
@@ -116,6 +124,15 @@ impl InboudItem {
 pub struct OutboundItem {
     pub protocol: String,
     pub tag: String,
+}
+
+#[cfg(feature = "user_domain_access")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UserDomainAccessStoreConfig {
+    pub path: String,
+    #[serde(default)]
+    pub node_uuid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -237,6 +254,38 @@ mod tests {
         "#;
         let c = cfg.parse::<LiteralConfig>().expect("should parse");
         println!("{:?}", c);
+    }
+
+    #[cfg(feature = "user_domain_access")]
+    #[test]
+    fn parses_user_domain_access_config() {
+        let config = r#"
+        {
+          "inbounds": [],
+          "outbounds": [],
+          "userDomainAccess": {
+            "defaultAction": "allow",
+            "users": [{
+              "userUuid": "11111111-1111-4111-8111-111111111111",
+              "mode": "allowlist",
+              "unknownTargetAction": "reject",
+              "rules": [{
+                "id": "allow-example",
+                "domain": "example.com",
+                "match": "suffix",
+                "action": "allow",
+                "priority": 10
+              }]
+            }]
+          }
+        }
+        "#
+        .parse::<LiteralConfig>()
+        .expect("userDomainAccess should parse");
+
+        let access = config.user_domain_access.expect("userDomainAccess missing");
+        assert_eq!(access.users.len(), 1);
+        assert_eq!(access.users[0].rules[0].domain, "example.com");
     }
 
     #[test]

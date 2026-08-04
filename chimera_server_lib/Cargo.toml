@@ -89,6 +89,7 @@ vless = []
 vmess = ["md-5", "sha3"]
 tuic = ["dashmap", "lru", "uuid"]
 traffic = []
+user_domain_access = ["uuid"]
 api = ["tonic", "tonic-prost", "prost-types", "tokio-stream"]
 
 full = [
@@ -107,6 +108,7 @@ full = [
     "tuic",
     "api",
     "traffic",
+    "user_domain_access",
 ]
 
 default = ["full"]

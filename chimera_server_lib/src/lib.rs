@@ -11,6 +11,8 @@ pub use config::{
 pub use config_loader::{ConfigFormat, resolve_config_source};
 pub use runtime::{OutboundSummary, RuntimeState};
 use std::net::SocketAddr;
+#[cfg(feature = "user_domain_access")]
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
 use tokio_rustls::rustls;
@@ -35,6 +37,8 @@ mod mcp;
 mod outbound;
 
 mod runtime;
+#[cfg(all(test, feature = "user_domain_access"))]
+mod runtime_user_domain_access_tests;
 
 #[cfg(feature = "reality")]
 pub mod reality;
@@ -51,6 +55,11 @@ mod routing_state;
 mod routing_webhook;
 
 pub mod traffic;
+
+#[cfg(feature = "user_domain_access")]
+mod tls_client_hello;
+#[cfg(feature = "user_domain_access")]
+pub mod user_domain_access;
 
 mod util;
 
@@ -102,6 +111,121 @@ pub enum Error {
     InvalidConfig(String),
 }
 
+#[cfg(feature = "user_domain_access")]
+fn resolve_user_domain_access_store_path(
+    store: Option<&config::def::UserDomainAccessStoreConfig>,
+    cwd: Option<&str>,
+) -> Result<Option<PathBuf>, Error> {
+    let Some(store) = store else {
+        return Ok(None);
+    };
+    let value = store.path.trim();
+    if value.is_empty() {
+        return Err(Error::InvalidConfig(
+            "userDomainAccessStore.path must not be empty".into(),
+        ));
+    }
+    if let Some(node_uuid) = store.node_uuid.as_deref() {
+        uuid::Uuid::parse_str(node_uuid.trim()).map_err(|error| {
+            Error::InvalidConfig(format!(
+                "invalid userDomainAccessStore.nodeUuid {node_uuid}: {error}"
+            ))
+        })?;
+    }
+    let path = PathBuf::from(value);
+    Ok(Some(if path.is_absolute() {
+        path
+    } else if let Some(cwd) = cwd {
+        Path::new(cwd).join(path)
+    } else {
+        path
+    }))
+}
+
+#[cfg(feature = "user_domain_access")]
+#[derive(Debug)]
+struct InitialUserDomainAccess {
+    config: Option<user_domain_access::UserDomainAccessConfig>,
+    highest_seen_version: u64,
+    history: Vec<user_domain_access::UserDomainAccessConfig>,
+}
+
+#[cfg(feature = "user_domain_access")]
+fn select_initial_user_domain_access(
+    configured: Option<user_domain_access::UserDomainAccessConfig>,
+    store_path: Option<&Path>,
+) -> Result<InitialUserDomainAccess, Error> {
+    let persisted = store_path
+        .map(runtime::load_user_domain_access_store)
+        .transpose()
+        .map_err(Error::InvalidConfig)?
+        .flatten();
+    let (persisted_config, persisted_highest, persisted_history) = match persisted {
+        Some(stored) => (
+            Some(stored.config),
+            stored.highest_seen_version,
+            stored.history,
+        ),
+        None => (None, 0, Vec::new()),
+    };
+    let (selected, history) = match (configured, persisted_config) {
+        (None, None) => (None, Vec::new()),
+        (Some(config), None) => (Some(config), Vec::new()),
+        (None, Some(config)) => (Some(config), persisted_history),
+        (Some(configured), Some(persisted)) => {
+            if configured.version == persisted.version {
+                if configured == persisted {
+                    (Some(configured), persisted_history)
+                } else {
+                    return Err(Error::InvalidConfig(format!(
+                        "user-domain access configured and persisted revisions both use version {} but differ",
+                        configured.version
+                    )));
+                }
+            } else if configured.version > persisted_highest {
+                let mut history =
+                    Vec::with_capacity(runtime::user_domain_access_history_limit());
+                history.push(persisted);
+                for revision in persisted_history {
+                    if history.len() == runtime::user_domain_access_history_limit() {
+                        break;
+                    }
+                    if !history
+                        .iter()
+                        .any(|existing| existing.version == revision.version)
+                    {
+                        history.push(revision);
+                    }
+                }
+                (Some(configured), history)
+            } else {
+                (Some(persisted), persisted_history)
+            }
+        }
+    };
+    let highest_seen_version = selected
+        .as_ref()
+        .map(|config| config.version)
+        .unwrap_or_default()
+        .max(persisted_highest);
+    Ok(InitialUserDomainAccess {
+        config: selected,
+        highest_seen_version,
+        history,
+    })
+}
+
+#[cfg(feature = "user_domain_access")]
+fn compile_user_domain_access(
+    config: Option<&user_domain_access::UserDomainAccessConfig>,
+) -> Result<Option<user_domain_access::UserDomainAccessPolicy>, Error> {
+    config
+        .cloned()
+        .map(user_domain_access::UserDomainAccessPolicy::compile)
+        .transpose()
+        .map_err(|error| Error::InvalidConfig(error.to_string()))
+}
+
 pub struct ServerRuntime {
     pub inbounds: Vec<ServerConfig>,
     pub runtime_state: RuntimeState,
@@ -112,8 +236,48 @@ pub fn prepare_server_runtime(
     cwd: Option<&str>,
     log_file: Option<&str>,
 ) -> Result<ServerRuntime, Error> {
+    #[cfg(feature = "user_domain_access")]
+    let user_domain_access_node_uuid = config
+        .user_domain_access_store
+        .as_ref()
+        .and_then(|store| store.node_uuid.clone());
+    #[cfg(feature = "user_domain_access")]
+    let user_domain_access_store = resolve_user_domain_access_store_path(
+        config.user_domain_access_store.as_ref(),
+        cwd,
+    )?;
+    #[cfg(feature = "user_domain_access")]
+    let user_domain_access = select_initial_user_domain_access(
+        config.user_domain_access.clone(),
+        user_domain_access_store.as_deref(),
+    )?;
     let inbounds = prepare_server_inbounds(config, cwd, log_file)?;
     let runtime_state = RuntimeState::new(inbounds.clone(), Vec::new());
+    #[cfg(feature = "user_domain_access")]
+    if let Some(path) = user_domain_access_store {
+        runtime_state
+            .configure_user_domain_access_store(path)
+            .map_err(Error::InvalidConfig)?;
+    }
+    #[cfg(feature = "user_domain_access")]
+    if let Some(node_uuid) = user_domain_access_node_uuid.as_deref() {
+        runtime_state
+            .configure_user_domain_access_target_node(node_uuid)
+            .map_err(Error::InvalidConfig)?;
+    }
+    #[cfg(feature = "user_domain_access")]
+    runtime_state
+        .restore_user_domain_access_persisted_state(
+            user_domain_access.highest_seen_version,
+            user_domain_access.history,
+        )
+        .map_err(Error::InvalidConfig)?;
+    #[cfg(feature = "user_domain_access")]
+    if let Some(config) = user_domain_access.config {
+        runtime_state
+            .install_user_domain_access(config)
+            .map_err(Error::InvalidConfig)?;
+    }
 
     Ok(ServerRuntime {
         inbounds,
@@ -299,6 +463,37 @@ pub fn validate(opts: Options) -> Result<(), Error> {
         config.burst_observatory.as_ref(),
     )
     .map_err(Error::InvalidConfig)?;
+    #[cfg(feature = "user_domain_access")]
+    {
+        let store_config = config.user_domain_access_store.as_ref();
+        let store_path = resolve_user_domain_access_store_path(
+            store_config,
+            opts.cwd.as_deref(),
+        )?;
+        let selected = select_initial_user_domain_access(
+            config.user_domain_access.clone(),
+            store_path.as_deref(),
+        )?;
+        let validation_state = RuntimeState::new(Vec::new(), Vec::new());
+        if let Some(node_uuid) =
+            store_config.and_then(|store| store.node_uuid.as_deref())
+        {
+            validation_state
+                .configure_user_domain_access_target_node(node_uuid)
+                .map_err(Error::InvalidConfig)?;
+        }
+        validation_state
+            .restore_user_domain_access_persisted_state(
+                selected.highest_seen_version,
+                selected.history,
+            )
+            .map_err(Error::InvalidConfig)?;
+        if let Some(config) = selected.config {
+            validation_state
+                .install_user_domain_access(config)
+                .map_err(Error::InvalidConfig)?;
+        }
+    }
 
     let all_inbounds = config
         .inbounds
@@ -364,6 +559,21 @@ async fn start_async(
         burst_observatory_config.as_ref(),
     )
     .map_err(Error::InvalidConfig)?;
+    #[cfg(feature = "user_domain_access")]
+    let user_domain_access_node_uuid = config
+        .user_domain_access_store
+        .as_ref()
+        .and_then(|store| store.node_uuid.clone());
+    #[cfg(feature = "user_domain_access")]
+    let user_domain_access_store = resolve_user_domain_access_store_path(
+        config.user_domain_access_store.as_ref(),
+        cwd,
+    )?;
+    #[cfg(feature = "user_domain_access")]
+    let user_domain_access = select_initial_user_domain_access(
+        config.user_domain_access.clone(),
+        user_domain_access_store.as_deref(),
+    )?;
     let outbounds = config
         .outbounds
         .iter()
@@ -382,6 +592,31 @@ async fn start_async(
         .collect::<Result<Vec<_>, _>>()?;
 
     let runtime_state = RuntimeState::new(all_inbounds.clone(), outbounds);
+    #[cfg(feature = "user_domain_access")]
+    if let Some(path) = user_domain_access_store {
+        runtime_state
+            .configure_user_domain_access_store(path)
+            .map_err(Error::InvalidConfig)?;
+    }
+    #[cfg(feature = "user_domain_access")]
+    if let Some(node_uuid) = user_domain_access_node_uuid.as_deref() {
+        runtime_state
+            .configure_user_domain_access_target_node(node_uuid)
+            .map_err(Error::InvalidConfig)?;
+    }
+    #[cfg(feature = "user_domain_access")]
+    runtime_state
+        .restore_user_domain_access_persisted_state(
+            user_domain_access.highest_seen_version,
+            user_domain_access.history,
+        )
+        .map_err(Error::InvalidConfig)?;
+    #[cfg(feature = "user_domain_access")]
+    if let Some(config) = user_domain_access.config {
+        runtime_state
+            .install_user_domain_access(config)
+            .map_err(Error::InvalidConfig)?;
+    }
     runtime_state.replace_routing(
         routing_state::RoutingState::from_config(config.routing.as_ref())
             .map_err(Error::InvalidConfig)?,
@@ -508,7 +743,19 @@ async fn start_async(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "user_domain_access")]
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use super::resolve_api_config;
+    #[cfg(feature = "user_domain_access")]
+    use super::{compile_user_domain_access, select_initial_user_domain_access};
+    #[cfg(feature = "user_domain_access")]
+    use crate::user_domain_access::{
+        UserDomainAccessConfig, user_domain_access_checksum,
+    };
     use crate::{
         address::{Address, BindLocation, NetLocation},
         config::{
@@ -518,6 +765,40 @@ mod tests {
             server_config::{DokodemoDoorConfig, ServerConfig, ServerProxyConfig},
         },
     };
+
+    #[cfg(feature = "user_domain_access")]
+    fn test_policy(version: u64, domain: &str) -> UserDomainAccessConfig {
+        let mut config: UserDomainAccessConfig =
+            serde_json::from_value(serde_json::json!({
+                "version": version,
+                "defaultAction": "reject",
+                "users": [{
+                    "userUuid": "11111111-1111-4111-8111-111111111111",
+                    "mode": "allowlist",
+                    "unknownTargetAction": "reject",
+                    "rules": [{
+                        "domain": domain,
+                        "match": "exact",
+                        "action": "allow"
+                    }]
+                }]
+            }))
+            .unwrap();
+        config.checksum = Some(user_domain_access_checksum(&config).unwrap());
+        config
+    }
+
+    #[cfg(feature = "user_domain_access")]
+    fn temporary_store_path() -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "chimera-startup-policy-{}-{nonce}.json",
+            std::process::id()
+        ))
+    }
 
     fn make_inbound(tag: &str, port: u16) -> ServerConfig {
         ServerConfig {
@@ -565,6 +846,176 @@ mod tests {
             Some("127.0.0.1:7000".into())
         );
         assert!(resolved.inbound.is_none());
+    }
+
+    #[cfg(feature = "user_domain_access")]
+    #[test]
+    fn compiles_user_domain_access_into_runtime_state() {
+        let config = r#"
+        {
+          "inbounds": [],
+          "outbounds": [],
+          "userDomainAccess": {
+            "defaultAction": "allow",
+            "users": [{
+              "userUuid": "11111111-1111-4111-8111-111111111111",
+              "mode": "allowlist",
+              "unknownTargetAction": "reject",
+              "rules": [{
+                "domain": "example.com",
+                "match": "suffix",
+                "action": "allow"
+              }]
+            }]
+          }
+        }
+        "#
+        .parse::<crate::LiteralConfig>()
+        .expect("literal policy should parse");
+        let policy = compile_user_domain_access(config.user_domain_access.as_ref())
+            .expect("policy should compile")
+            .expect("compiled policy missing");
+
+        let runtime = crate::RuntimeState::new(Vec::new(), Vec::new());
+        runtime.replace_user_domain_access(Some(policy));
+        let active = runtime
+            .user_domain_access()
+            .expect("runtime policy missing");
+        let user = "11111111-1111-4111-8111-111111111111"
+            .parse()
+            .expect("valid user UUID");
+        assert!(active.contains_user(user));
+    }
+
+    #[cfg(feature = "user_domain_access")]
+    #[test]
+    fn startup_selection_prefers_newer_persisted_revision() {
+        let store = temporary_store_path();
+        let runtime = crate::RuntimeState::new(Vec::new(), Vec::new());
+        runtime
+            .configure_user_domain_access_store(store.clone())
+            .unwrap();
+        runtime
+            .install_user_domain_access(test_policy(2, "persisted.example"))
+            .unwrap();
+
+        let selected = select_initial_user_domain_access(
+            Some(test_policy(1, "configured.example")),
+            Some(&store),
+        )
+        .unwrap();
+        let selected_config =
+            selected.config.expect("startup policy should be selected");
+        assert_eq!(selected.highest_seen_version, 2);
+        assert_eq!(selected_config.version, 2);
+        assert_eq!(
+            selected_config.users[0].rules[0].domain,
+            "persisted.example"
+        );
+
+        let mut conflicting = test_policy(2, "conflict.example");
+        conflicting.checksum =
+            Some(user_domain_access_checksum(&conflicting).unwrap());
+        let error =
+            select_initial_user_domain_access(Some(conflicting), Some(&store))
+                .expect_err("same-version divergent startup policies must fail");
+        assert!(error.to_string().contains("both use version 2 but differ"));
+
+        fs::remove_file(store).unwrap();
+    }
+
+    #[cfg(feature = "user_domain_access")]
+    #[test]
+    fn startup_selection_keeps_persisted_history_for_a_newer_configured_revision() {
+        let store = temporary_store_path();
+        let runtime = crate::RuntimeState::new(Vec::new(), Vec::new());
+        runtime
+            .configure_user_domain_access_store(store.clone())
+            .unwrap();
+        runtime
+            .install_user_domain_access(test_policy(1, "one.example"))
+            .unwrap();
+        runtime
+            .install_user_domain_access(test_policy(2, "two.example"))
+            .unwrap();
+        runtime.rollback_user_domain_access(1).unwrap();
+
+        let selected = select_initial_user_domain_access(
+            Some(test_policy(3, "three.example")),
+            Some(&store),
+        )
+        .expect("new configured policy should be selected");
+        assert_eq!(selected.highest_seen_version, 3);
+        assert_eq!(
+            selected
+                .config
+                .as_ref()
+                .expect("selected policy missing")
+                .version,
+            3
+        );
+        assert_eq!(
+            selected
+                .history
+                .iter()
+                .map(|config| config.version)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        let restarted = crate::RuntimeState::new(Vec::new(), Vec::new());
+        restarted
+            .restore_user_domain_access_persisted_state(
+                selected.highest_seen_version,
+                selected.history,
+            )
+            .expect("persisted history should restore");
+        restarted
+            .install_user_domain_access(
+                selected.config.expect("selected policy missing"),
+            )
+            .expect("new configured policy should install");
+        assert_eq!(
+            restarted
+                .rollback_user_domain_access(2)
+                .expect("persisted version 2 should remain retained")
+                .version,
+            2
+        );
+        assert_eq!(
+            restarted
+                .rollback_user_domain_access(1)
+                .expect("persisted version 1 should remain retained")
+                .version,
+            1
+        );
+
+        fs::remove_file(store).unwrap();
+    }
+
+    #[cfg(feature = "user_domain_access")]
+    #[test]
+    fn rejects_invalid_user_domain_access_before_runtime_installation() {
+        let config = r#"
+        {
+          "inbounds": [],
+          "outbounds": [],
+          "userDomainAccess": {
+            "users": [{
+              "userUuid": "11111111-1111-4111-8111-111111111111",
+              "mode": "allowlist",
+              "unknownTargetAction": "reject",
+              "rules": []
+            }]
+          }
+        }
+        "#
+        .parse::<crate::LiteralConfig>()
+        .expect("literal policy should parse");
+
+        let error = compile_user_domain_access(config.user_domain_access.as_ref())
+            .expect_err("empty allowlist should fail");
+        assert!(error.to_string().contains("allowlist"));
     }
 
     #[test]

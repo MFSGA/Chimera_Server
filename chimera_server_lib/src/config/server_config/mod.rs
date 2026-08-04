@@ -1,4 +1,5 @@
 mod builder;
+#[cfg(feature = "api")]
 pub(crate) use builder::collect_xhttp_settings_from_json;
 pub mod quic;
 mod types;

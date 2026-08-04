@@ -3,11 +3,29 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+#[cfg(feature = "user_domain_access")]
+use serde::{Deserialize, Serialize};
+#[cfg(feature = "user_domain_access")]
+use std::{
+    collections::VecDeque,
+    fs::{self, File, OpenOptions},
+    io::{BufWriter, Write},
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
+#[cfg(feature = "user_domain_access")]
+use uuid::Uuid;
+
 use tokio::{
     sync::broadcast,
     task::{AbortHandle, JoinHandle},
 };
 
+#[cfg(feature = "user_domain_access")]
+use crate::user_domain_access::{
+    AccessAction, AccessDecision, AccessDecisionReason, UserDomainAccessConfig,
+    UserDomainAccessPolicy,
+};
 use crate::{
     config::server_config::ServerConfig,
     routing_state::{
@@ -23,6 +41,100 @@ pub struct OutboundSummary {
     pub proxy_settings_value: Option<Vec<u8>>,
 }
 
+#[cfg(feature = "user_domain_access")]
+const USER_DOMAIN_ACCESS_HISTORY_LIMIT: usize = 5;
+#[cfg(feature = "user_domain_access")]
+pub(crate) const fn user_domain_access_history_limit() -> usize {
+    USER_DOMAIN_ACCESS_HISTORY_LIMIT
+}
+#[cfg(feature = "user_domain_access")]
+static USER_DOMAIN_ACCESS_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "user_domain_access")]
+const USER_DOMAIN_ACCESS_STORE_FORMAT_VERSION: u32 = 1;
+
+#[cfg(feature = "user_domain_access")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserDomainAccessRevisionInfo {
+    pub version: u64,
+    pub generated_at: Option<Arc<str>>,
+    pub source_backend_version: Option<Arc<str>>,
+    pub target_node_uuid: Option<Arc<str>>,
+    pub checksum: Option<Arc<str>>,
+}
+
+#[cfg(feature = "user_domain_access")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LoadedUserDomainAccessStore {
+    pub config: UserDomainAccessConfig,
+    pub highest_seen_version: u64,
+    pub history: Vec<UserDomainAccessConfig>,
+}
+
+#[cfg(feature = "user_domain_access")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UserDomainAccessStoreEnvelope {
+    format_version: u32,
+    highest_seen_version: u64,
+    current: UserDomainAccessConfig,
+    #[serde(default)]
+    history: Vec<UserDomainAccessConfig>,
+}
+
+#[cfg(feature = "user_domain_access")]
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum StoredUserDomainAccess {
+    Envelope(UserDomainAccessStoreEnvelope),
+    Legacy(UserDomainAccessConfig),
+}
+
+#[cfg(feature = "user_domain_access")]
+#[derive(Debug, Clone)]
+struct UserDomainAccessRevision {
+    info: UserDomainAccessRevisionInfo,
+    policy: Arc<UserDomainAccessPolicy>,
+    config: Option<Arc<UserDomainAccessConfig>>,
+}
+
+#[cfg(feature = "user_domain_access")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UserDomainAccessStats {
+    pub evaluations: u64,
+    pub allowed: u64,
+    pub rejected: u64,
+    pub matched_rule: u64,
+    pub no_user_policy: u64,
+    pub unknown_target: u64,
+    pub allow_all_default: u64,
+    pub allowlist_miss: u64,
+    pub denylist_miss: u64,
+}
+
+#[cfg(feature = "user_domain_access")]
+#[derive(Debug, Default)]
+struct UserDomainAccessMetrics {
+    evaluations: AtomicU64,
+    allowed: AtomicU64,
+    rejected: AtomicU64,
+    matched_rule: AtomicU64,
+    no_user_policy: AtomicU64,
+    unknown_target: AtomicU64,
+    allow_all_default: AtomicU64,
+    allowlist_miss: AtomicU64,
+    denylist_miss: AtomicU64,
+}
+
+#[cfg(feature = "user_domain_access")]
+#[derive(Debug, Default)]
+struct UserDomainAccessRuntimeState {
+    current: Option<UserDomainAccessRevision>,
+    history: VecDeque<UserDomainAccessRevision>,
+    highest_seen_version: u64,
+    store_path: Option<PathBuf>,
+    expected_target_node_uuid: Option<Uuid>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeState {
     inbounds: Arc<RwLock<Vec<ServerConfig>>>,
@@ -31,6 +143,10 @@ pub struct RuntimeState {
     routing: Arc<RwLock<RoutingState>>,
     balancer_overrides: Arc<RwLock<HashMap<String, String>>>,
     routing_events: broadcast::Sender<RoutingEvent>,
+    #[cfg(feature = "user_domain_access")]
+    user_domain_access: Arc<RwLock<UserDomainAccessRuntimeState>>,
+    #[cfg(feature = "user_domain_access")]
+    user_domain_access_metrics: Arc<UserDomainAccessMetrics>,
 }
 
 impl RuntimeState {
@@ -46,6 +162,12 @@ impl RuntimeState {
             routing: Arc::new(RwLock::new(RoutingState::default())),
             balancer_overrides: Arc::new(RwLock::new(HashMap::new())),
             routing_events,
+            #[cfg(feature = "user_domain_access")]
+            user_domain_access: Arc::new(RwLock::new(
+                UserDomainAccessRuntimeState::default(),
+            )),
+            #[cfg(feature = "user_domain_access")]
+            user_domain_access_metrics: Arc::new(UserDomainAccessMetrics::default()),
         }
     }
 
@@ -275,4 +397,621 @@ impl RuntimeState {
         let mut guard = self.routing.write().expect("runtime routing lock poisoned");
         mutator(&mut guard)
     }
+
+    /// Returns the active compiled user-domain access policy, if configured.
+    #[cfg(feature = "user_domain_access")]
+    pub fn user_domain_access(&self) -> Option<Arc<UserDomainAccessPolicy>> {
+        self.user_domain_access
+            .read()
+            .expect("runtime user-domain access lock poisoned")
+            .current
+            .as_ref()
+            .map(|revision| Arc::clone(&revision.policy))
+    }
+
+    /// Records one low-cardinality access decision without locking the data path.
+    #[cfg(feature = "user_domain_access")]
+    pub(crate) fn record_user_domain_access_decision(
+        &self,
+        decision: &AccessDecision,
+    ) {
+        self.user_domain_access_metrics.record(decision);
+    }
+
+    /// Returns a cumulative low-cardinality access decision snapshot.
+    #[cfg(feature = "user_domain_access")]
+    pub fn user_domain_access_stats(&self) -> UserDomainAccessStats {
+        self.user_domain_access_metrics.snapshot()
+    }
+
+    /// Returns metadata for the active user-domain access revision.
+    #[cfg(feature = "user_domain_access")]
+    pub fn user_domain_access_revision(
+        &self,
+    ) -> Option<UserDomainAccessRevisionInfo> {
+        self.user_domain_access
+            .read()
+            .expect("runtime user-domain access lock poisoned")
+            .current
+            .as_ref()
+            .map(|revision| revision.info.clone())
+    }
+
+    /// Configures the atomic persistence target used by installs and rollbacks.
+    #[cfg(feature = "user_domain_access")]
+    pub fn configure_user_domain_access_store(
+        &self,
+        path: impl Into<PathBuf>,
+    ) -> Result<(), String> {
+        let path = path.into();
+        if path.as_os_str().is_empty() {
+            return Err("user-domain access store path must not be empty".into());
+        }
+        self.user_domain_access
+            .write()
+            .expect("runtime user-domain access lock poisoned")
+            .store_path = Some(path);
+        Ok(())
+    }
+
+    /// Configures the node UUID that incoming policy publications must target.
+    #[cfg(feature = "user_domain_access")]
+    pub fn configure_user_domain_access_target_node(
+        &self,
+        node_uuid: &str,
+    ) -> Result<(), String> {
+        let node_uuid = Uuid::parse_str(node_uuid.trim()).map_err(|error| {
+            format!("invalid user-domain access node UUID {node_uuid}: {error}")
+        })?;
+        self.user_domain_access
+            .write()
+            .expect("runtime user-domain access lock poisoned")
+            .expected_target_node_uuid = Some(node_uuid);
+        Ok(())
+    }
+
+    /// Restores persisted replay protection and rollback history before installing the current revision.
+    #[cfg(feature = "user_domain_access")]
+    pub(crate) fn restore_user_domain_access_persisted_state(
+        &self,
+        highest_seen_version: u64,
+        history: Vec<UserDomainAccessConfig>,
+    ) -> Result<(), String> {
+        let mut state = self
+            .user_domain_access
+            .write()
+            .expect("runtime user-domain access lock poisoned");
+        if state.current.is_some() || !state.history.is_empty() {
+            return Err(
+                "user-domain access persisted state must be restored before current policy installation"
+                    .into(),
+            );
+        }
+        if history.len() > USER_DOMAIN_ACCESS_HISTORY_LIMIT {
+            return Err(format!(
+                "cannot restore {} user-domain access history revisions; maximum is {}",
+                history.len(),
+                USER_DOMAIN_ACCESS_HISTORY_LIMIT
+            ));
+        }
+        let mut versions = std::collections::HashSet::new();
+        let mut restored = VecDeque::with_capacity(history.len());
+        for config in history {
+            let info = revision_info_from_config(&config);
+            if !versions.insert(info.version) {
+                return Err(format!(
+                    "cannot restore duplicate user-domain access history version {}",
+                    info.version
+                ));
+            }
+            if info.version > highest_seen_version {
+                return Err(format!(
+                    "retained user-domain access version {} exceeds highestSeenVersion {}",
+                    info.version, highest_seen_version
+                ));
+            }
+            validate_user_domain_access_target(
+                &info,
+                state.expected_target_node_uuid,
+            )?;
+            let policy = Arc::new(
+                UserDomainAccessPolicy::compile(config.clone())
+                    .map_err(|error| error.to_string())?,
+            );
+            restored.push_back(UserDomainAccessRevision {
+                info,
+                policy,
+                config: Some(Arc::new(config)),
+            });
+        }
+        state.highest_seen_version =
+            state.highest_seen_version.max(highest_seen_version);
+        state.history = restored;
+        Ok(())
+    }
+
+    /// Compiles and atomically installs a strictly newer policy revision.
+    /// Invalid or stale revisions leave the active policy unchanged.
+    #[cfg(feature = "user_domain_access")]
+    pub fn install_user_domain_access(
+        &self,
+        config: UserDomainAccessConfig,
+    ) -> Result<UserDomainAccessRevisionInfo, String> {
+        let info = revision_info_from_config(&config);
+        let policy = Arc::new(
+            UserDomainAccessPolicy::compile(config.clone())
+                .map_err(|error| error.to_string())?,
+        );
+        let config = Arc::new(config);
+        let mut state = self
+            .user_domain_access
+            .write()
+            .expect("runtime user-domain access lock poisoned");
+        validate_user_domain_access_target(&info, state.expected_target_node_uuid)?;
+        if state.current.is_some() && info.version <= state.highest_seen_version {
+            return Err(format!(
+                "user-domain access version {} is not newer than highest installed version {}",
+                info.version, state.highest_seen_version
+            ));
+        }
+        if let Some(path) = state.store_path.as_deref() {
+            let mut history = Vec::with_capacity(USER_DOMAIN_ACCESS_HISTORY_LIMIT);
+            if let Some(current) = state.current.as_ref() {
+                append_persisted_history_config(&mut history, current, info.version);
+            }
+            for revision in &state.history {
+                append_persisted_history_config(
+                    &mut history,
+                    revision,
+                    info.version,
+                );
+                if history.len() == USER_DOMAIN_ACCESS_HISTORY_LIMIT {
+                    break;
+                }
+            }
+            persist_user_domain_access_config(
+                path,
+                &config,
+                state.highest_seen_version.max(info.version),
+                &history,
+            )?;
+        }
+        install_user_domain_revision(
+            &mut state,
+            UserDomainAccessRevision {
+                info: info.clone(),
+                policy,
+                config: Some(config),
+            },
+        );
+        Ok(info)
+    }
+
+    /// Installs the startup policy without requiring a positive version.
+    #[cfg(feature = "user_domain_access")]
+    pub fn replace_user_domain_access(
+        &self,
+        policy: Option<UserDomainAccessPolicy>,
+    ) {
+        let mut state = self
+            .user_domain_access
+            .write()
+            .expect("runtime user-domain access lock poisoned");
+        let store_path = state.store_path.take();
+        let expected_target_node_uuid = state.expected_target_node_uuid.take();
+        *state = UserDomainAccessRuntimeState::default();
+        state.store_path = store_path;
+        state.expected_target_node_uuid = expected_target_node_uuid;
+        if let Some(policy) = policy {
+            state.current = Some(UserDomainAccessRevision {
+                info: UserDomainAccessRevisionInfo {
+                    version: 0,
+                    generated_at: None,
+                    source_backend_version: None,
+                    target_node_uuid: None,
+                    checksum: None,
+                },
+                policy: Arc::new(policy),
+                config: None,
+            });
+        }
+    }
+
+    /// Atomically rolls back to a retained revision while preserving replay protection.
+    #[cfg(feature = "user_domain_access")]
+    pub fn rollback_user_domain_access(
+        &self,
+        version: u64,
+    ) -> Result<UserDomainAccessRevisionInfo, String> {
+        let mut state = self
+            .user_domain_access
+            .write()
+            .expect("runtime user-domain access lock poisoned");
+        if state
+            .current
+            .as_ref()
+            .is_some_and(|revision| revision.info.version == version)
+        {
+            return state
+                .current
+                .as_ref()
+                .map(|revision| revision.info.clone())
+                .ok_or_else(|| "user-domain access policy is not installed".into());
+        }
+        let Some(index) = state
+            .history
+            .iter()
+            .position(|revision| revision.info.version == version)
+        else {
+            return Err(format!(
+                "user-domain access version {version} is not retained"
+            ));
+        };
+        let revision = state
+            .history
+            .get(index)
+            .cloned()
+            .expect("retained revision index must exist");
+        if let Some(path) = state.store_path.as_deref() {
+            let config = revision.config.as_deref().ok_or_else(|| {
+                "retained user-domain access revision has no persisted config"
+                    .to_string()
+            })?;
+            let mut history = Vec::with_capacity(USER_DOMAIN_ACCESS_HISTORY_LIMIT);
+            if let Some(current) = state.current.as_ref() {
+                append_persisted_history_config(
+                    &mut history,
+                    current,
+                    revision.info.version,
+                );
+            }
+            for (history_index, retained) in state.history.iter().enumerate() {
+                if history_index == index {
+                    continue;
+                }
+                append_persisted_history_config(
+                    &mut history,
+                    retained,
+                    revision.info.version,
+                );
+                if history.len() == USER_DOMAIN_ACCESS_HISTORY_LIMIT {
+                    break;
+                }
+            }
+            persist_user_domain_access_config(
+                path,
+                config,
+                state.highest_seen_version,
+                &history,
+            )?;
+        }
+        let revision = state
+            .history
+            .remove(index)
+            .expect("retained revision index must exist");
+        if let Some(current) = state.current.take() {
+            push_user_domain_history(&mut state.history, current);
+        }
+        let info = revision.info.clone();
+        state.current = Some(revision);
+        Ok(info)
+    }
+}
+
+#[cfg(feature = "user_domain_access")]
+fn validate_user_domain_access_target(
+    info: &UserDomainAccessRevisionInfo,
+    expected_target_node_uuid: Option<Uuid>,
+) -> Result<(), String> {
+    let Some(expected_node_uuid) = expected_target_node_uuid else {
+        return Ok(());
+    };
+    let actual_node_uuid = info.target_node_uuid.as_deref().ok_or_else(|| {
+        format!(
+            "user-domain access revision {} is missing targetNodeUuid; expected {}",
+            info.version, expected_node_uuid
+        )
+    })?;
+    let actual_node_uuid = Uuid::parse_str(actual_node_uuid).map_err(|error| {
+        format!(
+            "invalid user-domain access targetNodeUuid {actual_node_uuid}: {error}"
+        )
+    })?;
+    if actual_node_uuid != expected_node_uuid {
+        return Err(format!(
+            "user-domain access revision {} targets node {}, expected {}",
+            info.version, actual_node_uuid, expected_node_uuid
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "user_domain_access")]
+fn append_persisted_history_config(
+    history: &mut Vec<UserDomainAccessConfig>,
+    revision: &UserDomainAccessRevision,
+    current_version: u64,
+) {
+    let Some(config) = revision.config.as_deref() else {
+        return;
+    };
+    if config.version == current_version
+        || history
+            .iter()
+            .any(|existing| existing.version == config.version)
+    {
+        return;
+    }
+    history.push(config.clone());
+}
+
+#[cfg(feature = "user_domain_access")]
+impl UserDomainAccessMetrics {
+    fn record(&self, decision: &AccessDecision) {
+        self.evaluations.fetch_add(1, Ordering::Relaxed);
+        match decision.action {
+            AccessAction::Allow => {
+                self.allowed.fetch_add(1, Ordering::Relaxed);
+            }
+            AccessAction::Reject => {
+                self.rejected.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let counter = match decision.reason {
+            AccessDecisionReason::MatchedRule => &self.matched_rule,
+            AccessDecisionReason::NoUserPolicy => &self.no_user_policy,
+            AccessDecisionReason::UnknownTarget => &self.unknown_target,
+            AccessDecisionReason::AllowAllDefault => &self.allow_all_default,
+            AccessDecisionReason::AllowlistMiss => &self.allowlist_miss,
+            AccessDecisionReason::DenylistMiss => &self.denylist_miss,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> UserDomainAccessStats {
+        UserDomainAccessStats {
+            evaluations: self.evaluations.load(Ordering::Relaxed),
+            allowed: self.allowed.load(Ordering::Relaxed),
+            rejected: self.rejected.load(Ordering::Relaxed),
+            matched_rule: self.matched_rule.load(Ordering::Relaxed),
+            no_user_policy: self.no_user_policy.load(Ordering::Relaxed),
+            unknown_target: self.unknown_target.load(Ordering::Relaxed),
+            allow_all_default: self.allow_all_default.load(Ordering::Relaxed),
+            allowlist_miss: self.allowlist_miss.load(Ordering::Relaxed),
+            denylist_miss: self.denylist_miss.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[cfg(feature = "user_domain_access")]
+pub(crate) fn load_user_domain_access_store(
+    path: &Path,
+) -> Result<Option<LoadedUserDomainAccessStore>, String> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(format!(
+                "failed to read user-domain access store {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let stored = serde_json::from_str::<StoredUserDomainAccess>(&content).map_err(
+        |error| {
+            format!(
+                "failed to parse user-domain access store {}: {error}",
+                path.display()
+            )
+        },
+    )?;
+    let loaded = match stored {
+        StoredUserDomainAccess::Legacy(config) => LoadedUserDomainAccessStore {
+            highest_seen_version: config.version,
+            config,
+            history: Vec::new(),
+        },
+        StoredUserDomainAccess::Envelope(envelope) => {
+            if envelope.format_version != USER_DOMAIN_ACCESS_STORE_FORMAT_VERSION {
+                return Err(format!(
+                    "unsupported user-domain access store format version {} in {}; expected {}",
+                    envelope.format_version,
+                    path.display(),
+                    USER_DOMAIN_ACCESS_STORE_FORMAT_VERSION
+                ));
+            }
+            if envelope.highest_seen_version < envelope.current.version {
+                return Err(format!(
+                    "user-domain access store {} has highestSeenVersion {} below current version {}",
+                    path.display(),
+                    envelope.highest_seen_version,
+                    envelope.current.version
+                ));
+            }
+            let mut versions = std::collections::HashSet::new();
+            versions.insert(envelope.current.version);
+            for revision in &envelope.history {
+                if revision.version > envelope.highest_seen_version {
+                    return Err(format!(
+                        "user-domain access store {} retains version {} above highestSeenVersion {}",
+                        path.display(),
+                        revision.version,
+                        envelope.highest_seen_version
+                    ));
+                }
+                if !versions.insert(revision.version) {
+                    return Err(format!(
+                        "user-domain access store {} contains duplicate version {}",
+                        path.display(),
+                        revision.version
+                    ));
+                }
+            }
+            if envelope.history.len() > USER_DOMAIN_ACCESS_HISTORY_LIMIT {
+                return Err(format!(
+                    "user-domain access store {} retains {} history revisions; maximum is {}",
+                    path.display(),
+                    envelope.history.len(),
+                    USER_DOMAIN_ACCESS_HISTORY_LIMIT
+                ));
+            }
+            LoadedUserDomainAccessStore {
+                config: envelope.current,
+                highest_seen_version: envelope.highest_seen_version,
+                history: envelope.history,
+            }
+        }
+    };
+    Ok(Some(loaded))
+}
+
+#[cfg(feature = "user_domain_access")]
+fn persist_user_domain_access_config(
+    path: &Path,
+    config: &UserDomainAccessConfig,
+    highest_seen_version: u64,
+    history: &[UserDomainAccessConfig],
+) -> Result<(), String> {
+    if highest_seen_version < config.version {
+        return Err(format!(
+            "cannot persist user-domain access version {} with highestSeenVersion {}",
+            config.version, highest_seen_version
+        ));
+    }
+    if history.len() > USER_DOMAIN_ACCESS_HISTORY_LIMIT {
+        return Err(format!(
+            "cannot persist {} user-domain access history revisions; maximum is {}",
+            history.len(),
+            USER_DOMAIN_ACCESS_HISTORY_LIMIT
+        ));
+    }
+    let envelope = UserDomainAccessStoreEnvelope {
+        format_version: USER_DOMAIN_ACCESS_STORE_FORMAT_VERSION,
+        highest_seen_version,
+        current: config.clone(),
+        history: history.to_vec(),
+    };
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create user-domain access store directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    let directory = parent.unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            format!(
+                "user-domain access store path {} has no valid file name",
+                path.display()
+            )
+        })?;
+    let counter = USER_DOMAIN_ACCESS_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temporary =
+        directory.join(format!(".{file_name}.tmp-{}-{counter}", std::process::id()));
+
+    let result = (|| -> Result<(), String> {
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|error| {
+                format!(
+                    "failed to create user-domain access temporary store {}: {error}",
+                    temporary.display()
+                )
+            })?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, &envelope).map_err(|error| {
+            format!(
+                "failed to serialize user-domain access store {}: {error}",
+                temporary.display()
+            )
+        })?;
+        writer.write_all(b"\n").map_err(|error| {
+            format!(
+                "failed to finalize user-domain access store {}: {error}",
+                temporary.display()
+            )
+        })?;
+        writer.flush().map_err(|error| {
+            format!(
+                "failed to flush user-domain access store {}: {error}",
+                temporary.display()
+            )
+        })?;
+        writer.get_ref().sync_all().map_err(|error| {
+            format!(
+                "failed to sync user-domain access store {}: {error}",
+                temporary.display()
+            )
+        })?;
+        fs::rename(&temporary, path).map_err(|error| {
+            format!(
+                "failed to atomically replace user-domain access store {}: {error}",
+                path.display()
+            )
+        })?;
+        #[cfg(unix)]
+        File::open(directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                format!(
+                    "failed to sync user-domain access store directory {}: {error}",
+                    directory.display()
+                )
+            })?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(feature = "user_domain_access")]
+fn revision_info_from_config(
+    config: &UserDomainAccessConfig,
+) -> UserDomainAccessRevisionInfo {
+    UserDomainAccessRevisionInfo {
+        version: config.version,
+        generated_at: config.generated_at.as_deref().map(Arc::from),
+        source_backend_version: config
+            .source_backend_version
+            .as_deref()
+            .map(Arc::from),
+        target_node_uuid: config.target_node_uuid.as_deref().map(Arc::from),
+        checksum: config.checksum.as_deref().map(Arc::from),
+    }
+}
+
+#[cfg(feature = "user_domain_access")]
+fn install_user_domain_revision(
+    state: &mut UserDomainAccessRuntimeState,
+    revision: UserDomainAccessRevision,
+) {
+    state.highest_seen_version =
+        state.highest_seen_version.max(revision.info.version);
+    if let Some(current) = state.current.take() {
+        push_user_domain_history(&mut state.history, current);
+    }
+    state.current = Some(revision);
+}
+
+#[cfg(feature = "user_domain_access")]
+fn push_user_domain_history(
+    history: &mut VecDeque<UserDomainAccessRevision>,
+    revision: UserDomainAccessRevision,
+) {
+    history.retain(|existing| existing.info.version != revision.info.version);
+    history.push_front(revision);
+    history.truncate(USER_DOMAIN_ACCESS_HISTORY_LIMIT);
 }
