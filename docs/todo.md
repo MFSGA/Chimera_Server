@@ -195,7 +195,7 @@ BPF SOCKHASH 不是当前必做项。只有物理机高并发数据证明网卡�
 
 详细差距分析见 [`20260804-234600-xray-parity-gap-analysis.zh.md`](./20260804-234600-xray-parity-gap-analysis.zh.md)。对比基线为仓库内 `ref/xray-core` 的 `5ca6f4b7d4dc`（Xray-core v26.7.28）。
 
-当前结论：入站、路由、Stats/Handler/Routing/Observatory 控制面已经较完整。出站运行时已从仅支持 `freedom`/`blackhole` 推进到支持 VLESS TCP，并完成可复用的 TCP/TLS/REALITY/WebSocket 静态 transport pipeline；HTTP Upgrade、gRPC、其他代理出站、通用 sniffing、Xray DNS/FakeDNS、mKCP、TUN、Reverse、WireGuard 和部分 XHTTP client/xmux/download 语义仍未完成。
+当前结论：入站、路由、Stats/Handler/Routing/Observatory 控制面已经较完整。出站运行时已从仅支持 `freedom`/`blackhole` 推进到支持 VLESS TCP，并完成可复用的 TCP/TLS/REALITY/WebSocket/HTTP Upgrade 静态 transport pipeline；gRPC、其他代理出站、通用 sniffing、Xray DNS/FakeDNS、mKCP、TUN、Reverse、WireGuard 和部分 XHTTP client/xmux/download 语义仍未完成。
 
 ### P0：Outbound Runtime
 
@@ -206,7 +206,7 @@ BPF SOCKHASH 不是当前必做项。只有物理机高并发数据证明网卡�
 - [x] 让静态配置和 HandlerService Add/RemoveOutbound 原子更新同一 registry；动态 Blackhole 已支持。
 - [x] unsupported outbound 在编译或安装阶段 fail-closed，而不是连接时才失败；测试兼容构造器仍保留诊断路径。
 - [x] 支持 VLESS TCP plain outbound：单 endpoint、单 UUID、原始 domain/IP target、惰性响应头、静态/动态配置和 ListOutbounds 回读；已通过本地 mock 与 Xray 26.2.6 真实进程互通。
-- [ ] 支持通用 outbound transport pipeline：TCP、静态 TLS、静态 REALITY 和静态 WebSocket 已完成。WebSocket 支持 host/path/普通 headers，并可与 TLS 组合为 WSS；early data、heartbeat、proxy protocol 和保留握手头 fail-closed。TLS、REALITY、WS、WSS 均已通过 Xray 26.2.6 真实互通；动态 sender settings、uTLS fingerprint、spiderX、HTTPUpgrade 和 gRPC 仍待完成。
+- [ ] 支持通用 outbound transport pipeline：TCP、静态 TLS、静态 REALITY、静态 WebSocket 和静态 HTTP Upgrade 已完成。HTTP Upgrade 支持 host/path/普通 headers，并可与 TLS 组合；early data、proxy protocol、Host/Connection/Upgrade 覆盖和 REALITY 组合 fail-closed。TLS、REALITY、WS、WSS、HTTP Upgrade 及其 TLS 组合均已通过 Xray 26.2.6 真实互通；动态 sender settings、uTLS fingerprint、spiderX 和 gRPC 仍待完成。
 - [ ] 依次接入 VMess、Trojan、SOCKS、HTTP、Shadowsocks TCP/UDP outbound。
 
 ### P0/P1：Sniffing 与 DNS
