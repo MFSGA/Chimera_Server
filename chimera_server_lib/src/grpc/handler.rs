@@ -1138,6 +1138,8 @@ impl HandlerServiceImpl {
                     network: "tcp".into(),
                     security: Some("none".into()),
                     tls_settings: None,
+                    #[cfg(feature = "reality")]
+                    reality_settings: None,
                 });
                 "vless"
             }

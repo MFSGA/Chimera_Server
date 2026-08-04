@@ -19,7 +19,7 @@ use process::{
 };
 
 /// Configuration for REALITY client connections
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct RealityClientConfig {
     /// Server's X25519 public key (32 bytes)
     pub public_key: [u8; 32],

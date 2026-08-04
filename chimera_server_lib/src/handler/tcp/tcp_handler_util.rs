@@ -7,9 +7,9 @@ use crate::handler::httpupgrade::HttpUpgradeTcpServerHandler;
 #[cfg(feature = "mixed")]
 use crate::handler::mixed::MixedTcpServerHandler;
 #[cfg(feature = "reality")]
-use crate::handler::reality::{
-    RealityServerHandler, RealityVisionVlessServerHandler,
-};
+use crate::handler::reality::RealityServerHandler;
+#[cfg(all(feature = "reality", feature = "vless"))]
+use crate::handler::reality::RealityVisionVlessServerHandler;
 #[cfg(feature = "shadowsocks")]
 use crate::handler::shadowsocks::ShadowsocksTcpServerHandler;
 #[cfg(feature = "vless")]

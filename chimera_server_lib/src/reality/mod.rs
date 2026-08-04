@@ -35,6 +35,7 @@ pub use reality_util::{
     decode_private_key, decode_public_key, decode_short_id, generate_keypair,
 };
 pub use stream::{RealitySession, RealityTlsStream};
+#[cfg(feature = "vless")]
 pub(crate) use sync_adapter::{SyncReadAdapter, SyncWriteAdapter};
 
 /// mihomo (Clash.Meta) reality-opts helper for building a client config.

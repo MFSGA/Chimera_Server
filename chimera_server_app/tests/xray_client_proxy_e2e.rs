@@ -474,6 +474,117 @@ async fn chimera_vless_tls_outbound_interoperates_with_xray_inbound() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera as SOCKS server and ./xray as a REALITY VLESS upstream"]
+async fn chimera_vless_reality_outbound_interoperates_with_xray_inbound() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("vless-reality-outbound");
+    let echo_addr = start_tcp_echo_server();
+    let reality_dest_addr = start_tls13_dest(&workspace).await;
+    let xray_vless_port = free_localhost_port();
+    let chimera_socks_port = free_localhost_port();
+    let xray_config_path = work_dir.join("xray-vless-reality-inbound.json");
+    let chimera_config_path = work_dir.join("chimera-vless-reality-outbound.json");
+
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_vless_port,
+                "protocol": "vless",
+                "tag": "vless-reality-in",
+                "settings": {
+                    "clients": [{"id": TEST_UUID}],
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "reality",
+                    "realitySettings": {
+                        "dest": format!("127.0.0.1:{}", reality_dest_addr.port()),
+                        "serverNames": [REALITY_SERVER_NAME],
+                        "privateKey": REALITY_PRIVATE_KEY,
+                        "shortIds": [REALITY_SHORT_ID],
+                        "minClientVer": "1.8.0",
+                        "maxTimeDiff": 0
+                    }
+                }
+            }],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }]
+        }),
+    );
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_socks_port,
+                "protocol": "socks",
+                "tag": "socks-in",
+                "settings": {"auth": "noauth"}
+            }],
+            "outbounds": [{
+                "tag": "to-xray-reality",
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": xray_vless_port,
+                        "users": [{
+                            "id": TEST_UUID,
+                            "encryption": "none",
+                            "flow": ""
+                        }]
+                    }]
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "reality",
+                    "realitySettings": {
+                        "serverName": REALITY_SERVER_NAME,
+                        "publicKey": REALITY_PUBLIC_KEY,
+                        "shortId": REALITY_SHORT_ID
+                    }
+                }
+            }],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["socks-in"],
+                    "outboundTag": "to-xray-reality"
+                }]
+            }
+        }),
+    );
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, xray_vless_port)));
+    xray.assert_running();
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_socks_port)));
+    chimera.assert_running();
+
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_socks_port));
+    assert_socks5_echo(
+        socks_addr,
+        echo_addr,
+        b"REALITY VLESS outbound through Xray inbound",
+    );
+    assert_socks5_echo(socks_addr, echo_addr, &deterministic_payload(64 * 1024));
+    assert_socks5_domain_echo(
+        socks_addr,
+        "localhost",
+        echo_addr.port(),
+        b"REALITY VLESS outbound domain target",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts Chimera and verifies unauthenticated VLESS fallback replay"]
 async fn unauthenticated_plain_tcp_reaches_vless_fallback() {
     let workspace = workspace_root();

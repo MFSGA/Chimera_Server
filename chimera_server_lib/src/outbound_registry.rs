@@ -303,6 +303,8 @@ mod tests {
                 network: "tcp".into(),
                 security: Some("none".into()),
                 tls_settings: None,
+                #[cfg(feature = "reality")]
+                reality_settings: None,
             }),
             proxy_settings_type: None,
             proxy_settings_value: None,
@@ -398,7 +400,7 @@ mod tests {
         assert!(
             OutboundConnectorKind::compile(&reality, true)
                 .unwrap_err()
-                .contains("unsupported security reality")
+                .contains("security=reality requires realitySettings")
         );
     }
 

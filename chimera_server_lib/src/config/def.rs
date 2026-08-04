@@ -140,6 +140,27 @@ pub struct OutboundStreamSettings {
     pub security: Option<String>,
     #[serde(default)]
     pub tls_settings: Option<OutboundTlsSettings>,
+    #[cfg(feature = "reality")]
+    #[serde(default)]
+    pub reality_settings: Option<OutboundRealitySettings>,
+}
+
+#[cfg(feature = "reality")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OutboundRealitySettings {
+    #[serde(default)]
+    pub server_name: Option<String>,
+    #[serde(default)]
+    pub public_key: Option<String>,
+    #[serde(default)]
+    pub short_id: Option<String>,
+    #[serde(default, alias = "cipher_suite")]
+    pub cipher_suites: Vec<crate::reality::CipherSuite>,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+    #[serde(default)]
+    pub spider_x: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

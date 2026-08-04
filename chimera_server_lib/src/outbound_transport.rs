@@ -15,6 +15,11 @@ use tokio_rustls::TlsConnector;
 
 #[cfg(any(feature = "tls", test))]
 use crate::address::Address;
+#[cfg(feature = "reality")]
+use crate::reality::{
+    RealityClientConfig, RealityClientConnection, RealityTlsStream,
+    decode_public_key, decode_short_id,
+};
 use crate::{
     address::NetLocation,
     async_stream::AsyncStream,
@@ -28,6 +33,8 @@ pub(crate) enum OutboundTransportConfig {
     Tcp,
     #[cfg(feature = "tls")]
     Tls(TlsOutboundTransportConfig),
+    #[cfg(feature = "reality")]
+    Reality(RealityClientConfig),
 }
 
 #[cfg(feature = "tls")]
@@ -64,9 +71,19 @@ impl OutboundTransportConfig {
                         "outbound {outbound_tag} provides tlsSettings without security=tls"
                     ));
                 }
+                if has_reality_settings(stream) {
+                    return Err(format!(
+                        "outbound {outbound_tag} provides realitySettings without security=reality"
+                    ));
+                }
                 Ok(Self::Tcp)
             }
             "tls" => {
+                if has_reality_settings(stream) {
+                    return Err(format!(
+                        "outbound {outbound_tag} provides realitySettings with security=tls"
+                    ));
+                }
                 #[cfg(feature = "tls")]
                 {
                     compile_tls_transport(server, stream, outbound_tag)
@@ -76,6 +93,25 @@ impl OutboundTransportConfig {
                 {
                     let _ = server;
                     Err(format!("outbound {outbound_tag} requires the tls feature"))
+                }
+            }
+            "reality" => {
+                if stream.is_some_and(|stream| stream.tls_settings.is_some()) {
+                    return Err(format!(
+                        "outbound {outbound_tag} provides tlsSettings with security=reality"
+                    ));
+                }
+                #[cfg(feature = "reality")]
+                {
+                    compile_reality_transport(stream, outbound_tag)
+                        .map(Self::Reality)
+                }
+                #[cfg(not(feature = "reality"))]
+                {
+                    let _ = server;
+                    Err(format!(
+                        "outbound {outbound_tag} requires the reality feature"
+                    ))
                 }
             }
             other => Err(format!(
@@ -112,6 +148,20 @@ impl OutboundTransportConfig {
                     })?;
                 Ok(Box::new(stream))
             }
+            #[cfg(feature = "reality")]
+            Self::Reality(config) => {
+                let session = RealityClientConnection::new(config.clone()).map_err(
+                    |error| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "failed to initialize outbound REALITY: {error}"
+                            ),
+                        )
+                    },
+                )?;
+                Ok(Box::new(RealityTlsStream::new(stream, session)))
+            }
         }
     }
 
@@ -124,6 +174,83 @@ impl OutboundTransportConfig {
     pub(crate) fn is_tls(&self) -> bool {
         matches!(self, Self::Tls(_))
     }
+
+    #[cfg(all(test, feature = "reality"))]
+    pub(crate) fn is_reality(&self) -> bool {
+        matches!(self, Self::Reality(_))
+    }
+}
+
+fn has_reality_settings(stream: Option<&OutboundStreamSettings>) -> bool {
+    #[cfg(feature = "reality")]
+    {
+        stream.is_some_and(|stream| stream.reality_settings.is_some())
+    }
+    #[cfg(not(feature = "reality"))]
+    {
+        let _ = stream;
+        false
+    }
+}
+
+#[cfg(feature = "reality")]
+fn compile_reality_transport(
+    stream: Option<&OutboundStreamSettings>,
+    outbound_tag: &str,
+) -> Result<RealityClientConfig, String> {
+    let settings = stream
+        .and_then(|stream| stream.reality_settings.as_ref())
+        .ok_or_else(|| {
+            format!(
+                "outbound {outbound_tag} security=reality requires realitySettings"
+            )
+        })?;
+
+    for (field, value) in [
+        ("fingerprint", settings.fingerprint.as_deref()),
+        ("spiderX", settings.spider_x.as_deref()),
+    ] {
+        if value.is_some_and(|value| !value.trim().is_empty()) {
+            return Err(format!(
+                "outbound {outbound_tag} REALITY field {field} is not supported yet"
+            ));
+        }
+    }
+
+    let server_name = settings
+        .server_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            format!("outbound {outbound_tag} REALITY serverName is required")
+        })?
+        .to_string();
+    let public_key = settings
+        .public_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            format!("outbound {outbound_tag} REALITY publicKey is required")
+        })?;
+    let public_key = decode_public_key(public_key).map_err(|error| {
+        format!("outbound {outbound_tag} has invalid REALITY publicKey: {error}")
+    })?;
+    let short_id =
+        decode_short_id(settings.short_id.as_deref().unwrap_or_default().trim())
+            .map_err(|error| {
+                format!(
+                    "outbound {outbound_tag} has invalid REALITY shortId: {error}"
+                )
+            })?;
+
+    Ok(RealityClientConfig {
+        public_key,
+        short_id,
+        server_name,
+        cipher_suites: settings.cipher_suites.clone(),
+    })
 }
 
 #[cfg(feature = "tls")]
@@ -335,6 +462,8 @@ fn tls_versions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "reality")]
+    use crate::config::def::OutboundRealitySettings;
     use crate::config::def::OutboundTlsSettings;
 
     #[test]
@@ -356,6 +485,8 @@ mod tests {
             network: "websocket".into(),
             security: None,
             tls_settings: None,
+            #[cfg(feature = "reality")]
+            reality_settings: None,
         };
         assert!(
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
@@ -388,11 +519,69 @@ mod tests {
                 }],
                 ..OutboundTlsSettings::default()
             }),
+            #[cfg(feature = "reality")]
+            reality_settings: None,
         };
         let transport =
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
                 .expect("inline verify root should compile");
         assert!(transport.is_tls());
+    }
+
+    #[cfg(feature = "reality")]
+    #[test]
+    fn reality_compiles_core_client_handshake_settings() {
+        let (_, public_key) = crate::reality::generate_keypair().unwrap();
+        let server =
+            NetLocation::new(Address::Hostname("proxy.example".into()), 443);
+        let stream = OutboundStreamSettings {
+            network: "tcp".into(),
+            security: Some("reality".into()),
+            tls_settings: None,
+            reality_settings: Some(OutboundRealitySettings {
+                server_name: Some("cover.example".into()),
+                public_key: Some(public_key),
+                short_id: Some("4ac97aaf8b9b0356".into()),
+                ..OutboundRealitySettings::default()
+            }),
+        };
+
+        let transport =
+            OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
+                .expect("core REALITY client settings should compile");
+        assert!(transport.is_reality());
+    }
+
+    #[cfg(feature = "reality")]
+    #[test]
+    fn reality_rejects_missing_or_unimplemented_client_fields() {
+        let (_, public_key) = crate::reality::generate_keypair().unwrap();
+        let server =
+            NetLocation::new(Address::Hostname("proxy.example".into()), 443);
+        let mut stream = OutboundStreamSettings {
+            network: "tcp".into(),
+            security: Some("reality".into()),
+            tls_settings: None,
+            reality_settings: Some(OutboundRealitySettings {
+                public_key: Some(public_key),
+                short_id: Some("4ac97aaf8b9b0356".into()),
+                ..OutboundRealitySettings::default()
+            }),
+        };
+        assert!(
+            OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
+                .unwrap_err()
+                .contains("serverName is required")
+        );
+
+        let settings = stream.reality_settings.as_mut().unwrap();
+        settings.server_name = Some("cover.example".into());
+        settings.fingerprint = Some("chrome".into());
+        assert!(
+            OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
+                .unwrap_err()
+                .contains("fingerprint is not supported yet")
+        );
     }
 
     #[cfg(feature = "tls")]
@@ -407,6 +596,8 @@ mod tests {
                 disable_system_root: true,
                 ..OutboundTlsSettings::default()
             }),
+            #[cfg(feature = "reality")]
+            reality_settings: None,
         };
         assert!(
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")

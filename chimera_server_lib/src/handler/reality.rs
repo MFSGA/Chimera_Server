@@ -11,9 +11,11 @@ use tokio::time::{Instant, timeout_at};
 
 use crate::async_stream::AsyncStream;
 use crate::config::server_config::RealityTransportConfig;
+#[cfg(feature = "vless")]
 use crate::config::server_config::{VlessFallback, VlessUser};
 use crate::handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::handler::tls_deframer::TlsDeframer;
+#[cfg(feature = "vless")]
 use crate::handler::vless_handler::setup_reality_mixed_vless_server_stream;
 use crate::reality::{BufReader, RealityServerConnection, RealityTlsStream};
 use crate::resolver::{NativeResolver, Resolver, resolve_single_address};
@@ -680,6 +682,7 @@ impl TcpServerHandler for RealityServerHandler {
     }
 }
 
+#[cfg(feature = "vless")]
 #[derive(Debug)]
 pub struct RealityVisionVlessServerHandler {
     transport_config: RealityTransportConfig,
@@ -688,6 +691,7 @@ pub struct RealityVisionVlessServerHandler {
     inbound_tag: String,
 }
 
+#[cfg(feature = "vless")]
 impl RealityVisionVlessServerHandler {
     pub fn new(
         config: RealityTransportConfig,
@@ -704,6 +708,7 @@ impl RealityVisionVlessServerHandler {
     }
 }
 
+#[cfg(feature = "vless")]
 #[async_trait]
 impl TcpServerHandler for RealityVisionVlessServerHandler {
     async fn setup_server_stream(
