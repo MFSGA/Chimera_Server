@@ -58,6 +58,16 @@ pub enum AccessAction {
     Reject,
 }
 
+/// Runtime behavior used when a policy produces a reject decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EnforcementMode {
+    #[default]
+    Enforce,
+    Shadow,
+    Disabled,
+}
+
 /// Default behavior for a user's policy when no domain rule matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -91,8 +101,14 @@ pub struct UserDomainAccessConfig {
     pub checksum: Option<String>,
     #[serde(default)]
     pub default_action: AccessAction,
+    #[serde(default, skip_serializing_if = "enforcement_mode_is_enforce")]
+    pub enforcement_mode: EnforcementMode,
     #[serde(default)]
     pub users: Vec<UserDomainPolicyConfig>,
+}
+
+fn enforcement_mode_is_enforce(value: &EnforcementMode) -> bool {
+    *value == EnforcementMode::Enforce
 }
 
 /// Literal configuration for one backend user.
@@ -317,6 +333,7 @@ pub struct AccessDecision {
 #[derive(Debug, Clone)]
 pub struct UserDomainAccessPolicy {
     default_action: AccessAction,
+    enforcement_mode: EnforcementMode,
     users: HashMap<UserId, CompiledUserPolicy>,
     vless_identities: HashMap<Uuid, UserId>,
     vmess_identities: HashMap<Uuid, UserId>,
@@ -478,6 +495,7 @@ impl UserDomainAccessPolicy {
         }
         Ok(Self {
             default_action: config.default_action,
+            enforcement_mode: config.enforcement_mode,
             users,
             vless_identities,
             vmess_identities,
@@ -487,6 +505,11 @@ impl UserDomainAccessPolicy {
             http_identities,
             socks_identities,
         })
+    }
+
+    /// Returns how reject decisions are applied to the data path.
+    pub const fn enforcement_mode(&self) -> EnforcementMode {
+        self.enforcement_mode
     }
 
     /// Evaluates one user and target without scanning policies for other users.

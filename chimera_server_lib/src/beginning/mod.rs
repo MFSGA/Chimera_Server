@@ -41,7 +41,7 @@ use crate::{
 use crate::{
     address::Address,
     tls_client_hello::{ClientHelloInspection, inspect_client_hello},
-    user_domain_access::{AccessAction, AccessTarget, UserId},
+    user_domain_access::{AccessAction, AccessTarget, EnforcementMode, UserId},
 };
 
 use tracing::{error, info};
@@ -595,6 +595,11 @@ pub(crate) fn enforce_user_domain_access(
     } else {
         return Ok(None);
     };
+    let enforcement_mode = policy.enforcement_mode();
+    if enforcement_mode == EnforcementMode::Disabled {
+        return Ok(user_uuid);
+    }
+
     let (target, target_source) = classify_access_target(context, remote_location)?;
     let decision = policy.decide_optional(user_uuid, &target);
     runtime.record_user_domain_access_decision(&decision);
@@ -606,6 +611,19 @@ pub(crate) fn enforce_user_domain_access(
         .user_uuid
         .map(|value| value.to_string())
         .unwrap_or_else(|| "unmapped".into());
+    if enforcement_mode == EnforcementMode::Shadow {
+        tracing::info!(
+            user_uuid = %decision_user_uuid,
+            target = %remote_location,
+            target_class = ?decision.target_class,
+            target_source,
+            reason = ?decision.reason,
+            matched_rule_id = decision.matched_rule_id.as_deref().unwrap_or("none"),
+            "user-domain access shadow policy would reject outbound target"
+        );
+        return Ok(user_uuid);
+    }
+
     tracing::warn!(
         user_uuid = %decision_user_uuid,
         target = %remote_location,
@@ -1209,6 +1227,56 @@ mod tests {
             resolved_user.to_string(),
             "11111111-1111-4111-8111-111111111111"
         );
+    }
+
+    #[cfg(feature = "user_domain_access")]
+    #[test]
+    fn shadow_and_disabled_modes_do_not_reject_data_path() {
+        fn runtime(mode: &str) -> RuntimeState {
+            let config = serde_json::from_value::<UserDomainAccessConfig>(
+                serde_json::json!({
+                    "enforcementMode": mode,
+                    "defaultAction": "reject",
+                    "users": [{
+                        "userUuid": "11111111-1111-4111-8111-111111111111",
+                        "protocolIdentity": {
+                            "vlessUuid": "22222222-2222-4222-8222-222222222222"
+                        },
+                        "mode": "allowlist",
+                        "unknownTargetAction": "reject",
+                        "rules": [{
+                            "domain": "allowed.example",
+                            "match": "exact",
+                            "action": "allow"
+                        }]
+                    }]
+                }),
+            )
+            .expect("policy config should parse");
+            let runtime = RuntimeState::new(Vec::new(), Vec::new());
+            runtime.replace_user_domain_access(Some(
+                UserDomainAccessPolicy::compile(config)
+                    .expect("policy should compile"),
+            ));
+            runtime
+        }
+
+        let context = TrafficContext::new("vless")
+            .with_protocol_identity("22222222-2222-4222-8222-222222222222");
+        let blocked =
+            NetLocation::new(Address::Hostname("blocked.example".into()), 443);
+
+        let shadow = runtime("shadow");
+        enforce_user_domain_access(&shadow, Some(&context), &blocked)
+            .expect("shadow mode must not reject the data path");
+        let shadow_stats = shadow.user_domain_access_stats();
+        assert_eq!(shadow_stats.evaluations, 1);
+        assert_eq!(shadow_stats.rejected, 1);
+
+        let disabled = runtime("disabled");
+        enforce_user_domain_access(&disabled, Some(&context), &blocked)
+            .expect("disabled mode must bypass policy evaluation");
+        assert_eq!(disabled.user_domain_access_stats().evaluations, 0);
     }
 
     #[cfg(feature = "user_domain_access")]
