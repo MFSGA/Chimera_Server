@@ -195,17 +195,17 @@ BPF SOCKHASH 不是当前必做项。只有物理机高并发数据证明网卡�
 
 详细差距分析见 [`20260804-234600-xray-parity-gap-analysis.zh.md`](./20260804-234600-xray-parity-gap-analysis.zh.md)。对比基线为仓库内 `ref/xray-core` 的 `5ca6f4b7d4dc`（Xray-core v26.7.28）。
 
-当前结论：入站、路由、Stats/Handler/Routing/Observatory 控制面已经较完整；最大结构性缺口是只有 `freedom` 和 `blackhole` 能执行真实出站连接。通用 sniffing、Xray DNS/FakeDNS、mKCP、TUN、Reverse、WireGuard 和部分 XHTTP client/xmux/download 语义仍未完成。
+当前结论：入站、路由、Stats/Handler/Routing/Observatory 控制面已经较完整。出站运行时已从仅支持 `freedom`/`blackhole` 推进到支持 VLESS plain TCP；通用 transport pipeline、其他代理出站、通用 sniffing、Xray DNS/FakeDNS、mKCP、TUN、Reverse、WireGuard 和部分 XHTTP client/xmux/download 语义仍未完成。
 
 ### P0：Outbound Runtime
 
-- [ ] 新增 typed outbound config，保留 `settings`、`streamSettings`、sender/via、proxySettings 和协议账户。
+- [ ] 完成 typed outbound config：当前已保留静态 `settings`、最小 `streamSettings.network/security` 和动态原始 proxy TypedMessage；sender/via、proxySettings 和完整 transport settings 仍待接入。
 - [x] 新增 tag → `Arc` connector registry，并保证 RemoveOutbound 不影响已选中 connector 的活动会话。
 - [ ] 新增 `OutboundSession` 和通用 TCP/UDP connector trait，为代理协议保存 endpoint、账户和 transport 状态。
 - [x] 将现有 Freedom/Blackhole 迁移到 registry，保持 TCP/UDP 行为不变。
 - [x] 让静态配置和 HandlerService Add/RemoveOutbound 原子更新同一 registry；动态 Blackhole 已支持。
 - [x] unsupported outbound 在编译或安装阶段 fail-closed，而不是连接时才失败；测试兼容构造器仍保留诊断路径。
-- [ ] 支持 VLESS TCP plain outbound，并与固定 Xray-core inbound 做真实互通。
+- [x] 支持 VLESS TCP plain outbound：单 endpoint、单 UUID、原始 domain/IP target、惰性响应头、静态/动态配置和 ListOutbounds 回读；已通过本地 mock 与 Xray 26.2.6 真实进程互通。VLESS UDP、Vision、TLS/REALITY/WS/gRPC/XHTTP outbound 不在该切片内。
 - [ ] 支持通用 outbound TLS/REALITY/WebSocket/HTTPUpgrade/gRPC transport pipeline。
 - [ ] 依次接入 VMess、Trojan、SOCKS、HTTP、Shadowsocks TCP/UDP outbound。
 

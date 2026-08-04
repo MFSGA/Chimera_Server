@@ -852,16 +852,18 @@ Chimera 当前未支持这些高级 transport 组合。
 
 ### Slice 2：VLESS TCP Plain Outbound
 
+当前实现状态：已完成。静态配置同时接受 Xray 标准 `vnext` 结构和简化 `address/port/id` 结构；动态 HandlerService 接受 `xray.proxy.vless.outbound.Config` 与 VLESS Account TypedMessage，并由同一 registry 编译路径校验。数据面保留原始 domain/IP target，写入标准 VLESS TCP 请求头，业务数据可立即上行；标准响应头在第一次下行读取时惰性消费，避免等待服务端响应导致首包死锁。当前只接受单 endpoint、单用户、`flow=""`、`encryption=none`、`network=tcp`、`security=none`；sender settings、UDP、Vision 和其他 transport 均 fail-closed。已通过 mock 协议级 roundtrip，以及 `SOCKS → Chimera → VLESS outbound → Xray 26.2.6 inbound → echo` 的真实进程互通，覆盖 IP、域名和 64KiB payload。
+
 目标：
 
-- 支持单 endpoint；
-- 支持单用户 UUID；
-- 支持原始 domain/IP target；
-- 支持 VLESS TCP command；
-- 支持首包；
-- 支持标准 response；
-- 先只允许 `network=tcp`、`security=none`；
-- 与本地 Xray-core VLESS inbound 做双向互通测试。
+- 支持单 endpoint；（已完成）
+- 支持单用户 UUID；（已完成）
+- 支持原始 domain/IP target；（已完成）
+- 支持 VLESS TCP command；（已完成）
+- 支持首包；（已完成）
+- 支持标准 response；（已完成，惰性消费 response header）
+- 先只允许 `network=tcp`、`security=none`；（已完成，其他组合 fail-closed）
+- 与本地 Xray-core VLESS inbound 做双向互通测试。（已完成，Xray 26.2.6）
 
 ### Slice 3：Outbound Transport Pipeline
 
