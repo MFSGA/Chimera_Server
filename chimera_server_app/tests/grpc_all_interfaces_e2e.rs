@@ -418,8 +418,16 @@ fn build_config(grpc_port: u16, socks_port: u16) -> String {
     "domainStrategy": "AsIs",
     "rules": [
       {{
+        "ruleTag": "socks-direct",
         "inboundTag": ["{SOCKS_TAG}"],
         "outboundTag": "{DIRECT_TAG}"
+      }}
+    ],
+    "balancers": [
+      {{
+        "tag": "balancer-a",
+        "selector": ["{DIRECT_TAG}", "{BACKUP_TAG}"],
+        "strategy": {{ "type": "random" }}
       }}
     ]
   }}

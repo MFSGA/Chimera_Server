@@ -657,19 +657,14 @@ impl proto::xray::app::router::command::routing_service_server::RoutingService
             )));
         }
         let principle_targets = self.principle_targets(balancer_tag);
-        let override_target = self
-            .runtime
-            .balancer_override(balancer_tag)
-            .unwrap_or_default();
+        let override_target = self.runtime.balancer_override(balancer_tag);
 
         Ok(Response::new(
             proto::xray::app::router::command::GetBalancerInfoResponse {
                 balancer: Some(proto::xray::app::router::command::BalancerMsg {
-                    r#override: Some(
-                        proto::xray::app::router::command::OverrideInfo {
-                            target: override_target,
-                        },
-                    ),
+                    r#override: override_target.map(|target| {
+                        proto::xray::app::router::command::OverrideInfo { target }
+                    }),
                     principle_target: Some(
                         proto::xray::app::router::command::PrincipleTargetInfo {
                             tag: principle_targets,
@@ -753,8 +748,15 @@ impl proto::xray::app::router::command::routing_service_server::RoutingService
         if request.rule_tag.trim().is_empty() {
             return Err(Status::invalid_argument("rule_tag is required"));
         }
-        self.runtime
+        let removed = self
+            .runtime
             .with_routing_mut(|routing| routing.remove_rule(&request.rule_tag));
+        if !removed {
+            return Err(Status::not_found(format!(
+                "routing rule {} not found",
+                request.rule_tag
+            )));
+        }
         Ok(Response::new(
             proto::xray::app::router::command::RemoveRuleResponse {},
         ))
@@ -1082,14 +1084,15 @@ mod tests {
             .expect_err("expected route to disappear after remove_rule");
         assert_eq!(err.code(), Code::Unknown);
 
-        service
+        let missing = service
             .remove_rule(Request::new(
                 proto::xray::app::router::command::RemoveRuleRequest {
                     rule_tag: "missing".into(),
                 },
             ))
             .await
-            .expect("Xray RemoveRule is idempotent for missing tags");
+            .expect_err("missing routing rule must return NotFound");
+        assert_eq!(missing.code(), Code::NotFound);
         assert!(
             runtime
                 .routing()
@@ -1700,14 +1703,7 @@ mod tests {
             .expect("get_balancer_info failed")
             .into_inner();
         let balancer = response.balancer.expect("balancer info missing");
-        assert_eq!(
-            balancer
-                .r#override
-                .as_ref()
-                .expect("empty override info missing")
-                .target,
-            ""
-        );
+        assert!(balancer.r#override.is_none());
         assert_eq!(
             balancer
                 .principle_target
