@@ -146,6 +146,23 @@ pub struct OutboundStreamSettings {
     #[cfg(feature = "ws")]
     #[serde(default, alias = "websocketSettings")]
     pub ws_settings: Option<OutboundWebsocketSettings>,
+    #[cfg(feature = "httpupgrade")]
+    #[serde(default, alias = "httpUpgradeSettings")]
+    pub httpupgrade_settings: Option<OutboundHttpUpgradeSettings>,
+}
+
+#[cfg(feature = "httpupgrade")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OutboundHttpUpgradeSettings {
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub accept_proxy_protocol: bool,
 }
 
 #[cfg(feature = "ws")]

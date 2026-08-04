@@ -358,6 +358,8 @@ mod tests {
                 reality_settings: None,
                 #[cfg(feature = "ws")]
                 ws_settings: None,
+                #[cfg(feature = "httpupgrade")]
+                httpupgrade_settings: None,
             }),
             proxy_settings_type: None,
             proxy_settings_value: None,

@@ -15,6 +15,8 @@ use tokio_rustls::TlsConnector;
 
 #[cfg(any(feature = "tls", test))]
 use crate::address::Address;
+#[cfg(feature = "httpupgrade")]
+use crate::handler::httpupgrade::HttpUpgradeClientConfig;
 #[cfg(feature = "ws")]
 use crate::handler::ws::WebsocketClientConfig;
 #[cfg(feature = "reality")]
@@ -50,6 +52,8 @@ enum OutboundProtocolConfig {
     Tcp,
     #[cfg(feature = "ws")]
     Websocket(WebsocketClientConfig),
+    #[cfg(feature = "httpupgrade")]
+    HttpUpgrade(HttpUpgradeClientConfig),
 }
 
 #[cfg(feature = "tls")]
@@ -82,9 +86,19 @@ impl OutboundTransportConfig {
                         "outbound {outbound_tag} provides wsSettings without network=ws"
                     ));
                 }
+                if has_httpupgrade_settings(stream) {
+                    return Err(format!(
+                        "outbound {outbound_tag} provides httpupgradeSettings without network=httpupgrade"
+                    ));
+                }
                 OutboundProtocolConfig::Tcp
             }
             "ws" | "websocket" => {
+                if has_httpupgrade_settings(stream) {
+                    return Err(format!(
+                        "outbound {outbound_tag} provides httpupgradeSettings with network=ws"
+                    ));
+                }
                 #[cfg(feature = "ws")]
                 {
                     compile_websocket_transport(server, stream, outbound_tag)
@@ -98,6 +112,25 @@ impl OutboundTransportConfig {
                     ));
                 }
             }
+            "httpupgrade" => {
+                if has_websocket_settings(stream) {
+                    return Err(format!(
+                        "outbound {outbound_tag} provides wsSettings with network=httpupgrade"
+                    ));
+                }
+                #[cfg(feature = "httpupgrade")]
+                {
+                    compile_httpupgrade_transport(server, stream, outbound_tag)
+                        .map(OutboundProtocolConfig::HttpUpgrade)?
+                }
+                #[cfg(not(feature = "httpupgrade"))]
+                {
+                    let _ = server;
+                    return Err(format!(
+                        "outbound {outbound_tag} requires the httpupgrade feature"
+                    ));
+                }
+            }
             other => {
                 return Err(format!(
                     "outbound {outbound_tag} uses unsupported network {other}"
@@ -108,7 +141,8 @@ impl OutboundTransportConfig {
             server,
             stream,
             outbound_tag,
-            protocol_is_websocket(&protocol),
+            protocol_requires_http1(&protocol),
+            protocol_supports_reality(&protocol),
         )?;
         Ok(Self { security, protocol })
     }
@@ -163,6 +197,10 @@ impl OutboundTransportConfig {
             OutboundProtocolConfig::Websocket(config) => {
                 config.connect(stream).await
             }
+            #[cfg(feature = "httpupgrade")]
+            OutboundProtocolConfig::HttpUpgrade(config) => {
+                config.connect(stream).await
+            }
         }
     }
 
@@ -186,25 +224,33 @@ impl OutboundTransportConfig {
     pub(crate) fn is_websocket(&self) -> bool {
         matches!(self.protocol, OutboundProtocolConfig::Websocket(_))
     }
+
+    #[cfg(all(test, feature = "httpupgrade"))]
+    pub(crate) fn is_httpupgrade(&self) -> bool {
+        matches!(self.protocol, OutboundProtocolConfig::HttpUpgrade(_))
+    }
 }
 
-fn protocol_is_websocket(protocol: &OutboundProtocolConfig) -> bool {
-    #[cfg(feature = "ws")]
-    {
-        matches!(protocol, OutboundProtocolConfig::Websocket(_))
+fn protocol_requires_http1(protocol: &OutboundProtocolConfig) -> bool {
+    match protocol {
+        OutboundProtocolConfig::Tcp => false,
+        #[cfg(feature = "ws")]
+        OutboundProtocolConfig::Websocket(_) => true,
+        #[cfg(feature = "httpupgrade")]
+        OutboundProtocolConfig::HttpUpgrade(_) => true,
     }
-    #[cfg(not(feature = "ws"))]
-    {
-        let _ = protocol;
-        false
-    }
+}
+
+fn protocol_supports_reality(protocol: &OutboundProtocolConfig) -> bool {
+    matches!(protocol, OutboundProtocolConfig::Tcp)
 }
 
 fn compile_security_transport(
     server: &NetLocation,
     stream: Option<&OutboundStreamSettings>,
     outbound_tag: &str,
-    websocket: bool,
+    requires_http1: bool,
+    supports_reality: bool,
 ) -> Result<OutboundSecurityConfig, String> {
     let security = stream
         .and_then(|stream| stream.security.as_deref())
@@ -233,12 +279,12 @@ fn compile_security_transport(
             }
             #[cfg(feature = "tls")]
             {
-                compile_tls_transport(server, stream, outbound_tag, websocket)
+                compile_tls_transport(server, stream, outbound_tag, requires_http1)
                     .map(OutboundSecurityConfig::Tls)
             }
             #[cfg(not(feature = "tls"))]
             {
-                let _ = (server, websocket);
+                let _ = (server, requires_http1, supports_reality);
                 Err(format!("outbound {outbound_tag} requires the tls feature"))
             }
         }
@@ -250,9 +296,9 @@ fn compile_security_transport(
             }
             #[cfg(feature = "reality")]
             {
-                if websocket {
+                if !supports_reality {
                     return Err(format!(
-                        "outbound {outbound_tag} REALITY does not support WebSocket transport"
+                        "outbound {outbound_tag} REALITY does not support the selected application transport"
                     ));
                 }
                 compile_reality_transport(stream, outbound_tag)
@@ -260,7 +306,7 @@ fn compile_security_transport(
             }
             #[cfg(not(feature = "reality"))]
             {
-                let _ = (server, websocket);
+                let _ = (server, requires_http1, supports_reality);
                 Err(format!(
                     "outbound {outbound_tag} requires the reality feature"
                 ))
@@ -282,6 +328,56 @@ fn has_websocket_settings(stream: Option<&OutboundStreamSettings>) -> bool {
         let _ = stream;
         false
     }
+}
+
+fn has_httpupgrade_settings(stream: Option<&OutboundStreamSettings>) -> bool {
+    #[cfg(feature = "httpupgrade")]
+    {
+        stream.is_some_and(|stream| stream.httpupgrade_settings.is_some())
+    }
+    #[cfg(not(feature = "httpupgrade"))]
+    {
+        let _ = stream;
+        false
+    }
+}
+
+#[cfg(feature = "httpupgrade")]
+fn compile_httpupgrade_transport(
+    server: &NetLocation,
+    stream: Option<&OutboundStreamSettings>,
+    outbound_tag: &str,
+) -> Result<HttpUpgradeClientConfig, String> {
+    let settings = stream
+        .and_then(|stream| stream.httpupgrade_settings.as_ref())
+        .cloned()
+        .unwrap_or_default();
+    let security = stream
+        .and_then(|stream| stream.security.as_deref())
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let tls_server_name = if security == "tls" {
+        stream
+            .and_then(|stream| stream.tls_settings.as_ref())
+            .and_then(|settings| settings.server_name.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    } else {
+        None
+    };
+    let fallback_host = tls_server_name
+        .map(str::to_string)
+        .unwrap_or_else(|| server.address().to_string());
+
+    HttpUpgradeClientConfig::compile(
+        settings.host.as_deref(),
+        settings.path.as_deref(),
+        &settings.headers,
+        &fallback_host,
+        settings.accept_proxy_protocol,
+        outbound_tag,
+    )
 }
 
 #[cfg(feature = "ws")]
@@ -400,7 +496,7 @@ fn compile_tls_transport(
     server: &NetLocation,
     stream: Option<&OutboundStreamSettings>,
     outbound_tag: &str,
-    websocket: bool,
+    requires_http1: bool,
 ) -> Result<TlsOutboundTransportConfig, String> {
     let settings = stream
         .and_then(|stream| stream.tls_settings.as_ref())
@@ -540,7 +636,7 @@ fn compile_tls_transport(
             Ok(protocol)
         })
         .collect::<Result<Vec<_>, String>>()?;
-    if websocket && client_config.alpn_protocols.is_empty() {
+    if requires_http1 && client_config.alpn_protocols.is_empty() {
         client_config.alpn_protocols.push(b"http/1.1".to_vec());
     }
     if !settings.enable_session_resumption {
@@ -608,6 +704,8 @@ fn tls_versions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "httpupgrade")]
+    use crate::config::def::OutboundHttpUpgradeSettings;
     #[cfg(feature = "reality")]
     use crate::config::def::OutboundRealitySettings;
     use crate::config::def::OutboundTlsSettings;
@@ -637,6 +735,8 @@ mod tests {
             reality_settings: None,
             #[cfg(feature = "ws")]
             ws_settings: None,
+            #[cfg(feature = "httpupgrade")]
+            httpupgrade_settings: None,
         };
         assert!(
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
@@ -661,11 +761,75 @@ mod tests {
                 path: Some("proxy".into()),
                 ..OutboundWebsocketSettings::default()
             }),
+            #[cfg(feature = "httpupgrade")]
+            httpupgrade_settings: None,
         };
         let transport =
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
                 .expect("WebSocket settings should compile");
         assert!(transport.is_websocket());
+    }
+
+    #[cfg(feature = "httpupgrade")]
+    #[test]
+    fn httpupgrade_compiles_as_a_raw_application_transport() {
+        let server =
+            NetLocation::new(Address::Hostname("proxy.example".into()), 443);
+        let stream = OutboundStreamSettings {
+            network: "httpupgrade".into(),
+            security: None,
+            tls_settings: None,
+            #[cfg(feature = "reality")]
+            reality_settings: None,
+            #[cfg(feature = "ws")]
+            ws_settings: None,
+            httpupgrade_settings: Some(OutboundHttpUpgradeSettings {
+                host: Some("edge.example".into()),
+                path: Some("proxy".into()),
+                ..OutboundHttpUpgradeSettings::default()
+            }),
+        };
+        let transport =
+            OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
+                .expect("HTTPUpgrade settings should compile");
+        assert!(transport.is_httpupgrade());
+    }
+
+    #[cfg(all(feature = "tls", feature = "httpupgrade"))]
+    #[test]
+    fn tls_httpupgrade_composes_security_and_application_layers() {
+        let generated =
+            rcgen::generate_simple_self_signed(["proxy.example".to_string()])
+                .unwrap();
+        let server =
+            NetLocation::new(Address::Hostname("proxy.example".into()), 443);
+        let stream = OutboundStreamSettings {
+            network: "httpupgrade".into(),
+            security: Some("tls".into()),
+            tls_settings: Some(OutboundTlsSettings {
+                server_name: Some("proxy.example".into()),
+                disable_system_root: true,
+                certificates: vec![crate::config::def::OutboundTlsCertificate {
+                    certificate: vec![generated.cert.pem()],
+                    usage: Some("verify".into()),
+                    ..crate::config::def::OutboundTlsCertificate::default()
+                }],
+                ..OutboundTlsSettings::default()
+            }),
+            #[cfg(feature = "reality")]
+            reality_settings: None,
+            #[cfg(feature = "ws")]
+            ws_settings: None,
+            httpupgrade_settings: Some(OutboundHttpUpgradeSettings {
+                path: Some("/proxy".into()),
+                ..OutboundHttpUpgradeSettings::default()
+            }),
+        };
+        let transport =
+            OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
+                .expect("TLS and HTTPUpgrade should compose");
+        assert!(transport.is_tls());
+        assert!(transport.is_httpupgrade());
     }
 
     #[cfg(feature = "tls")]
@@ -696,6 +860,8 @@ mod tests {
             reality_settings: None,
             #[cfg(feature = "ws")]
             ws_settings: None,
+            #[cfg(feature = "httpupgrade")]
+            httpupgrade_settings: None,
         };
         let transport =
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
@@ -730,6 +896,8 @@ mod tests {
                 path: Some("/proxy".into()),
                 ..OutboundWebsocketSettings::default()
             }),
+            #[cfg(feature = "httpupgrade")]
+            httpupgrade_settings: None,
         };
         let transport =
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
@@ -755,11 +923,15 @@ mod tests {
                 ..OutboundRealitySettings::default()
             }),
             ws_settings: Some(OutboundWebsocketSettings::default()),
+            #[cfg(feature = "httpupgrade")]
+            httpupgrade_settings: None,
         };
         assert!(
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
                 .unwrap_err()
-                .contains("REALITY does not support WebSocket")
+                .contains(
+                    "REALITY does not support the selected application transport"
+                )
         );
     }
 
@@ -781,6 +953,8 @@ mod tests {
             }),
             #[cfg(feature = "ws")]
             ws_settings: None,
+            #[cfg(feature = "httpupgrade")]
+            httpupgrade_settings: None,
         };
 
         let transport =
@@ -806,6 +980,8 @@ mod tests {
             }),
             #[cfg(feature = "ws")]
             ws_settings: None,
+            #[cfg(feature = "httpupgrade")]
+            httpupgrade_settings: None,
         };
         assert!(
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
@@ -839,6 +1015,8 @@ mod tests {
             reality_settings: None,
             #[cfg(feature = "ws")]
             ws_settings: None,
+            #[cfg(feature = "httpupgrade")]
+            httpupgrade_settings: None,
         };
         assert!(
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
