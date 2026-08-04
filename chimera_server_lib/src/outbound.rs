@@ -8,6 +8,7 @@ use tracing::warn;
 
 use crate::{
     address::{Address, NetLocation},
+    outbound_registry::OutboundConnectorKind,
     resolver::{Resolver, resolve_single_address},
     routing_process::enrich_routing_input,
     routing_state::{OutboundObservation, RoutingInput},
@@ -135,13 +136,24 @@ pub(crate) fn select_direct_outbound(
     else {
         return Ok(DirectOutboundAction::Freedom { tag: None });
     };
+    let connector = runtime.outbound_connector(&outbound.tag).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} outbound {} is missing from the runtime registry",
+                network_name, outbound.tag
+            ),
+        )
+    })?;
 
-    match outbound.protocol.trim().to_ascii_lowercase().as_str() {
-        "freedom" => Ok(DirectOutboundAction::Freedom {
+    match connector.as_ref() {
+        OutboundConnectorKind::Freedom => Ok(DirectOutboundAction::Freedom {
             tag: Some(outbound.tag),
         }),
-        "blackhole" => Ok(DirectOutboundAction::Blackhole { tag: outbound.tag }),
-        protocol => Err(std::io::Error::new(
+        OutboundConnectorKind::Blackhole => {
+            Ok(DirectOutboundAction::Blackhole { tag: outbound.tag })
+        }
+        OutboundConnectorKind::Unsupported { protocol } => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
                 "{} outbound {} uses unsupported protocol {}",

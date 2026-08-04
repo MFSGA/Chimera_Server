@@ -69,6 +69,7 @@ const TYPE_PROXY_TROJAN_SERVER_CONFIG_V2RAY: &str =
 const TYPE_PROXY_FREEDOM_CONFIG: &str = "xray.proxy.freedom.Config";
 const TYPE_PROXY_FREEDOM_CONFIG_V2RAY: &str = "v2ray.core.proxy.freedom.Config";
 const TYPE_PROXY_BLACKHOLE_CONFIG: &str = "xray.proxy.blackhole.Config";
+const TYPE_PROXY_BLACKHOLE_CONFIG_V2RAY: &str = "v2ray.core.proxy.blackhole.Config";
 #[cfg(feature = "trojan")]
 const TYPE_PROXY_TROJAN_ACCOUNT: &str = "xray.proxy.trojan.Account";
 #[cfg(feature = "trojan")]
@@ -1023,14 +1024,35 @@ impl HandlerServiceImpl {
         let proxy_settings = outbound.proxy_settings.as_ref().ok_or_else(|| {
             Status::invalid_argument("outbound.proxy_settings is required")
         })?;
-        let _ = self.decode_typed_message::<FreedomConfigPayload>(
-            proxy_settings,
-            &[TYPE_PROXY_FREEDOM_CONFIG, TYPE_PROXY_FREEDOM_CONFIG_V2RAY],
-            "outbound proxy settings",
-        )?;
+        let protocol = match Self::parse_typed_message_type(proxy_settings) {
+            TYPE_PROXY_FREEDOM_CONFIG | TYPE_PROXY_FREEDOM_CONFIG_V2RAY => {
+                let _ = self.decode_typed_message::<FreedomConfigPayload>(
+                    proxy_settings,
+                    &[TYPE_PROXY_FREEDOM_CONFIG, TYPE_PROXY_FREEDOM_CONFIG_V2RAY],
+                    "outbound proxy settings",
+                )?;
+                "freedom"
+            }
+            TYPE_PROXY_BLACKHOLE_CONFIG | TYPE_PROXY_BLACKHOLE_CONFIG_V2RAY => {
+                let _ = self.decode_typed_message::<BlackholeConfigPayload>(
+                    proxy_settings,
+                    &[
+                        TYPE_PROXY_BLACKHOLE_CONFIG,
+                        TYPE_PROXY_BLACKHOLE_CONFIG_V2RAY,
+                    ],
+                    "outbound proxy settings",
+                )?;
+                "blackhole"
+            }
+            unsupported => {
+                return Err(Status::invalid_argument(format!(
+                    "unsupported outbound proxy settings type: {unsupported}"
+                )));
+            }
+        };
         Ok(OutboundSummary {
             tag: outbound.tag,
-            protocol: "freedom".to_string(),
+            protocol: protocol.to_string(),
             proxy_settings_type: Some(proxy_settings.r#type.clone()),
             proxy_settings_value: Some(proxy_settings.value.clone()),
         })
@@ -2266,6 +2288,7 @@ mod tests {
             Transport,
             server_config::{ServerConfig, SocksUser, XhttpServerConfig},
         },
+        outbound_registry::OutboundConnectorKind,
         runtime::OutboundSummary,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2401,13 +2424,25 @@ mod tests {
     fn build_add_outbound_request(
         tag: &str,
     ) -> proto::xray::app::proxyman::command::AddOutboundRequest {
+        build_typed_add_outbound_request(
+            tag,
+            TYPE_PROXY_FREEDOM_CONFIG,
+            FreedomConfigPayload {}.encode_to_vec(),
+        )
+    }
+
+    fn build_typed_add_outbound_request(
+        tag: &str,
+        message_type: &str,
+        value: Vec<u8>,
+    ) -> proto::xray::app::proxyman::command::AddOutboundRequest {
         proto::xray::app::proxyman::command::AddOutboundRequest {
             outbound: Some(proto::xray::core::OutboundHandlerConfig {
                 tag: tag.to_string(),
                 sender_settings: None,
                 proxy_settings: Some(proto::xray::common::serial::TypedMessage {
-                    r#type: TYPE_PROXY_FREEDOM_CONFIG.to_string(),
-                    value: FreedomConfigPayload {}.encode_to_vec(),
+                    r#type: message_type.to_string(),
+                    value,
                 }),
                 expire: 0,
                 comment: String::new(),
@@ -2699,6 +2734,53 @@ mod tests {
         assert_eq!(proxy_settings.r#type, TYPE_PROXY_FREEDOM_CONFIG);
         FreedomConfigPayload::decode(proxy_settings.value.as_slice())
             .expect("decode freedom settings");
+    }
+
+    #[tokio::test]
+    async fn handler_installs_blackhole_and_rejects_unsupported_outbound_atomically()
+    {
+        let fixture = build_fixture();
+        let runtime = fixture.runtime.clone();
+        let service = HandlerServiceImpl::new(runtime.clone());
+        let blackhole_tag = unique_tag("blackhole");
+
+        service
+            .add_outbound(Request::new(build_typed_add_outbound_request(
+                &format!(" {blackhole_tag} "),
+                TYPE_PROXY_BLACKHOLE_CONFIG,
+                BlackholeConfigPayload {}.encode_to_vec(),
+            )))
+            .await
+            .expect("blackhole outbound should install");
+        assert_eq!(
+            runtime.outbound_connector(&blackhole_tag).as_deref(),
+            Some(&OutboundConnectorKind::Blackhole)
+        );
+        assert!(
+            runtime
+                .outbounds()
+                .iter()
+                .any(|outbound| outbound.tag == blackhole_tag)
+        );
+
+        let before = runtime.outbounds();
+        let unsupported_tag = unique_tag("unsupported");
+        let error = service
+            .add_outbound(Request::new(build_typed_add_outbound_request(
+                &unsupported_tag,
+                "xray.proxy.vless.outbound.Config",
+                Vec::new(),
+            )))
+            .await
+            .expect_err("unsupported outbound should fail before installation");
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(
+            error
+                .message()
+                .contains("unsupported outbound proxy settings")
+        );
+        assert_eq!(runtime.outbounds().len(), before.len());
+        assert!(runtime.outbound_connector(&unsupported_tag).is_none());
     }
 
     #[tokio::test]

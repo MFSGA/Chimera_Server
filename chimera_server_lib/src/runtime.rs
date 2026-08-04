@@ -32,6 +32,7 @@ use crate::user_domain_access::{
 };
 use crate::{
     config::server_config::ServerConfig,
+    outbound_registry::{OutboundConnectorKind, OutboundRegistry},
     routing_state::{
         OutboundObservation, RouteMatch, RoutingEvent, RoutingInput, RoutingState,
     },
@@ -43,6 +44,46 @@ pub struct OutboundSummary {
     pub protocol: String,
     pub proxy_settings_type: Option<String>,
     pub proxy_settings_value: Option<Vec<u8>>,
+}
+
+impl OutboundSummary {
+    fn normalize(mut self) -> Result<Self, String> {
+        self.tag = self.tag.trim().to_string();
+        if self.tag.is_empty() {
+            return Err("outbound tag must not be empty".into());
+        }
+        self.protocol = self.protocol.trim().to_ascii_lowercase();
+        if self.protocol.is_empty() {
+            return Err(format!("outbound {} protocol must not be empty", self.tag));
+        }
+        Ok(self)
+    }
+
+    fn normalize_lenient(mut self) -> Self {
+        self.tag = self.tag.trim().to_string();
+        self.protocol = self.protocol.trim().to_ascii_lowercase();
+        self
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct OutboundRuntimeState {
+    summaries: Vec<OutboundSummary>,
+    registry: OutboundRegistry,
+}
+
+impl OutboundRuntimeState {
+    fn from_outbounds_lenient(summaries: Vec<OutboundSummary>) -> Self {
+        let summaries = summaries
+            .into_iter()
+            .map(OutboundSummary::normalize_lenient)
+            .collect::<Vec<_>>();
+        let registry = OutboundRegistry::from_outbounds_lenient(&summaries);
+        Self {
+            summaries,
+            registry,
+        }
+    }
 }
 
 #[cfg(feature = "user_domain_access")]
@@ -222,7 +263,7 @@ struct UserDomainAccessRuntimeState {
 #[derive(Debug, Clone)]
 pub struct RuntimeState {
     inbounds: Arc<RwLock<Vec<ServerConfig>>>,
-    outbounds: Arc<RwLock<Vec<OutboundSummary>>>,
+    outbounds: Arc<RwLock<OutboundRuntimeState>>,
     inbound_tasks: Arc<RwLock<HashMap<String, Vec<AbortHandle>>>>,
     routing: Arc<RwLock<RoutingState>>,
     balancer_overrides: Arc<RwLock<HashMap<String, String>>>,
@@ -241,7 +282,9 @@ impl RuntimeState {
         let (routing_events, _) = broadcast::channel(256);
         Self {
             inbounds: Arc::new(RwLock::new(inbounds)),
-            outbounds: Arc::new(RwLock::new(outbounds)),
+            outbounds: Arc::new(RwLock::new(
+                OutboundRuntimeState::from_outbounds_lenient(outbounds),
+            )),
             inbound_tasks: Arc::new(RwLock::new(HashMap::new())),
             routing: Arc::new(RwLock::new(RoutingState::default())),
             balancer_overrides: Arc::new(RwLock::new(HashMap::new())),
@@ -253,6 +296,24 @@ impl RuntimeState {
             #[cfg(feature = "user_domain_access")]
             user_domain_access_metrics: Arc::new(UserDomainAccessMetrics::default()),
         }
+    }
+
+    pub fn compile_outbounds(
+        outbounds: Vec<OutboundSummary>,
+    ) -> Result<Vec<OutboundSummary>, String> {
+        let outbounds = outbounds
+            .into_iter()
+            .map(OutboundSummary::normalize)
+            .collect::<Result<Vec<_>, _>>()?;
+        OutboundRegistry::validate_strict(&outbounds)?;
+        Ok(outbounds)
+    }
+
+    pub fn try_new(
+        inbounds: Vec<ServerConfig>,
+        outbounds: Vec<OutboundSummary>,
+    ) -> Result<Self, String> {
+        Ok(Self::new(inbounds, Self::compile_outbounds(outbounds)?))
     }
 
     pub fn inbounds(&self) -> Vec<ServerConfig> {
@@ -336,7 +397,19 @@ impl RuntimeState {
         self.outbounds
             .read()
             .expect("runtime outbounds lock poisoned")
+            .summaries
             .clone()
+    }
+
+    pub(crate) fn outbound_connector(
+        &self,
+        tag: &str,
+    ) -> Option<Arc<OutboundConnectorKind>> {
+        self.outbounds
+            .read()
+            .expect("runtime outbounds lock poisoned")
+            .registry
+            .get(tag)
     }
 
     pub fn select_outbound(&self, input: &RoutingInput) -> Option<OutboundSummary> {
@@ -430,19 +503,23 @@ impl RuntimeState {
             .outbounds
             .write()
             .expect("runtime outbounds lock poisoned");
-        let index = guard.iter().position(|cfg| cfg.tag == tag)?;
-        Some(guard.remove(index))
+        let index = guard.summaries.iter().position(|cfg| cfg.tag == tag)?;
+        let outbound = guard.summaries.remove(index);
+        guard.registry.remove(tag);
+        Some(outbound)
     }
 
     pub fn add_outbound(&self, outbound: OutboundSummary) -> Result<(), String> {
+        let outbound = outbound.normalize()?;
         let mut guard = self
             .outbounds
             .write()
             .expect("runtime outbounds lock poisoned");
-        if guard.iter().any(|cfg| cfg.tag == outbound.tag) {
+        if guard.summaries.iter().any(|cfg| cfg.tag == outbound.tag) {
             return Err(format!("outbound {} already exists", outbound.tag));
         }
-        guard.push(outbound);
+        guard.registry.insert_strict(&outbound)?;
+        guard.summaries.push(outbound);
         Ok(())
     }
 

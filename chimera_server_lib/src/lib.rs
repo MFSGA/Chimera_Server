@@ -35,6 +35,7 @@ mod grpc;
 mod mcp;
 
 mod outbound;
+mod outbound_registry;
 
 mod runtime;
 #[cfg(all(test, feature = "user_domain_access"))]
@@ -251,6 +252,21 @@ fn compile_user_domain_access(
         .map_err(|error| Error::InvalidConfig(error.to_string()))
 }
 
+fn compile_outbound_summaries(
+    items: &[config::def::OutboundItem],
+) -> Result<Vec<OutboundSummary>, Error> {
+    let outbounds = items
+        .iter()
+        .map(|item| OutboundSummary {
+            tag: item.tag.clone(),
+            protocol: item.protocol.clone(),
+            proxy_settings_type: None,
+            proxy_settings_value: None,
+        })
+        .collect::<Vec<_>>();
+    RuntimeState::compile_outbounds(outbounds).map_err(Error::InvalidConfig)
+}
+
 pub struct ServerRuntime {
     pub inbounds: Vec<ServerConfig>,
     pub runtime_state: RuntimeState,
@@ -285,8 +301,10 @@ pub fn prepare_server_runtime(
         config.user_domain_access.clone(),
         user_domain_access_store.as_deref(),
     )?;
+    let outbounds = compile_outbound_summaries(&config.outbounds)?;
     let inbounds = prepare_server_inbounds(config, cwd, log_file)?;
-    let runtime_state = RuntimeState::new(inbounds.clone(), Vec::new());
+    let runtime_state = RuntimeState::try_new(inbounds.clone(), outbounds)
+        .map_err(Error::InvalidConfig)?;
     #[cfg(feature = "user_domain_access")]
     runtime_state
         .configure_user_domain_access_signature_verifier(
@@ -551,6 +569,7 @@ pub fn validate(opts: Options) -> Result<(), Error> {
         }
     }
 
+    compile_outbound_summaries(&config.outbounds)?;
     let all_inbounds = config
         .inbounds
         .into_iter()
@@ -639,16 +658,7 @@ async fn start_async(
         config.user_domain_access.clone(),
         user_domain_access_store.as_deref(),
     )?;
-    let outbounds = config
-        .outbounds
-        .iter()
-        .map(|item| OutboundSummary {
-            tag: item.tag.clone(),
-            protocol: item.protocol.clone(),
-            proxy_settings_type: None,
-            proxy_settings_value: None,
-        })
-        .collect::<Vec<_>>();
+    let outbounds = compile_outbound_summaries(&config.outbounds)?;
 
     let all_inbounds = config
         .inbounds
@@ -656,7 +666,8 @@ async fn start_async(
         .map(ServerConfig::try_from)
         .collect::<Result<Vec<_>, _>>()?;
 
-    let runtime_state = RuntimeState::new(all_inbounds.clone(), outbounds);
+    let runtime_state = RuntimeState::try_new(all_inbounds.clone(), outbounds)
+        .map_err(Error::InvalidConfig)?;
     #[cfg(feature = "user_domain_access")]
     runtime_state
         .configure_user_domain_access_signature_verifier(
@@ -827,7 +838,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::resolve_api_config;
+    use super::{compile_outbound_summaries, resolve_api_config};
     #[cfg(feature = "user_domain_access")]
     use super::{compile_user_domain_access, select_initial_user_domain_access};
     #[cfg(feature = "user_domain_access")]
@@ -835,13 +846,15 @@ mod tests {
         UserDomainAccessConfig, user_domain_access_checksum,
     };
     use crate::{
+        RuntimeState,
         address::{Address, BindLocation, NetLocation},
         config::{
             Transport,
-            def::ApiConfig,
+            def::{ApiConfig, OutboundItem},
             rule::{RoutingConfig, RuleConfig},
             server_config::{DokodemoDoorConfig, ServerConfig, ServerProxyConfig},
         },
+        outbound_registry::OutboundConnectorKind,
     };
 
     #[cfg(feature = "user_domain_access")]
@@ -897,6 +910,61 @@ mod tests {
             transport: Transport::Tcp,
             quic_settings: None,
         }
+    }
+
+    #[test]
+    fn static_outbounds_are_compiled_before_runtime_installation() {
+        let summaries = compile_outbound_summaries(&[
+            OutboundItem {
+                protocol: " Freedom ".into(),
+                tag: " direct ".into(),
+            },
+            OutboundItem {
+                protocol: "blackhole".into(),
+                tag: "blocked".into(),
+            },
+        ])
+        .expect("supported static outbounds should compile");
+        let runtime = RuntimeState::try_new(Vec::new(), summaries)
+            .expect("compiled outbounds should install");
+        assert_eq!(runtime.outbounds()[0].tag, "direct");
+        assert_eq!(runtime.outbounds()[0].protocol, "freedom");
+        assert_eq!(
+            runtime.outbound_connector("direct").as_deref(),
+            Some(&OutboundConnectorKind::Freedom)
+        );
+        assert_eq!(
+            runtime.outbound_connector("blocked").as_deref(),
+            Some(&OutboundConnectorKind::Blackhole)
+        );
+
+        let unsupported = compile_outbound_summaries(&[OutboundItem {
+            protocol: "vless".into(),
+            tag: "proxy".into(),
+        }])
+        .expect_err("unsupported static outbound must fail closed");
+        assert!(
+            unsupported
+                .to_string()
+                .contains("unsupported protocol vless")
+        );
+
+        let duplicate = compile_outbound_summaries(&[
+            OutboundItem {
+                protocol: "freedom".into(),
+                tag: "same".into(),
+            },
+            OutboundItem {
+                protocol: "blackhole".into(),
+                tag: "same".into(),
+            },
+        ])
+        .expect_err("duplicate static outbound tags must fail closed");
+        assert!(
+            duplicate
+                .to_string()
+                .contains("duplicate outbound tag same")
+        );
     }
 
     #[test]
