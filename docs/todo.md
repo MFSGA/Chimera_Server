@@ -156,6 +156,9 @@ BPF SOCKHASH 不是当前必做项。只有物理机高并发数据证明网卡�
 - [x] 通过 Rust rnode 或 Nest 节点接收 backend 的 JWT 发布请求，调用 Chimera gRPC Apply、Rollback、Status，并将结果返回 backend 确认。
 - [x] 增加低基数的命中、拒绝、fallback 和策略版本日志/指标。GetStatus 现在覆盖原始 allow/reject、实际阻断、shadow 拒绝、disabled bypass、TLS 探测结果与字节数，以及 Apply/Rollback 成败。
 - [x] 支持可选 Ed25519 策略签名验证；节点本地配置可信公钥和 `requireSignature`，验签失败在落盘及 RuntimeState 替换前拒绝。
+- [x] 强化持久化边界：16 MiB 上限、拒绝 symlink/非普通文件、Unix `0600`、原子 rename 和失败时保留当前策略。
+- [x] 限制策略资源规模：最多 100,000 用户、每用户 10,000 规则、总计 1,000,000 规则，并在大容量分配前校验。
+- [x] 将 TLS ClientHello probe timeout/max bytes 接入节点配置，默认 5ms/64KiB，安全范围 1–100ms 与 1–256KiB；Status 返回有效值。
 
 ### P1：backend 对接
 
@@ -183,5 +186,7 @@ BPF SOCKHASH 不是当前必做项。只有物理机高并发数据证明网卡�
 - [ ] 在所有现有落盘策略均已签名后启用 `requireSignature`，并验证错误签名、未知 key 和签名缺失均 fail closed。
 - [ ] 在固定硬件和 release 构建上执行完整 Criterion 基线，保存原始输出、Git commit、编译参数和硬件信息。
 - [ ] 为决策 p95/p99、编译耗时和策略内存占用设定回归阈值并接入 CI 或发布门禁。
+- [ ] 在 shadow 真实流量下比较 TLS probe 1/5/10/25ms 与 16/64/128/256KiB，确认首包延迟、SNI 识别率和 timeout 比例后固定生产值。
+- [ ] 演练策略文件超限、symlink、权限错误、磁盘满、只读文件系统及进程在 rename 前被终止等故障。
 
 代码层生产加固已完成；剩余项依赖真实节点、密钥管理、数据库和业务流量环境。

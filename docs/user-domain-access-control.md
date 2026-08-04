@@ -360,6 +360,8 @@ POST /api/nodes/{nodeUuid}/domain-access/publish
     "path": "state/user-domain-access.json",
     "nodeUuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
     "requireSignature": true,
+    "tlsProbeTimeoutMillis": 5,
+    "tlsProbeMaxBytes": 65536,
     "trustedSigningKeys": [
       {
         "keyId": "backend-key-2026-01",
@@ -387,6 +389,8 @@ POST /api/nodes/{nodeUuid}/domain-access/publish
 
 持久化文件使用版本化 envelope，保存 `formatVersion`、`highestSeenVersion`、当前策略和最多 5 个历史策略。启动和 `--check` 会校验当前策略及全部历史策略的 checksum、签名、目标节点和版本边界；重启后历史版本仍可回滚，旧版仅包含单个策略对象的存储文件也可兼容读取。启用强制签名之前，应先确认现有落盘策略已经由受信 key 签名，否则节点会按 fail-closed 原则拒绝启动。
 
+存储文件最大为 16 MiB。读取和覆盖都会拒绝符号链接及非普通文件；Unix 临时文件以 `0600` 创建并在 fsync 后原子替换，避免策略内容向 group/other 暴露。策略编译在容量分配前限制最多 100,000 用户、每用户 10,000 条规则、总计 1,000,000 条规则。
+
 CLI 示例：
 
 ```bash
@@ -411,7 +415,9 @@ chimera-cli user-domain-access \
 4. 按固定批次扩展到 5%、25%、50% 和 100%，每批完成 Apply、Status checksum 对账、重启恢复和 Rollback 演练。
 5. 稳定后再启用 `requireSignature`。密钥轮换时先同时配置新旧两个公钥，完成新 key 发布验证后再移除旧 key。
 
-指标严格保持低基数。Status 中的主要生产字段包括：原始 allow/reject 决策、实际阻断、shadow 拒绝、disabled bypass、TLS SNI/ECH/timeout/parse outcome、探测字节数以及 Apply/Rollback 成败。UUID、域名、IP 和连接 ID 不作为指标标签。
+指标严格保持低基数。Status 中的主要生产字段包括：原始 allow/reject 决策、实际阻断、shadow 拒绝、disabled bypass、TLS SNI/ECH/timeout/parse outcome、探测字节数、有效 probe timeout/max bytes，以及 Apply/Rollback 成败。UUID、域名、IP 和连接 ID 不作为指标标签。
+
+TLS ClientHello 探测默认 5ms/64KiB，可在节点本地配置为 1–100ms 和 1–256KiB。读取严格不超过配置上限，所有已捕获和未捕获字节仍按原顺序回放；`disabled` 模式完全跳过探测。调整前应通过 Status 和首包延迟基准确认影响，不应把超时无限放大。
 
 ### 11.2 性能基准
 
