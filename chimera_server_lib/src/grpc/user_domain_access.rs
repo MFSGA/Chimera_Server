@@ -29,26 +29,32 @@ impl proto::chimera::app::userdomain::command::user_domain_access_service_server
         Status,
     > {
         let json_config = request.into_inner().json_config;
-        if json_config.trim().is_empty() {
-            return Err(Status::invalid_argument("json_config is required"));
-        }
-        let config = serde_json::from_str::<UserDomainAccessConfig>(&json_config)
+        let result = async {
+            if json_config.trim().is_empty() {
+                return Err(Status::invalid_argument("json_config is required"));
+            }
+            let config = serde_json::from_str::<UserDomainAccessConfig>(&json_config)
+                .map_err(|error| {
+                    Status::invalid_argument(format!(
+                        "invalid user-domain access JSON: {error}"
+                    ))
+                })?;
+            let runtime = self.runtime.clone();
+            tokio::task::spawn_blocking(move || {
+                runtime.install_user_domain_access(config)
+            })
+            .await
             .map_err(|error| {
-                Status::invalid_argument(format!(
-                    "invalid user-domain access JSON: {error}"
+                Status::internal(format!(
+                    "user-domain access install task failed: {error}"
                 ))
-            })?;
-        let runtime = self.runtime.clone();
-        let revision = tokio::task::spawn_blocking(move || {
-            runtime.install_user_domain_access(config)
-        })
-        .await
-        .map_err(|error| {
-            Status::internal(format!(
-                "user-domain access install task failed: {error}"
-            ))
-        })?
-        .map_err(map_install_error)?;
+            })?
+            .map_err(map_install_error)
+        }
+        .await;
+        self.runtime
+            .record_user_domain_access_apply(result.is_ok());
+        let revision = result?;
         tracing::info!(
             version = revision.version,
             generated_at = revision.generated_at.as_deref().unwrap_or("none"),
@@ -79,7 +85,7 @@ impl proto::chimera::app::userdomain::command::user_domain_access_service_server
     > {
         let version = request.into_inner().version;
         let runtime = self.runtime.clone();
-        let revision = tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             runtime.rollback_user_domain_access(version)
         })
         .await
@@ -87,8 +93,11 @@ impl proto::chimera::app::userdomain::command::user_domain_access_service_server
             Status::internal(format!(
                 "user-domain access rollback task failed: {error}"
             ))
-        })?
-        .map_err(Status::failed_precondition)?;
+        })
+        .and_then(|result| result.map_err(Status::failed_precondition));
+        self.runtime
+            .record_user_domain_access_rollback(result.is_ok());
+        let revision = result?;
         tracing::warn!(
             version = revision.version,
             "user-domain access policy rolled back"
@@ -168,6 +177,22 @@ fn stats_to_proto(
         allow_all_default: stats.allow_all_default,
         allowlist_miss: stats.allowlist_miss,
         denylist_miss: stats.denylist_miss,
+        enforced_rejections: stats.enforced_rejections,
+        shadow_rejections: stats.shadow_rejections,
+        disabled_bypasses: stats.disabled_bypasses,
+        tls_probe_attempts: stats.tls_probe_attempts,
+        tls_sni_found: stats.tls_sni_found,
+        tls_ech_detected: stats.tls_ech_detected,
+        tls_not_tls: stats.tls_not_tls,
+        tls_incomplete: stats.tls_incomplete,
+        tls_malformed: stats.tls_malformed,
+        tls_no_server_name: stats.tls_no_server_name,
+        tls_timeouts: stats.tls_timeouts,
+        tls_captured_bytes: stats.tls_captured_bytes,
+        apply_succeeded: stats.apply_succeeded,
+        apply_failed: stats.apply_failed,
+        rollback_succeeded: stats.rollback_succeeded,
+        rollback_failed: stats.rollback_failed,
     }
 }
 
@@ -260,6 +285,9 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(status.revision.expect("revision missing").version, 2);
+        let stats = status.stats.expect("stats missing");
+        assert_eq!(stats.apply_succeeded, 2);
+        assert_eq!(stats.apply_failed, 0);
 
         let rollback = service
             .rollback_policy(Request::new(
@@ -281,6 +309,29 @@ mod tests {
             .await
             .expect_err("replayed version must fail");
         assert_eq!(replay.code(), tonic::Code::FailedPrecondition);
+
+        let missing = service
+            .rollback_policy(Request::new(
+                proto::chimera::app::userdomain::command::RollbackPolicyRequest {
+                    version: 999,
+                },
+            ))
+            .await
+            .expect_err("missing rollback version must fail");
+        assert_eq!(missing.code(), tonic::Code::FailedPrecondition);
+
+        let status = service
+            .get_policy_status(Request::new(
+                proto::chimera::app::userdomain::command::GetPolicyStatusRequest {},
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let stats = status.stats.expect("stats missing");
+        assert_eq!(stats.apply_succeeded, 2);
+        assert_eq!(stats.apply_failed, 1);
+        assert_eq!(stats.rollback_succeeded, 1);
+        assert_eq!(stats.rollback_failed, 1);
     }
 
     #[tokio::test]
@@ -387,5 +438,8 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(status.revision.expect("revision missing").version, 5);
+        let stats = status.stats.expect("stats missing");
+        assert_eq!(stats.apply_succeeded, 1);
+        assert_eq!(stats.apply_failed, 1);
     }
 }

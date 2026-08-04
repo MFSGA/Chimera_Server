@@ -206,6 +206,22 @@ fn stats_json(stats: &DecisionStats) -> Value {
         "allowAllDefault": stats.allow_all_default,
         "allowlistMiss": stats.allowlist_miss,
         "denylistMiss": stats.denylist_miss,
+        "enforcedRejections": stats.enforced_rejections,
+        "shadowRejections": stats.shadow_rejections,
+        "disabledBypasses": stats.disabled_bypasses,
+        "tlsProbeAttempts": stats.tls_probe_attempts,
+        "tlsSniFound": stats.tls_sni_found,
+        "tlsEchDetected": stats.tls_ech_detected,
+        "tlsNotTls": stats.tls_not_tls,
+        "tlsIncomplete": stats.tls_incomplete,
+        "tlsMalformed": stats.tls_malformed,
+        "tlsNoServerName": stats.tls_no_server_name,
+        "tlsTimeouts": stats.tls_timeouts,
+        "tlsCapturedBytes": stats.tls_captured_bytes,
+        "applySucceeded": stats.apply_succeeded,
+        "applyFailed": stats.apply_failed,
+        "rollbackSucceeded": stats.rollback_succeeded,
+        "rollbackFailed": stats.rollback_failed,
     })
 }
 
@@ -279,6 +295,38 @@ struct DecisionStats {
     allowlist_miss: u64,
     #[prost(uint64, tag = "9")]
     denylist_miss: u64,
+    #[prost(uint64, tag = "10")]
+    enforced_rejections: u64,
+    #[prost(uint64, tag = "11")]
+    shadow_rejections: u64,
+    #[prost(uint64, tag = "12")]
+    disabled_bypasses: u64,
+    #[prost(uint64, tag = "13")]
+    tls_probe_attempts: u64,
+    #[prost(uint64, tag = "14")]
+    tls_sni_found: u64,
+    #[prost(uint64, tag = "15")]
+    tls_ech_detected: u64,
+    #[prost(uint64, tag = "16")]
+    tls_not_tls: u64,
+    #[prost(uint64, tag = "17")]
+    tls_incomplete: u64,
+    #[prost(uint64, tag = "18")]
+    tls_malformed: u64,
+    #[prost(uint64, tag = "19")]
+    tls_no_server_name: u64,
+    #[prost(uint64, tag = "20")]
+    tls_timeouts: u64,
+    #[prost(uint64, tag = "21")]
+    tls_captured_bytes: u64,
+    #[prost(uint64, tag = "22")]
+    apply_succeeded: u64,
+    #[prost(uint64, tag = "23")]
+    apply_failed: u64,
+    #[prost(uint64, tag = "24")]
+    rollback_succeeded: u64,
+    #[prost(uint64, tag = "25")]
+    rollback_failed: u64,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]

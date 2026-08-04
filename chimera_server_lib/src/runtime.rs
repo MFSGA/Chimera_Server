@@ -23,8 +23,8 @@ use tokio::{
 
 #[cfg(feature = "user_domain_access")]
 use crate::user_domain_access::{
-    AccessAction, AccessDecision, AccessDecisionReason, UserDomainAccessConfig,
-    UserDomainAccessPolicy,
+    AccessAction, AccessDecision, AccessDecisionReason, EnforcementMode,
+    UserDomainAccessConfig, UserDomainAccessPolicy,
 };
 use crate::{
     config::server_config::ServerConfig,
@@ -109,6 +109,33 @@ pub struct UserDomainAccessStats {
     pub allow_all_default: u64,
     pub allowlist_miss: u64,
     pub denylist_miss: u64,
+    pub enforced_rejections: u64,
+    pub shadow_rejections: u64,
+    pub disabled_bypasses: u64,
+    pub tls_probe_attempts: u64,
+    pub tls_sni_found: u64,
+    pub tls_ech_detected: u64,
+    pub tls_not_tls: u64,
+    pub tls_incomplete: u64,
+    pub tls_malformed: u64,
+    pub tls_no_server_name: u64,
+    pub tls_timeouts: u64,
+    pub tls_captured_bytes: u64,
+    pub apply_succeeded: u64,
+    pub apply_failed: u64,
+    pub rollback_succeeded: u64,
+    pub rollback_failed: u64,
+}
+
+#[cfg(feature = "user_domain_access")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UserDomainAccessTlsProbeOutcome {
+    ServerName,
+    EncryptedClientHello,
+    NotTls,
+    Incomplete,
+    Malformed,
+    NoServerName,
 }
 
 #[cfg(feature = "user_domain_access")]
@@ -123,6 +150,22 @@ struct UserDomainAccessMetrics {
     allow_all_default: AtomicU64,
     allowlist_miss: AtomicU64,
     denylist_miss: AtomicU64,
+    enforced_rejections: AtomicU64,
+    shadow_rejections: AtomicU64,
+    disabled_bypasses: AtomicU64,
+    tls_probe_attempts: AtomicU64,
+    tls_sni_found: AtomicU64,
+    tls_ech_detected: AtomicU64,
+    tls_not_tls: AtomicU64,
+    tls_incomplete: AtomicU64,
+    tls_malformed: AtomicU64,
+    tls_no_server_name: AtomicU64,
+    tls_timeouts: AtomicU64,
+    tls_captured_bytes: AtomicU64,
+    apply_succeeded: AtomicU64,
+    apply_failed: AtomicU64,
+    rollback_succeeded: AtomicU64,
+    rollback_failed: AtomicU64,
 }
 
 #[cfg(feature = "user_domain_access")]
@@ -414,8 +457,41 @@ impl RuntimeState {
     pub(crate) fn record_user_domain_access_decision(
         &self,
         decision: &AccessDecision,
+        enforcement_mode: EnforcementMode,
     ) {
-        self.user_domain_access_metrics.record(decision);
+        self.user_domain_access_metrics
+            .record(decision, enforcement_mode);
+    }
+
+    #[cfg(feature = "user_domain_access")]
+    pub(crate) fn record_user_domain_access_disabled_bypass(&self) {
+        self.user_domain_access_metrics
+            .disabled_bypasses
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "user_domain_access")]
+    pub(crate) fn record_user_domain_access_tls_probe(
+        &self,
+        outcome: UserDomainAccessTlsProbeOutcome,
+        captured_bytes: usize,
+        timed_out: bool,
+    ) {
+        self.user_domain_access_metrics.record_tls_probe(
+            outcome,
+            captured_bytes,
+            timed_out,
+        );
+    }
+
+    #[cfg(feature = "user_domain_access")]
+    pub(crate) fn record_user_domain_access_apply(&self, succeeded: bool) {
+        self.user_domain_access_metrics.record_apply(succeeded);
+    }
+
+    #[cfg(feature = "user_domain_access")]
+    pub(crate) fn record_user_domain_access_rollback(&self, succeeded: bool) {
+        self.user_domain_access_metrics.record_rollback(succeeded);
     }
 
     /// Returns a cumulative low-cardinality access decision snapshot.
@@ -747,7 +823,7 @@ fn append_persisted_history_config(
 
 #[cfg(feature = "user_domain_access")]
 impl UserDomainAccessMetrics {
-    fn record(&self, decision: &AccessDecision) {
+    fn record(&self, decision: &AccessDecision, enforcement_mode: EnforcementMode) {
         self.evaluations.fetch_add(1, Ordering::Relaxed);
         match decision.action {
             AccessAction::Allow => {
@@ -755,6 +831,15 @@ impl UserDomainAccessMetrics {
             }
             AccessAction::Reject => {
                 self.rejected.fetch_add(1, Ordering::Relaxed);
+                match enforcement_mode {
+                    EnforcementMode::Enforce => {
+                        self.enforced_rejections.fetch_add(1, Ordering::Relaxed);
+                    }
+                    EnforcementMode::Shadow => {
+                        self.shadow_rejections.fetch_add(1, Ordering::Relaxed);
+                    }
+                    EnforcementMode::Disabled => {}
+                }
             }
         }
         let counter = match decision.reason {
@@ -764,6 +849,51 @@ impl UserDomainAccessMetrics {
             AccessDecisionReason::AllowAllDefault => &self.allow_all_default,
             AccessDecisionReason::AllowlistMiss => &self.allowlist_miss,
             AccessDecisionReason::DenylistMiss => &self.denylist_miss,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_tls_probe(
+        &self,
+        outcome: UserDomainAccessTlsProbeOutcome,
+        captured_bytes: usize,
+        timed_out: bool,
+    ) {
+        self.tls_probe_attempts.fetch_add(1, Ordering::Relaxed);
+        self.tls_captured_bytes
+            .fetch_add(captured_bytes as u64, Ordering::Relaxed);
+        if timed_out {
+            self.tls_timeouts.fetch_add(1, Ordering::Relaxed);
+        }
+        let counter = match outcome {
+            UserDomainAccessTlsProbeOutcome::ServerName => &self.tls_sni_found,
+            UserDomainAccessTlsProbeOutcome::EncryptedClientHello => {
+                &self.tls_ech_detected
+            }
+            UserDomainAccessTlsProbeOutcome::NotTls => &self.tls_not_tls,
+            UserDomainAccessTlsProbeOutcome::Incomplete => &self.tls_incomplete,
+            UserDomainAccessTlsProbeOutcome::Malformed => &self.tls_malformed,
+            UserDomainAccessTlsProbeOutcome::NoServerName => {
+                &self.tls_no_server_name
+            }
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_apply(&self, succeeded: bool) {
+        let counter = if succeeded {
+            &self.apply_succeeded
+        } else {
+            &self.apply_failed
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_rollback(&self, succeeded: bool) {
+        let counter = if succeeded {
+            &self.rollback_succeeded
+        } else {
+            &self.rollback_failed
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -779,6 +909,22 @@ impl UserDomainAccessMetrics {
             allow_all_default: self.allow_all_default.load(Ordering::Relaxed),
             allowlist_miss: self.allowlist_miss.load(Ordering::Relaxed),
             denylist_miss: self.denylist_miss.load(Ordering::Relaxed),
+            enforced_rejections: self.enforced_rejections.load(Ordering::Relaxed),
+            shadow_rejections: self.shadow_rejections.load(Ordering::Relaxed),
+            disabled_bypasses: self.disabled_bypasses.load(Ordering::Relaxed),
+            tls_probe_attempts: self.tls_probe_attempts.load(Ordering::Relaxed),
+            tls_sni_found: self.tls_sni_found.load(Ordering::Relaxed),
+            tls_ech_detected: self.tls_ech_detected.load(Ordering::Relaxed),
+            tls_not_tls: self.tls_not_tls.load(Ordering::Relaxed),
+            tls_incomplete: self.tls_incomplete.load(Ordering::Relaxed),
+            tls_malformed: self.tls_malformed.load(Ordering::Relaxed),
+            tls_no_server_name: self.tls_no_server_name.load(Ordering::Relaxed),
+            tls_timeouts: self.tls_timeouts.load(Ordering::Relaxed),
+            tls_captured_bytes: self.tls_captured_bytes.load(Ordering::Relaxed),
+            apply_succeeded: self.apply_succeeded.load(Ordering::Relaxed),
+            apply_failed: self.apply_failed.load(Ordering::Relaxed),
+            rollback_succeeded: self.rollback_succeeded.load(Ordering::Relaxed),
+            rollback_failed: self.rollback_failed.load(Ordering::Relaxed),
         }
     }
 }

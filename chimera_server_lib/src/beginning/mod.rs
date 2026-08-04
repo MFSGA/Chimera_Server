@@ -40,6 +40,7 @@ use crate::{
 #[cfg(feature = "user_domain_access")]
 use crate::{
     address::Address,
+    runtime::UserDomainAccessTlsProbeOutcome,
     tls_client_hello::{ClientHelloInspection, inspect_client_hello},
     user_domain_access::{AccessAction, AccessTarget, EnforcementMode, UserId},
 };
@@ -399,7 +400,10 @@ async fn enrich_tls_access_metadata(
     remote_location: &NetLocation,
     runtime: &RuntimeState,
 ) -> std::io::Result<Box<dyn AsyncStream>> {
-    if runtime.user_domain_access().is_none() {
+    let Some(policy) = runtime.user_domain_access() else {
+        return Ok(stream);
+    };
+    if policy.enforcement_mode() == EnforcementMode::Disabled {
         return Ok(stream);
     }
     let Some(context) = traffic_context.as_ref() else {
@@ -414,6 +418,7 @@ async fn enrich_tls_access_metadata(
 
     let deadline = Instant::now() + TLS_ACCESS_SNIFF_TIMEOUT;
     let mut captured = Vec::new();
+    let mut timed_out = false;
     let inspection = loop {
         match inspect_client_hello(&captured) {
             ClientHelloInspection::Incomplete
@@ -421,6 +426,7 @@ async fn enrich_tls_access_metadata(
             {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
+                    timed_out = true;
                     break ClientHelloInspection::Incomplete;
                 }
                 let mut buffer = [0u8; 4096];
@@ -428,12 +434,39 @@ async fn enrich_tls_access_metadata(
                     Ok(Ok(0)) => break ClientHelloInspection::Incomplete,
                     Ok(Ok(length)) => captured.extend_from_slice(&buffer[..length]),
                     Ok(Err(error)) => return Err(error),
-                    Err(_) => break ClientHelloInspection::Incomplete,
+                    Err(_) => {
+                        timed_out = true;
+                        break ClientHelloInspection::Incomplete;
+                    }
                 }
             }
             inspection => break inspection,
         }
     };
+
+    let probe_outcome = match &inspection {
+        ClientHelloInspection::ServerName(_) => {
+            UserDomainAccessTlsProbeOutcome::ServerName
+        }
+        ClientHelloInspection::EncryptedClientHello => {
+            UserDomainAccessTlsProbeOutcome::EncryptedClientHello
+        }
+        ClientHelloInspection::NotTls => UserDomainAccessTlsProbeOutcome::NotTls,
+        ClientHelloInspection::Incomplete => {
+            UserDomainAccessTlsProbeOutcome::Incomplete
+        }
+        ClientHelloInspection::Malformed => {
+            UserDomainAccessTlsProbeOutcome::Malformed
+        }
+        ClientHelloInspection::NoServerName => {
+            UserDomainAccessTlsProbeOutcome::NoServerName
+        }
+    };
+    runtime.record_user_domain_access_tls_probe(
+        probe_outcome,
+        captured.len(),
+        timed_out,
+    );
 
     if let Some(context) = traffic_context.as_mut() {
         match inspection {
@@ -597,12 +630,13 @@ pub(crate) fn enforce_user_domain_access(
     };
     let enforcement_mode = policy.enforcement_mode();
     if enforcement_mode == EnforcementMode::Disabled {
+        runtime.record_user_domain_access_disabled_bypass();
         return Ok(user_uuid);
     }
 
     let (target, target_source) = classify_access_target(context, remote_location)?;
     let decision = policy.decide_optional(user_uuid, &target);
-    runtime.record_user_domain_access_decision(&decision);
+    runtime.record_user_domain_access_decision(&decision, enforcement_mode);
     if decision.action == AccessAction::Allow {
         return Ok(user_uuid);
     }
@@ -1272,11 +1306,15 @@ mod tests {
         let shadow_stats = shadow.user_domain_access_stats();
         assert_eq!(shadow_stats.evaluations, 1);
         assert_eq!(shadow_stats.rejected, 1);
+        assert_eq!(shadow_stats.shadow_rejections, 1);
+        assert_eq!(shadow_stats.enforced_rejections, 0);
 
         let disabled = runtime("disabled");
         enforce_user_domain_access(&disabled, Some(&context), &blocked)
             .expect("disabled mode must bypass policy evaluation");
-        assert_eq!(disabled.user_domain_access_stats().evaluations, 0);
+        let disabled_stats = disabled.user_domain_access_stats();
+        assert_eq!(disabled_stats.evaluations, 0);
+        assert_eq!(disabled_stats.disabled_bypasses, 1);
     }
 
     #[cfg(feature = "user_domain_access")]
@@ -1384,6 +1422,10 @@ mod tests {
             .await
             .expect("read replayed ClientHello and payload");
         assert_eq!(replayed, expected);
+        let stats = runtime.user_domain_access_stats();
+        assert_eq!(stats.tls_probe_attempts, 1);
+        assert_eq!(stats.tls_sni_found, 1);
+        assert_eq!(stats.tls_captured_bytes, expected.len() as u64);
     }
 
     #[cfg(feature = "user_domain_access")]

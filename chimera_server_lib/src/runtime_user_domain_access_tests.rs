@@ -9,7 +9,7 @@ use std::{
 use crate::{
     RuntimeState,
     user_domain_access::{
-        AccessAction, AccessTarget, UserDomainAccessConfig,
+        AccessAction, AccessTarget, EnforcementMode, UserDomainAccessConfig,
         user_domain_access_checksum,
     },
 };
@@ -156,15 +156,15 @@ fn decision_metrics_use_fixed_reason_buckets() {
         user,
         &AccessTarget::classify(Some("allowed.example")).unwrap(),
     );
-    runtime.record_user_domain_access_decision(&allowed);
+    runtime.record_user_domain_access_decision(&allowed, EnforcementMode::Enforce);
     let rejected = policy.decide(
         user,
         &AccessTarget::classify(Some("blocked.example")).unwrap(),
     );
-    runtime.record_user_domain_access_decision(&rejected);
+    runtime.record_user_domain_access_decision(&rejected, EnforcementMode::Shadow);
     let unknown =
         policy.decide(user, &AccessTarget::IpAddress("192.0.2.1".parse().unwrap()));
-    runtime.record_user_domain_access_decision(&unknown);
+    runtime.record_user_domain_access_decision(&unknown, EnforcementMode::Enforce);
 
     let stats = runtime.user_domain_access_stats();
     assert_eq!(stats.evaluations, 3);
@@ -173,6 +173,8 @@ fn decision_metrics_use_fixed_reason_buckets() {
     assert_eq!(stats.matched_rule, 1);
     assert_eq!(stats.allowlist_miss, 1);
     assert_eq!(stats.unknown_target, 1);
+    assert_eq!(stats.enforced_rejections, 1);
+    assert_eq!(stats.shadow_rejections, 1);
 }
 
 #[test]
