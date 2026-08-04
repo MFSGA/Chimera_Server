@@ -137,7 +137,7 @@ BPF SOCKHASH 不是当前必做项。只有物理机高并发数据证明网卡�
 
 ### P0：Chimera Server 决策引擎
 
-当前进度：Chimera Server、Rust rnode、Nest 节点和中央 backend 的端到端实现均已完成。Chimera 负责策略编译、版本化 RuntimeState、原子持久化、回滚、防重放、节点目标校验、低基数指标和 CLI；两种节点实现均暴露一致的 JWT API 并转发到 Chimera gRPC；backend 已具备用户策略表、节点版本发布包、Apply/Rollback 审计事件、canonical checksum、SERIALIZABLE 版本分配及 HTTPS/JWT/可选 mTLS 调用。VLESS、VMess、Trojan、认证 HTTP、SOCKS、TUIC、Hysteria2 的身份均可映射到稳定 backend UUID；TCP、固定/多目标 UDP、XUDP、SOCKS UDP 及 QUIC TCP/UDP 均在 DNS 或出站建立前决策。目标为 IP/未知时会进行 5ms 有界 TLS ClientHello 探测并回放已读字节；ECH outer SNI 不被信任，统一按 `unknownTargetAction` 处理。
+当前进度：Chimera Server、Rust rnode、Nest 节点和中央 backend 的端到端实现均已完成。Chimera 负责策略编译、版本化 RuntimeState、原子持久化、回滚、防重放、节点目标校验、低基数指标和 CLI；两种节点实现均暴露一致的 JWT API 并转发到 Chimera gRPC；backend 已具备用户策略表、节点版本发布包、Apply/Rollback 审计事件、canonical checksum、SERIALIZABLE 版本分配及 HTTPS/JWT/可选 mTLS 调用。VLESS、VMess、Trojan、认证 HTTP、SOCKS、TUIC、Hysteria2 的身份均可映射到稳定 backend UUID；TCP、固定/多目标 UDP、XUDP、SOCKS UDP 及 QUIC TCP/UDP 均在 DNS 或出站建立前决策。目标为 IP/未知时会进行 5ms 有界 TLS ClientHello 探测并回放已读字节；ECH outer SNI 不被信任，统一按 `unknownTargetAction` 处理。生产加固已加入 `enforce/shadow/disabled`、固定维度运行指标、可选 Ed25519 发布验签和 Criterion 策略规模基准。
 
 - [x] 增加用户域名策略配置结构和严格校验。
 - [x] 在连接上下文中统一保存用户 UUID、协议身份、目标地址、端口、SNI、ECH 标记、HTTP Host 和传输类型。
@@ -146,6 +146,7 @@ BPF SOCKHASH 不是当前必做项。只有物理机高并发数据证明网卡�
 - [x] 明确未知目标、IP 直连、ECH 和不可识别 QUIC 流量的默认行为：不能得到可信域名时统一执行用户级 `unknownTargetAction`，未映射用户执行全局 `defaultAction`。
 - [x] 在 DNS 解析和建立出站连接前执行 `allow`/`reject` 决策，覆盖 VLESS、VMess、Trojan、HTTP、SOCKS、TUIC、Hysteria2 的 TCP/UDP/QUIC 路径及 XUDP。
 - [x] 为每次决策返回匹配规则、用户、目标分类和拒绝原因。
+- [x] 增加 `enforce`、`shadow`、`disabled` 三种执行模式；shadow 记录原始拒绝但不阻断，disabled 不执行目标分类和 TLS 探测。
 
 ### P1：配置链与 rnode 发布
 
@@ -153,7 +154,8 @@ BPF SOCKHASH 不是当前必做项。只有物理机高并发数据证明网卡�
 - [x] 增加配置版本、生成时间、目标节点、校验和及原子替换机制。checksum 使用排除自身字段、对象键排序的 canonical JSON SHA-256；版本严格递增并防止回滚后的旧包重放。
 - [x] 配置校验失败时保留旧配置，并支持最近版本回滚。当前将当前策略、最近 5 个历史版本和 `highestSeenVersion` 原子持久化；重启后仍可回滚，且旧高版本继续防重放。
 - [x] 通过 Rust rnode 或 Nest 节点接收 backend 的 JWT 发布请求，调用 Chimera gRPC Apply、Rollback、Status，并将结果返回 backend 确认。
-- [x] 增加低基数的命中、拒绝、fallback 和策略版本日志/指标。当前使用固定 action/reason 原子计数，并由 GetStatus 返回累计值。
+- [x] 增加低基数的命中、拒绝、fallback 和策略版本日志/指标。GetStatus 现在覆盖原始 allow/reject、实际阻断、shadow 拒绝、disabled bypass、TLS 探测结果与字节数，以及 Apply/Rollback 成败。
+- [x] 支持可选 Ed25519 策略签名验证；节点本地配置可信公钥和 `requireSignature`，验签失败在落盘及 RuntimeState 替换前拒绝。
 
 ### P1：backend 对接
 
@@ -169,5 +171,17 @@ BPF SOCKHASH 不是当前必做项。只有物理机高并发数据证明网卡�
 - [x] 覆盖 TCP/TLS ClientHello、VLESS、VMess、Trojan、HTTP、SOCKS、TUIC、Hysteria2 和 XUDP 的协议级回归；真实外部客户端/节点联调属于发布环境验收。
 - [x] 验证直接 IP、ECH、旁路 DNS 和不可识别目标符合 `unknownTargetAction`；ECH 测试确认 outer SNI 不参与域名放行。
 - [x] 验证非法发布、错误节点、写盘失败不会覆盖当前有效配置，并验证重启选择正确当前版本、恢复历史回滚能力及保留最高版本防重放。
+- [x] 增加 Criterion 基准，覆盖 1/100/10,000 用户和 1/10/100/1,000 exact/suffix 规则的编译、命中与 miss。
 
-代码完成后只剩部署验收：应用数据库 migration，配置节点 JWT 或 mTLS 凭据，在真实节点执行 Apply/Status/Rollback、重启恢复、断网失败审计和监控告警验证。
+### P0：生产部署验收
+
+- [ ] 在真实节点应用数据库 migration，并验证升级、回退和失败审计。
+- [ ] 配置节点 JWT 或 mTLS 凭据，完成 Apply/Status/Rollback、断网恢复及 checksum 对账。
+- [ ] 先以 `disabled` 校验发布链，再以 `shadow` 收集至少一个完整业务周期的 would-reject 数据。
+- [ ] 为 shadow reject、unknown target、未映射用户、TLS timeout/ECH、Apply/Rollback 失败配置 dashboard 和告警门槛。
+- [ ] 生成生产 Ed25519 signing key，完成离线私钥保护、公钥分发、双 key 轮换和旧 key 撤销演练。
+- [ ] 在所有现有落盘策略均已签名后启用 `requireSignature`，并验证错误签名、未知 key 和签名缺失均 fail closed。
+- [ ] 在固定硬件和 release 构建上执行完整 Criterion 基线，保存原始输出、Git commit、编译参数和硬件信息。
+- [ ] 为决策 p95/p99、编译耗时和策略内存占用设定回归阈值并接入 CI 或发布门禁。
+
+代码层生产加固已完成；剩余项依赖真实节点、密钥管理、数据库和业务流量环境。

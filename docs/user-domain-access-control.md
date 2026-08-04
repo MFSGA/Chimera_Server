@@ -342,8 +342,11 @@ POST /api/nodes/{nodeUuid}/domain-access/publish
 - 最近 5 个策略版本的内存与磁盘历史、原子写盘、文件与目录 fsync，以及重启后继续回滚。
 - 可选本机 `nodeUuid` 校验；缺失或目标不匹配的发布包不会落盘或替换内存策略。
 - `UserDomainAccessService` 的 Apply、Rollback、GetStatus，以及固定低基数决策统计。
-- `chimera-cli user-domain-access` 的 apply、status、rollback 操作。
+- `enforce`、`shadow`、`disabled` 三种执行模式；默认仍为 `enforce`。`shadow` 保留完整决策与“本来会拒绝”计数，但不阻断流量；`disabled` 在身份映射后直接绕过目标分类、TLS 探测和策略计算。
+- 可选 Ed25519 发布签名验证。节点本地保存可信公钥，签名缺失、未知 key ID、内容篡改或验签失败时，在写盘和替换 RuntimeState 前拒绝。
+- `chimera-cli user-domain-access` 的 apply、status、rollback 操作；Status 同时返回执行模式结果、TLS 探测、Apply/Rollback 成败和签名 key ID 等固定维度信息。
 - 稳定 backend UUID 优先进入访问控制与路由；协议显示身份仍用于原有流量可观测性。
+- Criterion 基准覆盖策略编译、用户规模、exact/suffix 规则规模、首尾规则命中与 miss。
 
 节点配置示例：
 
@@ -355,22 +358,34 @@ POST /api/nodes/{nodeUuid}/domain-access/publish
   },
   "userDomainAccessStore": {
     "path": "state/user-domain-access.json",
-    "nodeUuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    "nodeUuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "requireSignature": true,
+    "trustedSigningKeys": [
+      {
+        "keyId": "backend-key-2026-01",
+        "publicKey": "<base64-encoded 32-byte Ed25519 public key>"
+      }
+    ]
   },
   "userDomainAccess": {
     "version": 1,
     "generatedAt": "2026-08-04T00:00:00Z",
     "sourceBackendVersion": "bootstrap",
     "targetNodeUuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "signatureAlgorithm": "ed25519",
+    "signingKeyId": "backend-key-2026-01",
+    "checksum": "sha256:<hex>",
+    "signature": "<base64 Ed25519 signature>",
+    "enforcementMode": "shadow",
     "defaultAction": "reject",
     "users": []
   }
 }
 ```
 
-`checksum` 可由发布方在排除 checksum 字段后，对对象键排序的 canonical JSON 计算 SHA-256，并写为 `sha256:<hex>`。动态发布要求版本严格高于运行期见过的最高版本；回滚不会降低该最高版本。
+`checksum` 对排除顶层 `checksum` 与 `signature` 字段后的 canonical JSON 计算 SHA-256，并写为 `sha256:<hex>`。签名 payload 只排除顶层 `signature`，因此会认证 checksum、签名算法、key ID、版本、目标节点和完整策略内容。动态发布要求版本严格高于运行期见过的最高版本；回滚不会降低该最高版本。未配置 `requireSignature` 时保持兼容，可继续接受只有 checksum 的旧发布包；启用后所有当前策略和持久化历史都必须通过同一验签流程。
 
-持久化文件使用版本化 envelope，保存 `formatVersion`、`highestSeenVersion`、当前策略和最多 5 个历史策略。启动和 `--check` 会校验当前策略及全部历史策略的 checksum、目标节点和版本边界；重启后历史版本仍可回滚，旧版仅包含单个策略对象的存储文件也可兼容读取。
+持久化文件使用版本化 envelope，保存 `formatVersion`、`highestSeenVersion`、当前策略和最多 5 个历史策略。启动和 `--check` 会校验当前策略及全部历史策略的 checksum、签名、目标节点和版本边界；重启后历史版本仍可回滚，旧版仅包含单个策略对象的存储文件也可兼容读取。启用强制签名之前，应先确认现有落盘策略已经由受信 key 签名，否则节点会按 fail-closed 原则拒绝启动。
 
 CLI 示例：
 
@@ -387,6 +402,31 @@ chimera-cli user-domain-access \
   --endpoint 127.0.0.1:8080 \
   rollback 11
 ```
+
+### 11.1 推荐灰度顺序
+
+1. 先以 `disabled` 发布完整身份映射和规则，确认版本、checksum、签名及节点对账正常。
+2. 切换为 `shadow`，观察 `shadowRejections`、`unknownTarget`、`noUserPolicy`、TLS/ECH 探测结果和协议身份未映射情况。
+3. 修正遗漏规则后，选择少量节点进入 `enforce`；拒绝率或 unknown 比例超过预设门槛时停止扩容并回滚。
+4. 按固定批次扩展到 5%、25%、50% 和 100%，每批完成 Apply、Status checksum 对账、重启恢复和 Rollback 演练。
+5. 稳定后再启用 `requireSignature`。密钥轮换时先同时配置新旧两个公钥，完成新 key 发布验证后再移除旧 key。
+
+指标严格保持低基数。Status 中的主要生产字段包括：原始 allow/reject 决策、实际阻断、shadow 拒绝、disabled bypass、TLS SNI/ECH/timeout/parse outcome、探测字节数以及 Apply/Rollback 成败。UUID、域名、IP 和连接 ID 不作为指标标签。
+
+### 11.2 性能基准
+
+```bash
+cargo bench -p chimera_server_lib --bench user_domain_access
+```
+
+基准覆盖：
+
+- 1、100、10,000 用户的编译和末用户查找；
+- 1、10、100、1,000 条 exact/suffix 规则的编译；
+- 声明首条、声明末条和 miss 决策；
+- release profile 下的每次决策耗时和吞吐。
+
+短时 smoke 仅用于确认 benchmark 可执行，不能作为生产阈值。正式基线必须固定 CPU、内核、编译参数和负载，在独立重复运行中记录原始 Criterion 输出、Git commit 和硬件信息。
 
 ## 12. 跨仓库发布实现
 
