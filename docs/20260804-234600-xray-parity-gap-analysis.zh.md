@@ -867,14 +867,14 @@ Chimera 当前未支持这些高级 transport 组合。
 
 ### Slice 3：Outbound Transport Pipeline
 
-当前实现状态：TCP、TLS 与 REALITY 子切片已完成。Registry 在安装阶段将静态 `streamSettings` 编译成不可变 transport 状态，TCP connector 先建立底层连接，再按 transport 包装，最后写入 VLESS 请求头。TLS 当前支持系统根证书或内联 `certificates[].usage=verify` CA、SNI、ALPN、TLS 1.2/1.3 版本边界和 session resumption 开关；`allowInsecure`、fingerprint、证书 pin、ECH、客户端证书、证书文件和未知字段均 fail-closed。REALITY 复用现有客户端握手状态机，支持 `serverName/publicKey/shortId/cipherSuites`，并明确拒绝尚未实现的 uTLS fingerprint 与 spiderX。已分别通过 `SOCKS → Chimera → VLESS over TLS 1.3 + ALPN h2 → Xray 26.2.6 inbound → echo` 和 `SOCKS → Chimera → VLESS over REALITY → Xray 26.2.6 inbound → echo` 的真实进程互通，覆盖 IP、域名和 64KiB payload。当前仅静态 JSON 接入 TLS/REALITY，动态 HandlerService sender settings 尚未接入。
+当前实现状态：TCP、TLS、REALITY 与 WebSocket 子切片已完成。Registry 在安装阶段将静态 `streamSettings` 编译成不可变的“安全层 + 应用传输层”状态，TCP connector 先建立底层连接，再应用 TLS/REALITY，随后进行 WebSocket Upgrade，最后写入 VLESS 请求头。TLS 当前支持系统根证书或内联 `certificates[].usage=verify` CA、SNI、ALPN、TLS 1.2/1.3 版本边界和 session resumption 开关；`allowInsecure`、fingerprint、证书 pin、ECH、客户端证书、证书文件和未知字段均 fail-closed。REALITY 复用现有客户端握手状态机，支持 `serverName/publicKey/shortId/cipherSuites`，并明确拒绝尚未实现的 uTLS fingerprint 与 spiderX。WebSocket 复用现有二进制帧流，支持 host、规范化 path 和普通自定义 headers，严格验证 101/Upgrade/Connection/Sec-WebSocket-Accept 与客户端/服务端 masking 方向；early data、heartbeat、proxy protocol、保留握手头和 REALITY+WS 均 fail-closed。TLS、REALITY、WS 与 WSS 已分别通过 Xray 26.2.6 真实进程互通，覆盖 IP、域名和 64KiB payload。当前仅静态 JSON 接入这些 transport，动态 HandlerService sender settings 尚未接入。
 
 目标：
 
 - TCP；（已完成）
 - TLS；（静态配置已完成）
 - REALITY；（静态配置核心握手已完成）
-- WebSocket；
+- WebSocket；（静态 WS/WSS 已完成）
 - HTTP Upgrade；
 - gRPC；
 - transport pipeline 复用于 VLESS/VMess/Trojan。（VLESS 已接入）
