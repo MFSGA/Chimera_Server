@@ -190,3 +190,54 @@ BPF SOCKHASH 不是当前必做项。只有物理机高并发数据证明网卡�
 - [ ] 演练策略文件超限、symlink、权限错误、磁盘满、只读文件系统及进程在 rename 前被终止等故障。
 
 代码层生产加固已完成；剩余项依赖真实节点、密钥管理、数据库和业务流量环境。
+
+## Xray 兼容性下一阶段
+
+详细差距分析见 [`20260804-234600-xray-parity-gap-analysis.zh.md`](./20260804-234600-xray-parity-gap-analysis.zh.md)。对比基线为仓库内 `ref/xray-core` 的 `5ca6f4b7d4dc`（Xray-core v26.7.28）。
+
+当前结论：入站、路由、Stats/Handler/Routing/Observatory 控制面已经较完整；最大结构性缺口是只有 `freedom` 和 `blackhole` 能执行真实出站连接。通用 sniffing、Xray DNS/FakeDNS、mKCP、TUN、Reverse、WireGuard 和部分 XHTTP client/xmux/download 语义仍未完成。
+
+### P0：Outbound Runtime
+
+- [ ] 新增 typed outbound config，保留 `settings`、`streamSettings`、sender/via、proxySettings 和协议账户。
+- [ ] 新增 `OutboundSession`、TCP/UDP connector trait 和 tag → connector registry。
+- [ ] 将现有 Freedom/Blackhole 迁移到 registry，保持行为不变。
+- [ ] 让静态配置和 HandlerService Add/RemoveOutbound 原子更新同一 registry。
+- [ ] unsupported outbound 在编译或安装阶段 fail-closed，而不是连接时才失败。
+- [ ] 支持 VLESS TCP plain outbound，并与固定 Xray-core inbound 做真实互通。
+- [ ] 支持通用 outbound TLS/REALITY/WebSocket/HTTPUpgrade/gRPC transport pipeline。
+- [ ] 依次接入 VMess、Trojan、SOCKS、HTTP、Shadowsocks TCP/UDP outbound。
+
+### P0/P1：Sniffing 与 DNS
+
+- [ ] 将 inbound `sniffing` 从未使用的 `Value` 改为严格 typed config。
+- [ ] 建立独立 `SniffingContext`，支持 HTTP/TLS，后续扩展 QUIC/FakeDNS。
+- [ ] 实现 `destOverride`、`metadataOnly`、`routeOnly`、domain/IP exclusions。
+- [ ] 增加 typed 顶层 DNS 配置、static hosts、nameserver、query/fallback/cache strategy。
+- [ ] 支持 domain-scoped nameserver、expected/unexpected IP、parallel query 和 stale cache。
+- [ ] 在 Outbound Runtime 完成后实现 DNS outbound。
+- [ ] 最后实现 FakeDNS 池和 sniffing/routing 映射恢复。
+
+### P1：Transport 和 Xray 高级语义
+
+- [ ] 将旧 `xhttp_gap_vs_xray.zh.md` 作为历史文档；当前 XHTTP 已支持 VLESS inner、mode、placement、流控、TTL、TLS/REALITY。
+- [ ] 补 XHTTP outbound、HTTP/3/UNIX listener、`downloadSettings`、`xmux` 和 `noGRPCHeader` 数据面语义。
+- [ ] 对 `network=kcp` 明确 fail-closed；真正实现 mKCP 前不得映射为 QUIC。
+- [ ] 接入常用 `sockopt`：interface、mark、keepalive、TFO、original destination、acceptProxyProtocol。
+- [ ] 将顶层 `policy` 从未使用的 Value map 改为 Xray level/system policy，并接 timeout/stats/buffer。
+- [ ] 补 VLESS `xorMode`、`secondsFrom/secondsTo`、`padding` 和通用 userLevel。
+
+### P2：扩展能力
+
+- [ ] TUN inbound。
+- [ ] Reverse bridge/portal。
+- [ ] Loopback outbound，并增加路由环检测。
+- [ ] WireGuard outbound。
+- [ ] Prometheus/HTTP metrics endpoint。
+- [ ] FinalMask、Tagged transport、Browser Dialer、TCP header/mask。
+
+### 推荐立即执行的切片
+
+- [ ] Slice 1：只建立 Outbound Registry 基础层，并迁移 Freedom/Blackhole；不在同一提交中实现 VLESS wire protocol。
+- [ ] Slice 2：VLESS TCP plain outbound。
+- [ ] Slice 3：复用式 outbound transport pipeline。
