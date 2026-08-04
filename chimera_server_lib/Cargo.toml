@@ -72,7 +72,13 @@ tonic-prost-build = { workspace = true }
 protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 rcgen = { workspace = true }
+
+[[bench]]
+name = "user_domain_access"
+harness = false
+required-features = ["user_domain_access"]
 
 [features]
 hysteria = []
