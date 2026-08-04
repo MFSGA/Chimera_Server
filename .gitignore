@@ -13,7 +13,7 @@ config.json5
 .omo/
 .vscode/
 
-docs
+docs/*
 
 deploy/
 deploy/**/.generated/
