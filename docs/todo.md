@@ -200,10 +200,11 @@ BPF SOCKHASH 不是当前必做项。只有物理机高并发数据证明网卡�
 ### P0：Outbound Runtime
 
 - [ ] 新增 typed outbound config，保留 `settings`、`streamSettings`、sender/via、proxySettings 和协议账户。
-- [ ] 新增 `OutboundSession`、TCP/UDP connector trait 和 tag → connector registry。
-- [ ] 将现有 Freedom/Blackhole 迁移到 registry，保持行为不变。
-- [ ] 让静态配置和 HandlerService Add/RemoveOutbound 原子更新同一 registry。
-- [ ] unsupported outbound 在编译或安装阶段 fail-closed，而不是连接时才失败。
+- [x] 新增 tag → `Arc` connector registry，并保证 RemoveOutbound 不影响已选中 connector 的活动会话。
+- [ ] 新增 `OutboundSession` 和通用 TCP/UDP connector trait，为代理协议保存 endpoint、账户和 transport 状态。
+- [x] 将现有 Freedom/Blackhole 迁移到 registry，保持 TCP/UDP 行为不变。
+- [x] 让静态配置和 HandlerService Add/RemoveOutbound 原子更新同一 registry；动态 Blackhole 已支持。
+- [x] unsupported outbound 在编译或安装阶段 fail-closed，而不是连接时才失败；测试兼容构造器仍保留诊断路径。
 - [ ] 支持 VLESS TCP plain outbound，并与固定 Xray-core inbound 做真实互通。
 - [ ] 支持通用 outbound TLS/REALITY/WebSocket/HTTPUpgrade/gRPC transport pipeline。
 - [ ] 依次接入 VMess、Trojan、SOCKS、HTTP、Shadowsocks TCP/UDP outbound。

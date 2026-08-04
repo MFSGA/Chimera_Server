@@ -818,16 +818,18 @@ Chimera 当前未支持这些高级 transport 组合。
 
 ### Slice 1：Outbound Registry 基础层
 
+当前实现状态：基础 registry 已完成。RuntimeState 现在原子保存有序 outbound 摘要和 tag → `Arc` connector 映射；Freedom/Blackhole 的 TCP/UDP 选择已通过 registry 执行；静态启动、`--check` 和动态 HandlerService 会在安装前拒绝未知协议和重复 tag；RemoveOutbound 不会使已取得 connector 的活动会话失效。`OutboundSession`、通用 connector trait、typed settings 和 observatory connector 能力仍属于下一阶段。
+
 目标：
 
 - 新增 typed outbound config；
 - 新增 OutboundSession；
 - 新增 connector trait；
-- 新增 tag → connector registry；
-- Freedom/Blackhole 迁移到 registry；
-- TCP/UDP 路由改为通过 registry 执行；
-- 保持现有行为不变；
-- HandlerService Add/RemoveOutbound 原子更新 registry；
+- 新增 tag → connector registry；（已完成）
+- Freedom/Blackhole 迁移到 registry；（已完成）
+- TCP/UDP 路由改为通过 registry 执行；（已完成）
+- 保持现有行为不变；（已完成）
+- HandlerService Add/RemoveOutbound 原子更新 registry；（已完成）
 - observatory 从 registry 读取 connector 能力。
 
 明确不做：
