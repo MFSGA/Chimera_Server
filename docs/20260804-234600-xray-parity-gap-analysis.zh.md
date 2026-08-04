@@ -867,15 +867,17 @@ Chimera 当前未支持这些高级 transport 组合。
 
 ### Slice 3：Outbound Transport Pipeline
 
+当前实现状态：TCP 与 TLS 子切片已完成。Registry 在安装阶段将静态 `streamSettings` 编译成不可变 transport 状态，TCP connector 先建立底层连接，再按 transport 包装，最后写入 VLESS 请求头。TLS 当前支持系统根证书或内联 `certificates[].usage=verify` CA、SNI、ALPN、TLS 1.2/1.3 版本边界和 session resumption 开关；`allowInsecure`、fingerprint、证书 pin、ECH、客户端证书、证书文件和未知字段均 fail-closed。已通过 `SOCKS → Chimera → VLESS over TLS 1.3 + ALPN h2 → Xray 26.2.6 inbound → echo` 的真实进程互通。当前仅静态 JSON 接入 TLS，动态 HandlerService sender settings 尚未接入。
+
 目标：
 
-- TCP；
-- TLS；
+- TCP；（已完成）
+- TLS；（静态配置已完成）
 - REALITY；
 - WebSocket；
 - HTTP Upgrade；
 - gRPC；
-- transport pipeline 复用于 VLESS/VMess/Trojan。
+- transport pipeline 复用于 VLESS/VMess/Trojan。（VLESS 已接入）
 
 ---
 
