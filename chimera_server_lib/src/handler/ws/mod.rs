@@ -2,12 +2,14 @@ use std::collections::HashMap;
 
 use crate::config::{rule::RuleConfig, server_config::ws::WebsocketServerConfig};
 
+mod websocket_client;
 mod websocket_handler;
 
 mod parsed_http;
 
 mod websocket_stream;
 
+pub(crate) use websocket_client::WebsocketClientConfig;
 pub use websocket_handler::{WebsocketServerTarget, WebsocketTcpServerHandler};
 
 use super::tcp::tcp_handler_util::create_tcp_server_handler;

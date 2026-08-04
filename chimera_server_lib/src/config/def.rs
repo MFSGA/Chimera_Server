@@ -143,6 +143,25 @@ pub struct OutboundStreamSettings {
     #[cfg(feature = "reality")]
     #[serde(default)]
     pub reality_settings: Option<OutboundRealitySettings>,
+    #[cfg(feature = "ws")]
+    #[serde(default, alias = "websocketSettings")]
+    pub ws_settings: Option<OutboundWebsocketSettings>,
+}
+
+#[cfg(feature = "ws")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OutboundWebsocketSettings {
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub accept_proxy_protocol: bool,
+    #[serde(default)]
+    pub heartbeat_period: u32,
 }
 
 #[cfg(feature = "reality")]

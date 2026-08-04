@@ -1140,6 +1140,8 @@ impl HandlerServiceImpl {
                     tls_settings: None,
                     #[cfg(feature = "reality")]
                     reality_settings: None,
+                    #[cfg(feature = "ws")]
+                    ws_settings: None,
                 });
                 "vless"
             }

@@ -143,6 +143,14 @@ impl WebsocketStream {
         let _read_frame_final = first & 0x80 != 0;
 
         self.read_frame_masked = second & 0x80 != 0;
+        if self.read_frame_masked == self.is_client {
+            let peer = if self.is_client { "server" } else { "client" };
+            let expectation = if self.is_client { "unmasked" } else { "masked" };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("WebSocket {peer} frame must be {expectation}"),
+            ));
+        }
 
         self.read_frame_opcode = OpCode::from(first & 0x0f);
 

@@ -15,6 +15,8 @@ use tokio_rustls::TlsConnector;
 
 #[cfg(any(feature = "tls", test))]
 use crate::address::Address;
+#[cfg(feature = "ws")]
+use crate::handler::ws::WebsocketClientConfig;
 #[cfg(feature = "reality")]
 use crate::reality::{
     RealityClientConfig, RealityClientConnection, RealityTlsStream,
@@ -29,12 +31,25 @@ use crate::{
 };
 
 #[derive(Debug, Clone)]
-pub(crate) enum OutboundTransportConfig {
-    Tcp,
+pub(crate) struct OutboundTransportConfig {
+    security: OutboundSecurityConfig,
+    protocol: OutboundProtocolConfig,
+}
+
+#[derive(Debug, Clone)]
+enum OutboundSecurityConfig {
+    None,
     #[cfg(feature = "tls")]
     Tls(TlsOutboundTransportConfig),
     #[cfg(feature = "reality")]
     Reality(RealityClientConfig),
+}
+
+#[derive(Debug, Clone)]
+enum OutboundProtocolConfig {
+    Tcp,
+    #[cfg(feature = "ws")]
+    Websocket(WebsocketClientConfig),
 }
 
 #[cfg(feature = "tls")]
@@ -45,6 +60,13 @@ pub(crate) struct TlsOutboundTransportConfig {
 }
 
 impl OutboundTransportConfig {
+    pub(crate) fn tcp() -> Self {
+        Self {
+            security: OutboundSecurityConfig::None,
+            protocol: OutboundProtocolConfig::Tcp,
+        }
+    }
+
     pub(crate) fn compile(
         server: &NetLocation,
         stream: Option<&OutboundStreamSettings>,
@@ -53,71 +75,42 @@ impl OutboundTransportConfig {
         let network = stream
             .map(|stream| stream.network.trim().to_ascii_lowercase())
             .unwrap_or_default();
-        if !network.is_empty() && network != "tcp" {
-            return Err(format!(
-                "outbound {outbound_tag} requires TCP network, got {network}"
-            ));
-        }
-
-        let security = stream
-            .and_then(|stream| stream.security.as_deref())
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
-        match security.as_str() {
-            "" | "none" => {
-                if stream.is_some_and(|stream| stream.tls_settings.is_some()) {
+        let protocol = match network.as_str() {
+            "" | "tcp" => {
+                if has_websocket_settings(stream) {
                     return Err(format!(
-                        "outbound {outbound_tag} provides tlsSettings without security=tls"
+                        "outbound {outbound_tag} provides wsSettings without network=ws"
                     ));
                 }
-                if has_reality_settings(stream) {
-                    return Err(format!(
-                        "outbound {outbound_tag} provides realitySettings without security=reality"
-                    ));
-                }
-                Ok(Self::Tcp)
+                OutboundProtocolConfig::Tcp
             }
-            "tls" => {
-                if has_reality_settings(stream) {
-                    return Err(format!(
-                        "outbound {outbound_tag} provides realitySettings with security=tls"
-                    ));
-                }
-                #[cfg(feature = "tls")]
+            "ws" | "websocket" => {
+                #[cfg(feature = "ws")]
                 {
-                    compile_tls_transport(server, stream, outbound_tag)
-                        .map(Self::Tls)
+                    compile_websocket_transport(server, stream, outbound_tag)
+                        .map(OutboundProtocolConfig::Websocket)?
                 }
-                #[cfg(not(feature = "tls"))]
+                #[cfg(not(feature = "ws"))]
                 {
                     let _ = server;
-                    Err(format!("outbound {outbound_tag} requires the tls feature"))
-                }
-            }
-            "reality" => {
-                if stream.is_some_and(|stream| stream.tls_settings.is_some()) {
                     return Err(format!(
-                        "outbound {outbound_tag} provides tlsSettings with security=reality"
+                        "outbound {outbound_tag} requires the ws feature"
                     ));
                 }
-                #[cfg(feature = "reality")]
-                {
-                    compile_reality_transport(stream, outbound_tag)
-                        .map(Self::Reality)
-                }
-                #[cfg(not(feature = "reality"))]
-                {
-                    let _ = server;
-                    Err(format!(
-                        "outbound {outbound_tag} requires the reality feature"
-                    ))
-                }
             }
-            other => Err(format!(
-                "outbound {outbound_tag} uses unsupported security {other}"
-            )),
-        }
+            other => {
+                return Err(format!(
+                    "outbound {outbound_tag} uses unsupported network {other}"
+                ));
+            }
+        };
+        let security = compile_security_transport(
+            server,
+            stream,
+            outbound_tag,
+            protocol_is_websocket(&protocol),
+        )?;
+        Ok(Self { security, protocol })
     }
 
     pub(crate) async fn connect(
@@ -131,10 +124,10 @@ impl OutboundTransportConfig {
         stream.set_nodelay(true)?;
         let stream: Box<dyn AsyncStream> = Box::new(stream);
 
-        match self {
-            Self::Tcp => Ok(stream),
+        let stream = match &self.security {
+            OutboundSecurityConfig::None => stream,
             #[cfg(feature = "tls")]
-            Self::Tls(config) => {
+            OutboundSecurityConfig::Tls(config) => {
                 let connector =
                     TlsConnector::from(Arc::clone(&config.client_config));
                 let stream = connector
@@ -146,10 +139,10 @@ impl OutboundTransportConfig {
                             format!("outbound TLS handshake failed: {error}"),
                         )
                     })?;
-                Ok(Box::new(stream))
+                Box::new(stream)
             }
             #[cfg(feature = "reality")]
-            Self::Reality(config) => {
+            OutboundSecurityConfig::Reality(config) => {
                 let session = RealityClientConnection::new(config.clone()).map_err(
                     |error| {
                         std::io::Error::new(
@@ -160,25 +153,174 @@ impl OutboundTransportConfig {
                         )
                     },
                 )?;
-                Ok(Box::new(RealityTlsStream::new(stream, session)))
+                Box::new(RealityTlsStream::new(stream, session))
+            }
+        };
+
+        match &self.protocol {
+            OutboundProtocolConfig::Tcp => Ok(stream),
+            #[cfg(feature = "ws")]
+            OutboundProtocolConfig::Websocket(config) => {
+                config.connect(stream).await
             }
         }
     }
 
     #[cfg(test)]
     pub(crate) fn is_tcp(&self) -> bool {
-        matches!(self, Self::Tcp)
+        matches!(self.security, OutboundSecurityConfig::None)
+            && matches!(self.protocol, OutboundProtocolConfig::Tcp)
     }
 
     #[cfg(all(test, feature = "tls"))]
     pub(crate) fn is_tls(&self) -> bool {
-        matches!(self, Self::Tls(_))
+        matches!(self.security, OutboundSecurityConfig::Tls(_))
     }
 
     #[cfg(all(test, feature = "reality"))]
     pub(crate) fn is_reality(&self) -> bool {
-        matches!(self, Self::Reality(_))
+        matches!(self.security, OutboundSecurityConfig::Reality(_))
     }
+
+    #[cfg(all(test, feature = "ws"))]
+    pub(crate) fn is_websocket(&self) -> bool {
+        matches!(self.protocol, OutboundProtocolConfig::Websocket(_))
+    }
+}
+
+fn protocol_is_websocket(protocol: &OutboundProtocolConfig) -> bool {
+    #[cfg(feature = "ws")]
+    {
+        matches!(protocol, OutboundProtocolConfig::Websocket(_))
+    }
+    #[cfg(not(feature = "ws"))]
+    {
+        let _ = protocol;
+        false
+    }
+}
+
+fn compile_security_transport(
+    server: &NetLocation,
+    stream: Option<&OutboundStreamSettings>,
+    outbound_tag: &str,
+    websocket: bool,
+) -> Result<OutboundSecurityConfig, String> {
+    let security = stream
+        .and_then(|stream| stream.security.as_deref())
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match security.as_str() {
+        "" | "none" => {
+            if stream.is_some_and(|stream| stream.tls_settings.is_some()) {
+                return Err(format!(
+                    "outbound {outbound_tag} provides tlsSettings without security=tls"
+                ));
+            }
+            if has_reality_settings(stream) {
+                return Err(format!(
+                    "outbound {outbound_tag} provides realitySettings without security=reality"
+                ));
+            }
+            Ok(OutboundSecurityConfig::None)
+        }
+        "tls" => {
+            if has_reality_settings(stream) {
+                return Err(format!(
+                    "outbound {outbound_tag} provides realitySettings with security=tls"
+                ));
+            }
+            #[cfg(feature = "tls")]
+            {
+                compile_tls_transport(server, stream, outbound_tag, websocket)
+                    .map(OutboundSecurityConfig::Tls)
+            }
+            #[cfg(not(feature = "tls"))]
+            {
+                let _ = (server, websocket);
+                Err(format!("outbound {outbound_tag} requires the tls feature"))
+            }
+        }
+        "reality" => {
+            if stream.is_some_and(|stream| stream.tls_settings.is_some()) {
+                return Err(format!(
+                    "outbound {outbound_tag} provides tlsSettings with security=reality"
+                ));
+            }
+            #[cfg(feature = "reality")]
+            {
+                if websocket {
+                    return Err(format!(
+                        "outbound {outbound_tag} REALITY does not support WebSocket transport"
+                    ));
+                }
+                compile_reality_transport(stream, outbound_tag)
+                    .map(OutboundSecurityConfig::Reality)
+            }
+            #[cfg(not(feature = "reality"))]
+            {
+                let _ = (server, websocket);
+                Err(format!(
+                    "outbound {outbound_tag} requires the reality feature"
+                ))
+            }
+        }
+        other => Err(format!(
+            "outbound {outbound_tag} uses unsupported security {other}"
+        )),
+    }
+}
+
+fn has_websocket_settings(stream: Option<&OutboundStreamSettings>) -> bool {
+    #[cfg(feature = "ws")]
+    {
+        stream.is_some_and(|stream| stream.ws_settings.is_some())
+    }
+    #[cfg(not(feature = "ws"))]
+    {
+        let _ = stream;
+        false
+    }
+}
+
+#[cfg(feature = "ws")]
+fn compile_websocket_transport(
+    server: &NetLocation,
+    stream: Option<&OutboundStreamSettings>,
+    outbound_tag: &str,
+) -> Result<WebsocketClientConfig, String> {
+    let settings = stream
+        .and_then(|stream| stream.ws_settings.as_ref())
+        .cloned()
+        .unwrap_or_default();
+    let security = stream
+        .and_then(|stream| stream.security.as_deref())
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let tls_server_name = if security == "tls" {
+        stream
+            .and_then(|stream| stream.tls_settings.as_ref())
+            .and_then(|settings| settings.server_name.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    } else {
+        None
+    };
+    let fallback_host = tls_server_name
+        .map(str::to_string)
+        .unwrap_or_else(|| server.address().to_string());
+
+    WebsocketClientConfig::compile(
+        settings.host.as_deref(),
+        settings.path.as_deref(),
+        &settings.headers,
+        &fallback_host,
+        settings.accept_proxy_protocol,
+        settings.heartbeat_period,
+        outbound_tag,
+    )
 }
 
 fn has_reality_settings(stream: Option<&OutboundStreamSettings>) -> bool {
@@ -258,6 +400,7 @@ fn compile_tls_transport(
     server: &NetLocation,
     stream: Option<&OutboundStreamSettings>,
     outbound_tag: &str,
+    websocket: bool,
 ) -> Result<TlsOutboundTransportConfig, String> {
     let settings = stream
         .and_then(|stream| stream.tls_settings.as_ref())
@@ -397,6 +540,9 @@ fn compile_tls_transport(
             Ok(protocol)
         })
         .collect::<Result<Vec<_>, String>>()?;
+    if websocket && client_config.alpn_protocols.is_empty() {
+        client_config.alpn_protocols.push(b"http/1.1".to_vec());
+    }
     if !settings.enable_session_resumption {
         client_config.resumption = Resumption::disabled();
     }
@@ -465,6 +611,8 @@ mod tests {
     #[cfg(feature = "reality")]
     use crate::config::def::OutboundRealitySettings;
     use crate::config::def::OutboundTlsSettings;
+    #[cfg(feature = "ws")]
+    use crate::config::def::OutboundWebsocketSettings;
 
     #[test]
     fn plain_tcp_is_the_default_transport() {
@@ -478,21 +626,46 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_tcp_networks_before_connecting() {
+    fn rejects_unknown_networks_before_connecting() {
         let server =
             NetLocation::new(Address::Hostname("proxy.example".into()), 443);
         let stream = OutboundStreamSettings {
-            network: "websocket".into(),
+            network: "unknown".into(),
             security: None,
             tls_settings: None,
             #[cfg(feature = "reality")]
             reality_settings: None,
+            #[cfg(feature = "ws")]
+            ws_settings: None,
         };
         assert!(
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
                 .unwrap_err()
-                .contains("requires TCP network")
+                .contains("unsupported network unknown")
         );
+    }
+
+    #[cfg(feature = "ws")]
+    #[test]
+    fn websocket_compiles_as_an_application_transport() {
+        let server =
+            NetLocation::new(Address::Hostname("proxy.example".into()), 443);
+        let stream = OutboundStreamSettings {
+            network: "ws".into(),
+            security: None,
+            tls_settings: None,
+            #[cfg(feature = "reality")]
+            reality_settings: None,
+            ws_settings: Some(OutboundWebsocketSettings {
+                host: Some("edge.example".into()),
+                path: Some("proxy".into()),
+                ..OutboundWebsocketSettings::default()
+            }),
+        };
+        let transport =
+            OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
+                .expect("WebSocket settings should compile");
+        assert!(transport.is_websocket());
     }
 
     #[cfg(feature = "tls")]
@@ -521,11 +694,73 @@ mod tests {
             }),
             #[cfg(feature = "reality")]
             reality_settings: None,
+            #[cfg(feature = "ws")]
+            ws_settings: None,
         };
         let transport =
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
                 .expect("inline verify root should compile");
         assert!(transport.is_tls());
+    }
+
+    #[cfg(all(feature = "tls", feature = "ws"))]
+    #[test]
+    fn tls_websocket_composes_security_and_application_layers() {
+        let generated =
+            rcgen::generate_simple_self_signed(["proxy.example".to_string()])
+                .unwrap();
+        let server =
+            NetLocation::new(Address::Hostname("proxy.example".into()), 443);
+        let stream = OutboundStreamSettings {
+            network: "ws".into(),
+            security: Some("tls".into()),
+            tls_settings: Some(OutboundTlsSettings {
+                server_name: Some("proxy.example".into()),
+                disable_system_root: true,
+                certificates: vec![crate::config::def::OutboundTlsCertificate {
+                    certificate: vec![generated.cert.pem()],
+                    usage: Some("verify".into()),
+                    ..crate::config::def::OutboundTlsCertificate::default()
+                }],
+                ..OutboundTlsSettings::default()
+            }),
+            #[cfg(feature = "reality")]
+            reality_settings: None,
+            ws_settings: Some(OutboundWebsocketSettings {
+                path: Some("/proxy".into()),
+                ..OutboundWebsocketSettings::default()
+            }),
+        };
+        let transport =
+            OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
+                .expect("TLS and WebSocket should compose");
+        assert!(transport.is_tls());
+        assert!(transport.is_websocket());
+    }
+
+    #[cfg(all(feature = "reality", feature = "ws"))]
+    #[test]
+    fn reality_rejects_websocket_transport() {
+        let (_, public_key) = crate::reality::generate_keypair().unwrap();
+        let server =
+            NetLocation::new(Address::Hostname("proxy.example".into()), 443);
+        let stream = OutboundStreamSettings {
+            network: "ws".into(),
+            security: Some("reality".into()),
+            tls_settings: None,
+            reality_settings: Some(OutboundRealitySettings {
+                server_name: Some("cover.example".into()),
+                public_key: Some(public_key),
+                short_id: Some("4ac97aaf8b9b0356".into()),
+                ..OutboundRealitySettings::default()
+            }),
+            ws_settings: Some(OutboundWebsocketSettings::default()),
+        };
+        assert!(
+            OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
+                .unwrap_err()
+                .contains("REALITY does not support WebSocket")
+        );
     }
 
     #[cfg(feature = "reality")]
@@ -544,6 +779,8 @@ mod tests {
                 short_id: Some("4ac97aaf8b9b0356".into()),
                 ..OutboundRealitySettings::default()
             }),
+            #[cfg(feature = "ws")]
+            ws_settings: None,
         };
 
         let transport =
@@ -567,6 +804,8 @@ mod tests {
                 short_id: Some("4ac97aaf8b9b0356".into()),
                 ..OutboundRealitySettings::default()
             }),
+            #[cfg(feature = "ws")]
+            ws_settings: None,
         };
         assert!(
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
@@ -598,6 +837,8 @@ mod tests {
             }),
             #[cfg(feature = "reality")]
             reality_settings: None,
+            #[cfg(feature = "ws")]
+            ws_settings: None,
         };
         assert!(
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")

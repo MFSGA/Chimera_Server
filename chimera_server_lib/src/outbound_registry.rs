@@ -305,6 +305,8 @@ mod tests {
                 tls_settings: None,
                 #[cfg(feature = "reality")]
                 reality_settings: None,
+                #[cfg(feature = "ws")]
+                ws_settings: None,
             }),
             proxy_settings_type: None,
             proxy_settings_value: None,
@@ -350,7 +352,7 @@ mod tests {
 
     #[cfg(feature = "vless")]
     #[test]
-    fn rejects_vless_features_outside_the_current_transport_slice() {
+    fn rejects_vless_features_outside_supported_tcp_transports() {
         let id = "3ac9b383-75a1-431c-8184-106c80eb2273";
         let cases = [
             (
@@ -379,16 +381,16 @@ mod tests {
             assert!(error.contains(expected), "unexpected error: {error}");
         }
 
-        let mut websocket = literal_vless(serde_json::json!({
+        let mut grpc = literal_vless(serde_json::json!({
             "address": "127.0.0.1",
             "port": 443,
             "id": id
         }));
-        websocket.stream_settings.as_mut().unwrap().network = "ws".into();
+        grpc.stream_settings.as_mut().unwrap().network = "grpc".into();
         assert!(
-            OutboundConnectorKind::compile(&websocket, true)
+            OutboundConnectorKind::compile(&grpc, true)
                 .unwrap_err()
-                .contains("requires TCP network")
+                .contains("unsupported network grpc")
         );
 
         let mut reality = literal_vless(serde_json::json!({

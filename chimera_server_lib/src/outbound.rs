@@ -62,9 +62,11 @@ pub(crate) async fn connect_tcp_outbound(
         OutboundTransportConfig,
         Option<Vec<u8>>,
     ) = match connector.as_deref() {
-        None | Some(OutboundConnectorKind::Freedom) => {
-            (remote_location.clone(), OutboundTransportConfig::Tcp, None)
-        }
+        None | Some(OutboundConnectorKind::Freedom) => (
+            remote_location.clone(),
+            OutboundTransportConfig::tcp(),
+            None,
+        ),
         Some(OutboundConnectorKind::Blackhole) => return Ok(None),
         #[cfg(feature = "vless")]
         Some(OutboundConnectorKind::VlessTcp(config)) => (
@@ -354,6 +356,8 @@ mod tests {
                 tls_settings: None,
                 #[cfg(feature = "reality")]
                 reality_settings: None,
+                #[cfg(feature = "ws")]
+                ws_settings: None,
             }),
             proxy_settings_type: None,
             proxy_settings_value: None,
