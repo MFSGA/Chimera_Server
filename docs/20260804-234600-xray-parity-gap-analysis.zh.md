@@ -867,7 +867,7 @@ Chimera 当前未支持这些高级 transport 组合。
 
 ### Slice 3：Outbound Transport Pipeline
 
-当前实现状态：TCP、TLS、REALITY、WebSocket 与 HTTP Upgrade 子切片已完成。Registry 在安装阶段将静态 `streamSettings` 编译成不可变的“安全层 + 应用传输层”状态，TCP connector 先建立底层连接，再应用 TLS/REALITY，随后进行 WebSocket 或 HTTP Upgrade 握手，最后写入 VLESS 请求头。TLS 当前支持系统根证书或内联 `certificates[].usage=verify` CA、SNI、ALPN、TLS 1.2/1.3 版本边界和 session resumption 开关；`allowInsecure`、fingerprint、证书 pin、ECH、客户端证书、证书文件和未知字段均 fail-closed。REALITY 复用现有客户端握手状态机，支持 `serverName/publicKey/shortId/cipherSuites`，并明确拒绝尚未实现的 uTLS fingerprint 与 spiderX。WebSocket 复用现有二进制帧流，支持 host、规范化 path 和普通自定义 headers，严格验证 101/Upgrade/Connection/Sec-WebSocket-Accept 与客户端/服务端 masking 方向；early data、heartbeat、proxy protocol、保留握手头和 REALITY+WS 均 fail-closed。HTTP Upgrade 使用 Xray 的伪 WebSocket 101 握手，握手后保持原始字节流，支持 host、path、普通 headers 和 TLS 组合；early data、proxy protocol、Host/Connection/Upgrade 覆盖与 REALITY 组合 fail-closed。TLS、REALITY、WS、WSS、HTTP Upgrade 及 TLS+HTTP Upgrade 已分别通过 Xray 26.2.6 真实进程互通，覆盖 IP、域名和 64KiB payload。当前仅静态 JSON 接入这些 transport，动态 HandlerService sender settings 尚未接入。
+当前实现状态：TCP、TLS、REALITY、WebSocket、HTTP Upgrade 与 gRPC 子切片均已完成。Registry 在安装阶段将静态 `streamSettings` 编译成不可变的“安全层 + 应用传输层”状态，TCP connector 先建立底层连接，再应用 TLS/REALITY，随后进行 WebSocket、HTTP Upgrade 或 gRPC HTTP/2 建链，最后写入 VLESS 请求头。TLS 当前支持系统根证书或内联 `certificates[].usage=verify` CA、SNI、ALPN、TLS 1.2/1.3 版本边界和 session resumption 开关；`allowInsecure`、fingerprint、证书 pin、ECH、客户端证书、证书文件和未知字段均 fail-closed。REALITY 复用现有客户端握手状态机，支持 `serverName/publicKey/shortId/cipherSuites`，并明确拒绝尚未实现的 uTLS fingerprint 与 spiderX。WebSocket 复用现有二进制帧流，支持 host、规范化 path 和普通自定义 headers，严格验证 101/Upgrade/Connection/Sec-WebSocket-Accept 与客户端/服务端 masking 方向；early data、heartbeat、proxy protocol、保留握手头和 REALITY+WS 均 fail-closed。HTTP Upgrade 使用 Xray 的伪 WebSocket 101 握手，握手后保持原始字节流，支持 host、path、普通 headers 和 TLS 组合；early data、proxy protocol、Host/Connection/Upgrade 覆盖与 REALITY 组合 fail-closed。gRPC 复用现有 Hunk 编解码，通过 Hyper HTTP/2 建立单个双向 `/{serviceName}/Tun`，默认 `GunService`，支持 authority、userAgent、普通 serviceName，并可叠加 TLS 或 REALITY；客户端在后台等待响应头，避免 Go gRPC 服务读取首个 Hunk 前不回 header 导致的双向流死锁。multiMode、keepalive/window 调优和自定义 method path fail-closed。所有 transport 组合均已通过 Xray 26.2.6 真实进程互通，覆盖 IP、域名和 64KiB payload。当前仅静态 JSON 接入这些 transport，动态 HandlerService sender settings 尚未接入。
 
 目标：
 
@@ -876,7 +876,7 @@ Chimera 当前未支持这些高级 transport 组合。
 - REALITY；（静态配置核心握手已完成）
 - WebSocket；（静态 WS/WSS 已完成）
 - HTTP Upgrade；（静态 plain/TLS 已完成）
-- gRPC；
+- gRPC；（静态 plain/TLS/REALITY 已完成）
 - transport pipeline 复用于 VLESS/VMess/Trojan。（VLESS 已接入）
 
 ---
