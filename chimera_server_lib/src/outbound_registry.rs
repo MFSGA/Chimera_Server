@@ -5,13 +5,16 @@ use serde::Deserialize;
 
 #[cfg(feature = "vless")]
 use crate::address::{Address, NetLocation};
+#[cfg(feature = "vless")]
+use crate::outbound_transport::OutboundTransportConfig;
 use crate::runtime::OutboundSummary;
 
 #[cfg(feature = "vless")]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct VlessTcpOutboundConfig {
     pub server: NetLocation,
     pub user_uuid: [u8; 16],
+    pub transport: OutboundTransportConfig,
 }
 
 #[cfg(feature = "vless")]
@@ -58,7 +61,7 @@ struct LiteralVlessUser {
 /// Unsupported entries are retained only by the lenient constructor used by
 /// tests and compatibility helpers. Production installation paths use strict
 /// compilation and reject them before the runtime becomes active.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) enum OutboundConnectorKind {
     Freedom,
     Blackhole,
@@ -154,37 +157,18 @@ fn compile_vless_tcp(
         ));
     }
 
-    let network = summary
-        .stream_settings
-        .as_ref()
-        .map(|stream| stream.network.trim().to_ascii_lowercase())
-        .unwrap_or_default();
-    if !network.is_empty() && network != "tcp" {
-        return Err(format!(
-            "VLESS outbound {} plain slice requires TCP network, got {}",
-            summary.tag, network
-        ));
-    }
-    let security = summary
-        .stream_settings
-        .as_ref()
-        .and_then(|stream| stream.security.as_deref())
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    if !security.is_empty() && security != "none" {
-        return Err(format!(
-            "VLESS outbound {} plain slice requires security none, got {}",
-            summary.tag, security
-        ));
-    }
-
     let server_address = Address::from(address.trim()).map_err(|error| {
         format!(
             "invalid VLESS outbound {} server address: {error}",
             summary.tag
         )
     })?;
+    let server = NetLocation::new(server_address, port);
+    let transport = OutboundTransportConfig::compile(
+        &server,
+        summary.stream_settings.as_ref(),
+        &summary.tag,
+    )?;
     let user_uuid = uuid::Uuid::parse_str(user.id.trim())
         .map_err(|error| {
             format!("invalid VLESS outbound {} user id: {error}", summary.tag)
@@ -192,8 +176,9 @@ fn compile_vless_tcp(
         .into_bytes();
 
     Ok(VlessTcpOutboundConfig {
-        server: NetLocation::new(server_address, port),
+        server,
         user_uuid,
+        transport,
     })
 }
 
@@ -317,6 +302,7 @@ mod tests {
             stream_settings: Some(crate::config::def::OutboundStreamSettings {
                 network: "tcp".into(),
                 security: Some("none".into()),
+                tls_settings: None,
             }),
             proxy_settings_type: None,
             proxy_settings_value: None,
@@ -340,26 +326,29 @@ mod tests {
             "id": id,
             "encryption": "none"
         }));
-        let expected = VlessTcpOutboundConfig {
-            server: NetLocation::new(
-                Address::Ipv4("127.0.0.1".parse().unwrap()),
-                443,
-            ),
-            user_uuid: uuid::Uuid::parse_str(id).unwrap().into_bytes(),
+        let assert_plain_vless = |connector: OutboundConnectorKind| {
+            let OutboundConnectorKind::VlessTcp(config) = connector else {
+                panic!("expected VLESS TCP connector");
+            };
+            assert_eq!(
+                config.server,
+                NetLocation::new(Address::Ipv4("127.0.0.1".parse().unwrap()), 443,)
+            );
+            assert_eq!(
+                config.user_uuid,
+                uuid::Uuid::parse_str(id).unwrap().into_bytes()
+            );
+            assert!(config.transport.is_tcp());
         };
-        assert_eq!(
-            OutboundConnectorKind::compile(&standard, true).unwrap(),
-            OutboundConnectorKind::VlessTcp(expected.clone())
-        );
-        assert_eq!(
+        assert_plain_vless(OutboundConnectorKind::compile(&standard, true).unwrap());
+        assert_plain_vless(
             OutboundConnectorKind::compile(&simplified, true).unwrap(),
-            OutboundConnectorKind::VlessTcp(expected)
         );
     }
 
     #[cfg(feature = "vless")]
     #[test]
-    fn rejects_vless_features_outside_the_plain_tcp_slice() {
+    fn rejects_vless_features_outside_the_current_transport_slice() {
         let id = "3ac9b383-75a1-431c-8184-106c80eb2273";
         let cases = [
             (
@@ -400,16 +389,16 @@ mod tests {
                 .contains("requires TCP network")
         );
 
-        let mut tls = literal_vless(serde_json::json!({
+        let mut reality = literal_vless(serde_json::json!({
             "address": "127.0.0.1",
             "port": 443,
             "id": id
         }));
-        tls.stream_settings.as_mut().unwrap().security = Some("tls".into());
+        reality.stream_settings.as_mut().unwrap().security = Some("reality".into());
         assert!(
-            OutboundConnectorKind::compile(&tls, true)
+            OutboundConnectorKind::compile(&reality, true)
                 .unwrap_err()
-                .contains("requires security none")
+                .contains("unsupported security reality")
         );
     }
 
@@ -455,18 +444,18 @@ mod tests {
 
         registry.remove("direct");
         assert!(registry.get("direct").is_none());
-        assert_eq!(in_flight.as_ref(), &OutboundConnectorKind::Freedom);
+        assert!(matches!(in_flight.as_ref(), OutboundConnectorKind::Freedom));
     }
 
     #[test]
     fn lenient_registry_retains_unsupported_protocol_for_diagnostics() {
         let registry =
             OutboundRegistry::from_outbounds_lenient(&[outbound("proxy", "vmess")]);
-        assert_eq!(
-            registry.get("proxy").as_deref(),
-            Some(&OutboundConnectorKind::Unsupported {
-                protocol: Arc::from("vmess")
-            })
-        );
+        let connector = registry.get("proxy").expect("connector should remain");
+        let OutboundConnectorKind::Unsupported { protocol } = connector.as_ref()
+        else {
+            panic!("expected unsupported connector");
+        };
+        assert_eq!(protocol.as_ref(), "vmess");
     }
 }

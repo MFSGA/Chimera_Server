@@ -121,7 +121,7 @@ impl InboudItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OutboundItem {
     pub protocol: String,
     pub tag: String,
@@ -132,12 +132,58 @@ pub struct OutboundItem {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OutboundStreamSettings {
     #[serde(default)]
     pub network: String,
     #[serde(default)]
     pub security: Option<String>,
+    #[serde(default)]
+    pub tls_settings: Option<OutboundTlsSettings>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OutboundTlsSettings {
+    #[serde(default)]
+    pub allow_insecure: bool,
+    #[serde(default)]
+    pub server_name: Option<String>,
+    #[serde(default)]
+    pub alpn: Vec<String>,
+    #[serde(default)]
+    pub enable_session_resumption: bool,
+    #[serde(default)]
+    pub disable_system_root: bool,
+    #[serde(default)]
+    pub min_version: Option<String>,
+    #[serde(default)]
+    pub max_version: Option<String>,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+    #[serde(default)]
+    pub pinned_peer_cert_sha256: Option<String>,
+    #[serde(default)]
+    pub verify_peer_cert_by_name: Option<String>,
+    #[serde(default)]
+    pub ech_config_list: Option<String>,
+    #[serde(default)]
+    pub certificates: Vec<OutboundTlsCertificate>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OutboundTlsCertificate {
+    #[serde(default)]
+    pub certificate_file: Option<String>,
+    #[serde(default)]
+    pub certificate: Vec<String>,
+    #[serde(default)]
+    pub key_file: Option<String>,
+    #[serde(default)]
+    pub key: Vec<String>,
+    #[serde(default)]
+    pub usage: Option<String>,
 }
 
 #[cfg(feature = "user_domain_access")]

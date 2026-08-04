@@ -36,6 +36,7 @@ mod mcp;
 
 mod outbound;
 mod outbound_registry;
+mod outbound_transport;
 #[cfg(feature = "vless")]
 mod vless_outbound;
 
@@ -937,14 +938,14 @@ mod tests {
             .expect("compiled outbounds should install");
         assert_eq!(runtime.outbounds()[0].tag, "direct");
         assert_eq!(runtime.outbounds()[0].protocol, "freedom");
-        assert_eq!(
+        assert!(matches!(
             runtime.outbound_connector("direct").as_deref(),
-            Some(&OutboundConnectorKind::Freedom)
-        );
-        assert_eq!(
+            Some(OutboundConnectorKind::Freedom)
+        ));
+        assert!(matches!(
             runtime.outbound_connector("blocked").as_deref(),
-            Some(&OutboundConnectorKind::Blackhole)
-        );
+            Some(OutboundConnectorKind::Blackhole)
+        ));
 
         let unsupported = compile_outbound_summaries(&[OutboundItem {
             protocol: "vless".into(),

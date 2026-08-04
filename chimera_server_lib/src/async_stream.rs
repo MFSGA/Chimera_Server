@@ -14,7 +14,9 @@ use tokio::{
     net::{TcpStream, UdpSocket},
 };
 #[cfg(feature = "tls")]
-use tokio_rustls::server::TlsStream;
+use tokio_rustls::{
+    client::TlsStream as ClientTlsStream, server::TlsStream as ServerTlsStream,
+};
 
 pub trait AsyncPing {
     fn supports_ping(&self) -> bool;
@@ -277,7 +279,7 @@ impl<T: ?Sized + AsyncStream> AsyncStream for Box<T> {
 }
 
 #[cfg(feature = "tls")]
-impl<S> AsyncPing for TlsStream<S>
+impl<S> AsyncPing for ServerTlsStream<S>
 where
     S: AsyncPing + AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -294,4 +296,24 @@ where
 }
 
 #[cfg(feature = "tls")]
-impl<S> AsyncStream for TlsStream<S> where S: AsyncStream {}
+impl<S> AsyncStream for ServerTlsStream<S> where S: AsyncStream {}
+
+#[cfg(feature = "tls")]
+impl<S> AsyncPing for ClientTlsStream<S>
+where
+    S: AsyncPing + AsyncRead + AsyncWrite + Unpin + Send,
+{
+    fn supports_ping(&self) -> bool {
+        false
+    }
+
+    fn poll_write_ping(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<bool>> {
+        Poll::Ready(Ok(false))
+    }
+}
+
+#[cfg(feature = "tls")]
+impl<S> AsyncStream for ClientTlsStream<S> where S: AsyncStream {}

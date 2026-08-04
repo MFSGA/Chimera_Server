@@ -1137,6 +1137,7 @@ impl HandlerServiceImpl {
                 stream_settings = Some(OutboundStreamSettings {
                     network: "tcp".into(),
                     security: Some("none".into()),
+                    tls_settings: None,
                 });
                 "vless"
             }
@@ -2932,10 +2933,10 @@ mod tests {
             )))
             .await
             .expect("blackhole outbound should install");
-        assert_eq!(
+        assert!(matches!(
             runtime.outbound_connector(&blackhole_tag).as_deref(),
-            Some(&OutboundConnectorKind::Blackhole)
-        );
+            Some(OutboundConnectorKind::Blackhole)
+        ));
         assert!(
             runtime
                 .outbounds()

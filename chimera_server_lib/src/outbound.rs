@@ -5,7 +5,6 @@ use std::{
 };
 
 use tokio::io::AsyncWriteExt;
-use tracing::warn;
 
 #[cfg(feature = "vless")]
 use crate::vless_outbound::{VlessTcpOutboundStream, encode_vless_tcp_request};
@@ -13,11 +12,11 @@ use crate::{
     address::{Address, NetLocation},
     async_stream::AsyncStream,
     outbound_registry::OutboundConnectorKind,
+    outbound_transport::OutboundTransportConfig,
     resolver::{Resolver, resolve_single_address},
     routing_process::enrich_routing_input,
     routing_state::{OutboundObservation, RoutingInput},
     runtime::RuntimeState,
-    util::socket::new_tcp_socket,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,14 +57,19 @@ pub(crate) async fn connect_tcp_outbound(
         None => (None, None),
     };
 
-    let (connect_location, vless_request) = match connector.as_deref() {
+    let (connect_location, transport, vless_request): (
+        NetLocation,
+        OutboundTransportConfig,
+        Option<Vec<u8>>,
+    ) = match connector.as_deref() {
         None | Some(OutboundConnectorKind::Freedom) => {
-            (remote_location.clone(), None)
+            (remote_location.clone(), OutboundTransportConfig::Tcp, None)
         }
         Some(OutboundConnectorKind::Blackhole) => return Ok(None),
         #[cfg(feature = "vless")]
         Some(OutboundConnectorKind::VlessTcp(config)) => (
             config.server.clone(),
+            config.transport.clone(),
             Some(encode_vless_tcp_request(
                 &config.user_uuid,
                 remote_location,
@@ -82,16 +86,9 @@ pub(crate) async fn connect_tcp_outbound(
             ));
         }
     };
-    let connect_addr = if vless_request.is_some() {
-        resolve_single_address(resolver, &connect_location).await?
-    } else {
-        target_addr
-    };
-
-    let tcp_socket = new_tcp_socket(None, connect_addr.is_ipv6())?;
     let started = Instant::now();
     let attempted_at = unix_time_secs();
-    let mut stream = match tcp_socket.connect(connect_addr).await {
+    let mut stream = match transport.connect(resolver, &connect_location).await {
         Ok(stream) => stream,
         Err(error) => {
             record_tcp_outbound_failure(
@@ -104,10 +101,6 @@ pub(crate) async fn connect_tcp_outbound(
             return Err(error);
         }
     };
-    if let Err(err) = stream.set_nodelay(true) {
-        warn!("Failed to set TCP no-delay on client socket: {}", err);
-    }
-
     let stream: Box<dyn AsyncStream> = if let Some(request) = vless_request {
         if let Err(error) = stream.write_all(&request).await {
             record_tcp_outbound_failure(
@@ -121,7 +114,7 @@ pub(crate) async fn connect_tcp_outbound(
         }
         #[cfg(feature = "vless")]
         {
-            Box::new(VlessTcpOutboundStream::new(Box::new(stream)))
+            Box::new(VlessTcpOutboundStream::new(stream))
         }
         #[cfg(not(feature = "vless"))]
         {
@@ -131,7 +124,7 @@ pub(crate) async fn connect_tcp_outbound(
             ));
         }
     } else {
-        Box::new(stream)
+        stream
     };
 
     record_tcp_outbound_success(
@@ -358,6 +351,7 @@ mod tests {
             stream_settings: Some(OutboundStreamSettings {
                 network: "tcp".into(),
                 security: Some("none".into()),
+                tls_settings: None,
             }),
             proxy_settings_type: None,
             proxy_settings_value: None,
