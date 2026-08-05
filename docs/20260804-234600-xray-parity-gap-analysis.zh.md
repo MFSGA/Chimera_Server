@@ -82,7 +82,7 @@ freedom
 blackhole
 ```
 
-如果路由选到尚未实现的 `vmess`、`socks`、`http` 等代理出站，当前实现会在配置编译或动态安装阶段 fail-closed。VLESS TCP 与 Trojan TCP 已经形成真实 connector，说明通用 Outbound Runtime 路线有效，但剩余代理协议仍是最值得优先补齐的公共基础。
+如果路由选到尚未实现的 `vmess`、`http`、`shadowsocks` 等代理出站，当前实现会在配置编译或动态安装阶段 fail-closed。VLESS TCP、Trojan TCP 与 SOCKS5 TCP 已经形成真实 connector，说明通用 Outbound Runtime 路线有效，但剩余代理协议仍是最值得优先补齐的公共基础。
 
 ---
 
@@ -210,16 +210,16 @@ HandlerService 也能将 Xray `SenderConfig` 转换为同一静态模型。当�
 - `freedom`；
 - `blackhole`；
 - VLESS TCP；
-- Trojan TCP。
+- Trojan TCP；
+- SOCKS5 TCP。
 
-VLESS 与 Trojan 均支持静态 JSON、动态 HandlerService、原始 domain/IP target，并复用 TCP/TLS/REALITY/WebSocket/HTTP Upgrade/gRPC transport pipeline。Trojan 当前真实 Xray 验收覆盖 plain TCP 与 TLS；UDP associate 尚未完成。
+VLESS、Trojan 与 SOCKS 均支持静态 JSON、动态 HandlerService、原始 domain/IP target，并复用 TCP/TLS/REALITY/WebSocket/HTTP Upgrade/gRPC transport pipeline。Trojan 当前真实 Xray 验收覆盖 plain TCP 与 TLS；SOCKS 覆盖 plain no-auth 与 TLS+password；两个协议的 UDP associate 均尚未完成。
 
 下面这些 Xray outbound 尚未形成真实 connector：
 
 - VMess；
 - Shadowsocks；
 - HTTP proxy；
-- SOCKS proxy；
 - Hysteria；
 - WireGuard；
 - DNS outbound；
@@ -778,8 +778,9 @@ Chimera 当前未支持这些高级 transport 组合。
 3. VLESS TCP outbound；（已完成）
 4. Trojan TCP outbound；（已完成）
 5. VMess TCP outbound；
-6. SOCKS/HTTP outbound；
-7. Shadowsocks TCP/UDP outbound；
+6. SOCKS outbound；（TCP 已完成，UDP ASSOCIATE 待完成）
+7. HTTP outbound；
+8. Shadowsocks TCP/UDP outbound；
 8. 通用 sniffing context；
 9. typed DNS config + static hosts + nameserver rules；
 10. DNS outbound。
@@ -875,7 +876,7 @@ Chimera 当前未支持这些高级 transport 组合。
 - WebSocket；（静态 WS/WSS 已完成）
 - HTTP Upgrade；（静态 plain/TLS 已完成）
 - gRPC；（静态 plain/TLS/REALITY 已完成）
-- transport pipeline 复用于 VLESS/VMess/Trojan。（VLESS、Trojan 已接入）
+- transport pipeline 复用于 VLESS/VMess/Trojan/SOCKS/HTTP。（VLESS、Trojan、SOCKS 已接入）
 
 ### Slice 4：Trojan TCP Outbound
 
@@ -890,6 +891,21 @@ Chimera 当前未支持这些高级 transport 组合。
 - 复用共享 transport pipeline；（已完成）
 - 非空 flow 和 UDP associate fail-closed；（已完成）
 - 与 Xray Trojan inbound 做 plain/TLS 双向互通测试。（已完成）
+
+### Slice 5：SOCKS5 TCP Outbound
+
+当前实现状态：已完成。静态配置支持 Xray 标准 `servers:[{address,port,users}]` 与简化 `address/port/user/pass`；动态 HandlerService 支持 `xray.proxy.socks.ClientConfig`、SOCKS Account 与通用 SenderConfig，并通过 ListOutbounds 回显。客户端实现 SOCKS5 method negotiation、NO_AUTH、RFC1929 用户名密码认证、CONNECT command、IPv4/IPv6/domain target、reply code 映射和 bind address 完整消费；CONNECT 响应之后的同包业务字节不会丢失。仅允许单服务器和最多一个账户，用户名/密码长度在安装或握手前限制为 255 字节；UDP ASSOCIATE fail-closed。connector 复用完整 transport pipeline。plain no-auth 与 TLS+password 已通过 Xray 26.2.6 真实进程互通，覆盖 IP、域名和 64KiB payload。
+
+目标：
+
+- 支持 NO_AUTH 与 RFC1929 用户名密码；（已完成）
+- 支持标准与简化静态配置；（已完成）
+- 支持动态 ClientConfig、SenderConfig 与 ListOutbounds；（已完成）
+- 严格校验 SOCKS 版本、method、auth status、CONNECT reply、reserved byte 和 address type；（已完成）
+- 保留原始 domain/IP target 与 CONNECT 后首包；（已完成）
+- 复用共享 transport pipeline；（已完成）
+- UDP ASSOCIATE fail-closed；（已完成）
+- 与 Xray SOCKS inbound 做 no-auth 与 TLS+password 双向互通测试。（已完成）
 
 ---
 
@@ -957,7 +973,7 @@ Outbound Registry 完成后，新增协议和 transport 才能以插件式方式
 Outbound Registry
 → VLESS outbound
 → 通用 outbound transport
-→ VMess/Trojan/SOCKS/HTTP/Shadowsocks outbound
+→ VMess/HTTP/Shadowsocks outbound 与 SOCKS/Trojan UDP
 → 通用 sniffing
 → Xray DNS/FakeDNS
 → XHTTP client 与完整 xmux/download
