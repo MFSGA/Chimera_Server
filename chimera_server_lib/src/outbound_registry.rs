@@ -3,6 +3,8 @@ use std::{collections::HashMap, sync::Arc};
 use serde::Deserialize;
 
 use crate::address::{Address, NetLocation};
+#[cfg(feature = "shadowsocks")]
+use crate::handler::shadowsocks::{ShadowsocksCipher, compile_legacy_outbound_key};
 use crate::http_outbound::{HttpProxyCredentials, validate_http_proxy_headers};
 use crate::outbound_transport::OutboundTransportConfig;
 use crate::runtime::OutboundSummary;
@@ -20,6 +22,17 @@ pub(crate) struct HttpTcpOutboundConfig {
 pub(crate) struct SocksTcpOutboundConfig {
     pub server: NetLocation,
     pub credentials: Option<Socks5Credentials>,
+    pub transport: OutboundTransportConfig,
+}
+
+#[cfg(feature = "shadowsocks")]
+#[derive(Debug, Clone)]
+pub(crate) struct ShadowsocksTcpOutboundConfig {
+    pub server: NetLocation,
+    pub method: Arc<str>,
+    pub password: Arc<str>,
+    pub cipher: ShadowsocksCipher,
+    pub master_key: Arc<[u8]>,
     pub transport: OutboundTransportConfig,
 }
 
@@ -76,6 +89,36 @@ struct LiteralVlessUser {
     flow: String,
     #[serde(default)]
     encryption: String,
+}
+
+#[cfg(feature = "shadowsocks")]
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LiteralShadowsocksOutboundSettings {
+    #[serde(default)]
+    address: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    servers: Vec<LiteralShadowsocksServer>,
+}
+
+#[cfg(feature = "shadowsocks")]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LiteralShadowsocksServer {
+    address: String,
+    port: u16,
+    method: String,
+    password: String,
+    #[serde(default)]
+    level: u32,
+    #[serde(default)]
+    email: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -195,6 +238,8 @@ pub(crate) enum OutboundConnectorKind {
     Freedom,
     Blackhole,
     HttpTcp(Box<HttpTcpOutboundConfig>),
+    #[cfg(feature = "shadowsocks")]
+    ShadowsocksTcp(Box<ShadowsocksTcpOutboundConfig>),
     SocksTcp(Box<SocksTcpOutboundConfig>),
     #[cfg(feature = "trojan")]
     TrojanTcp(Box<TrojanTcpOutboundConfig>),
@@ -311,6 +356,98 @@ fn compile_vless_tcp(
     Ok(VlessTcpOutboundConfig {
         server,
         user_uuid,
+        transport,
+    })
+}
+
+#[cfg(feature = "shadowsocks")]
+fn compile_shadowsocks_tcp(
+    summary: &OutboundSummary,
+) -> Result<ShadowsocksTcpOutboundConfig, String> {
+    let settings = summary.settings.as_ref().ok_or_else(|| {
+        format!("Shadowsocks outbound {} requires settings", summary.tag)
+    })?;
+    let settings = serde_json::from_value::<LiteralShadowsocksOutboundSettings>(
+        settings.clone(),
+    )
+    .map_err(|error| {
+        format!(
+            "invalid Shadowsocks outbound {} settings: {error}",
+            summary.tag
+        )
+    })?;
+
+    let (address, port, method, password) = if let Some(address) = settings.address {
+        if !settings.servers.is_empty() {
+            return Err(format!(
+                "Shadowsocks outbound {} cannot combine address with servers",
+                summary.tag
+            ));
+        }
+        (
+            address,
+            settings.port.ok_or_else(|| {
+                format!("Shadowsocks outbound {} requires port", summary.tag)
+            })?,
+            settings.method.ok_or_else(|| {
+                format!("Shadowsocks outbound {} requires method", summary.tag)
+            })?,
+            settings.password.ok_or_else(|| {
+                format!("Shadowsocks outbound {} requires password", summary.tag)
+            })?,
+        )
+    } else {
+        if settings.servers.len() != 1 {
+            return Err(format!(
+                "Shadowsocks outbound {} requires exactly one server",
+                summary.tag
+            ));
+        }
+        let mut servers = settings.servers;
+        let server = servers.pop().ok_or_else(|| {
+            format!("Shadowsocks outbound {} server disappeared", summary.tag)
+        })?;
+        let _ = (server.level, server.email);
+        (server.address, server.port, server.method, server.password)
+    };
+
+    if address.trim().is_empty() {
+        return Err(format!(
+            "Shadowsocks outbound {} server address must not be empty",
+            summary.tag
+        ));
+    }
+    if port == 0 {
+        return Err(format!(
+            "Shadowsocks outbound {} server port must not be zero",
+            summary.tag
+        ));
+    }
+    let (cipher, master_key) = compile_legacy_outbound_key(method.trim(), &password)
+        .map_err(|error| {
+            format!(
+                "invalid Shadowsocks outbound {} account: {error}",
+                summary.tag
+            )
+        })?;
+    let server_address = Address::from(address.trim()).map_err(|error| {
+        format!(
+            "invalid Shadowsocks outbound {} server address: {error}",
+            summary.tag
+        )
+    })?;
+    let server = NetLocation::new(server_address, port);
+    let transport = OutboundTransportConfig::compile(
+        &server,
+        summary.stream_settings.as_ref(),
+        &summary.tag,
+    )?;
+    Ok(ShadowsocksTcpOutboundConfig {
+        server,
+        method: Arc::from(cipher.name()),
+        password: Arc::from(password),
+        cipher,
+        master_key,
         transport,
     })
 }
@@ -644,6 +781,10 @@ impl OutboundConnectorKind {
             "freedom" => Ok(Self::Freedom),
             "blackhole" => Ok(Self::Blackhole),
             "http" => compile_http_tcp(summary).map(Box::new).map(Self::HttpTcp),
+            #[cfg(feature = "shadowsocks")]
+            "shadowsocks" => compile_shadowsocks_tcp(summary)
+                .map(Box::new)
+                .map(Self::ShadowsocksTcp),
             "socks" => compile_socks_tcp(summary).map(Box::new).map(Self::SocksTcp),
             #[cfg(feature = "trojan")]
             "trojan" => compile_trojan_tcp(summary)
@@ -758,6 +899,22 @@ mod tests {
         OutboundSummary {
             tag: "http-proxy".into(),
             protocol: "http".into(),
+            settings: Some(settings),
+            stream_settings: Some(crate::config::def::OutboundStreamSettings {
+                network: "tcp".into(),
+                security: Some("none".into()),
+                ..crate::config::def::OutboundStreamSettings::default()
+            }),
+            proxy_settings_type: None,
+            proxy_settings_value: None,
+        }
+    }
+
+    #[cfg(feature = "shadowsocks")]
+    fn literal_shadowsocks(settings: serde_json::Value) -> OutboundSummary {
+        OutboundSummary {
+            tag: "shadowsocks-proxy".into(),
+            protocol: "shadowsocks".into(),
             settings: Some(settings),
             stream_settings: Some(crate::config::def::OutboundStreamSettings {
                 network: "tcp".into(),
@@ -901,6 +1058,97 @@ mod tests {
             let error =
                 OutboundConnectorKind::compile(&literal_http(settings), true)
                     .expect_err("invalid HTTP settings must fail closed");
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+    }
+
+    #[cfg(feature = "shadowsocks")]
+    #[test]
+    fn compiles_legacy_shadowsocks_cipher_matrix() {
+        for (method, expected) in [
+            ("aes-128-gcm", "aes-128-gcm"),
+            ("AEAD_AES_256_GCM", "aes-256-gcm"),
+            ("chacha20-poly1305", "chacha20-ietf-poly1305"),
+        ] {
+            let standard = literal_shadowsocks(serde_json::json!({
+                "servers": [{
+                    "address": "127.0.0.1",
+                    "port": 8388,
+                    "method": method,
+                    "password": "secret"
+                }]
+            }));
+            let OutboundConnectorKind::ShadowsocksTcp(config) =
+                OutboundConnectorKind::compile(&standard, true).unwrap()
+            else {
+                panic!("expected Shadowsocks TCP connector");
+            };
+            assert_eq!(config.server.to_string(), "127.0.0.1:8388");
+            assert_eq!(config.method.as_ref(), expected);
+            assert_eq!(config.password.as_ref(), "secret");
+            assert!(config.transport.is_tcp());
+            assert_eq!(config.master_key.len(), config.cipher.key_len());
+        }
+
+        let simplified = literal_shadowsocks(serde_json::json!({
+            "address": "proxy.example",
+            "port": 443,
+            "method": "aes-128-gcm",
+            "password": "secret"
+        }));
+        let OutboundConnectorKind::ShadowsocksTcp(config) =
+            OutboundConnectorKind::compile(&simplified, true).unwrap()
+        else {
+            panic!("expected simplified Shadowsocks connector");
+        };
+        assert_eq!(config.server.to_string(), "proxy.example:443");
+    }
+
+    #[cfg(feature = "shadowsocks")]
+    #[test]
+    fn rejects_unsupported_shadowsocks_variants_atomically() {
+        for (settings, expected) in [
+            (serde_json::json!({"servers": []}), "exactly one server"),
+            (
+                serde_json::json!({
+                    "address": "127.0.0.1",
+                    "port": 8388,
+                    "method": "aes-128-gcm",
+                    "password": ""
+                }),
+                "password is not specified",
+            ),
+            (
+                serde_json::json!({
+                    "address": "127.0.0.1",
+                    "port": 8388,
+                    "method": "2022-blake3-aes-128-gcm",
+                    "password": "AAAAAAAAAAAAAAAAAAAAAA=="
+                }),
+                "2022 outbound is not supported",
+            ),
+            (
+                serde_json::json!({
+                    "address": "127.0.0.1",
+                    "port": 8388,
+                    "method": "xchacha20-ietf-poly1305",
+                    "password": "secret"
+                }),
+                "xchacha20-poly1305",
+            ),
+            (
+                serde_json::json!({
+                    "address": "127.0.0.1",
+                    "port": 8388,
+                    "method": "rot13",
+                    "password": "secret"
+                }),
+                "unsupported Shadowsocks cipher method",
+            ),
+        ] {
+            let error =
+                OutboundConnectorKind::compile(&literal_shadowsocks(settings), true)
+                    .expect_err("unsupported Shadowsocks setting must fail closed");
             assert!(error.contains(expected), "unexpected error: {error}");
         }
     }

@@ -350,6 +350,227 @@ async fn chimera_vless_plain_outbound_interoperates_with_xray_inbound() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera as SOCKS server and ./xray as an AES-128-GCM Shadowsocks upstream"]
+async fn chimera_shadowsocks_aes128_outbound_interoperates_with_xray_inbound() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("shadowsocks-aes128-outbound");
+    let echo_addr = start_tcp_echo_server();
+    let xray_shadowsocks_port = free_localhost_port();
+    let chimera_socks_port = free_localhost_port();
+    let xray_config_path = work_dir.join("xray-shadowsocks-inbound.json");
+    let chimera_config_path = work_dir.join("chimera-shadowsocks-outbound.json");
+    let password = "chimera-shadowsocks-password";
+
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_shadowsocks_port,
+                "protocol": "shadowsocks",
+                "tag": "shadowsocks-in",
+                "settings": {
+                    "method": "aes-128-gcm",
+                    "password": password,
+                    "network": "tcp"
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "none"
+                }
+            }],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }]
+        }),
+    );
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_socks_port,
+                "protocol": "socks",
+                "tag": "socks-in",
+                "settings": {"auth": "noauth"}
+            }],
+            "outbounds": [{
+                "tag": "to-xray-shadowsocks",
+                "protocol": "shadowsocks",
+                "settings": {
+                    "servers": [{
+                        "address": "127.0.0.1",
+                        "port": xray_shadowsocks_port,
+                        "method": "aes-128-gcm",
+                        "password": password
+                    }]
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "none"
+                }
+            }],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["socks-in"],
+                    "outboundTag": "to-xray-shadowsocks"
+                }]
+            }
+        }),
+    );
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    wait_for_tcp(SocketAddr::from((
+        Ipv4Addr::LOCALHOST,
+        xray_shadowsocks_port,
+    )));
+    xray.assert_running();
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_socks_port)));
+    chimera.assert_running();
+
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_socks_port));
+    assert_socks5_echo(
+        socks_addr,
+        echo_addr,
+        b"AES-128-GCM Shadowsocks outbound through Xray inbound",
+    );
+    assert_socks5_echo(socks_addr, echo_addr, &deterministic_payload(64 * 1024));
+    assert_socks5_domain_echo(
+        socks_addr,
+        "localhost",
+        echo_addr.port(),
+        b"AES-128-GCM Shadowsocks outbound domain target",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera as SOCKS server and ./xray as a TLS ChaCha20 Shadowsocks upstream"]
+async fn chimera_shadowsocks_chacha_tls_outbound_interoperates_with_xray_inbound() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("shadowsocks-chacha-tls-outbound");
+    let echo_addr = start_tcp_echo_server();
+    let xray_shadowsocks_port = free_localhost_port();
+    let chimera_socks_port = free_localhost_port();
+    let xray_config_path = work_dir.join("xray-shadowsocks-tls-inbound.json");
+    let chimera_config_path = work_dir.join("chimera-shadowsocks-tls-outbound.json");
+    let certificate_path = work_dir.join("localhost-cert.pem");
+    let private_key_path = work_dir.join("localhost-key.pem");
+    let generated =
+        rcgen::generate_simple_self_signed(["localhost".to_string()]).unwrap();
+    let certificate_pem = generated.cert.pem();
+    fs::write(&certificate_path, &certificate_pem).unwrap();
+    fs::write(&private_key_path, generated.signing_key.serialize_pem()).unwrap();
+    let password = "chimera-shadowsocks-tls-password";
+
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_shadowsocks_port,
+                "protocol": "shadowsocks",
+                "tag": "shadowsocks-tls-in",
+                "settings": {
+                    "method": "chacha20-ietf-poly1305",
+                    "password": password,
+                    "network": "tcp"
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "minVersion": "1.3",
+                        "maxVersion": "1.3",
+                        "certificates": [{
+                            "certificateFile": certificate_path,
+                            "keyFile": private_key_path
+                        }]
+                    }
+                }
+            }],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }]
+        }),
+    );
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_socks_port,
+                "protocol": "socks",
+                "tag": "socks-in",
+                "settings": {"auth": "noauth"}
+            }],
+            "outbounds": [{
+                "tag": "to-xray-shadowsocks-tls",
+                "protocol": "shadowsocks",
+                "settings": {
+                    "address": "127.0.0.1",
+                    "port": xray_shadowsocks_port,
+                    "method": "chacha20-ietf-poly1305",
+                    "password": password
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "disableSystemRoot": true,
+                        "minVersion": "1.3",
+                        "maxVersion": "1.3",
+                        "certificates": [{
+                            "certificate": [certificate_pem],
+                            "usage": "verify"
+                        }]
+                    }
+                }
+            }],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["socks-in"],
+                    "outboundTag": "to-xray-shadowsocks-tls"
+                }]
+            }
+        }),
+    );
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    wait_for_tcp(SocketAddr::from((
+        Ipv4Addr::LOCALHOST,
+        xray_shadowsocks_port,
+    )));
+    xray.assert_running();
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_socks_port)));
+    chimera.assert_running();
+
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_socks_port));
+    assert_socks5_echo(
+        socks_addr,
+        echo_addr,
+        b"TLS ChaCha20 Shadowsocks outbound through Xray inbound",
+    );
+    assert_socks5_echo(socks_addr, echo_addr, &deterministic_payload(64 * 1024));
+    assert_socks5_domain_echo(
+        socks_addr,
+        "localhost",
+        echo_addr.port(),
+        b"TLS ChaCha20 Shadowsocks outbound domain target",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts Chimera as SOCKS server and ./xray as a no-auth HTTP upstream"]
 async fn chimera_http_no_auth_outbound_interoperates_with_xray_inbound() {
     let workspace = workspace_root();

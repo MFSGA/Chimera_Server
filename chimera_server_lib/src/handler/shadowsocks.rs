@@ -90,9 +90,55 @@ impl ShadowsocksCipher {
         }
     }
 
-    fn key_len(self) -> usize {
+    pub(crate) fn key_len(self) -> usize {
         self.algorithm.key_len()
     }
+
+    pub(crate) fn name(self) -> &'static str {
+        self.name
+    }
+}
+
+pub(crate) fn compile_legacy_outbound_key(
+    method: &str,
+    password: &str,
+) -> io::Result<(ShadowsocksCipher, Arc<[u8]>)> {
+    if password.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Shadowsocks password is not specified",
+        ));
+    }
+    if method
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("2022-blake3-")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Shadowsocks 2022 outbound is not supported by the legacy TCP slice",
+        ));
+    }
+    let cipher = ShadowsocksCipher::parse(method)?;
+    let master_key = derive_master_key(password, cipher.key_len());
+    Ok((cipher, master_key.into()))
+}
+
+pub(crate) async fn connect_legacy_aead_outbound(
+    encrypted: Box<dyn AsyncStream>,
+    cipher: ShadowsocksCipher,
+    master_key: Arc<[u8]>,
+    target: &NetLocation,
+) -> io::Result<Box<dyn AsyncStream>> {
+    let mut plaintext = spawn_aead_codec(
+        encrypted,
+        cipher,
+        master_key,
+        Arc::new(Mutex::new(TimedSaltChecker::default())),
+    );
+    plaintext.write_all(&encode_socks_location(target)?).await?;
+    plaintext.flush().await?;
+    Ok(Box::new(plaintext))
 }
 
 #[derive(Debug, Clone)]
@@ -1940,9 +1986,18 @@ impl AsyncStream for TaskBackedStream {}
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use crate::{
+        address::{Address, NetLocation},
+        config::server_config::ShadowsocksUser,
+        handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
+    };
+
     use super::{
-        ShadowsocksCipher, TimedSaltChecker, derive_aead2022_session_key,
-        derive_master_key,
+        ShadowsocksCipher, ShadowsocksTcpServerHandler, TimedSaltChecker,
+        compile_legacy_outbound_key, connect_legacy_aead_outbound,
+        derive_aead2022_session_key, derive_master_key,
     };
 
     #[test]
@@ -1966,6 +2021,70 @@ mod tests {
             ShadowsocksCipher::parse("chacha20-poly1305").unwrap().name,
             "chacha20-ietf-poly1305"
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_aead_outbound_roundtrips_cipher_matrix() {
+        for method in ["aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305"] {
+            let password = format!("secret-{method}");
+            let target =
+                NetLocation::new(Address::Hostname("echo.example".into()), 443);
+            let (client, server) = tokio::io::duplex(256 * 1024);
+            let handler = ShadowsocksTcpServerHandler::new(
+                vec![ShadowsocksUser {
+                    method: method.to_string(),
+                    password: password.clone(),
+                    email: "cipher-test@example.com".into(),
+                }],
+                None,
+                "shadowsocks-test",
+            )
+            .unwrap();
+            let expected_target = target.clone();
+            let server_task = tokio::spawn(async move {
+                let result =
+                    handler.setup_server_stream(Box::new(server)).await.unwrap();
+                let TcpServerSetupResult::TcpForward {
+                    remote_location,
+                    mut stream,
+                    ..
+                } = result
+                else {
+                    panic!("expected Shadowsocks TCP forwarding result");
+                };
+                assert_eq!(remote_location, expected_target);
+                let mut request = vec![0u8; 32 * 1024];
+                stream.read_exact(&mut request).await.unwrap();
+                assert!(
+                    request
+                        .iter()
+                        .enumerate()
+                        .all(|(index, byte)| { *byte == (index % 251) as u8 })
+                );
+                stream.write_all(b"shadowsocks-response").await.unwrap();
+                stream.flush().await.unwrap();
+            });
+
+            let (cipher, master_key) =
+                compile_legacy_outbound_key(method, &password).unwrap();
+            let mut stream = connect_legacy_aead_outbound(
+                Box::new(client),
+                cipher,
+                master_key,
+                &target,
+            )
+            .await
+            .unwrap();
+            let request = (0..32 * 1024)
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>();
+            stream.write_all(&request).await.unwrap();
+            stream.flush().await.unwrap();
+            let mut response = [0u8; 20];
+            stream.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response, b"shadowsocks-response");
+            server_task.await.unwrap();
+        }
     }
 
     #[test]

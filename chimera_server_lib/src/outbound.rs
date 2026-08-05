@@ -7,6 +7,8 @@ use std::{
 #[cfg(any(feature = "trojan", feature = "vless"))]
 use tokio::io::AsyncWriteExt;
 
+#[cfg(feature = "shadowsocks")]
+use crate::handler::shadowsocks::{ShadowsocksCipher, connect_legacy_aead_outbound};
 use crate::http_outbound::{HttpProxyCredentials, connect_http_proxy};
 use crate::socks_outbound::{Socks5Credentials, connect_socks5};
 #[cfg(feature = "trojan")]
@@ -40,6 +42,12 @@ enum TcpOutboundHandshake {
     Http {
         credentials: Option<HttpProxyCredentials>,
         headers: std::collections::HashMap<String, String>,
+        target: NetLocation,
+    },
+    #[cfg(feature = "shadowsocks")]
+    Shadowsocks {
+        cipher: ShadowsocksCipher,
+        master_key: Arc<[u8]>,
         target: NetLocation,
     },
     Socks {
@@ -92,6 +100,16 @@ pub(crate) async fn connect_tcp_outbound(
             TcpOutboundHandshake::Http {
                 credentials: config.credentials.clone(),
                 headers: config.headers.clone(),
+                target: remote_location.clone(),
+            },
+        ),
+        #[cfg(feature = "shadowsocks")]
+        Some(OutboundConnectorKind::ShadowsocksTcp(config)) => (
+            config.server.clone(),
+            config.transport.clone(),
+            TcpOutboundHandshake::Shadowsocks {
+                cipher: config.cipher,
+                master_key: config.master_key.clone(),
                 target: remote_location.clone(),
             },
         ),
@@ -174,6 +192,26 @@ pub(crate) async fn connect_tcp_outbound(
             }
             stream
         }
+        #[cfg(feature = "shadowsocks")]
+        TcpOutboundHandshake::Shadowsocks {
+            cipher,
+            master_key,
+            target,
+        } => match connect_legacy_aead_outbound(stream, cipher, master_key, &target)
+            .await
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                record_tcp_outbound_failure(
+                    runtime,
+                    outbound_tag.as_deref(),
+                    started,
+                    attempted_at,
+                    &error,
+                );
+                return Err(error);
+            }
+        },
         TcpOutboundHandshake::Socks {
             credentials,
             target,
@@ -300,6 +338,11 @@ pub(crate) fn select_direct_outbound(
         OutboundConnectorKind::HttpTcp(_) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("{network_name} outbound {tag} does not support UDP"),
+        )),
+        #[cfg(feature = "shadowsocks")]
+        OutboundConnectorKind::ShadowsocksTcp(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{network_name} outbound {tag} does not support UDP yet"),
         )),
         OutboundConnectorKind::SocksTcp(_) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,

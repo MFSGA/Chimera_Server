@@ -65,6 +65,17 @@ const TYPE_PROXY_HTTP_CLIENT_CONFIG_V2RAY: &str =
     "v2ray.core.proxy.http.ClientConfig";
 const TYPE_PROXY_HTTP_ACCOUNT: &str = "xray.proxy.http.Account";
 const TYPE_PROXY_HTTP_ACCOUNT_V2RAY: &str = "v2ray.core.proxy.http.Account";
+#[cfg(feature = "shadowsocks")]
+const TYPE_PROXY_SHADOWSOCKS_CLIENT_CONFIG: &str =
+    "xray.proxy.shadowsocks.ClientConfig";
+#[cfg(feature = "shadowsocks")]
+const TYPE_PROXY_SHADOWSOCKS_CLIENT_CONFIG_V2RAY: &str =
+    "v2ray.core.proxy.shadowsocks.ClientConfig";
+#[cfg(feature = "shadowsocks")]
+const TYPE_PROXY_SHADOWSOCKS_ACCOUNT: &str = "xray.proxy.shadowsocks.Account";
+#[cfg(feature = "shadowsocks")]
+const TYPE_PROXY_SHADOWSOCKS_ACCOUNT_V2RAY: &str =
+    "v2ray.core.proxy.shadowsocks.Account";
 const TYPE_PROXY_SOCKS_CLIENT_CONFIG: &str = "xray.proxy.socks.ClientConfig";
 const TYPE_PROXY_SOCKS_CLIENT_CONFIG_V2RAY: &str =
     "v2ray.core.proxy.socks.ClientConfig";
@@ -240,6 +251,24 @@ struct HttpHeaderPayload {
     key: String,
     #[prost(string, tag = "2")]
     value: String,
+}
+
+#[cfg(feature = "shadowsocks")]
+#[derive(Clone, PartialEq, Message)]
+struct ShadowsocksAccountPayload {
+    #[prost(string, tag = "1")]
+    password: String,
+    #[prost(int32, tag = "2")]
+    cipher_type: i32,
+    #[prost(bool, tag = "3")]
+    iv_check: bool,
+}
+
+#[cfg(feature = "shadowsocks")]
+#[derive(Clone, PartialEq, Message)]
+struct ShadowsocksClientConfigPayload {
+    #[prost(message, optional, tag = "1")]
+    server: Option<SocksServerEndpointPayload>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1923,6 +1952,91 @@ impl HandlerServiceImpl {
                 )?);
                 "http"
             }
+            #[cfg(feature = "shadowsocks")]
+            TYPE_PROXY_SHADOWSOCKS_CLIENT_CONFIG
+            | TYPE_PROXY_SHADOWSOCKS_CLIENT_CONFIG_V2RAY => {
+                let config = self
+                    .decode_typed_message::<ShadowsocksClientConfigPayload>(
+                        proxy_settings,
+                        &[
+                            TYPE_PROXY_SHADOWSOCKS_CLIENT_CONFIG,
+                            TYPE_PROXY_SHADOWSOCKS_CLIENT_CONFIG_V2RAY,
+                        ],
+                        "outbound proxy settings",
+                    )?;
+                let server = config.server.ok_or_else(|| {
+                    Status::invalid_argument(
+                        "Shadowsocks outbound server is required",
+                    )
+                })?;
+                if server.address.is_none() {
+                    return Err(Status::invalid_argument(
+                        "Shadowsocks outbound server address is required",
+                    ));
+                }
+                let address = self.parse_address(server.address)?;
+                let port = u16::try_from(server.port).map_err(|_| {
+                    Status::invalid_argument(
+                        "Shadowsocks outbound server port must fit in u16",
+                    )
+                })?;
+                if port == 0 {
+                    return Err(Status::invalid_argument(
+                        "Shadowsocks outbound server port must not be zero",
+                    ));
+                }
+                let user = server.user.ok_or_else(|| {
+                    Status::invalid_argument("Shadowsocks outbound user is required")
+                })?;
+                let account = user.account.as_ref().ok_or_else(|| {
+                    Status::invalid_argument(
+                        "Shadowsocks outbound user account is required",
+                    )
+                })?;
+                let account = self
+                    .decode_typed_message::<ShadowsocksAccountPayload>(
+                        account,
+                        &[
+                            TYPE_PROXY_SHADOWSOCKS_ACCOUNT,
+                            TYPE_PROXY_SHADOWSOCKS_ACCOUNT_V2RAY,
+                        ],
+                        "Shadowsocks outbound account",
+                    )?;
+                if account.iv_check {
+                    return Err(Status::invalid_argument(
+                        "Shadowsocks outbound iv_check is not supported",
+                    ));
+                }
+                let method = match account.cipher_type {
+                    5 => "aes-128-gcm",
+                    6 => "aes-256-gcm",
+                    7 => "chacha20-ietf-poly1305",
+                    8 => {
+                        return Err(Status::invalid_argument(
+                            "Shadowsocks XChaCha20-Poly1305 outbound is not supported",
+                        ));
+                    }
+                    other => {
+                        return Err(Status::invalid_argument(format!(
+                            "unsupported Shadowsocks outbound cipher type: {other}"
+                        )));
+                    }
+                };
+                literal_settings = Some(serde_json::json!({
+                    "servers": [{
+                        "address": address.to_string(),
+                        "port": port,
+                        "method": method,
+                        "password": account.password,
+                        "level": user.level,
+                        "email": user.email
+                    }]
+                }));
+                stream_settings = Some(self.parse_outbound_sender_settings(
+                    outbound.sender_settings.as_ref(),
+                )?);
+                "shadowsocks"
+            }
             TYPE_PROXY_SOCKS_CLIENT_CONFIG
             | TYPE_PROXY_SOCKS_CLIENT_CONFIG_V2RAY => {
                 let config = self.decode_typed_message::<SocksClientConfigPayload>(
@@ -2715,6 +2829,48 @@ impl HandlerServiceImpl {
                         _ => None,
                     },
                 ),
+                #[cfg(feature = "shadowsocks")]
+                "shadowsocks" => self
+                    .runtime
+                    .outbound_connector(&outbound.tag)
+                    .and_then(|connector| match connector.as_ref() {
+                        OutboundConnectorKind::ShadowsocksTcp(config) => {
+                            let cipher_type = match config.method.as_ref() {
+                                "aes-128-gcm" => 5,
+                                "aes-256-gcm" => 6,
+                                "chacha20-ietf-poly1305" => 7,
+                                _ => return None,
+                            };
+                            Some(Self::typed_message(
+                                TYPE_PROXY_SHADOWSOCKS_CLIENT_CONFIG,
+                                ShadowsocksClientConfigPayload {
+                                    server: Some(SocksServerEndpointPayload {
+                                        address: Self::encode_address(
+                                            config.server.address(),
+                                        ),
+                                        port: u32::from(config.server.port()),
+                                        user: Some(
+                                            proto::xray::common::protocol::User {
+                                                level: 0,
+                                                email: String::new(),
+                                                account: Some(Self::typed_message(
+                                                    TYPE_PROXY_SHADOWSOCKS_ACCOUNT,
+                                                    ShadowsocksAccountPayload {
+                                                        password: config
+                                                            .password
+                                                            .to_string(),
+                                                        cipher_type,
+                                                        iv_check: false,
+                                                    },
+                                                )),
+                                            },
+                                        ),
+                                    }),
+                                },
+                            ))
+                        }
+                        _ => None,
+                    }),
                 "socks" => self.runtime.outbound_connector(&outbound.tag).and_then(
                     |connector| match connector.as_ref() {
                         OutboundConnectorKind::SocksTcp(config) => {
@@ -3970,6 +4126,43 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "shadowsocks")]
+    fn build_add_shadowsocks_outbound_request(
+        tag: &str,
+        cipher_type: i32,
+        password: &str,
+        iv_check: bool,
+    ) -> proto::xray::app::proxyman::command::AddOutboundRequest {
+        let user = proto::xray::common::protocol::User {
+            level: 0,
+            email: "shadowsocks-outbound@example.com".into(),
+            account: Some(HandlerServiceImpl::typed_message(
+                TYPE_PROXY_SHADOWSOCKS_ACCOUNT,
+                ShadowsocksAccountPayload {
+                    password: password.to_string(),
+                    cipher_type,
+                    iv_check,
+                },
+            )),
+        };
+        build_typed_add_outbound_request(
+            tag,
+            TYPE_PROXY_SHADOWSOCKS_CLIENT_CONFIG,
+            ShadowsocksClientConfigPayload {
+                server: Some(SocksServerEndpointPayload {
+                    address: Some(IpOrDomainPayload {
+                        address: Some(ip_or_domain_payload::Address::Domain(
+                            "shadowsocks.example".into(),
+                        )),
+                    }),
+                    port: 8388,
+                    user: Some(user),
+                }),
+            }
+            .encode_to_vec(),
+        )
+    }
+
     fn build_add_socks_outbound_request(
         tag: &str,
         credentials: Option<(&str, &str)>,
@@ -4506,6 +4699,94 @@ mod tests {
         assert_eq!(error.code(), Code::InvalidArgument);
         assert!(error.message().contains("reserved"));
         assert!(runtime.outbound_connector(&reserved_tag).is_none());
+    }
+
+    #[cfg(feature = "shadowsocks")]
+    #[tokio::test]
+    async fn handler_installs_legacy_shadowsocks_and_rejects_newer_variants() {
+        let fixture = build_fixture();
+        let runtime = fixture.runtime.clone();
+        let service = HandlerServiceImpl::new(runtime.clone());
+        let tag = unique_tag("shadowsocks-aes");
+        let mut request =
+            build_add_shadowsocks_outbound_request(&tag, 5, "secret", false);
+        request.outbound.as_mut().unwrap().sender_settings =
+            Some(HandlerServiceImpl::typed_message(
+                TYPE_APP_SENDER_CONFIG,
+                SenderConfigPayload::default(),
+            ));
+
+        service
+            .add_outbound(Request::new(request))
+            .await
+            .expect("legacy Shadowsocks outbound should install");
+        let connector = runtime.outbound_connector(&tag).unwrap();
+        let OutboundConnectorKind::ShadowsocksTcp(config) = connector.as_ref()
+        else {
+            panic!("expected Shadowsocks TCP connector");
+        };
+        assert_eq!(config.server.to_string(), "shadowsocks.example:8388");
+        assert_eq!(config.method.as_ref(), "aes-128-gcm");
+        assert_eq!(config.password.as_ref(), "secret");
+        assert!(config.transport.is_tcp());
+
+        let listed = service
+            .list_outbounds(Request::new(
+                proto::xray::app::proxyman::command::ListOutboundsRequest {},
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let outbound = listed
+            .outbounds
+            .iter()
+            .find(|outbound| outbound.tag == tag)
+            .expect("listed Shadowsocks outbound missing");
+        assert_eq!(
+            outbound.proxy_settings.as_ref().unwrap().r#type,
+            TYPE_PROXY_SHADOWSOCKS_CLIENT_CONFIG
+        );
+        let config = ShadowsocksClientConfigPayload::decode(
+            outbound.proxy_settings.as_ref().unwrap().value.as_slice(),
+        )
+        .unwrap();
+        let account = config.server.unwrap().user.unwrap().account.unwrap();
+        let account =
+            ShadowsocksAccountPayload::decode(account.value.as_slice()).unwrap();
+        assert_eq!(account.password, "secret");
+        assert_eq!(account.cipher_type, 5);
+        assert!(!account.iv_check);
+        assert!(outbound.sender_settings.is_some());
+
+        for (suffix, cipher_type, iv_check, expected) in [
+            ("xchacha", 8, false, "XChaCha20-Poly1305"),
+            (
+                "unknown",
+                99,
+                false,
+                "unsupported Shadowsocks outbound cipher",
+            ),
+            ("iv-check", 5, true, "iv_check is not supported"),
+        ] {
+            let rejected_tag = unique_tag(suffix);
+            let before = runtime.outbounds().len();
+            let error = service
+                .add_outbound(Request::new(build_add_shadowsocks_outbound_request(
+                    &rejected_tag,
+                    cipher_type,
+                    "secret",
+                    iv_check,
+                )))
+                .await
+                .expect_err("unsupported Shadowsocks variant must fail atomically");
+            assert_eq!(error.code(), Code::InvalidArgument);
+            assert!(
+                error.message().contains(expected),
+                "unexpected error: {error}"
+            );
+            assert_eq!(runtime.outbounds().len(), before);
+            assert!(runtime.outbound_connector(&rejected_tag).is_none());
+        }
     }
 
     #[tokio::test]
