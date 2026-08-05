@@ -211,15 +211,15 @@ HandlerService 也能将 Xray `SenderConfig` 转换为同一静态模型。当�
 - `blackhole`；
 - VLESS TCP；
 - Trojan TCP；
-- SOCKS5 TCP。
+- SOCKS5 TCP；
+- HTTP CONNECT TCP。
 
-VLESS、Trojan 与 SOCKS 均支持静态 JSON、动态 HandlerService、原始 domain/IP target，并复用 TCP/TLS/REALITY/WebSocket/HTTP Upgrade/gRPC transport pipeline。Trojan 当前真实 Xray 验收覆盖 plain TCP 与 TLS；SOCKS 覆盖 plain no-auth 与 TLS+password；两个协议的 UDP associate 均尚未完成。
+VLESS、Trojan、SOCKS 与 HTTP 均支持静态 JSON、动态 HandlerService、原始 domain/IP target，并复用 TCP/TLS/REALITY/WebSocket/HTTP Upgrade/gRPC transport pipeline。Trojan 当前真实 Xray 验收覆盖 plain TCP 与 TLS；SOCKS 覆盖 plain no-auth 与 TLS+password；HTTP 覆盖 plain no-auth 与 TLS+Basic Auth。Trojan/SOCKS 的 UDP associate 与 HTTP 非 CONNECT 转发均尚未完成。
 
 下面这些 Xray outbound 尚未形成真实 connector：
 
 - VMess；
 - Shadowsocks；
-- HTTP proxy；
 - Hysteria；
 - WireGuard；
 - DNS outbound；
@@ -779,11 +779,11 @@ Chimera 当前未支持这些高级 transport 组合。
 4. Trojan TCP outbound；（已完成）
 5. VMess TCP outbound；
 6. SOCKS outbound；（TCP 已完成，UDP ASSOCIATE 待完成）
-7. HTTP outbound；
+7. HTTP outbound；（CONNECT TCP 已完成）
 8. Shadowsocks TCP/UDP outbound；
-8. 通用 sniffing context；
-9. typed DNS config + static hosts + nameserver rules；
-10. DNS outbound。
+9. 通用 sniffing context；
+10. typed DNS config + static hosts + nameserver rules；
+11. DNS outbound。
 
 ## P1：高价值兼容能力
 
@@ -876,7 +876,7 @@ Chimera 当前未支持这些高级 transport 组合。
 - WebSocket；（静态 WS/WSS 已完成）
 - HTTP Upgrade；（静态 plain/TLS 已完成）
 - gRPC；（静态 plain/TLS/REALITY 已完成）
-- transport pipeline 复用于 VLESS/VMess/Trojan/SOCKS/HTTP。（VLESS、Trojan、SOCKS 已接入）
+- transport pipeline 复用于 VLESS/VMess/Trojan/SOCKS/HTTP。（VLESS、Trojan、SOCKS、HTTP 已接入）
 
 ### Slice 4：Trojan TCP Outbound
 
@@ -906,6 +906,21 @@ Chimera 当前未支持这些高级 transport 组合。
 - 复用共享 transport pipeline；（已完成）
 - UDP ASSOCIATE fail-closed；（已完成）
 - 与 Xray SOCKS inbound 做 no-auth 与 TLS+password 双向互通测试。（已完成）
+
+### Slice 6：HTTP CONNECT TCP Outbound
+
+当前实现状态：已完成。静态配置支持 Xray 标准 `servers:[{address,port,users}]/headers` 与简化 `address/port/user/pass/headers`；动态 HandlerService 支持 `xray.proxy.http.ClientConfig`、HTTP Account、重复 header 检测、通用 SenderConfig 与 ListOutbounds 回显。客户端发送 HTTP/1.1 CONNECT、规范化 Host authority、可选 Basic Proxy-Authorization、Proxy-Connection keep-alive 与经过严格校验的自定义 header；IPv6 target 使用方括号 authority。响应头限制为 64KiB，仅接受 HTTP/1.0/1.1 的 2xx，407 映射权限错误、502/503 映射连接拒绝、408/504 映射超时，CONNECT 后同包业务字节不会丢失。Host、Proxy-Authorization、Proxy-Connection、Connection、Content-Length 和 Transfer-Encoding 等保留头以及 CR/LF 注入均在安装前 fail-closed。connector 复用完整 transport pipeline。plain no-auth 与 TLS+Basic Auth 已通过 Xray 26.2.6 真实进程互通，覆盖 IP、域名、自定义 header 和 64KiB payload。
+
+目标：
+
+- 支持单服务器、无认证与 Basic Proxy-Authorization；（已完成）
+- 支持标准与简化静态配置及安全自定义 header；（已完成）
+- 支持动态 ClientConfig、SenderConfig 与 ListOutbounds；（已完成）
+- 严格校验响应版本、状态码、64KiB 头部边界与保留 header；（已完成）
+- 保留原始 domain/IP target、IPv6 authority 与 CONNECT 后首包；（已完成）
+- 复用共享 transport pipeline；（已完成）
+- 非 CONNECT forward proxy 语义 fail-closed；（已完成）
+- 与 Xray HTTP inbound 做 plain no-auth 与 TLS+Basic Auth 双向互通测试。（已完成）
 
 ---
 
