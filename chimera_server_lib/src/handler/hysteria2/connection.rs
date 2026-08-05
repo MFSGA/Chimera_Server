@@ -25,6 +25,8 @@ use tokio::{
 };
 use tracing::{debug, warn};
 
+#[cfg(feature = "shadowsocks")]
+use crate::outbound::exchange_shadowsocks_udp;
 #[cfg(feature = "user_domain_access")]
 use crate::user_domain_access::hysteria2_password_identity;
 use crate::{
@@ -882,6 +884,31 @@ async fn drive_udp_datagrams(
                 );
                 continue;
             }
+            #[cfg(feature = "shadowsocks")]
+            DirectOutboundAction::Shadowsocks { tag } => {
+                traffic_context = traffic_context.with_outbound_tag(tag.clone());
+                let response = exchange_shadowsocks_udp(
+                    &resolver,
+                    &runtime,
+                    &tag,
+                    &session.last_location,
+                    complete_payload.as_ref(),
+                )
+                .await?;
+                send_hysteria_udp_payload(
+                    &connection,
+                    session_id,
+                    packet_id,
+                    &response.source,
+                    &response.payload,
+                )?;
+                record_transfer(
+                    Some(traffic_context),
+                    complete_payload.len() as u64,
+                    response.payload.len() as u64,
+                );
+                continue;
+            }
             DirectOutboundAction::Freedom { tag: Some(tag) } => {
                 traffic_context = traffic_context.with_outbound_tag(tag);
             }
@@ -978,6 +1005,67 @@ async fn create_udp_session(
         response_contexts,
         _connection_guard: connection_guard,
     })
+}
+
+fn send_hysteria_udp_payload(
+    connection: &quinn::Connection,
+    session_id: u32,
+    packet_id: u16,
+    source: &NetLocation,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    let max_datagram_size = connection
+        .max_datagram_size()
+        .ok_or_else(|| Error::other("peer does not support datagrams"))?;
+    let address_bytes = Bytes::from(source.to_string().into_bytes());
+    let mut address_len_buf = Vec::with_capacity(8);
+    push_varint(&mut address_len_buf, address_bytes.len() as u64)?;
+    let address_len_bytes = Bytes::from(address_len_buf);
+    let header_overhead =
+        4 + 2 + 1 + 1 + address_len_bytes.len() + address_bytes.len();
+    if header_overhead >= max_datagram_size {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "hysteria2 UDP response header exceeds max datagram size",
+        ));
+    }
+    let available_payload = max_datagram_size - header_overhead;
+    if payload.len() <= available_payload {
+        let mut datagram = BytesMut::with_capacity(header_overhead + payload.len());
+        datagram.extend_from_slice(&session_id.to_be_bytes());
+        datagram.extend_from_slice(&packet_id.to_be_bytes());
+        datagram.extend_from_slice(&[0, 1]);
+        datagram.extend_from_slice(&address_len_bytes);
+        datagram.extend_from_slice(&address_bytes);
+        datagram.extend_from_slice(payload);
+        connection
+            .send_datagram(datagram.freeze())
+            .map_err(Error::other)?;
+        return Ok(());
+    }
+
+    let fragment_count = payload.len().div_ceil(available_payload);
+    if fragment_count > u8::MAX as usize {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "hysteria2 UDP response requires too many fragments",
+        ));
+    }
+    for fragment_id in 0..fragment_count {
+        let start = fragment_id * available_payload;
+        let end = std::cmp::min(start + available_payload, payload.len());
+        let mut datagram = BytesMut::with_capacity(header_overhead + (end - start));
+        datagram.extend_from_slice(&session_id.to_be_bytes());
+        datagram.extend_from_slice(&packet_id.to_be_bytes());
+        datagram.extend_from_slice(&[fragment_id as u8, fragment_count as u8]);
+        datagram.extend_from_slice(&address_len_bytes);
+        datagram.extend_from_slice(&address_bytes);
+        datagram.extend_from_slice(&payload[start..end]);
+        connection
+            .send_datagram(datagram.freeze())
+            .map_err(Error::other)?;
+    }
+    Ok(())
 }
 
 async fn run_udp_remote_to_local_loop(

@@ -235,10 +235,14 @@ impl OutboundTransportConfig {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn is_tcp(&self) -> bool {
+    pub(crate) fn supports_direct_udp(&self) -> bool {
         matches!(self.security, OutboundSecurityConfig::None)
             && matches!(self.protocol, OutboundProtocolConfig::Tcp)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_tcp(&self) -> bool {
+        self.supports_direct_udp()
     }
 
     #[cfg(all(test, feature = "tls"))]

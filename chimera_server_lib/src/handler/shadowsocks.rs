@@ -824,6 +824,43 @@ impl ShadowsocksUdpCodec {
         Ok(Self { users, identity })
     }
 
+    pub(crate) fn encrypt_client_packet(
+        &self,
+        target: &NetLocation,
+        payload: &[u8],
+    ) -> io::Result<Vec<u8>> {
+        if self.identity.is_some() || self.users.len() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Shadowsocks UDP outbound requires exactly one non-EIH user",
+            ));
+        }
+        let user = &self.users[0];
+        match &user.mode {
+            ShadowsocksUdpMode::Legacy { master_key, .. } => {
+                user.encrypt_legacy_packet(target, payload, master_key)
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Shadowsocks 2022 UDP outbound is not supported yet",
+            )),
+        }
+    }
+
+    pub(crate) fn decrypt_client_packet(
+        &self,
+        packet: &[u8],
+    ) -> io::Result<(NetLocation, Vec<u8>)> {
+        if self.identity.is_some() || self.users.len() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Shadowsocks UDP outbound requires exactly one non-EIH user",
+            ));
+        }
+        let request = self.users[0].decrypt_packet(packet)?;
+        Ok((request.target_location, request.payload))
+    }
+
     pub(crate) fn decrypt_packet(
         &self,
         packet: &[u8],
@@ -1986,6 +2023,8 @@ impl AsyncStream for TaskBackedStream {}
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use crate::{
@@ -1995,8 +2034,8 @@ mod tests {
     };
 
     use super::{
-        ShadowsocksCipher, ShadowsocksTcpServerHandler, TimedSaltChecker,
-        compile_legacy_outbound_key, connect_legacy_aead_outbound,
+        ShadowsocksCipher, ShadowsocksTcpServerHandler, ShadowsocksUdpCodec,
+        TimedSaltChecker, compile_legacy_outbound_key, connect_legacy_aead_outbound,
         derive_aead2022_session_key, derive_master_key,
     };
 
@@ -2021,6 +2060,48 @@ mod tests {
             ShadowsocksCipher::parse("chacha20-poly1305").unwrap().name,
             "chacha20-ietf-poly1305"
         );
+    }
+
+    #[test]
+    fn legacy_udp_client_codec_roundtrips_and_rejects_replay() {
+        for method in ["aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305"] {
+            let password = format!("udp-secret-{method}");
+            let user = ShadowsocksUser {
+                method: method.to_string(),
+                password,
+                email: "udp-client-test@example.com".into(),
+            };
+            let client = ShadowsocksUdpCodec::new(vec![user.clone()], None).unwrap();
+            let server = ShadowsocksUdpCodec::new(vec![user], None).unwrap();
+            let target =
+                NetLocation::new(Address::Hostname("dns.example".into()), 5353);
+            let request_packet = client
+                .encrypt_client_packet(&target, b"udp-request")
+                .unwrap();
+            let request = server.decrypt_packet(&request_packet).unwrap();
+            assert_eq!(request.target_location, target);
+            assert_eq!(request.payload, b"udp-request");
+            let replay = server
+                .decrypt_packet(&request_packet)
+                .expect_err("replayed UDP salt must be rejected");
+            assert_eq!(replay.kind(), io::ErrorKind::PermissionDenied);
+
+            let source = NetLocation::new(
+                Address::Ipv6("2001:db8::1".parse().unwrap()),
+                5353,
+            );
+            let response_packet = server
+                .encrypt_packet(&request, &source, b"udp-response")
+                .unwrap();
+            let (decoded_source, decoded_payload) =
+                client.decrypt_client_packet(&response_packet).unwrap();
+            assert_eq!(decoded_source, source);
+            assert_eq!(decoded_payload, b"udp-response");
+
+            let mut tampered = response_packet;
+            *tampered.last_mut().unwrap() ^= 0x80;
+            assert!(client.decrypt_client_packet(&tampered).is_err());
+        }
     }
 
     #[tokio::test]

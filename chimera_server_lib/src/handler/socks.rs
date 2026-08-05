@@ -19,6 +19,9 @@ use crate::{
     },
 };
 
+#[cfg(feature = "shadowsocks")]
+use crate::outbound::exchange_shadowsocks_udp;
+
 const SOCKS_VERSION: u8 = 0x05;
 const METHOD_NO_AUTH: u8 = 0x00;
 const METHOD_USERNAME_PASSWORD: u8 = 0x02;
@@ -564,6 +567,31 @@ pub(crate) async fn run_udp_relay(
                 );
                 continue;
             }
+            #[cfg(feature = "shadowsocks")]
+            DirectOutboundAction::Shadowsocks { tag } => {
+                datagram_context = datagram_context
+                    .map(|context| context.with_outbound_tag(tag.clone()));
+                let response = exchange_shadowsocks_udp(
+                    &resolver,
+                    &runtime,
+                    &tag,
+                    &target_location,
+                    payload,
+                )
+                .await?;
+                let mut socks5_response =
+                    build_udp_response_header_location(&response.source)?;
+                socks5_response.extend_from_slice(&response.payload);
+                udp_socket_clone
+                    .send_to(&socks5_response, response_endpoint)
+                    .await?;
+                record_transfer(
+                    datagram_context,
+                    payload.len() as u64,
+                    response.payload.len() as u64,
+                );
+                continue;
+            }
             DirectOutboundAction::Freedom { tag: Some(tag) } => {
                 datagram_context =
                     datagram_context.map(|context| context.with_outbound_tag(tag));
@@ -714,6 +742,35 @@ fn parse_udp_address(
 }
 
 /// Build a SOCKS5 UDP response header from the response source address.
+fn build_udp_response_header_location(
+    source: &NetLocation,
+) -> std::io::Result<Vec<u8>> {
+    let mut header = vec![0x00, 0x00, 0x00];
+    match source.address() {
+        Address::Ipv4(address) => {
+            header.push(ADDR_TYPE_IPV4);
+            header.extend_from_slice(&address.octets());
+        }
+        Address::Ipv6(address) => {
+            header.push(ADDR_TYPE_IPV6);
+            header.extend_from_slice(&address.octets());
+        }
+        Address::Hostname(hostname) => {
+            let length = u8::try_from(hostname.len()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "SOCKS5 UDP response domain exceeds 255 bytes",
+                )
+            })?;
+            header.push(ADDR_TYPE_DOMAIN);
+            header.push(length);
+            header.extend_from_slice(hostname.as_bytes());
+        }
+    }
+    header.extend_from_slice(&source.port().to_be_bytes());
+    Ok(header)
+}
+
 fn build_udp_response_header(src_addr: SocketAddr) -> Vec<u8> {
     let mut header = vec![0x00, 0x00, 0x00]; // RSV + FRAG=0
 

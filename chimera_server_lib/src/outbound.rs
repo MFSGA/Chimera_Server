@@ -4,8 +4,13 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(feature = "shadowsocks")]
+use std::time::Duration;
+
 #[cfg(any(feature = "trojan", feature = "vless"))]
 use tokio::io::AsyncWriteExt;
+#[cfg(feature = "shadowsocks")]
+use tokio::{net::UdpSocket, time::timeout};
 
 #[cfg(feature = "shadowsocks")]
 use crate::handler::shadowsocks::{ShadowsocksCipher, connect_legacy_aead_outbound};
@@ -30,8 +35,22 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DirectOutboundAction {
-    Freedom { tag: Option<String> },
-    Blackhole { tag: String },
+    Freedom {
+        tag: Option<String>,
+    },
+    Blackhole {
+        tag: String,
+    },
+    #[cfg(feature = "shadowsocks")]
+    Shadowsocks {
+        tag: String,
+    },
+}
+
+#[cfg(feature = "shadowsocks")]
+pub(crate) struct UdpOutboundResponse {
+    pub source: NetLocation,
+    pub payload: Vec<u8>,
 }
 
 pub(crate) struct TcpOutboundConnection {
@@ -355,6 +374,64 @@ fn select_outbound_connector(
     Ok(Some((outbound.tag, connector)))
 }
 
+#[cfg(feature = "shadowsocks")]
+pub(crate) async fn exchange_shadowsocks_udp(
+    resolver: &Arc<dyn Resolver>,
+    runtime: &RuntimeState,
+    tag: &str,
+    target: &NetLocation,
+    payload: &[u8],
+) -> std::io::Result<UdpOutboundResponse> {
+    let connector = runtime.outbound_connector(tag).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Shadowsocks UDP outbound {tag} is missing from the registry"),
+        )
+    })?;
+    let OutboundConnectorKind::ShadowsocksTcp(config) = connector.as_ref() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("outbound {tag} is not a Shadowsocks connector"),
+        ));
+    };
+    if !config.transport.supports_direct_udp() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "Shadowsocks UDP outbound {tag} requires network=tcp and security=none"
+            ),
+        ));
+    }
+    let server_addr = resolve_single_address(resolver, &config.server).await?;
+    let bind_addr = if server_addr.is_ipv6() {
+        SocketAddr::from(([0u16; 8], 0))
+    } else {
+        SocketAddr::from(([0, 0, 0, 0], 0))
+    };
+    let socket = UdpSocket::bind(bind_addr).await?;
+    let packet = config.udp_codec.encrypt_client_packet(target, payload)?;
+    socket.send_to(&packet, server_addr).await?;
+    let mut response = vec![0u8; 64 * 1024];
+    let response_len = timeout(Duration::from_secs(60), async {
+        loop {
+            let (length, source) = socket.recv_from(&mut response).await?;
+            if source.ip() == server_addr.ip() {
+                return Ok::<usize, std::io::Error>(length);
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "Shadowsocks UDP response timed out",
+        )
+    })??;
+    response.truncate(response_len);
+    let (source, payload) = config.udp_codec.decrypt_client_packet(&response)?;
+    Ok(UdpOutboundResponse { source, payload })
+}
+
 pub(crate) fn select_direct_outbound(
     runtime: &RuntimeState,
     input: &RoutingInput,
@@ -376,9 +453,13 @@ pub(crate) fn select_direct_outbound(
             format!("{network_name} outbound {tag} does not support UDP"),
         )),
         #[cfg(feature = "shadowsocks")]
+        OutboundConnectorKind::ShadowsocksTcp(_) if network_name == "udp" => {
+            Ok(DirectOutboundAction::Shadowsocks { tag })
+        }
+        #[cfg(feature = "shadowsocks")]
         OutboundConnectorKind::ShadowsocksTcp(_) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("{network_name} outbound {tag} does not support UDP yet"),
+            format!("{network_name} outbound {tag} requires the TCP connector path"),
         )),
         OutboundConnectorKind::SocksTcp(_) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,

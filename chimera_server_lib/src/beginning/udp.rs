@@ -50,12 +50,22 @@ const UDP_BUFFER_SIZE: usize = 64 * 1024;
 const VMESS_UDP_MESSAGE_BUFFER_SIZE: usize = 8192;
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const UDP_SESSION_CHANNEL_CAPACITY: usize = 64;
+#[cfg(feature = "shadowsocks")]
+use crate::outbound::exchange_shadowsocks_udp;
 // Keep UDP routing intentionally limited to direct and drop outbounds for now.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum UdpOutboundAction {
-    Freedom { tag: Option<String> },
-    Blackhole { tag: String },
+    Freedom {
+        tag: Option<String>,
+    },
+    Blackhole {
+        tag: String,
+    },
+    #[cfg(feature = "shadowsocks")]
+    Shadowsocks {
+        tag: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -295,6 +305,21 @@ pub(crate) async fn run_bidirectional_udp(
             )
             .await
         }
+        #[cfg(feature = "shadowsocks")]
+        DirectOutboundAction::Shadowsocks { tag } => {
+            traffic_context = traffic_context
+                .map(|context| context.with_outbound_tag(tag.clone()));
+            let _connection_guard = register_connection(traffic_context.as_ref());
+            copy_shadowsocks_udp_messages(
+                &mut *server_stream,
+                &resolver,
+                &runtime,
+                &tag,
+                &remote_location,
+                traffic_context,
+            )
+            .await
+        }
         DirectOutboundAction::Freedom { tag } => {
             if let Some(tag) = tag {
                 traffic_context =
@@ -414,6 +439,37 @@ pub(crate) async fn run_multi_directional_udp(
                         debug!(
                             "targeted udp packet to {} dropped by blackhole outbound {}",
                             target_location, tag
+                        );
+                    }
+                    #[cfg(feature = "shadowsocks")]
+                    DirectOutboundAction::Shadowsocks { tag } => {
+                        let packet_context = packet_context
+                            .clone()
+                            .map(|context| context.with_outbound_tag(tag.clone()));
+                        let response = exchange_shadowsocks_udp(
+                            &resolver,
+                            &runtime,
+                            &tag,
+                            &target_location,
+                            &payload,
+                        )
+                        .await?;
+                        let source = resolve_single_address(
+                            &resolver,
+                            &response.source,
+                        )
+                        .await?;
+                        write_sourced_message(
+                            &mut *server_stream,
+                            &response.payload,
+                            &source,
+                        )
+                        .await?;
+                        flush_targeted_message(&mut *server_stream).await?;
+                        record_transfer(
+                            packet_context,
+                            payload_length as u64,
+                            response.payload.len() as u64,
                         );
                     }
                     DirectOutboundAction::Freedom { tag } => {
@@ -611,6 +667,38 @@ pub(crate) async fn run_session_based_udp(
                         debug!(
                             "session udp packet {} to {} dropped by blackhole outbound {}",
                             session_id, target_location, tag
+                        );
+                    }
+                    #[cfg(feature = "shadowsocks")]
+                    DirectOutboundAction::Shadowsocks { tag } => {
+                        let packet_context = packet_context
+                            .clone()
+                            .map(|context| context.with_outbound_tag(tag.clone()));
+                        let response = exchange_shadowsocks_udp(
+                            &resolver,
+                            &runtime,
+                            &tag,
+                            &target_location,
+                            &payload,
+                        )
+                        .await?;
+                        let source = resolve_single_address(
+                            &resolver,
+                            &response.source,
+                        )
+                        .await?;
+                        write_session_message(
+                            &mut *server_stream,
+                            session_id,
+                            &response.payload,
+                            &source,
+                        )
+                        .await?;
+                        flush_session_message(&mut *server_stream).await?;
+                        record_transfer(
+                            packet_context,
+                            payload_length as u64,
+                            response.payload.len() as u64,
                         );
                     }
                     DirectOutboundAction::Freedom { tag } => {
@@ -1533,6 +1621,34 @@ async fn consume_blackholed_udp_messages(
     }
 }
 
+#[cfg(feature = "shadowsocks")]
+async fn copy_shadowsocks_udp_messages(
+    stream: &mut dyn AsyncMessageStream,
+    resolver: &Arc<dyn Resolver>,
+    runtime: &RuntimeState,
+    tag: &str,
+    target: &NetLocation,
+    traffic_context: Option<TrafficContext>,
+) -> std::io::Result<()> {
+    let mut buffer = vec![0u8; VMESS_UDP_MESSAGE_BUFFER_SIZE];
+    loop {
+        let len = read_message(stream, &mut buffer).await?;
+        if len == 0 {
+            return Ok(());
+        }
+        let response =
+            exchange_shadowsocks_udp(resolver, runtime, tag, target, &buffer[..len])
+                .await?;
+        write_message(stream, &response.payload).await?;
+        flush_message(stream).await?;
+        record_transfer(
+            traffic_context.clone(),
+            len as u64,
+            response.payload.len() as u64,
+        );
+    }
+}
+
 async fn copy_bidirectional_udp_messages(
     stream: &mut dyn AsyncMessageStream,
     socket: &UdpSocket,
@@ -1790,6 +1906,30 @@ async fn relay_shadowsocks_udp_packet(
             record_transfer(Some(traffic_context), request.payload.len() as u64, 0);
             Ok(())
         }
+        #[cfg(feature = "shadowsocks")]
+        UdpOutboundAction::Shadowsocks { tag } => {
+            traffic_context = traffic_context.with_outbound_tag(tag.clone());
+            let response = exchange_shadowsocks_udp(
+                &resolver,
+                &runtime,
+                &tag,
+                &request.target_location,
+                &request.payload,
+            )
+            .await?;
+            let encrypted = codec.encrypt_packet(
+                &request,
+                &response.source,
+                &response.payload,
+            )?;
+            server_socket.send_to(&encrypted, client_addr).await?;
+            record_transfer(
+                Some(traffic_context),
+                request.payload.len() as u64,
+                response.payload.len() as u64,
+            );
+            Ok(())
+        }
         UdpOutboundAction::Freedom { tag } => {
             if let Some(tag) = tag {
                 traffic_context = traffic_context.with_outbound_tag(tag);
@@ -1928,6 +2068,38 @@ async fn relay_dokodemo_udp_datagram(
                 client_addr, target_location, tag
             );
             record_transfer(Some(traffic_context), payload.len() as u64, 0);
+            Ok(())
+        }
+        #[cfg(feature = "shadowsocks")]
+        UdpOutboundAction::Shadowsocks { tag } => {
+            let traffic_context = traffic_context.with_outbound_tag(tag.clone());
+            let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+            let response = exchange_shadowsocks_udp(
+                &resolver,
+                &runtime,
+                &tag,
+                &target_location,
+                &payload,
+            )
+            .await?;
+            let source_addr =
+                resolve_single_address(&resolver, &response.source).await?;
+            relay_state
+                .server_socket
+                .send_to(&response.payload, client_addr)
+                .await?;
+            record_transfer(
+                Some(traffic_context),
+                payload.len() as u64,
+                response.payload.len() as u64,
+            );
+            debug!(
+                "dokodemo-door udp relay {} <- {} via {} forwarded {} bytes",
+                client_addr,
+                source_addr,
+                tag,
+                response.payload.len()
+            );
             Ok(())
         }
         UdpOutboundAction::Freedom { tag } => {
@@ -2135,6 +2307,8 @@ async fn select_udp_outbound(
             tag: Some(outbound.tag),
         }),
         "blackhole" => Ok(UdpOutboundAction::Blackhole { tag: outbound.tag }),
+        #[cfg(feature = "shadowsocks")]
+        "shadowsocks" => Ok(UdpOutboundAction::Shadowsocks { tag: outbound.tag }),
         protocol => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(

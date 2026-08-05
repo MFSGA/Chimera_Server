@@ -1342,6 +1342,15 @@ async fn forward_udp_payload(
             );
             return Ok(true);
         }
+        #[cfg(feature = "shadowsocks")]
+        DirectOutboundAction::Shadowsocks { tag } => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!(
+                    "TUIC UDP outbound {tag} requires a response-channel adapter that is not implemented yet"
+                ),
+            ));
+        }
         DirectOutboundAction::Freedom { tag: Some(tag) } => {
             traffic_context = traffic_context.with_outbound_tag(tag);
         }

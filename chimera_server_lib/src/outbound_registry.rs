@@ -4,7 +4,11 @@ use serde::Deserialize;
 
 use crate::address::{Address, NetLocation};
 #[cfg(feature = "shadowsocks")]
-use crate::handler::shadowsocks::{ShadowsocksCipher, compile_legacy_outbound_key};
+use crate::config::server_config::ShadowsocksUser;
+#[cfg(feature = "shadowsocks")]
+use crate::handler::shadowsocks::{
+    ShadowsocksCipher, ShadowsocksUdpCodec, compile_legacy_outbound_key,
+};
 #[cfg(feature = "vmess")]
 use crate::handler::vmess::client::{VmessDataSecurity, parse_vmess_user_id};
 use crate::http_outbound::{HttpProxyCredentials, validate_http_proxy_headers};
@@ -35,6 +39,7 @@ pub(crate) struct ShadowsocksTcpOutboundConfig {
     pub password: Arc<str>,
     pub cipher: ShadowsocksCipher,
     pub master_key: Arc<[u8]>,
+    pub udp_codec: Arc<ShadowsocksUdpCodec>,
     pub transport: OutboundTransportConfig,
 }
 
@@ -611,12 +616,27 @@ fn compile_shadowsocks_tcp(
         summary.stream_settings.as_ref(),
         &summary.tag,
     )?;
+    let udp_codec = ShadowsocksUdpCodec::new(
+        vec![ShadowsocksUser {
+            method: cipher.name().to_string(),
+            password: password.clone(),
+            email: String::new(),
+        }],
+        None,
+    )
+    .map_err(|error| {
+        format!(
+            "invalid Shadowsocks outbound {} UDP codec: {error}",
+            summary.tag
+        )
+    })?;
     Ok(ShadowsocksTcpOutboundConfig {
         server,
         method: Arc::from(cipher.name()),
         password: Arc::from(password),
         cipher,
         master_key,
+        udp_codec: Arc::new(udp_codec),
         transport,
     })
 }
