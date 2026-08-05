@@ -1,15 +1,11 @@
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-
-#[cfg(feature = "shadowsocks")]
-use std::time::Duration;
 
 #[cfg(any(feature = "trojan", feature = "vless"))]
 use tokio::io::AsyncWriteExt;
-#[cfg(feature = "shadowsocks")]
 use tokio::{net::UdpSocket, time::timeout};
 
 #[cfg(feature = "shadowsocks")]
@@ -17,7 +13,10 @@ use crate::handler::shadowsocks::{ShadowsocksCipher, connect_legacy_aead_outboun
 #[cfg(feature = "vmess")]
 use crate::handler::vmess::client::{VmessDataSecurity, connect_vmess_tcp};
 use crate::http_outbound::{HttpProxyCredentials, connect_http_proxy};
-use crate::socks_outbound::{Socks5Credentials, connect_socks5};
+use crate::socks_outbound::{
+    Socks5Credentials, associate_socks5_udp, connect_socks5,
+    decode_socks5_udp_packet, encode_socks5_udp_packet,
+};
 #[cfg(feature = "trojan")]
 use crate::trojan_outbound::encode_trojan_tcp_request;
 #[cfg(feature = "vless")]
@@ -45,9 +44,11 @@ pub(crate) enum DirectOutboundAction {
     Shadowsocks {
         tag: String,
     },
+    Socks {
+        tag: String,
+    },
 }
 
-#[cfg(feature = "shadowsocks")]
 pub(crate) struct UdpOutboundResponse {
     pub source: NetLocation,
     pub payload: Vec<u8>,
@@ -432,6 +433,74 @@ pub(crate) async fn exchange_shadowsocks_udp(
     Ok(UdpOutboundResponse { source, payload })
 }
 
+pub(crate) async fn exchange_socks_udp(
+    resolver: &Arc<dyn Resolver>,
+    runtime: &RuntimeState,
+    tag: &str,
+    target: &NetLocation,
+    payload: &[u8],
+) -> std::io::Result<UdpOutboundResponse> {
+    let connector = runtime.outbound_connector(tag).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("SOCKS UDP outbound {tag} is missing from the registry"),
+        )
+    })?;
+    let OutboundConnectorKind::SocksTcp(config) = connector.as_ref() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("outbound {tag} is not a SOCKS connector"),
+        ));
+    };
+
+    let server_addr = resolve_single_address(resolver, &config.server).await?;
+    let mut control = config.transport.connect(resolver, &config.server).await?;
+    let relay_location =
+        associate_socks5_udp(&mut *control, config.credentials.as_ref()).await?;
+    if relay_location.port() == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "SOCKS UDP ASSOCIATE returned relay port zero",
+        ));
+    }
+    let mut relay_addr = resolve_single_address(resolver, &relay_location).await?;
+    if relay_addr.ip().is_unspecified() {
+        relay_addr.set_ip(server_addr.ip());
+    }
+    let bind_addr = if relay_addr.is_ipv6() {
+        SocketAddr::from(([0u16; 8], 0))
+    } else {
+        SocketAddr::from(([0, 0, 0, 0], 0))
+    };
+    let socket = UdpSocket::bind(bind_addr).await?;
+    let packet = encode_socks5_udp_packet(target, payload)?;
+    socket.send_to(&packet, relay_addr).await?;
+
+    let mut response = vec![0u8; 64 * 1024];
+    let response_len = timeout(Duration::from_secs(60), async {
+        loop {
+            let (length, source) = socket.recv_from(&mut response).await?;
+            if source == relay_addr {
+                return Ok::<usize, std::io::Error>(length);
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "SOCKS UDP response timed out",
+        )
+    })??;
+    response.truncate(response_len);
+    let decoded = decode_socks5_udp_packet(&response)?;
+    drop(control);
+    Ok(UdpOutboundResponse {
+        source: decoded.location,
+        payload: decoded.payload,
+    })
+}
+
 pub(crate) fn select_direct_outbound(
     runtime: &RuntimeState,
     input: &RoutingInput,
@@ -461,9 +530,12 @@ pub(crate) fn select_direct_outbound(
             std::io::ErrorKind::InvalidInput,
             format!("{network_name} outbound {tag} requires the TCP connector path"),
         )),
+        OutboundConnectorKind::SocksTcp(_) if network_name == "udp" => {
+            Ok(DirectOutboundAction::Socks { tag })
+        }
         OutboundConnectorKind::SocksTcp(_) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("{network_name} outbound {tag} does not support UDP yet"),
+            format!("{network_name} outbound {tag} requires the TCP connector path"),
         )),
         #[cfg(feature = "trojan")]
         OutboundConnectorKind::TrojanTcp(_) => Err(std::io::Error::new(

@@ -1095,6 +1095,7 @@ async fn chimera_socks_no_auth_outbound_interoperates_with_xray_inbound() {
     let workspace = workspace_root();
     let work_dir = create_test_dir("socks-no-auth-outbound");
     let echo_addr = start_tcp_echo_server();
+    let udp_echo_addr = start_udp_echo_server().await;
     let xray_socks_port = free_localhost_port();
     let chimera_socks_port = free_localhost_port();
     let xray_config_path = work_dir.join("xray-socks-inbound.json");
@@ -1111,7 +1112,7 @@ async fn chimera_socks_no_auth_outbound_interoperates_with_xray_inbound() {
                 "tag": "socks-upstream-in",
                 "settings": {
                     "auth": "noauth",
-                    "udp": false
+                    "udp": true
                 },
                 "streamSettings": {
                     "network": "tcp",
@@ -1132,7 +1133,7 @@ async fn chimera_socks_no_auth_outbound_interoperates_with_xray_inbound() {
                 "port": chimera_socks_port,
                 "protocol": "socks",
                 "tag": "socks-in",
-                "settings": {"auth": "noauth"}
+                "settings": {"auth": "noauth", "udp": true}
             }],
             "outbounds": [{
                 "tag": "to-xray-socks",
@@ -1179,6 +1180,14 @@ async fn chimera_socks_no_auth_outbound_interoperates_with_xray_inbound() {
         echo_addr.port(),
         b"no-auth SOCKS outbound domain target",
     );
+    assert_socks5_udp_echo(
+        socks_addr,
+        udp_echo_addr,
+        b"no-auth SOCKS UDP outbound through Xray inbound",
+    )
+    .await;
+    assert_socks5_udp_echo(socks_addr, udp_echo_addr, &deterministic_payload(1200))
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1187,6 +1196,7 @@ async fn chimera_socks_password_tls_outbound_interoperates_with_xray_inbound() {
     let workspace = workspace_root();
     let work_dir = create_test_dir("socks-password-tls-outbound");
     let echo_addr = start_tcp_echo_server();
+    let udp_echo_addr = start_udp_echo_server().await;
     let xray_socks_port = free_localhost_port();
     let chimera_socks_port = free_localhost_port();
     let xray_config_path = work_dir.join("xray-socks-tls-inbound.json");
@@ -1211,7 +1221,7 @@ async fn chimera_socks_password_tls_outbound_interoperates_with_xray_inbound() {
                 "settings": {
                     "auth": "password",
                     "accounts": [{"user": "alice", "pass": "secret"}],
-                    "udp": false
+                    "udp": true
                 },
                 "streamSettings": {
                     "network": "tcp",
@@ -1240,7 +1250,7 @@ async fn chimera_socks_password_tls_outbound_interoperates_with_xray_inbound() {
                 "port": chimera_socks_port,
                 "protocol": "socks",
                 "tag": "socks-in",
-                "settings": {"auth": "noauth"}
+                "settings": {"auth": "noauth", "udp": true}
             }],
             "outbounds": [{
                 "tag": "to-xray-socks-tls",
@@ -1297,6 +1307,14 @@ async fn chimera_socks_password_tls_outbound_interoperates_with_xray_inbound() {
         echo_addr.port(),
         b"TLS password SOCKS outbound domain target",
     );
+    assert_socks5_udp_echo(
+        socks_addr,
+        udp_echo_addr,
+        b"TLS password SOCKS UDP outbound through Xray inbound",
+    )
+    .await;
+    assert_socks5_udp_echo(socks_addr, udp_echo_addr, &deterministic_payload(1200))
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -27,6 +27,7 @@ use tracing::{debug, warn};
 
 #[cfg(feature = "shadowsocks")]
 use crate::outbound::exchange_shadowsocks_udp;
+use crate::outbound::exchange_socks_udp;
 #[cfg(feature = "user_domain_access")]
 use crate::user_domain_access::hysteria2_password_identity;
 use crate::{
@@ -79,6 +80,7 @@ fn hysteria2_traffic_context(
     inbound_tag: &str,
     peer_addr: SocketAddr,
 ) -> TrafficContext {
+    #[allow(unused_mut)]
     let mut context = TrafficContext::new("hysteria2")
         .with_identity(hysteria2_routing_identity(client))
         .with_inbound_tag(inbound_tag.to_string())
@@ -737,6 +739,7 @@ async fn drive_udp_datagrams(
             }
         };
 
+        #[allow(unused_mut)]
         let mut packet_context = base_context.clone().with_access_target(
             remote_location.address().to_string(),
             remote_location.port(),
@@ -888,6 +891,30 @@ async fn drive_udp_datagrams(
             DirectOutboundAction::Shadowsocks { tag } => {
                 traffic_context = traffic_context.with_outbound_tag(tag.clone());
                 let response = exchange_shadowsocks_udp(
+                    &resolver,
+                    &runtime,
+                    &tag,
+                    &session.last_location,
+                    complete_payload.as_ref(),
+                )
+                .await?;
+                send_hysteria_udp_payload(
+                    &connection,
+                    session_id,
+                    packet_id,
+                    &response.source,
+                    &response.payload,
+                )?;
+                record_transfer(
+                    Some(traffic_context),
+                    complete_payload.len() as u64,
+                    response.payload.len() as u64,
+                );
+                continue;
+            }
+            DirectOutboundAction::Socks { tag } => {
+                traffic_context = traffic_context.with_outbound_tag(tag.clone());
+                let response = exchange_socks_udp(
                     &resolver,
                     &runtime,
                     &tag,

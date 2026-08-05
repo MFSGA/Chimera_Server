@@ -21,6 +21,7 @@ use crate::{
 
 #[cfg(feature = "shadowsocks")]
 use crate::outbound::exchange_shadowsocks_udp;
+use crate::outbound::exchange_socks_udp;
 
 const SOCKS_VERSION: u8 = 0x05;
 const METHOD_NO_AUTH: u8 = 0x00;
@@ -572,6 +573,30 @@ pub(crate) async fn run_udp_relay(
                 datagram_context = datagram_context
                     .map(|context| context.with_outbound_tag(tag.clone()));
                 let response = exchange_shadowsocks_udp(
+                    &resolver,
+                    &runtime,
+                    &tag,
+                    &target_location,
+                    payload,
+                )
+                .await?;
+                let mut socks5_response =
+                    build_udp_response_header_location(&response.source)?;
+                socks5_response.extend_from_slice(&response.payload);
+                udp_socket_clone
+                    .send_to(&socks5_response, response_endpoint)
+                    .await?;
+                record_transfer(
+                    datagram_context,
+                    payload.len() as u64,
+                    response.payload.len() as u64,
+                );
+                continue;
+            }
+            DirectOutboundAction::Socks { tag } => {
+                datagram_context = datagram_context
+                    .map(|context| context.with_outbound_tag(tag.clone()));
+                let response = exchange_socks_udp(
                     &resolver,
                     &runtime,
                     &tag,
