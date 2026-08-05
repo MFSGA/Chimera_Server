@@ -1,5 +1,15 @@
 use tonic::{Request, Response, Status};
 
+#[cfg(all(feature = "vless", feature = "grpc_transport"))]
+use crate::config::def::OutboundGrpcSettings;
+#[cfg(all(feature = "vless", feature = "httpupgrade"))]
+use crate::config::def::OutboundHttpUpgradeSettings;
+#[cfg(all(feature = "vless", feature = "reality"))]
+use crate::config::def::OutboundRealitySettings;
+#[cfg(all(feature = "vless", feature = "ws"))]
+use crate::config::def::OutboundWebsocketSettings;
+#[cfg(all(feature = "vless", feature = "tls"))]
+use crate::config::def::{OutboundTlsCertificate, OutboundTlsSettings};
 #[cfg(feature = "hysteria")]
 use crate::config::server_config::Hysteria2Client;
 #[cfg(feature = "reality")]
@@ -31,6 +41,8 @@ use crate::{
     config::{def::OutboundStreamSettings, server_config::VlessUser},
     outbound_registry::OutboundConnectorKind,
 };
+#[cfg(all(feature = "vless", feature = "reality"))]
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use prost::Message;
 
 use super::proto;
@@ -47,6 +59,10 @@ const ERR_PROXY_NOT_USER_MANAGER: &str =
 const TYPE_APP_RECEIVER_CONFIG: &str = "xray.app.proxyman.ReceiverConfig";
 const TYPE_APP_RECEIVER_CONFIG_V2RAY: &str =
     "v2ray.core.app.proxyman.ReceiverConfig";
+#[cfg(feature = "vless")]
+const TYPE_APP_SENDER_CONFIG: &str = "xray.app.proxyman.SenderConfig";
+#[cfg(feature = "vless")]
+const TYPE_APP_SENDER_CONFIG_V2RAY: &str = "v2ray.core.app.proxyman.SenderConfig";
 const TYPE_PROXY_SOCKS_SERVER_CONFIG: &str = "xray.proxy.socks.ServerConfig";
 const TYPE_PROXY_SOCKS_SERVER_CONFIG_V2RAY: &str =
     "v2ray.core.proxy.socks.ServerConfig";
@@ -88,6 +104,18 @@ const TYPE_TRANSPORT_WEBSOCKET_CONFIG: &str =
 #[cfg(feature = "ws")]
 const TYPE_TRANSPORT_WEBSOCKET_CONFIG_V2RAY: &str =
     "v2ray.core.transport.internet.websocket.Config";
+#[cfg(feature = "httpupgrade")]
+const TYPE_TRANSPORT_HTTPUPGRADE_CONFIG: &str =
+    "xray.transport.internet.httpupgrade.Config";
+#[cfg(feature = "httpupgrade")]
+const TYPE_TRANSPORT_HTTPUPGRADE_CONFIG_V2RAY: &str =
+    "v2ray.core.transport.internet.httpupgrade.Config";
+#[cfg(feature = "grpc_transport")]
+const TYPE_TRANSPORT_GRPC_CONFIG: &str =
+    "xray.transport.internet.grpc.encoding.Config";
+#[cfg(feature = "grpc_transport")]
+const TYPE_TRANSPORT_GRPC_CONFIG_V2RAY: &str =
+    "v2ray.core.transport.internet.grpc.encoding.Config";
 const TYPE_TRANSPORT_SPLITHTTP_CONFIG: &str =
     "xray.transport.internet.splithttp.Config";
 const TYPE_TRANSPORT_SPLITHTTP_CONFIG_V2RAY: &str =
@@ -210,6 +238,234 @@ struct TransportConfigPayload {
     settings: Option<proto::xray::common::serial::TypedMessage>,
     #[prost(string, tag = "3")]
     protocol_name: String,
+}
+
+#[cfg(feature = "vless")]
+#[derive(Clone, PartialEq, Message)]
+struct SenderConfigPayload {
+    #[prost(message, optional, tag = "1")]
+    via: Option<IpOrDomainPayload>,
+    #[prost(message, optional, tag = "2")]
+    stream_settings: Option<SenderStreamConfigPayload>,
+    #[prost(message, optional, tag = "3")]
+    proxy_settings: Option<SenderProxyConfigPayload>,
+    #[prost(message, optional, tag = "4")]
+    multiplex_settings: Option<SenderMultiplexingConfigPayload>,
+    #[prost(string, tag = "5")]
+    via_cidr: String,
+    #[prost(int32, tag = "6")]
+    target_strategy: i32,
+}
+
+#[cfg(feature = "vless")]
+#[derive(Clone, PartialEq, Message)]
+struct SenderProxyConfigPayload {
+    #[prost(string, tag = "1")]
+    tag: String,
+    #[prost(bool, tag = "2")]
+    transport_layer_proxy: bool,
+}
+
+#[cfg(feature = "vless")]
+#[derive(Clone, PartialEq, Message)]
+struct SenderMultiplexingConfigPayload {
+    #[prost(bool, tag = "1")]
+    enabled: bool,
+    #[prost(int32, tag = "2")]
+    concurrency: i32,
+    #[prost(int32, tag = "3")]
+    xudp_concurrency: i32,
+    #[prost(string, tag = "4")]
+    xudp_proxy_udp443: String,
+}
+
+#[cfg(feature = "vless")]
+#[derive(Clone, PartialEq, Message)]
+struct SenderStreamConfigPayload {
+    #[prost(message, repeated, tag = "2")]
+    transport_settings: Vec<TransportConfigPayload>,
+    #[prost(string, tag = "3")]
+    security_type: String,
+    #[prost(message, repeated, tag = "4")]
+    security_settings: Vec<proto::xray::common::serial::TypedMessage>,
+    #[prost(string, tag = "5")]
+    protocol_name: String,
+    #[prost(message, optional, tag = "6")]
+    socket_settings: Option<OpaqueSenderMessage>,
+    #[prost(message, optional, tag = "8")]
+    address: Option<IpOrDomainPayload>,
+    #[prost(uint32, tag = "9")]
+    port: u32,
+    #[prost(message, repeated, tag = "10")]
+    udp_masks: Vec<proto::xray::common::serial::TypedMessage>,
+    #[prost(message, repeated, tag = "11")]
+    tcp_masks: Vec<proto::xray::common::serial::TypedMessage>,
+    #[prost(message, optional, tag = "12")]
+    quic_params: Option<OpaqueSenderMessage>,
+}
+
+#[cfg(feature = "vless")]
+#[derive(Clone, PartialEq, Message)]
+struct OpaqueSenderMessage {}
+
+#[cfg(all(feature = "vless", feature = "ws"))]
+#[derive(Clone, PartialEq, Message)]
+struct OutboundWebsocketConfigPayload {
+    #[prost(string, tag = "1")]
+    host: String,
+    #[prost(string, tag = "2")]
+    path: String,
+    #[prost(map = "string, string", tag = "3")]
+    header: std::collections::HashMap<String, String>,
+    #[prost(bool, tag = "4")]
+    accept_proxy_protocol: bool,
+    #[prost(uint32, tag = "5")]
+    early_data: u32,
+    #[prost(uint32, tag = "6")]
+    heartbeat_period: u32,
+}
+
+#[cfg(all(feature = "vless", feature = "httpupgrade"))]
+#[derive(Clone, PartialEq, Message)]
+struct OutboundHttpUpgradeConfigPayload {
+    #[prost(string, tag = "1")]
+    host: String,
+    #[prost(string, tag = "2")]
+    path: String,
+    #[prost(map = "string, string", tag = "3")]
+    header: std::collections::HashMap<String, String>,
+    #[prost(bool, tag = "4")]
+    accept_proxy_protocol: bool,
+    #[prost(uint32, tag = "5")]
+    early_data: u32,
+}
+
+#[cfg(all(feature = "vless", feature = "grpc_transport"))]
+#[derive(Clone, PartialEq, Message)]
+struct OutboundGrpcConfigPayload {
+    #[prost(string, tag = "1")]
+    authority: String,
+    #[prost(string, tag = "2")]
+    service_name: String,
+    #[prost(bool, tag = "3")]
+    multi_mode: bool,
+    #[prost(int32, tag = "4")]
+    idle_timeout: i32,
+    #[prost(int32, tag = "5")]
+    health_check_timeout: i32,
+    #[prost(bool, tag = "6")]
+    permit_without_stream: bool,
+    #[prost(int32, tag = "7")]
+    initial_windows_size: i32,
+    #[prost(string, tag = "8")]
+    user_agent: String,
+}
+
+#[cfg(all(feature = "vless", feature = "tls"))]
+#[derive(Clone, PartialEq, Message)]
+struct OutboundTlsConfigPayload {
+    #[prost(message, repeated, tag = "2")]
+    certificate: Vec<OutboundTlsCertificatePayload>,
+    #[prost(string, tag = "3")]
+    server_name: String,
+    #[prost(string, repeated, tag = "4")]
+    next_protocol: Vec<String>,
+    #[prost(bool, tag = "5")]
+    enable_session_resumption: bool,
+    #[prost(bool, tag = "6")]
+    disable_system_root: bool,
+    #[prost(string, tag = "7")]
+    min_version: String,
+    #[prost(string, tag = "8")]
+    max_version: String,
+    #[prost(string, tag = "9")]
+    cipher_suites: String,
+    #[prost(string, tag = "11")]
+    fingerprint: String,
+    #[prost(bool, tag = "12")]
+    reject_unknown_sni: bool,
+    #[prost(string, tag = "15")]
+    master_key_log: String,
+    #[prost(string, repeated, tag = "16")]
+    curve_preferences: Vec<String>,
+    #[prost(string, repeated, tag = "17")]
+    verify_peer_cert_by_name: Vec<String>,
+    #[prost(bytes = "vec", tag = "18")]
+    ech_server_keys: Vec<u8>,
+    #[prost(string, tag = "19")]
+    ech_config_list: String,
+    #[prost(message, optional, tag = "21")]
+    ech_socket_settings: Option<OpaqueSenderMessage>,
+    #[prost(bytes = "vec", repeated, tag = "22")]
+    pinned_peer_cert_sha256: Vec<Vec<u8>>,
+}
+
+#[cfg(all(feature = "vless", feature = "tls"))]
+#[derive(Clone, PartialEq, Message)]
+struct OutboundTlsCertificatePayload {
+    #[prost(bytes = "vec", tag = "1")]
+    certificate: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    key: Vec<u8>,
+    #[prost(int32, tag = "3")]
+    usage: i32,
+    #[prost(uint64, tag = "4")]
+    ocsp_stapling: u64,
+    #[prost(string, tag = "5")]
+    certificate_path: String,
+    #[prost(string, tag = "6")]
+    key_path: String,
+    #[prost(bool, tag = "7")]
+    one_time_loading: bool,
+    #[prost(bool, tag = "8")]
+    build_chain: bool,
+}
+
+#[cfg(all(feature = "vless", feature = "reality"))]
+#[derive(Clone, PartialEq, Message)]
+struct OutboundRealityConfigPayload {
+    #[prost(bool, tag = "1")]
+    show: bool,
+    #[prost(string, tag = "2")]
+    dest: String,
+    #[prost(string, tag = "3")]
+    transport_type: String,
+    #[prost(uint64, tag = "4")]
+    xver: u64,
+    #[prost(string, repeated, tag = "5")]
+    server_names: Vec<String>,
+    #[prost(bytes = "vec", tag = "6")]
+    private_key: Vec<u8>,
+    #[prost(bytes = "vec", tag = "7")]
+    min_client_ver: Vec<u8>,
+    #[prost(bytes = "vec", tag = "8")]
+    max_client_ver: Vec<u8>,
+    #[prost(uint64, tag = "9")]
+    max_time_diff: u64,
+    #[prost(bytes = "vec", repeated, tag = "10")]
+    short_ids: Vec<Vec<u8>>,
+    #[prost(bytes = "vec", tag = "11")]
+    mldsa65_seed: Vec<u8>,
+    #[prost(message, optional, tag = "12")]
+    limit_fallback_upload: Option<OpaqueSenderMessage>,
+    #[prost(message, optional, tag = "13")]
+    limit_fallback_download: Option<OpaqueSenderMessage>,
+    #[prost(string, tag = "21")]
+    fingerprint: String,
+    #[prost(string, tag = "22")]
+    server_name: String,
+    #[prost(bytes = "vec", tag = "23")]
+    public_key: Vec<u8>,
+    #[prost(bytes = "vec", tag = "24")]
+    short_id: Vec<u8>,
+    #[prost(bytes = "vec", tag = "25")]
+    mldsa65_verify: Vec<u8>,
+    #[prost(string, tag = "26")]
+    spider_x: String,
+    #[prost(int64, repeated, tag = "27")]
+    spider_y: Vec<i64>,
+    #[prost(string, tag = "31")]
+    master_key_log: String,
 }
 
 #[cfg(feature = "vless")]
@@ -1042,6 +1298,459 @@ impl HandlerServiceImpl {
         Ok(Some(version))
     }
 
+    #[cfg(feature = "vless")]
+    fn parse_outbound_sender_settings(
+        &self,
+        sender_settings: Option<&proto::xray::common::serial::TypedMessage>,
+    ) -> Result<OutboundStreamSettings, Status> {
+        let mut output = OutboundStreamSettings {
+            network: "tcp".to_string(),
+            security: Some("none".to_string()),
+            ..OutboundStreamSettings::default()
+        };
+        let Some(sender_settings) = sender_settings else {
+            return Ok(output);
+        };
+        let sender = self.decode_typed_message::<SenderConfigPayload>(
+            sender_settings,
+            &[TYPE_APP_SENDER_CONFIG, TYPE_APP_SENDER_CONFIG_V2RAY],
+            "outbound sender settings",
+        )?;
+        if sender.via.is_some() {
+            return Err(Status::invalid_argument(
+                "outbound SenderConfig.via is not supported yet",
+            ));
+        }
+        if sender.proxy_settings.is_some() {
+            return Err(Status::invalid_argument(
+                "outbound SenderConfig.proxy_settings is not supported yet",
+            ));
+        }
+        if sender.multiplex_settings.is_some() {
+            return Err(Status::invalid_argument(
+                "outbound SenderConfig.multiplex_settings is not supported yet",
+            ));
+        }
+        if !sender.via_cidr.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "outbound SenderConfig.via_cidr is not supported yet",
+            ));
+        }
+        if sender.target_strategy != 0 {
+            return Err(Status::invalid_argument(
+                "outbound SenderConfig.target_strategy currently requires AsIs",
+            ));
+        }
+
+        let stream = sender.stream_settings.unwrap_or_default();
+        if stream.address.is_some()
+            || stream.port != 0
+            || stream.socket_settings.is_some()
+            || stream.quic_params.is_some()
+            || !stream.udp_masks.is_empty()
+            || !stream.tcp_masks.is_empty()
+        {
+            return Err(Status::invalid_argument(
+                "outbound SenderConfig stream address/port/socket/mask/quic fields are not supported yet",
+            ));
+        }
+
+        output.network =
+            match stream.protocol_name.trim().to_ascii_lowercase().as_str() {
+                "" | "tcp" => {
+                    if !stream.transport_settings.is_empty() {
+                        return Err(Status::invalid_argument(
+                            "outbound TCP transport settings are not supported yet",
+                        ));
+                    }
+                    "tcp".to_string()
+                }
+                #[cfg(feature = "ws")]
+                "ws" | "websocket" => {
+                    let typed = self.single_sender_transport_setting(
+                        &stream,
+                        &["ws", "websocket"],
+                        "websocket",
+                    )?;
+                    let settings = self
+                        .decode_typed_message::<OutboundWebsocketConfigPayload>(
+                            typed,
+                            &[
+                                TYPE_TRANSPORT_WEBSOCKET_CONFIG,
+                                TYPE_TRANSPORT_WEBSOCKET_CONFIG_V2RAY,
+                            ],
+                            "outbound websocket transport settings",
+                        )?;
+                    if settings.early_data != 0 {
+                        return Err(Status::invalid_argument(
+                            "outbound websocket early data is not supported yet",
+                        ));
+                    }
+                    output.ws_settings = Some(OutboundWebsocketSettings {
+                        host: (!settings.host.trim().is_empty())
+                            .then_some(settings.host),
+                        path: (!settings.path.trim().is_empty())
+                            .then_some(settings.path),
+                        headers: settings.header,
+                        accept_proxy_protocol: settings.accept_proxy_protocol,
+                        heartbeat_period: settings.heartbeat_period,
+                    });
+                    "ws".to_string()
+                }
+                #[cfg(feature = "httpupgrade")]
+                "httpupgrade" => {
+                    let typed = self.single_sender_transport_setting(
+                        &stream,
+                        &["httpupgrade"],
+                        "httpupgrade",
+                    )?;
+                    let settings = self
+                        .decode_typed_message::<OutboundHttpUpgradeConfigPayload>(
+                            typed,
+                            &[
+                                TYPE_TRANSPORT_HTTPUPGRADE_CONFIG,
+                                TYPE_TRANSPORT_HTTPUPGRADE_CONFIG_V2RAY,
+                            ],
+                            "outbound HTTP Upgrade transport settings",
+                        )?;
+                    if settings.early_data != 0 {
+                        return Err(Status::invalid_argument(
+                            "outbound HTTP Upgrade early data is not supported yet",
+                        ));
+                    }
+                    output.httpupgrade_settings =
+                        Some(OutboundHttpUpgradeSettings {
+                            host: (!settings.host.trim().is_empty())
+                                .then_some(settings.host),
+                            path: (!settings.path.trim().is_empty())
+                                .then_some(settings.path),
+                            headers: settings.header,
+                            accept_proxy_protocol: settings.accept_proxy_protocol,
+                        });
+                    "httpupgrade".to_string()
+                }
+                #[cfg(feature = "grpc_transport")]
+                "grpc" => {
+                    let typed = self.single_sender_transport_setting(
+                        &stream,
+                        &["grpc"],
+                        "grpc",
+                    )?;
+                    let settings = self
+                        .decode_typed_message::<OutboundGrpcConfigPayload>(
+                            typed,
+                            &[
+                                TYPE_TRANSPORT_GRPC_CONFIG,
+                                TYPE_TRANSPORT_GRPC_CONFIG_V2RAY,
+                            ],
+                            "outbound gRPC transport settings",
+                        )?;
+                    output.grpc_settings = Some(OutboundGrpcSettings {
+                        authority: (!settings.authority.trim().is_empty())
+                            .then_some(settings.authority),
+                        service_name: (!settings.service_name.trim().is_empty())
+                            .then_some(settings.service_name),
+                        multi_mode: settings.multi_mode,
+                        idle_timeout: u32::try_from(settings.idle_timeout).map_err(
+                            |_| {
+                                Status::invalid_argument(
+                                    "gRPC idle_timeout must not be negative",
+                                )
+                            },
+                        )?,
+                        health_check_timeout: u32::try_from(
+                            settings.health_check_timeout,
+                        )
+                        .map_err(|_| {
+                            Status::invalid_argument(
+                                "gRPC health_check_timeout must not be negative",
+                            )
+                        })?,
+                        permit_without_stream: settings.permit_without_stream,
+                        initial_windows_size: u32::try_from(
+                            settings.initial_windows_size,
+                        )
+                        .map_err(|_| {
+                            Status::invalid_argument(
+                                "gRPC initial_windows_size must not be negative",
+                            )
+                        })?,
+                        user_agent: (!settings.user_agent.trim().is_empty())
+                            .then_some(settings.user_agent),
+                    });
+                    "grpc".to_string()
+                }
+                unsupported => {
+                    return Err(Status::invalid_argument(format!(
+                        "unsupported outbound sender network: {unsupported}"
+                    )));
+                }
+            };
+
+        output.security = Some(
+            match stream.security_type.trim().to_ascii_lowercase().as_str() {
+                "" | "none" => {
+                    if !stream.security_settings.is_empty() {
+                        return Err(Status::invalid_argument(
+                            "outbound security settings require a supported security_type",
+                        ));
+                    }
+                    "none".to_string()
+                }
+                #[cfg(feature = "tls")]
+                "tls"
+                | TYPE_TRANSPORT_TLS_CONFIG
+                | TYPE_TRANSPORT_TLS_CONFIG_V2RAY => {
+                    let typed = self.single_sender_security_setting(
+                        &stream,
+                        &[
+                            TYPE_TRANSPORT_TLS_CONFIG,
+                            TYPE_TRANSPORT_TLS_CONFIG_V2RAY,
+                        ],
+                        "tls",
+                    )?;
+                    output.tls_settings =
+                        Some(self.parse_outbound_tls_settings(typed)?);
+                    "tls".to_string()
+                }
+                #[cfg(feature = "reality")]
+                "reality" | TYPE_TRANSPORT_REALITY_CONFIG => {
+                    let typed = self.single_sender_security_setting(
+                        &stream,
+                        &[TYPE_TRANSPORT_REALITY_CONFIG],
+                        "reality",
+                    )?;
+                    output.reality_settings =
+                        Some(self.parse_outbound_reality_settings(typed)?);
+                    "reality".to_string()
+                }
+                unsupported => {
+                    return Err(Status::invalid_argument(format!(
+                        "unsupported outbound sender security: {unsupported}"
+                    )));
+                }
+            },
+        );
+        Ok(output)
+    }
+
+    #[cfg(feature = "vless")]
+    fn single_sender_transport_setting<'a>(
+        &self,
+        stream: &'a SenderStreamConfigPayload,
+        accepted_names: &[&str],
+        label: &str,
+    ) -> Result<&'a proto::xray::common::serial::TypedMessage, Status> {
+        let mut selected = None;
+        for transport in &stream.transport_settings {
+            let name = transport.protocol_name.trim().to_ascii_lowercase();
+            if !accepted_names.contains(&name.as_str()) {
+                return Err(Status::invalid_argument(format!(
+                    "unexpected outbound transport settings for {name}"
+                )));
+            }
+            if selected.is_some() {
+                return Err(Status::invalid_argument(format!(
+                    "duplicate outbound {label} transport settings"
+                )));
+            }
+            selected = transport.settings.as_ref();
+        }
+        selected.ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "outbound {label} transport settings are required"
+            ))
+        })
+    }
+
+    #[cfg(feature = "vless")]
+    fn single_sender_security_setting<'a>(
+        &self,
+        stream: &'a SenderStreamConfigPayload,
+        accepted_types: &[&str],
+        label: &str,
+    ) -> Result<&'a proto::xray::common::serial::TypedMessage, Status> {
+        let mut selected = None;
+        for setting in &stream.security_settings {
+            let setting_type = Self::parse_typed_message_type(setting);
+            if !accepted_types.contains(&setting_type) {
+                return Err(Status::invalid_argument(format!(
+                    "unexpected outbound security settings type: {setting_type}"
+                )));
+            }
+            if selected.is_some() {
+                return Err(Status::invalid_argument(format!(
+                    "duplicate outbound {label} security settings"
+                )));
+            }
+            selected = Some(setting);
+        }
+        selected.ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "outbound {label} security settings are required"
+            ))
+        })
+    }
+
+    #[cfg(all(feature = "vless", feature = "tls"))]
+    fn parse_outbound_tls_settings(
+        &self,
+        typed: &proto::xray::common::serial::TypedMessage,
+    ) -> Result<OutboundTlsSettings, Status> {
+        let tls = self.decode_typed_message::<OutboundTlsConfigPayload>(
+            typed,
+            &[TYPE_TRANSPORT_TLS_CONFIG, TYPE_TRANSPORT_TLS_CONFIG_V2RAY],
+            "outbound TLS security settings",
+        )?;
+        if !tls.cipher_suites.trim().is_empty()
+            || tls.reject_unknown_sni
+            || !tls.master_key_log.trim().is_empty()
+            || !tls.curve_preferences.is_empty()
+            || !tls.ech_server_keys.is_empty()
+            || tls.ech_socket_settings.is_some()
+        {
+            return Err(Status::invalid_argument(
+                "outbound TLS cipher suites, server-only SNI, key log, curves, and ECH socket settings are not supported yet",
+            ));
+        }
+        if !tls.pinned_peer_cert_sha256.is_empty() {
+            return Err(Status::invalid_argument(
+                "outbound TLS pinned peer certificates are not supported yet",
+            ));
+        }
+        if tls.verify_peer_cert_by_name.len() > 1 {
+            return Err(Status::invalid_argument(
+                "outbound TLS verify_peer_cert_by_name accepts at most one value",
+            ));
+        }
+
+        let certificates = tls
+            .certificate
+            .into_iter()
+            .map(|certificate| {
+                if certificate.usage != 1 {
+                    return Err(Status::invalid_argument(
+                        "outbound TLS certificates must use AUTHORITY_VERIFY",
+                    ));
+                }
+                if !certificate.key.is_empty()
+                    || certificate.ocsp_stapling != 0
+                    || !certificate.certificate_path.trim().is_empty()
+                    || !certificate.key_path.trim().is_empty()
+                    || certificate.one_time_loading
+                    || certificate.build_chain
+                {
+                    return Err(Status::invalid_argument(
+                        "outbound TLS client keys, file paths, OCSP, one-time loading, and build-chain are not supported yet",
+                    ));
+                }
+                if certificate.certificate.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "outbound TLS verify certificate must not be empty",
+                    ));
+                }
+                let certificate = String::from_utf8(certificate.certificate)
+                    .map_err(|_| Status::invalid_argument(
+                        "outbound TLS dynamic certificates currently require PEM text",
+                    ))?;
+                Ok(OutboundTlsCertificate {
+                    certificate_file: None,
+                    certificate: vec![certificate],
+                    key_file: None,
+                    key: Vec::new(),
+                    usage: Some("verify".to_string()),
+                })
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+
+        Ok(OutboundTlsSettings {
+            allow_insecure: false,
+            server_name: (!tls.server_name.trim().is_empty())
+                .then_some(tls.server_name),
+            alpn: tls.next_protocol,
+            enable_session_resumption: tls.enable_session_resumption,
+            disable_system_root: tls.disable_system_root,
+            min_version: (!tls.min_version.trim().is_empty())
+                .then_some(tls.min_version),
+            max_version: (!tls.max_version.trim().is_empty())
+                .then_some(tls.max_version),
+            fingerprint: (!tls.fingerprint.trim().is_empty())
+                .then_some(tls.fingerprint),
+            pinned_peer_cert_sha256: None,
+            verify_peer_cert_by_name: tls
+                .verify_peer_cert_by_name
+                .into_iter()
+                .next(),
+            ech_config_list: (!tls.ech_config_list.trim().is_empty())
+                .then_some(tls.ech_config_list),
+            certificates,
+        })
+    }
+
+    #[cfg(all(feature = "vless", feature = "reality"))]
+    fn parse_outbound_reality_settings(
+        &self,
+        typed: &proto::xray::common::serial::TypedMessage,
+    ) -> Result<OutboundRealitySettings, Status> {
+        let reality = self.decode_typed_message::<OutboundRealityConfigPayload>(
+            typed,
+            &[TYPE_TRANSPORT_REALITY_CONFIG],
+            "outbound REALITY security settings",
+        )?;
+        if reality.show
+            || !reality.dest.trim().is_empty()
+            || !reality.transport_type.trim().is_empty()
+            || reality.xver != 0
+            || !reality.server_names.is_empty()
+            || !reality.private_key.is_empty()
+            || !reality.min_client_ver.is_empty()
+            || !reality.max_client_ver.is_empty()
+            || reality.max_time_diff != 0
+            || !reality.short_ids.is_empty()
+            || !reality.mldsa65_seed.is_empty()
+            || reality.limit_fallback_upload.is_some()
+            || reality.limit_fallback_download.is_some()
+        {
+            return Err(Status::invalid_argument(
+                "outbound REALITY sender settings contain server-only fields",
+            ));
+        }
+        if !reality.mldsa65_verify.is_empty()
+            || !reality.spider_y.is_empty()
+            || !reality.master_key_log.trim().is_empty()
+        {
+            return Err(Status::invalid_argument(
+                "outbound REALITY ML-DSA, spiderY, and key-log fields are not supported yet",
+            ));
+        }
+        if reality.public_key.len() != 32 {
+            return Err(Status::invalid_argument(
+                "outbound REALITY public_key must be exactly 32 bytes",
+            ));
+        }
+        if reality.short_id.len() > 8 {
+            return Err(Status::invalid_argument(
+                "outbound REALITY short_id must be at most 8 bytes",
+            ));
+        }
+        let short_id = reality
+            .short_id
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Ok(OutboundRealitySettings {
+            server_name: (!reality.server_name.trim().is_empty())
+                .then_some(reality.server_name),
+            public_key: Some(URL_SAFE_NO_PAD.encode(reality.public_key)),
+            short_id: (!short_id.is_empty()).then_some(short_id),
+            cipher_suites: Vec::new(),
+            fingerprint: (!reality.fingerprint.trim().is_empty())
+                .then_some(reality.fingerprint),
+            spider_x: (!reality.spider_x.trim().is_empty())
+                .then_some(reality.spider_x),
+        })
+    }
+
     fn parse_add_outbound(
         &self,
         outbound: proto::xray::core::OutboundHandlerConfig,
@@ -1056,6 +1765,11 @@ impl HandlerServiceImpl {
         let mut stream_settings = None;
         let protocol = match Self::parse_typed_message_type(proxy_settings) {
             TYPE_PROXY_FREEDOM_CONFIG | TYPE_PROXY_FREEDOM_CONFIG_V2RAY => {
+                if outbound.sender_settings.is_some() {
+                    return Err(Status::invalid_argument(
+                        "freedom outbound sender_settings are not supported yet",
+                    ));
+                }
                 let _ = self.decode_typed_message::<FreedomConfigPayload>(
                     proxy_settings,
                     &[TYPE_PROXY_FREEDOM_CONFIG, TYPE_PROXY_FREEDOM_CONFIG_V2RAY],
@@ -1064,6 +1778,11 @@ impl HandlerServiceImpl {
                 "freedom"
             }
             TYPE_PROXY_BLACKHOLE_CONFIG | TYPE_PROXY_BLACKHOLE_CONFIG_V2RAY => {
+                if outbound.sender_settings.is_some() {
+                    return Err(Status::invalid_argument(
+                        "blackhole outbound sender_settings are not supported yet",
+                    ));
+                }
                 let _ = self.decode_typed_message::<BlackholeConfigPayload>(
                     proxy_settings,
                     &[
@@ -1077,11 +1796,6 @@ impl HandlerServiceImpl {
             #[cfg(feature = "vless")]
             TYPE_PROXY_VLESS_OUTBOUND_CONFIG
             | TYPE_PROXY_VLESS_OUTBOUND_CONFIG_V2RAY => {
-                if outbound.sender_settings.is_some() {
-                    return Err(Status::invalid_argument(
-                        "plain VLESS outbound does not accept sender_settings yet",
-                    ));
-                }
                 let config = self
                     .decode_typed_message::<VlessOutboundConfigPayload>(
                         proxy_settings,
@@ -1134,19 +1848,9 @@ impl HandlerServiceImpl {
                         }]
                     }]
                 }));
-                stream_settings = Some(OutboundStreamSettings {
-                    network: "tcp".into(),
-                    security: Some("none".into()),
-                    tls_settings: None,
-                    #[cfg(feature = "reality")]
-                    reality_settings: None,
-                    #[cfg(feature = "ws")]
-                    ws_settings: None,
-                    #[cfg(feature = "httpupgrade")]
-                    httpupgrade_settings: None,
-                    #[cfg(feature = "grpc_transport")]
-                    grpc_settings: None,
-                });
+                stream_settings = Some(self.parse_outbound_sender_settings(
+                    outbound.sender_settings.as_ref(),
+                )?);
                 "vless"
             }
             unsupported => {
@@ -1459,6 +2163,236 @@ impl HandlerServiceImpl {
         }
     }
 
+    #[cfg(feature = "vless")]
+    fn encode_outbound_sender_settings(
+        &self,
+        stream: Option<&OutboundStreamSettings>,
+    ) -> Option<proto::xray::common::serial::TypedMessage> {
+        let stream = stream?;
+        let network = stream.network.trim().to_ascii_lowercase();
+        let mut transport_settings = Vec::new();
+        match network.as_str() {
+            "" | "tcp" => {}
+            #[cfg(feature = "ws")]
+            "ws" | "websocket" => {
+                let settings = stream.ws_settings.as_ref()?;
+                transport_settings.push(TransportConfigPayload {
+                    protocol_name: "websocket".to_string(),
+                    settings: Some(Self::typed_message(
+                        TYPE_TRANSPORT_WEBSOCKET_CONFIG,
+                        OutboundWebsocketConfigPayload {
+                            host: settings.host.clone().unwrap_or_default(),
+                            path: settings.path.clone().unwrap_or_default(),
+                            header: settings.headers.clone(),
+                            accept_proxy_protocol: settings.accept_proxy_protocol,
+                            early_data: 0,
+                            heartbeat_period: settings.heartbeat_period,
+                        },
+                    )),
+                });
+            }
+            #[cfg(feature = "httpupgrade")]
+            "httpupgrade" => {
+                let settings = stream.httpupgrade_settings.as_ref()?;
+                transport_settings.push(TransportConfigPayload {
+                    protocol_name: "httpupgrade".to_string(),
+                    settings: Some(Self::typed_message(
+                        TYPE_TRANSPORT_HTTPUPGRADE_CONFIG,
+                        OutboundHttpUpgradeConfigPayload {
+                            host: settings.host.clone().unwrap_or_default(),
+                            path: settings.path.clone().unwrap_or_default(),
+                            header: settings.headers.clone(),
+                            accept_proxy_protocol: settings.accept_proxy_protocol,
+                            early_data: 0,
+                        },
+                    )),
+                });
+            }
+            #[cfg(feature = "grpc_transport")]
+            "grpc" => {
+                let settings = stream.grpc_settings.as_ref()?;
+                transport_settings.push(TransportConfigPayload {
+                    protocol_name: "grpc".to_string(),
+                    settings: Some(Self::typed_message(
+                        TYPE_TRANSPORT_GRPC_CONFIG,
+                        OutboundGrpcConfigPayload {
+                            authority: settings
+                                .authority
+                                .clone()
+                                .unwrap_or_default(),
+                            service_name: settings
+                                .service_name
+                                .clone()
+                                .unwrap_or_default(),
+                            multi_mode: settings.multi_mode,
+                            idle_timeout: i32::try_from(settings.idle_timeout)
+                                .ok()?,
+                            health_check_timeout: i32::try_from(
+                                settings.health_check_timeout,
+                            )
+                            .ok()?,
+                            permit_without_stream: settings.permit_without_stream,
+                            initial_windows_size: i32::try_from(
+                                settings.initial_windows_size,
+                            )
+                            .ok()?,
+                            user_agent: settings
+                                .user_agent
+                                .clone()
+                                .unwrap_or_default(),
+                        },
+                    )),
+                });
+            }
+            _ => return None,
+        }
+
+        let security_type = stream
+            .security
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let mut security_settings = Vec::new();
+        match security_type.as_str() {
+            "" | "none" => {}
+            #[cfg(feature = "tls")]
+            "tls" => {
+                let settings = stream.tls_settings.as_ref()?;
+                security_settings.push(Self::typed_message(
+                    TYPE_TRANSPORT_TLS_CONFIG,
+                    OutboundTlsConfigPayload {
+                        certificate: settings
+                            .certificates
+                            .iter()
+                            .map(|certificate| OutboundTlsCertificatePayload {
+                                certificate: certificate
+                                    .certificate
+                                    .join("\n")
+                                    .into_bytes(),
+                                key: Vec::new(),
+                                usage: 1,
+                                ocsp_stapling: 0,
+                                certificate_path: String::new(),
+                                key_path: String::new(),
+                                one_time_loading: false,
+                                build_chain: false,
+                            })
+                            .collect(),
+                        server_name: settings
+                            .server_name
+                            .clone()
+                            .unwrap_or_default(),
+                        next_protocol: settings.alpn.clone(),
+                        enable_session_resumption: settings
+                            .enable_session_resumption,
+                        disable_system_root: settings.disable_system_root,
+                        min_version: settings
+                            .min_version
+                            .clone()
+                            .unwrap_or_default(),
+                        max_version: settings
+                            .max_version
+                            .clone()
+                            .unwrap_or_default(),
+                        cipher_suites: String::new(),
+                        fingerprint: settings
+                            .fingerprint
+                            .clone()
+                            .unwrap_or_default(),
+                        reject_unknown_sni: false,
+                        master_key_log: String::new(),
+                        curve_preferences: Vec::new(),
+                        verify_peer_cert_by_name: settings
+                            .verify_peer_cert_by_name
+                            .clone()
+                            .into_iter()
+                            .collect(),
+                        ech_server_keys: Vec::new(),
+                        ech_config_list: settings
+                            .ech_config_list
+                            .clone()
+                            .unwrap_or_default(),
+                        ech_socket_settings: None,
+                        pinned_peer_cert_sha256: Vec::new(),
+                    },
+                ));
+            }
+            #[cfg(feature = "reality")]
+            "reality" => {
+                let settings = stream.reality_settings.as_ref()?;
+                let public_key = URL_SAFE_NO_PAD
+                    .decode(settings.public_key.as_deref()?)
+                    .ok()?;
+                let short_id = crate::reality::decode_short_id(
+                    settings.short_id.as_deref().unwrap_or_default(),
+                )
+                .ok()?
+                .to_vec();
+                security_settings.push(Self::typed_message(
+                    TYPE_TRANSPORT_REALITY_CONFIG,
+                    OutboundRealityConfigPayload {
+                        show: false,
+                        dest: String::new(),
+                        transport_type: String::new(),
+                        xver: 0,
+                        server_names: Vec::new(),
+                        private_key: Vec::new(),
+                        min_client_ver: Vec::new(),
+                        max_client_ver: Vec::new(),
+                        max_time_diff: 0,
+                        short_ids: Vec::new(),
+                        mldsa65_seed: Vec::new(),
+                        limit_fallback_upload: None,
+                        limit_fallback_download: None,
+                        fingerprint: settings
+                            .fingerprint
+                            .clone()
+                            .unwrap_or_default(),
+                        server_name: settings
+                            .server_name
+                            .clone()
+                            .unwrap_or_default(),
+                        public_key,
+                        short_id,
+                        mldsa65_verify: Vec::new(),
+                        spider_x: settings.spider_x.clone().unwrap_or_default(),
+                        spider_y: Vec::new(),
+                        master_key_log: String::new(),
+                    },
+                ));
+            }
+            _ => return None,
+        }
+
+        Some(Self::typed_message(
+            TYPE_APP_SENDER_CONFIG,
+            SenderConfigPayload {
+                via: None,
+                stream_settings: Some(SenderStreamConfigPayload {
+                    transport_settings,
+                    security_type,
+                    security_settings,
+                    protocol_name: if network.is_empty() {
+                        "tcp".to_string()
+                    } else {
+                        network
+                    },
+                    socket_settings: None,
+                    address: None,
+                    port: 0,
+                    udp_masks: Vec::new(),
+                    tcp_masks: Vec::new(),
+                    quic_params: None,
+                }),
+                proxy_settings: None,
+                multiplex_settings: None,
+                via_cidr: String::new(),
+                target_strategy: 0,
+            },
+        ))
+    }
+
     fn encode_outbound_config(
         &self,
         outbound: &OutboundSummary,
@@ -1523,6 +2457,10 @@ impl HandlerServiceImpl {
         };
         proto::xray::core::OutboundHandlerConfig {
             tag: outbound.tag.clone(),
+            #[cfg(feature = "vless")]
+            sender_settings: self
+                .encode_outbound_sender_settings(outbound.stream_settings.as_ref()),
+            #[cfg(not(feature = "vless"))]
             sender_settings: None,
             proxy_settings,
             expire: 0,
@@ -2619,6 +3557,24 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "vless")]
+    fn build_sender_add_vless_outbound_request(
+        tag: &str,
+        user_id: &str,
+        stream_settings: SenderStreamConfigPayload,
+    ) -> proto::xray::app::proxyman::command::AddOutboundRequest {
+        let mut request = build_add_vless_outbound_request(tag, user_id, "");
+        request.outbound.as_mut().unwrap().sender_settings =
+            Some(HandlerServiceImpl::typed_message(
+                TYPE_APP_SENDER_CONFIG,
+                SenderConfigPayload {
+                    stream_settings: Some(stream_settings),
+                    ..SenderConfigPayload::default()
+                },
+            ));
+        request
+    }
+
     fn build_typed_add_outbound_request(
         tag: &str,
         message_type: &str,
@@ -3048,22 +4004,264 @@ mod tests {
         let sender_tag = unique_tag("vless-sender");
         let mut request = build_add_vless_outbound_request(&sender_tag, user_id, "");
         request.outbound.as_mut().unwrap().sender_settings =
-            Some(proto::xray::common::serial::TypedMessage {
-                r#type: "xray.app.proxyman.SenderConfig".into(),
-                value: Vec::new(),
-            });
-        let sender_error = service
+            Some(HandlerServiceImpl::typed_message(
+                TYPE_APP_SENDER_CONFIG,
+                SenderConfigPayload::default(),
+            ));
+        service
             .add_outbound(Request::new(request))
             .await
-            .expect_err("sender settings must fail until transport pipeline exists");
-        assert_eq!(sender_error.code(), Code::InvalidArgument);
-        assert!(
-            sender_error
-                .message()
-                .contains("does not accept sender_settings")
+            .expect("default SenderConfig should install as TCP/none");
+        let connector = runtime
+            .outbound_connector(&sender_tag)
+            .expect("sender connector should be registered");
+        let OutboundConnectorKind::VlessTcp(config) = connector.as_ref() else {
+            panic!("expected VLESS connector");
+        };
+        assert!(config.transport.is_tcp());
+        let listed = service
+            .list_outbounds(Request::new(
+                proto::xray::app::proxyman::command::ListOutboundsRequest {},
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let listed_sender = listed
+            .outbounds
+            .iter()
+            .find(|outbound| outbound.tag == sender_tag)
+            .and_then(|outbound| outbound.sender_settings.as_ref())
+            .expect("SenderConfig should be listed");
+        let listed_sender =
+            SenderConfigPayload::decode(listed_sender.value.as_slice())
+                .expect("listed SenderConfig should decode");
+        assert_eq!(
+            listed_sender
+                .stream_settings
+                .expect("listed stream settings")
+                .protocol_name,
+            "tcp"
         );
-        assert_eq!(runtime.outbounds().len(), before);
-        assert!(runtime.outbound_connector(&sender_tag).is_none());
+
+        let rejected_tag = unique_tag("vless-mux");
+        let mut rejected =
+            build_add_vless_outbound_request(&rejected_tag, user_id, "");
+        rejected.outbound.as_mut().unwrap().sender_settings =
+            Some(HandlerServiceImpl::typed_message(
+                TYPE_APP_SENDER_CONFIG,
+                SenderConfigPayload {
+                    multiplex_settings: Some(SenderMultiplexingConfigPayload {
+                        enabled: true,
+                        concurrency: 8,
+                        xudp_concurrency: 0,
+                        xudp_proxy_udp443: String::new(),
+                    }),
+                    ..SenderConfigPayload::default()
+                },
+            ));
+        let sender_error = service
+            .add_outbound(Request::new(rejected))
+            .await
+            .expect_err("unsupported mux must fail before installation");
+        assert_eq!(sender_error.code(), Code::InvalidArgument);
+        assert!(sender_error.message().contains("multiplex_settings"));
+        assert!(runtime.outbound_connector(&rejected_tag).is_none());
+    }
+
+    #[cfg(all(
+        feature = "vless",
+        feature = "ws",
+        feature = "httpupgrade",
+        feature = "tls",
+        feature = "reality",
+        feature = "grpc_transport"
+    ))]
+    #[tokio::test]
+    async fn handler_installs_dynamic_sender_transport_matrix_and_lists_it() {
+        let fixture = build_fixture();
+        let runtime = fixture.runtime.clone();
+        let service = HandlerServiceImpl::new(runtime.clone());
+        let user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
+
+        let websocket_tag = unique_tag("dynamic-ws");
+        service
+            .add_outbound(Request::new(build_sender_add_vless_outbound_request(
+                &websocket_tag,
+                user_id,
+                SenderStreamConfigPayload {
+                    protocol_name: "websocket".to_string(),
+                    transport_settings: vec![TransportConfigPayload {
+                        protocol_name: "websocket".to_string(),
+                        settings: Some(HandlerServiceImpl::typed_message(
+                            TYPE_TRANSPORT_WEBSOCKET_CONFIG,
+                            OutboundWebsocketConfigPayload {
+                                host: "edge.example".to_string(),
+                                path: "/ws".to_string(),
+                                header: std::collections::HashMap::from([(
+                                    "X-Test".to_string(),
+                                    "dynamic".to_string(),
+                                )]),
+                                accept_proxy_protocol: false,
+                                early_data: 0,
+                                heartbeat_period: 0,
+                            },
+                        )),
+                    }],
+                    security_type: "none".to_string(),
+                    ..SenderStreamConfigPayload::default()
+                },
+            )))
+            .await
+            .expect("dynamic WebSocket sender should install");
+        let connector = runtime.outbound_connector(&websocket_tag).unwrap();
+        let OutboundConnectorKind::VlessTcp(config) = connector.as_ref() else {
+            panic!("expected VLESS WebSocket connector");
+        };
+        assert!(config.transport.is_websocket());
+
+        let generated =
+            rcgen::generate_simple_self_signed(["proxy.example".to_string()])
+                .unwrap();
+        let httpupgrade_tag = unique_tag("dynamic-tls-httpupgrade");
+        service
+            .add_outbound(Request::new(build_sender_add_vless_outbound_request(
+                &httpupgrade_tag,
+                user_id,
+                SenderStreamConfigPayload {
+                    protocol_name: "httpupgrade".to_string(),
+                    transport_settings: vec![TransportConfigPayload {
+                        protocol_name: "httpupgrade".to_string(),
+                        settings: Some(HandlerServiceImpl::typed_message(
+                            TYPE_TRANSPORT_HTTPUPGRADE_CONFIG,
+                            OutboundHttpUpgradeConfigPayload {
+                                host: "proxy.example".to_string(),
+                                path: "/upgrade".to_string(),
+                                header: std::collections::HashMap::new(),
+                                accept_proxy_protocol: false,
+                                early_data: 0,
+                            },
+                        )),
+                    }],
+                    security_type: "tls".to_string(),
+                    security_settings: vec![HandlerServiceImpl::typed_message(
+                        TYPE_TRANSPORT_TLS_CONFIG,
+                        OutboundTlsConfigPayload {
+                            certificate: vec![OutboundTlsCertificatePayload {
+                                certificate: generated.cert.pem().into_bytes(),
+                                usage: 1,
+                                ..OutboundTlsCertificatePayload::default()
+                            }],
+                            server_name: "proxy.example".to_string(),
+                            disable_system_root: true,
+                            ..OutboundTlsConfigPayload::default()
+                        },
+                    )],
+                    ..SenderStreamConfigPayload::default()
+                },
+            )))
+            .await
+            .expect("dynamic TLS HTTP Upgrade sender should install");
+        let connector = runtime.outbound_connector(&httpupgrade_tag).unwrap();
+        let OutboundConnectorKind::VlessTcp(config) = connector.as_ref() else {
+            panic!("expected VLESS HTTP Upgrade connector");
+        };
+        assert!(config.transport.is_tls());
+        assert!(config.transport.is_httpupgrade());
+
+        let (_, public_key) = crate::reality::generate_keypair().unwrap();
+        let public_key = URL_SAFE_NO_PAD.decode(public_key).unwrap();
+        let grpc_tag = unique_tag("dynamic-reality-grpc");
+        service
+            .add_outbound(Request::new(build_sender_add_vless_outbound_request(
+                &grpc_tag,
+                user_id,
+                SenderStreamConfigPayload {
+                    protocol_name: "grpc".to_string(),
+                    transport_settings: vec![TransportConfigPayload {
+                        protocol_name: "grpc".to_string(),
+                        settings: Some(HandlerServiceImpl::typed_message(
+                            TYPE_TRANSPORT_GRPC_CONFIG,
+                            OutboundGrpcConfigPayload {
+                                authority: "grpc.example".to_string(),
+                                service_name: "dynamic-grpc".to_string(),
+                                user_agent: "chimera-dynamic-test".to_string(),
+                                ..OutboundGrpcConfigPayload::default()
+                            },
+                        )),
+                    }],
+                    security_type: "reality".to_string(),
+                    security_settings: vec![HandlerServiceImpl::typed_message(
+                        TYPE_TRANSPORT_REALITY_CONFIG,
+                        OutboundRealityConfigPayload {
+                            server_name: "cover.example".to_string(),
+                            public_key,
+                            short_id: vec![0x4a, 0xc9, 0x7a, 0xaf],
+                            ..OutboundRealityConfigPayload::default()
+                        },
+                    )],
+                    ..SenderStreamConfigPayload::default()
+                },
+            )))
+            .await
+            .expect("dynamic REALITY gRPC sender should install");
+        let connector = runtime.outbound_connector(&grpc_tag).unwrap();
+        let OutboundConnectorKind::VlessTcp(config) = connector.as_ref() else {
+            panic!("expected VLESS gRPC connector");
+        };
+        assert!(config.transport.is_reality());
+        assert!(config.transport.is_grpc());
+
+        let listed = service
+            .list_outbounds(Request::new(
+                proto::xray::app::proxyman::command::ListOutboundsRequest {},
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        for (tag, network, security) in [
+            (&websocket_tag, "ws", "none"),
+            (&httpupgrade_tag, "httpupgrade", "tls"),
+            (&grpc_tag, "grpc", "reality"),
+        ] {
+            let sender = listed
+                .outbounds
+                .iter()
+                .find(|outbound| outbound.tag == *tag)
+                .and_then(|outbound| outbound.sender_settings.as_ref())
+                .expect("dynamic SenderConfig should be listed");
+            assert_eq!(sender.r#type, TYPE_APP_SENDER_CONFIG);
+            let sender =
+                SenderConfigPayload::decode(sender.value.as_slice()).unwrap();
+            let stream = sender.stream_settings.unwrap();
+            assert_eq!(stream.protocol_name, network);
+            assert_eq!(stream.security_type, security);
+        }
+
+        let rejected_tag = unique_tag("dynamic-ws-ed");
+        let error = service
+            .add_outbound(Request::new(build_sender_add_vless_outbound_request(
+                &rejected_tag,
+                user_id,
+                SenderStreamConfigPayload {
+                    protocol_name: "websocket".to_string(),
+                    transport_settings: vec![TransportConfigPayload {
+                        protocol_name: "websocket".to_string(),
+                        settings: Some(HandlerServiceImpl::typed_message(
+                            TYPE_TRANSPORT_WEBSOCKET_CONFIG,
+                            OutboundWebsocketConfigPayload {
+                                early_data: 1,
+                                ..OutboundWebsocketConfigPayload::default()
+                            },
+                        )),
+                    }],
+                    ..SenderStreamConfigPayload::default()
+                },
+            )))
+            .await
+            .expect_err("unsupported early data must fail atomically");
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("early data"));
+        assert!(runtime.outbound_connector(&rejected_tag).is_none());
     }
 
     #[tokio::test]
