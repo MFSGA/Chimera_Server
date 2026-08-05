@@ -216,7 +216,7 @@ HandlerService 也能将 Xray `SenderConfig` 转换为同一静态模型。当�
 - HTTP CONNECT TCP；
 - Shadowsocks legacy AEAD TCP/UDP。
 
-VLESS、VMess、Trojan、SOCKS、HTTP 与 Shadowsocks legacy AEAD 均支持静态 JSON、动态 HandlerService 和原始 domain/IP target；TCP 协议复用 TCP/TLS/REALITY/WebSocket/HTTP Upgrade/gRPC transport pipeline。VMess 当前真实 Xray 验收覆盖 plain none 与 TLS+AES-128-GCM；Trojan 覆盖 plain TCP 与 TLS；SOCKS 覆盖 plain no-auth 与 TLS+password；HTTP 覆盖 plain no-auth 与 TLS+Basic Auth；Shadowsocks TCP 覆盖 plain AES-128-GCM 与 TLS+ChaCha20-IETF-Poly1305，UDP 覆盖 SOCKS5 UDP → Chimera → Xray → echo 的文本与 1200-byte datagram。VLESS/VMess/Trojan/SOCKS 的代理 UDP、HTTP 非 CONNECT 转发、Shadowsocks XChaCha/2022/EIH，以及 Shadowsocks UDP 的 TUIC response adapter 与持久 association 均尚未完成。
+VLESS、VMess、Trojan、SOCKS、HTTP 与 Shadowsocks legacy AEAD 均支持静态 JSON、动态 HandlerService 和原始 domain/IP target；TCP 协议复用 TCP/TLS/REALITY/WebSocket/HTTP Upgrade/gRPC transport pipeline。VMess 当前真实 Xray 验收覆盖 plain none 与 TLS+AES-128-GCM；Trojan 覆盖 plain TCP 与 TLS；SOCKS 覆盖 plain no-auth 与 TLS+password；HTTP 覆盖 plain no-auth 与 TLS+Basic Auth；Shadowsocks TCP 覆盖 plain AES-128-GCM 与 TLS+ChaCha20-IETF-Poly1305，UDP 覆盖 SOCKS5 UDP → Chimera → Xray → echo 的文本与 1200-byte datagram，并覆盖 TUIC datagram 与 UDP-over-stream response adapter。VLESS/VMess/Trojan/SOCKS 的代理 UDP、HTTP 非 CONNECT 转发、Shadowsocks XChaCha/2022/EIH 与持久 association 均尚未完成。
 
 下面这些 Xray outbound 尚未形成真实 connector：
 
@@ -780,7 +780,7 @@ Chimera 当前未支持这些高级 transport 组合。
 5. VMess TCP outbound；（已完成）
 6. SOCKS outbound；（TCP 已完成，UDP ASSOCIATE 待完成）
 7. HTTP outbound；（CONNECT TCP 已完成）
-8. Shadowsocks TCP/UDP outbound；（legacy AEAD TCP/UDP 主路径已完成，TUIC adapter 待补）
+8. Shadowsocks TCP/UDP outbound；（legacy AEAD TCP/UDP 主路径与 TUIC response adapter 已完成）
 9. 通用 sniffing context；
 10. typed DNS config + static hosts + nameserver rules；
 11. DNS outbound。
@@ -924,7 +924,7 @@ Chimera 当前未支持这些高级 transport 组合。
 
 ### Slice 7：Shadowsocks Legacy AEAD TCP/UDP Outbound
 
-当前实现状态：TCP 与 UDP 主路径已完成。静态配置支持 Xray 标准 `servers:[{address,port,method,password}]` 与简化 `address/port/method/password`；动态 HandlerService 支持 `xray.proxy.shadowsocks.ClientConfig`、legacy Account、通用 SenderConfig 与 ListOutbounds 回显。Registry 仅接受 AES-128-GCM、AES-256-GCM 和 ChaCha20-IETF-Poly1305，并在安装时通过 EVP_BytesToKey/MD5 派生 master key。TCP 数据面复用入站已验证的 Shadowsocks AEAD codec，建立共享 transport 后发送随机 salt、加密长度与加密 payload，并将原始 domain/IPv4/IPv6 target 放入首个明文 chunk；响应方向独立读取服务端 salt并解密 chunk。UDP 数据面复用同一用户配置构建 packet codec，每个请求生成独立 salt，密文包含目标地址和 payload；响应解密恢复源地址与 payload，并通过 salt checker 拒绝 replay。当前 UDP executor 为 one-shot socket，只允许 plain proxy endpoint，覆盖固定目标、目标化消息、session/XUDP、SOCKS5、Dokodemo、Shadowsocks inbound 与 Hysteria2 response framing；TUIC 的 stream/datagram response adapter 仍显式 fail-closed。XChaCha、`iv_check=true`、2022/EIH 和持久 UDP association 尚未实现。三种 cipher 已通过本地 TCP/UDP roundtrip、tamper 与 replay 回归；plain AES-128-GCM 与 TLS+ChaCha20-IETF-Poly1305 TCP 已通过 Xray 26.2.6 真实互通，SOCKS5 UDP → Chimera → Xray → echo 已通过文本与 1200-byte datagram 真实互通。32KiB 单 datagram 超出该 Xray legacy UDP 路径的实际处理边界，因此未作为兼容目标。
+当前实现状态：TCP 与 UDP 主路径已完成。静态配置支持 Xray 标准 `servers:[{address,port,method,password}]` 与简化 `address/port/method/password`；动态 HandlerService 支持 `xray.proxy.shadowsocks.ClientConfig`、legacy Account、通用 SenderConfig 与 ListOutbounds 回显。Registry 仅接受 AES-128-GCM、AES-256-GCM 和 ChaCha20-IETF-Poly1305，并在安装时通过 EVP_BytesToKey/MD5 派生 master key。TCP 数据面复用入站已验证的 Shadowsocks AEAD codec，建立共享 transport 后发送随机 salt、加密长度与加密 payload，并将原始 domain/IPv4/IPv6 target 放入首个明文 chunk；响应方向独立读取服务端 salt并解密 chunk。UDP 数据面复用同一用户配置构建 packet codec，每个请求生成独立 salt，密文包含目标地址和 payload；响应解密恢复源地址与 payload，并通过 salt checker 拒绝 replay。当前 UDP executor 为 one-shot socket，只允许 plain proxy endpoint，覆盖固定目标、目标化消息、session/XUDP、SOCKS5、Dokodemo、Shadowsocks inbound、Hysteria2 与 TUIC response framing。TUIC adapter 同时支持 QUIC datagram 与 UDP-over-stream，两个方向共享原子 packet ID；datagram 回包按当前 QUIC 最大 datagram size 分片，stream 回包通过共享 SendStream 串行写入。XChaCha、`iv_check=true`、2022/EIH 和持久 UDP association 尚未实现。三种 cipher 已通过本地 TCP/UDP roundtrip、tamper 与 replay 回归；plain AES-128-GCM 与 TLS+ChaCha20-IETF-Poly1305 TCP 已通过 Xray 26.2.6 真实互通，SOCKS5 UDP → Chimera → Xray → echo 已通过文本与 1200-byte datagram 真实互通；TUIC datagram 与 UDP-over-stream 已通过本地 Shadowsocks AEAD 真实往返。32KiB 单 datagram 超出该 Xray legacy UDP 路径的实际处理边界，因此未作为兼容目标。
 
 目标：
 
@@ -935,7 +935,7 @@ Chimera 当前未支持这些高级 transport 组合。
 - 保留原始 domain/IP target；（已完成）
 - 支持 legacy AEAD UDP packet 加密、响应源地址恢复、tamper 与 replay 拒绝；（已完成）
 - 覆盖固定/目标化/session、SOCKS5、Dokodemo、Shadowsocks inbound 与 Hysteria2；（已完成）
-- XChaCha、2022/EIH、iv_check、TUIC adapter 和持久 UDP association fail-closed；（已完成）
+- XChaCha、2022/EIH、iv_check 和持久 UDP association fail-closed；TUIC adapter 已完成。
 - 与 Xray Shadowsocks inbound 做 plain AES、TLS+ChaCha TCP 以及 SOCKS5 UDP 双向互通测试。（已完成）
 
 ### Slice 8：VMess TCP Outbound
