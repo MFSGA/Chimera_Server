@@ -7,6 +7,7 @@ use std::{
 #[cfg(any(feature = "trojan", feature = "vless"))]
 use tokio::io::AsyncWriteExt;
 
+use crate::socks_outbound::{Socks5Credentials, connect_socks5};
 #[cfg(feature = "trojan")]
 use crate::trojan_outbound::encode_trojan_tcp_request;
 #[cfg(feature = "vless")]
@@ -35,6 +36,10 @@ pub(crate) struct TcpOutboundConnection {
 
 enum TcpOutboundHandshake {
     None,
+    Socks {
+        credentials: Option<Socks5Credentials>,
+        target: NetLocation,
+    },
     #[cfg(feature = "trojan")]
     Trojan(Vec<u8>),
     #[cfg(feature = "vless")]
@@ -75,6 +80,14 @@ pub(crate) async fn connect_tcp_outbound(
             TcpOutboundHandshake::None,
         ),
         Some(OutboundConnectorKind::Blackhole) => return Ok(None),
+        Some(OutboundConnectorKind::SocksTcp(config)) => (
+            config.server.clone(),
+            config.transport.clone(),
+            TcpOutboundHandshake::Socks {
+                credentials: config.credentials.clone(),
+                target: remote_location.clone(),
+            },
+        ),
         #[cfg(feature = "trojan")]
         Some(OutboundConnectorKind::TrojanTcp(config)) => (
             config.server.clone(),
@@ -119,10 +132,27 @@ pub(crate) async fn connect_tcp_outbound(
             return Err(error);
         }
     };
-    #[cfg(any(feature = "trojan", feature = "vless"))]
     let mut stream = stream;
     let stream: Box<dyn AsyncStream> = match handshake {
         TcpOutboundHandshake::None => stream,
+        TcpOutboundHandshake::Socks {
+            credentials,
+            target,
+        } => {
+            if let Err(error) =
+                connect_socks5(&mut *stream, credentials.as_ref(), &target).await
+            {
+                record_tcp_outbound_failure(
+                    runtime,
+                    outbound_tag.as_deref(),
+                    started,
+                    attempted_at,
+                    &error,
+                );
+                return Err(error);
+            }
+            stream
+        }
         #[cfg(feature = "trojan")]
         TcpOutboundHandshake::Trojan(request) => {
             if let Err(error) = stream.write_all(&request).await {
@@ -228,6 +258,10 @@ pub(crate) fn select_direct_outbound(
         OutboundConnectorKind::Blackhole => {
             Ok(DirectOutboundAction::Blackhole { tag })
         }
+        OutboundConnectorKind::SocksTcp(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{network_name} outbound {tag} does not support UDP yet"),
+        )),
         #[cfg(feature = "trojan")]
         OutboundConnectorKind::TrojanTcp(_) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,

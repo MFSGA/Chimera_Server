@@ -1,13 +1,18 @@
 use std::{collections::HashMap, sync::Arc};
 
-#[cfg(any(feature = "trojan", feature = "vless"))]
 use serde::Deserialize;
 
-#[cfg(any(feature = "trojan", feature = "vless"))]
 use crate::address::{Address, NetLocation};
-#[cfg(any(feature = "trojan", feature = "vless"))]
 use crate::outbound_transport::OutboundTransportConfig;
 use crate::runtime::OutboundSummary;
+use crate::socks_outbound::Socks5Credentials;
+
+#[derive(Debug, Clone)]
+pub(crate) struct SocksTcpOutboundConfig {
+    pub server: NetLocation,
+    pub credentials: Option<Socks5Credentials>,
+    pub transport: OutboundTransportConfig,
+}
 
 #[cfg(feature = "trojan")]
 #[derive(Debug, Clone)]
@@ -64,6 +69,43 @@ struct LiteralVlessUser {
     encryption: String,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LiteralSocksOutboundSettings {
+    #[serde(default)]
+    address: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default, alias = "username")]
+    user: Option<String>,
+    #[serde(default, alias = "password")]
+    pass: Option<String>,
+    #[serde(default)]
+    servers: Vec<LiteralSocksServer>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LiteralSocksServer {
+    address: String,
+    port: u16,
+    #[serde(default)]
+    users: Vec<LiteralSocksUser>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LiteralSocksUser {
+    #[serde(default, alias = "username")]
+    user: String,
+    #[serde(default, alias = "password")]
+    pass: String,
+    #[serde(default)]
+    level: u32,
+    #[serde(default)]
+    email: String,
+}
+
 #[cfg(feature = "trojan")]
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -104,6 +146,7 @@ struct LiteralTrojanServer {
 pub(crate) enum OutboundConnectorKind {
     Freedom,
     Blackhole,
+    SocksTcp(Box<SocksTcpOutboundConfig>),
     #[cfg(feature = "trojan")]
     TrojanTcp(Box<TrojanTcpOutboundConfig>),
     #[cfg(feature = "vless")]
@@ -223,6 +266,127 @@ fn compile_vless_tcp(
     })
 }
 
+fn compile_socks_tcp(
+    summary: &OutboundSummary,
+) -> Result<SocksTcpOutboundConfig, String> {
+    let settings = summary.settings.as_ref().ok_or_else(|| {
+        format!("SOCKS outbound {} requires settings", summary.tag)
+    })?;
+    let settings =
+        serde_json::from_value::<LiteralSocksOutboundSettings>(settings.clone())
+            .map_err(|error| {
+                format!("invalid SOCKS outbound {} settings: {error}", summary.tag)
+            })?;
+
+    let (address, port, credentials) = if let Some(address) = settings.address {
+        if !settings.servers.is_empty() {
+            return Err(format!(
+                "SOCKS outbound {} cannot combine address with servers",
+                summary.tag
+            ));
+        }
+        let username = settings.user.unwrap_or_default();
+        let password = settings.pass.unwrap_or_default();
+        let credentials = if username.is_empty() {
+            if !password.is_empty() {
+                return Err(format!(
+                    "SOCKS outbound {} password requires a username",
+                    summary.tag
+                ));
+            }
+            None
+        } else {
+            Some(Socks5Credentials { username, password })
+        };
+        (
+            address,
+            settings.port.ok_or_else(|| {
+                format!("SOCKS outbound {} requires port", summary.tag)
+            })?,
+            credentials,
+        )
+    } else {
+        if settings.servers.len() != 1 {
+            return Err(format!(
+                "SOCKS outbound {} requires exactly one server",
+                summary.tag
+            ));
+        }
+        let mut servers = settings.servers;
+        let mut server = servers.pop().ok_or_else(|| {
+            format!("SOCKS outbound {} server disappeared", summary.tag)
+        })?;
+        if server.users.len() > 1 {
+            return Err(format!(
+                "SOCKS outbound {} supports at most one user",
+                summary.tag
+            ));
+        }
+        let credentials = server.users.pop().map(|user| {
+            let _ = (user.level, user.email);
+            Socks5Credentials {
+                username: user.user,
+                password: user.pass,
+            }
+        });
+        if credentials
+            .as_ref()
+            .is_some_and(|credentials| credentials.username.is_empty())
+        {
+            return Err(format!(
+                "SOCKS outbound {} username must not be empty",
+                summary.tag
+            ));
+        }
+        (server.address, server.port, credentials)
+    };
+
+    if address.trim().is_empty() {
+        return Err(format!(
+            "SOCKS outbound {} server address must not be empty",
+            summary.tag
+        ));
+    }
+    if port == 0 {
+        return Err(format!(
+            "SOCKS outbound {} server port must not be zero",
+            summary.tag
+        ));
+    }
+    if let Some(credentials) = &credentials {
+        if credentials.username.len() > u8::MAX as usize {
+            return Err(format!(
+                "SOCKS outbound {} username exceeds 255 bytes",
+                summary.tag
+            ));
+        }
+        if credentials.password.len() > u8::MAX as usize {
+            return Err(format!(
+                "SOCKS outbound {} password exceeds 255 bytes",
+                summary.tag
+            ));
+        }
+    }
+
+    let server_address = Address::from(address.trim()).map_err(|error| {
+        format!(
+            "invalid SOCKS outbound {} server address: {error}",
+            summary.tag
+        )
+    })?;
+    let server = NetLocation::new(server_address, port);
+    let transport = OutboundTransportConfig::compile(
+        &server,
+        summary.stream_settings.as_ref(),
+        &summary.tag,
+    )?;
+    Ok(SocksTcpOutboundConfig {
+        server,
+        credentials,
+        transport,
+    })
+}
+
 #[cfg(feature = "trojan")]
 fn compile_trojan_tcp(
     summary: &OutboundSummary,
@@ -318,6 +482,7 @@ impl OutboundConnectorKind {
         match protocol.as_str() {
             "freedom" => Ok(Self::Freedom),
             "blackhole" => Ok(Self::Blackhole),
+            "socks" => compile_socks_tcp(summary).map(Box::new).map(Self::SocksTcp),
             #[cfg(feature = "trojan")]
             "trojan" => compile_trojan_tcp(summary)
                 .map(Box::new)
@@ -427,6 +592,21 @@ mod tests {
         }
     }
 
+    fn literal_socks(settings: serde_json::Value) -> OutboundSummary {
+        OutboundSummary {
+            tag: "socks-proxy".into(),
+            protocol: "socks".into(),
+            settings: Some(settings),
+            stream_settings: Some(crate::config::def::OutboundStreamSettings {
+                network: "tcp".into(),
+                security: Some("none".into()),
+                ..crate::config::def::OutboundStreamSettings::default()
+            }),
+            proxy_settings_type: None,
+            proxy_settings_value: None,
+        }
+    }
+
     #[cfg(feature = "trojan")]
     fn literal_trojan(settings: serde_json::Value) -> OutboundSummary {
         OutboundSummary {
@@ -464,6 +644,84 @@ mod tests {
             }),
             proxy_settings_type: None,
             proxy_settings_value: None,
+        }
+    }
+
+    #[test]
+    fn compiles_socks_no_auth_and_username_password_settings() {
+        let no_auth = literal_socks(serde_json::json!({
+            "servers": [{
+                "address": "127.0.0.1",
+                "port": 1080
+            }]
+        }));
+        let authenticated = literal_socks(serde_json::json!({
+            "address": "proxy.example",
+            "port": 1080,
+            "user": "alice",
+            "pass": "secret"
+        }));
+
+        let OutboundConnectorKind::SocksTcp(no_auth) =
+            OutboundConnectorKind::compile(&no_auth, true).unwrap()
+        else {
+            panic!("expected no-auth SOCKS connector");
+        };
+        assert!(no_auth.credentials.is_none());
+        assert!(no_auth.transport.is_tcp());
+
+        let OutboundConnectorKind::SocksTcp(authenticated) =
+            OutboundConnectorKind::compile(&authenticated, true).unwrap()
+        else {
+            panic!("expected authenticated SOCKS connector");
+        };
+        assert_eq!(authenticated.server.to_string(), "proxy.example:1080");
+        assert_eq!(
+            authenticated.credentials,
+            Some(Socks5Credentials {
+                username: "alice".into(),
+                password: "secret".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_socks_server_and_credentials() {
+        for (settings, expected) in [
+            (serde_json::json!({"servers": []}), "exactly one server"),
+            (
+                serde_json::json!({
+                    "servers": [{
+                        "address": "127.0.0.1",
+                        "port": 1080,
+                        "users": [
+                            {"user": "a", "pass": "a"},
+                            {"user": "b", "pass": "b"}
+                        ]
+                    }]
+                }),
+                "at most one user",
+            ),
+            (
+                serde_json::json!({
+                    "address": "127.0.0.1",
+                    "port": 1080,
+                    "pass": "secret"
+                }),
+                "requires a username",
+            ),
+            (
+                serde_json::json!({
+                    "address": "127.0.0.1",
+                    "port": 0
+                }),
+                "port must not be zero",
+            ),
+        ] {
+            let error =
+                OutboundConnectorKind::compile(&literal_socks(settings), true)
+                    .expect_err("invalid SOCKS settings must fail closed");
+            assert!(error.contains(expected), "unexpected error: {error}");
         }
     }
 

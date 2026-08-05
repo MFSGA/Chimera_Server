@@ -1,20 +1,14 @@
 use tonic::{Request, Response, Status};
 
-#[cfg(all(
-    any(feature = "trojan", feature = "vless"),
-    feature = "grpc_transport"
-))]
+#[cfg(feature = "grpc_transport")]
 use crate::config::def::OutboundGrpcSettings;
-#[cfg(all(
-    any(feature = "trojan", feature = "vless"),
-    feature = "httpupgrade"
-))]
+#[cfg(feature = "httpupgrade")]
 use crate::config::def::OutboundHttpUpgradeSettings;
-#[cfg(all(any(feature = "trojan", feature = "vless"), feature = "reality"))]
+#[cfg(feature = "reality")]
 use crate::config::def::OutboundRealitySettings;
-#[cfg(all(any(feature = "trojan", feature = "vless"), feature = "ws"))]
+#[cfg(feature = "ws")]
 use crate::config::def::OutboundWebsocketSettings;
-#[cfg(all(any(feature = "trojan", feature = "vless"), feature = "tls"))]
+#[cfg(feature = "tls")]
 use crate::config::def::{OutboundTlsCertificate, OutboundTlsSettings};
 #[cfg(feature = "hysteria")]
 use crate::config::server_config::Hysteria2Client;
@@ -35,6 +29,7 @@ use crate::util::option::OneOrSome;
 use crate::{
     address::{Address, BindLocation, NetLocation},
     beginning::start_servers,
+    config::def::OutboundStreamSettings,
     config::{
         Transport,
         server_config::{
@@ -42,13 +37,10 @@ use crate::{
             collect_xhttp_settings_from_json,
         },
     },
+    outbound_registry::OutboundConnectorKind,
     runtime::{OutboundSummary, RuntimeState},
 };
-#[cfg(any(feature = "trojan", feature = "vless"))]
-use crate::{
-    config::def::OutboundStreamSettings, outbound_registry::OutboundConnectorKind,
-};
-#[cfg(all(any(feature = "trojan", feature = "vless"), feature = "reality"))]
+#[cfg(feature = "reality")]
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use prost::Message;
 
@@ -66,10 +58,11 @@ const ERR_PROXY_NOT_USER_MANAGER: &str =
 const TYPE_APP_RECEIVER_CONFIG: &str = "xray.app.proxyman.ReceiverConfig";
 const TYPE_APP_RECEIVER_CONFIG_V2RAY: &str =
     "v2ray.core.app.proxyman.ReceiverConfig";
-#[cfg(any(feature = "trojan", feature = "vless"))]
 const TYPE_APP_SENDER_CONFIG: &str = "xray.app.proxyman.SenderConfig";
-#[cfg(any(feature = "trojan", feature = "vless"))]
 const TYPE_APP_SENDER_CONFIG_V2RAY: &str = "v2ray.core.app.proxyman.SenderConfig";
+const TYPE_PROXY_SOCKS_CLIENT_CONFIG: &str = "xray.proxy.socks.ClientConfig";
+const TYPE_PROXY_SOCKS_CLIENT_CONFIG_V2RAY: &str =
+    "v2ray.core.proxy.socks.ClientConfig";
 const TYPE_PROXY_SOCKS_SERVER_CONFIG: &str = "xray.proxy.socks.ServerConfig";
 const TYPE_PROXY_SOCKS_SERVER_CONFIG_V2RAY: &str =
     "v2ray.core.proxy.socks.ServerConfig";
@@ -229,6 +222,22 @@ struct SocksAccountPayload {
 }
 
 #[derive(Clone, PartialEq, Message)]
+struct SocksClientConfigPayload {
+    #[prost(message, optional, tag = "1")]
+    server: Option<SocksServerEndpointPayload>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct SocksServerEndpointPayload {
+    #[prost(message, optional, tag = "1")]
+    address: Option<IpOrDomainPayload>,
+    #[prost(uint32, tag = "2")]
+    port: u32,
+    #[prost(message, optional, tag = "3")]
+    user: Option<proto::xray::common::protocol::User>,
+}
+
+#[derive(Clone, PartialEq, Message)]
 struct DokodemoConfigPayload {
     #[prost(message, optional, tag = "1")]
     address: Option<IpOrDomainPayload>,
@@ -270,7 +279,6 @@ struct TransportConfigPayload {
     protocol_name: String,
 }
 
-#[cfg(any(feature = "trojan", feature = "vless"))]
 #[derive(Clone, PartialEq, Message)]
 struct SenderConfigPayload {
     #[prost(message, optional, tag = "1")]
@@ -287,7 +295,6 @@ struct SenderConfigPayload {
     target_strategy: i32,
 }
 
-#[cfg(any(feature = "trojan", feature = "vless"))]
 #[derive(Clone, PartialEq, Message)]
 struct SenderProxyConfigPayload {
     #[prost(string, tag = "1")]
@@ -296,7 +303,6 @@ struct SenderProxyConfigPayload {
     transport_layer_proxy: bool,
 }
 
-#[cfg(any(feature = "trojan", feature = "vless"))]
 #[derive(Clone, PartialEq, Message)]
 struct SenderMultiplexingConfigPayload {
     #[prost(bool, tag = "1")]
@@ -309,7 +315,6 @@ struct SenderMultiplexingConfigPayload {
     xudp_proxy_udp443: String,
 }
 
-#[cfg(any(feature = "trojan", feature = "vless"))]
 #[derive(Clone, PartialEq, Message)]
 struct SenderStreamConfigPayload {
     #[prost(message, repeated, tag = "2")]
@@ -334,11 +339,10 @@ struct SenderStreamConfigPayload {
     quic_params: Option<OpaqueSenderMessage>,
 }
 
-#[cfg(any(feature = "trojan", feature = "vless"))]
 #[derive(Clone, PartialEq, Message)]
 struct OpaqueSenderMessage {}
 
-#[cfg(all(any(feature = "trojan", feature = "vless"), feature = "ws"))]
+#[cfg(feature = "ws")]
 #[derive(Clone, PartialEq, Message)]
 struct OutboundWebsocketConfigPayload {
     #[prost(string, tag = "1")]
@@ -355,7 +359,7 @@ struct OutboundWebsocketConfigPayload {
     heartbeat_period: u32,
 }
 
-#[cfg(all(any(feature = "trojan", feature = "vless"), feature = "httpupgrade"))]
+#[cfg(feature = "httpupgrade")]
 #[derive(Clone, PartialEq, Message)]
 struct OutboundHttpUpgradeConfigPayload {
     #[prost(string, tag = "1")]
@@ -370,7 +374,7 @@ struct OutboundHttpUpgradeConfigPayload {
     early_data: u32,
 }
 
-#[cfg(all(any(feature = "trojan", feature = "vless"), feature = "grpc_transport"))]
+#[cfg(feature = "grpc_transport")]
 #[derive(Clone, PartialEq, Message)]
 struct OutboundGrpcConfigPayload {
     #[prost(string, tag = "1")]
@@ -391,7 +395,7 @@ struct OutboundGrpcConfigPayload {
     user_agent: String,
 }
 
-#[cfg(all(any(feature = "trojan", feature = "vless"), feature = "tls"))]
+#[cfg(feature = "tls")]
 #[derive(Clone, PartialEq, Message)]
 struct OutboundTlsConfigPayload {
     #[prost(message, repeated, tag = "2")]
@@ -430,7 +434,7 @@ struct OutboundTlsConfigPayload {
     pinned_peer_cert_sha256: Vec<Vec<u8>>,
 }
 
-#[cfg(all(any(feature = "trojan", feature = "vless"), feature = "tls"))]
+#[cfg(feature = "tls")]
 #[derive(Clone, PartialEq, Message)]
 struct OutboundTlsCertificatePayload {
     #[prost(bytes = "vec", tag = "1")]
@@ -451,7 +455,7 @@ struct OutboundTlsCertificatePayload {
     build_chain: bool,
 }
 
-#[cfg(all(any(feature = "trojan", feature = "vless"), feature = "reality"))]
+#[cfg(feature = "reality")]
 #[derive(Clone, PartialEq, Message)]
 struct OutboundRealityConfigPayload {
     #[prost(bool, tag = "1")]
@@ -1328,7 +1332,6 @@ impl HandlerServiceImpl {
         Ok(Some(version))
     }
 
-    #[cfg(any(feature = "trojan", feature = "vless"))]
     fn parse_outbound_sender_settings(
         &self,
         sender_settings: Option<&proto::xray::common::serial::TypedMessage>,
@@ -1564,7 +1567,6 @@ impl HandlerServiceImpl {
         Ok(output)
     }
 
-    #[cfg(any(feature = "trojan", feature = "vless"))]
     fn single_sender_transport_setting<'a>(
         &self,
         stream: &'a SenderStreamConfigPayload,
@@ -1593,7 +1595,6 @@ impl HandlerServiceImpl {
         })
     }
 
-    #[cfg(any(feature = "trojan", feature = "vless"))]
     fn single_sender_security_setting<'a>(
         &self,
         stream: &'a SenderStreamConfigPayload,
@@ -1622,7 +1623,7 @@ impl HandlerServiceImpl {
         })
     }
 
-    #[cfg(all(any(feature = "trojan", feature = "vless"), feature = "tls"))]
+    #[cfg(feature = "tls")]
     fn parse_outbound_tls_settings(
         &self,
         typed: &proto::xray::common::serial::TypedMessage,
@@ -1717,7 +1718,7 @@ impl HandlerServiceImpl {
         })
     }
 
-    #[cfg(all(any(feature = "trojan", feature = "vless"), feature = "reality"))]
+    #[cfg(feature = "reality")]
     fn parse_outbound_reality_settings(
         &self,
         typed: &proto::xray::common::serial::TypedMessage,
@@ -1822,6 +1823,67 @@ impl HandlerServiceImpl {
                     "outbound proxy settings",
                 )?;
                 "blackhole"
+            }
+            TYPE_PROXY_SOCKS_CLIENT_CONFIG
+            | TYPE_PROXY_SOCKS_CLIENT_CONFIG_V2RAY => {
+                let config = self.decode_typed_message::<SocksClientConfigPayload>(
+                    proxy_settings,
+                    &[
+                        TYPE_PROXY_SOCKS_CLIENT_CONFIG,
+                        TYPE_PROXY_SOCKS_CLIENT_CONFIG_V2RAY,
+                    ],
+                    "outbound proxy settings",
+                )?;
+                let server = config.server.ok_or_else(|| {
+                    Status::invalid_argument("SOCKS outbound server is required")
+                })?;
+                if server.address.is_none() {
+                    return Err(Status::invalid_argument(
+                        "SOCKS outbound server address is required",
+                    ));
+                }
+                let address = self.parse_address(server.address)?;
+                let port = u16::try_from(server.port).map_err(|_| {
+                    Status::invalid_argument(
+                        "SOCKS outbound server port must fit in u16",
+                    )
+                })?;
+                if port == 0 {
+                    return Err(Status::invalid_argument(
+                        "SOCKS outbound server port must not be zero",
+                    ));
+                }
+                let users = if let Some(user) = server.user {
+                    let account = user.account.as_ref().ok_or_else(|| {
+                        Status::invalid_argument(
+                            "SOCKS outbound user account is required",
+                        )
+                    })?;
+                    let account = self.decode_typed_message::<SocksAccountPayload>(
+                        account,
+                        &[TYPE_PROXY_SOCKS_ACCOUNT, TYPE_PROXY_SOCKS_ACCOUNT_V2RAY],
+                        "SOCKS outbound account",
+                    )?;
+                    vec![serde_json::json!({
+                        "user": account.username,
+                        "pass": account.password,
+                        "level": user.level,
+                        "email": user.email
+                    })]
+                } else {
+                    Vec::new()
+                };
+                literal_settings = Some(serde_json::json!({
+                    "servers": [{
+                        "address": address.to_string(),
+                        "port": port,
+                        "users": users
+                    }]
+                }));
+                stream_settings = Some(self.parse_outbound_sender_settings(
+                    outbound.sender_settings.as_ref(),
+                )?);
+                "socks"
             }
             #[cfg(feature = "trojan")]
             TYPE_PROXY_TROJAN_CLIENT_CONFIG
@@ -2251,7 +2313,6 @@ impl HandlerServiceImpl {
         }
     }
 
-    #[cfg(any(feature = "trojan", feature = "vless"))]
     fn encode_outbound_sender_settings(
         &self,
         stream: Option<&OutboundStreamSettings>,
@@ -2504,6 +2565,47 @@ impl HandlerServiceImpl {
                     TYPE_PROXY_BLACKHOLE_CONFIG,
                     BlackholeConfigPayload {},
                 )),
+                "socks" => self.runtime.outbound_connector(&outbound.tag).and_then(
+                    |connector| match connector.as_ref() {
+                        OutboundConnectorKind::SocksTcp(config) => {
+                            Some(Self::typed_message(
+                                TYPE_PROXY_SOCKS_CLIENT_CONFIG,
+                                SocksClientConfigPayload {
+                                    server: Some(SocksServerEndpointPayload {
+                                        address: Self::encode_address(
+                                            config.server.address(),
+                                        ),
+                                        port: u32::from(config.server.port()),
+                                        user: config.credentials.as_ref().map(
+                                            |credentials| {
+                                                proto::xray::common::protocol::User {
+                                                    level: 0,
+                                                    email: String::new(),
+                                                    account: Some(
+                                                        Self::typed_message(
+                                                            TYPE_PROXY_SOCKS_ACCOUNT,
+                                                            SocksAccountPayload {
+                                                                username:
+                                                                    credentials
+                                                                        .username
+                                                                        .clone(),
+                                                                password:
+                                                                    credentials
+                                                                        .password
+                                                                        .clone(),
+                                                            },
+                                                        ),
+                                                    ),
+                                                }
+                                            },
+                                        ),
+                                    }),
+                                },
+                            ))
+                        }
+                        _ => None,
+                    },
+                ),
                 #[cfg(feature = "trojan")]
                 "trojan" => self.runtime.outbound_connector(&outbound.tag).and_then(
                     |connector| match connector.as_ref() {
@@ -2578,11 +2680,8 @@ impl HandlerServiceImpl {
         };
         proto::xray::core::OutboundHandlerConfig {
             tag: outbound.tag.clone(),
-            #[cfg(any(feature = "trojan", feature = "vless"))]
             sender_settings: self
                 .encode_outbound_sender_settings(outbound.stream_settings.as_ref()),
-            #[cfg(not(any(feature = "trojan", feature = "vless")))]
-            sender_settings: None,
             proxy_settings,
             expire: 0,
             comment: String::new(),
@@ -3678,6 +3777,41 @@ mod tests {
         )
     }
 
+    fn build_add_socks_outbound_request(
+        tag: &str,
+        credentials: Option<(&str, &str)>,
+    ) -> proto::xray::app::proxyman::command::AddOutboundRequest {
+        let user = credentials.map(|(username, password)| {
+            proto::xray::common::protocol::User {
+                level: 0,
+                email: "socks-outbound@example.com".into(),
+                account: Some(HandlerServiceImpl::typed_message(
+                    TYPE_PROXY_SOCKS_ACCOUNT,
+                    SocksAccountPayload {
+                        username: username.to_string(),
+                        password: password.to_string(),
+                    },
+                )),
+            }
+        });
+        build_typed_add_outbound_request(
+            tag,
+            TYPE_PROXY_SOCKS_CLIENT_CONFIG,
+            SocksClientConfigPayload {
+                server: Some(SocksServerEndpointPayload {
+                    address: Some(IpOrDomainPayload {
+                        address: Some(ip_or_domain_payload::Address::Domain(
+                            "socks.example".into(),
+                        )),
+                    }),
+                    port: 1080,
+                    user,
+                }),
+            }
+            .encode_to_vec(),
+        )
+    }
+
     #[cfg(feature = "trojan")]
     fn build_add_trojan_outbound_request(
         tag: &str,
@@ -4080,6 +4214,92 @@ mod tests {
         );
         assert_eq!(runtime.outbounds().len(), before.len());
         assert!(runtime.outbound_connector(&unsupported_tag).is_none());
+    }
+
+    #[tokio::test]
+    async fn handler_installs_socks_outbound_with_and_without_authentication() {
+        let fixture = build_fixture();
+        let runtime = fixture.runtime.clone();
+        let service = HandlerServiceImpl::new(runtime.clone());
+
+        let no_auth_tag = unique_tag("socks-no-auth");
+        service
+            .add_outbound(Request::new(build_add_socks_outbound_request(
+                &no_auth_tag,
+                None,
+            )))
+            .await
+            .expect("no-auth SOCKS outbound should install");
+        let connector = runtime.outbound_connector(&no_auth_tag).unwrap();
+        let OutboundConnectorKind::SocksTcp(config) = connector.as_ref() else {
+            panic!("expected SOCKS TCP connector");
+        };
+        assert!(config.credentials.is_none());
+        assert!(config.transport.is_tcp());
+
+        let auth_tag = unique_tag("socks-auth");
+        let mut request =
+            build_add_socks_outbound_request(&auth_tag, Some(("alice", "secret")));
+        request.outbound.as_mut().unwrap().sender_settings =
+            Some(HandlerServiceImpl::typed_message(
+                TYPE_APP_SENDER_CONFIG,
+                SenderConfigPayload::default(),
+            ));
+        service
+            .add_outbound(Request::new(request))
+            .await
+            .expect("authenticated SOCKS outbound should install");
+        let connector = runtime.outbound_connector(&auth_tag).unwrap();
+        let OutboundConnectorKind::SocksTcp(config) = connector.as_ref() else {
+            panic!("expected authenticated SOCKS TCP connector");
+        };
+        assert_eq!(
+            config.credentials,
+            Some(crate::socks_outbound::Socks5Credentials {
+                username: "alice".into(),
+                password: "secret".into(),
+            })
+        );
+
+        let listed = service
+            .list_outbounds(Request::new(
+                proto::xray::app::proxyman::command::ListOutboundsRequest {},
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let outbound = listed
+            .outbounds
+            .iter()
+            .find(|outbound| outbound.tag == auth_tag)
+            .expect("listed authenticated SOCKS outbound missing");
+        assert_eq!(
+            outbound.proxy_settings.as_ref().unwrap().r#type,
+            TYPE_PROXY_SOCKS_CLIENT_CONFIG
+        );
+        let config = SocksClientConfigPayload::decode(
+            outbound.proxy_settings.as_ref().unwrap().value.as_slice(),
+        )
+        .unwrap();
+        let user = config.server.unwrap().user.unwrap();
+        let account =
+            SocksAccountPayload::decode(user.account.unwrap().value.as_slice())
+                .unwrap();
+        assert_eq!(account.username, "alice");
+        assert_eq!(account.password, "secret");
+        assert!(outbound.sender_settings.is_some());
+
+        let rejected_tag = unique_tag("socks-empty-user");
+        let error = service
+            .add_outbound(Request::new(build_add_socks_outbound_request(
+                &rejected_tag,
+                Some(("", "secret")),
+            )))
+            .await
+            .expect_err("empty SOCKS username must fail atomically");
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("username must not be empty"));
+        assert!(runtime.outbound_connector(&rejected_tag).is_none());
     }
 
     #[cfg(feature = "trojan")]
