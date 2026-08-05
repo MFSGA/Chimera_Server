@@ -3,6 +3,7 @@ use aws_lc_rs::digest::{SHA224, digest};
 use crate::address::{Address, NetLocation};
 
 const COMMAND_TCP: u8 = 0x01;
+const COMMAND_UDP: u8 = 0x03;
 const ADDRESS_IPV4: u8 = 0x01;
 const ADDRESS_DOMAIN: u8 = 0x03;
 const ADDRESS_IPV6: u8 = 0x04;
@@ -10,6 +11,21 @@ const CRLF: [u8; 2] = *b"\r\n";
 
 pub(crate) fn encode_trojan_tcp_request(
     password: &str,
+    target: &NetLocation,
+) -> std::io::Result<Vec<u8>> {
+    encode_trojan_request(password, COMMAND_TCP, target)
+}
+
+pub(crate) fn encode_trojan_udp_request(
+    password: &str,
+    target: &NetLocation,
+) -> std::io::Result<Vec<u8>> {
+    encode_trojan_request(password, COMMAND_UDP, target)
+}
+
+fn encode_trojan_request(
+    password: &str,
+    command: u8,
     target: &NetLocation,
 ) -> std::io::Result<Vec<u8>> {
     if password.is_empty() {
@@ -23,7 +39,7 @@ pub(crate) fn encode_trojan_tcp_request(
     let mut request = Vec::with_capacity(96);
     request.extend_from_slice(&password_hash);
     request.extend_from_slice(&CRLF);
-    request.push(COMMAND_TCP);
+    request.push(command);
     write_address(&mut request, target.address())?;
     request.extend_from_slice(&target.port().to_be_bytes());
     request.extend_from_slice(&CRLF);
@@ -106,6 +122,19 @@ mod tests {
             assert_eq!(request[59], expected_type);
             assert_eq!(&request[request.len() - 2..], &CRLF);
         }
+    }
+
+    #[test]
+    fn udp_request_uses_associate_command_and_preserves_domain_target() {
+        let target = NetLocation::new(Address::Hostname("dns.example".into()), 53);
+        let request = encode_trojan_udp_request("test-password", &target).unwrap();
+        assert_eq!(&request[56..58], &CRLF);
+        assert_eq!(request[58], COMMAND_UDP);
+        assert_eq!(request[59], ADDRESS_DOMAIN);
+        assert_eq!(request[60] as usize, "dns.example".len());
+        assert_eq!(&request[61..72], b"dns.example");
+        assert_eq!(&request[72..74], &53u16.to_be_bytes());
+        assert_eq!(&request[74..], &CRLF);
     }
 
     #[test]

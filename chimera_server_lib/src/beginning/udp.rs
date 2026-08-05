@@ -53,6 +53,8 @@ const UDP_SESSION_CHANNEL_CAPACITY: usize = 64;
 #[cfg(feature = "shadowsocks")]
 use crate::outbound::exchange_shadowsocks_udp;
 use crate::outbound::exchange_socks_udp;
+#[cfg(feature = "trojan")]
+use crate::outbound::exchange_trojan_udp;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum UdpOutboundAction {
@@ -67,6 +69,10 @@ enum UdpOutboundAction {
         tag: String,
     },
     Socks {
+        tag: String,
+    },
+    #[cfg(feature = "trojan")]
+    Trojan {
         tag: String,
     },
 }
@@ -337,6 +343,21 @@ pub(crate) async fn run_bidirectional_udp(
             )
             .await
         }
+        #[cfg(feature = "trojan")]
+        DirectOutboundAction::Trojan { tag } => {
+            traffic_context = traffic_context
+                .map(|context| context.with_outbound_tag(tag.clone()));
+            let _connection_guard = register_connection(traffic_context.as_ref());
+            copy_trojan_udp_messages(
+                &mut *server_stream,
+                &resolver,
+                &runtime,
+                &tag,
+                &remote_location,
+                traffic_context,
+            )
+            .await
+        }
         DirectOutboundAction::Freedom { tag } => {
             if let Some(tag) = tag {
                 traffic_context =
@@ -494,6 +515,37 @@ pub(crate) async fn run_multi_directional_udp(
                             .clone()
                             .map(|context| context.with_outbound_tag(tag.clone()));
                         let response = exchange_socks_udp(
+                            &resolver,
+                            &runtime,
+                            &tag,
+                            &target_location,
+                            &payload,
+                        )
+                        .await?;
+                        let source = resolve_single_address(
+                            &resolver,
+                            &response.source,
+                        )
+                        .await?;
+                        write_sourced_message(
+                            &mut *server_stream,
+                            &response.payload,
+                            &source,
+                        )
+                        .await?;
+                        flush_targeted_message(&mut *server_stream).await?;
+                        record_transfer(
+                            packet_context,
+                            payload_length as u64,
+                            response.payload.len() as u64,
+                        );
+                    }
+                    #[cfg(feature = "trojan")]
+                    DirectOutboundAction::Trojan { tag } => {
+                        let packet_context = packet_context
+                            .clone()
+                            .map(|context| context.with_outbound_tag(tag.clone()));
+                        let response = exchange_trojan_udp(
                             &resolver,
                             &runtime,
                             &tag,
@@ -753,6 +805,38 @@ pub(crate) async fn run_session_based_udp(
                             .clone()
                             .map(|context| context.with_outbound_tag(tag.clone()));
                         let response = exchange_socks_udp(
+                            &resolver,
+                            &runtime,
+                            &tag,
+                            &target_location,
+                            &payload,
+                        )
+                        .await?;
+                        let source = resolve_single_address(
+                            &resolver,
+                            &response.source,
+                        )
+                        .await?;
+                        write_session_message(
+                            &mut *server_stream,
+                            session_id,
+                            &response.payload,
+                            &source,
+                        )
+                        .await?;
+                        flush_session_message(&mut *server_stream).await?;
+                        record_transfer(
+                            packet_context,
+                            payload_length as u64,
+                            response.payload.len() as u64,
+                        );
+                    }
+                    #[cfg(feature = "trojan")]
+                    DirectOutboundAction::Trojan { tag } => {
+                        let packet_context = packet_context
+                            .clone()
+                            .map(|context| context.with_outbound_tag(tag.clone()));
+                        let response = exchange_trojan_udp(
                             &resolver,
                             &runtime,
                             &tag,
@@ -1754,6 +1838,34 @@ async fn copy_socks_udp_messages(
     }
 }
 
+#[cfg(feature = "trojan")]
+async fn copy_trojan_udp_messages(
+    stream: &mut dyn AsyncMessageStream,
+    resolver: &Arc<dyn Resolver>,
+    runtime: &RuntimeState,
+    tag: &str,
+    target: &NetLocation,
+    traffic_context: Option<TrafficContext>,
+) -> std::io::Result<()> {
+    let mut buffer = vec![0u8; VMESS_UDP_MESSAGE_BUFFER_SIZE];
+    loop {
+        let len = read_message(stream, &mut buffer).await?;
+        if len == 0 {
+            return Ok(());
+        }
+        let response =
+            exchange_trojan_udp(resolver, runtime, tag, target, &buffer[..len])
+                .await?;
+        write_message(stream, &response.payload).await?;
+        flush_message(stream).await?;
+        record_transfer(
+            traffic_context.clone(),
+            len as u64,
+            response.payload.len() as u64,
+        );
+    }
+}
+
 async fn copy_bidirectional_udp_messages(
     stream: &mut dyn AsyncMessageStream,
     socket: &UdpSocket,
@@ -2058,6 +2170,30 @@ async fn relay_shadowsocks_udp_packet(
             );
             Ok(())
         }
+        #[cfg(feature = "trojan")]
+        UdpOutboundAction::Trojan { tag } => {
+            traffic_context = traffic_context.with_outbound_tag(tag.clone());
+            let response = exchange_trojan_udp(
+                &resolver,
+                &runtime,
+                &tag,
+                &request.target_location,
+                &request.payload,
+            )
+            .await?;
+            let encrypted = codec.encrypt_packet(
+                &request,
+                &response.source,
+                &response.payload,
+            )?;
+            server_socket.send_to(&encrypted, client_addr).await?;
+            record_transfer(
+                Some(traffic_context),
+                request.payload.len() as u64,
+                response.payload.len() as u64,
+            );
+            Ok(())
+        }
         UdpOutboundAction::Freedom { tag } => {
             if let Some(tag) = tag {
                 traffic_context = traffic_context.with_outbound_tag(tag);
@@ -2234,6 +2370,38 @@ async fn relay_dokodemo_udp_datagram(
             let traffic_context = traffic_context.with_outbound_tag(tag.clone());
             let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
             let response = exchange_socks_udp(
+                &resolver,
+                &runtime,
+                &tag,
+                &target_location,
+                &payload,
+            )
+            .await?;
+            let source_addr =
+                resolve_single_address(&resolver, &response.source).await?;
+            relay_state
+                .server_socket
+                .send_to(&response.payload, client_addr)
+                .await?;
+            record_transfer(
+                Some(traffic_context),
+                payload.len() as u64,
+                response.payload.len() as u64,
+            );
+            debug!(
+                "dokodemo-door udp relay {} <- {} via {} forwarded {} bytes",
+                client_addr,
+                source_addr,
+                tag,
+                response.payload.len()
+            );
+            Ok(())
+        }
+        #[cfg(feature = "trojan")]
+        UdpOutboundAction::Trojan { tag } => {
+            let traffic_context = traffic_context.with_outbound_tag(tag.clone());
+            let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+            let response = exchange_trojan_udp(
                 &resolver,
                 &runtime,
                 &tag,
@@ -2469,6 +2637,8 @@ async fn select_udp_outbound(
         #[cfg(feature = "shadowsocks")]
         "shadowsocks" => Ok(UdpOutboundAction::Shadowsocks { tag: outbound.tag }),
         "socks" => Ok(UdpOutboundAction::Socks { tag: outbound.tag }),
+        #[cfg(feature = "trojan")]
+        "trojan" => Ok(UdpOutboundAction::Trojan { tag: outbound.tag }),
         protocol => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(

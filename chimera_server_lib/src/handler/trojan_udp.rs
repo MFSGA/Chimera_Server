@@ -177,7 +177,7 @@ impl AsyncPing for TrojanUdpStream {
 
 impl AsyncTargetedMessageStream for TrojanUdpStream {}
 
-async fn read_packet<R>(reader: &mut R) -> PacketResult
+pub(crate) async fn read_packet<R>(reader: &mut R) -> PacketResult
 where
     R: AsyncRead + Unpin,
 {
@@ -249,6 +249,16 @@ where
 }
 
 fn encode_packet(source: &SocketAddr, payload: &[u8]) -> std::io::Result<Vec<u8>> {
+    encode_packet_location(
+        &NetLocation::from_ip_addr(source.ip(), source.port()),
+        payload,
+    )
+}
+
+pub(crate) fn encode_packet_location(
+    location: &NetLocation,
+    payload: &[u8],
+) -> std::io::Result<Vec<u8>> {
     if payload.len() > MAX_PACKET_LENGTH {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -257,17 +267,35 @@ fn encode_packet(source: &SocketAddr, payload: &[u8]) -> std::io::Result<Vec<u8>
     }
 
     let mut packet = Vec::with_capacity(1 + 16 + 2 + 2 + 2 + payload.len());
-    match source.ip() {
-        std::net::IpAddr::V4(address) => {
+    match location.address() {
+        Address::Ipv4(address) => {
             packet.push(ADDR_TYPE_IPV4);
             packet.extend_from_slice(&address.octets());
         }
-        std::net::IpAddr::V6(address) => {
+        Address::Ipv6(address) => {
             packet.push(ADDR_TYPE_IPV6);
             packet.extend_from_slice(&address.octets());
         }
+        Address::Hostname(domain) => {
+            let bytes = domain.as_bytes();
+            let length = u8::try_from(bytes.len()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "trojan udp domain exceeds 255 bytes",
+                )
+            })?;
+            if length == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "trojan udp domain is empty",
+                ));
+            }
+            packet.push(ADDR_TYPE_DOMAIN_NAME);
+            packet.push(length);
+            packet.extend_from_slice(bytes);
+        }
     }
-    packet.extend_from_slice(&source.port().to_be_bytes());
+    packet.extend_from_slice(&location.port().to_be_bytes());
     packet.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     packet.extend_from_slice(&CRLF);
     packet.extend_from_slice(payload);
@@ -281,6 +309,17 @@ mod tests {
     use tokio::io::{AsyncWriteExt, duplex};
 
     use super::*;
+
+    #[tokio::test]
+    async fn packet_location_roundtrips_domain_target() {
+        let location =
+            NetLocation::new(Address::Hostname("dns.example".into()), 5353);
+        let encoded = encode_packet_location(&location, b"domain payload").unwrap();
+        let mut input = Cursor::new(encoded);
+        let (decoded_location, payload) = read_packet(&mut input).await.unwrap();
+        assert_eq!(decoded_location, location);
+        assert_eq!(payload, b"domain payload");
+    }
 
     #[tokio::test]
     async fn read_packet_rejects_invalid_crlf() {

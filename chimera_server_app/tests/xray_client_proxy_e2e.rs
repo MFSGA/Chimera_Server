@@ -1323,6 +1323,7 @@ async fn chimera_trojan_plain_outbound_interoperates_with_xray_inbound() {
     let workspace = workspace_root();
     let work_dir = create_test_dir("trojan-plain-outbound");
     let echo_addr = start_tcp_echo_server();
+    let udp_echo_addr = start_udp_echo_server().await;
     let xray_trojan_port = free_localhost_port();
     let chimera_socks_port = free_localhost_port();
     let xray_config_path = work_dir.join("xray-trojan-inbound.json");
@@ -1360,7 +1361,7 @@ async fn chimera_trojan_plain_outbound_interoperates_with_xray_inbound() {
                 "port": chimera_socks_port,
                 "protocol": "socks",
                 "tag": "socks-in",
-                "settings": {"auth": "noauth"}
+                "settings": {"auth": "noauth", "udp": true}
             }],
             "outbounds": [{
                 "tag": "to-xray-trojan",
@@ -1408,6 +1409,14 @@ async fn chimera_trojan_plain_outbound_interoperates_with_xray_inbound() {
         echo_addr.port(),
         b"plain Trojan outbound domain target",
     );
+    assert_socks5_udp_echo(
+        socks_addr,
+        udp_echo_addr,
+        b"plain Trojan UDP outbound through Xray inbound",
+    )
+    .await;
+    assert_socks5_udp_echo(socks_addr, udp_echo_addr, &deterministic_payload(1200))
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1416,6 +1425,7 @@ async fn chimera_trojan_tls_outbound_interoperates_with_xray_inbound() {
     let workspace = workspace_root();
     let work_dir = create_test_dir("trojan-tls-outbound");
     let echo_addr = start_tcp_echo_server();
+    let udp_echo_addr = start_udp_echo_server().await;
     let xray_trojan_port = free_localhost_port();
     let chimera_socks_port = free_localhost_port();
     let xray_config_path = work_dir.join("xray-trojan-tls-inbound.json");
@@ -1468,7 +1478,7 @@ async fn chimera_trojan_tls_outbound_interoperates_with_xray_inbound() {
                 "port": chimera_socks_port,
                 "protocol": "socks",
                 "tag": "socks-in",
-                "settings": {"auth": "noauth"}
+                "settings": {"auth": "noauth", "udp": true}
             }],
             "outbounds": [{
                 "tag": "to-xray-trojan-tls",
@@ -1524,6 +1534,14 @@ async fn chimera_trojan_tls_outbound_interoperates_with_xray_inbound() {
         echo_addr.port(),
         b"TLS Trojan outbound domain target",
     );
+    assert_socks5_udp_echo(
+        socks_addr,
+        udp_echo_addr,
+        b"TLS Trojan UDP outbound through Xray inbound",
+    )
+    .await;
+    assert_socks5_udp_echo(socks_addr, udp_echo_addr, &deterministic_payload(1200))
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -17,8 +17,6 @@ use crate::socks_outbound::{
     Socks5Credentials, associate_socks5_udp, connect_socks5,
     decode_socks5_udp_packet, encode_socks5_udp_packet,
 };
-#[cfg(feature = "trojan")]
-use crate::trojan_outbound::encode_trojan_tcp_request;
 #[cfg(feature = "vless")]
 use crate::vless_outbound::{VlessTcpOutboundStream, encode_vless_tcp_request};
 use crate::{
@@ -30,6 +28,11 @@ use crate::{
     routing_process::enrich_routing_input,
     routing_state::{OutboundObservation, RoutingInput},
     runtime::RuntimeState,
+};
+#[cfg(feature = "trojan")]
+use crate::{
+    handler::trojan_udp::{encode_packet_location, read_packet},
+    trojan_outbound::{encode_trojan_tcp_request, encode_trojan_udp_request},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +48,10 @@ pub(crate) enum DirectOutboundAction {
         tag: String,
     },
     Socks {
+        tag: String,
+    },
+    #[cfg(feature = "trojan")]
+    Trojan {
         tag: String,
     },
 }
@@ -433,6 +440,48 @@ pub(crate) async fn exchange_shadowsocks_udp(
     Ok(UdpOutboundResponse { source, payload })
 }
 
+#[cfg(feature = "trojan")]
+pub(crate) async fn exchange_trojan_udp(
+    resolver: &Arc<dyn Resolver>,
+    runtime: &RuntimeState,
+    tag: &str,
+    target: &NetLocation,
+    payload: &[u8],
+) -> std::io::Result<UdpOutboundResponse> {
+    let connector = runtime.outbound_connector(tag).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Trojan UDP outbound {tag} is missing from the registry"),
+        )
+    })?;
+    let OutboundConnectorKind::TrojanTcp(config) = connector.as_ref() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("outbound {tag} is not a Trojan connector"),
+        ));
+    };
+
+    let mut stream = config.transport.connect(resolver, &config.server).await?;
+    let request = encode_trojan_udp_request(&config.password, target)?;
+    stream.write_all(&request).await?;
+    let packet = encode_packet_location(target, payload)?;
+    stream.write_all(&packet).await?;
+    stream.flush().await?;
+    let (source, response) =
+        timeout(Duration::from_secs(60), read_packet(&mut stream))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Trojan UDP response timed out",
+                )
+            })??;
+    Ok(UdpOutboundResponse {
+        source,
+        payload: response,
+    })
+}
+
 pub(crate) async fn exchange_socks_udp(
     resolver: &Arc<dyn Resolver>,
     runtime: &RuntimeState,
@@ -538,9 +587,13 @@ pub(crate) fn select_direct_outbound(
             format!("{network_name} outbound {tag} requires the TCP connector path"),
         )),
         #[cfg(feature = "trojan")]
+        OutboundConnectorKind::TrojanTcp(_) if network_name == "udp" => {
+            Ok(DirectOutboundAction::Trojan { tag })
+        }
+        #[cfg(feature = "trojan")]
         OutboundConnectorKind::TrojanTcp(_) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("{network_name} outbound {tag} does not support UDP yet"),
+            format!("{network_name} outbound {tag} requires the TCP connector path"),
         )),
         #[cfg(feature = "vless")]
         OutboundConnectorKind::VlessTcp(_) => Err(std::io::Error::new(

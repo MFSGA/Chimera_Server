@@ -28,6 +28,8 @@ use tracing::{debug, warn};
 #[cfg(feature = "shadowsocks")]
 use crate::outbound::exchange_shadowsocks_udp;
 use crate::outbound::exchange_socks_udp;
+#[cfg(feature = "trojan")]
+use crate::outbound::exchange_trojan_udp;
 #[cfg(feature = "user_domain_access")]
 use crate::user_domain_access::hysteria2_password_identity;
 use crate::{
@@ -915,6 +917,31 @@ async fn drive_udp_datagrams(
             DirectOutboundAction::Socks { tag } => {
                 traffic_context = traffic_context.with_outbound_tag(tag.clone());
                 let response = exchange_socks_udp(
+                    &resolver,
+                    &runtime,
+                    &tag,
+                    &session.last_location,
+                    complete_payload.as_ref(),
+                )
+                .await?;
+                send_hysteria_udp_payload(
+                    &connection,
+                    session_id,
+                    packet_id,
+                    &response.source,
+                    &response.payload,
+                )?;
+                record_transfer(
+                    Some(traffic_context),
+                    complete_payload.len() as u64,
+                    response.payload.len() as u64,
+                );
+                continue;
+            }
+            #[cfg(feature = "trojan")]
+            DirectOutboundAction::Trojan { tag } => {
+                traffic_context = traffic_context.with_outbound_tag(tag.clone());
+                let response = exchange_trojan_udp(
                     &resolver,
                     &runtime,
                     &tag,

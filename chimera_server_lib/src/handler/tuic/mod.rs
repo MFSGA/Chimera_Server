@@ -25,6 +25,8 @@ use tracing::{debug, error};
 #[cfg(feature = "shadowsocks")]
 use crate::outbound::exchange_shadowsocks_udp;
 use crate::outbound::exchange_socks_udp;
+#[cfg(feature = "trojan")]
+use crate::outbound::exchange_trojan_udp;
 use crate::{
     address::{Address, NetLocation},
     config::server_config::TuicServerConfig,
@@ -1588,6 +1590,28 @@ async fn forward_udp_payload(
         DirectOutboundAction::Socks { tag } => {
             traffic_context = traffic_context.with_outbound_tag(tag.clone());
             let response = exchange_socks_udp(
+                resolver,
+                &context.connection.runtime,
+                &tag,
+                remote_location,
+                payload,
+            )
+            .await?;
+            record_transfer(Some(traffic_context.clone()), payload.len() as u64, 0);
+            session
+                .send_response(
+                    assoc_id,
+                    &response.source,
+                    &response.payload,
+                    traffic_context,
+                )
+                .await?;
+            return Ok(true);
+        }
+        #[cfg(feature = "trojan")]
+        DirectOutboundAction::Trojan { tag } => {
+            traffic_context = traffic_context.with_outbound_tag(tag.clone());
+            let response = exchange_trojan_udp(
                 resolver,
                 &context.connection.runtime,
                 &tag,
