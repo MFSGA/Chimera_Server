@@ -82,7 +82,7 @@ freedom
 blackhole
 ```
 
-如果路由选到尚未实现的 `vmess`、`http`、`shadowsocks` 等代理出站，当前实现会在配置编译或动态安装阶段 fail-closed。VLESS TCP、Trojan TCP 与 SOCKS5 TCP 已经形成真实 connector，说明通用 Outbound Runtime 路线有效，但剩余代理协议仍是最值得优先补齐的公共基础。
+如果路由选到尚未实现的代理出站，当前实现会在配置编译或动态安装阶段 fail-closed。VLESS TCP、Trojan TCP/UDP 与 SOCKS5 TCP/UDP 已经形成真实 connector，说明通用 Outbound Runtime 路线有效，但剩余代理协议仍是最值得优先补齐的公共基础。
 
 ---
 
@@ -211,12 +211,12 @@ HandlerService 也能将 Xray `SenderConfig` 转换为同一静态模型。当�
 - `blackhole`；
 - VLESS TCP；
 - VMess TCP；
-- Trojan TCP；
+- Trojan TCP/UDP；
 - SOCKS5 TCP/UDP；
 - HTTP CONNECT TCP；
 - Shadowsocks legacy AEAD TCP/UDP。
 
-VLESS、VMess、Trojan、SOCKS、HTTP 与 Shadowsocks legacy AEAD 均支持静态 JSON、动态 HandlerService 和原始 domain/IP target；TCP 协议复用 TCP/TLS/REALITY/WebSocket/HTTP Upgrade/gRPC transport pipeline。VMess 当前真实 Xray 验收覆盖 plain none 与 TLS+AES-128-GCM；Trojan 覆盖 plain TCP 与 TLS；SOCKS TCP/UDP 覆盖 plain no-auth 与 TLS+password，UDP 文本与 1200-byte datagram 均已通过 Xray 真实互通；HTTP 覆盖 plain no-auth 与 TLS+Basic Auth；Shadowsocks TCP 覆盖 plain AES-128-GCM 与 TLS+ChaCha20-IETF-Poly1305，UDP 覆盖 SOCKS5 UDP → Chimera → Xray → echo 的文本与 1200-byte datagram，并覆盖 TUIC datagram 与 UDP-over-stream response adapter。VLESS/VMess/Trojan 的代理 UDP、HTTP 非 CONNECT 转发、Shadowsocks XChaCha/2022/EIH，以及 SOCKS/Shadowsocks 的持久 UDP association 均尚未完成。
+VLESS、VMess、Trojan、SOCKS、HTTP 与 Shadowsocks legacy AEAD 均支持静态 JSON、动态 HandlerService 和原始 domain/IP target；TCP 协议复用 TCP/TLS/REALITY/WebSocket/HTTP Upgrade/gRPC transport pipeline。VMess 当前真实 Xray 验收覆盖 plain none 与 TLS+AES-128-GCM；Trojan TCP/UDP 覆盖 plain 与 TLS，UDP 文本与 1200-byte datagram 均已通过 Xray 真实互通；SOCKS TCP/UDP 覆盖 plain no-auth 与 TLS+password，UDP 文本与 1200-byte datagram 均已通过 Xray 真实互通；HTTP 覆盖 plain no-auth 与 TLS+Basic Auth；Shadowsocks TCP 覆盖 plain AES-128-GCM 与 TLS+ChaCha20-IETF-Poly1305，UDP 覆盖 SOCKS5 UDP → Chimera → Xray → echo 的文本与 1200-byte datagram，并覆盖 TUIC datagram 与 UDP-over-stream response adapter。VLESS/VMess 的代理 UDP、HTTP 非 CONNECT 转发、Shadowsocks XChaCha/2022/EIH，以及 Trojan/SOCKS/Shadowsocks 的持久 UDP association 均尚未完成。
 
 下面这些 Xray outbound 尚未形成真实 connector：
 
@@ -776,7 +776,7 @@ Chimera 当前未支持这些高级 transport 组合。
 1. 通用 Outbound Runtime；
 2. Freedom/Blackhole 迁移到新 registry；
 3. VLESS TCP outbound；（已完成）
-4. Trojan TCP outbound；（已完成）
+4. Trojan TCP/UDP outbound；（已完成）
 5. VMess TCP outbound；（已完成）
 6. SOCKS outbound；（TCP 与 UDP ASSOCIATE 已完成）
 7. HTTP outbound；（CONNECT TCP 已完成）
@@ -787,7 +787,7 @@ Chimera 当前未支持这些高级 transport 组合。
 
 ## P1：高价值兼容能力
 
-1. VLESS/VMess/Trojan UDP outbound；
+1. VLESS/VMess UDP outbound；
 2. outbound TLS/REALITY/WS/HTTPUpgrade/gRPC；
 3. XHTTP outbound；
 4. XHTTP downloadSettings/xmux；
@@ -878,19 +878,21 @@ Chimera 当前未支持这些高级 transport 组合。
 - gRPC；（静态 plain/TLS/REALITY 已完成）
 - transport pipeline 复用于 VLESS/VMess/Trojan/SOCKS/HTTP。（全部已接入 TCP 主路径）
 
-### Slice 4：Trojan TCP Outbound
+### Slice 4：Trojan TCP/UDP Outbound
 
-当前实现状态：已完成。静态配置支持 Xray 标准 `servers:[...]` 与简化 `address/port/password`；动态 HandlerService 支持 `xray.proxy.trojan.ClientConfig`、Trojan Account 与通用 SenderConfig，并由同一 registry 编译器原子安装。数据面发送 SHA-224 小写十六进制密码摘要、CRLF、TCP command、原始 domain/IPv4/IPv6 target 与结尾 CRLF，之后直接透传双向字节流。仅允许单 endpoint、单密码和空 flow；UDP associate 与已移除 flow 语义 fail-closed。Trojan connector 复用完整 TCP/TLS/REALITY/WebSocket/HTTP Upgrade/gRPC transport pipeline；plain TCP 与 TLS 已通过 Xray 26.2.6 真实进程互通，覆盖 IP、域名和 64KiB payload。
+当前实现状态：TCP 与 UDP 主路径已完成。静态配置支持 Xray 标准 `servers:[...]` 与简化 `address/port/password`；动态 HandlerService 支持 `xray.proxy.trojan.ClientConfig`、Trojan Account 与通用 SenderConfig，并由同一 registry 编译器原子安装。TCP 数据面发送 SHA-224 小写十六进制密码摘要、CRLF、command `0x01`、原始 domain/IPv4/IPv6 target 与结尾 CRLF，之后直接透传双向字节流。UDP executor 通过同一 transport pipeline 建立流，发送相同认证摘要、command `0x03` 和 association target；每个 datagram 使用 `address + port + u16 payload length + CRLF + payload` 分帧，60 秒内有界读取同格式响应并恢复原始 source。该 one-shot executor 已接入固定目标、目标化消息、session/XUDP、SOCKS5 inbound、Dokodemo、Shadowsocks inbound、Hysteria2 与 TUIC response channel。仅允许单 endpoint、单密码和空 flow；非空或已移除 flow 继续 fail-closed，持久 UDP association 尚未实现。Trojan connector 复用完整 TCP/TLS/REALITY/WebSocket/HTTP Upgrade/gRPC transport pipeline；plain 与 TLS 均已通过 Xray 26.2.6 真实进程 TCP/UDP 互通，TCP 覆盖 IP、域名和 64KiB，UDP 覆盖文本与 1200-byte datagram。
 
 目标：
 
 - 支持标准与简化静态配置；（已完成）
 - 支持动态 ClientConfig、SenderConfig 和 ListOutbounds；（已完成）
-- 支持 SHA-224 hex 认证头与 TCP command；（已完成）
-- 保留原始 domain/IP target；（已完成）
+- 支持 SHA-224 hex 认证头与 TCP/UDP command；（已完成）
+- 保留原始 domain/IP target 与 UDP response source；（已完成）
 - 复用共享 transport pipeline；（已完成）
-- 非空 flow 和 UDP associate fail-closed；（已完成）
-- 与 Xray Trojan inbound 做 plain/TLS 双向互通测试。（已完成）
+- 覆盖固定/目标化/session、SOCKS5、Dokodemo、Shadowsocks inbound、Hysteria2 与 TUIC；（已完成）
+- 非空 flow fail-closed；（已完成）
+- 与 Xray Trojan inbound 做 plain/TLS TCP/UDP 双向互通测试。（已完成）
+- 持久 UDP association；（待完成）
 
 ### Slice 5：SOCKS5 TCP/UDP Outbound
 
@@ -1022,7 +1024,7 @@ Outbound Registry
 → VLESS outbound
 → 通用 outbound transport
 → VMess/HTTP/Shadowsocks outbound 与 SOCKS UDP
-→ VLESS/VMess/Trojan UDP 与 Shadowsocks 2022/EIH
+→ VLESS/VMess UDP 与 Shadowsocks 2022/EIH
 → 通用 sniffing
 → Xray DNS/FakeDNS
 → XHTTP client 与完整 xmux/download
