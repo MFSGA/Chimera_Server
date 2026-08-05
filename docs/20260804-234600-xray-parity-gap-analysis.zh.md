@@ -210,16 +210,16 @@ HandlerService 也能将 Xray `SenderConfig` 转换为同一静态模型。当�
 - `freedom`；
 - `blackhole`；
 - VLESS TCP；
+- VMess TCP；
 - Trojan TCP；
 - SOCKS5 TCP；
 - HTTP CONNECT TCP；
 - Shadowsocks legacy AEAD TCP。
 
-VLESS、Trojan、SOCKS、HTTP 与 Shadowsocks legacy AEAD 均支持静态 JSON、动态 HandlerService、原始 domain/IP target，并复用 TCP/TLS/REALITY/WebSocket/HTTP Upgrade/gRPC transport pipeline。Trojan 当前真实 Xray 验收覆盖 plain TCP 与 TLS；SOCKS 覆盖 plain no-auth 与 TLS+password；HTTP 覆盖 plain no-auth 与 TLS+Basic Auth；Shadowsocks 覆盖 plain AES-128-GCM 与 TLS+ChaCha20-IETF-Poly1305。Trojan/SOCKS 的 UDP associate、HTTP 非 CONNECT 转发、Shadowsocks XChaCha/2022/EIH/UDP 均尚未完成。
+VLESS、VMess、Trojan、SOCKS、HTTP 与 Shadowsocks legacy AEAD 均支持静态 JSON、动态 HandlerService、原始 domain/IP target，并复用 TCP/TLS/REALITY/WebSocket/HTTP Upgrade/gRPC transport pipeline。VMess 当前真实 Xray 验收覆盖 plain none 与 TLS+AES-128-GCM；Trojan 覆盖 plain TCP 与 TLS；SOCKS 覆盖 plain no-auth 与 TLS+password；HTTP 覆盖 plain no-auth 与 TLS+Basic Auth；Shadowsocks 覆盖 plain AES-128-GCM 与 TLS+ChaCha20-IETF-Poly1305。VLESS/VMess/Trojan/SOCKS/Shadowsocks 的 UDP、HTTP 非 CONNECT 转发、Shadowsocks XChaCha/2022/EIH 均尚未完成。
 
 下面这些 Xray outbound 尚未形成真实 connector：
 
-- VMess；
 - Hysteria；
 - WireGuard；
 - DNS outbound；
@@ -777,7 +777,7 @@ Chimera 当前未支持这些高级 transport 组合。
 2. Freedom/Blackhole 迁移到新 registry；
 3. VLESS TCP outbound；（已完成）
 4. Trojan TCP outbound；（已完成）
-5. VMess TCP outbound；
+5. VMess TCP outbound；（已完成）
 6. SOCKS outbound；（TCP 已完成，UDP ASSOCIATE 待完成）
 7. HTTP outbound；（CONNECT TCP 已完成）
 8. Shadowsocks TCP/UDP outbound；（legacy AEAD TCP 已完成）
@@ -876,7 +876,7 @@ Chimera 当前未支持这些高级 transport 组合。
 - WebSocket；（静态 WS/WSS 已完成）
 - HTTP Upgrade；（静态 plain/TLS 已完成）
 - gRPC；（静态 plain/TLS/REALITY 已完成）
-- transport pipeline 复用于 VLESS/VMess/Trojan/SOCKS/HTTP。（VLESS、Trojan、SOCKS、HTTP 已接入）
+- transport pipeline 复用于 VLESS/VMess/Trojan/SOCKS/HTTP。（全部已接入 TCP 主路径）
 
 ### Slice 4：Trojan TCP Outbound
 
@@ -935,6 +935,21 @@ Chimera 当前未支持这些高级 transport 组合。
 - 保留原始 domain/IP target；（已完成）
 - XChaCha、2022/EIH、iv_check 和 UDP fail-closed；（已完成）
 - 与 Xray Shadowsocks inbound 做 plain AES 与 TLS+ChaCha 双向互通测试。（已完成）
+
+### Slice 8：VMess TCP Outbound
+
+当前实现状态：已完成。静态配置支持 Xray 标准 `vnext:[{address,port,users}]` 与简化 `address/port/id/security`；动态 HandlerService 支持 `xray.proxy.vmess.outbound.Config`、VMess Account、通用 SenderConfig 与 ListOutbounds 回显。客户端生成带时间戳、随机数和 CRC32C 的 AuthID，经 VMess KDF 和 AES-ECB 加密；请求长度和请求头分别通过标准 AEAD KDF 路径加密，头部包含随机数据 IV/key、响应认证字节、TCP command、原始 domain/IPv4/IPv6 target 与 FNV1a 校验。数据层支持 `none`、AES-128-GCM 和 ChaCha20-Poly1305，响应 key/IV 按 SHA-256 派生并复用现有 `VmessStream` 交换读写方向。AUTO、AES-CFB、alterId、experiments、Mux 和 UDP 均在安装或路由阶段 fail-closed。三种 security 已通过本地客户端/服务端双向协议 roundtrip；plain none 与 TLS+AES-128-GCM 已通过 Xray 26.2.6 真实进程互通，覆盖 IP、域名和 64KiB payload。
+
+目标：
+
+- 支持 VMess AEAD AuthID、请求长度和请求头；（已完成）
+- 支持 none、AES-128-GCM 与 ChaCha20-Poly1305 body；（已完成）
+- 支持标准与简化静态配置；（已完成）
+- 支持动态 Config、Account、SenderConfig 与 ListOutbounds；（已完成）
+- 保留原始 domain/IP target，并正确消费 response header；（已完成）
+- 复用共享 transport pipeline；（已完成）
+- AUTO、AES-CFB、alterId、experiments、Mux 和 UDP fail-closed；（已完成）
+- 与 Xray VMess inbound 做 plain none 与 TLS+AES 双向互通测试。（已完成）
 
 ---
 
