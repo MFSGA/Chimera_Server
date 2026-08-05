@@ -212,11 +212,11 @@ HandlerService 也能将 Xray `SenderConfig` 转换为同一静态模型。当�
 - VLESS TCP；
 - VMess TCP；
 - Trojan TCP；
-- SOCKS5 TCP；
+- SOCKS5 TCP/UDP；
 - HTTP CONNECT TCP；
 - Shadowsocks legacy AEAD TCP/UDP。
 
-VLESS、VMess、Trojan、SOCKS、HTTP 与 Shadowsocks legacy AEAD 均支持静态 JSON、动态 HandlerService 和原始 domain/IP target；TCP 协议复用 TCP/TLS/REALITY/WebSocket/HTTP Upgrade/gRPC transport pipeline。VMess 当前真实 Xray 验收覆盖 plain none 与 TLS+AES-128-GCM；Trojan 覆盖 plain TCP 与 TLS；SOCKS 覆盖 plain no-auth 与 TLS+password；HTTP 覆盖 plain no-auth 与 TLS+Basic Auth；Shadowsocks TCP 覆盖 plain AES-128-GCM 与 TLS+ChaCha20-IETF-Poly1305，UDP 覆盖 SOCKS5 UDP → Chimera → Xray → echo 的文本与 1200-byte datagram，并覆盖 TUIC datagram 与 UDP-over-stream response adapter。VLESS/VMess/Trojan/SOCKS 的代理 UDP、HTTP 非 CONNECT 转发、Shadowsocks XChaCha/2022/EIH 与持久 association 均尚未完成。
+VLESS、VMess、Trojan、SOCKS、HTTP 与 Shadowsocks legacy AEAD 均支持静态 JSON、动态 HandlerService 和原始 domain/IP target；TCP 协议复用 TCP/TLS/REALITY/WebSocket/HTTP Upgrade/gRPC transport pipeline。VMess 当前真实 Xray 验收覆盖 plain none 与 TLS+AES-128-GCM；Trojan 覆盖 plain TCP 与 TLS；SOCKS TCP/UDP 覆盖 plain no-auth 与 TLS+password，UDP 文本与 1200-byte datagram 均已通过 Xray 真实互通；HTTP 覆盖 plain no-auth 与 TLS+Basic Auth；Shadowsocks TCP 覆盖 plain AES-128-GCM 与 TLS+ChaCha20-IETF-Poly1305，UDP 覆盖 SOCKS5 UDP → Chimera → Xray → echo 的文本与 1200-byte datagram，并覆盖 TUIC datagram 与 UDP-over-stream response adapter。VLESS/VMess/Trojan 的代理 UDP、HTTP 非 CONNECT 转发、Shadowsocks XChaCha/2022/EIH，以及 SOCKS/Shadowsocks 的持久 UDP association 均尚未完成。
 
 下面这些 Xray outbound 尚未形成真实 connector：
 
@@ -778,7 +778,7 @@ Chimera 当前未支持这些高级 transport 组合。
 3. VLESS TCP outbound；（已完成）
 4. Trojan TCP outbound；（已完成）
 5. VMess TCP outbound；（已完成）
-6. SOCKS outbound；（TCP 已完成，UDP ASSOCIATE 待完成）
+6. SOCKS outbound；（TCP 与 UDP ASSOCIATE 已完成）
 7. HTTP outbound；（CONNECT TCP 已完成）
 8. Shadowsocks TCP/UDP outbound；（legacy AEAD TCP/UDP 主路径与 TUIC response adapter 已完成）
 9. 通用 sniffing context；
@@ -892,20 +892,22 @@ Chimera 当前未支持这些高级 transport 组合。
 - 非空 flow 和 UDP associate fail-closed；（已完成）
 - 与 Xray Trojan inbound 做 plain/TLS 双向互通测试。（已完成）
 
-### Slice 5：SOCKS5 TCP Outbound
+### Slice 5：SOCKS5 TCP/UDP Outbound
 
-当前实现状态：已完成。静态配置支持 Xray 标准 `servers:[{address,port,users}]` 与简化 `address/port/user/pass`；动态 HandlerService 支持 `xray.proxy.socks.ClientConfig`、SOCKS Account 与通用 SenderConfig，并通过 ListOutbounds 回显。客户端实现 SOCKS5 method negotiation、NO_AUTH、RFC1929 用户名密码认证、CONNECT command、IPv4/IPv6/domain target、reply code 映射和 bind address 完整消费；CONNECT 响应之后的同包业务字节不会丢失。仅允许单服务器和最多一个账户，用户名/密码长度在安装或握手前限制为 255 字节；UDP ASSOCIATE fail-closed。connector 复用完整 transport pipeline。plain no-auth 与 TLS+password 已通过 Xray 26.2.6 真实进程互通，覆盖 IP、域名和 64KiB payload。
+当前实现状态：已完成 TCP 与 UDP 主路径。静态配置支持 Xray 标准 `servers:[{address,port,users}]` 与简化 `address/port/user/pass`；动态 HandlerService 支持 `xray.proxy.socks.ClientConfig`、SOCKS Account 与通用 SenderConfig，并通过 ListOutbounds 回显。TCP 客户端实现 SOCKS5 method negotiation、NO_AUTH、RFC1929 用户名密码认证、CONNECT command、IPv4/IPv6/domain target、reply code 映射和 bind address 完整消费；CONNECT 响应之后的同包业务字节不会丢失。UDP executor 通过完整 transport pipeline 建立控制流，执行相同认证后发送 `UDP ASSOCIATE 0.0.0.0:0`，严格解析 IPv4/IPv6/domain relay；relay 返回 unspecified IP 时回退到代理 endpoint IP。每个请求保持控制流存活，创建匹配地址族的 one-shot UDP socket，按 RFC 1928 编码目标与 payload，并仅接受配置 relay socket 的响应；响应严格要求 `RSV=0`、`FRAG=0`，恢复原始 IPv4/IPv6/domain source 与 payload。该 executor 已接入固定目标、目标化消息、session/XUDP、SOCKS5 inbound、Dokodemo、Shadowsocks inbound、Hysteria2 与 TUIC response channel。仅允许单服务器和最多一个账户，用户名/密码长度在安装或握手前限制为 255 字节；SOCKS UDP fragmentation 与持久 association 尚未实现。plain no-auth 与 TLS+password 已通过 Xray 26.2.6 真实进程 TCP/UDP 互通，TCP 覆盖 IP、域名和 64KiB，UDP 覆盖文本与 1200-byte datagram。
 
 目标：
 
 - 支持 NO_AUTH 与 RFC1929 用户名密码；（已完成）
 - 支持标准与简化静态配置；（已完成）
 - 支持动态 ClientConfig、SenderConfig 与 ListOutbounds；（已完成）
-- 严格校验 SOCKS 版本、method、auth status、CONNECT reply、reserved byte 和 address type；（已完成）
-- 保留原始 domain/IP target 与 CONNECT 后首包；（已完成）
+- 严格校验 SOCKS 版本、method、auth status、CONNECT/UDP ASSOCIATE reply、reserved byte 和 address type；（已完成）
+- 保留原始 domain/IP target、CONNECT 后首包和 UDP response source；（已完成）
 - 复用共享 transport pipeline；（已完成）
-- UDP ASSOCIATE fail-closed；（已完成）
-- 与 Xray SOCKS inbound 做 no-auth 与 TLS+password 双向互通测试。（已完成）
+- 支持 RFC 1928 UDP ASSOCIATE 与 RSV/FRAG fail-closed；（已完成）
+- 覆盖固定/目标化/session、SOCKS5、Dokodemo、Shadowsocks inbound、Hysteria2 与 TUIC；（已完成）
+- 与 Xray SOCKS inbound 做 plain no-auth 与 TLS+password 的 TCP/UDP 双向互通测试。（已完成）
+- 持久 UDP association 与 fragmentation；（待完成）
 
 ### Slice 6：HTTP CONNECT TCP Outbound
 
@@ -1019,7 +1021,8 @@ Outbound Registry 完成后，新增协议和 transport 才能以插件式方式
 Outbound Registry
 → VLESS outbound
 → 通用 outbound transport
-→ VMess/HTTP/Shadowsocks outbound 与 SOCKS/Trojan UDP
+→ VMess/HTTP/Shadowsocks outbound 与 SOCKS UDP
+→ VLESS/VMess/Trojan UDP 与 Shadowsocks 2022/EIH
 → 通用 sniffing
 → Xray DNS/FakeDNS
 → XHTTP client 与完整 xmux/download
