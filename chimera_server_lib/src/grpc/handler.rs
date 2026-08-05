@@ -1,14 +1,20 @@
 use tonic::{Request, Response, Status};
 
-#[cfg(all(feature = "vless", feature = "grpc_transport"))]
+#[cfg(all(
+    any(feature = "trojan", feature = "vless"),
+    feature = "grpc_transport"
+))]
 use crate::config::def::OutboundGrpcSettings;
-#[cfg(all(feature = "vless", feature = "httpupgrade"))]
+#[cfg(all(
+    any(feature = "trojan", feature = "vless"),
+    feature = "httpupgrade"
+))]
 use crate::config::def::OutboundHttpUpgradeSettings;
-#[cfg(all(feature = "vless", feature = "reality"))]
+#[cfg(all(any(feature = "trojan", feature = "vless"), feature = "reality"))]
 use crate::config::def::OutboundRealitySettings;
-#[cfg(all(feature = "vless", feature = "ws"))]
+#[cfg(all(any(feature = "trojan", feature = "vless"), feature = "ws"))]
 use crate::config::def::OutboundWebsocketSettings;
-#[cfg(all(feature = "vless", feature = "tls"))]
+#[cfg(all(any(feature = "trojan", feature = "vless"), feature = "tls"))]
 use crate::config::def::{OutboundTlsCertificate, OutboundTlsSettings};
 #[cfg(feature = "hysteria")]
 use crate::config::server_config::Hysteria2Client;
@@ -18,6 +24,8 @@ use crate::config::server_config::RealityTransportConfig;
 use crate::config::server_config::TlsServerConfig;
 #[cfg(feature = "trojan")]
 use crate::config::server_config::TrojanUser;
+#[cfg(feature = "vless")]
+use crate::config::server_config::VlessUser;
 #[cfg(feature = "ws")]
 use crate::config::server_config::ws::WebsocketServerConfig;
 #[cfg(feature = "tls")]
@@ -36,12 +44,11 @@ use crate::{
     },
     runtime::{OutboundSummary, RuntimeState},
 };
-#[cfg(feature = "vless")]
+#[cfg(any(feature = "trojan", feature = "vless"))]
 use crate::{
-    config::{def::OutboundStreamSettings, server_config::VlessUser},
-    outbound_registry::OutboundConnectorKind,
+    config::def::OutboundStreamSettings, outbound_registry::OutboundConnectorKind,
 };
-#[cfg(all(feature = "vless", feature = "reality"))]
+#[cfg(all(any(feature = "trojan", feature = "vless"), feature = "reality"))]
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use prost::Message;
 
@@ -59,9 +66,9 @@ const ERR_PROXY_NOT_USER_MANAGER: &str =
 const TYPE_APP_RECEIVER_CONFIG: &str = "xray.app.proxyman.ReceiverConfig";
 const TYPE_APP_RECEIVER_CONFIG_V2RAY: &str =
     "v2ray.core.app.proxyman.ReceiverConfig";
-#[cfg(feature = "vless")]
+#[cfg(any(feature = "trojan", feature = "vless"))]
 const TYPE_APP_SENDER_CONFIG: &str = "xray.app.proxyman.SenderConfig";
-#[cfg(feature = "vless")]
+#[cfg(any(feature = "trojan", feature = "vless"))]
 const TYPE_APP_SENDER_CONFIG_V2RAY: &str = "v2ray.core.app.proxyman.SenderConfig";
 const TYPE_PROXY_SOCKS_SERVER_CONFIG: &str = "xray.proxy.socks.ServerConfig";
 const TYPE_PROXY_SOCKS_SERVER_CONFIG_V2RAY: &str =
@@ -85,6 +92,11 @@ const TYPE_PROXY_VLESS_OUTBOUND_CONFIG: &str = "xray.proxy.vless.outbound.Config
 #[cfg(feature = "vless")]
 const TYPE_PROXY_VLESS_OUTBOUND_CONFIG_V2RAY: &str =
     "v2ray.core.proxy.vless.outbound.Config";
+#[cfg(feature = "trojan")]
+const TYPE_PROXY_TROJAN_CLIENT_CONFIG: &str = "xray.proxy.trojan.ClientConfig";
+#[cfg(feature = "trojan")]
+const TYPE_PROXY_TROJAN_CLIENT_CONFIG_V2RAY: &str =
+    "v2ray.core.proxy.trojan.ClientConfig";
 #[cfg(feature = "trojan")]
 const TYPE_PROXY_TROJAN_SERVER_CONFIG: &str = "xray.proxy.trojan.ServerConfig";
 #[cfg(feature = "trojan")]
@@ -133,6 +145,24 @@ const TYPE_TRANSPORT_REALITY_CONFIG: &str = "xray.transport.internet.reality.Con
 struct TrojanAccountPayload {
     #[prost(string, tag = "1")]
     password: String,
+}
+
+#[cfg(feature = "trojan")]
+#[derive(Clone, PartialEq, Message)]
+struct TrojanClientConfigPayload {
+    #[prost(message, optional, tag = "1")]
+    server: Option<TrojanServerEndpointPayload>,
+}
+
+#[cfg(feature = "trojan")]
+#[derive(Clone, PartialEq, Message)]
+struct TrojanServerEndpointPayload {
+    #[prost(message, optional, tag = "1")]
+    address: Option<IpOrDomainPayload>,
+    #[prost(uint32, tag = "2")]
+    port: u32,
+    #[prost(message, optional, tag = "3")]
+    user: Option<proto::xray::common::protocol::User>,
 }
 
 #[cfg(feature = "hysteria")]
@@ -240,7 +270,7 @@ struct TransportConfigPayload {
     protocol_name: String,
 }
 
-#[cfg(feature = "vless")]
+#[cfg(any(feature = "trojan", feature = "vless"))]
 #[derive(Clone, PartialEq, Message)]
 struct SenderConfigPayload {
     #[prost(message, optional, tag = "1")]
@@ -257,7 +287,7 @@ struct SenderConfigPayload {
     target_strategy: i32,
 }
 
-#[cfg(feature = "vless")]
+#[cfg(any(feature = "trojan", feature = "vless"))]
 #[derive(Clone, PartialEq, Message)]
 struct SenderProxyConfigPayload {
     #[prost(string, tag = "1")]
@@ -266,7 +296,7 @@ struct SenderProxyConfigPayload {
     transport_layer_proxy: bool,
 }
 
-#[cfg(feature = "vless")]
+#[cfg(any(feature = "trojan", feature = "vless"))]
 #[derive(Clone, PartialEq, Message)]
 struct SenderMultiplexingConfigPayload {
     #[prost(bool, tag = "1")]
@@ -279,7 +309,7 @@ struct SenderMultiplexingConfigPayload {
     xudp_proxy_udp443: String,
 }
 
-#[cfg(feature = "vless")]
+#[cfg(any(feature = "trojan", feature = "vless"))]
 #[derive(Clone, PartialEq, Message)]
 struct SenderStreamConfigPayload {
     #[prost(message, repeated, tag = "2")]
@@ -304,11 +334,11 @@ struct SenderStreamConfigPayload {
     quic_params: Option<OpaqueSenderMessage>,
 }
 
-#[cfg(feature = "vless")]
+#[cfg(any(feature = "trojan", feature = "vless"))]
 #[derive(Clone, PartialEq, Message)]
 struct OpaqueSenderMessage {}
 
-#[cfg(all(feature = "vless", feature = "ws"))]
+#[cfg(all(any(feature = "trojan", feature = "vless"), feature = "ws"))]
 #[derive(Clone, PartialEq, Message)]
 struct OutboundWebsocketConfigPayload {
     #[prost(string, tag = "1")]
@@ -325,7 +355,7 @@ struct OutboundWebsocketConfigPayload {
     heartbeat_period: u32,
 }
 
-#[cfg(all(feature = "vless", feature = "httpupgrade"))]
+#[cfg(all(any(feature = "trojan", feature = "vless"), feature = "httpupgrade"))]
 #[derive(Clone, PartialEq, Message)]
 struct OutboundHttpUpgradeConfigPayload {
     #[prost(string, tag = "1")]
@@ -340,7 +370,7 @@ struct OutboundHttpUpgradeConfigPayload {
     early_data: u32,
 }
 
-#[cfg(all(feature = "vless", feature = "grpc_transport"))]
+#[cfg(all(any(feature = "trojan", feature = "vless"), feature = "grpc_transport"))]
 #[derive(Clone, PartialEq, Message)]
 struct OutboundGrpcConfigPayload {
     #[prost(string, tag = "1")]
@@ -361,7 +391,7 @@ struct OutboundGrpcConfigPayload {
     user_agent: String,
 }
 
-#[cfg(all(feature = "vless", feature = "tls"))]
+#[cfg(all(any(feature = "trojan", feature = "vless"), feature = "tls"))]
 #[derive(Clone, PartialEq, Message)]
 struct OutboundTlsConfigPayload {
     #[prost(message, repeated, tag = "2")]
@@ -400,7 +430,7 @@ struct OutboundTlsConfigPayload {
     pinned_peer_cert_sha256: Vec<Vec<u8>>,
 }
 
-#[cfg(all(feature = "vless", feature = "tls"))]
+#[cfg(all(any(feature = "trojan", feature = "vless"), feature = "tls"))]
 #[derive(Clone, PartialEq, Message)]
 struct OutboundTlsCertificatePayload {
     #[prost(bytes = "vec", tag = "1")]
@@ -421,7 +451,7 @@ struct OutboundTlsCertificatePayload {
     build_chain: bool,
 }
 
-#[cfg(all(feature = "vless", feature = "reality"))]
+#[cfg(all(any(feature = "trojan", feature = "vless"), feature = "reality"))]
 #[derive(Clone, PartialEq, Message)]
 struct OutboundRealityConfigPayload {
     #[prost(bool, tag = "1")]
@@ -1298,7 +1328,7 @@ impl HandlerServiceImpl {
         Ok(Some(version))
     }
 
-    #[cfg(feature = "vless")]
+    #[cfg(any(feature = "trojan", feature = "vless"))]
     fn parse_outbound_sender_settings(
         &self,
         sender_settings: Option<&proto::xray::common::serial::TypedMessage>,
@@ -1534,7 +1564,7 @@ impl HandlerServiceImpl {
         Ok(output)
     }
 
-    #[cfg(feature = "vless")]
+    #[cfg(any(feature = "trojan", feature = "vless"))]
     fn single_sender_transport_setting<'a>(
         &self,
         stream: &'a SenderStreamConfigPayload,
@@ -1563,7 +1593,7 @@ impl HandlerServiceImpl {
         })
     }
 
-    #[cfg(feature = "vless")]
+    #[cfg(any(feature = "trojan", feature = "vless"))]
     fn single_sender_security_setting<'a>(
         &self,
         stream: &'a SenderStreamConfigPayload,
@@ -1592,7 +1622,7 @@ impl HandlerServiceImpl {
         })
     }
 
-    #[cfg(all(feature = "vless", feature = "tls"))]
+    #[cfg(all(any(feature = "trojan", feature = "vless"), feature = "tls"))]
     fn parse_outbound_tls_settings(
         &self,
         typed: &proto::xray::common::serial::TypedMessage,
@@ -1687,7 +1717,7 @@ impl HandlerServiceImpl {
         })
     }
 
-    #[cfg(all(feature = "vless", feature = "reality"))]
+    #[cfg(all(any(feature = "trojan", feature = "vless"), feature = "reality"))]
     fn parse_outbound_reality_settings(
         &self,
         typed: &proto::xray::common::serial::TypedMessage,
@@ -1792,6 +1822,64 @@ impl HandlerServiceImpl {
                     "outbound proxy settings",
                 )?;
                 "blackhole"
+            }
+            #[cfg(feature = "trojan")]
+            TYPE_PROXY_TROJAN_CLIENT_CONFIG
+            | TYPE_PROXY_TROJAN_CLIENT_CONFIG_V2RAY => {
+                let config = self
+                    .decode_typed_message::<TrojanClientConfigPayload>(
+                        proxy_settings,
+                        &[
+                            TYPE_PROXY_TROJAN_CLIENT_CONFIG,
+                            TYPE_PROXY_TROJAN_CLIENT_CONFIG_V2RAY,
+                        ],
+                        "outbound proxy settings",
+                    )?;
+                let server = config.server.ok_or_else(|| {
+                    Status::invalid_argument("Trojan outbound server is required")
+                })?;
+                if server.address.is_none() {
+                    return Err(Status::invalid_argument(
+                        "Trojan outbound server address is required",
+                    ));
+                }
+                let address = self.parse_address(server.address)?;
+                let port = u16::try_from(server.port).map_err(|_| {
+                    Status::invalid_argument(
+                        "Trojan outbound server port must fit in u16",
+                    )
+                })?;
+                if port == 0 {
+                    return Err(Status::invalid_argument(
+                        "Trojan outbound server port must not be zero",
+                    ));
+                }
+                let user = server.user.ok_or_else(|| {
+                    Status::invalid_argument("Trojan outbound user is required")
+                })?;
+                let account = user.account.as_ref().ok_or_else(|| {
+                    Status::invalid_argument(
+                        "Trojan outbound user account is required",
+                    )
+                })?;
+                let account = self.decode_typed_message::<TrojanAccountPayload>(
+                    account,
+                    &[TYPE_PROXY_TROJAN_ACCOUNT, TYPE_PROXY_TROJAN_ACCOUNT_V2RAY],
+                    "Trojan outbound account",
+                )?;
+                literal_settings = Some(serde_json::json!({
+                    "servers": [{
+                        "address": address.to_string(),
+                        "port": port,
+                        "password": account.password,
+                        "level": user.level,
+                        "email": user.email
+                    }]
+                }));
+                stream_settings = Some(self.parse_outbound_sender_settings(
+                    outbound.sender_settings.as_ref(),
+                )?);
+                "trojan"
             }
             #[cfg(feature = "vless")]
             TYPE_PROXY_VLESS_OUTBOUND_CONFIG
@@ -2163,7 +2251,7 @@ impl HandlerServiceImpl {
         }
     }
 
-    #[cfg(feature = "vless")]
+    #[cfg(any(feature = "trojan", feature = "vless"))]
     fn encode_outbound_sender_settings(
         &self,
         stream: Option<&OutboundStreamSettings>,
@@ -2416,6 +2504,39 @@ impl HandlerServiceImpl {
                     TYPE_PROXY_BLACKHOLE_CONFIG,
                     BlackholeConfigPayload {},
                 )),
+                #[cfg(feature = "trojan")]
+                "trojan" => self.runtime.outbound_connector(&outbound.tag).and_then(
+                    |connector| match connector.as_ref() {
+                        OutboundConnectorKind::TrojanTcp(config) => {
+                            Some(Self::typed_message(
+                                TYPE_PROXY_TROJAN_CLIENT_CONFIG,
+                                TrojanClientConfigPayload {
+                                    server: Some(TrojanServerEndpointPayload {
+                                        address: Self::encode_address(
+                                            config.server.address(),
+                                        ),
+                                        port: u32::from(config.server.port()),
+                                        user: Some(
+                                            proto::xray::common::protocol::User {
+                                                level: 0,
+                                                email: String::new(),
+                                                account: Some(Self::typed_message(
+                                                    TYPE_PROXY_TROJAN_ACCOUNT,
+                                                    TrojanAccountPayload {
+                                                        password: config
+                                                            .password
+                                                            .to_string(),
+                                                    },
+                                                )),
+                                            },
+                                        ),
+                                    }),
+                                },
+                            ))
+                        }
+                        _ => None,
+                    },
+                ),
                 #[cfg(feature = "vless")]
                 "vless" => self.runtime.outbound_connector(&outbound.tag).and_then(
                     |connector| match connector.as_ref() {
@@ -2457,10 +2578,10 @@ impl HandlerServiceImpl {
         };
         proto::xray::core::OutboundHandlerConfig {
             tag: outbound.tag.clone(),
-            #[cfg(feature = "vless")]
+            #[cfg(any(feature = "trojan", feature = "vless"))]
             sender_settings: self
                 .encode_outbound_sender_settings(outbound.stream_settings.as_ref()),
-            #[cfg(not(feature = "vless"))]
+            #[cfg(not(any(feature = "trojan", feature = "vless")))]
             sender_settings: None,
             proxy_settings,
             expire: 0,
@@ -3557,6 +3678,39 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "trojan")]
+    fn build_add_trojan_outbound_request(
+        tag: &str,
+        password: &str,
+    ) -> proto::xray::app::proxyman::command::AddOutboundRequest {
+        let user = proto::xray::common::protocol::User {
+            level: 0,
+            email: "trojan-outbound@example.com".into(),
+            account: Some(HandlerServiceImpl::typed_message(
+                TYPE_PROXY_TROJAN_ACCOUNT,
+                TrojanAccountPayload {
+                    password: password.to_string(),
+                },
+            )),
+        };
+        build_typed_add_outbound_request(
+            tag,
+            TYPE_PROXY_TROJAN_CLIENT_CONFIG,
+            TrojanClientConfigPayload {
+                server: Some(TrojanServerEndpointPayload {
+                    address: Some(IpOrDomainPayload {
+                        address: Some(ip_or_domain_payload::Address::Domain(
+                            "trojan.example".into(),
+                        )),
+                    }),
+                    port: 443,
+                    user: Some(user),
+                }),
+            }
+            .encode_to_vec(),
+        )
+    }
+
     #[cfg(feature = "vless")]
     fn build_sender_add_vless_outbound_request(
         tag: &str,
@@ -3926,6 +4080,71 @@ mod tests {
         );
         assert_eq!(runtime.outbounds().len(), before.len());
         assert!(runtime.outbound_connector(&unsupported_tag).is_none());
+    }
+
+    #[cfg(feature = "trojan")]
+    #[tokio::test]
+    async fn handler_installs_trojan_outbound_and_lists_sender_settings() {
+        let fixture = build_fixture();
+        let runtime = fixture.runtime.clone();
+        let service = HandlerServiceImpl::new(runtime.clone());
+        let tag = unique_tag("trojan-outbound");
+
+        let mut request = build_add_trojan_outbound_request(&tag, "secret");
+        request.outbound.as_mut().unwrap().sender_settings =
+            Some(HandlerServiceImpl::typed_message(
+                TYPE_APP_SENDER_CONFIG,
+                SenderConfigPayload::default(),
+            ));
+        service
+            .add_outbound(Request::new(request))
+            .await
+            .expect("Trojan outbound should install");
+
+        let connector = runtime
+            .outbound_connector(&tag)
+            .expect("Trojan connector should be registered");
+        let OutboundConnectorKind::TrojanTcp(config) = connector.as_ref() else {
+            panic!("expected Trojan TCP connector");
+        };
+        assert_eq!(config.server.to_string(), "trojan.example:443");
+        assert_eq!(config.password.as_ref(), "secret");
+        assert!(config.transport.is_tcp());
+
+        let listed = service
+            .list_outbounds(Request::new(
+                proto::xray::app::proxyman::command::ListOutboundsRequest {},
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let outbound = listed
+            .outbounds
+            .iter()
+            .find(|outbound| outbound.tag == tag)
+            .expect("listed Trojan outbound missing");
+        assert_eq!(
+            outbound.proxy_settings.as_ref().unwrap().r#type,
+            TYPE_PROXY_TROJAN_CLIENT_CONFIG
+        );
+        let sender = outbound
+            .sender_settings
+            .as_ref()
+            .expect("Trojan SenderConfig should be listed");
+        let sender = SenderConfigPayload::decode(sender.value.as_slice()).unwrap();
+        assert_eq!(sender.stream_settings.unwrap().protocol_name, "tcp");
+
+        let rejected_tag = unique_tag("trojan-empty-password");
+        let error = service
+            .add_outbound(Request::new(build_add_trojan_outbound_request(
+                &rejected_tag,
+                "",
+            )))
+            .await
+            .expect_err("empty Trojan password must fail atomically");
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("password must not be empty"));
+        assert!(runtime.outbound_connector(&rejected_tag).is_none());
     }
 
     #[cfg(feature = "vless")]

@@ -4,8 +4,11 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(any(feature = "trojan", feature = "vless"))]
 use tokio::io::AsyncWriteExt;
 
+#[cfg(feature = "trojan")]
+use crate::trojan_outbound::encode_trojan_tcp_request;
 #[cfg(feature = "vless")]
 use crate::vless_outbound::{VlessTcpOutboundStream, encode_vless_tcp_request};
 use crate::{
@@ -28,6 +31,14 @@ pub(crate) enum DirectOutboundAction {
 pub(crate) struct TcpOutboundConnection {
     pub stream: Box<dyn AsyncStream>,
     pub outbound_tag: Option<String>,
+}
+
+enum TcpOutboundHandshake {
+    None,
+    #[cfg(feature = "trojan")]
+    Trojan(Vec<u8>),
+    #[cfg(feature = "vless")]
+    Vless(Vec<u8>),
 }
 
 pub(crate) async fn connect_tcp_outbound(
@@ -57,22 +68,27 @@ pub(crate) async fn connect_tcp_outbound(
         None => (None, None),
     };
 
-    let (connect_location, transport, vless_request): (
-        NetLocation,
-        OutboundTransportConfig,
-        Option<Vec<u8>>,
-    ) = match connector.as_deref() {
+    let (connect_location, transport, handshake) = match connector.as_deref() {
         None | Some(OutboundConnectorKind::Freedom) => (
             remote_location.clone(),
             OutboundTransportConfig::tcp(),
-            None,
+            TcpOutboundHandshake::None,
         ),
         Some(OutboundConnectorKind::Blackhole) => return Ok(None),
+        #[cfg(feature = "trojan")]
+        Some(OutboundConnectorKind::TrojanTcp(config)) => (
+            config.server.clone(),
+            config.transport.clone(),
+            TcpOutboundHandshake::Trojan(encode_trojan_tcp_request(
+                &config.password,
+                remote_location,
+            )?),
+        ),
         #[cfg(feature = "vless")]
         Some(OutboundConnectorKind::VlessTcp(config)) => (
             config.server.clone(),
             config.transport.clone(),
-            Some(encode_vless_tcp_request(
+            TcpOutboundHandshake::Vless(encode_vless_tcp_request(
                 &config.user_uuid,
                 remote_location,
             )?),
@@ -90,7 +106,7 @@ pub(crate) async fn connect_tcp_outbound(
     };
     let started = Instant::now();
     let attempted_at = unix_time_secs();
-    let mut stream = match transport.connect(resolver, &connect_location).await {
+    let stream = match transport.connect(resolver, &connect_location).await {
         Ok(stream) => stream,
         Err(error) => {
             record_tcp_outbound_failure(
@@ -103,30 +119,38 @@ pub(crate) async fn connect_tcp_outbound(
             return Err(error);
         }
     };
-    let stream: Box<dyn AsyncStream> = if let Some(request) = vless_request {
-        if let Err(error) = stream.write_all(&request).await {
-            record_tcp_outbound_failure(
-                runtime,
-                outbound_tag.as_deref(),
-                started,
-                attempted_at,
-                &error,
-            );
-            return Err(error);
+    #[cfg(any(feature = "trojan", feature = "vless"))]
+    let mut stream = stream;
+    let stream: Box<dyn AsyncStream> = match handshake {
+        TcpOutboundHandshake::None => stream,
+        #[cfg(feature = "trojan")]
+        TcpOutboundHandshake::Trojan(request) => {
+            if let Err(error) = stream.write_all(&request).await {
+                record_tcp_outbound_failure(
+                    runtime,
+                    outbound_tag.as_deref(),
+                    started,
+                    attempted_at,
+                    &error,
+                );
+                return Err(error);
+            }
+            stream
         }
         #[cfg(feature = "vless")]
-        {
+        TcpOutboundHandshake::Vless(request) => {
+            if let Err(error) = stream.write_all(&request).await {
+                record_tcp_outbound_failure(
+                    runtime,
+                    outbound_tag.as_deref(),
+                    started,
+                    attempted_at,
+                    &error,
+                );
+                return Err(error);
+            }
             Box::new(VlessTcpOutboundStream::new(stream))
         }
-        #[cfg(not(feature = "vless"))]
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "VLESS outbound feature is disabled",
-            ));
-        }
-    } else {
-        stream
     };
 
     record_tcp_outbound_success(
@@ -204,6 +228,11 @@ pub(crate) fn select_direct_outbound(
         OutboundConnectorKind::Blackhole => {
             Ok(DirectOutboundAction::Blackhole { tag })
         }
+        #[cfg(feature = "trojan")]
+        OutboundConnectorKind::TrojanTcp(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{network_name} outbound {tag} does not support UDP yet"),
+        )),
         #[cfg(feature = "vless")]
         OutboundConnectorKind::VlessTcp(_) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,

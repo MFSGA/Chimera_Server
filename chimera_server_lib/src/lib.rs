@@ -37,6 +37,8 @@ mod mcp;
 mod outbound;
 mod outbound_registry;
 mod outbound_transport;
+#[cfg(feature = "trojan")]
+mod trojan_outbound;
 #[cfg(feature = "vless")]
 mod vless_outbound;
 

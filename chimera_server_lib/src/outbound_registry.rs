@@ -1,13 +1,21 @@
 use std::{collections::HashMap, sync::Arc};
 
-#[cfg(feature = "vless")]
+#[cfg(any(feature = "trojan", feature = "vless"))]
 use serde::Deserialize;
 
-#[cfg(feature = "vless")]
+#[cfg(any(feature = "trojan", feature = "vless"))]
 use crate::address::{Address, NetLocation};
-#[cfg(feature = "vless")]
+#[cfg(any(feature = "trojan", feature = "vless"))]
 use crate::outbound_transport::OutboundTransportConfig;
 use crate::runtime::OutboundSummary;
+
+#[cfg(feature = "trojan")]
+#[derive(Debug, Clone)]
+pub(crate) struct TrojanTcpOutboundConfig {
+    pub server: NetLocation,
+    pub password: Arc<str>,
+    pub transport: OutboundTransportConfig,
+}
 
 #[cfg(feature = "vless")]
 #[derive(Debug, Clone)]
@@ -56,6 +64,37 @@ struct LiteralVlessUser {
     encryption: String,
 }
 
+#[cfg(feature = "trojan")]
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LiteralTrojanOutboundSettings {
+    #[serde(default)]
+    address: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    flow: Option<String>,
+    #[serde(default)]
+    servers: Vec<LiteralTrojanServer>,
+}
+
+#[cfg(feature = "trojan")]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LiteralTrojanServer {
+    address: String,
+    port: u16,
+    password: String,
+    #[serde(default)]
+    flow: String,
+    #[serde(default)]
+    level: u32,
+    #[serde(default)]
+    email: String,
+}
+
 /// Compiled outbound behavior installed in the runtime registry.
 ///
 /// Unsupported entries are retained only by the lenient constructor used by
@@ -65,6 +104,8 @@ struct LiteralVlessUser {
 pub(crate) enum OutboundConnectorKind {
     Freedom,
     Blackhole,
+    #[cfg(feature = "trojan")]
+    TrojanTcp(Box<TrojanTcpOutboundConfig>),
     #[cfg(feature = "vless")]
     VlessTcp(Box<VlessTcpOutboundConfig>),
     Unsupported {
@@ -182,12 +223,105 @@ fn compile_vless_tcp(
     })
 }
 
+#[cfg(feature = "trojan")]
+fn compile_trojan_tcp(
+    summary: &OutboundSummary,
+) -> Result<TrojanTcpOutboundConfig, String> {
+    let settings = summary.settings.as_ref().ok_or_else(|| {
+        format!("Trojan outbound {} requires settings", summary.tag)
+    })?;
+    let settings =
+        serde_json::from_value::<LiteralTrojanOutboundSettings>(settings.clone())
+            .map_err(|error| {
+                format!("invalid Trojan outbound {} settings: {error}", summary.tag)
+            })?;
+
+    let (address, port, password, flow) = if let Some(address) = settings.address {
+        if !settings.servers.is_empty() {
+            return Err(format!(
+                "Trojan outbound {} cannot combine address with servers",
+                summary.tag
+            ));
+        }
+        (
+            address,
+            settings.port.ok_or_else(|| {
+                format!("Trojan outbound {} requires port", summary.tag)
+            })?,
+            settings.password.ok_or_else(|| {
+                format!("Trojan outbound {} requires password", summary.tag)
+            })?,
+            settings.flow.unwrap_or_default(),
+        )
+    } else {
+        if settings.servers.len() != 1 {
+            return Err(format!(
+                "Trojan outbound {} requires exactly one server",
+                summary.tag
+            ));
+        }
+        let mut servers = settings.servers;
+        let server = servers.pop().ok_or_else(|| {
+            format!("Trojan outbound {} server disappeared", summary.tag)
+        })?;
+        let _ = (server.level, server.email);
+        (server.address, server.port, server.password, server.flow)
+    };
+
+    if address.trim().is_empty() {
+        return Err(format!(
+            "Trojan outbound {} server address must not be empty",
+            summary.tag
+        ));
+    }
+    if port == 0 {
+        return Err(format!(
+            "Trojan outbound {} server port must not be zero",
+            summary.tag
+        ));
+    }
+    if password.is_empty() {
+        return Err(format!(
+            "Trojan outbound {} password must not be empty",
+            summary.tag
+        ));
+    }
+    if !flow.trim().is_empty() {
+        return Err(format!(
+            "Trojan outbound {} does not support removed flow {}",
+            summary.tag, flow
+        ));
+    }
+
+    let server_address = Address::from(address.trim()).map_err(|error| {
+        format!(
+            "invalid Trojan outbound {} server address: {error}",
+            summary.tag
+        )
+    })?;
+    let server = NetLocation::new(server_address, port);
+    let transport = OutboundTransportConfig::compile(
+        &server,
+        summary.stream_settings.as_ref(),
+        &summary.tag,
+    )?;
+    Ok(TrojanTcpOutboundConfig {
+        server,
+        password: Arc::from(password),
+        transport,
+    })
+}
+
 impl OutboundConnectorKind {
     fn compile(summary: &OutboundSummary, strict: bool) -> Result<Self, String> {
         let protocol = summary.protocol.trim().to_ascii_lowercase();
         match protocol.as_str() {
             "freedom" => Ok(Self::Freedom),
             "blackhole" => Ok(Self::Blackhole),
+            #[cfg(feature = "trojan")]
+            "trojan" => compile_trojan_tcp(summary)
+                .map(Box::new)
+                .map(Self::TrojanTcp),
             #[cfg(feature = "vless")]
             "vless" => compile_vless_tcp(summary).map(Box::new).map(Self::VlessTcp),
             "" => Err(format!(
@@ -293,6 +427,22 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "trojan")]
+    fn literal_trojan(settings: serde_json::Value) -> OutboundSummary {
+        OutboundSummary {
+            tag: "trojan-proxy".into(),
+            protocol: "trojan".into(),
+            settings: Some(settings),
+            stream_settings: Some(crate::config::def::OutboundStreamSettings {
+                network: "tcp".into(),
+                security: Some("none".into()),
+                ..crate::config::def::OutboundStreamSettings::default()
+            }),
+            proxy_settings_type: None,
+            proxy_settings_value: None,
+        }
+    }
+
     #[cfg(feature = "vless")]
     fn literal_vless(settings: serde_json::Value) -> OutboundSummary {
         OutboundSummary {
@@ -314,6 +464,71 @@ mod tests {
             }),
             proxy_settings_type: None,
             proxy_settings_value: None,
+        }
+    }
+
+    #[cfg(feature = "trojan")]
+    #[test]
+    fn compiles_standard_and_simplified_trojan_tcp_settings() {
+        let standard = literal_trojan(serde_json::json!({
+            "servers": [{
+                "address": "127.0.0.1",
+                "port": 443,
+                "password": "secret"
+            }]
+        }));
+        let simplified = literal_trojan(serde_json::json!({
+            "address": "127.0.0.1",
+            "port": 443,
+            "password": "secret"
+        }));
+        let assert_trojan = |connector: OutboundConnectorKind| {
+            let OutboundConnectorKind::TrojanTcp(config) = connector else {
+                panic!("expected Trojan TCP connector");
+            };
+            assert_eq!(
+                config.server,
+                NetLocation::new(Address::Ipv4("127.0.0.1".parse().unwrap()), 443)
+            );
+            assert_eq!(config.password.as_ref(), "secret");
+            assert!(config.transport.is_tcp());
+        };
+        assert_trojan(OutboundConnectorKind::compile(&standard, true).unwrap());
+        assert_trojan(OutboundConnectorKind::compile(&simplified, true).unwrap());
+    }
+
+    #[cfg(feature = "trojan")]
+    #[test]
+    fn rejects_invalid_trojan_server_and_removed_flow() {
+        for (settings, expected) in [
+            (
+                serde_json::json!({
+                    "servers": []
+                }),
+                "exactly one server",
+            ),
+            (
+                serde_json::json!({
+                    "address": "127.0.0.1",
+                    "port": 443,
+                    "password": "secret",
+                    "flow": "xtls-rprx-direct"
+                }),
+                "removed flow",
+            ),
+            (
+                serde_json::json!({
+                    "address": "127.0.0.1",
+                    "port": 443,
+                    "password": ""
+                }),
+                "password must not be empty",
+            ),
+        ] {
+            let error =
+                OutboundConnectorKind::compile(&literal_trojan(settings), true)
+                    .expect_err("invalid Trojan settings must fail closed");
+            assert!(error.contains(expected), "unexpected error: {error}");
         }
     }
 
