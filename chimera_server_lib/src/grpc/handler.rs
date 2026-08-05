@@ -24,6 +24,8 @@ use crate::config::server_config::VlessUser;
 use crate::config::server_config::ws::WebsocketServerConfig;
 #[cfg(feature = "tls")]
 use crate::config::server_config::{TlsCertificateConfig, TlsCertificateUsage};
+#[cfg(feature = "vmess")]
+use crate::handler::vmess::client::format_vmess_user_id;
 #[cfg(feature = "ws")]
 use crate::util::option::OneOrSome;
 use crate::{
@@ -96,6 +98,15 @@ const TYPE_PROXY_VLESS_INBOUND_CONFIG_V2RAY: &str =
 const TYPE_PROXY_VLESS_ACCOUNT: &str = "xray.proxy.vless.Account";
 #[cfg(feature = "vless")]
 const TYPE_PROXY_VLESS_ACCOUNT_V2RAY: &str = "v2ray.core.proxy.vless.Account";
+#[cfg(feature = "vmess")]
+const TYPE_PROXY_VMESS_OUTBOUND_CONFIG: &str = "xray.proxy.vmess.outbound.Config";
+#[cfg(feature = "vmess")]
+const TYPE_PROXY_VMESS_OUTBOUND_CONFIG_V2RAY: &str =
+    "v2ray.core.proxy.vmess.outbound.Config";
+#[cfg(feature = "vmess")]
+const TYPE_PROXY_VMESS_ACCOUNT: &str = "xray.proxy.vmess.Account";
+#[cfg(feature = "vmess")]
+const TYPE_PROXY_VMESS_ACCOUNT_V2RAY: &str = "v2ray.core.proxy.vmess.Account";
 #[cfg(feature = "vless")]
 const TYPE_PROXY_VLESS_OUTBOUND_CONFIG: &str = "xray.proxy.vless.outbound.Config";
 #[cfg(feature = "vless")]
@@ -565,6 +576,31 @@ struct OutboundRealityConfigPayload {
 struct VlessInboundConfigPayload {
     #[prost(message, repeated, tag = "1")]
     clients: Vec<proto::xray::common::protocol::User>,
+}
+
+#[cfg(feature = "vmess")]
+#[derive(Clone, PartialEq, Message)]
+struct VmessSecurityConfigPayload {
+    #[prost(int32, tag = "1")]
+    security_type: i32,
+}
+
+#[cfg(feature = "vmess")]
+#[derive(Clone, PartialEq, Message)]
+struct VmessAccountPayload {
+    #[prost(string, tag = "1")]
+    id: String,
+    #[prost(message, optional, tag = "3")]
+    security_settings: Option<VmessSecurityConfigPayload>,
+    #[prost(string, tag = "4")]
+    tests_enabled: String,
+}
+
+#[cfg(feature = "vmess")]
+#[derive(Clone, PartialEq, Message)]
+struct VmessOutboundConfigPayload {
+    #[prost(message, optional, tag = "1")]
+    receiver: Option<SocksServerEndpointPayload>,
 }
 
 #[cfg(feature = "vless")]
@@ -2156,6 +2192,94 @@ impl HandlerServiceImpl {
                 )?);
                 "trojan"
             }
+            #[cfg(feature = "vmess")]
+            TYPE_PROXY_VMESS_OUTBOUND_CONFIG
+            | TYPE_PROXY_VMESS_OUTBOUND_CONFIG_V2RAY => {
+                let config = self
+                    .decode_typed_message::<VmessOutboundConfigPayload>(
+                        proxy_settings,
+                        &[
+                            TYPE_PROXY_VMESS_OUTBOUND_CONFIG,
+                            TYPE_PROXY_VMESS_OUTBOUND_CONFIG_V2RAY,
+                        ],
+                        "outbound proxy settings",
+                    )?;
+                let receiver = config.receiver.ok_or_else(|| {
+                    Status::invalid_argument("VMess outbound receiver is required")
+                })?;
+                if receiver.address.is_none() {
+                    return Err(Status::invalid_argument(
+                        "VMess outbound server address is required",
+                    ));
+                }
+                let address = self.parse_address(receiver.address)?;
+                let port = u16::try_from(receiver.port).map_err(|_| {
+                    Status::invalid_argument(
+                        "VMess outbound server port must fit in u16",
+                    )
+                })?;
+                if port == 0 {
+                    return Err(Status::invalid_argument(
+                        "VMess outbound server port must not be zero",
+                    ));
+                }
+                let user = receiver.user.ok_or_else(|| {
+                    Status::invalid_argument("VMess outbound user is required")
+                })?;
+                let account = user.account.as_ref().ok_or_else(|| {
+                    Status::invalid_argument(
+                        "VMess outbound user account is required",
+                    )
+                })?;
+                let account = self.decode_typed_message::<VmessAccountPayload>(
+                    account,
+                    &[TYPE_PROXY_VMESS_ACCOUNT, TYPE_PROXY_VMESS_ACCOUNT_V2RAY],
+                    "VMess outbound account",
+                )?;
+                if !account.tests_enabled.trim().is_empty() {
+                    return Err(Status::invalid_argument(
+                        "VMess outbound experiments are not supported",
+                    ));
+                }
+                let security_type = account
+                    .security_settings
+                    .as_ref()
+                    .map(|settings| settings.security_type)
+                    .unwrap_or_default();
+                let security = match security_type {
+                    0 => "none",
+                    3 => "aes-128-gcm",
+                    4 => "chacha20-poly1305",
+                    2 => {
+                        return Err(Status::invalid_argument(
+                            "VMess outbound requires explicit security instead of auto",
+                        ));
+                    }
+                    other => {
+                        return Err(Status::invalid_argument(format!(
+                            "unsupported VMess outbound security type: {other}"
+                        )));
+                    }
+                };
+                literal_settings = Some(serde_json::json!({
+                    "vnext": [{
+                        "address": address.to_string(),
+                        "port": port,
+                        "users": [{
+                            "id": account.id,
+                            "security": security,
+                            "alterId": 0,
+                            "experiments": account.tests_enabled,
+                            "level": user.level,
+                            "email": user.email
+                        }]
+                    }]
+                }));
+                stream_settings = Some(self.parse_outbound_sender_settings(
+                    outbound.sender_settings.as_ref(),
+                )?);
+                "vmess"
+            }
             #[cfg(feature = "vless")]
             TYPE_PROXY_VLESS_OUTBOUND_CONFIG
             | TYPE_PROXY_VLESS_OUTBOUND_CONFIG_V2RAY => {
@@ -2934,6 +3058,50 @@ impl HandlerServiceImpl {
                                                         password: config
                                                             .password
                                                             .to_string(),
+                                                    },
+                                                )),
+                                            },
+                                        ),
+                                    }),
+                                },
+                            ))
+                        }
+                        _ => None,
+                    },
+                ),
+                #[cfg(feature = "vmess")]
+                "vmess" => self.runtime.outbound_connector(&outbound.tag).and_then(
+                    |connector| match connector.as_ref() {
+                        OutboundConnectorKind::VmessTcp(config) => {
+                            let security_type = match config.security {
+                                crate::handler::vmess::client::VmessDataSecurity::None => 0,
+                                crate::handler::vmess::client::VmessDataSecurity::Aes128Gcm => 3,
+                                crate::handler::vmess::client::VmessDataSecurity::ChaCha20Poly1305 => 4,
+                            };
+                            Some(Self::typed_message(
+                                TYPE_PROXY_VMESS_OUTBOUND_CONFIG,
+                                VmessOutboundConfigPayload {
+                                    receiver: Some(SocksServerEndpointPayload {
+                                        address: Self::encode_address(
+                                            config.server.address(),
+                                        ),
+                                        port: u32::from(config.server.port()),
+                                        user: Some(
+                                            proto::xray::common::protocol::User {
+                                                level: 0,
+                                                email: String::new(),
+                                                account: Some(Self::typed_message(
+                                                    TYPE_PROXY_VMESS_ACCOUNT,
+                                                    VmessAccountPayload {
+                                                        id: format_vmess_user_id(
+                                                            config.user_uuid,
+                                                        ),
+                                                        security_settings: Some(
+                                                            VmessSecurityConfigPayload {
+                                                                security_type,
+                                                            },
+                                                        ),
+                                                        tests_enabled: String::new(),
                                                     },
                                                 )),
                                             },
@@ -4046,6 +4214,44 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "vmess")]
+    fn build_add_vmess_outbound_request(
+        tag: &str,
+        security_type: i32,
+        tests_enabled: &str,
+    ) -> proto::xray::app::proxyman::command::AddOutboundRequest {
+        let user = proto::xray::common::protocol::User {
+            level: 0,
+            email: "vmess-outbound@example.com".into(),
+            account: Some(HandlerServiceImpl::typed_message(
+                TYPE_PROXY_VMESS_ACCOUNT,
+                VmessAccountPayload {
+                    id: "3ac9b383-75a1-431c-8184-106c80eb2273".into(),
+                    security_settings: Some(VmessSecurityConfigPayload {
+                        security_type,
+                    }),
+                    tests_enabled: tests_enabled.to_string(),
+                },
+            )),
+        };
+        build_typed_add_outbound_request(
+            tag,
+            TYPE_PROXY_VMESS_OUTBOUND_CONFIG,
+            VmessOutboundConfigPayload {
+                receiver: Some(SocksServerEndpointPayload {
+                    address: Some(IpOrDomainPayload {
+                        address: Some(ip_or_domain_payload::Address::Domain(
+                            "vmess.example".into(),
+                        )),
+                    }),
+                    port: 443,
+                    user: Some(user),
+                }),
+            }
+            .encode_to_vec(),
+        )
+    }
+
     #[cfg(feature = "vless")]
     fn build_add_vless_outbound_request(
         tag: &str,
@@ -4587,7 +4793,7 @@ mod tests {
         let error = service
             .add_outbound(Request::new(build_typed_add_outbound_request(
                 &unsupported_tag,
-                "xray.proxy.vmess.outbound.Config",
+                "xray.proxy.wireguard.Config",
                 Vec::new(),
             )))
             .await
@@ -4699,6 +4905,96 @@ mod tests {
         assert_eq!(error.code(), Code::InvalidArgument);
         assert!(error.message().contains("reserved"));
         assert!(runtime.outbound_connector(&reserved_tag).is_none());
+    }
+
+    #[cfg(feature = "vmess")]
+    #[tokio::test]
+    async fn handler_installs_vmess_and_rejects_auto_or_experiments() {
+        let fixture = build_fixture();
+        let runtime = fixture.runtime.clone();
+        let service = HandlerServiceImpl::new(runtime.clone());
+        let tag = unique_tag("vmess-aes");
+        let mut request = build_add_vmess_outbound_request(&tag, 3, "");
+        request.outbound.as_mut().unwrap().sender_settings =
+            Some(HandlerServiceImpl::typed_message(
+                TYPE_APP_SENDER_CONFIG,
+                SenderConfigPayload::default(),
+            ));
+
+        service
+            .add_outbound(Request::new(request))
+            .await
+            .expect("VMess outbound should install");
+        let connector = runtime.outbound_connector(&tag).unwrap();
+        let OutboundConnectorKind::VmessTcp(config) = connector.as_ref() else {
+            panic!("expected VMess TCP connector");
+        };
+        assert_eq!(config.server.to_string(), "vmess.example:443");
+        assert_eq!(
+            config.security,
+            crate::handler::vmess::client::VmessDataSecurity::Aes128Gcm
+        );
+        assert_eq!(
+            format_vmess_user_id(config.user_uuid),
+            "3ac9b383-75a1-431c-8184-106c80eb2273"
+        );
+        assert!(config.transport.is_tcp());
+
+        let listed = service
+            .list_outbounds(Request::new(
+                proto::xray::app::proxyman::command::ListOutboundsRequest {},
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let outbound = listed
+            .outbounds
+            .iter()
+            .find(|outbound| outbound.tag == tag)
+            .expect("listed VMess outbound missing");
+        assert_eq!(
+            outbound.proxy_settings.as_ref().unwrap().r#type,
+            TYPE_PROXY_VMESS_OUTBOUND_CONFIG
+        );
+        let config = VmessOutboundConfigPayload::decode(
+            outbound.proxy_settings.as_ref().unwrap().value.as_slice(),
+        )
+        .unwrap();
+        let account = config.receiver.unwrap().user.unwrap().account.unwrap();
+        let account = VmessAccountPayload::decode(account.value.as_slice()).unwrap();
+        assert_eq!(account.id, "3ac9b383-75a1-431c-8184-106c80eb2273");
+        assert_eq!(account.security_settings.unwrap().security_type, 3);
+        assert!(account.tests_enabled.is_empty());
+        assert!(outbound.sender_settings.is_some());
+
+        for (suffix, security_type, tests_enabled, expected) in [
+            ("auto", 2, "", "explicit security"),
+            ("unknown", 99, "", "unsupported VMess outbound security"),
+            (
+                "experiments",
+                3,
+                "AuthenticatedLength",
+                "experiments are not supported",
+            ),
+        ] {
+            let rejected_tag = unique_tag(suffix);
+            let before = runtime.outbounds().len();
+            let error = service
+                .add_outbound(Request::new(build_add_vmess_outbound_request(
+                    &rejected_tag,
+                    security_type,
+                    tests_enabled,
+                )))
+                .await
+                .expect_err("unsupported VMess variant must fail atomically");
+            assert_eq!(error.code(), Code::InvalidArgument);
+            assert!(
+                error.message().contains(expected),
+                "unexpected error: {error}"
+            );
+            assert_eq!(runtime.outbounds().len(), before);
+            assert!(runtime.outbound_connector(&rejected_tag).is_none());
+        }
     }
 
     #[cfg(feature = "shadowsocks")]

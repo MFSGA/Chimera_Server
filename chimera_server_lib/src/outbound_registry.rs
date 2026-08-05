@@ -5,6 +5,8 @@ use serde::Deserialize;
 use crate::address::{Address, NetLocation};
 #[cfg(feature = "shadowsocks")]
 use crate::handler::shadowsocks::{ShadowsocksCipher, compile_legacy_outbound_key};
+#[cfg(feature = "vmess")]
+use crate::handler::vmess::client::{VmessDataSecurity, parse_vmess_user_id};
 use crate::http_outbound::{HttpProxyCredentials, validate_http_proxy_headers};
 use crate::outbound_transport::OutboundTransportConfig;
 use crate::runtime::OutboundSummary;
@@ -44,12 +46,67 @@ pub(crate) struct TrojanTcpOutboundConfig {
     pub transport: OutboundTransportConfig,
 }
 
+#[cfg(feature = "vmess")]
+#[derive(Debug, Clone)]
+pub(crate) struct VmessTcpOutboundConfig {
+    pub server: NetLocation,
+    pub user_uuid: [u8; 16],
+    pub security: VmessDataSecurity,
+    pub transport: OutboundTransportConfig,
+}
+
 #[cfg(feature = "vless")]
 #[derive(Debug, Clone)]
 pub(crate) struct VlessTcpOutboundConfig {
     pub server: NetLocation,
     pub user_uuid: [u8; 16],
     pub transport: OutboundTransportConfig,
+}
+
+#[cfg(feature = "vmess")]
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LiteralVmessOutboundSettings {
+    #[serde(default)]
+    address: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    security: Option<String>,
+    #[serde(default)]
+    alter_id: Option<u16>,
+    #[serde(default)]
+    experiments: Option<String>,
+    #[serde(default)]
+    vnext: Vec<LiteralVmessServer>,
+}
+
+#[cfg(feature = "vmess")]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LiteralVmessServer {
+    address: String,
+    port: u16,
+    users: Vec<LiteralVmessUser>,
+}
+
+#[cfg(feature = "vmess")]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LiteralVmessUser {
+    id: String,
+    #[serde(default)]
+    security: String,
+    #[serde(default)]
+    alter_id: u16,
+    #[serde(default)]
+    experiments: String,
+    #[serde(default)]
+    level: u32,
+    #[serde(default)]
+    email: String,
 }
 
 #[cfg(feature = "vless")]
@@ -245,9 +302,121 @@ pub(crate) enum OutboundConnectorKind {
     TrojanTcp(Box<TrojanTcpOutboundConfig>),
     #[cfg(feature = "vless")]
     VlessTcp(Box<VlessTcpOutboundConfig>),
+    #[cfg(feature = "vmess")]
+    VmessTcp(Box<VmessTcpOutboundConfig>),
     Unsupported {
         protocol: Arc<str>,
     },
+}
+
+#[cfg(feature = "vmess")]
+fn compile_vmess_tcp(
+    summary: &OutboundSummary,
+) -> Result<VmessTcpOutboundConfig, String> {
+    let settings = summary.settings.as_ref().ok_or_else(|| {
+        format!("VMess outbound {} requires settings", summary.tag)
+    })?;
+    let settings =
+        serde_json::from_value::<LiteralVmessOutboundSettings>(settings.clone())
+            .map_err(|error| {
+                format!("invalid VMess outbound {} settings: {error}", summary.tag)
+            })?;
+
+    let (address, port, user) = if let Some(address) = settings.address {
+        if !settings.vnext.is_empty() {
+            return Err(format!(
+                "VMess outbound {} cannot combine address with vnext",
+                summary.tag
+            ));
+        }
+        (
+            address,
+            settings.port.ok_or_else(|| {
+                format!("VMess outbound {} requires port", summary.tag)
+            })?,
+            LiteralVmessUser {
+                id: settings.id.ok_or_else(|| {
+                    format!("VMess outbound {} requires id", summary.tag)
+                })?,
+                security: settings.security.unwrap_or_default(),
+                alter_id: settings.alter_id.unwrap_or_default(),
+                experiments: settings.experiments.unwrap_or_default(),
+                level: 0,
+                email: String::new(),
+            },
+        )
+    } else {
+        if settings.vnext.len() != 1 {
+            return Err(format!(
+                "VMess outbound {} requires exactly one vnext endpoint",
+                summary.tag
+            ));
+        }
+        let mut vnext = settings.vnext;
+        let server = vnext.pop().ok_or_else(|| {
+            format!("VMess outbound {} endpoint disappeared", summary.tag)
+        })?;
+        if server.users.len() != 1 {
+            return Err(format!(
+                "VMess outbound {} requires exactly one user",
+                summary.tag
+            ));
+        }
+        let mut users = server.users;
+        let user = users.pop().ok_or_else(|| {
+            format!("VMess outbound {} user disappeared", summary.tag)
+        })?;
+        (server.address, server.port, user)
+    };
+
+    let _ = (user.level, user.email);
+    if address.trim().is_empty() {
+        return Err(format!(
+            "VMess outbound {} server address must not be empty",
+            summary.tag
+        ));
+    }
+    if port == 0 {
+        return Err(format!(
+            "VMess outbound {} server port must not be zero",
+            summary.tag
+        ));
+    }
+    if user.alter_id != 0 {
+        return Err(format!(
+            "VMess outbound {} does not support legacy alterId {}",
+            summary.tag, user.alter_id
+        ));
+    }
+    if !user.experiments.trim().is_empty() {
+        return Err(format!(
+            "VMess outbound {} does not support experiments {}",
+            summary.tag, user.experiments
+        ));
+    }
+    let security = VmessDataSecurity::parse(&user.security)
+        .map_err(|error| format!("VMess outbound {}: {error}", summary.tag))?;
+    let user_uuid = parse_vmess_user_id(user.id.trim()).map_err(|error| {
+        format!("invalid VMess outbound {} user id: {error}", summary.tag)
+    })?;
+    let server_address = Address::from(address.trim()).map_err(|error| {
+        format!(
+            "invalid VMess outbound {} server address: {error}",
+            summary.tag
+        )
+    })?;
+    let server = NetLocation::new(server_address, port);
+    let transport = OutboundTransportConfig::compile(
+        &server,
+        summary.stream_settings.as_ref(),
+        &summary.tag,
+    )?;
+    Ok(VmessTcpOutboundConfig {
+        server,
+        user_uuid,
+        security,
+        transport,
+    })
 }
 
 #[cfg(feature = "vless")]
@@ -792,6 +961,8 @@ impl OutboundConnectorKind {
                 .map(Self::TrojanTcp),
             #[cfg(feature = "vless")]
             "vless" => compile_vless_tcp(summary).map(Box::new).map(Self::VlessTcp),
+            #[cfg(feature = "vmess")]
+            "vmess" => compile_vmess_tcp(summary).map(Box::new).map(Self::VmessTcp),
             "" => Err(format!(
                 "outbound {} protocol must not be empty",
                 summary.tag
@@ -957,6 +1128,22 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "vmess")]
+    fn literal_vmess(settings: serde_json::Value) -> OutboundSummary {
+        OutboundSummary {
+            tag: "vmess-proxy".into(),
+            protocol: "vmess".into(),
+            settings: Some(settings),
+            stream_settings: Some(crate::config::def::OutboundStreamSettings {
+                network: "tcp".into(),
+                security: Some("none".into()),
+                ..crate::config::def::OutboundStreamSettings::default()
+            }),
+            proxy_settings_type: None,
+            proxy_settings_value: None,
+        }
+    }
+
     #[cfg(feature = "vless")]
     fn literal_vless(settings: serde_json::Value) -> OutboundSummary {
         OutboundSummary {
@@ -978,6 +1165,116 @@ mod tests {
             }),
             proxy_settings_type: None,
             proxy_settings_value: None,
+        }
+    }
+
+    #[cfg(feature = "vmess")]
+    #[test]
+    fn compiles_vmess_security_matrix_and_simplified_settings() {
+        let user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
+        for (security, expected) in [
+            ("none", VmessDataSecurity::None),
+            ("aes-128-gcm", VmessDataSecurity::Aes128Gcm),
+            (
+                "chacha20-ietf-poly1305",
+                VmessDataSecurity::ChaCha20Poly1305,
+            ),
+        ] {
+            let standard = literal_vmess(serde_json::json!({
+                "vnext": [{
+                    "address": "127.0.0.1",
+                    "port": 443,
+                    "users": [{
+                        "id": user_id,
+                        "security": security,
+                        "alterId": 0
+                    }]
+                }]
+            }));
+            let OutboundConnectorKind::VmessTcp(config) =
+                OutboundConnectorKind::compile(&standard, true).unwrap()
+            else {
+                panic!("expected VMess TCP connector");
+            };
+            assert_eq!(config.server.to_string(), "127.0.0.1:443");
+            assert_eq!(config.security, expected);
+            assert_eq!(config.user_uuid, parse_vmess_user_id(user_id).unwrap());
+            assert!(config.transport.is_tcp());
+        }
+
+        let simplified = literal_vmess(serde_json::json!({
+            "address": "proxy.example",
+            "port": 8443,
+            "id": user_id,
+            "security": "aes-128-gcm"
+        }));
+        let OutboundConnectorKind::VmessTcp(config) =
+            OutboundConnectorKind::compile(&simplified, true).unwrap()
+        else {
+            panic!("expected simplified VMess connector");
+        };
+        assert_eq!(config.server.to_string(), "proxy.example:8443");
+    }
+
+    #[cfg(feature = "vmess")]
+    #[test]
+    fn rejects_unsupported_vmess_settings_atomically() {
+        let user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
+        for (settings, expected) in [
+            (serde_json::json!({"vnext": []}), "exactly one vnext"),
+            (
+                serde_json::json!({
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": 443,
+                        "users": []
+                    }]
+                }),
+                "exactly one user",
+            ),
+            (
+                serde_json::json!({
+                    "address": "127.0.0.1",
+                    "port": 443,
+                    "id": user_id,
+                    "security": "auto"
+                }),
+                "explicit security",
+            ),
+            (
+                serde_json::json!({
+                    "address": "127.0.0.1",
+                    "port": 443,
+                    "id": user_id,
+                    "security": "none",
+                    "alterId": 1
+                }),
+                "alterId 1",
+            ),
+            (
+                serde_json::json!({
+                    "address": "127.0.0.1",
+                    "port": 443,
+                    "id": user_id,
+                    "security": "none",
+                    "experiments": "AuthenticatedLength"
+                }),
+                "experiments",
+            ),
+            (
+                serde_json::json!({
+                    "address": "127.0.0.1",
+                    "port": 443,
+                    "id": "not-a-uuid",
+                    "security": "none"
+                }),
+                "canonical UUID",
+            ),
+        ] {
+            let error =
+                OutboundConnectorKind::compile(&literal_vmess(settings), true)
+                    .expect_err("unsupported VMess settings must fail closed");
+            assert!(error.contains(expected), "unexpected error: {error}");
         }
     }
 
@@ -1397,9 +1694,10 @@ mod tests {
         ])
         .expect("supported outbounds should validate");
 
-        let error = OutboundRegistry::validate_strict(&[outbound("proxy", "vmess")])
-            .expect_err("unsupported outbound must fail before installation");
-        assert!(error.contains("unsupported protocol vmess"));
+        let error =
+            OutboundRegistry::validate_strict(&[outbound("proxy", "wireguard")])
+                .expect_err("unsupported outbound must fail before installation");
+        assert!(error.contains("unsupported protocol wireguard"));
     }
 
     #[test]

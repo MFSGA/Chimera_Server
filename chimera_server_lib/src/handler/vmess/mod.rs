@@ -1,3 +1,4 @@
+pub(crate) mod client;
 mod crc32;
 mod fnv1a;
 mod md5;

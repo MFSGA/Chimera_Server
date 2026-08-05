@@ -350,6 +350,220 @@ async fn chimera_vless_plain_outbound_interoperates_with_xray_inbound() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera as SOCKS server and ./xray as a plain VMess upstream"]
+async fn chimera_vmess_none_outbound_interoperates_with_xray_inbound() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("vmess-none-outbound");
+    let echo_addr = start_tcp_echo_server();
+    let xray_vmess_port = free_localhost_port();
+    let chimera_socks_port = free_localhost_port();
+    let xray_config_path = work_dir.join("xray-vmess-inbound.json");
+    let chimera_config_path = work_dir.join("chimera-vmess-outbound.json");
+
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_vmess_port,
+                "protocol": "vmess",
+                "tag": "vmess-in",
+                "settings": {
+                    "clients": [{
+                        "id": TEST_UUID
+                    }]
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "none"
+                }
+            }],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }]
+        }),
+    );
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_socks_port,
+                "protocol": "socks",
+                "tag": "socks-in",
+                "settings": {"auth": "noauth"}
+            }],
+            "outbounds": [{
+                "tag": "to-xray-vmess",
+                "protocol": "vmess",
+                "settings": {
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": xray_vmess_port,
+                        "users": [{
+                            "id": TEST_UUID,
+                            "security": "none",
+                            "alterId": 0
+                        }]
+                    }]
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "none"
+                }
+            }],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["socks-in"],
+                    "outboundTag": "to-xray-vmess"
+                }]
+            }
+        }),
+    );
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, xray_vmess_port)));
+    xray.assert_running();
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_socks_port)));
+    chimera.assert_running();
+
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_socks_port));
+    assert_socks5_echo(
+        socks_addr,
+        echo_addr,
+        b"VMess none outbound through Xray inbound",
+    );
+    assert_socks5_echo(socks_addr, echo_addr, &deterministic_payload(64 * 1024));
+    assert_socks5_domain_echo(
+        socks_addr,
+        "localhost",
+        echo_addr.port(),
+        b"VMess none outbound domain target",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera as SOCKS server and ./xray as a TLS AES VMess upstream"]
+async fn chimera_vmess_aes_tls_outbound_interoperates_with_xray_inbound() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("vmess-aes-tls-outbound");
+    let echo_addr = start_tcp_echo_server();
+    let xray_vmess_port = free_localhost_port();
+    let chimera_socks_port = free_localhost_port();
+    let xray_config_path = work_dir.join("xray-vmess-tls-inbound.json");
+    let chimera_config_path = work_dir.join("chimera-vmess-tls-outbound.json");
+    let certificate_path = work_dir.join("localhost-cert.pem");
+    let private_key_path = work_dir.join("localhost-key.pem");
+    let generated =
+        rcgen::generate_simple_self_signed(["localhost".to_string()]).unwrap();
+    let certificate_pem = generated.cert.pem();
+    fs::write(&certificate_path, &certificate_pem).unwrap();
+    fs::write(&private_key_path, generated.signing_key.serialize_pem()).unwrap();
+
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_vmess_port,
+                "protocol": "vmess",
+                "tag": "vmess-tls-in",
+                "settings": {
+                    "clients": [{"id": TEST_UUID}]
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "minVersion": "1.3",
+                        "maxVersion": "1.3",
+                        "certificates": [{
+                            "certificateFile": certificate_path,
+                            "keyFile": private_key_path
+                        }]
+                    }
+                }
+            }],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }]
+        }),
+    );
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_socks_port,
+                "protocol": "socks",
+                "tag": "socks-in",
+                "settings": {"auth": "noauth"}
+            }],
+            "outbounds": [{
+                "tag": "to-xray-vmess-tls",
+                "protocol": "vmess",
+                "settings": {
+                    "address": "127.0.0.1",
+                    "port": xray_vmess_port,
+                    "id": TEST_UUID,
+                    "security": "aes-128-gcm"
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "disableSystemRoot": true,
+                        "minVersion": "1.3",
+                        "maxVersion": "1.3",
+                        "certificates": [{
+                            "certificate": [certificate_pem],
+                            "usage": "verify"
+                        }]
+                    }
+                }
+            }],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["socks-in"],
+                    "outboundTag": "to-xray-vmess-tls"
+                }]
+            }
+        }),
+    );
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, xray_vmess_port)));
+    xray.assert_running();
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_socks_port)));
+    chimera.assert_running();
+
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_socks_port));
+    assert_socks5_echo(
+        socks_addr,
+        echo_addr,
+        b"TLS AES VMess outbound through Xray inbound",
+    );
+    assert_socks5_echo(socks_addr, echo_addr, &deterministic_payload(64 * 1024));
+    assert_socks5_domain_echo(
+        socks_addr,
+        "localhost",
+        echo_addr.port(),
+        b"TLS AES VMess outbound domain target",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts Chimera as SOCKS server and ./xray as an AES-128-GCM Shadowsocks upstream"]
 async fn chimera_shadowsocks_aes128_outbound_interoperates_with_xray_inbound() {
     let workspace = workspace_root();

@@ -9,6 +9,8 @@ use tokio::io::AsyncWriteExt;
 
 #[cfg(feature = "shadowsocks")]
 use crate::handler::shadowsocks::{ShadowsocksCipher, connect_legacy_aead_outbound};
+#[cfg(feature = "vmess")]
+use crate::handler::vmess::client::{VmessDataSecurity, connect_vmess_tcp};
 use crate::http_outbound::{HttpProxyCredentials, connect_http_proxy};
 use crate::socks_outbound::{Socks5Credentials, connect_socks5};
 #[cfg(feature = "trojan")]
@@ -58,6 +60,12 @@ enum TcpOutboundHandshake {
     Trojan(Vec<u8>),
     #[cfg(feature = "vless")]
     Vless(Vec<u8>),
+    #[cfg(feature = "vmess")]
+    Vmess {
+        user_uuid: [u8; 16],
+        security: VmessDataSecurity,
+        target: NetLocation,
+    },
 }
 
 pub(crate) async fn connect_tcp_outbound(
@@ -138,6 +146,16 @@ pub(crate) async fn connect_tcp_outbound(
                 &config.user_uuid,
                 remote_location,
             )?),
+        ),
+        #[cfg(feature = "vmess")]
+        Some(OutboundConnectorKind::VmessTcp(config)) => (
+            config.server.clone(),
+            config.transport.clone(),
+            TcpOutboundHandshake::Vmess {
+                user_uuid: config.user_uuid,
+                security: config.security,
+                target: remote_location.clone(),
+            },
         ),
         Some(OutboundConnectorKind::Unsupported { protocol }) => {
             return Err(std::io::Error::new(
@@ -258,6 +276,24 @@ pub(crate) async fn connect_tcp_outbound(
             }
             Box::new(VlessTcpOutboundStream::new(stream))
         }
+        #[cfg(feature = "vmess")]
+        TcpOutboundHandshake::Vmess {
+            user_uuid,
+            security,
+            target,
+        } => match connect_vmess_tcp(stream, user_uuid, security, &target) {
+            Ok(stream) => stream,
+            Err(error) => {
+                record_tcp_outbound_failure(
+                    runtime,
+                    outbound_tag.as_deref(),
+                    started,
+                    attempted_at,
+                    &error,
+                );
+                return Err(error);
+            }
+        },
     };
 
     record_tcp_outbound_success(
@@ -355,6 +391,11 @@ pub(crate) fn select_direct_outbound(
         )),
         #[cfg(feature = "vless")]
         OutboundConnectorKind::VlessTcp(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{network_name} outbound {tag} does not support UDP yet"),
+        )),
+        #[cfg(feature = "vmess")]
+        OutboundConnectorKind::VmessTcp(_) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("{network_name} outbound {tag} does not support UDP yet"),
         )),
