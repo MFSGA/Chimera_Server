@@ -195,7 +195,7 @@ BPF SOCKHASH 不是当前必做项。只有物理机高并发数据证明网卡�
 
 详细差距分析见 [`20260804-234600-xray-parity-gap-analysis.zh.md`](./20260804-234600-xray-parity-gap-analysis.zh.md)。对比基线为仓库内 `ref/xray-core` 的 `5ca6f4b7d4dc`（Xray-core v26.7.28）。
 
-当前结论：入站、路由、Stats/Handler/Routing/Observatory 控制面已经较完整。出站运行时已从仅支持 `freedom`/`blackhole` 推进到支持 VLESS TCP，并完成可复用的 TCP/TLS/REALITY/WebSocket/HTTP Upgrade/gRPC transport pipeline；静态 JSON 与 HandlerService 动态 SenderConfig 均复用同一严格编译路径。其他代理出站、通用 sniffing、Xray DNS/FakeDNS、mKCP、TUN、Reverse、WireGuard 和部分 XHTTP client/xmux/download 语义仍未完成。
+当前结论：入站、路由、Stats/Handler/Routing/Observatory 控制面已经较完整。出站运行时已从仅支持 `freedom`/`blackhole` 推进到支持 VLESS TCP 与 Trojan TCP，并完成可复用的 TCP/TLS/REALITY/WebSocket/HTTP Upgrade/gRPC transport pipeline；静态 JSON 与 HandlerService 动态 SenderConfig 均复用同一严格编译路径。其他代理出站、通用 sniffing、Xray DNS/FakeDNS、mKCP、TUN、Reverse、WireGuard 和部分 XHTTP client/xmux/download 语义仍未完成。
 
 ### P0：Outbound Runtime
 
@@ -207,7 +207,8 @@ BPF SOCKHASH 不是当前必做项。只有物理机高并发数据证明网卡�
 - [x] unsupported outbound 在编译或安装阶段 fail-closed，而不是连接时才失败；测试兼容构造器仍保留诊断路径。
 - [x] 支持 VLESS TCP plain outbound：单 endpoint、单 UUID、原始 domain/IP target、惰性响应头、静态/动态配置和 ListOutbounds 回读；已通过本地 mock 与 Xray 26.2.6 真实进程互通。
 - [x] 完成 VLESS outbound transport pipeline：TCP、TLS、REALITY、WebSocket、HTTP Upgrade 和 gRPC 均已接入统一“安全层 + 应用传输层”模型，并支持静态 JSON 与动态 HandlerService SenderConfig。gRPC 支持单流 `Tun`、默认 `GunService`、authority、userAgent 与 serviceName，并可叠加 TLS 或 REALITY；multiMode、keepalive 调优和自定义 method path 继续 fail-closed。plain/TLS/REALITY gRPC 均已通过 Xray 26.2.6 真实互通，覆盖 IP、域名和 64KiB。
-- [ ] 依次接入 VMess、Trojan、SOCKS、HTTP、Shadowsocks TCP/UDP outbound。
+- [x] 支持 Trojan TCP outbound：标准 `servers` 与简化 `address/port/password` 配置、动态 `xray.proxy.trojan.ClientConfig`、ListOutbounds 回显、SHA-224 hex 认证头、原始 domain/IP target，并复用完整 transport pipeline；plain/TLS 已通过 Xray 26.2.6 真实互通，UDP associate 尚未实现。
+- [ ] 依次接入 VMess、SOCKS、HTTP、Shadowsocks TCP/UDP outbound。
 
 ### P0/P1：Sniffing 与 DNS
 

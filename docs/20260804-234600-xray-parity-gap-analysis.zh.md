@@ -82,7 +82,7 @@ freedom
 blackhole
 ```
 
-如果路由选到 `vmess`、`vless` 或其他代理出站，当前实现会直接返回 unsupported protocol。这意味着路由控制面已经走在数据面前面，出站运行时是最值得优先补齐的公共基础。
+如果路由选到尚未实现的 `vmess`、`socks`、`http` 等代理出站，当前实现会在配置编译或动态安装阶段 fail-closed。VLESS TCP 与 Trojan TCP 已经形成真实 connector，说明通用 Outbound Runtime 路线有效，但剩余代理协议仍是最值得优先补齐的公共基础。
 
 ---
 
@@ -183,42 +183,40 @@ Chimera 当前提供与 Xray 同名的主要服务：
 
 这是当前最重要的差距。
 
-## 5.1 当前 OutboundItem 配置过窄
+## 5.1 当前 OutboundItem 已具备主干字段，但高级 sender 语义仍有限
 
-当前静态 outbound 只保存：
-
-```json
-{
-  "protocol": "freedom",
-  "tag": "direct"
-}
-```
-
-缺少 Xray outbound 所需的：
+静态 outbound 已能保存并严格编译：
 
 - `settings`；
 - `streamSettings`；
-- `sendThrough` / `via`；
-- `mux`；
-- `proxySettings`；
-- `sockopt`；
-- target strategy；
 - outbound user/account；
 - server endpoint；
-- TLS/REALITY/WebSocket/gRPC/XHTTP 等出站 transport。
+- TCP/TLS/REALITY/WebSocket/HTTP Upgrade/gRPC transport。
 
-## 5.2 当前真实可执行 outbound 只有两种
+HandlerService 也能将 Xray `SenderConfig` 转换为同一静态模型。当前仍明确拒绝：
 
-当前数据面只支持：
+- `sendThrough` / `via`；
+- mux；
+- proxy chaining；
+- sockopt；
+- mask/QUIC 参数；
+- 非 `AsIs` target strategy；
+- XHTTP outbound transport。
+
+## 5.2 当前真实可执行 outbound
+
+当前数据面支持：
 
 - `freedom`；
-- `blackhole`。
+- `blackhole`；
+- VLESS TCP；
+- Trojan TCP。
+
+VLESS 与 Trojan 均支持静态 JSON、动态 HandlerService、原始 domain/IP target，并复用 TCP/TLS/REALITY/WebSocket/HTTP Upgrade/gRPC transport pipeline。Trojan 当前真实 Xray 验收覆盖 plain TCP 与 TLS；UDP associate 尚未完成。
 
 下面这些 Xray outbound 尚未形成真实 connector：
 
-- VLESS；
 - VMess；
-- Trojan；
 - Shadowsocks；
 - HTTP proxy；
 - SOCKS proxy；
@@ -228,7 +226,7 @@ Chimera 当前提供与 Xray 同名的主要服务：
 - Loopback；
 - Shadowsocks 2022 outbound。
 
-HandlerService 可以保存某些 outbound TypedMessage，但运行时路由到这些协议后仍无法建立连接。
+对尚未支持的协议，静态启动和 HandlerService 安装会在数据面可见前拒绝，不再保存“可列出但不可执行”的虚假 outbound。
 
 ## 5.3 Freedom 只实现了最小连接
 
@@ -777,9 +775,9 @@ Chimera 当前未支持这些高级 transport 组合。
 
 1. 通用 Outbound Runtime；
 2. Freedom/Blackhole 迁移到新 registry；
-3. VLESS TCP outbound；
-4. VMess TCP outbound；
-5. Trojan TCP outbound；
+3. VLESS TCP outbound；（已完成）
+4. Trojan TCP outbound；（已完成）
+5. VMess TCP outbound；
 6. SOCKS/HTTP outbound；
 7. Shadowsocks TCP/UDP outbound；
 8. 通用 sniffing context；
@@ -877,7 +875,21 @@ Chimera 当前未支持这些高级 transport 组合。
 - WebSocket；（静态 WS/WSS 已完成）
 - HTTP Upgrade；（静态 plain/TLS 已完成）
 - gRPC；（静态 plain/TLS/REALITY 已完成）
-- transport pipeline 复用于 VLESS/VMess/Trojan。（VLESS 已接入）
+- transport pipeline 复用于 VLESS/VMess/Trojan。（VLESS、Trojan 已接入）
+
+### Slice 4：Trojan TCP Outbound
+
+当前实现状态：已完成。静态配置支持 Xray 标准 `servers:[...]` 与简化 `address/port/password`；动态 HandlerService 支持 `xray.proxy.trojan.ClientConfig`、Trojan Account 与通用 SenderConfig，并由同一 registry 编译器原子安装。数据面发送 SHA-224 小写十六进制密码摘要、CRLF、TCP command、原始 domain/IPv4/IPv6 target 与结尾 CRLF，之后直接透传双向字节流。仅允许单 endpoint、单密码和空 flow；UDP associate 与已移除 flow 语义 fail-closed。Trojan connector 复用完整 TCP/TLS/REALITY/WebSocket/HTTP Upgrade/gRPC transport pipeline；plain TCP 与 TLS 已通过 Xray 26.2.6 真实进程互通，覆盖 IP、域名和 64KiB payload。
+
+目标：
+
+- 支持标准与简化静态配置；（已完成）
+- 支持动态 ClientConfig、SenderConfig 和 ListOutbounds；（已完成）
+- 支持 SHA-224 hex 认证头与 TCP command；（已完成）
+- 保留原始 domain/IP target；（已完成）
+- 复用共享 transport pipeline；（已完成）
+- 非空 flow 和 UDP associate fail-closed；（已完成）
+- 与 Xray Trojan inbound 做 plain/TLS 双向互通测试。（已完成）
 
 ---
 
