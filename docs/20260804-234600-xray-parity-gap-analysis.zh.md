@@ -212,14 +212,14 @@ HandlerService 也能将 Xray `SenderConfig` 转换为同一静态模型。当�
 - VLESS TCP；
 - Trojan TCP；
 - SOCKS5 TCP；
-- HTTP CONNECT TCP。
+- HTTP CONNECT TCP；
+- Shadowsocks legacy AEAD TCP。
 
-VLESS、Trojan、SOCKS 与 HTTP 均支持静态 JSON、动态 HandlerService、原始 domain/IP target，并复用 TCP/TLS/REALITY/WebSocket/HTTP Upgrade/gRPC transport pipeline。Trojan 当前真实 Xray 验收覆盖 plain TCP 与 TLS；SOCKS 覆盖 plain no-auth 与 TLS+password；HTTP 覆盖 plain no-auth 与 TLS+Basic Auth。Trojan/SOCKS 的 UDP associate 与 HTTP 非 CONNECT 转发均尚未完成。
+VLESS、Trojan、SOCKS、HTTP 与 Shadowsocks legacy AEAD 均支持静态 JSON、动态 HandlerService、原始 domain/IP target，并复用 TCP/TLS/REALITY/WebSocket/HTTP Upgrade/gRPC transport pipeline。Trojan 当前真实 Xray 验收覆盖 plain TCP 与 TLS；SOCKS 覆盖 plain no-auth 与 TLS+password；HTTP 覆盖 plain no-auth 与 TLS+Basic Auth；Shadowsocks 覆盖 plain AES-128-GCM 与 TLS+ChaCha20-IETF-Poly1305。Trojan/SOCKS 的 UDP associate、HTTP 非 CONNECT 转发、Shadowsocks XChaCha/2022/EIH/UDP 均尚未完成。
 
 下面这些 Xray outbound 尚未形成真实 connector：
 
 - VMess；
-- Shadowsocks；
 - Hysteria；
 - WireGuard；
 - DNS outbound；
@@ -780,7 +780,7 @@ Chimera 当前未支持这些高级 transport 组合。
 5. VMess TCP outbound；
 6. SOCKS outbound；（TCP 已完成，UDP ASSOCIATE 待完成）
 7. HTTP outbound；（CONNECT TCP 已完成）
-8. Shadowsocks TCP/UDP outbound；
+8. Shadowsocks TCP/UDP outbound；（legacy AEAD TCP 已完成）
 9. 通用 sniffing context；
 10. typed DNS config + static hosts + nameserver rules；
 11. DNS outbound。
@@ -921,6 +921,20 @@ Chimera 当前未支持这些高级 transport 组合。
 - 复用共享 transport pipeline；（已完成）
 - 非 CONNECT forward proxy 语义 fail-closed；（已完成）
 - 与 Xray HTTP inbound 做 plain no-auth 与 TLS+Basic Auth 双向互通测试。（已完成）
+
+### Slice 7：Shadowsocks Legacy AEAD TCP Outbound
+
+当前实现状态：已完成。静态配置支持 Xray 标准 `servers:[{address,port,method,password}]` 与简化 `address/port/method/password`；动态 HandlerService 支持 `xray.proxy.shadowsocks.ClientConfig`、legacy Account、通用 SenderConfig 与 ListOutbounds 回显。Registry 仅接受 AES-128-GCM、AES-256-GCM 和 ChaCha20-IETF-Poly1305，并在安装时通过 EVP_BytesToKey/MD5 派生 master key；数据面复用入站已验证的 Shadowsocks AEAD codec，建立共享 transport 后发送随机 salt、加密长度与加密 payload，并将原始 domain/IPv4/IPv6 target 放入首个明文 chunk。响应方向独立读取服务端 salt 并解密 chunk。XChaCha、`iv_check=true`、2022/EIH 和 UDP 均在安装或路由阶段 fail-closed。三种 cipher 已通过本地双向协议 roundtrip；plain AES-128-GCM 与 TLS+ChaCha20-IETF-Poly1305 已通过 Xray 26.2.6 真实进程互通，覆盖 IP、域名和 64KiB payload。
+
+目标：
+
+- 支持 AES-128-GCM、AES-256-GCM 与 ChaCha20-IETF-Poly1305；（已完成）
+- 支持标准与简化静态配置；（已完成）
+- 支持动态 ClientConfig、SenderConfig 与 ListOutbounds；（已完成）
+- 复用现有 salt/subkey/nonce/chunk codec，并保持请求响应独立 salt；（已完成）
+- 保留原始 domain/IP target；（已完成）
+- XChaCha、2022/EIH、iv_check 和 UDP fail-closed；（已完成）
+- 与 Xray Shadowsocks inbound 做 plain AES 与 TLS+ChaCha 双向互通测试。（已完成）
 
 ---
 
