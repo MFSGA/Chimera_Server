@@ -2,7 +2,10 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     num::NonZeroUsize,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU16, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -13,11 +16,14 @@ use lru::LruCache;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::UdpSocket,
+    sync::Mutex,
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
+#[cfg(feature = "shadowsocks")]
+use crate::outbound::exchange_shadowsocks_udp;
 use crate::{
     address::{Address, NetLocation},
     config::server_config::TuicServerConfig,
@@ -628,8 +634,16 @@ fn serialize_socket_addr(addr: &SocketAddr) -> Vec<u8> {
     res
 }
 
+#[derive(Clone)]
+enum TuicUdpResponseChannel {
+    Stream(Arc<Mutex<quinn::SendStream>>),
+    Datagram(quinn::Connection),
+}
+
 struct UdpSession {
     send_socket: Arc<UdpSocket>,
+    response_channel: Option<TuicUdpResponseChannel>,
+    next_packet_id: Arc<AtomicU16>,
     last_location: NetLocation,
     last_socket_addr: SocketAddr,
     last_activity: std::time::Instant,
@@ -660,9 +674,15 @@ impl UdpSession {
         let session_cancel_token = parent_cancel_token.child_token();
         let response_contexts = Arc::new(DashMap::new());
         let connection_guard = register_connection(Some(&base_context));
+        let send_stream = Arc::new(Mutex::new(send_stream));
+        let next_packet_id = Arc::new(AtomicU16::new(0));
 
         let session = UdpSession {
             send_socket: client_socket.clone(),
+            response_channel: Some(TuicUdpResponseChannel::Stream(
+                send_stream.clone(),
+            )),
+            next_packet_id: next_packet_id.clone(),
             last_location: initial_location,
             last_socket_addr: initial_socket_addr,
             last_activity: std::time::Instant::now(),
@@ -676,6 +696,7 @@ impl UdpSession {
             if let Err(e) = run_udp_remote_to_local_stream_loop(
                 assoc_id,
                 send_stream,
+                next_packet_id,
                 client_socket,
                 session_cancel_token,
                 response_contexts,
@@ -702,9 +723,14 @@ impl UdpSession {
         let session_cancel_token = parent_cancel_token.child_token();
         let response_contexts = Arc::new(DashMap::new());
         let connection_guard = register_connection(Some(&base_context));
+        let next_packet_id = Arc::new(AtomicU16::new(0));
 
         let session = UdpSession {
             send_socket: client_socket.clone(),
+            response_channel: Some(TuicUdpResponseChannel::Datagram(
+                connection.clone(),
+            )),
+            next_packet_id: next_packet_id.clone(),
             last_location: initial_location,
             last_socket_addr: initial_socket_addr,
             last_activity: std::time::Instant::now(),
@@ -718,6 +744,7 @@ impl UdpSession {
             if let Err(e) = run_udp_remote_to_local_datagram_loop(
                 assoc_id,
                 connection,
+                next_packet_id,
                 client_socket,
                 session_cancel_token,
                 response_contexts,
@@ -753,17 +780,208 @@ impl UdpSession {
         self.last_location = location;
         self.last_socket_addr = socket_addr;
     }
+
+    async fn send_response(
+        &self,
+        assoc_id: u16,
+        source: &NetLocation,
+        payload: &[u8],
+        traffic_context: TrafficContext,
+    ) -> std::io::Result<()> {
+        let packet_id = self.next_packet_id.fetch_add(1, Ordering::Relaxed);
+        match self.response_channel.as_ref().ok_or_else(|| {
+            std::io::Error::other("TUIC UDP response channel is unavailable")
+        })? {
+            TuicUdpResponseChannel::Stream(send_stream) => {
+                send_tuic_stream_response(
+                    send_stream,
+                    assoc_id,
+                    packet_id,
+                    source,
+                    payload,
+                )
+                .await?;
+            }
+            TuicUdpResponseChannel::Datagram(connection) => {
+                send_tuic_datagram_response(
+                    connection, assoc_id, packet_id, source, payload,
+                )?;
+            }
+        }
+        record_transfer(Some(traffic_context), 0, payload.len() as u64);
+        Ok(())
+    }
+}
+
+async fn send_tuic_stream_response(
+    send_stream: &Arc<Mutex<quinn::SendStream>>,
+    assoc_id: u16,
+    packet_id: u16,
+    source: &NetLocation,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    let frame = encode_tuic_stream_response(assoc_id, packet_id, source, payload)?;
+    let mut send_stream = send_stream.lock().await;
+    send_stream
+        .write_all(&frame)
+        .await
+        .map_err(std::io::Error::other)
+}
+
+fn encode_tuic_stream_response(
+    assoc_id: u16,
+    packet_id: u16,
+    source: &NetLocation,
+    payload: &[u8],
+) -> std::io::Result<Vec<u8>> {
+    let payload_len = u16::try_from(payload.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TUIC UDP stream response exceeds u16 payload size",
+        )
+    })?;
+    let address_bytes = serialize_address(source);
+    let mut frame = Vec::with_capacity(8 + address_bytes.len() + payload.len());
+    frame.extend_from_slice(&assoc_id.to_be_bytes());
+    frame.extend_from_slice(&packet_id.to_be_bytes());
+    frame.extend_from_slice(&[1, 0]);
+    frame.extend_from_slice(&payload_len.to_be_bytes());
+    frame.extend_from_slice(&address_bytes);
+    frame.extend_from_slice(payload);
+    Ok(frame)
+}
+
+fn send_tuic_datagram_response(
+    connection: &quinn::Connection,
+    assoc_id: u16,
+    packet_id: u16,
+    source: &NetLocation,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    let max_datagram_size = connection.max_datagram_size().ok_or_else(|| {
+        std::io::Error::other("datagram not supported by remote endpoint")
+    })?;
+    for datagram in encode_tuic_datagram_responses(
+        max_datagram_size,
+        assoc_id,
+        packet_id,
+        source,
+        payload,
+    )? {
+        connection.send_datagram(datagram).map_err(|error| {
+            std::io::Error::other(format!(
+                "failed to send TUIC UDP datagram: {error}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn encode_tuic_datagram_responses(
+    max_datagram_size: usize,
+    assoc_id: u16,
+    packet_id: u16,
+    source: &NetLocation,
+    payload: &[u8],
+) -> std::io::Result<Vec<Bytes>> {
+    let address_bytes = serialize_address(source);
+    let header_overhead = 1 + 1 + 2 + 2 + 1 + 1 + 2 + address_bytes.len();
+    if header_overhead >= max_datagram_size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TUIC UDP response header exceeds max datagram size",
+        ));
+    }
+    if header_overhead + payload.len() <= max_datagram_size {
+        let payload_len = u16::try_from(payload.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "TUIC UDP response exceeds u16 payload size",
+            )
+        })?;
+        let mut datagram = BytesMut::with_capacity(header_overhead + payload.len());
+        datagram.extend_from_slice(&[TUIC_VERSION, COMMAND_TYPE_PACKET]);
+        datagram.extend_from_slice(&assoc_id.to_be_bytes());
+        datagram.extend_from_slice(&packet_id.to_be_bytes());
+        datagram.extend_from_slice(&[1, 0]);
+        datagram.extend_from_slice(&payload_len.to_be_bytes());
+        datagram.extend_from_slice(&address_bytes);
+        datagram.extend_from_slice(payload);
+        return Ok(vec![datagram.freeze()]);
+    }
+
+    let other_overhead = 1 + 1 + 2 + 2 + 1 + 1 + 2 + 1;
+    if other_overhead >= max_datagram_size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TUIC UDP fragment header exceeds max datagram size",
+        ));
+    }
+    let first_capacity = max_datagram_size - header_overhead;
+    let other_capacity = max_datagram_size - other_overhead;
+    let remaining = payload.len().saturating_sub(first_capacity);
+    let fragment_count = 1 + remaining.div_ceil(other_capacity);
+    let fragment_count_u8 = u8::try_from(fragment_count).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TUIC UDP response requires more than 255 fragments",
+        )
+    })?;
+    let mut datagrams = Vec::with_capacity(fragment_count);
+    let mut offset = 0usize;
+    for fragment_id in 0..fragment_count {
+        let capacity = if fragment_id == 0 {
+            first_capacity
+        } else {
+            other_capacity
+        };
+        let fragment_payload_len = std::cmp::min(capacity, payload.len() - offset);
+        let fragment_payload_len_u16 =
+            u16::try_from(fragment_payload_len).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "TUIC UDP fragment exceeds u16 payload size",
+                )
+            })?;
+        let fragment_id_u8 = u8::try_from(fragment_id).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "TUIC UDP fragment id exceeds u8",
+            )
+        })?;
+        let header_size = if fragment_id == 0 {
+            header_overhead
+        } else {
+            other_overhead
+        };
+        let mut datagram =
+            BytesMut::with_capacity(header_size + fragment_payload_len);
+        datagram.extend_from_slice(&[TUIC_VERSION, COMMAND_TYPE_PACKET]);
+        datagram.extend_from_slice(&assoc_id.to_be_bytes());
+        datagram.extend_from_slice(&packet_id.to_be_bytes());
+        datagram.extend_from_slice(&[fragment_count_u8, fragment_id_u8]);
+        datagram.extend_from_slice(&fragment_payload_len_u16.to_be_bytes());
+        if fragment_id == 0 {
+            datagram.extend_from_slice(&address_bytes);
+        } else {
+            datagram.put_u8(0xff);
+        }
+        datagram.extend_from_slice(&payload[offset..offset + fragment_payload_len]);
+        datagrams.push(datagram.freeze());
+        offset += fragment_payload_len;
+    }
+    Ok(datagrams)
 }
 
 async fn run_udp_remote_to_local_stream_loop(
     assoc_id: u16,
-    mut send_stream: quinn::SendStream,
+    send_stream: Arc<Mutex<quinn::SendStream>>,
+    next_packet_id: Arc<AtomicU16>,
     socket: Arc<UdpSocket>,
     cancel_token: CancellationToken,
     response_contexts: Arc<DashMap<SocketAddr, TrafficContext>>,
     fallback_context: TrafficContext,
 ) -> std::io::Result<()> {
-    let mut next_packet_id: u16 = 0;
     let mut buf = allocate_vec(MAX_HEADER_LEN + 65535).into_boxed_slice();
     let mut loop_count: u8 = 0;
 
@@ -794,8 +1012,7 @@ async fn run_udp_remote_to_local_stream_loop(
             tokio::task::yield_now().await;
         }
 
-        let packet_id = next_packet_id;
-        next_packet_id = next_packet_id.wrapping_add(1);
+        let packet_id = next_packet_id.fetch_add(1, Ordering::Relaxed);
         let traffic_context = response_contexts
             .get(&src_addr)
             .map(|entry| entry.value().clone())
@@ -822,14 +1039,11 @@ async fn run_udp_remote_to_local_stream_loop(
         buf[start_offset + 8..start_offset + 8 + address_bytes_len]
             .copy_from_slice(&address_bytes);
 
-        let mut i = start_offset;
-        while i < end_offset {
-            let count = send_stream
-                .write(&buf[i..end_offset])
-                .await
-                .map_err(std::io::Error::other)?;
-            i += count;
-        }
+        let mut send_stream = send_stream.lock().await;
+        send_stream
+            .write_all(&buf[start_offset..end_offset])
+            .await
+            .map_err(std::io::Error::other)?;
         record_transfer(Some(traffic_context), 0, payload_len as u64);
     }
 }
@@ -837,6 +1051,7 @@ async fn run_udp_remote_to_local_stream_loop(
 async fn run_udp_remote_to_local_datagram_loop(
     assoc_id: u16,
     connection: quinn::Connection,
+    next_packet_id: Arc<AtomicU16>,
     client_socket: Arc<UdpSocket>,
     cancel_token: CancellationToken,
     response_contexts: Arc<DashMap<SocketAddr, TrafficContext>>,
@@ -846,7 +1061,6 @@ async fn run_udp_remote_to_local_datagram_loop(
         std::io::Error::other("datagram not supported by remote endpoint")
     })?;
 
-    let mut next_packet_id: u16 = 0;
     let mut buf = allocate_vec(65535).into_boxed_slice();
     let mut loop_count: u8 = 0;
 
@@ -876,8 +1090,7 @@ async fn run_udp_remote_to_local_datagram_loop(
             tokio::task::yield_now().await;
         }
 
-        let packet_id = next_packet_id;
-        next_packet_id = next_packet_id.wrapping_add(1);
+        let packet_id = next_packet_id.fetch_add(1, Ordering::Relaxed);
         let traffic_context = response_contexts
             .get(&src_addr)
             .map(|entry| entry.value().clone())
@@ -1259,35 +1472,40 @@ async fn process_udp_packet(
         (remote_location, complete_payload.freeze())
     };
 
-    let mut traffic_context = session.base_context.clone().with_access_target(
+    let traffic_context = session.base_context.clone().with_access_target(
         remote_location.address().to_string(),
         remote_location.port(),
         AccessTransport::Quic,
     );
     #[cfg(feature = "user_domain_access")]
-    match crate::beginning::enforce_user_domain_access(
-        &context.connection.runtime,
-        Some(&traffic_context),
-        &remote_location,
-    ) {
-        Ok(Some(user_uuid)) => {
-            traffic_context.set_user_uuid(user_uuid.to_string());
+    let traffic_context = {
+        let mut traffic_context = traffic_context;
+        match crate::beginning::enforce_user_domain_access(
+            &context.connection.runtime,
+            Some(&traffic_context),
+            &remote_location,
+        ) {
+            Ok(Some(user_uuid)) => {
+                traffic_context.set_user_uuid(user_uuid.to_string());
+            }
+            Ok(None) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                debug!(
+                    "TUIC UDP target {} rejected by user-domain access policy",
+                    remote_location
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error),
         }
-        Ok(None) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            debug!(
-                "TUIC UDP target {} rejected by user-domain access policy",
-                remote_location
-            );
-            return Ok(());
-        }
-        Err(error) => return Err(error),
-    }
+        traffic_context
+    };
 
     let (socket_addr, is_updated) =
         session.resolve_address(&remote_location, resolver).await?;
     let keep_session = forward_udp_payload(
         &session,
+        resolver,
         context,
         traffic_context,
         assoc_id,
@@ -1312,8 +1530,10 @@ async fn process_udp_packet(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn forward_udp_payload(
     session: &UdpSession,
+    resolver: &Arc<dyn Resolver>,
     context: &TuicFlowContext,
     mut traffic_context: TrafficContext,
     assoc_id: u16,
@@ -1344,12 +1564,25 @@ async fn forward_udp_payload(
         }
         #[cfg(feature = "shadowsocks")]
         DirectOutboundAction::Shadowsocks { tag } => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                format!(
-                    "TUIC UDP outbound {tag} requires a response-channel adapter that is not implemented yet"
-                ),
-            ));
+            traffic_context = traffic_context.with_outbound_tag(tag.clone());
+            let response = exchange_shadowsocks_udp(
+                resolver,
+                &context.connection.runtime,
+                &tag,
+                remote_location,
+                payload,
+            )
+            .await?;
+            record_transfer(Some(traffic_context.clone()), payload.len() as u64, 0);
+            session
+                .send_response(
+                    assoc_id,
+                    &response.source,
+                    &response.payload,
+                    traffic_context,
+                )
+                .await?;
+            return Ok(true);
         }
         DirectOutboundAction::Freedom { tag: Some(tag) } => {
             traffic_context = traffic_context.with_outbound_tag(tag);
@@ -1631,6 +1864,45 @@ mod tests {
         assert_eq!(&bytes[5..7], &8080u16.to_be_bytes());
     }
 
+    #[test]
+    fn encodes_stream_and_fragmented_datagram_responses() {
+        let source = NetLocation::new(Address::from("dns.example").unwrap(), 5353);
+        let frame =
+            encode_tuic_stream_response(0x1234, 0x5678, &source, b"reply").unwrap();
+        assert_eq!(&frame[..2], &0x1234u16.to_be_bytes());
+        assert_eq!(&frame[2..4], &0x5678u16.to_be_bytes());
+        assert_eq!(&frame[4..6], &[1, 0]);
+        assert_eq!(&frame[6..8], &5u16.to_be_bytes());
+        assert_eq!(frame[8], 0x00);
+        assert_eq!(frame[9] as usize, "dns.example".len());
+        assert!(frame.ends_with(b"reply"));
+
+        let source =
+            NetLocation::new(Address::Ipv4(Ipv4Addr::new(203, 0, 113, 7)), 5353);
+        let payload = (0..100).map(|index| index as u8).collect::<Vec<_>>();
+        let datagrams =
+            encode_tuic_datagram_responses(64, 7, 9, &source, &payload).unwrap();
+        assert_eq!(datagrams.len(), 2);
+        assert_eq!(&datagrams[0][..2], &[TUIC_VERSION, COMMAND_TYPE_PACKET]);
+        assert_eq!(&datagrams[0][2..4], &7u16.to_be_bytes());
+        assert_eq!(&datagrams[0][4..6], &9u16.to_be_bytes());
+        assert_eq!(&datagrams[0][6..8], &[2, 0]);
+        assert_eq!(datagrams[0][10], 0x01);
+        assert_eq!(&datagrams[0][11..15], &[203, 0, 113, 7]);
+        assert_eq!(&datagrams[0][15..17], &5353u16.to_be_bytes());
+        assert_eq!(&datagrams[1][6..8], &[2, 1]);
+        assert_eq!(datagrams[1][10], 0xff);
+
+        let first_len =
+            u16::from_be_bytes([datagrams[0][8], datagrams[0][9]]) as usize;
+        let second_len =
+            u16::from_be_bytes([datagrams[1][8], datagrams[1][9]]) as usize;
+        let mut reassembled = Vec::with_capacity(payload.len());
+        reassembled.extend_from_slice(&datagrams[0][17..17 + first_len]);
+        reassembled.extend_from_slice(&datagrams[1][11..11 + second_len]);
+        assert_eq!(reassembled, payload);
+    }
+
     #[tokio::test]
     async fn udp_forward_uses_selected_outbound_and_records_upload() {
         let outbound_tag = "tuic-udp-test-direct";
@@ -1665,6 +1937,8 @@ mod tests {
             send_socket: Arc::new(
                 UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap(),
             ),
+            response_channel: None,
+            next_packet_id: Arc::new(AtomicU16::new(0)),
             last_location: location.clone(),
             last_socket_addr: target_addr,
             last_activity: std::time::Instant::now(),
@@ -1680,9 +1954,11 @@ mod tests {
             .unwrap_or_default();
         let payload = b"tuic UDP accounting";
 
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
         assert!(
             forward_udp_payload(
                 &session,
+                &resolver,
                 &context,
                 context.traffic_context().with_access_target(
                     location.address().to_string(),

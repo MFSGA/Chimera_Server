@@ -8,6 +8,11 @@ use tokio::{
 };
 
 use super::*;
+#[cfg(feature = "shadowsocks")]
+use crate::{
+    config::{def::OutboundStreamSettings, server_config::ShadowsocksUser},
+    handler::shadowsocks::ShadowsocksUdpCodec,
+};
 use crate::{
     runtime::{OutboundSummary, RuntimeState},
     traffic::{TrafficSnapshot, active_connections, snapshot},
@@ -18,6 +23,12 @@ const TEST_UUID: &str = "3ac9b383-75a1-431c-8184-106c80eb2273";
 const TEST_PASSWORD: &str = "tuic-test-password";
 const TEST_INBOUND: &str = "tuic-e2e-in";
 const TEST_OUTBOUND: &str = "tuic-e2e-out";
+#[cfg(feature = "shadowsocks")]
+const TEST_SHADOWSOCKS_INBOUND: &str = "tuic-shadowsocks-e2e-in";
+#[cfg(feature = "shadowsocks")]
+const TEST_SHADOWSOCKS_OUTBOUND: &str = "tuic-shadowsocks-e2e-out";
+#[cfg(feature = "shadowsocks")]
+const TEST_SHADOWSOCKS_PASSWORD: &str = "tuic-shadowsocks-password";
 
 #[derive(Debug)]
 struct AcceptTestServerCert;
@@ -87,8 +98,14 @@ async fn udp_stream_and_datagram_roundtrips_record_stats() {
             && entry.identity.as_deref() == Some(TEST_UUID)
     }));
     let expected_bytes = payloads.iter().map(|payload| payload.len() as u64).sum();
-    let after = wait_for_stats(&before, expected_bytes).await;
-    assert_all_stat_deltas(&before, &after, expected_bytes);
+    let after = wait_for_stats(&before, TEST_OUTBOUND, expected_bytes).await;
+    assert_all_stat_deltas(
+        &before,
+        &after,
+        TEST_INBOUND,
+        TEST_OUTBOUND,
+        expected_bytes,
+    );
 
     connection.close(0u32.into(), b"done");
     endpoint.wait_idle().await;
@@ -96,7 +113,114 @@ async fn udp_stream_and_datagram_roundtrips_record_stats() {
     echo_task.await.unwrap();
 }
 
+#[cfg(feature = "shadowsocks")]
+#[tokio::test]
+async fn shadowsocks_udp_outbound_roundtrips_over_stream_and_datagram() {
+    let payloads = [
+        b"TUIC Shadowsocks datagram".as_slice(),
+        b"TUIC Shadowsocks stream".as_slice(),
+    ];
+    let proxy_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let proxy_addr = proxy_socket.local_addr().unwrap();
+    let codec = Arc::new(
+        ShadowsocksUdpCodec::new(
+            vec![ShadowsocksUser {
+                method: "aes-128-gcm".into(),
+                password: TEST_SHADOWSOCKS_PASSWORD.into(),
+                email: "tuic-shadowsocks@example.com".into(),
+            }],
+            None,
+        )
+        .unwrap(),
+    );
+    let proxy_task = {
+        let codec = codec.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let (len, peer) = proxy_socket.recv_from(&mut buf).await.unwrap();
+                let request = codec.decrypt_packet(&buf[..len]).unwrap();
+                let response = codec
+                    .encrypt_packet(
+                        &request,
+                        &request.target_location,
+                        &request.payload,
+                    )
+                    .unwrap();
+                proxy_socket.send_to(&response, peer).await.unwrap();
+            }
+        })
+    };
+
+    let outbound = OutboundSummary {
+        tag: TEST_SHADOWSOCKS_OUTBOUND.into(),
+        protocol: "shadowsocks".into(),
+        settings: Some(serde_json::json!({
+            "address": proxy_addr.ip().to_string(),
+            "port": proxy_addr.port(),
+            "method": "aes-128-gcm",
+            "password": TEST_SHADOWSOCKS_PASSWORD
+        })),
+        stream_settings: Some(OutboundStreamSettings {
+            network: "tcp".into(),
+            security: Some("none".into()),
+            ..OutboundStreamSettings::default()
+        }),
+        proxy_settings_type: None,
+        proxy_settings_value: None,
+    };
+    let (server_task, endpoint, connection) =
+        start_test_connection_with_outbound(TEST_SHADOWSOCKS_INBOUND, outbound)
+            .await;
+    authenticate(&connection).await;
+    let before = snapshot();
+    let target = SocketAddr::from((Ipv4Addr::LOCALHOST, 5353));
+
+    assert_datagram_roundtrip(&connection, target, payloads[0]).await;
+    assert_stream_roundtrip(&connection, target, payloads[1]).await;
+
+    let expected_bytes = payloads.iter().map(|payload| payload.len() as u64).sum();
+    let after =
+        wait_for_stats(&before, TEST_SHADOWSOCKS_OUTBOUND, expected_bytes).await;
+    assert_all_stat_deltas(
+        &before,
+        &after,
+        TEST_SHADOWSOCKS_INBOUND,
+        TEST_SHADOWSOCKS_OUTBOUND,
+        expected_bytes,
+    );
+
+    connection.close(0u32.into(), b"done");
+    server_task.abort();
+    proxy_task.abort();
+    timeout(Duration::from_secs(2), endpoint.wait_idle())
+        .await
+        .expect("TUIC Shadowsocks endpoint shutdown");
+}
+
 async fn start_test_connection() -> (
+    tokio::task::JoinHandle<std::io::Result<()>>,
+    quinn::Endpoint,
+    quinn::Connection,
+) {
+    start_test_connection_with_outbound(
+        TEST_INBOUND,
+        OutboundSummary {
+            tag: TEST_OUTBOUND.into(),
+            protocol: "freedom".into(),
+            settings: None,
+            stream_settings: None,
+            proxy_settings_type: None,
+            proxy_settings_value: None,
+        },
+    )
+    .await
+}
+
+async fn start_test_connection_with_outbound(
+    inbound_tag: &str,
+    outbound: OutboundSummary,
+) -> (
     tokio::task::JoinHandle<std::io::Result<()>>,
     quinn::Endpoint,
     quinn::Connection,
@@ -113,17 +237,7 @@ async fn start_test_connection() -> (
         create_server_config(&cert_bytes, &key_bytes, &["h3".into()], &[])
             .expect("create server config for e2e test"),
     );
-    let runtime = RuntimeState::new(
-        Vec::new(),
-        vec![OutboundSummary {
-            tag: TEST_OUTBOUND.into(),
-            protocol: "freedom".into(),
-            settings: None,
-            stream_settings: None,
-            proxy_settings_type: None,
-            proxy_settings_value: None,
-        }],
-    );
+    let runtime = RuntimeState::new(Vec::new(), vec![outbound]);
     let server_task = tokio::spawn(run_tuic_server(
         server_addr,
         server_config,
@@ -132,7 +246,7 @@ async fn start_test_connection() -> (
             password: TEST_PASSWORD.into(),
             zero_rtt_handshake: false,
         },
-        TEST_INBOUND.into(),
+        inbound_tag.into(),
         runtime,
     ));
 
@@ -245,18 +359,22 @@ async fn assert_stream_roundtrip(
     assert_eq!(echoed, payload);
 }
 
-async fn wait_for_stats(before: &TrafficSnapshot, expected: u64) -> TrafficSnapshot {
+async fn wait_for_stats(
+    before: &TrafficSnapshot,
+    outbound_tag: &str,
+    expected: u64,
+) -> TrafficSnapshot {
     timeout(Duration::from_secs(1), async {
         loop {
             let current = snapshot();
             let before_upload = before
                 .per_outbound
-                .get(TEST_OUTBOUND)
+                .get(outbound_tag)
                 .map(|totals| totals.upload_bytes)
                 .unwrap_or_default();
             let current_upload = current
                 .per_outbound
-                .get(TEST_OUTBOUND)
+                .get(outbound_tag)
                 .map(|totals| totals.upload_bytes)
                 .unwrap_or_default();
             if current_upload.saturating_sub(before_upload) == expected {
@@ -272,24 +390,26 @@ async fn wait_for_stats(before: &TrafficSnapshot, expected: u64) -> TrafficSnaps
 fn assert_all_stat_deltas(
     before: &TrafficSnapshot,
     after: &TrafficSnapshot,
+    inbound_tag: &str,
+    outbound_tag: &str,
     expected: u64,
 ) {
     assert_stat_delta(
         &before.per_outbound,
         &after.per_outbound,
-        &TEST_OUTBOUND.to_string(),
+        &outbound_tag.to_string(),
         expected,
     );
     assert_stat_delta(
         &before.per_inbound,
         &after.per_inbound,
-        &TEST_INBOUND.to_string(),
+        &inbound_tag.to_string(),
         expected,
     );
     assert_stat_delta(
         &before.per_inbound_user,
         &after.per_inbound_user,
-        &(TEST_INBOUND.to_string(), TEST_UUID.to_string()),
+        &(inbound_tag.to_string(), TEST_UUID.to_string()),
         expected,
     );
 }
