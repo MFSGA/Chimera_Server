@@ -195,7 +195,7 @@ BPF SOCKHASH 不是当前必做项。只有物理机高并发数据证明网卡�
 
 详细差距分析见 [`20260804-234600-xray-parity-gap-analysis.zh.md`](./20260804-234600-xray-parity-gap-analysis.zh.md)。对比基线为仓库内 `ref/xray-core` 的 `5ca6f4b7d4dc`（Xray-core v26.7.28）。
 
-当前结论：入站、路由、Stats/Handler/Routing/Observatory 控制面已经较完整。出站运行时已从仅支持 `freedom`/`blackhole` 推进到支持 VLESS TCP、VMess TCP、Trojan TCP、SOCKS5 TCP、HTTP CONNECT TCP 与 Shadowsocks legacy AEAD TCP，并完成可复用的 TCP/TLS/REALITY/WebSocket/HTTP Upgrade/gRPC transport pipeline；静态 JSON 与 HandlerService 动态 SenderConfig 均复用同一严格编译路径。其他代理出站、通用 sniffing、Xray DNS/FakeDNS、mKCP、TUN、Reverse、WireGuard 和部分 XHTTP client/xmux/download 语义仍未完成。
+当前结论：入站、路由、Stats/Handler/Routing/Observatory 控制面已经较完整。出站运行时已从仅支持 `freedom`/`blackhole` 推进到支持 VLESS TCP、VMess TCP、Trojan TCP、SOCKS5 TCP、HTTP CONNECT TCP，以及 Shadowsocks legacy AEAD TCP/UDP，并完成可复用的 TCP/TLS/REALITY/WebSocket/HTTP Upgrade/gRPC transport pipeline；静态 JSON 与 HandlerService 动态 SenderConfig 均复用同一严格编译路径。其他代理出站、通用 sniffing、Xray DNS/FakeDNS、mKCP、TUN、Reverse、WireGuard 和部分 XHTTP client/xmux/download 语义仍未完成。
 
 ### P0：Outbound Runtime
 
@@ -210,9 +210,9 @@ BPF SOCKHASH 不是当前必做项。只有物理机高并发数据证明网卡�
 - [x] 支持 Trojan TCP outbound：标准 `servers` 与简化 `address/port/password` 配置、动态 `xray.proxy.trojan.ClientConfig`、ListOutbounds 回显、SHA-224 hex 认证头、原始 domain/IP target，并复用完整 transport pipeline；plain/TLS 已通过 Xray 26.2.6 真实互通，UDP associate 尚未实现。
 - [x] 支持 SOCKS5 TCP outbound：单服务器、NO_AUTH 与 RFC1929 用户名密码、标准 `servers/users` 与简化配置、动态 `xray.proxy.socks.ClientConfig`、ListOutbounds 回显、CONNECT 响应严格校验和原始 domain/IP target；plain no-auth 与 TLS+password 已通过 Xray 26.2.6 真实互通，UDP ASSOCIATE 尚未实现。
 - [x] 支持 HTTP CONNECT TCP outbound：单服务器、可选 Basic Proxy-Authorization、自定义安全 header、标准 `servers/users/headers` 与简化配置、动态 `xray.proxy.http.ClientConfig`、ListOutbounds 回显、2xx/407/502/504 响应处理和 IPv6 authority；plain no-auth 与 TLS+Basic Auth 已通过 Xray 26.2.6 真实互通。
-- [x] 支持 Shadowsocks legacy AEAD TCP outbound：AES-128-GCM、AES-256-GCM、ChaCha20-IETF-Poly1305、标准 `servers` 与简化配置、动态 `xray.proxy.shadowsocks.ClientConfig`、ListOutbounds、原始 domain/IP target 和共享 transport pipeline；plain AES 与 TLS+ChaCha 已通过 Xray 26.2.6 真实互通。XChaCha、2022/EIH 和 UDP 尚未实现。
+- [x] 支持 Shadowsocks legacy AEAD TCP/UDP outbound：AES-128-GCM、AES-256-GCM、ChaCha20-IETF-Poly1305、标准 `servers` 与简化配置、动态 `xray.proxy.shadowsocks.ClientConfig`、ListOutbounds、原始 domain/IP target、salt 防重放与共享 TCP transport pipeline。UDP 当前使用 plain proxy endpoint 的 one-shot datagram exchange，覆盖固定目标、目标化/session/XUDP、SOCKS5、Dokodemo、Shadowsocks inbound 与 Hysteria2；SOCKS5 UDP → Chimera → Xray 已通过文本与 1200-byte payload 真实互通。TUIC response adapter、XChaCha、2022/EIH 和持久 UDP association 尚未实现。
 - [x] 支持 VMess TCP outbound：标准 `vnext/users` 与简化配置、AEAD AuthID/request header、`none`/AES-128-GCM/ChaCha20-Poly1305 body、动态 `xray.proxy.vmess.outbound.Config`、ListOutbounds、原始 domain/IP target 和共享 transport pipeline；plain none 与 TLS+AES 已通过 Xray 26.2.6 真实互通。AUTO、alterId、experiments、Mux 和 UDP 均 fail-closed。
-- [ ] 继续接入 Shadowsocks 2022/EIH 与 VLESS/VMess/Trojan/SOCKS/Shadowsocks UDP outbound。
+- [ ] 继续接入 TUIC 的 Shadowsocks UDP response adapter、Shadowsocks 2022/EIH，以及 VLESS/VMess/Trojan/SOCKS UDP outbound。
 
 ### P0/P1：Sniffing 与 DNS
 
