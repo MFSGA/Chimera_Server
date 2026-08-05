@@ -60,6 +60,11 @@ const TYPE_APP_RECEIVER_CONFIG_V2RAY: &str =
     "v2ray.core.app.proxyman.ReceiverConfig";
 const TYPE_APP_SENDER_CONFIG: &str = "xray.app.proxyman.SenderConfig";
 const TYPE_APP_SENDER_CONFIG_V2RAY: &str = "v2ray.core.app.proxyman.SenderConfig";
+const TYPE_PROXY_HTTP_CLIENT_CONFIG: &str = "xray.proxy.http.ClientConfig";
+const TYPE_PROXY_HTTP_CLIENT_CONFIG_V2RAY: &str =
+    "v2ray.core.proxy.http.ClientConfig";
+const TYPE_PROXY_HTTP_ACCOUNT: &str = "xray.proxy.http.Account";
+const TYPE_PROXY_HTTP_ACCOUNT_V2RAY: &str = "v2ray.core.proxy.http.Account";
 const TYPE_PROXY_SOCKS_CLIENT_CONFIG: &str = "xray.proxy.socks.ClientConfig";
 const TYPE_PROXY_SOCKS_CLIENT_CONFIG_V2RAY: &str =
     "v2ray.core.proxy.socks.ClientConfig";
@@ -211,6 +216,30 @@ struct SocksServerConfigPayload {
     auth_type: i32,
     #[prost(map = "string, string", tag = "2")]
     accounts: std::collections::HashMap<String, String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct HttpAccountPayload {
+    #[prost(string, tag = "1")]
+    username: String,
+    #[prost(string, tag = "2")]
+    password: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct HttpClientConfigPayload {
+    #[prost(message, optional, tag = "1")]
+    server: Option<SocksServerEndpointPayload>,
+    #[prost(message, repeated, tag = "2")]
+    header: Vec<HttpHeaderPayload>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct HttpHeaderPayload {
+    #[prost(string, tag = "1")]
+    key: String,
+    #[prost(string, tag = "2")]
+    value: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1824,6 +1853,76 @@ impl HandlerServiceImpl {
                 )?;
                 "blackhole"
             }
+            TYPE_PROXY_HTTP_CLIENT_CONFIG | TYPE_PROXY_HTTP_CLIENT_CONFIG_V2RAY => {
+                let config = self.decode_typed_message::<HttpClientConfigPayload>(
+                    proxy_settings,
+                    &[
+                        TYPE_PROXY_HTTP_CLIENT_CONFIG,
+                        TYPE_PROXY_HTTP_CLIENT_CONFIG_V2RAY,
+                    ],
+                    "outbound proxy settings",
+                )?;
+                let server = config.server.ok_or_else(|| {
+                    Status::invalid_argument("HTTP outbound server is required")
+                })?;
+                if server.address.is_none() {
+                    return Err(Status::invalid_argument(
+                        "HTTP outbound server address is required",
+                    ));
+                }
+                let address = self.parse_address(server.address)?;
+                let port = u16::try_from(server.port).map_err(|_| {
+                    Status::invalid_argument(
+                        "HTTP outbound server port must fit in u16",
+                    )
+                })?;
+                if port == 0 {
+                    return Err(Status::invalid_argument(
+                        "HTTP outbound server port must not be zero",
+                    ));
+                }
+                let users = if let Some(user) = server.user {
+                    let account = user.account.as_ref().ok_or_else(|| {
+                        Status::invalid_argument(
+                            "HTTP outbound user account is required",
+                        )
+                    })?;
+                    let account = self.decode_typed_message::<HttpAccountPayload>(
+                        account,
+                        &[TYPE_PROXY_HTTP_ACCOUNT, TYPE_PROXY_HTTP_ACCOUNT_V2RAY],
+                        "HTTP outbound account",
+                    )?;
+                    vec![serde_json::json!({
+                        "user": account.username,
+                        "pass": account.password,
+                        "level": user.level,
+                        "email": user.email
+                    })]
+                } else {
+                    Vec::new()
+                };
+                let mut headers = std::collections::HashMap::new();
+                for header in config.header {
+                    if headers.insert(header.key.clone(), header.value).is_some() {
+                        return Err(Status::invalid_argument(format!(
+                            "duplicate HTTP outbound header {}",
+                            header.key
+                        )));
+                    }
+                }
+                literal_settings = Some(serde_json::json!({
+                    "servers": [{
+                        "address": address.to_string(),
+                        "port": port,
+                        "users": users
+                    }],
+                    "headers": headers
+                }));
+                stream_settings = Some(self.parse_outbound_sender_settings(
+                    outbound.sender_settings.as_ref(),
+                )?);
+                "http"
+            }
             TYPE_PROXY_SOCKS_CLIENT_CONFIG
             | TYPE_PROXY_SOCKS_CLIENT_CONFIG_V2RAY => {
                 let config = self.decode_typed_message::<SocksClientConfigPayload>(
@@ -2565,6 +2664,57 @@ impl HandlerServiceImpl {
                     TYPE_PROXY_BLACKHOLE_CONFIG,
                     BlackholeConfigPayload {},
                 )),
+                "http" => self.runtime.outbound_connector(&outbound.tag).and_then(
+                    |connector| match connector.as_ref() {
+                        OutboundConnectorKind::HttpTcp(config) => {
+                            let mut headers = config
+                                .headers
+                                .iter()
+                                .map(|(key, value)| HttpHeaderPayload {
+                                    key: key.clone(),
+                                    value: value.clone(),
+                                })
+                                .collect::<Vec<_>>();
+                            headers.sort_by(|left, right| left.key.cmp(&right.key));
+                            Some(Self::typed_message(
+                                TYPE_PROXY_HTTP_CLIENT_CONFIG,
+                                HttpClientConfigPayload {
+                                    server: Some(SocksServerEndpointPayload {
+                                        address: Self::encode_address(
+                                            config.server.address(),
+                                        ),
+                                        port: u32::from(config.server.port()),
+                                        user: config.credentials.as_ref().map(
+                                            |credentials| {
+                                                proto::xray::common::protocol::User {
+                                                    level: 0,
+                                                    email: String::new(),
+                                                    account: Some(
+                                                        Self::typed_message(
+                                                            TYPE_PROXY_HTTP_ACCOUNT,
+                                                            HttpAccountPayload {
+                                                                username:
+                                                                    credentials
+                                                                        .username
+                                                                        .clone(),
+                                                                password:
+                                                                    credentials
+                                                                        .password
+                                                                        .clone(),
+                                                            },
+                                                        ),
+                                                    ),
+                                                }
+                                            },
+                                        ),
+                                    }),
+                                    header: headers,
+                                },
+                            ))
+                        }
+                        _ => None,
+                    },
+                ),
                 "socks" => self.runtime.outbound_connector(&outbound.tag).and_then(
                     |connector| match connector.as_ref() {
                         OutboundConnectorKind::SocksTcp(config) => {
@@ -3777,6 +3927,49 @@ mod tests {
         )
     }
 
+    fn build_add_http_outbound_request(
+        tag: &str,
+        credentials: Option<(&str, &str)>,
+        headers: Vec<(&str, &str)>,
+    ) -> proto::xray::app::proxyman::command::AddOutboundRequest {
+        let user = credentials.map(|(username, password)| {
+            proto::xray::common::protocol::User {
+                level: 0,
+                email: "http-outbound@example.com".into(),
+                account: Some(HandlerServiceImpl::typed_message(
+                    TYPE_PROXY_HTTP_ACCOUNT,
+                    HttpAccountPayload {
+                        username: username.to_string(),
+                        password: password.to_string(),
+                    },
+                )),
+            }
+        });
+        build_typed_add_outbound_request(
+            tag,
+            TYPE_PROXY_HTTP_CLIENT_CONFIG,
+            HttpClientConfigPayload {
+                server: Some(SocksServerEndpointPayload {
+                    address: Some(IpOrDomainPayload {
+                        address: Some(ip_or_domain_payload::Address::Domain(
+                            "http.example".into(),
+                        )),
+                    }),
+                    port: 8080,
+                    user,
+                }),
+                header: headers
+                    .into_iter()
+                    .map(|(key, value)| HttpHeaderPayload {
+                        key: key.to_string(),
+                        value: value.to_string(),
+                    })
+                    .collect(),
+            }
+            .encode_to_vec(),
+        )
+    }
+
     fn build_add_socks_outbound_request(
         tag: &str,
         credentials: Option<(&str, &str)>,
@@ -4214,6 +4407,105 @@ mod tests {
         );
         assert_eq!(runtime.outbounds().len(), before.len());
         assert!(runtime.outbound_connector(&unsupported_tag).is_none());
+    }
+
+    #[tokio::test]
+    async fn handler_installs_http_outbound_and_preserves_headers() {
+        let fixture = build_fixture();
+        let runtime = fixture.runtime.clone();
+        let service = HandlerServiceImpl::new(runtime.clone());
+        let tag = unique_tag("http-auth");
+        let mut request = build_add_http_outbound_request(
+            &tag,
+            Some(("alice", "secret")),
+            vec![("X-Region", "edge"), ("X-Trace", "enabled")],
+        );
+        request.outbound.as_mut().unwrap().sender_settings =
+            Some(HandlerServiceImpl::typed_message(
+                TYPE_APP_SENDER_CONFIG,
+                SenderConfigPayload::default(),
+            ));
+
+        service
+            .add_outbound(Request::new(request))
+            .await
+            .expect("HTTP outbound should install");
+        let connector = runtime.outbound_connector(&tag).unwrap();
+        let OutboundConnectorKind::HttpTcp(config) = connector.as_ref() else {
+            panic!("expected HTTP TCP connector");
+        };
+        assert_eq!(config.server.to_string(), "http.example:8080");
+        assert_eq!(
+            config.credentials,
+            Some(crate::http_outbound::HttpProxyCredentials {
+                username: "alice".into(),
+                password: "secret".into(),
+            })
+        );
+        assert_eq!(config.headers.get("X-Region"), Some(&"edge".to_string()));
+        assert!(config.transport.is_tcp());
+
+        let listed = service
+            .list_outbounds(Request::new(
+                proto::xray::app::proxyman::command::ListOutboundsRequest {},
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let outbound = listed
+            .outbounds
+            .iter()
+            .find(|outbound| outbound.tag == tag)
+            .expect("listed HTTP outbound missing");
+        assert_eq!(
+            outbound.proxy_settings.as_ref().unwrap().r#type,
+            TYPE_PROXY_HTTP_CLIENT_CONFIG
+        );
+        let config = HttpClientConfigPayload::decode(
+            outbound.proxy_settings.as_ref().unwrap().value.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            config
+                .header
+                .iter()
+                .map(|header| (header.key.as_str(), header.value.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("X-Region", "edge"), ("X-Trace", "enabled")]
+        );
+        let account = config.server.unwrap().user.unwrap().account.unwrap();
+        let account = HttpAccountPayload::decode(account.value.as_slice()).unwrap();
+        assert_eq!(account.username, "alice");
+        assert_eq!(account.password, "secret");
+        assert!(outbound.sender_settings.is_some());
+
+        let before = runtime.outbounds().len();
+        let duplicate_tag = unique_tag("http-duplicate-header");
+        let error = service
+            .add_outbound(Request::new(build_add_http_outbound_request(
+                &duplicate_tag,
+                None,
+                vec![("X-Test", "one"), ("X-Test", "two")],
+            )))
+            .await
+            .expect_err("duplicate HTTP headers must fail atomically");
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("duplicate HTTP outbound header"));
+        assert_eq!(runtime.outbounds().len(), before);
+        assert!(runtime.outbound_connector(&duplicate_tag).is_none());
+
+        let reserved_tag = unique_tag("http-reserved-header");
+        let error = service
+            .add_outbound(Request::new(build_add_http_outbound_request(
+                &reserved_tag,
+                None,
+                vec![("Proxy-Authorization", "override")],
+            )))
+            .await
+            .expect_err("reserved HTTP headers must fail atomically");
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("reserved"));
+        assert!(runtime.outbound_connector(&reserved_tag).is_none());
     }
 
     #[tokio::test]

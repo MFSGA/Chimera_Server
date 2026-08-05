@@ -3,9 +3,18 @@ use std::{collections::HashMap, sync::Arc};
 use serde::Deserialize;
 
 use crate::address::{Address, NetLocation};
+use crate::http_outbound::{HttpProxyCredentials, validate_http_proxy_headers};
 use crate::outbound_transport::OutboundTransportConfig;
 use crate::runtime::OutboundSummary;
 use crate::socks_outbound::Socks5Credentials;
+
+#[derive(Debug, Clone)]
+pub(crate) struct HttpTcpOutboundConfig {
+    pub server: NetLocation,
+    pub credentials: Option<HttpProxyCredentials>,
+    pub headers: std::collections::HashMap<String, String>,
+    pub transport: OutboundTransportConfig,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct SocksTcpOutboundConfig {
@@ -67,6 +76,45 @@ struct LiteralVlessUser {
     flow: String,
     #[serde(default)]
     encryption: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LiteralHttpOutboundSettings {
+    #[serde(default)]
+    address: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default, alias = "username")]
+    user: Option<String>,
+    #[serde(default, alias = "password")]
+    pass: Option<String>,
+    #[serde(default)]
+    servers: Vec<LiteralHttpServer>,
+    #[serde(default)]
+    headers: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LiteralHttpServer {
+    address: String,
+    port: u16,
+    #[serde(default)]
+    users: Vec<LiteralHttpUser>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LiteralHttpUser {
+    #[serde(default, alias = "username")]
+    user: String,
+    #[serde(default, alias = "password")]
+    pass: String,
+    #[serde(default)]
+    level: u32,
+    #[serde(default)]
+    email: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -146,6 +194,7 @@ struct LiteralTrojanServer {
 pub(crate) enum OutboundConnectorKind {
     Freedom,
     Blackhole,
+    HttpTcp(Box<HttpTcpOutboundConfig>),
     SocksTcp(Box<SocksTcpOutboundConfig>),
     #[cfg(feature = "trojan")]
     TrojanTcp(Box<TrojanTcpOutboundConfig>),
@@ -262,6 +311,118 @@ fn compile_vless_tcp(
     Ok(VlessTcpOutboundConfig {
         server,
         user_uuid,
+        transport,
+    })
+}
+
+fn compile_http_tcp(
+    summary: &OutboundSummary,
+) -> Result<HttpTcpOutboundConfig, String> {
+    let settings = summary
+        .settings
+        .as_ref()
+        .ok_or_else(|| format!("HTTP outbound {} requires settings", summary.tag))?;
+    let settings =
+        serde_json::from_value::<LiteralHttpOutboundSettings>(settings.clone())
+            .map_err(|error| {
+                format!("invalid HTTP outbound {} settings: {error}", summary.tag)
+            })?;
+    validate_http_proxy_headers(&settings.headers).map_err(|error| {
+        format!("invalid HTTP outbound {} headers: {error}", summary.tag)
+    })?;
+
+    let (address, port, credentials) = if let Some(address) = settings.address {
+        if !settings.servers.is_empty() {
+            return Err(format!(
+                "HTTP outbound {} cannot combine address with servers",
+                summary.tag
+            ));
+        }
+        let username = settings.user.unwrap_or_default();
+        let password = settings.pass.unwrap_or_default();
+        let credentials = if username.is_empty() {
+            if !password.is_empty() {
+                return Err(format!(
+                    "HTTP outbound {} password requires a username",
+                    summary.tag
+                ));
+            }
+            None
+        } else {
+            Some(HttpProxyCredentials { username, password })
+        };
+        (
+            address,
+            settings.port.ok_or_else(|| {
+                format!("HTTP outbound {} requires port", summary.tag)
+            })?,
+            credentials,
+        )
+    } else {
+        if settings.servers.len() != 1 {
+            return Err(format!(
+                "HTTP outbound {} requires exactly one server",
+                summary.tag
+            ));
+        }
+        let mut servers = settings.servers;
+        let mut server = servers.pop().ok_or_else(|| {
+            format!("HTTP outbound {} server disappeared", summary.tag)
+        })?;
+        if server.users.len() > 1 {
+            return Err(format!(
+                "HTTP outbound {} supports at most one user",
+                summary.tag
+            ));
+        }
+        let credentials = server.users.pop().map(|user| {
+            let _ = (user.level, user.email);
+            HttpProxyCredentials {
+                username: user.user,
+                password: user.pass,
+            }
+        });
+        if credentials
+            .as_ref()
+            .is_some_and(|credentials| credentials.username.is_empty())
+        {
+            return Err(format!(
+                "HTTP outbound {} username must not be empty",
+                summary.tag
+            ));
+        }
+        (server.address, server.port, credentials)
+    };
+
+    if address.trim().is_empty() {
+        return Err(format!(
+            "HTTP outbound {} server address must not be empty",
+            summary.tag
+        ));
+    }
+    if port == 0 {
+        return Err(format!(
+            "HTTP outbound {} server port must not be zero",
+            summary.tag
+        ));
+    }
+
+    let server_address = Address::from(address.trim()).map_err(|error| {
+        format!(
+            "invalid HTTP outbound {} server address: {error}",
+            summary.tag
+        )
+    })?;
+    let server = NetLocation::new(server_address, port);
+    let transport = OutboundTransportConfig::compile(
+        &server,
+        summary.stream_settings.as_ref(),
+        &summary.tag,
+    )?;
+    Ok(HttpTcpOutboundConfig {
+        server,
+        credentials,
+        headers: settings.headers,
         transport,
     })
 }
@@ -482,6 +643,7 @@ impl OutboundConnectorKind {
         match protocol.as_str() {
             "freedom" => Ok(Self::Freedom),
             "blackhole" => Ok(Self::Blackhole),
+            "http" => compile_http_tcp(summary).map(Box::new).map(Self::HttpTcp),
             "socks" => compile_socks_tcp(summary).map(Box::new).map(Self::SocksTcp),
             #[cfg(feature = "trojan")]
             "trojan" => compile_trojan_tcp(summary)
@@ -592,6 +754,21 @@ mod tests {
         }
     }
 
+    fn literal_http(settings: serde_json::Value) -> OutboundSummary {
+        OutboundSummary {
+            tag: "http-proxy".into(),
+            protocol: "http".into(),
+            settings: Some(settings),
+            stream_settings: Some(crate::config::def::OutboundStreamSettings {
+                network: "tcp".into(),
+                security: Some("none".into()),
+                ..crate::config::def::OutboundStreamSettings::default()
+            }),
+            proxy_settings_type: None,
+            proxy_settings_value: None,
+        }
+    }
+
     fn literal_socks(settings: serde_json::Value) -> OutboundSummary {
         OutboundSummary {
             tag: "socks-proxy".into(),
@@ -644,6 +821,87 @@ mod tests {
             }),
             proxy_settings_type: None,
             proxy_settings_value: None,
+        }
+    }
+
+    #[test]
+    fn compiles_http_no_auth_basic_auth_and_headers() {
+        let no_auth = literal_http(serde_json::json!({
+            "servers": [{
+                "address": "127.0.0.1",
+                "port": 8080
+            }],
+            "headers": {"X-Test": "static"}
+        }));
+        let authenticated = literal_http(serde_json::json!({
+            "address": "proxy.example",
+            "port": 8443,
+            "user": "alice",
+            "pass": "secret"
+        }));
+
+        let OutboundConnectorKind::HttpTcp(no_auth) =
+            OutboundConnectorKind::compile(&no_auth, true).unwrap()
+        else {
+            panic!("expected no-auth HTTP connector");
+        };
+        assert!(no_auth.credentials.is_none());
+        assert_eq!(no_auth.headers.get("X-Test"), Some(&"static".to_string()));
+        assert!(no_auth.transport.is_tcp());
+
+        let OutboundConnectorKind::HttpTcp(authenticated) =
+            OutboundConnectorKind::compile(&authenticated, true).unwrap()
+        else {
+            panic!("expected authenticated HTTP connector");
+        };
+        assert_eq!(authenticated.server.to_string(), "proxy.example:8443");
+        assert_eq!(
+            authenticated.credentials,
+            Some(HttpProxyCredentials {
+                username: "alice".into(),
+                password: "secret".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_http_server_credentials_and_headers() {
+        for (settings, expected) in [
+            (serde_json::json!({"servers": []}), "exactly one server"),
+            (
+                serde_json::json!({
+                    "servers": [{
+                        "address": "127.0.0.1",
+                        "port": 8080,
+                        "users": [
+                            {"user": "a", "pass": "a"},
+                            {"user": "b", "pass": "b"}
+                        ]
+                    }]
+                }),
+                "at most one user",
+            ),
+            (
+                serde_json::json!({
+                    "address": "127.0.0.1",
+                    "port": 8080,
+                    "pass": "secret"
+                }),
+                "requires a username",
+            ),
+            (
+                serde_json::json!({
+                    "address": "127.0.0.1",
+                    "port": 8080,
+                    "headers": {"Proxy-Authorization": "override"}
+                }),
+                "reserved",
+            ),
+        ] {
+            let error =
+                OutboundConnectorKind::compile(&literal_http(settings), true)
+                    .expect_err("invalid HTTP settings must fail closed");
+            assert!(error.contains(expected), "unexpected error: {error}");
         }
     }
 

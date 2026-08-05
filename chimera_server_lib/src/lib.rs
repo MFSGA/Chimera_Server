@@ -53,6 +53,7 @@ pub mod reality;
 mod log;
 
 mod handler;
+mod http_outbound;
 
 mod resolver;
 

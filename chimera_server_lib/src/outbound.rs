@@ -7,6 +7,7 @@ use std::{
 #[cfg(any(feature = "trojan", feature = "vless"))]
 use tokio::io::AsyncWriteExt;
 
+use crate::http_outbound::{HttpProxyCredentials, connect_http_proxy};
 use crate::socks_outbound::{Socks5Credentials, connect_socks5};
 #[cfg(feature = "trojan")]
 use crate::trojan_outbound::encode_trojan_tcp_request;
@@ -36,6 +37,11 @@ pub(crate) struct TcpOutboundConnection {
 
 enum TcpOutboundHandshake {
     None,
+    Http {
+        credentials: Option<HttpProxyCredentials>,
+        headers: std::collections::HashMap<String, String>,
+        target: NetLocation,
+    },
     Socks {
         credentials: Option<Socks5Credentials>,
         target: NetLocation,
@@ -80,6 +86,15 @@ pub(crate) async fn connect_tcp_outbound(
             TcpOutboundHandshake::None,
         ),
         Some(OutboundConnectorKind::Blackhole) => return Ok(None),
+        Some(OutboundConnectorKind::HttpTcp(config)) => (
+            config.server.clone(),
+            config.transport.clone(),
+            TcpOutboundHandshake::Http {
+                credentials: config.credentials.clone(),
+                headers: config.headers.clone(),
+                target: remote_location.clone(),
+            },
+        ),
         Some(OutboundConnectorKind::SocksTcp(config)) => (
             config.server.clone(),
             config.transport.clone(),
@@ -135,6 +150,30 @@ pub(crate) async fn connect_tcp_outbound(
     let mut stream = stream;
     let stream: Box<dyn AsyncStream> = match handshake {
         TcpOutboundHandshake::None => stream,
+        TcpOutboundHandshake::Http {
+            credentials,
+            headers,
+            target,
+        } => {
+            if let Err(error) = connect_http_proxy(
+                &mut *stream,
+                credentials.as_ref(),
+                &headers,
+                &target,
+            )
+            .await
+            {
+                record_tcp_outbound_failure(
+                    runtime,
+                    outbound_tag.as_deref(),
+                    started,
+                    attempted_at,
+                    &error,
+                );
+                return Err(error);
+            }
+            stream
+        }
         TcpOutboundHandshake::Socks {
             credentials,
             target,
@@ -258,6 +297,10 @@ pub(crate) fn select_direct_outbound(
         OutboundConnectorKind::Blackhole => {
             Ok(DirectOutboundAction::Blackhole { tag })
         }
+        OutboundConnectorKind::HttpTcp(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{network_name} outbound {tag} does not support UDP"),
+        )),
         OutboundConnectorKind::SocksTcp(_) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("{network_name} outbound {tag} does not support UDP yet"),

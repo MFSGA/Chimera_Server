@@ -234,22 +234,6 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
-    use crate::async_stream::AsyncPing;
-
-    impl AsyncPing for tokio::io::DuplexStream {
-        fn supports_ping(&self) -> bool {
-            false
-        }
-
-        fn poll_write_ping(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<bool>> {
-            std::task::Poll::Ready(Ok(false))
-        }
-    }
-
-    impl AsyncStream for tokio::io::DuplexStream {}
 
     #[tokio::test]
     async fn no_auth_connect_preserves_domain_target_and_payload() {

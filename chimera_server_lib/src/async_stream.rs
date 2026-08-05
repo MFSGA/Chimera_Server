@@ -317,3 +317,20 @@ where
 
 #[cfg(feature = "tls")]
 impl<S> AsyncStream for ClientTlsStream<S> where S: AsyncStream {}
+
+#[cfg(test)]
+impl AsyncPing for tokio::io::DuplexStream {
+    fn supports_ping(&self) -> bool {
+        false
+    }
+
+    fn poll_write_ping(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<bool>> {
+        Poll::Ready(Ok(false))
+    }
+}
+
+#[cfg(test)]
+impl AsyncStream for tokio::io::DuplexStream {}
