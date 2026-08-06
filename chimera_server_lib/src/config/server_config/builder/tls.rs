@@ -288,6 +288,21 @@ pub(super) fn apply_security_layers(
         .map_or("", |settings| settings.tproxy.as_str())
         .to_ascii_lowercase();
     let configure_transparent = matches!(tproxy.as_str(), "tproxy" | "redirect");
+    let receive_original_destination = stream_settings
+        .sockopt
+        .as_ref()
+        .is_some_and(|settings| settings.receive_original_dest_address);
+    if receive_original_destination && network != "udp" {
+        return Err(Error::InvalidConfig(
+            "receiveOriginalDestAddress is supported only for UDP transport".into(),
+        ));
+    }
+    #[cfg(not(target_os = "linux"))]
+    if receive_original_destination {
+        return Err(Error::InvalidConfig(
+            "receiveOriginalDestAddress is currently supported only on Linux".into(),
+        ));
+    }
     if configure_transparent
         && !matches!(
             network.as_str(),
@@ -935,6 +950,13 @@ pub(super) fn apply_security_layers(
     };
     let protocol = if configure_mptcp {
         ServerProxyConfig::TcpMultipath {
+            inner: Box::new(protocol),
+        }
+    } else {
+        protocol
+    };
+    let protocol = if receive_original_destination {
+        ServerProxyConfig::ReceiveOriginalDestination {
             inner: Box::new(protocol),
         }
     } else {

@@ -160,7 +160,8 @@ fn is_grpc_server_protocol(protocol: &ServerProxyConfig) -> bool {
         | ServerProxyConfig::BindMark { inner, .. }
         | ServerProxyConfig::CustomSockopt { inner, .. }
         | ServerProxyConfig::TcpMultipath { inner }
-        | ServerProxyConfig::TransparentSocket { inner } => {
+        | ServerProxyConfig::TransparentSocket { inner }
+        | ServerProxyConfig::ReceiveOriginalDestination { inner } => {
             is_grpc_server_protocol(inner)
         }
         #[cfg(feature = "tls")]
@@ -190,7 +191,8 @@ fn is_xhttp_server_protocol(protocol: &ServerProxyConfig) -> bool {
         | ServerProxyConfig::BindMark { inner, .. }
         | ServerProxyConfig::CustomSockopt { inner, .. }
         | ServerProxyConfig::TcpMultipath { inner }
-        | ServerProxyConfig::TransparentSocket { inner } => {
+        | ServerProxyConfig::TransparentSocket { inner }
+        | ServerProxyConfig::ReceiveOriginalDestination { inner } => {
             is_xhttp_server_protocol(inner)
         }
         #[cfg(feature = "tls")]

@@ -111,6 +111,8 @@ pub struct SocketSettings {
     #[serde(default)]
     tproxy: String,
     #[serde(default)]
+    receive_original_dest_address: bool,
+    #[serde(default)]
     tcp_keep_alive_interval: i32,
     #[serde(default)]
     tcp_keep_alive_idle: i32,

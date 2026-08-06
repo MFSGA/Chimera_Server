@@ -470,6 +470,9 @@ pub enum ServerProxyConfig {
     TransparentSocket {
         inner: Box<ServerProxyConfig>,
     },
+    ReceiveOriginalDestination {
+        inner: Box<ServerProxyConfig>,
+    },
     Ipv6Only {
         inner: Box<ServerProxyConfig>,
     },
@@ -558,6 +561,9 @@ impl std::fmt::Display for ServerProxyConfig {
                 Self::TcpMaxSeg { .. } => "TcpMaxSeg",
                 Self::TcpMultipath { .. } => "TcpMultipath",
                 Self::TransparentSocket { .. } => "TransparentSocket",
+                Self::ReceiveOriginalDestination { .. } => {
+                    "ReceiveOriginalDestination"
+                }
                 Self::Ipv6Only { .. } => "Ipv6Only",
                 Self::TcpFastOpen { .. } => "TcpFastOpen",
                 Self::BindInterface { .. } => "BindInterface",

@@ -3613,6 +3613,58 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn dokodemo_udp_builds_receive_original_destination_wrapper() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "dokodemo-door",
+            "tag": "dokodemo-udp-original-destination",
+            "settings": {
+                "address": "127.0.0.1",
+                "port": 5353
+            },
+            "streamSettings": {
+                "network": "udp",
+                "sockopt": {"receiveOriginalDestAddress": true}
+            }
+        }))
+        .expect("valid receiveOriginalDestAddress config");
+
+        let config = ServerConfig::try_from(inbound)
+            .expect("UDP receiveOriginalDestAddress should build");
+        let ServerProxyConfig::ReceiveOriginalDestination { inner } =
+            config.protocol
+        else {
+            panic!("receiveOriginalDestAddress must wrap the UDP listener");
+        };
+        assert!(matches!(*inner, ServerProxyConfig::DokodemoDoor { .. }));
+    }
+
+    #[test]
+    fn receive_original_destination_rejects_tcp_transport() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "dokodemo-door",
+            "tag": "dokodemo-tcp-original-destination",
+            "settings": {
+                "address": "127.0.0.1",
+                "port": 5353
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "sockopt": {"receiveOriginalDestAddress": true}
+            }
+        }))
+        .expect("valid inbound shape");
+
+        let error = ServerConfig::try_from(inbound)
+            .expect_err("receiveOriginalDestAddress must reject TCP");
+        assert!(error.to_string().contains("only for UDP"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn dokodemo_udp_builds_socket_option_wrappers() {
         let inbound: InboudItem = serde_json::from_value(serde_json::json!({
             "listen": "::1",
