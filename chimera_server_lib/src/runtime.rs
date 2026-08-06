@@ -299,6 +299,7 @@ pub(crate) struct PolicyRelayTimeouts {
     pub connection_idle: Option<Duration>,
     pub uplink_only: Option<Duration>,
     pub downlink_only: Option<Duration>,
+    pub buffer_size: Option<usize>,
 }
 
 impl PolicyRelayTimeouts {
@@ -306,6 +307,7 @@ impl PolicyRelayTimeouts {
         self.connection_idle.is_none()
             && self.uplink_only.is_none()
             && self.downlink_only.is_none()
+            && self.buffer_size.is_none()
     }
 }
 
@@ -315,6 +317,7 @@ struct PolicyRuntimeState {
     connection_idle_timeouts: HashMap<u32, Duration>,
     uplink_only_timeouts: HashMap<u32, Duration>,
     downlink_only_timeouts: HashMap<u32, Duration>,
+    buffer_sizes: HashMap<u32, usize>,
     user_stats: HashMap<u32, PolicyUserStats>,
     system_stats: PolicySystemStats,
 }
@@ -404,6 +407,7 @@ impl RuntimeState {
         let mut connection_idle_timeouts = HashMap::new();
         let mut uplink_only_timeouts = HashMap::new();
         let mut downlink_only_timeouts = HashMap::new();
+        let mut buffer_sizes = HashMap::new();
         let mut user_stats = HashMap::new();
         let mut system_stats = PolicySystemStats::default();
         if let Some(policy) = policy {
@@ -428,6 +432,16 @@ impl RuntimeState {
                 if let Some(seconds) = level_policy.downlink_only {
                     downlink_only_timeouts
                         .insert(level, Duration::from_secs(u64::from(seconds)));
+                }
+                if let Some(kibibytes) = level_policy.buffer_size {
+                    let bytes = if kibibytes <= 0 {
+                        1
+                    } else {
+                        usize::try_from(kibibytes)
+                            .unwrap_or(usize::MAX)
+                            .saturating_mul(1024)
+                    };
+                    buffer_sizes.insert(level, bytes);
                 }
                 if level_policy.stats_user_uplink.is_some()
                     || level_policy.stats_user_downlink.is_some()
@@ -458,6 +472,7 @@ impl RuntimeState {
         runtime_policy.connection_idle_timeouts = connection_idle_timeouts;
         runtime_policy.uplink_only_timeouts = uplink_only_timeouts;
         runtime_policy.downlink_only_timeouts = downlink_only_timeouts;
+        runtime_policy.buffer_sizes = buffer_sizes;
         runtime_policy.user_stats = user_stats;
         runtime_policy.system_stats = system_stats;
         Ok(())
@@ -505,6 +520,7 @@ impl RuntimeState {
             connection_idle: policy.connection_idle_timeouts.get(&level).copied(),
             uplink_only: policy.uplink_only_timeouts.get(&level).copied(),
             downlink_only: policy.downlink_only_timeouts.get(&level).copied(),
+            buffer_size: policy.buffer_sizes.get(&level).copied(),
         }
     }
 

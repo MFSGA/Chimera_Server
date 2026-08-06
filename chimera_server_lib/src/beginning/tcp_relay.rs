@@ -227,7 +227,19 @@ where
     A: AsyncStream + ?Sized,
     B: AsyncStream + ?Sized,
 {
-    let size = configured_copy_buffer_size();
+    copy_bidirectional_with_buffer_size(left, right, configured_copy_buffer_size())
+        .await
+}
+
+pub(crate) async fn copy_bidirectional_with_buffer_size<A, B>(
+    left: &mut A,
+    right: &mut B,
+    size: usize,
+) -> io::Result<TcpRelayResult>
+where
+    A: AsyncStream + ?Sized,
+    B: AsyncStream + ?Sized,
+{
     let backend = configured_relay_backend();
     #[cfg(target_os = "linux")]
     let _auto_guard =

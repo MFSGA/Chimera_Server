@@ -6,7 +6,9 @@ use std::{
 };
 
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf, copy, split},
+    io::{
+        AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf, copy_buf, split,
+    },
     sync::watch,
     time::{Instant, Sleep, sleep},
 };
@@ -106,12 +108,17 @@ where
 // default raw-relay state so policy-controlled sessions stay in userspace.
 impl<S> AsyncStream for ActivityStream<'_, S> where S: AsyncStream + ?Sized {}
 
-async fn copy_and_shutdown<R, W>(mut reader: R, mut writer: W) -> io::Result<u64>
+async fn copy_and_shutdown<R, W>(
+    reader: R,
+    mut writer: W,
+    buffer_size: usize,
+) -> io::Result<u64>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let transferred = copy(&mut reader, &mut writer).await?;
+    let mut reader = BufReader::with_capacity(buffer_size, reader);
+    let transferred = copy_buf(&mut reader, &mut writer).await?;
     writer.shutdown().await?;
     Ok(transferred)
 }
@@ -146,14 +153,28 @@ where
     if timeouts.is_empty() {
         return tcp_relay::copy_bidirectional(left, right).await;
     }
+    if timeouts.connection_idle.is_none()
+        && timeouts.uplink_only.is_none()
+        && timeouts.downlink_only.is_none()
+    {
+        return tcp_relay::copy_bidirectional_with_buffer_size(
+            left,
+            right,
+            timeouts.buffer_size.unwrap_or(1),
+        )
+        .await;
+    }
 
     let (activity_sender, mut activity_receiver) = watch::channel(());
     let left = ActivityStream::new(left, activity_sender.clone());
     let right = ActivityStream::new(right, activity_sender);
     let (left_reader, left_writer) = split(left);
     let (right_reader, right_writer) = split(right);
-    let uplink = copy_and_shutdown(left_reader, right_writer);
-    let downlink = copy_and_shutdown(right_reader, left_writer);
+    let buffer_size = timeouts
+        .buffer_size
+        .unwrap_or_else(tcp_relay::configured_copy_buffer_size);
+    let uplink = copy_and_shutdown(left_reader, right_writer, buffer_size);
+    let downlink = copy_and_shutdown(right_reader, left_writer, buffer_size);
     tokio::pin!(uplink);
     tokio::pin!(downlink);
 

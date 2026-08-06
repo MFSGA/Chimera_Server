@@ -976,7 +976,7 @@ mod tests {
                 "outbounds": [],
                 "policy": {
                     "levels": {
-                        "0": {"handshake": 4, "connIdle": 30, "uplinkOnly": 2, "downlinkOnly": 3},
+                        "0": {"handshake": 4, "connIdle": 30, "uplinkOnly": 2, "downlinkOnly": 3, "bufferSize": 64},
                         "7": {"connIdle": 9, "statsUserUplink": false, "statsUserDownlink": true, "statsUserOnline": false}
                     },
                     "system": {
@@ -1018,6 +1018,7 @@ mod tests {
             relay_timeouts.downlink_only,
             Some(std::time::Duration::from_secs(3))
         );
+        assert_eq!(relay_timeouts.buffer_size, Some(64 * 1024));
         assert_eq!(
             runtime
                 .runtime_state
@@ -1039,22 +1040,19 @@ mod tests {
         assert_eq!(system_stats.outbound_uplink, Some(true));
         assert_eq!(system_stats.outbound_downlink, Some(false));
 
-        for unsupported_policy in [
-            serde_json::json!({"levels": {"0": {"bufferSize": 0}}}),
-            serde_json::json!({"system": {"statsUnknown": true}}),
-        ] {
-            let error = ConfigType::Str(
-                serde_json::json!({
-                    "inbounds": [],
-                    "outbounds": [],
-                    "policy": unsupported_policy
-                })
-                .to_string(),
-            )
-            .try_parse(Some(crate::ConfigFormat::Json))
-            .expect_err("unimplemented policy fields must fail closed");
-            assert!(error.to_string().contains("unknown field"), "{error}");
-        }
+        let unsupported_policy =
+            serde_json::json!({"system": {"statsUnknown": true}});
+        let error = ConfigType::Str(
+            serde_json::json!({
+                "inbounds": [],
+                "outbounds": [],
+                "policy": unsupported_policy
+            })
+            .to_string(),
+        )
+        .try_parse(Some(crate::ConfigFormat::Json))
+        .expect_err("unimplemented policy fields must fail closed");
+        assert!(error.to_string().contains("unknown field"), "{error}");
 
         let error = ConfigType::Str(
             serde_json::json!({

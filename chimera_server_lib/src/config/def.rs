@@ -521,6 +521,8 @@ pub struct PolicyLevelConfig {
     pub stats_user_downlink: Option<bool>,
     #[serde(default, rename = "statsUserOnline")]
     pub stats_user_online: Option<bool>,
+    #[serde(default, rename = "bufferSize")]
+    pub buffer_size: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
