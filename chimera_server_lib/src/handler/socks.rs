@@ -431,8 +431,9 @@ pub(crate) async fn run_udp_relay(
     runtime: RuntimeState,
     tcp_peer_addr: SocketAddr,
     client_udp_port_hint: Option<u16>,
-    traffic_context: Option<TrafficContext>,
+    mut traffic_context: Option<TrafficContext>,
 ) -> std::io::Result<()> {
+    apply_udp_stats_policy(&runtime, traffic_context.as_mut());
     let udp_socket_clone = udp_socket.clone();
     let _connection_guard = register_connection(traffic_context.as_ref());
 
@@ -778,6 +779,28 @@ fn build_udp_response_header_location(
     Ok(header)
 }
 
+fn apply_udp_stats_policy(
+    runtime: &RuntimeState,
+    context: Option<&mut TrafficContext>,
+) {
+    let Some(context) = context else {
+        return;
+    };
+    let user_stats = runtime.policy_user_stats(context.user_level);
+    let system_stats = runtime.policy_system_stats();
+    context.set_user_stats_policy(
+        user_stats.uplink,
+        user_stats.downlink,
+        user_stats.online,
+    );
+    context.set_system_stats_policy(
+        system_stats.inbound_uplink,
+        system_stats.inbound_downlink,
+        system_stats.outbound_uplink,
+        system_stats.outbound_downlink,
+    );
+}
+
 fn build_udp_response_header(src_addr: SocketAddr) -> Vec<u8> {
     let mut header = vec![0x00, 0x00, 0x00]; // RSV + FRAG=0
 
@@ -864,6 +887,39 @@ mod tests {
         traffic::{active_connections, snapshot},
         user_domain_access::UserDomainAccessConfig,
     };
+
+    #[test]
+    fn udp_context_applies_policy_stats() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let policy = serde_json::from_value(serde_json::json!({
+            "levels": {"7": {
+                "statsUserUplink": false,
+                "statsUserDownlink": true,
+                "statsUserOnline": false
+            }},
+            "system": {
+                "statsInboundUplink": true,
+                "statsInboundDownlink": false,
+                "statsOutboundUplink": false,
+                "statsOutboundDownlink": true
+            }
+        }))
+        .expect("policy config should parse");
+        runtime
+            .configure_policy(Some(&policy))
+            .expect("policy should install");
+        let mut context = TrafficContext::new("socks").with_user_level(7);
+
+        apply_udp_stats_policy(&runtime, Some(&mut context));
+
+        assert_eq!(context.stats_user_uplink, Some(false));
+        assert_eq!(context.stats_user_downlink, Some(true));
+        assert_eq!(context.stats_user_online, Some(false));
+        assert_eq!(context.stats_inbound_uplink, Some(true));
+        assert_eq!(context.stats_inbound_downlink, Some(false));
+        assert_eq!(context.stats_outbound_uplink, Some(false));
+        assert_eq!(context.stats_outbound_downlink, Some(true));
+    }
 
     #[tokio::test]
     async fn global_user_level_reaches_tcp_and_udp_contexts() {
