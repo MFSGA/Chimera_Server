@@ -289,7 +289,14 @@ pub(super) fn apply_security_layers(
     if !custom_sockopt.is_empty()
         && !matches!(
             network.as_str(),
-            "" | "raw" | "tcp" | "ws" | "websocket" | "httpupgrade" | "grpc"
+            "" | "raw"
+                | "tcp"
+                | "ws"
+                | "websocket"
+                | "httpupgrade"
+                | "grpc"
+                | "xhttp"
+                | "splithttp"
         )
     {
         return Err(Error::InvalidConfig(format!(

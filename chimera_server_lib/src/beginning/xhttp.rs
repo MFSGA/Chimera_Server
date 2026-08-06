@@ -190,6 +190,7 @@ pub async fn start_xhttp_server(
         bind_interface,
         bind_mark,
         tcp_mptcp,
+        custom_sockopt,
     } = parse_listener_protocol(protocol)?;
 
     let bind_addr = match bind_location {
@@ -215,6 +216,7 @@ pub async fn start_xhttp_server(
             ipv6_only,
             bind_interface,
             bind_mark,
+            custom_sockopt,
         )
         .await;
     }
@@ -236,6 +238,12 @@ pub async fn start_xhttp_server(
     if let Some(value) = tcp_max_seg {
         crate::handler::tcp_max_seg::configure_listener(&socket, value)?;
     }
+    #[cfg(target_os = "linux")]
+    crate::util::socket::configure_custom_sockopt(
+        socket.as_raw_fd(),
+        if bind_addr.is_ipv6() { "tcp6" } else { "tcp4" },
+        &custom_sockopt,
+    )?;
     socket.bind(bind_addr)?;
     let listener = socket.listen(1024)?;
     let security = security.clone();
@@ -344,6 +352,7 @@ async fn start_xhttp3_server(
     ipv6_only: bool,
     bind_interface: Option<String>,
     bind_mark: Option<i32>,
+    custom_sockopt: Vec<crate::config::CustomSockoptConfig>,
 ) -> std::io::Result<Vec<tokio::task::JoinHandle<()>>> {
     let quic_crypto: quinn::crypto::rustls::QuicServerConfig =
         tls_config.try_into().map_err(std::io::Error::other)?;
@@ -374,6 +383,12 @@ async fn start_xhttp3_server(
     if let Some(value) = bind_mark {
         crate::util::socket::configure_socket_mark(socket.as_raw_fd(), value)?;
     }
+    #[cfg(target_os = "linux")]
+    crate::util::socket::configure_custom_sockopt(
+        socket.as_raw_fd(),
+        if bind_addr.is_ipv6() { "udp6" } else { "udp4" },
+        &custom_sockopt,
+    )?;
     if ipv6_only {
         socket.set_only_v6(true)?;
     }
@@ -504,6 +519,7 @@ struct XhttpListenerConfig {
     bind_interface: Option<String>,
     bind_mark: Option<i32>,
     tcp_mptcp: bool,
+    custom_sockopt: Vec<crate::config::CustomSockoptConfig>,
 }
 
 #[derive(Clone)]
@@ -633,6 +649,11 @@ fn parse_listener_protocol(
     protocol: ServerProxyConfig,
 ) -> std::io::Result<XhttpListenerConfig> {
     match protocol {
+        ServerProxyConfig::CustomSockopt { options, inner } => {
+            let mut config = parse_listener_protocol(*inner)?;
+            config.custom_sockopt = options;
+            Ok(config)
+        }
         ServerProxyConfig::TcpMultipath { inner } => {
             let mut config = parse_listener_protocol(*inner)?;
             #[cfg(feature = "tls")]
@@ -763,6 +784,7 @@ fn parse_listener_protocol(
             bind_interface: None,
             bind_mark: None,
             tcp_mptcp: false,
+            custom_sockopt: Vec::new(),
         }),
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(TlsServerConfig {
@@ -833,6 +855,7 @@ fn parse_listener_protocol(
                     bind_interface: None,
                     bind_mark: None,
                     tcp_mptcp: false,
+                    custom_sockopt: Vec::new(),
                 })
             }
             _ => Err(std::io::Error::other(
@@ -858,6 +881,7 @@ fn parse_listener_protocol(
                         bind_interface: None,
                         bind_mark: None,
                         tcp_mptcp: false,
+                        custom_sockopt: Vec::new(),
                     })
                 }
                 _ => Err(std::io::Error::other(

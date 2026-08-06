@@ -1814,6 +1814,88 @@ mod tests {
 
     #[cfg(all(feature = "vless", target_os = "linux"))]
     #[test]
+    fn custom_sockopt_wraps_xhttp_listener() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-xhttp-custom-sockopt",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "xhttp",
+                "xhttpSettings": {"path": "/proxy"},
+                "sockopt": {
+                    "customSockopt": [{
+                        "system": "linux",
+                        "network": "tcp",
+                        "level": "1",
+                        "opt": "2",
+                        "value": "1",
+                        "type": "int"
+                    }]
+                }
+            }
+        }))
+        .unwrap();
+        let config = ServerConfig::try_from(inbound).unwrap();
+        let ServerProxyConfig::CustomSockopt { options, inner } = config.protocol
+        else {
+            panic!("customSockopt must wrap the XHTTP listener");
+        };
+        assert_eq!(options[0].network, "tcp");
+        assert!(matches!(*inner, ServerProxyConfig::Xhttp { .. }));
+    }
+
+    #[cfg(all(feature = "vless", feature = "tls", target_os = "linux"))]
+    #[test]
+    fn custom_sockopt_wraps_xhttp_http3_listener() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "::1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-xhttp-h3-custom-sockopt",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "xhttp",
+                "security": "tls",
+                "xhttpSettings": {"path": "/proxy"},
+                "sockopt": {
+                    "customSockopt": [{
+                        "system": "linux",
+                        "network": "udp",
+                        "level": "1",
+                        "opt": "2",
+                        "value": "1",
+                        "type": "int"
+                    }]
+                },
+                "tlsSettings": {
+                    "alpn": ["h3"],
+                    "certificates": [{
+                        "certificate": ["-----BEGIN CERTIFICATE-----","MIIB","-----END CERTIFICATE-----"],
+                        "key": ["-----BEGIN PRIVATE KEY-----","MIIB","-----END PRIVATE KEY-----"]
+                    }]
+                }
+            }
+        }))
+        .unwrap();
+        let config = ServerConfig::try_from(inbound).unwrap();
+        let ServerProxyConfig::CustomSockopt { options, inner } = config.protocol
+        else {
+            panic!("customSockopt must wrap the XHTTP HTTP/3 listener");
+        };
+        assert_eq!(options[0].network, "udp");
+        assert!(matches!(*inner, ServerProxyConfig::Tls(_)));
+    }
+
+    #[cfg(all(feature = "vless", target_os = "linux"))]
+    #[test]
     fn socket_tcp_mptcp_wraps_xhttp_listener() {
         let inbound: InboudItem = serde_json::from_value(serde_json::json!({
             "listen": "127.0.0.1",
