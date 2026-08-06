@@ -3534,6 +3534,52 @@ impl HandlerServiceImpl {
         })
     }
 
+    #[cfg(feature = "shadowsocks")]
+    fn parse_shadowsocks_user(
+        &self,
+        user: &proto::xray::common::protocol::User,
+    ) -> Result<ShadowsocksUser, Status> {
+        let account = user.account.as_ref().ok_or_else(|| {
+            Status::invalid_argument(
+                "AddUserOperation.user.account is required for Shadowsocks",
+            )
+        })?;
+        let account = self.decode_typed_message::<ShadowsocksAccountPayload>(
+            account,
+            &[
+                TYPE_PROXY_SHADOWSOCKS_ACCOUNT,
+                TYPE_PROXY_SHADOWSOCKS_ACCOUNT_V2RAY,
+            ],
+            "Shadowsocks account",
+        )?;
+        if account.iv_check {
+            return Err(Status::invalid_argument(
+                "Shadowsocks iv_check is not supported",
+            ));
+        }
+        let method = match account.cipher_type {
+            5 => "aes-128-gcm",
+            6 => "aes-256-gcm",
+            7 => "chacha20-ietf-poly1305",
+            8 => "xchacha20-ietf-poly1305",
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "unsupported Shadowsocks cipher type: {other}"
+                )));
+            }
+        };
+        let user = ShadowsocksUser {
+            method: method.to_string(),
+            password: account.password,
+            email: user.email.trim().to_string(),
+            user_level: user.level,
+        };
+        crate::handler::shadowsocks::validate_user(&user).map_err(|error| {
+            Status::invalid_argument(format!("invalid Shadowsocks user: {error}"))
+        })?;
+        Ok(user)
+    }
+
     #[cfg(feature = "hysteria")]
     fn parse_hysteria_client(
         &self,
@@ -3644,6 +3690,27 @@ impl HandlerServiceImpl {
                 }
                 Ok(true)
             }
+            #[cfg(feature = "shadowsocks")]
+            ServerProxyConfig::Shadowsocks { users, identity } => {
+                if identity.is_some()
+                    || users
+                        .iter()
+                        .any(|user| user.method.starts_with("2022-blake3-"))
+                {
+                    return Ok(false);
+                }
+                let user = self.parse_shadowsocks_user(user)?;
+                if !user.email.is_empty()
+                    && let Some(existing) = users.iter_mut().find(|existing| {
+                        existing.email.eq_ignore_ascii_case(&user.email)
+                    })
+                {
+                    *existing = user;
+                } else {
+                    users.push(user);
+                }
+                Ok(true)
+            }
             ServerProxyConfig::Socks { accounts, .. } => {
                 accounts.upsert(self.parse_socks_user(user)?);
                 Ok(true)
@@ -3718,6 +3785,19 @@ impl HandlerServiceImpl {
                     .clients
                     .retain(|client| client.email.as_deref() != Some(email));
                 Ok(before != config.clients.len())
+            }
+            #[cfg(feature = "shadowsocks")]
+            ServerProxyConfig::Shadowsocks { users, identity } => {
+                if identity.is_some()
+                    || users
+                        .iter()
+                        .any(|user| user.method.starts_with("2022-blake3-"))
+                {
+                    return Ok(false);
+                }
+                let before = users.len();
+                users.retain(|user| !user.email.eq_ignore_ascii_case(email));
+                Ok(before != users.len())
             }
             ServerProxyConfig::Socks { accounts, .. } => Ok(accounts.remove(email)),
             #[cfg(feature = "ws")]
@@ -5378,6 +5458,101 @@ mod tests {
                 .is_none(),
             "2022 Shadowsocks must not use the legacy ServerConfig type"
         );
+    }
+
+    #[cfg(feature = "shadowsocks")]
+    #[test]
+    fn handler_alters_legacy_shadowsocks_users() {
+        let service =
+            HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+        let mut protocol = ServerProxyConfig::Shadowsocks {
+            users: vec![ShadowsocksUser {
+                method: "aes-128-gcm".to_string(),
+                password: "initial-secret".to_string(),
+                email: "alice@example.com".to_string(),
+                user_level: 3,
+            }],
+            identity: None,
+        };
+        let make_user = |email: &str, level: u32, password: &str, cipher_type| {
+            proto::xray::common::protocol::User {
+                level,
+                email: email.to_string(),
+                account: Some(HandlerServiceImpl::typed_message(
+                    TYPE_PROXY_SHADOWSOCKS_ACCOUNT,
+                    ShadowsocksAccountPayload {
+                        password: password.to_string(),
+                        cipher_type,
+                        iv_check: false,
+                    },
+                )),
+            }
+        };
+
+        service
+            .apply_add_user_operation(
+                &mut protocol,
+                proto::xray::app::proxyman::command::AddUserOperation {
+                    user: Some(make_user("bob@example.com", 7, "bob-secret", 6)),
+                },
+            )
+            .unwrap();
+        service
+            .apply_add_user_operation(
+                &mut protocol,
+                proto::xray::app::proxyman::command::AddUserOperation {
+                    user: Some(make_user("BOB@example.com", 9, "updated-secret", 7)),
+                },
+            )
+            .unwrap();
+
+        let ServerProxyConfig::Shadowsocks { users, .. } = &protocol else {
+            unreachable!();
+        };
+        assert_eq!(users.len(), 2);
+        let bob = users
+            .iter()
+            .find(|user| user.email.eq_ignore_ascii_case("bob@example.com"))
+            .unwrap();
+        assert_eq!(bob.method, "chacha20-ietf-poly1305");
+        assert_eq!(bob.password, "updated-secret");
+        assert_eq!(bob.user_level, 9);
+        let listed = service.get_user_manager_users(&protocol).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[1].level, 9);
+
+        service
+            .apply_remove_user_operation(
+                &mut protocol,
+                proto::xray::app::proxyman::command::RemoveUserOperation {
+                    email: "bob@EXAMPLE.com".to_string(),
+                },
+            )
+            .unwrap();
+        let ServerProxyConfig::Shadowsocks { users, .. } = &protocol else {
+            unreachable!();
+        };
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].email, "alice@example.com");
+
+        let mut modern = ServerProxyConfig::Shadowsocks {
+            users: vec![ShadowsocksUser {
+                method: "2022-blake3-aes-128-gcm".to_string(),
+                password: "AAECAwQFBgcICQoLDA0ODw==".to_string(),
+                email: "modern@example.com".to_string(),
+                user_level: 5,
+            }],
+            identity: None,
+        };
+        let error = service
+            .apply_add_user_operation(
+                &mut modern,
+                proto::xray::app::proxyman::command::AddUserOperation {
+                    user: Some(make_user("other@example.com", 1, "other-secret", 5)),
+                },
+            )
+            .expect_err("2022 users require their native UserManager");
+        assert_eq!(error.message(), ERR_PROXY_NOT_USER_MANAGER);
     }
 
     #[tokio::test]
