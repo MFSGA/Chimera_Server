@@ -185,6 +185,7 @@ pub async fn start_xhttp_server(
         tcp_congestion,
         tcp_window_clamp,
         tcp_max_seg,
+        ipv6_only,
     } = parse_listener_protocol(protocol)?;
 
     let bind_addr = match bind_location {
@@ -203,10 +204,14 @@ pub async fn start_xhttp_server(
     ));
     #[cfg(feature = "tls")]
     if let XhttpSecurityLayer::Http3(tls_config) = &security {
-        return start_xhttp3_server(bind_addr, tls_config.clone(), state).await;
+        return start_xhttp3_server(bind_addr, tls_config.clone(), state, ipv6_only)
+            .await;
     }
 
     let socket = crate::util::socket::new_tcp_socket(None, bind_addr.is_ipv6())?;
+    if ipv6_only {
+        crate::handler::ipv6_only::configure_listener(&socket)?;
+    }
     if let Some(value) = tcp_max_seg {
         crate::handler::tcp_max_seg::configure_listener(&socket, value)?;
     }
@@ -315,6 +320,7 @@ async fn start_xhttp3_server(
     bind_addr: std::net::SocketAddr,
     tls_config: Arc<tokio_rustls::rustls::ServerConfig>,
     state: Arc<AppState>,
+    ipv6_only: bool,
 ) -> std::io::Result<Vec<tokio::task::JoinHandle<()>>> {
     let quic_crypto: quinn::crypto::rustls::QuicServerConfig =
         tls_config.try_into().map_err(std::io::Error::other)?;
@@ -337,11 +343,15 @@ async fn start_xhttp3_server(
     let socket = new_socket2_udp_socket_with_buffer_size(
         bind_addr.is_ipv6(),
         None,
-        Some(bind_addr),
+        None,
         false,
         Some(8_625_000),
     )
     .map_err(std::io::Error::other)?;
+    if ipv6_only {
+        socket.set_only_v6(true)?;
+    }
+    socket.bind(&socket2::SockAddr::from(bind_addr))?;
     let endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
         Some(server_config),
@@ -463,6 +473,7 @@ struct XhttpListenerConfig {
     tcp_congestion: Option<String>,
     tcp_window_clamp: Option<i32>,
     tcp_max_seg: Option<i32>,
+    ipv6_only: bool,
 }
 
 #[derive(Clone)]
@@ -592,6 +603,11 @@ fn parse_listener_protocol(
     protocol: ServerProxyConfig,
 ) -> std::io::Result<XhttpListenerConfig> {
     match protocol {
+        ServerProxyConfig::Ipv6Only { inner } => {
+            let mut config = parse_listener_protocol(*inner)?;
+            config.ipv6_only = true;
+            Ok(config)
+        }
         ServerProxyConfig::TcpMaxSeg { value, inner } => {
             let mut config = parse_listener_protocol(*inner)?;
             #[cfg(feature = "tls")]
@@ -678,6 +694,7 @@ fn parse_listener_protocol(
             tcp_congestion: None,
             tcp_window_clamp: None,
             tcp_max_seg: None,
+            ipv6_only: false,
         }),
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(TlsServerConfig {
@@ -743,6 +760,7 @@ fn parse_listener_protocol(
                     tcp_congestion: None,
                     tcp_window_clamp: None,
                     tcp_max_seg: None,
+                    ipv6_only: false,
                 })
             }
             _ => Err(std::io::Error::other(
@@ -763,6 +781,7 @@ fn parse_listener_protocol(
                         tcp_congestion: None,
                         tcp_window_clamp: None,
                         tcp_max_seg: None,
+                        ipv6_only: false,
                     })
                 }
                 _ => Err(std::io::Error::other(

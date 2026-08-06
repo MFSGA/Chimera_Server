@@ -1737,6 +1737,70 @@ mod tests {
         assert!(matches!(*inner, ServerProxyConfig::Grpc(_)));
     }
 
+    #[cfg(all(feature = "vless", any(target_os = "android", target_os = "linux")))]
+    #[test]
+    fn socket_v6only_wraps_xhttp_listener() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "::",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-xhttp-v6only",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "xhttp",
+                "xhttpSettings": {"path": "/proxy"},
+                "sockopt": {"v6only": true}
+            }
+        }))
+        .unwrap();
+        let config = ServerConfig::try_from(inbound).unwrap();
+        let ServerProxyConfig::Ipv6Only { inner } = config.protocol else {
+            panic!("v6only must wrap the XHTTP listener");
+        };
+        assert!(matches!(*inner, ServerProxyConfig::Xhttp { .. }));
+    }
+
+    #[cfg(all(
+        feature = "vless",
+        feature = "tls",
+        any(target_os = "android", target_os = "linux")
+    ))]
+    #[test]
+    fn socket_v6only_wraps_xhttp_http3_listener() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "::",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-xhttp-h3-v6only",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "xhttp",
+                "security": "tls",
+                "xhttpSettings": {"path": "/proxy"},
+                "sockopt": {"v6only": true},
+                "tlsSettings": {
+                    "alpn": ["h3"],
+                    "certificates": [{
+                        "certificate": ["-----BEGIN CERTIFICATE-----","MIIB","-----END CERTIFICATE-----"],
+                        "key": ["-----BEGIN PRIVATE KEY-----","MIIB","-----END PRIVATE KEY-----"]
+                    }]
+                }
+            }
+        }))
+        .unwrap();
+        let config = ServerConfig::try_from(inbound).unwrap();
+        let ServerProxyConfig::Ipv6Only { inner } = config.protocol else {
+            panic!("v6only must wrap the XHTTP HTTP/3 listener");
+        };
+        assert!(matches!(*inner, ServerProxyConfig::Tls(_)));
+    }
+
     #[cfg(feature = "vless")]
     #[test]
     fn socket_non_positive_tcp_max_seg_is_ignored() {
