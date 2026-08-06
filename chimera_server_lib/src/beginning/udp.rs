@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::{
     collections::{HashMap, VecDeque},
     future::poll_fn,
@@ -18,10 +20,10 @@ use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "shadowsocks")]
 use crate::handler::shadowsocks::ShadowsocksUdpCodec;
+use crate::util::socket::new_socket2_udp_socket;
 #[cfg(target_os = "linux")]
 use crate::util::socket::{
-    enable_udp_original_destination, new_socket2_udp_socket,
-    recv_udp_with_original_destination,
+    enable_udp_original_destination, recv_udp_with_original_destination,
 };
 
 use crate::{
@@ -1745,6 +1747,53 @@ async fn shutdown_message(
     poll_fn(|cx| Pin::new(&mut *stream).poll_shutdown_message(cx)).await
 }
 
+#[derive(Debug, Default)]
+struct UdpListenerOptions {
+    mark: Option<i32>,
+}
+
+fn parse_udp_listener_protocol(
+    protocol: ServerProxyConfig,
+) -> (ServerProxyConfig, UdpListenerOptions) {
+    match protocol {
+        ServerProxyConfig::BindMark { value, inner } => {
+            (*inner, UdpListenerOptions { mark: Some(value) })
+        }
+        protocol => (protocol, UdpListenerOptions::default()),
+    }
+}
+
+fn create_udp_listener(
+    bind_addr: SocketAddr,
+    options: &UdpListenerOptions,
+    receive_original_destination: bool,
+) -> std::io::Result<Arc<UdpSocket>> {
+    let socket = new_socket2_udp_socket(bind_addr.is_ipv6(), None, None, false)?;
+    #[cfg(target_os = "linux")]
+    if let Some(mark) = options.mark {
+        crate::util::socket::configure_socket_mark(socket.as_raw_fd(), mark)?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    if options.mark.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "sockopt.mark is currently supported only on Linux",
+        ));
+    }
+    if receive_original_destination {
+        #[cfg(target_os = "linux")]
+        enable_udp_original_destination(&socket, bind_addr.is_ipv6())?;
+        #[cfg(not(target_os = "linux"))]
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "UDP original destination is supported only on Linux",
+        ));
+    }
+    socket.bind(&socket2::SockAddr::from(bind_addr))?;
+    let socket: std::net::UdpSocket = socket.into();
+    Ok(Arc::new(UdpSocket::from_std(socket)?))
+}
+
 pub async fn start_udp_server(
     config: ServerConfig,
     runtime: RuntimeState,
@@ -1756,6 +1805,7 @@ pub async fn start_udp_server(
         ..
     } = config;
 
+    let (protocol, listener_options) = parse_udp_listener_protocol(protocol);
     let dokodemo_config = match protocol {
         #[cfg(feature = "shadowsocks")]
         ServerProxyConfig::Shadowsocks { users, identity } => {
@@ -1765,6 +1815,7 @@ pub async fn start_udp_server(
                 users,
                 identity,
                 runtime,
+                listener_options,
             )
             .await;
         }
@@ -1807,24 +1858,11 @@ pub async fn start_udp_server(
         );
     }
 
-    let socket = if dokodemo_config.follow_redirect {
-        #[cfg(target_os = "linux")]
-        {
-            let socket = new_socket2_udp_socket(
-                bind_addr.is_ipv6(),
-                None,
-                Some(bind_addr),
-                false,
-            )?;
-            enable_udp_original_destination(&socket, bind_addr.is_ipv6())?;
-            let socket: std::net::UdpSocket = socket.into();
-            Arc::new(UdpSocket::from_std(socket)?)
-        }
-        #[cfg(not(target_os = "linux"))]
-        unreachable!("non-Linux followRedirect returned before socket setup")
-    } else {
-        Arc::new(UdpSocket::bind(bind_addr).await?)
-    };
+    let socket = create_udp_listener(
+        bind_addr,
+        &listener_options,
+        dokodemo_config.follow_redirect,
+    )?;
     Ok(Some(tokio::spawn(async move {
         if let Err(err) = run_dokodemo_udp_server(
             socket,
@@ -1974,9 +2012,10 @@ async fn start_shadowsocks_udp_server(
     users: Vec<crate::config::server_config::ShadowsocksUser>,
     identity: Option<crate::config::server_config::ShadowsocksServerIdentity>,
     runtime: RuntimeState,
+    listener_options: UdpListenerOptions,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let bind_addr = bind_location_to_socket_addr(&bind_location)?;
-    let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
+    let socket = create_udp_listener(bind_addr, &listener_options, false)?;
     let codec = Arc::new(ShadowsocksUdpCodec::new(users, identity)?);
     info!("Starting Shadowsocks UDP server at {}", bind_location);
 
@@ -2517,6 +2556,58 @@ mod tests {
     };
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn marked_udp_listener_applies_so_mark() {
+        let socket = match create_udp_listener(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            &UdpListenerOptions { mark: Some(255) },
+            false,
+        ) {
+            Ok(socket) => socket,
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EPERM | libc::EACCES)
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("create marked UDP listener: {error}"),
+        };
+        let mut value = 0;
+        let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+        // SAFETY: `value` and `length` are valid writable getsockopt buffers.
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_MARK,
+                std::ptr::from_mut(&mut value).cast(),
+                &mut length,
+            )
+        };
+        assert_eq!(result, 0);
+        assert_eq!(value, 255);
+    }
+
+    #[test]
+    fn udp_listener_parser_extracts_mark_wrapper() {
+        let protocol = ServerProxyConfig::BindMark {
+            value: 17,
+            inner: Box::new(ServerProxyConfig::DokodemoDoor {
+                config: DokodemoDoorConfig {
+                    target: NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 53),
+                    follow_redirect: false,
+                    user_level: 0,
+                },
+            }),
+        };
+        let (protocol, options) = parse_udp_listener_protocol(protocol);
+        assert_eq!(options.mark, Some(17));
+        assert!(matches!(protocol, ServerProxyConfig::DokodemoDoor { .. }));
+    }
 
     struct TestStream(DuplexStream);
 
