@@ -804,6 +804,11 @@ where
             let user_level = traffic_context
                 .as_ref()
                 .map_or(0, |context| context.user_level);
+            let user_stats = runtime.policy_user_stats(user_level);
+            if let Some(context) = traffic_context.as_mut() {
+                context
+                    .set_user_stats_policy(user_stats.uplink, user_stats.downlink);
+            }
             let user = traffic_context
                 .as_ref()
                 .and_then(TrafficContext::routing_identity)

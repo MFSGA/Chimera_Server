@@ -976,7 +976,7 @@ mod tests {
                 "outbounds": [],
                 "policy": {"levels": {
                     "0": {"handshake": 4, "connIdle": 30, "uplinkOnly": 2, "downlinkOnly": 3},
-                    "7": {"connIdle": 9}
+                    "7": {"connIdle": 9, "statsUserUplink": false, "statsUserDownlink": true}
                 }}
             })
             .to_string(),
@@ -1016,6 +1016,13 @@ mod tests {
                 .policy_relay_timeouts(7)
                 .connection_idle,
             Some(std::time::Duration::from_secs(9))
+        );
+        let user_stats = runtime.runtime_state.policy_user_stats(7);
+        assert_eq!(user_stats.uplink, Some(false));
+        assert_eq!(user_stats.downlink, Some(true));
+        assert_eq!(
+            runtime.runtime_state.policy_user_stats(1),
+            crate::runtime::PolicyUserStats::default()
         );
 
         for unsupported_policy in [

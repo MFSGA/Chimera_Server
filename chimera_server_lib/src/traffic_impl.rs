@@ -19,6 +19,8 @@ pub struct TrafficContext {
     pub outbound_tag: Option<String>,
     pub client_ip: Option<IpAddr>,
     pub user_level: u32,
+    pub stats_user_uplink: Option<bool>,
+    pub stats_user_downlink: Option<bool>,
 }
 
 impl TrafficContext {
@@ -31,6 +33,8 @@ impl TrafficContext {
             outbound_tag: None,
             client_ip: None,
             user_level: 0,
+            stats_user_uplink: None,
+            stats_user_downlink: None,
         }
     }
 
@@ -145,6 +149,15 @@ impl TrafficContext {
         self.user_level = level;
         self
     }
+
+    pub fn set_user_stats_policy(
+        &mut self,
+        uplink: Option<bool>,
+        downlink: Option<bool>,
+    ) {
+        self.stats_user_uplink = uplink;
+        self.stats_user_downlink = downlink;
+    }
 }
 
 impl Default for TrafficContext {
@@ -157,6 +170,8 @@ impl Default for TrafficContext {
             outbound_tag: None,
             client_ip: None,
             user_level: 0,
+            stats_user_uplink: None,
+            stats_user_downlink: None,
         }
     }
 }
@@ -203,6 +218,11 @@ impl StatsInner {
         let identity = context.identity.clone();
         let inbound_tag = context.inbound_tag.clone();
         let outbound_tag = context.outbound_tag.clone();
+        let record_user_uplink = context.stats_user_uplink.unwrap_or(true);
+        let record_user_downlink = context.stats_user_downlink.unwrap_or(true);
+        let user_upload = if record_user_uplink { upload } else { 0 };
+        let user_download = if record_user_downlink { download } else { 0 };
+        let record_user = record_user_uplink || record_user_downlink;
 
         let protocol_entry = self
             .per_protocol
@@ -210,20 +230,20 @@ impl StatsInner {
             .or_default();
         protocol_entry.accumulate(upload, download);
 
-        if let Some(identity) = identity.clone() {
+        if record_user && let Some(identity) = identity.clone() {
             let key = (context.protocol.to_string(), identity);
             let entry = self.per_identity.entry(key).or_default();
-            entry.accumulate(upload, download);
+            entry.accumulate(user_upload, user_download);
         }
 
         if let Some(tag) = inbound_tag {
             let inbound_entry = self.per_inbound.entry(tag.clone()).or_default();
             inbound_entry.accumulate(upload, download);
 
-            if let Some(identity) = identity {
+            if record_user && let Some(identity) = identity {
                 let key = (tag, identity);
                 let entry = self.per_inbound_user.entry(key).or_default();
-                entry.accumulate(upload, download);
+                entry.accumulate(user_upload, user_download);
             }
         }
 
@@ -293,9 +313,14 @@ struct ActiveConnection {
 }
 
 #[derive(Debug, Default)]
+struct ActiveConnectionsInner {
+    connections: HashMap<u64, ActiveConnection>,
+}
+
+#[derive(Debug, Default)]
 struct ActiveConnections {
     next_id: AtomicU64,
-    inner: RwLock<HashMap<u64, ActiveConnection>>,
+    inner: RwLock<ActiveConnectionsInner>,
 }
 
 impl ActiveConnections {
@@ -306,24 +331,31 @@ impl ActiveConnections {
 
     fn insert(&self, entry: ActiveConnection) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let mut guard = self.inner.write().expect("active connections poisoned");
-        guard.insert(id, entry);
+        self.inner
+            .write()
+            .expect("active connections poisoned")
+            .connections
+            .insert(id, entry);
         id
     }
 
     fn remove(&self, id: u64) {
-        let mut guard = self.inner.write().expect("active connections poisoned");
-        guard.remove(&id);
+        self.inner
+            .write()
+            .expect("active connections poisoned")
+            .connections
+            .remove(&id);
     }
 
     fn snapshot(&self) -> Vec<ActiveConnectionSnapshot> {
-        let guard = self.inner.read().expect("active connections poisoned");
-        guard
+        self.inner
+            .read()
+            .expect("active connections poisoned")
+            .connections
             .values()
-            .cloned()
             .map(|entry| ActiveConnectionSnapshot {
-                inbound_tag: entry.inbound_tag,
-                identity: entry.identity,
+                inbound_tag: entry.inbound_tag.clone(),
+                identity: entry.identity.clone(),
                 client_ip: entry.client_ip,
                 started_at: entry.started_at,
             })
@@ -331,8 +363,11 @@ impl ActiveConnections {
     }
 
     fn count(&self) -> usize {
-        let guard = self.inner.read().expect("active connections poisoned");
-        guard.len()
+        self.inner
+            .read()
+            .expect("active connections poisoned")
+            .connections
+            .len()
     }
 }
 
@@ -374,4 +409,56 @@ pub fn active_connections() -> Vec<ActiveConnectionSnapshot> {
 
 pub fn active_connection_count() -> usize {
     ActiveConnections::global().count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StatsInner, TrafficContext};
+
+    #[test]
+    fn user_stats_policy_filters_only_user_dimensions() {
+        let mut stats = StatsInner::default();
+        let mut context = TrafficContext::new("vless")
+            .with_identity("alice")
+            .with_inbound_tag("edge");
+        context.set_user_stats_policy(Some(false), Some(true));
+
+        stats.record(context, 100, 200);
+
+        assert_eq!(stats.total.upload_bytes, 100);
+        assert_eq!(stats.total.download_bytes, 200);
+        assert_eq!(stats.per_protocol["vless"].upload_bytes, 100);
+        assert_eq!(stats.per_protocol["vless"].download_bytes, 200);
+        assert_eq!(stats.per_inbound["edge"].upload_bytes, 100);
+        assert_eq!(stats.per_inbound["edge"].download_bytes, 200);
+
+        let identity = stats
+            .per_identity
+            .get(&("vless".to_string(), "alice".to_string()))
+            .expect("user protocol stats should exist");
+        assert_eq!(identity.upload_bytes, 0);
+        assert_eq!(identity.download_bytes, 200);
+        let inbound_user = stats
+            .per_inbound_user
+            .get(&("edge".to_string(), "alice".to_string()))
+            .expect("inbound user stats should exist");
+        assert_eq!(inbound_user.upload_bytes, 0);
+        assert_eq!(inbound_user.download_bytes, 200);
+    }
+
+    #[test]
+    fn disabling_both_user_directions_omits_user_entries() {
+        let mut stats = StatsInner::default();
+        let mut context = TrafficContext::new("vmess")
+            .with_identity("bob")
+            .with_inbound_tag("edge");
+        context.set_user_stats_policy(Some(false), Some(false));
+
+        stats.record(context, 100, 200);
+
+        assert!(stats.per_identity.is_empty());
+        assert!(stats.per_inbound_user.is_empty());
+        assert_eq!(stats.per_protocol["vmess"].upload_bytes, 100);
+        assert_eq!(stats.per_inbound["edge"].download_bytes, 200);
+    }
 }

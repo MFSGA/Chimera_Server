@@ -155,6 +155,8 @@ mod traffic_noop {
         pub outbound_tag: Option<String>,
         pub client_ip: Option<IpAddr>,
         pub user_level: u32,
+        pub stats_user_uplink: Option<bool>,
+        pub stats_user_downlink: Option<bool>,
     }
 
     impl TrafficContext {
@@ -167,6 +169,8 @@ mod traffic_noop {
                 outbound_tag: None,
                 client_ip: None,
                 user_level: 0,
+                stats_user_uplink: None,
+                stats_user_downlink: None,
             }
         }
 
@@ -281,6 +285,15 @@ mod traffic_noop {
             self.user_level = level;
             self
         }
+
+        pub fn set_user_stats_policy(
+            &mut self,
+            uplink: Option<bool>,
+            downlink: Option<bool>,
+        ) {
+            self.stats_user_uplink = uplink;
+            self.stats_user_downlink = downlink;
+        }
     }
 
     impl Default for TrafficContext {
@@ -293,6 +306,8 @@ mod traffic_noop {
                 outbound_tag: None,
                 client_ip: None,
                 user_level: 0,
+                stats_user_uplink: None,
+                stats_user_downlink: None,
             }
         }
     }

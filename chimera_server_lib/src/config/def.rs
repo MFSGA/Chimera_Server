@@ -515,6 +515,10 @@ pub struct PolicyLevelConfig {
     pub uplink_only: Option<u32>,
     #[serde(default, rename = "downlinkOnly")]
     pub downlink_only: Option<u32>,
+    #[serde(default, rename = "statsUserUplink")]
+    pub stats_user_uplink: Option<bool>,
+    #[serde(default, rename = "statsUserDownlink")]
+    pub stats_user_downlink: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
