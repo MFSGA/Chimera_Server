@@ -31,6 +31,7 @@ use crate::{
     handler::dokodemo::DokodemoDoorTcpHandler,
     handler::proxy_protocol::ProxyProtocolServerHandler,
     handler::socks::SocksTcpServerHandler,
+    handler::tcp_keepalive::TcpKeepAliveServerHandler,
 };
 
 use super::tcp_handler::TcpServerHandler;
@@ -48,6 +49,18 @@ pub fn create_tcp_server_handler(
         ServerProxyConfig::ProxyProtocol { inner } => {
             let inner = create_tcp_server_handler(*inner, inbound_tag, rules_stack)?;
             Ok(Box::new(ProxyProtocolServerHandler::new(inner)))
+        }
+        ServerProxyConfig::TcpKeepAlive {
+            idle_secs,
+            interval_secs,
+            inner,
+        } => {
+            let inner = create_tcp_server_handler(*inner, inbound_tag, rules_stack)?;
+            Ok(Box::new(TcpKeepAliveServerHandler::new(
+                idle_secs,
+                interval_secs,
+                inner,
+            )))
         }
         #[cfg(feature = "vless")]
         ServerProxyConfig::Vless { users, fallbacks } => {

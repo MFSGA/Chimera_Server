@@ -44,6 +44,55 @@ pub fn new_tcp_socket(
     Ok(tcp_socket)
 }
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub fn configure_tcp_keepalive(
+    fd: std::os::fd::RawFd,
+    idle_secs: i32,
+    interval_secs: i32,
+) -> std::io::Result<()> {
+    let enabled = i32::from(idle_secs > 0 || interval_secs > 0);
+    set_socket_option_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, enabled)?;
+    if enabled == 0 {
+        return Ok(());
+    }
+    if idle_secs > 0 {
+        set_socket_option_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, idle_secs)?;
+    }
+    if interval_secs > 0 {
+        set_socket_option_int(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPINTVL,
+            interval_secs,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn set_socket_option_int(
+    fd: std::os::fd::RawFd,
+    level: libc::c_int,
+    option: libc::c_int,
+    value: libc::c_int,
+) -> std::io::Result<()> {
+    // SAFETY: `fd` is borrowed for this call and `value` is a valid integer
+    // socket-option payload for the full duration of `setsockopt`.
+    let result = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            option,
+            std::ptr::from_ref(&value).cast(),
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 pub fn new_socket2_udp_socket(
     is_ipv6: bool,
     bind_interface: Option<String>,

@@ -7,6 +7,7 @@ pub mod httpupgrade;
 pub mod mixed;
 pub mod proxy_protocol;
 pub mod tcp;
+pub mod tcp_keepalive;
 #[cfg(feature = "tls")]
 pub mod tls;
 #[cfg(any(feature = "reality", feature = "vless"))]

@@ -279,6 +279,37 @@ pub(super) fn apply_security_layers(
     }?;
 
     let network = stream_settings.network.trim().to_ascii_lowercase();
+    let (keepalive_idle, keepalive_interval) =
+        stream_settings.sockopt.as_ref().map_or((0, 0), |settings| {
+            (
+                settings.tcp_keep_alive_idle,
+                settings.tcp_keep_alive_interval,
+            )
+        });
+    if i64::from(keepalive_idle) * i64::from(keepalive_interval) < 0 {
+        return Err(Error::InvalidConfig(format!(
+            "invalid tcpKeepAliveIdle/tcpKeepAliveInterval values: {keepalive_idle} {keepalive_interval}"
+        )));
+    }
+    let configure_keepalive = keepalive_idle != 0 || keepalive_interval != 0;
+    if configure_keepalive
+        && !matches!(
+            network.as_str(),
+            "" | "raw" | "tcp" | "ws" | "websocket" | "httpupgrade"
+        )
+    {
+        return Err(Error::InvalidConfig(format!(
+            "TCP keepalive sockopt is not supported for {network} transport yet"
+        )));
+    }
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    if configure_keepalive {
+        return Err(Error::InvalidConfig(
+            "TCP keepalive sockopt is currently supported only on Linux and Android"
+                .into(),
+        ));
+    }
+
     let mut accept_proxy_protocol = false;
     if stream_settings
         .sockopt
@@ -348,8 +379,17 @@ pub(super) fn apply_security_layers(
         ));
     }
 
-    if accept_proxy_protocol {
-        Ok(ServerProxyConfig::ProxyProtocol {
+    let protocol = if accept_proxy_protocol {
+        ServerProxyConfig::ProxyProtocol {
+            inner: Box::new(protocol),
+        }
+    } else {
+        protocol
+    };
+    if configure_keepalive {
+        Ok(ServerProxyConfig::TcpKeepAlive {
+            idle_secs: keepalive_idle,
+            interval_secs: keepalive_interval,
             inner: Box::new(protocol),
         })
     } else {

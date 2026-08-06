@@ -443,6 +443,11 @@ pub enum ServerProxyConfig {
     ProxyProtocol {
         inner: Box<ServerProxyConfig>,
     },
+    TcpKeepAlive {
+        idle_secs: i32,
+        interval_secs: i32,
+        inner: Box<ServerProxyConfig>,
+    },
     #[cfg(feature = "tls")]
     Tls(TlsServerConfig),
     #[cfg(feature = "reality")]
@@ -505,6 +510,7 @@ impl std::fmt::Display for ServerProxyConfig {
                 #[cfg(feature = "trojan")]
                 Self::Trojan { .. } => "Trojan",
                 Self::ProxyProtocol { .. } => "ProxyProtocol",
+                Self::TcpKeepAlive { .. } => "TcpKeepAlive",
                 #[cfg(feature = "reality")]
                 Self::Reality(_) => "Reality",
                 #[cfg(feature = "tls")]

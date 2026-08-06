@@ -1493,6 +1493,89 @@ mod tests {
         assert!(matches!(*inner, ServerProxyConfig::Vless { .. }));
     }
 
+    #[cfg(all(feature = "vless", any(target_os = "android", target_os = "linux")))]
+    #[test]
+    fn socket_tcp_keepalive_wraps_proxy_protocol_outermost() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-keepalive",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "sockopt": {
+                    "acceptProxyProtocol": true,
+                    "tcpKeepAliveIdle": 30,
+                    "tcpKeepAliveInterval": 10
+                }
+            }
+        }))
+        .unwrap();
+        let config = ServerConfig::try_from(inbound).unwrap();
+        let ServerProxyConfig::TcpKeepAlive {
+            idle_secs,
+            interval_secs,
+            inner,
+        } = config.protocol
+        else {
+            panic!("TCP keepalive must be the outer socket wrapper");
+        };
+        assert_eq!((idle_secs, interval_secs), (30, 10));
+        assert!(matches!(*inner, ServerProxyConfig::ProxyProtocol { .. }));
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn socket_tcp_keepalive_rejects_mixed_signs() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-invalid-keepalive",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "sockopt": {
+                    "tcpKeepAliveIdle": -1,
+                    "tcpKeepAliveInterval": 10
+                }
+            }
+        }))
+        .unwrap();
+        let error = ServerConfig::try_from(inbound).unwrap_err();
+        assert!(error.to_string().contains("tcpKeepAliveIdle"));
+    }
+
+    #[cfg(all(feature = "vless", feature = "grpc_transport"))]
+    #[test]
+    fn socket_tcp_keepalive_rejects_dedicated_grpc_listener() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-grpc-keepalive",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "grpc",
+                "grpcSettings": {"serviceName": "proxy"},
+                "sockopt": {"tcpKeepAliveIdle": 30}
+            }
+        }))
+        .unwrap();
+        let error = ServerConfig::try_from(inbound).unwrap_err();
+        assert!(error.to_string().contains("not supported for grpc"));
+    }
+
     #[cfg(all(feature = "vless", feature = "grpc_transport"))]
     #[test]
     fn socket_accept_proxy_protocol_wraps_grpc_transport() {

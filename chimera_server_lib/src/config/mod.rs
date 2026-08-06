@@ -82,6 +82,10 @@ pub struct StreamSettings {
 pub struct SocketSettings {
     #[serde(default)]
     accept_proxy_protocol: bool,
+    #[serde(default)]
+    tcp_keep_alive_interval: i32,
+    #[serde(default)]
+    tcp_keep_alive_idle: i32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
