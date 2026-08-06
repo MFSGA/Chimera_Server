@@ -282,6 +282,35 @@ pub(super) fn apply_security_layers(
     }?;
 
     let network = stream_settings.network.trim().to_ascii_lowercase();
+    let bind_interface = stream_settings
+        .sockopt
+        .as_ref()
+        .map_or("", |settings| settings.interface.as_str())
+        .to_string();
+    let configure_bind_interface = !bind_interface.is_empty();
+    if bind_interface.contains('\0') {
+        return Err(Error::InvalidConfig(
+            "sockopt.interface must not contain NUL bytes".into(),
+        ));
+    }
+    if configure_bind_interface
+        && !matches!(
+            network.as_str(),
+            "" | "raw" | "tcp" | "ws" | "websocket" | "httpupgrade"
+        )
+    {
+        return Err(Error::InvalidConfig(format!(
+            "sockopt.interface is not supported for {network} transport yet"
+        )));
+    }
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    if configure_bind_interface {
+        return Err(Error::InvalidConfig(
+            "sockopt.interface is currently supported only on Linux and Android"
+                .into(),
+        ));
+    }
+
     let tcp_fast_open = match stream_settings
         .sockopt
         .as_ref()
@@ -730,9 +759,17 @@ pub(super) fn apply_security_layers(
     } else {
         protocol
     };
-    if let Some(value) = tcp_fast_open {
-        Ok(ServerProxyConfig::TcpFastOpen {
+    let protocol = if let Some(value) = tcp_fast_open {
+        ServerProxyConfig::TcpFastOpen {
             value,
+            inner: Box::new(protocol),
+        }
+    } else {
+        protocol
+    };
+    if configure_bind_interface {
+        Ok(ServerProxyConfig::BindInterface {
+            name: bind_interface,
             inner: Box::new(protocol),
         })
     } else {

@@ -105,6 +105,8 @@ pub struct SocketSettings {
     tcp_max_seg: i32,
     #[serde(default)]
     v6only: bool,
+    #[serde(default)]
+    interface: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

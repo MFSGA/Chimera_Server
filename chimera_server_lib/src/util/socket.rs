@@ -406,6 +406,37 @@ fn socket_addr_from_v6(address: &libc::sockaddr_in6) -> SocketAddr {
 }
 
 #[cfg(all(test, target_os = "linux"))]
+mod bind_interface_tests {
+    use std::os::fd::AsRawFd;
+
+    use super::*;
+
+    #[test]
+    fn tcp_socket_binds_to_loopback_interface() {
+        let socket = new_tcp_socket(Some("lo".into()), false)
+            .expect("bind TCP socket to loopback interface");
+        let mut value = [0u8; libc::IFNAMSIZ];
+        let mut length = value.len() as libc::socklen_t;
+        // SAFETY: `value` and `length` are valid writable getsockopt buffers.
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                value.as_mut_ptr().cast(),
+                &mut length,
+            )
+        };
+        assert_eq!(result, 0);
+        let end = value
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(value.len());
+        assert_eq!(&value[..end], b"lo");
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
 mod original_destination_tests {
     use std::{
         net::{Ipv4Addr, Ipv6Addr},

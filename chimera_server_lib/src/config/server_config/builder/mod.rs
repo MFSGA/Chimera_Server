@@ -1636,6 +1636,79 @@ mod tests {
 
     #[cfg(all(feature = "vless", any(target_os = "android", target_os = "linux")))]
     #[test]
+    fn socket_interface_wraps_listener_options_outermost() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-interface",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "sockopt": {"interface": "lo", "tcpFastOpen": true}
+            }
+        }))
+        .unwrap();
+        let config = ServerConfig::try_from(inbound).unwrap();
+        let ServerProxyConfig::BindInterface { name, inner } = config.protocol
+        else {
+            panic!("interface must be the outer listener option");
+        };
+        assert_eq!(name, "lo");
+        assert!(matches!(*inner, ServerProxyConfig::TcpFastOpen { .. }));
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn socket_empty_interface_is_ignored() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-interface-default",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "sockopt": {"interface": ""}
+            }
+        }))
+        .unwrap();
+        let config = ServerConfig::try_from(inbound).unwrap();
+        assert!(matches!(config.protocol, ServerProxyConfig::Vless { .. }));
+    }
+
+    #[cfg(all(feature = "vless", feature = "grpc_transport"))]
+    #[test]
+    fn socket_interface_rejects_dedicated_grpc_listener() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-grpc-interface",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "grpc",
+                "grpcSettings": {"serviceName": "proxy"},
+                "sockopt": {"interface": "lo"}
+            }
+        }))
+        .unwrap();
+        let error = ServerConfig::try_from(inbound).unwrap_err();
+        assert!(error.to_string().contains("interface"));
+        assert!(error.to_string().contains("grpc"));
+    }
+
+    #[cfg(all(feature = "vless", any(target_os = "android", target_os = "linux")))]
+    #[test]
     fn socket_tcp_fast_open_wraps_listener_options_outermost() {
         let inbound: InboudItem = serde_json::from_value(serde_json::json!({
             "listen": "::",

@@ -153,7 +153,8 @@ fn is_grpc_server_protocol(protocol: &ServerProxyConfig) -> bool {
         | ServerProxyConfig::TcpWindowClamp { inner, .. }
         | ServerProxyConfig::TcpMaxSeg { inner, .. }
         | ServerProxyConfig::Ipv6Only { inner }
-        | ServerProxyConfig::TcpFastOpen { inner, .. } => {
+        | ServerProxyConfig::TcpFastOpen { inner, .. }
+        | ServerProxyConfig::BindInterface { inner, .. } => {
             is_grpc_server_protocol(inner)
         }
         #[cfg(feature = "tls")]
@@ -178,7 +179,8 @@ fn is_xhttp_server_protocol(protocol: &ServerProxyConfig) -> bool {
         | ServerProxyConfig::TcpWindowClamp { inner, .. }
         | ServerProxyConfig::TcpMaxSeg { inner, .. }
         | ServerProxyConfig::Ipv6Only { inner }
-        | ServerProxyConfig::TcpFastOpen { inner, .. } => {
+        | ServerProxyConfig::TcpFastOpen { inner, .. }
+        | ServerProxyConfig::BindInterface { inner, .. } => {
             is_xhttp_server_protocol(inner)
         }
         #[cfg(feature = "tls")]
@@ -216,11 +218,16 @@ async fn start_tcp_server_with_runtime(
     } = config;
 
     let mut protocol = Some(protocol);
+    let mut bind_interface = None;
     let mut tcp_fast_open = None;
     let mut tcp_max_seg = None;
     let mut ipv6_only = false;
     loop {
         match protocol.take().expect("listener protocol must be present") {
+            ServerProxyConfig::BindInterface { name, inner } => {
+                bind_interface = Some(name);
+                protocol = Some(*inner);
+            }
             ServerProxyConfig::TcpFastOpen { value, inner } => {
                 tcp_fast_open = Some(value);
                 protocol = Some(*inner);
@@ -252,7 +259,7 @@ async fn start_tcp_server_with_runtime(
     let listener = match bind_location {
         BindLocation::Address(a) => {
             let socket_addr = a.to_socket_addr()?;
-            let socket = new_tcp_socket(None, socket_addr.is_ipv6())?;
+            let socket = new_tcp_socket(bind_interface, socket_addr.is_ipv6())?;
             if let Some(value) = tcp_fast_open {
                 crate::handler::tcp_fast_open::configure_listener(&socket, value)?;
             }
