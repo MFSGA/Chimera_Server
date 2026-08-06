@@ -651,7 +651,7 @@ fn shadowsocks_transport(
 #[cfg(feature = "http")]
 fn collect_http_settings(
     settings: Option<crate::config::SettingObject>,
-) -> Result<(Vec<crate::config::server_config::HttpUser>, bool), Error> {
+) -> Result<(Vec<crate::config::server_config::HttpUser>, bool, u32), Error> {
     let raw = settings
         .map(|settings| settings.deserialize::<HttpInboundSettings>())
         .transpose()
@@ -659,12 +659,6 @@ fn collect_http_settings(
             Error::InvalidConfig(format!("invalid http inbound settings: {error}"))
         })?
         .unwrap_or_default();
-
-    if raw.user_level != 0 {
-        return Err(Error::InvalidConfig(
-            "http settings.userLevel is not supported yet".into(),
-        ));
-    }
 
     let accounts = raw.accounts.or(raw.users).unwrap_or_default();
     Ok((
@@ -676,6 +670,7 @@ fn collect_http_settings(
             })
             .collect(),
         raw.allow_transparent,
+        raw.user_level,
     ))
 }
 
@@ -1201,11 +1196,12 @@ impl TryFrom<InboudItem> for ServerConfig {
 
             #[cfg(feature = "http")]
             Protocol::Http => {
-                let (accounts, allow_transparent) =
+                let (accounts, allow_transparent, user_level) =
                     collect_http_settings(settings)?;
                 let mut protocol = ServerProxyConfig::Http {
                     accounts,
                     allow_transparent,
+                    user_level,
                 };
 
                 #[cfg(feature = "ws")]
@@ -1518,9 +1514,11 @@ mod tests {
             ServerProxyConfig::Http {
                 accounts,
                 allow_transparent,
+                user_level,
             } => {
                 assert!(accounts.is_empty());
                 assert!(!allow_transparent);
+                assert_eq!(user_level, 0);
             }
             other => panic!("expected http protocol, got {other:?}"),
         }
@@ -1535,7 +1533,8 @@ mod tests {
             "protocol": "http",
             "tag": "http-transparent",
             "settings": {
-                "allowTransparent": true
+                "allowTransparent": true,
+                "userLevel": 7
             }
         }))
         .expect("valid HTTP transparent inbound");
@@ -1543,8 +1542,13 @@ mod tests {
             .expect("transparent HTTP inbound should build");
         match config.protocol {
             ServerProxyConfig::Http {
-                allow_transparent, ..
-            } => assert!(allow_transparent),
+                allow_transparent,
+                user_level,
+                ..
+            } => {
+                assert!(allow_transparent);
+                assert_eq!(user_level, 7);
+            }
             other => panic!("expected http protocol, got {other:?}"),
         }
     }

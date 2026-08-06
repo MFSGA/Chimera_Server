@@ -10,6 +10,8 @@ use crate::config::def::OutboundRealitySettings;
 use crate::config::def::OutboundWebsocketSettings;
 #[cfg(feature = "tls")]
 use crate::config::def::{OutboundTlsCertificate, OutboundTlsSettings};
+#[cfg(feature = "http")]
+use crate::config::server_config::HttpUser;
 #[cfg(feature = "hysteria")]
 use crate::config::server_config::Hysteria2Client;
 #[cfg(feature = "reality")]
@@ -62,6 +64,11 @@ const TYPE_APP_RECEIVER_CONFIG_V2RAY: &str =
     "v2ray.core.app.proxyman.ReceiverConfig";
 const TYPE_APP_SENDER_CONFIG: &str = "xray.app.proxyman.SenderConfig";
 const TYPE_APP_SENDER_CONFIG_V2RAY: &str = "v2ray.core.app.proxyman.SenderConfig";
+#[cfg(feature = "http")]
+const TYPE_PROXY_HTTP_SERVER_CONFIG: &str = "xray.proxy.http.ServerConfig";
+#[cfg(feature = "http")]
+const TYPE_PROXY_HTTP_SERVER_CONFIG_V2RAY: &str =
+    "v2ray.core.proxy.http.ServerConfig";
 const TYPE_PROXY_HTTP_CLIENT_CONFIG: &str = "xray.proxy.http.ClientConfig";
 const TYPE_PROXY_HTTP_CLIENT_CONFIG_V2RAY: &str =
     "v2ray.core.proxy.http.ClientConfig";
@@ -239,6 +246,17 @@ struct SocksServerConfigPayload {
     #[prost(map = "string, string", tag = "2")]
     accounts: std::collections::HashMap<String, String>,
     #[prost(uint32, tag = "6")]
+    user_level: u32,
+}
+
+#[cfg(feature = "http")]
+#[derive(Clone, PartialEq, Message)]
+struct HttpServerConfigPayload {
+    #[prost(map = "string, string", tag = "2")]
+    accounts: std::collections::HashMap<String, String>,
+    #[prost(bool, tag = "3")]
+    allow_transparent: bool,
+    #[prost(uint32, tag = "4")]
     user_level: u32,
 }
 
@@ -1031,6 +1049,27 @@ impl HandlerServiceImpl {
         proxy_settings: &proto::xray::common::serial::TypedMessage,
     ) -> Result<ServerProxyConfig, Status> {
         match Self::parse_typed_message_type(proxy_settings) {
+            #[cfg(feature = "http")]
+            TYPE_PROXY_HTTP_SERVER_CONFIG | TYPE_PROXY_HTTP_SERVER_CONFIG_V2RAY => {
+                let http = self.decode_typed_message::<HttpServerConfigPayload>(
+                    proxy_settings,
+                    &[
+                        TYPE_PROXY_HTTP_SERVER_CONFIG,
+                        TYPE_PROXY_HTTP_SERVER_CONFIG_V2RAY,
+                    ],
+                    "inbound proxy settings",
+                )?;
+                let accounts = http
+                    .accounts
+                    .into_iter()
+                    .map(|(username, password)| HttpUser { username, password })
+                    .collect();
+                Ok(ServerProxyConfig::Http {
+                    accounts,
+                    allow_transparent: http.allow_transparent,
+                    user_level: http.user_level,
+                })
+            }
             TYPE_PROXY_SOCKS_SERVER_CONFIG
             | TYPE_PROXY_SOCKS_SERVER_CONFIG_V2RAY => {
                 let socks = self.decode_typed_message::<SocksServerConfigPayload>(
@@ -2465,6 +2504,27 @@ impl HandlerServiceImpl {
                     TrojanServerConfigPayload { users, fallbacks },
                 ))
             }
+            #[cfg(feature = "http")]
+            ServerProxyConfig::Http {
+                accounts,
+                allow_transparent,
+                user_level,
+            } => {
+                let account_map = accounts
+                    .iter()
+                    .map(|account| {
+                        (account.username.clone(), account.password.clone())
+                    })
+                    .collect();
+                Some(Self::typed_message(
+                    TYPE_PROXY_HTTP_SERVER_CONFIG,
+                    HttpServerConfigPayload {
+                        accounts: account_map,
+                        allow_transparent: *allow_transparent,
+                        user_level: *user_level,
+                    },
+                ))
+            }
             ServerProxyConfig::Socks {
                 accounts,
                 user_level,
@@ -3626,7 +3686,12 @@ impl HandlerServiceImpl {
                     .collect(),
             ),
             #[cfg(feature = "http")]
-            ServerProxyConfig::Http { .. } => None,
+            ServerProxyConfig::Http { accounts, .. } => Some(
+                accounts
+                    .iter()
+                    .map(|account| account.username.clone())
+                    .collect(),
+            ),
             #[cfg(feature = "mixed")]
             ServerProxyConfig::Mixed { .. } => None,
             #[cfg(feature = "shadowsocks")]
@@ -3782,7 +3847,27 @@ impl HandlerServiceImpl {
                     .collect(),
             ),
             #[cfg(feature = "http")]
-            ServerProxyConfig::Http { .. } => None,
+            ServerProxyConfig::Http {
+                accounts,
+                user_level,
+                ..
+            } => Some(
+                accounts
+                    .iter()
+                    .map(|account| proto::xray::common::protocol::User {
+                        level: *user_level,
+                        email: account.username.clone(),
+                        account: Some(proto::xray::common::serial::TypedMessage {
+                            r#type: TYPE_PROXY_HTTP_ACCOUNT.to_string(),
+                            value: HttpAccountPayload {
+                                username: account.username.clone(),
+                                password: account.password.clone(),
+                            }
+                            .encode_to_vec(),
+                        }),
+                    })
+                    .collect(),
+            ),
             #[cfg(feature = "mixed")]
             ServerProxyConfig::Mixed { .. } => None,
             #[cfg(feature = "shadowsocks")]
@@ -4738,6 +4823,96 @@ mod tests {
         assert_eq!(socks.user_level, 7);
         assert_eq!(socks.accounts.len(), 1);
         assert!(socks.accounts.values().any(|password| password == "pass-a"));
+    }
+
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn handler_preserves_http_global_user_level() {
+        let service =
+            HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+        let mut account_map = std::collections::HashMap::new();
+        account_map.insert("alice".to_string(), "secret".to_string());
+        let parsed = service
+            .parse_add_inbound_protocol(&HandlerServiceImpl::typed_message(
+                TYPE_PROXY_HTTP_SERVER_CONFIG,
+                HttpServerConfigPayload {
+                    accounts: account_map,
+                    allow_transparent: true,
+                    user_level: 7,
+                },
+            ))
+            .expect("HTTP server config should parse");
+        let ServerProxyConfig::Http {
+            accounts,
+            allow_transparent,
+            user_level,
+        } = parsed
+        else {
+            panic!("expected HTTP inbound");
+        };
+        assert_eq!(accounts.len(), 1);
+        assert!(allow_transparent);
+        assert_eq!(user_level, 7);
+
+        let tag = unique_tag("http-inbound");
+        let runtime = RuntimeState::new(
+            vec![ServerConfig {
+                tag: tag.clone(),
+                bind_location: BindLocation::Address(NetLocation::new(
+                    Address::Ipv4(Ipv4Addr::LOCALHOST),
+                    8080,
+                )),
+                protocol: ServerProxyConfig::Http {
+                    accounts,
+                    allow_transparent,
+                    user_level,
+                },
+                transport: Transport::Tcp,
+                quic_settings: None,
+            }],
+            Vec::new(),
+        );
+        let service = HandlerServiceImpl::new(runtime);
+        let listed = service
+            .list_inbounds(Request::new(
+                proto::xray::app::proxyman::command::ListInboundsRequest {
+                    is_only_tags: false,
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let proxy = listed.inbounds[0].proxy_settings.as_ref().unwrap();
+        assert_eq!(proxy.r#type, TYPE_PROXY_HTTP_SERVER_CONFIG);
+        let encoded =
+            HttpServerConfigPayload::decode(proxy.value.as_slice()).unwrap();
+        assert_eq!(encoded.user_level, 7);
+        assert!(encoded.allow_transparent);
+        assert_eq!(
+            encoded.accounts.get("alice").map(String::as_str),
+            Some("secret")
+        );
+
+        let users = service
+            .get_inbound_users(Request::new(
+                proto::xray::app::proxyman::command::GetInboundUserRequest {
+                    tag,
+                    email: String::new(),
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .users;
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].email, "alice");
+        assert_eq!(users[0].level, 7);
+        let account = HttpAccountPayload::decode(
+            users[0].account.as_ref().unwrap().value.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(account.username, "alice");
+        assert_eq!(account.password, "secret");
     }
 
     #[tokio::test]

@@ -175,10 +175,12 @@ pub fn create_tcp_server_handler(
         ServerProxyConfig::Http {
             accounts,
             allow_transparent,
+            user_level,
         } => Ok(Box::new(HttpTcpServerHandler::new(
             accounts,
             allow_transparent,
             inbound_tag,
+            user_level,
         ))),
         #[cfg(feature = "mixed")]
         ServerProxyConfig::Mixed {

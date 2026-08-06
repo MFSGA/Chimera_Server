@@ -19,6 +19,7 @@ pub struct HttpTcpServerHandler {
     accounts: Vec<HttpUser>,
     allow_transparent: bool,
     inbound_tag: String,
+    user_level: u32,
 }
 
 impl HttpTcpServerHandler {
@@ -26,11 +27,13 @@ impl HttpTcpServerHandler {
         accounts: Vec<HttpUser>,
         allow_transparent: bool,
         inbound_tag: &str,
+        user_level: u32,
     ) -> Self {
         Self {
             accounts,
             allow_transparent,
             inbound_tag: inbound_tag.to_string(),
+            user_level,
         }
     }
 }
@@ -237,6 +240,7 @@ impl HttpTcpServerHandler {
         host_header: Option<&str>,
     ) -> TrafficContext {
         let mut context = TrafficContext::new("http")
+            .with_user_level(self.user_level)
             .with_access_target(
                 remote_location.address().to_string(),
                 remote_location.port(),
@@ -383,7 +387,7 @@ mod tests {
 
     #[tokio::test]
     async fn connect_preserves_early_tunnel_bytes() {
-        let handler = HttpTcpServerHandler::new(Vec::new(), false, "http-in");
+        let handler = HttpTcpServerHandler::new(Vec::new(), false, "http-in", 7);
         let request =
             b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\nearly";
         let (mut client, server) = duplex(1024);
@@ -410,6 +414,7 @@ mod tests {
         );
         let context = traffic_context.expect("HTTP context must exist");
         assert_eq!(context.inbound_tag.as_deref(), Some("http-in"));
+        assert_eq!(context.user_level, 7);
         let access = context.access_context().expect("access context must exist");
         assert_eq!(access.target_host.as_deref(), Some("example.com"));
         assert_eq!(access.target_port, Some(443));
@@ -429,6 +434,7 @@ mod tests {
             }],
             false,
             "http-auth",
+            0,
         );
         let token = BASE64.encode("alice:secret");
         let request = format!(
@@ -465,6 +471,7 @@ mod tests {
             }],
             false,
             "http-forward",
+            0,
         );
         let token = BASE64.encode("alice:secret");
         let request = format!(
@@ -516,7 +523,7 @@ mod tests {
     #[tokio::test]
     async fn transparent_origin_form_uses_host_header() {
         let handler =
-            HttpTcpServerHandler::new(Vec::new(), true, "http-transparent");
+            HttpTcpServerHandler::new(Vec::new(), true, "http-transparent", 0);
         let request = b"GET /health HTTP/1.1\r\nHost: example.com:8081\r\n\r\n";
         let (mut client, server) = duplex(2048);
         client.write_all(request).await.unwrap();
@@ -547,7 +554,7 @@ mod tests {
 
     #[tokio::test]
     async fn origin_form_requires_allow_transparent() {
-        let handler = HttpTcpServerHandler::new(Vec::new(), false, "http-proxy");
+        let handler = HttpTcpServerHandler::new(Vec::new(), false, "http-proxy", 0);
         let (mut client, server) = duplex(1024);
         client
             .write_all(b"GET /health HTTP/1.1\r\nHost: example.com\r\n\r\n")
@@ -573,6 +580,7 @@ mod tests {
             }],
             false,
             "http-auth",
+            0,
         );
         let (mut client, server) = duplex(2048);
         client

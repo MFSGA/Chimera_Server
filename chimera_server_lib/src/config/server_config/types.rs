@@ -453,6 +453,8 @@ pub enum ServerProxyConfig {
         accounts: Vec<HttpUser>,
         #[serde(default)]
         allow_transparent: bool,
+        #[serde(default)]
+        user_level: u32,
     },
     #[cfg(feature = "mixed")]
     Mixed {

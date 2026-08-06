@@ -35,7 +35,7 @@ impl MixedTcpServerHandler {
             })
             .collect();
         Self {
-            http: HttpTcpServerHandler::new(http_accounts, false, inbound_tag),
+            http: HttpTcpServerHandler::new(http_accounts, false, inbound_tag, 0),
             socks: SocksTcpServerHandler::new(accounts, inbound_tag, udp_enabled, 0),
         }
     }
