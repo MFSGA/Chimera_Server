@@ -14,7 +14,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use futures::StreamExt;
 use http_body_util::{BodyExt, Empty, StreamBody, combinators::UnsyncBoxBody};
 use hyper::{
-    Method, Request, Response, StatusCode,
+    HeaderMap, Method, Request, Response, StatusCode,
     body::{Frame, Incoming},
     client::conn::http2,
     header,
@@ -338,6 +338,7 @@ struct GrpcListenerConfig {
     tcp_mptcp: bool,
     custom_sockopt: Vec<crate::config::CustomSockoptConfig>,
     transparent: bool,
+    trusted_x_forwarded_for: Vec<String>,
 }
 
 pub(super) async fn start_grpc_server(
@@ -367,6 +368,7 @@ pub(super) async fn start_grpc_server(
         tcp_mptcp,
         custom_sockopt,
         transparent,
+        trusted_x_forwarded_for,
     } = parse_listener_protocol(protocol)?;
     let mut rules_stack = Vec::new();
     let server_handler: Arc<Box<dyn TcpServerHandler>> = Arc::new(
@@ -431,6 +433,7 @@ pub(super) async fn start_grpc_server(
             let runtime = runtime.clone();
             let security = security.clone();
             let tcp_congestion = tcp_congestion.clone();
+            let trusted_x_forwarded_for = trusted_x_forwarded_for.clone();
             tokio::spawn(async move {
                 let mut stream = stream;
                 if let Err(error) =
@@ -480,6 +483,7 @@ pub(super) async fn start_grpc_server(
                             resolver,
                             runtime,
                             peer_addr,
+                            trusted_x_forwarded_for,
                         )
                         .await;
                     }
@@ -495,6 +499,7 @@ pub(super) async fn start_grpc_server(
                                     resolver,
                                     runtime,
                                     peer_addr,
+                                    trusted_x_forwarded_for,
                                 )
                                 .await;
                             }
@@ -520,6 +525,7 @@ pub(super) async fn start_grpc_server(
                                     resolver,
                                     runtime,
                                     peer_addr,
+                                    trusted_x_forwarded_for,
                                 )
                                 .await;
                             }
@@ -651,6 +657,11 @@ fn parse_listener_protocol(
     protocol: ServerProxyConfig,
 ) -> io::Result<GrpcListenerConfig> {
     match protocol {
+        ServerProxyConfig::TrustedForwardedHeaders { names, inner } => {
+            let mut config = parse_listener_protocol(*inner)?;
+            config.trusted_x_forwarded_for = names;
+            Ok(config)
+        }
         ServerProxyConfig::TransparentSocket { inner } => {
             let mut config = parse_listener_protocol(*inner)?;
             config.transparent = true;
@@ -739,6 +750,7 @@ fn parse_listener_protocol(
                 tcp_mptcp: false,
                 custom_sockopt: Vec::new(),
                 transparent: false,
+                trusted_x_forwarded_for: Vec::new(),
             })
         }
         #[cfg(feature = "tls")]
@@ -807,6 +819,7 @@ fn parse_listener_protocol(
                 tcp_mptcp: false,
                 custom_sockopt: Vec::new(),
                 transparent: false,
+                trusted_x_forwarded_for: Vec::new(),
             })
         }
         #[cfg(feature = "reality")]
@@ -837,6 +850,7 @@ fn parse_listener_protocol(
                 tcp_mptcp: false,
                 custom_sockopt: Vec::new(),
                 transparent: false,
+                trusted_x_forwarded_for: Vec::new(),
             })
         }
         other => Err(io::Error::new(
@@ -853,6 +867,7 @@ async fn serve_grpc_connection<IO>(
     resolver: Arc<dyn Resolver>,
     runtime: RuntimeState,
     peer_addr: std::net::SocketAddr,
+    trusted_x_forwarded_for: Vec<String>,
 ) where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -865,11 +880,49 @@ async fn serve_grpc_connection<IO>(
             resolver.clone(),
             runtime.clone(),
             peer_addr,
+            trusted_x_forwarded_for.clone(),
         )
     });
     if let Err(error) = builder.serve_connection(TokioIo::new(io), service).await {
         debug!("gRPC transport connection {peer_addr} ended: {error}");
     }
+}
+
+fn apply_trusted_x_forwarded_for(
+    headers: &HeaderMap,
+    trusted_header_names: &[String],
+    peer_addr: std::net::SocketAddr,
+) -> std::net::SocketAddr {
+    let Some(forwarded_for) = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return peer_addr;
+    };
+
+    for name in trusted_header_names {
+        let Ok(name) = hyper::header::HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        if !headers.contains_key(name) {
+            continue;
+        }
+
+        let candidate = forwarded_for
+            .split_once(',')
+            .map_or(forwarded_for, |(first, _)| first)
+            .trim();
+        let candidate = candidate
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+            .unwrap_or(candidate);
+        return candidate
+            .parse::<std::net::IpAddr>()
+            .map(|ip| std::net::SocketAddr::new(ip, 0))
+            .unwrap_or(peer_addr);
+    }
+
+    peer_addr
 }
 
 async fn handle_request(
@@ -879,6 +932,7 @@ async fn handle_request(
     resolver: Arc<dyn Resolver>,
     runtime: RuntimeState,
     peer_addr: std::net::SocketAddr,
+    trusted_x_forwarded_for: Vec<String>,
 ) -> Result<Response<ResponseBody>, Infallible> {
     if request.method() != Method::POST
         || request.uri().path() != service_path
@@ -891,6 +945,11 @@ async fn handle_request(
         return Ok(grpc_status_response(12, "unimplemented gRPC method"));
     }
 
+    let peer_addr = apply_trusted_x_forwarded_for(
+        request.headers(),
+        &trusted_x_forwarded_for,
+        peer_addr,
+    );
     let (handler_stream, transport_stream) = duplex(GRPC_PIPE_CAPACITY);
     let (transport_read, transport_write) = tokio::io::split(transport_stream);
     let mut body = request.into_body();
@@ -1232,6 +1291,25 @@ mod tests {
         let mut remaining = vec![0u8; preface.len()];
         server.read_exact(&mut remaining).await.unwrap();
         assert_eq!(remaining, preface);
+    }
+
+    #[test]
+    fn trusted_forwarded_header_uses_first_xff_ip() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            hyper::header::HeaderName::from_static("x-forwarded-for"),
+            hyper::header::HeaderValue::from_static("203.0.113.9, 198.51.100.4"),
+        );
+        headers.insert(
+            hyper::header::HeaderName::from_static("x-trusted-proxy"),
+            hyper::header::HeaderValue::from_static("1"),
+        );
+        let peer = apply_trusted_x_forwarded_for(
+            &headers,
+            &["X-Trusted-Proxy".into()],
+            "127.0.0.1:1234".parse().unwrap(),
+        );
+        assert_eq!(peer, "203.0.113.9:0".parse().unwrap());
     }
 
     #[test]

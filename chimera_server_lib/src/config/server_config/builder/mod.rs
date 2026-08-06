@@ -1747,6 +1747,37 @@ mod tests {
         assert!(matches!(*inner, ServerProxyConfig::Xhttp { .. }));
     }
 
+    #[cfg(all(feature = "vless", feature = "grpc_transport"))]
+    #[test]
+    fn trusted_forwarded_headers_wrap_grpc_listener() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-grpc-forwarded",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "grpc",
+                "grpcSettings": {"serviceName": "proxy"},
+                "sockopt": {
+                    "trustedXForwardedFor": ["X-Trusted-Proxy"]
+                }
+            }
+        }))
+        .unwrap();
+        let config = ServerConfig::try_from(inbound).unwrap();
+        let ServerProxyConfig::TrustedForwardedHeaders { names, inner } =
+            config.protocol
+        else {
+            panic!("trustedXForwardedFor must wrap the gRPC listener");
+        };
+        assert_eq!(names, vec!["X-Trusted-Proxy"]);
+        assert!(matches!(*inner, ServerProxyConfig::Grpc(_)));
+    }
+
     #[cfg(feature = "vless")]
     #[test]
     fn trusted_forwarded_headers_reject_non_http_transport() {
