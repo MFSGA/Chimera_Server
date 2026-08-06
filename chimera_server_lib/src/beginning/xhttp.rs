@@ -183,6 +183,7 @@ pub async fn start_xhttp_server(
         tcp_keepalive,
         tcp_user_timeout_ms,
         tcp_congestion,
+        tcp_window_clamp,
     } = parse_listener_protocol(protocol)?;
 
     let bind_addr = match bind_location {
@@ -230,6 +231,12 @@ pub async fn start_xhttp_server(
                     tcp_congestion.as_deref(),
                 ) {
                     debug!("xhttp TCP_CONGESTION setup failed: {error}");
+                    return;
+                }
+                if let Err(error) =
+                    configure_xhttp_tcp_window_clamp(&stream, tcp_window_clamp)
+                {
+                    debug!("xhttp TCP_WINDOW_CLAMP setup failed: {error}");
                     return;
                 }
                 if let Err(error) =
@@ -448,6 +455,7 @@ struct XhttpListenerConfig {
     tcp_keepalive: Option<(i32, i32)>,
     tcp_user_timeout_ms: Option<i32>,
     tcp_congestion: Option<String>,
+    tcp_window_clamp: Option<i32>,
 }
 
 #[derive(Clone)]
@@ -478,6 +486,27 @@ fn configure_xhttp_tcp_congestion(
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "tcpCongestion is currently supported only on Linux and Android",
+        ))
+    }
+}
+
+fn configure_xhttp_tcp_window_clamp(
+    stream: &tokio::net::TcpStream,
+    value: Option<i32>,
+) -> std::io::Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    {
+        crate::util::socket::configure_tcp_window_clamp(stream.as_raw_fd(), value)
+    }
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    {
+        let _ = (stream, value);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "tcpWindowClamp is currently supported only on Linux and Android",
         ))
     }
 }
@@ -568,6 +597,18 @@ fn parse_listener_protocol(
             config.tcp_congestion = Some(algorithm);
             Ok(config)
         }
+        ServerProxyConfig::TcpWindowClamp { value, inner } => {
+            let mut config = parse_listener_protocol(*inner)?;
+            #[cfg(feature = "tls")]
+            if matches!(&config.security, XhttpSecurityLayer::Http3(_)) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "XHTTP HTTP/3 does not support tcpWindowClamp",
+                ));
+            }
+            config.tcp_window_clamp = Some(value);
+            Ok(config)
+        }
         ServerProxyConfig::TcpUserTimeout { timeout_ms, inner } => {
             let mut config = parse_listener_protocol(*inner)?;
             #[cfg(feature = "tls")]
@@ -616,6 +657,7 @@ fn parse_listener_protocol(
             tcp_keepalive: None,
             tcp_user_timeout_ms: None,
             tcp_congestion: None,
+            tcp_window_clamp: None,
         }),
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(TlsServerConfig {
@@ -679,6 +721,7 @@ fn parse_listener_protocol(
                     tcp_keepalive: None,
                     tcp_user_timeout_ms: None,
                     tcp_congestion: None,
+                    tcp_window_clamp: None,
                 })
             }
             _ => Err(std::io::Error::other(
@@ -697,6 +740,7 @@ fn parse_listener_protocol(
                         tcp_keepalive: None,
                         tcp_user_timeout_ms: None,
                         tcp_congestion: None,
+                        tcp_window_clamp: None,
                     })
                 }
                 _ => Err(std::io::Error::other(
