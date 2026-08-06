@@ -977,7 +977,9 @@ mod tests {
                 "policy": {
                     "levels": {
                         "0": {"handshake": 4, "connIdle": 30, "uplinkOnly": 2, "downlinkOnly": 3, "bufferSize": 64},
-                        "7": {"connIdle": 9, "statsUserUplink": false, "statsUserDownlink": true, "statsUserOnline": false}
+                        "7": {"connIdle": 9, "statsUserUplink": false, "statsUserDownlink": true, "statsUserOnline": false},
+                        "8": {"bufferSize": -1},
+                        "9": {"bufferSize": 0}
                     },
                     "system": {
                         "statsInboundUplink": false,
@@ -1019,6 +1021,14 @@ mod tests {
             Some(std::time::Duration::from_secs(3))
         );
         assert_eq!(relay_timeouts.buffer_size, Some(64 * 1024));
+        assert_eq!(
+            runtime.runtime_state.policy_relay_timeouts(8).buffer_size,
+            None
+        );
+        assert_eq!(
+            runtime.runtime_state.policy_relay_timeouts(9).buffer_size,
+            Some(1)
+        );
         assert_eq!(
             runtime
                 .runtime_state

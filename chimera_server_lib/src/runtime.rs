@@ -433,14 +433,13 @@ impl RuntimeState {
                     downlink_only_timeouts
                         .insert(level, Duration::from_secs(u64::from(seconds)));
                 }
-                if let Some(kibibytes) = level_policy.buffer_size {
-                    let bytes = if kibibytes <= 0 {
-                        1
-                    } else {
-                        usize::try_from(kibibytes)
-                            .unwrap_or(usize::MAX)
-                            .saturating_mul(1024)
-                    };
+                if let Some(kibibytes) = level_policy.buffer_size
+                    && kibibytes >= 0
+                {
+                    let bytes = usize::try_from(kibibytes)
+                        .unwrap_or(usize::MAX)
+                        .saturating_mul(1024)
+                        .max(1);
                     buffer_sizes.insert(level, bytes);
                 }
                 if level_policy.stats_user_uplink.is_some()
