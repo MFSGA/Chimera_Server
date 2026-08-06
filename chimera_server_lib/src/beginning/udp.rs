@@ -1750,16 +1750,26 @@ async fn shutdown_message(
 #[derive(Debug, Default)]
 struct UdpListenerOptions {
     mark: Option<i32>,
+    bind_interface: Option<String>,
 }
 
 fn parse_udp_listener_protocol(
     protocol: ServerProxyConfig,
 ) -> (ServerProxyConfig, UdpListenerOptions) {
-    match protocol {
-        ServerProxyConfig::BindMark { value, inner } => {
-            (*inner, UdpListenerOptions { mark: Some(value) })
+    let mut protocol = protocol;
+    let mut options = UdpListenerOptions::default();
+    loop {
+        match protocol {
+            ServerProxyConfig::BindInterface { name, inner } => {
+                options.bind_interface = Some(name);
+                protocol = *inner;
+            }
+            ServerProxyConfig::BindMark { value, inner } => {
+                options.mark = Some(value);
+                protocol = *inner;
+            }
+            protocol => return (protocol, options),
         }
-        protocol => (protocol, UdpListenerOptions::default()),
     }
 }
 
@@ -1768,7 +1778,12 @@ fn create_udp_listener(
     options: &UdpListenerOptions,
     receive_original_destination: bool,
 ) -> std::io::Result<Arc<UdpSocket>> {
-    let socket = new_socket2_udp_socket(bind_addr.is_ipv6(), None, None, false)?;
+    let socket = new_socket2_udp_socket(
+        bind_addr.is_ipv6(),
+        options.bind_interface.clone(),
+        None,
+        false,
+    )?;
     #[cfg(target_os = "linux")]
     if let Some(mark) = options.mark {
         crate::util::socket::configure_socket_mark(socket.as_raw_fd(), mark)?;
@@ -2562,7 +2577,10 @@ mod tests {
     async fn marked_udp_listener_applies_so_mark() {
         let socket = match create_udp_listener(
             SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-            &UdpListenerOptions { mark: Some(255) },
+            &UdpListenerOptions {
+                mark: Some(255),
+                ..UdpListenerOptions::default()
+            },
             false,
         ) {
             Ok(socket) => socket,
@@ -2592,20 +2610,69 @@ mod tests {
         assert_eq!(value, 255);
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn interface_bound_udp_listener_uses_loopback_device() {
+        let socket = match create_udp_listener(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            &UdpListenerOptions {
+                bind_interface: Some("lo".into()),
+                ..UdpListenerOptions::default()
+            },
+            false,
+        ) {
+            Ok(socket) => socket,
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EPERM | libc::EACCES)
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("create interface-bound UDP listener: {error}"),
+        };
+        let mut value = [0u8; libc::IFNAMSIZ];
+        let mut length = value.len() as libc::socklen_t;
+        // SAFETY: `value` and `length` are valid writable getsockopt buffers.
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                value.as_mut_ptr().cast(),
+                &mut length,
+            )
+        };
+        assert_eq!(result, 0);
+        let end = value
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(value.len());
+        assert_eq!(&value[..end], b"lo");
+    }
+
     #[test]
-    fn udp_listener_parser_extracts_mark_wrapper() {
-        let protocol = ServerProxyConfig::BindMark {
-            value: 17,
-            inner: Box::new(ServerProxyConfig::DokodemoDoor {
-                config: DokodemoDoorConfig {
-                    target: NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 53),
-                    follow_redirect: false,
-                    user_level: 0,
-                },
+    fn udp_listener_parser_extracts_interface_and_mark_wrappers() {
+        let protocol = ServerProxyConfig::BindInterface {
+            name: "lo".into(),
+            inner: Box::new(ServerProxyConfig::BindMark {
+                value: 17,
+                inner: Box::new(ServerProxyConfig::DokodemoDoor {
+                    config: DokodemoDoorConfig {
+                        target: NetLocation::new(
+                            Address::Ipv4(Ipv4Addr::LOCALHOST),
+                            53,
+                        ),
+                        follow_redirect: false,
+                        user_level: 0,
+                    },
+                }),
             }),
         };
         let (protocol, options) = parse_udp_listener_protocol(protocol);
         assert_eq!(options.mark, Some(17));
+        assert_eq!(options.bind_interface.as_deref(), Some("lo"));
         assert!(matches!(protocol, ServerProxyConfig::DokodemoDoor { .. }));
     }
 
