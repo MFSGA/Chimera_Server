@@ -1684,7 +1684,7 @@ mod tests {
 
     #[cfg(all(feature = "vless", feature = "grpc_transport", target_os = "linux"))]
     #[test]
-    fn socket_mark_rejects_dedicated_grpc_listener() {
+    fn socket_mark_wraps_dedicated_grpc_listener() {
         let inbound: InboudItem = serde_json::from_value(serde_json::json!({
             "listen": "127.0.0.1",
             "port": 443,
@@ -1701,9 +1701,12 @@ mod tests {
             }
         }))
         .unwrap();
-        let error = ServerConfig::try_from(inbound).unwrap_err();
-        assert!(error.to_string().contains("sockopt.mark"));
-        assert!(error.to_string().contains("grpc"));
+        let config = ServerConfig::try_from(inbound).unwrap();
+        let ServerProxyConfig::BindMark { value, inner } = config.protocol else {
+            panic!("SO_MARK must wrap the gRPC listener");
+        };
+        assert_eq!(value, 255);
+        assert!(matches!(*inner, ServerProxyConfig::Grpc(_)));
     }
 
     #[cfg(all(feature = "vless", any(target_os = "android", target_os = "linux")))]
