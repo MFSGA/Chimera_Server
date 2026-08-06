@@ -1727,6 +1727,43 @@ mod tests {
         assert!(matches!(*inner, ServerProxyConfig::BindMark { .. }));
     }
 
+    #[cfg(all(feature = "vless", feature = "grpc_transport", target_os = "linux"))]
+    #[test]
+    fn custom_sockopt_wraps_grpc_listener() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-grpc-custom-sockopt",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "grpc",
+                "grpcSettings": {"serviceName": "proxy"},
+                "sockopt": {
+                    "customSockopt": [{
+                        "system": "linux",
+                        "network": "tcp",
+                        "level": "1",
+                        "opt": "2",
+                        "value": "1",
+                        "type": "int"
+                    }]
+                }
+            }
+        }))
+        .unwrap();
+        let config = ServerConfig::try_from(inbound).unwrap();
+        let ServerProxyConfig::CustomSockopt { options, inner } = config.protocol
+        else {
+            panic!("customSockopt must wrap the gRPC listener");
+        };
+        assert_eq!(options.len(), 1);
+        assert!(matches!(*inner, ServerProxyConfig::Grpc(_)));
+    }
+
     #[cfg(feature = "vless")]
     #[test]
     fn socket_tcp_mptcp_false_is_ignored() {

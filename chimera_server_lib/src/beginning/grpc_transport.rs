@@ -336,6 +336,7 @@ struct GrpcListenerConfig {
     bind_interface: Option<String>,
     bind_mark: Option<i32>,
     tcp_mptcp: bool,
+    custom_sockopt: Vec<crate::config::CustomSockoptConfig>,
 }
 
 pub(super) async fn start_grpc_server(
@@ -363,6 +364,7 @@ pub(super) async fn start_grpc_server(
         bind_interface,
         bind_mark,
         tcp_mptcp,
+        custom_sockopt,
     } = parse_listener_protocol(protocol)?;
     let mut rules_stack = Vec::new();
     let server_handler: Arc<Box<dyn TcpServerHandler>> = Arc::new(
@@ -389,6 +391,16 @@ pub(super) async fn start_grpc_server(
     if let Some(value) = tcp_max_seg {
         crate::handler::tcp_max_seg::configure_listener(&socket, value)?;
     }
+    #[cfg(target_os = "linux")]
+    crate::util::socket::configure_custom_sockopt(
+        socket.as_raw_fd(),
+        if listen_addr.is_ipv6() {
+            "tcp6"
+        } else {
+            "tcp4"
+        },
+        &custom_sockopt,
+    )?;
     socket.bind(listen_addr)?;
     let listener = socket.listen(1024)?;
     info!(
@@ -633,6 +645,11 @@ fn parse_listener_protocol(
     protocol: ServerProxyConfig,
 ) -> io::Result<GrpcListenerConfig> {
     match protocol {
+        ServerProxyConfig::CustomSockopt { options, inner } => {
+            let mut config = parse_listener_protocol(*inner)?;
+            config.custom_sockopt = options;
+            Ok(config)
+        }
         ServerProxyConfig::TcpMultipath { inner } => {
             let mut config = parse_listener_protocol(*inner)?;
             config.tcp_mptcp = true;
@@ -709,6 +726,7 @@ fn parse_listener_protocol(
                 bind_interface: None,
                 bind_mark: None,
                 tcp_mptcp: false,
+                custom_sockopt: Vec::new(),
             })
         }
         #[cfg(feature = "tls")]
@@ -775,6 +793,7 @@ fn parse_listener_protocol(
                 bind_interface: None,
                 bind_mark: None,
                 tcp_mptcp: false,
+                custom_sockopt: Vec::new(),
             })
         }
         #[cfg(feature = "reality")]
@@ -803,6 +822,7 @@ fn parse_listener_protocol(
                 bind_interface: None,
                 bind_mark: None,
                 tcp_mptcp: false,
+                custom_sockopt: Vec::new(),
             })
         }
         other => Err(io::Error::new(
