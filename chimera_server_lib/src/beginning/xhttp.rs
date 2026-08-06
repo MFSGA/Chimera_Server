@@ -181,6 +181,7 @@ pub async fn start_xhttp_server(
         security,
         accept_proxy_protocol,
         tcp_keepalive,
+        tcp_user_timeout_ms,
     } = parse_listener_protocol(protocol)?;
 
     let bind_addr = match bind_location {
@@ -222,6 +223,12 @@ pub async fn start_xhttp_server(
                 #[cfg(feature = "reality")]
                 let reality_resolver = state.resolver.clone();
                 let mut stream = stream;
+                if let Err(error) =
+                    configure_xhttp_tcp_user_timeout(&stream, tcp_user_timeout_ms)
+                {
+                    debug!("xhttp TCP_USER_TIMEOUT setup failed: {error}");
+                    return;
+                }
                 if let Err(error) =
                     configure_xhttp_tcp_keepalive(&stream, tcp_keepalive)
                 {
@@ -430,6 +437,7 @@ struct XhttpListenerConfig {
     security: XhttpSecurityLayer,
     accept_proxy_protocol: bool,
     tcp_keepalive: Option<(i32, i32)>,
+    tcp_user_timeout_ms: Option<i32>,
 }
 
 #[derive(Clone)]
@@ -441,6 +449,30 @@ enum XhttpSecurityLayer {
     Http3(Arc<tokio_rustls::rustls::ServerConfig>),
     #[cfg(feature = "reality")]
     Reality(RealityTransportConfig),
+}
+
+fn configure_xhttp_tcp_user_timeout(
+    stream: &tokio::net::TcpStream,
+    timeout_ms: Option<i32>,
+) -> std::io::Result<()> {
+    let Some(timeout_ms) = timeout_ms else {
+        return Ok(());
+    };
+    #[cfg(target_os = "linux")]
+    {
+        crate::util::socket::configure_tcp_user_timeout(
+            stream.as_raw_fd(),
+            timeout_ms,
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (stream, timeout_ms);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "tcpUserTimeout is currently supported only on Linux",
+        ))
+    }
 }
 
 fn configure_xhttp_tcp_keepalive(
@@ -493,6 +525,18 @@ fn parse_listener_protocol(
     protocol: ServerProxyConfig,
 ) -> std::io::Result<XhttpListenerConfig> {
     match protocol {
+        ServerProxyConfig::TcpUserTimeout { timeout_ms, inner } => {
+            let mut config = parse_listener_protocol(*inner)?;
+            #[cfg(feature = "tls")]
+            if matches!(&config.security, XhttpSecurityLayer::Http3(_)) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "XHTTP HTTP/3 does not support tcpUserTimeout",
+                ));
+            }
+            config.tcp_user_timeout_ms = Some(timeout_ms);
+            Ok(config)
+        }
         ServerProxyConfig::TcpKeepAlive {
             idle_secs,
             interval_secs,
@@ -527,6 +571,7 @@ fn parse_listener_protocol(
             security: XhttpSecurityLayer::None,
             accept_proxy_protocol: false,
             tcp_keepalive: None,
+            tcp_user_timeout_ms: None,
         }),
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(TlsServerConfig {
@@ -588,6 +633,7 @@ fn parse_listener_protocol(
                     security,
                     accept_proxy_protocol: false,
                     tcp_keepalive: None,
+                    tcp_user_timeout_ms: None,
                 })
             }
             _ => Err(std::io::Error::other(
@@ -604,6 +650,7 @@ fn parse_listener_protocol(
                         security: XhttpSecurityLayer::Reality(reality_config),
                         accept_proxy_protocol: false,
                         tcp_keepalive: None,
+                        tcp_user_timeout_ms: None,
                     })
                 }
                 _ => Err(std::io::Error::other(

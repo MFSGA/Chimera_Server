@@ -1608,6 +1608,67 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "vless", target_os = "linux"))]
+    #[test]
+    fn socket_tcp_user_timeout_wraps_dedicated_xhttp_listener() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-xhttp-user-timeout",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "xhttp",
+                "xhttpSettings": {"path": "/proxy"},
+                "sockopt": {"tcpUserTimeout": 12345}
+            }
+        }))
+        .unwrap();
+        let config = ServerConfig::try_from(inbound).unwrap();
+        let ServerProxyConfig::TcpUserTimeout { timeout_ms, inner } =
+            config.protocol
+        else {
+            panic!("TCP_USER_TIMEOUT must wrap the XHTTP listener");
+        };
+        assert_eq!(timeout_ms, 12_345);
+        assert!(matches!(*inner, ServerProxyConfig::Xhttp { .. }));
+    }
+
+    #[cfg(all(feature = "vless", feature = "tls", target_os = "linux"))]
+    #[test]
+    fn socket_tcp_user_timeout_rejects_xhttp_http3() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-xhttp-h3-user-timeout",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "xhttp",
+                "security": "tls",
+                "xhttpSettings": {"path": "/proxy"},
+                "sockopt": {"tcpUserTimeout": 12345},
+                "tlsSettings": {
+                    "alpn": ["h3"],
+                    "certificates": [{
+                        "certificate": ["-----BEGIN CERTIFICATE-----","MIIB","-----END CERTIFICATE-----"],
+                        "key": ["-----BEGIN PRIVATE KEY-----","MIIB","-----END PRIVATE KEY-----"]
+                    }]
+                }
+            }
+        }))
+        .unwrap();
+        let error = ServerConfig::try_from(inbound).unwrap_err();
+        assert!(error.to_string().contains("HTTP/3"));
+        assert!(error.to_string().contains("tcpUserTimeout"));
+    }
+
     #[cfg(all(feature = "vless", feature = "grpc_transport"))]
     #[test]
     fn socket_tcp_user_timeout_wraps_dedicated_grpc_listener() {

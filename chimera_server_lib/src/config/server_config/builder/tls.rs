@@ -325,7 +325,14 @@ pub(super) fn apply_security_layers(
     if configure_user_timeout
         && !matches!(
             network.as_str(),
-            "" | "raw" | "tcp" | "ws" | "websocket" | "httpupgrade" | "grpc"
+            "" | "raw"
+                | "tcp"
+                | "ws"
+                | "websocket"
+                | "httpupgrade"
+                | "grpc"
+                | "xhttp"
+                | "splithttp"
         )
     {
         return Err(Error::InvalidConfig(format!(
@@ -391,6 +398,21 @@ pub(super) fn apply_security_layers(
             .is_some_and(|settings| settings.accept_proxy_protocol)
     {
         accept_proxy_protocol = true;
+    }
+
+    if configure_user_timeout
+        && matches!(network.as_str(), "xhttp" | "splithttp")
+        && stream_settings
+            .tls_settings
+            .as_ref()
+            .is_some_and(|settings| {
+                settings.alpn.len() == 1
+                    && settings.alpn[0].eq_ignore_ascii_case("h3")
+            })
+    {
+        return Err(Error::InvalidConfig(
+            "XHTTP HTTP/3 does not support tcpUserTimeout".into(),
+        ));
     }
 
     if configure_keepalive
