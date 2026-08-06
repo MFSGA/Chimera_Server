@@ -1091,8 +1091,9 @@ where
         }
         TcpServerSetupResult::MultiDirectionalUdp {
             stream,
-            traffic_context,
+            mut traffic_context,
         } => {
+            apply_policy_stats(&runtime, traffic_context.as_mut());
             run_multi_directional_udp(
                 stream,
                 resolver,
@@ -1117,6 +1118,28 @@ where
         }
         TcpServerSetupResult::AlreadyHandled => Ok(()),
     }
+}
+
+fn apply_policy_stats(
+    runtime: &RuntimeState,
+    traffic_context: Option<&mut TrafficContext>,
+) {
+    let Some(context) = traffic_context else {
+        return;
+    };
+    let user_stats = runtime.policy_user_stats(context.user_level);
+    let system_stats = runtime.policy_system_stats();
+    context.set_user_stats_policy(
+        user_stats.uplink,
+        user_stats.downlink,
+        user_stats.online,
+    );
+    context.set_system_stats_policy(
+        system_stats.inbound_uplink,
+        system_stats.inbound_downlink,
+        system_stats.outbound_uplink,
+        system_stats.outbound_downlink,
+    );
 }
 
 async fn setup_server_stream<AS>(
@@ -1311,6 +1334,41 @@ mod tests {
         ];
         record.extend_from_slice(&handshake);
         record
+    }
+
+    #[test]
+    fn trojan_udp_context_applies_policy_stats() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let policy = serde_json::from_value(serde_json::json!({
+            "levels": {
+                "7": {
+                    "statsUserUplink": false,
+                    "statsUserDownlink": true,
+                    "statsUserOnline": false
+                }
+            },
+            "system": {
+                "statsInboundUplink": true,
+                "statsInboundDownlink": false,
+                "statsOutboundUplink": false,
+                "statsOutboundDownlink": true
+            }
+        }))
+        .expect("policy config should parse");
+        runtime
+            .configure_policy(Some(&policy))
+            .expect("policy should install");
+        let mut context = TrafficContext::new("trojan").with_user_level(7);
+
+        apply_policy_stats(&runtime, Some(&mut context));
+
+        assert_eq!(context.stats_user_uplink, Some(false));
+        assert_eq!(context.stats_user_downlink, Some(true));
+        assert_eq!(context.stats_user_online, Some(false));
+        assert_eq!(context.stats_inbound_uplink, Some(true));
+        assert_eq!(context.stats_inbound_downlink, Some(false));
+        assert_eq!(context.stats_outbound_uplink, Some(false));
+        assert_eq!(context.stats_outbound_downlink, Some(true));
     }
 
     #[test]
