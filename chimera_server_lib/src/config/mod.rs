@@ -92,6 +92,8 @@ pub struct SocketSettings {
     tcp_congestion: String,
     #[serde(default)]
     tcp_window_clamp: i32,
+    #[serde(default)]
+    tcp_max_seg: i32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

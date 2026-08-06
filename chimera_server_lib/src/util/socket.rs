@@ -86,6 +86,14 @@ pub fn configure_tcp_window_clamp(
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
+pub fn configure_tcp_max_seg(
+    fd: std::os::fd::RawFd,
+    value: i32,
+) -> std::io::Result<()> {
+    set_socket_option_int(fd, libc::IPPROTO_TCP, libc::TCP_MAXSEG, value)
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
 pub fn configure_tcp_congestion(
     fd: std::os::fd::RawFd,
     algorithm: &str,

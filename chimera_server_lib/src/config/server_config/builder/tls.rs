@@ -381,6 +381,28 @@ pub(super) fn apply_security_layers(
         ));
     }
 
+    let max_seg = stream_settings
+        .sockopt
+        .as_ref()
+        .map_or(0, |settings| settings.tcp_max_seg);
+    let configure_max_seg = max_seg > 0;
+    if configure_max_seg
+        && !matches!(
+            network.as_str(),
+            "" | "raw" | "tcp" | "ws" | "websocket" | "httpupgrade"
+        )
+    {
+        return Err(Error::InvalidConfig(format!(
+            "tcpMaxSeg is not supported for {network} transport yet"
+        )));
+    }
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    if configure_max_seg {
+        return Err(Error::InvalidConfig(
+            "tcpMaxSeg is currently supported only on Linux and Android".into(),
+        ));
+    }
+
     let user_timeout_ms = stream_settings
         .sockopt
         .as_ref()
@@ -571,9 +593,17 @@ pub(super) fn apply_security_layers(
     } else {
         protocol
     };
-    if configure_congestion {
-        Ok(ServerProxyConfig::TcpCongestion {
+    let protocol = if configure_congestion {
+        ServerProxyConfig::TcpCongestion {
             algorithm: congestion_algorithm,
+            inner: Box::new(protocol),
+        }
+    } else {
+        protocol
+    };
+    if configure_max_seg {
+        Ok(ServerProxyConfig::TcpMaxSeg {
+            value: max_seg,
             inner: Box::new(protocol),
         })
     } else {

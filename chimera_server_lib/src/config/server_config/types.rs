@@ -460,6 +460,10 @@ pub enum ServerProxyConfig {
         value: i32,
         inner: Box<ServerProxyConfig>,
     },
+    TcpMaxSeg {
+        value: i32,
+        inner: Box<ServerProxyConfig>,
+    },
     #[cfg(feature = "tls")]
     Tls(TlsServerConfig),
     #[cfg(feature = "reality")]
@@ -526,6 +530,7 @@ impl std::fmt::Display for ServerProxyConfig {
                 Self::TcpUserTimeout { .. } => "TcpUserTimeout",
                 Self::TcpCongestion { .. } => "TcpCongestion",
                 Self::TcpWindowClamp { .. } => "TcpWindowClamp",
+                Self::TcpMaxSeg { .. } => "TcpMaxSeg",
                 #[cfg(feature = "reality")]
                 Self::Reality(_) => "Reality",
                 #[cfg(feature = "tls")]

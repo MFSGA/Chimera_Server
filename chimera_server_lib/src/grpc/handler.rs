@@ -3983,7 +3983,8 @@ impl HandlerServiceImpl {
             | ServerProxyConfig::TcpKeepAlive { inner, .. }
             | ServerProxyConfig::TcpUserTimeout { inner, .. }
             | ServerProxyConfig::TcpCongestion { inner, .. }
-            | ServerProxyConfig::TcpWindowClamp { inner, .. } => {
+            | ServerProxyConfig::TcpWindowClamp { inner, .. }
+            | ServerProxyConfig::TcpMaxSeg { inner, .. } => {
                 self.get_user_manager_identities(inner)
             }
             ServerProxyConfig::Socks { accounts, .. } => Some(
@@ -4146,7 +4147,8 @@ impl HandlerServiceImpl {
             | ServerProxyConfig::TcpKeepAlive { inner, .. }
             | ServerProxyConfig::TcpUserTimeout { inner, .. }
             | ServerProxyConfig::TcpCongestion { inner, .. }
-            | ServerProxyConfig::TcpWindowClamp { inner, .. } => {
+            | ServerProxyConfig::TcpWindowClamp { inner, .. }
+            | ServerProxyConfig::TcpMaxSeg { inner, .. } => {
                 self.get_user_manager_users(inner)
             }
             ServerProxyConfig::Socks {

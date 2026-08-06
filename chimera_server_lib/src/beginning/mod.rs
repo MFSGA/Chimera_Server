@@ -150,7 +150,8 @@ fn is_grpc_server_protocol(protocol: &ServerProxyConfig) -> bool {
         | ServerProxyConfig::TcpKeepAlive { inner, .. }
         | ServerProxyConfig::TcpUserTimeout { inner, .. }
         | ServerProxyConfig::TcpCongestion { inner, .. }
-        | ServerProxyConfig::TcpWindowClamp { inner, .. } => {
+        | ServerProxyConfig::TcpWindowClamp { inner, .. }
+        | ServerProxyConfig::TcpMaxSeg { inner, .. } => {
             is_grpc_server_protocol(inner)
         }
         #[cfg(feature = "tls")]
@@ -172,7 +173,8 @@ fn is_xhttp_server_protocol(protocol: &ServerProxyConfig) -> bool {
         | ServerProxyConfig::TcpKeepAlive { inner, .. }
         | ServerProxyConfig::TcpUserTimeout { inner, .. }
         | ServerProxyConfig::TcpCongestion { inner, .. }
-        | ServerProxyConfig::TcpWindowClamp { inner, .. } => {
+        | ServerProxyConfig::TcpWindowClamp { inner, .. }
+        | ServerProxyConfig::TcpMaxSeg { inner, .. } => {
             is_xhttp_server_protocol(inner)
         }
         #[cfg(feature = "tls")]
@@ -209,6 +211,11 @@ async fn start_tcp_server_with_runtime(
         ..
     } = config;
 
+    let (protocol, tcp_max_seg) = match protocol {
+        ServerProxyConfig::TcpMaxSeg { value, inner } => (*inner, Some(value)),
+        protocol => (protocol, None),
+    };
+
     tracing::info!("Starting {} TCP server at {}", &protocol, &bind_location);
 
     let mut rules_stack = vec![];
@@ -220,7 +227,12 @@ async fn start_tcp_server_with_runtime(
     let listener = match bind_location {
         BindLocation::Address(a) => {
             let socket_addr = a.to_socket_addr()?;
-            tokio::net::TcpListener::bind(socket_addr).await?
+            let socket = new_tcp_socket(None, socket_addr.is_ipv6())?;
+            if let Some(value) = tcp_max_seg {
+                crate::handler::tcp_max_seg::configure_listener(&socket, value)?;
+            }
+            socket.bind(socket_addr)?;
+            socket.listen(1024)?
         }
     };
 
