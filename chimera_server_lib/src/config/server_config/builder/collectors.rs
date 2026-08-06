@@ -351,9 +351,17 @@ fn parse_trojan_fallback_dest(
     }
 }
 
+#[derive(Debug)]
+pub(super) struct CollectedSocksSettings {
+    pub accounts: SocksUserStore,
+    pub udp_enabled: bool,
+    pub user_level: u32,
+}
+
 pub(super) fn collect_socks_settings(
     settings: SettingObject,
-) -> Result<(SocksUserStore, bool), Error> {
+    allow_user_level: bool,
+) -> Result<CollectedSocksSettings, Error> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct SocksInboundSettings {
@@ -366,7 +374,7 @@ pub(super) fn collect_socks_settings(
         #[serde(default)]
         ip: Option<serde_json::Value>,
         #[serde(default)]
-        user_level: Option<serde_json::Value>,
+        user_level: Option<u32>,
     }
 
     #[derive(Deserialize)]
@@ -387,11 +395,12 @@ pub(super) fn collect_socks_settings(
             "socks settings.ip is not supported yet".into(),
         ));
     }
-    if socks_settings.user_level.is_some() {
+    if socks_settings.user_level.is_some() && !allow_user_level {
         return Err(Error::InvalidConfig(
-            "socks settings.userLevel is not supported yet".into(),
+            "mixed settings.userLevel is not supported".into(),
         ));
     }
+    let user_level = socks_settings.user_level.unwrap_or_default();
 
     let auth_mode = socks_settings
         .auth
@@ -406,18 +415,19 @@ pub(super) fn collect_socks_settings(
         });
 
     match auth_mode.as_str() {
-        "noauth" | "none" => Ok((
-            SocksUserStore::with_auth_required(Vec::new(), false),
+        "noauth" | "none" => Ok(CollectedSocksSettings {
+            accounts: SocksUserStore::with_auth_required(Vec::new(), false),
             udp_enabled,
-        )),
+            user_level,
+        }),
         "password" => {
             if socks_settings.accounts.is_empty() {
                 return Err(Error::InvalidConfig(
                     "socks inbound with password auth requires accounts".into(),
                 ));
             }
-            Ok((
-                SocksUserStore::with_auth_required(
+            Ok(CollectedSocksSettings {
+                accounts: SocksUserStore::with_auth_required(
                     socks_settings
                         .accounts
                         .into_iter()
@@ -429,7 +439,8 @@ pub(super) fn collect_socks_settings(
                     true,
                 ),
                 udp_enabled,
-            ))
+                user_level,
+            })
         }
         other => Err(Error::InvalidConfig(format!(
             "unsupported socks auth mode: {}",
@@ -1015,10 +1026,11 @@ mod tests {
             "udp": true
         }));
 
-        let (users, udp_enabled) =
-            collect_socks_settings(settings).expect("socks udp should be accepted");
-        assert!(!users.auth_required());
-        assert!(udp_enabled);
+        let collected = collect_socks_settings(settings, true)
+            .expect("socks udp should be accepted");
+        assert!(!collected.accounts.auth_required());
+        assert!(collected.udp_enabled);
+        assert_eq!(collected.user_level, 0);
     }
 
     #[test]
@@ -1028,12 +1040,39 @@ mod tests {
             "ip": "127.0.0.1"
         }));
 
-        let err =
-            collect_socks_settings(settings).expect_err("socks ip unsupported");
+        let err = collect_socks_settings(settings, true)
+            .expect_err("socks ip unsupported");
         assert!(
             err.to_string()
                 .contains("socks settings.ip is not supported yet")
         );
+    }
+
+    #[test]
+    fn collect_socks_settings_preserves_global_user_level() {
+        let settings = SettingObject(serde_json::json!({
+            "auth": "password",
+            "accounts": [{"user": "alice", "pass": "secret"}],
+            "userLevel": 7
+        }));
+
+        let collected = collect_socks_settings(settings, true)
+            .expect("socks userLevel should be accepted");
+        assert_eq!(collected.user_level, 7);
+        assert!(collected.accounts.auth_required());
+        assert_eq!(collected.accounts.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn collect_mixed_settings_rejects_socks_user_level() {
+        let settings = SettingObject(serde_json::json!({
+            "auth": "noauth",
+            "userLevel": 7
+        }));
+
+        let error = collect_socks_settings(settings, false)
+            .expect_err("mixed userLevel must remain unsupported");
+        assert!(error.to_string().contains("mixed settings.userLevel"));
     }
 
     #[test]
@@ -1043,10 +1082,10 @@ mod tests {
             "udp": false
         }));
 
-        let (users, udp_enabled) =
-            collect_socks_settings(settings).expect("udp false is a no-op");
-        assert!(!users.auth_required());
-        assert!(!udp_enabled);
+        let collected =
+            collect_socks_settings(settings, true).expect("udp false is a no-op");
+        assert!(!collected.accounts.auth_required());
+        assert!(!collected.udp_enabled);
     }
 
     #[cfg(feature = "trojan")]

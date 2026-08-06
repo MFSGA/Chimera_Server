@@ -238,6 +238,8 @@ struct SocksServerConfigPayload {
     auth_type: i32,
     #[prost(map = "string, string", tag = "2")]
     accounts: std::collections::HashMap<String, String>,
+    #[prost(uint32, tag = "6")]
+    user_level: u32,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1054,6 +1056,7 @@ impl HandlerServiceImpl {
                 Ok(ServerProxyConfig::Socks {
                     accounts,
                     udp_enabled: false,
+                    user_level: socks.user_level,
                 })
             }
             #[cfg(feature = "vless")]
@@ -2462,7 +2465,11 @@ impl HandlerServiceImpl {
                     TrojanServerConfigPayload { users, fallbacks },
                 ))
             }
-            ServerProxyConfig::Socks { accounts, .. } => {
+            ServerProxyConfig::Socks {
+                accounts,
+                user_level,
+                ..
+            } => {
                 let auth_type = i32::from(accounts.auth_required());
                 let account_map = accounts
                     .snapshot()
@@ -2476,6 +2483,7 @@ impl HandlerServiceImpl {
                     SocksServerConfigPayload {
                         auth_type,
                         accounts: account_map,
+                        user_level: *user_level,
                     },
                 ))
             }
@@ -3751,12 +3759,16 @@ impl HandlerServiceImpl {
             ServerProxyConfig::Grpc(config) => {
                 self.get_user_manager_users(&config.inner)
             }
-            ServerProxyConfig::Socks { accounts, .. } => Some(
+            ServerProxyConfig::Socks {
+                accounts,
+                user_level,
+                ..
+            } => Some(
                 accounts
                     .snapshot()
                     .iter()
                     .map(|account| proto::xray::common::protocol::User {
-                        level: 0,
+                        level: *user_level,
                         email: account.username.clone(),
                         account: Some(proto::xray::common::serial::TypedMessage {
                             r#type: TYPE_PROXY_SOCKS_ACCOUNT.to_string(),
@@ -4124,6 +4136,7 @@ mod tests {
             }]
             .into(),
             udp_enabled: false,
+            user_level: 7,
         };
         let inbound = ServerConfig {
             tag: inbound_tag.clone(),
@@ -4186,6 +4199,7 @@ mod tests {
                     value: SocksServerConfigPayload {
                         auth_type: 1,
                         accounts,
+                        user_level: 7,
                     }
                     .encode_to_vec(),
                 }),
@@ -4527,6 +4541,7 @@ mod tests {
                 }]
                 .into(),
                 udp_enabled: false,
+                user_level: 0,
             },
             transport: Transport::Tcp,
             quic_settings: None,
@@ -4720,6 +4735,7 @@ mod tests {
             SocksServerConfigPayload::decode(proxy_settings.value.as_slice())
                 .expect("decode socks settings");
         assert_eq!(socks.auth_type, 1);
+        assert_eq!(socks.user_level, 7);
         assert_eq!(socks.accounts.len(), 1);
         assert!(socks.accounts.values().any(|password| password == "pass-a"));
     }
@@ -5642,6 +5658,7 @@ mod tests {
             .into_inner();
         assert_eq!(users.users.len(), 1);
         assert!(users.users[0].email.starts_with("user-a-"));
+        assert_eq!(users.users[0].level, 7);
 
         let users_count = service
             .get_inbound_users_count(Request::new(
@@ -6614,7 +6631,7 @@ mod tests {
 
         let add_operation = proto::xray::app::proxyman::command::AddUserOperation {
             user: Some(proto::xray::common::protocol::User {
-                level: 0,
+                level: 99,
                 email: username.clone(),
                 account: Some(proto::xray::common::serial::TypedMessage {
                     r#type: TYPE_PROXY_SOCKS_ACCOUNT.to_string(),
@@ -6651,7 +6668,11 @@ mod tests {
             .into_inner()
             .users;
         assert_eq!(users_after_add.len(), 2);
-        assert!(users_after_add.iter().any(|user| user.email == username));
+        let added_user = users_after_add
+            .iter()
+            .find(|user| user.email == username)
+            .expect("added SOCKS user should be returned");
+        assert_eq!(added_user.level, 7);
 
         let remove_operation =
             proto::xray::app::proxyman::command::RemoveUserOperation {

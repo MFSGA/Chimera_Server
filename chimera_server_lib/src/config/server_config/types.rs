@@ -469,6 +469,8 @@ pub enum ServerProxyConfig {
         accounts: SocksUserStore,
         #[serde(default)]
         udp_enabled: bool,
+        #[serde(default)]
+        user_level: u32,
     },
     DokodemoDoor {
         config: DokodemoDoorConfig,

@@ -56,6 +56,7 @@ pub struct SocksTcpServerHandler {
     accounts: SocksUserStore,
     inbound_tag: String,
     udp_enabled: bool,
+    user_level: u32,
 }
 
 impl SocksTcpServerHandler {
@@ -63,11 +64,13 @@ impl SocksTcpServerHandler {
         accounts: SocksUserStore,
         inbound_tag: &str,
         udp_enabled: bool,
+        user_level: u32,
     ) -> Self {
         Self {
             accounts,
             inbound_tag: inbound_tag.to_string(),
             udp_enabled,
+            user_level,
         }
     }
 
@@ -118,8 +121,9 @@ impl TcpServerHandler for SocksTcpServerHandler {
 
         let command = server_stream.read_u8().await?;
 
-        let mut traffic_context =
-            TrafficContext::new("socks").with_inbound_tag(self.inbound_tag.clone());
+        let mut traffic_context = TrafficContext::new("socks")
+            .with_user_level(self.user_level)
+            .with_inbound_tag(self.inbound_tag.clone());
         if let Some(id) = identity.as_deref() {
             traffic_context = traffic_context
                 .with_identity(id.to_string())
@@ -848,6 +852,7 @@ mod tests {
     };
 
     use tokio::{
+        io::{AsyncWriteExt, duplex},
         net::{TcpListener, TcpStream, UdpSocket},
         time::timeout,
     };
@@ -859,6 +864,49 @@ mod tests {
         traffic::{active_connections, snapshot},
         user_domain_access::UserDomainAccessConfig,
     };
+
+    #[tokio::test]
+    async fn global_user_level_reaches_tcp_and_udp_contexts() {
+        for command in [CMD_CONNECT, CMD_UDP_ASSOCIATE] {
+            let handler = SocksTcpServerHandler::new(
+                SocksUserStore::with_auth_required(Vec::new(), false),
+                "socks-level",
+                true,
+                7,
+            );
+            let mut request = vec![SOCKS_VERSION, 1, METHOD_NO_AUTH];
+            request.extend_from_slice(&[
+                SOCKS_VERSION,
+                command,
+                0,
+                ADDR_TYPE_IPV4,
+                127,
+                0,
+                0,
+                1,
+                0,
+                80,
+            ]);
+            let (mut client, server) = duplex(1024);
+            client.write_all(&request).await.unwrap();
+
+            let result = handler
+                .setup_server_stream(Box::new(server))
+                .await
+                .expect("SOCKS handshake should succeed");
+            let context = match result {
+                TcpServerSetupResult::TcpForward {
+                    traffic_context, ..
+                }
+                | TcpServerSetupResult::UdpAssociate {
+                    traffic_context, ..
+                } => traffic_context.expect("SOCKS traffic context should exist"),
+                _ => panic!("unexpected SOCKS result"),
+            };
+            assert_eq!(context.user_level, 7);
+            assert_eq!(context.inbound_tag.as_deref(), Some("socks-level"));
+        }
+    }
 
     struct CountingResolver {
         calls: Arc<AtomicU64>,

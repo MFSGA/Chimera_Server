@@ -1251,10 +1251,10 @@ impl TryFrom<InboudItem> for ServerConfig {
                 let settings = settings.unwrap_or_else(|| {
                     crate::config::SettingObject(serde_json::json!({}))
                 });
-                let (accounts, udp_enabled) = collect_socks_settings(settings)?;
+                let collected = collect_socks_settings(settings, false)?;
                 let mut protocol = ServerProxyConfig::Mixed {
-                    accounts,
-                    udp_enabled,
+                    accounts: collected.accounts,
+                    udp_enabled: collected.udp_enabled,
                 };
 
                 #[cfg(feature = "ws")]
@@ -1354,10 +1354,11 @@ impl TryFrom<InboudItem> for ServerConfig {
                 let settings = settings.ok_or_else(|| {
                     Error::InvalidConfig("socks inbound requires settings".into())
                 })?;
-                let (accounts, udp_enabled) = collect_socks_settings(settings)?;
+                let collected = collect_socks_settings(settings, true)?;
                 let mut protocol = ServerProxyConfig::Socks {
-                    accounts,
-                    udp_enabled,
+                    accounts: collected.accounts,
+                    udp_enabled: collected.udp_enabled,
+                    user_level: collected.user_level,
                 };
                 let _stream_network = stream_settings
                     .as_ref()
