@@ -188,6 +188,7 @@ pub async fn start_xhttp_server(
         ipv6_only,
         tcp_fast_open,
         bind_interface,
+        bind_mark,
     } = parse_listener_protocol(protocol)?;
 
     let bind_addr = match bind_location {
@@ -212,12 +213,16 @@ pub async fn start_xhttp_server(
             state,
             ipv6_only,
             bind_interface,
+            bind_mark,
         )
         .await;
     }
 
     let socket =
         crate::util::socket::new_tcp_socket(bind_interface, bind_addr.is_ipv6())?;
+    if let Some(value) = bind_mark {
+        crate::util::socket::configure_socket_mark(socket.as_raw_fd(), value)?;
+    }
     if let Some(value) = tcp_fast_open {
         crate::handler::tcp_fast_open::configure_listener(&socket, value)?;
     }
@@ -334,6 +339,7 @@ async fn start_xhttp3_server(
     state: Arc<AppState>,
     ipv6_only: bool,
     bind_interface: Option<String>,
+    bind_mark: Option<i32>,
 ) -> std::io::Result<Vec<tokio::task::JoinHandle<()>>> {
     let quic_crypto: quinn::crypto::rustls::QuicServerConfig =
         tls_config.try_into().map_err(std::io::Error::other)?;
@@ -361,6 +367,9 @@ async fn start_xhttp3_server(
         Some(8_625_000),
     )
     .map_err(std::io::Error::other)?;
+    if let Some(value) = bind_mark {
+        crate::util::socket::configure_socket_mark(socket.as_raw_fd(), value)?;
+    }
     if ipv6_only {
         socket.set_only_v6(true)?;
     }
@@ -489,6 +498,7 @@ struct XhttpListenerConfig {
     ipv6_only: bool,
     tcp_fast_open: Option<i32>,
     bind_interface: Option<String>,
+    bind_mark: Option<i32>,
 }
 
 #[derive(Clone)]
@@ -618,6 +628,11 @@ fn parse_listener_protocol(
     protocol: ServerProxyConfig,
 ) -> std::io::Result<XhttpListenerConfig> {
     match protocol {
+        ServerProxyConfig::BindMark { value, inner } => {
+            let mut config = parse_listener_protocol(*inner)?;
+            config.bind_mark = Some(value);
+            Ok(config)
+        }
         ServerProxyConfig::BindInterface { name, inner } => {
             let mut config = parse_listener_protocol(*inner)?;
             config.bind_interface = Some(name);
@@ -729,6 +744,7 @@ fn parse_listener_protocol(
             ipv6_only: false,
             tcp_fast_open: None,
             bind_interface: None,
+            bind_mark: None,
         }),
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(TlsServerConfig {
@@ -797,6 +813,7 @@ fn parse_listener_protocol(
                     ipv6_only: false,
                     tcp_fast_open: None,
                     bind_interface: None,
+                    bind_mark: None,
                 })
             }
             _ => Err(std::io::Error::other(
@@ -820,6 +837,7 @@ fn parse_listener_protocol(
                         ipv6_only: false,
                         tcp_fast_open: None,
                         bind_interface: None,
+                        bind_mark: None,
                     })
                 }
                 _ => Err(std::io::Error::other(
