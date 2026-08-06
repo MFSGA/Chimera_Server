@@ -1,5 +1,7 @@
 #[cfg(feature = "tls")]
 use std::fs;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use std::os::fd::AsRawFd;
 use std::{
     convert::Infallible,
     io,
@@ -319,6 +321,14 @@ enum GrpcSecurity {
     Reality(RealityTransportConfig),
 }
 
+struct GrpcListenerConfig {
+    grpc: GrpcServerConfig,
+    inner: ServerProxyConfig,
+    security: GrpcSecurity,
+    accept_proxy_protocol: bool,
+    tcp_keepalive: Option<(i32, i32)>,
+}
+
 pub(super) async fn start_grpc_server(
     config: ServerConfig,
     runtime: RuntimeState,
@@ -329,8 +339,13 @@ pub(super) async fn start_grpc_server(
         protocol,
         ..
     } = config;
-    let (grpc_config, inner_protocol, security, accept_proxy_protocol) =
-        parse_listener_protocol(protocol)?;
+    let GrpcListenerConfig {
+        grpc: grpc_config,
+        inner: inner_protocol,
+        security,
+        accept_proxy_protocol,
+        tcp_keepalive,
+    } = parse_listener_protocol(protocol)?;
     let mut rules_stack = Vec::new();
     let server_handler: Arc<Box<dyn TcpServerHandler>> = Arc::new(
         create_tcp_server_handler(inner_protocol, &tag, &mut rules_stack)?,
@@ -363,6 +378,12 @@ pub(super) async fn start_grpc_server(
             let security = security.clone();
             tokio::spawn(async move {
                 let mut stream = stream;
+                if let Err(error) =
+                    configure_grpc_tcp_keepalive(&stream, tcp_keepalive)
+                {
+                    debug!("gRPC TCP keepalive setup failed: {error}");
+                    return;
+                }
                 let peer_addr = match resolve_grpc_peer_addr(
                     &mut stream,
                     peer_addr,
@@ -441,6 +462,31 @@ pub(super) async fn start_grpc_server(
     Ok(vec![handle])
 }
 
+fn configure_grpc_tcp_keepalive(
+    stream: &tokio::net::TcpStream,
+    keepalive: Option<(i32, i32)>,
+) -> io::Result<()> {
+    let Some((idle_secs, interval_secs)) = keepalive else {
+        return Ok(());
+    };
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    {
+        crate::util::socket::configure_tcp_keepalive(
+            stream.as_raw_fd(),
+            idle_secs,
+            interval_secs,
+        )
+    }
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    {
+        let _ = (stream, idle_secs, interval_secs);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "TCP keepalive sockopt is currently supported only on Linux and Android",
+        ))
+    }
+}
+
 async fn resolve_grpc_peer_addr<S>(
     stream: &mut S,
     socket_peer_addr: std::net::SocketAddr,
@@ -464,15 +510,31 @@ where
 
 fn parse_listener_protocol(
     protocol: ServerProxyConfig,
-) -> io::Result<(GrpcServerConfig, ServerProxyConfig, GrpcSecurity, bool)> {
+) -> io::Result<GrpcListenerConfig> {
     match protocol {
+        ServerProxyConfig::TcpKeepAlive {
+            idle_secs,
+            interval_secs,
+            inner,
+        } => {
+            let mut config = parse_listener_protocol(*inner)?;
+            config.tcp_keepalive = Some((idle_secs, interval_secs));
+            Ok(config)
+        }
         ServerProxyConfig::ProxyProtocol { inner } => {
-            let (config, inner, security, _) = parse_listener_protocol(*inner)?;
-            Ok((config, inner, security, true))
+            let mut config = parse_listener_protocol(*inner)?;
+            config.accept_proxy_protocol = true;
+            Ok(config)
         }
         ServerProxyConfig::Grpc(config) => {
             let inner = (*config.inner).clone();
-            Ok((config, inner, GrpcSecurity::Plain, false))
+            Ok(GrpcListenerConfig {
+                grpc: config,
+                inner,
+                security: GrpcSecurity::Plain,
+                accept_proxy_protocol: false,
+                tcp_keepalive: None,
+            })
         }
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(tls_config) => {
@@ -523,12 +585,13 @@ fn parse_listener_protocol(
             let server_config =
                 create_server_config(&cert_bytes, &key_bytes, &alpn_protocols, &[])?;
             let inner = (*config.inner).clone();
-            Ok((
-                config,
+            Ok(GrpcListenerConfig {
+                grpc: config,
                 inner,
-                GrpcSecurity::Tls(Arc::new(server_config)),
-                false,
-            ))
+                security: GrpcSecurity::Tls(Arc::new(server_config)),
+                accept_proxy_protocol: false,
+                tcp_keepalive: None,
+            })
         }
         #[cfg(feature = "reality")]
         ServerProxyConfig::Reality(reality_config) => {
@@ -541,7 +604,13 @@ fn parse_listener_protocol(
             };
             let config = config.clone();
             let inner = (*config.inner).clone();
-            Ok((config, inner, GrpcSecurity::Reality(reality_config), false))
+            Ok(GrpcListenerConfig {
+                grpc: config,
+                inner,
+                security: GrpcSecurity::Reality(reality_config),
+                accept_proxy_protocol: false,
+                tcp_keepalive: None,
+            })
         }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,

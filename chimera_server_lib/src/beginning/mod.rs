@@ -146,7 +146,10 @@ pub async fn start_servers(
 fn is_grpc_server_protocol(protocol: &ServerProxyConfig) -> bool {
     match protocol {
         ServerProxyConfig::Grpc(_) => true,
-        ServerProxyConfig::ProxyProtocol { inner } => is_grpc_server_protocol(inner),
+        ServerProxyConfig::ProxyProtocol { inner }
+        | ServerProxyConfig::TcpKeepAlive { inner, .. } => {
+            is_grpc_server_protocol(inner)
+        }
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(tls_config) => {
             matches!(tls_config.inner.as_ref(), ServerProxyConfig::Grpc(_))
