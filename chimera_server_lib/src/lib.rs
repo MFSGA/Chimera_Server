@@ -358,11 +358,15 @@ pub fn prepare_server_runtime(
         user_domain_access_store.as_deref(),
     )?;
     let dns_config = config.dns.clone();
+    let policy_config = config.policy.clone();
     let outbounds = compile_outbound_summaries(&config.outbounds)?;
     let inbounds = prepare_server_inbounds(config, cwd, log_file)?;
     let runtime_state = RuntimeState::try_new(inbounds.clone(), outbounds)
         .map_err(Error::InvalidConfig)?;
     configure_runtime_resolver(&runtime_state, dns_config.as_ref())?;
+    runtime_state
+        .configure_policy(policy_config.as_ref())
+        .map_err(Error::InvalidConfig)?;
     #[cfg(feature = "user_domain_access")]
     runtime_state
         .configure_user_domain_access_signature_verifier(
@@ -688,6 +692,7 @@ async fn start_async(
     let observatory_config = config.observatory.clone();
     let burst_observatory_config = config.burst_observatory.clone();
     let dns_config = config.dns.clone();
+    let policy_config = config.policy.clone();
     routing_observer::validate_observatory_config(
         observatory_config.as_ref(),
         burst_observatory_config.as_ref(),
@@ -728,6 +733,9 @@ async fn start_async(
     let runtime_state = RuntimeState::try_new(all_inbounds.clone(), outbounds)
         .map_err(Error::InvalidConfig)?;
     configure_runtime_resolver(&runtime_state, dns_config.as_ref())?;
+    runtime_state
+        .configure_policy(policy_config.as_ref())
+        .map_err(Error::InvalidConfig)?;
     #[cfg(feature = "user_domain_access")]
     runtime_state
         .configure_user_domain_access_signature_verifier(
@@ -962,7 +970,7 @@ mod tests {
             assert!(error.to_string().contains(field));
         }
 
-        let error = ConfigType::Str(
+        let config = ConfigType::Str(
             serde_json::json!({
                 "inbounds": [],
                 "outbounds": [],
@@ -971,8 +979,34 @@ mod tests {
             .to_string(),
         )
         .try_parse(Some(crate::ConfigFormat::Json))
-        .expect_err("non-empty Xray policy must fail closed");
-        assert!(error.to_string().contains("policy.levels/system"));
+        .expect("policy.levels.0.handshake should be supported");
+        let runtime = prepare_server_runtime(config, None, None)
+            .expect("policy runtime should build");
+        assert_eq!(
+            runtime.runtime_state.policy_handshake_timeout(0),
+            std::time::Duration::from_secs(4)
+        );
+        assert_eq!(
+            runtime.runtime_state.policy_handshake_timeout(1),
+            std::time::Duration::from_secs(60)
+        );
+
+        for unsupported_policy in [
+            serde_json::json!({"levels": {"0": {"connIdle": 30}}}),
+            serde_json::json!({"system": {"statsInboundUplink": true}}),
+        ] {
+            let error = ConfigType::Str(
+                serde_json::json!({
+                    "inbounds": [],
+                    "outbounds": [],
+                    "policy": unsupported_policy
+                })
+                .to_string(),
+            )
+            .try_parse(Some(crate::ConfigFormat::Json))
+            .expect_err("unimplemented policy fields must fail closed");
+            assert!(error.to_string().contains("unknown field"), "{error}");
+        }
 
         let error = ConfigType::Str(
             serde_json::json!({

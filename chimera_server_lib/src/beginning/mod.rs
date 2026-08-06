@@ -715,7 +715,7 @@ where
     }
     let local_addr = connection_context.local_addr;
     let setup_server_stream_future = timeout(
-        Duration::from_secs(60),
+        runtime.policy_handshake_timeout(0),
         setup_server_stream(stream, server_handler, connection_context),
     );
     tracing::info!("prepare to setup server stream");

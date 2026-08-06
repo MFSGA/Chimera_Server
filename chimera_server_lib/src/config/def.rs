@@ -168,13 +168,8 @@ impl LiteralConfig {
         if let Some(dns) = self.dns.as_ref() {
             dns.validate_runtime_support()?;
         }
-        if self.policy.as_ref().is_some_and(|policy| {
-            !policy.levels.is_empty() || !policy.system.is_empty()
-        }) {
-            return Err(Error::InvalidConfig(
-                "Xray policy.levels/system are parsed but not implemented yet"
-                    .into(),
-            ));
+        if let Some(policy) = self.policy.as_ref() {
+            policy.validate_runtime_support()?;
         }
         Ok(self)
     }
@@ -488,13 +483,37 @@ pub struct HealthPingConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PolicyConfig {
     #[serde(default)]
-    pub levels: HashMap<String, Value>,
+    pub levels: HashMap<String, PolicyLevelConfig>,
     #[serde(default)]
-    pub system: HashMap<String, Value>,
+    pub system: Option<PolicySystemConfig>,
 }
+
+impl PolicyConfig {
+    fn validate_runtime_support(&self) -> Result<(), Error> {
+        for level in self.levels.keys() {
+            level.parse::<u32>().map_err(|error| {
+                Error::InvalidConfig(format!(
+                    "policy level {level:?} must be an unsigned integer: {error}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PolicyLevelConfig {
+    #[serde(default)]
+    pub handshake: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PolicySystemConfig {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

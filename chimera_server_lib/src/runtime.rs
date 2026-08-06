@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
+    time::Duration,
 };
 
 #[cfg(feature = "user_domain_access")]
@@ -14,7 +15,6 @@ use std::{
     io::{BufWriter, Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
 };
 #[cfg(feature = "user_domain_access")]
 use uuid::Uuid;
@@ -31,7 +31,7 @@ use crate::user_domain_access::{
     UserDomainAccessSignatureVerifier,
 };
 use crate::{
-    config::server_config::ServerConfig,
+    config::{def::PolicyConfig, server_config::ServerConfig},
     outbound_registry::{OutboundConnectorKind, OutboundRegistry},
     resolver::{NativeResolver, Resolver},
     routing_state::{
@@ -277,6 +277,13 @@ impl std::fmt::Debug for ResolverRuntimeState {
     }
 }
 
+const DEFAULT_POLICY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Default)]
+struct PolicyRuntimeState {
+    handshake_timeouts: HashMap<u32, Duration>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeState {
     inbounds: Arc<RwLock<Vec<ServerConfig>>>,
@@ -285,6 +292,7 @@ pub struct RuntimeState {
     routing: Arc<RwLock<RoutingState>>,
     balancer_overrides: Arc<RwLock<HashMap<String, String>>>,
     resolver: Arc<RwLock<ResolverRuntimeState>>,
+    policy: Arc<RwLock<PolicyRuntimeState>>,
     routing_events: broadcast::Sender<RoutingEvent>,
     #[cfg(feature = "user_domain_access")]
     user_domain_access: Arc<RwLock<UserDomainAccessRuntimeState>>,
@@ -309,6 +317,7 @@ impl RuntimeState {
             resolver: Arc::new(RwLock::new(ResolverRuntimeState {
                 resolver: Arc::new(NativeResolver::new()),
             })),
+            policy: Arc::new(RwLock::new(PolicyRuntimeState::default())),
             routing_events,
             #[cfg(feature = "user_domain_access")]
             user_domain_access: Arc::new(RwLock::new(
@@ -350,6 +359,41 @@ impl RuntimeState {
             .write()
             .expect("runtime resolver lock poisoned")
             .resolver = resolver;
+    }
+
+    pub fn configure_policy(
+        &self,
+        policy: Option<&PolicyConfig>,
+    ) -> Result<(), String> {
+        let mut handshake_timeouts = HashMap::new();
+        if let Some(policy) = policy {
+            for (raw_level, level_policy) in &policy.levels {
+                let level = raw_level.parse::<u32>().map_err(|error| {
+                    format!(
+                        "policy level {raw_level:?} must be an unsigned integer: {error}"
+                    )
+                })?;
+                if let Some(seconds) = level_policy.handshake {
+                    handshake_timeouts
+                        .insert(level, Duration::from_secs(u64::from(seconds)));
+                }
+            }
+        }
+        self.policy
+            .write()
+            .expect("runtime policy lock poisoned")
+            .handshake_timeouts = handshake_timeouts;
+        Ok(())
+    }
+
+    pub fn policy_handshake_timeout(&self, level: u32) -> Duration {
+        self.policy
+            .read()
+            .expect("runtime policy lock poisoned")
+            .handshake_timeouts
+            .get(&level)
+            .copied()
+            .unwrap_or(DEFAULT_POLICY_HANDSHAKE_TIMEOUT)
     }
 
     pub fn inbounds(&self) -> Vec<ServerConfig> {
