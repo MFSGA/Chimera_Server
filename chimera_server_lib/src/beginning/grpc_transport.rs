@@ -328,6 +328,7 @@ struct GrpcListenerConfig {
     accept_proxy_protocol: bool,
     tcp_keepalive: Option<(i32, i32)>,
     tcp_user_timeout_ms: Option<i32>,
+    tcp_congestion: Option<String>,
 }
 
 pub(super) async fn start_grpc_server(
@@ -347,6 +348,7 @@ pub(super) async fn start_grpc_server(
         accept_proxy_protocol,
         tcp_keepalive,
         tcp_user_timeout_ms,
+        tcp_congestion,
     } = parse_listener_protocol(protocol)?;
     let mut rules_stack = Vec::new();
     let server_handler: Arc<Box<dyn TcpServerHandler>> = Arc::new(
@@ -378,8 +380,15 @@ pub(super) async fn start_grpc_server(
             let resolver = resolver.clone();
             let runtime = runtime.clone();
             let security = security.clone();
+            let tcp_congestion = tcp_congestion.clone();
             tokio::spawn(async move {
                 let mut stream = stream;
+                if let Err(error) =
+                    configure_grpc_tcp_congestion(&stream, tcp_congestion.as_deref())
+                {
+                    debug!("gRPC TCP_CONGESTION setup failed: {error}");
+                    return;
+                }
                 if let Err(error) =
                     configure_grpc_tcp_user_timeout(&stream, tcp_user_timeout_ms)
                 {
@@ -470,6 +479,27 @@ pub(super) async fn start_grpc_server(
     Ok(vec![handle])
 }
 
+fn configure_grpc_tcp_congestion(
+    stream: &tokio::net::TcpStream,
+    algorithm: Option<&str>,
+) -> io::Result<()> {
+    let Some(algorithm) = algorithm else {
+        return Ok(());
+    };
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    {
+        crate::util::socket::configure_tcp_congestion(stream.as_raw_fd(), algorithm)
+    }
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    {
+        let _ = (stream, algorithm);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "tcpCongestion is currently supported only on Linux and Android",
+        ))
+    }
+}
+
 fn configure_grpc_tcp_user_timeout(
     stream: &tokio::net::TcpStream,
     timeout_ms: Option<i32>,
@@ -544,6 +574,11 @@ fn parse_listener_protocol(
     protocol: ServerProxyConfig,
 ) -> io::Result<GrpcListenerConfig> {
     match protocol {
+        ServerProxyConfig::TcpCongestion { algorithm, inner } => {
+            let mut config = parse_listener_protocol(*inner)?;
+            config.tcp_congestion = Some(algorithm);
+            Ok(config)
+        }
         ServerProxyConfig::TcpUserTimeout { timeout_ms, inner } => {
             let mut config = parse_listener_protocol(*inner)?;
             config.tcp_user_timeout_ms = Some(timeout_ms);
@@ -572,6 +607,7 @@ fn parse_listener_protocol(
                 accept_proxy_protocol: false,
                 tcp_keepalive: None,
                 tcp_user_timeout_ms: None,
+                tcp_congestion: None,
             })
         }
         #[cfg(feature = "tls")]
@@ -630,6 +666,7 @@ fn parse_listener_protocol(
                 accept_proxy_protocol: false,
                 tcp_keepalive: None,
                 tcp_user_timeout_ms: None,
+                tcp_congestion: None,
             })
         }
         #[cfg(feature = "reality")]
@@ -650,6 +687,7 @@ fn parse_listener_protocol(
                 accept_proxy_protocol: false,
                 tcp_keepalive: None,
                 tcp_user_timeout_ms: None,
+                tcp_congestion: None,
             })
         }
         other => Err(io::Error::new(
