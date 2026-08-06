@@ -299,6 +299,7 @@ pub(super) fn apply_security_layers(
                 | "grpc"
                 | "xhttp"
                 | "splithttp"
+                | "udp"
         )
     {
         return Err(Error::InvalidConfig(format!(
@@ -327,6 +328,7 @@ pub(super) fn apply_security_layers(
                 | "grpc"
                 | "xhttp"
                 | "splithttp"
+                | "udp"
         )
     {
         return Err(Error::InvalidConfig(format!(
@@ -356,6 +358,7 @@ pub(super) fn apply_security_layers(
                 | "grpc"
                 | "xhttp"
                 | "splithttp"
+                | "udp"
         )
     {
         return Err(Error::InvalidConfig(format!(
@@ -391,6 +394,7 @@ pub(super) fn apply_security_layers(
                 | "grpc"
                 | "xhttp"
                 | "splithttp"
+                | "udp"
         )
     {
         return Err(Error::InvalidConfig(format!(
@@ -625,6 +629,7 @@ pub(super) fn apply_security_layers(
                 | "grpc"
                 | "xhttp"
                 | "splithttp"
+                | "udp"
         )
     {
         return Err(Error::InvalidConfig(format!(

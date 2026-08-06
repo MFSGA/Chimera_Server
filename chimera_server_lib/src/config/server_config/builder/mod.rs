@@ -757,13 +757,14 @@ impl TryFrom<InboudItem> for ServerConfig {
                     settings.network.trim().to_ascii_lowercase()
                 }) {
                     Some(network) if network == "udp" => {
-                        if let Some(stream_setting) = stream_settings.as_ref()
-                            && stream_setting.security.as_deref().unwrap_or("none") != "none"
-                        {
-                            return Err(Error::InvalidConfig(
-                                "dokodemo-door udp transport does not support streamSettings.security"
-                                    .into(),
-                            ));
+                        if let Some(stream_setting) = stream_settings.as_ref() {
+                            if stream_setting.security.as_deref().unwrap_or("none") != "none" {
+                                return Err(Error::InvalidConfig(
+                                    "dokodemo-door udp transport does not support streamSettings.security"
+                                        .into(),
+                                ));
+                            }
+                            protocol = apply_security_layers(protocol, stream_setting)?;
                         }
                         Transport::Udp
                     }
@@ -3608,6 +3609,62 @@ mod tests {
             }
             other => panic!("expected dokodemo-door, got {other:?}"),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dokodemo_udp_builds_socket_option_wrappers() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "::1",
+            "port": 10000,
+            "protocol": "dokodemo-door",
+            "tag": "dokodemo-udp-sockopt",
+            "settings": {
+                "address": "127.0.0.1",
+                "port": 5353
+            },
+            "streamSettings": {
+                "network": "udp",
+                "sockopt": {
+                    "tproxy": "redirect",
+                    "interface": "lo",
+                    "mark": 255,
+                    "v6only": true,
+                    "customSockopt": [{
+                        "system": "linux",
+                        "network": "udp",
+                        "level": "1",
+                        "opt": "2",
+                        "value": "1",
+                        "type": "int"
+                    }]
+                }
+            }
+        }))
+        .expect("valid dokodemo UDP socket options");
+
+        let config = ServerConfig::try_from(inbound)
+            .expect("dokodemo UDP socket options should build");
+        assert_eq!(config.transport, Transport::Udp);
+        let ServerProxyConfig::TransparentSocket { inner } = config.protocol else {
+            panic!("tproxy must be the outer UDP listener option");
+        };
+        let ServerProxyConfig::BindInterface { name, inner } = *inner else {
+            panic!("interface must wrap the UDP listener");
+        };
+        assert_eq!(name, "lo");
+        let ServerProxyConfig::CustomSockopt { options, inner } = *inner else {
+            panic!("customSockopt must wrap the UDP listener");
+        };
+        assert_eq!(options.len(), 1);
+        let ServerProxyConfig::BindMark { value, inner } = *inner else {
+            panic!("mark must wrap the UDP listener");
+        };
+        assert_eq!(value, 255);
+        let ServerProxyConfig::Ipv6Only { inner } = *inner else {
+            panic!("v6only must wrap the UDP listener");
+        };
+        assert!(matches!(*inner, ServerProxyConfig::DokodemoDoor { .. }));
     }
 
     #[test]
