@@ -337,6 +337,7 @@ struct GrpcListenerConfig {
     bind_mark: Option<i32>,
     tcp_mptcp: bool,
     custom_sockopt: Vec<crate::config::CustomSockoptConfig>,
+    transparent: bool,
 }
 
 pub(super) async fn start_grpc_server(
@@ -365,6 +366,7 @@ pub(super) async fn start_grpc_server(
         bind_mark,
         tcp_mptcp,
         custom_sockopt,
+        transparent,
     } = parse_listener_protocol(protocol)?;
     let mut rules_stack = Vec::new();
     let server_handler: Arc<Box<dyn TcpServerHandler>> = Arc::new(
@@ -401,6 +403,10 @@ pub(super) async fn start_grpc_server(
         },
         &custom_sockopt,
     )?;
+    #[cfg(target_os = "linux")]
+    if transparent {
+        crate::util::socket::configure_ip_transparent(socket.as_raw_fd())?;
+    }
     socket.bind(listen_addr)?;
     let listener = socket.listen(1024)?;
     info!(
@@ -645,6 +651,11 @@ fn parse_listener_protocol(
     protocol: ServerProxyConfig,
 ) -> io::Result<GrpcListenerConfig> {
     match protocol {
+        ServerProxyConfig::TransparentSocket { inner } => {
+            let mut config = parse_listener_protocol(*inner)?;
+            config.transparent = true;
+            Ok(config)
+        }
         ServerProxyConfig::CustomSockopt { options, inner } => {
             let mut config = parse_listener_protocol(*inner)?;
             config.custom_sockopt = options;
@@ -727,6 +738,7 @@ fn parse_listener_protocol(
                 bind_mark: None,
                 tcp_mptcp: false,
                 custom_sockopt: Vec::new(),
+                transparent: false,
             })
         }
         #[cfg(feature = "tls")]
@@ -794,6 +806,7 @@ fn parse_listener_protocol(
                 bind_mark: None,
                 tcp_mptcp: false,
                 custom_sockopt: Vec::new(),
+                transparent: false,
             })
         }
         #[cfg(feature = "reality")]
@@ -823,6 +836,7 @@ fn parse_listener_protocol(
                 bind_mark: None,
                 tcp_mptcp: false,
                 custom_sockopt: Vec::new(),
+                transparent: false,
             })
         }
         other => Err(io::Error::new(
