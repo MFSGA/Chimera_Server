@@ -519,6 +519,8 @@ pub struct PolicyLevelConfig {
     pub stats_user_uplink: Option<bool>,
     #[serde(default, rename = "statsUserDownlink")]
     pub stats_user_downlink: Option<bool>,
+    #[serde(default, rename = "statsUserOnline")]
+    pub stats_user_online: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

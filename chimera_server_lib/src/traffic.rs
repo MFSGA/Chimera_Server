@@ -157,6 +157,7 @@ mod traffic_noop {
         pub user_level: u32,
         pub stats_user_uplink: Option<bool>,
         pub stats_user_downlink: Option<bool>,
+        pub stats_user_online: Option<bool>,
         pub stats_inbound_uplink: Option<bool>,
         pub stats_inbound_downlink: Option<bool>,
         pub stats_outbound_uplink: Option<bool>,
@@ -175,6 +176,7 @@ mod traffic_noop {
                 user_level: 0,
                 stats_user_uplink: None,
                 stats_user_downlink: None,
+                stats_user_online: None,
                 stats_inbound_uplink: None,
                 stats_inbound_downlink: None,
                 stats_outbound_uplink: None,
@@ -298,9 +300,11 @@ mod traffic_noop {
             &mut self,
             uplink: Option<bool>,
             downlink: Option<bool>,
+            online: Option<bool>,
         ) {
             self.stats_user_uplink = uplink;
             self.stats_user_downlink = downlink;
+            self.stats_user_online = online;
         }
 
         pub fn set_system_stats_policy(
@@ -329,6 +333,7 @@ mod traffic_noop {
                 user_level: 0,
                 stats_user_uplink: None,
                 stats_user_downlink: None,
+                stats_user_online: None,
                 stats_inbound_uplink: None,
                 stats_inbound_downlink: None,
                 stats_outbound_uplink: None,

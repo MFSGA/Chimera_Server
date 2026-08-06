@@ -977,7 +977,7 @@ mod tests {
                 "policy": {
                     "levels": {
                         "0": {"handshake": 4, "connIdle": 30, "uplinkOnly": 2, "downlinkOnly": 3},
-                        "7": {"connIdle": 9, "statsUserUplink": false, "statsUserDownlink": true}
+                        "7": {"connIdle": 9, "statsUserUplink": false, "statsUserDownlink": true, "statsUserOnline": false}
                     },
                     "system": {
                         "statsInboundUplink": false,
@@ -1028,6 +1028,7 @@ mod tests {
         let user_stats = runtime.runtime_state.policy_user_stats(7);
         assert_eq!(user_stats.uplink, Some(false));
         assert_eq!(user_stats.downlink, Some(true));
+        assert_eq!(user_stats.online, Some(false));
         assert_eq!(
             runtime.runtime_state.policy_user_stats(1),
             crate::runtime::PolicyUserStats::default()

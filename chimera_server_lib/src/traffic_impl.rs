@@ -21,6 +21,7 @@ pub struct TrafficContext {
     pub user_level: u32,
     pub stats_user_uplink: Option<bool>,
     pub stats_user_downlink: Option<bool>,
+    pub stats_user_online: Option<bool>,
     pub stats_inbound_uplink: Option<bool>,
     pub stats_inbound_downlink: Option<bool>,
     pub stats_outbound_uplink: Option<bool>,
@@ -39,6 +40,7 @@ impl TrafficContext {
             user_level: 0,
             stats_user_uplink: None,
             stats_user_downlink: None,
+            stats_user_online: None,
             stats_inbound_uplink: None,
             stats_inbound_downlink: None,
             stats_outbound_uplink: None,
@@ -162,9 +164,11 @@ impl TrafficContext {
         &mut self,
         uplink: Option<bool>,
         downlink: Option<bool>,
+        online: Option<bool>,
     ) {
         self.stats_user_uplink = uplink;
         self.stats_user_downlink = downlink;
+        self.stats_user_online = online;
     }
 
     pub fn set_system_stats_policy(
@@ -193,6 +197,7 @@ impl Default for TrafficContext {
             user_level: 0,
             stats_user_uplink: None,
             stats_user_downlink: None,
+            stats_user_online: None,
             stats_inbound_uplink: None,
             stats_inbound_downlink: None,
             stats_outbound_uplink: None,
@@ -354,6 +359,22 @@ struct ActiveConnection {
     started_at: SystemTime,
 }
 
+impl ActiveConnection {
+    fn from_context(context: &TrafficContext) -> Self {
+        let identity = if context.stats_user_online.unwrap_or(true) {
+            context.identity.clone()
+        } else {
+            None
+        };
+        Self {
+            inbound_tag: context.inbound_tag.clone(),
+            identity,
+            client_ip: context.client_ip,
+            started_at: SystemTime::now(),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct ActiveConnectionsInner {
     connections: HashMap<u64, ActiveConnection>,
@@ -434,12 +455,7 @@ pub fn register_connection(context: Option<&TrafficContext>) -> ConnectionGuard 
         }
     };
 
-    let entry = ActiveConnection {
-        inbound_tag: context.inbound_tag.clone(),
-        identity: context.identity.clone(),
-        client_ip: context.client_ip,
-        started_at: SystemTime::now(),
-    };
+    let entry = ActiveConnection::from_context(context);
 
     let id = ActiveConnections::global().insert(entry);
     ConnectionGuard { id: Some(id) }
@@ -455,7 +471,9 @@ pub fn active_connection_count() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{StatsInner, TrafficContext};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::{ActiveConnection, StatsInner, TrafficContext};
 
     #[test]
     fn user_stats_policy_filters_only_user_dimensions() {
@@ -463,7 +481,7 @@ mod tests {
         let mut context = TrafficContext::new("vless")
             .with_identity("alice")
             .with_inbound_tag("edge");
-        context.set_user_stats_policy(Some(false), Some(true));
+        context.set_user_stats_policy(Some(false), Some(true), None);
 
         stats.record(context, 100, 200);
 
@@ -494,7 +512,7 @@ mod tests {
         let mut context = TrafficContext::new("vmess")
             .with_identity("bob")
             .with_inbound_tag("edge");
-        context.set_user_stats_policy(Some(false), Some(false));
+        context.set_user_stats_policy(Some(false), Some(false), None);
 
         stats.record(context, 100, 200);
 
@@ -502,6 +520,27 @@ mod tests {
         assert!(stats.per_inbound_user.is_empty());
         assert_eq!(stats.per_protocol["vmess"].upload_bytes, 100);
         assert_eq!(stats.per_inbound["edge"].download_bytes, 200);
+    }
+
+    #[test]
+    fn online_stats_policy_hides_identity_but_preserves_connection_metadata() {
+        let mut context = TrafficContext::new("vless")
+            .with_identity("alice")
+            .with_inbound_tag("edge")
+            .with_client_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+        context.set_user_stats_policy(None, None, Some(false));
+
+        let hidden = ActiveConnection::from_context(&context);
+        assert_eq!(hidden.inbound_tag.as_deref(), Some("edge"));
+        assert_eq!(hidden.identity, None);
+        assert_eq!(
+            hidden.client_ip,
+            Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))
+        );
+
+        context.set_user_stats_policy(None, None, Some(true));
+        let visible = ActiveConnection::from_context(&context);
+        assert_eq!(visible.identity.as_deref(), Some("alice"));
     }
 
     #[test]

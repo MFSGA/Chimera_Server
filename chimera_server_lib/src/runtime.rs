@@ -283,6 +283,7 @@ const DEFAULT_POLICY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) struct PolicyUserStats {
     pub uplink: Option<bool>,
     pub downlink: Option<bool>,
+    pub online: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -430,12 +431,14 @@ impl RuntimeState {
                 }
                 if level_policy.stats_user_uplink.is_some()
                     || level_policy.stats_user_downlink.is_some()
+                    || level_policy.stats_user_online.is_some()
                 {
                     user_stats.insert(
                         level,
                         PolicyUserStats {
                             uplink: level_policy.stats_user_uplink,
                             downlink: level_policy.stats_user_downlink,
+                            online: level_policy.stats_user_online,
                         },
                     );
                 }
