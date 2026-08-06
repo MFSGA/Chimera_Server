@@ -2209,19 +2209,19 @@ impl XhttpClientConfig {
 
     fn generate_session_id(&self) -> String {
         let Some(length_range) = self.session_id_length else {
-            return uuid::Uuid::new_v4().to_string();
+            return random_uuid_v4_string();
         };
         let Some(table) = self.session_id_table.as_deref() else {
-            return uuid::Uuid::new_v4().to_string();
+            return random_uuid_v4_string();
         };
         let table = predefined_session_table(table).unwrap_or(table);
         if table.is_empty() {
-            return uuid::Uuid::new_v4().to_string();
+            return random_uuid_v4_string();
         }
         let bytes = table.as_bytes();
         let length = random_usize(length_range);
         if length == 0 {
-            return uuid::Uuid::new_v4().to_string();
+            return random_uuid_v4_string();
         }
         let mut id = String::with_capacity(length);
         let mut rng = rand::rng();
@@ -2230,6 +2230,23 @@ impl XhttpClientConfig {
         }
         id
     }
+}
+
+fn random_uuid_v4_string() -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut bytes = rand::rng().random::<[u8; 16]>();
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    let mut value = String::with_capacity(36);
+    for (index, byte) in bytes.into_iter().enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            value.push('-');
+        }
+        value.push(HEX[usize::from(byte >> 4)] as char);
+        value.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    value
 }
 
 fn parse_mode(
@@ -3708,6 +3725,23 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
+
+    #[test]
+    fn generated_session_uuid_is_rfc4122_v4() {
+        let value = random_uuid_v4_string();
+        assert_eq!(value.len(), 36);
+        assert_eq!(&value[8..9], "-");
+        assert_eq!(&value[13..14], "-");
+        assert_eq!(&value[18..19], "-");
+        assert_eq!(&value[23..24], "-");
+        assert_eq!(&value[14..15], "4");
+        assert!(matches!(&value[19..20], "8" | "9" | "a" | "b"));
+        assert!(
+            value
+                .chars()
+                .all(|character| character == '-' || character.is_ascii_hexdigit())
+        );
+    }
 
     struct TestAsyncStream(DuplexStream);
 

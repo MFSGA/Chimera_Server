@@ -210,6 +210,7 @@ pub async fn start_xhttp_server(
             let state = state.clone();
             let security = security.clone();
             tokio::spawn(async move {
+                #[cfg(feature = "reality")]
                 let reality_resolver = state.resolver.clone();
                 let stream: Box<dyn AsyncStream> = Box::new(stream);
                 let wrapped_stream: std::io::Result<Box<dyn AsyncStream>> =
