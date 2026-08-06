@@ -1136,6 +1136,7 @@ impl HandlerServiceImpl {
             } else {
                 user.email.clone()
             },
+            user_level: user.level,
             flow: account.flow,
         })
     }
@@ -6152,11 +6153,13 @@ mod tests {
                     VlessUser {
                         user_id: "5df5643d-4e28-4399-bb9e-22014a2d3246".to_string(),
                         user_label: "first-user@example.com".to_string(),
+                        user_level: 0,
                         flow: String::new(),
                     },
                     VlessUser {
                         user_id: "4571894c-7ece-4b27-a734-746330d1a984".to_string(),
                         user_label: "second-user@example.com".to_string(),
+                        user_level: 0,
                         flow: "xtls-rprx-vision".to_string(),
                     },
                 ],

@@ -58,8 +58,17 @@ pub use vision::{VisionVlessTcpHandler, setup_reality_mixed_vless_server_stream}
 const SERVER_RESPONSE_HEADER: &[u8] = &[0u8, 0u8];
 
 #[derive(Debug)]
+struct ParsedVlessUser {
+    user_id: Box<[u8]>,
+    user_label: String,
+    flow: String,
+    user_uuid: String,
+    user_level: u32,
+}
+
+#[derive(Debug)]
 pub struct VlessTcpHandler {
-    users: Vec<(Box<[u8]>, String, String, String)>,
+    users: Vec<ParsedVlessUser>,
     fallbacks: Vec<VlessFallback>,
     inbound_tag: String,
 }
@@ -77,13 +86,12 @@ impl VlessTcpHandler {
         Self {
             users: users
                 .iter()
-                .map(|user| {
-                    (
-                        parse_hex(&user.user_id),
-                        user.user_label.clone(),
-                        user.flow.clone(),
-                        user.user_id.clone(),
-                    )
+                .map(|user| ParsedVlessUser {
+                    user_id: parse_hex(&user.user_id),
+                    user_label: user.user_label.clone(),
+                    flow: user.flow.clone(),
+                    user_uuid: user.user_id.clone(),
+                    user_level: user.user_level,
                 })
                 .collect(),
             fallbacks: fallbacks.to_vec(),
@@ -108,9 +116,9 @@ impl VlessTcpHandler {
             let (mut prefix, candidate) =
                 read_vless_auth_prefix(&mut server_stream).await;
             let authenticated = candidate.is_some_and(|candidate| {
-                self.users.iter().any(|(stored_user_id, _, _, _)| {
-                    stored_user_id.len() == 16
-                        && stored_user_id.as_ref() == candidate.as_slice()
+                self.users.iter().any(|user| {
+                    user.user_id.len() == 16
+                        && user.user_id.as_ref() == candidate.as_slice()
                 })
             });
             if !authenticated {
@@ -147,16 +155,15 @@ impl VlessTcpHandler {
             command,
             remote_location,
         } = read_request_header(&mut server_stream).await?;
-        let matched_user = self.users.iter().find(|(stored_user_id, _, _, _)| {
-            stored_user_id.len() == 16
-                && stored_user_id.as_ref() == user_id.as_slice()
+        let matched_user = self.users.iter().find(|user| {
+            user.user_id.len() == 16 && user.user_id.as_ref() == user_id.as_slice()
         });
 
-        let Some((_, user_label, configured_flow, user_uuid)) = matched_user else {
+        let Some(matched_user) = matched_user else {
             let expected = self
                 .users
                 .iter()
-                .map(|(user_id, _, _, _)| encode_hex(user_id.as_ref()))
+                .map(|user| encode_hex(user.user_id.as_ref()))
                 .collect::<Vec<_>>()
                 .join(",");
             let got = encode_hex(&user_id);
@@ -173,7 +180,7 @@ impl VlessTcpHandler {
             ));
         };
 
-        validate_request_flow(configured_flow, &request_flow, command)?;
+        validate_request_flow(&matched_user.flow, &request_flow, command)?;
 
         let access_transport = if command == COMMAND_TCP {
             AccessTransport::Tcp
@@ -182,8 +189,9 @@ impl VlessTcpHandler {
         };
         let traffic_context = Some(
             TrafficContext::new("vless")
-                .with_identity(user_label.clone())
-                .with_protocol_identity(user_uuid.clone())
+                .with_identity(matched_user.user_label.clone())
+                .with_protocol_identity(matched_user.user_uuid.clone())
+                .with_user_level(matched_user.user_level)
                 .with_access_target(
                     remote_location.address().to_string(),
                     remote_location.port(),
@@ -502,10 +510,19 @@ mod tests {
     impl AsyncStream for TestStream {}
 
     fn plain_vless_handler(user_id: &str, user_label: &str) -> VlessTcpHandler {
+        plain_vless_handler_with_level(user_id, user_label, 0)
+    }
+
+    fn plain_vless_handler_with_level(
+        user_id: &str,
+        user_label: &str,
+        user_level: u32,
+    ) -> VlessTcpHandler {
         VlessTcpHandler::new(
             &[VlessUser {
                 user_id: user_id.into(),
                 user_label: user_label.into(),
+                user_level,
                 flow: String::new(),
             }],
             "vless-test",
@@ -517,6 +534,7 @@ mod tests {
             &[VlessUser {
                 user_id: user_id.into(),
                 user_label: "fallback-user".into(),
+                user_level: 0,
                 flow: String::new(),
             }],
             &[VlessFallback {
@@ -549,7 +567,7 @@ mod tests {
     #[tokio::test]
     async fn tcp_request_returns_success_response_and_traffic_context() {
         let user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
-        let handler = plain_vless_handler(user_id, "vless-tcp-user");
+        let handler = plain_vless_handler_with_level(user_id, "vless-tcp-user", 7);
         let request = build_plain_vless_request(user_id, COMMAND_TCP);
         let (mut client, server) = duplex(1024);
         client
@@ -583,6 +601,7 @@ mod tests {
         );
         let context = traffic_context.expect("VLESS TCP context must exist");
         assert_eq!(context.identity.as_deref(), Some("vless-tcp-user"));
+        assert_eq!(context.user_level, 7);
         assert_eq!(context.protocol_identity(), Some(user_id));
         assert!(context.user_uuid().is_none());
         let access = context.access_context().expect("access context must exist");
@@ -719,6 +738,7 @@ mod tests {
             &[VlessUser {
                 user_id: user_id.into(),
                 user_label: "vless-udp-user".into(),
+                user_level: 0,
                 flow: String::new(),
             }],
             "vless-udp",
@@ -806,6 +826,7 @@ mod tests {
             &[VlessUser {
                 user_id: user_id.into(),
                 user_label: "vless-runtime-user".into(),
+                user_level: 0,
                 flow: String::new(),
             }],
             "vless-runtime-udp",
@@ -865,6 +886,7 @@ mod tests {
             &[VlessUser {
                 user_id: user_id.into(),
                 user_label: "fragmented-xudp-user".into(),
+                user_level: 0,
                 flow: String::new(),
             }],
             "vless-fragmented-xudp",
@@ -972,6 +994,7 @@ mod tests {
             &[VlessUser {
                 user_id: user_id.into(),
                 user_label: "vless-xudp-user".into(),
+                user_level: 0,
                 flow: String::new(),
             }],
             "vless-xudp",

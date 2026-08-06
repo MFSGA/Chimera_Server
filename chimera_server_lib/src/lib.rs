@@ -974,7 +974,10 @@ mod tests {
             serde_json::json!({
                 "inbounds": [],
                 "outbounds": [],
-                "policy": {"levels": {"0": {"handshake": 4, "connIdle": 30, "uplinkOnly": 2, "downlinkOnly": 3}}}
+                "policy": {"levels": {
+                    "0": {"handshake": 4, "connIdle": 30, "uplinkOnly": 2, "downlinkOnly": 3},
+                    "7": {"connIdle": 9}
+                }}
             })
             .to_string(),
         )
@@ -1006,6 +1009,13 @@ mod tests {
         assert_eq!(
             relay_timeouts.downlink_only,
             Some(std::time::Duration::from_secs(3))
+        );
+        assert_eq!(
+            runtime
+                .runtime_state
+                .policy_relay_timeouts(7)
+                .connection_idle,
+            Some(std::time::Duration::from_secs(9))
         );
 
         for unsupported_policy in [

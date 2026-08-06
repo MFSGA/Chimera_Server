@@ -801,6 +801,9 @@ where
                 }
             }
 
+            let user_level = traffic_context
+                .as_ref()
+                .map_or(0, |context| context.user_level);
             let user = traffic_context
                 .as_ref()
                 .and_then(TrafficContext::routing_identity)
@@ -868,7 +871,7 @@ where
                 server_stream.write_all(&data).await?;
             }
 
-            let relay_timeouts = runtime.policy_relay_timeouts(0);
+            let relay_timeouts = runtime.policy_relay_timeouts(user_level);
             let copy_result = if relay_timeouts.is_empty() {
                 tcp_relay::copy_bidirectional(&mut server_stream, &mut client_stream)
                     .await

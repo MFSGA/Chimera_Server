@@ -201,6 +201,8 @@ pub struct VlessUser {
     pub user_id: String,
     pub user_label: String,
     #[serde(default)]
+    pub user_level: u32,
+    #[serde(default)]
     pub flow: String,
 }
 

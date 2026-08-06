@@ -922,6 +922,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                                     } else {
                                         client.email
                                     },
+                                    user_level: client.level,
                                     flow,
                                 })
                             })

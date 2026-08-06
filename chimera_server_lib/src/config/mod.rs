@@ -253,6 +253,8 @@ pub struct ClientSetting {
     flow: String,
     id: String,
     #[serde(default)]
+    level: u32,
+    #[serde(default)]
     security: Option<String>,
 }
 
