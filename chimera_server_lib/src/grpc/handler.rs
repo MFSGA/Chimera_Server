@@ -3301,6 +3301,8 @@ impl HandlerServiceImpl {
                     .find(|existing| existing.user_label == user.user_label)
                 {
                     existing.user_id = user.user_id;
+                    existing.user_level = user.user_level;
+                    existing.flow = user.flow;
                 } else {
                     users.push(user);
                 }
@@ -3633,7 +3635,7 @@ impl HandlerServiceImpl {
                 users
                     .iter()
                     .map(|user| proto::xray::common::protocol::User {
-                        level: 0,
+                        level: user.user_level,
                         email: user.user_label.clone(),
                         account: Some(proto::xray::common::serial::TypedMessage {
                             r#type: TYPE_PROXY_VLESS_ACCOUNT.to_string(),
@@ -6157,13 +6159,13 @@ mod tests {
                     VlessUser {
                         user_id: "5df5643d-4e28-4399-bb9e-22014a2d3246".to_string(),
                         user_label: "first-user@example.com".to_string(),
-                        user_level: 0,
+                        user_level: 3,
                         flow: String::new(),
                     },
                     VlessUser {
                         user_id: "4571894c-7ece-4b27-a734-746330d1a984".to_string(),
                         user_label: "second-user@example.com".to_string(),
-                        user_level: 0,
+                        user_level: 7,
                         flow: "xtls-rprx-vision".to_string(),
                     },
                 ],
@@ -6192,27 +6194,23 @@ mod tests {
                     VlessAccountPayload::decode(account.value.as_slice())
                         .expect("decode vless account from initial users")
                 });
-                (user.email, account)
+                (user.email, user.level, account)
             })
             .collect::<Vec<_>>();
         assert_eq!(initial_users.len(), 2);
-        assert!(
-            initial_users
-                .iter()
-                .any(|(email, _)| email == "first-user@example.com")
-        );
-        assert!(
-            initial_users
-                .iter()
-                .any(|(email, _)| email == "second-user@example.com")
-        );
-        assert!(initial_users.iter().any(|(email, account)| {
+        assert!(initial_users.iter().any(|(email, level, _)| {
+            email == "first-user@example.com" && *level == 3
+        }));
+        assert!(initial_users.iter().any(|(email, level, _)| {
+            email == "second-user@example.com" && *level == 7
+        }));
+        assert!(initial_users.iter().any(|(email, _, account)| {
             email == "first-user@example.com"
                 && account
                     .as_ref()
                     .is_some_and(|account| account.flow.is_empty())
         }));
-        assert!(initial_users.iter().any(|(email, account)| {
+        assert!(initial_users.iter().any(|(email, _, account)| {
             email == "second-user@example.com"
                 && account
                     .as_ref()
@@ -6234,7 +6232,7 @@ mod tests {
         let email = unique_tag("vless-user");
         let add_operation = proto::xray::app::proxyman::command::AddUserOperation {
             user: Some(proto::xray::common::protocol::User {
-                level: 0,
+                level: 9,
                 email: email.clone(),
                 account: Some(proto::xray::common::serial::TypedMessage {
                     r#type: TYPE_PROXY_VLESS_ACCOUNT.to_string(),
@@ -6282,6 +6280,7 @@ mod tests {
             .account
             .as_ref()
             .expect("returned vless user should include account");
+        assert_eq!(added_user.level, 9);
         assert_eq!(account.r#type, TYPE_PROXY_VLESS_ACCOUNT);
 
         let count_after_add = service
