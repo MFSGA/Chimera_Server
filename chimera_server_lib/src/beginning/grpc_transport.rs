@@ -329,6 +329,7 @@ struct GrpcListenerConfig {
     tcp_keepalive: Option<(i32, i32)>,
     tcp_user_timeout_ms: Option<i32>,
     tcp_congestion: Option<String>,
+    tcp_window_clamp: Option<i32>,
 }
 
 pub(super) async fn start_grpc_server(
@@ -349,6 +350,7 @@ pub(super) async fn start_grpc_server(
         tcp_keepalive,
         tcp_user_timeout_ms,
         tcp_congestion,
+        tcp_window_clamp,
     } = parse_listener_protocol(protocol)?;
     let mut rules_stack = Vec::new();
     let server_handler: Arc<Box<dyn TcpServerHandler>> = Arc::new(
@@ -387,6 +389,12 @@ pub(super) async fn start_grpc_server(
                     configure_grpc_tcp_congestion(&stream, tcp_congestion.as_deref())
                 {
                     debug!("gRPC TCP_CONGESTION setup failed: {error}");
+                    return;
+                }
+                if let Err(error) =
+                    configure_grpc_tcp_window_clamp(&stream, tcp_window_clamp)
+                {
+                    debug!("gRPC TCP_WINDOW_CLAMP setup failed: {error}");
                     return;
                 }
                 if let Err(error) =
@@ -500,6 +508,27 @@ fn configure_grpc_tcp_congestion(
     }
 }
 
+fn configure_grpc_tcp_window_clamp(
+    stream: &tokio::net::TcpStream,
+    value: Option<i32>,
+) -> io::Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    {
+        crate::util::socket::configure_tcp_window_clamp(stream.as_raw_fd(), value)
+    }
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    {
+        let _ = (stream, value);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "tcpWindowClamp is currently supported only on Linux and Android",
+        ))
+    }
+}
+
 fn configure_grpc_tcp_user_timeout(
     stream: &tokio::net::TcpStream,
     timeout_ms: Option<i32>,
@@ -579,6 +608,11 @@ fn parse_listener_protocol(
             config.tcp_congestion = Some(algorithm);
             Ok(config)
         }
+        ServerProxyConfig::TcpWindowClamp { value, inner } => {
+            let mut config = parse_listener_protocol(*inner)?;
+            config.tcp_window_clamp = Some(value);
+            Ok(config)
+        }
         ServerProxyConfig::TcpUserTimeout { timeout_ms, inner } => {
             let mut config = parse_listener_protocol(*inner)?;
             config.tcp_user_timeout_ms = Some(timeout_ms);
@@ -608,6 +642,7 @@ fn parse_listener_protocol(
                 tcp_keepalive: None,
                 tcp_user_timeout_ms: None,
                 tcp_congestion: None,
+                tcp_window_clamp: None,
             })
         }
         #[cfg(feature = "tls")]
@@ -667,6 +702,7 @@ fn parse_listener_protocol(
                 tcp_keepalive: None,
                 tcp_user_timeout_ms: None,
                 tcp_congestion: None,
+                tcp_window_clamp: None,
             })
         }
         #[cfg(feature = "reality")]
@@ -688,6 +724,7 @@ fn parse_listener_protocol(
                 tcp_keepalive: None,
                 tcp_user_timeout_ms: None,
                 tcp_congestion: None,
+                tcp_window_clamp: None,
             })
         }
         other => Err(io::Error::new(

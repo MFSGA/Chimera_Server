@@ -360,7 +360,7 @@ pub(super) fn apply_security_layers(
     if configure_window_clamp
         && !matches!(
             network.as_str(),
-            "" | "raw" | "tcp" | "ws" | "websocket" | "httpupgrade"
+            "" | "raw" | "tcp" | "ws" | "websocket" | "httpupgrade" | "grpc"
         )
     {
         return Err(Error::InvalidConfig(format!(
