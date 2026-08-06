@@ -1845,6 +1845,7 @@ mod tests {
                 method: "aes-128-gcm".into(),
                 password: password.into(),
                 email: "association-test".into(),
+                user_level: 0,
             }],
             None,
         )

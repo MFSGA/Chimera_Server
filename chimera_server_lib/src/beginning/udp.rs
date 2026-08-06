@@ -2034,6 +2034,7 @@ async fn relay_shadowsocks_udp_packet(
     )
     .await?;
     let mut traffic_context = TrafficContext::new("shadowsocks")
+        .with_user_level(request.user_level)
         .with_inbound_tag(context.inbound_tag.clone())
         .with_client_ip(client_addr.ip());
     if !request.identity.is_empty() {

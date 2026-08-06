@@ -537,17 +537,13 @@ fn collect_shadowsocks_users(
                     method: identity.method.clone(),
                     password: identity.password.clone(),
                     email: String::new(),
+                    user_level: 0,
                 },
             )
             .map_err(|error| Error::InvalidConfig(error.to_string()))?;
             let users = accounts
                 .into_iter()
                 .map(|user| {
-                    if user.level != 0 {
-                        return Err(Error::InvalidConfig(
-                            "shadowsocks user level is not supported yet".into(),
-                        ));
-                    }
                     if !user.method.trim().is_empty() {
                         return Err(Error::InvalidConfig(
                             "Shadowsocks 2022 EIH users must omit method".into(),
@@ -557,6 +553,7 @@ fn collect_shadowsocks_users(
                         method: raw.method.clone(),
                         password: user.password,
                         email: user.email,
+                        user_level: user.level,
                     })
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
@@ -565,31 +562,23 @@ fn collect_shadowsocks_users(
             let users = accounts
                 .into_iter()
                 .map(|user| {
-                    if user.level != 0 {
-                        return Err(Error::InvalidConfig(
-                            "shadowsocks user level is not supported yet".into(),
-                        ));
-                    }
                     Ok(crate::config::server_config::ShadowsocksUser {
                         method: user.method,
                         password: user.password,
                         email: user.email,
+                        user_level: user.level,
                     })
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
             (users, None)
         }
     } else {
-        if raw.level != 0 {
-            return Err(Error::InvalidConfig(
-                "shadowsocks settings.level is not supported yet".into(),
-            ));
-        }
         (
             vec![crate::config::server_config::ShadowsocksUser {
                 method: raw.method,
                 password: raw.password,
                 email: raw.email,
+                user_level: raw.level,
             }],
             None,
         )
@@ -1586,6 +1575,7 @@ mod tests {
                 "method": "aes-128-gcm",
                 "password": "secret",
                 "email": "ss@example.test",
+                "level": 3,
                 "network": "tcp"
             }
         }))
@@ -1599,6 +1589,7 @@ mod tests {
                 assert_eq!(users[0].method, "aes-128-gcm");
                 assert_eq!(users[0].password, "secret");
                 assert_eq!(users[0].email, "ss@example.test");
+                assert_eq!(users[0].user_level, 3);
             }
             other => panic!("expected shadowsocks protocol, got {other:?}"),
         }
@@ -1616,11 +1607,13 @@ mod tests {
                 "clients": [{
                     "method": "aes-128-gcm",
                     "password": "secret-a",
-                    "email": "a@example.test"
+                    "email": "a@example.test",
+                    "level": 3
                 }, {
                     "method": "chacha20-ietf-poly1305",
                     "password": "secret-b",
-                    "email": "b@example.test"
+                    "email": "b@example.test",
+                    "level": 7
                 }],
                 "network": "tcp,udp"
             }
@@ -1633,7 +1626,9 @@ mod tests {
                 assert!(identity.is_none());
                 assert_eq!(users.len(), 2);
                 assert_eq!(users[0].email, "a@example.test");
+                assert_eq!(users[0].user_level, 3);
                 assert_eq!(users[1].email, "b@example.test");
+                assert_eq!(users[1].user_level, 7);
             }
             other => panic!("expected shadowsocks protocol, got {other:?}"),
         }
@@ -1653,10 +1648,12 @@ mod tests {
                 "password": "AAECAwQFBgcICQoLDA0ODw==",
                 "clients": [{
                     "password": "EBESExQVFhcYGRobHB0eHw==",
-                    "email": "user-a@example.test"
+                    "email": "user-a@example.test",
+                    "level": 5
                 }, {
                     "password": "ICEiIyQlJicoKSorLC0uLw==",
-                    "email": "user-b@example.test"
+                    "email": "user-b@example.test",
+                    "level": 9
                 }],
                 "network": "tcp,udp"
             }
@@ -1669,7 +1666,9 @@ mod tests {
                 assert_eq!(users.len(), 2);
                 assert_eq!(users[0].method, "2022-blake3-aes-128-gcm");
                 assert_eq!(users[0].email, "user-a@example.test");
+                assert_eq!(users[0].user_level, 5);
                 assert_eq!(users[1].email, "user-b@example.test");
+                assert_eq!(users[1].user_level, 9);
                 let identity = identity.expect("server EIH identity");
                 assert_eq!(identity.method, "2022-blake3-aes-128-gcm");
                 assert_eq!(identity.password, "AAECAwQFBgcICQoLDA0ODw==");

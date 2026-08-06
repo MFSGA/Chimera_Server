@@ -128,6 +128,7 @@ async fn shadowsocks_udp_outbound_roundtrips_over_stream_and_datagram() {
                 method: "aes-128-gcm".into(),
                 password: TEST_SHADOWSOCKS_PASSWORD.into(),
                 email: "tuic-shadowsocks@example.com".into(),
+                user_level: 0,
             }],
             None,
         )

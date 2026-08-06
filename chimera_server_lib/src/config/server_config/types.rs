@@ -102,6 +102,8 @@ pub struct ShadowsocksUser {
     pub password: String,
     #[serde(default)]
     pub email: String,
+    #[serde(default)]
+    pub user_level: u32,
 }
 
 #[cfg(feature = "shadowsocks")]

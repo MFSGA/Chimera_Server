@@ -224,6 +224,7 @@ fn parse_identity_key(
         method: identity.method,
         password: identity.password,
         email: String::new(),
+        user_level: 0,
     };
     let (cipher, key) = parse_user_key(&user)?;
     let ShadowsocksKeyMaterial::Aead2022(psk) = key else {
@@ -333,6 +334,7 @@ pub(crate) struct ShadowsocksUdpRequest {
     pub target_location: NetLocation,
     pub payload: Vec<u8>,
     pub identity: String,
+    pub user_level: u32,
     user_index: usize,
     client_session_id: Option<[u8; 8]>,
 }
@@ -342,6 +344,7 @@ struct ShadowsocksUdpUserCodec {
     cipher: ShadowsocksCipher,
     mode: ShadowsocksUdpMode,
     identity: String,
+    user_level: u32,
 }
 
 impl ShadowsocksUdpUserCodec {
@@ -394,6 +397,7 @@ impl ShadowsocksUdpUserCodec {
             cipher,
             mode,
             identity: user.email,
+            user_level: user.user_level,
         })
     }
 
@@ -516,6 +520,7 @@ impl ShadowsocksUdpUserCodec {
             target_location,
             payload: plaintext[offset..].to_vec(),
             identity: String::new(),
+            user_level: 0,
             user_index: 0,
             client_session_id: None,
         })
@@ -627,6 +632,7 @@ impl ShadowsocksUdpUserCodec {
             target_location,
             payload: body[payload_offset..].to_vec(),
             identity: String::new(),
+            user_level: 0,
             user_index: 0,
             client_session_id: Some(client_session_id),
         })
@@ -742,6 +748,7 @@ impl ShadowsocksUdpUserCodec {
             target_location,
             payload: body[payload_offset..].to_vec(),
             identity: String::new(),
+            user_level: 0,
             user_index: 0,
             client_session_id: Some(client_session_id),
         })
@@ -874,6 +881,7 @@ impl ShadowsocksUdpCodec {
                 Ok(mut request) => {
                     request.user_index = user_index;
                     request.identity = user.identity.clone();
+                    request.user_level = user.user_level;
                     return Ok(request);
                 }
                 Err(error) => last_error = Some(error),
@@ -932,6 +940,7 @@ impl ShadowsocksUdpCodec {
         let mut request = user.decrypt_packet(&rewritten)?;
         request.user_index = user_index;
         request.identity = user.identity.clone();
+        request.user_level = user.user_level;
         Ok(request)
     }
 
@@ -957,6 +966,7 @@ struct ShadowsocksServerUser {
     key: ShadowsocksKeyMaterial,
     salt_checker: Arc<Mutex<TimedSaltChecker>>,
     identity: String,
+    user_level: u32,
 }
 
 impl ShadowsocksServerUser {
@@ -996,6 +1006,7 @@ impl ShadowsocksTcpServerHandler {
                     key,
                     salt_checker: Arc::new(Mutex::new(TimedSaltChecker::default())),
                     identity: user.email,
+                    user_level: user.user_level,
                 })
             })
             .collect::<io::Result<Vec<_>>>()?;
@@ -1120,10 +1131,12 @@ impl TcpServerHandler for ShadowsocksTcpServerHandler {
         }
         let traffic_context = Some(if user.identity.is_empty() {
             TrafficContext::new("shadowsocks")
+                .with_user_level(user.user_level)
                 .with_inbound_tag(self.inbound_tag.clone())
         } else {
             TrafficContext::new("shadowsocks")
                 .with_identity(user.identity.clone())
+                .with_user_level(user.user_level)
                 .with_inbound_tag(self.inbound_tag.clone())
         });
         Ok(TcpServerSetupResult::TcpForward {
@@ -2070,6 +2083,7 @@ mod tests {
                 method: method.to_string(),
                 password,
                 email: "udp-client-test@example.com".into(),
+                user_level: 7,
             };
             let client = ShadowsocksUdpCodec::new(vec![user.clone()], None).unwrap();
             let server = ShadowsocksUdpCodec::new(vec![user], None).unwrap();
@@ -2081,6 +2095,7 @@ mod tests {
             let request = server.decrypt_packet(&request_packet).unwrap();
             assert_eq!(request.target_location, target);
             assert_eq!(request.payload, b"udp-request");
+            assert_eq!(request.user_level, 7);
             let replay = server
                 .decrypt_packet(&request_packet)
                 .expect_err("replayed UDP salt must be rejected");
@@ -2116,6 +2131,7 @@ mod tests {
                     method: method.to_string(),
                     password: password.clone(),
                     email: "cipher-test@example.com".into(),
+                    user_level: 7,
                 }],
                 None,
                 "shadowsocks-test",
@@ -2128,12 +2144,19 @@ mod tests {
                 let TcpServerSetupResult::TcpForward {
                     remote_location,
                     mut stream,
+                    traffic_context,
                     ..
                 } = result
                 else {
                     panic!("expected Shadowsocks TCP forwarding result");
                 };
                 assert_eq!(remote_location, expected_target);
+                assert_eq!(
+                    traffic_context
+                        .expect("Shadowsocks traffic context")
+                        .user_level,
+                    7
+                );
                 let mut request = vec![0u8; 32 * 1024];
                 stream.read_exact(&mut request).await.unwrap();
                 assert!(

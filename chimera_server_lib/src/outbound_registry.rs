@@ -652,6 +652,7 @@ fn compile_shadowsocks_tcp(
             method: cipher.name().to_string(),
             password: password.clone(),
             email: String::new(),
+            user_level: 0,
         }],
         None,
     )
