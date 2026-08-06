@@ -1715,6 +1715,69 @@ mod tests {
         assert!(matches!(*inner, ServerProxyConfig::Grpc(_)));
     }
 
+    #[cfg(all(feature = "vless", any(target_os = "android", target_os = "linux")))]
+    #[test]
+    fn socket_tcp_max_seg_wraps_dedicated_xhttp_listener() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-xhttp-max-seg",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "xhttp",
+                "xhttpSettings": {"path": "/proxy"},
+                "sockopt": {"tcpMaxSeg": 1200}
+            }
+        }))
+        .unwrap();
+        let config = ServerConfig::try_from(inbound).unwrap();
+        let ServerProxyConfig::TcpMaxSeg { value, inner } = config.protocol else {
+            panic!("TCP_MAXSEG must wrap the XHTTP listener");
+        };
+        assert_eq!(value, 1200);
+        assert!(matches!(*inner, ServerProxyConfig::Xhttp { .. }));
+    }
+
+    #[cfg(all(
+        feature = "vless",
+        feature = "tls",
+        any(target_os = "android", target_os = "linux")
+    ))]
+    #[test]
+    fn socket_tcp_max_seg_rejects_xhttp_http3() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-xhttp-h3-max-seg",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "xhttp",
+                "security": "tls",
+                "xhttpSettings": {"path": "/proxy"},
+                "sockopt": {"tcpMaxSeg": 1200},
+                "tlsSettings": {
+                    "alpn": ["h3"],
+                    "certificates": [{
+                        "certificate": ["-----BEGIN CERTIFICATE-----","MIIB","-----END CERTIFICATE-----"],
+                        "key": ["-----BEGIN PRIVATE KEY-----","MIIB","-----END PRIVATE KEY-----"]
+                    }]
+                }
+            }
+        }))
+        .unwrap();
+        let error = ServerConfig::try_from(inbound).unwrap_err();
+        assert!(error.to_string().contains("HTTP/3"));
+        assert!(error.to_string().contains("tcpMaxSeg"));
+    }
+
     #[cfg(all(feature = "vless", feature = "grpc_transport"))]
     #[test]
     fn socket_tcp_window_clamp_wraps_dedicated_grpc_listener() {

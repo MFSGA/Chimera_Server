@@ -184,6 +184,7 @@ pub async fn start_xhttp_server(
         tcp_user_timeout_ms,
         tcp_congestion,
         tcp_window_clamp,
+        tcp_max_seg,
     } = parse_listener_protocol(protocol)?;
 
     let bind_addr = match bind_location {
@@ -205,7 +206,12 @@ pub async fn start_xhttp_server(
         return start_xhttp3_server(bind_addr, tls_config.clone(), state).await;
     }
 
-    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    let socket = crate::util::socket::new_tcp_socket(None, bind_addr.is_ipv6())?;
+    if let Some(value) = tcp_max_seg {
+        crate::handler::tcp_max_seg::configure_listener(&socket, value)?;
+    }
+    socket.bind(bind_addr)?;
+    let listener = socket.listen(1024)?;
     let security = security.clone();
 
     let handle = tokio::spawn(async move {
@@ -456,6 +462,7 @@ struct XhttpListenerConfig {
     tcp_user_timeout_ms: Option<i32>,
     tcp_congestion: Option<String>,
     tcp_window_clamp: Option<i32>,
+    tcp_max_seg: Option<i32>,
 }
 
 #[derive(Clone)]
@@ -585,6 +592,18 @@ fn parse_listener_protocol(
     protocol: ServerProxyConfig,
 ) -> std::io::Result<XhttpListenerConfig> {
     match protocol {
+        ServerProxyConfig::TcpMaxSeg { value, inner } => {
+            let mut config = parse_listener_protocol(*inner)?;
+            #[cfg(feature = "tls")]
+            if matches!(&config.security, XhttpSecurityLayer::Http3(_)) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "XHTTP HTTP/3 does not support tcpMaxSeg",
+                ));
+            }
+            config.tcp_max_seg = Some(value);
+            Ok(config)
+        }
         ServerProxyConfig::TcpCongestion { algorithm, inner } => {
             let mut config = parse_listener_protocol(*inner)?;
             #[cfg(feature = "tls")]
@@ -658,6 +677,7 @@ fn parse_listener_protocol(
             tcp_user_timeout_ms: None,
             tcp_congestion: None,
             tcp_window_clamp: None,
+            tcp_max_seg: None,
         }),
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(TlsServerConfig {
@@ -722,6 +742,7 @@ fn parse_listener_protocol(
                     tcp_user_timeout_ms: None,
                     tcp_congestion: None,
                     tcp_window_clamp: None,
+                    tcp_max_seg: None,
                 })
             }
             _ => Err(std::io::Error::other(
@@ -741,6 +762,7 @@ fn parse_listener_protocol(
                         tcp_user_timeout_ms: None,
                         tcp_congestion: None,
                         tcp_window_clamp: None,
+                        tcp_max_seg: None,
                     })
                 }
                 _ => Err(std::io::Error::other(
