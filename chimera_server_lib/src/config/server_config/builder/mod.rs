@@ -1713,7 +1713,7 @@ mod tests {
 
     #[cfg(all(feature = "vless", feature = "grpc_transport"))]
     #[test]
-    fn socket_v6only_rejects_dedicated_grpc_listener() {
+    fn socket_v6only_wraps_dedicated_grpc_listener() {
         let inbound: InboudItem = serde_json::from_value(serde_json::json!({
             "listen": "::",
             "port": 443,
@@ -1730,9 +1730,11 @@ mod tests {
             }
         }))
         .unwrap();
-        let error = ServerConfig::try_from(inbound).unwrap_err();
-        assert!(error.to_string().contains("v6only"));
-        assert!(error.to_string().contains("grpc"));
+        let config = ServerConfig::try_from(inbound).unwrap();
+        let ServerProxyConfig::Ipv6Only { inner } = config.protocol else {
+            panic!("v6only must wrap the gRPC listener");
+        };
+        assert!(matches!(*inner, ServerProxyConfig::Grpc(_)));
     }
 
     #[cfg(feature = "vless")]
