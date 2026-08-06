@@ -72,9 +72,12 @@ impl TcpServerHandler for ProxyProtocolServerHandler {
     }
 }
 
-async fn read_proxy_header(
-    stream: &mut Box<dyn AsyncStream>,
-) -> io::Result<Option<SocketAddr>> {
+pub(crate) async fn read_proxy_header<S>(
+    stream: &mut S,
+) -> io::Result<Option<SocketAddr>>
+where
+    S: tokio::io::AsyncRead + Unpin + ?Sized,
+{
     let mut prefix = [0u8; 12];
     stream.read_exact(&mut prefix).await?;
     if &prefix == V2_SIGNATURE {
@@ -89,10 +92,13 @@ async fn read_proxy_header(
     ))
 }
 
-async fn read_v1_header(
-    stream: &mut Box<dyn AsyncStream>,
+async fn read_v1_header<S>(
+    stream: &mut S,
     mut header: Vec<u8>,
-) -> io::Result<Option<SocketAddr>> {
+) -> io::Result<Option<SocketAddr>>
+where
+    S: tokio::io::AsyncRead + Unpin + ?Sized,
+{
     while !header.ends_with(b"\r\n") {
         if header.len() >= V1_MAX_HEADER_BYTES {
             return Err(io::Error::new(
@@ -171,9 +177,10 @@ fn parse_port(value: &str) -> io::Result<u16> {
     })
 }
 
-async fn read_v2_header(
-    stream: &mut Box<dyn AsyncStream>,
-) -> io::Result<Option<SocketAddr>> {
+async fn read_v2_header<S>(stream: &mut S) -> io::Result<Option<SocketAddr>>
+where
+    S: tokio::io::AsyncRead + Unpin + ?Sized,
+{
     let mut fixed = [0u8; V2_FIXED_HEADER_BYTES - V2_SIGNATURE.len()];
     stream.read_exact(&mut fixed).await?;
     let version_command = fixed[0];

@@ -1496,7 +1496,7 @@ mod tests {
 
     #[cfg(all(feature = "vless", feature = "grpc_transport"))]
     #[test]
-    fn socket_accept_proxy_protocol_rejects_grpc_until_listener_supports_it() {
+    fn socket_accept_proxy_protocol_wraps_grpc_transport() {
         let inbound: InboudItem = serde_json::from_value(serde_json::json!({
             "listen": "127.0.0.1",
             "port": 443,
@@ -1513,8 +1513,11 @@ mod tests {
             }
         }))
         .unwrap();
-        let error = ServerConfig::try_from(inbound).unwrap_err();
-        assert!(error.to_string().contains("not supported for grpc"));
+        let config = ServerConfig::try_from(inbound).unwrap();
+        let ServerProxyConfig::ProxyProtocol { inner } = config.protocol else {
+            panic!("sockopt PROXY protocol must wrap gRPC transport");
+        };
+        assert!(matches!(*inner, ServerProxyConfig::Grpc(_)));
     }
 
     #[cfg(all(feature = "vless", feature = "ws"))]

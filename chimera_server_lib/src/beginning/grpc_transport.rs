@@ -25,6 +25,7 @@ use hyper_util::{
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex},
     task::JoinHandle,
+    time::timeout,
 };
 #[cfg(feature = "tls")]
 use tokio_rustls::TlsAcceptor;
@@ -38,8 +39,12 @@ use crate::{
         def::OutboundGrpcSettings,
         server_config::{GrpcServerConfig, ServerConfig, ServerProxyConfig},
     },
-    handler::tcp::{
-        tcp_handler::TcpServerHandler, tcp_handler_util::create_tcp_server_handler,
+    handler::{
+        proxy_protocol::read_proxy_header,
+        tcp::{
+            tcp_handler::TcpServerHandler,
+            tcp_handler_util::create_tcp_server_handler,
+        },
     },
     resolver::Resolver,
     runtime::RuntimeState,
@@ -305,7 +310,7 @@ async fn decode_response_body(
     writer.shutdown().await
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum GrpcSecurity {
     Plain,
     #[cfg(feature = "tls")]
@@ -324,7 +329,8 @@ pub(super) async fn start_grpc_server(
         protocol,
         ..
     } = config;
-    let (grpc_config, inner_protocol, security) = parse_listener_protocol(protocol)?;
+    let (grpc_config, inner_protocol, security, accept_proxy_protocol) =
+        parse_listener_protocol(protocol)?;
     let mut rules_stack = Vec::new();
     let server_handler: Arc<Box<dyn TcpServerHandler>> = Arc::new(
         create_tcp_server_handler(inner_protocol, &tag, &mut rules_stack)?,
@@ -354,21 +360,38 @@ pub(super) async fn start_grpc_server(
             let server_handler = server_handler.clone();
             let resolver = resolver.clone();
             let runtime = runtime.clone();
-            match &security {
-                GrpcSecurity::Plain => {
-                    tokio::spawn(serve_grpc_connection(
-                        stream,
-                        service_path,
-                        server_handler,
-                        resolver,
-                        runtime,
-                        peer_addr,
-                    ));
-                }
-                #[cfg(feature = "tls")]
-                GrpcSecurity::Tls(server_config) => {
-                    let acceptor = TlsAcceptor::from(server_config.clone());
-                    tokio::spawn(async move {
+            let security = security.clone();
+            tokio::spawn(async move {
+                let mut stream = stream;
+                let peer_addr = match resolve_grpc_peer_addr(
+                    &mut stream,
+                    peer_addr,
+                    accept_proxy_protocol,
+                    runtime.policy_handshake_timeout(0),
+                )
+                .await
+                {
+                    Ok(peer_addr) => peer_addr,
+                    Err(error) => {
+                        debug!("gRPC PROXY protocol handshake failed: {error}");
+                        return;
+                    }
+                };
+                match security {
+                    GrpcSecurity::Plain => {
+                        serve_grpc_connection(
+                            stream,
+                            service_path,
+                            server_handler,
+                            resolver,
+                            runtime,
+                            peer_addr,
+                        )
+                        .await;
+                    }
+                    #[cfg(feature = "tls")]
+                    GrpcSecurity::Tls(server_config) => {
+                        let acceptor = TlsAcceptor::from(server_config);
                         match acceptor.accept(stream).await {
                             Ok(stream) => {
                                 serve_grpc_connection(
@@ -385,12 +408,9 @@ pub(super) async fn start_grpc_server(
                                 debug!("gRPC TLS handshake failed: {error}");
                             }
                         }
-                    });
-                }
-                #[cfg(feature = "reality")]
-                GrpcSecurity::Reality(reality_config) => {
-                    let reality_config = reality_config.clone();
-                    tokio::spawn(async move {
+                    }
+                    #[cfg(feature = "reality")]
+                    GrpcSecurity::Reality(reality_config) => {
                         match accept_reality_stream(
                             Box::new(stream),
                             &reality_config,
@@ -413,21 +433,46 @@ pub(super) async fn start_grpc_server(
                                 debug!("gRPC REALITY handshake failed: {error}");
                             }
                         }
-                    });
+                    }
                 }
-            }
+            });
         }
     });
     Ok(vec![handle])
 }
 
+async fn resolve_grpc_peer_addr<S>(
+    stream: &mut S,
+    socket_peer_addr: std::net::SocketAddr,
+    accept_proxy_protocol: bool,
+    handshake_timeout: std::time::Duration,
+) -> io::Result<std::net::SocketAddr>
+where
+    S: AsyncRead + Unpin,
+{
+    if !accept_proxy_protocol {
+        return Ok(socket_peer_addr);
+    }
+    match timeout(handshake_timeout, read_proxy_header(stream)).await {
+        Ok(result) => Ok(result?.unwrap_or(socket_peer_addr)),
+        Err(error) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("PROXY protocol handshake timed out: {error}"),
+        )),
+    }
+}
+
 fn parse_listener_protocol(
     protocol: ServerProxyConfig,
-) -> io::Result<(GrpcServerConfig, ServerProxyConfig, GrpcSecurity)> {
+) -> io::Result<(GrpcServerConfig, ServerProxyConfig, GrpcSecurity, bool)> {
     match protocol {
+        ServerProxyConfig::ProxyProtocol { inner } => {
+            let (config, inner, security, _) = parse_listener_protocol(*inner)?;
+            Ok((config, inner, security, true))
+        }
         ServerProxyConfig::Grpc(config) => {
             let inner = (*config.inner).clone();
-            Ok((config, inner, GrpcSecurity::Plain))
+            Ok((config, inner, GrpcSecurity::Plain, false))
         }
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(tls_config) => {
@@ -478,7 +523,12 @@ fn parse_listener_protocol(
             let server_config =
                 create_server_config(&cert_bytes, &key_bytes, &alpn_protocols, &[])?;
             let inner = (*config.inner).clone();
-            Ok((config, inner, GrpcSecurity::Tls(Arc::new(server_config))))
+            Ok((
+                config,
+                inner,
+                GrpcSecurity::Tls(Arc::new(server_config)),
+                false,
+            ))
         }
         #[cfg(feature = "reality")]
         ServerProxyConfig::Reality(reality_config) => {
@@ -491,7 +541,7 @@ fn parse_listener_protocol(
             };
             let config = config.clone();
             let inner = (*config.inner).clone();
-            Ok((config, inner, GrpcSecurity::Reality(reality_config)))
+            Ok((config, inner, GrpcSecurity::Reality(reality_config), false))
         }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -861,6 +911,31 @@ mod tests {
         assert_eq!(response, payload);
         stream.shutdown().await.unwrap();
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_protocol_replaces_grpc_peer_before_http2() {
+        let (mut client, mut server) = duplex(1024);
+        let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        client
+            .write_all(
+                b"PROXY TCP4 203.0.113.7 192.0.2.1 4567 443\r\nPRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let socket_peer = "127.0.0.1:12345".parse().unwrap();
+        let peer_addr = resolve_grpc_peer_addr(
+            &mut server,
+            socket_peer,
+            true,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(peer_addr, "203.0.113.7:4567".parse().unwrap());
+        let mut remaining = vec![0u8; preface.len()];
+        server.read_exact(&mut remaining).await.unwrap();
+        assert_eq!(remaining, preface);
     }
 
     #[test]
