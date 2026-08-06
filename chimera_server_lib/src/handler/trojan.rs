@@ -35,6 +35,7 @@ type FallbackSelection<'a> = Option<(&'a TrojanFallback, FallbackScore)>;
 struct TrojanCredential {
     password_hash: Box<[u8]>,
     identity: Option<String>,
+    user_level: u32,
 }
 
 #[derive(Debug)]
@@ -57,6 +58,7 @@ impl TrojanTcpHandler {
                 TrojanCredential {
                     password_hash: create_password_hash(&user.password),
                     identity,
+                    user_level: user.user_level,
                 }
             })
             .collect();
@@ -182,6 +184,7 @@ impl TrojanTcpHandler {
         };
         let mut traffic_context = TrafficContext::new("trojan")
             .with_protocol_identity(protocol_identity)
+            .with_user_level(credential.user_level)
             .with_access_target(
                 remote_location.address().to_string(),
                 remote_location.port(),
@@ -533,6 +536,7 @@ mod tests {
             vec![TrojanUser {
                 password: password.into(),
                 email: Some("fallback-user".into()),
+                user_level: 0,
             }],
             ports
                 .iter()
@@ -707,10 +711,12 @@ mod tests {
                 TrojanUser {
                     password: password_a.into(),
                     email: Some("trojan-user-a".into()),
+                    user_level: 3,
                 },
                 TrojanUser {
                     password: password_b.into(),
                     email: Some("trojan-user-b".into()),
+                    user_level: 7,
                 },
             ],
             Vec::new(),
@@ -725,6 +731,7 @@ mod tests {
                 Ipv4Addr::LOCALHOST.octets().to_vec(),
                 NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 80),
                 80,
+                3,
             ),
             (
                 password_b,
@@ -733,6 +740,7 @@ mod tests {
                 ipv6.octets().to_vec(),
                 NetLocation::new(Address::Ipv6(ipv6), 443),
                 443,
+                7,
             ),
             (
                 password_a,
@@ -741,6 +749,7 @@ mod tests {
                 [vec![12], b"example.test".to_vec()].concat(),
                 NetLocation::new(Address::from("example.test").unwrap(), 8443),
                 8443,
+                3,
             ),
         ];
 
@@ -751,6 +760,7 @@ mod tests {
             address_payload,
             expected_target,
             port,
+            expected_level,
         ) in cases
         {
             let request = build_trojan_request(
@@ -782,6 +792,7 @@ mod tests {
             let context =
                 traffic_context.expect("Trojan CONNECT context must exist");
             assert_eq!(context.identity.as_deref(), Some(expected_identity));
+            assert_eq!(context.user_level, expected_level);
             let expected_protocol_identity = create_password_hash(password);
             assert_eq!(
                 context.protocol_identity(),
@@ -873,6 +884,7 @@ mod tests {
             vec![TrojanUser {
                 password: password.into(),
                 email: Some("udp-user".into()),
+                user_level: 5,
             }],
             Vec::new(),
             "trojan-udp",
@@ -901,6 +913,7 @@ mod tests {
             } => {
                 let context = traffic_context.expect("Trojan context should exist");
                 assert_eq!(context.identity.as_deref(), Some("udp-user"));
+                assert_eq!(context.user_level, 5);
                 let access =
                     context.access_context().expect("access context must exist");
                 assert_eq!(access.target_host.as_deref(), Some("127.0.0.1"));

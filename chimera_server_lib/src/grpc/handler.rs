@@ -1152,6 +1152,7 @@ impl HandlerServiceImpl {
             users.push(TrojanUser {
                 password,
                 email: (!user.email.trim().is_empty()).then(|| user.email.clone()),
+                user_level: user.level,
             });
         }
 
@@ -3316,6 +3317,7 @@ impl HandlerServiceImpl {
                     users.push(TrojanUser {
                         password,
                         email: None,
+                        user_level: user.level,
                     });
                     return Ok(true);
                 }
@@ -3325,10 +3327,12 @@ impl HandlerServiceImpl {
                     .find(|existing| existing.email.as_deref() == Some(email))
                 {
                     existing.password = password;
+                    existing.user_level = user.level;
                 } else {
                     users.push(TrojanUser {
                         password,
                         email: Some(email.to_string()),
+                        user_level: user.level,
                     });
                 }
                 Ok(true)
@@ -3659,7 +3663,7 @@ impl HandlerServiceImpl {
                 users
                     .iter()
                     .map(|user| proto::xray::common::protocol::User {
-                        level: 0,
+                        level: user.user_level,
                         email: user.email.clone().unwrap_or_default(),
                         account: Some(proto::xray::common::serial::TypedMessage {
                             r#type: TYPE_PROXY_TROJAN_ACCOUNT.to_string(),
@@ -6695,6 +6699,7 @@ mod tests {
                 users: vec![TrojanUser {
                     password: "initial-password".to_string(),
                     email: Some("initial-user".to_string()),
+                    user_level: 0,
                 }],
                 fallbacks: Vec::new(),
             },
@@ -6707,7 +6712,7 @@ mod tests {
         let email = unique_tag("trojan-user");
         let add_operation = proto::xray::app::proxyman::command::AddUserOperation {
             user: Some(proto::xray::common::protocol::User {
-                level: 0,
+                level: 9,
                 email: email.clone(),
                 account: Some(proto::xray::common::serial::TypedMessage {
                     r#type: TYPE_PROXY_TROJAN_ACCOUNT.to_string(),
@@ -6741,11 +6746,12 @@ mod tests {
             .await
             .expect("trojan get users after add failed")
             .into_inner()
-            .users
-            .into_iter()
-            .map(|user| user.email)
-            .collect::<Vec<_>>();
-        assert!(users_after_add.iter().any(|candidate| candidate == &email));
+            .users;
+        let added_user = users_after_add
+            .iter()
+            .find(|candidate| candidate.email == email)
+            .expect("added Trojan user should be listed");
+        assert_eq!(added_user.level, 9);
 
         let count_after_add = service
             .get_inbound_users_count(Request::new(

@@ -72,6 +72,8 @@ pub struct TuicServerConfig {
 pub struct TrojanUser {
     pub password: String,
     pub email: Option<String>,
+    #[serde(default)]
+    pub user_level: u32,
 }
 
 #[cfg(feature = "trojan")]

@@ -263,6 +263,8 @@ pub struct ClientSetting {
 pub struct TrojanClientSetting {
     #[serde(default)]
     email: Option<String>,
+    #[serde(default)]
+    level: u32,
     password: String,
 }
 
