@@ -179,7 +179,7 @@ impl AsyncTargetedMessageStream for TrojanUdpStream {}
 
 pub(crate) async fn read_packet<R>(reader: &mut R) -> PacketResult
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead + Unpin + ?Sized,
 {
     let target = read_location(reader).await?;
     let payload_length = reader.read_u16().await? as usize;
@@ -206,7 +206,7 @@ where
 
 async fn read_location<R>(reader: &mut R) -> std::io::Result<NetLocation>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead + Unpin + ?Sized,
 {
     let address = match reader.read_u8().await? {
         ADDR_TYPE_IPV4 => {

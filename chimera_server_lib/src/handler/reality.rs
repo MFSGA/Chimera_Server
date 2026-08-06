@@ -13,7 +13,9 @@ use crate::async_stream::AsyncStream;
 use crate::config::server_config::RealityTransportConfig;
 #[cfg(feature = "vless")]
 use crate::config::server_config::{VlessFallback, VlessUser};
-use crate::handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
+use crate::handler::tcp::tcp_handler::{
+    TcpServerConnectionContext, TcpServerHandler, TcpServerSetupResult,
+};
 use crate::handler::tls_deframer::TlsDeframer;
 #[cfg(feature = "vless")]
 use crate::handler::vless_handler::setup_reality_mixed_vless_server_stream;
@@ -369,9 +371,9 @@ fn parse_dest_server_hello(
 
 async fn connect_dest(
     config: &RealityTransportConfig,
+    resolver: &Arc<dyn Resolver>,
 ) -> io::Result<Box<dyn AsyncStream>> {
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
-    let target_addr = resolve_single_address(&resolver, &config.dest).await?;
+    let target_addr = resolve_single_address(resolver, &config.dest).await?;
     let tcp_socket = new_tcp_socket(None, target_addr.is_ipv6())?;
     let stream = tcp_socket.connect(target_addr).await?;
     if let Err(err) = stream.set_nodelay(true) {
@@ -532,11 +534,12 @@ fn start_forward_to_dest(
 pub async fn accept_reality_stream(
     mut server_stream: Box<dyn AsyncStream>,
     config: &RealityTransportConfig,
+    resolver: Arc<dyn Resolver>,
 ) -> io::Result<RealityTlsStream<Box<dyn AsyncStream>, RealityServerConnection>> {
     let client_hello = read_client_hello(&mut server_stream).await?;
     let sni = extract_sni_from_client_hello(&client_hello)?;
 
-    let mut dest_stream = connect_dest(config).await?;
+    let mut dest_stream = connect_dest(config, &resolver).await?;
     dest_stream.write_all(&client_hello).await?;
     dest_stream.flush().await?;
 
@@ -674,10 +677,30 @@ impl TcpServerHandler for RealityServerHandler {
         &self,
         server_stream: Box<dyn AsyncStream>,
     ) -> io::Result<TcpServerSetupResult> {
+        self.setup_server_stream_with_context(
+            server_stream,
+            TcpServerConnectionContext {
+                resolver: Some(Arc::new(NativeResolver::new())),
+                ..TcpServerConnectionContext::default()
+            },
+        )
+        .await
+    }
+
+    async fn setup_server_stream_with_context(
+        &self,
+        server_stream: Box<dyn AsyncStream>,
+        context: TcpServerConnectionContext,
+    ) -> io::Result<TcpServerSetupResult> {
+        let resolver = context
+            .resolver
+            .clone()
+            .unwrap_or_else(|| Arc::new(NativeResolver::new()));
         let wrapped_stream =
-            accept_reality_stream(server_stream, &self.transport_config).await?;
+            accept_reality_stream(server_stream, &self.transport_config, resolver)
+                .await?;
         self.inner
-            .setup_server_stream(Box::new(wrapped_stream))
+            .setup_server_stream_with_context(Box::new(wrapped_stream), context)
             .await
     }
 }
@@ -715,8 +738,27 @@ impl TcpServerHandler for RealityVisionVlessServerHandler {
         &self,
         server_stream: Box<dyn AsyncStream>,
     ) -> io::Result<TcpServerSetupResult> {
+        self.setup_server_stream_with_context(
+            server_stream,
+            TcpServerConnectionContext {
+                resolver: Some(Arc::new(NativeResolver::new())),
+                ..TcpServerConnectionContext::default()
+            },
+        )
+        .await
+    }
+
+    async fn setup_server_stream_with_context(
+        &self,
+        server_stream: Box<dyn AsyncStream>,
+        context: TcpServerConnectionContext,
+    ) -> io::Result<TcpServerSetupResult> {
+        let resolver = context
+            .resolver
+            .unwrap_or_else(|| Arc::new(NativeResolver::new()));
         let tls_stream =
-            accept_reality_stream(server_stream, &self.transport_config).await?;
+            accept_reality_stream(server_stream, &self.transport_config, resolver)
+                .await?;
         setup_reality_mixed_vless_server_stream(
             tls_stream,
             &self.users,

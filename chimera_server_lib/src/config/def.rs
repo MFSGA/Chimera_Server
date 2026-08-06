@@ -1,4 +1,4 @@
-use std::{path::PathBuf, str::FromStr};
+use std::{net::IpAddr, path::PathBuf, str::FromStr};
 
 use std::collections::HashMap;
 
@@ -13,7 +13,95 @@ use super::{
     Protocol, SettingObject, StreamSettings, Transport, rule::RoutingConfig,
 };
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum DnsHostValue {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl DnsHostValue {
+    fn values(&self) -> &[String] {
+        match self {
+            Self::One(value) => std::slice::from_ref(value),
+            Self::Many(values) => values,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DnsConfig {
+    pub hosts: HashMap<String, DnsHostValue>,
+    pub servers: Vec<Value>,
+}
+
+impl DnsConfig {
+    fn validate_runtime_support(&self) -> Result<(), Error> {
+        self.compile_servers()?;
+        self.compile_hosts().map(|_| ())
+    }
+
+    pub(crate) fn compile_servers(
+        &self,
+    ) -> Result<Vec<crate::resolver::DnsUpstream>, Error> {
+        self.servers
+            .iter()
+            .map(|server| {
+                let server = server.as_str().ok_or_else(|| {
+                    Error::InvalidConfig(
+                        "dns.servers advanced objects are not supported yet".into(),
+                    )
+                })?;
+                crate::resolver::DnsUpstream::parse(server)
+                    .map_err(Error::InvalidConfig)
+            })
+            .collect()
+    }
+
+    pub(crate) fn compile_hosts(
+        &self,
+    ) -> Result<HashMap<String, Vec<IpAddr>>, Error> {
+        let mut compiled = HashMap::with_capacity(self.hosts.len());
+        for (raw_pattern, raw_values) in &self.hosts {
+            let pattern = raw_pattern.trim();
+            let hostname = pattern.strip_prefix("full:").unwrap_or(pattern);
+            if hostname.is_empty()
+                || pattern.starts_with("domain:")
+                || pattern.starts_with("keyword:")
+                || pattern.starts_with("regexp:")
+                || pattern.starts_with("geosite:")
+                || hostname.contains('*')
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "dns.hosts pattern {raw_pattern:?} is not an exact hostname"
+                )));
+            }
+
+            let mut addresses = Vec::new();
+            for raw_value in raw_values.values() {
+                let address = raw_value.trim().parse::<IpAddr>().map_err(|_| {
+                    Error::InvalidConfig(format!(
+                        "dns.hosts value {raw_value:?} for {raw_pattern:?} must be an IPv4 or IPv6 address"
+                    ))
+                })?;
+                if !addresses.contains(&address) {
+                    addresses.push(address);
+                }
+            }
+            if addresses.is_empty() {
+                return Err(Error::InvalidConfig(format!(
+                    "dns.hosts entry {raw_pattern:?} must contain at least one IP address"
+                )));
+            }
+            compiled.insert(hostname.to_string(), addresses);
+        }
+        Ok(compiled)
+    }
+}
+
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct LiteralConfig {
     pub inbounds: Vec<InboudItem>,
     pub outbounds: Vec<OutboundItem>,
@@ -37,6 +125,59 @@ pub struct LiteralConfig {
     pub burst_observatory: Option<BurstObservatoryConfig>,
     // mcp settings
     pub mcp: Option<McpConfig>,
+    #[serde(default)]
+    pub dns: Option<DnsConfig>,
+    #[serde(default)]
+    pub metrics: Option<Value>,
+    #[serde(default)]
+    pub reverse: Option<Value>,
+    #[serde(default, rename = "fakeDns")]
+    pub fake_dns: Option<Value>,
+    #[serde(default)]
+    pub version: Option<Value>,
+    #[serde(default)]
+    pub geodata: Option<Value>,
+    #[serde(default)]
+    pub env: Option<Value>,
+    #[serde(default)]
+    pub transport: Option<Value>,
+}
+
+impl LiteralConfig {
+    pub(crate) fn validate_runtime_support(self) -> Result<Self, Error> {
+        let mut unsupported = Vec::new();
+        for (name, present) in [
+            ("metrics", self.metrics.is_some()),
+            ("reverse", self.reverse.is_some()),
+            ("fakeDns", self.fake_dns.is_some()),
+            ("version", self.version.is_some()),
+            ("geodata", self.geodata.is_some()),
+            ("env", self.env.is_some()),
+            ("transport", self.transport.is_some()),
+        ] {
+            if present {
+                unsupported.push(name);
+            }
+        }
+        if !unsupported.is_empty() {
+            return Err(Error::InvalidConfig(format!(
+                "unsupported Xray top-level application(s): {}",
+                unsupported.join(", ")
+            )));
+        }
+        if let Some(dns) = self.dns.as_ref() {
+            dns.validate_runtime_support()?;
+        }
+        if self.policy.as_ref().is_some_and(|policy| {
+            !policy.levels.is_empty() || !policy.system.is_empty()
+        }) {
+            return Err(Error::InvalidConfig(
+                "Xray policy.levels/system are parsed but not implemented yet"
+                    .into(),
+            ));
+        }
+        Ok(self)
+    }
 }
 
 impl TryFrom<PathBuf> for LiteralConfig {
@@ -75,7 +216,7 @@ impl TryFrom<PathBuf> for LiteralConfig {
             }
         };
 
-        Ok(config)
+        config.validate_runtime_support()
     }
 }
 
@@ -83,16 +224,15 @@ impl FromStr for LiteralConfig {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        serde_json::from_str(s).map_err(|x| {
-            Error::InvalidConfig(format!(
-                "cound not parse config content {}: {}",
-                s, x
-            ))
-        })
+        let config = serde_json::from_str(s).map_err(|error| {
+            Error::InvalidConfig(format!("could not parse JSON config: {error}"))
+        })?;
+        LiteralConfig::validate_runtime_support(config)
     }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InboudItem {
     pub allocate: Option<Value>,
     pub listen: Option<String>,
@@ -152,6 +292,8 @@ pub struct OutboundStreamSettings {
     #[cfg(feature = "grpc_transport")]
     #[serde(default, alias = "grpcSettings")]
     pub grpc_settings: Option<OutboundGrpcSettings>,
+    #[serde(default, alias = "splithttpSettings")]
+    pub xhttp_settings: Option<serde_json::Value>,
 }
 
 #[cfg(feature = "grpc_transport")]

@@ -41,7 +41,7 @@ use crate::{
     handler::tcp::{
         tcp_handler::TcpServerHandler, tcp_handler_util::create_tcp_server_handler,
     },
-    resolver::{NativeResolver, Resolver},
+    resolver::Resolver,
     runtime::RuntimeState,
 };
 #[cfg(feature = "reality")]
@@ -329,7 +329,7 @@ pub(super) async fn start_grpc_server(
     let server_handler: Arc<Box<dyn TcpServerHandler>> = Arc::new(
         create_tcp_server_handler(inner_protocol, &tag, &mut rules_stack)?,
     );
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let resolver = runtime.resolver();
     let listen_addr = match bind_location {
         BindLocation::Address(location) => location.to_socket_addr()?,
     };
@@ -394,6 +394,7 @@ pub(super) async fn start_grpc_server(
                         match accept_reality_stream(
                             Box::new(stream),
                             &reality_config,
+                            resolver.clone(),
                         )
                         .await
                         {

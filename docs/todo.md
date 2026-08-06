@@ -195,7 +195,7 @@ BPF SOCKHASH 不是当前必做项。只有物理机高并发数据证明网卡�
 
 详细差距分析见 [`20260804-234600-xray-parity-gap-analysis.zh.md`](./20260804-234600-xray-parity-gap-analysis.zh.md)。对比基线为仓库内 `ref/xray-core` 的 `5ca6f4b7d4dc`（Xray-core v26.7.28）。
 
-当前结论：入站、路由、Stats/Handler/Routing/Observatory 控制面已经较完整。出站运行时已从仅支持 `freedom`/`blackhole` 推进到支持 VLESS TCP、VMess TCP、Trojan TCP/UDP、SOCKS5 TCP/UDP、HTTP CONNECT TCP，以及 Shadowsocks legacy AEAD TCP/UDP，并完成可复用的 TCP/TLS/REALITY/WebSocket/HTTP Upgrade/gRPC transport pipeline；静态 JSON 与 HandlerService 动态 SenderConfig 均复用同一严格编译路径。其他代理出站、通用 sniffing、Xray DNS/FakeDNS、mKCP、TUN、Reverse、WireGuard 和部分 XHTTP client/xmux/download 语义仍未完成。
+当前结论：入站、路由、Stats/Handler/Routing/Observatory 控制面已经较完整。出站运行时已从仅支持 `freedom`/`blackhole` 推进到支持 VLESS TCP/UDP/XUDP、VMess TCP、Trojan TCP/UDP、SOCKS5 TCP/UDP、HTTP CONNECT TCP，以及 Shadowsocks legacy AEAD TCP/UDP，并完成可复用的 TCP/TLS/REALITY/WebSocket/HTTP Upgrade/gRPC/XHTTP transport pipeline；静态 JSON 与 HandlerService 动态 SenderConfig 均复用同一严格编译路径。XHTTP client 的 H2/H3 modes、metadata/data placement、obfs、`downloadSettings`、`xmux` 与 UDP/XUDP 已完成真实 Xray 互通。其他代理出站、通用 sniffing、Xray DNS/FakeDNS、mKCP、TUN、Reverse、WireGuard 和 Unix-domain XHTTP listener 仍未完成。
 
 ### P0：Outbound Runtime
 
@@ -212,7 +212,7 @@ BPF SOCKHASH 不是当前必做项。只有物理机高并发数据证明网卡�
 - [x] 支持 HTTP CONNECT TCP outbound：单服务器、可选 Basic Proxy-Authorization、自定义安全 header、标准 `servers/users/headers` 与简化配置、动态 `xray.proxy.http.ClientConfig`、ListOutbounds 回显、2xx/407/502/504 响应处理和 IPv6 authority；plain no-auth 与 TLS+Basic Auth 已通过 Xray 26.2.6 真实互通。
 - [x] 支持 Shadowsocks legacy AEAD TCP/UDP outbound：AES-128-GCM、AES-256-GCM、ChaCha20-IETF-Poly1305、标准 `servers` 与简化配置、动态 `xray.proxy.shadowsocks.ClientConfig`、ListOutbounds、原始 domain/IP target、salt 防重放与共享 TCP transport pipeline。UDP 当前使用 plain proxy endpoint 的 one-shot datagram exchange，覆盖固定目标、目标化/session/XUDP、SOCKS5、Dokodemo、Shadowsocks inbound、Hysteria2 与 TUIC；TUIC stream/datagram response channel 共享原子 packet ID，并保留 datagram fragmentation。SOCKS5 UDP → Chimera → Xray 已通过文本与 1200-byte payload 真实互通，TUIC datagram 与 UDP-over-stream 已通过本地 Shadowsocks AEAD 真实往返。XChaCha、2022/EIH 和持久 UDP association 尚未实现。
 - [x] 支持 VMess TCP outbound：标准 `vnext/users` 与简化配置、AEAD AuthID/request header、`none`/AES-128-GCM/ChaCha20-Poly1305 body、动态 `xray.proxy.vmess.outbound.Config`、ListOutbounds、原始 domain/IP target 和共享 transport pipeline；plain none 与 TLS+AES 已通过 Xray 26.2.6 真实互通。AUTO、alterId、experiments、Mux 和 UDP 均 fail-closed。
-- [ ] 继续接入 Shadowsocks 2022/EIH，以及 VLESS/VMess UDP outbound。
+- [ ] 继续接入 Shadowsocks 2022/EIH 与 VMess UDP outbound；VLESS native UDP 和 `packetEncoding: "xudp"` 已完成，并通过 XHTTP H2/H3 真实互通。
 
 ### P0/P1：Sniffing 与 DNS
 
@@ -226,8 +226,8 @@ BPF SOCKHASH 不是当前必做项。只有物理机高并发数据证明网卡�
 
 ### P1：Transport 和 Xray 高级语义
 
-- [ ] 将旧 `xhttp_gap_vs_xray.zh.md` 作为历史文档；当前 XHTTP 已支持 VLESS inner、mode、placement、流控、TTL、TLS/REALITY。
-- [ ] 补 XHTTP outbound、HTTP/3/UNIX listener、`downloadSettings`、`xmux` 和 `noGRPCHeader` 数据面语义。
+- [x] 将旧 `xhttp_gap_vs_xray.zh.md` 作为历史文档；当前 XHTTP 已支持 VLESS inner、mode、placement、流控、TTL、TLS/REALITY、H2/H3 outbound、`xPaddingObfs*`、`downloadSettings`、`xmux`、`noGRPCHeader` 和 UDP/XUDP，并完成协议、安全与 Xray 互通矩阵。
+- [ ] 补 Unix-domain XHTTP listener。HTTP/1.1 当前仅支持可靠的 `packet-up`/`auto`；`stream-one`/`stream-up` 因 Go HTTP/1.x request-body 半双工限制保持 fail-closed。
 - [ ] 对 `network=kcp` 明确 fail-closed；真正实现 mKCP 前不得映射为 QUIC。
 - [ ] 接入常用 `sockopt`：interface、mark、keepalive、TFO、original destination、acceptProxyProtocol。
 - [ ] 将顶层 `policy` 从未使用的 Value map 改为 Xray level/system policy，并接 timeout/stats/buffer。

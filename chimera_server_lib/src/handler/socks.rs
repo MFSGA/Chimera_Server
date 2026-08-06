@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10,7 +11,8 @@ use crate::{
     config::server_config::{SocksUser, SocksUserStore},
     handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
     outbound::{
-        DirectOutboundAction, connection_routing_input, select_direct_outbound,
+        DirectOutboundAction, UdpProxyAssociationRegistry, connection_routing_input,
+        select_direct_outbound,
     },
     resolver::{Resolver, resolve_single_address},
     runtime::RuntimeState,
@@ -18,12 +20,6 @@ use crate::{
         AccessTransport, TrafficContext, record_transfer, register_connection,
     },
 };
-
-#[cfg(feature = "shadowsocks")]
-use crate::outbound::exchange_shadowsocks_udp;
-use crate::outbound::exchange_socks_udp;
-#[cfg(feature = "trojan")]
-use crate::outbound::exchange_trojan_udp;
 
 const SOCKS_VERSION: u8 = 0x05;
 const METHOD_NO_AUTH: u8 = 0x00;
@@ -53,6 +49,7 @@ const SUCCESS_RESPONSE: [u8; 10] = [
 ];
 
 const UDP_BUFFER_SIZE: usize = 2 * 1024 * 1024;
+const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 pub struct SocksTcpServerHandler {
@@ -446,6 +443,8 @@ pub(crate) async fn run_udp_relay(
     });
 
     let mut recv_buf = vec![0u8; UDP_BUFFER_SIZE];
+    let mut proxy_associations =
+        UdpProxyAssociationRegistry::new(UDP_SESSION_IDLE_TIMEOUT);
     let mut client_endpoint =
         client_udp_port_hint.map(|port| SocketAddr::new(tcp_peer_addr.ip(), port));
 
@@ -570,85 +569,37 @@ pub(crate) async fn run_udp_relay(
                 );
                 continue;
             }
-            #[cfg(feature = "shadowsocks")]
-            DirectOutboundAction::Shadowsocks { tag } => {
-                datagram_context = datagram_context
-                    .map(|context| context.with_outbound_tag(tag.clone()));
-                let response = exchange_shadowsocks_udp(
-                    &resolver,
-                    &runtime,
-                    &tag,
-                    &target_location,
-                    payload,
-                )
-                .await?;
-                let mut socks5_response =
-                    build_udp_response_header_location(&response.source)?;
-                socks5_response.extend_from_slice(&response.payload);
-                udp_socket_clone
-                    .send_to(&socks5_response, response_endpoint)
-                    .await?;
-                record_transfer(
-                    datagram_context,
-                    payload.len() as u64,
-                    response.payload.len() as u64,
-                );
-                continue;
-            }
-            DirectOutboundAction::Socks { tag } => {
-                datagram_context = datagram_context
-                    .map(|context| context.with_outbound_tag(tag.clone()));
-                let response = exchange_socks_udp(
-                    &resolver,
-                    &runtime,
-                    &tag,
-                    &target_location,
-                    payload,
-                )
-                .await?;
-                let mut socks5_response =
-                    build_udp_response_header_location(&response.source)?;
-                socks5_response.extend_from_slice(&response.payload);
-                udp_socket_clone
-                    .send_to(&socks5_response, response_endpoint)
-                    .await?;
-                record_transfer(
-                    datagram_context,
-                    payload.len() as u64,
-                    response.payload.len() as u64,
-                );
-                continue;
-            }
-            #[cfg(feature = "trojan")]
-            DirectOutboundAction::Trojan { tag } => {
-                datagram_context = datagram_context
-                    .map(|context| context.with_outbound_tag(tag.clone()));
-                let response = exchange_trojan_udp(
-                    &resolver,
-                    &runtime,
-                    &tag,
-                    &target_location,
-                    payload,
-                )
-                .await?;
-                let mut socks5_response =
-                    build_udp_response_header_location(&response.source)?;
-                socks5_response.extend_from_slice(&response.payload);
-                udp_socket_clone
-                    .send_to(&socks5_response, response_endpoint)
-                    .await?;
-                record_transfer(
-                    datagram_context,
-                    payload.len() as u64,
-                    response.payload.len() as u64,
-                );
-                continue;
-            }
             DirectOutboundAction::Freedom { tag: Some(tag) } => {
                 datagram_context =
                     datagram_context.map(|context| context.with_outbound_tag(tag));
             }
             DirectOutboundAction::Freedom { tag: None } => {}
+            proxy_action => {
+                let tag = proxy_action.required_outbound_tag()?.to_string();
+                datagram_context =
+                    datagram_context.map(|context| context.with_outbound_tag(tag));
+                let response = proxy_associations
+                    .exchange(
+                        &resolver,
+                        &runtime,
+                        &proxy_action,
+                        &target_location,
+                        payload,
+                    )
+                    .await?;
+                let mut socks5_response =
+                    build_udp_response_header_location(&response.source)?;
+                socks5_response.extend_from_slice(&response.payload);
+                udp_socket_clone
+                    .send_to(&socks5_response, response_endpoint)
+                    .await?;
+                record_transfer(
+                    datagram_context,
+                    payload.len() as u64,
+                    response.payload.len() as u64,
+                );
+                continue;
+            }
         }
 
         // Forward payload to target

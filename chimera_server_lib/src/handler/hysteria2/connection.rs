@@ -9,6 +9,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
     task::{Context, Poll},
+    time::Duration,
 };
 
 use bytes::{Bytes, BytesMut};
@@ -25,11 +26,6 @@ use tokio::{
 };
 use tracing::{debug, warn};
 
-#[cfg(feature = "shadowsocks")]
-use crate::outbound::exchange_shadowsocks_udp;
-use crate::outbound::exchange_socks_udp;
-#[cfg(feature = "trojan")]
-use crate::outbound::exchange_trojan_udp;
 #[cfg(feature = "user_domain_access")]
 use crate::user_domain_access::hysteria2_password_identity;
 use crate::{
@@ -37,8 +33,8 @@ use crate::{
     async_stream::AsyncStream,
     config::server_config::{Hysteria2Client, Hysteria2ServerConfig},
     outbound::{
-        DirectOutboundAction, connect_tcp_outbound, connection_routing_input,
-        select_direct_outbound,
+        DirectOutboundAction, UdpProxyAssociationRegistry, connect_tcp_outbound,
+        connection_routing_input, select_direct_outbound,
     },
     resolver::{Resolver, resolve_single_address},
     runtime::RuntimeState,
@@ -58,6 +54,7 @@ const TCP_REQUEST_ID: u64 = 0x401;
 const MAX_ADDRESS_LEN: usize = 1024;
 const PADDING_SCRATCH_LEN: usize = 1024;
 const TCP_SUCCESS_STATUS: u8 = 0x00;
+const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const TCP_ERROR_STATUS: u8 = 0x01;
 
 fn hysteria2_routing_identity(client: &Hysteria2Client) -> String {
@@ -889,84 +886,37 @@ async fn drive_udp_datagrams(
                 );
                 continue;
             }
-            #[cfg(feature = "shadowsocks")]
-            DirectOutboundAction::Shadowsocks { tag } => {
-                traffic_context = traffic_context.with_outbound_tag(tag.clone());
-                let response = exchange_shadowsocks_udp(
-                    &resolver,
-                    &runtime,
-                    &tag,
-                    &session.last_location,
-                    complete_payload.as_ref(),
-                )
-                .await?;
-                send_hysteria_udp_payload(
-                    &connection,
-                    session_id,
-                    packet_id,
-                    &response.source,
-                    &response.payload,
-                )?;
-                record_transfer(
-                    Some(traffic_context),
-                    complete_payload.len() as u64,
-                    response.payload.len() as u64,
-                );
-                continue;
-            }
-            DirectOutboundAction::Socks { tag } => {
-                traffic_context = traffic_context.with_outbound_tag(tag.clone());
-                let response = exchange_socks_udp(
-                    &resolver,
-                    &runtime,
-                    &tag,
-                    &session.last_location,
-                    complete_payload.as_ref(),
-                )
-                .await?;
-                send_hysteria_udp_payload(
-                    &connection,
-                    session_id,
-                    packet_id,
-                    &response.source,
-                    &response.payload,
-                )?;
-                record_transfer(
-                    Some(traffic_context),
-                    complete_payload.len() as u64,
-                    response.payload.len() as u64,
-                );
-                continue;
-            }
-            #[cfg(feature = "trojan")]
-            DirectOutboundAction::Trojan { tag } => {
-                traffic_context = traffic_context.with_outbound_tag(tag.clone());
-                let response = exchange_trojan_udp(
-                    &resolver,
-                    &runtime,
-                    &tag,
-                    &session.last_location,
-                    complete_payload.as_ref(),
-                )
-                .await?;
-                send_hysteria_udp_payload(
-                    &connection,
-                    session_id,
-                    packet_id,
-                    &response.source,
-                    &response.payload,
-                )?;
-                record_transfer(
-                    Some(traffic_context),
-                    complete_payload.len() as u64,
-                    response.payload.len() as u64,
-                );
-                continue;
-            }
             DirectOutboundAction::Freedom { tag: Some(tag) } => {
                 traffic_context = traffic_context.with_outbound_tag(tag);
             }
             DirectOutboundAction::Freedom { tag: None } => {}
+            proxy_action => {
+                let tag = proxy_action.required_outbound_tag()?.to_string();
+                traffic_context = traffic_context.with_outbound_tag(tag);
+                let response = session
+                    .proxy_associations
+                    .exchange(
+                        &resolver,
+                        &runtime,
+                        &proxy_action,
+                        &session.last_location,
+                        complete_payload.as_ref(),
+                    )
+                    .await?;
+                send_hysteria_udp_payload(
+                    &connection,
+                    session_id,
+                    packet_id,
+                    &response.source,
+                    &response.payload,
+                )?;
+                record_transfer(
+                    Some(traffic_context),
+                    complete_payload.len() as u64,
+                    response.payload.len() as u64,
+                );
+                continue;
+            }
         }
 
         session
@@ -1000,6 +950,7 @@ struct UdpSession {
     last_socket_addr: SocketAddr,
     base_context: TrafficContext,
     response_contexts: Arc<RwLock<HashMap<SocketAddr, TrafficContext>>>,
+    proxy_associations: UdpProxyAssociationRegistry,
     _connection_guard: ConnectionGuard,
 }
 
@@ -1057,6 +1008,9 @@ async fn create_udp_session(
         last_socket_addr: remote_addr,
         base_context,
         response_contexts,
+        proxy_associations: UdpProxyAssociationRegistry::new(
+            UDP_SESSION_IDLE_TIMEOUT,
+        ),
         _connection_guard: connection_guard,
     })
 }

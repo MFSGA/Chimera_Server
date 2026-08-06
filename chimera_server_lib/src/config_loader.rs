@@ -1,9 +1,14 @@
 use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use crate::{Error, config::def::LiteralConfig};
+
+const CONFIG_FETCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const CONFIG_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CONFIG_SOURCE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub enum ConfigFormat {
@@ -74,7 +79,17 @@ fn load_external_config_source(source: &str) -> Result<String, Error> {
 }
 
 fn fetch_http_content(target: &str) -> Result<String, Error> {
-    let response = reqwest::blocking::get(target).map_err(|err| {
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(CONFIG_FETCH_CONNECT_TIMEOUT)
+        .timeout(CONFIG_FETCH_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .map_err(|err| {
+            Error::InvalidConfig(format!(
+                "could not create HTTP client for config source {target}: {err}"
+            ))
+        })?;
+    let response = client.get(target).send().map_err(|err| {
         Error::InvalidConfig(format!(
             "could not fetch config source {target}: {err}"
         ))
@@ -85,33 +100,56 @@ fn fetch_http_content(target: &str) -> Result<String, Error> {
             "unexpected HTTP status code from config source {target}: {status}"
         )));
     }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_CONFIG_SOURCE_BYTES as u64)
+    {
+        return Err(Error::InvalidConfig(format!(
+            "config source {target} exceeds the {} byte limit",
+            MAX_CONFIG_SOURCE_BYTES
+        )));
+    }
 
-    response.text().map_err(|err| {
-        Error::InvalidConfig(format!(
-            "config source {target} did not contain valid UTF-8 text: {err}"
-        ))
-    })
+    read_bounded_utf8(response, target)
 }
 
-fn parse_config_content(
+pub(crate) fn parse_config_content(
     content: &str,
     format: Option<ConfigFormat>,
 ) -> Result<LiteralConfig, Error> {
-    match format {
+    let config: LiteralConfig = match format {
         Some(ConfigFormat::Json) => serde_json::from_str(content).map_err(|err| {
             Error::InvalidConfig(format!("could not parse JSON: {err}"))
-        }),
+        })?,
         Some(ConfigFormat::Json5) => json5::from_str(content).map_err(|err| {
             Error::InvalidConfig(format!("could not parse JSON5: {err}"))
-        }),
+        })?,
         None => serde_json::from_str(content).or_else(|json_err| {
             json5::from_str(content).map_err(|json5_err| {
                 Error::InvalidConfig(format!(
                     "could not parse config as JSON ({json_err}) or JSON5 ({json5_err})"
                 ))
             })
-        }),
+        })?,
+    };
+    config.validate_runtime_support()
+}
+
+fn read_bounded_utf8(reader: impl Read, source: &str) -> Result<String, Error> {
+    let mut limited = reader.take(MAX_CONFIG_SOURCE_BYTES as u64 + 1);
+    let mut content = Vec::new();
+    limited.read_to_end(&mut content)?;
+    if content.len() > MAX_CONFIG_SOURCE_BYTES {
+        return Err(Error::InvalidConfig(format!(
+            "config source {source} exceeds the {} byte limit",
+            MAX_CONFIG_SOURCE_BYTES
+        )));
     }
+    String::from_utf8(content).map_err(|err| {
+        Error::InvalidConfig(format!(
+            "config source {source} did not contain valid UTF-8 text: {err}"
+        ))
+    })
 }
 
 #[cfg(unix)]
@@ -120,6 +158,8 @@ fn fetch_unix_socket_http_content(target: &str) -> Result<String, Error> {
 
     let (socket_path, http_path) = parse_unix_socket_target(target)?;
     let mut stream = UnixStream::connect(&socket_path)?;
+    stream.set_read_timeout(Some(CONFIG_FETCH_TIMEOUT))?;
+    stream.set_write_timeout(Some(CONFIG_FETCH_TIMEOUT))?;
     let request = format!(
         "GET {http_path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
     );
@@ -127,7 +167,15 @@ fn fetch_unix_socket_http_content(target: &str) -> Result<String, Error> {
     stream.flush()?;
 
     let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
+    stream
+        .take(MAX_CONFIG_SOURCE_BYTES as u64 + 1)
+        .read_to_end(&mut response)?;
+    if response.len() > MAX_CONFIG_SOURCE_BYTES {
+        return Err(Error::InvalidConfig(format!(
+            "config source {target} exceeds the {} byte limit",
+            MAX_CONFIG_SOURCE_BYTES
+        )));
+    }
 
     let (headers, body) = split_http_response(&response)?;
     let status = parse_http_status(headers)?;
@@ -298,8 +346,8 @@ fn expand_env_placeholders(input: &str) -> Result<String, Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_chunked_body, expand_env_placeholders, is_external_config_source,
-        parse_unix_socket_target,
+        MAX_CONFIG_SOURCE_BYTES, decode_chunked_body, expand_env_placeholders,
+        is_external_config_source, parse_unix_socket_target, read_bounded_utf8,
     };
 
     #[test]
@@ -338,6 +386,20 @@ mod tests {
             decode_chunked_body(body).expect("chunk decoding should succeed");
 
         assert_eq!(decoded, b"hello world");
+    }
+
+    #[test]
+    fn bounded_config_reader_rejects_oversized_and_invalid_utf8_content() {
+        let oversized = vec![b'x'; MAX_CONFIG_SOURCE_BYTES + 1];
+        let error =
+            read_bounded_utf8(std::io::Cursor::new(oversized), "test-source")
+                .expect_err("oversized config must fail");
+        assert!(error.to_string().contains("exceeds"));
+
+        let error =
+            read_bounded_utf8(std::io::Cursor::new(vec![0xff]), "test-source")
+                .expect_err("invalid UTF-8 config must fail");
+        assert!(error.to_string().contains("UTF-8"));
     }
 
     #[test]

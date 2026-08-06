@@ -176,8 +176,18 @@ async fn shadowsocks_udp_outbound_roundtrips_over_stream_and_datagram() {
     let before = snapshot();
     let target = SocketAddr::from((Ipv4Addr::LOCALHOST, 5353));
 
-    assert_datagram_roundtrip(&connection, target, payloads[0]).await;
-    assert_stream_roundtrip(&connection, target, payloads[1]).await;
+    timeout(
+        Duration::from_secs(5),
+        assert_datagram_roundtrip(&connection, target, payloads[0]),
+    )
+    .await
+    .expect("TUIC Shadowsocks datagram roundtrip");
+    timeout(
+        Duration::from_secs(5),
+        assert_stream_roundtrip(&connection, target, payloads[1]),
+    )
+    .await
+    .expect("TUIC Shadowsocks stream roundtrip");
 
     let expected_bytes = payloads.iter().map(|payload| payload.len() as u64).sum();
     let after =

@@ -42,9 +42,16 @@ jobs:
 
       - name: cargo fmt
         run: cargo fmt --all -- --check
-      # todo
-      #- name: cargo clippy
-      #  run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Check minimal protocol feature sets
+        run: |
+          cargo check -p chimera_server_lib --no-default-features
+          cargo check -p chimera_server_lib --no-default-features --features vless
+          cargo check -p chimera_server_lib --no-default-features --features vmess
+          cargo check -p chimera_server_lib --no-default-features --features trojan
 
   test:
     name: Tests (${{ matrix.os }})

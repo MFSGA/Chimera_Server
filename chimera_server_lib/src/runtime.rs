@@ -33,6 +33,7 @@ use crate::user_domain_access::{
 use crate::{
     config::server_config::ServerConfig,
     outbound_registry::{OutboundConnectorKind, OutboundRegistry},
+    resolver::{NativeResolver, Resolver},
     routing_state::{
         OutboundObservation, RouteMatch, RoutingEvent, RoutingInput, RoutingState,
     },
@@ -262,6 +263,20 @@ struct UserDomainAccessRuntimeState {
     tls_probe: UserDomainAccessTlsProbeConfig,
 }
 
+#[derive(Clone)]
+struct ResolverRuntimeState {
+    resolver: Arc<dyn Resolver>,
+}
+
+impl std::fmt::Debug for ResolverRuntimeState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolverRuntimeState")
+            .field("resolver", &"dyn Resolver")
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeState {
     inbounds: Arc<RwLock<Vec<ServerConfig>>>,
@@ -269,6 +284,7 @@ pub struct RuntimeState {
     inbound_tasks: Arc<RwLock<HashMap<String, Vec<AbortHandle>>>>,
     routing: Arc<RwLock<RoutingState>>,
     balancer_overrides: Arc<RwLock<HashMap<String, String>>>,
+    resolver: Arc<RwLock<ResolverRuntimeState>>,
     routing_events: broadcast::Sender<RoutingEvent>,
     #[cfg(feature = "user_domain_access")]
     user_domain_access: Arc<RwLock<UserDomainAccessRuntimeState>>,
@@ -290,6 +306,9 @@ impl RuntimeState {
             inbound_tasks: Arc::new(RwLock::new(HashMap::new())),
             routing: Arc::new(RwLock::new(RoutingState::default())),
             balancer_overrides: Arc::new(RwLock::new(HashMap::new())),
+            resolver: Arc::new(RwLock::new(ResolverRuntimeState {
+                resolver: Arc::new(NativeResolver::new()),
+            })),
             routing_events,
             #[cfg(feature = "user_domain_access")]
             user_domain_access: Arc::new(RwLock::new(
@@ -316,6 +335,21 @@ impl RuntimeState {
         outbounds: Vec<OutboundSummary>,
     ) -> Result<Self, String> {
         Ok(Self::new(inbounds, Self::compile_outbounds(outbounds)?))
+    }
+
+    pub fn resolver(&self) -> Arc<dyn Resolver> {
+        self.resolver
+            .read()
+            .expect("runtime resolver lock poisoned")
+            .resolver
+            .clone()
+    }
+
+    pub fn replace_resolver(&self, resolver: Arc<dyn Resolver>) {
+        self.resolver
+            .write()
+            .expect("runtime resolver lock poisoned")
+            .resolver = resolver;
     }
 
     pub fn inbounds(&self) -> Vec<ServerConfig> {

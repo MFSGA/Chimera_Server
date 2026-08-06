@@ -7,14 +7,12 @@ use std::{
     time::Duration,
 };
 
-#[cfg(any(test, feature = "shadowsocks"))]
-use tokio::time::timeout;
 use tokio::{
     io::ReadBuf,
     net::UdpSocket,
     sync::{Mutex, Notify, RwLock, mpsc, oneshot},
     task::JoinHandle,
-    time::{Instant, sleep},
+    time::{Instant, sleep, timeout},
 };
 use tracing::{debug, error, info, warn};
 
@@ -34,9 +32,11 @@ use crate::{
     },
     config::server_config::{DokodemoDoorConfig, ServerConfig, ServerProxyConfig},
     outbound::{
-        DirectOutboundAction, connection_routing_input, select_direct_outbound,
+        DirectOutboundAction, UdpOutboundResponse, UdpProxyAssociationRegistry,
+        connect_fixed_target_udp_proxy_association, connection_routing_input,
+        select_direct_outbound,
     },
-    resolver::{NativeResolver, Resolver, resolve_single_address},
+    resolver::{Resolver, resolve_single_address},
     routing_process::enrich_routing_input,
     routing_state::RoutingInput,
     runtime::RuntimeState,
@@ -50,32 +50,6 @@ const UDP_BUFFER_SIZE: usize = 64 * 1024;
 const VMESS_UDP_MESSAGE_BUFFER_SIZE: usize = 8192;
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const UDP_SESSION_CHANNEL_CAPACITY: usize = 64;
-#[cfg(feature = "shadowsocks")]
-use crate::outbound::exchange_shadowsocks_udp;
-use crate::outbound::exchange_socks_udp;
-#[cfg(feature = "trojan")]
-use crate::outbound::exchange_trojan_udp;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum UdpOutboundAction {
-    Freedom {
-        tag: Option<String>,
-    },
-    Blackhole {
-        tag: String,
-    },
-    #[cfg(feature = "shadowsocks")]
-    Shadowsocks {
-        tag: String,
-    },
-    Socks {
-        tag: String,
-    },
-    #[cfg(feature = "trojan")]
-    Trojan {
-        tag: String,
-    },
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct UdpSessionKey {
@@ -110,6 +84,21 @@ struct TargetedUdpResponse {
     payload: Vec<u8>,
     traffic_context: Option<TrafficContext>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProxyUdpWorkerKey {
+    client_addr: SocketAddr,
+    action: DirectOutboundAction,
+}
+
+struct ProxyUdpWorkerRequest {
+    target: NetLocation,
+    payload: Vec<u8>,
+    response: oneshot::Sender<std::io::Result<UdpOutboundResponse>>,
+}
+
+type ProxyUdpWorkerIndex =
+    Arc<Mutex<HashMap<ProxyUdpWorkerKey, mpsc::Sender<ProxyUdpWorkerRequest>>>>;
 
 struct SessionUdpResponse {
     session_id: u16,
@@ -243,6 +232,7 @@ fn global_xudp_workers() -> Arc<Mutex<GlobalXudpWorkers>> {
 struct UdpRelayState {
     server_socket: Arc<UdpSocket>,
     sessions: Mutex<HashMap<UdpSessionKey, mpsc::Sender<Vec<u8>>>>,
+    proxy_workers: ProxyUdpWorkerIndex,
 }
 
 impl UdpRelayState {
@@ -250,6 +240,7 @@ impl UdpRelayState {
         Self {
             server_socket,
             sessions: Mutex::new(HashMap::new()),
+            proxy_workers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -314,50 +305,6 @@ pub(crate) async fn run_bidirectional_udp(
             )
             .await
         }
-        #[cfg(feature = "shadowsocks")]
-        DirectOutboundAction::Shadowsocks { tag } => {
-            traffic_context = traffic_context
-                .map(|context| context.with_outbound_tag(tag.clone()));
-            let _connection_guard = register_connection(traffic_context.as_ref());
-            copy_shadowsocks_udp_messages(
-                &mut *server_stream,
-                &resolver,
-                &runtime,
-                &tag,
-                &remote_location,
-                traffic_context,
-            )
-            .await
-        }
-        DirectOutboundAction::Socks { tag } => {
-            traffic_context = traffic_context
-                .map(|context| context.with_outbound_tag(tag.clone()));
-            let _connection_guard = register_connection(traffic_context.as_ref());
-            copy_socks_udp_messages(
-                &mut *server_stream,
-                &resolver,
-                &runtime,
-                &tag,
-                &remote_location,
-                traffic_context,
-            )
-            .await
-        }
-        #[cfg(feature = "trojan")]
-        DirectOutboundAction::Trojan { tag } => {
-            traffic_context = traffic_context
-                .map(|context| context.with_outbound_tag(tag.clone()));
-            let _connection_guard = register_connection(traffic_context.as_ref());
-            copy_trojan_udp_messages(
-                &mut *server_stream,
-                &resolver,
-                &runtime,
-                &tag,
-                &remote_location,
-                traffic_context,
-            )
-            .await
-        }
         DirectOutboundAction::Freedom { tag } => {
             if let Some(tag) = tag {
                 traffic_context =
@@ -374,6 +321,21 @@ pub(crate) async fn run_bidirectional_udp(
             copy_bidirectional_udp_messages(
                 &mut *server_stream,
                 &socket,
+                traffic_context,
+            )
+            .await
+        }
+        proxy_action => {
+            let tag = proxy_action.required_outbound_tag()?.to_string();
+            traffic_context =
+                traffic_context.map(|context| context.with_outbound_tag(tag));
+            let _connection_guard = register_connection(traffic_context.as_ref());
+            copy_proxy_udp_messages(
+                &mut *server_stream,
+                &resolver,
+                &runtime,
+                &proxy_action,
+                &remote_location,
                 traffic_context,
             )
             .await
@@ -403,6 +365,8 @@ pub(crate) async fn run_multi_directional_udp(
         mpsc::channel::<TargetedUdpResponse>(UDP_SESSION_CHANNEL_CAPACITY);
     let mut sessions =
         HashMap::<TargetedUdpSessionKey, mpsc::Sender<Vec<u8>>>::new();
+    let mut proxy_associations =
+        UdpProxyAssociationRegistry::new(UDP_SESSION_IDLE_TIMEOUT);
     let mut client_buffer = vec![0u8; UDP_BUFFER_SIZE];
 
     let result = loop {
@@ -479,98 +443,6 @@ pub(crate) async fn run_multi_directional_udp(
                             target_location, tag
                         );
                     }
-                    #[cfg(feature = "shadowsocks")]
-                    DirectOutboundAction::Shadowsocks { tag } => {
-                        let packet_context = packet_context
-                            .clone()
-                            .map(|context| context.with_outbound_tag(tag.clone()));
-                        let response = exchange_shadowsocks_udp(
-                            &resolver,
-                            &runtime,
-                            &tag,
-                            &target_location,
-                            &payload,
-                        )
-                        .await?;
-                        let source = resolve_single_address(
-                            &resolver,
-                            &response.source,
-                        )
-                        .await?;
-                        write_sourced_message(
-                            &mut *server_stream,
-                            &response.payload,
-                            &source,
-                        )
-                        .await?;
-                        flush_targeted_message(&mut *server_stream).await?;
-                        record_transfer(
-                            packet_context,
-                            payload_length as u64,
-                            response.payload.len() as u64,
-                        );
-                    }
-                    DirectOutboundAction::Socks { tag } => {
-                        let packet_context = packet_context
-                            .clone()
-                            .map(|context| context.with_outbound_tag(tag.clone()));
-                        let response = exchange_socks_udp(
-                            &resolver,
-                            &runtime,
-                            &tag,
-                            &target_location,
-                            &payload,
-                        )
-                        .await?;
-                        let source = resolve_single_address(
-                            &resolver,
-                            &response.source,
-                        )
-                        .await?;
-                        write_sourced_message(
-                            &mut *server_stream,
-                            &response.payload,
-                            &source,
-                        )
-                        .await?;
-                        flush_targeted_message(&mut *server_stream).await?;
-                        record_transfer(
-                            packet_context,
-                            payload_length as u64,
-                            response.payload.len() as u64,
-                        );
-                    }
-                    #[cfg(feature = "trojan")]
-                    DirectOutboundAction::Trojan { tag } => {
-                        let packet_context = packet_context
-                            .clone()
-                            .map(|context| context.with_outbound_tag(tag.clone()));
-                        let response = exchange_trojan_udp(
-                            &resolver,
-                            &runtime,
-                            &tag,
-                            &target_location,
-                            &payload,
-                        )
-                        .await?;
-                        let source = resolve_single_address(
-                            &resolver,
-                            &response.source,
-                        )
-                        .await?;
-                        write_sourced_message(
-                            &mut *server_stream,
-                            &response.payload,
-                            &source,
-                        )
-                        .await?;
-                        flush_targeted_message(&mut *server_stream).await?;
-                        record_transfer(
-                            packet_context,
-                            payload_length as u64,
-                            response.payload.len() as u64,
-                        );
-                    }
                     DirectOutboundAction::Freedom { tag } => {
                         let packet_context = match &tag {
                             Some(tag) => packet_context
@@ -614,6 +486,38 @@ pub(crate) async fn run_multi_directional_udp(
                             )?;
                             sessions.insert(key, sender);
                         }
+                    }
+                    proxy_action => {
+                        let tag = proxy_action.required_outbound_tag()?.to_string();
+                        let packet_context = packet_context
+                            .clone()
+                            .map(|context| context.with_outbound_tag(tag));
+                        let response = proxy_associations
+                            .exchange(
+                                &resolver,
+                                &runtime,
+                                &proxy_action,
+                                &target_location,
+                                &payload,
+                            )
+                            .await?;
+                        let source = resolve_single_address(
+                            &resolver,
+                            &response.source,
+                        )
+                        .await?;
+                        write_sourced_message(
+                            &mut *server_stream,
+                            &response.payload,
+                            &source,
+                        )
+                        .await?;
+                        flush_targeted_message(&mut *server_stream).await?;
+                        record_transfer(
+                            packet_context,
+                            payload_length as u64,
+                            response.payload.len() as u64,
+                        );
                     }
                 }
             }
@@ -659,6 +563,7 @@ pub(crate) async fn run_session_based_udp(
     let (response_sender, mut response_receiver) =
         mpsc::channel::<SessionUdpEvent>(UDP_SESSION_CHANNEL_CAPACITY);
     let mut sessions = HashMap::<u16, SessionUdpWorker>::new();
+    let mut proxy_associations = HashMap::<u16, UdpProxyAssociationRegistry>::new();
     let mut next_generation = 1u64;
     let mut client_buffer = vec![0u8; UDP_BUFFER_SIZE];
 
@@ -688,6 +593,7 @@ pub(crate) async fn run_session_based_udp(
                     }
                     Ok((SessionMessage::End { session_id }, _)) => {
                         expire_session_udp_worker(&mut sessions, session_id).await;
+                        proxy_associations.remove(&session_id);
                         debug!("session udp {} ended by peer", session_id);
                         continue;
                     }
@@ -696,8 +602,11 @@ pub(crate) async fn run_session_based_udp(
                     }
                     Err(error) => break Err(error),
                 };
-                if is_new && sessions.contains_key(&session_id) {
-                    expire_session_udp_worker(&mut sessions, session_id).await;
+                if is_new {
+                    if sessions.contains_key(&session_id) {
+                        expire_session_udp_worker(&mut sessions, session_id).await;
+                    }
+                    proxy_associations.remove(&session_id);
                 }
                 let packet_context = traffic_context.clone().map(|context| {
                     context.with_access_target(
@@ -766,101 +675,6 @@ pub(crate) async fn run_session_based_udp(
                         debug!(
                             "session udp packet {} to {} dropped by blackhole outbound {}",
                             session_id, target_location, tag
-                        );
-                    }
-                    #[cfg(feature = "shadowsocks")]
-                    DirectOutboundAction::Shadowsocks { tag } => {
-                        let packet_context = packet_context
-                            .clone()
-                            .map(|context| context.with_outbound_tag(tag.clone()));
-                        let response = exchange_shadowsocks_udp(
-                            &resolver,
-                            &runtime,
-                            &tag,
-                            &target_location,
-                            &payload,
-                        )
-                        .await?;
-                        let source = resolve_single_address(
-                            &resolver,
-                            &response.source,
-                        )
-                        .await?;
-                        write_session_message(
-                            &mut *server_stream,
-                            session_id,
-                            &response.payload,
-                            &source,
-                        )
-                        .await?;
-                        flush_session_message(&mut *server_stream).await?;
-                        record_transfer(
-                            packet_context,
-                            payload_length as u64,
-                            response.payload.len() as u64,
-                        );
-                    }
-                    DirectOutboundAction::Socks { tag } => {
-                        let packet_context = packet_context
-                            .clone()
-                            .map(|context| context.with_outbound_tag(tag.clone()));
-                        let response = exchange_socks_udp(
-                            &resolver,
-                            &runtime,
-                            &tag,
-                            &target_location,
-                            &payload,
-                        )
-                        .await?;
-                        let source = resolve_single_address(
-                            &resolver,
-                            &response.source,
-                        )
-                        .await?;
-                        write_session_message(
-                            &mut *server_stream,
-                            session_id,
-                            &response.payload,
-                            &source,
-                        )
-                        .await?;
-                        flush_session_message(&mut *server_stream).await?;
-                        record_transfer(
-                            packet_context,
-                            payload_length as u64,
-                            response.payload.len() as u64,
-                        );
-                    }
-                    #[cfg(feature = "trojan")]
-                    DirectOutboundAction::Trojan { tag } => {
-                        let packet_context = packet_context
-                            .clone()
-                            .map(|context| context.with_outbound_tag(tag.clone()));
-                        let response = exchange_trojan_udp(
-                            &resolver,
-                            &runtime,
-                            &tag,
-                            &target_location,
-                            &payload,
-                        )
-                        .await?;
-                        let source = resolve_single_address(
-                            &resolver,
-                            &response.source,
-                        )
-                        .await?;
-                        write_session_message(
-                            &mut *server_stream,
-                            session_id,
-                            &response.payload,
-                            &source,
-                        )
-                        .await?;
-                        flush_session_message(&mut *server_stream).await?;
-                        record_transfer(
-                            packet_context,
-                            payload_length as u64,
-                            response.payload.len() as u64,
                         );
                     }
                     DirectOutboundAction::Freedom { tag } => {
@@ -935,6 +749,46 @@ pub(crate) async fn run_session_based_udp(
                             sessions.insert(session_id, worker);
                         }
                     }
+                    proxy_action => {
+                        let tag = proxy_action.required_outbound_tag()?.to_string();
+                        let packet_context = packet_context
+                            .clone()
+                            .map(|context| context.with_outbound_tag(tag));
+                        let registry = proxy_associations
+                            .entry(session_id)
+                            .or_insert_with(|| {
+                                UdpProxyAssociationRegistry::new(
+                                    UDP_SESSION_IDLE_TIMEOUT,
+                                )
+                            });
+                        let response = registry
+                            .exchange(
+                                &resolver,
+                                &runtime,
+                                &proxy_action,
+                                &target_location,
+                                &payload,
+                            )
+                            .await?;
+                        let source = resolve_single_address(
+                            &resolver,
+                            &response.source,
+                        )
+                        .await?;
+                        write_session_message(
+                            &mut *server_stream,
+                            session_id,
+                            &response.payload,
+                            &source,
+                        )
+                        .await?;
+                        flush_session_message(&mut *server_stream).await?;
+                        record_transfer(
+                            packet_context,
+                            payload_length as u64,
+                            response.payload.len() as u64,
+                        );
+                    }
                 }
             }
             event = response_receiver.recv() => {
@@ -981,6 +835,7 @@ pub(crate) async fn run_session_based_udp(
                             continue;
                         }
                         expire_session_udp_worker(&mut sessions, session_id).await;
+                        proxy_associations.remove(&session_id);
                         write_session_end(
                             &mut *server_stream,
                             session_id,
@@ -1783,79 +1638,35 @@ async fn consume_blackholed_udp_messages(
     }
 }
 
-#[cfg(feature = "shadowsocks")]
-async fn copy_shadowsocks_udp_messages(
+async fn copy_proxy_udp_messages(
     stream: &mut dyn AsyncMessageStream,
     resolver: &Arc<dyn Resolver>,
     runtime: &RuntimeState,
-    tag: &str,
+    action: &DirectOutboundAction,
     target: &NetLocation,
     traffic_context: Option<TrafficContext>,
 ) -> std::io::Result<()> {
     let mut buffer = vec![0u8; VMESS_UDP_MESSAGE_BUFFER_SIZE];
+    let mut association = None;
     loop {
         let len = read_message(stream, &mut buffer).await?;
         if len == 0 {
             return Ok(());
         }
-        let response =
-            exchange_shadowsocks_udp(resolver, runtime, tag, target, &buffer[..len])
-                .await?;
-        write_message(stream, &response.payload).await?;
-        flush_message(stream).await?;
-        record_transfer(
-            traffic_context.clone(),
-            len as u64,
-            response.payload.len() as u64,
-        );
-    }
-}
-
-async fn copy_socks_udp_messages(
-    stream: &mut dyn AsyncMessageStream,
-    resolver: &Arc<dyn Resolver>,
-    runtime: &RuntimeState,
-    tag: &str,
-    target: &NetLocation,
-    traffic_context: Option<TrafficContext>,
-) -> std::io::Result<()> {
-    let mut buffer = vec![0u8; VMESS_UDP_MESSAGE_BUFFER_SIZE];
-    loop {
-        let len = read_message(stream, &mut buffer).await?;
-        if len == 0 {
-            return Ok(());
+        if association.is_none() {
+            association = Some(
+                connect_fixed_target_udp_proxy_association(
+                    resolver, runtime, action, target,
+                )
+                .await?,
+            );
         }
-        let response =
-            exchange_socks_udp(resolver, runtime, tag, target, &buffer[..len])
-                .await?;
-        write_message(stream, &response.payload).await?;
-        flush_message(stream).await?;
-        record_transfer(
-            traffic_context.clone(),
-            len as u64,
-            response.payload.len() as u64,
-        );
-    }
-}
-
-#[cfg(feature = "trojan")]
-async fn copy_trojan_udp_messages(
-    stream: &mut dyn AsyncMessageStream,
-    resolver: &Arc<dyn Resolver>,
-    runtime: &RuntimeState,
-    tag: &str,
-    target: &NetLocation,
-    traffic_context: Option<TrafficContext>,
-) -> std::io::Result<()> {
-    let mut buffer = vec![0u8; VMESS_UDP_MESSAGE_BUFFER_SIZE];
-    loop {
-        let len = read_message(stream, &mut buffer).await?;
-        if len == 0 {
-            return Ok(());
-        }
-        let response =
-            exchange_trojan_udp(resolver, runtime, tag, target, &buffer[..len])
-                .await?;
+        let association = association.as_mut().ok_or_else(|| {
+            std::io::Error::other(
+                "fixed-target UDP proxy association was not initialized",
+            )
+        })?;
+        let response = association.exchange(target, &buffer[..len]).await?;
         write_message(stream, &response.payload).await?;
         flush_message(stream).await?;
         record_transfer(
@@ -1980,7 +1791,7 @@ pub async fn start_udp_server(
     let target_addr = if dokodemo_config.follow_redirect {
         None
     } else {
-        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let resolver = runtime.resolver();
         Some(resolve_single_address(&resolver, &dokodemo_config.target).await?)
     };
 
@@ -2037,6 +1848,125 @@ fn bind_location_to_socket_addr(
     }
 }
 
+async fn exchange_proxy_udp_via_worker(
+    workers: &ProxyUdpWorkerIndex,
+    resolver: Arc<dyn Resolver>,
+    runtime: RuntimeState,
+    client_addr: SocketAddr,
+    action: DirectOutboundAction,
+    target: NetLocation,
+    payload: Vec<u8>,
+) -> std::io::Result<UdpOutboundResponse> {
+    let key = ProxyUdpWorkerKey {
+        client_addr,
+        action,
+    };
+    let sender = proxy_udp_worker_sender(
+        workers,
+        key.clone(),
+        resolver.clone(),
+        runtime.clone(),
+    )
+    .await;
+    let (response, received) = oneshot::channel();
+    let request = ProxyUdpWorkerRequest {
+        target,
+        payload,
+        response,
+    };
+    let request = match sender.send(request).await {
+        Ok(()) => None,
+        Err(error) => Some(error.0),
+    };
+    if let Some(request) = request {
+        workers.lock().await.remove(&key);
+        let sender = proxy_udp_worker_sender(workers, key, resolver, runtime).await;
+        sender.send(request).await.map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "UDP proxy worker closed before accepting the request",
+            )
+        })?;
+    }
+    received.await.map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "UDP proxy worker closed before returning a response",
+        )
+    })?
+}
+
+async fn proxy_udp_worker_sender(
+    workers: &ProxyUdpWorkerIndex,
+    key: ProxyUdpWorkerKey,
+    resolver: Arc<dyn Resolver>,
+    runtime: RuntimeState,
+) -> mpsc::Sender<ProxyUdpWorkerRequest> {
+    let mut guard = workers.lock().await;
+    if let Some(sender) = guard.get(&key)
+        && !sender.is_closed()
+    {
+        return sender.clone();
+    }
+
+    let (sender, receiver) = mpsc::channel(UDP_SESSION_CHANNEL_CAPACITY);
+    guard.insert(key.clone(), sender.clone());
+    drop(guard);
+
+    let workers = workers.clone();
+    let cleanup_sender = sender.clone();
+    let action = key.action.clone();
+    tokio::spawn(async move {
+        run_proxy_udp_worker(receiver, resolver, runtime, action).await;
+        let mut guard = workers.lock().await;
+        if guard
+            .get(&key)
+            .is_some_and(|current| current.same_channel(&cleanup_sender))
+        {
+            guard.remove(&key);
+        }
+    });
+    sender
+}
+
+async fn run_proxy_udp_worker(
+    mut receiver: mpsc::Receiver<ProxyUdpWorkerRequest>,
+    resolver: Arc<dyn Resolver>,
+    runtime: RuntimeState,
+    action: DirectOutboundAction,
+) {
+    let mut associations =
+        UdpProxyAssociationRegistry::new(UDP_SESSION_IDLE_TIMEOUT);
+    loop {
+        let request = match timeout(UDP_SESSION_IDLE_TIMEOUT, receiver.recv()).await
+        {
+            Ok(Some(request)) => request,
+            Ok(None) | Err(_) => return,
+        };
+        let result = associations
+            .exchange(
+                &resolver,
+                &runtime,
+                &action,
+                &request.target,
+                &request.payload,
+            )
+            .await;
+        let _ = request.response.send(result);
+    }
+}
+
+#[cfg(feature = "shadowsocks")]
+#[derive(Clone)]
+struct ShadowsocksUdpRelayContext {
+    server_socket: Arc<UdpSocket>,
+    codec: Arc<ShadowsocksUdpCodec>,
+    resolver: Arc<dyn Resolver>,
+    runtime: RuntimeState,
+    inbound_tag: String,
+    proxy_workers: ProxyUdpWorkerIndex,
+}
+
 #[cfg(feature = "shadowsocks")]
 async fn start_shadowsocks_udp_server(
     bind_location: BindLocation,
@@ -2051,33 +1981,30 @@ async fn start_shadowsocks_udp_server(
     info!("Starting Shadowsocks UDP server at {}", bind_location);
 
     Ok(Some(tokio::spawn(async move {
-        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let context = ShadowsocksUdpRelayContext {
+            server_socket: socket,
+            codec,
+            resolver: runtime.resolver(),
+            runtime,
+            inbound_tag,
+            proxy_workers: Arc::new(Mutex::new(HashMap::new())),
+        };
         let mut buffer = vec![0u8; UDP_BUFFER_SIZE];
         loop {
-            let (len, client_addr) = match socket.recv_from(&mut buffer).await {
-                Ok(value) => value,
-                Err(error) => {
-                    error!("Shadowsocks UDP receive failed: {error}");
-                    break;
-                }
-            };
+            let (len, client_addr) =
+                match context.server_socket.recv_from(&mut buffer).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        error!("Shadowsocks UDP receive failed: {error}");
+                        break;
+                    }
+                };
             let packet = buffer[..len].to_vec();
-            let socket = socket.clone();
-            let codec = codec.clone();
-            let runtime = runtime.clone();
-            let resolver = resolver.clone();
-            let inbound_tag = inbound_tag.clone();
+            let packet_context = context.clone();
             tokio::spawn(async move {
-                if let Err(error) = relay_shadowsocks_udp_packet(
-                    socket,
-                    codec,
-                    resolver,
-                    runtime,
-                    inbound_tag,
-                    client_addr,
-                    packet,
-                )
-                .await
+                if let Err(error) =
+                    relay_shadowsocks_udp_packet(packet_context, client_addr, packet)
+                        .await
                 {
                     debug!(
                         "Shadowsocks UDP packet from {} failed: {}",
@@ -2091,110 +2018,35 @@ async fn start_shadowsocks_udp_server(
 
 #[cfg(feature = "shadowsocks")]
 async fn relay_shadowsocks_udp_packet(
-    server_socket: Arc<UdpSocket>,
-    codec: Arc<ShadowsocksUdpCodec>,
-    resolver: Arc<dyn Resolver>,
-    runtime: RuntimeState,
-    inbound_tag: String,
+    context: ShadowsocksUdpRelayContext,
     client_addr: SocketAddr,
     packet: Vec<u8>,
 ) -> std::io::Result<()> {
-    let request = codec.decrypt_packet(&packet)?;
+    let request = context.codec.decrypt_packet(&packet)?;
     let target_addr =
-        resolve_single_address(&resolver, &request.target_location).await?;
+        resolve_single_address(&context.resolver, &request.target_location).await?;
     let outbound_action = select_udp_outbound(
-        &runtime,
-        &inbound_tag,
+        &context.runtime,
+        &context.inbound_tag,
         client_addr,
         target_addr,
         &request.target_location,
     )
     .await?;
     let mut traffic_context = TrafficContext::new("shadowsocks")
-        .with_inbound_tag(inbound_tag)
+        .with_inbound_tag(context.inbound_tag.clone())
         .with_client_ip(client_addr.ip());
     if !request.identity.is_empty() {
         traffic_context = traffic_context.with_identity(request.identity.clone());
     }
 
     match outbound_action {
-        UdpOutboundAction::Blackhole { tag } => {
+        DirectOutboundAction::Blackhole { tag } => {
             traffic_context = traffic_context.with_outbound_tag(tag);
             record_transfer(Some(traffic_context), request.payload.len() as u64, 0);
             Ok(())
         }
-        #[cfg(feature = "shadowsocks")]
-        UdpOutboundAction::Shadowsocks { tag } => {
-            traffic_context = traffic_context.with_outbound_tag(tag.clone());
-            let response = exchange_shadowsocks_udp(
-                &resolver,
-                &runtime,
-                &tag,
-                &request.target_location,
-                &request.payload,
-            )
-            .await?;
-            let encrypted = codec.encrypt_packet(
-                &request,
-                &response.source,
-                &response.payload,
-            )?;
-            server_socket.send_to(&encrypted, client_addr).await?;
-            record_transfer(
-                Some(traffic_context),
-                request.payload.len() as u64,
-                response.payload.len() as u64,
-            );
-            Ok(())
-        }
-        UdpOutboundAction::Socks { tag } => {
-            traffic_context = traffic_context.with_outbound_tag(tag.clone());
-            let response = exchange_socks_udp(
-                &resolver,
-                &runtime,
-                &tag,
-                &request.target_location,
-                &request.payload,
-            )
-            .await?;
-            let encrypted = codec.encrypt_packet(
-                &request,
-                &response.source,
-                &response.payload,
-            )?;
-            server_socket.send_to(&encrypted, client_addr).await?;
-            record_transfer(
-                Some(traffic_context),
-                request.payload.len() as u64,
-                response.payload.len() as u64,
-            );
-            Ok(())
-        }
-        #[cfg(feature = "trojan")]
-        UdpOutboundAction::Trojan { tag } => {
-            traffic_context = traffic_context.with_outbound_tag(tag.clone());
-            let response = exchange_trojan_udp(
-                &resolver,
-                &runtime,
-                &tag,
-                &request.target_location,
-                &request.payload,
-            )
-            .await?;
-            let encrypted = codec.encrypt_packet(
-                &request,
-                &response.source,
-                &response.payload,
-            )?;
-            server_socket.send_to(&encrypted, client_addr).await?;
-            record_transfer(
-                Some(traffic_context),
-                request.payload.len() as u64,
-                response.payload.len() as u64,
-            );
-            Ok(())
-        }
-        UdpOutboundAction::Freedom { tag } => {
+        DirectOutboundAction::Freedom { tag } => {
             if let Some(tag) = tag {
                 traffic_context = traffic_context.with_outbound_tag(tag);
             }
@@ -2219,13 +2071,45 @@ async fn relay_shadowsocks_udp_packet(
                     })??;
             let source =
                 NetLocation::from_ip_addr(response_addr.ip(), response_addr.port());
-            let encrypted = codec.encrypt_packet(
+            let encrypted = context.codec.encrypt_packet(
                 &request,
                 &source,
                 &response[..response_len],
             )?;
-            server_socket.send_to(&encrypted, client_addr).await?;
+            context
+                .server_socket
+                .send_to(&encrypted, client_addr)
+                .await?;
             record_transfer(Some(traffic_context), 0, response_len as u64);
+            Ok(())
+        }
+        proxy_action => {
+            let tag = proxy_action.required_outbound_tag()?.to_string();
+            traffic_context = traffic_context.with_outbound_tag(tag);
+            let response = exchange_proxy_udp_via_worker(
+                &context.proxy_workers,
+                context.resolver.clone(),
+                context.runtime.clone(),
+                client_addr,
+                proxy_action,
+                request.target_location.clone(),
+                request.payload.clone(),
+            )
+            .await?;
+            let encrypted = context.codec.encrypt_packet(
+                &request,
+                &response.source,
+                &response.payload,
+            )?;
+            context
+                .server_socket
+                .send_to(&encrypted, client_addr)
+                .await?;
+            record_transfer(
+                Some(traffic_context),
+                request.payload.len() as u64,
+                response.payload.len() as u64,
+            );
             Ok(())
         }
     }
@@ -2325,7 +2209,7 @@ async fn relay_dokodemo_udp_datagram(
         .with_client_ip(client_addr.ip());
 
     match outbound_action {
-        UdpOutboundAction::Blackhole { tag } => {
+        DirectOutboundAction::Blackhole { tag } => {
             let traffic_context = traffic_context.with_outbound_tag(tag.clone());
             debug!(
                 "dokodemo-door udp packet from {} to {} dropped by blackhole outbound {}",
@@ -2334,102 +2218,7 @@ async fn relay_dokodemo_udp_datagram(
             record_transfer(Some(traffic_context), payload.len() as u64, 0);
             Ok(())
         }
-        #[cfg(feature = "shadowsocks")]
-        UdpOutboundAction::Shadowsocks { tag } => {
-            let traffic_context = traffic_context.with_outbound_tag(tag.clone());
-            let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
-            let response = exchange_shadowsocks_udp(
-                &resolver,
-                &runtime,
-                &tag,
-                &target_location,
-                &payload,
-            )
-            .await?;
-            let source_addr =
-                resolve_single_address(&resolver, &response.source).await?;
-            relay_state
-                .server_socket
-                .send_to(&response.payload, client_addr)
-                .await?;
-            record_transfer(
-                Some(traffic_context),
-                payload.len() as u64,
-                response.payload.len() as u64,
-            );
-            debug!(
-                "dokodemo-door udp relay {} <- {} via {} forwarded {} bytes",
-                client_addr,
-                source_addr,
-                tag,
-                response.payload.len()
-            );
-            Ok(())
-        }
-        UdpOutboundAction::Socks { tag } => {
-            let traffic_context = traffic_context.with_outbound_tag(tag.clone());
-            let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
-            let response = exchange_socks_udp(
-                &resolver,
-                &runtime,
-                &tag,
-                &target_location,
-                &payload,
-            )
-            .await?;
-            let source_addr =
-                resolve_single_address(&resolver, &response.source).await?;
-            relay_state
-                .server_socket
-                .send_to(&response.payload, client_addr)
-                .await?;
-            record_transfer(
-                Some(traffic_context),
-                payload.len() as u64,
-                response.payload.len() as u64,
-            );
-            debug!(
-                "dokodemo-door udp relay {} <- {} via {} forwarded {} bytes",
-                client_addr,
-                source_addr,
-                tag,
-                response.payload.len()
-            );
-            Ok(())
-        }
-        #[cfg(feature = "trojan")]
-        UdpOutboundAction::Trojan { tag } => {
-            let traffic_context = traffic_context.with_outbound_tag(tag.clone());
-            let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
-            let response = exchange_trojan_udp(
-                &resolver,
-                &runtime,
-                &tag,
-                &target_location,
-                &payload,
-            )
-            .await?;
-            let source_addr =
-                resolve_single_address(&resolver, &response.source).await?;
-            relay_state
-                .server_socket
-                .send_to(&response.payload, client_addr)
-                .await?;
-            record_transfer(
-                Some(traffic_context),
-                payload.len() as u64,
-                response.payload.len() as u64,
-            );
-            debug!(
-                "dokodemo-door udp relay {} <- {} via {} forwarded {} bytes",
-                client_addr,
-                source_addr,
-                tag,
-                response.payload.len()
-            );
-            Ok(())
-        }
-        UdpOutboundAction::Freedom { tag } => {
+        DirectOutboundAction::Freedom { tag } => {
             let traffic_context = match &tag {
                 Some(tag) => traffic_context.with_outbound_tag(tag.clone()),
                 None => traffic_context,
@@ -2454,6 +2243,40 @@ async fn relay_dokodemo_udp_datagram(
                     "dokodemo-door udp session closed before payload was sent",
                 )
             })
+        }
+        proxy_action => {
+            let tag = proxy_action.required_outbound_tag()?.to_string();
+            let traffic_context = traffic_context.with_outbound_tag(tag.clone());
+            let resolver = runtime.resolver();
+            let response = exchange_proxy_udp_via_worker(
+                &relay_state.proxy_workers,
+                resolver.clone(),
+                runtime,
+                client_addr,
+                proxy_action,
+                target_location,
+                payload.clone(),
+            )
+            .await?;
+            let source_addr =
+                resolve_single_address(&resolver, &response.source).await?;
+            relay_state
+                .server_socket
+                .send_to(&response.payload, client_addr)
+                .await?;
+            record_transfer(
+                Some(traffic_context),
+                payload.len() as u64,
+                response.payload.len() as u64,
+            );
+            debug!(
+                "dokodemo-door udp relay {} <- {} via {} forwarded {} bytes",
+                client_addr,
+                source_addr,
+                tag,
+                response.payload.len()
+            );
+            Ok(())
         }
     }
 }
@@ -2603,7 +2426,7 @@ async fn select_udp_outbound(
     client_addr: SocketAddr,
     target_addr: SocketAddr,
     target_location: &NetLocation,
-) -> std::io::Result<UdpOutboundAction> {
+) -> std::io::Result<DirectOutboundAction> {
     let mut route_input = RoutingInput {
         inbound_tag: inbound_tag.to_string(),
         network: 3,
@@ -2618,35 +2441,7 @@ async fn select_udp_outbound(
         enrich_routing_input(&mut route_input).await;
     }
 
-    let selected =
-        runtime
-            .select_outbound_checked(&route_input)
-            .map_err(|error| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
-            })?;
-
-    let Some(outbound) = selected else {
-        return Ok(UdpOutboundAction::Freedom { tag: None });
-    };
-
-    match outbound.protocol.trim().to_ascii_lowercase().as_str() {
-        "freedom" => Ok(UdpOutboundAction::Freedom {
-            tag: Some(outbound.tag),
-        }),
-        "blackhole" => Ok(UdpOutboundAction::Blackhole { tag: outbound.tag }),
-        #[cfg(feature = "shadowsocks")]
-        "shadowsocks" => Ok(UdpOutboundAction::Shadowsocks { tag: outbound.tag }),
-        "socks" => Ok(UdpOutboundAction::Socks { tag: outbound.tag }),
-        #[cfg(feature = "trojan")]
-        "trojan" => Ok(UdpOutboundAction::Trojan { tag: outbound.tag }),
-        protocol => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "udp outbound {} uses unsupported protocol {}",
-                outbound.tag, protocol
-            ),
-        )),
-    }
+    select_direct_outbound(runtime, &route_input, "udp")
 }
 
 fn encode_ip(ip: IpAddr) -> Vec<u8> {
@@ -2681,7 +2476,7 @@ mod tests {
             AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream,
             ReadBuf, duplex,
         },
-        net::UdpSocket,
+        net::{TcpListener, UdpSocket},
         time::timeout,
     };
 
@@ -2689,6 +2484,7 @@ mod tests {
         address::{Address, NetLocation},
         async_stream::{AsyncPing, AsyncStream},
         config::{
+            def::OutboundStreamSettings,
             rule::{
                 BalancerConfig, NetworkListConfig, PortListConfig, PortRangeConfig,
                 RoutingConfig, RuleConfig,
@@ -2696,7 +2492,7 @@ mod tests {
             server_config::DokodemoDoorConfig,
         },
         handler::{
-            trojan_udp::TrojanUdpStream,
+            trojan_udp::{TrojanUdpStream, encode_packet_location, read_packet},
             xudp::{
                 frame::{FrameMetadata, FrameOption, SessionStatus, TargetNetwork},
                 message_stream::XudpMessageStream,
@@ -2798,6 +2594,32 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "vless")]
+    fn vless_udp_outbound(
+        tag: &str,
+        server: SocketAddr,
+        user_id: &str,
+    ) -> OutboundSummary {
+        OutboundSummary {
+            tag: tag.into(),
+            protocol: "vless".into(),
+            settings: Some(serde_json::json!({
+                "address": server.ip().to_string(),
+                "port": server.port(),
+                "id": user_id,
+                "flow": "",
+                "encryption": "none"
+            })),
+            stream_settings: Some(OutboundStreamSettings {
+                network: "tcp".into(),
+                security: Some("none".into()),
+                ..OutboundStreamSettings::default()
+            }),
+            proxy_settings_type: None,
+            proxy_settings_value: None,
+        }
+    }
+
     #[cfg(feature = "user_domain_access")]
     #[tokio::test]
     async fn bidirectional_udp_policy_rejects_before_dns_resolution() {
@@ -2881,6 +2703,119 @@ mod tests {
             42
         );
         assert_eq!(next_generation, 43);
+    }
+
+    #[cfg(feature = "vless")]
+    #[tokio::test]
+    async fn session_udp_reuses_vless_proxy_association() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind XUDP VLESS upstream");
+        let upstream_addr = listener.local_addr().unwrap();
+        let user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
+        let expected_uuid = uuid::Uuid::parse_str(user_id).unwrap().into_bytes();
+        let target =
+            NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)), 5354);
+        let expected_target = target.clone();
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut prefix = [0u8; 19];
+            stream.read_exact(&mut prefix).await.unwrap();
+            assert_eq!(prefix[0], 0);
+            assert_eq!(&prefix[1..17], &expected_uuid);
+            assert_eq!(prefix[17], 0);
+            assert_eq!(prefix[18], 2);
+            assert_eq!(stream.read_u16().await.unwrap(), expected_target.port());
+            assert_eq!(stream.read_u8().await.unwrap(), 1);
+            let mut address = [0u8; 4];
+            stream.read_exact(&mut address).await.unwrap();
+            let Address::Ipv4(expected_address) = expected_target.address() else {
+                panic!("test target must be IPv4");
+            };
+            assert_eq!(address, expected_address.octets());
+
+            for (index, expected) in [b"first".as_slice(), b"second".as_slice()]
+                .into_iter()
+                .enumerate()
+            {
+                let length = stream.read_u16().await.unwrap() as usize;
+                let mut payload = vec![0u8; length];
+                stream.read_exact(&mut payload).await.unwrap();
+                assert_eq!(payload, expected);
+                if index == 0 {
+                    stream.write_all(&[0, 0]).await.unwrap();
+                }
+                stream.write_u16(length as u16).await.unwrap();
+                stream.write_all(&payload).await.unwrap();
+                stream.flush().await.unwrap();
+            }
+        });
+
+        let runtime = RuntimeState::try_new(
+            Vec::new(),
+            vec![vless_udp_outbound("vless-proxy", upstream_addr, user_id)],
+        )
+        .expect("compile XUDP VLESS outbound");
+        let (mut client, server) = duplex(4096);
+        let stream = XudpMessageStream::new(
+            Box::new(TestStream(server)),
+            Arc::new(NativeResolver::new()),
+        );
+        let relay = tokio::spawn(run_session_based_udp(
+            Box::new(stream),
+            Arc::new(NativeResolver::new()),
+            runtime,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 43114)),
+            None,
+        ));
+
+        for (index, payload) in [b"first".as_slice(), b"second".as_slice()]
+            .into_iter()
+            .enumerate()
+        {
+            let mut frame = BytesMut::new();
+            FrameMetadata {
+                session_id: 14,
+                status: if index == 0 {
+                    SessionStatus::New
+                } else {
+                    SessionStatus::Keep
+                },
+                option: FrameOption::default().with_data(),
+                target: Some(target.clone()),
+                network: Some(TargetNetwork::Udp),
+                global_id: None,
+            }
+            .encode(&mut frame)
+            .expect("encode XUDP VLESS request metadata");
+            frame.put_u16(payload.len() as u16);
+            frame.extend_from_slice(payload);
+            client.write_all(&frame).await.unwrap();
+            client.flush().await.unwrap();
+
+            let metadata_length = timeout(Duration::from_secs(2), client.read_u16())
+                .await
+                .expect("XUDP VLESS response metadata timeout")
+                .expect("read XUDP VLESS response metadata length")
+                as usize;
+            let mut raw = BytesMut::new();
+            raw.put_u16(metadata_length as u16);
+            raw.resize(2 + metadata_length, 0);
+            client.read_exact(&mut raw[2..]).await.unwrap();
+            let metadata = FrameMetadata::decode(&mut raw)
+                .expect("decode XUDP VLESS response metadata")
+                .expect("complete XUDP VLESS response metadata");
+            assert_eq!(metadata.session_id, 14);
+            assert_eq!(metadata.status, SessionStatus::Keep);
+            assert_eq!(metadata.target.as_ref(), Some(&target));
+            let response_length = client.read_u16().await.unwrap() as usize;
+            let mut response = vec![0u8; response_length];
+            client.read_exact(&mut response).await.unwrap();
+            assert_eq!(response, payload);
+        }
+
+        upstream.await.expect("XUDP VLESS upstream task");
+        relay.abort();
     }
 
     #[tokio::test]
@@ -3883,6 +3818,86 @@ mod tests {
         assert!(!sessions.contains_key(&23));
     }
 
+    #[cfg(feature = "vless")]
+    #[tokio::test]
+    async fn targeted_udp_reuses_vless_proxy_association() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind VLESS UDP upstream");
+        let upstream_addr = listener.local_addr().unwrap();
+        let user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
+        let expected_uuid = uuid::Uuid::parse_str(user_id).unwrap().into_bytes();
+        let target =
+            NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 5353);
+        let expected_target = target.clone();
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut prefix = [0u8; 19];
+            stream.read_exact(&mut prefix).await.unwrap();
+            assert_eq!(prefix[0], 0);
+            assert_eq!(&prefix[1..17], &expected_uuid);
+            assert_eq!(prefix[17], 0);
+            assert_eq!(prefix[18], 2);
+            assert_eq!(stream.read_u16().await.unwrap(), expected_target.port());
+            assert_eq!(stream.read_u8().await.unwrap(), 1);
+            let mut address = [0u8; 4];
+            stream.read_exact(&mut address).await.unwrap();
+            let Address::Ipv4(expected_address) = expected_target.address() else {
+                panic!("test target must be IPv4");
+            };
+            assert_eq!(address, expected_address.octets());
+
+            for (index, expected) in [b"first".as_slice(), b"second".as_slice()]
+                .into_iter()
+                .enumerate()
+            {
+                let length = stream.read_u16().await.unwrap() as usize;
+                let mut payload = vec![0u8; length];
+                stream.read_exact(&mut payload).await.unwrap();
+                assert_eq!(payload, expected);
+                if index == 0 {
+                    stream.write_all(&[0, 0]).await.unwrap();
+                }
+                stream.write_u16(length as u16).await.unwrap();
+                stream.write_all(&payload).await.unwrap();
+                stream.flush().await.unwrap();
+            }
+        });
+
+        let runtime = RuntimeState::try_new(
+            Vec::new(),
+            vec![vless_udp_outbound("vless-proxy", upstream_addr, user_id)],
+        )
+        .expect("compile VLESS UDP outbound");
+        let (mut client, server) = duplex(4096);
+        let relay_task = tokio::spawn(run_multi_directional_udp(
+            Box::new(TrojanUdpStream::new(Box::new(TestStream(server)))),
+            Arc::new(NativeResolver::new()),
+            runtime,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 32001)),
+            Some(
+                TrafficContext::new("trojan")
+                    .with_identity("udp-user")
+                    .with_inbound_tag("trojan-vless-udp"),
+            ),
+        ));
+
+        for payload in [b"first".as_slice(), b"second".as_slice()] {
+            let packet = encode_packet_location(&target, payload).unwrap();
+            client.write_all(&packet).await.unwrap();
+            let (source, response) =
+                timeout(Duration::from_secs(2), read_packet(&mut client))
+                    .await
+                    .expect("targeted VLESS UDP response timeout")
+                    .expect("read targeted VLESS UDP response");
+            assert_eq!(source, target);
+            assert_eq!(response, payload);
+        }
+
+        upstream.await.expect("VLESS UDP upstream task");
+        relay_task.abort();
+    }
+
     #[tokio::test]
     async fn multi_directional_udp_relays_trojan_packets() {
         let echo_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
@@ -4327,7 +4342,7 @@ mod tests {
 
         assert_eq!(
             action,
-            UdpOutboundAction::Blackhole {
+            DirectOutboundAction::Blackhole {
                 tag: "blocked".into()
             }
         );
@@ -4375,7 +4390,7 @@ mod tests {
 
         assert_eq!(
             action,
-            UdpOutboundAction::Blackhole {
+            DirectOutboundAction::Blackhole {
                 tag: "blocked".into()
             }
         );
@@ -4397,7 +4412,7 @@ mod tests {
 
         assert_eq!(
             action,
-            UdpOutboundAction::Freedom {
+            DirectOutboundAction::Freedom {
                 tag: Some("direct".into())
             }
         );

@@ -10,10 +10,10 @@ pub use config::{
 };
 pub use config_loader::{ConfigFormat, resolve_config_source};
 pub use runtime::{OutboundSummary, RuntimeState};
-use std::net::SocketAddr;
 #[cfg(feature = "user_domain_access")]
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use std::{net::SocketAddr, sync::Arc};
 use thiserror::Error;
 use tokio_rustls::rustls;
 
@@ -71,6 +71,7 @@ pub mod user_domain_access;
 
 mod util;
 
+mod xhttp_outbound;
 mod xudp_registry;
 
 #[allow(clippy::large_enum_variant)]
@@ -89,9 +90,8 @@ impl ConfigType {
             ConfigType::File(file) => {
                 config_loader::parse_config_source(&file, format)
             }
-
-            _ => {
-                todo!()
+            ConfigType::Str(content) => {
+                config_loader::parse_config_content(&content, format)
             }
         }
     }
@@ -281,6 +281,53 @@ pub struct ServerRuntime {
     pub runtime_state: RuntimeState,
 }
 
+fn configure_runtime_resolver(
+    runtime_state: &RuntimeState,
+    dns: Option<&crate::config::def::DnsConfig>,
+) -> Result<(), Error> {
+    let Some(dns) = dns else {
+        return Ok(());
+    };
+    let dns_servers = dns.compile_servers()?;
+    let dns_hosts = dns.compile_hosts()?;
+    let mut configured_resolver = runtime_state.resolver();
+    let mut resolver_changed = false;
+    if !dns_servers.is_empty() {
+        let upstreams = dns_servers
+            .into_iter()
+            .map(|upstream| {
+                let resolver: Arc<dyn crate::resolver::Resolver> =
+                    Arc::new(crate::resolver::DnsWireResolver::new(upstream));
+                Arc::new(crate::resolver::TimeoutResolver::new(
+                    resolver,
+                    Duration::from_secs(5),
+                )) as Arc<dyn crate::resolver::Resolver>
+            })
+            .collect::<Vec<_>>();
+        let composite: Arc<dyn crate::resolver::Resolver> =
+            Arc::new(crate::resolver::CompositeResolver::new(upstreams));
+        let ordered: Arc<dyn crate::resolver::Resolver> =
+            Arc::new(crate::resolver::AddressOrderingResolver::new(
+                composite,
+                crate::resolver::AddressFamilyPreference::Preserve,
+            ));
+        configured_resolver =
+            Arc::new(crate::resolver::CachedResolver::new(ordered));
+        resolver_changed = true;
+    }
+    if !dns_hosts.is_empty() {
+        configured_resolver = Arc::new(crate::resolver::HostsResolver::new(
+            dns_hosts,
+            configured_resolver,
+        ));
+        resolver_changed = true;
+    }
+    if resolver_changed {
+        runtime_state.replace_resolver(configured_resolver);
+    }
+    Ok(())
+}
+
 pub fn prepare_server_runtime(
     config: LiteralConfig,
     cwd: Option<&str>,
@@ -310,10 +357,12 @@ pub fn prepare_server_runtime(
         config.user_domain_access.clone(),
         user_domain_access_store.as_deref(),
     )?;
+    let dns_config = config.dns.clone();
     let outbounds = compile_outbound_summaries(&config.outbounds)?;
     let inbounds = prepare_server_inbounds(config, cwd, log_file)?;
     let runtime_state = RuntimeState::try_new(inbounds.clone(), outbounds)
         .map_err(Error::InvalidConfig)?;
+    configure_runtime_resolver(&runtime_state, dns_config.as_ref())?;
     #[cfg(feature = "user_domain_access")]
     runtime_state
         .configure_user_domain_access_signature_verifier(
@@ -638,6 +687,7 @@ async fn start_async(
     let routing_config = config.routing.clone();
     let observatory_config = config.observatory.clone();
     let burst_observatory_config = config.burst_observatory.clone();
+    let dns_config = config.dns.clone();
     routing_observer::validate_observatory_config(
         observatory_config.as_ref(),
         burst_observatory_config.as_ref(),
@@ -677,6 +727,7 @@ async fn start_async(
 
     let runtime_state = RuntimeState::try_new(all_inbounds.clone(), outbounds)
         .map_err(Error::InvalidConfig)?;
+    configure_runtime_resolver(&runtime_state, dns_config.as_ref())?;
     #[cfg(feature = "user_domain_access")]
     runtime_state
         .configure_user_domain_access_signature_verifier(
@@ -841,13 +892,18 @@ async fn start_async(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
     #[cfg(feature = "user_domain_access")]
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
     };
+    use tokio::net::UdpSocket;
 
-    use super::{compile_outbound_summaries, resolve_api_config};
+    use super::{
+        ConfigType, compile_outbound_summaries, prepare_server_runtime,
+        resolve_api_config,
+    };
     #[cfg(feature = "user_domain_access")]
     use super::{compile_user_domain_access, select_initial_user_domain_access};
     #[cfg(feature = "user_domain_access")]
@@ -865,6 +921,287 @@ mod tests {
         },
         outbound_registry::OutboundConnectorKind,
     };
+
+    #[test]
+    fn string_config_parses_without_exposing_source_on_failure() {
+        let parsed =
+            ConfigType::Str(r#"{"inbounds":[],"outbounds":[]}"#.to_string())
+                .try_parse(Some(crate::ConfigFormat::Json))
+                .expect("inline JSON config should parse");
+        assert!(parsed.inbounds.is_empty());
+        assert!(parsed.outbounds.is_empty());
+
+        let secret = "do-not-log-this-password";
+        let error = ConfigType::Str(format!(
+            r#"{{"inbounds":[],"outbounds":[],"password":"{secret}""#
+        ))
+        .try_parse(Some(crate::ConfigFormat::Json))
+        .expect_err("invalid inline JSON must fail");
+        assert!(!error.to_string().contains(secret));
+    }
+
+    #[test]
+    fn unsupported_xray_top_level_apps_and_policy_fail_closed() {
+        for field in [
+            "metrics",
+            "reverse",
+            "fakeDns",
+            "version",
+            "geodata",
+            "env",
+            "transport",
+        ] {
+            let mut config = serde_json::json!({
+                "inbounds": [],
+                "outbounds": []
+            });
+            config[field] = serde_json::json!({});
+            let error = ConfigType::Str(config.to_string())
+                .try_parse(Some(crate::ConfigFormat::Json))
+                .expect_err("unsupported Xray top-level app must fail closed");
+            assert!(error.to_string().contains(field));
+        }
+
+        let error = ConfigType::Str(
+            serde_json::json!({
+                "inbounds": [],
+                "outbounds": [],
+                "policy": {"levels": {"0": {"handshake": 4}}}
+            })
+            .to_string(),
+        )
+        .try_parse(Some(crate::ConfigFormat::Json))
+        .expect_err("non-empty Xray policy must fail closed");
+        assert!(error.to_string().contains("policy.levels/system"));
+
+        let error = ConfigType::Str(
+            serde_json::json!({
+                "inbounds": [],
+                "outbounds": [],
+                "unknownXrayField": true
+            })
+            .to_string(),
+        )
+        .try_parse(Some(crate::ConfigFormat::Json))
+        .expect_err("unknown top-level field must fail closed");
+        assert!(error.to_string().contains("unknownXrayField"));
+    }
+
+    fn dns_runtime_test_response(query: &[u8]) -> Vec<u8> {
+        const HEADER_LENGTH: usize = 12;
+        let query_type =
+            u16::from_be_bytes([query[query.len() - 4], query[query.len() - 3]]);
+        let rdata = match query_type {
+            1 => vec![198, 51, 100, 88],
+            28 => "2001:db8::88"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets()
+                .to_vec(),
+            other => panic!("unexpected DNS query type {other}"),
+        };
+        let mut response = Vec::new();
+        response.extend_from_slice(&query[..2]);
+        response.extend_from_slice(&0x8180u16.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&0u16.to_be_bytes());
+        response.extend_from_slice(&0u16.to_be_bytes());
+        response.extend_from_slice(&query[HEADER_LENGTH..]);
+        response.extend_from_slice(&[0xc0, 0x0c]);
+        response.extend_from_slice(&query_type.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&60u32.to_be_bytes());
+        response.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        response.extend_from_slice(&rdata);
+        response
+    }
+
+    #[tokio::test]
+    async fn dns_servers_install_cached_udp_runtime_resolver() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let mut buffer = vec![0u8; 512];
+            for _ in 0..2 {
+                let (length, peer) = server.recv_from(&mut buffer).await.unwrap();
+                let response = dns_runtime_test_response(&buffer[..length]);
+                server.send_to(&response, peer).await.unwrap();
+            }
+        });
+
+        let config = ConfigType::Str(
+            serde_json::json!({
+                "inbounds": [],
+                "outbounds": [],
+                "dns": {"servers": [server_addr.to_string()]}
+            })
+            .to_string(),
+        )
+        .try_parse(Some(crate::ConfigFormat::Json))
+        .expect("UDP dns.servers config should parse");
+        let runtime = prepare_server_runtime(config, None, None)
+            .expect("UDP dns.servers runtime should build")
+            .runtime_state;
+        let target =
+            NetLocation::new(Address::from("runtime-dns.example").unwrap(), 9443);
+        let first = tokio::time::timeout(
+            Duration::from_secs(2),
+            runtime.resolver().resolve_location(&target),
+        )
+        .await
+        .expect("runtime DNS lookup timeout")
+        .expect("runtime DNS lookup failed");
+        let second = tokio::time::timeout(
+            Duration::from_secs(2),
+            runtime.resolver().resolve_location(&target),
+        )
+        .await
+        .expect("cached runtime DNS lookup timeout")
+        .expect("cached runtime DNS lookup failed");
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            vec![
+                "198.51.100.88:9443".parse().unwrap(),
+                "[2001:db8::88]:9443".parse().unwrap(),
+            ]
+        );
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dns_hosts_install_exact_runtime_overrides() {
+        let config = ConfigType::Str(
+            serde_json::json!({
+                "inbounds": [],
+                "outbounds": [],
+                "dns": {
+                    "hosts": {
+                        "full:Runtime.Test.Invalid": [
+                            "192.0.2.44",
+                            "2001:db8::44"
+                        ]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .try_parse(Some(crate::ConfigFormat::Json))
+        .expect("exact dns.hosts config should parse");
+        let runtime = prepare_server_runtime(config, None, None)
+            .expect("dns.hosts runtime should build")
+            .runtime_state;
+        let addresses = runtime
+            .resolver()
+            .resolve_location(&NetLocation::new(
+                Address::from("runtime.test.invalid").unwrap(),
+                8443,
+            ))
+            .await
+            .expect("dns.hosts runtime lookup should succeed");
+        assert_eq!(
+            addresses,
+            vec![
+                "192.0.2.44:8443".parse().unwrap(),
+                "[2001:db8::44]:8443".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn unsupported_dns_semantics_fail_closed() {
+        for (dns, expected_error) in [
+            (
+                serde_json::json!({
+                    "servers": [{
+                        "address": "1.1.1.1",
+                        "expectIPs": ["geoip:us"]
+                    }]
+                }),
+                "dns.servers advanced objects",
+            ),
+            (
+                serde_json::json!({
+                    "servers": ["https://1.1.1.1/dns-query"]
+                }),
+                "unsupported DNS upstream scheme",
+            ),
+            (
+                serde_json::json!({
+                    "hosts": {"domain:example.com": "192.0.2.1"}
+                }),
+                "dns.hosts pattern",
+            ),
+            (
+                serde_json::json!({
+                    "hosts": {"example.com": "alias.example"}
+                }),
+                "dns.hosts value",
+            ),
+        ] {
+            let error = ConfigType::Str(
+                serde_json::json!({
+                    "inbounds": [],
+                    "outbounds": [],
+                    "dns": dns
+                })
+                .to_string(),
+            )
+            .try_parse(Some(crate::ConfigFormat::Json))
+            .expect_err("unsupported DNS semantics must fail closed");
+            assert!(error.to_string().contains(expected_error));
+        }
+    }
+
+    #[test]
+    fn unknown_inbound_and_stream_fields_fail_closed() {
+        for (field, value) in [
+            ("snifing", serde_json::json!({"enabled": true})),
+            ("unexpectedInboundOption", serde_json::json!(true)),
+        ] {
+            let mut inbound = serde_json::json!({
+                "listen": "127.0.0.1",
+                "port": 10000,
+                "protocol": "dokodemo-door",
+                "tag": "strict-inbound",
+                "settings": {"address": "127.0.0.1", "port": 53}
+            });
+            inbound[field] = value;
+            let error = ConfigType::Str(
+                serde_json::json!({
+                    "inbounds": [inbound],
+                    "outbounds": []
+                })
+                .to_string(),
+            )
+            .try_parse(Some(crate::ConfigFormat::Json))
+            .expect_err("unknown inbound field must fail closed");
+            assert!(error.to_string().contains(field));
+        }
+
+        for field in ["sockopt", "tcpSettings", "unexpectedTransportOption"] {
+            let mut stream_settings = serde_json::json!({"network": "tcp"});
+            stream_settings[field] = serde_json::json!({});
+            let error = ConfigType::Str(
+                serde_json::json!({
+                    "inbounds": [{
+                        "listen": "127.0.0.1",
+                        "port": 10000,
+                        "protocol": "dokodemo-door",
+                        "tag": "strict-stream",
+                        "settings": {"address": "127.0.0.1", "port": 53},
+                        "streamSettings": stream_settings
+                    }],
+                    "outbounds": []
+                })
+                .to_string(),
+            )
+            .try_parse(Some(crate::ConfigFormat::Json))
+            .expect_err("unknown streamSettings field must fail closed");
+            assert!(error.to_string().contains(field));
+        }
+    }
 
     #[cfg(feature = "user_domain_access")]
     fn test_policy(version: u64, domain: &str) -> UserDomainAccessConfig {

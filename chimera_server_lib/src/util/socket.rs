@@ -35,7 +35,10 @@ pub fn new_tcp_socket(
             target_os = "fuchsia",
             target_os = "linux"
         )))]
-        panic!("Could not find to device, unsupported platform.")
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "binding a TCP socket to an interface is not supported on this platform",
+        ));
     }
 
     Ok(tcp_socket)
@@ -81,7 +84,10 @@ pub fn new_socket2_udp_socket_with_buffer_size(
         socket.set_reuse_port(true)?;
 
         #[cfg(any(not(unix), target_os = "solaris", target_os = "illumos"))]
-        panic!("Cannot support reuse sockets");
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "UDP reuse-port is not supported on this platform",
+        ));
     }
 
     if let Some(ref _interface) = bind_interface {
@@ -98,7 +104,10 @@ pub fn new_socket2_udp_socket_with_buffer_size(
             target_os = "fuchsia",
             target_os = "linux"
         )))]
-        panic!("Could not bind to device, unsupported platform.")
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "binding a UDP socket to an interface is not supported on this platform",
+        ));
     }
 
     if let Some(bind_address) = bind_address {

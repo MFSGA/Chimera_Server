@@ -60,6 +60,66 @@ fn websocket_server_config(
     }
 }
 
+fn validate_tcp_inbound_network(
+    protocol_name: &str,
+    stream_settings: &crate::config::StreamSettings,
+    allow_xhttp: bool,
+) -> Result<String, Error> {
+    let configured = stream_settings.network.trim().to_ascii_lowercase();
+    let network = match configured.as_str() {
+        "" | "raw" | "tcp" => "tcp",
+        "ws" | "websocket" => "ws",
+        "httpupgrade" => "httpupgrade",
+        "grpc" => "grpc",
+        "xhttp" | "splithttp" if allow_xhttp => "xhttp",
+        unsupported => {
+            return Err(Error::InvalidConfig(format!(
+                "{protocol_name} inbound streamSettings.network={unsupported} is not supported"
+            )));
+        }
+    };
+
+    #[cfg(feature = "ws")]
+    {
+        if network == "ws" && stream_settings.ws_settings.is_none() {
+            return Err(Error::InvalidConfig(format!(
+                "{protocol_name} websocket inbound requires wsSettings"
+            )));
+        }
+        if network != "ws" && stream_settings.ws_settings.is_some() {
+            return Err(Error::InvalidConfig(format!(
+                "{protocol_name} inbound wsSettings requires streamSettings.network=ws"
+            )));
+        }
+    }
+    #[cfg(not(feature = "ws"))]
+    if network == "ws" {
+        return Err(Error::InvalidConfig(
+            "websocket transport requires the ws feature".into(),
+        ));
+    }
+
+    #[cfg(feature = "httpupgrade")]
+    if network != "httpupgrade" && stream_settings.httpupgrade_settings.is_some() {
+        return Err(Error::InvalidConfig(format!(
+            "{protocol_name} inbound httpupgradeSettings requires streamSettings.network=httpupgrade"
+        )));
+    }
+    #[cfg(feature = "grpc_transport")]
+    if network != "grpc" && stream_settings.grpc_settings.is_some() {
+        return Err(Error::InvalidConfig(format!(
+            "{protocol_name} inbound grpcSettings requires streamSettings.network=grpc"
+        )));
+    }
+    if network != "xhttp" && stream_settings.xhttp_settings.is_some() {
+        return Err(Error::InvalidConfig(format!(
+            "{protocol_name} inbound xhttpSettings requires streamSettings.network=xhttp"
+        )));
+    }
+
+    Ok(network.to_string())
+}
+
 #[cfg(feature = "grpc_transport")]
 fn apply_grpc_layer(
     protocol: ServerProxyConfig,
@@ -625,21 +685,54 @@ fn planned_unsupported_protocol_error(protocol: &str) -> Error {
     ))
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SniffingEnableGate {
+    #[serde(default)]
+    enabled: bool,
+}
+
 impl TryFrom<InboudItem> for ServerConfig {
     type Error = Error;
 
     fn try_from(value: InboudItem) -> Result<Self, Self::Error> {
-        tracing::info!("try from inbound item {:?}", &value);
+        tracing::info!(
+            tag = %value.tag,
+            protocol = ?value.protocol,
+            listen = ?value.listen,
+            port = value.port,
+            "building inbound configuration"
+        );
 
         let InboudItem {
+            allocate,
             listen,
             port,
             protocol,
             settings,
+            sniffing,
             stream_settings,
             tag,
-            ..
         } = value;
+
+        if allocate.is_some() {
+            return Err(Error::InvalidConfig(format!(
+                "inbound {tag} uses unsupported Xray allocate settings"
+            )));
+        }
+        if let Some(sniffing) = sniffing {
+            let sniffing = serde_json::from_value::<SniffingEnableGate>(sniffing)
+                .map_err(|error| {
+                    Error::InvalidConfig(format!(
+                        "invalid inbound {tag} sniffing settings: {error}"
+                    ))
+                })?;
+            if sniffing.enabled {
+                return Err(Error::InvalidConfig(format!(
+                    "inbound {tag} enables Xray sniffing, which is not implemented yet"
+                )));
+            }
+        }
 
         let listen = listen.unwrap_or_else(|| "0.0.0.0".to_string());
         let address = Address::from(&listen).map_err(|err| {
@@ -846,10 +939,14 @@ impl TryFrom<InboudItem> for ServerConfig {
                     users,
                     fallbacks,
                 };
-                let uses_xhttp = stream_settings
+                let stream_network = stream_settings
                     .as_ref()
-                    .map(|settings| settings.network.eq_ignore_ascii_case("xhttp"))
-                    .unwrap_or(false);
+                    .map(|settings| {
+                        validate_tcp_inbound_network("vless", settings, true)
+                    })
+                    .transpose()?
+                    .unwrap_or_else(|| "tcp".to_string());
+                let uses_xhttp = stream_network == "xhttp";
                 let security = stream_settings
                     .as_ref()
                     .and_then(|settings| settings.security.as_deref())
@@ -871,7 +968,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                 }
 
                 #[cfg(feature = "ws")]
-                if !uses_xhttp
+                if stream_network == "ws"
                     && let Some(stream_setting) = stream_settings.as_ref()
                         && let Some(ws_setting) = stream_setting.ws_settings.clone() {
                             if uses_vision {
@@ -916,10 +1013,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                         }
                     } else {
                         if uses_vision
-                            && matches!(
-                                stream_setting.network.to_ascii_lowercase().as_str(),
-                                "httpupgrade" | "grpc"
-                            )
+                            && matches!(stream_network.as_str(), "httpupgrade" | "grpc")
                         {
                             return Err(Error::InvalidConfig(
                                 "xtls-rprx-vision does not support httpupgrade or grpc transport"
@@ -968,9 +1062,17 @@ impl TryFrom<InboudItem> for ServerConfig {
                     })
                     .collect::<Result<Vec<_>, Error>>()?;
                 let mut protocol = ServerProxyConfig::Vmess { users };
+                let _stream_network = stream_settings
+                    .as_ref()
+                    .map(|settings| {
+                        validate_tcp_inbound_network("vmess", settings, false)
+                    })
+                    .transpose()?
+                    .unwrap_or_else(|| "tcp".to_string());
 
                 #[cfg(feature = "ws")]
-                if let Some(stream_setting) = stream_settings.as_ref()
+                if _stream_network == "ws"
+                    && let Some(stream_setting) = stream_settings.as_ref()
                     && let Some(ws_setting) = stream_setting.ws_settings.clone() {
                         tracing::info!("use websocket");
                         protocol = ServerProxyConfig::Websocket {
@@ -1006,9 +1108,17 @@ impl TryFrom<InboudItem> for ServerConfig {
                     users: trojan_users,
                     fallbacks: trojan_fallbacks,
                 };
+                let _stream_network = stream_settings
+                    .as_ref()
+                    .map(|settings| {
+                        validate_tcp_inbound_network("trojan", settings, false)
+                    })
+                    .transpose()?
+                    .unwrap_or_else(|| "tcp".to_string());
 
                 #[cfg(feature = "ws")]
-                if let Some(stream_setting) = stream_settings.as_ref()
+                if _stream_network == "ws"
+                    && let Some(stream_setting) = stream_settings.as_ref()
                     && let Some(ws_setting) = stream_setting.ws_settings.clone() {
                         tracing::info!("use websocket");
                         protocol = ServerProxyConfig::Websocket {
@@ -1247,9 +1357,17 @@ impl TryFrom<InboudItem> for ServerConfig {
                     accounts,
                     udp_enabled,
                 };
+                let _stream_network = stream_settings
+                    .as_ref()
+                    .map(|settings| {
+                        validate_tcp_inbound_network("socks", settings, false)
+                    })
+                    .transpose()?
+                    .unwrap_or_else(|| "tcp".to_string());
 
                 #[cfg(feature = "ws")]
-                if let Some(stream_setting) = stream_settings.as_ref()
+                if _stream_network == "ws"
+                    && let Some(stream_setting) = stream_settings.as_ref()
                     && let Some(ws_setting) = stream_setting.ws_settings.clone() {
                         tracing::info!("use websocket");
                         protocol = ServerProxyConfig::Websocket {
@@ -1289,6 +1407,103 @@ mod tests {
             "tag": format!("{protocol}-planned")
         }))
         .expect("valid inbound item")
+    }
+
+    #[test]
+    fn inbound_builder_rejects_unimplemented_sniffing_and_allocate() {
+        for (field, value) in [
+            ("sniffing", serde_json::json!({"enabled": true})),
+            ("allocate", serde_json::json!({"strategy": "random"})),
+        ] {
+            let mut inbound = serde_json::json!({
+                "listen": "127.0.0.1",
+                "port": 10000,
+                "protocol": "dokodemo-door",
+                "tag": format!("dokodemo-{field}"),
+                "settings": {"address": "127.0.0.1", "port": 53}
+            });
+            inbound[field] = value;
+            let inbound = serde_json::from_value::<InboudItem>(inbound)
+                .expect("literal inbound should parse");
+            let error = ServerConfig::try_from(inbound)
+                .expect_err("unimplemented inbound option must fail closed");
+            assert!(error.to_string().contains(field));
+        }
+    }
+
+    #[test]
+    fn tcp_inbound_network_validation_matches_xray_aliases_and_rejects_kcp() {
+        let raw = serde_json::from_value::<crate::config::StreamSettings>(
+            serde_json::json!({"network": "raw"}),
+        )
+        .expect("raw stream settings");
+        assert_eq!(
+            validate_tcp_inbound_network("vless", &raw, true).unwrap(),
+            "tcp"
+        );
+
+        let split_http = serde_json::from_value::<crate::config::StreamSettings>(
+            serde_json::json!({"network": "splithttp"}),
+        )
+        .expect("splithttp stream settings");
+        assert_eq!(
+            validate_tcp_inbound_network("vless", &split_http, true).unwrap(),
+            "xhttp"
+        );
+        assert!(
+            validate_tcp_inbound_network("vmess", &split_http, false)
+                .unwrap_err()
+                .to_string()
+                .contains("not supported")
+        );
+
+        for network in ["kcp", "mkcp", "websokcet"] {
+            let settings = serde_json::from_value::<crate::config::StreamSettings>(
+                serde_json::json!({"network": network}),
+            )
+            .expect("stream settings");
+            let error = validate_tcp_inbound_network("vless", &settings, true)
+                .expect_err("unsupported transport must fail closed");
+            assert!(error.to_string().contains(network));
+        }
+    }
+
+    #[cfg(feature = "ws")]
+    #[test]
+    fn websocket_settings_require_websocket_network() {
+        let settings = serde_json::from_value::<crate::config::StreamSettings>(
+            serde_json::json!({
+                "network": "tcp",
+                "wsSettings": {"path": "/ws"}
+            }),
+        )
+        .expect("stream settings");
+        let error = validate_tcp_inbound_network("vless", &settings, true)
+            .expect_err("mismatched wsSettings must fail closed");
+        assert!(error.to_string().contains("wsSettings requires"));
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn vless_builder_rejects_mkcp_instead_of_treating_it_as_quic() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-mkcp",
+            "settings": {
+                "clients": [{
+                    "id": "3ac9b383-75a1-431c-8184-106c80eb2273"
+                }],
+                "decryption": "none"
+            },
+            "streamSettings": {"network": "mkcp"}
+        }))
+        .expect("valid literal inbound");
+
+        let error = ServerConfig::try_from(inbound)
+            .expect_err("mKCP must not be treated as QUIC");
+        assert!(error.to_string().contains("network=mkcp"));
     }
 
     #[cfg(feature = "http")]
@@ -1979,6 +2194,7 @@ mod tests {
                 "decryption": "none"
             },
             "streamSettings": {
+                "network": "ws",
                 "security": "tls",
                 "wsSettings": {
                     "host": "example.com",

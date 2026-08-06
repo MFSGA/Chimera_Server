@@ -2,20 +2,24 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
     io,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{
         Arc, Mutex, MutexGuard, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU16, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use futures::future::FutureExt;
-use tokio::sync::watch;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpStream, UdpSocket},
+    sync::watch,
+};
 use tracing::debug;
 
-use crate::address::NetLocation;
+use crate::address::{Address, NetLocation};
 
 const DEFAULT_POSITIVE_TTL: Duration = Duration::from_secs(60);
 const DEFAULT_NEGATIVE_TTL: Duration = Duration::from_secs(5);
@@ -365,6 +369,452 @@ fn cached_result_to_io(result: CachedLookupResult) -> io::Result<Vec<SocketAddr>
     result.map_err(|error| error.to_io())
 }
 
+/// Resolver that applies exact static hostname overrides before falling back to
+/// another resolver. Hostnames are normalized to lowercase without a trailing
+/// dot, while the destination port always comes from the original request.
+#[derive(Clone)]
+pub struct HostsResolver {
+    hosts: Arc<HashMap<String, Vec<IpAddr>>>,
+    fallback: Arc<dyn Resolver>,
+}
+
+impl HostsResolver {
+    pub fn new(
+        hosts: HashMap<String, Vec<IpAddr>>,
+        fallback: Arc<dyn Resolver>,
+    ) -> Self {
+        let hosts = hosts
+            .into_iter()
+            .map(|(hostname, addresses)| (normalize_hostname(&hostname), addresses))
+            .collect();
+        Self {
+            hosts: Arc::new(hosts),
+            fallback,
+        }
+    }
+}
+
+impl Resolver for HostsResolver {
+    fn resolve_location(
+        &self,
+        location: &NetLocation,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send>> {
+        let hostname = match location.address() {
+            crate::address::Address::Hostname(hostname) => {
+                normalize_hostname(hostname)
+            }
+            _ => return self.fallback.resolve_location(location),
+        };
+        let port = location.port();
+        if let Some(addresses) = self.hosts.get(&hostname) {
+            let addresses = addresses
+                .iter()
+                .copied()
+                .map(|address| SocketAddr::new(address, port))
+                .collect::<Vec<_>>();
+            return Box::pin(async move { Ok(addresses) });
+        }
+        self.fallback.resolve_location(location)
+    }
+}
+
+fn normalize_hostname(hostname: &str) -> String {
+    hostname.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+const DNS_DEFAULT_PORT: u16 = 53;
+const DNS_HEADER_LENGTH: usize = 12;
+const DNS_MAX_UDP_RESPONSE: usize = 4096;
+const DNS_TYPE_A: u16 = 1;
+const DNS_TYPE_AAAA: u16 = 28;
+const DNS_CLASS_IN: u16 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DnsUpstreamTransport {
+    Udp,
+    Tcp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DnsUpstream {
+    transport: DnsUpstreamTransport,
+    location: NetLocation,
+}
+
+impl DnsUpstream {
+    pub(crate) fn parse(raw: &str) -> Result<Self, String> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Err("DNS upstream must not be empty".into());
+        }
+        let (transport, authority) =
+            if let Some(authority) = raw.strip_prefix("tcp://") {
+                (DnsUpstreamTransport::Tcp, authority)
+            } else if let Some(authority) = raw.strip_prefix("udp://") {
+                (DnsUpstreamTransport::Udp, authority)
+            } else if raw.contains("://") {
+                return Err(format!("unsupported DNS upstream scheme in {raw:?}"));
+            } else {
+                (DnsUpstreamTransport::Udp, raw)
+            };
+        if authority.is_empty() {
+            return Err(format!("DNS upstream {raw:?} is missing an address"));
+        }
+        let location = if let Ok(address) = authority.parse::<SocketAddr>() {
+            NetLocation::from_ip_addr(address.ip(), address.port())
+        } else if let Ok(address) = authority.parse::<IpAddr>() {
+            NetLocation::from_ip_addr(address, DNS_DEFAULT_PORT)
+        } else {
+            NetLocation::from_str(authority, Some(DNS_DEFAULT_PORT))
+                .map_err(|error| format!("invalid DNS upstream {raw:?}: {error}"))?
+        };
+        if location.port() == 0 {
+            return Err(format!("DNS upstream {raw:?} has port zero"));
+        }
+        Ok(Self {
+            transport,
+            location,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct DnsWireResolver {
+    upstream: DnsUpstream,
+    next_query_id: Arc<AtomicU16>,
+}
+
+impl DnsWireResolver {
+    pub(crate) fn new(upstream: DnsUpstream) -> Self {
+        Self {
+            upstream,
+            next_query_id: Arc::new(AtomicU16::new(1)),
+        }
+    }
+}
+
+impl Resolver for DnsWireResolver {
+    fn resolve_location(
+        &self,
+        location: &NetLocation,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send>> {
+        if let Some(address) = location.to_socket_addr_nonblocking() {
+            return Box::pin(async move { Ok(vec![address]) });
+        }
+        let hostname = match location.address() {
+            Address::Hostname(hostname) => normalize_hostname(hostname),
+            _ => unreachable!("non-hostname destinations returned above"),
+        };
+        let port = location.port();
+        let upstream = self.upstream.clone();
+        let next_query_id = self.next_query_id.clone();
+        Box::pin(async move {
+            let mut addresses = Vec::new();
+            let mut last_error = None;
+            for query_type in [DNS_TYPE_A, DNS_TYPE_AAAA] {
+                let query_id = next_query_id.fetch_add(1, Ordering::Relaxed);
+                match query_dns_upstream(&upstream, &hostname, query_type, query_id)
+                    .await
+                {
+                    Ok(results) => {
+                        for address in results {
+                            let socket = SocketAddr::new(address, port);
+                            if !addresses.contains(&socket) {
+                                addresses.push(socket);
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        last_error = Some(error);
+                    }
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            if addresses.is_empty() {
+                return Err(last_error.unwrap_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("DNS returned no addresses for {hostname}"),
+                    )
+                }));
+            }
+            Ok(addresses)
+        })
+    }
+}
+
+async fn query_dns_upstream(
+    upstream: &DnsUpstream,
+    hostname: &str,
+    query_type: u16,
+    query_id: u16,
+) -> io::Result<Vec<IpAddr>> {
+    let request = build_dns_query(hostname, query_type, query_id)?;
+    let upstream_address = resolve_dns_upstream_address(&upstream.location).await?;
+    let response = match upstream.transport {
+        DnsUpstreamTransport::Udp => {
+            let response = query_dns_udp(upstream_address, &request).await?;
+            if dns_response_is_truncated(&response, query_id)? {
+                query_dns_tcp(upstream_address, &request).await?
+            } else {
+                response
+            }
+        }
+        DnsUpstreamTransport::Tcp => {
+            query_dns_tcp(upstream_address, &request).await?
+        }
+    };
+    parse_dns_response(&response, query_id)
+}
+
+async fn resolve_dns_upstream_address(
+    location: &NetLocation,
+) -> io::Result<SocketAddr> {
+    if let Some(address) = location.to_socket_addr_nonblocking() {
+        return Ok(address);
+    }
+    let Address::Hostname(hostname) = location.address() else {
+        unreachable!("non-hostname DNS upstream returned above");
+    };
+    tokio::net::lookup_host((hostname.as_str(), location.port()))
+        .await?
+        .next()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("could not resolve DNS upstream {location}"),
+            )
+        })
+}
+
+fn build_dns_query(
+    hostname: &str,
+    query_type: u16,
+    query_id: u16,
+) -> io::Result<Vec<u8>> {
+    let hostname = normalize_hostname(hostname);
+    if hostname.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "DNS hostname must not be empty",
+        ));
+    }
+    let mut query = Vec::with_capacity(DNS_HEADER_LENGTH + hostname.len() + 6);
+    query.extend_from_slice(&query_id.to_be_bytes());
+    query.extend_from_slice(&0x0100u16.to_be_bytes());
+    query.extend_from_slice(&1u16.to_be_bytes());
+    query.extend_from_slice(&0u16.to_be_bytes());
+    query.extend_from_slice(&0u16.to_be_bytes());
+    query.extend_from_slice(&0u16.to_be_bytes());
+    for label in hostname.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid DNS label in {hostname:?}"),
+            ));
+        }
+        query.push(label.len() as u8);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.push(0);
+    query.extend_from_slice(&query_type.to_be_bytes());
+    query.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+    Ok(query)
+}
+
+async fn query_dns_udp(server: SocketAddr, request: &[u8]) -> io::Result<Vec<u8>> {
+    let bind_address = if server.is_ipv6() {
+        SocketAddr::from(([0u16; 8], 0))
+    } else {
+        SocketAddr::from(([0, 0, 0, 0], 0))
+    };
+    let socket = UdpSocket::bind(bind_address).await?;
+    socket.send_to(request, server).await?;
+    let mut response = vec![0u8; DNS_MAX_UDP_RESPONSE];
+    loop {
+        let (length, source) = socket.recv_from(&mut response).await?;
+        if source == server {
+            response.truncate(length);
+            return Ok(response);
+        }
+    }
+}
+
+async fn query_dns_tcp(server: SocketAddr, request: &[u8]) -> io::Result<Vec<u8>> {
+    let request_length = u16::try_from(request.len()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "DNS request exceeds u16")
+    })?;
+    let mut stream = TcpStream::connect(server).await?;
+    stream.write_u16(request_length).await?;
+    stream.write_all(request).await?;
+    stream.flush().await?;
+    let response_length = stream.read_u16().await? as usize;
+    if response_length < DNS_HEADER_LENGTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS-over-TCP response is shorter than its header",
+        ));
+    }
+    let mut response = vec![0u8; response_length];
+    stream.read_exact(&mut response).await?;
+    Ok(response)
+}
+
+fn dns_response_is_truncated(response: &[u8], query_id: u16) -> io::Result<bool> {
+    let (response_id, flags) = read_dns_response_prefix(response)?;
+    if response_id != query_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS response transaction ID does not match the query",
+        ));
+    }
+    Ok(flags & 0x0200 != 0)
+}
+
+fn parse_dns_response(response: &[u8], query_id: u16) -> io::Result<Vec<IpAddr>> {
+    let (response_id, flags) = read_dns_response_prefix(response)?;
+    if response_id != query_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS response transaction ID does not match the query",
+        ));
+    }
+    if flags & 0x8000 == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS packet is not a response",
+        ));
+    }
+    let response_code = flags & 0x000f;
+    if response_code == 3 {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "DNS NXDOMAIN"));
+    }
+    if response_code != 0 {
+        return Err(io::Error::other(format!(
+            "DNS server returned response code {response_code}"
+        )));
+    }
+
+    let question_count = read_dns_u16(response, 4)? as usize;
+    let answer_count = read_dns_u16(response, 6)? as usize;
+    let mut offset = DNS_HEADER_LENGTH;
+    for _ in 0..question_count {
+        offset = skip_dns_name(response, offset)?;
+        offset = offset.checked_add(4).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "DNS question overflow")
+        })?;
+        if offset > response.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated DNS question",
+            ));
+        }
+    }
+
+    let mut addresses = Vec::new();
+    for _ in 0..answer_count {
+        offset = skip_dns_name(response, offset)?;
+        if offset + 10 > response.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated DNS answer header",
+            ));
+        }
+        let record_type = read_dns_u16(response, offset)?;
+        let class = read_dns_u16(response, offset + 2)?;
+        let data_length = read_dns_u16(response, offset + 8)? as usize;
+        offset += 10;
+        let data_end = offset.checked_add(data_length).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "DNS record length overflow")
+        })?;
+        if data_end > response.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated DNS answer data",
+            ));
+        }
+        if class == DNS_CLASS_IN {
+            match (record_type, data_length) {
+                (DNS_TYPE_A, 4) => {
+                    addresses.push(IpAddr::V4(std::net::Ipv4Addr::new(
+                        response[offset],
+                        response[offset + 1],
+                        response[offset + 2],
+                        response[offset + 3],
+                    )))
+                }
+                (DNS_TYPE_AAAA, 16) => {
+                    let mut octets = [0u8; 16];
+                    octets.copy_from_slice(&response[offset..data_end]);
+                    addresses.push(IpAddr::V6(std::net::Ipv6Addr::from(octets)));
+                }
+                _ => {}
+            }
+        }
+        offset = data_end;
+    }
+    if addresses.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "DNS response contained no A or AAAA records",
+        ));
+    }
+    Ok(addresses)
+}
+
+fn read_dns_response_prefix(response: &[u8]) -> io::Result<(u16, u16)> {
+    if response.len() < DNS_HEADER_LENGTH {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "DNS response is shorter than its header",
+        ));
+    }
+    Ok((read_dns_u16(response, 0)?, read_dns_u16(response, 2)?))
+}
+
+fn read_dns_u16(packet: &[u8], offset: usize) -> io::Result<u16> {
+    let bytes = packet.get(offset..offset + 2).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::UnexpectedEof, "truncated DNS integer")
+    })?;
+    Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+fn skip_dns_name(packet: &[u8], mut offset: usize) -> io::Result<usize> {
+    loop {
+        let length = *packet.get(offset).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "truncated DNS name")
+        })?;
+        if length & 0xc0 == 0xc0 {
+            if offset + 2 > packet.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated DNS compression pointer",
+                ));
+            }
+            return Ok(offset + 2);
+        }
+        if length & 0xc0 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid DNS label type",
+            ));
+        }
+        offset += 1;
+        if length == 0 {
+            return Ok(offset);
+        }
+        offset = offset.checked_add(length as usize).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "DNS name length overflow")
+        })?;
+        if offset > packet.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated DNS label",
+            ));
+        }
+    }
+}
+
 /// Resolver that tries multiple upstreams in order until one returns addresses.
 #[derive(Clone)]
 pub struct CompositeResolver {
@@ -649,6 +1099,50 @@ mod tests {
     };
 
     use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, UdpSocket},
+    };
+
+    fn dns_test_response(query: &[u8]) -> Vec<u8> {
+        let query_type =
+            u16::from_be_bytes([query[query.len() - 4], query[query.len() - 3]]);
+        let rdata = match query_type {
+            DNS_TYPE_A => vec![192, 0, 2, 77],
+            DNS_TYPE_AAAA => "2001:db8::77"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets()
+                .to_vec(),
+            other => panic!("unexpected DNS test query type {other}"),
+        };
+        let mut response = Vec::new();
+        response.extend_from_slice(&query[..2]);
+        response.extend_from_slice(&0x8180u16.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&0u16.to_be_bytes());
+        response.extend_from_slice(&0u16.to_be_bytes());
+        response.extend_from_slice(&query[DNS_HEADER_LENGTH..]);
+        response.extend_from_slice(&[0xc0, 0x0c]);
+        response.extend_from_slice(&query_type.to_be_bytes());
+        response.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+        response.extend_from_slice(&60u32.to_be_bytes());
+        response.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        response.extend_from_slice(&rdata);
+        response
+    }
+
+    fn truncated_dns_test_response(query: &[u8]) -> Vec<u8> {
+        let mut response = Vec::with_capacity(DNS_HEADER_LENGTH);
+        response.extend_from_slice(&query[..2]);
+        response.extend_from_slice(&0x8200u16.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&0u16.to_be_bytes());
+        response.extend_from_slice(&0u16.to_be_bytes());
+        response.extend_from_slice(&0u16.to_be_bytes());
+        response
+    }
 
     #[derive(Clone)]
     struct CountingResolver {
@@ -714,6 +1208,165 @@ mod tests {
             negative_ttl: Duration::from_secs(30),
             max_entries: 16,
         }
+    }
+
+    #[tokio::test]
+    async fn dns_wire_udp_truncation_falls_back_to_tcp_for_a_and_aaaa() {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = tcp.local_addr().unwrap();
+        let udp = UdpSocket::bind(server).await.unwrap();
+
+        let udp_task = tokio::spawn(async move {
+            let mut buffer = vec![0u8; 512];
+            for _ in 0..2 {
+                let (length, peer) = udp.recv_from(&mut buffer).await.unwrap();
+                let response = truncated_dns_test_response(&buffer[..length]);
+                udp.send_to(&response, peer).await.unwrap();
+            }
+        });
+        let tcp_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = tcp.accept().await.unwrap();
+                let length = stream.read_u16().await.unwrap() as usize;
+                let mut request = vec![0u8; length];
+                stream.read_exact(&mut request).await.unwrap();
+                let response = dns_test_response(&request);
+                stream.write_u16(response.len() as u16).await.unwrap();
+                stream.write_all(&response).await.unwrap();
+                stream.flush().await.unwrap();
+            }
+        });
+
+        let resolver = DnsWireResolver::new(
+            DnsUpstream::parse(&format!("udp://{server}")).unwrap(),
+        );
+        let addresses = tokio::time::timeout(
+            Duration::from_secs(2),
+            resolver.resolve_location(
+                &NetLocation::from_str("wire.example:8443", None).unwrap(),
+            ),
+        )
+        .await
+        .expect("DNS wire lookup timeout")
+        .expect("DNS wire lookup failed");
+        assert_eq!(
+            addresses,
+            vec![
+                "192.0.2.77:8443".parse().unwrap(),
+                "[2001:db8::77]:8443".parse().unwrap(),
+            ]
+        );
+        udp_task.await.unwrap();
+        tcp_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dns_wire_tcp_queries_a_and_aaaa() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let length = stream.read_u16().await.unwrap() as usize;
+                let mut request = vec![0u8; length];
+                stream.read_exact(&mut request).await.unwrap();
+                let response = dns_test_response(&request);
+                stream.write_u16(response.len() as u16).await.unwrap();
+                stream.write_all(&response).await.unwrap();
+                stream.flush().await.unwrap();
+            }
+        });
+
+        let resolver = DnsWireResolver::new(
+            DnsUpstream::parse(&format!("tcp://{server}")).unwrap(),
+        );
+        let addresses = tokio::time::timeout(
+            Duration::from_secs(2),
+            resolver.resolve_location(
+                &NetLocation::from_str("tcp-wire.example:7443", None).unwrap(),
+            ),
+        )
+        .await
+        .expect("DNS-over-TCP lookup timeout")
+        .expect("DNS-over-TCP lookup failed");
+        assert_eq!(
+            addresses,
+            vec![
+                "192.0.2.77:7443".parse().unwrap(),
+                "[2001:db8::77]:7443".parse().unwrap(),
+            ]
+        );
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dns_wire_rejects_mismatched_transaction_ids() {
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = udp.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut buffer = vec![0u8; 512];
+            for _ in 0..2 {
+                let (length, peer) = udp.recv_from(&mut buffer).await.unwrap();
+                let mut response = dns_test_response(&buffer[..length]);
+                let transaction_id =
+                    u16::from_be_bytes([response[0], response[1]]).wrapping_add(1);
+                response[..2].copy_from_slice(&transaction_id.to_be_bytes());
+                udp.send_to(&response, peer).await.unwrap();
+            }
+        });
+
+        let resolver =
+            DnsWireResolver::new(DnsUpstream::parse(&server.to_string()).unwrap());
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            resolver.resolve_location(
+                &NetLocation::from_str("mismatch.example:443", None).unwrap(),
+            ),
+        )
+        .await
+        .expect("mismatched DNS lookup timeout")
+        .expect_err("mismatched DNS transaction ID must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hosts_resolver_overrides_exact_names_and_preserves_ports() {
+        let fallback = CountingResolver::successful(Duration::ZERO);
+        let fallback_calls = fallback.calls.clone();
+        let resolver = HostsResolver::new(
+            HashMap::from([(
+                "Static.Example.".to_string(),
+                vec![
+                    "192.0.2.20".parse().unwrap(),
+                    "2001:db8::20".parse().unwrap(),
+                ],
+            )]),
+            Arc::new(fallback),
+        );
+
+        let addresses = resolver
+            .resolve_location(
+                &NetLocation::from_str("static.example:8443", None).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            addresses,
+            vec![
+                "192.0.2.20:8443".parse().unwrap(),
+                "[2001:db8::20]:8443".parse().unwrap(),
+            ]
+        );
+        assert_eq!(fallback_calls.load(Ordering::Relaxed), 0);
+
+        resolver
+            .resolve_location(
+                &NetLocation::from_str("fallback.example:443", None).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fallback_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]

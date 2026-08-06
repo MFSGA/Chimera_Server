@@ -1,6 +1,6 @@
 # XHTTP 与 Xray-core 差距清单（历史工作文档）
 
-> 本文基线为 2026-02-10，部分结论已经被后续实现取代。当前差距请以 [`20260804-234600-xray-parity-gap-analysis.zh.md`](./20260804-234600-xray-parity-gap-analysis.zh.md) 第 9 节为准。当前 XHTTP 已支持 VLESS inner transport、mode、placement、流控、TTL、TLS 和 REALITY；本文保留用于追踪历史演进。
+> 本文基线为 2026-02-10，正文保留用于追踪历史演进，未勾选项不再代表当前实现状态。2026-08-06 的实现已覆盖 VLESS XHTTP inbound/outbound、H2/H3、`stream-one`/`stream-up`/`packet-up`/`auto`、metadata/data placement、流控与 TTL、TLS/REALITY、`xPaddingObfs*`、独立 `downloadSettings`、H2/H3 `xmux` 连接复用，以及 native VLESS UDP 与 `packetEncoding: "xudp"`；上述能力均有 Chimera↔Xray 真实进程互通测试。剩余明确边界是 Unix-domain XHTTP listener 尚未实现；HTTP/1.1 仅开放可靠的 `packet-up`/`auto`，`stream-one`/`stream-up` 因 Go HTTP/1.x request-body 半双工限制保持 fail-closed。
 
 ## 文档目的
 用于记录 Chimera_Server 当前 `xhttp` 与 `xray-core` 的差距，并作为后续逐步完善的执行清单。

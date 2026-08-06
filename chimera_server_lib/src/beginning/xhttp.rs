@@ -11,21 +11,19 @@ use std::{
     task::{Context, Poll},
 };
 
+use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use bytes::Bytes;
-use futures::StreamExt;
-use http_body_util::{
-    BodyExt, Empty, LengthLimitError, Limited, StreamBody,
-    combinators::UnsyncBoxBody,
-};
+use bytes::{Buf, Bytes};
+use futures::{Stream, StreamExt};
+use http_body_util::{BodyExt, Empty, StreamBody, combinators::UnsyncBoxBody};
 use hyper::{
-    Method, Request, Response, StatusCode,
+    HeaderMap, Method, Request, Response, StatusCode, Uri,
     body::{Frame, Incoming},
     header,
     service::service_fn,
 };
 use hyper_util::{
-    rt::{TokioExecutor, TokioIo},
+    rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto,
 };
 use rand::RngExt as _;
@@ -36,7 +34,7 @@ use tokio::{
 };
 #[cfg(feature = "tls")]
 use tokio_rustls::TlsAcceptor;
-use tokio_util::io::ReaderStream;
+use tokio_util::{io::ReaderStream, sync::CancellationToken};
 use tracing::{debug, error};
 
 use crate::{
@@ -50,7 +48,7 @@ use crate::{
     handler::tcp::{
         tcp_handler::TcpServerHandler, tcp_handler_util::create_tcp_server_handler,
     },
-    resolver::{NativeResolver, Resolver},
+    resolver::Resolver,
     runtime::RuntimeState,
 };
 #[cfg(feature = "reality")]
@@ -60,7 +58,11 @@ use crate::{
 };
 #[cfg(feature = "tls")]
 use crate::{
-    config::server_config::TlsServerConfig, util::rustls_util::create_server_config,
+    config::server_config::TlsServerConfig,
+    util::{
+        rustls_util::create_server_config,
+        socket::new_socket2_udp_socket_with_buffer_size,
+    },
 };
 
 use super::process_stream;
@@ -71,6 +73,90 @@ const UPLOAD_MODE_PACKET: u8 = 1;
 const UPLOAD_MODE_STREAM: u8 = 2;
 
 type ResponseBody = UnsyncBoxBody<Bytes, Infallible>;
+type XhttpResponseStream =
+    Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send + 'static>>;
+
+struct XhttpRequest {
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Box<dyn XhttpRequestBody>,
+}
+
+impl XhttpRequest {
+    fn from_hyper(request: Request<Incoming>) -> Self {
+        let (parts, body) = request.into_parts();
+        Self {
+            method: parts.method,
+            uri: parts.uri,
+            headers: parts.headers,
+            body: Box::new(HyperRequestBody { inner: body }),
+        }
+    }
+}
+
+#[async_trait]
+trait XhttpRequestBody: Send {
+    async fn next_data(&mut self) -> std::io::Result<Option<Bytes>>;
+}
+
+struct HyperRequestBody {
+    inner: Incoming,
+}
+
+#[async_trait]
+impl XhttpRequestBody for HyperRequestBody {
+    async fn next_data(&mut self) -> std::io::Result<Option<Bytes>> {
+        loop {
+            let Some(frame) = self.inner.frame().await else {
+                return Ok(None);
+            };
+            let frame = frame.map_err(std::io::Error::other)?;
+            if let Ok(data) = frame.into_data() {
+                return Ok(Some(data));
+            }
+        }
+    }
+}
+
+struct H3RequestBody<S> {
+    inner: h3::server::RequestStream<S, Bytes>,
+}
+
+#[async_trait]
+impl<S> XhttpRequestBody for H3RequestBody<S>
+where
+    S: h3::quic::RecvStream + Send + Unpin + 'static,
+{
+    async fn next_data(&mut self) -> std::io::Result<Option<Bytes>> {
+        let Some(mut data) = self
+            .inner
+            .recv_data()
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let remaining = data.remaining();
+        Ok(Some(data.copy_to_bytes(remaining)))
+    }
+}
+
+struct XhttpResponsePlan {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Option<XhttpResponseStream>,
+}
+
+impl XhttpResponsePlan {
+    fn empty(status: StatusCode) -> Self {
+        Self {
+            status,
+            headers: HeaderMap::new(),
+            body: None,
+        }
+    }
+}
 
 pub async fn start_xhttp_server(
     config: ServerConfig,
@@ -95,13 +181,18 @@ pub async fn start_xhttp_server(
         &tag,
         &mut rules_stack,
     )?);
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let resolver = runtime.resolver();
     let state = Arc::new(AppState::new(
         listener_config.xhttp_config,
         server_handler,
         resolver,
         runtime,
     ));
+    #[cfg(feature = "tls")]
+    if let XhttpSecurityLayer::Http3(tls_config) = &listener_config.security {
+        return start_xhttp3_server(bind_addr, tls_config.clone(), state).await;
+    }
+
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     let security = listener_config.security.clone();
 
@@ -119,6 +210,7 @@ pub async fn start_xhttp_server(
             let state = state.clone();
             let security = security.clone();
             tokio::spawn(async move {
+                let reality_resolver = state.resolver.clone();
                 let stream: Box<dyn AsyncStream> = Box::new(stream);
                 let wrapped_stream: std::io::Result<Box<dyn AsyncStream>> =
                     match security {
@@ -131,10 +223,16 @@ pub async fn start_xhttp_server(
                         }
                         #[cfg(feature = "reality")]
                         XhttpSecurityLayer::Reality(config) => {
-                            accept_reality_stream(stream, &config).await.map(
-                                |stream| Box::new(stream) as Box<dyn AsyncStream>,
-                            )
+                            accept_reality_stream(stream, &config, reality_resolver)
+                                .await
+                                .map(|stream| {
+                                    Box::new(stream) as Box<dyn AsyncStream>
+                                })
                         }
+                        #[cfg(feature = "tls")]
+                        XhttpSecurityLayer::Http3(_) => unreachable!(
+                            "HTTP/3 security is handled by the UDP listener"
+                        ),
                     };
 
                 match wrapped_stream {
@@ -152,6 +250,149 @@ pub async fn start_xhttp_server(
     Ok(vec![handle])
 }
 
+#[cfg(feature = "tls")]
+async fn start_xhttp3_server(
+    bind_addr: std::net::SocketAddr,
+    tls_config: Arc<tokio_rustls::rustls::ServerConfig>,
+    state: Arc<AppState>,
+) -> std::io::Result<Vec<tokio::task::JoinHandle<()>>> {
+    let quic_crypto: quinn::crypto::rustls::QuicServerConfig =
+        tls_config.try_into().map_err(std::io::Error::other)?;
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
+    let transport = Arc::get_mut(&mut server_config.transport).ok_or_else(|| {
+        std::io::Error::other("xhttp HTTP/3 transport config already shared")
+    })?;
+    let idle_timeout = Duration::from_secs(300).try_into().map_err(|error| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
+    })?;
+    transport
+        .max_concurrent_bidi_streams(4096_u32.into())
+        .max_concurrent_uni_streams(4096_u32.into())
+        .max_idle_timeout(Some(idle_timeout))
+        .keep_alive_interval(Some(Duration::from_secs(15)))
+        .send_window(16 * 1024 * 1024)
+        .receive_window((20u32 * 1024 * 1024).into())
+        .stream_receive_window((8u32 * 1024 * 1024).into());
+
+    let socket = new_socket2_udp_socket_with_buffer_size(
+        bind_addr.is_ipv6(),
+        None,
+        Some(bind_addr),
+        false,
+        Some(8_625_000),
+    )
+    .map_err(std::io::Error::other)?;
+    let endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        socket.into(),
+        Arc::new(quinn::TokioRuntime),
+    )
+    .map_err(std::io::Error::other)?;
+
+    let handle = tokio::spawn(async move {
+        while let Some(incoming) = endpoint.accept().await {
+            let state = state.clone();
+            tokio::spawn(async move {
+                match incoming.await {
+                    Ok(connection) => {
+                        if let Err(error) =
+                            serve_xhttp3_connection(connection, state).await
+                        {
+                            error!("xhttp HTTP/3 connection failed: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        debug!("xhttp HTTP/3 handshake failed: {error}");
+                    }
+                }
+            });
+        }
+    });
+
+    Ok(vec![handle])
+}
+
+#[cfg(feature = "tls")]
+async fn serve_xhttp3_connection(
+    connection: quinn::Connection,
+    state: Arc<AppState>,
+) -> std::io::Result<()> {
+    let peer_addr = connection.remote_address();
+    let h3_transport = h3_quinn::Connection::new(connection);
+    let mut h3_builder = h3::server::builder();
+    h3_builder.max_field_section_size(
+        state.server_max_header_bytes.min(u64::MAX as usize) as u64,
+    );
+    let mut h3_connection = h3_builder
+        .build(h3_transport)
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+
+    loop {
+        let Some(resolver) = h3_connection
+            .accept()
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+        else {
+            return Ok(());
+        };
+        let state = state.clone();
+        tokio::spawn(async move {
+            let result = async move {
+                let (request, stream) = resolver
+                    .resolve_request()
+                    .await
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                let (send_stream, recv_stream) = stream.split();
+                let (parts, ()) = request.into_parts();
+                let request = XhttpRequest {
+                    method: parts.method,
+                    uri: parts.uri,
+                    headers: parts.headers,
+                    body: Box::new(H3RequestBody { inner: recv_stream }),
+                };
+                let plan = handle_xhttp_request(request, state, peer_addr).await;
+                write_xhttp3_response(send_stream, plan).await
+            }
+            .await;
+            if let Err(error) = result {
+                debug!("xhttp HTTP/3 request failed: {error}");
+            }
+        });
+    }
+}
+
+#[cfg(feature = "tls")]
+async fn write_xhttp3_response<S>(
+    mut stream: h3::server::RequestStream<S, Bytes>,
+    mut plan: XhttpResponsePlan,
+) -> std::io::Result<()>
+where
+    S: h3::quic::SendStream<Bytes> + Send + Unpin,
+{
+    let mut response = Response::new(());
+    *response.status_mut() = plan.status;
+    *response.headers_mut() = plan.headers;
+    stream
+        .send_response(response)
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+
+    if let Some(mut body) = plan.body.take() {
+        while let Some(chunk) = body.next().await {
+            stream
+                .send_data(chunk?)
+                .await
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+        }
+    }
+    stream
+        .finish()
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))
+}
+
 struct XhttpListenerConfig {
     xhttp_config: XhttpServerConfig,
     inner: ServerProxyConfig,
@@ -163,6 +404,8 @@ enum XhttpSecurityLayer {
     None,
     #[cfg(feature = "tls")]
     Tls(TlsAcceptor),
+    #[cfg(feature = "tls")]
+    Http3(Arc<tokio_rustls::rustls::ServerConfig>),
     #[cfg(feature = "reality")]
     Reality(RealityTransportConfig),
 }
@@ -188,8 +431,10 @@ fn parse_listener_protocol(
             inner,
         }) => match *inner {
             ServerProxyConfig::Xhttp { config, inner } => {
-                if !alpn_protocols.iter().any(|proto| proto == "h2") {
-                    alpn_protocols.push("h2".to_string());
+                let is_h3 = alpn_protocols.len() == 1
+                    && alpn_protocols[0].eq_ignore_ascii_case("h3");
+                if !is_h3 && alpn_protocols.is_empty() {
+                    alpn_protocols = vec!["h2".to_string(), "http/1.1".to_string()];
                 }
 
                 let certificate = certificates
@@ -223,12 +468,15 @@ fn parse_listener_protocol(
                     &[],
                 )?;
 
+                let security = if is_h3 {
+                    XhttpSecurityLayer::Http3(Arc::new(tls_config))
+                } else {
+                    XhttpSecurityLayer::Tls(TlsAcceptor::from(Arc::new(tls_config)))
+                };
                 Ok(XhttpListenerConfig {
                     xhttp_config: config,
                     inner: *inner,
-                    security: XhttpSecurityLayer::Tls(TlsAcceptor::from(Arc::new(
-                        tls_config,
-                    ))),
+                    security,
                 })
             }
             _ => Err(std::io::Error::other(
@@ -267,7 +515,12 @@ async fn serve_http_connection<IO>(
     builder
         .http1()
         .max_buf_size(max_header_bytes)
-        .max_headers((max_header_bytes / 16).max(100));
+        .max_headers((max_header_bytes / 16).max(100))
+        .header_read_timeout(Duration::from_secs(4))
+        .timer(TokioTimer::new());
+    builder.http2().max_header_list_size(
+        state.server_max_header_bytes.min(u32::MAX as usize) as u32,
+    );
     builder
         .http2()
         .max_header_list_size(max_header_bytes.min(u32::MAX as usize) as u32);
@@ -357,7 +610,8 @@ impl AppState {
 
     fn extract_meta(
         &self,
-        request: &Request<Incoming>,
+        uri: &Uri,
+        headers: &HeaderMap,
         decoded_path: &str,
     ) -> (Option<String>, Option<String>) {
         let path_tail = decoded_path.strip_prefix(&self.base_path).unwrap_or("");
@@ -375,23 +629,15 @@ impl AppState {
 
         let session_id = match self.session_placement {
             XhttpPlacement::Path => next_path_value(),
-            XhttpPlacement::Query => {
-                query_value(request.uri().query(), &self.session_key)
-            }
-            XhttpPlacement::Header => {
-                header_value(request.headers(), &self.session_key)
-            }
-            XhttpPlacement::Cookie => {
-                cookie_value(request.headers(), &self.session_key)
-            }
+            XhttpPlacement::Query => query_value(uri.query(), &self.session_key),
+            XhttpPlacement::Header => header_value(headers, &self.session_key),
+            XhttpPlacement::Cookie => cookie_value(headers, &self.session_key),
         };
         let seq = match self.seq_placement {
             XhttpPlacement::Path => next_path_value(),
-            XhttpPlacement::Query => {
-                query_value(request.uri().query(), &self.seq_key)
-            }
-            XhttpPlacement::Header => header_value(request.headers(), &self.seq_key),
-            XhttpPlacement::Cookie => cookie_value(request.headers(), &self.seq_key),
+            XhttpPlacement::Query => query_value(uri.query(), &self.seq_key),
+            XhttpPlacement::Header => header_value(headers, &self.seq_key),
+            XhttpPlacement::Cookie => cookie_value(headers, &self.seq_key),
         };
         (session_id, seq)
     }
@@ -429,8 +675,7 @@ impl AppState {
         self.session_placement == XhttpPlacement::Cookie
             || self.seq_placement == XhttpPlacement::Cookie
             || self.uplink_data_placement == XhttpDataPlacement::Cookie
-            || (self.padding_obfs_mode
-                && self.padding_placement == XhttpPaddingPlacement::Cookie)
+            || self.padding_placement == XhttpPaddingPlacement::Cookie
     }
 
     fn extract_padding_value(
@@ -493,41 +738,41 @@ struct CorsRequest {
 }
 
 impl CorsRequest {
-    fn from_request(request: &Request<Incoming>) -> Self {
+    fn from_request(request: &XhttpRequest) -> Self {
         Self {
             origin: request
-                .headers()
+                .headers
                 .get(header::ORIGIN)
                 .and_then(|value| value.to_str().ok())
                 .map(ToOwned::to_owned),
             requested_method: request
-                .headers()
+                .headers
                 .get(header::ACCESS_CONTROL_REQUEST_METHOD)
                 .and_then(|value| value.to_str().ok())
                 .map(ToOwned::to_owned),
             requested_headers: request
-                .headers()
+                .headers
                 .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
                 .and_then(|value| value.to_str().ok())
                 .map(ToOwned::to_owned),
-            is_options: request.method() == Method::OPTIONS,
+            is_options: request.method == Method::OPTIONS,
         }
     }
 }
 
 fn apply_cors_headers(
-    mut response: Response<ResponseBody>,
+    response: &mut XhttpResponsePlan,
     request: &CorsRequest,
     allow_credentials: bool,
-) -> Response<ResponseBody> {
+) {
     let origin = request.origin.as_deref().unwrap_or("*");
     if let Ok(origin) = hyper::header::HeaderValue::from_str(origin) {
         response
-            .headers_mut()
+            .headers
             .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
     }
     if allow_credentials {
-        response.headers_mut().insert(
+        response.headers.insert(
             header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
             hyper::header::HeaderValue::from_static("true"),
         );
@@ -536,32 +781,30 @@ fn apply_cors_headers(
         let allowed_method = request.requested_method.as_deref().unwrap_or("*");
         if let Ok(value) = hyper::header::HeaderValue::from_str(allowed_method) {
             response
-                .headers_mut()
+                .headers
                 .insert(header::ACCESS_CONTROL_ALLOW_METHODS, value);
         }
         let allowed_headers = request.requested_headers.as_deref().unwrap_or("*");
         if let Ok(value) = hyper::header::HeaderValue::from_str(allowed_headers) {
             response
-                .headers_mut()
+                .headers
                 .insert(header::ACCESS_CONTROL_ALLOW_HEADERS, value);
         }
     }
-    response
 }
 
 fn apply_xhttp_response_headers(
-    response: Response<ResponseBody>,
+    response: &mut XhttpResponsePlan,
     request: &CorsRequest,
     state: &AppState,
-) -> Response<ResponseBody> {
-    let mut response =
-        apply_cors_headers(response, request, state.uses_cookie_transport());
+) {
+    apply_cors_headers(response, request, state.uses_cookie_transport());
     let padding = state.response_padding_value();
     if !state.padding_obfs_mode {
         if let Ok(value) = hyper::header::HeaderValue::from_str(&padding) {
-            response.headers_mut().insert("x-padding", value);
+            response.headers.insert("x-padding", value);
         }
-        return response;
+        return;
     }
 
     match state.padding_placement {
@@ -572,7 +815,7 @@ fn apply_xhttp_response_headers(
                 ),
                 hyper::header::HeaderValue::from_str(&padding),
             ) {
-                response.headers_mut().insert(name, value);
+                response.headers.insert(name, value);
             }
         }
         XhttpPaddingPlacement::QueryInHeader => {
@@ -585,7 +828,7 @@ fn apply_xhttp_response_headers(
                     state.padding_key
                 )),
             ) {
-                response.headers_mut().insert(name, value);
+                response.headers.insert(name, value);
             }
         }
         XhttpPaddingPlacement::Cookie => {
@@ -593,12 +836,11 @@ fn apply_xhttp_response_headers(
                 "{}={padding}; Path=/",
                 state.padding_key
             )) {
-                response.headers_mut().append(header::SET_COOKIE, value);
+                response.headers.append(header::SET_COOKIE, value);
             }
         }
         XhttpPaddingPlacement::Query => {}
     }
-    response
 }
 
 async fn handle_request(
@@ -606,91 +848,119 @@ async fn handle_request(
     state: Arc<AppState>,
     peer_addr: std::net::SocketAddr,
 ) -> Result<Response<ResponseBody>, Infallible> {
+    let plan =
+        handle_xhttp_request(XhttpRequest::from_hyper(request), state, peer_addr)
+            .await;
+    Ok(into_hyper_response(plan))
+}
+
+fn into_hyper_response(plan: XhttpResponsePlan) -> Response<ResponseBody> {
+    let body = match plan.body {
+        Some(stream) => {
+            let stream = stream.filter_map(|result| async move {
+                match result {
+                    Ok(bytes) => Some(Ok(Frame::data(bytes))),
+                    Err(error) => {
+                        error!("xhttp response stream failed: {error}");
+                        None
+                    }
+                }
+            });
+            BodyExt::boxed_unsync(StreamBody::new(stream))
+        }
+        None => BodyExt::boxed_unsync(Empty::<Bytes>::new()),
+    };
+    let mut response = Response::new(body);
+    *response.status_mut() = plan.status;
+    *response.headers_mut() = plan.headers;
+    response
+}
+
+async fn handle_xhttp_request(
+    request: XhttpRequest,
+    state: Arc<AppState>,
+    peer_addr: std::net::SocketAddr,
+) -> XhttpResponsePlan {
     let host_header = request
-        .headers()
+        .headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok());
-    let authority_host = request.uri().authority().map(|value| value.as_str());
+    let authority_host = request.uri.authority().map(|value| value.as_str());
     let request_host = host_header.or(authority_host);
 
     if !state.validate_host(request_host) {
         debug!(
-            method = %request.method(),
-            path = %request.uri().path(),
+            method = %request.method,
+            path = %request.uri.path(),
             host = ?request_host,
             "xhttp request rejected by host validation"
         );
-        return Ok(simple_response(StatusCode::NOT_FOUND));
+        return XhttpResponsePlan::empty(StatusCode::NOT_FOUND);
     }
 
-    let Some(path) = decode_uri_path(request.uri().path()) else {
-        return Ok(simple_response(StatusCode::NOT_FOUND));
+    let Some(path) = decode_uri_path(request.uri.path()) else {
+        return XhttpResponsePlan::empty(StatusCode::NOT_FOUND);
     };
     if !matches_base_path(&path, &state.base_path) {
         debug!(
-            method = %request.method(),
+            method = %request.method,
             path = %path,
             base_path = %state.base_path,
             "xhttp request rejected by path validation"
         );
-        return Ok(simple_response(StatusCode::NOT_FOUND));
+        return XhttpResponsePlan::empty(StatusCode::NOT_FOUND);
     }
     let cors = CorsRequest::from_request(&request);
-    if !state.validate_padding(request.uri().query(), request.headers()) {
+    if !state.validate_padding(request.uri.query(), &request.headers) {
         debug!(
-            method = %request.method(),
-            path = %request.uri().path(),
-            query = ?request.uri().query(),
+            method = %request.method,
+            path = %request.uri.path(),
+            query = ?request.uri.query(),
             "xhttp request rejected by padding validation"
         );
-        return Ok(apply_xhttp_response_headers(
-            simple_response(StatusCode::BAD_REQUEST),
-            &cors,
-            &state,
-        ));
+        let mut response = XhttpResponsePlan::empty(StatusCode::BAD_REQUEST);
+        apply_xhttp_response_headers(&mut response, &cors, &state);
+        return response;
     }
 
-    if request.method() == Method::OPTIONS {
-        return Ok(apply_xhttp_response_headers(
-            simple_response(StatusCode::OK),
-            &cors,
-            &state,
-        ));
+    if request.method == Method::OPTIONS {
+        let mut response = XhttpResponsePlan::empty(StatusCode::OK);
+        apply_xhttp_response_headers(&mut response, &cors, &state);
+        return response;
     }
 
-    let (session_id, seq) = state.extract_meta(&request, &path);
-    let is_uplink_request = request.method() != Method::GET || seq.is_some();
+    let (session_id, seq) =
+        state.extract_meta(&request.uri, &request.headers, &path);
+    let is_uplink_request = request.method != Method::GET || seq.is_some();
 
-    let response = if session_id.is_none()
+    let mut response = if session_id.is_none()
         && !matches!(
             state.mode,
             XhttpMode::Auto | XhttpMode::StreamOne | XhttpMode::StreamUp
         ) {
-        simple_response(StatusCode::BAD_REQUEST)
+        XhttpResponsePlan::empty(StatusCode::BAD_REQUEST)
     } else if is_uplink_request {
         match (session_id, seq) {
             (Some(session_id), None)
                 if matches!(state.mode, XhttpMode::Auto | XhttpMode::StreamUp) =>
             {
                 let keepalive_enabled = state.padding_obfs_mode
-                    || request.headers().contains_key(header::REFERER);
+                    || request.headers.contains_key(header::REFERER);
                 handle_stream_up(
                     request,
                     state.clone(),
                     session_id,
-                    peer_addr,
                     keepalive_enabled,
                 )
                 .await
             }
-            (Some(_), None) => simple_response(StatusCode::BAD_REQUEST),
+            (Some(_), None) => XhttpResponsePlan::empty(StatusCode::BAD_REQUEST),
             (Some(session_id), Some(seq))
                 if matches!(state.mode, XhttpMode::Auto | XhttpMode::PacketUp) =>
             {
-                handle_packet_up(request, state.clone(), session_id, seq, peer_addr)
-                    .await
+                handle_packet_up(request, state.clone(), session_id, seq).await
             }
-            (Some(_), Some(_)) => simple_response(StatusCode::BAD_REQUEST),
+            (Some(_), Some(_)) => XhttpResponsePlan::empty(StatusCode::BAD_REQUEST),
             (None, _) => handle_stream_one(request, state.clone(), peer_addr).await,
         }
     } else if let Some(session_id) = session_id {
@@ -699,14 +969,15 @@ async fn handle_request(
         handle_stream_one(request, state.clone(), peer_addr).await
     };
 
-    Ok(apply_xhttp_response_headers(response, &cors, &state))
+    apply_xhttp_response_headers(&mut response, &cors, &state);
+    response
 }
 
 async fn handle_stream_one(
-    request: Request<Incoming>,
+    request: XhttpRequest,
     state: Arc<AppState>,
     peer_addr: std::net::SocketAddr,
-) -> Response<ResponseBody> {
+) -> XhttpResponsePlan {
     let (client_upload, server_read) = duplex(XHTTP_PIPE_CAPACITY);
     let (server_write, client_download) = duplex(XHTTP_PIPE_CAPACITY);
     let logical_stream = XhttpLogicalStream::new(server_read, server_write);
@@ -714,18 +985,11 @@ async fn handle_stream_one(
     spawn_handler_stream(logical_stream, state.clone(), peer_addr);
 
     let mut upload_writer = client_upload;
-    let mut body = request.into_body();
+    let mut body = request.body;
     tokio::spawn(async move {
-        while let Some(frame_result) = body.frame().await {
-            match frame_result {
-                Ok(frame) => {
-                    if let Some(chunk) = frame.data_ref()
-                        && upload_writer.write_all(chunk).await.is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(_) => break,
+        while let Ok(Some(chunk)) = body.next_data().await {
+            if upload_writer.write_all(&chunk).await.is_err() {
+                break;
             }
         }
         let _ = upload_writer.shutdown().await;
@@ -735,26 +999,22 @@ async fn handle_stream_one(
 }
 
 async fn handle_stream_up(
-    request: Request<Incoming>,
+    request: XhttpRequest,
     state: Arc<AppState>,
     session_id: String,
-    peer_addr: std::net::SocketAddr,
     keepalive_enabled: bool,
-) -> Response<ResponseBody> {
+) -> XhttpResponsePlan {
     let session = state.sessions.get_or_create(&session_id);
     if !session.claim_stream_upload() {
-        return simple_response(StatusCode::CONFLICT);
+        return XhttpResponsePlan::empty(StatusCode::CONFLICT);
     }
-    if let Some(stream) = session.take_handler_stream().await {
-        spawn_handler_stream(stream, state.clone(), peer_addr);
-    }
-
     let (mut response_writer, response_reader) = duplex(XHTTP_PIPE_CAPACITY);
     let sessions = state.sessions.clone();
     let task_state = state.clone();
     let task_session = session.clone();
+    let cancel_token = session.cancel_token.clone();
     tokio::spawn(async move {
-        let mut body = request.into_body();
+        let mut body = request.body;
         let mut upload_state = task_session.upload.lock().await;
         let mut keepalive_enabled = keepalive_enabled;
         let mut failed = false;
@@ -769,10 +1029,11 @@ async fn handle_stream_up(
         }
 
         loop {
-            let next_frame = if keepalive_enabled {
+            let next_chunk = if keepalive_enabled {
                 if let Some(delay) = task_state.stream_up_keepalive_delay() {
                     tokio::select! {
-                        frame = body.frame() => frame,
+                        _ = cancel_token.cancelled() => break,
+                        chunk = body.next_data() => chunk,
                         _ = sleep(delay) => {
                             if response_writer
                                 .write_all(&task_state.stream_up_padding())
@@ -785,26 +1046,28 @@ async fn handle_stream_up(
                         }
                     }
                 } else {
-                    body.frame().await
+                    tokio::select! {
+                        _ = cancel_token.cancelled() => break,
+                        chunk = body.next_data() => chunk,
+                    }
                 }
             } else {
-                body.frame().await
+                tokio::select! {
+                    _ = cancel_token.cancelled() => break,
+                    chunk = body.next_data() => chunk,
+                }
             };
 
-            let Some(frame_result) = next_frame else {
-                break;
-            };
-            let frame = match frame_result {
-                Ok(frame) => frame,
+            let chunk = match next_chunk {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
                 Err(error) => {
                     error!("xhttp stream-up body read failed: {}", error);
                     failed = true;
                     break;
                 }
             };
-            if let Some(chunk) = frame.data_ref()
-                && let Err(error) = upload_state.writer.write_all(chunk).await
-            {
+            if let Err(error) = upload_state.writer.write_all(&chunk).await {
                 error!("xhttp stream-up write failed: {}", error);
                 failed = true;
                 break;
@@ -828,7 +1091,7 @@ async fn handle_stream_down(
     state: Arc<AppState>,
     session_id: String,
     peer_addr: std::net::SocketAddr,
-) -> Response<ResponseBody> {
+) -> XhttpResponsePlan {
     let session = state.sessions.get_or_create(&session_id);
     session.fully_connected.store(true, Ordering::Release);
 
@@ -837,7 +1100,7 @@ async fn handle_stream_down(
     }
 
     let Some(reader) = session.take_downlink_reader().await else {
-        return simple_response(StatusCode::CONFLICT);
+        return XhttpResponsePlan::empty(StatusCode::CONFLICT);
     };
 
     let body_stream =
@@ -847,37 +1110,36 @@ async fn handle_stream_down(
 }
 
 async fn handle_packet_up(
-    request: Request<Incoming>,
+    mut request: XhttpRequest,
     state: Arc<AppState>,
     session_id: String,
     seq: String,
-    peer_addr: std::net::SocketAddr,
-) -> Response<ResponseBody> {
+) -> XhttpResponsePlan {
     let Ok(seq) = seq.parse::<u64>() else {
-        return simple_response(StatusCode::INTERNAL_SERVER_ERROR);
+        return XhttpResponsePlan::empty(StatusCode::INTERNAL_SERVER_ERROR);
     };
 
     if matches!(
         state.uplink_data_placement,
         XhttpDataPlacement::Auto | XhttpDataPlacement::Body
     ) && request
-        .headers()
+        .headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
         .is_some_and(|length| length > state.max_each_post_bytes as u64)
     {
-        return simple_response(StatusCode::PAYLOAD_TOO_LARGE);
+        return XhttpResponsePlan::empty(StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    let (parts, body) = request.into_parts();
     let header_payload = if matches!(
         state.uplink_data_placement,
         XhttpDataPlacement::Auto | XhttpDataPlacement::Header
     ) {
-        match decode_chunked_header_payload(&parts.headers, &state.uplink_data_key) {
+        match decode_chunked_header_payload(&request.headers, &state.uplink_data_key)
+        {
             Ok(payload) => payload,
-            Err(_) => return simple_response(StatusCode::BAD_REQUEST),
+            Err(_) => return XhttpResponsePlan::empty(StatusCode::BAD_REQUEST),
         }
     } else {
         Vec::new()
@@ -886,9 +1148,10 @@ async fn handle_packet_up(
         state.uplink_data_placement,
         XhttpDataPlacement::Auto | XhttpDataPlacement::Cookie
     ) {
-        match decode_chunked_cookie_payload(&parts.headers, &state.uplink_data_key) {
+        match decode_chunked_cookie_payload(&request.headers, &state.uplink_data_key)
+        {
             Ok(payload) => payload,
-            Err(_) => return simple_response(StatusCode::BAD_REQUEST),
+            Err(_) => return XhttpResponsePlan::empty(StatusCode::BAD_REQUEST),
         }
     } else {
         Vec::new()
@@ -897,13 +1160,16 @@ async fn handle_packet_up(
         state.uplink_data_placement,
         XhttpDataPlacement::Auto | XhttpDataPlacement::Body
     ) {
-        let body = Limited::new(body, state.max_each_post_bytes.saturating_add(1));
-        match body.collect().await {
-            Ok(collected) => collected.to_bytes().to_vec(),
-            Err(error) if error.downcast_ref::<LengthLimitError>().is_some() => {
-                return simple_response(StatusCode::PAYLOAD_TOO_LARGE);
+        match collect_request_body(request.body.as_mut(), state.max_each_post_bytes)
+            .await
+        {
+            Ok(payload) => payload,
+            Err(CollectBodyError::TooLarge) => {
+                return XhttpResponsePlan::empty(StatusCode::PAYLOAD_TOO_LARGE);
             }
-            Err(_) => return simple_response(StatusCode::BAD_REQUEST),
+            Err(CollectBodyError::Read) => {
+                return XhttpResponsePlan::empty(StatusCode::BAD_REQUEST);
+            }
         }
     } else {
         Vec::new()
@@ -925,23 +1191,19 @@ async fn handle_packet_up(
         XhttpDataPlacement::Cookie => cookie_payload,
     };
     if payload.len() > state.max_each_post_bytes {
-        return simple_response(StatusCode::PAYLOAD_TOO_LARGE);
+        return XhttpResponsePlan::empty(StatusCode::PAYLOAD_TOO_LARGE);
     }
     let collected = Bytes::from(payload);
 
     let session = state.sessions.get_or_create(&session_id);
     if !session.claim_packet_upload() {
-        return simple_response(StatusCode::CONFLICT);
+        return XhttpResponsePlan::empty(StatusCode::CONFLICT);
     }
-    if let Some(stream) = session.take_handler_stream().await {
-        spawn_handler_stream(stream, state.clone(), peer_addr);
-    }
-
     let mut upload_state = session.upload.lock().await;
     match upload_state.packet_queue.push_packet(seq, collected) {
         Ok(()) => {}
         Err(QueueError::TooManyBuffered) => {
-            return simple_response(StatusCode::INTERNAL_SERVER_ERROR);
+            return XhttpResponsePlan::empty(StatusCode::INTERNAL_SERVER_ERROR);
         }
     }
 
@@ -949,18 +1211,45 @@ async fn handle_packet_up(
         if let Err(err) = upload_state.writer.write_all(&chunk).await {
             error!("xhttp packet-up write failed: {}", err);
             state.sessions.remove(&session_id).await;
-            return simple_response(StatusCode::BAD_GATEWAY);
+            return XhttpResponsePlan::empty(StatusCode::BAD_GATEWAY);
         }
     }
 
-    let mut response = simple_response(StatusCode::OK);
+    let mut response = XhttpResponsePlan::empty(StatusCode::OK);
     if body_payload_is_empty {
-        response.headers_mut().insert(
+        response.headers.insert(
             header::CACHE_CONTROL,
             hyper::header::HeaderValue::from_static("no-store"),
         );
     }
     response
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollectBodyError {
+    TooLarge,
+    Read,
+}
+
+async fn collect_request_body(
+    body: &mut dyn XhttpRequestBody,
+    limit: usize,
+) -> Result<Vec<u8>, CollectBodyError> {
+    let mut payload = Vec::new();
+    loop {
+        let chunk = body.next_data().await.map_err(|_| CollectBodyError::Read)?;
+        let Some(chunk) = chunk else {
+            return Ok(payload);
+        };
+        let next_len = payload
+            .len()
+            .checked_add(chunk.len())
+            .ok_or(CollectBodyError::TooLarge)?;
+        if next_len > limit {
+            return Err(CollectBodyError::TooLarge);
+        }
+        payload.extend_from_slice(&chunk);
+    }
 }
 
 fn spawn_handler_stream(
@@ -1014,16 +1303,14 @@ impl SessionBodyStream {
 }
 
 impl futures::Stream for SessionBodyStream {
-    type Item = Result<Frame<Bytes>, Infallible>;
+    type Item = std::io::Result<Bytes>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(bytes))) => {
-                Poll::Ready(Some(Ok(Frame::data(bytes))))
-            }
+            Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Some(Ok(bytes))),
             Poll::Ready(Some(Err(err))) => {
                 error!("xhttp stream-down read failed: {}", err);
                 self.start_cleanup();
@@ -1048,44 +1335,38 @@ fn reader_response(
     status: StatusCode,
     reader: DuplexStream,
     no_sse_header: bool,
-) -> Response<ResponseBody> {
-    let body_stream = ReaderStream::new(reader).filter_map(|result| async move {
-        match result {
-            Ok(bytes) => Some(Ok(Frame::data(bytes))),
-            Err(err) => {
-                error!("xhttp response read failed: {}", err);
-                None
-            }
-        }
-    });
-    stream_response(status, body_stream.boxed(), no_sse_header)
+) -> XhttpResponsePlan {
+    stream_response(status, ReaderStream::new(reader), no_sse_header)
 }
 
 fn stream_response<S>(
     status: StatusCode,
     body_stream: S,
     no_sse_header: bool,
-) -> Response<ResponseBody>
+) -> XhttpResponsePlan
 where
-    S: futures::Stream<Item = Result<Frame<Bytes>, Infallible>> + Send + 'static,
+    S: Stream<Item = std::io::Result<Bytes>> + Send + 'static,
 {
-    let mut response = Response::builder()
-        .status(status)
-        .header(header::CACHE_CONTROL, "no-store")
-        .header("x-accel-buffering", "no");
+    let mut response = XhttpResponsePlan {
+        status,
+        headers: HeaderMap::new(),
+        body: Some(Box::pin(body_stream)),
+    };
+    response.headers.insert(
+        header::CACHE_CONTROL,
+        hyper::header::HeaderValue::from_static("no-store"),
+    );
+    response.headers.insert(
+        "x-accel-buffering",
+        hyper::header::HeaderValue::from_static("no"),
+    );
     if !no_sse_header {
-        response = response.header(header::CONTENT_TYPE, "text/event-stream");
+        response.headers.insert(
+            header::CONTENT_TYPE,
+            hyper::header::HeaderValue::from_static("text/event-stream"),
+        );
     }
     response
-        .body(BodyExt::boxed_unsync(StreamBody::new(body_stream)))
-        .unwrap_or_else(|_| simple_response(StatusCode::INTERNAL_SERVER_ERROR))
-}
-
-fn simple_response(status: StatusCode) -> Response<ResponseBody> {
-    Response::builder()
-        .status(status)
-        .body(BodyExt::boxed_unsync(Empty::<Bytes>::new()))
-        .unwrap()
 }
 
 #[derive(Clone)]
@@ -1122,7 +1403,10 @@ impl SessionStore {
     }
 
     async fn remove(&self, session_id: &str) {
-        self.inner.write().unwrap().remove(session_id);
+        let session = self.inner.write().unwrap().remove(session_id);
+        if let Some(session) = session {
+            session.close().await;
+        }
     }
 
     fn spawn_ttl_cleanup(&self, session_id: String) {
@@ -1148,6 +1432,7 @@ struct XhttpSession {
     handler_stream: Mutex<Option<XhttpLogicalStream>>,
     fully_connected: AtomicBool,
     upload_mode: AtomicU8,
+    cancel_token: CancellationToken,
 }
 
 impl XhttpSession {
@@ -1167,6 +1452,7 @@ impl XhttpSession {
             ))),
             fully_connected: AtomicBool::new(false),
             upload_mode: AtomicU8::new(UPLOAD_MODE_NONE),
+            cancel_token: CancellationToken::new(),
         }
     }
 
@@ -1211,6 +1497,14 @@ impl XhttpSession {
 
     async fn take_downlink_reader(&self) -> Option<DuplexStream> {
         self.downlink_reader.lock().await.take()
+    }
+
+    async fn close(&self) {
+        self.cancel_token.cancel();
+        drop(self.handler_stream.lock().await.take());
+        drop(self.downlink_reader.lock().await.take());
+        let mut upload = self.upload.lock().await;
+        let _ = upload.writer.shutdown().await;
     }
 }
 
@@ -1638,6 +1932,40 @@ mod tests {
             queue.push_packet(3, Bytes::from_static(b"three")),
             Err(QueueError::TooManyBuffered)
         ));
+    }
+
+    #[tokio::test]
+    async fn incomplete_session_ttl_cancels_and_closes_pipes() {
+        let store = SessionStore::new(Duration::from_millis(10), 30);
+        let session = store.get_or_create("ttl-session");
+        let cancellation = session.cancel_token.clone();
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        assert!(cancellation.is_cancelled());
+        assert!(!store.inner.read().unwrap().contains_key("ttl-session"));
+        assert!(session.handler_stream.lock().await.is_none());
+        assert!(session.downlink_reader.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn fully_connected_session_survives_initial_ttl() {
+        let store = SessionStore::new(Duration::from_millis(10), 30);
+        let session = store.get_or_create("connected-session");
+        session.fully_connected.store(true, Ordering::Release);
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        assert!(
+            store
+                .inner
+                .read()
+                .unwrap()
+                .contains_key("connected-session")
+        );
+        assert!(!session.cancel_token.is_cancelled());
+        store.remove("connected-session").await;
+        assert!(session.cancel_token.is_cancelled());
     }
 
     #[tokio::test]

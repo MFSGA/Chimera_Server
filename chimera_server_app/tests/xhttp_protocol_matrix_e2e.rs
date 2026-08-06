@@ -370,3 +370,28 @@ fn cookie_padding_roundtrips_with_credentials() {
         Some("true")
     );
 }
+
+#[test]
+#[ignore = "starts Chimera and validates Xray cookie credential semantics without obfuscation"]
+fn configured_cookie_padding_enables_credentials_without_obfuscation() {
+    let _serial = serial_xray_guard();
+    let options = ServerOptions {
+        padding_obfs: false,
+        padding_placement: "cookie",
+        ..ServerOptions::default()
+    };
+    let (_server, addr) = start_server("cookie-credentials-no-obfs", options);
+    let headers = [("Origin", "https://browser.example".to_string())];
+    let head = send_http_request(
+        addr,
+        &request("OPTIONS", &padded_path(), "localhost", &headers, 0, b""),
+    );
+    assert_eq!(head.status, 200);
+    assert_eq!(
+        head.headers
+            .get("access-control-allow-credentials")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert!(head.headers.get("set-cookie").is_none());
+}

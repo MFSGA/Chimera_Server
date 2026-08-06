@@ -50,7 +50,7 @@ pub enum Protocol {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StreamSettings {
     #[serde(default)]
     network: String,

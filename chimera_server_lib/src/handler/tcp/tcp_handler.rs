@@ -6,15 +6,30 @@ use tokio::net::UdpSocket;
 use crate::{
     address::NetLocation,
     async_stream::{AsyncMessageStream, AsyncStream, AsyncTargetedMessageStream},
+    resolver::Resolver,
     traffic::TrafficContext,
 };
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct TcpServerConnectionContext {
     pub original_destination: Option<NetLocation>,
     pub local_addr: Option<std::net::SocketAddr>,
     pub server_name: Option<String>,
     pub alpn_protocol: Option<String>,
+    pub resolver: Option<Arc<dyn Resolver>>,
+}
+
+impl Debug for TcpServerConnectionContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TcpServerConnectionContext")
+            .field("original_destination", &self.original_destination)
+            .field("local_addr", &self.local_addr)
+            .field("server_name", &self.server_name)
+            .field("alpn_protocol", &self.alpn_protocol)
+            .field("resolver", &self.resolver.as_ref().map(|_| "dyn Resolver"))
+            .finish()
+    }
 }
 
 #[async_trait]

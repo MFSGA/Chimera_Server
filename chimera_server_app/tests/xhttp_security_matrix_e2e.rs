@@ -30,6 +30,9 @@ static RUSTLS_PROVIDER: Once = Once::new();
 enum SecurityCase {
     None,
     Tls,
+    Http3Packet,
+    Http3StreamOne,
+    Http3StreamUp,
     Reality,
 }
 
@@ -38,6 +41,9 @@ impl SecurityCase {
         match self {
             Self::None => "none",
             Self::Tls => "tls",
+            Self::Http3Packet => "h3-packet-up",
+            Self::Http3StreamOne => "h3-stream-one",
+            Self::Http3StreamUp => "h3-stream-up",
             Self::Reality => "reality",
         }
     }
@@ -46,8 +52,18 @@ impl SecurityCase {
         match self {
             Self::None => "packet-up",
             Self::Tls => "stream-one",
+            Self::Http3Packet => "packet-up",
+            Self::Http3StreamOne => "stream-one",
+            Self::Http3StreamUp => "stream-up",
             Self::Reality => "stream-up",
         }
+    }
+
+    fn is_http3(self) -> bool {
+        matches!(
+            self,
+            Self::Http3Packet | Self::Http3StreamOne | Self::Http3StreamUp
+        )
     }
 }
 
@@ -60,7 +76,11 @@ async fn run_security_case(case: SecurityCase) {
     let _serial = serial_xray_guard();
     let work_dir = create_test_dir(&format!("security-{}", case.name()));
     let echo_addr = start_tcp_echo_server();
-    let chimera_port = free_localhost_port();
+    let chimera_port = if case.is_http3() {
+        free_localhost_udp_port()
+    } else {
+        free_localhost_port()
+    };
     let xray_socks_port = free_localhost_port();
     let chimera_config_path = work_dir.join("chimera.json");
     let xray_config_path = work_dir.join("xray.json");
@@ -147,7 +167,11 @@ async fn run_security_case(case: SecurityCase) {
     );
 
     let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
-    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    if case.is_http3() {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    } else {
+        wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    }
     chimera.assert_running();
     let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
     let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
@@ -175,13 +199,20 @@ fn chimera_stream_settings(
             "security": "none",
             "xhttpSettings": xhttp_settings
         }),
-        SecurityCase::Tls => json!({
+        SecurityCase::Tls
+        | SecurityCase::Http3Packet
+        | SecurityCase::Http3StreamOne
+        | SecurityCase::Http3StreamUp => json!({
             "network": "xhttp",
             "security": "tls",
             "xhttpSettings": xhttp_settings,
             "tlsSettings": {
                 "serverName": "localhost",
-                "alpn": ["h2", "http/1.1"],
+                "alpn": if case.is_http3() {
+                    json!(["h3"])
+                } else {
+                    json!(["h2", "http/1.1"])
+                },
                 "certificates": [{
                     "certificateFile": cert_path,
                     "keyFile": key_path
@@ -215,14 +246,21 @@ fn xray_stream_settings(
             "security": "none",
             "xhttpSettings": xhttp_settings
         }),
-        SecurityCase::Tls => json!({
+        SecurityCase::Tls
+        | SecurityCase::Http3Packet
+        | SecurityCase::Http3StreamOne
+        | SecurityCase::Http3StreamUp => json!({
             "network": "xhttp",
             "security": "tls",
             "xhttpSettings": xhttp_settings,
             "tlsSettings": {
                 "serverName": "localhost",
                 "pinnedPeerCertSha256": pinned_cert,
-                "alpn": ["h2", "http/1.1"]
+                "alpn": if case.is_http3() {
+                    json!(["h3"])
+                } else {
+                    json!(["h2", "http/1.1"])
+                }
             }
         }),
         SecurityCase::Reality => json!({
@@ -252,9 +290,35 @@ async fn xhttp_security_tls() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "starts Chimera and Xray for packet-up XHTTP over HTTP/3"]
+async fn xhttp_security_http3_packet_up() {
+    run_security_case(SecurityCase::Http3Packet).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "starts Chimera and Xray for stream-one XHTTP over HTTP/3"]
+async fn xhttp_security_http3_stream_one() {
+    run_security_case(SecurityCase::Http3StreamOne).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "starts Chimera and Xray for stream-up XHTTP over HTTP/3"]
+async fn xhttp_security_http3_stream_up() {
+    run_security_case(SecurityCase::Http3StreamUp).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "starts Chimera and Xray for XHTTP over REALITY"]
 async fn xhttp_security_reality() {
     run_security_case(SecurityCase::Reality).await;
+}
+
+fn free_localhost_udp_port() -> u16 {
+    std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .expect("bind temporary UDP socket")
+        .local_addr()
+        .expect("temporary UDP socket address")
+        .port()
 }
 
 async fn start_tls13_dest(workspace: &Path) -> SocketAddr {

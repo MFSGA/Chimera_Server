@@ -349,6 +349,981 @@ async fn chimera_vless_plain_outbound_interoperates_with_xray_inbound() {
     );
 }
 
+#[derive(Clone, Copy)]
+enum XhttpOutboundSecurityCase {
+    None,
+    Tls,
+    TlsH1,
+    TlsH3,
+    Reality,
+}
+
+impl XhttpOutboundSecurityCase {
+    fn is_h1(self) -> bool {
+        matches!(self, Self::TlsH1)
+    }
+
+    fn is_h3(self) -> bool {
+        matches!(self, Self::TlsH3)
+    }
+
+    fn alpn(self) -> &'static str {
+        if self.is_h1() {
+            "http/1.1"
+        } else if self.is_h3() {
+            "h3"
+        } else {
+            "h2"
+        }
+    }
+}
+
+async fn run_chimera_vless_xhttp_outbound_case(
+    case_name: &str,
+    xhttp_settings: serde_json::Value,
+    large_payload_size: usize,
+) {
+    run_chimera_vless_xhttp_outbound_case_with_security(
+        case_name,
+        xhttp_settings,
+        large_payload_size,
+        XhttpOutboundSecurityCase::None,
+    )
+    .await;
+}
+
+async fn run_chimera_vless_xhttp_outbound_case_with_security(
+    case_name: &str,
+    xhttp_settings: serde_json::Value,
+    large_payload_size: usize,
+    security: XhttpOutboundSecurityCase,
+) {
+    run_chimera_vless_xhttp_outbound_case_with_security_and_connections(
+        case_name,
+        xhttp_settings,
+        large_payload_size,
+        security,
+        None,
+    )
+    .await;
+}
+
+async fn run_chimera_vless_xhttp_outbound_case_with_security_and_connections(
+    case_name: &str,
+    xhttp_settings: serde_json::Value,
+    large_payload_size: usize,
+    security: XhttpOutboundSecurityCase,
+    expected_upstream_connections: Option<usize>,
+) {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir(&format!("vless-xhttp-{case_name}-outbound"));
+    let echo_addr = start_tcp_echo_server();
+    let xray_vless_port = if security.is_h3() {
+        std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("bind temporary XHTTP H3 UDP socket")
+            .local_addr()
+            .expect("temporary XHTTP H3 UDP socket address")
+            .port()
+    } else {
+        free_localhost_port()
+    };
+    let (chimera_vless_port, upstream_connection_count) =
+        if expected_upstream_connections.is_some() {
+            assert!(
+                !security.is_h3(),
+                "TCP connection counting is only available for H1/H2 XHTTP tests"
+            );
+            let (forward_addr, count) = start_counting_tcp_forwarder(
+                SocketAddr::from((Ipv4Addr::LOCALHOST, xray_vless_port)),
+            );
+            (forward_addr.port(), Some(count))
+        } else {
+            (xray_vless_port, None)
+        };
+    let chimera_socks_port = free_localhost_port();
+    let xray_config_path = work_dir.join("xray-vless-xhttp-inbound.json");
+    let chimera_config_path = work_dir.join("chimera-vless-xhttp-outbound.json");
+    let mut xhttp_settings = xhttp_settings;
+    if xhttp_settings
+        .pointer("/downloadSettings/port")
+        .and_then(serde_json::Value::as_u64)
+        == Some(0)
+    {
+        let download_port = if security.is_h3() {
+            xray_vless_port
+        } else {
+            start_tcp_forwarder(SocketAddr::from((
+                Ipv4Addr::LOCALHOST,
+                xray_vless_port,
+            )))
+            .port()
+        };
+        xhttp_settings["downloadSettings"]["port"] = json!(download_port);
+    }
+    let mut server_xhttp_settings = xhttp_settings.clone();
+    if let Some(object) = server_xhttp_settings.as_object_mut() {
+        object.remove("downloadSettings");
+    }
+    let reality_dest_addr = match security {
+        XhttpOutboundSecurityCase::Reality => {
+            Some(start_tls13_dest(&workspace).await)
+        }
+        _ => None,
+    };
+    let cert_path = work_dir.join("xhttp-localhost-cert.pem");
+    let key_path = work_dir.join("xhttp-localhost-key.pem");
+    let generated =
+        rcgen::generate_simple_self_signed(["localhost".to_string()]).unwrap();
+    let trusted_certificate = generated.cert.pem();
+    fs::write(&cert_path, &trusted_certificate).unwrap();
+    fs::write(&key_path, generated.signing_key.serialize_pem()).unwrap();
+    if xhttp_settings
+        .pointer("/downloadSettings/security")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| value.eq_ignore_ascii_case("tls"))
+        && let Some(tls_settings) = xhttp_settings
+            .pointer_mut("/downloadSettings/tlsSettings")
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        tls_settings.remove("allowInsecure");
+        tls_settings.insert("disableSystemRoot".into(), json!(true));
+        tls_settings.insert(
+            "certificates".into(),
+            json!([{
+                "usage": "verify",
+                "certificate": [trusted_certificate.clone()]
+            }]),
+        );
+    }
+    let xray_stream_settings = match security {
+        XhttpOutboundSecurityCase::None => json!({
+            "network": "xhttp",
+            "security": "none",
+            "xhttpSettings": server_xhttp_settings.clone()
+        }),
+        XhttpOutboundSecurityCase::Tls
+        | XhttpOutboundSecurityCase::TlsH1
+        | XhttpOutboundSecurityCase::TlsH3 => json!({
+            "network": "xhttp",
+            "security": "tls",
+            "xhttpSettings": server_xhttp_settings.clone(),
+            "tlsSettings": {
+                "alpn": [security.alpn()],
+                "certificates": [{
+                    "certificateFile": cert_path,
+                    "keyFile": key_path
+                }]
+            }
+        }),
+        XhttpOutboundSecurityCase::Reality => json!({
+            "network": "xhttp",
+            "security": "reality",
+            "xhttpSettings": server_xhttp_settings,
+            "realitySettings": {
+                "dest": format!(
+                    "127.0.0.1:{}",
+                    reality_dest_addr.expect("REALITY destination").port()
+                ),
+                "serverNames": [REALITY_SERVER_NAME],
+                "privateKey": REALITY_PRIVATE_KEY,
+                "shortIds": [REALITY_SHORT_ID]
+            }
+        }),
+    };
+    let chimera_stream_settings = match security {
+        XhttpOutboundSecurityCase::None => json!({
+            "network": "xhttp",
+            "security": "none",
+            "xhttpSettings": xhttp_settings
+        }),
+        XhttpOutboundSecurityCase::Tls
+        | XhttpOutboundSecurityCase::TlsH1
+        | XhttpOutboundSecurityCase::TlsH3 => json!({
+            "network": "xhttp",
+            "security": "tls",
+            "xhttpSettings": xhttp_settings,
+            "tlsSettings": {
+                "serverName": "localhost",
+                "disableSystemRoot": true,
+                "alpn": [security.alpn()],
+                "certificates": [{
+                    "usage": "verify",
+                    "certificate": [trusted_certificate]
+                }]
+            }
+        }),
+        XhttpOutboundSecurityCase::Reality => json!({
+            "network": "xhttp",
+            "security": "reality",
+            "xhttpSettings": xhttp_settings,
+            "realitySettings": {
+                "serverName": REALITY_SERVER_NAME,
+                "publicKey": REALITY_PUBLIC_KEY,
+                "shortId": REALITY_SHORT_ID
+            }
+        }),
+    };
+
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_vless_port,
+                "protocol": "vless",
+                "tag": "vless-xhttp-in",
+                "settings": {
+                    "clients": [{"id": TEST_UUID}],
+                    "decryption": "none"
+                },
+                "streamSettings": xray_stream_settings
+            }],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }]
+        }),
+    );
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_socks_port,
+                "protocol": "socks",
+                "tag": "socks-in",
+                "settings": {"auth": "noauth"}
+            }],
+            "outbounds": [{
+                "tag": "to-xray-vless-xhttp",
+                "protocol": "vless",
+                "settings": {
+                    "address": "127.0.0.1",
+                    "port": chimera_vless_port,
+                    "id": TEST_UUID,
+                    "encryption": "none"
+                },
+                "streamSettings": chimera_stream_settings
+            }],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["socks-in"],
+                    "outboundTag": "to-xray-vless-xhttp"
+                }]
+            }
+        }),
+    );
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    if security.is_h3() {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    } else {
+        wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, xray_vless_port)));
+    }
+    xray.assert_running();
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_socks_port));
+    wait_for_tcp(socks_addr);
+    chimera.assert_running();
+
+    let payload = format!("VLESS XHTTP {case_name} outbound through Xray inbound");
+    assert_socks5_echo(socks_addr, echo_addr, payload.as_bytes());
+    assert_socks5_echo(
+        socks_addr,
+        echo_addr,
+        &deterministic_payload(large_payload_size),
+    );
+    if let (Some(expected), Some(count)) =
+        (expected_upstream_connections, upstream_connection_count)
+    {
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            expected,
+            "unexpected XHTTP upstream connection count for {case_name}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera SOCKS and ./xray as a VLESS XHTTP stream-one upstream"]
+async fn chimera_vless_xhttp_stream_one_outbound_interoperates_with_xray_inbound() {
+    run_chimera_vless_xhttp_outbound_case(
+        "stream-one",
+        json!({
+            "host": "localhost",
+            "path": "/xhttp",
+            "mode": "stream-one",
+            "noGRPCHeader": true,
+            "xPaddingBytes": 100
+        }),
+        64 * 1024,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera SOCKS and ./xray as a TLS VLESS XHTTP stream-one upstream"]
+async fn chimera_vless_xhttp_tls_stream_one_outbound_interoperates_with_xray_inbound()
+ {
+    run_chimera_vless_xhttp_outbound_case_with_security(
+        "tls-stream-one",
+        json!({
+            "host": "localhost",
+            "path": "/xhttp",
+            "mode": "stream-one",
+            "noGRPCHeader": true,
+            "xPaddingBytes": 100
+        }),
+        64 * 1024,
+        XhttpOutboundSecurityCase::Tls,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera SOCKS and ./xray as a REALITY VLESS XHTTP auto upstream"]
+async fn chimera_vless_xhttp_reality_auto_outbound_interoperates_with_xray_inbound()
+{
+    run_chimera_vless_xhttp_outbound_case_with_security(
+        "reality-auto",
+        json!({
+            "host": "localhost",
+            "path": "/xhttp",
+            "mode": "auto",
+            "noGRPCHeader": true,
+            "xPaddingBytes": 100
+        }),
+        64 * 1024,
+        XhttpOutboundSecurityCase::Reality,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera SOCKS and ./xray as a VLESS XHTTP stream-up upstream"]
+async fn chimera_vless_xhttp_stream_up_outbound_interoperates_with_xray_inbound() {
+    run_chimera_vless_xhttp_outbound_case(
+        "stream-up",
+        json!({
+            "host": "localhost",
+            "path": "/xhttp",
+            "mode": "stream-up",
+            "noGRPCHeader": true,
+            "xPaddingBytes": 100
+        }),
+        64 * 1024,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera SOCKS and ./xray as a VLESS XHTTP packet-up upstream"]
+async fn chimera_vless_xhttp_packet_up_outbound_interoperates_with_xray_inbound() {
+    run_chimera_vless_xhttp_outbound_case(
+        "packet-up",
+        json!({
+            "host": "localhost",
+            "path": "/xhttp",
+            "mode": "packet-up",
+            "noGRPCHeader": true,
+            "xPaddingBytes": 100
+        }),
+        64 * 1024,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera SOCKS and ./xray as a TLS VLESS XHTTP packet-up upstream"]
+async fn chimera_vless_xhttp_tls_packet_up_outbound_interoperates_with_xray_inbound()
+{
+    run_chimera_vless_xhttp_outbound_case_with_security(
+        "tls-packet-up",
+        json!({
+            "host": "localhost",
+            "path": "/xhttp",
+            "mode": "packet-up",
+            "noGRPCHeader": true,
+            "xPaddingBytes": 100
+        }),
+        64 * 1024,
+        XhttpOutboundSecurityCase::Tls,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera SOCKS and ./xray across VLESS XHTTP HTTP/3 modes"]
+async fn chimera_vless_xhttp_h3_outbound_interoperates_with_xray_inbound() {
+    for mode in ["stream-one", "stream-up", "packet-up"] {
+        run_chimera_vless_xhttp_outbound_case_with_security(
+            &format!("h3-{mode}"),
+            json!({
+                "host": "localhost",
+                "path": "/xhttp",
+                "mode": mode,
+                "noGRPCHeader": true,
+                "xPaddingBytes": 100,
+                "scMinPostsIntervalMs": 1
+            }),
+            64 * 1024,
+            XhttpOutboundSecurityCase::TlsH3,
+        )
+        .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera SOCKS and ./xray across reliable VLESS XHTTP HTTP/1.1 modes"]
+async fn chimera_vless_xhttp_h1_outbound_interoperates_with_xray_inbound() {
+    for mode in ["packet-up", "auto"] {
+        run_chimera_vless_xhttp_outbound_case_with_security(
+            &format!("h1-{mode}"),
+            json!({
+                "host": "localhost",
+                "path": "/xhttp",
+                "mode": mode,
+                "noGRPCHeader": true,
+                "xPaddingBytes": 100,
+                "scMinPostsIntervalMs": 1
+            }),
+            64 * 1024,
+            XhttpOutboundSecurityCase::TlsH1,
+        )
+        .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera SOCKS and ./xray with an independent XHTTP downloadSettings connection"]
+async fn chimera_vless_xhttp_download_settings_interoperates_with_xray_inbound() {
+    run_chimera_vless_xhttp_outbound_case(
+        "download-settings",
+        json!({
+            "host": "localhost",
+            "path": "/xhttp",
+            "mode": "packet-up",
+            "noGRPCHeader": true,
+            "xPaddingBytes": 100,
+            "scMinPostsIntervalMs": 1,
+            "downloadSettings": {
+                "address": "127.0.0.1",
+                "port": 0,
+                "network": "xhttp",
+                "security": "none",
+                "xhttpSettings": {
+                    "host": "localhost",
+                    "path": "/xhttp",
+                    "mode": "packet-up",
+                    "noGRPCHeader": true,
+                    "xPaddingBytes": 100
+                }
+            }
+        }),
+        64 * 1024,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera SOCKS and ./xray with independent XHTTP HTTP/1.1 downloadSettings"]
+async fn chimera_vless_xhttp_h1_download_settings_interoperates_with_xray_inbound() {
+    run_chimera_vless_xhttp_outbound_case_with_security(
+        "download-settings-h1",
+        json!({
+            "host": "localhost",
+            "path": "/xhttp",
+            "mode": "packet-up",
+            "noGRPCHeader": true,
+            "xPaddingBytes": 100,
+            "scMinPostsIntervalMs": 1,
+            "downloadSettings": {
+                "address": "127.0.0.1",
+                "port": 0,
+                "network": "xhttp",
+                "security": "tls",
+                "tlsSettings": {
+                    "serverName": "localhost",
+                    "allowInsecure": true,
+                    "alpn": ["http/1.1"]
+                },
+                "xhttpSettings": {
+                    "host": "localhost",
+                    "path": "/xhttp",
+                    "mode": "packet-up",
+                    "noGRPCHeader": true,
+                    "xPaddingBytes": 100
+                }
+            }
+        }),
+        64 * 1024,
+        XhttpOutboundSecurityCase::TlsH1,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera SOCKS and ./xray with independent XHTTP HTTP/3 downloadSettings"]
+async fn chimera_vless_xhttp_h3_download_settings_interoperates_with_xray_inbound() {
+    run_chimera_vless_xhttp_outbound_case_with_security(
+        "download-settings-h3",
+        json!({
+            "host": "localhost",
+            "path": "/xhttp",
+            "mode": "packet-up",
+            "noGRPCHeader": true,
+            "xPaddingBytes": 100,
+            "scMinPostsIntervalMs": 1,
+            "downloadSettings": {
+                "address": "127.0.0.1",
+                "port": 0,
+                "network": "xhttp",
+                "security": "tls",
+                "tlsSettings": {
+                    "serverName": "localhost",
+                    "allowInsecure": true,
+                    "alpn": ["h3"]
+                },
+                "xhttpSettings": {
+                    "host": "localhost",
+                    "path": "/xhttp",
+                    "mode": "packet-up",
+                    "noGRPCHeader": true,
+                    "xPaddingBytes": 100
+                }
+            }
+        }),
+        64 * 1024,
+        XhttpOutboundSecurityCase::TlsH3,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera SOCKS and ./xray with REALITY auto mode plus downloadSettings"]
+async fn chimera_vless_xhttp_reality_auto_download_settings_interoperates_with_xray_inbound()
+ {
+    run_chimera_vless_xhttp_outbound_case_with_security(
+        "download-settings-reality-auto",
+        json!({
+            "host": "localhost",
+            "path": "/xhttp",
+            "mode": "auto",
+            "noGRPCHeader": true,
+            "xPaddingBytes": 100,
+            "downloadSettings": {
+                "address": "127.0.0.1",
+                "port": 0,
+                "network": "xhttp",
+                "security": "reality",
+                "realitySettings": {
+                    "serverName": REALITY_SERVER_NAME,
+                    "publicKey": REALITY_PUBLIC_KEY,
+                    "shortId": REALITY_SHORT_ID
+                },
+                "xhttpSettings": {
+                    "host": "localhost",
+                    "path": "/xhttp",
+                    "mode": "packet-up",
+                    "noGRPCHeader": true,
+                    "xPaddingBytes": 100
+                }
+            }
+        }),
+        64 * 1024,
+        XhttpOutboundSecurityCase::Reality,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera SOCKS and ./xray while counting XHTTP H2 xmux connections"]
+async fn chimera_vless_xhttp_xmux_reuses_and_rotates_h2_connections() {
+    for (case_name, xmux, expected_connections) in [
+        ("xmux-default", json!({}), 1usize),
+        ("xmux-max-connections", json!({"maxConnections": 2}), 2usize),
+        ("xmux-reuse-limit", json!({"cMaxReuseTimes": 1}), 2usize),
+        ("xmux-request-limit", json!({"hMaxRequestTimes": 2}), 3usize),
+    ] {
+        run_chimera_vless_xhttp_outbound_case_with_security_and_connections(
+            case_name,
+            json!({
+                "host": "localhost",
+                "path": "/xhttp",
+                "mode": "packet-up",
+                "noGRPCHeader": true,
+                "xPaddingBytes": 100,
+                "scMinPostsIntervalMs": 1,
+                "xmux": xmux
+            }),
+            64 * 1024,
+            XhttpOutboundSecurityCase::None,
+            Some(expected_connections),
+        )
+        .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera SOCKS and ./xray as an auto-mode VLESS XHTTP upstream"]
+async fn chimera_vless_xhttp_auto_outbound_interoperates_with_xray_inbound() {
+    run_chimera_vless_xhttp_outbound_case(
+        "auto",
+        json!({
+            "host": "localhost",
+            "path": "/xhttp",
+            "mode": "auto",
+            "noGRPCHeader": true,
+            "xPaddingBytes": 100
+        }),
+        64 * 1024,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera SOCKS and ./xray with XHTTP header/query metadata"]
+async fn chimera_vless_xhttp_header_query_outbound_interoperates_with_xray_inbound()
+{
+    run_chimera_vless_xhttp_outbound_case(
+        "header-query",
+        json!({
+            "host": "localhost",
+            "path": "/xhttp",
+            "mode": "packet-up",
+            "noGRPCHeader": true,
+            "xPaddingBytes": 100,
+            "sessionPlacement": "header",
+            "sessionKey": "X-Test-Session",
+            "seqPlacement": "header",
+            "seqKey": "X-Test-Seq",
+            "uplinkDataPlacement": "header",
+            "uplinkDataKey": "X-Test-Data",
+            "uplinkChunkSize": 256,
+            "serverMaxHeaderBytes": 65536
+        }),
+        2 * 1024,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera SOCKS and ./xray with XHTTP cookie metadata"]
+async fn chimera_vless_xhttp_cookie_outbound_interoperates_with_xray_inbound() {
+    run_chimera_vless_xhttp_outbound_case(
+        "cookie",
+        json!({
+            "host": "localhost",
+            "path": "/xhttp",
+            "mode": "packet-up",
+            "noGRPCHeader": true,
+            "xPaddingBytes": 100,
+            "sessionPlacement": "cookie",
+            "sessionKey": "x_test_session",
+            "seqPlacement": "cookie",
+            "seqKey": "x_test_seq",
+            "uplinkDataPlacement": "cookie",
+            "uplinkDataKey": "x_test_data",
+            "uplinkChunkSize": 256,
+            "serverMaxHeaderBytes": 65536
+        }),
+        1024,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera SOCKS and ./xray across XHTTP padding obfs placements"]
+async fn chimera_vless_xhttp_padding_obfs_outbound_interoperates_with_xray_inbound()
+{
+    for (name, placement, method) in [
+        ("obfs-query", "query", "repeat-x"),
+        ("obfs-header", "header", "repeat-x"),
+        ("obfs-query-in-header", "queryInHeader", "tokenish"),
+        ("obfs-cookie", "cookie", "tokenish"),
+    ] {
+        run_chimera_vless_xhttp_outbound_case(
+            name,
+            json!({
+                "host": "localhost",
+                "path": "/xhttp?existing=1",
+                "mode": "packet-up",
+                "noGRPCHeader": true,
+                "xPaddingBytes": 100,
+                "xPaddingObfsMode": true,
+                "xPaddingPlacement": placement,
+                "xPaddingMethod": method,
+                "xPaddingKey": "test_padding",
+                "xPaddingHeader": "X-Test-Padding"
+            }),
+            16 * 1024,
+        )
+        .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera SOCKS UDP and ./xray as a VLESS UDP upstream"]
+async fn chimera_vless_udp_outbound_interoperates_with_xray_inbound() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("vless-udp-outbound");
+    let udp_echo_addr = start_udp_echo_server().await;
+    let xray_vless_port = free_localhost_port();
+    let chimera_socks_port = free_localhost_port();
+    let xray_config_path = work_dir.join("xray-vless-udp-inbound.json");
+    let chimera_config_path = work_dir.join("chimera-vless-udp-outbound.json");
+
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_vless_port,
+                "protocol": "vless",
+                "tag": "vless-udp-in",
+                "settings": {
+                    "clients": [{"id": TEST_UUID}],
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "none"
+                }
+            }],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }]
+        }),
+    );
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_socks_port,
+                "protocol": "socks",
+                "tag": "socks-in",
+                "settings": {"auth": "noauth", "udp": true}
+            }],
+            "outbounds": [{
+                "tag": "to-xray-vless-udp",
+                "protocol": "vless",
+                "settings": {
+                    "address": "127.0.0.1",
+                    "port": xray_vless_port,
+                    "id": TEST_UUID,
+                    "encryption": "none"
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "none"
+                }
+            }],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["socks-in"],
+                    "network": "udp",
+                    "outboundTag": "to-xray-vless-udp"
+                }]
+            }
+        }),
+    );
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, xray_vless_port)));
+    xray.assert_running();
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_socks_port));
+    wait_for_tcp(socks_addr);
+    chimera.assert_running();
+
+    let large_payload = deterministic_payload(1200);
+    assert_socks5_udp_echo_sequence(
+        socks_addr,
+        udp_echo_addr,
+        &[
+            b"VLESS UDP outbound through Xray inbound".as_slice(),
+            &large_payload,
+        ],
+    )
+    .await;
+}
+
+async fn run_chimera_vless_xhttp_udp_outbound_case(
+    case_name: &str,
+    h3: bool,
+    xudp: bool,
+) {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir(&format!("vless-xhttp-udp-{case_name}"));
+    let udp_echo_addr = start_udp_echo_server().await;
+    let xray_vless_port = if h3 {
+        std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("bind temporary VLESS XHTTP H3 UDP socket")
+            .local_addr()
+            .expect("temporary VLESS XHTTP H3 UDP address")
+            .port()
+    } else {
+        free_localhost_port()
+    };
+    let chimera_socks_port = free_localhost_port();
+    let xray_config_path = work_dir.join("xray-vless-xhttp-udp-inbound.json");
+    let chimera_config_path = work_dir.join("chimera-vless-xhttp-udp-outbound.json");
+    let cert_path = work_dir.join("xhttp-udp-localhost-cert.pem");
+    let key_path = work_dir.join("xhttp-udp-localhost-key.pem");
+    let generated =
+        rcgen::generate_simple_self_signed(["localhost".to_string()]).unwrap();
+    let trusted_certificate = generated.cert.pem();
+    fs::write(&cert_path, &trusted_certificate).unwrap();
+    fs::write(&key_path, generated.signing_key.serialize_pem()).unwrap();
+    let xhttp_settings = json!({
+        "host": "localhost",
+        "path": "/xhttp-udp",
+        "mode": "packet-up",
+        "noGRPCHeader": true,
+        "xPaddingBytes": 100,
+        "scMinPostsIntervalMs": 1
+    });
+    let xray_stream_settings = if h3 {
+        json!({
+            "network": "xhttp",
+            "security": "tls",
+            "xhttpSettings": xhttp_settings.clone(),
+            "tlsSettings": {
+                "alpn": ["h3"],
+                "certificates": [{
+                    "certificateFile": cert_path,
+                    "keyFile": key_path
+                }]
+            }
+        })
+    } else {
+        json!({
+            "network": "xhttp",
+            "security": "none",
+            "xhttpSettings": xhttp_settings.clone()
+        })
+    };
+    let chimera_stream_settings = if h3 {
+        json!({
+            "network": "xhttp",
+            "security": "tls",
+            "xhttpSettings": xhttp_settings,
+            "tlsSettings": {
+                "serverName": "localhost",
+                "disableSystemRoot": true,
+                "alpn": ["h3"],
+                "certificates": [{
+                    "usage": "verify",
+                    "certificate": [trusted_certificate]
+                }]
+            }
+        })
+    } else {
+        json!({
+            "network": "xhttp",
+            "security": "none",
+            "xhttpSettings": xhttp_settings
+        })
+    };
+
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_vless_port,
+                "protocol": "vless",
+                "tag": "vless-xhttp-udp-in",
+                "settings": {
+                    "clients": [{"id": TEST_UUID}],
+                    "decryption": "none"
+                },
+                "streamSettings": xray_stream_settings
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+        }),
+    );
+    let mut vless_outbound_settings = json!({
+        "address": "127.0.0.1",
+        "port": xray_vless_port,
+        "id": TEST_UUID,
+        "encryption": "none"
+    });
+    if xudp {
+        vless_outbound_settings["packetEncoding"] = json!("xudp");
+    }
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_socks_port,
+                "protocol": "socks",
+                "tag": "socks-in",
+                "settings": {"auth": "noauth", "udp": true}
+            }],
+            "outbounds": [{
+                "tag": "to-xray-vless-xhttp-udp",
+                "protocol": "vless",
+                "settings": vless_outbound_settings,
+                "streamSettings": chimera_stream_settings
+            }],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["socks-in"],
+                    "network": "udp",
+                    "outboundTag": "to-xray-vless-xhttp-udp"
+                }]
+            }
+        }),
+    );
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    if h3 {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    } else {
+        wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, xray_vless_port)));
+    }
+    xray.assert_running();
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_socks_port));
+    wait_for_tcp(socks_addr);
+    chimera.assert_running();
+
+    let first_payload = format!("VLESS UDP over XHTTP {case_name}");
+    let large_payload = deterministic_payload(1200);
+    assert_socks5_udp_echo_sequence(
+        socks_addr,
+        udp_echo_addr,
+        &[
+            first_payload.as_bytes(),
+            &large_payload,
+            b"third XHTTP UDP datagram",
+        ],
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera SOCKS UDP and ./xray across VLESS UDP over XHTTP H2/H3"]
+async fn chimera_vless_udp_over_xhttp_interoperates_with_xray_inbound() {
+    run_chimera_vless_xhttp_udp_outbound_case("h2-native", false, false).await;
+    run_chimera_vless_xhttp_udp_outbound_case("h3-native", true, false).await;
+    run_chimera_vless_xhttp_udp_outbound_case("h2-xudp", false, true).await;
+    run_chimera_vless_xhttp_udp_outbound_case("h3-xudp", true, true).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts Chimera as SOCKS server and ./xray as a plain VMess upstream"]
 async fn chimera_vmess_none_outbound_interoperates_with_xray_inbound() {
@@ -445,6 +1420,96 @@ async fn chimera_vmess_none_outbound_interoperates_with_xray_inbound() {
         echo_addr.port(),
         b"VMess none outbound domain target",
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera SOCKS UDP and ./xray as a VMess UDP upstream"]
+async fn chimera_vmess_udp_outbound_interoperates_with_xray_inbound() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("vmess-udp-outbound");
+    let udp_echo_addr = start_udp_echo_server().await;
+    let xray_vmess_port = free_localhost_port();
+    let chimera_socks_port = free_localhost_port();
+    let xray_config_path = work_dir.join("xray-vmess-udp-inbound.json");
+    let chimera_config_path = work_dir.join("chimera-vmess-udp-outbound.json");
+
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_vmess_port,
+                "protocol": "vmess",
+                "tag": "vmess-udp-in",
+                "settings": {
+                    "clients": [{"id": TEST_UUID}]
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "none"
+                }
+            }],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }]
+        }),
+    );
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_socks_port,
+                "protocol": "socks",
+                "tag": "socks-in",
+                "settings": {"auth": "noauth", "udp": true}
+            }],
+            "outbounds": [{
+                "tag": "to-xray-vmess-udp",
+                "protocol": "vmess",
+                "settings": {
+                    "address": "127.0.0.1",
+                    "port": xray_vmess_port,
+                    "id": TEST_UUID,
+                    "security": "none"
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "none"
+                }
+            }],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["socks-in"],
+                    "network": "udp",
+                    "outboundTag": "to-xray-vmess-udp"
+                }]
+            }
+        }),
+    );
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, xray_vmess_port)));
+    xray.assert_running();
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_socks_port));
+    wait_for_tcp(socks_addr);
+    chimera.assert_running();
+
+    let large_payload = deterministic_payload(1200);
+    assert_socks5_udp_echo_sequence(
+        socks_addr,
+        udp_echo_addr,
+        &[
+            b"VMess UDP outbound through Xray inbound".as_slice(),
+            &large_payload,
+        ],
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4152,6 +5217,45 @@ fn start_tcp_echo_server() -> SocketAddr {
     )))
 }
 
+fn start_tcp_forwarder(target: SocketAddr) -> SocketAddr {
+    start_counting_tcp_forwarder(target).0
+}
+
+fn start_counting_tcp_forwarder(
+    target: SocketAddr,
+) -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind TCP forwarder");
+    let address = listener.local_addr().expect("TCP forwarder address");
+    let connection_count = Arc::new(AtomicUsize::new(0));
+    let worker_count = Arc::clone(&connection_count);
+    thread::spawn(move || {
+        for client in listener.incoming().take(64) {
+            let Ok(mut client) = client else {
+                continue;
+            };
+            let Ok(mut upstream) = TcpStream::connect(target) else {
+                continue;
+            };
+            worker_count.fetch_add(1, Ordering::SeqCst);
+            thread::spawn(move || {
+                let Ok(mut client_reader) = client.try_clone() else {
+                    return;
+                };
+                let Ok(mut upstream_writer) = upstream.try_clone() else {
+                    return;
+                };
+                let uplink = thread::spawn(move || {
+                    let _ = io::copy(&mut client_reader, &mut upstream_writer);
+                });
+                let _ = io::copy(&mut upstream, &mut client);
+                let _ = uplink.join();
+            });
+        }
+    });
+    (address, connection_count)
+}
+
 fn start_tcp_echo_server_v6() -> SocketAddr {
     start_tcp_echo_server_on(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)))
 }
@@ -4482,6 +5586,15 @@ async fn assert_socks5_udp_echo(
     target_addr: SocketAddr,
     payload: &[u8],
 ) {
+    let payloads = [payload];
+    assert_socks5_udp_echo_sequence(socks_addr, target_addr, &payloads).await;
+}
+
+async fn assert_socks5_udp_echo_sequence(
+    socks_addr: SocketAddr,
+    target_addr: SocketAddr,
+    payloads: &[&[u8]],
+) {
     let mut control = tokio::net::TcpStream::connect(socks_addr)
         .await
         .expect("connect xray SOCKS UDP control");
@@ -4519,21 +5632,24 @@ async fn assert_socks5_udp_echo(
         std::net::IpAddr::V4(ip) => ip,
         std::net::IpAddr::V6(_) => panic!("SOCKS UDP E2E target must be IPv4"),
     };
-    let mut request = vec![0x00, 0x00, 0x00, 0x01];
-    request.extend_from_slice(&target_ip.octets());
-    request.extend_from_slice(&target_addr.port().to_be_bytes());
-    request.extend_from_slice(payload);
-    udp.send_to(&request, relay_addr)
-        .await
-        .expect("send SOCKS UDP payload");
+    for payload in payloads {
+        let mut request = vec![0x00, 0x00, 0x00, 0x01];
+        request.extend_from_slice(&target_ip.octets());
+        request.extend_from_slice(&target_addr.port().to_be_bytes());
+        request.extend_from_slice(payload);
+        udp.send_to(&request, relay_addr)
+            .await
+            .expect("send SOCKS UDP payload");
 
-    let mut response = vec![0u8; payload.len() + 64];
-    let (len, _) = tokio::time::timeout(IO_TIMEOUT, udp.recv_from(&mut response))
-        .await
-        .expect("SOCKS UDP echo timeout")
-        .expect("receive SOCKS UDP echo");
-    let payload_offset = socks_udp_payload_offset(&response[..len]);
-    assert_eq!(&response[payload_offset..len], payload);
+        let mut response = vec![0u8; payload.len() + 64];
+        let (len, _) =
+            tokio::time::timeout(IO_TIMEOUT, udp.recv_from(&mut response))
+                .await
+                .expect("SOCKS UDP echo timeout")
+                .expect("receive SOCKS UDP echo");
+        let payload_offset = socks_udp_payload_offset(&response[..len]);
+        assert_eq!(&response[payload_offset..len], *payload);
+    }
 }
 
 async fn assert_tls_echo_through_socks(

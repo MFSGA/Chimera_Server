@@ -61,10 +61,18 @@ pub(crate) struct VmessTcpOutboundConfig {
 }
 
 #[cfg(feature = "vless")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VlessUdpPacketEncoding {
+    Native,
+    Xudp,
+}
+
+#[cfg(feature = "vless")]
 #[derive(Debug, Clone)]
 pub(crate) struct VlessTcpOutboundConfig {
     pub server: NetLocation,
     pub user_uuid: [u8; 16],
+    pub udp_packet_encoding: VlessUdpPacketEncoding,
     pub transport: OutboundTransportConfig,
 }
 
@@ -129,6 +137,8 @@ struct LiteralVlessOutboundSettings {
     #[serde(default)]
     encryption: Option<String>,
     #[serde(default)]
+    packet_encoding: Option<String>,
+    #[serde(default)]
     vnext: Vec<LiteralVlessServer>,
 }
 
@@ -151,6 +161,8 @@ struct LiteralVlessUser {
     flow: String,
     #[serde(default)]
     encryption: String,
+    #[serde(default)]
+    packet_encoding: Option<String>,
 }
 
 #[cfg(feature = "shadowsocks")]
@@ -436,6 +448,7 @@ fn compile_vless_tcp(
             .map_err(|error| {
                 format!("invalid VLESS outbound {} settings: {error}", summary.tag)
             })?;
+    let top_level_packet_encoding = settings.packet_encoding.clone();
 
     let (address, port, user) = if let Some(address) = settings.address {
         if !settings.vnext.is_empty() {
@@ -457,6 +470,7 @@ fn compile_vless_tcp(
                 id,
                 flow: settings.flow.unwrap_or_default(),
                 encryption: settings.encryption.unwrap_or_default(),
+                packet_encoding: top_level_packet_encoding.clone(),
             },
         )
     } else {
@@ -526,10 +540,27 @@ fn compile_vless_tcp(
             format!("invalid VLESS outbound {} user id: {error}", summary.tag)
         })?
         .into_bytes();
+    let packet_encoding = user
+        .packet_encoding
+        .or(top_level_packet_encoding)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let udp_packet_encoding = match packet_encoding.as_str() {
+        "" | "none" | "native" => VlessUdpPacketEncoding::Native,
+        "xudp" => VlessUdpPacketEncoding::Xudp,
+        other => {
+            return Err(format!(
+                "VLESS outbound {} has unsupported packetEncoding {other}",
+                summary.tag
+            ));
+        }
+    };
 
     Ok(VlessTcpOutboundConfig {
         server,
         user_uuid,
+        udp_packet_encoding,
         transport,
     })
 }
@@ -1182,6 +1213,7 @@ mod tests {
                 httpupgrade_settings: None,
                 #[cfg(feature = "grpc_transport")]
                 grpc_settings: None,
+                xhttp_settings: None,
             }),
             proxy_settings_type: None,
             proxy_settings_value: None,
@@ -1686,12 +1718,30 @@ mod tests {
             "port": 443,
             "id": id
         }));
-        xhttp.stream_settings.as_mut().unwrap().network = "xhttp".into();
-        assert!(
-            OutboundConnectorKind::compile(&xhttp, true)
-                .unwrap_err()
-                .contains("unsupported network xhttp")
-        );
+        let xhttp_stream = xhttp.stream_settings.as_mut().unwrap();
+        xhttp_stream.network = "xhttp".into();
+        xhttp_stream.xhttp_settings = Some(serde_json::json!({
+            "path": "/xhttp",
+            "mode": "stream-one"
+        }));
+        let compiled = OutboundConnectorKind::compile(&xhttp, true)
+            .expect("VLESS stream-one XHTTP outbound should compile");
+        let OutboundConnectorKind::VlessTcp(config) = compiled else {
+            panic!("expected compiled VLESS outbound");
+        };
+        assert!(config.transport.is_xhttp());
+
+        xhttp.stream_settings.as_mut().unwrap().xhttp_settings =
+            Some(serde_json::json!({
+                "path": "/xhttp",
+                "mode": "packet-up"
+            }));
+        let compiled = OutboundConnectorKind::compile(&xhttp, true)
+            .expect("VLESS packet-up XHTTP outbound should compile");
+        let OutboundConnectorKind::VlessTcp(config) = compiled else {
+            panic!("expected compiled VLESS outbound");
+        };
+        assert!(config.transport.is_xhttp());
 
         let mut reality = literal_vless(serde_json::json!({
             "address": "127.0.0.1",

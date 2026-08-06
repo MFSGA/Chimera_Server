@@ -10,7 +10,7 @@ use tracing::warn;
 use crate::{
     async_stream::AsyncStream,
     config::server_config::{VlessFallback, VlessUser},
-    resolver::NativeResolver,
+    resolver::{NativeResolver, Resolver},
     traffic::{AccessTransport, TrafficContext},
     util::prefixed_stream::PrefixedStream,
 };
@@ -102,6 +102,7 @@ impl VlessTcpHandler {
         mut server_stream: Box<dyn AsyncStream>,
         server_name: &str,
         alpn: &str,
+        resolver: Arc<dyn Resolver>,
     ) -> std::io::Result<TcpServerSetupResult> {
         if !self.fallbacks.is_empty() {
             let (mut prefix, candidate) =
@@ -209,7 +210,7 @@ impl VlessTcpHandler {
             COMMAND_MUX => Ok(TcpServerSetupResult::SessionBasedUdp {
                 stream: Box::new(XudpMessageStream::with_write_prefix(
                     server_stream,
-                    Arc::new(NativeResolver::new()),
+                    resolver,
                     SERVER_RESPONSE_HEADER.to_vec(),
                 )),
                 traffic_context,
@@ -228,8 +229,13 @@ impl TcpServerHandler for VlessTcpHandler {
         &self,
         server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
-        self.setup_server_stream_with_metadata(server_stream, "", "")
-            .await
+        self.setup_server_stream_with_metadata(
+            server_stream,
+            "",
+            "",
+            Arc::new(NativeResolver::new()),
+        )
+        .await
     }
 
     async fn setup_server_stream_with_context(
@@ -237,10 +243,15 @@ impl TcpServerHandler for VlessTcpHandler {
         server_stream: Box<dyn AsyncStream>,
         context: TcpServerConnectionContext,
     ) -> std::io::Result<TcpServerSetupResult> {
+        let resolver = context
+            .resolver
+            .clone()
+            .unwrap_or_else(|| Arc::new(NativeResolver::new()));
         self.setup_server_stream_with_metadata(
             server_stream,
             context.server_name.as_deref().unwrap_or(""),
             context.alpn_protocol.as_deref().unwrap_or(""),
+            resolver,
         )
         .await
     }

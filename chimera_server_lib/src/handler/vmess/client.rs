@@ -12,7 +12,7 @@ use rand::Rng;
 
 use crate::{
     address::{Address, NetLocation},
-    async_stream::AsyncStream,
+    async_stream::{AsyncMessageStream, AsyncStream},
 };
 
 use super::{
@@ -27,6 +27,7 @@ use super::{
 const COMMAND_KEY_SALT: &[u8] = b"c48619fe-8f02-49e0-b9e9-edf763e17e21";
 const TAG_LEN: usize = 16;
 const COMMAND_TCP: u8 = 1;
+const COMMAND_UDP: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VmessDataSecurity {
@@ -135,6 +136,40 @@ pub(crate) fn connect_vmess_tcp(
     security: VmessDataSecurity,
     target: &NetLocation,
 ) -> std::io::Result<Box<dyn AsyncStream>> {
+    Ok(Box::new(build_vmess_stream(
+        stream,
+        user_uuid,
+        security,
+        target,
+        COMMAND_TCP,
+        false,
+    )?))
+}
+
+pub(crate) fn connect_vmess_udp(
+    stream: Box<dyn AsyncStream>,
+    user_uuid: [u8; 16],
+    security: VmessDataSecurity,
+    target: &NetLocation,
+) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+    Ok(Box::new(build_vmess_stream(
+        stream,
+        user_uuid,
+        security,
+        target,
+        COMMAND_UDP,
+        true,
+    )?))
+}
+
+fn build_vmess_stream(
+    stream: Box<dyn AsyncStream>,
+    user_uuid: [u8; 16],
+    security: VmessDataSecurity,
+    target: &NetLocation,
+    command: u8,
+    is_udp: bool,
+) -> std::io::Result<VmessStream> {
     let mut rng = rand::rng();
     let mut data_iv = [0u8; 16];
     let mut data_key = [0u8; 16];
@@ -153,6 +188,7 @@ pub(crate) fn connect_vmess_tcp(
         &data_iv,
         &data_key,
         response_authentication[0],
+        command,
         target,
     )?;
     let request_prefix =
@@ -200,9 +236,9 @@ pub(crate) fn connect_vmess_tcp(
         VmessDataSecurity::None => None,
     };
 
-    Ok(Box::new(VmessStream::new(
+    Ok(VmessStream::new(
         stream,
-        false,
+        is_udp,
         encryption_keys,
         None,
         None,
@@ -213,7 +249,7 @@ pub(crate) fn connect_vmess_tcp(
             response_header_iv: response_iv,
             response_authentication_v: response_authentication[0],
         }),
-    )))
+    ))
 }
 
 fn build_auth_id(user_uuid: [u8; 16], random: [u8; 4]) -> std::io::Result<[u8; 16]> {
@@ -248,6 +284,7 @@ fn build_request_header(
     data_iv: &[u8; 16],
     data_key: &[u8; 16],
     response_authentication: u8,
+    command: u8,
     target: &NetLocation,
 ) -> std::io::Result<Vec<u8>> {
     let mut header = Vec::with_capacity(80);
@@ -258,7 +295,7 @@ fn build_request_header(
     header.push(0x01);
     header.push(security.header_code());
     header.push(0);
-    header.push(COMMAND_TCP);
+    header.push(command);
     header.extend_from_slice(&target.port().to_be_bytes());
     match target.address() {
         Address::Ipv4(address) => {
@@ -380,15 +417,38 @@ fn first_16(input: &[u8; 32]) -> [u8; 16] {
 
 #[cfg(test)]
 mod tests {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use std::{future::poll_fn, pin::Pin};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
 
     use crate::{
+        async_stream::AsyncMessageStream,
         config::server_config::VmessUser,
         handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
     };
 
     use super::*;
     use crate::handler::vmess::vmess_handler::VmessTcpServerHandler;
+
+    async fn write_message(stream: &mut dyn AsyncMessageStream, payload: &[u8]) {
+        poll_fn(|cx| Pin::new(&mut *stream).poll_write_message(cx, payload))
+            .await
+            .unwrap();
+        poll_fn(|cx| Pin::new(&mut *stream).poll_flush_message(cx))
+            .await
+            .unwrap();
+    }
+
+    async fn read_message(
+        stream: &mut dyn AsyncMessageStream,
+        buffer: &mut [u8],
+    ) -> usize {
+        let mut read_buffer = ReadBuf::new(buffer);
+        poll_fn(|cx| Pin::new(&mut *stream).poll_read_message(cx, &mut read_buffer))
+            .await
+            .unwrap();
+        read_buffer.filled().len()
+    }
 
     #[tokio::test]
     async fn client_roundtrips_supported_security_matrix() {
@@ -446,6 +506,56 @@ mod tests {
             let mut response = [0u8; 14];
             stream.read_exact(&mut response).await.unwrap();
             assert_eq!(&response, b"vmess-response");
+            server_task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_client_roundtrips_supported_security_matrix() {
+        let user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
+        let user_uuid = uuid::Uuid::parse_str(user_id).unwrap().into_bytes();
+        let target = NetLocation::new(Address::Hostname("dns.example".into()), 53);
+        for (security, name) in [
+            (VmessDataSecurity::None, "none"),
+            (VmessDataSecurity::Aes128Gcm, "aes-128-gcm"),
+            (VmessDataSecurity::ChaCha20Poly1305, "chacha20-poly1305"),
+        ] {
+            let (client, server) = tokio::io::duplex(256 * 1024);
+            let handler = VmessTcpServerHandler::new(
+                vec![VmessUser {
+                    user_id: user_id.into(),
+                    user_label: "vmess-udp-client-test".into(),
+                    cipher: name.into(),
+                }],
+                true,
+                "vmess-udp-client-test",
+            );
+            let expected_target = target.clone();
+            let server_task = tokio::spawn(async move {
+                let result =
+                    handler.setup_server_stream(Box::new(server)).await.unwrap();
+                let TcpServerSetupResult::BidirectionalUdp {
+                    remote_location,
+                    mut stream,
+                    ..
+                } = result
+                else {
+                    panic!("expected VMess UDP forward");
+                };
+                assert_eq!(remote_location, expected_target);
+                let mut payload = [0u8; 64];
+                let len = read_message(&mut *stream, &mut payload).await;
+                assert_eq!(&payload[..len], b"vmess-udp-query");
+                write_message(&mut *stream, b"vmess-udp-answer").await;
+            });
+
+            let mut stream =
+                connect_vmess_udp(Box::new(client), user_uuid, security, &target)
+                    .unwrap();
+            write_message(&mut *stream, b"vmess-udp-query").await;
+            let mut response = [0u8; 64];
+            let len = read_message(&mut *stream, &mut response).await;
+            assert_eq!(&response[..len], b"vmess-udp-answer");
             server_task.await.unwrap();
         }
     }

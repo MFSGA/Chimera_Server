@@ -22,19 +22,14 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
-#[cfg(feature = "shadowsocks")]
-use crate::outbound::exchange_shadowsocks_udp;
-use crate::outbound::exchange_socks_udp;
-#[cfg(feature = "trojan")]
-use crate::outbound::exchange_trojan_udp;
 use crate::{
     address::{Address, NetLocation},
     config::server_config::TuicServerConfig,
     outbound::{
-        DirectOutboundAction, connect_tcp_outbound, connection_routing_input,
-        select_direct_outbound,
+        DirectOutboundAction, UdpProxyAssociationRegistry, connect_tcp_outbound,
+        connection_routing_input, select_direct_outbound,
     },
-    resolver::{NativeResolver, Resolver, resolve_single_address},
+    resolver::{Resolver, resolve_single_address},
     runtime::RuntimeState,
     traffic::{
         AccessTransport, ConnectionGuard, MeteredStream, TrafficContext,
@@ -110,7 +105,7 @@ pub async fn run_tuic_server(
     inbound_tag: String,
     runtime: RuntimeState,
 ) -> std::io::Result<()> {
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let resolver = runtime.resolver();
 
     let quic_server_config: quinn::crypto::rustls::QuicServerConfig =
         server_config.try_into().map_err(std::io::Error::other)?;
@@ -653,6 +648,7 @@ struct UdpSession {
     cancel_token: CancellationToken,
     base_context: TrafficContext,
     response_contexts: Arc<DashMap<SocketAddr, TrafficContext>>,
+    proxy_associations: Mutex<UdpProxyAssociationRegistry>,
     _connection_guard: ConnectionGuard,
 }
 
@@ -692,6 +688,9 @@ impl UdpSession {
             cancel_token: session_cancel_token.clone(),
             base_context: base_context.clone(),
             response_contexts: response_contexts.clone(),
+            proxy_associations: Mutex::new(UdpProxyAssociationRegistry::new(
+                IDLE_TIMEOUT,
+            )),
             _connection_guard: connection_guard,
         };
 
@@ -740,6 +739,9 @@ impl UdpSession {
             cancel_token: session_cancel_token.clone(),
             base_context: base_context.clone(),
             response_contexts: response_contexts.clone(),
+            proxy_associations: Mutex::new(UdpProxyAssociationRegistry::new(
+                IDLE_TIMEOUT,
+            )),
             _connection_guard: connection_guard,
         };
 
@@ -1565,75 +1567,36 @@ async fn forward_udp_payload(
             );
             return Ok(true);
         }
-        #[cfg(feature = "shadowsocks")]
-        DirectOutboundAction::Shadowsocks { tag } => {
-            traffic_context = traffic_context.with_outbound_tag(tag.clone());
-            let response = exchange_shadowsocks_udp(
-                resolver,
-                &context.connection.runtime,
-                &tag,
-                remote_location,
-                payload,
-            )
-            .await?;
-            record_transfer(Some(traffic_context.clone()), payload.len() as u64, 0);
-            session
-                .send_response(
-                    assoc_id,
-                    &response.source,
-                    &response.payload,
-                    traffic_context,
-                )
-                .await?;
-            return Ok(true);
-        }
-        DirectOutboundAction::Socks { tag } => {
-            traffic_context = traffic_context.with_outbound_tag(tag.clone());
-            let response = exchange_socks_udp(
-                resolver,
-                &context.connection.runtime,
-                &tag,
-                remote_location,
-                payload,
-            )
-            .await?;
-            record_transfer(Some(traffic_context.clone()), payload.len() as u64, 0);
-            session
-                .send_response(
-                    assoc_id,
-                    &response.source,
-                    &response.payload,
-                    traffic_context,
-                )
-                .await?;
-            return Ok(true);
-        }
-        #[cfg(feature = "trojan")]
-        DirectOutboundAction::Trojan { tag } => {
-            traffic_context = traffic_context.with_outbound_tag(tag.clone());
-            let response = exchange_trojan_udp(
-                resolver,
-                &context.connection.runtime,
-                &tag,
-                remote_location,
-                payload,
-            )
-            .await?;
-            record_transfer(Some(traffic_context.clone()), payload.len() as u64, 0);
-            session
-                .send_response(
-                    assoc_id,
-                    &response.source,
-                    &response.payload,
-                    traffic_context,
-                )
-                .await?;
-            return Ok(true);
-        }
         DirectOutboundAction::Freedom { tag: Some(tag) } => {
             traffic_context = traffic_context.with_outbound_tag(tag);
         }
         DirectOutboundAction::Freedom { tag: None } => {}
+        proxy_action => {
+            let tag = proxy_action.required_outbound_tag()?.to_string();
+            traffic_context = traffic_context.with_outbound_tag(tag);
+            let response = session
+                .proxy_associations
+                .lock()
+                .await
+                .exchange(
+                    resolver,
+                    &context.connection.runtime,
+                    &proxy_action,
+                    remote_location,
+                    payload,
+                )
+                .await?;
+            record_transfer(Some(traffic_context.clone()), payload.len() as u64, 0);
+            session
+                .send_response(
+                    assoc_id,
+                    &response.source,
+                    &response.payload,
+                    traffic_context,
+                )
+                .await?;
+            return Ok(true);
+        }
     }
 
     session
@@ -1885,6 +1848,7 @@ mod tests {
     use tokio::time::timeout;
 
     use crate::{
+        resolver::NativeResolver,
         runtime::OutboundSummary,
         traffic::{register_connection, snapshot},
     };
@@ -1991,6 +1955,9 @@ mod tests {
             cancel_token: CancellationToken::new(),
             base_context,
             response_contexts: Arc::new(DashMap::new()),
+            proxy_associations: Mutex::new(UdpProxyAssociationRegistry::new(
+                IDLE_TIMEOUT,
+            )),
             _connection_guard: connection_guard,
         };
         let before = snapshot()

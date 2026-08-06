@@ -26,10 +26,12 @@ use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
 use crate::config::server_config::VmessUser;
 use crate::handler::{
-    tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
+    tcp::tcp_handler::{
+        TcpServerConnectionContext, TcpServerHandler, TcpServerSetupResult,
+    },
     xudp::message_stream::XudpMessageStream,
 };
-use crate::resolver::NativeResolver;
+use crate::resolver::{NativeResolver, Resolver};
 use crate::traffic::{AccessTransport, TrafficContext};
 use crate::util::allocate_vec;
 
@@ -206,11 +208,11 @@ impl VmessTcpServerHandler {
     }
 }
 
-#[async_trait]
-impl TcpServerHandler for VmessTcpServerHandler {
-    async fn setup_server_stream(
+impl VmessTcpServerHandler {
+    async fn setup_server_stream_with_resolver(
         &self,
         mut server_stream: Box<dyn AsyncStream>,
+        resolver: Arc<dyn Resolver>,
     ) -> std::io::Result<TcpServerSetupResult> {
         let mut cert_hash = [0u8; 16];
         server_stream.read_exact(&mut cert_hash).await?;
@@ -641,12 +643,38 @@ impl TcpServerHandler for VmessTcpServerHandler {
             COMMAND_MUX => Ok(TcpServerSetupResult::SessionBasedUdp {
                 stream: Box::new(XudpMessageStream::new(
                     Box::new(vmess_stream),
-                    Arc::new(NativeResolver::new()),
+                    resolver,
                 )),
                 traffic_context,
             }),
             _ => unreachable!("VMess command was validated before stream creation"),
         }
+    }
+}
+
+#[async_trait]
+impl TcpServerHandler for VmessTcpServerHandler {
+    async fn setup_server_stream(
+        &self,
+        server_stream: Box<dyn AsyncStream>,
+    ) -> std::io::Result<TcpServerSetupResult> {
+        self.setup_server_stream_with_resolver(
+            server_stream,
+            Arc::new(NativeResolver::new()),
+        )
+        .await
+    }
+
+    async fn setup_server_stream_with_context(
+        &self,
+        server_stream: Box<dyn AsyncStream>,
+        context: TcpServerConnectionContext,
+    ) -> std::io::Result<TcpServerSetupResult> {
+        let resolver = context
+            .resolver
+            .unwrap_or_else(|| Arc::new(NativeResolver::new()));
+        self.setup_server_stream_with_resolver(server_stream, resolver)
+            .await
     }
 }
 

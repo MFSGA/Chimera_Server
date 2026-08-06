@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use serde_json::Value;
+
 #[cfg(feature = "tls")]
 use std::io::Cursor;
 
@@ -32,12 +35,23 @@ use crate::{
     config::def::OutboundStreamSettings,
     resolver::{Resolver, resolve_single_address},
     util::socket::new_tcp_socket,
+    xhttp_outbound::{
+        XhttpClientConfig, XhttpDownlinkConnector, XhttpH3Dialer, XhttpHttpVersion,
+        XhttpStreamDialer,
+    },
 };
 
 #[derive(Debug, Clone)]
 pub(crate) struct OutboundTransportConfig {
     security: OutboundSecurityConfig,
     protocol: OutboundProtocolConfig,
+    xhttp_download: Option<Arc<XhttpDownloadTransportConfig>>,
+}
+
+#[derive(Debug, Clone)]
+struct XhttpDownloadTransportConfig {
+    server: NetLocation,
+    transport: OutboundTransportConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +72,57 @@ enum OutboundProtocolConfig {
     HttpUpgrade(HttpUpgradeClientConfig),
     #[cfg(feature = "grpc_transport")]
     Grpc(GrpcClientConfig),
+    Xhttp(Box<XhttpClientConfig>),
+}
+
+#[derive(Clone)]
+struct OutboundXhttpStreamDialer {
+    resolver: Arc<dyn Resolver>,
+    server: NetLocation,
+    security: OutboundSecurityConfig,
+}
+
+#[async_trait]
+impl XhttpStreamDialer for OutboundXhttpStreamDialer {
+    async fn dial(&self) -> std::io::Result<Box<dyn AsyncStream>> {
+        dial_secured_tcp(&self.resolver, &self.server, &self.security).await
+    }
+}
+
+#[derive(Clone)]
+struct OutboundXhttpH3Dialer {
+    resolver: Arc<dyn Resolver>,
+    server: NetLocation,
+    security: OutboundSecurityConfig,
+}
+
+#[async_trait]
+impl XhttpH3Dialer for OutboundXhttpH3Dialer {
+    async fn dial_h3(
+        &self,
+        keep_alive: Option<std::time::Duration>,
+    ) -> std::io::Result<(Arc<quinn::Endpoint>, quinn::Connection)> {
+        dial_xhttp_h3(&self.resolver, &self.server, &self.security, keep_alive).await
+    }
+}
+
+#[derive(Clone)]
+struct OutboundXhttpDownlinkConnector {
+    resolver: Arc<dyn Resolver>,
+    config: Arc<XhttpDownloadTransportConfig>,
+}
+
+#[async_trait]
+impl XhttpDownlinkConnector for OutboundXhttpDownlinkConnector {
+    async fn open_downlink(
+        &self,
+        session_id: &str,
+    ) -> std::io::Result<tokio::io::DuplexStream> {
+        self.config
+            .transport
+            .open_xhttp_downlink(&self.resolver, &self.config.server, session_id)
+            .await
+    }
 }
 
 #[cfg(feature = "tls")]
@@ -65,6 +130,7 @@ enum OutboundProtocolConfig {
 pub(crate) struct TlsOutboundTransportConfig {
     client_config: Arc<ClientConfig>,
     server_name: ServerName<'static>,
+    server_name_text: String,
 }
 
 impl OutboundTransportConfig {
@@ -72,6 +138,7 @@ impl OutboundTransportConfig {
         Self {
             security: OutboundSecurityConfig::None,
             protocol: OutboundProtocolConfig::Tcp,
+            xhttp_download: None,
         }
     }
 
@@ -83,7 +150,8 @@ impl OutboundTransportConfig {
         let network = stream
             .map(|stream| stream.network.trim().to_ascii_lowercase())
             .unwrap_or_default();
-        let protocol = match network.as_str() {
+        let mut download_settings = None;
+        let mut protocol = match network.as_str() {
             "" | "tcp" => {
                 if has_websocket_settings(stream) {
                     return Err(format!(
@@ -100,10 +168,18 @@ impl OutboundTransportConfig {
                         "outbound {outbound_tag} provides grpcSettings without network=grpc"
                     ));
                 }
+                if has_xhttp_settings(stream) {
+                    return Err(format!(
+                        "outbound {outbound_tag} provides xhttpSettings without network=xhttp"
+                    ));
+                }
                 OutboundProtocolConfig::Tcp
             }
             "ws" | "websocket" => {
-                if has_httpupgrade_settings(stream) || has_grpc_settings(stream) {
+                if has_httpupgrade_settings(stream)
+                    || has_grpc_settings(stream)
+                    || has_xhttp_settings(stream)
+                {
                     return Err(format!(
                         "outbound {outbound_tag} provides incompatible transport settings with network=ws"
                     ));
@@ -122,7 +198,10 @@ impl OutboundTransportConfig {
                 }
             }
             "httpupgrade" => {
-                if has_websocket_settings(stream) || has_grpc_settings(stream) {
+                if has_websocket_settings(stream)
+                    || has_grpc_settings(stream)
+                    || has_xhttp_settings(stream)
+                {
                     return Err(format!(
                         "outbound {outbound_tag} provides incompatible transport settings with network=httpupgrade"
                     ));
@@ -141,7 +220,9 @@ impl OutboundTransportConfig {
                 }
             }
             "grpc" => {
-                if has_websocket_settings(stream) || has_httpupgrade_settings(stream)
+                if has_websocket_settings(stream)
+                    || has_httpupgrade_settings(stream)
+                    || has_xhttp_settings(stream)
                 {
                     return Err(format!(
                         "outbound {outbound_tag} provides incompatible transport settings with network=grpc"
@@ -160,12 +241,39 @@ impl OutboundTransportConfig {
                     ));
                 }
             }
+            "xhttp" | "splithttp" => {
+                if has_websocket_settings(stream)
+                    || has_httpupgrade_settings(stream)
+                    || has_grpc_settings(stream)
+                {
+                    return Err(format!(
+                        "outbound {outbound_tag} provides incompatible transport settings with network=xhttp"
+                    ));
+                }
+                let mut settings = stream
+                    .and_then(|stream| stream.xhttp_settings.clone())
+                    .ok_or_else(|| {
+                        format!(
+                            "outbound {outbound_tag} requires xhttpSettings with network=xhttp"
+                        )
+                    })?;
+                download_settings = take_download_settings(&mut settings)?;
+                OutboundProtocolConfig::Xhttp(Box::new(XhttpClientConfig::compile(
+                    server,
+                    settings,
+                    outbound_tag,
+                )?))
+            }
             other => {
                 return Err(format!(
                     "outbound {outbound_tag} uses unsupported network {other}"
                 ));
             }
         };
+        if let OutboundProtocolConfig::Xhttp(config) = &mut protocol {
+            let version = decide_xhttp_http_version(stream, outbound_tag)?;
+            config.configure_http_version(version, outbound_tag)?;
+        }
         let security = compile_security_transport(
             server,
             stream,
@@ -173,7 +281,17 @@ impl OutboundTransportConfig {
             protocol_required_alpn(&protocol),
             protocol_supports_reality(&protocol),
         )?;
-        Ok(Self { security, protocol })
+        let xhttp_download = download_settings
+            .map(|settings| {
+                compile_xhttp_download_transport(settings, outbound_tag)
+                    .map(Arc::new)
+            })
+            .transpose()?;
+        Ok(Self {
+            security,
+            protocol,
+            xhttp_download,
+        })
     }
 
     pub(crate) async fn connect(
@@ -181,44 +299,61 @@ impl OutboundTransportConfig {
         resolver: &Arc<dyn Resolver>,
         server: &NetLocation,
     ) -> std::io::Result<Box<dyn AsyncStream>> {
-        let address = resolve_single_address(resolver, server).await?;
-        let socket = new_tcp_socket(None, address.is_ipv6())?;
-        let stream = socket.connect(address).await?;
-        stream.set_nodelay(true)?;
-        let stream: Box<dyn AsyncStream> = Box::new(stream);
-
-        let stream = match &self.security {
-            OutboundSecurityConfig::None => stream,
-            #[cfg(feature = "tls")]
-            OutboundSecurityConfig::Tls(config) => {
-                let connector =
-                    TlsConnector::from(Arc::clone(&config.client_config));
-                let stream = connector
-                    .connect(config.server_name.clone(), stream)
-                    .await
-                    .map_err(|error| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::ConnectionAborted,
-                            format!("outbound TLS handshake failed: {error}"),
-                        )
-                    })?;
-                Box::new(stream)
+        let downlink = self.xhttp_download.as_ref().map(|config| {
+            Arc::new(OutboundXhttpDownlinkConnector {
+                resolver: Arc::clone(resolver),
+                config: Arc::clone(config),
+            }) as Arc<dyn XhttpDownlinkConnector>
+        });
+        if let OutboundProtocolConfig::Xhttp(config) = &self.protocol {
+            if config.uses_http3() {
+                return self
+                    .connect_xhttp_h3(resolver, server, config, downlink)
+                    .await;
+            }
+            if config.uses_http1() {
+                #[cfg(feature = "reality")]
+                let reality =
+                    matches!(&self.security, OutboundSecurityConfig::Reality(_));
+                #[cfg(not(feature = "reality"))]
+                let reality = false;
+                let dialer: Arc<dyn XhttpStreamDialer> =
+                    Arc::new(OutboundXhttpStreamDialer {
+                        resolver: Arc::clone(resolver),
+                        server: server.clone(),
+                        security: self.security.clone(),
+                    });
+                return config
+                    .connect_http1_with_dialer(
+                        dialer,
+                        !matches!(&self.security, OutboundSecurityConfig::None),
+                        reality,
+                        downlink,
+                    )
+                    .await;
             }
             #[cfg(feature = "reality")]
-            OutboundSecurityConfig::Reality(config) => {
-                let session = RealityClientConnection::new(config.clone()).map_err(
-                    |error| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            format!(
-                                "failed to initialize outbound REALITY: {error}"
-                            ),
-                        )
-                    },
-                )?;
-                Box::new(RealityTlsStream::new(stream, session))
-            }
-        };
+            let reality =
+                matches!(&self.security, OutboundSecurityConfig::Reality(_));
+            #[cfg(not(feature = "reality"))]
+            let reality = false;
+            let dialer: Arc<dyn XhttpStreamDialer> =
+                Arc::new(OutboundXhttpStreamDialer {
+                    resolver: Arc::clone(resolver),
+                    server: server.clone(),
+                    security: self.security.clone(),
+                });
+            return config
+                .connect_h2_with_dialer(
+                    dialer,
+                    !matches!(&self.security, OutboundSecurityConfig::None),
+                    reality,
+                    downlink,
+                )
+                .await;
+        }
+
+        let stream = dial_secured_tcp(resolver, server, &self.security).await?;
 
         match &self.protocol {
             OutboundProtocolConfig::Tcp => Ok(stream),
@@ -232,7 +367,80 @@ impl OutboundTransportConfig {
             }
             #[cfg(feature = "grpc_transport")]
             OutboundProtocolConfig::Grpc(config) => config.connect(stream).await,
+            OutboundProtocolConfig::Xhttp(config) => {
+                #[cfg(feature = "reality")]
+                let reality =
+                    matches!(&self.security, OutboundSecurityConfig::Reality(_));
+                #[cfg(not(feature = "reality"))]
+                let reality = false;
+                config
+                    .connect(
+                        stream,
+                        !matches!(&self.security, OutboundSecurityConfig::None),
+                        reality,
+                        downlink,
+                    )
+                    .await
+            }
         }
+    }
+
+    async fn connect_xhttp_h3(
+        &self,
+        resolver: &Arc<dyn Resolver>,
+        server: &NetLocation,
+        config: &XhttpClientConfig,
+        downlink: Option<Arc<dyn XhttpDownlinkConnector>>,
+    ) -> std::io::Result<Box<dyn AsyncStream>> {
+        let dialer: Arc<dyn XhttpH3Dialer> = Arc::new(OutboundXhttpH3Dialer {
+            resolver: Arc::clone(resolver),
+            server: server.clone(),
+            security: self.security.clone(),
+        });
+        config.connect_h3_with_dialer(dialer, false, downlink).await
+    }
+
+    async fn open_xhttp_downlink(
+        &self,
+        resolver: &Arc<dyn Resolver>,
+        server: &NetLocation,
+        session_id: &str,
+    ) -> std::io::Result<tokio::io::DuplexStream> {
+        let OutboundProtocolConfig::Xhttp(config) = &self.protocol else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "XHTTP download transport is not XHTTP",
+            ));
+        };
+        let secure = !matches!(&self.security, OutboundSecurityConfig::None);
+        if config.uses_http1() {
+            let dialer: Arc<dyn XhttpStreamDialer> =
+                Arc::new(OutboundXhttpStreamDialer {
+                    resolver: Arc::clone(resolver),
+                    server: server.clone(),
+                    security: self.security.clone(),
+                });
+            return config.open_http1_downlink(dialer, secure, session_id).await;
+        }
+        if config.uses_http3() {
+            let dialer: Arc<dyn XhttpH3Dialer> = Arc::new(OutboundXhttpH3Dialer {
+                resolver: Arc::clone(resolver),
+                server: server.clone(),
+                security: self.security.clone(),
+            });
+            return config
+                .open_h3_downlink_with_dialer(dialer, session_id)
+                .await;
+        }
+        let dialer: Arc<dyn XhttpStreamDialer> =
+            Arc::new(OutboundXhttpStreamDialer {
+                resolver: Arc::clone(resolver),
+                server: server.clone(),
+                security: self.security.clone(),
+            });
+        config
+            .open_h2_downlink_with_dialer(dialer, secure, session_id)
+            .await
     }
 
     pub(crate) fn supports_direct_udp(&self) -> bool {
@@ -269,6 +477,227 @@ impl OutboundTransportConfig {
     pub(crate) fn is_grpc(&self) -> bool {
         matches!(self.protocol, OutboundProtocolConfig::Grpc(_))
     }
+
+    #[cfg(test)]
+    pub(crate) fn is_xhttp(&self) -> bool {
+        matches!(self.protocol, OutboundProtocolConfig::Xhttp(_))
+    }
+}
+
+fn take_download_settings(settings: &mut Value) -> Result<Option<Value>, String> {
+    let object = settings
+        .as_object_mut()
+        .ok_or_else(|| "XHTTP settings must be a JSON object".to_string())?;
+    Ok(object.remove("downloadSettings"))
+}
+
+fn compile_xhttp_download_transport(
+    settings: Value,
+    outbound_tag: &str,
+) -> Result<XhttpDownloadTransportConfig, String> {
+    let mut object = settings.as_object().cloned().ok_or_else(|| {
+        format!("XHTTP outbound {outbound_tag} downloadSettings must be an object")
+    })?;
+    let address = object
+        .remove("address")
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .ok_or_else(|| {
+            format!(
+                "XHTTP outbound {outbound_tag} downloadSettings requires address"
+            )
+        })?;
+    let port = object
+        .remove("port")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u16::try_from(value).ok())
+        .filter(|port| *port != 0)
+        .ok_or_else(|| {
+            format!(
+                "XHTTP outbound {outbound_tag} downloadSettings requires a valid port"
+            )
+        })?;
+    let xhttp_key = if object.contains_key("xhttpSettings") {
+        "xhttpSettings"
+    } else {
+        "splithttpSettings"
+    };
+    let xhttp_value = object.get_mut(xhttp_key).ok_or_else(|| {
+        format!(
+            "XHTTP outbound {outbound_tag} downloadSettings requires xhttpSettings"
+        )
+    })?;
+    if xhttp_value
+        .as_object()
+        .is_some_and(|value| value.contains_key("downloadSettings"))
+    {
+        return Err(format!(
+            "XHTTP outbound {outbound_tag} does not allow recursive downloadSettings"
+        ));
+    }
+    if !object.contains_key("network") {
+        object.insert("network".into(), Value::String("xhttp".into()));
+    }
+    let stream = serde_json::from_value::<OutboundStreamSettings>(Value::Object(
+        object,
+    ))
+    .map_err(|error| {
+        format!(
+            "XHTTP outbound {outbound_tag} has invalid downloadSettings: {error}"
+        )
+    })?;
+    if !matches!(
+        stream.network.trim().to_ascii_lowercase().as_str(),
+        "xhttp" | "splithttp"
+    ) {
+        return Err(format!(
+            "XHTTP outbound {outbound_tag} downloadSettings network must be xhttp"
+        ));
+    }
+    let server = NetLocation::from_str(&address, Some(port)).map_err(|error| {
+        format!(
+            "XHTTP outbound {outbound_tag} has invalid downloadSettings address: {error}"
+        )
+    })?;
+    let transport = OutboundTransportConfig::compile(
+        &server,
+        Some(&stream),
+        &format!("{outbound_tag}#download"),
+    )?;
+    Ok(XhttpDownloadTransportConfig { server, transport })
+}
+
+async fn dial_xhttp_h3(
+    resolver: &Arc<dyn Resolver>,
+    server: &NetLocation,
+    security: &OutboundSecurityConfig,
+    keep_alive: Option<std::time::Duration>,
+) -> std::io::Result<(Arc<quinn::Endpoint>, quinn::Connection)> {
+    #[cfg(feature = "tls")]
+    {
+        let tls = match security {
+            OutboundSecurityConfig::Tls(config) => config,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "XHTTP HTTP/3 requires security=tls",
+                ));
+            }
+        };
+        let remote = resolve_single_address(resolver, server).await?;
+        let local = if remote.is_ipv6() {
+            std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
+        } else {
+            std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0))
+        };
+        let mut endpoint =
+            quinn::Endpoint::client(local).map_err(std::io::Error::other)?;
+        let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(
+            Arc::clone(&tls.client_config),
+        )
+        .map_err(std::io::Error::other)?;
+        let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
+        let mut transport = quinn::TransportConfig::default();
+        let idle_timeout = std::time::Duration::from_secs(300)
+            .try_into()
+            .map_err(std::io::Error::other)?;
+        transport
+            .max_concurrent_bidi_streams(4096_u32.into())
+            .max_concurrent_uni_streams(4096_u32.into())
+            .max_idle_timeout(Some(idle_timeout))
+            .keep_alive_interval(keep_alive)
+            .send_window(16 * 1024 * 1024)
+            .receive_window((20u32 * 1024 * 1024).into())
+            .stream_receive_window((8u32 * 1024 * 1024).into());
+        client_config.transport_config(Arc::new(transport));
+        endpoint.set_default_client_config(client_config);
+        let connection = endpoint
+            .connect(remote, &tls.server_name_text)
+            .map_err(std::io::Error::other)?
+            .await
+            .map_err(std::io::Error::other)?;
+        Ok((Arc::new(endpoint), connection))
+    }
+    #[cfg(not(feature = "tls"))]
+    {
+        let _ = (resolver, server, security, keep_alive);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "XHTTP HTTP/3 requires the tls feature",
+        ))
+    }
+}
+
+async fn dial_secured_tcp(
+    resolver: &Arc<dyn Resolver>,
+    server: &NetLocation,
+    security: &OutboundSecurityConfig,
+) -> std::io::Result<Box<dyn AsyncStream>> {
+    let address = resolve_single_address(resolver, server).await?;
+    let socket = new_tcp_socket(None, address.is_ipv6())?;
+    let stream = socket.connect(address).await?;
+    stream.set_nodelay(true)?;
+    let stream: Box<dyn AsyncStream> = Box::new(stream);
+
+    match security {
+        OutboundSecurityConfig::None => Ok(stream),
+        #[cfg(feature = "tls")]
+        OutboundSecurityConfig::Tls(config) => {
+            let connector = TlsConnector::from(Arc::clone(&config.client_config));
+            let stream = connector
+                .connect(config.server_name.clone(), stream)
+                .await
+                .map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        format!("outbound TLS handshake failed: {error}"),
+                    )
+                })?;
+            Ok(Box::new(stream))
+        }
+        #[cfg(feature = "reality")]
+        OutboundSecurityConfig::Reality(config) => {
+            let session =
+                RealityClientConnection::new(config.clone()).map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("failed to initialize outbound REALITY: {error}"),
+                    )
+                })?;
+            Ok(Box::new(RealityTlsStream::new(stream, session)))
+        }
+    }
+}
+
+fn decide_xhttp_http_version(
+    stream: Option<&OutboundStreamSettings>,
+    _outbound_tag: &str,
+) -> Result<XhttpHttpVersion, String> {
+    let security = stream
+        .and_then(|stream| stream.security.as_deref())
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match security.as_str() {
+        "reality" => Ok(XhttpHttpVersion::Http2),
+        "" | "none" => Ok(XhttpHttpVersion::Http2),
+        "tls" => {
+            let alpn = stream
+                .and_then(|stream| stream.tls_settings.as_ref())
+                .map(|settings| settings.alpn.as_slice())
+                .unwrap_or_default();
+            if alpn.len() == 1 {
+                let protocol = alpn[0].trim().to_ascii_lowercase();
+                if protocol == "http/1.1" {
+                    return Ok(XhttpHttpVersion::Http1);
+                }
+                if protocol == "h3" {
+                    return Ok(XhttpHttpVersion::Http3);
+                }
+            }
+            Ok(XhttpHttpVersion::Http2)
+        }
+        _ => Ok(XhttpHttpVersion::Http2),
+    }
 }
 
 fn protocol_required_alpn(
@@ -282,6 +711,7 @@ fn protocol_required_alpn(
         OutboundProtocolConfig::HttpUpgrade(_) => Some(b"http/1.1"),
         #[cfg(feature = "grpc_transport")]
         OutboundProtocolConfig::Grpc(_) => Some(b"h2"),
+        OutboundProtocolConfig::Xhttp(config) => Some(config.required_alpn()),
     }
 }
 
@@ -290,6 +720,7 @@ fn protocol_supports_reality(protocol: &OutboundProtocolConfig) -> bool {
         OutboundProtocolConfig::Tcp => true,
         #[cfg(feature = "grpc_transport")]
         OutboundProtocolConfig::Grpc(_) => true,
+        OutboundProtocolConfig::Xhttp(_) => true,
         #[cfg(feature = "ws")]
         OutboundProtocolConfig::Websocket(_) => false,
         #[cfg(feature = "httpupgrade")]
@@ -404,6 +835,10 @@ fn has_grpc_settings(stream: Option<&OutboundStreamSettings>) -> bool {
         let _ = stream;
         false
     }
+}
+
+fn has_xhttp_settings(stream: Option<&OutboundStreamSettings>) -> bool {
+    stream.is_some_and(|stream| stream.xhttp_settings.is_some())
 }
 
 #[cfg(feature = "grpc_transport")]
@@ -758,17 +1193,17 @@ fn compile_tls_transport(
             Address::Ipv4(address) => address.to_string(),
             Address::Ipv6(address) => address.to_string(),
         });
-    let server_name = ServerName::try_from(server_name.trim().to_string()).map_err(
-        |error| {
-            format!(
-                "outbound {outbound_tag} has invalid TLS serverName {server_name}: {error}"
-            )
-        },
-    )?;
+    let server_name_text = server_name.trim().to_string();
+    let server_name = ServerName::try_from(server_name_text.clone()).map_err(|error| {
+        format!(
+            "outbound {outbound_tag} has invalid TLS serverName {server_name_text}: {error}"
+        )
+    })?;
 
     Ok(TlsOutboundTransportConfig {
         client_config: Arc::new(client_config),
         server_name,
+        server_name_text,
     })
 }
 
@@ -848,6 +1283,7 @@ mod tests {
             httpupgrade_settings: None,
             #[cfg(feature = "grpc_transport")]
             grpc_settings: None,
+            xhttp_settings: None,
         };
         assert!(
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
@@ -876,6 +1312,7 @@ mod tests {
             httpupgrade_settings: None,
             #[cfg(feature = "grpc_transport")]
             grpc_settings: None,
+            xhttp_settings: None,
         };
         let transport =
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
@@ -902,6 +1339,7 @@ mod tests {
                 service_name: Some("chimera-grpc".into()),
                 ..OutboundGrpcSettings::default()
             }),
+            xhttp_settings: None,
         };
         let transport =
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
@@ -940,6 +1378,7 @@ mod tests {
                 service_name: Some("chimera-grpc".into()),
                 ..OutboundGrpcSettings::default()
             }),
+            xhttp_settings: None,
         };
         let transport =
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
@@ -972,6 +1411,7 @@ mod tests {
                 service_name: Some("chimera-grpc".into()),
                 ..OutboundGrpcSettings::default()
             }),
+            xhttp_settings: None,
         };
         let transport =
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
@@ -1000,6 +1440,7 @@ mod tests {
             }),
             #[cfg(feature = "grpc_transport")]
             grpc_settings: None,
+            xhttp_settings: None,
         };
         let transport =
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
@@ -1038,6 +1479,7 @@ mod tests {
             }),
             #[cfg(feature = "grpc_transport")]
             grpc_settings: None,
+            xhttp_settings: None,
         };
         let transport =
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
@@ -1078,6 +1520,7 @@ mod tests {
             httpupgrade_settings: None,
             #[cfg(feature = "grpc_transport")]
             grpc_settings: None,
+            xhttp_settings: None,
         };
         let transport =
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
@@ -1116,6 +1559,7 @@ mod tests {
             httpupgrade_settings: None,
             #[cfg(feature = "grpc_transport")]
             grpc_settings: None,
+            xhttp_settings: None,
         };
         let transport =
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
@@ -1145,6 +1589,7 @@ mod tests {
             httpupgrade_settings: None,
             #[cfg(feature = "grpc_transport")]
             grpc_settings: None,
+            xhttp_settings: None,
         };
         assert!(
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
@@ -1177,6 +1622,7 @@ mod tests {
             httpupgrade_settings: None,
             #[cfg(feature = "grpc_transport")]
             grpc_settings: None,
+            xhttp_settings: None,
         };
 
         let transport =
@@ -1206,6 +1652,7 @@ mod tests {
             httpupgrade_settings: None,
             #[cfg(feature = "grpc_transport")]
             grpc_settings: None,
+            xhttp_settings: None,
         };
         assert!(
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")
@@ -1243,6 +1690,7 @@ mod tests {
             httpupgrade_settings: None,
             #[cfg(feature = "grpc_transport")]
             grpc_settings: None,
+            xhttp_settings: None,
         };
         assert!(
             OutboundTransportConfig::compile(&server, Some(&stream), "proxy")

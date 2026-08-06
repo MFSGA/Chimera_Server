@@ -28,7 +28,7 @@ use crate::{
         },
     },
     outbound::connect_tcp_outbound,
-    resolver::{NativeResolver, Resolver, resolve_single_address},
+    resolver::{Resolver, resolve_single_address},
     runtime::RuntimeState,
     traffic::{
         MeteredStream, TrafficContext, TrafficDirection, record_transfer,
@@ -221,7 +221,7 @@ async fn run_tcp_server(
     server_handler: Arc<Box<dyn TcpServerHandler>>,
     runtime: RuntimeState,
 ) -> std::io::Result<()> {
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let resolver = runtime.resolver();
 
     loop {
         let (stream, addr) = match listener.accept().await {
@@ -705,11 +705,14 @@ async fn process_stream_with_context<AS>(
     resolver: Arc<dyn Resolver>,
     peer_addr: SocketAddr,
     runtime: RuntimeState,
-    connection_context: TcpServerConnectionContext,
+    mut connection_context: TcpServerConnectionContext,
 ) -> std::io::Result<()>
 where
     AS: AsyncStream + 'static,
 {
+    if connection_context.resolver.is_none() {
+        connection_context.resolver = Some(resolver.clone());
+    }
     let local_addr = connection_context.local_addr;
     let setup_server_stream_future = timeout(
         Duration::from_secs(60),

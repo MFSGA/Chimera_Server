@@ -9,9 +9,7 @@ use connection::process_hysteria2_connection;
 use quinn::congestion::BbrConfig;
 
 use crate::{
-    config::server_config::Hysteria2ServerConfig,
-    resolver::{NativeResolver, Resolver},
-    runtime::RuntimeState,
+    config::server_config::Hysteria2ServerConfig, runtime::RuntimeState,
     util::socket::new_socket2_udp_socket,
 };
 
@@ -27,7 +25,7 @@ pub async fn run_hysteria2_server(
     inbound_tag: String,
     runtime: RuntimeState,
 ) -> std::io::Result<()> {
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let resolver = runtime.resolver();
 
     let quic_server_config: quinn::crypto::rustls::QuicServerConfig =
         server_config.try_into().map_err(std::io::Error::other)?;
