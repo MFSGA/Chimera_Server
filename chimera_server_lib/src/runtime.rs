@@ -279,10 +279,27 @@ impl std::fmt::Debug for ResolverRuntimeState {
 
 const DEFAULT_POLICY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PolicyRelayTimeouts {
+    pub connection_idle: Option<Duration>,
+    pub uplink_only: Option<Duration>,
+    pub downlink_only: Option<Duration>,
+}
+
+impl PolicyRelayTimeouts {
+    pub const fn is_empty(self) -> bool {
+        self.connection_idle.is_none()
+            && self.uplink_only.is_none()
+            && self.downlink_only.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct PolicyRuntimeState {
     handshake_timeouts: HashMap<u32, Duration>,
     connection_idle_timeouts: HashMap<u32, Duration>,
+    uplink_only_timeouts: HashMap<u32, Duration>,
+    downlink_only_timeouts: HashMap<u32, Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -368,6 +385,8 @@ impl RuntimeState {
     ) -> Result<(), String> {
         let mut handshake_timeouts = HashMap::new();
         let mut connection_idle_timeouts = HashMap::new();
+        let mut uplink_only_timeouts = HashMap::new();
+        let mut downlink_only_timeouts = HashMap::new();
         if let Some(policy) = policy {
             for (raw_level, level_policy) in &policy.levels {
                 let level = raw_level.parse::<u32>().map_err(|error| {
@@ -383,12 +402,22 @@ impl RuntimeState {
                     connection_idle_timeouts
                         .insert(level, Duration::from_secs(u64::from(seconds)));
                 }
+                if let Some(seconds) = level_policy.uplink_only {
+                    uplink_only_timeouts
+                        .insert(level, Duration::from_secs(u64::from(seconds)));
+                }
+                if let Some(seconds) = level_policy.downlink_only {
+                    downlink_only_timeouts
+                        .insert(level, Duration::from_secs(u64::from(seconds)));
+                }
             }
         }
         let mut runtime_policy =
             self.policy.write().expect("runtime policy lock poisoned");
         runtime_policy.handshake_timeouts = handshake_timeouts;
         runtime_policy.connection_idle_timeouts = connection_idle_timeouts;
+        runtime_policy.uplink_only_timeouts = uplink_only_timeouts;
+        runtime_policy.downlink_only_timeouts = downlink_only_timeouts;
         Ok(())
     }
 
@@ -409,6 +438,15 @@ impl RuntimeState {
             .connection_idle_timeouts
             .get(&level)
             .copied()
+    }
+
+    pub(crate) fn policy_relay_timeouts(&self, level: u32) -> PolicyRelayTimeouts {
+        let policy = self.policy.read().expect("runtime policy lock poisoned");
+        PolicyRelayTimeouts {
+            connection_idle: policy.connection_idle_timeouts.get(&level).copied(),
+            uplink_only: policy.uplink_only_timeouts.get(&level).copied(),
+            downlink_only: policy.downlink_only_timeouts.get(&level).copied(),
+        }
     }
 
     pub fn inbounds(&self) -> Vec<ServerConfig> {

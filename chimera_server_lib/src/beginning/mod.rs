@@ -868,22 +868,17 @@ where
                 server_stream.write_all(&data).await?;
             }
 
-            let copy_result = match runtime.policy_connection_idle_timeout(0) {
-                Some(idle_timeout) => {
-                    policy_stream::copy_bidirectional_with_idle_timeout(
-                        &mut server_stream,
-                        &mut client_stream,
-                        idle_timeout,
-                    )
+            let relay_timeouts = runtime.policy_relay_timeouts(0);
+            let copy_result = if relay_timeouts.is_empty() {
+                tcp_relay::copy_bidirectional(&mut server_stream, &mut client_stream)
                     .await
-                }
-                None => {
-                    tcp_relay::copy_bidirectional(
-                        &mut server_stream,
-                        &mut client_stream,
-                    )
-                    .await
-                }
+            } else {
+                policy_stream::copy_bidirectional_with_timeouts(
+                    &mut server_stream,
+                    &mut client_stream,
+                    relay_timeouts,
+                )
+                .await
             };
 
             let (_, _) =

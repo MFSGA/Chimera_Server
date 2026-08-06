@@ -169,6 +169,10 @@ impl TcpRelayResult {
         }
     }
 
+    pub(super) fn policy_userspace(left_to_right: u64, right_to_left: u64) -> Self {
+        Self::userspace(configured_relay_backend(), left_to_right, right_to_left)
+    }
+
     fn userspace_fallback(
         configured_backend: RelayBackend,
         fallback_reason: RelayFallbackReason,

@@ -1,17 +1,20 @@
 use std::{
+    future::pending,
     io,
     pin::Pin,
     task::{Context, Poll},
-    time::Duration,
 };
 
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf, copy, split},
     sync::watch,
-    time::timeout,
+    time::{Instant, Sleep, sleep},
 };
 
-use crate::async_stream::{AsyncPing, AsyncStream};
+use crate::{
+    async_stream::{AsyncPing, AsyncStream},
+    runtime::PolicyRelayTimeouts,
+};
 
 use super::tcp_relay::{self, TcpRelayResult};
 
@@ -41,7 +44,7 @@ where
     ) -> Poll<io::Result<()>> {
         let before = buffer.filled().len();
         let result = Pin::new(&mut *self.inner).poll_read(cx, buffer);
-        if matches!(result, Poll::Ready(Ok(()))) && buffer.filled().len() > before {
+        if matches!(&result, Poll::Ready(Ok(()))) && buffer.filled().len() > before {
             self.notify_activity();
         }
         result
@@ -58,7 +61,7 @@ where
         buffer: &[u8],
     ) -> Poll<io::Result<usize>> {
         let result = Pin::new(&mut *self.inner).poll_write(cx, buffer);
-        if matches!(result, Poll::Ready(Ok(written)) if written > 0) {
+        if matches!(&result, Poll::Ready(Ok(written)) if *written > 0) {
             self.notify_activity();
         }
         result
@@ -92,7 +95,7 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<bool>> {
         let result = Pin::new(&mut *self.inner).poll_write_ping(cx);
-        if matches!(result, Poll::Ready(Ok(true))) {
+        if matches!(&result, Poll::Ready(Ok(true))) {
             self.notify_activity();
         }
         result
@@ -100,44 +103,116 @@ where
 }
 
 // Policy activity accounting must observe every byte. Deliberately use the
-// default raw-relay state so configured connIdle sessions stay in userspace.
+// default raw-relay state so policy-controlled sessions stay in userspace.
 impl<S> AsyncStream for ActivityStream<'_, S> where S: AsyncStream + ?Sized {}
 
-pub(super) async fn copy_bidirectional_with_idle_timeout<A, B>(
+async fn copy_and_shutdown<R, W>(mut reader: R, mut writer: W) -> io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let transferred = copy(&mut reader, &mut writer).await?;
+    writer.shutdown().await?;
+    Ok(transferred)
+}
+
+async fn wait_optional_sleep(timer: &mut Option<Pin<Box<Sleep>>>) {
+    match timer {
+        Some(timer) => timer.as_mut().await,
+        None => pending().await,
+    }
+}
+
+async fn wait_for_activity(
+    receiver: &mut watch::Receiver<()>,
+    enabled: bool,
+) -> Result<(), watch::error::RecvError> {
+    if enabled {
+        receiver.changed().await
+    } else {
+        pending().await
+    }
+}
+
+pub(super) async fn copy_bidirectional_with_timeouts<A, B>(
     left: &mut A,
     right: &mut B,
-    idle_timeout: Duration,
+    timeouts: PolicyRelayTimeouts,
 ) -> io::Result<TcpRelayResult>
 where
     A: AsyncStream + ?Sized,
     B: AsyncStream + ?Sized,
 {
+    if timeouts.is_empty() {
+        return tcp_relay::copy_bidirectional(left, right).await;
+    }
+
     let (activity_sender, mut activity_receiver) = watch::channel(());
-    let mut left = ActivityStream::new(left, activity_sender.clone());
-    let mut right = ActivityStream::new(right, activity_sender);
-    let relay = tcp_relay::copy_bidirectional(&mut left, &mut right);
-    tokio::pin!(relay);
+    let left = ActivityStream::new(left, activity_sender.clone());
+    let right = ActivityStream::new(right, activity_sender);
+    let (left_reader, left_writer) = split(left);
+    let (right_reader, right_writer) = split(right);
+    let uplink = copy_and_shutdown(left_reader, right_writer);
+    let downlink = copy_and_shutdown(right_reader, left_writer);
+    tokio::pin!(uplink);
+    tokio::pin!(downlink);
+
+    let mut uplink_done = None;
+    let mut downlink_done = None;
+    let mut idle_timer = timeouts
+        .connection_idle
+        .map(|duration| Box::pin(sleep(duration)));
+    let mut uplink_grace = None;
+    let mut downlink_grace = None;
 
     loop {
         tokio::select! {
-            result = &mut relay => return result,
-            changed = timeout(idle_timeout, activity_receiver.changed()) => {
-                match changed {
-                    Ok(Ok(())) => {}
-                    Ok(Err(_)) => return relay.await,
-                    Err(_) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            format!(
-                                "TCP relay was idle for {} seconds",
-                                idle_timeout.as_secs()
-                            ),
-                        ));
-                    }
+            result = &mut uplink, if uplink_done.is_none() => {
+                uplink_done = Some(result?);
+                if downlink_done.is_some() {
+                    break;
+                }
+                uplink_grace = timeouts.uplink_only.map(|duration| Box::pin(sleep(duration)));
+            }
+            result = &mut downlink, if downlink_done.is_none() => {
+                downlink_done = Some(result?);
+                if uplink_done.is_some() {
+                    break;
+                }
+                downlink_grace = timeouts.downlink_only.map(|duration| Box::pin(sleep(duration)));
+            }
+            activity = wait_for_activity(
+                &mut activity_receiver,
+                timeouts.connection_idle.is_some(),
+            ) => {
+                if activity.is_err() {
+                    break;
+                }
+                if let (Some(duration), Some(timer)) = (
+                    timeouts.connection_idle,
+                    idle_timer.as_mut(),
+                ) {
+                    timer.as_mut().reset(Instant::now() + duration);
                 }
             }
+            _ = wait_optional_sleep(&mut idle_timer) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "TCP relay was idle for {} seconds",
+                        timeouts.connection_idle.unwrap_or_default().as_secs()
+                    ),
+                ));
+            }
+            _ = wait_optional_sleep(&mut uplink_grace) => break,
+            _ = wait_optional_sleep(&mut downlink_grace) => break,
         }
     }
+
+    Ok(TcpRelayResult::policy_userspace(
+        uplink_done.unwrap_or_default(),
+        downlink_done.unwrap_or_default(),
+    ))
 }
 
 #[cfg(test)]
@@ -149,17 +224,22 @@ mod tests {
         time::{sleep, timeout},
     };
 
-    use super::copy_bidirectional_with_idle_timeout;
+    use crate::runtime::PolicyRelayTimeouts;
+
+    use super::copy_bidirectional_with_timeouts;
 
     #[tokio::test]
     async fn relay_times_out_after_configured_inactivity() {
         let (mut left, _left_peer) = duplex(64);
         let (mut right, _right_peer) = duplex(64);
 
-        let error = copy_bidirectional_with_idle_timeout(
+        let error = copy_bidirectional_with_timeouts(
             &mut left,
             &mut right,
-            Duration::from_millis(20),
+            PolicyRelayTimeouts {
+                connection_idle: Some(Duration::from_millis(20)),
+                ..PolicyRelayTimeouts::default()
+            },
         )
         .await
         .expect_err("idle relay must time out");
@@ -171,10 +251,13 @@ mod tests {
         let (mut left, mut left_peer) = duplex(64);
         let (mut right, mut right_peer) = duplex(64);
         let relay = tokio::spawn(async move {
-            copy_bidirectional_with_idle_timeout(
+            copy_bidirectional_with_timeouts(
                 &mut left,
                 &mut right,
-                Duration::from_millis(100),
+                PolicyRelayTimeouts {
+                    connection_idle: Some(Duration::from_millis(100)),
+                    ..PolicyRelayTimeouts::default()
+                },
             )
             .await
         });
@@ -198,5 +281,74 @@ mod tests {
             .expect("relay should finish after both peers close")
             .expect("relay task should not panic")
             .expect("relay should close cleanly");
+    }
+
+    #[tokio::test]
+    async fn uplink_eof_starts_the_uplink_only_grace_period() {
+        let (mut left, mut left_peer) = duplex(64);
+        let (mut right, mut right_peer) = duplex(64);
+        let relay = tokio::spawn(async move {
+            copy_bidirectional_with_timeouts(
+                &mut left,
+                &mut right,
+                PolicyRelayTimeouts {
+                    uplink_only: Some(Duration::from_millis(30)),
+                    ..PolicyRelayTimeouts::default()
+                },
+            )
+            .await
+        });
+
+        left_peer.write_all(b"hello").await.expect("write uplink");
+        left_peer.shutdown().await.expect("close uplink");
+        let mut received = [0_u8; 5];
+        right_peer
+            .read_exact(&mut received)
+            .await
+            .expect("read uplink");
+        assert_eq!(&received, b"hello");
+
+        let result = timeout(Duration::from_millis(200), relay)
+            .await
+            .expect("uplink-only grace should expire")
+            .expect("relay task should not panic")
+            .expect("relay should close cleanly");
+        assert_eq!(result.left_to_right, 5);
+    }
+
+    #[tokio::test]
+    async fn downlink_eof_starts_the_downlink_only_grace_period() {
+        let (mut left, mut left_peer) = duplex(64);
+        let (mut right, mut right_peer) = duplex(64);
+        let relay = tokio::spawn(async move {
+            copy_bidirectional_with_timeouts(
+                &mut left,
+                &mut right,
+                PolicyRelayTimeouts {
+                    downlink_only: Some(Duration::from_millis(30)),
+                    ..PolicyRelayTimeouts::default()
+                },
+            )
+            .await
+        });
+
+        right_peer
+            .write_all(b"hello")
+            .await
+            .expect("write downlink");
+        right_peer.shutdown().await.expect("close downlink");
+        let mut received = [0_u8; 5];
+        left_peer
+            .read_exact(&mut received)
+            .await
+            .expect("read downlink");
+        assert_eq!(&received, b"hello");
+
+        let result = timeout(Duration::from_millis(200), relay)
+            .await
+            .expect("downlink-only grace should expire")
+            .expect("relay task should not panic")
+            .expect("relay should close cleanly");
+        assert_eq!(result.right_to_left, 5);
     }
 }

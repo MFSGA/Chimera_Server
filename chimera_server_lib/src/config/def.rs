@@ -511,6 +511,10 @@ pub struct PolicyLevelConfig {
     pub handshake: Option<u32>,
     #[serde(default, rename = "connIdle")]
     pub connection_idle: Option<u32>,
+    #[serde(default, rename = "uplinkOnly")]
+    pub uplink_only: Option<u32>,
+    #[serde(default, rename = "downlinkOnly")]
+    pub downlink_only: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
