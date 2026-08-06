@@ -2139,10 +2139,12 @@ async fn relay_shadowsocks_udp_packet(
         &request.target_location,
     )
     .await?;
-    let mut traffic_context = TrafficContext::new("shadowsocks")
-        .with_user_level(request.user_level)
-        .with_inbound_tag(context.inbound_tag.clone())
-        .with_client_ip(client_addr.ip());
+    let mut traffic_context = shadowsocks_udp_traffic_context(
+        &context.runtime,
+        context.inbound_tag.clone(),
+        client_addr,
+        request.user_level,
+    );
     if !request.identity.is_empty() {
         traffic_context = traffic_context.with_identity(request.identity.clone());
     }
@@ -2296,6 +2298,33 @@ async fn run_dokodemo_udp_server(
             }
         });
     }
+}
+
+#[cfg(feature = "shadowsocks")]
+fn shadowsocks_udp_traffic_context(
+    runtime: &RuntimeState,
+    inbound_tag: String,
+    client_addr: SocketAddr,
+    user_level: u32,
+) -> TrafficContext {
+    let mut context = TrafficContext::new("shadowsocks")
+        .with_user_level(user_level)
+        .with_inbound_tag(inbound_tag)
+        .with_client_ip(client_addr.ip());
+    let user_stats = runtime.policy_user_stats(user_level);
+    let system_stats = runtime.policy_system_stats();
+    context.set_user_stats_policy(
+        user_stats.uplink,
+        user_stats.downlink,
+        user_stats.online,
+    );
+    context.set_system_stats_policy(
+        system_stats.inbound_uplink,
+        system_stats.inbound_downlink,
+        system_stats.outbound_uplink,
+        system_stats.outbound_downlink,
+    );
+    context
 }
 
 fn dokodemo_udp_traffic_context(
@@ -4446,6 +4475,50 @@ mod tests {
         assert_eq!(&response[..len], b"vmess-udp-message");
         echo_task.await.expect("UDP echo task finished");
         relay_task.abort();
+    }
+
+    #[cfg(feature = "shadowsocks")]
+    #[test]
+    fn shadowsocks_udp_context_applies_policy_stats() {
+        let client_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 12345));
+        let runtime = runtime_with_outbounds(Vec::new());
+        let policy = serde_json::from_value(serde_json::json!({
+            "levels": {
+                "7": {
+                    "statsUserUplink": false,
+                    "statsUserDownlink": true,
+                    "statsUserOnline": false
+                }
+            },
+            "system": {
+                "statsInboundUplink": true,
+                "statsInboundDownlink": false,
+                "statsOutboundUplink": false,
+                "statsOutboundDownlink": true
+            }
+        }))
+        .expect("policy config should parse");
+        runtime
+            .configure_policy(Some(&policy))
+            .expect("policy should install");
+
+        let context = shadowsocks_udp_traffic_context(
+            &runtime,
+            "shadowsocks-udp".to_string(),
+            client_addr,
+            7,
+        );
+
+        assert_eq!(context.user_level, 7);
+        assert_eq!(context.inbound_tag.as_deref(), Some("shadowsocks-udp"));
+        assert_eq!(context.client_ip, Some(client_addr.ip()));
+        assert_eq!(context.stats_user_uplink, Some(false));
+        assert_eq!(context.stats_user_downlink, Some(true));
+        assert_eq!(context.stats_user_online, Some(false));
+        assert_eq!(context.stats_inbound_uplink, Some(true));
+        assert_eq!(context.stats_inbound_downlink, Some(false));
+        assert_eq!(context.stats_outbound_uplink, Some(false));
+        assert_eq!(context.stats_outbound_downlink, Some(true));
     }
 
     #[test]
