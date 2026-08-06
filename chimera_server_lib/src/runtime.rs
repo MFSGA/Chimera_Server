@@ -286,6 +286,14 @@ pub(crate) struct PolicyUserStats {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PolicySystemStats {
+    pub inbound_uplink: Option<bool>,
+    pub inbound_downlink: Option<bool>,
+    pub outbound_uplink: Option<bool>,
+    pub outbound_downlink: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct PolicyRelayTimeouts {
     pub connection_idle: Option<Duration>,
     pub uplink_only: Option<Duration>,
@@ -307,6 +315,7 @@ struct PolicyRuntimeState {
     uplink_only_timeouts: HashMap<u32, Duration>,
     downlink_only_timeouts: HashMap<u32, Duration>,
     user_stats: HashMap<u32, PolicyUserStats>,
+    system_stats: PolicySystemStats,
 }
 
 #[derive(Debug, Clone)]
@@ -395,6 +404,7 @@ impl RuntimeState {
         let mut uplink_only_timeouts = HashMap::new();
         let mut downlink_only_timeouts = HashMap::new();
         let mut user_stats = HashMap::new();
+        let mut system_stats = PolicySystemStats::default();
         if let Some(policy) = policy {
             for (raw_level, level_policy) in &policy.levels {
                 let level = raw_level.parse::<u32>().map_err(|error| {
@@ -430,6 +440,14 @@ impl RuntimeState {
                     );
                 }
             }
+            if let Some(system) = policy.system.as_ref() {
+                system_stats = PolicySystemStats {
+                    inbound_uplink: system.stats_inbound_uplink,
+                    inbound_downlink: system.stats_inbound_downlink,
+                    outbound_uplink: system.stats_outbound_uplink,
+                    outbound_downlink: system.stats_outbound_downlink,
+                };
+            }
         }
         let mut runtime_policy =
             self.policy.write().expect("runtime policy lock poisoned");
@@ -438,6 +456,7 @@ impl RuntimeState {
         runtime_policy.uplink_only_timeouts = uplink_only_timeouts;
         runtime_policy.downlink_only_timeouts = downlink_only_timeouts;
         runtime_policy.user_stats = user_stats;
+        runtime_policy.system_stats = system_stats;
         Ok(())
     }
 
@@ -458,6 +477,13 @@ impl RuntimeState {
             .connection_idle_timeouts
             .get(&level)
             .copied()
+    }
+
+    pub(crate) fn policy_system_stats(&self) -> PolicySystemStats {
+        self.policy
+            .read()
+            .expect("runtime policy lock poisoned")
+            .system_stats
     }
 
     pub(crate) fn policy_user_stats(&self, level: u32) -> PolicyUserStats {

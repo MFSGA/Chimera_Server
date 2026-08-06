@@ -974,10 +974,18 @@ mod tests {
             serde_json::json!({
                 "inbounds": [],
                 "outbounds": [],
-                "policy": {"levels": {
-                    "0": {"handshake": 4, "connIdle": 30, "uplinkOnly": 2, "downlinkOnly": 3},
-                    "7": {"connIdle": 9, "statsUserUplink": false, "statsUserDownlink": true}
-                }}
+                "policy": {
+                    "levels": {
+                        "0": {"handshake": 4, "connIdle": 30, "uplinkOnly": 2, "downlinkOnly": 3},
+                        "7": {"connIdle": 9, "statsUserUplink": false, "statsUserDownlink": true}
+                    },
+                    "system": {
+                        "statsInboundUplink": false,
+                        "statsInboundDownlink": true,
+                        "statsOutboundUplink": true,
+                        "statsOutboundDownlink": false
+                    }
+                }
             })
             .to_string(),
         )
@@ -1024,10 +1032,15 @@ mod tests {
             runtime.runtime_state.policy_user_stats(1),
             crate::runtime::PolicyUserStats::default()
         );
+        let system_stats = runtime.runtime_state.policy_system_stats();
+        assert_eq!(system_stats.inbound_uplink, Some(false));
+        assert_eq!(system_stats.inbound_downlink, Some(true));
+        assert_eq!(system_stats.outbound_uplink, Some(true));
+        assert_eq!(system_stats.outbound_downlink, Some(false));
 
         for unsupported_policy in [
             serde_json::json!({"levels": {"0": {"bufferSize": 0}}}),
-            serde_json::json!({"system": {"statsInboundUplink": true}}),
+            serde_json::json!({"system": {"statsUnknown": true}}),
         ] {
             let error = ConfigType::Str(
                 serde_json::json!({

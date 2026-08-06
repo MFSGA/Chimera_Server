@@ -805,9 +805,16 @@ where
                 .as_ref()
                 .map_or(0, |context| context.user_level);
             let user_stats = runtime.policy_user_stats(user_level);
+            let system_stats = runtime.policy_system_stats();
             if let Some(context) = traffic_context.as_mut() {
                 context
                     .set_user_stats_policy(user_stats.uplink, user_stats.downlink);
+                context.set_system_stats_policy(
+                    system_stats.inbound_uplink,
+                    system_stats.inbound_downlink,
+                    system_stats.outbound_uplink,
+                    system_stats.outbound_downlink,
+                );
             }
             let user = traffic_context
                 .as_ref()

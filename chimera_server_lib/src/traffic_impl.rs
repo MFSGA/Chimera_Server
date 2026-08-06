@@ -21,6 +21,10 @@ pub struct TrafficContext {
     pub user_level: u32,
     pub stats_user_uplink: Option<bool>,
     pub stats_user_downlink: Option<bool>,
+    pub stats_inbound_uplink: Option<bool>,
+    pub stats_inbound_downlink: Option<bool>,
+    pub stats_outbound_uplink: Option<bool>,
+    pub stats_outbound_downlink: Option<bool>,
 }
 
 impl TrafficContext {
@@ -35,6 +39,10 @@ impl TrafficContext {
             user_level: 0,
             stats_user_uplink: None,
             stats_user_downlink: None,
+            stats_inbound_uplink: None,
+            stats_inbound_downlink: None,
+            stats_outbound_uplink: None,
+            stats_outbound_downlink: None,
         }
     }
 
@@ -158,6 +166,19 @@ impl TrafficContext {
         self.stats_user_uplink = uplink;
         self.stats_user_downlink = downlink;
     }
+
+    pub fn set_system_stats_policy(
+        &mut self,
+        inbound_uplink: Option<bool>,
+        inbound_downlink: Option<bool>,
+        outbound_uplink: Option<bool>,
+        outbound_downlink: Option<bool>,
+    ) {
+        self.stats_inbound_uplink = inbound_uplink;
+        self.stats_inbound_downlink = inbound_downlink;
+        self.stats_outbound_uplink = outbound_uplink;
+        self.stats_outbound_downlink = outbound_downlink;
+    }
 }
 
 impl Default for TrafficContext {
@@ -172,6 +193,10 @@ impl Default for TrafficContext {
             user_level: 0,
             stats_user_uplink: None,
             stats_user_downlink: None,
+            stats_inbound_uplink: None,
+            stats_inbound_downlink: None,
+            stats_outbound_uplink: None,
+            stats_outbound_downlink: None,
         }
     }
 }
@@ -223,6 +248,21 @@ impl StatsInner {
         let user_upload = if record_user_uplink { upload } else { 0 };
         let user_download = if record_user_downlink { download } else { 0 };
         let record_user = record_user_uplink || record_user_downlink;
+        let record_inbound_uplink = context.stats_inbound_uplink.unwrap_or(true);
+        let record_inbound_downlink = context.stats_inbound_downlink.unwrap_or(true);
+        let inbound_upload = if record_inbound_uplink { upload } else { 0 };
+        let inbound_download = if record_inbound_downlink { download } else { 0 };
+        let record_inbound = record_inbound_uplink || record_inbound_downlink;
+        let record_outbound_uplink = context.stats_outbound_uplink.unwrap_or(true);
+        let record_outbound_downlink =
+            context.stats_outbound_downlink.unwrap_or(true);
+        let outbound_upload = if record_outbound_uplink { upload } else { 0 };
+        let outbound_download = if record_outbound_downlink {
+            download
+        } else {
+            0
+        };
+        let record_outbound = record_outbound_uplink || record_outbound_downlink;
 
         let protocol_entry = self
             .per_protocol
@@ -237,8 +277,10 @@ impl StatsInner {
         }
 
         if let Some(tag) = inbound_tag {
-            let inbound_entry = self.per_inbound.entry(tag.clone()).or_default();
-            inbound_entry.accumulate(upload, download);
+            if record_inbound {
+                let inbound_entry = self.per_inbound.entry(tag.clone()).or_default();
+                inbound_entry.accumulate(inbound_upload, inbound_download);
+            }
 
             if record_user && let Some(identity) = identity {
                 let key = (tag, identity);
@@ -247,9 +289,9 @@ impl StatsInner {
             }
         }
 
-        if let Some(tag) = outbound_tag {
+        if record_outbound && let Some(tag) = outbound_tag {
             let outbound_entry = self.per_outbound.entry(tag).or_default();
-            outbound_entry.accumulate(upload, download);
+            outbound_entry.accumulate(outbound_upload, outbound_download);
         }
     }
 
@@ -460,5 +502,37 @@ mod tests {
         assert!(stats.per_inbound_user.is_empty());
         assert_eq!(stats.per_protocol["vmess"].upload_bytes, 100);
         assert_eq!(stats.per_inbound["edge"].download_bytes, 200);
+    }
+
+    #[test]
+    fn system_stats_policy_filters_inbound_and_outbound_directions() {
+        let mut stats = StatsInner::default();
+        let mut context = TrafficContext::new("trojan")
+            .with_identity("carol")
+            .with_inbound_tag("edge")
+            .with_outbound_tag("direct");
+        context.set_system_stats_policy(
+            Some(false),
+            Some(true),
+            Some(true),
+            Some(false),
+        );
+
+        stats.record(context, 100, 200);
+
+        let inbound = stats
+            .per_inbound
+            .get("edge")
+            .expect("inbound stats should exist");
+        assert_eq!(inbound.upload_bytes, 0);
+        assert_eq!(inbound.download_bytes, 200);
+        let outbound = stats
+            .per_outbound
+            .get("direct")
+            .expect("outbound stats should exist");
+        assert_eq!(outbound.upload_bytes, 100);
+        assert_eq!(outbound.download_bytes, 0);
+        assert_eq!(stats.per_protocol["trojan"].upload_bytes, 100);
+        assert_eq!(stats.per_protocol["trojan"].download_bytes, 200);
     }
 }

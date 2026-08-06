@@ -157,6 +157,10 @@ mod traffic_noop {
         pub user_level: u32,
         pub stats_user_uplink: Option<bool>,
         pub stats_user_downlink: Option<bool>,
+        pub stats_inbound_uplink: Option<bool>,
+        pub stats_inbound_downlink: Option<bool>,
+        pub stats_outbound_uplink: Option<bool>,
+        pub stats_outbound_downlink: Option<bool>,
     }
 
     impl TrafficContext {
@@ -171,6 +175,10 @@ mod traffic_noop {
                 user_level: 0,
                 stats_user_uplink: None,
                 stats_user_downlink: None,
+                stats_inbound_uplink: None,
+                stats_inbound_downlink: None,
+                stats_outbound_uplink: None,
+                stats_outbound_downlink: None,
             }
         }
 
@@ -294,6 +302,19 @@ mod traffic_noop {
             self.stats_user_uplink = uplink;
             self.stats_user_downlink = downlink;
         }
+
+        pub fn set_system_stats_policy(
+            &mut self,
+            inbound_uplink: Option<bool>,
+            inbound_downlink: Option<bool>,
+            outbound_uplink: Option<bool>,
+            outbound_downlink: Option<bool>,
+        ) {
+            self.stats_inbound_uplink = inbound_uplink;
+            self.stats_inbound_downlink = inbound_downlink;
+            self.stats_outbound_uplink = outbound_uplink;
+            self.stats_outbound_downlink = outbound_downlink;
+        }
     }
 
     impl Default for TrafficContext {
@@ -308,6 +329,10 @@ mod traffic_noop {
                 user_level: 0,
                 stats_user_uplink: None,
                 stats_user_downlink: None,
+                stats_inbound_uplink: None,
+                stats_inbound_downlink: None,
+                stats_outbound_uplink: None,
+                stats_outbound_downlink: None,
             }
         }
     }

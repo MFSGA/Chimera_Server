@@ -523,7 +523,16 @@ pub struct PolicyLevelConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PolicySystemConfig {}
+pub struct PolicySystemConfig {
+    #[serde(default, rename = "statsInboundUplink")]
+    pub stats_inbound_uplink: Option<bool>,
+    #[serde(default, rename = "statsInboundDownlink")]
+    pub stats_inbound_downlink: Option<bool>,
+    #[serde(default, rename = "statsOutboundUplink")]
+    pub stats_outbound_uplink: Option<bool>,
+    #[serde(default, rename = "statsOutboundDownlink")]
+    pub stats_outbound_downlink: Option<bool>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
