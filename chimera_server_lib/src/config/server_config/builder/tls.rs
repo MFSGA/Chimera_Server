@@ -310,7 +310,10 @@ pub(super) fn apply_security_layers(
             settings.trusted_x_forwarded_for.clone()
         });
     if !trusted_x_forwarded_for.is_empty()
-        && !matches!(network.as_str(), "grpc" | "xhttp" | "splithttp")
+        && !matches!(
+            network.as_str(),
+            "ws" | "websocket" | "grpc" | "xhttp" | "splithttp"
+        )
     {
         return Err(Error::InvalidConfig(format!(
             "trustedXForwardedFor is not supported for {network} transport yet"

@@ -39,18 +39,45 @@ use crate::{
 
 use super::tcp_handler::TcpServerHandler;
 
-#[allow(clippy::only_used_in_recursion)]
 pub fn create_tcp_server_handler(
     server_proxy_config: ServerProxyConfig,
     inbound_tag: &str,
     rules_stack: &mut Vec<Vec<RuleConfig>>,
 ) -> Result<Box<dyn TcpServerHandler>> {
+    create_tcp_server_handler_with_trusted_headers(
+        server_proxy_config,
+        inbound_tag,
+        rules_stack,
+        &[],
+    )
+}
+
+#[allow(clippy::only_used_in_recursion)]
+fn create_tcp_server_handler_with_trusted_headers(
+    server_proxy_config: ServerProxyConfig,
+    inbound_tag: &str,
+    rules_stack: &mut Vec<Vec<RuleConfig>>,
+    trusted_forwarded_headers: &[String],
+) -> Result<Box<dyn TcpServerHandler>> {
     #[cfg(not(any(feature = "ws", feature = "tls", feature = "reality")))]
-    let _ = rules_stack;
+    let _ = (&*rules_stack, trusted_forwarded_headers);
 
     match server_proxy_config {
+        ServerProxyConfig::TrustedForwardedHeaders { names, inner } => {
+            create_tcp_server_handler_with_trusted_headers(
+                *inner,
+                inbound_tag,
+                rules_stack,
+                &names,
+            )
+        }
         ServerProxyConfig::ProxyProtocol { inner } => {
-            let inner = create_tcp_server_handler(*inner, inbound_tag, rules_stack)?;
+            let inner = create_tcp_server_handler_with_trusted_headers(
+                *inner,
+                inbound_tag,
+                rules_stack,
+                trusted_forwarded_headers,
+            )?;
             Ok(Box::new(ProxyProtocolServerHandler::new(inner)))
         }
         ServerProxyConfig::TcpKeepAlive {
@@ -58,7 +85,12 @@ pub fn create_tcp_server_handler(
             interval_secs,
             inner,
         } => {
-            let inner = create_tcp_server_handler(*inner, inbound_tag, rules_stack)?;
+            let inner = create_tcp_server_handler_with_trusted_headers(
+                *inner,
+                inbound_tag,
+                rules_stack,
+                trusted_forwarded_headers,
+            )?;
             Ok(Box::new(TcpKeepAliveServerHandler::new(
                 idle_secs,
                 interval_secs,
@@ -66,17 +98,32 @@ pub fn create_tcp_server_handler(
             )))
         }
         ServerProxyConfig::TcpUserTimeout { timeout_ms, inner } => {
-            let inner = create_tcp_server_handler(*inner, inbound_tag, rules_stack)?;
+            let inner = create_tcp_server_handler_with_trusted_headers(
+                *inner,
+                inbound_tag,
+                rules_stack,
+                trusted_forwarded_headers,
+            )?;
             Ok(Box::new(TcpUserTimeoutServerHandler::new(
                 timeout_ms, inner,
             )))
         }
         ServerProxyConfig::TcpCongestion { algorithm, inner } => {
-            let inner = create_tcp_server_handler(*inner, inbound_tag, rules_stack)?;
+            let inner = create_tcp_server_handler_with_trusted_headers(
+                *inner,
+                inbound_tag,
+                rules_stack,
+                trusted_forwarded_headers,
+            )?;
             Ok(Box::new(TcpCongestionServerHandler::new(algorithm, inner)))
         }
         ServerProxyConfig::TcpWindowClamp { value, inner } => {
-            let inner = create_tcp_server_handler(*inner, inbound_tag, rules_stack)?;
+            let inner = create_tcp_server_handler_with_trusted_headers(
+                *inner,
+                inbound_tag,
+                rules_stack,
+                trusted_forwarded_headers,
+            )?;
             Ok(Box::new(TcpWindowClampServerHandler::new(value, inner)))
         }
         #[cfg(feature = "vless")]
@@ -116,7 +163,10 @@ pub fn create_tcp_server_handler(
                     create_websocket_server_target(config, inbound_tag, rules_stack)
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(Box::new(WebsocketTcpServerHandler::new(server_targets)))
+            Ok(Box::new(WebsocketTcpServerHandler::new(
+                server_targets,
+                trusted_forwarded_headers.to_vec(),
+            )))
         }
         #[cfg(feature = "trojan")]
         ServerProxyConfig::Trojan { users, fallbacks } => {
@@ -156,8 +206,12 @@ pub fn create_tcp_server_handler(
                 )?));
             }
 
-            let inner_handler =
-                create_tcp_server_handler(*inner, inbound_tag, rules_stack)?;
+            let inner_handler = create_tcp_server_handler_with_trusted_headers(
+                *inner,
+                inbound_tag,
+                rules_stack,
+                trusted_forwarded_headers,
+            )?;
             let tls_handler = TlsServerHandler::new(
                 certificates,
                 alpn_protocols,
@@ -192,10 +246,11 @@ pub fn create_tcp_server_handler(
                 )));
             }
 
-            let inner_handler = create_tcp_server_handler(
+            let inner_handler = create_tcp_server_handler_with_trusted_headers(
                 (*reality_config.inner).clone(),
                 inbound_tag,
                 rules_stack,
+                trusted_forwarded_headers,
             )?;
             Ok(Box::new(RealityServerHandler::new(
                 reality_config,
@@ -242,8 +297,12 @@ pub fn create_tcp_server_handler(
         }
         #[cfg(feature = "httpupgrade")]
         ServerProxyConfig::HttpUpgrade(config) => {
-            let inner =
-                create_tcp_server_handler(*config.inner, inbound_tag, rules_stack)?;
+            let inner = create_tcp_server_handler_with_trusted_headers(
+                *config.inner,
+                inbound_tag,
+                rules_stack,
+                trusted_forwarded_headers,
+            )?;
             Ok(Box::new(HttpUpgradeTcpServerHandler::new(
                 config.host,
                 config.path,

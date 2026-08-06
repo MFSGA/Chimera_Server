@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, net::SocketAddr};
 
 use async_trait::async_trait;
 use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
@@ -24,11 +24,18 @@ pub struct WebsocketServerTarget {
 #[derive(Debug)]
 pub struct WebsocketTcpServerHandler {
     server_targets: Vec<WebsocketServerTarget>,
+    trusted_forwarded_headers: Vec<String>,
 }
 
 impl WebsocketTcpServerHandler {
-    pub fn new(server_targets: Vec<WebsocketServerTarget>) -> Self {
-        Self { server_targets }
+    pub fn new(
+        server_targets: Vec<WebsocketServerTarget>,
+        trusted_forwarded_headers: Vec<String>,
+    ) -> Self {
+        Self {
+            server_targets,
+            trusted_forwarded_headers,
+        }
     }
 }
 
@@ -136,6 +143,12 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
 
             if let Ok(ref mut setup_result) = target_setup_result {
                 setup_result.set_need_initial_flush(true);
+                if let Some(client_addr) = trusted_forwarded_client_addr(
+                    &request_headers,
+                    &self.trusted_forwarded_headers,
+                ) {
+                    setup_result.set_client_addr(client_addr);
+                }
                 debug!("todo override_proxy_provider_unspecified");
             }
 
@@ -146,10 +159,64 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
     }
 }
 
+fn trusted_forwarded_client_addr(
+    headers: &HashMap<String, String>,
+    trusted: &[String],
+) -> Option<SocketAddr> {
+    let forwarded_for = headers.get("x-forwarded-for")?;
+    let trusted_header_present = trusted
+        .iter()
+        .any(|name| headers.contains_key(&name.trim().to_ascii_lowercase()));
+    if !trusted_header_present {
+        return None;
+    }
+    let candidate = forwarded_for
+        .split_once(',')
+        .map_or(forwarded_for.as_str(), |(first, _)| first)
+        .trim();
+    candidate.parse().ok().map(|ip| SocketAddr::new(ip, 0))
+}
+
 fn create_websocket_key_response(key: String) -> String {
     const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     let mut input = key.into_bytes();
     input.extend_from_slice(WS_GUID);
     let hash = digest(&SHA1_FOR_LEGACY_USE_ONLY, &input);
     BASE64.encode(hash.as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trusted_forwarded_header_uses_first_ip_with_zero_port() {
+        let headers = HashMap::from([
+            ("x-forwarded-for".into(), "203.0.113.9, 198.51.100.7".into()),
+            ("x-trusted-proxy".into(), "1".into()),
+        ]);
+        assert_eq!(
+            trusted_forwarded_client_addr(&headers, &["X-Trusted-Proxy".into()]),
+            Some("203.0.113.9:0".parse().unwrap()),
+        );
+    }
+
+    #[test]
+    fn untrusted_or_invalid_forwarded_header_is_ignored() {
+        let headers =
+            HashMap::from([("x-forwarded-for".into(), "203.0.113.9".into())]);
+        assert_eq!(
+            trusted_forwarded_client_addr(&headers, &["X-Trusted-Proxy".into()]),
+            None,
+        );
+
+        let headers = HashMap::from([
+            ("x-forwarded-for".into(), "not-an-ip".into()),
+            ("x-trusted-proxy".into(), "1".into()),
+        ]);
+        assert_eq!(
+            trusted_forwarded_client_addr(&headers, &["X-Trusted-Proxy".into()]),
+            None,
+        );
+    }
 }
