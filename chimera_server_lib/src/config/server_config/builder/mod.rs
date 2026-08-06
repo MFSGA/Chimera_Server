@@ -1553,6 +1553,82 @@ mod tests {
         assert!(error.to_string().contains("tcpKeepAliveIdle"));
     }
 
+    #[cfg(all(feature = "vless", any(target_os = "android", target_os = "linux")))]
+    #[test]
+    fn socket_tcp_congestion_wraps_other_socket_options_outermost() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-congestion",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "sockopt": {
+                    "tcpCongestion": "cubic",
+                    "tcpUserTimeout": 12345
+                }
+            }
+        }))
+        .unwrap();
+        let config = ServerConfig::try_from(inbound).unwrap();
+        let ServerProxyConfig::TcpCongestion { algorithm, inner } = config.protocol
+        else {
+            panic!("TCP_CONGESTION must be the outer socket wrapper");
+        };
+        assert_eq!(algorithm, "cubic");
+        assert!(matches!(*inner, ServerProxyConfig::TcpUserTimeout { .. }));
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn socket_empty_tcp_congestion_is_ignored() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-congestion-default",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "sockopt": {"tcpCongestion": ""}
+            }
+        }))
+        .unwrap();
+        let config = ServerConfig::try_from(inbound).unwrap();
+        assert!(matches!(config.protocol, ServerProxyConfig::Vless { .. }));
+    }
+
+    #[cfg(all(feature = "vless", feature = "grpc_transport"))]
+    #[test]
+    fn socket_tcp_congestion_rejects_dedicated_grpc_listener() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-grpc-congestion",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "grpc",
+                "grpcSettings": {"serviceName": "proxy"},
+                "sockopt": {"tcpCongestion": "cubic"}
+            }
+        }))
+        .unwrap();
+        let error = ServerConfig::try_from(inbound).unwrap_err();
+        assert!(error.to_string().contains("tcpCongestion"));
+        assert!(error.to_string().contains("grpc"));
+    }
+
     #[cfg(all(feature = "vless", target_os = "linux"))]
     #[test]
     fn socket_tcp_user_timeout_wraps_keepalive_outermost() {

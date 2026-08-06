@@ -78,6 +78,34 @@ pub fn configure_tcp_user_timeout(
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
+pub fn configure_tcp_congestion(
+    fd: std::os::fd::RawFd,
+    algorithm: &str,
+) -> std::io::Result<()> {
+    let algorithm = std::ffi::CString::new(algorithm).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "tcpCongestion must not contain NUL bytes",
+        )
+    })?;
+    // SAFETY: `fd` is borrowed for this call and `algorithm` is a valid
+    // NUL-terminated byte string for the full duration of `setsockopt`.
+    let result = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_TCP,
+            libc::TCP_CONGESTION,
+            algorithm.as_ptr().cast(),
+            algorithm.as_bytes_with_nul().len() as libc::socklen_t,
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
 fn set_socket_option_int(
     fd: std::os::fd::RawFd,
     level: libc::c_int,

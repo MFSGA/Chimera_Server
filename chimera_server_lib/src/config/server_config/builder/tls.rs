@@ -317,6 +317,34 @@ pub(super) fn apply_security_layers(
         ));
     }
 
+    let congestion_algorithm = stream_settings
+        .sockopt
+        .as_ref()
+        .map_or("", |settings| settings.tcp_congestion.as_str())
+        .to_string();
+    let configure_congestion = !congestion_algorithm.is_empty();
+    if congestion_algorithm.contains('\0') {
+        return Err(Error::InvalidConfig(
+            "tcpCongestion must not contain NUL bytes".into(),
+        ));
+    }
+    if configure_congestion
+        && !matches!(
+            network.as_str(),
+            "" | "raw" | "tcp" | "ws" | "websocket" | "httpupgrade"
+        )
+    {
+        return Err(Error::InvalidConfig(format!(
+            "tcpCongestion is not supported for {network} transport yet"
+        )));
+    }
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    if configure_congestion {
+        return Err(Error::InvalidConfig(
+            "tcpCongestion is currently supported only on Linux and Android".into(),
+        ));
+    }
+
     let user_timeout_ms = stream_settings
         .sockopt
         .as_ref()
@@ -461,9 +489,17 @@ pub(super) fn apply_security_layers(
     } else {
         protocol
     };
-    if configure_user_timeout {
-        Ok(ServerProxyConfig::TcpUserTimeout {
+    let protocol = if configure_user_timeout {
+        ServerProxyConfig::TcpUserTimeout {
             timeout_ms: user_timeout_ms,
+            inner: Box::new(protocol),
+        }
+    } else {
+        protocol
+    };
+    if configure_congestion {
+        Ok(ServerProxyConfig::TcpCongestion {
+            algorithm: congestion_algorithm,
             inner: Box::new(protocol),
         })
     } else {

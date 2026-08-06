@@ -31,6 +31,7 @@ use crate::{
     handler::dokodemo::DokodemoDoorTcpHandler,
     handler::proxy_protocol::ProxyProtocolServerHandler,
     handler::socks::SocksTcpServerHandler,
+    handler::tcp_congestion::TcpCongestionServerHandler,
     handler::tcp_keepalive::TcpKeepAliveServerHandler,
     handler::tcp_user_timeout::TcpUserTimeoutServerHandler,
 };
@@ -68,6 +69,10 @@ pub fn create_tcp_server_handler(
             Ok(Box::new(TcpUserTimeoutServerHandler::new(
                 timeout_ms, inner,
             )))
+        }
+        ServerProxyConfig::TcpCongestion { algorithm, inner } => {
+            let inner = create_tcp_server_handler(*inner, inbound_tag, rules_stack)?;
+            Ok(Box::new(TcpCongestionServerHandler::new(algorithm, inner)))
         }
         #[cfg(feature = "vless")]
         ServerProxyConfig::Vless { users, fallbacks } => {
