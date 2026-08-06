@@ -94,6 +94,8 @@ pub struct SocketSettings {
     tcp_window_clamp: i32,
     #[serde(default)]
     tcp_max_seg: i32,
+    #[serde(default)]
+    v6only: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

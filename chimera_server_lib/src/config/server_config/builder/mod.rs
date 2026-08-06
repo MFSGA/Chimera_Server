@@ -1664,6 +1664,77 @@ mod tests {
         assert!(matches!(*inner, ServerProxyConfig::TcpUserTimeout { .. }));
     }
 
+    #[cfg(all(feature = "vless", any(target_os = "android", target_os = "linux")))]
+    #[test]
+    fn socket_v6only_is_outermost_listener_option() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "::",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-v6only",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "sockopt": {"tcpMaxSeg": 1200, "v6only": true}
+            }
+        }))
+        .unwrap();
+        let config = ServerConfig::try_from(inbound).unwrap();
+        let ServerProxyConfig::Ipv6Only { inner } = config.protocol else {
+            panic!("v6only must be the outer listener option");
+        };
+        assert!(matches!(*inner, ServerProxyConfig::TcpMaxSeg { .. }));
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn socket_v6only_false_is_ignored() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "::",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-v6only-default",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "sockopt": {"v6only": false}
+            }
+        }))
+        .unwrap();
+        let config = ServerConfig::try_from(inbound).unwrap();
+        assert!(matches!(config.protocol, ServerProxyConfig::Vless { .. }));
+    }
+
+    #[cfg(all(feature = "vless", feature = "grpc_transport"))]
+    #[test]
+    fn socket_v6only_rejects_dedicated_grpc_listener() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "::",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-grpc-v6only",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "grpc",
+                "grpcSettings": {"serviceName": "proxy"},
+                "sockopt": {"v6only": true}
+            }
+        }))
+        .unwrap();
+        let error = ServerConfig::try_from(inbound).unwrap_err();
+        assert!(error.to_string().contains("v6only"));
+        assert!(error.to_string().contains("grpc"));
+    }
+
     #[cfg(feature = "vless")]
     #[test]
     fn socket_non_positive_tcp_max_seg_is_ignored() {

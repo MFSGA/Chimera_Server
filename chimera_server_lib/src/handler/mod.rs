@@ -3,6 +3,7 @@ pub mod dokodemo;
 pub mod http;
 #[cfg(feature = "httpupgrade")]
 pub mod httpupgrade;
+pub mod ipv6_only;
 #[cfg(feature = "mixed")]
 pub mod mixed;
 pub mod proxy_protocol;

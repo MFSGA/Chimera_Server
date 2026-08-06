@@ -86,6 +86,11 @@ pub fn configure_tcp_window_clamp(
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
+pub fn configure_ipv6_only(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    set_socket_option_int(fd, libc::SOL_IPV6, libc::IPV6_V6ONLY, 1)
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
 pub fn configure_tcp_max_seg(
     fd: std::os::fd::RawFd,
     value: i32,

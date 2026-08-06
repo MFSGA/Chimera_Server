@@ -151,9 +151,8 @@ fn is_grpc_server_protocol(protocol: &ServerProxyConfig) -> bool {
         | ServerProxyConfig::TcpUserTimeout { inner, .. }
         | ServerProxyConfig::TcpCongestion { inner, .. }
         | ServerProxyConfig::TcpWindowClamp { inner, .. }
-        | ServerProxyConfig::TcpMaxSeg { inner, .. } => {
-            is_grpc_server_protocol(inner)
-        }
+        | ServerProxyConfig::TcpMaxSeg { inner, .. }
+        | ServerProxyConfig::Ipv6Only { inner } => is_grpc_server_protocol(inner),
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(tls_config) => {
             matches!(tls_config.inner.as_ref(), ServerProxyConfig::Grpc(_))
@@ -174,9 +173,8 @@ fn is_xhttp_server_protocol(protocol: &ServerProxyConfig) -> bool {
         | ServerProxyConfig::TcpUserTimeout { inner, .. }
         | ServerProxyConfig::TcpCongestion { inner, .. }
         | ServerProxyConfig::TcpWindowClamp { inner, .. }
-        | ServerProxyConfig::TcpMaxSeg { inner, .. } => {
-            is_xhttp_server_protocol(inner)
-        }
+        | ServerProxyConfig::TcpMaxSeg { inner, .. }
+        | ServerProxyConfig::Ipv6Only { inner } => is_xhttp_server_protocol(inner),
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(tls_config) => {
             matches!(tls_config.inner.as_ref(), ServerProxyConfig::Xhttp { .. })
@@ -211,10 +209,26 @@ async fn start_tcp_server_with_runtime(
         ..
     } = config;
 
-    let (protocol, tcp_max_seg) = match protocol {
-        ServerProxyConfig::TcpMaxSeg { value, inner } => (*inner, Some(value)),
-        protocol => (protocol, None),
-    };
+    let mut protocol = Some(protocol);
+    let mut tcp_max_seg = None;
+    let mut ipv6_only = false;
+    loop {
+        match protocol.take().expect("listener protocol must be present") {
+            ServerProxyConfig::TcpMaxSeg { value, inner } => {
+                tcp_max_seg = Some(value);
+                protocol = Some(*inner);
+            }
+            ServerProxyConfig::Ipv6Only { inner } => {
+                ipv6_only = true;
+                protocol = Some(*inner);
+            }
+            inner => {
+                protocol = Some(inner);
+                break;
+            }
+        }
+    }
+    let protocol = protocol.expect("listener protocol must be restored");
 
     tracing::info!("Starting {} TCP server at {}", &protocol, &bind_location);
 
@@ -228,6 +242,9 @@ async fn start_tcp_server_with_runtime(
         BindLocation::Address(a) => {
             let socket_addr = a.to_socket_addr()?;
             let socket = new_tcp_socket(None, socket_addr.is_ipv6())?;
+            if ipv6_only {
+                crate::handler::ipv6_only::configure_listener(&socket)?;
+            }
             if let Some(value) = tcp_max_seg {
                 crate::handler::tcp_max_seg::configure_listener(&socket, value)?;
             }

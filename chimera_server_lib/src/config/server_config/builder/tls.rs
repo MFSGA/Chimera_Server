@@ -410,6 +410,27 @@ pub(super) fn apply_security_layers(
         ));
     }
 
+    let configure_ipv6_only = stream_settings
+        .sockopt
+        .as_ref()
+        .is_some_and(|settings| settings.v6only);
+    if configure_ipv6_only
+        && !matches!(
+            network.as_str(),
+            "" | "raw" | "tcp" | "ws" | "websocket" | "httpupgrade"
+        )
+    {
+        return Err(Error::InvalidConfig(format!(
+            "v6only is not supported for {network} transport yet"
+        )));
+    }
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    if configure_ipv6_only {
+        return Err(Error::InvalidConfig(
+            "v6only is currently supported only on Linux and Android".into(),
+        ));
+    }
+
     let user_timeout_ms = stream_settings
         .sockopt
         .as_ref()
@@ -623,9 +644,16 @@ pub(super) fn apply_security_layers(
     } else {
         protocol
     };
-    if configure_max_seg {
-        Ok(ServerProxyConfig::TcpMaxSeg {
+    let protocol = if configure_max_seg {
+        ServerProxyConfig::TcpMaxSeg {
             value: max_seg,
+            inner: Box::new(protocol),
+        }
+    } else {
+        protocol
+    };
+    if configure_ipv6_only {
+        Ok(ServerProxyConfig::Ipv6Only {
             inner: Box::new(protocol),
         })
     } else {

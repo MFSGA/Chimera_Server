@@ -464,6 +464,9 @@ pub enum ServerProxyConfig {
         value: i32,
         inner: Box<ServerProxyConfig>,
     },
+    Ipv6Only {
+        inner: Box<ServerProxyConfig>,
+    },
     #[cfg(feature = "tls")]
     Tls(TlsServerConfig),
     #[cfg(feature = "reality")]
@@ -531,6 +534,7 @@ impl std::fmt::Display for ServerProxyConfig {
                 Self::TcpCongestion { .. } => "TcpCongestion",
                 Self::TcpWindowClamp { .. } => "TcpWindowClamp",
                 Self::TcpMaxSeg { .. } => "TcpMaxSeg",
+                Self::Ipv6Only { .. } => "Ipv6Only",
                 #[cfg(feature = "reality")]
                 Self::Reality(_) => "Reality",
                 #[cfg(feature = "tls")]
