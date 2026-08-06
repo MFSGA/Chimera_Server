@@ -1077,8 +1077,9 @@ where
         TcpServerSetupResult::BidirectionalUdp {
             remote_location,
             stream,
-            traffic_context,
+            mut traffic_context,
         } => {
+            apply_policy_stats(&runtime, traffic_context.as_mut());
             run_bidirectional_udp(
                 stream,
                 remote_location,
@@ -1334,6 +1335,41 @@ mod tests {
         ];
         record.extend_from_slice(&handshake);
         record
+    }
+
+    #[test]
+    fn bidirectional_udp_context_applies_policy_stats() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let policy = serde_json::from_value(serde_json::json!({
+            "levels": {
+                "3": {
+                    "statsUserUplink": true,
+                    "statsUserDownlink": false,
+                    "statsUserOnline": true
+                }
+            },
+            "system": {
+                "statsInboundUplink": false,
+                "statsInboundDownlink": true,
+                "statsOutboundUplink": true,
+                "statsOutboundDownlink": false
+            }
+        }))
+        .expect("policy config should parse");
+        runtime
+            .configure_policy(Some(&policy))
+            .expect("policy should install");
+        let mut context = TrafficContext::new("vmess").with_user_level(3);
+
+        apply_policy_stats(&runtime, Some(&mut context));
+
+        assert_eq!(context.stats_user_uplink, Some(true));
+        assert_eq!(context.stats_user_downlink, Some(false));
+        assert_eq!(context.stats_user_online, Some(true));
+        assert_eq!(context.stats_inbound_uplink, Some(false));
+        assert_eq!(context.stats_inbound_downlink, Some(true));
+        assert_eq!(context.stats_outbound_uplink, Some(true));
+        assert_eq!(context.stats_outbound_downlink, Some(false));
     }
 
     #[test]
