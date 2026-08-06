@@ -186,6 +186,7 @@ pub async fn start_xhttp_server(
         tcp_window_clamp,
         tcp_max_seg,
         ipv6_only,
+        tcp_fast_open,
     } = parse_listener_protocol(protocol)?;
 
     let bind_addr = match bind_location {
@@ -209,6 +210,9 @@ pub async fn start_xhttp_server(
     }
 
     let socket = crate::util::socket::new_tcp_socket(None, bind_addr.is_ipv6())?;
+    if let Some(value) = tcp_fast_open {
+        crate::handler::tcp_fast_open::configure_listener(&socket, value)?;
+    }
     if ipv6_only {
         crate::handler::ipv6_only::configure_listener(&socket)?;
     }
@@ -474,6 +478,7 @@ struct XhttpListenerConfig {
     tcp_window_clamp: Option<i32>,
     tcp_max_seg: Option<i32>,
     ipv6_only: bool,
+    tcp_fast_open: Option<i32>,
 }
 
 #[derive(Clone)]
@@ -603,6 +608,18 @@ fn parse_listener_protocol(
     protocol: ServerProxyConfig,
 ) -> std::io::Result<XhttpListenerConfig> {
     match protocol {
+        ServerProxyConfig::TcpFastOpen { value, inner } => {
+            let mut config = parse_listener_protocol(*inner)?;
+            #[cfg(feature = "tls")]
+            if matches!(&config.security, XhttpSecurityLayer::Http3(_)) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "XHTTP HTTP/3 does not support tcpFastOpen",
+                ));
+            }
+            config.tcp_fast_open = Some(value);
+            Ok(config)
+        }
         ServerProxyConfig::Ipv6Only { inner } => {
             let mut config = parse_listener_protocol(*inner)?;
             config.ipv6_only = true;
@@ -695,6 +712,7 @@ fn parse_listener_protocol(
             tcp_window_clamp: None,
             tcp_max_seg: None,
             ipv6_only: false,
+            tcp_fast_open: None,
         }),
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(TlsServerConfig {
@@ -761,6 +779,7 @@ fn parse_listener_protocol(
                     tcp_window_clamp: None,
                     tcp_max_seg: None,
                     ipv6_only: false,
+                    tcp_fast_open: None,
                 })
             }
             _ => Err(std::io::Error::other(
@@ -782,6 +801,7 @@ fn parse_listener_protocol(
                         tcp_window_clamp: None,
                         tcp_max_seg: None,
                         ipv6_only: false,
+                        tcp_fast_open: None,
                     })
                 }
                 _ => Err(std::io::Error::other(
