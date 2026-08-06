@@ -1569,6 +1569,7 @@ mod tests {
                 "network": "tcp",
                 "sockopt": {
                     "tcpCongestion": "cubic",
+                    "tcpWindowClamp": 65535,
                     "tcpUserTimeout": 12345
                 }
             }
@@ -1580,6 +1581,10 @@ mod tests {
             panic!("TCP_CONGESTION must be the outer socket wrapper");
         };
         assert_eq!(algorithm, "cubic");
+        let ServerProxyConfig::TcpWindowClamp { value, inner } = *inner else {
+            panic!("TCP_WINDOW_CLAMP must wrap TCP_USER_TIMEOUT");
+        };
+        assert_eq!(value, 65_535);
         assert!(matches!(*inner, ServerProxyConfig::TcpUserTimeout { .. }));
     }
 
@@ -1603,6 +1608,54 @@ mod tests {
         .unwrap();
         let config = ServerConfig::try_from(inbound).unwrap();
         assert!(matches!(config.protocol, ServerProxyConfig::Vless { .. }));
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn socket_non_positive_tcp_window_clamp_is_ignored() {
+        for value in [0, -1] {
+            let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+                "listen": "127.0.0.1",
+                "port": 443,
+                "protocol": "vless",
+                "tag": "vless-window-clamp-disabled",
+                "settings": {
+                    "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "sockopt": {"tcpWindowClamp": value}
+                }
+            }))
+            .unwrap();
+            let config = ServerConfig::try_from(inbound).unwrap();
+            assert!(matches!(config.protocol, ServerProxyConfig::Vless { .. }));
+        }
+    }
+
+    #[cfg(all(feature = "vless", feature = "grpc_transport"))]
+    #[test]
+    fn socket_tcp_window_clamp_rejects_dedicated_grpc_listener() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-grpc-window-clamp",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "grpc",
+                "grpcSettings": {"serviceName": "proxy"},
+                "sockopt": {"tcpWindowClamp": 65535}
+            }
+        }))
+        .unwrap();
+        let error = ServerConfig::try_from(inbound).unwrap_err();
+        assert!(error.to_string().contains("tcpWindowClamp"));
+        assert!(error.to_string().contains("grpc"));
     }
 
     #[cfg(all(feature = "vless", feature = "grpc_transport"))]

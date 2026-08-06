@@ -10,6 +10,7 @@ pub mod tcp;
 pub mod tcp_congestion;
 pub mod tcp_keepalive;
 pub mod tcp_user_timeout;
+pub mod tcp_window_clamp;
 #[cfg(feature = "tls")]
 pub mod tls;
 #[cfg(any(feature = "reality", feature = "vless"))]

@@ -352,6 +352,28 @@ pub(super) fn apply_security_layers(
         ));
     }
 
+    let window_clamp = stream_settings
+        .sockopt
+        .as_ref()
+        .map_or(0, |settings| settings.tcp_window_clamp);
+    let configure_window_clamp = window_clamp > 0;
+    if configure_window_clamp
+        && !matches!(
+            network.as_str(),
+            "" | "raw" | "tcp" | "ws" | "websocket" | "httpupgrade"
+        )
+    {
+        return Err(Error::InvalidConfig(format!(
+            "tcpWindowClamp is not supported for {network} transport yet"
+        )));
+    }
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    if configure_window_clamp {
+        return Err(Error::InvalidConfig(
+            "tcpWindowClamp is currently supported only on Linux and Android".into(),
+        ));
+    }
+
     let user_timeout_ms = stream_settings
         .sockopt
         .as_ref()
@@ -514,6 +536,14 @@ pub(super) fn apply_security_layers(
     let protocol = if configure_user_timeout {
         ServerProxyConfig::TcpUserTimeout {
             timeout_ms: user_timeout_ms,
+            inner: Box::new(protocol),
+        }
+    } else {
+        protocol
+    };
+    let protocol = if configure_window_clamp {
+        ServerProxyConfig::TcpWindowClamp {
+            value: window_clamp,
             inner: Box::new(protocol),
         }
     } else {

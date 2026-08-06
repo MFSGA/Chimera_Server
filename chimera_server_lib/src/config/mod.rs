@@ -90,6 +90,8 @@ pub struct SocketSettings {
     tcp_user_timeout: i32,
     #[serde(default)]
     tcp_congestion: String,
+    #[serde(default)]
+    tcp_window_clamp: i32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

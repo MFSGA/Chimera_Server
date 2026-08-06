@@ -34,6 +34,7 @@ use crate::{
     handler::tcp_congestion::TcpCongestionServerHandler,
     handler::tcp_keepalive::TcpKeepAliveServerHandler,
     handler::tcp_user_timeout::TcpUserTimeoutServerHandler,
+    handler::tcp_window_clamp::TcpWindowClampServerHandler,
 };
 
 use super::tcp_handler::TcpServerHandler;
@@ -73,6 +74,10 @@ pub fn create_tcp_server_handler(
         ServerProxyConfig::TcpCongestion { algorithm, inner } => {
             let inner = create_tcp_server_handler(*inner, inbound_tag, rules_stack)?;
             Ok(Box::new(TcpCongestionServerHandler::new(algorithm, inner)))
+        }
+        ServerProxyConfig::TcpWindowClamp { value, inner } => {
+            let inner = create_tcp_server_handler(*inner, inbound_tag, rules_stack)?;
+            Ok(Box::new(TcpWindowClampServerHandler::new(value, inner)))
         }
         #[cfg(feature = "vless")]
         ServerProxyConfig::Vless { users, fallbacks } => {

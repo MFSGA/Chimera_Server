@@ -78,6 +78,14 @@ pub fn configure_tcp_user_timeout(
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
+pub fn configure_tcp_window_clamp(
+    fd: std::os::fd::RawFd,
+    value: i32,
+) -> std::io::Result<()> {
+    set_socket_option_int(fd, libc::IPPROTO_TCP, libc::TCP_WINDOW_CLAMP, value)
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
 pub fn configure_tcp_congestion(
     fd: std::os::fd::RawFd,
     algorithm: &str,
