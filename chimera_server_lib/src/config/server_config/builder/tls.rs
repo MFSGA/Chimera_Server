@@ -291,7 +291,14 @@ pub(super) fn apply_security_layers(
     if configure_transparent
         && !matches!(
             network.as_str(),
-            "" | "raw" | "tcp" | "ws" | "websocket" | "httpupgrade" | "grpc"
+            "" | "raw"
+                | "tcp"
+                | "ws"
+                | "websocket"
+                | "httpupgrade"
+                | "grpc"
+                | "xhttp"
+                | "splithttp"
         )
     {
         return Err(Error::InvalidConfig(format!(

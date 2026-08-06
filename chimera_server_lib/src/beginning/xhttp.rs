@@ -191,6 +191,7 @@ pub async fn start_xhttp_server(
         bind_mark,
         tcp_mptcp,
         custom_sockopt,
+        transparent,
     } = parse_listener_protocol(protocol)?;
 
     let bind_addr = match bind_location {
@@ -213,10 +214,13 @@ pub async fn start_xhttp_server(
             bind_addr,
             tls_config.clone(),
             state,
-            ipv6_only,
-            bind_interface,
-            bind_mark,
-            custom_sockopt,
+            Xhttp3ListenerOptions {
+                ipv6_only,
+                bind_interface,
+                bind_mark,
+                custom_sockopt,
+                transparent,
+            },
         )
         .await;
     }
@@ -244,6 +248,10 @@ pub async fn start_xhttp_server(
         if bind_addr.is_ipv6() { "tcp6" } else { "tcp4" },
         &custom_sockopt,
     )?;
+    #[cfg(target_os = "linux")]
+    if transparent {
+        crate::util::socket::configure_ip_transparent(socket.as_raw_fd())?;
+    }
     socket.bind(bind_addr)?;
     let listener = socket.listen(1024)?;
     let security = security.clone();
@@ -345,15 +353,28 @@ pub async fn start_xhttp_server(
 }
 
 #[cfg(feature = "tls")]
-async fn start_xhttp3_server(
-    bind_addr: std::net::SocketAddr,
-    tls_config: Arc<tokio_rustls::rustls::ServerConfig>,
-    state: Arc<AppState>,
+struct Xhttp3ListenerOptions {
     ipv6_only: bool,
     bind_interface: Option<String>,
     bind_mark: Option<i32>,
     custom_sockopt: Vec<crate::config::CustomSockoptConfig>,
+    transparent: bool,
+}
+
+#[cfg(feature = "tls")]
+async fn start_xhttp3_server(
+    bind_addr: std::net::SocketAddr,
+    tls_config: Arc<tokio_rustls::rustls::ServerConfig>,
+    state: Arc<AppState>,
+    options: Xhttp3ListenerOptions,
 ) -> std::io::Result<Vec<tokio::task::JoinHandle<()>>> {
+    let Xhttp3ListenerOptions {
+        ipv6_only,
+        bind_interface,
+        bind_mark,
+        custom_sockopt,
+        transparent,
+    } = options;
     let quic_crypto: quinn::crypto::rustls::QuicServerConfig =
         tls_config.try_into().map_err(std::io::Error::other)?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
@@ -389,6 +410,10 @@ async fn start_xhttp3_server(
         if bind_addr.is_ipv6() { "udp6" } else { "udp4" },
         &custom_sockopt,
     )?;
+    #[cfg(target_os = "linux")]
+    if transparent {
+        crate::util::socket::configure_ip_transparent(socket.as_raw_fd())?;
+    }
     if ipv6_only {
         socket.set_only_v6(true)?;
     }
@@ -520,6 +545,7 @@ struct XhttpListenerConfig {
     bind_mark: Option<i32>,
     tcp_mptcp: bool,
     custom_sockopt: Vec<crate::config::CustomSockoptConfig>,
+    transparent: bool,
 }
 
 #[derive(Clone)]
@@ -649,6 +675,11 @@ fn parse_listener_protocol(
     protocol: ServerProxyConfig,
 ) -> std::io::Result<XhttpListenerConfig> {
     match protocol {
+        ServerProxyConfig::TransparentSocket { inner } => {
+            let mut config = parse_listener_protocol(*inner)?;
+            config.transparent = true;
+            Ok(config)
+        }
         ServerProxyConfig::CustomSockopt { options, inner } => {
             let mut config = parse_listener_protocol(*inner)?;
             config.custom_sockopt = options;
@@ -785,6 +816,7 @@ fn parse_listener_protocol(
             bind_mark: None,
             tcp_mptcp: false,
             custom_sockopt: Vec::new(),
+            transparent: false,
         }),
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(TlsServerConfig {
@@ -856,6 +888,7 @@ fn parse_listener_protocol(
                     bind_mark: None,
                     tcp_mptcp: false,
                     custom_sockopt: Vec::new(),
+                    transparent: false,
                 })
             }
             _ => Err(std::io::Error::other(
@@ -882,6 +915,7 @@ fn parse_listener_protocol(
                         bind_mark: None,
                         tcp_mptcp: false,
                         custom_sockopt: Vec::new(),
+                        transparent: false,
                     })
                 }
                 _ => Err(std::io::Error::other(
