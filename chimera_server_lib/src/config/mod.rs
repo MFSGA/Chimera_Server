@@ -86,6 +86,23 @@ pub(super) enum TcpFastOpenValue {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CustomSockoptConfig {
+    #[serde(default)]
+    pub system: String,
+    #[serde(default)]
+    pub network: String,
+    #[serde(default)]
+    pub level: String,
+    #[serde(default)]
+    pub opt: String,
+    #[serde(default)]
+    pub value: String,
+    #[serde(default, rename = "type")]
+    pub value_type: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SocketSettings {
     #[serde(default)]
     accept_proxy_protocol: bool,
@@ -109,6 +126,8 @@ pub struct SocketSettings {
     interface: String,
     #[serde(default)]
     mark: i32,
+    #[serde(default)]
+    custom_sockopt: Vec<CustomSockoptConfig>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

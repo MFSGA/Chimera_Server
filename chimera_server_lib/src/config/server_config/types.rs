@@ -479,6 +479,10 @@ pub enum ServerProxyConfig {
         value: i32,
         inner: Box<ServerProxyConfig>,
     },
+    CustomSockopt {
+        options: Vec<crate::config::CustomSockoptConfig>,
+        inner: Box<ServerProxyConfig>,
+    },
     #[cfg(feature = "tls")]
     Tls(TlsServerConfig),
     #[cfg(feature = "reality")]
@@ -550,6 +554,7 @@ impl std::fmt::Display for ServerProxyConfig {
                 Self::TcpFastOpen { .. } => "TcpFastOpen",
                 Self::BindInterface { .. } => "BindInterface",
                 Self::BindMark { .. } => "BindMark",
+                Self::CustomSockopt { .. } => "CustomSockopt",
                 #[cfg(feature = "reality")]
                 Self::Reality(_) => "Reality",
                 #[cfg(feature = "tls")]

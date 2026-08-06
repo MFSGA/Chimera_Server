@@ -1660,6 +1660,48 @@ mod tests {
         assert!(matches!(*inner, ServerProxyConfig::Vless { .. }));
     }
 
+    #[cfg(all(feature = "vless", target_os = "linux"))]
+    #[test]
+    fn custom_sockopt_wraps_tcp_listener() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-custom-sockopt",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "sockopt": {
+                    "customSockopt": [{
+                        "system": "linux",
+                        "network": "tcp",
+                        "level": "1",
+                        "opt": "2",
+                        "value": "1",
+                        "type": "int"
+                    }]
+                }
+            }
+        }))
+        .unwrap();
+        let config = ServerConfig::try_from(inbound).unwrap();
+        let ServerProxyConfig::CustomSockopt { options, inner } = config.protocol
+        else {
+            panic!("customSockopt must wrap the TCP listener");
+        };
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].system, "linux");
+        assert_eq!(options[0].network, "tcp");
+        assert_eq!(options[0].level, "1");
+        assert_eq!(options[0].opt, "2");
+        assert_eq!(options[0].value, "1");
+        assert_eq!(options[0].value_type, "int");
+        assert!(matches!(*inner, ServerProxyConfig::Vless { .. }));
+    }
+
     #[cfg(feature = "vless")]
     #[test]
     fn socket_zero_mark_is_ignored() {

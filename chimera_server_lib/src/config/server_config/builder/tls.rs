@@ -282,6 +282,27 @@ pub(super) fn apply_security_layers(
     }?;
 
     let network = stream_settings.network.trim().to_ascii_lowercase();
+    let custom_sockopt = stream_settings
+        .sockopt
+        .as_ref()
+        .map_or_else(Vec::new, |settings| settings.custom_sockopt.clone());
+    if !custom_sockopt.is_empty()
+        && !matches!(
+            network.as_str(),
+            "" | "raw" | "tcp" | "ws" | "websocket" | "httpupgrade"
+        )
+    {
+        return Err(Error::InvalidConfig(format!(
+            "customSockopt is not supported for {network} transport yet"
+        )));
+    }
+    #[cfg(not(target_os = "linux"))]
+    if !custom_sockopt.is_empty() {
+        return Err(Error::InvalidConfig(
+            "customSockopt is currently supported only on Linux".into(),
+        ));
+    }
+
     let mark = stream_settings
         .sockopt
         .as_ref()
@@ -810,6 +831,14 @@ pub(super) fn apply_security_layers(
         }
     } else {
         protocol
+    };
+    let protocol = if custom_sockopt.is_empty() {
+        protocol
+    } else {
+        ServerProxyConfig::CustomSockopt {
+            options: custom_sockopt,
+            inner: Box::new(protocol),
+        }
     };
     if configure_bind_interface {
         Ok(ServerProxyConfig::BindInterface {

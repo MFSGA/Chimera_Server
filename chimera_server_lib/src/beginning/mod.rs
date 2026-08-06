@@ -157,7 +157,8 @@ fn is_grpc_server_protocol(protocol: &ServerProxyConfig) -> bool {
         | ServerProxyConfig::Ipv6Only { inner }
         | ServerProxyConfig::TcpFastOpen { inner, .. }
         | ServerProxyConfig::BindInterface { inner, .. }
-        | ServerProxyConfig::BindMark { inner, .. } => {
+        | ServerProxyConfig::BindMark { inner, .. }
+        | ServerProxyConfig::CustomSockopt { inner, .. } => {
             is_grpc_server_protocol(inner)
         }
         #[cfg(feature = "tls")]
@@ -184,7 +185,8 @@ fn is_xhttp_server_protocol(protocol: &ServerProxyConfig) -> bool {
         | ServerProxyConfig::Ipv6Only { inner }
         | ServerProxyConfig::TcpFastOpen { inner, .. }
         | ServerProxyConfig::BindInterface { inner, .. }
-        | ServerProxyConfig::BindMark { inner, .. } => {
+        | ServerProxyConfig::BindMark { inner, .. }
+        | ServerProxyConfig::CustomSockopt { inner, .. } => {
             is_xhttp_server_protocol(inner)
         }
         #[cfg(feature = "tls")]
@@ -224,6 +226,7 @@ async fn start_tcp_server_with_runtime(
     let mut protocol = Some(protocol);
     let mut bind_interface = None;
     let mut mark = None;
+    let mut custom_sockopt = Vec::new();
     let mut tcp_fast_open = None;
     let mut tcp_max_seg = None;
     let mut ipv6_only = false;
@@ -235,6 +238,10 @@ async fn start_tcp_server_with_runtime(
             }
             ServerProxyConfig::BindMark { value, inner } => {
                 mark = Some(value);
+                protocol = Some(*inner);
+            }
+            ServerProxyConfig::CustomSockopt { options, inner } => {
+                custom_sockopt = options;
                 protocol = Some(*inner);
             }
             ServerProxyConfig::TcpFastOpen { value, inner } => {
@@ -285,6 +292,16 @@ async fn start_tcp_server_with_runtime(
             if let Some(value) = tcp_max_seg {
                 crate::handler::tcp_max_seg::configure_listener(&socket, value)?;
             }
+            #[cfg(target_os = "linux")]
+            crate::util::socket::configure_custom_sockopt(
+                socket.as_raw_fd(),
+                if socket_addr.is_ipv6() {
+                    "tcp6"
+                } else {
+                    "tcp4"
+                },
+                &custom_sockopt,
+            )?;
             socket.bind(socket_addr)?;
             socket.listen(1024)?
         }

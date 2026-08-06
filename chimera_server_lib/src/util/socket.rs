@@ -94,6 +94,79 @@ pub fn configure_socket_mark(
     set_socket_option_int(fd, libc::SOL_SOCKET, libc::SO_MARK, value)
 }
 
+#[cfg(target_os = "linux")]
+pub fn configure_custom_sockopt(
+    fd: std::os::fd::RawFd,
+    network: &str,
+    options: &[crate::config::CustomSockoptConfig],
+) -> std::io::Result<()> {
+    for option in options {
+        if !option.system.is_empty() && option.system != "linux" {
+            continue;
+        }
+        if !network.starts_with(&option.network) {
+            continue;
+        }
+        if option.opt.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "customSockopt.opt must not be empty",
+            ));
+        }
+        let level = if option.level.is_empty() {
+            libc::IPPROTO_TCP
+        } else {
+            option.level.parse::<libc::c_int>().map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid customSockopt.level: {error}"),
+                )
+            })?
+        };
+        let opt = option.opt.parse::<libc::c_int>().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid customSockopt.opt: {error}"),
+            )
+        })?;
+        match option.value_type.as_str() {
+            "int" => {
+                let value =
+                    option.value.parse::<libc::c_int>().map_err(|error| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("invalid customSockopt integer value: {error}"),
+                        )
+                    })?;
+                set_socket_option_int(fd, level, opt, value)?;
+            }
+            "str" => {
+                // SAFETY: `fd` is borrowed for this call and `value` remains
+                // alive for the complete duration of `setsockopt`.
+                let result = unsafe {
+                    libc::setsockopt(
+                        fd,
+                        level,
+                        opt,
+                        option.value.as_ptr().cast(),
+                        option.value.len() as libc::socklen_t,
+                    )
+                };
+                if result == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unknown customSockopt type: {other}"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn configure_tcp_fast_open(
     fd: std::os::fd::RawFd,
     value: i32,
@@ -411,6 +484,71 @@ fn socket_addr_from_v6(address: &libc::sockaddr_in6) -> SocketAddr {
         address.sin6_flowinfo,
         address.sin6_scope_id,
     ))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod custom_sockopt_tests {
+    use std::os::fd::AsRawFd;
+
+    use super::*;
+
+    fn socket_option_int(
+        fd: RawFd,
+        level: libc::c_int,
+        option: libc::c_int,
+    ) -> io::Result<i32> {
+        let mut value = 0;
+        let mut length = mem::size_of_val(&value) as libc::socklen_t;
+        // SAFETY: `value` and `length` are valid writable getsockopt buffers.
+        let result = unsafe {
+            libc::getsockopt(
+                fd,
+                level,
+                option,
+                ptr::from_mut(&mut value).cast(),
+                &mut length,
+            )
+        };
+        if result == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(value)
+    }
+
+    #[test]
+    fn applies_matching_integer_option_and_skips_other_networks() {
+        let socket =
+            Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        let options = [
+            crate::config::CustomSockoptConfig {
+                system: "linux".into(),
+                network: "udp".into(),
+                level: libc::SOL_SOCKET.to_string(),
+                opt: libc::SO_REUSEADDR.to_string(),
+                value: "0".into(),
+                value_type: "int".into(),
+            },
+            crate::config::CustomSockoptConfig {
+                system: "linux".into(),
+                network: "tcp".into(),
+                level: libc::SOL_SOCKET.to_string(),
+                opt: libc::SO_REUSEADDR.to_string(),
+                value: "1".into(),
+                value_type: "int".into(),
+            },
+        ];
+
+        configure_custom_sockopt(socket.as_raw_fd(), "tcp4", &options).unwrap();
+        assert_eq!(
+            socket_option_int(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR
+            )
+            .unwrap(),
+            1,
+        );
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
