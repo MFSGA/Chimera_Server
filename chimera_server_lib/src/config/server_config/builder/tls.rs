@@ -307,7 +307,7 @@ pub(super) fn apply_security_layers(
     if tcp_fast_open.is_some()
         && !matches!(
             network.as_str(),
-            "" | "raw" | "tcp" | "ws" | "websocket" | "httpupgrade"
+            "" | "raw" | "tcp" | "ws" | "websocket" | "httpupgrade" | "grpc"
         )
     {
         return Err(Error::InvalidConfig(format!(

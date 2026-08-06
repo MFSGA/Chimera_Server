@@ -332,6 +332,7 @@ struct GrpcListenerConfig {
     tcp_window_clamp: Option<i32>,
     tcp_max_seg: Option<i32>,
     ipv6_only: bool,
+    tcp_fast_open: Option<i32>,
 }
 
 pub(super) async fn start_grpc_server(
@@ -355,6 +356,7 @@ pub(super) async fn start_grpc_server(
         tcp_window_clamp,
         tcp_max_seg,
         ipv6_only,
+        tcp_fast_open,
     } = parse_listener_protocol(protocol)?;
     let mut rules_stack = Vec::new();
     let server_handler: Arc<Box<dyn TcpServerHandler>> = Arc::new(
@@ -365,6 +367,9 @@ pub(super) async fn start_grpc_server(
         BindLocation::Address(location) => location.to_socket_addr()?,
     };
     let socket = crate::util::socket::new_tcp_socket(None, listen_addr.is_ipv6())?;
+    if let Some(value) = tcp_fast_open {
+        crate::handler::tcp_fast_open::configure_listener(&socket, value)?;
+    }
     if ipv6_only {
         crate::handler::ipv6_only::configure_listener(&socket)?;
     }
@@ -615,6 +620,11 @@ fn parse_listener_protocol(
     protocol: ServerProxyConfig,
 ) -> io::Result<GrpcListenerConfig> {
     match protocol {
+        ServerProxyConfig::TcpFastOpen { value, inner } => {
+            let mut config = parse_listener_protocol(*inner)?;
+            config.tcp_fast_open = Some(value);
+            Ok(config)
+        }
         ServerProxyConfig::Ipv6Only { inner } => {
             let mut config = parse_listener_protocol(*inner)?;
             config.ipv6_only = true;
@@ -667,6 +677,7 @@ fn parse_listener_protocol(
                 tcp_window_clamp: None,
                 tcp_max_seg: None,
                 ipv6_only: false,
+                tcp_fast_open: None,
             })
         }
         #[cfg(feature = "tls")]
@@ -729,6 +740,7 @@ fn parse_listener_protocol(
                 tcp_window_clamp: None,
                 tcp_max_seg: None,
                 ipv6_only: false,
+                tcp_fast_open: None,
             })
         }
         #[cfg(feature = "reality")]
@@ -753,6 +765,7 @@ fn parse_listener_protocol(
                 tcp_window_clamp: None,
                 tcp_max_seg: None,
                 ipv6_only: false,
+                tcp_fast_open: None,
             })
         }
         other => Err(io::Error::new(
