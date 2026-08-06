@@ -287,7 +287,14 @@ pub(super) fn apply_security_layers(
     {
         if !matches!(
             network.as_str(),
-            "" | "raw" | "tcp" | "ws" | "websocket" | "httpupgrade" | "grpc"
+            "" | "raw"
+                | "tcp"
+                | "ws"
+                | "websocket"
+                | "httpupgrade"
+                | "grpc"
+                | "xhttp"
+                | "splithttp"
         ) {
             return Err(Error::InvalidConfig(format!(
                 "sockopt.acceptProxyProtocol is not supported for {network} transport yet"
@@ -324,6 +331,21 @@ pub(super) fn apply_security_layers(
             .is_some_and(|settings| settings.accept_proxy_protocol)
     {
         accept_proxy_protocol = true;
+    }
+
+    if accept_proxy_protocol
+        && matches!(network.as_str(), "xhttp" | "splithttp")
+        && stream_settings
+            .tls_settings
+            .as_ref()
+            .is_some_and(|settings| {
+                settings.alpn.len() == 1
+                    && settings.alpn[0].eq_ignore_ascii_case("h3")
+            })
+    {
+        return Err(Error::InvalidConfig(
+            "XHTTP HTTP/3 does not support TCP PROXY protocol".into(),
+        ));
     }
 
     if accept_proxy_protocol {

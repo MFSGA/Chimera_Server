@@ -162,6 +162,9 @@ fn is_grpc_server_protocol(protocol: &ServerProxyConfig) -> bool {
 fn is_xhttp_server_protocol(protocol: &ServerProxyConfig) -> bool {
     match protocol {
         ServerProxyConfig::Xhttp { .. } => true,
+        ServerProxyConfig::ProxyProtocol { inner } => {
+            is_xhttp_server_protocol(inner)
+        }
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(tls_config) => {
             matches!(tls_config.inner.as_ref(), ServerProxyConfig::Xhttp { .. })

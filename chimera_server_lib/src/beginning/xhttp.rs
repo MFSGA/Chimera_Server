@@ -30,7 +30,7 @@ use rand::RngExt as _;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex},
     sync::Mutex,
-    time::{Duration, sleep},
+    time::{Duration, sleep, timeout},
 };
 #[cfg(feature = "tls")]
 use tokio_rustls::TlsAcceptor;
@@ -45,8 +45,12 @@ use crate::{
         XhttpPaddingMethod, XhttpPaddingPlacement, XhttpPlacement,
         XhttpServerConfig,
     },
-    handler::tcp::{
-        tcp_handler::TcpServerHandler, tcp_handler_util::create_tcp_server_handler,
+    handler::{
+        proxy_protocol::read_proxy_header,
+        tcp::{
+            tcp_handler::TcpServerHandler,
+            tcp_handler_util::create_tcp_server_handler,
+        },
     },
     resolver::Resolver,
     runtime::RuntimeState,
@@ -195,6 +199,7 @@ pub async fn start_xhttp_server(
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     let security = listener_config.security.clone();
+    let accept_proxy_protocol = listener_config.accept_proxy_protocol;
 
     let handle = tokio::spawn(async move {
         loop {
@@ -212,6 +217,21 @@ pub async fn start_xhttp_server(
             tokio::spawn(async move {
                 #[cfg(feature = "reality")]
                 let reality_resolver = state.resolver.clone();
+                let mut stream = stream;
+                let peer_addr = match resolve_xhttp_peer_addr(
+                    &mut stream,
+                    peer_addr,
+                    accept_proxy_protocol,
+                    state.runtime.policy_handshake_timeout(0),
+                )
+                .await
+                {
+                    Ok(peer_addr) => peer_addr,
+                    Err(err) => {
+                        debug!("xhttp PROXY protocol handshake failed: {err}");
+                        return;
+                    }
+                };
                 let stream: Box<dyn AsyncStream> = Box::new(stream);
                 let wrapped_stream: std::io::Result<Box<dyn AsyncStream>> =
                     match security {
@@ -398,6 +418,7 @@ struct XhttpListenerConfig {
     xhttp_config: XhttpServerConfig,
     inner: ServerProxyConfig,
     security: XhttpSecurityLayer,
+    accept_proxy_protocol: bool,
 }
 
 #[derive(Clone)]
@@ -411,14 +432,48 @@ enum XhttpSecurityLayer {
     Reality(RealityTransportConfig),
 }
 
+async fn resolve_xhttp_peer_addr<S>(
+    stream: &mut S,
+    socket_peer_addr: std::net::SocketAddr,
+    accept_proxy_protocol: bool,
+    handshake_timeout: Duration,
+) -> std::io::Result<std::net::SocketAddr>
+where
+    S: AsyncRead + Unpin,
+{
+    if !accept_proxy_protocol {
+        return Ok(socket_peer_addr);
+    }
+    match timeout(handshake_timeout, read_proxy_header(stream)).await {
+        Ok(result) => Ok(result?.unwrap_or(socket_peer_addr)),
+        Err(error) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("PROXY protocol handshake timed out: {error}"),
+        )),
+    }
+}
+
 fn parse_listener_protocol(
     protocol: ServerProxyConfig,
 ) -> std::io::Result<XhttpListenerConfig> {
     match protocol {
+        ServerProxyConfig::ProxyProtocol { inner } => {
+            let mut config = parse_listener_protocol(*inner)?;
+            #[cfg(feature = "tls")]
+            if matches!(&config.security, XhttpSecurityLayer::Http3(_)) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "XHTTP HTTP/3 does not support TCP PROXY protocol",
+                ));
+            }
+            config.accept_proxy_protocol = true;
+            Ok(config)
+        }
         ServerProxyConfig::Xhttp { config, inner } => Ok(XhttpListenerConfig {
             xhttp_config: config,
             inner: *inner,
             security: XhttpSecurityLayer::None,
+            accept_proxy_protocol: false,
         }),
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(TlsServerConfig {
@@ -478,6 +533,7 @@ fn parse_listener_protocol(
                     xhttp_config: config,
                     inner: *inner,
                     security,
+                    accept_proxy_protocol: false,
                 })
             }
             _ => Err(std::io::Error::other(
@@ -492,6 +548,7 @@ fn parse_listener_protocol(
                         xhttp_config: config.clone(),
                         inner: (**inner).clone(),
                         security: XhttpSecurityLayer::Reality(reality_config),
+                        accept_proxy_protocol: false,
                     })
                 }
                 _ => Err(std::io::Error::other(
@@ -1820,7 +1877,33 @@ fn generate_padding(method: XhttpPaddingMethod, target_length: usize) -> String 
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use super::*;
+
+    #[tokio::test]
+    async fn proxy_protocol_replaces_xhttp_peer_before_http() {
+        let (mut client, mut server) = duplex(1024);
+        let request = b"GET /xhttp/ HTTP/1.1\r\nHost: example.test\r\n\r\n";
+        client
+            .write_all(
+                b"PROXY TCP4 203.0.113.8 192.0.2.1 5678 443\r\nGET /xhttp/ HTTP/1.1\r\nHost: example.test\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let peer_addr = resolve_xhttp_peer_addr(
+            &mut server,
+            "127.0.0.1:12345".parse().unwrap(),
+            true,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(peer_addr, "203.0.113.8:5678".parse().unwrap());
+        let mut remaining = vec![0u8; request.len()];
+        server.read_exact(&mut remaining).await.unwrap();
+        assert_eq!(remaining, request);
+    }
 
     #[test]
     fn hpack_huffman_length_matches_known_ascii_codes() {
