@@ -182,6 +182,7 @@ pub async fn start_xhttp_server(
         accept_proxy_protocol,
         tcp_keepalive,
         tcp_user_timeout_ms,
+        tcp_congestion,
     } = parse_listener_protocol(protocol)?;
 
     let bind_addr = match bind_location {
@@ -219,10 +220,18 @@ pub async fn start_xhttp_server(
 
             let state = state.clone();
             let security = security.clone();
+            let tcp_congestion = tcp_congestion.clone();
             tokio::spawn(async move {
                 #[cfg(feature = "reality")]
                 let reality_resolver = state.resolver.clone();
                 let mut stream = stream;
+                if let Err(error) = configure_xhttp_tcp_congestion(
+                    &stream,
+                    tcp_congestion.as_deref(),
+                ) {
+                    debug!("xhttp TCP_CONGESTION setup failed: {error}");
+                    return;
+                }
                 if let Err(error) =
                     configure_xhttp_tcp_user_timeout(&stream, tcp_user_timeout_ms)
                 {
@@ -438,6 +447,7 @@ struct XhttpListenerConfig {
     accept_proxy_protocol: bool,
     tcp_keepalive: Option<(i32, i32)>,
     tcp_user_timeout_ms: Option<i32>,
+    tcp_congestion: Option<String>,
 }
 
 #[derive(Clone)]
@@ -449,6 +459,27 @@ enum XhttpSecurityLayer {
     Http3(Arc<tokio_rustls::rustls::ServerConfig>),
     #[cfg(feature = "reality")]
     Reality(RealityTransportConfig),
+}
+
+fn configure_xhttp_tcp_congestion(
+    stream: &tokio::net::TcpStream,
+    algorithm: Option<&str>,
+) -> std::io::Result<()> {
+    let Some(algorithm) = algorithm else {
+        return Ok(());
+    };
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    {
+        crate::util::socket::configure_tcp_congestion(stream.as_raw_fd(), algorithm)
+    }
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    {
+        let _ = (stream, algorithm);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "tcpCongestion is currently supported only on Linux and Android",
+        ))
+    }
 }
 
 fn configure_xhttp_tcp_user_timeout(
@@ -525,6 +556,18 @@ fn parse_listener_protocol(
     protocol: ServerProxyConfig,
 ) -> std::io::Result<XhttpListenerConfig> {
     match protocol {
+        ServerProxyConfig::TcpCongestion { algorithm, inner } => {
+            let mut config = parse_listener_protocol(*inner)?;
+            #[cfg(feature = "tls")]
+            if matches!(&config.security, XhttpSecurityLayer::Http3(_)) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "XHTTP HTTP/3 does not support tcpCongestion",
+                ));
+            }
+            config.tcp_congestion = Some(algorithm);
+            Ok(config)
+        }
         ServerProxyConfig::TcpUserTimeout { timeout_ms, inner } => {
             let mut config = parse_listener_protocol(*inner)?;
             #[cfg(feature = "tls")]
@@ -572,6 +615,7 @@ fn parse_listener_protocol(
             accept_proxy_protocol: false,
             tcp_keepalive: None,
             tcp_user_timeout_ms: None,
+            tcp_congestion: None,
         }),
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(TlsServerConfig {
@@ -634,6 +678,7 @@ fn parse_listener_protocol(
                     accept_proxy_protocol: false,
                     tcp_keepalive: None,
                     tcp_user_timeout_ms: None,
+                    tcp_congestion: None,
                 })
             }
             _ => Err(std::io::Error::other(
@@ -651,6 +696,7 @@ fn parse_listener_protocol(
                         accept_proxy_protocol: false,
                         tcp_keepalive: None,
                         tcp_user_timeout_ms: None,
+                        tcp_congestion: None,
                     })
                 }
                 _ => Err(std::io::Error::other(

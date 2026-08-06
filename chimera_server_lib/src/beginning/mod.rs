@@ -169,7 +169,8 @@ fn is_xhttp_server_protocol(protocol: &ServerProxyConfig) -> bool {
         ServerProxyConfig::Xhttp { .. } => true,
         ServerProxyConfig::ProxyProtocol { inner }
         | ServerProxyConfig::TcpKeepAlive { inner, .. }
-        | ServerProxyConfig::TcpUserTimeout { inner, .. } => {
+        | ServerProxyConfig::TcpUserTimeout { inner, .. }
+        | ServerProxyConfig::TcpCongestion { inner, .. } => {
             is_xhttp_server_protocol(inner)
         }
         #[cfg(feature = "tls")]
