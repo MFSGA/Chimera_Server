@@ -16,6 +16,8 @@ use crate::config::server_config::HttpUser;
 use crate::config::server_config::Hysteria2Client;
 #[cfg(feature = "reality")]
 use crate::config::server_config::RealityTransportConfig;
+#[cfg(feature = "shadowsocks")]
+use crate::config::server_config::ShadowsocksUser;
 #[cfg(feature = "tls")]
 use crate::config::server_config::TlsServerConfig;
 #[cfg(feature = "trojan")]
@@ -80,6 +82,12 @@ const TYPE_PROXY_SHADOWSOCKS_CLIENT_CONFIG: &str =
 #[cfg(feature = "shadowsocks")]
 const TYPE_PROXY_SHADOWSOCKS_CLIENT_CONFIG_V2RAY: &str =
     "v2ray.core.proxy.shadowsocks.ClientConfig";
+#[cfg(feature = "shadowsocks")]
+const TYPE_PROXY_SHADOWSOCKS_SERVER_CONFIG: &str =
+    "xray.proxy.shadowsocks.ServerConfig";
+#[cfg(feature = "shadowsocks")]
+const TYPE_PROXY_SHADOWSOCKS_SERVER_CONFIG_V2RAY: &str =
+    "v2ray.core.proxy.shadowsocks.ServerConfig";
 #[cfg(feature = "shadowsocks")]
 const TYPE_PROXY_SHADOWSOCKS_ACCOUNT: &str = "xray.proxy.shadowsocks.Account";
 #[cfg(feature = "shadowsocks")]
@@ -301,6 +309,15 @@ struct ShadowsocksAccountPayload {
 struct ShadowsocksClientConfigPayload {
     #[prost(message, optional, tag = "1")]
     server: Option<SocksServerEndpointPayload>,
+}
+
+#[cfg(feature = "shadowsocks")]
+#[derive(Clone, PartialEq, Message)]
+struct ShadowsocksServerConfigPayload {
+    #[prost(message, repeated, tag = "1")]
+    users: Vec<proto::xray::common::protocol::User>,
+    #[prost(enumeration = "proto::xray::common::net::Network", repeated, tag = "2")]
+    network: Vec<i32>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1030,6 +1047,7 @@ impl HandlerServiceImpl {
         let proxy_settings = inbound.proxy_settings.as_ref().ok_or_else(|| {
             Status::invalid_argument("inbound.proxy_settings is required")
         })?;
+        let transport = self.parse_add_inbound_transport(proxy_settings)?;
         let mut protocol = self.parse_add_inbound_protocol(proxy_settings)?;
         if let Some(stream_settings) = receiver.stream_settings {
             protocol =
@@ -1040,9 +1058,57 @@ impl HandlerServiceImpl {
             tag: inbound.tag,
             bind_location: BindLocation::Address(NetLocation::new(address, port)),
             protocol,
-            transport: Transport::Tcp,
+            transport,
             quic_settings: None,
         })
+    }
+
+    fn parse_add_inbound_transport(
+        &self,
+        proxy_settings: &proto::xray::common::serial::TypedMessage,
+    ) -> Result<Transport, Status> {
+        match Self::parse_typed_message_type(proxy_settings) {
+            #[cfg(feature = "shadowsocks")]
+            TYPE_PROXY_SHADOWSOCKS_SERVER_CONFIG
+            | TYPE_PROXY_SHADOWSOCKS_SERVER_CONFIG_V2RAY => {
+                let config = self
+                    .decode_typed_message::<ShadowsocksServerConfigPayload>(
+                        proxy_settings,
+                        &[
+                            TYPE_PROXY_SHADOWSOCKS_SERVER_CONFIG,
+                            TYPE_PROXY_SHADOWSOCKS_SERVER_CONFIG_V2RAY,
+                        ],
+                        "inbound proxy settings",
+                    )?;
+                if config.network.is_empty() {
+                    return Ok(Transport::Tcp);
+                }
+                let mut tcp = false;
+                let mut udp = false;
+                for network in config.network {
+                    if network == proto::xray::common::net::Network::Tcp as i32 {
+                        tcp = true;
+                    } else if network
+                        == proto::xray::common::net::Network::Udp as i32
+                    {
+                        udp = true;
+                    } else {
+                        return Err(Status::invalid_argument(format!(
+                            "unsupported Shadowsocks inbound network: {network}"
+                        )));
+                    }
+                }
+                match (tcp, udp) {
+                    (true, true) => Ok(Transport::TcpAndUdp),
+                    (true, false) => Ok(Transport::Tcp),
+                    (false, true) => Ok(Transport::Udp),
+                    (false, false) => Err(Status::invalid_argument(
+                        "Shadowsocks inbound network list is empty",
+                    )),
+                }
+            }
+            _ => Ok(Transport::Tcp),
+        }
     }
 
     fn parse_add_inbound_protocol(
@@ -1093,6 +1159,77 @@ impl HandlerServiceImpl {
                         follow_redirect: dokodemo.follow_redirect,
                         user_level: dokodemo.user_level,
                     },
+                })
+            }
+            #[cfg(feature = "shadowsocks")]
+            TYPE_PROXY_SHADOWSOCKS_SERVER_CONFIG
+            | TYPE_PROXY_SHADOWSOCKS_SERVER_CONFIG_V2RAY => {
+                let config = self
+                    .decode_typed_message::<ShadowsocksServerConfigPayload>(
+                        proxy_settings,
+                        &[
+                            TYPE_PROXY_SHADOWSOCKS_SERVER_CONFIG,
+                            TYPE_PROXY_SHADOWSOCKS_SERVER_CONFIG_V2RAY,
+                        ],
+                        "inbound proxy settings",
+                    )?;
+                if config.users.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "Shadowsocks inbound requires at least one user",
+                    ));
+                }
+                let users = config
+                    .users
+                    .into_iter()
+                    .map(|user| {
+                        let account = user.account.as_ref().ok_or_else(|| {
+                            Status::invalid_argument(
+                                "Shadowsocks inbound user account is required",
+                            )
+                        })?;
+                        let account = self
+                            .decode_typed_message::<ShadowsocksAccountPayload>(
+                                account,
+                                &[
+                                    TYPE_PROXY_SHADOWSOCKS_ACCOUNT,
+                                    TYPE_PROXY_SHADOWSOCKS_ACCOUNT_V2RAY,
+                                ],
+                                "Shadowsocks inbound account",
+                            )?;
+                        if account.iv_check {
+                            return Err(Status::invalid_argument(
+                                "Shadowsocks inbound iv_check is not supported",
+                            ));
+                        }
+                        let method = match account.cipher_type {
+                            5 => "aes-128-gcm",
+                            6 => "aes-256-gcm",
+                            7 => "chacha20-ietf-poly1305",
+                            8 => "xchacha20-ietf-poly1305",
+                            other => {
+                                return Err(Status::invalid_argument(format!(
+                                    "unsupported Shadowsocks inbound cipher type: {other}"
+                                )));
+                            }
+                        };
+                        let user = ShadowsocksUser {
+                            method: method.to_string(),
+                            password: account.password,
+                            email: user.email,
+                            user_level: user.level,
+                        };
+                        crate::handler::shadowsocks::validate_user(&user)
+                            .map_err(|error| {
+                                Status::invalid_argument(format!(
+                                    "invalid Shadowsocks inbound user: {error}"
+                                ))
+                            })?;
+                        Ok(user)
+                    })
+                    .collect::<Result<Vec<_>, Status>>()?;
+                Ok(ServerProxyConfig::Shadowsocks {
+                    users,
+                    identity: None,
                 })
             }
             TYPE_PROXY_SOCKS_SERVER_CONFIG
@@ -2479,6 +2616,7 @@ impl HandlerServiceImpl {
     fn encode_user_manager_protocol(
         &self,
         protocol: &ServerProxyConfig,
+        transport: &Transport,
     ) -> Option<proto::xray::common::serial::TypedMessage> {
         match protocol {
             #[cfg(feature = "vless")]
@@ -2550,6 +2688,61 @@ impl HandlerServiceImpl {
                     },
                 ))
             }
+            #[cfg(feature = "shadowsocks")]
+            ServerProxyConfig::Shadowsocks { users, identity } => {
+                if identity.is_some()
+                    || users
+                        .iter()
+                        .any(|user| user.method.starts_with("2022-blake3-"))
+                {
+                    return None;
+                }
+                let users = users
+                    .iter()
+                    .map(|user| {
+                        let cipher_type = match user.method.as_str() {
+                            "aes-128-gcm" | "aead_aes_128_gcm" => 5,
+                            "aes-256-gcm" | "aead_aes_256_gcm" => 6,
+                            "chacha20-ietf-poly1305"
+                            | "chacha20-poly1305"
+                            | "aead_chacha20_poly1305" => 7,
+                            "xchacha20-ietf-poly1305"
+                            | "xchacha20-poly1305"
+                            | "aead_xchacha20_poly1305" => 8,
+                            _ => return None,
+                        };
+                        Some(proto::xray::common::protocol::User {
+                            level: user.user_level,
+                            email: user.email.clone(),
+                            account: Some(Self::typed_message(
+                                TYPE_PROXY_SHADOWSOCKS_ACCOUNT,
+                                ShadowsocksAccountPayload {
+                                    password: user.password.clone(),
+                                    cipher_type,
+                                    iv_check: false,
+                                },
+                            )),
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                let network = match transport {
+                    Transport::Tcp => {
+                        vec![proto::xray::common::net::Network::Tcp as i32]
+                    }
+                    Transport::Udp => {
+                        vec![proto::xray::common::net::Network::Udp as i32]
+                    }
+                    Transport::TcpAndUdp => vec![
+                        proto::xray::common::net::Network::Tcp as i32,
+                        proto::xray::common::net::Network::Udp as i32,
+                    ],
+                    Transport::Quic => return None,
+                };
+                Some(Self::typed_message(
+                    TYPE_PROXY_SHADOWSOCKS_SERVER_CONFIG,
+                    ShadowsocksServerConfigPayload { users, network },
+                ))
+            }
             ServerProxyConfig::Socks {
                 accounts,
                 user_level,
@@ -2596,8 +2789,8 @@ impl HandlerServiceImpl {
         &self,
         inbound: &ServerConfig,
     ) -> proto::xray::core::InboundHandlerConfig {
-        let (stream_settings, proxy_settings) =
-            self.encode_inbound_protocol_layers(&inbound.protocol);
+        let (stream_settings, proxy_settings) = self
+            .encode_inbound_protocol_layers(&inbound.protocol, &inbound.transport);
         proto::xray::core::InboundHandlerConfig {
             tag: inbound.tag.clone(),
             receiver_settings: Some(
@@ -2610,6 +2803,7 @@ impl HandlerServiceImpl {
     fn encode_inbound_protocol_layers(
         &self,
         protocol: &ServerProxyConfig,
+        transport: &Transport,
     ) -> (
         Option<StreamConfigPayload>,
         Option<proto::xray::common::serial::TypedMessage>,
@@ -2641,7 +2835,7 @@ impl HandlerServiceImpl {
                     },
                 );
                 let (mut stream_settings, proxy_settings) =
-                    self.encode_inbound_protocol_layers(&target.protocol);
+                    self.encode_inbound_protocol_layers(&target.protocol, transport);
                 let settings =
                     stream_settings.get_or_insert_with(|| StreamConfigPayload {
                         protocol_name: "websocket".to_string(),
@@ -2659,7 +2853,7 @@ impl HandlerServiceImpl {
             #[cfg(feature = "tls")]
             ServerProxyConfig::Tls(tls) => {
                 let (mut stream_settings, proxy_settings) =
-                    self.encode_inbound_protocol_layers(&tls.inner);
+                    self.encode_inbound_protocol_layers(&tls.inner, transport);
                 let settings =
                     stream_settings.get_or_insert_with(|| StreamConfigPayload {
                         protocol_name: "tcp".to_string(),
@@ -2695,7 +2889,7 @@ impl HandlerServiceImpl {
             #[cfg(feature = "reality")]
             ServerProxyConfig::Reality(reality) => {
                 let (mut stream_settings, proxy_settings) =
-                    self.encode_inbound_protocol_layers(&reality.inner);
+                    self.encode_inbound_protocol_layers(&reality.inner, transport);
                 let settings =
                     stream_settings.get_or_insert_with(|| StreamConfigPayload {
                         protocol_name: "tcp".to_string(),
@@ -2730,7 +2924,7 @@ impl HandlerServiceImpl {
             }
             ServerProxyConfig::Xhttp { inner, .. } => {
                 let (mut stream_settings, proxy_settings) =
-                    self.encode_inbound_protocol_layers(inner);
+                    self.encode_inbound_protocol_layers(inner, transport);
                 let settings =
                     stream_settings.get_or_insert_with(|| StreamConfigPayload {
                         protocol_name: "xhttp".to_string(),
@@ -2741,7 +2935,9 @@ impl HandlerServiceImpl {
                 settings.protocol_name = "xhttp".to_string();
                 (stream_settings, proxy_settings)
             }
-            protocol => (None, self.encode_user_manager_protocol(protocol)),
+            protocol => {
+                (None, self.encode_user_manager_protocol(protocol, transport))
+            }
         }
     }
 
@@ -3720,7 +3916,17 @@ impl HandlerServiceImpl {
             #[cfg(feature = "mixed")]
             ServerProxyConfig::Mixed { .. } => None,
             #[cfg(feature = "shadowsocks")]
-            ServerProxyConfig::Shadowsocks { .. } => None,
+            ServerProxyConfig::Shadowsocks { users, identity } => {
+                if identity.is_some()
+                    || users
+                        .iter()
+                        .any(|user| user.method.starts_with("2022-blake3-"))
+                {
+                    None
+                } else {
+                    Some(users.iter().map(|user| user.email.clone()).collect())
+                }
+            }
             ServerProxyConfig::DokodemoDoor { .. } => None,
         }
     }
@@ -3896,7 +4102,43 @@ impl HandlerServiceImpl {
             #[cfg(feature = "mixed")]
             ServerProxyConfig::Mixed { .. } => None,
             #[cfg(feature = "shadowsocks")]
-            ServerProxyConfig::Shadowsocks { .. } => None,
+            ServerProxyConfig::Shadowsocks { users, identity } => {
+                if identity.is_some()
+                    || users
+                        .iter()
+                        .any(|user| user.method.starts_with("2022-blake3-"))
+                {
+                    return None;
+                }
+                users
+                    .iter()
+                    .map(|user| {
+                        let cipher_type = match user.method.as_str() {
+                            "aes-128-gcm" | "aead_aes_128_gcm" => 5,
+                            "aes-256-gcm" | "aead_aes_256_gcm" => 6,
+                            "chacha20-ietf-poly1305"
+                            | "chacha20-poly1305"
+                            | "aead_chacha20_poly1305" => 7,
+                            "xchacha20-ietf-poly1305"
+                            | "xchacha20-poly1305"
+                            | "aead_xchacha20_poly1305" => 8,
+                            _ => return None,
+                        };
+                        Some(proto::xray::common::protocol::User {
+                            level: user.user_level,
+                            email: user.email.clone(),
+                            account: Some(Self::typed_message(
+                                TYPE_PROXY_SHADOWSOCKS_ACCOUNT,
+                                ShadowsocksAccountPayload {
+                                    password: user.password.clone(),
+                                    cipher_type,
+                                    iv_check: false,
+                                },
+                            )),
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()
+            }
             ServerProxyConfig::DokodemoDoor { .. } => None,
         }
     }
@@ -4993,6 +5235,149 @@ mod tests {
         assert_eq!(encoded.port, 5353);
         assert_eq!(encoded.user_level, 7);
         assert!(!encoded.follow_redirect);
+    }
+
+    #[cfg(feature = "shadowsocks")]
+    #[tokio::test]
+    async fn handler_preserves_legacy_shadowsocks_server_config() {
+        let service =
+            HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+        let proxy = HandlerServiceImpl::typed_message(
+            TYPE_PROXY_SHADOWSOCKS_SERVER_CONFIG,
+            ShadowsocksServerConfigPayload {
+                users: vec![
+                    proto::xray::common::protocol::User {
+                        level: 3,
+                        email: "alice@example.com".to_string(),
+                        account: Some(HandlerServiceImpl::typed_message(
+                            TYPE_PROXY_SHADOWSOCKS_ACCOUNT,
+                            ShadowsocksAccountPayload {
+                                password: "secret-a".to_string(),
+                                cipher_type: 5,
+                                iv_check: false,
+                            },
+                        )),
+                    },
+                    proto::xray::common::protocol::User {
+                        level: 7,
+                        email: "bob@example.com".to_string(),
+                        account: Some(HandlerServiceImpl::typed_message(
+                            TYPE_PROXY_SHADOWSOCKS_ACCOUNT,
+                            ShadowsocksAccountPayload {
+                                password: "secret-b".to_string(),
+                                cipher_type: 7,
+                                iv_check: false,
+                            },
+                        )),
+                    },
+                ],
+                network: vec![
+                    proto::xray::common::net::Network::Tcp as i32,
+                    proto::xray::common::net::Network::Udp as i32,
+                ],
+            },
+        );
+        assert_eq!(
+            service
+                .parse_add_inbound_transport(&proxy)
+                .expect("Shadowsocks network should parse"),
+            Transport::TcpAndUdp
+        );
+        let protocol = service
+            .parse_add_inbound_protocol(&proxy)
+            .expect("Shadowsocks server config should parse");
+        let ServerProxyConfig::Shadowsocks { users, identity } = &protocol else {
+            panic!("expected Shadowsocks inbound");
+        };
+        assert!(identity.is_none());
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0].method, "aes-128-gcm");
+        assert_eq!(users[0].user_level, 3);
+        assert_eq!(users[1].method, "chacha20-ietf-poly1305");
+        assert_eq!(users[1].user_level, 7);
+
+        let tag = unique_tag("shadowsocks-inbound");
+        let runtime = RuntimeState::new(
+            vec![ServerConfig {
+                tag: tag.clone(),
+                bind_location: BindLocation::Address(NetLocation::new(
+                    Address::Ipv4(Ipv4Addr::LOCALHOST),
+                    8388,
+                )),
+                protocol,
+                transport: Transport::TcpAndUdp,
+                quic_settings: None,
+            }],
+            Vec::new(),
+        );
+        let service = HandlerServiceImpl::new(runtime);
+        let listed = service
+            .list_inbounds(Request::new(
+                proto::xray::app::proxyman::command::ListInboundsRequest {
+                    is_only_tags: false,
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let encoded = ShadowsocksServerConfigPayload::decode(
+            listed.inbounds[0]
+                .proxy_settings
+                .as_ref()
+                .expect("Shadowsocks proxy settings")
+                .value
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(encoded.users.len(), 2);
+        assert_eq!(encoded.users[0].level, 3);
+        assert_eq!(encoded.users[1].level, 7);
+        assert_eq!(
+            encoded.network,
+            vec![
+                proto::xray::common::net::Network::Tcp as i32,
+                proto::xray::common::net::Network::Udp as i32,
+            ]
+        );
+
+        let users = service
+            .get_inbound_users(Request::new(
+                proto::xray::app::proxyman::command::GetInboundUserRequest {
+                    tag,
+                    email: String::new(),
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .users;
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0].email, "alice@example.com");
+        assert_eq!(users[0].level, 3);
+        assert_eq!(users[1].email, "bob@example.com");
+        assert_eq!(users[1].level, 7);
+        let account = ShadowsocksAccountPayload::decode(
+            users[1].account.as_ref().unwrap().value.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(account.password, "secret-b");
+        assert_eq!(account.cipher_type, 7);
+
+        let aead2022 = ServerProxyConfig::Shadowsocks {
+            users: vec![ShadowsocksUser {
+                method: "2022-blake3-aes-128-gcm".to_string(),
+                password: "AAECAwQFBgcICQoLDA0ODw==".to_string(),
+                email: "modern@example.com".to_string(),
+                user_level: 9,
+            }],
+            identity: None,
+        };
+        assert!(
+            service
+                .encode_user_manager_protocol(&aead2022, &Transport::Tcp)
+                .is_none(),
+            "2022 Shadowsocks must not use the legacy ServerConfig type"
+        );
     }
 
     #[tokio::test]
