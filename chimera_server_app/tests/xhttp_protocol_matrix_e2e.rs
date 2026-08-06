@@ -393,5 +393,5 @@ fn configured_cookie_padding_enables_credentials_without_obfuscation() {
             .map(String::as_str),
         Some("true")
     );
-    assert!(head.headers.get("set-cookie").is_none());
+    assert!(!head.headers.contains_key("set-cookie"));
 }

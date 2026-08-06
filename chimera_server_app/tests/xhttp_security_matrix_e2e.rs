@@ -67,6 +67,7 @@ impl SecurityCase {
     }
 }
 
+#[allow(clippy::await_holding_lock)]
 async fn run_security_case(case: SecurityCase) {
     let workspace = workspace_root();
     let reality_dest = match case {
