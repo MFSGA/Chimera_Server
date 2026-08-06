@@ -1106,8 +1106,9 @@ where
         }
         TcpServerSetupResult::SessionBasedUdp {
             stream,
-            traffic_context,
+            mut traffic_context,
         } => {
+            apply_policy_stats(&runtime, traffic_context.as_mut());
             run_session_based_udp(
                 stream,
                 resolver,
@@ -1369,6 +1370,41 @@ mod tests {
         assert_eq!(context.stats_inbound_uplink, Some(false));
         assert_eq!(context.stats_inbound_downlink, Some(true));
         assert_eq!(context.stats_outbound_uplink, Some(true));
+        assert_eq!(context.stats_outbound_downlink, Some(false));
+    }
+
+    #[test]
+    fn session_based_udp_context_applies_policy_stats() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let policy = serde_json::from_value(serde_json::json!({
+            "levels": {
+                "5": {
+                    "statsUserUplink": false,
+                    "statsUserDownlink": false,
+                    "statsUserOnline": true
+                }
+            },
+            "system": {
+                "statsInboundUplink": true,
+                "statsInboundDownlink": true,
+                "statsOutboundUplink": false,
+                "statsOutboundDownlink": false
+            }
+        }))
+        .expect("policy config should parse");
+        runtime
+            .configure_policy(Some(&policy))
+            .expect("policy should install");
+        let mut context = TrafficContext::new("vless").with_user_level(5);
+
+        apply_policy_stats(&runtime, Some(&mut context));
+
+        assert_eq!(context.stats_user_uplink, Some(false));
+        assert_eq!(context.stats_user_downlink, Some(false));
+        assert_eq!(context.stats_user_online, Some(true));
+        assert_eq!(context.stats_inbound_uplink, Some(true));
+        assert_eq!(context.stats_inbound_downlink, Some(true));
+        assert_eq!(context.stats_outbound_uplink, Some(false));
         assert_eq!(context.stats_outbound_downlink, Some(false));
     }
 
