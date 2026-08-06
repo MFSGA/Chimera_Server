@@ -312,7 +312,7 @@ pub(super) fn apply_security_layers(
     if !trusted_x_forwarded_for.is_empty()
         && !matches!(
             network.as_str(),
-            "ws" | "websocket" | "grpc" | "xhttp" | "splithttp"
+            "ws" | "websocket" | "httpupgrade" | "grpc" | "xhttp" | "splithttp"
         )
     {
         return Err(Error::InvalidConfig(format!(

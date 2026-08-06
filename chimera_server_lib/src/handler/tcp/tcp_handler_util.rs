@@ -303,11 +303,14 @@ fn create_tcp_server_handler_with_trusted_headers(
                 rules_stack,
                 trusted_forwarded_headers,
             )?;
-            Ok(Box::new(HttpUpgradeTcpServerHandler::new(
-                config.host,
-                config.path,
-                inner,
-            )))
+            Ok(Box::new(
+                HttpUpgradeTcpServerHandler::new_with_trusted_headers(
+                    config.host,
+                    config.path,
+                    inner,
+                    trusted_forwarded_headers.to_vec(),
+                ),
+            ))
         }
         ServerProxyConfig::Xhttp { .. } => Err(Error::new(
             ErrorKind::InvalidInput,

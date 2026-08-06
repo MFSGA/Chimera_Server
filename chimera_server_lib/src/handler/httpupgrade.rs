@@ -153,6 +153,7 @@ pub struct HttpUpgradeTcpServerHandler {
     host: Option<String>,
     path: String,
     inner: Box<dyn TcpServerHandler>,
+    trusted_forwarded_headers: Vec<String>,
 }
 
 impl HttpUpgradeTcpServerHandler {
@@ -161,14 +162,27 @@ impl HttpUpgradeTcpServerHandler {
         path: String,
         inner: Box<dyn TcpServerHandler>,
     ) -> Self {
+        Self::new_with_trusted_headers(host, path, inner, Vec::new())
+    }
+
+    pub fn new_with_trusted_headers(
+        host: Option<String>,
+        path: String,
+        inner: Box<dyn TcpServerHandler>,
+        trusted_forwarded_headers: Vec<String>,
+    ) -> Self {
         Self {
             host: host.map(|value| value.trim().to_ascii_lowercase()),
             path: normalize_path(path),
             inner,
+            trusted_forwarded_headers,
         }
     }
 
-    async fn upgrade(&self, stream: &mut Box<dyn AsyncStream>) -> io::Result<()> {
+    async fn upgrade(
+        &self,
+        stream: &mut Box<dyn AsyncStream>,
+    ) -> io::Result<Option<std::net::SocketAddr>> {
         let request = timeout(HANDSHAKE_TIMEOUT, read_http_header(stream))
             .await
             .map_err(|_| {
@@ -222,7 +236,11 @@ impl HttpUpgradeTcpServerHandler {
                   Upgrade: websocket\r\n\r\n",
             )
             .await?;
-        stream.flush().await
+        stream.flush().await?;
+        Ok(trusted_forwarded_client_addr(
+            &headers,
+            &self.trusted_forwarded_headers,
+        ))
     }
 }
 
@@ -244,10 +262,15 @@ impl TcpServerHandler for HttpUpgradeTcpServerHandler {
         mut server_stream: Box<dyn AsyncStream>,
         context: TcpServerConnectionContext,
     ) -> io::Result<TcpServerSetupResult> {
-        self.upgrade(&mut server_stream).await?;
-        self.inner
+        let client_addr = self.upgrade(&mut server_stream).await?;
+        let mut result = self
+            .inner
             .setup_server_stream_with_context(server_stream, context)
-            .await
+            .await?;
+        if let Some(client_addr) = client_addr {
+            result.set_client_addr(client_addr);
+        }
+        Ok(result)
     }
 }
 
@@ -302,6 +325,27 @@ fn parse_request(
         headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
     }
     Ok((method, target, version, headers))
+}
+
+fn trusted_forwarded_client_addr(
+    headers: &HashMap<String, String>,
+    trusted: &[String],
+) -> Option<std::net::SocketAddr> {
+    let forwarded_for = headers.get("x-forwarded-for")?;
+    if !trusted
+        .iter()
+        .any(|name| headers.contains_key(&name.trim().to_ascii_lowercase()))
+    {
+        return None;
+    }
+    let candidate = forwarded_for
+        .split_once(',')
+        .map_or(forwarded_for.as_str(), |(first, _)| first)
+        .trim();
+    candidate
+        .parse()
+        .ok()
+        .map(|ip| std::net::SocketAddr::new(ip, 0))
 }
 
 fn parse_response(
@@ -456,7 +500,10 @@ mod tests {
         handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
     };
 
-    use super::{HttpUpgradeClientConfig, HttpUpgradeTcpServerHandler};
+    use super::{
+        HttpUpgradeClientConfig, HttpUpgradeTcpServerHandler,
+        trusted_forwarded_client_addr,
+    };
 
     #[derive(Debug)]
     struct Inner;
@@ -660,6 +707,31 @@ mod tests {
         let mut protocol = [0u8; 8];
         stream.read_exact(&mut protocol).await.unwrap();
         assert_eq!(&protocol, b"protocol");
+    }
+
+    #[test]
+    fn trusted_forwarded_header_uses_first_ip_with_zero_port() {
+        let headers = HashMap::from([
+            (
+                "x-forwarded-for".into(),
+                "203.0.113.10, 198.51.100.8".into(),
+            ),
+            ("x-trusted-proxy".into(), "1".into()),
+        ]);
+        assert_eq!(
+            trusted_forwarded_client_addr(&headers, &["X-Trusted-Proxy".into()]),
+            Some("203.0.113.10:0".parse().unwrap()),
+        );
+    }
+
+    #[test]
+    fn untrusted_forwarded_header_is_ignored() {
+        let headers =
+            HashMap::from([("x-forwarded-for".into(), "203.0.113.10".into())]);
+        assert_eq!(
+            trusted_forwarded_client_addr(&headers, &["X-Trusted-Proxy".into()]),
+            None,
+        );
     }
 
     #[tokio::test]
