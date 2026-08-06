@@ -2269,6 +2269,7 @@ async fn run_dokodemo_udp_server(
             };
         let payload = recv_buf[..len].to_vec();
         let traffic_context = dokodemo_udp_traffic_context(
+            &runtime,
             inbound_tag.clone(),
             client_addr,
             config.user_level,
@@ -2298,14 +2299,29 @@ async fn run_dokodemo_udp_server(
 }
 
 fn dokodemo_udp_traffic_context(
+    runtime: &RuntimeState,
     inbound_tag: String,
     client_addr: SocketAddr,
     user_level: u32,
 ) -> TrafficContext {
-    TrafficContext::new("dokodemo-door")
+    let mut context = TrafficContext::new("dokodemo-door")
         .with_user_level(user_level)
         .with_inbound_tag(inbound_tag)
-        .with_client_ip(client_addr.ip())
+        .with_client_ip(client_addr.ip());
+    let user_stats = runtime.policy_user_stats(user_level);
+    let system_stats = runtime.policy_system_stats();
+    context.set_user_stats_policy(
+        user_stats.uplink,
+        user_stats.downlink,
+        user_stats.online,
+    );
+    context.set_system_stats_policy(
+        system_stats.inbound_uplink,
+        system_stats.inbound_downlink,
+        system_stats.outbound_uplink,
+        system_stats.outbound_downlink,
+    );
+    context
 }
 
 async fn relay_dokodemo_udp_datagram(
@@ -4433,14 +4449,46 @@ mod tests {
     }
 
     #[test]
-    fn dokodemo_udp_context_preserves_user_level() {
+    fn dokodemo_udp_context_applies_policy_stats() {
         let client_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 12345));
-        let context =
-            dokodemo_udp_traffic_context("dokodemo-udp".to_string(), client_addr, 7);
+        let runtime = runtime_with_outbounds(Vec::new());
+        let policy = serde_json::from_value(serde_json::json!({
+            "levels": {
+                "7": {
+                    "statsUserUplink": false,
+                    "statsUserDownlink": true,
+                    "statsUserOnline": false
+                }
+            },
+            "system": {
+                "statsInboundUplink": true,
+                "statsInboundDownlink": false,
+                "statsOutboundUplink": false,
+                "statsOutboundDownlink": true
+            }
+        }))
+        .expect("policy config should parse");
+        runtime
+            .configure_policy(Some(&policy))
+            .expect("policy should install");
+
+        let context = dokodemo_udp_traffic_context(
+            &runtime,
+            "dokodemo-udp".to_string(),
+            client_addr,
+            7,
+        );
 
         assert_eq!(context.user_level, 7);
         assert_eq!(context.inbound_tag.as_deref(), Some("dokodemo-udp"));
         assert_eq!(context.client_ip, Some(client_addr.ip()));
+        assert_eq!(context.stats_user_uplink, Some(false));
+        assert_eq!(context.stats_user_downlink, Some(true));
+        assert_eq!(context.stats_user_online, Some(false));
+        assert_eq!(context.stats_inbound_uplink, Some(true));
+        assert_eq!(context.stats_inbound_downlink, Some(false));
+        assert_eq!(context.stats_outbound_uplink, Some(false));
+        assert_eq!(context.stats_outbound_downlink, Some(true));
     }
 
     #[cfg(target_os = "linux")]
