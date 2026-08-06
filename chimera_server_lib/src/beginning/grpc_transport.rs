@@ -335,6 +335,7 @@ struct GrpcListenerConfig {
     tcp_fast_open: Option<i32>,
     bind_interface: Option<String>,
     bind_mark: Option<i32>,
+    tcp_mptcp: bool,
 }
 
 pub(super) async fn start_grpc_server(
@@ -361,6 +362,7 @@ pub(super) async fn start_grpc_server(
         tcp_fast_open,
         bind_interface,
         bind_mark,
+        tcp_mptcp,
     } = parse_listener_protocol(protocol)?;
     let mut rules_stack = Vec::new();
     let server_handler: Arc<Box<dyn TcpServerHandler>> = Arc::new(
@@ -370,8 +372,11 @@ pub(super) async fn start_grpc_server(
     let listen_addr = match bind_location {
         BindLocation::Address(location) => location.to_socket_addr()?,
     };
-    let socket =
-        crate::util::socket::new_tcp_socket(bind_interface, listen_addr.is_ipv6())?;
+    let socket = crate::util::socket::new_tcp_socket_with_mptcp(
+        bind_interface,
+        listen_addr.is_ipv6(),
+        tcp_mptcp,
+    )?;
     if let Some(value) = bind_mark {
         crate::util::socket::configure_socket_mark(socket.as_raw_fd(), value)?;
     }
@@ -628,6 +633,11 @@ fn parse_listener_protocol(
     protocol: ServerProxyConfig,
 ) -> io::Result<GrpcListenerConfig> {
     match protocol {
+        ServerProxyConfig::TcpMultipath { inner } => {
+            let mut config = parse_listener_protocol(*inner)?;
+            config.tcp_mptcp = true;
+            Ok(config)
+        }
         ServerProxyConfig::BindMark { value, inner } => {
             let mut config = parse_listener_protocol(*inner)?;
             config.bind_mark = Some(value);
@@ -698,6 +708,7 @@ fn parse_listener_protocol(
                 tcp_fast_open: None,
                 bind_interface: None,
                 bind_mark: None,
+                tcp_mptcp: false,
             })
         }
         #[cfg(feature = "tls")]
@@ -763,6 +774,7 @@ fn parse_listener_protocol(
                 tcp_fast_open: None,
                 bind_interface: None,
                 bind_mark: None,
+                tcp_mptcp: false,
             })
         }
         #[cfg(feature = "reality")]
@@ -790,6 +802,7 @@ fn parse_listener_protocol(
                 tcp_fast_open: None,
                 bind_interface: None,
                 bind_mark: None,
+                tcp_mptcp: false,
             })
         }
         other => Err(io::Error::new(

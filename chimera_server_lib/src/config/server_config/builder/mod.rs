@@ -1751,7 +1751,7 @@ mod tests {
 
     #[cfg(all(feature = "vless", feature = "grpc_transport", target_os = "linux"))]
     #[test]
-    fn socket_tcp_mptcp_rejects_dedicated_grpc_listener() {
+    fn socket_tcp_mptcp_wraps_dedicated_grpc_listener() {
         let inbound: InboudItem = serde_json::from_value(serde_json::json!({
             "listen": "127.0.0.1",
             "port": 443,
@@ -1768,9 +1768,11 @@ mod tests {
             }
         }))
         .unwrap();
-        let error = ServerConfig::try_from(inbound).unwrap_err();
-        assert!(error.to_string().contains("tcpMptcp"));
-        assert!(error.to_string().contains("grpc"));
+        let config = ServerConfig::try_from(inbound).unwrap();
+        let ServerProxyConfig::TcpMultipath { inner } = config.protocol else {
+            panic!("tcpMptcp must wrap the gRPC listener");
+        };
+        assert!(matches!(*inner, ServerProxyConfig::Grpc(_)));
     }
 
     #[cfg(feature = "vless")]
