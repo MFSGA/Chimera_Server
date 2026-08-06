@@ -192,6 +192,7 @@ pub async fn start_xhttp_server(
         tcp_mptcp,
         custom_sockopt,
         transparent,
+        trusted_x_forwarded_for,
     } = parse_listener_protocol(protocol)?;
 
     let bind_addr = match bind_location {
@@ -207,6 +208,7 @@ pub async fn start_xhttp_server(
         server_handler,
         resolver,
         runtime,
+        trusted_x_forwarded_for,
     ));
     #[cfg(feature = "tls")]
     if let XhttpSecurityLayer::Http3(tls_config) = &security {
@@ -546,6 +548,7 @@ struct XhttpListenerConfig {
     tcp_mptcp: bool,
     custom_sockopt: Vec<crate::config::CustomSockoptConfig>,
     transparent: bool,
+    trusted_x_forwarded_for: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -675,6 +678,11 @@ fn parse_listener_protocol(
     protocol: ServerProxyConfig,
 ) -> std::io::Result<XhttpListenerConfig> {
     match protocol {
+        ServerProxyConfig::TrustedForwardedHeaders { names, inner } => {
+            let mut config = parse_listener_protocol(*inner)?;
+            config.trusted_x_forwarded_for = names;
+            Ok(config)
+        }
         ServerProxyConfig::TransparentSocket { inner } => {
             let mut config = parse_listener_protocol(*inner)?;
             config.transparent = true;
@@ -817,6 +825,7 @@ fn parse_listener_protocol(
             tcp_mptcp: false,
             custom_sockopt: Vec::new(),
             transparent: false,
+            trusted_x_forwarded_for: Vec::new(),
         }),
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(TlsServerConfig {
@@ -889,6 +898,7 @@ fn parse_listener_protocol(
                     tcp_mptcp: false,
                     custom_sockopt: Vec::new(),
                     transparent: false,
+                    trusted_x_forwarded_for: Vec::new(),
                 })
             }
             _ => Err(std::io::Error::other(
@@ -916,6 +926,7 @@ fn parse_listener_protocol(
                         tcp_mptcp: false,
                         custom_sockopt: Vec::new(),
                         transparent: false,
+                        trusted_x_forwarded_for: Vec::new(),
                     })
                 }
                 _ => Err(std::io::Error::other(
@@ -982,6 +993,7 @@ struct AppState {
     server_handler: Arc<Box<dyn TcpServerHandler>>,
     resolver: Arc<dyn Resolver>,
     runtime: RuntimeState,
+    trusted_x_forwarded_for: Vec<String>,
     sessions: SessionStore,
 }
 
@@ -991,6 +1003,7 @@ impl AppState {
         server_handler: Arc<Box<dyn TcpServerHandler>>,
         resolver: Arc<dyn Resolver>,
         runtime: RuntimeState,
+        trusted_x_forwarded_for: Vec<String>,
     ) -> Self {
         Self {
             mode: config.mode,
@@ -1016,6 +1029,7 @@ impl AppState {
             server_handler,
             resolver,
             runtime,
+            trusted_x_forwarded_for,
             sessions: SessionStore::new(
                 Duration::from_secs(config.session_ttl_secs),
                 config.max_buffered_posts,
@@ -1301,11 +1315,53 @@ fn into_hyper_response(plan: XhttpResponsePlan) -> Response<ResponseBody> {
     response
 }
 
+fn apply_trusted_x_forwarded_for(
+    headers: &HeaderMap,
+    trusted_header_names: &[String],
+    peer_addr: std::net::SocketAddr,
+) -> std::net::SocketAddr {
+    let Some(forwarded_for) = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return peer_addr;
+    };
+
+    for name in trusted_header_names {
+        let Ok(name) = hyper::header::HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        if !headers.contains_key(name) {
+            continue;
+        }
+
+        let candidate = forwarded_for
+            .split_once(',')
+            .map_or(forwarded_for, |(first, _)| first)
+            .trim();
+        let candidate = candidate
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+            .unwrap_or(candidate);
+        return candidate
+            .parse::<std::net::IpAddr>()
+            .map(|ip| std::net::SocketAddr::new(ip, 0))
+            .unwrap_or(peer_addr);
+    }
+
+    peer_addr
+}
+
 async fn handle_xhttp_request(
     request: XhttpRequest,
     state: Arc<AppState>,
     peer_addr: std::net::SocketAddr,
 ) -> XhttpResponsePlan {
+    let peer_addr = apply_trusted_x_forwarded_for(
+        &request.headers,
+        &state.trusted_x_forwarded_for,
+        peer_addr,
+    );
     let host_header = request
         .headers
         .get(header::HOST)
@@ -2270,6 +2326,87 @@ mod tests {
         let mut remaining = vec![0u8; request.len()];
         server.read_exact(&mut remaining).await.unwrap();
         assert_eq!(remaining, request);
+    }
+
+    #[test]
+    fn trusted_forwarded_header_uses_first_xff_ip() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            hyper::header::HeaderName::from_static("x-forwarded-for"),
+            hyper::header::HeaderValue::from_static("203.0.113.9, 198.51.100.4"),
+        );
+        headers.insert(
+            hyper::header::HeaderName::from_static("x-trusted-proxy"),
+            hyper::header::HeaderValue::from_static("1"),
+        );
+        let peer = apply_trusted_x_forwarded_for(
+            &headers,
+            &["X-Trusted-Proxy".into()],
+            "127.0.0.1:1234".parse().unwrap(),
+        );
+        assert_eq!(peer, "203.0.113.9:0".parse().unwrap());
+    }
+
+    #[test]
+    fn trusted_forwarded_header_accepts_bracketed_ipv6() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            hyper::header::HeaderName::from_static("x-forwarded-for"),
+            hyper::header::HeaderValue::from_static(" [2001:db8::8] "),
+        );
+        headers.insert(
+            hyper::header::HeaderName::from_static("x-proxy-authenticated"),
+            hyper::header::HeaderValue::from_static("yes"),
+        );
+        let peer = apply_trusted_x_forwarded_for(
+            &headers,
+            &["x-proxy-authenticated".into()],
+            "127.0.0.1:1234".parse().unwrap(),
+        );
+        assert_eq!(peer, "[2001:db8::8]:0".parse().unwrap());
+    }
+
+    #[test]
+    fn untrusted_or_invalid_forwarded_for_keeps_real_peer() {
+        let real_peer = "127.0.0.1:1234".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            hyper::header::HeaderName::from_static("x-forwarded-for"),
+            hyper::header::HeaderValue::from_static("203.0.113.9"),
+        );
+        assert_eq!(
+            apply_trusted_x_forwarded_for(
+                &headers,
+                &["x-trusted-proxy".into()],
+                real_peer,
+            ),
+            real_peer
+        );
+
+        headers.insert(
+            hyper::header::HeaderName::from_static("x-trusted-proxy"),
+            hyper::header::HeaderValue::from_static("1"),
+        );
+        headers.insert(
+            hyper::header::HeaderName::from_static("x-forwarded-for"),
+            hyper::header::HeaderValue::from_static("not-an-ip, 203.0.113.9"),
+        );
+        assert_eq!(
+            apply_trusted_x_forwarded_for(
+                &headers,
+                &["x-trusted-proxy".into()],
+                real_peer,
+            ),
+            real_peer
+        );
+        assert_eq!(
+            apply_trusted_x_forwarded_for(
+                &headers,
+                &["not a header".into()],
+                real_peer,
+            ),
+            real_peer
+        );
     }
 
     #[test]

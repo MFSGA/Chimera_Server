@@ -473,6 +473,10 @@ pub enum ServerProxyConfig {
     ReceiveOriginalDestination {
         inner: Box<ServerProxyConfig>,
     },
+    TrustedForwardedHeaders {
+        names: Vec<String>,
+        inner: Box<ServerProxyConfig>,
+    },
     Ipv6Only {
         inner: Box<ServerProxyConfig>,
     },
@@ -564,6 +568,7 @@ impl std::fmt::Display for ServerProxyConfig {
                 Self::ReceiveOriginalDestination { .. } => {
                     "ReceiveOriginalDestination"
                 }
+                Self::TrustedForwardedHeaders { .. } => "TrustedForwardedHeaders",
                 Self::Ipv6Only { .. } => "Ipv6Only",
                 Self::TcpFastOpen { .. } => "TcpFastOpen",
                 Self::BindInterface { .. } => "BindInterface",

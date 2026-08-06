@@ -113,6 +113,8 @@ pub struct SocketSettings {
     #[serde(default)]
     receive_original_dest_address: bool,
     #[serde(default)]
+    trusted_x_forwarded_for: Vec<String>,
+    #[serde(default)]
     tcp_keep_alive_interval: i32,
     #[serde(default)]
     tcp_keep_alive_idle: i32,
