@@ -333,6 +333,7 @@ struct GrpcListenerConfig {
     tcp_max_seg: Option<i32>,
     ipv6_only: bool,
     tcp_fast_open: Option<i32>,
+    bind_interface: Option<String>,
 }
 
 pub(super) async fn start_grpc_server(
@@ -357,6 +358,7 @@ pub(super) async fn start_grpc_server(
         tcp_max_seg,
         ipv6_only,
         tcp_fast_open,
+        bind_interface,
     } = parse_listener_protocol(protocol)?;
     let mut rules_stack = Vec::new();
     let server_handler: Arc<Box<dyn TcpServerHandler>> = Arc::new(
@@ -366,7 +368,8 @@ pub(super) async fn start_grpc_server(
     let listen_addr = match bind_location {
         BindLocation::Address(location) => location.to_socket_addr()?,
     };
-    let socket = crate::util::socket::new_tcp_socket(None, listen_addr.is_ipv6())?;
+    let socket =
+        crate::util::socket::new_tcp_socket(bind_interface, listen_addr.is_ipv6())?;
     if let Some(value) = tcp_fast_open {
         crate::handler::tcp_fast_open::configure_listener(&socket, value)?;
     }
@@ -620,6 +623,11 @@ fn parse_listener_protocol(
     protocol: ServerProxyConfig,
 ) -> io::Result<GrpcListenerConfig> {
     match protocol {
+        ServerProxyConfig::BindInterface { name, inner } => {
+            let mut config = parse_listener_protocol(*inner)?;
+            config.bind_interface = Some(name);
+            Ok(config)
+        }
         ServerProxyConfig::TcpFastOpen { value, inner } => {
             let mut config = parse_listener_protocol(*inner)?;
             config.tcp_fast_open = Some(value);
@@ -678,6 +686,7 @@ fn parse_listener_protocol(
                 tcp_max_seg: None,
                 ipv6_only: false,
                 tcp_fast_open: None,
+                bind_interface: None,
             })
         }
         #[cfg(feature = "tls")]
@@ -741,6 +750,7 @@ fn parse_listener_protocol(
                 tcp_max_seg: None,
                 ipv6_only: false,
                 tcp_fast_open: None,
+                bind_interface: None,
             })
         }
         #[cfg(feature = "reality")]
@@ -766,6 +776,7 @@ fn parse_listener_protocol(
                 tcp_max_seg: None,
                 ipv6_only: false,
                 tcp_fast_open: None,
+                bind_interface: None,
             })
         }
         other => Err(io::Error::new(
