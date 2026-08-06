@@ -51,6 +51,7 @@ use tracing::{error, info};
 mod grpc_transport;
 #[cfg(feature = "grpc_transport")]
 pub(crate) use grpc_transport::GrpcClientConfig;
+mod policy_stream;
 mod quic;
 mod tcp_relay;
 pub(crate) mod udp;
@@ -867,11 +868,23 @@ where
                 server_stream.write_all(&data).await?;
             }
 
-            let copy_result = tcp_relay::copy_bidirectional(
-                &mut server_stream,
-                &mut client_stream,
-            )
-            .await;
+            let copy_result = match runtime.policy_connection_idle_timeout(0) {
+                Some(idle_timeout) => {
+                    policy_stream::copy_bidirectional_with_idle_timeout(
+                        &mut server_stream,
+                        &mut client_stream,
+                        idle_timeout,
+                    )
+                    .await
+                }
+                None => {
+                    tcp_relay::copy_bidirectional(
+                        &mut server_stream,
+                        &mut client_stream,
+                    )
+                    .await
+                }
+            };
 
             let (_, _) =
                 futures::join!(server_stream.shutdown(), client_stream.shutdown());

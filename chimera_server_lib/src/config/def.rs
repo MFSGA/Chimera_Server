@@ -509,6 +509,8 @@ impl PolicyConfig {
 pub struct PolicyLevelConfig {
     #[serde(default)]
     pub handshake: Option<u32>,
+    #[serde(default, rename = "connIdle")]
+    pub connection_idle: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

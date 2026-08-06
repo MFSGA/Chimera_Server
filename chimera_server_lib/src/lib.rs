@@ -974,7 +974,7 @@ mod tests {
             serde_json::json!({
                 "inbounds": [],
                 "outbounds": [],
-                "policy": {"levels": {"0": {"handshake": 4}}}
+                "policy": {"levels": {"0": {"handshake": 4, "connIdle": 30}}}
             })
             .to_string(),
         )
@@ -990,9 +990,17 @@ mod tests {
             runtime.runtime_state.policy_handshake_timeout(1),
             std::time::Duration::from_secs(60)
         );
+        assert_eq!(
+            runtime.runtime_state.policy_connection_idle_timeout(0),
+            Some(std::time::Duration::from_secs(30))
+        );
+        assert_eq!(
+            runtime.runtime_state.policy_connection_idle_timeout(1),
+            None
+        );
 
         for unsupported_policy in [
-            serde_json::json!({"levels": {"0": {"connIdle": 30}}}),
+            serde_json::json!({"levels": {"0": {"uplinkOnly": 2}}}),
             serde_json::json!({"system": {"statsInboundUplink": true}}),
         ] {
             let error = ConfigType::Str(

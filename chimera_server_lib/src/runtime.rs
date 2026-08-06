@@ -282,6 +282,7 @@ const DEFAULT_POLICY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone, Default)]
 struct PolicyRuntimeState {
     handshake_timeouts: HashMap<u32, Duration>,
+    connection_idle_timeouts: HashMap<u32, Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -366,6 +367,7 @@ impl RuntimeState {
         policy: Option<&PolicyConfig>,
     ) -> Result<(), String> {
         let mut handshake_timeouts = HashMap::new();
+        let mut connection_idle_timeouts = HashMap::new();
         if let Some(policy) = policy {
             for (raw_level, level_policy) in &policy.levels {
                 let level = raw_level.parse::<u32>().map_err(|error| {
@@ -377,12 +379,16 @@ impl RuntimeState {
                     handshake_timeouts
                         .insert(level, Duration::from_secs(u64::from(seconds)));
                 }
+                if let Some(seconds) = level_policy.connection_idle {
+                    connection_idle_timeouts
+                        .insert(level, Duration::from_secs(u64::from(seconds)));
+                }
             }
         }
-        self.policy
-            .write()
-            .expect("runtime policy lock poisoned")
-            .handshake_timeouts = handshake_timeouts;
+        let mut runtime_policy =
+            self.policy.write().expect("runtime policy lock poisoned");
+        runtime_policy.handshake_timeouts = handshake_timeouts;
+        runtime_policy.connection_idle_timeouts = connection_idle_timeouts;
         Ok(())
     }
 
@@ -394,6 +400,15 @@ impl RuntimeState {
             .get(&level)
             .copied()
             .unwrap_or(DEFAULT_POLICY_HANDSHAKE_TIMEOUT)
+    }
+
+    pub fn policy_connection_idle_timeout(&self, level: u32) -> Option<Duration> {
+        self.policy
+            .read()
+            .expect("runtime policy lock poisoned")
+            .connection_idle_timeouts
+            .get(&level)
+            .copied()
     }
 
     pub fn inbounds(&self) -> Vec<ServerConfig> {
