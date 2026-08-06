@@ -1636,6 +1636,82 @@ mod tests {
 
     #[cfg(all(feature = "vless", target_os = "linux"))]
     #[test]
+    fn socket_tproxy_modes_wrap_listener() {
+        for mode in ["tproxy", "redirect", "TPROXY"] {
+            let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+                "listen": "127.0.0.1",
+                "port": 443,
+                "protocol": "vless",
+                "tag": "vless-transparent",
+                "settings": {
+                    "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "sockopt": {"tproxy": mode}
+                }
+            }))
+            .unwrap();
+            let config = ServerConfig::try_from(inbound).unwrap();
+            let ServerProxyConfig::TransparentSocket { inner } = config.protocol
+            else {
+                panic!("{mode} must wrap the TCP listener");
+            };
+            assert!(matches!(*inner, ServerProxyConfig::Vless { .. }));
+        }
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn socket_unknown_tproxy_modes_are_ignored() {
+        for mode in ["", "off", "unknown", " tproxy "] {
+            let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+                "listen": "127.0.0.1",
+                "port": 443,
+                "protocol": "vless",
+                "tag": "vless-transparent-disabled",
+                "settings": {
+                    "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "sockopt": {"tproxy": mode}
+                }
+            }))
+            .unwrap();
+            let config = ServerConfig::try_from(inbound).unwrap();
+            assert!(matches!(config.protocol, ServerProxyConfig::Vless { .. }));
+        }
+    }
+
+    #[cfg(all(feature = "vless", feature = "grpc_transport", target_os = "linux"))]
+    #[test]
+    fn socket_tproxy_rejects_dedicated_grpc_listener() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-grpc-transparent",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "grpc",
+                "grpcSettings": {"serviceName": "proxy"},
+                "sockopt": {"tproxy": "tproxy"}
+            }
+        }))
+        .unwrap();
+        let error = ServerConfig::try_from(inbound).unwrap_err();
+        assert!(error.to_string().contains("sockopt.tproxy"));
+        assert!(error.to_string().contains("grpc"));
+    }
+
+    #[cfg(all(feature = "vless", target_os = "linux"))]
+    #[test]
     fn socket_mark_wraps_tcp_listener() {
         let inbound: InboudItem = serde_json::from_value(serde_json::json!({
             "listen": "127.0.0.1",

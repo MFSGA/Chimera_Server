@@ -1752,6 +1752,7 @@ struct UdpListenerOptions {
     mark: Option<i32>,
     bind_interface: Option<String>,
     custom_sockopt: Vec<crate::config::CustomSockoptConfig>,
+    transparent: bool,
     ipv6_only: bool,
 }
 
@@ -1775,6 +1776,10 @@ fn parse_udp_listener_protocol(
                 inner,
             } => {
                 options.custom_sockopt = values;
+                protocol = *inner;
+            }
+            ServerProxyConfig::TransparentSocket { inner } => {
+                options.transparent = true;
                 protocol = *inner;
             }
             ServerProxyConfig::Ipv6Only { inner } => {
@@ -1819,6 +1824,17 @@ fn create_udp_listener(
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "customSockopt is currently supported only on Linux",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    if options.transparent {
+        crate::util::socket::configure_ip_transparent(socket.as_raw_fd())?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    if options.transparent {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "sockopt.tproxy is currently supported only on Linux",
         ));
     }
     if options.ipv6_only {
@@ -2641,6 +2657,44 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn transparent_udp_listener_sets_kernel_option() {
+        let socket = match create_udp_listener(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            &UdpListenerOptions {
+                transparent: true,
+                ..UdpListenerOptions::default()
+            },
+            false,
+        ) {
+            Ok(socket) => socket,
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EPERM | libc::EACCES)
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("create transparent UDP listener: {error}"),
+        };
+        let mut value = 0;
+        let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+        // SAFETY: `value` and `length` are valid writable getsockopt buffers.
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_IP,
+                libc::IP_TRANSPARENT,
+                std::ptr::from_mut(&mut value).cast(),
+                &mut length,
+            )
+        };
+        assert_eq!(result, 0);
+        assert_eq!(value, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn interface_bound_udp_listener_uses_loopback_device() {
         let socket = match create_udp_listener(
             SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
@@ -2785,17 +2839,19 @@ mod tests {
                         value: "1".into(),
                         value_type: "int".into(),
                     }],
-                    inner: Box::new(ServerProxyConfig::BindMark {
-                        value: 17,
-                        inner: Box::new(ServerProxyConfig::DokodemoDoor {
-                            config: DokodemoDoorConfig {
-                                target: NetLocation::new(
-                                    Address::Ipv4(Ipv4Addr::LOCALHOST),
-                                    53,
-                                ),
-                                follow_redirect: false,
-                                user_level: 0,
-                            },
+                    inner: Box::new(ServerProxyConfig::TransparentSocket {
+                        inner: Box::new(ServerProxyConfig::BindMark {
+                            value: 17,
+                            inner: Box::new(ServerProxyConfig::DokodemoDoor {
+                                config: DokodemoDoorConfig {
+                                    target: NetLocation::new(
+                                        Address::Ipv4(Ipv4Addr::LOCALHOST),
+                                        53,
+                                    ),
+                                    follow_redirect: false,
+                                    user_level: 0,
+                                },
+                            }),
                         }),
                     }),
                 }),
@@ -2805,6 +2861,7 @@ mod tests {
         assert_eq!(options.mark, Some(17));
         assert_eq!(options.bind_interface.as_deref(), Some("lo"));
         assert_eq!(options.custom_sockopt.len(), 1);
+        assert!(options.transparent);
         assert!(options.ipv6_only);
         assert!(matches!(protocol, ServerProxyConfig::DokodemoDoor { .. }));
     }

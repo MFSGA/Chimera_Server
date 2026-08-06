@@ -109,6 +109,8 @@ pub struct SocketSettings {
     #[serde(default)]
     tcp_fast_open: Option<TcpFastOpenValue>,
     #[serde(default)]
+    tproxy: String,
+    #[serde(default)]
     tcp_keep_alive_interval: i32,
     #[serde(default)]
     tcp_keep_alive_idle: i32,

@@ -467,6 +467,9 @@ pub enum ServerProxyConfig {
     TcpMultipath {
         inner: Box<ServerProxyConfig>,
     },
+    TransparentSocket {
+        inner: Box<ServerProxyConfig>,
+    },
     Ipv6Only {
         inner: Box<ServerProxyConfig>,
     },
@@ -554,6 +557,7 @@ impl std::fmt::Display for ServerProxyConfig {
                 Self::TcpWindowClamp { .. } => "TcpWindowClamp",
                 Self::TcpMaxSeg { .. } => "TcpMaxSeg",
                 Self::TcpMultipath { .. } => "TcpMultipath",
+                Self::TransparentSocket { .. } => "TransparentSocket",
                 Self::Ipv6Only { .. } => "Ipv6Only",
                 Self::TcpFastOpen { .. } => "TcpFastOpen",
                 Self::BindInterface { .. } => "BindInterface",

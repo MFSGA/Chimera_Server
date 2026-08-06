@@ -126,6 +126,11 @@ pub fn configure_socket_mark(
 }
 
 #[cfg(target_os = "linux")]
+pub fn configure_ip_transparent(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    set_socket_option_int(fd, libc::SOL_IP, libc::IP_TRANSPARENT, 1)
+}
+
+#[cfg(target_os = "linux")]
 pub fn configure_custom_sockopt(
     fd: std::os::fd::RawFd,
     network: &str,
@@ -515,6 +520,46 @@ fn socket_addr_from_v6(address: &libc::sockaddr_in6) -> SocketAddr {
         address.sin6_flowinfo,
         address.sin6_scope_id,
     ))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod transparent_socket_tests {
+    use std::{io, os::fd::AsRawFd};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn configures_linux_ip_transparent() {
+        let socket = new_tcp_socket(None, false).expect("create TCP socket");
+        match configure_ip_transparent(socket.as_raw_fd()) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EPERM | libc::EACCES)
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("configure IP_TRANSPARENT: {error}"),
+        }
+        let mut value = 0;
+        let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+        // SAFETY: `value` and `length` are valid writable getsockopt buffers.
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_IP,
+                libc::IP_TRANSPARENT,
+                std::ptr::from_mut(&mut value).cast(),
+                &mut length,
+            )
+        };
+        if result == -1 {
+            panic!("read IP_TRANSPARENT: {}", io::Error::last_os_error());
+        }
+        assert_eq!(value, 1);
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

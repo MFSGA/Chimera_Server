@@ -159,7 +159,8 @@ fn is_grpc_server_protocol(protocol: &ServerProxyConfig) -> bool {
         | ServerProxyConfig::BindInterface { inner, .. }
         | ServerProxyConfig::BindMark { inner, .. }
         | ServerProxyConfig::CustomSockopt { inner, .. }
-        | ServerProxyConfig::TcpMultipath { inner } => {
+        | ServerProxyConfig::TcpMultipath { inner }
+        | ServerProxyConfig::TransparentSocket { inner } => {
             is_grpc_server_protocol(inner)
         }
         #[cfg(feature = "tls")]
@@ -188,7 +189,8 @@ fn is_xhttp_server_protocol(protocol: &ServerProxyConfig) -> bool {
         | ServerProxyConfig::BindInterface { inner, .. }
         | ServerProxyConfig::BindMark { inner, .. }
         | ServerProxyConfig::CustomSockopt { inner, .. }
-        | ServerProxyConfig::TcpMultipath { inner } => {
+        | ServerProxyConfig::TcpMultipath { inner }
+        | ServerProxyConfig::TransparentSocket { inner } => {
             is_xhttp_server_protocol(inner)
         }
         #[cfg(feature = "tls")]
@@ -232,6 +234,7 @@ async fn start_tcp_server_with_runtime(
     let mut tcp_fast_open = None;
     let mut tcp_max_seg = None;
     let mut tcp_mptcp = false;
+    let mut transparent = false;
     let mut ipv6_only = false;
     loop {
         match protocol.take().expect("listener protocol must be present") {
@@ -257,6 +260,10 @@ async fn start_tcp_server_with_runtime(
             }
             ServerProxyConfig::TcpMultipath { inner } => {
                 tcp_mptcp = true;
+                protocol = Some(*inner);
+            }
+            ServerProxyConfig::TransparentSocket { inner } => {
+                transparent = true;
                 protocol = Some(*inner);
             }
             ServerProxyConfig::Ipv6Only { inner } => {
@@ -313,6 +320,17 @@ async fn start_tcp_server_with_runtime(
                 },
                 &custom_sockopt,
             )?;
+            #[cfg(target_os = "linux")]
+            if transparent {
+                crate::util::socket::configure_ip_transparent(socket.as_raw_fd())?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            if transparent {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "sockopt.tproxy is currently supported only on Linux",
+                ));
+            }
             socket.bind(socket_addr)?;
             socket.listen(1024)?
         }

@@ -282,6 +282,29 @@ pub(super) fn apply_security_layers(
     }?;
 
     let network = stream_settings.network.trim().to_ascii_lowercase();
+    let tproxy = stream_settings
+        .sockopt
+        .as_ref()
+        .map_or("", |settings| settings.tproxy.as_str())
+        .to_ascii_lowercase();
+    let configure_transparent = matches!(tproxy.as_str(), "tproxy" | "redirect");
+    if configure_transparent
+        && !matches!(
+            network.as_str(),
+            "" | "raw" | "tcp" | "ws" | "websocket" | "httpupgrade"
+        )
+    {
+        return Err(Error::InvalidConfig(format!(
+            "sockopt.tproxy is not supported for {network} transport yet"
+        )));
+    }
+    #[cfg(not(target_os = "linux"))]
+    if configure_transparent {
+        return Err(Error::InvalidConfig(
+            "sockopt.tproxy is currently supported only on Linux".into(),
+        ));
+    }
+
     let custom_sockopt = stream_settings
         .sockopt
         .as_ref()
@@ -898,8 +921,15 @@ pub(super) fn apply_security_layers(
     } else {
         protocol
     };
-    if configure_mptcp {
-        Ok(ServerProxyConfig::TcpMultipath {
+    let protocol = if configure_mptcp {
+        ServerProxyConfig::TcpMultipath {
+            inner: Box::new(protocol),
+        }
+    } else {
+        protocol
+    };
+    if configure_transparent {
+        Ok(ServerProxyConfig::TransparentSocket {
             inner: Box::new(protocol),
         })
     } else {
