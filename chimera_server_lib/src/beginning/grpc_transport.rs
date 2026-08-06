@@ -327,6 +327,7 @@ struct GrpcListenerConfig {
     security: GrpcSecurity,
     accept_proxy_protocol: bool,
     tcp_keepalive: Option<(i32, i32)>,
+    tcp_user_timeout_ms: Option<i32>,
 }
 
 pub(super) async fn start_grpc_server(
@@ -345,6 +346,7 @@ pub(super) async fn start_grpc_server(
         security,
         accept_proxy_protocol,
         tcp_keepalive,
+        tcp_user_timeout_ms,
     } = parse_listener_protocol(protocol)?;
     let mut rules_stack = Vec::new();
     let server_handler: Arc<Box<dyn TcpServerHandler>> = Arc::new(
@@ -378,6 +380,12 @@ pub(super) async fn start_grpc_server(
             let security = security.clone();
             tokio::spawn(async move {
                 let mut stream = stream;
+                if let Err(error) =
+                    configure_grpc_tcp_user_timeout(&stream, tcp_user_timeout_ms)
+                {
+                    debug!("gRPC TCP_USER_TIMEOUT setup failed: {error}");
+                    return;
+                }
                 if let Err(error) =
                     configure_grpc_tcp_keepalive(&stream, tcp_keepalive)
                 {
@@ -462,6 +470,30 @@ pub(super) async fn start_grpc_server(
     Ok(vec![handle])
 }
 
+fn configure_grpc_tcp_user_timeout(
+    stream: &tokio::net::TcpStream,
+    timeout_ms: Option<i32>,
+) -> io::Result<()> {
+    let Some(timeout_ms) = timeout_ms else {
+        return Ok(());
+    };
+    #[cfg(target_os = "linux")]
+    {
+        crate::util::socket::configure_tcp_user_timeout(
+            stream.as_raw_fd(),
+            timeout_ms,
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (stream, timeout_ms);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "tcpUserTimeout is currently supported only on Linux",
+        ))
+    }
+}
+
 fn configure_grpc_tcp_keepalive(
     stream: &tokio::net::TcpStream,
     keepalive: Option<(i32, i32)>,
@@ -512,6 +544,11 @@ fn parse_listener_protocol(
     protocol: ServerProxyConfig,
 ) -> io::Result<GrpcListenerConfig> {
     match protocol {
+        ServerProxyConfig::TcpUserTimeout { timeout_ms, inner } => {
+            let mut config = parse_listener_protocol(*inner)?;
+            config.tcp_user_timeout_ms = Some(timeout_ms);
+            Ok(config)
+        }
         ServerProxyConfig::TcpKeepAlive {
             idle_secs,
             interval_secs,
@@ -534,6 +571,7 @@ fn parse_listener_protocol(
                 security: GrpcSecurity::Plain,
                 accept_proxy_protocol: false,
                 tcp_keepalive: None,
+                tcp_user_timeout_ms: None,
             })
         }
         #[cfg(feature = "tls")]
@@ -591,6 +629,7 @@ fn parse_listener_protocol(
                 security: GrpcSecurity::Tls(Arc::new(server_config)),
                 accept_proxy_protocol: false,
                 tcp_keepalive: None,
+                tcp_user_timeout_ms: None,
             })
         }
         #[cfg(feature = "reality")]
@@ -610,6 +649,7 @@ fn parse_listener_protocol(
                 security: GrpcSecurity::Reality(reality_config),
                 accept_proxy_protocol: false,
                 tcp_keepalive: None,
+                tcp_user_timeout_ms: None,
             })
         }
         other => Err(io::Error::new(

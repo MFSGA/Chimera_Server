@@ -1610,7 +1610,7 @@ mod tests {
 
     #[cfg(all(feature = "vless", feature = "grpc_transport"))]
     #[test]
-    fn socket_tcp_user_timeout_rejects_dedicated_grpc_listener() {
+    fn socket_tcp_user_timeout_wraps_dedicated_grpc_listener() {
         let inbound: InboudItem = serde_json::from_value(serde_json::json!({
             "listen": "127.0.0.1",
             "port": 443,
@@ -1627,9 +1627,14 @@ mod tests {
             }
         }))
         .unwrap();
-        let error = ServerConfig::try_from(inbound).unwrap_err();
-        assert!(error.to_string().contains("tcpUserTimeout"));
-        assert!(error.to_string().contains("grpc"));
+        let config = ServerConfig::try_from(inbound).unwrap();
+        let ServerProxyConfig::TcpUserTimeout { timeout_ms, inner } =
+            config.protocol
+        else {
+            panic!("TCP_USER_TIMEOUT must wrap the gRPC listener");
+        };
+        assert_eq!(timeout_ms, 12_345);
+        assert!(matches!(*inner, ServerProxyConfig::Grpc(_)));
     }
 
     #[cfg(all(feature = "vless", feature = "grpc_transport"))]
