@@ -1775,6 +1775,64 @@ mod tests {
         assert!(matches!(*inner, ServerProxyConfig::Grpc(_)));
     }
 
+    #[cfg(all(feature = "vless", target_os = "linux"))]
+    #[test]
+    fn socket_tcp_mptcp_wraps_xhttp_listener() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-xhttp-mptcp",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "xhttp",
+                "xhttpSettings": {"path": "/proxy"},
+                "sockopt": {"tcpMptcp": true}
+            }
+        }))
+        .unwrap();
+        let config = ServerConfig::try_from(inbound).unwrap();
+        let ServerProxyConfig::TcpMultipath { inner } = config.protocol else {
+            panic!("tcpMptcp must wrap the XHTTP listener");
+        };
+        assert!(matches!(*inner, ServerProxyConfig::Xhttp { .. }));
+    }
+
+    #[cfg(all(feature = "vless", feature = "tls", target_os = "linux"))]
+    #[test]
+    fn socket_tcp_mptcp_rejects_xhttp_http3() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "::1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-xhttp-h3-mptcp",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "xhttp",
+                "security": "tls",
+                "xhttpSettings": {"path": "/proxy"},
+                "sockopt": {"tcpMptcp": true},
+                "tlsSettings": {
+                    "alpn": ["h3"],
+                    "certificates": [{
+                        "certificate": ["-----BEGIN CERTIFICATE-----","MIIB","-----END CERTIFICATE-----"],
+                        "key": ["-----BEGIN PRIVATE KEY-----","MIIB","-----END PRIVATE KEY-----"]
+                    }]
+                }
+            }
+        }))
+        .unwrap();
+        let error = ServerConfig::try_from(inbound).unwrap_err();
+        assert!(error.to_string().contains("HTTP/3"));
+        assert!(error.to_string().contains("tcpMptcp"));
+    }
+
     #[cfg(feature = "vless")]
     #[test]
     fn socket_zero_mark_is_ignored() {

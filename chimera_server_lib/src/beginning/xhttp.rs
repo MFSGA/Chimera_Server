@@ -189,6 +189,7 @@ pub async fn start_xhttp_server(
         tcp_fast_open,
         bind_interface,
         bind_mark,
+        tcp_mptcp,
     } = parse_listener_protocol(protocol)?;
 
     let bind_addr = match bind_location {
@@ -218,8 +219,11 @@ pub async fn start_xhttp_server(
         .await;
     }
 
-    let socket =
-        crate::util::socket::new_tcp_socket(bind_interface, bind_addr.is_ipv6())?;
+    let socket = crate::util::socket::new_tcp_socket_with_mptcp(
+        bind_interface,
+        bind_addr.is_ipv6(),
+        tcp_mptcp,
+    )?;
     if let Some(value) = bind_mark {
         crate::util::socket::configure_socket_mark(socket.as_raw_fd(), value)?;
     }
@@ -499,6 +503,7 @@ struct XhttpListenerConfig {
     tcp_fast_open: Option<i32>,
     bind_interface: Option<String>,
     bind_mark: Option<i32>,
+    tcp_mptcp: bool,
 }
 
 #[derive(Clone)]
@@ -628,6 +633,18 @@ fn parse_listener_protocol(
     protocol: ServerProxyConfig,
 ) -> std::io::Result<XhttpListenerConfig> {
     match protocol {
+        ServerProxyConfig::TcpMultipath { inner } => {
+            let mut config = parse_listener_protocol(*inner)?;
+            #[cfg(feature = "tls")]
+            if matches!(&config.security, XhttpSecurityLayer::Http3(_)) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "XHTTP HTTP/3 does not support tcpMptcp",
+                ));
+            }
+            config.tcp_mptcp = true;
+            Ok(config)
+        }
         ServerProxyConfig::BindMark { value, inner } => {
             let mut config = parse_listener_protocol(*inner)?;
             config.bind_mark = Some(value);
@@ -745,6 +762,7 @@ fn parse_listener_protocol(
             tcp_fast_open: None,
             bind_interface: None,
             bind_mark: None,
+            tcp_mptcp: false,
         }),
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(TlsServerConfig {
@@ -814,6 +832,7 @@ fn parse_listener_protocol(
                     tcp_fast_open: None,
                     bind_interface: None,
                     bind_mark: None,
+                    tcp_mptcp: false,
                 })
             }
             _ => Err(std::io::Error::other(
@@ -838,6 +857,7 @@ fn parse_listener_protocol(
                         tcp_fast_open: None,
                         bind_interface: None,
                         bind_mark: None,
+                        tcp_mptcp: false,
                     })
                 }
                 _ => Err(std::io::Error::other(
