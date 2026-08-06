@@ -193,12 +193,15 @@ pub struct XhttpRange {
 
 #[cfg(feature = "ws")]
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WsSettings {
     #[serde(default)]
     host: Option<String>,
     path: Option<String>,
     #[serde(default)]
     headers: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    accept_proxy_protocol: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

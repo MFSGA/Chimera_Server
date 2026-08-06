@@ -190,11 +190,6 @@ fn apply_httpupgrade_layer(
                     "httpupgrade inbound requires httpupgradeSettings".into(),
                 )
             })?;
-    if settings.accept_proxy_protocol {
-        return Err(Error::InvalidConfig(
-            "httpupgradeSettings.acceptProxyProtocol is not supported yet".into(),
-        ));
-    }
     if settings.ed != 0 {
         return Err(Error::InvalidConfig(
             "httpupgradeSettings.ed is not supported yet".into(),
@@ -1472,6 +1467,62 @@ mod tests {
         let error = validate_tcp_inbound_network("vless", &settings, true)
             .expect_err("mismatched wsSettings must fail closed");
         assert!(error.to_string().contains("wsSettings requires"));
+    }
+
+    #[cfg(all(feature = "vless", feature = "ws"))]
+    #[test]
+    fn websocket_accept_proxy_protocol_wraps_transport() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-ws-proxy",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "ws",
+                "wsSettings": {
+                    "path": "/ws",
+                    "acceptProxyProtocol": true
+                }
+            }
+        }))
+        .unwrap();
+        let config = ServerConfig::try_from(inbound).unwrap();
+        let ServerProxyConfig::ProxyProtocol { inner } = config.protocol else {
+            panic!("PROXY protocol must be outside WebSocket");
+        };
+        assert!(matches!(*inner, ServerProxyConfig::Websocket { .. }));
+    }
+
+    #[cfg(all(feature = "vless", feature = "httpupgrade"))]
+    #[test]
+    fn httpupgrade_accept_proxy_protocol_wraps_transport() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-httpupgrade-proxy",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "httpupgrade",
+                "httpupgradeSettings": {
+                    "path": "/upgrade",
+                    "acceptProxyProtocol": true
+                }
+            }
+        }))
+        .unwrap();
+        let config = ServerConfig::try_from(inbound).unwrap();
+        let ServerProxyConfig::ProxyProtocol { inner } = config.protocol else {
+            panic!("PROXY protocol must be outside HTTPUpgrade");
+        };
+        assert!(matches!(*inner, ServerProxyConfig::HttpUpgrade(_)));
     }
 
     #[cfg(feature = "vless")]

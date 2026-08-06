@@ -279,6 +279,7 @@ pub(super) fn apply_security_layers(
     }?;
 
     let network = stream_settings.network.trim().to_ascii_lowercase();
+    let mut accept_proxy_protocol = false;
     if stream_settings
         .tcp_settings
         .as_ref()
@@ -289,10 +290,32 @@ pub(super) fn apply_security_layers(
                 "tcpSettings.acceptProxyProtocol requires raw/tcp transport".into(),
             ));
         }
-        return Ok(ServerProxyConfig::ProxyProtocol {
-            inner: Box::new(protocol),
-        });
+        accept_proxy_protocol = true;
+    }
+    #[cfg(feature = "ws")]
+    if matches!(network.as_str(), "ws" | "websocket")
+        && stream_settings
+            .ws_settings
+            .as_ref()
+            .is_some_and(|settings| settings.accept_proxy_protocol)
+    {
+        accept_proxy_protocol = true;
+    }
+    #[cfg(feature = "httpupgrade")]
+    if network == "httpupgrade"
+        && stream_settings
+            .httpupgrade_settings
+            .as_ref()
+            .is_some_and(|settings| settings.accept_proxy_protocol)
+    {
+        accept_proxy_protocol = true;
     }
 
-    Ok(protocol)
+    if accept_proxy_protocol {
+        Ok(ServerProxyConfig::ProxyProtocol {
+            inner: Box::new(protocol),
+        })
+    } else {
+        Ok(protocol)
+    }
 }
