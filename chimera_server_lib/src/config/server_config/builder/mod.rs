@@ -1469,6 +1469,54 @@ mod tests {
         assert!(error.to_string().contains("wsSettings requires"));
     }
 
+    #[cfg(feature = "vless")]
+    #[test]
+    fn socket_accept_proxy_protocol_wraps_raw_transport() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-raw-proxy",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "sockopt": {"acceptProxyProtocol": true}
+            }
+        }))
+        .unwrap();
+        let config = ServerConfig::try_from(inbound).unwrap();
+        let ServerProxyConfig::ProxyProtocol { inner } = config.protocol else {
+            panic!("sockopt PROXY protocol must wrap raw transport");
+        };
+        assert!(matches!(*inner, ServerProxyConfig::Vless { .. }));
+    }
+
+    #[cfg(all(feature = "vless", feature = "grpc_transport"))]
+    #[test]
+    fn socket_accept_proxy_protocol_rejects_grpc_until_listener_supports_it() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-grpc-proxy",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "grpc",
+                "grpcSettings": {"serviceName": "proxy"},
+                "sockopt": {"acceptProxyProtocol": true}
+            }
+        }))
+        .unwrap();
+        let error = ServerConfig::try_from(inbound).unwrap_err();
+        assert!(error.to_string().contains("not supported for grpc"));
+    }
+
     #[cfg(all(feature = "vless", feature = "ws"))]
     #[test]
     fn websocket_accept_proxy_protocol_wraps_transport() {

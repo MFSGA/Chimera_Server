@@ -281,6 +281,21 @@ pub(super) fn apply_security_layers(
     let network = stream_settings.network.trim().to_ascii_lowercase();
     let mut accept_proxy_protocol = false;
     if stream_settings
+        .sockopt
+        .as_ref()
+        .is_some_and(|settings| settings.accept_proxy_protocol)
+    {
+        if !matches!(
+            network.as_str(),
+            "" | "raw" | "tcp" | "ws" | "websocket" | "httpupgrade"
+        ) {
+            return Err(Error::InvalidConfig(format!(
+                "sockopt.acceptProxyProtocol is not supported for {network} transport yet"
+            )));
+        }
+        accept_proxy_protocol = true;
+    }
+    if stream_settings
         .tcp_settings
         .as_ref()
         .is_some_and(|settings| settings.accept_proxy_protocol)
