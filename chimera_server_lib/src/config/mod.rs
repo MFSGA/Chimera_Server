@@ -77,11 +77,20 @@ pub struct StreamSettings {
     reality_settings: Option<RealitySettings>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub(super) enum TcpFastOpenValue {
+    Bool(bool),
+    Number(f64),
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SocketSettings {
     #[serde(default)]
     accept_proxy_protocol: bool,
+    #[serde(default)]
+    tcp_fast_open: Option<TcpFastOpenValue>,
     #[serde(default)]
     tcp_keep_alive_interval: i32,
     #[serde(default)]

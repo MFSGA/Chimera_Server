@@ -1,4 +1,7 @@
-use crate::{Error, config::StreamSettings};
+use crate::{
+    Error,
+    config::{StreamSettings, TcpFastOpenValue},
+};
 
 #[cfg(feature = "reality")]
 use crate::reality::{decode_private_key, decode_short_id};
@@ -279,6 +282,45 @@ pub(super) fn apply_security_layers(
     }?;
 
     let network = stream_settings.network.trim().to_ascii_lowercase();
+    let tcp_fast_open = match stream_settings
+        .sockopt
+        .as_ref()
+        .and_then(|settings| settings.tcp_fast_open.as_ref())
+    {
+        None => None,
+        Some(TcpFastOpenValue::Bool(true)) => Some(256),
+        Some(TcpFastOpenValue::Bool(false)) => Some(0),
+        Some(TcpFastOpenValue::Number(value)) => {
+            if !value.is_finite() {
+                return Err(Error::InvalidConfig(
+                    "tcpFastOpen must be a finite number".into(),
+                ));
+            }
+            let value = value.min(i32::MAX as f64) as i32;
+            match value.cmp(&0) {
+                std::cmp::Ordering::Equal => None,
+                std::cmp::Ordering::Less => Some(0),
+                std::cmp::Ordering::Greater => Some(value),
+            }
+        }
+    };
+    if tcp_fast_open.is_some()
+        && !matches!(
+            network.as_str(),
+            "" | "raw" | "tcp" | "ws" | "websocket" | "httpupgrade"
+        )
+    {
+        return Err(Error::InvalidConfig(format!(
+            "tcpFastOpen is not supported for {network} transport yet"
+        )));
+    }
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    if tcp_fast_open.is_some() {
+        return Err(Error::InvalidConfig(
+            "tcpFastOpen is currently supported only on Linux and Android".into(),
+        ));
+    }
+
     let (keepalive_idle, keepalive_interval) =
         stream_settings.sockopt.as_ref().map_or((0, 0), |settings| {
             (
@@ -659,8 +701,16 @@ pub(super) fn apply_security_layers(
     } else {
         protocol
     };
-    if configure_ipv6_only {
-        Ok(ServerProxyConfig::Ipv6Only {
+    let protocol = if configure_ipv6_only {
+        ServerProxyConfig::Ipv6Only {
+            inner: Box::new(protocol),
+        }
+    } else {
+        protocol
+    };
+    if let Some(value) = tcp_fast_open {
+        Ok(ServerProxyConfig::TcpFastOpen {
+            value,
             inner: Box::new(protocol),
         })
     } else {

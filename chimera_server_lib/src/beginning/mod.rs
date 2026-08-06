@@ -152,7 +152,10 @@ fn is_grpc_server_protocol(protocol: &ServerProxyConfig) -> bool {
         | ServerProxyConfig::TcpCongestion { inner, .. }
         | ServerProxyConfig::TcpWindowClamp { inner, .. }
         | ServerProxyConfig::TcpMaxSeg { inner, .. }
-        | ServerProxyConfig::Ipv6Only { inner } => is_grpc_server_protocol(inner),
+        | ServerProxyConfig::Ipv6Only { inner }
+        | ServerProxyConfig::TcpFastOpen { inner, .. } => {
+            is_grpc_server_protocol(inner)
+        }
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(tls_config) => {
             matches!(tls_config.inner.as_ref(), ServerProxyConfig::Grpc(_))
@@ -174,7 +177,10 @@ fn is_xhttp_server_protocol(protocol: &ServerProxyConfig) -> bool {
         | ServerProxyConfig::TcpCongestion { inner, .. }
         | ServerProxyConfig::TcpWindowClamp { inner, .. }
         | ServerProxyConfig::TcpMaxSeg { inner, .. }
-        | ServerProxyConfig::Ipv6Only { inner } => is_xhttp_server_protocol(inner),
+        | ServerProxyConfig::Ipv6Only { inner }
+        | ServerProxyConfig::TcpFastOpen { inner, .. } => {
+            is_xhttp_server_protocol(inner)
+        }
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(tls_config) => {
             matches!(tls_config.inner.as_ref(), ServerProxyConfig::Xhttp { .. })
@@ -210,10 +216,15 @@ async fn start_tcp_server_with_runtime(
     } = config;
 
     let mut protocol = Some(protocol);
+    let mut tcp_fast_open = None;
     let mut tcp_max_seg = None;
     let mut ipv6_only = false;
     loop {
         match protocol.take().expect("listener protocol must be present") {
+            ServerProxyConfig::TcpFastOpen { value, inner } => {
+                tcp_fast_open = Some(value);
+                protocol = Some(*inner);
+            }
             ServerProxyConfig::TcpMaxSeg { value, inner } => {
                 tcp_max_seg = Some(value);
                 protocol = Some(*inner);
@@ -242,6 +253,9 @@ async fn start_tcp_server_with_runtime(
         BindLocation::Address(a) => {
             let socket_addr = a.to_socket_addr()?;
             let socket = new_tcp_socket(None, socket_addr.is_ipv6())?;
+            if let Some(value) = tcp_fast_open {
+                crate::handler::tcp_fast_open::configure_listener(&socket, value)?;
+            }
             if ipv6_only {
                 crate::handler::ipv6_only::configure_listener(&socket)?;
             }

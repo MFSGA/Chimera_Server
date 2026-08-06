@@ -1636,6 +1636,102 @@ mod tests {
 
     #[cfg(all(feature = "vless", any(target_os = "android", target_os = "linux")))]
     #[test]
+    fn socket_tcp_fast_open_wraps_listener_options_outermost() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "::",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-fast-open",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "sockopt": {
+                    "tcpFastOpen": true,
+                    "tcpMaxSeg": 1200,
+                    "v6only": true
+                }
+            }
+        }))
+        .unwrap();
+        let config = ServerConfig::try_from(inbound).unwrap();
+        let ServerProxyConfig::TcpFastOpen { value, inner } = config.protocol else {
+            panic!("TCP_FASTOPEN must be the outer listener option");
+        };
+        assert_eq!(value, 256);
+        assert!(matches!(*inner, ServerProxyConfig::Ipv6Only { .. }));
+    }
+
+    #[cfg(all(feature = "vless", any(target_os = "android", target_os = "linux")))]
+    #[test]
+    fn socket_tcp_fast_open_preserves_xray_value_semantics() {
+        for (input, expected) in [
+            (serde_json::json!(false), Some(0)),
+            (serde_json::json!(128), Some(128)),
+            (serde_json::json!(0), None),
+            (serde_json::json!(-1), Some(0)),
+        ] {
+            let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+                "listen": "127.0.0.1",
+                "port": 443,
+                "protocol": "vless",
+                "tag": "vless-fast-open-values",
+                "settings": {
+                    "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "sockopt": {"tcpFastOpen": input}
+                }
+            }))
+            .unwrap();
+            let config = ServerConfig::try_from(inbound).unwrap();
+            match expected {
+                Some(expected) => {
+                    let ServerProxyConfig::TcpFastOpen { value, .. } =
+                        config.protocol
+                    else {
+                        panic!("tcpFastOpen value must build a listener option");
+                    };
+                    assert_eq!(value, expected);
+                }
+                None => assert!(matches!(
+                    config.protocol,
+                    ServerProxyConfig::Vless { .. }
+                )),
+            }
+        }
+    }
+
+    #[cfg(all(feature = "vless", feature = "grpc_transport"))]
+    #[test]
+    fn socket_tcp_fast_open_rejects_dedicated_grpc_listener() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-grpc-fast-open",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "grpc",
+                "grpcSettings": {"serviceName": "proxy"},
+                "sockopt": {"tcpFastOpen": true}
+            }
+        }))
+        .unwrap();
+        let error = ServerConfig::try_from(inbound).unwrap_err();
+        assert!(error.to_string().contains("tcpFastOpen"));
+        assert!(error.to_string().contains("grpc"));
+    }
+
+    #[cfg(all(feature = "vless", any(target_os = "android", target_os = "linux")))]
+    #[test]
     fn socket_tcp_max_seg_is_outermost_listener_option() {
         let inbound: InboudItem = serde_json::from_value(serde_json::json!({
             "listen": "127.0.0.1",
