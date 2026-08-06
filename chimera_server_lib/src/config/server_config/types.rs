@@ -336,6 +336,8 @@ pub struct DokodemoDoorConfig {
     pub target: NetLocation,
     #[serde(default)]
     pub follow_redirect: bool,
+    #[serde(default)]
+    pub user_level: u32,
 }
 
 #[cfg(feature = "tls")]

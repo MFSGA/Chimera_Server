@@ -94,6 +94,7 @@ const TYPE_PROXY_SOCKS_SERVER_CONFIG_V2RAY: &str =
 const TYPE_PROXY_SOCKS_ACCOUNT: &str = "xray.proxy.socks.Account";
 const TYPE_PROXY_SOCKS_ACCOUNT_V2RAY: &str = "v2ray.core.proxy.socks.Account";
 const TYPE_PROXY_DOKODEMO_CONFIG: &str = "xray.proxy.dokodemo.Config";
+const TYPE_PROXY_DOKODEMO_CONFIG_V2RAY: &str = "v2ray.core.proxy.dokodemo.Config";
 #[cfg(feature = "hysteria")]
 const TYPE_PROXY_HYSTERIA_ACCOUNT: &str = "xray.proxy.hysteria.account.Account";
 #[cfg(feature = "vless")]
@@ -1068,6 +1069,30 @@ impl HandlerServiceImpl {
                     accounts,
                     allow_transparent: http.allow_transparent,
                     user_level: http.user_level,
+                })
+            }
+            TYPE_PROXY_DOKODEMO_CONFIG | TYPE_PROXY_DOKODEMO_CONFIG_V2RAY => {
+                let dokodemo = self.decode_typed_message::<DokodemoConfigPayload>(
+                    proxy_settings,
+                    &[TYPE_PROXY_DOKODEMO_CONFIG, TYPE_PROXY_DOKODEMO_CONFIG_V2RAY],
+                    "inbound proxy settings",
+                )?;
+                let has_address = dokodemo.address.is_some();
+                let address = self.parse_address(dokodemo.address)?;
+                let port = u16::try_from(dokodemo.port).map_err(|_| {
+                    Status::invalid_argument("dokodemo port must fit in u16")
+                })?;
+                if !dokodemo.follow_redirect && (!has_address || port == 0) {
+                    return Err(Status::invalid_argument(
+                        "dokodemo address and port are required unless followRedirect is enabled",
+                    ));
+                }
+                Ok(ServerProxyConfig::DokodemoDoor {
+                    config: crate::config::server_config::DokodemoDoorConfig {
+                        target: NetLocation::new(address, port),
+                        follow_redirect: dokodemo.follow_redirect,
+                        user_level: dokodemo.user_level,
+                    },
                 })
             }
             TYPE_PROXY_SOCKS_SERVER_CONFIG
@@ -2559,7 +2584,7 @@ impl HandlerServiceImpl {
                             proto::xray::common::net::Network::Tcp as i32,
                         ],
                         follow_redirect: config.follow_redirect,
-                        user_level: 0,
+                        user_level: config.user_level,
                     },
                 ))
             }
@@ -4913,6 +4938,61 @@ mod tests {
         .unwrap();
         assert_eq!(account.username, "alice");
         assert_eq!(account.password, "secret");
+    }
+
+    #[tokio::test]
+    async fn handler_preserves_dokodemo_global_user_level() {
+        let service =
+            HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+        let parsed = service
+            .parse_add_inbound_protocol(&HandlerServiceImpl::typed_message(
+                TYPE_PROXY_DOKODEMO_CONFIG,
+                DokodemoConfigPayload {
+                    address: Some(localhost_ip_payload()),
+                    port: 5353,
+                    port_map: std::collections::HashMap::new(),
+                    networks: vec![proto::xray::common::net::Network::Udp as i32],
+                    follow_redirect: false,
+                    user_level: 7,
+                },
+            ))
+            .expect("dokodemo server config should parse");
+        let ServerProxyConfig::DokodemoDoor { config } = parsed else {
+            panic!("expected dokodemo inbound");
+        };
+        assert_eq!(config.target.port(), 5353);
+        assert!(!config.follow_redirect);
+        assert_eq!(config.user_level, 7);
+
+        let runtime = RuntimeState::new(
+            vec![ServerConfig {
+                tag: "dokodemo-inbound".to_string(),
+                bind_location: BindLocation::Address(NetLocation::new(
+                    Address::Ipv4(Ipv4Addr::LOCALHOST),
+                    10000,
+                )),
+                protocol: ServerProxyConfig::DokodemoDoor { config },
+                transport: Transport::Udp,
+                quic_settings: None,
+            }],
+            Vec::new(),
+        );
+        let service = HandlerServiceImpl::new(runtime);
+        let listed = service
+            .list_inbounds(Request::new(
+                proto::xray::app::proxyman::command::ListInboundsRequest {
+                    is_only_tags: false,
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let proxy = listed.inbounds[0].proxy_settings.as_ref().unwrap();
+        assert_eq!(proxy.r#type, TYPE_PROXY_DOKODEMO_CONFIG);
+        let encoded = DokodemoConfigPayload::decode(proxy.value.as_slice()).unwrap();
+        assert_eq!(encoded.port, 5353);
+        assert_eq!(encoded.user_level, 7);
+        assert!(!encoded.follow_redirect);
     }
 
     #[tokio::test]

@@ -328,6 +328,8 @@ struct DokodemoDoorSettings {
     port: Option<u16>,
     #[serde(default)]
     follow_redirect: bool,
+    #[serde(default)]
+    user_level: u32,
 }
 
 #[cfg(feature = "vless")]
@@ -763,6 +765,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                     config: super::types::DokodemoDoorConfig {
                         target: remote_location,
                         follow_redirect: settings.follow_redirect,
+                        user_level: settings.user_level,
                     },
                 };
 
@@ -1705,7 +1708,8 @@ mod tests {
             "tag": "dokodemo-udp",
             "settings": {
                 "address": "127.0.0.1",
-                "port": 5353
+                "port": 5353,
+                "userLevel": 7
             },
             "streamSettings": {
                 "network": "udp"
@@ -1719,6 +1723,7 @@ mod tests {
         match config.protocol {
             ServerProxyConfig::DokodemoDoor { config } => {
                 assert_eq!(config.target.port(), 5353);
+                assert_eq!(config.user_level, 7);
             }
             other => panic!("expected dokodemo-door, got {other:?}"),
         }

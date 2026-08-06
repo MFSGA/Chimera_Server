@@ -2161,7 +2161,11 @@ async fn run_dokodemo_udp_server(
                 (len, client_addr, target_addr, config.target.clone())
             };
         let payload = recv_buf[..len].to_vec();
-        let inbound_tag = inbound_tag.clone();
+        let traffic_context = dokodemo_udp_traffic_context(
+            inbound_tag.clone(),
+            client_addr,
+            config.user_level,
+        );
         let runtime = runtime.clone();
         let relay_state = relay_state.clone();
 
@@ -2171,8 +2175,8 @@ async fn run_dokodemo_udp_server(
                 client_addr,
                 datagram_target,
                 target_location,
-                inbound_tag,
                 runtime,
+                traffic_context,
                 payload,
             )
             .await
@@ -2186,15 +2190,27 @@ async fn run_dokodemo_udp_server(
     }
 }
 
+fn dokodemo_udp_traffic_context(
+    inbound_tag: String,
+    client_addr: SocketAddr,
+    user_level: u32,
+) -> TrafficContext {
+    TrafficContext::new("dokodemo-door")
+        .with_user_level(user_level)
+        .with_inbound_tag(inbound_tag)
+        .with_client_ip(client_addr.ip())
+}
+
 async fn relay_dokodemo_udp_datagram(
     relay_state: Arc<UdpRelayState>,
     client_addr: SocketAddr,
     target_addr: SocketAddr,
     target_location: NetLocation,
-    inbound_tag: String,
     runtime: RuntimeState,
+    traffic_context: TrafficContext,
     payload: Vec<u8>,
 ) -> std::io::Result<()> {
+    let inbound_tag = traffic_context.inbound_tag.clone().unwrap_or_default();
     let outbound_action = select_udp_outbound(
         &runtime,
         &inbound_tag,
@@ -2203,10 +2219,6 @@ async fn relay_dokodemo_udp_datagram(
         &target_location,
     )
     .await?;
-
-    let traffic_context = TrafficContext::new("dokodemo-door")
-        .with_inbound_tag(inbound_tag)
-        .with_client_ip(client_addr.ip());
 
     match outbound_action {
         DirectOutboundAction::Blackhole { tag } => {
@@ -4029,6 +4041,17 @@ mod tests {
         relay_task.abort();
     }
 
+    #[test]
+    fn dokodemo_udp_context_preserves_user_level() {
+        let client_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 12345));
+        let context =
+            dokodemo_udp_traffic_context("dokodemo-udp".to_string(), client_addr, 7);
+
+        assert_eq!(context.user_level, 7);
+        assert_eq!(context.inbound_tag.as_deref(), Some("dokodemo-udp"));
+        assert_eq!(context.client_ip, Some(client_addr.ip()));
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn dokodemo_udp_follow_redirect_routes_by_original_destination() {
@@ -4087,6 +4110,7 @@ mod tests {
                     observation_addr.port(),
                 ),
                 follow_redirect: true,
+                user_level: 0,
             },
             None::<SocketAddr>,
             "dokodemo-follow-redirect".into(),
@@ -4148,6 +4172,7 @@ mod tests {
             DokodemoDoorConfig {
                 target: target.clone(),
                 follow_redirect: false,
+                user_level: 7,
             },
             echo_addr,
             "dokodemo-udp-test".into(),
@@ -4206,6 +4231,7 @@ mod tests {
             DokodemoDoorConfig {
                 target: target.clone(),
                 follow_redirect: false,
+                user_level: 0,
             },
             echo_addr,
             "dokodemo-udp-test".into(),
@@ -4279,6 +4305,7 @@ mod tests {
             DokodemoDoorConfig {
                 target: target.clone(),
                 follow_redirect: false,
+                user_level: 0,
             },
             echo_addr,
             "dokodemo-udp-test".into(),

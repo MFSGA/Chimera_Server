@@ -1555,6 +1555,7 @@ mod tests {
             DokodemoDoorConfig {
                 target: NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 1),
                 follow_redirect: true,
+                user_level: 0,
             },
             "dokodemo-original-destination",
         );

@@ -35,6 +35,7 @@ impl DokodemoDoorTcpHandler {
             connection_success_response: None,
             traffic_context: Some(
                 TrafficContext::new("dokodemo-door")
+                    .with_user_level(self.config.user_level)
                     .with_inbound_tag(self.inbound_tag.clone()),
             ),
         }
@@ -154,6 +155,7 @@ mod tests {
             DokodemoDoorConfig {
                 target: NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 80),
                 follow_redirect,
+                user_level: 7,
             },
             "dokodemo",
         )
@@ -177,8 +179,18 @@ mod tests {
 
         match result {
             TcpServerSetupResult::TcpForward {
-                remote_location, ..
-            } => assert_eq!(remote_location, original_destination),
+                remote_location,
+                traffic_context,
+                ..
+            } => {
+                assert_eq!(remote_location, original_destination);
+                assert_eq!(
+                    traffic_context
+                        .expect("dokodemo traffic context")
+                        .user_level,
+                    7
+                );
+            }
             _ => panic!("dokodemo followRedirect returned a non-TCP result"),
         }
     }

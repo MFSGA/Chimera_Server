@@ -321,6 +321,7 @@ mod tests {
                             80,
                         ),
                         follow_redirect: false,
+                        user_level: 0,
                     },
                 }),
             },
