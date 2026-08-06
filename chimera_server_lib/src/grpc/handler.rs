@@ -3989,7 +3989,8 @@ impl HandlerServiceImpl {
             | ServerProxyConfig::TcpFastOpen { inner, .. }
             | ServerProxyConfig::BindInterface { inner, .. }
             | ServerProxyConfig::BindMark { inner, .. }
-            | ServerProxyConfig::CustomSockopt { inner, .. } => {
+            | ServerProxyConfig::CustomSockopt { inner, .. }
+            | ServerProxyConfig::TcpMultipath { inner } => {
                 self.get_user_manager_identities(inner)
             }
             ServerProxyConfig::Socks { accounts, .. } => Some(
@@ -4158,7 +4159,8 @@ impl HandlerServiceImpl {
             | ServerProxyConfig::TcpFastOpen { inner, .. }
             | ServerProxyConfig::BindInterface { inner, .. }
             | ServerProxyConfig::BindMark { inner, .. }
-            | ServerProxyConfig::CustomSockopt { inner, .. } => {
+            | ServerProxyConfig::CustomSockopt { inner, .. }
+            | ServerProxyConfig::TcpMultipath { inner } => {
                 self.get_user_manager_users(inner)
             }
             ServerProxyConfig::Socks {

@@ -545,6 +545,27 @@ pub(super) fn apply_security_layers(
         ));
     }
 
+    let configure_mptcp = stream_settings
+        .sockopt
+        .as_ref()
+        .is_some_and(|settings| settings.tcp_mptcp);
+    if configure_mptcp
+        && !matches!(
+            network.as_str(),
+            "" | "raw" | "tcp" | "ws" | "websocket" | "httpupgrade"
+        )
+    {
+        return Err(Error::InvalidConfig(format!(
+            "tcpMptcp is not supported for {network} transport yet"
+        )));
+    }
+    #[cfg(not(target_os = "linux"))]
+    if configure_mptcp {
+        return Err(Error::InvalidConfig(
+            "tcpMptcp is currently supported only on Linux".into(),
+        ));
+    }
+
     let configure_ipv6_only = stream_settings
         .sockopt
         .as_ref()
@@ -840,9 +861,16 @@ pub(super) fn apply_security_layers(
             inner: Box::new(protocol),
         }
     };
-    if configure_bind_interface {
-        Ok(ServerProxyConfig::BindInterface {
+    let protocol = if configure_bind_interface {
+        ServerProxyConfig::BindInterface {
             name: bind_interface,
+            inner: Box::new(protocol),
+        }
+    } else {
+        protocol
+    };
+    if configure_mptcp {
+        Ok(ServerProxyConfig::TcpMultipath {
             inner: Box::new(protocol),
         })
     } else {

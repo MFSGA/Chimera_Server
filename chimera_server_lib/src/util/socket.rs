@@ -5,7 +5,7 @@ use std::{
     io,
     mem::{self, MaybeUninit},
     net::{Ipv4Addr, Ipv6Addr},
-    os::fd::{AsRawFd, RawFd},
+    os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
     ptr,
 };
 
@@ -16,7 +16,38 @@ pub fn new_tcp_socket(
     bind_interface: Option<String>,
     is_ipv6: bool,
 ) -> std::io::Result<tokio::net::TcpSocket> {
-    let tcp_socket = if is_ipv6 {
+    new_tcp_socket_with_mptcp(bind_interface, is_ipv6, false)
+}
+
+#[inline]
+pub fn new_tcp_socket_with_mptcp(
+    bind_interface: Option<String>,
+    is_ipv6: bool,
+    multipath: bool,
+) -> std::io::Result<tokio::net::TcpSocket> {
+    let tcp_socket = if multipath {
+        #[cfg(target_os = "linux")]
+        {
+            let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
+            let socket = Socket::new(
+                domain,
+                Type::STREAM,
+                Some(Protocol::from(libc::IPPROTO_MPTCP)),
+            )?;
+            socket.set_nonblocking(true)?;
+            let fd = socket.into_raw_fd();
+            // SAFETY: ownership of a valid nonblocking TCP-compatible socket is
+            // transferred exactly once into Tokio's TcpSocket wrapper.
+            unsafe { tokio::net::TcpSocket::from_raw_fd(fd) }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "tcpMptcp is currently supported only on Linux",
+            ));
+        }
+    } else if is_ipv6 {
         tokio::net::TcpSocket::new_v6()?
     } else {
         tokio::net::TcpSocket::new_v4()?
@@ -548,6 +579,43 @@ mod custom_sockopt_tests {
             .unwrap(),
             1,
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod mptcp_tests {
+    use std::{io, os::fd::AsRawFd};
+
+    use super::*;
+
+    fn socket_protocol(socket: &tokio::net::TcpSocket) -> io::Result<i32> {
+        let mut value = 0;
+        let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+        // SAFETY: `value` and `length` are valid writable getsockopt buffers.
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                38, // SO_PROTOCOL on Linux.
+                std::ptr::from_mut(&mut value).cast(),
+                &mut length,
+            )
+        };
+        if result == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(value)
+    }
+
+    #[tokio::test]
+    async fn creates_linux_mptcp_listener_socket() {
+        let socket = new_tcp_socket_with_mptcp(None, false, true)
+            .expect("create MPTCP listener socket");
+        assert_eq!(socket_protocol(&socket).unwrap(), libc::IPPROTO_MPTCP);
+        socket
+            .bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .expect("bind MPTCP listener socket");
+        socket.listen(16).expect("listen on MPTCP socket");
     }
 }
 

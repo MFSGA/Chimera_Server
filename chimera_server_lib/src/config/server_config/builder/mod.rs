@@ -1702,6 +1702,77 @@ mod tests {
         assert!(matches!(*inner, ServerProxyConfig::Vless { .. }));
     }
 
+    #[cfg(all(feature = "vless", target_os = "linux"))]
+    #[test]
+    fn socket_tcp_mptcp_wraps_listener_creation_outermost() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-mptcp",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "sockopt": {"mark": 255, "tcpMptcp": true}
+            }
+        }))
+        .unwrap();
+        let config = ServerConfig::try_from(inbound).unwrap();
+        let ServerProxyConfig::TcpMultipath { inner } = config.protocol else {
+            panic!("tcpMptcp must be the outer listener creation option");
+        };
+        assert!(matches!(*inner, ServerProxyConfig::BindMark { .. }));
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn socket_tcp_mptcp_false_is_ignored() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-mptcp-default",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "sockopt": {"tcpMptcp": false}
+            }
+        }))
+        .unwrap();
+        let config = ServerConfig::try_from(inbound).unwrap();
+        assert!(matches!(config.protocol, ServerProxyConfig::Vless { .. }));
+    }
+
+    #[cfg(all(feature = "vless", feature = "grpc_transport", target_os = "linux"))]
+    #[test]
+    fn socket_tcp_mptcp_rejects_dedicated_grpc_listener() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-grpc-mptcp",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "grpc",
+                "grpcSettings": {"serviceName": "proxy"},
+                "sockopt": {"tcpMptcp": true}
+            }
+        }))
+        .unwrap();
+        let error = ServerConfig::try_from(inbound).unwrap_err();
+        assert!(error.to_string().contains("tcpMptcp"));
+        assert!(error.to_string().contains("grpc"));
+    }
+
     #[cfg(feature = "vless")]
     #[test]
     fn socket_zero_mark_is_ignored() {

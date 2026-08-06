@@ -158,7 +158,8 @@ fn is_grpc_server_protocol(protocol: &ServerProxyConfig) -> bool {
         | ServerProxyConfig::TcpFastOpen { inner, .. }
         | ServerProxyConfig::BindInterface { inner, .. }
         | ServerProxyConfig::BindMark { inner, .. }
-        | ServerProxyConfig::CustomSockopt { inner, .. } => {
+        | ServerProxyConfig::CustomSockopt { inner, .. }
+        | ServerProxyConfig::TcpMultipath { inner } => {
             is_grpc_server_protocol(inner)
         }
         #[cfg(feature = "tls")]
@@ -186,7 +187,8 @@ fn is_xhttp_server_protocol(protocol: &ServerProxyConfig) -> bool {
         | ServerProxyConfig::TcpFastOpen { inner, .. }
         | ServerProxyConfig::BindInterface { inner, .. }
         | ServerProxyConfig::BindMark { inner, .. }
-        | ServerProxyConfig::CustomSockopt { inner, .. } => {
+        | ServerProxyConfig::CustomSockopt { inner, .. }
+        | ServerProxyConfig::TcpMultipath { inner } => {
             is_xhttp_server_protocol(inner)
         }
         #[cfg(feature = "tls")]
@@ -229,6 +231,7 @@ async fn start_tcp_server_with_runtime(
     let mut custom_sockopt = Vec::new();
     let mut tcp_fast_open = None;
     let mut tcp_max_seg = None;
+    let mut tcp_mptcp = false;
     let mut ipv6_only = false;
     loop {
         match protocol.take().expect("listener protocol must be present") {
@@ -250,6 +253,10 @@ async fn start_tcp_server_with_runtime(
             }
             ServerProxyConfig::TcpMaxSeg { value, inner } => {
                 tcp_max_seg = Some(value);
+                protocol = Some(*inner);
+            }
+            ServerProxyConfig::TcpMultipath { inner } => {
+                tcp_mptcp = true;
                 protocol = Some(*inner);
             }
             ServerProxyConfig::Ipv6Only { inner } => {
@@ -275,7 +282,11 @@ async fn start_tcp_server_with_runtime(
     let listener = match bind_location {
         BindLocation::Address(a) => {
             let socket_addr = a.to_socket_addr()?;
-            let socket = new_tcp_socket(bind_interface, socket_addr.is_ipv6())?;
+            let socket = crate::util::socket::new_tcp_socket_with_mptcp(
+                bind_interface,
+                socket_addr.is_ipv6(),
+                tcp_mptcp,
+            )?;
             #[cfg(target_os = "linux")]
             if let Some(value) = mark {
                 crate::util::socket::configure_socket_mark(

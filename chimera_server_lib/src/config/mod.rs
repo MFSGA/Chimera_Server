@@ -121,6 +121,8 @@ pub struct SocketSettings {
     #[serde(default)]
     tcp_max_seg: i32,
     #[serde(default)]
+    tcp_mptcp: bool,
+    #[serde(default)]
     v6only: bool,
     #[serde(default)]
     interface: String,
