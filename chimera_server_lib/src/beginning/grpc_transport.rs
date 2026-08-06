@@ -330,6 +330,7 @@ struct GrpcListenerConfig {
     tcp_user_timeout_ms: Option<i32>,
     tcp_congestion: Option<String>,
     tcp_window_clamp: Option<i32>,
+    tcp_max_seg: Option<i32>,
 }
 
 pub(super) async fn start_grpc_server(
@@ -351,6 +352,7 @@ pub(super) async fn start_grpc_server(
         tcp_user_timeout_ms,
         tcp_congestion,
         tcp_window_clamp,
+        tcp_max_seg,
     } = parse_listener_protocol(protocol)?;
     let mut rules_stack = Vec::new();
     let server_handler: Arc<Box<dyn TcpServerHandler>> = Arc::new(
@@ -360,7 +362,12 @@ pub(super) async fn start_grpc_server(
     let listen_addr = match bind_location {
         BindLocation::Address(location) => location.to_socket_addr()?,
     };
-    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+    let socket = crate::util::socket::new_tcp_socket(None, listen_addr.is_ipv6())?;
+    if let Some(value) = tcp_max_seg {
+        crate::handler::tcp_max_seg::configure_listener(&socket, value)?;
+    }
+    socket.bind(listen_addr)?;
+    let listener = socket.listen(1024)?;
     info!(
         service = %grpc_config.service_name,
         address = %listen_addr,
@@ -603,6 +610,11 @@ fn parse_listener_protocol(
     protocol: ServerProxyConfig,
 ) -> io::Result<GrpcListenerConfig> {
     match protocol {
+        ServerProxyConfig::TcpMaxSeg { value, inner } => {
+            let mut config = parse_listener_protocol(*inner)?;
+            config.tcp_max_seg = Some(value);
+            Ok(config)
+        }
         ServerProxyConfig::TcpCongestion { algorithm, inner } => {
             let mut config = parse_listener_protocol(*inner)?;
             config.tcp_congestion = Some(algorithm);
@@ -643,6 +655,7 @@ fn parse_listener_protocol(
                 tcp_user_timeout_ms: None,
                 tcp_congestion: None,
                 tcp_window_clamp: None,
+                tcp_max_seg: None,
             })
         }
         #[cfg(feature = "tls")]
@@ -703,6 +716,7 @@ fn parse_listener_protocol(
                 tcp_user_timeout_ms: None,
                 tcp_congestion: None,
                 tcp_window_clamp: None,
+                tcp_max_seg: None,
             })
         }
         #[cfg(feature = "reality")]
@@ -725,6 +739,7 @@ fn parse_listener_protocol(
                 tcp_user_timeout_ms: None,
                 tcp_congestion: None,
                 tcp_window_clamp: None,
+                tcp_max_seg: None,
             })
         }
         other => Err(io::Error::new(
