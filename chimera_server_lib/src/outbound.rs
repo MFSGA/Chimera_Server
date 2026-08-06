@@ -2066,6 +2066,7 @@ mod tests {
             vec![VmessUser {
                 user_id: user_id.into(),
                 user_label: "vmess-udp-outbound-test".into(),
+                user_level: 0,
                 cipher: "aes-128-gcm".into(),
             }],
             true,

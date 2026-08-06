@@ -465,6 +465,7 @@ mod tests {
                 vec![VmessUser {
                     user_id: user_id.into(),
                     user_label: "vmess-client-test".into(),
+                    user_level: 0,
                     cipher: name.into(),
                 }],
                 false,
@@ -525,6 +526,7 @@ mod tests {
                 vec![VmessUser {
                     user_id: user_id.into(),
                     user_label: "vmess-udp-client-test".into(),
+                    user_level: 0,
                     cipher: name.into(),
                 }],
                 true,

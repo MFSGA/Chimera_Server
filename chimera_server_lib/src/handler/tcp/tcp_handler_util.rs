@@ -242,11 +242,13 @@ mod tests {
                     crate::config::server_config::VmessUser {
                         user_id: "3ac9b383-75a1-431c-8184-106c80eb2273".into(),
                         user_label: "user-a".into(),
+                        user_level: 0,
                         cipher: "auto".into(),
                     },
                     crate::config::server_config::VmessUser {
                         user_id: "e041e73e-a0a0-49f5-9754-6401aa621fb7".into(),
                         user_label: "user-b".into(),
+                        user_level: 0,
                         cipher: "auto".into(),
                     },
                 ],

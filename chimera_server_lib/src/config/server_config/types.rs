@@ -213,6 +213,8 @@ pub struct VmessUser {
     #[serde(default)]
     pub user_label: String,
     #[serde(default)]
+    pub user_level: u32,
+    #[serde(default)]
     pub cipher: String,
 }
 

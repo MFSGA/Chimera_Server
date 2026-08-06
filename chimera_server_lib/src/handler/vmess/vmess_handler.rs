@@ -71,6 +71,7 @@ struct VmessServerUser {
     aead_decrypting_key: CipherDecryptingKey,
     user_id: String,
     user_label: String,
+    user_level: u32,
 }
 
 impl VmessServerUser {
@@ -89,6 +90,7 @@ impl VmessServerUser {
             aead_decrypting_key,
             user_id: user.user_id,
             user_label: user.user_label,
+            user_level: user.user_level,
         }
     }
 }
@@ -222,6 +224,7 @@ impl VmessTcpServerHandler {
         let data_cipher = user.data_cipher.clone();
         let user_id = user.user_id.clone();
         let user_label = user.user_label.clone();
+        let user_level = user.user_level;
 
         let mut encrypted_payload_length = [0u8; 18];
         server_stream
@@ -619,6 +622,7 @@ impl VmessTcpServerHandler {
             TrafficContext::new("vmess")
                 .with_identity(user_label)
                 .with_protocol_identity(user_id)
+                .with_user_level(user_level)
                 .with_access_target(
                     remote_location.address().to_string(),
                     remote_location.port(),
@@ -822,9 +826,19 @@ mod tests {
     impl AsyncStream for TestStream {}
 
     fn vmess_user(user_id: &str, user_label: &str, cipher: &str) -> VmessUser {
+        vmess_user_with_level(user_id, user_label, cipher, 0)
+    }
+
+    fn vmess_user_with_level(
+        user_id: &str,
+        user_label: &str,
+        cipher: &str,
+        user_level: u32,
+    ) -> VmessUser {
         VmessUser {
             user_id: user_id.into(),
             user_label: user_label.into(),
+            user_level,
             cipher: cipher.into(),
         }
     }
@@ -1480,15 +1494,15 @@ mod tests {
         let user_b_id = "e041e73e-a0a0-49f5-9754-6401aa621fb7";
         let handler = VmessTcpServerHandler::new(
             vec![
-                vmess_user(user_a_id, "user-a", "none"),
-                vmess_user(user_b_id, "user-b", "none"),
+                vmess_user_with_level(user_a_id, "user-a", "none", 3),
+                vmess_user_with_level(user_b_id, "user-b", "none", 7),
             ],
             false,
             "vmess-multi",
         );
 
-        for (user_id, expected_label) in
-            [(user_a_id, "user-a"), (user_b_id, "user-b")]
+        for (user_id, expected_label, expected_level) in
+            [(user_a_id, "user-a", 3), (user_b_id, "user-b", 7)]
         {
             let request = build_tcp_request(user_id);
             let (mut client, server) = duplex(1024);
@@ -1515,6 +1529,7 @@ mod tests {
                         traffic_context.identity.as_deref(),
                         Some(expected_label)
                     );
+                    assert_eq!(traffic_context.user_level, expected_level);
                     assert_eq!(
                         traffic_context.inbound_tag.as_deref(),
                         Some("vmess-multi")

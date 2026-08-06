@@ -1055,6 +1055,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                         Ok(crate::config::server_config::VmessUser {
                             user_id: client.id,
                             user_label,
+                            user_level: client.level,
                             cipher: client
                                 .security
                                 .filter(|value| !value.trim().is_empty())

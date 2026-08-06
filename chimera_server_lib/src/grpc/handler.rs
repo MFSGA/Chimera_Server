@@ -3648,7 +3648,7 @@ impl HandlerServiceImpl {
                 users
                     .iter()
                     .map(|user| proto::xray::common::protocol::User {
-                        level: 0,
+                        level: user.user_level,
                         email: user.user_label.clone(),
                         account: None,
                     })
