@@ -5,6 +5,7 @@ pub mod http;
 pub mod httpupgrade;
 #[cfg(feature = "mixed")]
 pub mod mixed;
+pub mod proxy_protocol;
 pub mod tcp;
 #[cfg(feature = "tls")]
 pub mod tls;

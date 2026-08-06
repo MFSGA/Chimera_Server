@@ -440,6 +440,9 @@ pub enum ServerProxyConfig {
         #[serde(default)]
         fallbacks: Vec<TrojanFallback>,
     },
+    ProxyProtocol {
+        inner: Box<ServerProxyConfig>,
+    },
     #[cfg(feature = "tls")]
     Tls(TlsServerConfig),
     #[cfg(feature = "reality")]
@@ -501,6 +504,7 @@ impl std::fmt::Display for ServerProxyConfig {
                 Self::TuicV5 { .. } => "TuicV5",
                 #[cfg(feature = "trojan")]
                 Self::Trojan { .. } => "Trojan",
+                Self::ProxyProtocol { .. } => "ProxyProtocol",
                 #[cfg(feature = "reality")]
                 Self::Reality(_) => "Reality",
                 #[cfg(feature = "tls")]

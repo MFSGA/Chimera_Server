@@ -259,7 +259,7 @@ pub(super) fn apply_security_layers(
         .as_deref()
         .map(|value| value.trim().to_ascii_lowercase());
 
-    match security.as_deref() {
+    let protocol = match security.as_deref() {
         None | Some("") | Some("none") => Ok(protocol),
         #[cfg(feature = "tls")]
         Some("tls") => build_tls_layer(protocol, stream_settings),
@@ -276,5 +276,23 @@ pub(super) fn apply_security_layers(
         Some(unsupported) => Err(Error::InvalidConfig(format!(
             "unsupported streamSettings.security={unsupported}"
         ))),
+    }?;
+
+    let network = stream_settings.network.trim().to_ascii_lowercase();
+    if stream_settings
+        .tcp_settings
+        .as_ref()
+        .is_some_and(|settings| settings.accept_proxy_protocol)
+    {
+        if !matches!(network.as_str(), "" | "raw" | "tcp") {
+            return Err(Error::InvalidConfig(
+                "tcpSettings.acceptProxyProtocol requires raw/tcp transport".into(),
+            ));
+        }
+        return Ok(ServerProxyConfig::ProxyProtocol {
+            inner: Box::new(protocol),
+        });
     }
+
+    Ok(protocol)
 }

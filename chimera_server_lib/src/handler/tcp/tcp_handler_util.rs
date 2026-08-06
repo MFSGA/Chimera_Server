@@ -29,6 +29,7 @@ use crate::{
 use crate::{
     config::{rule::RuleConfig, server_config::ServerProxyConfig},
     handler::dokodemo::DokodemoDoorTcpHandler,
+    handler::proxy_protocol::ProxyProtocolServerHandler,
     handler::socks::SocksTcpServerHandler,
 };
 
@@ -44,6 +45,10 @@ pub fn create_tcp_server_handler(
     let _ = rules_stack;
 
     match server_proxy_config {
+        ServerProxyConfig::ProxyProtocol { inner } => {
+            let inner = create_tcp_server_handler(*inner, inbound_tag, rules_stack)?;
+            Ok(Box::new(ProxyProtocolServerHandler::new(inner)))
+        }
         #[cfg(feature = "vless")]
         ServerProxyConfig::Vless { users, fallbacks } => {
             if users_require_vision(&users) {

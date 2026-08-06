@@ -37,6 +37,7 @@ pub struct AccessContext {
     pub identity: Option<AccessIdentity>,
     pub target_host: Option<String>,
     pub target_port: Option<u16>,
+    pub source_port: Option<u16>,
     pub sni: Option<String>,
     pub tls_ech: bool,
     pub http_host: Option<String>,
@@ -289,6 +290,19 @@ mod traffic_noop {
         pub fn with_client_ip(mut self, ip: IpAddr) -> Self {
             self.client_ip = Some(ip);
             self
+        }
+
+        pub fn with_client_addr(mut self, addr: std::net::SocketAddr) -> Self {
+            self.client_ip = Some(addr.ip());
+            self.access_context_mut().source_port = Some(addr.port());
+            self
+        }
+
+        pub fn client_addr(&self) -> Option<std::net::SocketAddr> {
+            Some(std::net::SocketAddr::new(
+                self.client_ip?,
+                self.access_context()?.source_port?,
+            ))
         }
 
         pub fn with_user_level(mut self, level: u32) -> Self {

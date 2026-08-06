@@ -3979,6 +3979,9 @@ impl HandlerServiceImpl {
             ServerProxyConfig::Grpc(config) => {
                 self.get_user_manager_identities(&config.inner)
             }
+            ServerProxyConfig::ProxyProtocol { inner } => {
+                self.get_user_manager_identities(inner)
+            }
             ServerProxyConfig::Socks { accounts, .. } => Some(
                 accounts
                     .snapshot()
@@ -4134,6 +4137,9 @@ impl HandlerServiceImpl {
             #[cfg(feature = "grpc_transport")]
             ServerProxyConfig::Grpc(config) => {
                 self.get_user_manager_users(&config.inner)
+            }
+            ServerProxyConfig::ProxyProtocol { inner } => {
+                self.get_user_manager_users(inner)
             }
             ServerProxyConfig::Socks {
                 accounts,

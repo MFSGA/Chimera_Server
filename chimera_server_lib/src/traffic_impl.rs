@@ -155,6 +155,19 @@ impl TrafficContext {
         self
     }
 
+    pub fn with_client_addr(mut self, addr: std::net::SocketAddr) -> Self {
+        self.client_ip = Some(addr.ip());
+        self.access_context_mut().source_port = Some(addr.port());
+        self
+    }
+
+    pub fn client_addr(&self) -> Option<std::net::SocketAddr> {
+        Some(std::net::SocketAddr::new(
+            self.client_ip?,
+            self.access_context()?.source_port?,
+        ))
+    }
+
     pub fn with_user_level(mut self, level: u32) -> Self {
         self.user_level = level;
         self

@@ -93,6 +93,64 @@ pub enum TcpServerSetupResult {
 }
 
 impl TcpServerSetupResult {
+    fn traffic_context_mut(&mut self) -> Option<&mut Option<TrafficContext>> {
+        match self {
+            Self::TcpForward {
+                traffic_context, ..
+            }
+            | Self::TcpFallback {
+                traffic_context, ..
+            }
+            | Self::UdpAssociate {
+                traffic_context, ..
+            }
+            | Self::BidirectionalUdp {
+                traffic_context, ..
+            }
+            | Self::MultiDirectionalUdp {
+                traffic_context, ..
+            }
+            | Self::SessionBasedUdp {
+                traffic_context, ..
+            } => Some(traffic_context),
+            Self::AlreadyHandled => None,
+        }
+    }
+
+    pub fn set_client_addr(&mut self, client_addr: std::net::SocketAddr) {
+        if let Some(traffic_context) = self.traffic_context_mut()
+            && let Some(context) = traffic_context.take()
+        {
+            *traffic_context = Some(context.with_client_addr(client_addr));
+        }
+    }
+
+    pub fn client_addr(&self) -> Option<std::net::SocketAddr> {
+        match self {
+            Self::TcpForward {
+                traffic_context, ..
+            }
+            | Self::TcpFallback {
+                traffic_context, ..
+            }
+            | Self::UdpAssociate {
+                traffic_context, ..
+            }
+            | Self::BidirectionalUdp {
+                traffic_context, ..
+            }
+            | Self::MultiDirectionalUdp {
+                traffic_context, ..
+            }
+            | Self::SessionBasedUdp {
+                traffic_context, ..
+            } => traffic_context
+                .as_ref()
+                .and_then(TrafficContext::client_addr),
+            Self::AlreadyHandled => None,
+        }
+    }
+
     pub fn set_need_initial_flush(&mut self, need_initial_flush: bool) {
         if let TcpServerSetupResult::TcpForward {
             need_initial_flush: flush,

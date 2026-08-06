@@ -56,6 +56,8 @@ pub struct StreamSettings {
     network: String,
     security: Option<String>,
     tls_settings: Option<TlsSettings>,
+    #[serde(alias = "tcpSettings", alias = "rawSettings")]
+    tcp_settings: Option<TcpSettings>,
     #[serde(alias = "xhttpSettings")]
     xhttp_settings: Option<XhttpSettings>,
     #[cfg(feature = "ws")]
@@ -71,6 +73,13 @@ pub struct StreamSettings {
     #[cfg(feature = "reality")]
     #[serde(alias = "realitySettings")]
     reality_settings: Option<RealitySettings>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TcpSettings {
+    #[serde(default)]
+    accept_proxy_protocol: bool,
 }
 
 #[cfg(feature = "grpc_transport")]

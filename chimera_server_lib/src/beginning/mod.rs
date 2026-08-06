@@ -735,6 +735,7 @@ where
             ));
         }
     };
+    let peer_addr = setup_result.client_addr().unwrap_or(peer_addr);
     let setup_result = match setup_result {
         TcpServerSetupResult::TcpFallback {
             remote_location,
@@ -766,8 +767,8 @@ where
             connection_success_response,
             traffic_context,
         } => {
-            let mut traffic_context = traffic_context
-                .map(|context| context.with_client_ip(peer_addr.ip()));
+            let mut traffic_context =
+                traffic_context.map(|context| context.with_client_addr(peer_addr));
             let inbound_tag = traffic_context
                 .as_ref()
                 .and_then(|context| context.inbound_tag.as_deref())
@@ -930,8 +931,8 @@ where
             client_udp_port_hint,
             traffic_context,
         } => {
-            let traffic_context = traffic_context
-                .map(|context| context.with_client_ip(peer_addr.ip()));
+            let traffic_context =
+                traffic_context.map(|context| context.with_client_addr(peer_addr));
             run_udp_relay(
                 socket,
                 stream,
