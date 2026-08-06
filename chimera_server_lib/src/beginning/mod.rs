@@ -165,7 +165,8 @@ fn is_grpc_server_protocol(protocol: &ServerProxyConfig) -> bool {
 fn is_xhttp_server_protocol(protocol: &ServerProxyConfig) -> bool {
     match protocol {
         ServerProxyConfig::Xhttp { .. } => true,
-        ServerProxyConfig::ProxyProtocol { inner } => {
+        ServerProxyConfig::ProxyProtocol { inner }
+        | ServerProxyConfig::TcpKeepAlive { inner, .. } => {
             is_xhttp_server_protocol(inner)
         }
         #[cfg(feature = "tls")]

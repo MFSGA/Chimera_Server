@@ -1,5 +1,7 @@
 #[cfg(feature = "tls")]
 use std::fs;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use std::os::fd::AsRawFd;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     convert::Infallible,
@@ -173,33 +175,35 @@ pub async fn start_xhttp_server(
         ..
     } = config;
 
-    let listener_config = parse_listener_protocol(protocol)?;
+    let XhttpListenerConfig {
+        xhttp_config,
+        inner,
+        security,
+        accept_proxy_protocol,
+        tcp_keepalive,
+    } = parse_listener_protocol(protocol)?;
 
     let bind_addr = match bind_location {
         BindLocation::Address(address) => address.to_socket_addr()?,
     };
 
     let mut rules_stack = vec![];
-    let server_handler = Arc::new(create_tcp_server_handler(
-        listener_config.inner,
-        &tag,
-        &mut rules_stack,
-    )?);
+    let server_handler =
+        Arc::new(create_tcp_server_handler(inner, &tag, &mut rules_stack)?);
     let resolver = runtime.resolver();
     let state = Arc::new(AppState::new(
-        listener_config.xhttp_config,
+        xhttp_config,
         server_handler,
         resolver,
         runtime,
     ));
     #[cfg(feature = "tls")]
-    if let XhttpSecurityLayer::Http3(tls_config) = &listener_config.security {
+    if let XhttpSecurityLayer::Http3(tls_config) = &security {
         return start_xhttp3_server(bind_addr, tls_config.clone(), state).await;
     }
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    let security = listener_config.security.clone();
-    let accept_proxy_protocol = listener_config.accept_proxy_protocol;
+    let security = security.clone();
 
     let handle = tokio::spawn(async move {
         loop {
@@ -218,6 +222,12 @@ pub async fn start_xhttp_server(
                 #[cfg(feature = "reality")]
                 let reality_resolver = state.resolver.clone();
                 let mut stream = stream;
+                if let Err(error) =
+                    configure_xhttp_tcp_keepalive(&stream, tcp_keepalive)
+                {
+                    debug!("xhttp TCP keepalive setup failed: {error}");
+                    return;
+                }
                 let peer_addr = match resolve_xhttp_peer_addr(
                     &mut stream,
                     peer_addr,
@@ -419,6 +429,7 @@ struct XhttpListenerConfig {
     inner: ServerProxyConfig,
     security: XhttpSecurityLayer,
     accept_proxy_protocol: bool,
+    tcp_keepalive: Option<(i32, i32)>,
 }
 
 #[derive(Clone)]
@@ -430,6 +441,31 @@ enum XhttpSecurityLayer {
     Http3(Arc<tokio_rustls::rustls::ServerConfig>),
     #[cfg(feature = "reality")]
     Reality(RealityTransportConfig),
+}
+
+fn configure_xhttp_tcp_keepalive(
+    stream: &tokio::net::TcpStream,
+    keepalive: Option<(i32, i32)>,
+) -> std::io::Result<()> {
+    let Some((idle_secs, interval_secs)) = keepalive else {
+        return Ok(());
+    };
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    {
+        crate::util::socket::configure_tcp_keepalive(
+            stream.as_raw_fd(),
+            idle_secs,
+            interval_secs,
+        )
+    }
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    {
+        let _ = (stream, idle_secs, interval_secs);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "TCP keepalive sockopt is currently supported only on Linux and Android",
+        ))
+    }
 }
 
 async fn resolve_xhttp_peer_addr<S>(
@@ -457,6 +493,22 @@ fn parse_listener_protocol(
     protocol: ServerProxyConfig,
 ) -> std::io::Result<XhttpListenerConfig> {
     match protocol {
+        ServerProxyConfig::TcpKeepAlive {
+            idle_secs,
+            interval_secs,
+            inner,
+        } => {
+            let mut config = parse_listener_protocol(*inner)?;
+            #[cfg(feature = "tls")]
+            if matches!(&config.security, XhttpSecurityLayer::Http3(_)) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "XHTTP HTTP/3 does not support TCP keepalive sockopt",
+                ));
+            }
+            config.tcp_keepalive = Some((idle_secs, interval_secs));
+            Ok(config)
+        }
         ServerProxyConfig::ProxyProtocol { inner } => {
             let mut config = parse_listener_protocol(*inner)?;
             #[cfg(feature = "tls")]
@@ -474,6 +526,7 @@ fn parse_listener_protocol(
             inner: *inner,
             security: XhttpSecurityLayer::None,
             accept_proxy_protocol: false,
+            tcp_keepalive: None,
         }),
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(TlsServerConfig {
@@ -534,6 +587,7 @@ fn parse_listener_protocol(
                     inner: *inner,
                     security,
                     accept_proxy_protocol: false,
+                    tcp_keepalive: None,
                 })
             }
             _ => Err(std::io::Error::other(
@@ -549,6 +603,7 @@ fn parse_listener_protocol(
                         inner: (**inner).clone(),
                         security: XhttpSecurityLayer::Reality(reality_config),
                         accept_proxy_protocol: false,
+                        tcp_keepalive: None,
                     })
                 }
                 _ => Err(std::io::Error::other(
