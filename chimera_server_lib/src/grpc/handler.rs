@@ -3987,7 +3987,8 @@ impl HandlerServiceImpl {
             | ServerProxyConfig::TcpMaxSeg { inner, .. }
             | ServerProxyConfig::Ipv6Only { inner }
             | ServerProxyConfig::TcpFastOpen { inner, .. }
-            | ServerProxyConfig::BindInterface { inner, .. } => {
+            | ServerProxyConfig::BindInterface { inner, .. }
+            | ServerProxyConfig::BindMark { inner, .. } => {
                 self.get_user_manager_identities(inner)
             }
             ServerProxyConfig::Socks { accounts, .. } => Some(
@@ -4154,7 +4155,8 @@ impl HandlerServiceImpl {
             | ServerProxyConfig::TcpMaxSeg { inner, .. }
             | ServerProxyConfig::Ipv6Only { inner }
             | ServerProxyConfig::TcpFastOpen { inner, .. }
-            | ServerProxyConfig::BindInterface { inner, .. } => {
+            | ServerProxyConfig::BindInterface { inner, .. }
+            | ServerProxyConfig::BindMark { inner, .. } => {
                 self.get_user_manager_users(inner)
             }
             ServerProxyConfig::Socks {

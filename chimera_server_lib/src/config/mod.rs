@@ -107,6 +107,8 @@ pub struct SocketSettings {
     v6only: bool,
     #[serde(default)]
     interface: String,
+    #[serde(default)]
+    mark: i32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

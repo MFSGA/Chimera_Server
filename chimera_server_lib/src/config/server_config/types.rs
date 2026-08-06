@@ -475,6 +475,10 @@ pub enum ServerProxyConfig {
         name: String,
         inner: Box<ServerProxyConfig>,
     },
+    BindMark {
+        value: i32,
+        inner: Box<ServerProxyConfig>,
+    },
     #[cfg(feature = "tls")]
     Tls(TlsServerConfig),
     #[cfg(feature = "reality")]
@@ -545,6 +549,7 @@ impl std::fmt::Display for ServerProxyConfig {
                 Self::Ipv6Only { .. } => "Ipv6Only",
                 Self::TcpFastOpen { .. } => "TcpFastOpen",
                 Self::BindInterface { .. } => "BindInterface",
+                Self::BindMark { .. } => "BindMark",
                 #[cfg(feature = "reality")]
                 Self::Reality(_) => "Reality",
                 #[cfg(feature = "tls")]

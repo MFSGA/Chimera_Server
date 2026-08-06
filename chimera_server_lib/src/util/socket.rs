@@ -86,6 +86,14 @@ pub fn configure_tcp_window_clamp(
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
+#[cfg(target_os = "linux")]
+pub fn configure_socket_mark(
+    fd: std::os::fd::RawFd,
+    value: i32,
+) -> std::io::Result<()> {
+    set_socket_option_int(fd, libc::SOL_SOCKET, libc::SO_MARK, value)
+}
+
 pub fn configure_tcp_fast_open(
     fd: std::os::fd::RawFd,
     value: i32,

@@ -282,6 +282,28 @@ pub(super) fn apply_security_layers(
     }?;
 
     let network = stream_settings.network.trim().to_ascii_lowercase();
+    let mark = stream_settings
+        .sockopt
+        .as_ref()
+        .map_or(0, |settings| settings.mark);
+    let configure_mark = mark != 0;
+    if configure_mark
+        && !matches!(
+            network.as_str(),
+            "" | "raw" | "tcp" | "ws" | "websocket" | "httpupgrade"
+        )
+    {
+        return Err(Error::InvalidConfig(format!(
+            "sockopt.mark is not supported for {network} transport yet"
+        )));
+    }
+    #[cfg(not(target_os = "linux"))]
+    if configure_mark {
+        return Err(Error::InvalidConfig(
+            "sockopt.mark is currently supported only on Linux".into(),
+        ));
+    }
+
     let bind_interface = stream_settings
         .sockopt
         .as_ref()
@@ -769,6 +791,14 @@ pub(super) fn apply_security_layers(
     let protocol = if let Some(value) = tcp_fast_open {
         ServerProxyConfig::TcpFastOpen {
             value,
+            inner: Box::new(protocol),
+        }
+    } else {
+        protocol
+    };
+    let protocol = if configure_mark {
+        ServerProxyConfig::BindMark {
+            value: mark,
             inner: Box::new(protocol),
         }
     } else {
