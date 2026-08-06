@@ -1751,6 +1751,7 @@ async fn shutdown_message(
 struct UdpListenerOptions {
     mark: Option<i32>,
     bind_interface: Option<String>,
+    custom_sockopt: Vec<crate::config::CustomSockoptConfig>,
 }
 
 fn parse_udp_listener_protocol(
@@ -1766,6 +1767,13 @@ fn parse_udp_listener_protocol(
             }
             ServerProxyConfig::BindMark { value, inner } => {
                 options.mark = Some(value);
+                protocol = *inner;
+            }
+            ServerProxyConfig::CustomSockopt {
+                options: values,
+                inner,
+            } => {
+                options.custom_sockopt = values;
                 protocol = *inner;
             }
             protocol => return (protocol, options),
@@ -1793,6 +1801,19 @@ fn create_udp_listener(
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "sockopt.mark is currently supported only on Linux",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    crate::util::socket::configure_custom_sockopt(
+        socket.as_raw_fd(),
+        if bind_addr.is_ipv6() { "udp6" } else { "udp4" },
+        &options.custom_sockopt,
+    )?;
+    #[cfg(not(target_os = "linux"))]
+    if !options.custom_sockopt.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "customSockopt is currently supported only on Linux",
         ));
     }
     if receive_original_destination {
@@ -2652,27 +2673,73 @@ mod tests {
         assert_eq!(&value[..end], b"lo");
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn custom_udp_listener_option_applies_to_socket() {
+        let socket = create_udp_listener(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            &UdpListenerOptions {
+                custom_sockopt: vec![crate::config::CustomSockoptConfig {
+                    system: "linux".into(),
+                    network: "udp".into(),
+                    level: libc::SOL_SOCKET.to_string(),
+                    opt: libc::SO_REUSEADDR.to_string(),
+                    value: "1".into(),
+                    value_type: "int".into(),
+                }],
+                ..UdpListenerOptions::default()
+            },
+            false,
+        )
+        .expect("create UDP listener with custom socket option");
+        let mut value = 0;
+        let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+        // SAFETY: `value` and `length` are valid writable getsockopt buffers.
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                std::ptr::from_mut(&mut value).cast(),
+                &mut length,
+            )
+        };
+        assert_eq!(result, 0);
+        assert_eq!(value, 1);
+    }
+
     #[test]
-    fn udp_listener_parser_extracts_interface_and_mark_wrappers() {
+    fn udp_listener_parser_extracts_common_socket_wrappers() {
         let protocol = ServerProxyConfig::BindInterface {
             name: "lo".into(),
-            inner: Box::new(ServerProxyConfig::BindMark {
-                value: 17,
-                inner: Box::new(ServerProxyConfig::DokodemoDoor {
-                    config: DokodemoDoorConfig {
-                        target: NetLocation::new(
-                            Address::Ipv4(Ipv4Addr::LOCALHOST),
-                            53,
-                        ),
-                        follow_redirect: false,
-                        user_level: 0,
-                    },
+            inner: Box::new(ServerProxyConfig::CustomSockopt {
+                options: vec![crate::config::CustomSockoptConfig {
+                    system: "linux".into(),
+                    network: "udp".into(),
+                    level: "1".into(),
+                    opt: "2".into(),
+                    value: "1".into(),
+                    value_type: "int".into(),
+                }],
+                inner: Box::new(ServerProxyConfig::BindMark {
+                    value: 17,
+                    inner: Box::new(ServerProxyConfig::DokodemoDoor {
+                        config: DokodemoDoorConfig {
+                            target: NetLocation::new(
+                                Address::Ipv4(Ipv4Addr::LOCALHOST),
+                                53,
+                            ),
+                            follow_redirect: false,
+                            user_level: 0,
+                        },
+                    }),
                 }),
             }),
         };
         let (protocol, options) = parse_udp_listener_protocol(protocol);
         assert_eq!(options.mark, Some(17));
         assert_eq!(options.bind_interface.as_deref(), Some("lo"));
+        assert_eq!(options.custom_sockopt.len(), 1);
         assert!(matches!(protocol, ServerProxyConfig::DokodemoDoor { .. }));
     }
 
