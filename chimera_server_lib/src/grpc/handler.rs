@@ -3284,6 +3284,7 @@ impl HandlerServiceImpl {
         Ok(Hysteria2Client {
             password: auth.to_string(),
             email: Some(email.to_string()),
+            user_level: user.level,
         })
     }
 
@@ -3348,6 +3349,7 @@ impl HandlerServiceImpl {
                     .find(|existing| existing.email == client.email)
                 {
                     existing.password = client.password;
+                    existing.user_level = client.user_level;
                 } else {
                     config.clients.push(client);
                 }
@@ -3685,7 +3687,7 @@ impl HandlerServiceImpl {
                     .filter_map(|client| {
                         client.email.clone().map(|email| {
                             proto::xray::common::protocol::User {
-                                level: 0,
+                                level: client.user_level,
                                 email,
                                 account: Some(
                                     proto::xray::common::serial::TypedMessage {
@@ -6817,6 +6819,7 @@ mod tests {
                     clients: vec![Hysteria2Client {
                         password: "initial-auth".to_string(),
                         email: Some("initial-user".to_string()),
+                        user_level: 3,
                     }],
                     bandwidth: Hysteria2BandwidthConfig::default(),
                     ignore_client_bandwidth: false,
@@ -6832,7 +6835,7 @@ mod tests {
 
         let add_operation = proto::xray::app::proxyman::command::AddUserOperation {
             user: Some(proto::xray::common::protocol::User {
-                level: 0,
+                level: 9,
                 email: email.clone(),
                 account: Some(proto::xray::common::serial::TypedMessage {
                     r#type: TYPE_PROXY_HYSTERIA_ACCOUNT.to_string(),
@@ -6868,6 +6871,7 @@ mod tests {
             .into_inner()
             .users;
         assert_eq!(users_after_add.len(), 1);
+        assert_eq!(users_after_add[0].level, 9);
         let account = users_after_add[0]
             .account
             .as_ref()

@@ -82,6 +82,7 @@ fn hysteria2_traffic_context(
     #[allow(unused_mut)]
     let mut context = TrafficContext::new("hysteria2")
         .with_identity(hysteria2_routing_identity(client))
+        .with_user_level(client.user_level)
         .with_inbound_tag(inbound_tag.to_string())
         .with_client_ip(peer_addr.ip());
     #[cfg(feature = "user_domain_access")]
@@ -89,6 +90,26 @@ fn hysteria2_traffic_context(
         context = context
             .with_protocol_identity(hysteria2_password_identity(&client.password));
     }
+    context
+}
+
+fn apply_hysteria2_policy(
+    mut context: TrafficContext,
+    runtime: &RuntimeState,
+) -> TrafficContext {
+    let user_stats = runtime.policy_user_stats(context.user_level);
+    let system_stats = runtime.policy_system_stats();
+    context.set_user_stats_policy(
+        user_stats.uplink,
+        user_stats.downlink,
+        user_stats.online,
+    );
+    context.set_system_stats_policy(
+        system_stats.inbound_uplink,
+        system_stats.inbound_downlink,
+        system_stats.outbound_uplink,
+        system_stats.outbound_downlink,
+    );
     context
 }
 
@@ -302,13 +323,15 @@ async fn handle_tcp_stream(
     runtime: RuntimeState,
 ) -> std::io::Result<()> {
     let request = TcpRequest::read(&mut recv).await?;
-    let mut context =
-        hysteria2_traffic_context(&client, inbound_tag.as_str(), peer_addr)
-            .with_access_target(
-                request.target.address().to_string(),
-                request.target.port(),
-                AccessTransport::Quic,
-            );
+    let mut context = apply_hysteria2_policy(
+        hysteria2_traffic_context(&client, inbound_tag.as_str(), peer_addr),
+        &runtime,
+    )
+    .with_access_target(
+        request.target.address().to_string(),
+        request.target.port(),
+        AccessTransport::Quic,
+    );
     #[cfg(feature = "user_domain_access")]
     match crate::beginning::enforce_user_domain_access(
         &runtime,
@@ -675,8 +698,10 @@ async fn drive_udp_datagrams(
 ) -> std::io::Result<()> {
     let mut sessions: HashMap<u32, UdpSession> = HashMap::new();
     let peer_addr = connection.remote_address();
-    let base_context =
-        hysteria2_traffic_context(&auth_ctx.client, inbound_tag.as_str(), peer_addr);
+    let base_context = apply_hysteria2_policy(
+        hysteria2_traffic_context(&auth_ctx.client, inbound_tag.as_str(), peer_addr),
+        &runtime,
+    );
 
     loop {
         let data = match connection.read_datagram().await {
@@ -1258,6 +1283,7 @@ mod tests {
         let client = Hysteria2Client {
             password: "super-secret".into(),
             email: None,
+            user_level: 3,
         };
         let context = hysteria2_traffic_context(
             &client,
@@ -1269,6 +1295,7 @@ mod tests {
         assert_eq!(context.protocol_identity(), Some(expected.as_str()));
         assert!(!expected.contains(&client.password));
         assert_eq!(context.inbound_tag.as_deref(), Some("hysteria-test"));
+        assert_eq!(context.user_level, 3);
     }
 
     #[test]
@@ -1276,6 +1303,7 @@ mod tests {
         let client = Hysteria2Client {
             password: "super-secret".into(),
             email: Some("user@example.com".into()),
+            user_level: 7,
         };
         let context = hysteria2_traffic_context(
             &client,
@@ -1285,5 +1313,6 @@ mod tests {
         let expected = hysteria2_password_identity(&client.password);
         assert_eq!(context.identity.as_deref(), Some("user@example.com"));
         assert_eq!(context.protocol_identity(), Some(expected.as_str()));
+        assert_eq!(context.user_level, 7);
     }
 }

@@ -55,6 +55,8 @@ pub(super) fn collect_hysteria2_settings(
         auth: Option<String>,
         #[serde(default)]
         email: String,
+        #[serde(default)]
+        level: u32,
     }
 
     #[derive(Deserialize)]
@@ -92,6 +94,7 @@ pub(super) fn collect_hysteria2_settings(
                 } else {
                     Some(client.email)
                 },
+                user_level: client.level,
             })
         })
         .collect::<Result<Vec<_>, Error>>()?;
@@ -1474,7 +1477,8 @@ mod tests {
         let settings = SettingObject(serde_json::json!({
             "clients": [{
                 "auth": "xray-auth-token",
-                "email": "hy@example.com"
+                "email": "hy@example.com",
+                "level": 7
             }]
         }));
 
@@ -1483,6 +1487,7 @@ mod tests {
         assert_eq!(config.clients.len(), 1);
         assert_eq!(config.clients[0].password, "xray-auth-token");
         assert_eq!(config.clients[0].email.as_deref(), Some("hy@example.com"));
+        assert_eq!(config.clients[0].user_level, 7);
     }
 
     #[cfg(feature = "hysteria")]

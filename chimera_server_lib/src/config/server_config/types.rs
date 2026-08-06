@@ -33,6 +33,8 @@ pub struct ServerConfig {
 pub struct Hysteria2Client {
     pub password: String,
     pub email: Option<String>,
+    #[serde(default)]
+    pub user_level: u32,
 }
 
 #[cfg(feature = "hysteria")]
