@@ -8,6 +8,7 @@ pub mod mixed;
 pub mod proxy_protocol;
 pub mod tcp;
 pub mod tcp_keepalive;
+pub mod tcp_user_timeout;
 #[cfg(feature = "tls")]
 pub mod tls;
 #[cfg(any(feature = "reality", feature = "vless"))]

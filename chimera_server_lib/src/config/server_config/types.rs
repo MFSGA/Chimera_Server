@@ -448,6 +448,10 @@ pub enum ServerProxyConfig {
         interval_secs: i32,
         inner: Box<ServerProxyConfig>,
     },
+    TcpUserTimeout {
+        timeout_ms: i32,
+        inner: Box<ServerProxyConfig>,
+    },
     #[cfg(feature = "tls")]
     Tls(TlsServerConfig),
     #[cfg(feature = "reality")]
@@ -511,6 +515,7 @@ impl std::fmt::Display for ServerProxyConfig {
                 Self::Trojan { .. } => "Trojan",
                 Self::ProxyProtocol { .. } => "ProxyProtocol",
                 Self::TcpKeepAlive { .. } => "TcpKeepAlive",
+                Self::TcpUserTimeout { .. } => "TcpUserTimeout",
                 #[cfg(feature = "reality")]
                 Self::Reality(_) => "Reality",
                 #[cfg(feature = "tls")]

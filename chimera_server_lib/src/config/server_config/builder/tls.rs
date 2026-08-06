@@ -317,6 +317,28 @@ pub(super) fn apply_security_layers(
         ));
     }
 
+    let user_timeout_ms = stream_settings
+        .sockopt
+        .as_ref()
+        .map_or(0, |settings| settings.tcp_user_timeout);
+    let configure_user_timeout = user_timeout_ms > 0;
+    if configure_user_timeout
+        && !matches!(
+            network.as_str(),
+            "" | "raw" | "tcp" | "ws" | "websocket" | "httpupgrade"
+        )
+    {
+        return Err(Error::InvalidConfig(format!(
+            "tcpUserTimeout is not supported for {network} transport yet"
+        )));
+    }
+    #[cfg(not(target_os = "linux"))]
+    if configure_user_timeout {
+        return Err(Error::InvalidConfig(
+            "tcpUserTimeout is currently supported only on Linux".into(),
+        ));
+    }
+
     let mut accept_proxy_protocol = false;
     if stream_settings
         .sockopt
@@ -408,10 +430,18 @@ pub(super) fn apply_security_layers(
     } else {
         protocol
     };
-    if configure_keepalive {
-        Ok(ServerProxyConfig::TcpKeepAlive {
+    let protocol = if configure_keepalive {
+        ServerProxyConfig::TcpKeepAlive {
             idle_secs: keepalive_idle,
             interval_secs: keepalive_interval,
+            inner: Box::new(protocol),
+        }
+    } else {
+        protocol
+    };
+    if configure_user_timeout {
+        Ok(ServerProxyConfig::TcpUserTimeout {
+            timeout_ms: user_timeout_ms,
             inner: Box::new(protocol),
         })
     } else {

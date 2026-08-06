@@ -3980,7 +3980,8 @@ impl HandlerServiceImpl {
                 self.get_user_manager_identities(&config.inner)
             }
             ServerProxyConfig::ProxyProtocol { inner }
-            | ServerProxyConfig::TcpKeepAlive { inner, .. } => {
+            | ServerProxyConfig::TcpKeepAlive { inner, .. }
+            | ServerProxyConfig::TcpUserTimeout { inner, .. } => {
                 self.get_user_manager_identities(inner)
             }
             ServerProxyConfig::Socks { accounts, .. } => Some(
@@ -4140,7 +4141,8 @@ impl HandlerServiceImpl {
                 self.get_user_manager_users(&config.inner)
             }
             ServerProxyConfig::ProxyProtocol { inner }
-            | ServerProxyConfig::TcpKeepAlive { inner, .. } => {
+            | ServerProxyConfig::TcpKeepAlive { inner, .. }
+            | ServerProxyConfig::TcpUserTimeout { inner, .. } => {
                 self.get_user_manager_users(inner)
             }
             ServerProxyConfig::Socks {

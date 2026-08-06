@@ -69,6 +69,14 @@ pub fn configure_tcp_keepalive(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+pub fn configure_tcp_user_timeout(
+    fd: std::os::fd::RawFd,
+    timeout_ms: i32,
+) -> std::io::Result<()> {
+    set_socket_option_int(fd, libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, timeout_ms)
+}
+
 #[cfg(any(target_os = "android", target_os = "linux"))]
 fn set_socket_option_int(
     fd: std::os::fd::RawFd,

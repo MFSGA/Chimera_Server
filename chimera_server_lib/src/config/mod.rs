@@ -86,6 +86,8 @@ pub struct SocketSettings {
     tcp_keep_alive_interval: i32,
     #[serde(default)]
     tcp_keep_alive_idle: i32,
+    #[serde(default)]
+    tcp_user_timeout: i32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

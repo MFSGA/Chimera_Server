@@ -32,6 +32,7 @@ use crate::{
     handler::proxy_protocol::ProxyProtocolServerHandler,
     handler::socks::SocksTcpServerHandler,
     handler::tcp_keepalive::TcpKeepAliveServerHandler,
+    handler::tcp_user_timeout::TcpUserTimeoutServerHandler,
 };
 
 use super::tcp_handler::TcpServerHandler;
@@ -60,6 +61,12 @@ pub fn create_tcp_server_handler(
                 idle_secs,
                 interval_secs,
                 inner,
+            )))
+        }
+        ServerProxyConfig::TcpUserTimeout { timeout_ms, inner } => {
+            let inner = create_tcp_server_handler(*inner, inbound_tag, rules_stack)?;
+            Ok(Box::new(TcpUserTimeoutServerHandler::new(
+                timeout_ms, inner,
             )))
         }
         #[cfg(feature = "vless")]
