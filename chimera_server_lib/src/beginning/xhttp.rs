@@ -1334,19 +1334,24 @@ fn apply_trusted_x_forwarded_for(
     trusted_sources: &[String],
     peer_addr: std::net::SocketAddr,
 ) -> std::net::SocketAddr {
-    if !trusted_sources.is_empty()
-        && !trusted_sources
-            .iter()
-            .any(|source| trusted_source_contains(source, peer_addr.ip()))
-    {
-        return peer_addr;
-    }
     let Some(forwarded_for) = headers
         .get("x-forwarded-for")
         .and_then(|value| value.to_str().ok())
     else {
         return peer_addr;
     };
+    if !trusted_sources.is_empty()
+        && !trusted_sources
+            .iter()
+            .any(|source| trusted_source_contains(source, peer_addr.ip()))
+    {
+        warn!(
+            peer = %peer_addr,
+            x_forwarded_for = %forwarded_for,
+            "xhttp ignored potentially forged X-Forwarded-For from untrusted source"
+        );
+        return peer_addr;
+    }
 
     let candidate = forwarded_for
         .split_once(',')
