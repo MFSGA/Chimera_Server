@@ -1,5 +1,3 @@
-#[cfg(feature = "tls")]
-use std::fs;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use std::os::fd::AsRawFd;
 use std::{
@@ -58,7 +56,7 @@ use crate::{
 };
 #[cfg(feature = "tls")]
 use crate::{
-    config::server_config::TlsServerConfig, util::rustls_util::create_server_config,
+    config::server_config::TlsServerConfig, handler::tls::build_server_config,
 };
 
 use super::process_stream;
@@ -758,10 +756,10 @@ fn parse_listener_protocol(
             let TlsServerConfig {
                 certificates,
                 mut alpn_protocols,
-                enable_session_resumption: _,
-                reject_unknown_sni: _,
-                min_version: _,
-                max_version: _,
+                enable_session_resumption,
+                reject_unknown_sni,
+                min_version,
+                max_version,
                 server_name: _,
                 inner,
             } = tls_config;
@@ -774,33 +772,14 @@ fn parse_listener_protocol(
             if !alpn_protocols.iter().any(|value| value == "h2") {
                 alpn_protocols.push("h2".to_string());
             }
-            let certificate = certificates
-                .into_iter()
-                .find(|certificate| {
-                    certificate.key_path.is_some() || certificate.key_pem.is_some()
-                })
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "gRPC TLS certificate and private key are required",
-                    )
-                })?;
-            let cert_bytes = match certificate.certificate_path {
-                Some(path) => fs::read(path)?,
-                None => certificate.certificate_pem,
-            };
-            let key_bytes = match (certificate.key_path, certificate.key_pem) {
-                (Some(path), _) => fs::read(path)?,
-                (None, Some(key)) => key,
-                (None, None) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "gRPC TLS private key is required",
-                    ));
-                }
-            };
-            let server_config =
-                create_server_config(&cert_bytes, &key_bytes, &alpn_protocols, &[])?;
+            let server_config = build_server_config(
+                &certificates,
+                &alpn_protocols,
+                enable_session_resumption,
+                reject_unknown_sni,
+                min_version.as_deref(),
+                max_version.as_deref(),
+            )?;
             let inner = (*config.inner).clone();
             Ok(GrpcListenerConfig {
                 grpc: config,
@@ -1291,6 +1270,55 @@ mod tests {
         let mut remaining = vec![0u8; preface.len()];
         server.read_exact(&mut remaining).await.unwrap();
         assert_eq!(remaining, preface);
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_listener_honors_reject_unknown_sni_config() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        use crate::{
+            address::{Address, NetLocation},
+            config::server_config::{
+                DokodemoDoorConfig, TlsCertificateConfig, TlsCertificateUsage,
+            },
+        };
+
+        let generated =
+            rcgen::generate_simple_self_signed(["proxy.example".to_string()])
+                .unwrap();
+        let inner = ServerProxyConfig::Grpc(GrpcServerConfig {
+            service_name: "proxy".into(),
+            inner: Box::new(ServerProxyConfig::DokodemoDoor {
+                config: DokodemoDoorConfig {
+                    target: NetLocation::new(Address::UNSPECIFIED, 443),
+                    follow_redirect: false,
+                    user_level: 0,
+                },
+            }),
+        });
+        let listener =
+            parse_listener_protocol(ServerProxyConfig::Tls(TlsServerConfig {
+                certificates: vec![TlsCertificateConfig {
+                    certificate_path: None,
+                    certificate_pem: generated.cert.pem().into_bytes(),
+                    key_path: None,
+                    key_pem: Some(
+                        generated.signing_key.serialize_pem().into_bytes(),
+                    ),
+                    usage: TlsCertificateUsage::Encipherment,
+                }],
+                alpn_protocols: Vec::new(),
+                enable_session_resumption: false,
+                reject_unknown_sni: true,
+                min_version: None,
+                max_version: None,
+                server_name: None,
+                inner: Box::new(inner),
+            }))
+            .expect("gRPC TLS listener should compile with rejectUnknownSni");
+
+        assert!(matches!(listener.security, GrpcSecurity::Tls(_)));
+        assert_eq!(listener.grpc.service_name, "proxy");
     }
 
     #[test]

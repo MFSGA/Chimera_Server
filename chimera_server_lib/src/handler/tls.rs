@@ -191,7 +191,7 @@ impl TcpServerHandler for TlsServerHandler {
     }
 }
 
-fn build_server_config(
+pub(crate) fn build_server_config(
     certificates: &[TlsCertificateConfig],
     alpn_protocols: &[String],
     enable_session_resumption: bool,
