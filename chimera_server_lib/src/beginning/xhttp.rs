@@ -35,7 +35,7 @@ use tokio::{
 #[cfg(feature = "tls")]
 use tokio_rustls::TlsAcceptor;
 use tokio_util::{io::ReaderStream, sync::CancellationToken};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::{
     address::BindLocation,
@@ -197,6 +197,12 @@ pub async fn start_xhttp_server(
     let mut rules_stack = vec![];
     let server_handler =
         Arc::new(create_tcp_server_handler(inner, &tag, &mut rules_stack)?);
+    if trusted_x_forwarded_for.is_empty() {
+        warn!(
+            inbound_tag = %tag,
+            "XHTTP inbound has no sockopt.trustedXForwardedFor; trusting X-Forwarded-For implicitly for Xray compatibility"
+        );
+    }
     let resolver = runtime.resolver();
     let state = Arc::new(AppState::new(
         xhttp_config,
@@ -1328,9 +1334,10 @@ fn apply_trusted_x_forwarded_for(
     trusted_sources: &[String],
     peer_addr: std::net::SocketAddr,
 ) -> std::net::SocketAddr {
-    if !trusted_sources
-        .iter()
-        .any(|source| trusted_source_contains(source, peer_addr.ip()))
+    if !trusted_sources.is_empty()
+        && !trusted_sources
+            .iter()
+            .any(|source| trusted_source_contains(source, peer_addr.ip()))
     {
         return peer_addr;
     }
@@ -2389,6 +2396,21 @@ mod tests {
             &headers,
             &["127.0.0.0/8".into()],
             "127.0.0.1:1234".parse().unwrap(),
+        );
+        assert_eq!(peer, "203.0.113.9:0".parse().unwrap());
+    }
+
+    #[test]
+    fn missing_trusted_forwarded_for_preserves_xray_implicit_trust() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            hyper::header::HeaderName::from_static("x-forwarded-for"),
+            hyper::header::HeaderValue::from_static("203.0.113.9"),
+        );
+        let peer = apply_trusted_x_forwarded_for(
+            &headers,
+            &[],
+            "192.0.2.10:1234".parse().unwrap(),
         );
         assert_eq!(peer, "203.0.113.9:0".parse().unwrap());
     }
