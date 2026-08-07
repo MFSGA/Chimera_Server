@@ -9,7 +9,9 @@ use crate::{
     address::{Address, NetLocation},
     async_stream::AsyncStream,
     config::server_config::{SocksUser, SocksUserStore},
-    handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
+    handler::tcp::tcp_handler::{
+        TcpServerConnectionContext, TcpServerHandler, TcpServerSetupResult,
+    },
     outbound::{
         DirectOutboundAction, UdpProxyAssociationRegistry, connection_routing_input,
         select_direct_outbound,
@@ -97,11 +99,11 @@ impl SocksMethod {
     }
 }
 
-#[async_trait]
-impl TcpServerHandler for SocksTcpServerHandler {
-    async fn setup_server_stream(
+impl SocksTcpServerHandler {
+    async fn setup_server_stream_inner(
         &self,
         mut server_stream: Box<dyn AsyncStream>,
+        local_ip: Option<std::net::IpAddr>,
     ) -> std::io::Result<TcpServerSetupResult> {
         let method =
             negotiate_method(&mut server_stream, self.requires_auth()).await?;
@@ -155,7 +157,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
             CMD_UDP_ASSOCIATE if self.udp_enabled => {
                 handle_udp_associate(
                     server_stream,
-                    self.udp_bind_ip,
+                    self.udp_bind_ip.or(local_ip),
                     Some(traffic_context),
                 )
                 .await
@@ -177,6 +179,28 @@ impl TcpServerHandler for SocksTcpServerHandler {
                 ))
             }
         }
+    }
+}
+
+#[async_trait]
+impl TcpServerHandler for SocksTcpServerHandler {
+    async fn setup_server_stream(
+        &self,
+        server_stream: Box<dyn AsyncStream>,
+    ) -> std::io::Result<TcpServerSetupResult> {
+        self.setup_server_stream_inner(server_stream, None).await
+    }
+
+    async fn setup_server_stream_with_context(
+        &self,
+        server_stream: Box<dyn AsyncStream>,
+        context: TcpServerConnectionContext,
+    ) -> std::io::Result<TcpServerSetupResult> {
+        self.setup_server_stream_inner(
+            server_stream,
+            context.local_addr.map(|addr| addr.ip()),
+        )
+        .await
     }
 }
 
@@ -975,6 +999,49 @@ mod tests {
             assert_eq!(context.user_level, 7);
             assert_eq!(context.inbound_tag.as_deref(), Some("socks-level"));
         }
+    }
+
+    #[tokio::test]
+    async fn udp_associate_uses_tcp_local_ip_by_default() {
+        let handler = SocksTcpServerHandler::new(
+            SocksUserStore::with_auth_required(Vec::new(), false),
+            "socks-local",
+            true,
+            None,
+            0,
+        );
+        let request = [
+            SOCKS_VERSION,
+            1,
+            METHOD_NO_AUTH,
+            SOCKS_VERSION,
+            CMD_UDP_ASSOCIATE,
+            0,
+            ADDR_TYPE_IPV4,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        let (mut client, server) = duplex(1024);
+        client.write_all(&request).await.unwrap();
+
+        let result = handler
+            .setup_server_stream_with_context(
+                Box::new(server),
+                TcpServerConnectionContext {
+                    local_addr: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 1080))),
+                    ..TcpServerConnectionContext::default()
+                },
+            )
+            .await
+            .expect("SOCKS UDP ASSOCIATE should succeed");
+        let TcpServerSetupResult::UdpAssociate { socket, .. } = result else {
+            panic!("expected UDP associate result");
+        };
+        assert_eq!(socket.local_addr().unwrap().ip(), Ipv4Addr::LOCALHOST);
     }
 
     #[tokio::test]
