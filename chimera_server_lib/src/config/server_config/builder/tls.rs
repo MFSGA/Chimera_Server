@@ -493,11 +493,6 @@ pub(super) fn apply_security_layers(
                 settings.tcp_keep_alive_interval,
             )
         });
-    if i64::from(keepalive_idle) * i64::from(keepalive_interval) < 0 {
-        return Err(Error::InvalidConfig(format!(
-            "invalid tcpKeepAliveIdle/tcpKeepAliveInterval values: {keepalive_idle} {keepalive_interval}"
-        )));
-    }
     let configure_keepalive = keepalive_idle != 0 || keepalive_interval != 0;
     if configure_keepalive
         && !matches!(

@@ -1530,9 +1530,9 @@ mod tests {
         assert!(matches!(*inner, ServerProxyConfig::ProxyProtocol { .. }));
     }
 
-    #[cfg(feature = "vless")]
+    #[cfg(all(feature = "vless", any(target_os = "android", target_os = "linux")))]
     #[test]
-    fn socket_tcp_keepalive_rejects_mixed_signs() {
+    fn socket_tcp_keepalive_preserves_mixed_signs() {
         let inbound: InboudItem = serde_json::from_value(serde_json::json!({
             "listen": "127.0.0.1",
             "port": 443,
@@ -1551,8 +1551,16 @@ mod tests {
             }
         }))
         .unwrap();
-        let error = ServerConfig::try_from(inbound).unwrap_err();
-        assert!(error.to_string().contains("tcpKeepAliveIdle"));
+        let config = ServerConfig::try_from(inbound).unwrap();
+        let ServerProxyConfig::TcpKeepAlive {
+            idle_secs,
+            interval_secs,
+            ..
+        } = config.protocol
+        else {
+            panic!("mixed-sign keepalive must remain configurable like Xray");
+        };
+        assert_eq!((idle_secs, interval_secs), (-1, 10));
     }
 
     #[cfg(all(feature = "vless", any(target_os = "android", target_os = "linux")))]
