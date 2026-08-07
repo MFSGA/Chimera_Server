@@ -9,6 +9,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     time::timeout,
 };
+use tracing::warn;
 
 use crate::{
     async_stream::AsyncStream,
@@ -336,6 +337,17 @@ fn trusted_forwarded_client_addr(
         .iter()
         .any(|name| headers.contains_key(&name.trim().to_ascii_lowercase()))
     {
+        if trusted.is_empty() {
+            warn!(
+                x_forwarded_for = %forwarded_for,
+                "HTTPUpgrade received X-Forwarded-For without sockopt.trustedXForwardedFor; using real peer"
+            );
+        } else {
+            warn!(
+                x_forwarded_for = %forwarded_for,
+                "HTTPUpgrade ignored potentially forged X-Forwarded-For without a configured trusted header"
+            );
+        }
         return None;
     }
     let candidate = forwarded_for
@@ -732,6 +744,7 @@ mod tests {
             trusted_forwarded_client_addr(&headers, &["X-Trusted-Proxy".into()]),
             None,
         );
+        assert_eq!(trusted_forwarded_client_addr(&headers, &[]), None);
     }
 
     #[tokio::test]
