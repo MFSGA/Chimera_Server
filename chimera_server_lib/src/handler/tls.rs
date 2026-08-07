@@ -53,16 +53,40 @@ pub struct TlsServerHandler {
 }
 
 #[derive(Debug)]
-struct XraySniResolver {
+struct XraySniCertificate {
     certified_key: Arc<CertifiedKey>,
     names: Vec<String>,
 }
 
+#[derive(Debug)]
+struct XraySniResolver {
+    certificates: Vec<XraySniCertificate>,
+    reject_unknown_sni: bool,
+}
+
 impl ResolvesServerCert for XraySniResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        let sni = client_hello.server_name()?;
-        sni_matches_names(sni, &self.names).then(|| self.certified_key.clone())
+        let sni = client_hello.server_name().unwrap_or_default();
+        let index = select_sni_certificate(
+            self.certificates
+                .iter()
+                .map(|certificate| certificate.names.as_slice()),
+            sni,
+            self.reject_unknown_sni,
+        )?;
+        Some(self.certificates[index].certified_key.clone())
     }
+}
+
+fn select_sni_certificate<'a>(
+    certificate_names: impl Iterator<Item = &'a [String]>,
+    sni: &str,
+    reject_unknown_sni: bool,
+) -> Option<usize> {
+    certificate_names
+        .enumerate()
+        .find_map(|(index, names)| sni_matches_names(sni, names).then_some(index))
+        .or_else(|| (!reject_unknown_sni).then_some(0))
 }
 
 fn sni_matches_names(sni: &str, names: &[String]) -> bool {
@@ -200,35 +224,46 @@ pub(crate) fn build_server_config(
     min_version: Option<&str>,
     max_version: Option<&str>,
 ) -> io::Result<rustls::ServerConfig> {
-    let certificate = certificates
+    let encipherment_certificates = certificates
         .iter()
-        .find(|certificate| {
+        .filter(|certificate| {
             matches!(certificate.usage, TlsCertificateUsage::Encipherment)
         })
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "no encipherment certificate found for TLS server",
-            )
-        })?;
+        .collect::<Vec<_>>();
+    let certificate = encipherment_certificates.first().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no encipherment certificate found for TLS server",
+        )
+    })?;
     let cert_chain = load_certs(certificate)?;
     let private_key = load_private_key(certificate)?;
 
     let versions = tls_versions(min_version, max_version)?;
     let mut config = rustls::ServerConfig::builder_with_protocol_versions(&versions)
         .with_no_client_auth()
-        .with_single_cert(cert_chain.clone(), private_key.clone_key())
+        .with_single_cert(cert_chain, private_key)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    if reject_unknown_sni {
-        let certified_key = CertifiedKey::from_der(
-            cert_chain.clone(),
-            private_key,
-            config.crypto_provider(),
-        )
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    if reject_unknown_sni || encipherment_certificates.len() > 1 {
+        let mut sni_certificates =
+            Vec::with_capacity(encipherment_certificates.len());
+        for certificate in encipherment_certificates {
+            let cert_chain = load_certs(certificate)?;
+            let private_key = load_private_key(certificate)?;
+            let certified_key = CertifiedKey::from_der(
+                cert_chain.clone(),
+                private_key,
+                config.crypto_provider(),
+            )
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+            sni_certificates.push(XraySniCertificate {
+                certified_key: Arc::new(certified_key),
+                names: certificate_dns_names(&cert_chain[0])?,
+            });
+        }
         config.cert_resolver = Arc::new(XraySniResolver {
-            certified_key: Arc::new(certified_key),
-            names: certificate_dns_names(&cert_chain[0])?,
+            certificates: sni_certificates,
+            reject_unknown_sni,
         });
     }
 
@@ -405,6 +440,31 @@ mod tests {
         );
         assert_eq!(tls_versions(Some("1.3"), None).unwrap(), vec![&TLS13]);
         assert!(tls_versions(Some("1.3"), Some("1.2")).is_err());
+    }
+
+    #[test]
+    fn multiple_certificates_follow_xray_sni_selection_and_fallback() {
+        let names = [
+            vec!["first.example".into()],
+            vec!["second.example".into(), "*.example.net".into()],
+        ];
+        let certificate_names = || names.iter().map(Vec::as_slice);
+        assert_eq!(
+            select_sni_certificate(certificate_names(), "second.example", false),
+            Some(1)
+        );
+        assert_eq!(
+            select_sni_certificate(certificate_names(), "api.example.net", false),
+            Some(1)
+        );
+        assert_eq!(
+            select_sni_certificate(certificate_names(), "unknown.example", false),
+            Some(0)
+        );
+        assert_eq!(
+            select_sni_certificate(certificate_names(), "unknown.example", true),
+            None
+        );
     }
 
     #[test]
