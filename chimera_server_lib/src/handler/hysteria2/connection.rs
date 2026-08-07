@@ -1278,6 +1278,8 @@ fn push_varint(buf: &mut Vec<u8>, value: u64) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    use crate::config::def::{PolicyConfig, PolicyLevelConfig, PolicySystemConfig};
+
     #[test]
     fn password_only_context_does_not_expose_plaintext() {
         let client = Hysteria2Client {
@@ -1296,6 +1298,51 @@ mod tests {
         assert!(!expected.contains(&client.password));
         assert_eq!(context.inbound_tag.as_deref(), Some("hysteria-test"));
         assert_eq!(context.user_level, 3);
+    }
+
+    #[test]
+    fn traffic_context_applies_user_and_system_stats_policy() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        runtime
+            .configure_policy(Some(&PolicyConfig {
+                levels: std::collections::HashMap::from([(
+                    "7".into(),
+                    PolicyLevelConfig {
+                        stats_user_uplink: Some(false),
+                        stats_user_downlink: Some(true),
+                        stats_user_online: Some(false),
+                        ..PolicyLevelConfig::default()
+                    },
+                )]),
+                system: Some(PolicySystemConfig {
+                    stats_inbound_uplink: Some(true),
+                    stats_inbound_downlink: Some(false),
+                    stats_outbound_uplink: Some(false),
+                    stats_outbound_downlink: Some(true),
+                }),
+            }))
+            .unwrap();
+        let client = Hysteria2Client {
+            password: "policy-secret".into(),
+            email: Some("policy@example.com".into()),
+            user_level: 7,
+        };
+        let context = apply_hysteria2_policy(
+            hysteria2_traffic_context(
+                &client,
+                "hysteria-policy",
+                "127.0.0.1:12345".parse().unwrap(),
+            ),
+            &runtime,
+        );
+
+        assert_eq!(context.stats_user_uplink, Some(false));
+        assert_eq!(context.stats_user_downlink, Some(true));
+        assert_eq!(context.stats_user_online, Some(false));
+        assert_eq!(context.stats_inbound_uplink, Some(true));
+        assert_eq!(context.stats_inbound_downlink, Some(false));
+        assert_eq!(context.stats_outbound_uplink, Some(false));
+        assert_eq!(context.stats_outbound_downlink, Some(true));
     }
 
     #[test]
