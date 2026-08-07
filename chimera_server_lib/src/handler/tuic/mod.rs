@@ -83,12 +83,30 @@ struct TuicFlowContext {
 
 impl TuicFlowContext {
     fn traffic_context(&self) -> TrafficContext {
-        TrafficContext::new("tuic")
+        let mut context = TrafficContext::new("tuic")
             .with_identity((*self.connection.identity).clone())
             .with_protocol_identity((*self.connection.identity).clone())
             .with_inbound_tag((*self.connection.inbound_tag).clone())
-            .with_client_ip(self.peer_addr.ip())
+            .with_client_ip(self.peer_addr.ip());
+        apply_tuic_stats_policy(&self.connection.runtime, &mut context);
+        context
     }
+}
+
+fn apply_tuic_stats_policy(runtime: &RuntimeState, context: &mut TrafficContext) {
+    let user_stats = runtime.policy_user_stats(context.user_level);
+    let system_stats = runtime.policy_system_stats();
+    context.set_user_stats_policy(
+        user_stats.uplink,
+        user_stats.downlink,
+        user_stats.online,
+    );
+    context.set_system_stats_policy(
+        system_stats.inbound_uplink,
+        system_stats.inbound_downlink,
+        system_stats.outbound_uplink,
+        system_stats.outbound_downlink,
+    );
 }
 
 fn fragment_cache_size() -> NonZeroUsize {
@@ -1848,10 +1866,53 @@ mod tests {
     use tokio::time::timeout;
 
     use crate::{
+        config::def::{PolicyConfig, PolicyLevelConfig, PolicySystemConfig},
         resolver::NativeResolver,
         runtime::OutboundSummary,
         traffic::{register_connection, snapshot},
     };
+
+    #[test]
+    fn traffic_context_applies_level_zero_and_system_stats_policy() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        runtime
+            .configure_policy(Some(&PolicyConfig {
+                levels: std::collections::HashMap::from([(
+                    "0".into(),
+                    PolicyLevelConfig {
+                        stats_user_uplink: Some(false),
+                        stats_user_downlink: Some(true),
+                        stats_user_online: Some(false),
+                        ..PolicyLevelConfig::default()
+                    },
+                )]),
+                system: Some(PolicySystemConfig {
+                    stats_inbound_uplink: Some(true),
+                    stats_inbound_downlink: Some(false),
+                    stats_outbound_uplink: Some(false),
+                    stats_outbound_downlink: Some(true),
+                }),
+            }))
+            .unwrap();
+        let context = TuicFlowContext {
+            connection: TuicConnectionContext {
+                identity: Arc::new("tuic-policy-user".into()),
+                inbound_tag: Arc::new("tuic-policy-in".into()),
+                runtime,
+            },
+            peer_addr: "127.0.0.1:12345".parse().unwrap(),
+        }
+        .traffic_context();
+
+        assert_eq!(context.user_level, 0);
+        assert_eq!(context.stats_user_uplink, Some(false));
+        assert_eq!(context.stats_user_downlink, Some(true));
+        assert_eq!(context.stats_user_online, Some(false));
+        assert_eq!(context.stats_inbound_uplink, Some(true));
+        assert_eq!(context.stats_inbound_downlink, Some(false));
+        assert_eq!(context.stats_outbound_uplink, Some(false));
+        assert_eq!(context.stats_outbound_downlink, Some(true));
+    }
 
     #[test]
     fn serialize_address_hostname() {
