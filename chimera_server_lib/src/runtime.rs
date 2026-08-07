@@ -282,19 +282,40 @@ const DEFAULT_POLICY_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(300
 const DEFAULT_POLICY_UPLINK_ONLY_TIMEOUT: Duration = Duration::from_secs(1);
 const DEFAULT_POLICY_DOWNLINK_ONLY_TIMEOUT: Duration = Duration::from_secs(1);
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PolicyUserStats {
     pub uplink: Option<bool>,
     pub downlink: Option<bool>,
     pub online: Option<bool>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+impl Default for PolicyUserStats {
+    fn default() -> Self {
+        Self {
+            uplink: Some(false),
+            downlink: Some(false),
+            online: Some(false),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PolicySystemStats {
     pub inbound_uplink: Option<bool>,
     pub inbound_downlink: Option<bool>,
     pub outbound_uplink: Option<bool>,
     pub outbound_downlink: Option<bool>,
+}
+
+impl Default for PolicySystemStats {
+    fn default() -> Self {
+        Self {
+            inbound_uplink: Some(false),
+            inbound_downlink: Some(false),
+            outbound_uplink: Some(false),
+            outbound_downlink: Some(false),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -445,26 +466,35 @@ impl RuntimeState {
                         .max(1);
                     buffer_sizes.insert(level, bytes);
                 }
-                if level_policy.stats_user_uplink.is_some()
-                    || level_policy.stats_user_downlink.is_some()
-                    || level_policy.stats_user_online.is_some()
-                {
-                    user_stats.insert(
-                        level,
-                        PolicyUserStats {
-                            uplink: level_policy.stats_user_uplink,
-                            downlink: level_policy.stats_user_downlink,
-                            online: level_policy.stats_user_online,
-                        },
-                    );
-                }
+                user_stats.insert(
+                    level,
+                    PolicyUserStats {
+                        uplink: Some(
+                            level_policy.stats_user_uplink.unwrap_or(false),
+                        ),
+                        downlink: Some(
+                            level_policy.stats_user_downlink.unwrap_or(false),
+                        ),
+                        online: Some(
+                            level_policy.stats_user_online.unwrap_or(false),
+                        ),
+                    },
+                );
             }
             if let Some(system) = policy.system.as_ref() {
                 system_stats = PolicySystemStats {
-                    inbound_uplink: system.stats_inbound_uplink,
-                    inbound_downlink: system.stats_inbound_downlink,
-                    outbound_uplink: system.stats_outbound_uplink,
-                    outbound_downlink: system.stats_outbound_downlink,
+                    inbound_uplink: Some(
+                        system.stats_inbound_uplink.unwrap_or(false),
+                    ),
+                    inbound_downlink: Some(
+                        system.stats_inbound_downlink.unwrap_or(false),
+                    ),
+                    outbound_uplink: Some(
+                        system.stats_outbound_uplink.unwrap_or(false),
+                    ),
+                    outbound_downlink: Some(
+                        system.stats_outbound_downlink.unwrap_or(false),
+                    ),
                 };
             }
         }

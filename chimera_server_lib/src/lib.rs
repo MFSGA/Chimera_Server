@@ -1046,6 +1046,10 @@ mod tests {
                 .connection_idle,
             Some(std::time::Duration::from_secs(9))
         );
+        let level_zero_stats = runtime.runtime_state.policy_user_stats(0);
+        assert_eq!(level_zero_stats.uplink, Some(false));
+        assert_eq!(level_zero_stats.downlink, Some(false));
+        assert_eq!(level_zero_stats.online, Some(false));
         let user_stats = runtime.runtime_state.policy_user_stats(7);
         assert_eq!(user_stats.uplink, Some(false));
         assert_eq!(user_stats.downlink, Some(true));
