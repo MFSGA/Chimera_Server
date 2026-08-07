@@ -267,12 +267,7 @@ pub(crate) fn build_server_config(
         });
     }
 
-    if !alpn_protocols.is_empty() {
-        config.alpn_protocols = alpn_protocols
-            .iter()
-            .map(|proto| proto.as_bytes().to_vec())
-            .collect();
-    }
+    config.alpn_protocols = tls_alpn_protocols(alpn_protocols);
     config.send_tls13_tickets = if enable_session_resumption { 2 } else { 0 };
 
     Ok(config)
@@ -395,6 +390,17 @@ fn open_pem_reader(
     Ok(BufReader::new(Box::new(Cursor::new(inline_pem.to_vec()))))
 }
 
+fn tls_alpn_protocols(alpn_protocols: &[String]) -> Vec<Vec<u8>> {
+    if alpn_protocols.is_empty() {
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+    } else {
+        alpn_protocols
+            .iter()
+            .map(|proto| proto.as_bytes().to_vec())
+            .collect()
+    }
+}
+
 fn tls_versions(
     min_version: Option<&str>,
     max_version: Option<&str>,
@@ -430,6 +436,18 @@ fn tls_versions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_alpn_uses_xray_server_defaults() {
+        assert_eq!(
+            tls_alpn_protocols(&[]),
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+        assert_eq!(
+            tls_alpn_protocols(&["custom".into()]),
+            vec![b"custom".to_vec()]
+        );
+    }
 
     #[test]
     fn tls_versions_apply_xray_server_version_bounds() {
