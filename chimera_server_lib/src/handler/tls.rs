@@ -16,6 +16,7 @@ use tokio_rustls::{
         },
         server::{ClientHello, ResolvesServerCert},
         sign::CertifiedKey,
+        version::{TLS12, TLS13},
     },
 };
 use x509_parser::{extensions::GeneralName, prelude::FromDer};
@@ -213,7 +214,8 @@ pub(crate) fn build_server_config(
     let cert_chain = load_certs(certificate)?;
     let private_key = load_private_key(certificate)?;
 
-    let mut config = rustls::ServerConfig::builder()
+    let versions = tls_versions(min_version, max_version)?;
+    let mut config = rustls::ServerConfig::builder_with_protocol_versions(&versions)
         .with_no_client_auth()
         .with_single_cert(cert_chain.clone(), private_key.clone_key())
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
@@ -237,7 +239,6 @@ pub(crate) fn build_server_config(
             .collect();
     }
     config.send_tls13_tickets = if enable_session_resumption { 2 } else { 0 };
-    apply_tls_version_overrides(&mut config, min_version, max_version)?;
 
     Ok(config)
 }
@@ -359,41 +360,52 @@ fn open_pem_reader(
     Ok(BufReader::new(Box::new(Cursor::new(inline_pem.to_vec()))))
 }
 
-fn apply_tls_version_overrides(
-    _config: &mut rustls::ServerConfig,
+fn tls_versions(
     min_version: Option<&str>,
     max_version: Option<&str>,
-) -> io::Result<()> {
-    if let Some(value) = min_version {
-        match value {
-            "1.2" | "1.3" | "" => {}
-            other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unsupported tls minVersion: {other}"),
-                ));
-            }
+) -> io::Result<Vec<&'static rustls::SupportedProtocolVersion>> {
+    let parse = |value: Option<&str>, default: u8, field: &str| -> io::Result<u8> {
+        match value.unwrap_or_default().trim() {
+            "" => Ok(default),
+            "1.2" => Ok(12),
+            "1.3" => Ok(13),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported tls {field}: {other}"),
+            )),
         }
+    };
+    let minimum = parse(min_version, 12, "minVersion")?;
+    let maximum = parse(max_version, 13, "maxVersion")?;
+    if minimum > maximum {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tls minVersion exceeds maxVersion",
+        ));
     }
 
-    if let Some(value) = max_version {
-        match value {
-            "1.2" | "1.3" | "" => {}
-            other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unsupported tls maxVersion: {other}"),
-                ));
-            }
-        }
-    }
-
-    Ok(())
+    Ok(match (minimum, maximum) {
+        (12, 12) => vec![&TLS12],
+        (12, 13) => vec![&TLS13, &TLS12],
+        (13, 13) => vec![&TLS13],
+        _ => unreachable!("validated TLS version bounds"),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tls_versions_apply_xray_server_version_bounds() {
+        assert_eq!(tls_versions(None, None).unwrap(), vec![&TLS13, &TLS12]);
+        assert_eq!(
+            tls_versions(Some("1.2"), Some("1.2")).unwrap(),
+            vec![&TLS12]
+        );
+        assert_eq!(tls_versions(Some("1.3"), None).unwrap(), vec![&TLS13]);
+        assert!(tls_versions(Some("1.3"), Some("1.2")).is_err());
+    }
 
     #[test]
     fn sni_matching_follows_xray_exact_and_wildcard_rules() {
