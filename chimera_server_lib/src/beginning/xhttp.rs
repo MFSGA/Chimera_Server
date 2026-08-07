@@ -197,12 +197,6 @@ pub async fn start_xhttp_server(
     let mut rules_stack = vec![];
     let server_handler =
         Arc::new(create_tcp_server_handler(inner, &tag, &mut rules_stack)?);
-    if trusted_x_forwarded_for.is_empty() {
-        warn!(
-            inbound_tag = %tag,
-            "XHTTP inbound has no sockopt.trustedXForwardedFor; trusting X-Forwarded-For implicitly for Xray compatibility"
-        );
-    }
     let resolver = runtime.resolver();
     let state = Arc::new(AppState::new(
         xhttp_config,
@@ -1294,44 +1288,9 @@ fn into_hyper_response(plan: XhttpResponsePlan) -> Response<ResponseBody> {
     response
 }
 
-fn trusted_source_contains(rule: &str, peer_ip: std::net::IpAddr) -> bool {
-    let (network, prefix) = match rule.trim().split_once('/') {
-        Some((network, prefix)) => {
-            let Ok(prefix) = prefix.parse::<u8>() else {
-                return false;
-            };
-            (network, Some(prefix))
-        }
-        None => (rule.trim(), None),
-    };
-    let Ok(network) = network.parse::<std::net::IpAddr>() else {
-        return false;
-    };
-
-    match (network, peer_ip) {
-        (std::net::IpAddr::V4(network), std::net::IpAddr::V4(peer)) => {
-            let prefix = prefix.unwrap_or(32);
-            if prefix > 32 {
-                return false;
-            }
-            let mask = u32::MAX.checked_shl(u32::from(32 - prefix)).unwrap_or(0);
-            u32::from(network) & mask == u32::from(peer) & mask
-        }
-        (std::net::IpAddr::V6(network), std::net::IpAddr::V6(peer)) => {
-            let prefix = prefix.unwrap_or(128);
-            if prefix > 128 {
-                return false;
-            }
-            let mask = u128::MAX.checked_shl(u32::from(128 - prefix)).unwrap_or(0);
-            u128::from(network) & mask == u128::from(peer) & mask
-        }
-        _ => false,
-    }
-}
-
 fn apply_trusted_x_forwarded_for(
     headers: &HeaderMap,
-    trusted_sources: &[String],
+    trusted_headers: &[String],
     peer_addr: std::net::SocketAddr,
 ) -> std::net::SocketAddr {
     let Some(forwarded_for) = headers
@@ -1340,15 +1299,22 @@ fn apply_trusted_x_forwarded_for(
     else {
         return peer_addr;
     };
-    if !trusted_sources.is_empty()
-        && !trusted_sources
-            .iter()
-            .any(|source| trusted_source_contains(source, peer_addr.ip()))
-    {
+    if trusted_headers.is_empty() {
         warn!(
             peer = %peer_addr,
             x_forwarded_for = %forwarded_for,
-            "xhttp ignored potentially forged X-Forwarded-For from untrusted source"
+            "xhttp received X-Forwarded-For without sockopt.trustedXForwardedFor; using real peer"
+        );
+        return peer_addr;
+    }
+    if !trusted_headers
+        .iter()
+        .any(|name| headers.contains_key(name.as_str()))
+    {
+        error!(
+            peer = %peer_addr,
+            x_forwarded_for = %forwarded_for,
+            "xhttp ignored potentially forged X-Forwarded-For without a configured trusted header"
         );
         return peer_addr;
     }
@@ -2391,83 +2357,68 @@ mod tests {
     }
 
     #[test]
-    fn trusted_forwarded_for_uses_first_xff_ip_for_trusted_source() {
+    fn trusted_forwarded_for_uses_first_xff_ip_when_trusted_header_is_present() {
         let mut headers = HeaderMap::new();
         headers.insert(
             hyper::header::HeaderName::from_static("x-forwarded-for"),
             hyper::header::HeaderValue::from_static("203.0.113.9, 198.51.100.4"),
         );
+        headers.insert(
+            hyper::header::HeaderName::from_static("x-trusted-cdn"),
+            hyper::header::HeaderValue::from_static("1"),
+        );
         let peer = apply_trusted_x_forwarded_for(
             &headers,
-            &["127.0.0.0/8".into()],
+            &["X-Trusted-CDN".into()],
             "127.0.0.1:1234".parse().unwrap(),
         );
         assert_eq!(peer, "203.0.113.9:0".parse().unwrap());
     }
 
     #[test]
-    fn missing_trusted_forwarded_for_preserves_xray_implicit_trust() {
+    fn missing_trusted_forwarded_for_keeps_real_peer() {
         let mut headers = HeaderMap::new();
         headers.insert(
             hyper::header::HeaderName::from_static("x-forwarded-for"),
             hyper::header::HeaderValue::from_static("203.0.113.9"),
         );
-        let peer = apply_trusted_x_forwarded_for(
-            &headers,
-            &[],
-            "192.0.2.10:1234".parse().unwrap(),
-        );
-        assert_eq!(peer, "203.0.113.9:0".parse().unwrap());
+        let real_peer = "192.0.2.10:1234".parse().unwrap();
+        let peer = apply_trusted_x_forwarded_for(&headers, &[], real_peer);
+        assert_eq!(peer, real_peer);
     }
 
     #[test]
-    fn trusted_forwarded_for_accepts_ipv6_source_cidr_and_bracketed_client() {
+    fn configured_trusted_header_must_be_present() {
         let mut headers = HeaderMap::new();
         headers.insert(
             hyper::header::HeaderName::from_static("x-forwarded-for"),
-            hyper::header::HeaderValue::from_static(" [2001:db8::8] "),
+            hyper::header::HeaderValue::from_static("203.0.113.9"),
         );
+        let real_peer = "192.0.2.10:1234".parse().unwrap();
         let peer = apply_trusted_x_forwarded_for(
             &headers,
-            &["2001:db8:1::/48".into()],
-            "[2001:db8:1::20]:1234".parse().unwrap(),
+            &["X-Trusted-CDN".into()],
+            real_peer,
         );
-        assert_eq!(peer, "[2001:db8::8]:0".parse().unwrap());
+        assert_eq!(peer, real_peer);
     }
 
     #[test]
-    fn untrusted_or_invalid_forwarded_for_keeps_real_peer() {
+    fn invalid_forwarded_for_keeps_real_peer() {
         let real_peer = "192.0.2.10:1234".parse().unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(
             hyper::header::HeaderName::from_static("x-forwarded-for"),
-            hyper::header::HeaderValue::from_static("203.0.113.9"),
-        );
-        assert_eq!(
-            apply_trusted_x_forwarded_for(
-                &headers,
-                &["127.0.0.0/8".into()],
-                real_peer
-            ),
-            real_peer
-        );
-
-        headers.insert(
-            hyper::header::HeaderName::from_static("x-forwarded-for"),
             hyper::header::HeaderValue::from_static("not-an-ip, 203.0.113.9"),
         );
-        assert_eq!(
-            apply_trusted_x_forwarded_for(
-                &headers,
-                &["192.0.2.0/24".into()],
-                real_peer
-            ),
-            real_peer
+        headers.insert(
+            hyper::header::HeaderName::from_static("x-trusted-cdn"),
+            hyper::header::HeaderValue::from_static("1"),
         );
         assert_eq!(
             apply_trusted_x_forwarded_for(
                 &headers,
-                &["invalid-cidr".into()],
+                &["X-Trusted-CDN".into()],
                 real_peer
             ),
             real_peer
