@@ -867,11 +867,52 @@ async fn serve_grpc_connection<IO>(
     }
 }
 
+fn trusted_source_contains(rule: &str, peer_ip: std::net::IpAddr) -> bool {
+    let (network, prefix) = match rule.trim().split_once('/') {
+        Some((network, prefix)) => {
+            let Ok(prefix) = prefix.parse::<u8>() else {
+                return false;
+            };
+            (network, Some(prefix))
+        }
+        None => (rule.trim(), None),
+    };
+    let Ok(network) = network.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+
+    match (network, peer_ip) {
+        (std::net::IpAddr::V4(network), std::net::IpAddr::V4(peer)) => {
+            let prefix = prefix.unwrap_or(32);
+            if prefix > 32 {
+                return false;
+            }
+            let mask = u32::MAX.checked_shl(u32::from(32 - prefix)).unwrap_or(0);
+            u32::from(network) & mask == u32::from(peer) & mask
+        }
+        (std::net::IpAddr::V6(network), std::net::IpAddr::V6(peer)) => {
+            let prefix = prefix.unwrap_or(128);
+            if prefix > 128 {
+                return false;
+            }
+            let mask = u128::MAX.checked_shl(u32::from(128 - prefix)).unwrap_or(0);
+            u128::from(network) & mask == u128::from(peer) & mask
+        }
+        _ => false,
+    }
+}
+
 fn apply_trusted_x_forwarded_for(
     headers: &HeaderMap,
-    trusted_header_names: &[String],
+    trusted_sources: &[String],
     peer_addr: std::net::SocketAddr,
 ) -> std::net::SocketAddr {
+    if !trusted_sources
+        .iter()
+        .any(|source| trusted_source_contains(source, peer_addr.ip()))
+    {
+        return peer_addr;
+    }
     let Some(forwarded_for) = headers
         .get("x-forwarded-for")
         .and_then(|value| value.to_str().ok())
@@ -879,29 +920,18 @@ fn apply_trusted_x_forwarded_for(
         return peer_addr;
     };
 
-    for name in trusted_header_names {
-        let Ok(name) = hyper::header::HeaderName::from_bytes(name.as_bytes()) else {
-            continue;
-        };
-        if !headers.contains_key(name) {
-            continue;
-        }
-
-        let candidate = forwarded_for
-            .split_once(',')
-            .map_or(forwarded_for, |(first, _)| first)
-            .trim();
-        let candidate = candidate
-            .strip_prefix('[')
-            .and_then(|value| value.strip_suffix(']'))
-            .unwrap_or(candidate);
-        return candidate
-            .parse::<std::net::IpAddr>()
-            .map(|ip| std::net::SocketAddr::new(ip, 0))
-            .unwrap_or(peer_addr);
-    }
-
-    peer_addr
+    let candidate = forwarded_for
+        .split_once(',')
+        .map_or(forwarded_for, |(first, _)| first)
+        .trim();
+    let candidate = candidate
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(candidate);
+    candidate
+        .parse::<std::net::IpAddr>()
+        .map(|ip| std::net::SocketAddr::new(ip, 0))
+        .unwrap_or(peer_addr)
 }
 
 async fn handle_request(
@@ -1322,22 +1352,32 @@ mod tests {
     }
 
     #[test]
-    fn trusted_forwarded_header_uses_first_xff_ip() {
+    fn trusted_forwarded_for_uses_first_xff_ip_for_trusted_source() {
         let mut headers = HeaderMap::new();
         headers.insert(
             hyper::header::HeaderName::from_static("x-forwarded-for"),
             hyper::header::HeaderValue::from_static("203.0.113.9, 198.51.100.4"),
         );
-        headers.insert(
-            hyper::header::HeaderName::from_static("x-trusted-proxy"),
-            hyper::header::HeaderValue::from_static("1"),
-        );
         let peer = apply_trusted_x_forwarded_for(
             &headers,
-            &["X-Trusted-Proxy".into()],
+            &["127.0.0.0/8".into()],
             "127.0.0.1:1234".parse().unwrap(),
         );
         assert_eq!(peer, "203.0.113.9:0".parse().unwrap());
+    }
+
+    #[test]
+    fn trusted_forwarded_for_rejects_untrusted_source() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            hyper::header::HeaderName::from_static("x-forwarded-for"),
+            hyper::header::HeaderValue::from_static("203.0.113.9"),
+        );
+        let peer = "192.0.2.10:1234".parse().unwrap();
+        assert_eq!(
+            apply_trusted_x_forwarded_for(&headers, &["127.0.0.0/8".into()], peer),
+            peer
+        );
     }
 
     #[test]
