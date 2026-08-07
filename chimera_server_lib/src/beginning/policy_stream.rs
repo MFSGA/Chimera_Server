@@ -193,14 +193,14 @@ where
                 if downlink_done.is_some() {
                     break;
                 }
-                uplink_grace = timeouts.uplink_only.map(|duration| Box::pin(sleep(duration)));
+                uplink_grace = timeouts.downlink_only.map(|duration| Box::pin(sleep(duration)));
             }
             result = &mut downlink, if downlink_done.is_none() => {
                 downlink_done = Some(result?);
                 if uplink_done.is_some() {
                     break;
                 }
-                downlink_grace = timeouts.downlink_only.map(|duration| Box::pin(sleep(duration)));
+                downlink_grace = timeouts.uplink_only.map(|duration| Box::pin(sleep(duration)));
             }
             activity = wait_for_activity(
                 &mut activity_receiver,
@@ -305,7 +305,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uplink_eof_starts_the_uplink_only_grace_period() {
+    async fn uplink_eof_starts_the_downlink_only_grace_period() {
         let (mut left, mut left_peer) = duplex(64);
         let (mut right, mut right_peer) = duplex(64);
         let relay = tokio::spawn(async move {
@@ -313,7 +313,7 @@ mod tests {
                 &mut left,
                 &mut right,
                 PolicyRelayTimeouts {
-                    uplink_only: Some(Duration::from_millis(30)),
+                    downlink_only: Some(Duration::from_millis(30)),
                     ..PolicyRelayTimeouts::default()
                 },
             )
@@ -331,14 +331,14 @@ mod tests {
 
         let result = timeout(Duration::from_millis(200), relay)
             .await
-            .expect("uplink-only grace should expire")
+            .expect("downlink-only grace should expire")
             .expect("relay task should not panic")
             .expect("relay should close cleanly");
         assert_eq!(result.left_to_right, 5);
     }
 
     #[tokio::test]
-    async fn downlink_eof_starts_the_downlink_only_grace_period() {
+    async fn downlink_eof_starts_the_uplink_only_grace_period() {
         let (mut left, mut left_peer) = duplex(64);
         let (mut right, mut right_peer) = duplex(64);
         let relay = tokio::spawn(async move {
@@ -346,7 +346,7 @@ mod tests {
                 &mut left,
                 &mut right,
                 PolicyRelayTimeouts {
-                    downlink_only: Some(Duration::from_millis(30)),
+                    uplink_only: Some(Duration::from_millis(30)),
                     ..PolicyRelayTimeouts::default()
                 },
             )
@@ -367,7 +367,7 @@ mod tests {
 
         let result = timeout(Duration::from_millis(200), relay)
             .await
-            .expect("downlink-only grace should expire")
+            .expect("uplink-only grace should expire")
             .expect("relay task should not panic")
             .expect("relay should close cleanly");
         assert_eq!(result.right_to_left, 5);
