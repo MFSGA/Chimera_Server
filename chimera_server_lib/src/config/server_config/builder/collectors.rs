@@ -487,7 +487,9 @@ pub(super) fn collect_socks_settings(
         #[serde(default)]
         auth: Option<String>,
         #[serde(default)]
-        accounts: Vec<SocksAccountSetting>,
+        users: Option<Vec<SocksAccountSetting>>,
+        #[serde(default)]
+        accounts: Option<Vec<SocksAccountSetting>>,
         #[serde(default)]
         udp: Option<bool>,
         #[serde(default)]
@@ -506,6 +508,13 @@ pub(super) fn collect_socks_settings(
         settings.deserialize().map_err(|e| {
             Error::InvalidConfig(format!("failed to parse socks settings: {}", e))
         })?;
+
+    // Xray treats a present `accounts` field as an alias that overrides
+    // `users`, including when it is explicitly an empty list.
+    let raw_accounts = socks_settings
+        .accounts
+        .or(socks_settings.users)
+        .unwrap_or_default();
 
     // SOCKS UDP is implemented through UDP ASSOCIATE on the TCP control stream.
     let udp_enabled = socks_settings.udp.unwrap_or(false);
@@ -533,15 +542,14 @@ pub(super) fn collect_socks_settings(
         .as_deref()
         .map(|value| value.trim().to_lowercase())
         .unwrap_or_else(|| {
-            if socks_settings.accounts.is_empty() {
+            if raw_accounts.is_empty() {
                 "noauth".to_string()
             } else {
                 "password".to_string()
             }
         });
 
-    let accounts = socks_settings
-        .accounts
+    let accounts = raw_accounts
         .into_iter()
         .map(|account| SocksUser {
             username: account.user,
@@ -1177,6 +1185,27 @@ mod tests {
             udp_bind_ip,
             Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
         );
+    }
+
+    #[test]
+    fn collect_socks_users_alias_and_accounts_override_match_xray() {
+        let users_only = SettingObject(serde_json::json!({
+            "auth": "password",
+            "users": [{"user": "legacy", "pass": "secret"}]
+        }));
+        let (users, _, _) = collect_socks_settings(users_only)
+            .expect("legacy socks users should be accepted");
+        assert!(users.auth_required());
+        assert_eq!(users.snapshot()[0].username, "legacy");
+
+        let accounts_override = SettingObject(serde_json::json!({
+            "users": [{"user": "legacy", "pass": "secret"}],
+            "accounts": []
+        }));
+        let (users, _, _) = collect_socks_settings(accounts_override)
+            .expect("explicit accounts should override legacy users");
+        assert!(!users.auth_required());
+        assert!(users.snapshot().is_empty());
     }
 
     #[test]
