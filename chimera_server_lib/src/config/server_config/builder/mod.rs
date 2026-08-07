@@ -1341,6 +1341,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                 let mut protocol = ServerProxyConfig::Socks {
                     accounts: collected.accounts,
                     udp_enabled: collected.udp_enabled,
+                    udp_bind_ip: collected.udp_bind_ip,
                     user_level: collected.user_level,
                 };
                 let _stream_network = stream_settings

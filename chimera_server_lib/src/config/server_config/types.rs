@@ -1,4 +1,7 @@
-use std::sync::{Arc, RwLock};
+use std::{
+    net::IpAddr,
+    sync::{Arc, RwLock},
+};
 
 use serde::Deserialize;
 
@@ -531,6 +534,8 @@ pub enum ServerProxyConfig {
         accounts: SocksUserStore,
         #[serde(default)]
         udp_enabled: bool,
+        #[serde(default)]
+        udp_bind_ip: Option<IpAddr>,
         #[serde(default)]
         user_level: u32,
     },

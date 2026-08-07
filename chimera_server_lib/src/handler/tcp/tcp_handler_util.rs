@@ -285,11 +285,13 @@ fn create_tcp_server_handler_with_trusted_headers(
         ServerProxyConfig::Socks {
             accounts,
             udp_enabled,
+            udp_bind_ip,
             user_level,
         } => Ok(Box::new(SocksTcpServerHandler::new(
             accounts,
             inbound_tag,
             udp_enabled,
+            udp_bind_ip,
             user_level,
         ))),
         ServerProxyConfig::DokodemoDoor { config } => {

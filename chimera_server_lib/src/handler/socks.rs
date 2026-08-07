@@ -56,6 +56,7 @@ pub struct SocksTcpServerHandler {
     accounts: SocksUserStore,
     inbound_tag: String,
     udp_enabled: bool,
+    udp_bind_ip: Option<std::net::IpAddr>,
     user_level: u32,
 }
 
@@ -64,12 +65,14 @@ impl SocksTcpServerHandler {
         accounts: SocksUserStore,
         inbound_tag: &str,
         udp_enabled: bool,
+        udp_bind_ip: Option<std::net::IpAddr>,
         user_level: u32,
     ) -> Self {
         Self {
             accounts,
             inbound_tag: inbound_tag.to_string(),
             udp_enabled,
+            udp_bind_ip,
             user_level,
         }
     }
@@ -150,7 +153,12 @@ impl TcpServerHandler for SocksTcpServerHandler {
                 })
             }
             CMD_UDP_ASSOCIATE if self.udp_enabled => {
-                handle_udp_associate(server_stream, Some(traffic_context)).await
+                handle_udp_associate(
+                    server_stream,
+                    self.udp_bind_ip,
+                    Some(traffic_context),
+                )
+                .await
             }
             CMD_UDP_ASSOCIATE => {
                 send_command_response(&mut server_stream, REP_COMMAND_NOT_SUPPORTED)
@@ -361,6 +369,7 @@ async fn read_address_from_stream(
 /// Takes ownership of `server_stream` while the UDP relay task is active.
 async fn handle_udp_associate(
     mut server_stream: Box<dyn AsyncStream>,
+    udp_bind_ip: Option<std::net::IpAddr>,
     traffic_context: Option<TrafficContext>,
 ) -> std::io::Result<TcpServerSetupResult> {
     // The TCP peer address is authoritative. A non-zero hint port narrows the
@@ -370,9 +379,12 @@ async fn handle_udp_associate(
         (client_hint.port() != 0).then_some(client_hint.port());
     tracing::debug!("SOCKS5 UDP ASSOCIATE: client hint = {:?}", client_hint);
 
-    let udp_bind_addr = SocketAddr::from(([0, 0, 0, 0], 0u16));
+    let udp_bind_addr = SocketAddr::new(
+        udp_bind_ip.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+        0,
+    );
     let udp_socket = crate::util::socket::new_socket2_udp_socket_with_buffer_size(
-        false,
+        udp_bind_addr.is_ipv6(),
         None,
         Some(udp_bind_addr),
         false,
@@ -928,6 +940,7 @@ mod tests {
                 SocksUserStore::with_auth_required(Vec::new(), false),
                 "socks-level",
                 true,
+                None,
                 7,
             );
             let mut request = vec![SOCKS_VERSION, 1, METHOD_NO_AUTH];
@@ -962,6 +975,43 @@ mod tests {
             assert_eq!(context.user_level, 7);
             assert_eq!(context.inbound_tag.as_deref(), Some("socks-level"));
         }
+    }
+
+    #[tokio::test]
+    async fn udp_associate_binds_configured_ip() {
+        let handler = SocksTcpServerHandler::new(
+            SocksUserStore::with_auth_required(Vec::new(), false),
+            "socks-ip",
+            true,
+            Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            0,
+        );
+        let request = [
+            SOCKS_VERSION,
+            1,
+            METHOD_NO_AUTH,
+            SOCKS_VERSION,
+            CMD_UDP_ASSOCIATE,
+            0,
+            ADDR_TYPE_IPV4,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        let (mut client, server) = duplex(1024);
+        client.write_all(&request).await.unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(server))
+            .await
+            .expect("SOCKS UDP ASSOCIATE should succeed");
+        let TcpServerSetupResult::UdpAssociate { socket, .. } = result else {
+            panic!("expected UDP associate result");
+        };
+        assert_eq!(socket.local_addr().unwrap().ip(), Ipv4Addr::LOCALHOST);
     }
 
     struct CountingResolver {

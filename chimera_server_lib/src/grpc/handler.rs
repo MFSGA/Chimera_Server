@@ -1257,6 +1257,7 @@ impl HandlerServiceImpl {
                 Ok(ServerProxyConfig::Socks {
                     accounts,
                     udp_enabled: false,
+                    udp_bind_ip: None,
                     user_level: socks.user_level,
                 })
             }
@@ -4602,6 +4603,7 @@ mod tests {
             }]
             .into(),
             udp_enabled: false,
+            udp_bind_ip: None,
             user_level: 7,
         };
         let inbound = ServerConfig {
@@ -5007,6 +5009,7 @@ mod tests {
                 }]
                 .into(),
                 udp_enabled: false,
+                udp_bind_ip: None,
                 user_level: 0,
             },
             transport: Transport::Tcp,

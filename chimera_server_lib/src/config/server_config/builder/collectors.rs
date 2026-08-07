@@ -355,6 +355,7 @@ fn parse_trojan_fallback_dest(
 pub(super) struct CollectedSocksSettings {
     pub accounts: SocksUserStore,
     pub udp_enabled: bool,
+    pub udp_bind_ip: Option<std::net::IpAddr>,
     pub user_level: u32,
 }
 
@@ -374,7 +375,7 @@ pub(super) fn collect_socks_settings(
         #[serde(default)]
         udp: Option<bool>,
         #[serde(default)]
-        ip: Option<serde_json::Value>,
+        ip: Option<String>,
         #[serde(default)]
         user_level: Option<u32>,
     }
@@ -398,11 +399,16 @@ pub(super) fn collect_socks_settings(
 
     // SOCKS UDP is implemented through UDP ASSOCIATE on the TCP control stream.
     let udp_enabled = socks_settings.udp.unwrap_or(false);
-    if socks_settings.ip.is_some() {
-        return Err(Error::InvalidConfig(
-            "socks settings.ip is not supported yet".into(),
-        ));
-    }
+    let udp_bind_ip = socks_settings
+        .ip
+        .map(|value| {
+            value.parse::<std::net::IpAddr>().map_err(|_| {
+                Error::InvalidConfig(format!(
+                    "socks settings.ip must be an IP address: {value}"
+                ))
+            })
+        })
+        .transpose()?;
     if socks_settings.user_level.is_some() && !allow_user_level {
         return Err(Error::InvalidConfig(
             "mixed settings.userLevel is not supported".into(),
@@ -426,6 +432,7 @@ pub(super) fn collect_socks_settings(
         "noauth" | "none" => Ok(CollectedSocksSettings {
             accounts: SocksUserStore::with_auth_required(Vec::new(), false),
             udp_enabled,
+            udp_bind_ip,
             user_level,
         }),
         "password" => {
@@ -446,12 +453,14 @@ pub(super) fn collect_socks_settings(
                     true,
                 ),
                 udp_enabled,
+                udp_bind_ip,
                 user_level,
             })
         }
         _ => Ok(CollectedSocksSettings {
             accounts: SocksUserStore::with_auth_required(Vec::new(), false),
             udp_enabled,
+            udp_bind_ip,
             user_level,
         }),
     }
@@ -1080,17 +1089,17 @@ mod tests {
     }
 
     #[test]
-    fn collect_socks_accounts_rejects_ip_until_supported() {
+    fn collect_socks_settings_preserves_udp_bind_ip() {
         let settings = SettingObject(serde_json::json!({
             "auth": "noauth",
             "ip": "127.0.0.1"
         }));
 
-        let err = collect_socks_settings(settings, true)
-            .expect_err("socks ip unsupported");
-        assert!(
-            err.to_string()
-                .contains("socks settings.ip is not supported yet")
+        let collected = collect_socks_settings(settings, true)
+            .expect("socks ip should be accepted");
+        assert_eq!(
+            collected.udp_bind_ip,
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
         );
     }
 
