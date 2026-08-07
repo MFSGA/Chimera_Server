@@ -867,44 +867,9 @@ async fn serve_grpc_connection<IO>(
     }
 }
 
-fn trusted_source_contains(rule: &str, peer_ip: std::net::IpAddr) -> bool {
-    let (network, prefix) = match rule.trim().split_once('/') {
-        Some((network, prefix)) => {
-            let Ok(prefix) = prefix.parse::<u8>() else {
-                return false;
-            };
-            (network, Some(prefix))
-        }
-        None => (rule.trim(), None),
-    };
-    let Ok(network) = network.parse::<std::net::IpAddr>() else {
-        return false;
-    };
-
-    match (network, peer_ip) {
-        (std::net::IpAddr::V4(network), std::net::IpAddr::V4(peer)) => {
-            let prefix = prefix.unwrap_or(32);
-            if prefix > 32 {
-                return false;
-            }
-            let mask = u32::MAX.checked_shl(u32::from(32 - prefix)).unwrap_or(0);
-            u32::from(network) & mask == u32::from(peer) & mask
-        }
-        (std::net::IpAddr::V6(network), std::net::IpAddr::V6(peer)) => {
-            let prefix = prefix.unwrap_or(128);
-            if prefix > 128 {
-                return false;
-            }
-            let mask = u128::MAX.checked_shl(u32::from(128 - prefix)).unwrap_or(0);
-            u128::from(network) & mask == u128::from(peer) & mask
-        }
-        _ => false,
-    }
-}
-
 fn apply_trusted_x_forwarded_for(
     headers: &HeaderMap,
-    trusted_sources: &[String],
+    trusted_headers: &[String],
     peer_addr: std::net::SocketAddr,
 ) -> std::net::SocketAddr {
     let Some(forwarded_for) = headers
@@ -913,14 +878,22 @@ fn apply_trusted_x_forwarded_for(
     else {
         return peer_addr;
     };
-    if !trusted_sources
-        .iter()
-        .any(|source| trusted_source_contains(source, peer_addr.ip()))
-    {
+    if trusted_headers.is_empty() {
         warn!(
             peer = %peer_addr,
             x_forwarded_for = %forwarded_for,
-            "gRPC ignored potentially forged X-Forwarded-For from untrusted source"
+            "gRPC received X-Forwarded-For without sockopt.trustedXForwardedFor; using real peer"
+        );
+        return peer_addr;
+    }
+    if !trusted_headers
+        .iter()
+        .any(|name| headers.contains_key(name.as_str()))
+    {
+        error!(
+            peer = %peer_addr,
+            x_forwarded_for = %forwarded_for,
+            "gRPC ignored potentially forged X-Forwarded-For without a configured trusted header"
         );
         return peer_addr;
     }
@@ -1357,22 +1330,26 @@ mod tests {
     }
 
     #[test]
-    fn trusted_forwarded_for_uses_first_xff_ip_for_trusted_source() {
+    fn trusted_forwarded_for_uses_first_xff_ip_when_trusted_header_is_present() {
         let mut headers = HeaderMap::new();
         headers.insert(
             hyper::header::HeaderName::from_static("x-forwarded-for"),
             hyper::header::HeaderValue::from_static("203.0.113.9, 198.51.100.4"),
         );
+        headers.insert(
+            hyper::header::HeaderName::from_static("x-trusted-cdn"),
+            hyper::header::HeaderValue::from_static("1"),
+        );
         let peer = apply_trusted_x_forwarded_for(
             &headers,
-            &["127.0.0.0/8".into()],
+            &["X-Trusted-CDN".into()],
             "127.0.0.1:1234".parse().unwrap(),
         );
         assert_eq!(peer, "203.0.113.9:0".parse().unwrap());
     }
 
     #[test]
-    fn trusted_forwarded_for_rejects_untrusted_source() {
+    fn trusted_forwarded_for_requires_configured_header() {
         let mut headers = HeaderMap::new();
         headers.insert(
             hyper::header::HeaderName::from_static("x-forwarded-for"),
@@ -1380,9 +1357,20 @@ mod tests {
         );
         let peer = "192.0.2.10:1234".parse().unwrap();
         assert_eq!(
-            apply_trusted_x_forwarded_for(&headers, &["127.0.0.0/8".into()], peer),
+            apply_trusted_x_forwarded_for(&headers, &["X-Trusted-CDN".into()], peer),
             peer
         );
+    }
+
+    #[test]
+    fn missing_trusted_forwarded_for_keeps_real_peer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            hyper::header::HeaderName::from_static("x-forwarded-for"),
+            hyper::header::HeaderValue::from_static("203.0.113.9"),
+        );
+        let peer = "192.0.2.10:1234".parse().unwrap();
+        assert_eq!(apply_trusted_x_forwarded_for(&headers, &[], peer), peer);
     }
 
     #[test]
