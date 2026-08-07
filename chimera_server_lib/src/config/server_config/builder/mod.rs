@@ -3827,12 +3827,10 @@ mod tests {
             panic!("interface must wrap the UDP listener");
         };
         assert_eq!(name, "lo");
-        let ServerProxyConfig::CustomSockopt { options, inner } = *inner else {
-            panic!("customSockopt must wrap the UDP listener");
-        };
-        assert_eq!(options.len(), 1);
         let ServerProxyConfig::BindMark { value, inner } = *inner else {
-            panic!("mark must wrap the UDP listener");
+            panic!(
+                "mark must wrap the UDP listener and customSockopt must be ignored"
+            );
         };
         assert_eq!(value, 255);
         let ServerProxyConfig::Ipv6Only { inner } = *inner else {

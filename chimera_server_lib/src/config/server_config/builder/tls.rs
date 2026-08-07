@@ -948,7 +948,7 @@ pub(super) fn apply_security_layers(
     } else {
         protocol
     };
-    let protocol = if custom_sockopt.is_empty() {
+    let protocol = if custom_sockopt.is_empty() || network == "udp" {
         protocol
     } else {
         ServerProxyConfig::CustomSockopt {
