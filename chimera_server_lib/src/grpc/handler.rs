@@ -254,6 +254,8 @@ struct SocksServerConfigPayload {
     auth_type: i32,
     #[prost(map = "string, string", tag = "2")]
     accounts: std::collections::HashMap<String, String>,
+    #[prost(bool, tag = "4")]
+    udp_enabled: bool,
     #[prost(uint32, tag = "6")]
     user_level: u32,
 }
@@ -1256,7 +1258,7 @@ impl HandlerServiceImpl {
 
                 Ok(ServerProxyConfig::Socks {
                     accounts,
-                    udp_enabled: false,
+                    udp_enabled: socks.udp_enabled,
                     udp_bind_ip: None,
                     user_level: socks.user_level,
                 })
@@ -2746,6 +2748,7 @@ impl HandlerServiceImpl {
             }
             ServerProxyConfig::Socks {
                 accounts,
+                udp_enabled,
                 user_level,
                 ..
             } => {
@@ -2762,6 +2765,7 @@ impl HandlerServiceImpl {
                     SocksServerConfigPayload {
                         auth_type,
                         accounts: account_map,
+                        udp_enabled: *udp_enabled,
                         user_level: *user_level,
                     },
                 ))
@@ -4667,6 +4671,7 @@ mod tests {
                     value: SocksServerConfigPayload {
                         auth_type: 1,
                         accounts,
+                        udp_enabled: true,
                         user_level: 7,
                     }
                     .encode_to_vec(),
@@ -5204,9 +5209,31 @@ mod tests {
             SocksServerConfigPayload::decode(proxy_settings.value.as_slice())
                 .expect("decode socks settings");
         assert_eq!(socks.auth_type, 1);
+        assert!(!socks.udp_enabled);
         assert_eq!(socks.user_level, 7);
         assert_eq!(socks.accounts.len(), 1);
         assert!(socks.accounts.values().any(|password| password == "pass-a"));
+    }
+
+    #[test]
+    fn handler_preserves_socks_udp_enabled() {
+        let service =
+            HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+        let parsed = service
+            .parse_add_inbound_protocol(&HandlerServiceImpl::typed_message(
+                TYPE_PROXY_SOCKS_SERVER_CONFIG,
+                SocksServerConfigPayload {
+                    auth_type: 0,
+                    accounts: std::collections::HashMap::new(),
+                    udp_enabled: true,
+                    user_level: 0,
+                },
+            ))
+            .expect("SOCKS server config should parse");
+        let ServerProxyConfig::Socks { udp_enabled, .. } = parsed else {
+            panic!("expected SOCKS inbound config");
+        };
+        assert!(udp_enabled);
     }
 
     #[cfg(feature = "http")]
