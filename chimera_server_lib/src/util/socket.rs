@@ -195,15 +195,22 @@ pub fn configure_custom_sockopt(
                 set_socket_option_int(fd, level, opt, value)?;
             }
             "str" => {
-                // SAFETY: `fd` is borrowed for this call and `value` remains
-                // alive for the complete duration of `setsockopt`.
+                let value =
+                    std::ffi::CString::new(option.value.as_str()).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "customSockopt string value must not contain NUL bytes",
+                        )
+                    })?;
+                // SAFETY: `fd` is borrowed for this call and `value` is a valid
+                // NUL-terminated byte string for the full duration of `setsockopt`.
                 let result = unsafe {
                     libc::setsockopt(
                         fd,
                         level,
                         opt,
-                        option.value.as_ptr().cast(),
-                        option.value.len() as libc::socklen_t,
+                        value.as_ptr().cast(),
+                        value.as_bytes_with_nul().len() as libc::socklen_t,
                     )
                 };
                 if result == -1 {
@@ -642,6 +649,62 @@ mod custom_sockopt_tests {
             .unwrap(),
             1,
         );
+    }
+
+    #[test]
+    fn applies_nul_terminated_string_option() {
+        let socket =
+            Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        let options = [crate::config::CustomSockoptConfig {
+            system: "linux".into(),
+            network: "tcp".into(),
+            level: libc::IPPROTO_TCP.to_string(),
+            opt: libc::TCP_CONGESTION.to_string(),
+            value: "reno".into(),
+            value_type: "str".into(),
+        }];
+
+        configure_custom_sockopt(socket.as_raw_fd(), "tcp4", &options).unwrap();
+
+        let mut value = [0u8; 32];
+        let mut length = value.len() as libc::socklen_t;
+        // SAFETY: `value` and `length` are valid writable getsockopt buffers.
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_CONGESTION,
+                value.as_mut_ptr().cast(),
+                &mut length,
+            )
+        };
+        assert_eq!(
+            result,
+            0,
+            "read TCP_CONGESTION: {}",
+            io::Error::last_os_error()
+        );
+        let length = usize::try_from(length).unwrap();
+        let value = std::ffi::CStr::from_bytes_until_nul(&value[..length]).unwrap();
+        assert_eq!(value.to_bytes(), b"reno");
+    }
+
+    #[test]
+    fn rejects_embedded_nul_in_string_option() {
+        let socket =
+            Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        let options = [crate::config::CustomSockoptConfig {
+            system: "linux".into(),
+            network: "tcp".into(),
+            level: libc::IPPROTO_TCP.to_string(),
+            opt: libc::TCP_CONGESTION.to_string(),
+            value: "reno\0cubic".into(),
+            value_type: "str".into(),
+        }];
+
+        let error = configure_custom_sockopt(socket.as_raw_fd(), "tcp4", &options)
+            .expect_err("embedded NUL must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }
 
