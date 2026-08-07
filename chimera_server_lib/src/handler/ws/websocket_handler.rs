@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tokio::io::AsyncWriteExt;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
     async_stream::AsyncStream,
@@ -168,6 +168,17 @@ fn trusted_forwarded_client_addr(
         .iter()
         .any(|name| headers.contains_key(&name.trim().to_ascii_lowercase()));
     if !trusted_header_present {
+        if trusted.is_empty() {
+            warn!(
+                x_forwarded_for = %forwarded_for,
+                "websocket received X-Forwarded-For without sockopt.trustedXForwardedFor; using real peer"
+            );
+        } else {
+            warn!(
+                x_forwarded_for = %forwarded_for,
+                "websocket ignored potentially forged X-Forwarded-For without a configured trusted header"
+            );
+        }
         return None;
     }
     let candidate = forwarded_for
@@ -209,6 +220,7 @@ mod tests {
             trusted_forwarded_client_addr(&headers, &["X-Trusted-Proxy".into()]),
             None,
         );
+        assert_eq!(trusted_forwarded_client_addr(&headers, &[]), None);
 
         let headers = HashMap::from([
             ("x-forwarded-for".into(), "not-an-ip".into()),
