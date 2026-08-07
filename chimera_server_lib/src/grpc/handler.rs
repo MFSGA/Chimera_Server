@@ -1255,7 +1255,7 @@ impl HandlerServiceImpl {
                 let accounts =
                     crate::config::server_config::SocksUserStore::with_auth_required(
                         accounts,
-                        socks.auth_type != 0,
+                        socks.auth_type == 1,
                     );
 
                 let udp_bind_ip = match socks.address {
@@ -5265,6 +5265,31 @@ mod tests {
             panic!("expected SOCKS inbound config");
         };
         assert!(udp_enabled);
+    }
+
+    #[test]
+    fn handler_treats_unknown_socks_auth_type_as_noauth() {
+        let service =
+            HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+        let parsed = service
+            .parse_add_inbound_protocol(&HandlerServiceImpl::typed_message(
+                TYPE_PROXY_SOCKS_SERVER_CONFIG,
+                SocksServerConfigPayload {
+                    auth_type: 2,
+                    accounts: std::collections::HashMap::from([(
+                        "alice".to_string(),
+                        "secret".to_string(),
+                    )]),
+                    address: None,
+                    udp_enabled: false,
+                    user_level: 0,
+                },
+            ))
+            .expect("SOCKS server config should parse");
+        let ServerProxyConfig::Socks { accounts, .. } = parsed else {
+            panic!("expected SOCKS inbound config");
+        };
+        assert!(!accounts.auth_required());
     }
 
     #[test]
