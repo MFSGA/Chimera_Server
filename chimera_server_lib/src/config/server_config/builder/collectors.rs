@@ -442,10 +442,11 @@ pub(super) fn collect_socks_settings(
                 user_level,
             })
         }
-        other => Err(Error::InvalidConfig(format!(
-            "unsupported socks auth mode: {}",
-            other
-        ))),
+        _ => Ok(CollectedSocksSettings {
+            accounts: SocksUserStore::with_auth_required(Vec::new(), false),
+            udp_enabled,
+            user_level,
+        }),
     }
 }
 
@@ -1031,6 +1032,23 @@ mod tests {
         assert!(!collected.accounts.auth_required());
         assert!(collected.udp_enabled);
         assert_eq!(collected.user_level, 0);
+    }
+
+    #[test]
+    fn collect_socks_unknown_auth_defaults_to_noauth() {
+        let settings = SettingObject(serde_json::json!({
+            "auth": "future-auth",
+            "accounts": [{"user": "alice", "pass": "secret"}],
+            "udp": true,
+            "userLevel": 7
+        }));
+
+        let collected = collect_socks_settings(settings, true)
+            .expect("unknown socks auth should match Xray noauth fallback");
+        assert!(!collected.accounts.auth_required());
+        assert!(collected.accounts.snapshot().is_empty());
+        assert!(collected.udp_enabled);
+        assert_eq!(collected.user_level, 7);
     }
 
     #[test]
