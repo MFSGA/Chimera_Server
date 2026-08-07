@@ -1805,7 +1805,7 @@ fn create_udp_listener(
         bind_addr.is_ipv6(),
         options.bind_interface.clone(),
         None,
-        false,
+        true,
     )?;
     #[cfg(target_os = "linux")]
     if let Some(mark) = options.mark {
@@ -2668,6 +2668,31 @@ mod tests {
     };
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn udp_listener_enables_reuse_port() {
+        let socket = create_udp_listener(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            &UdpListenerOptions::default(),
+            false,
+        )
+        .expect("create UDP listener");
+        let mut value = 0;
+        let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+        // SAFETY: `value` and `length` are valid writable getsockopt buffers.
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                std::ptr::from_mut(&mut value).cast(),
+                &mut length,
+            )
+        };
+        assert_eq!(result, 0);
+        assert_eq!(value, 1);
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]

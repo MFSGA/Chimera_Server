@@ -399,7 +399,7 @@ async fn start_xhttp3_server(
         bind_addr.is_ipv6(),
         bind_interface,
         None,
-        false,
+        true,
         Some(8_625_000),
     )
     .map_err(std::io::Error::other)?;

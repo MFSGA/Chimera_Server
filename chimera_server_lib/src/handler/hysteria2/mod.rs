@@ -53,7 +53,7 @@ pub async fn run_hysteria2_server(
             bind_address.is_ipv6(),
             None,
             Some(bind_address),
-            false,
+            true,
         )?;
 
         let endpoint = quinn::Endpoint::new(
