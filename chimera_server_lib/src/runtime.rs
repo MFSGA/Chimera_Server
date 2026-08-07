@@ -278,6 +278,9 @@ impl std::fmt::Debug for ResolverRuntimeState {
 }
 
 const DEFAULT_POLICY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_POLICY_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_POLICY_UPLINK_ONLY_TIMEOUT: Duration = Duration::from_secs(1);
+const DEFAULT_POLICY_DOWNLINK_ONLY_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct PolicyUserStats {
@@ -488,12 +491,15 @@ impl RuntimeState {
     }
 
     pub fn policy_connection_idle_timeout(&self, level: u32) -> Option<Duration> {
-        self.policy
-            .read()
-            .expect("runtime policy lock poisoned")
-            .connection_idle_timeouts
-            .get(&level)
-            .copied()
+        Some(
+            self.policy
+                .read()
+                .expect("runtime policy lock poisoned")
+                .connection_idle_timeouts
+                .get(&level)
+                .copied()
+                .unwrap_or(DEFAULT_POLICY_CONNECTION_IDLE_TIMEOUT),
+        )
     }
 
     pub(crate) fn policy_system_stats(&self) -> PolicySystemStats {
@@ -516,9 +522,27 @@ impl RuntimeState {
     pub(crate) fn policy_relay_timeouts(&self, level: u32) -> PolicyRelayTimeouts {
         let policy = self.policy.read().expect("runtime policy lock poisoned");
         PolicyRelayTimeouts {
-            connection_idle: policy.connection_idle_timeouts.get(&level).copied(),
-            uplink_only: policy.uplink_only_timeouts.get(&level).copied(),
-            downlink_only: policy.downlink_only_timeouts.get(&level).copied(),
+            connection_idle: Some(
+                policy
+                    .connection_idle_timeouts
+                    .get(&level)
+                    .copied()
+                    .unwrap_or(DEFAULT_POLICY_CONNECTION_IDLE_TIMEOUT),
+            ),
+            uplink_only: Some(
+                policy
+                    .uplink_only_timeouts
+                    .get(&level)
+                    .copied()
+                    .unwrap_or(DEFAULT_POLICY_UPLINK_ONLY_TIMEOUT),
+            ),
+            downlink_only: Some(
+                policy
+                    .downlink_only_timeouts
+                    .get(&level)
+                    .copied()
+                    .unwrap_or(DEFAULT_POLICY_DOWNLINK_ONLY_TIMEOUT),
+            ),
             buffer_size: policy.buffer_sizes.get(&level).copied(),
         }
     }

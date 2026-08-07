@@ -1009,7 +1009,7 @@ mod tests {
         );
         assert_eq!(
             runtime.runtime_state.policy_connection_idle_timeout(1),
-            None
+            Some(std::time::Duration::from_secs(300))
         );
         let relay_timeouts = runtime.runtime_state.policy_relay_timeouts(0);
         assert_eq!(
@@ -1021,10 +1021,20 @@ mod tests {
             Some(std::time::Duration::from_secs(3))
         );
         assert_eq!(relay_timeouts.buffer_size, Some(64 * 1024));
+        let default_relay_timeouts = runtime.runtime_state.policy_relay_timeouts(8);
         assert_eq!(
-            runtime.runtime_state.policy_relay_timeouts(8).buffer_size,
-            None
+            default_relay_timeouts.connection_idle,
+            Some(std::time::Duration::from_secs(300))
         );
+        assert_eq!(
+            default_relay_timeouts.uplink_only,
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert_eq!(
+            default_relay_timeouts.downlink_only,
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert_eq!(default_relay_timeouts.buffer_size, None);
         assert_eq!(
             runtime.runtime_state.policy_relay_timeouts(9).buffer_size,
             Some(1)
