@@ -540,38 +540,38 @@ pub(super) fn collect_socks_settings(
             }
         });
 
+    let accounts = socks_settings
+        .accounts
+        .into_iter()
+        .map(|account| SocksUser {
+            username: account.user,
+            password: account.pass,
+        })
+        .collect::<Vec<_>>();
+
     match auth_mode.as_str() {
         "noauth" | "none" => Ok((
-            SocksUserStore::with_auth_required(Vec::new(), false),
+            SocksUserStore::with_auth_required(accounts, false),
             udp_enabled,
             udp_bind_ip,
         )),
         "password" => {
-            if socks_settings.accounts.is_empty() {
+            if accounts.is_empty() {
                 return Err(Error::InvalidConfig(
                     "socks inbound with password auth requires accounts".into(),
                 ));
             }
             Ok((
-                SocksUserStore::with_auth_required(
-                    socks_settings
-                        .accounts
-                        .into_iter()
-                        .map(|account| SocksUser {
-                            username: account.user,
-                            password: account.pass,
-                        })
-                        .collect(),
-                    true,
-                ),
+                SocksUserStore::with_auth_required(accounts, true),
                 udp_enabled,
                 udp_bind_ip,
             ))
         }
-        other => Err(Error::InvalidConfig(format!(
-            "unsupported socks auth mode: {}",
-            other
-        ))),
+        _ => Ok((
+            SocksUserStore::with_auth_required(accounts, false),
+            udp_enabled,
+            udp_bind_ip,
+        )),
     }
 }
 
@@ -1157,6 +1157,26 @@ mod tests {
         assert!(!users.auth_required());
         assert!(udp_enabled);
         assert!(udp_bind_ip.is_none());
+    }
+
+    #[test]
+    fn collect_socks_unknown_auth_defaults_to_noauth() {
+        let settings = SettingObject(serde_json::json!({
+            "auth": "future-auth",
+            "accounts": [{"user": "alice", "pass": "secret"}],
+            "udp": true,
+            "ip": "127.0.0.1"
+        }));
+
+        let (users, udp_enabled, udp_bind_ip) = collect_socks_settings(settings)
+            .expect("unknown socks auth should match Xray noauth fallback");
+        assert!(!users.auth_required());
+        assert_eq!(users.snapshot()[0].username, "alice");
+        assert!(udp_enabled);
+        assert_eq!(
+            udp_bind_ip,
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        );
     }
 
     #[test]
