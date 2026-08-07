@@ -1,5 +1,3 @@
-#[cfg(feature = "tls")]
-use std::fs;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use std::os::fd::AsRawFd;
 use std::{
@@ -64,11 +62,8 @@ use crate::{
 };
 #[cfg(feature = "tls")]
 use crate::{
-    config::server_config::TlsServerConfig,
-    util::{
-        rustls_util::create_server_config,
-        socket::new_socket2_udp_socket_with_buffer_size,
-    },
+    config::server_config::TlsServerConfig, handler::tls::build_server_config,
+    util::socket::new_socket2_udp_socket_with_buffer_size,
 };
 
 use super::process_stream;
@@ -831,10 +826,10 @@ fn parse_listener_protocol(
         ServerProxyConfig::Tls(TlsServerConfig {
             certificates,
             mut alpn_protocols,
-            enable_session_resumption: _,
-            reject_unknown_sni: _,
-            min_version: _,
-            max_version: _,
+            enable_session_resumption,
+            reject_unknown_sni,
+            min_version,
+            max_version,
             server_name: _,
             inner,
         }) => match *inner {
@@ -845,35 +840,13 @@ fn parse_listener_protocol(
                     alpn_protocols = vec!["h2".to_string(), "http/1.1".to_string()];
                 }
 
-                let certificate = certificates
-                    .into_iter()
-                    .find(|certificate| {
-                        certificate.key_path.is_some()
-                            || certificate.key_pem.is_some()
-                    })
-                    .ok_or_else(|| {
-                        std::io::Error::other(
-                            "missing tls key material for xhttp server",
-                        )
-                    })?;
-                let cert_bytes = match certificate.certificate_path {
-                    Some(path) => fs::read(path)?,
-                    None => certificate.certificate_pem,
-                };
-                let key_bytes = match (certificate.key_path, certificate.key_pem) {
-                    (Some(path), _) => fs::read(path)?,
-                    (None, Some(key)) => key,
-                    (None, None) => {
-                        return Err(std::io::Error::other(
-                            "missing tls private key for xhttp server",
-                        ));
-                    }
-                };
-                let tls_config = create_server_config(
-                    &cert_bytes,
-                    &key_bytes,
+                let tls_config = build_server_config(
+                    &certificates,
                     &alpn_protocols,
-                    &[],
+                    enable_session_resumption,
+                    reject_unknown_sni,
+                    min_version.as_deref(),
+                    max_version.as_deref(),
                 )?;
 
                 let security = if is_h3 {
@@ -2326,6 +2299,53 @@ mod tests {
         let mut remaining = vec![0u8; request.len()];
         server.read_exact(&mut remaining).await.unwrap();
         assert_eq!(remaining, request);
+    }
+
+    #[cfg(all(feature = "tls", feature = "vless"))]
+    #[test]
+    fn tls_listener_honors_reject_unknown_sni_config() {
+        use crate::config::def::InboudItem;
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let generated =
+            rcgen::generate_simple_self_signed(["proxy.example".to_string()])
+                .unwrap();
+        let cert = generated
+            .cert
+            .pem()
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let key = generated
+            .signing_key
+            .serialize_pem()
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "vless-xhttp-reject-sni",
+            "settings": {
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "xhttp",
+                "security": "tls",
+                "xhttpSettings": {"path": "/proxy"},
+                "tlsSettings": {
+                    "rejectUnknownSni": true,
+                    "certificates": [{"certificate": cert, "key": key}]
+                }
+            }
+        }))
+        .unwrap();
+        let config = ServerConfig::try_from(inbound).unwrap();
+        let listener = parse_listener_protocol(config.protocol)
+            .expect("XHTTP TLS listener should compile with rejectUnknownSni");
+        assert!(matches!(listener.security, XhttpSecurityLayer::Tls(_)));
     }
 
     #[test]
