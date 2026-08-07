@@ -254,6 +254,8 @@ struct SocksServerConfigPayload {
     auth_type: i32,
     #[prost(map = "string, string", tag = "2")]
     accounts: std::collections::HashMap<String, String>,
+    #[prost(message, optional, tag = "3")]
+    address: Option<IpOrDomainPayload>,
     #[prost(bool, tag = "4")]
     udp_enabled: bool,
     #[prost(uint32, tag = "6")]
@@ -1256,10 +1258,23 @@ impl HandlerServiceImpl {
                         socks.auth_type != 0,
                     );
 
+                let udp_bind_ip = match socks.address {
+                    Some(address) => match self.parse_address(Some(address))? {
+                        Address::Ipv4(ip) => Some(ip.into()),
+                        Address::Ipv6(ip) => Some(ip.into()),
+                        Address::Hostname(_) => {
+                            return Err(Status::invalid_argument(
+                                "SOCKS server address must be an IP address",
+                            ));
+                        }
+                    },
+                    None => None,
+                };
+
                 Ok(ServerProxyConfig::Socks {
                     accounts,
                     udp_enabled: socks.udp_enabled,
-                    udp_bind_ip: None,
+                    udp_bind_ip,
                     user_level: socks.user_level,
                 })
             }
@@ -2749,8 +2764,8 @@ impl HandlerServiceImpl {
             ServerProxyConfig::Socks {
                 accounts,
                 udp_enabled,
+                udp_bind_ip,
                 user_level,
-                ..
             } => {
                 let auth_type = i32::from(accounts.auth_required());
                 let account_map = accounts
@@ -2765,6 +2780,20 @@ impl HandlerServiceImpl {
                     SocksServerConfigPayload {
                         auth_type,
                         accounts: account_map,
+                        address: udp_bind_ip.map(|ip| IpOrDomainPayload {
+                            address: Some(match ip {
+                                std::net::IpAddr::V4(ip) => {
+                                    ip_or_domain_payload::Address::Ip(
+                                        ip.octets().to_vec(),
+                                    )
+                                }
+                                std::net::IpAddr::V6(ip) => {
+                                    ip_or_domain_payload::Address::Ip(
+                                        ip.octets().to_vec(),
+                                    )
+                                }
+                            }),
+                        }),
                         udp_enabled: *udp_enabled,
                         user_level: *user_level,
                     },
@@ -4671,6 +4700,7 @@ mod tests {
                     value: SocksServerConfigPayload {
                         auth_type: 1,
                         accounts,
+                        address: None,
                         udp_enabled: true,
                         user_level: 7,
                     }
@@ -5225,6 +5255,7 @@ mod tests {
                 SocksServerConfigPayload {
                     auth_type: 0,
                     accounts: std::collections::HashMap::new(),
+                    address: None,
                     udp_enabled: true,
                     user_level: 0,
                 },
@@ -5234,6 +5265,28 @@ mod tests {
             panic!("expected SOCKS inbound config");
         };
         assert!(udp_enabled);
+    }
+
+    #[test]
+    fn handler_preserves_socks_bind_address() {
+        let service =
+            HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+        let parsed = service
+            .parse_add_inbound_protocol(&HandlerServiceImpl::typed_message(
+                TYPE_PROXY_SOCKS_SERVER_CONFIG,
+                SocksServerConfigPayload {
+                    auth_type: 0,
+                    accounts: std::collections::HashMap::new(),
+                    address: Some(localhost_ip_payload()),
+                    udp_enabled: true,
+                    user_level: 0,
+                },
+            ))
+            .expect("SOCKS server config should parse");
+        let ServerProxyConfig::Socks { udp_bind_ip, .. } = parsed else {
+            panic!("expected SOCKS inbound config");
+        };
+        assert_eq!(udp_bind_ip, Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)));
     }
 
     #[cfg(feature = "http")]
