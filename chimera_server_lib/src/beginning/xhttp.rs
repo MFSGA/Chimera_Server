@@ -227,7 +227,7 @@ pub async fn start_xhttp_server(
         .await;
     }
 
-    let socket = crate::util::socket::new_tcp_socket_with_mptcp(
+    let socket = crate::util::socket::new_xray_tcp_listener_socket_with_mptcp(
         bind_interface,
         bind_addr.is_ipv6(),
         tcp_mptcp,

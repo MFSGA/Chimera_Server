@@ -20,6 +20,24 @@ pub fn new_tcp_socket(
 }
 
 #[inline]
+pub fn new_xray_tcp_listener_socket_with_mptcp(
+    bind_interface: Option<String>,
+    is_ipv6: bool,
+    multipath: bool,
+) -> std::io::Result<tokio::net::TcpSocket> {
+    let socket = new_tcp_socket_with_mptcp(bind_interface, is_ipv6, multipath)?;
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos"
+    ))]
+    socket2::SockRef::from(&socket).set_reuse_port(true)?;
+    Ok(socket)
+}
+
+#[inline]
 pub fn new_tcp_socket_with_mptcp(
     bind_interface: Option<String>,
     is_ipv6: bool,
@@ -661,6 +679,26 @@ mod mptcp_tests {
             .bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .expect("bind MPTCP listener socket");
         socket.listen(16).expect("listen on MPTCP socket");
+    }
+
+    #[test]
+    fn xray_tcp_listener_enables_reuse_port() {
+        let socket = new_xray_tcp_listener_socket_with_mptcp(None, false, false)
+            .expect("create Xray-compatible TCP listener socket");
+        let mut value = 0;
+        let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+        // SAFETY: `value` and `length` are valid writable getsockopt buffers.
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                std::ptr::from_mut(&mut value).cast(),
+                &mut length,
+            )
+        };
+        assert_eq!(result, 0);
+        assert_eq!(value, 1);
     }
 }
 

@@ -293,11 +293,12 @@ async fn start_tcp_server_with_runtime(
     let listener = match bind_location {
         BindLocation::Address(a) => {
             let socket_addr = a.to_socket_addr()?;
-            let socket = crate::util::socket::new_tcp_socket_with_mptcp(
-                bind_interface,
-                socket_addr.is_ipv6(),
-                tcp_mptcp,
-            )?;
+            let socket =
+                crate::util::socket::new_xray_tcp_listener_socket_with_mptcp(
+                    bind_interface,
+                    socket_addr.is_ipv6(),
+                    tcp_mptcp,
+                )?;
             #[cfg(target_os = "linux")]
             if let Some(value) = mark {
                 crate::util::socket::configure_socket_mark(

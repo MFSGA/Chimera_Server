@@ -378,7 +378,7 @@ pub(super) async fn start_grpc_server(
     let listen_addr = match bind_location {
         BindLocation::Address(location) => location.to_socket_addr()?,
     };
-    let socket = crate::util::socket::new_tcp_socket_with_mptcp(
+    let socket = crate::util::socket::new_xray_tcp_listener_socket_with_mptcp(
         bind_interface,
         listen_addr.is_ipv6(),
         tcp_mptcp,
