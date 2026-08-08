@@ -299,11 +299,27 @@ pub(super) fn collect_hysteria2_quic_params(
                 .into(),
         ));
     }
+    if params.init_stream_receive_window != 0
+        && params.init_stream_receive_window < 16_384
+    {
+        return Err(Error::InvalidConfig(
+            "hysteria2 finalmask.quicParams.initStreamReceiveWindow must be at least 16384"
+                .into(),
+        ));
+    }
     if params.max_stream_receive_window != 0
         && params.max_stream_receive_window < 16_384
     {
         return Err(Error::InvalidConfig(
             "hysteria2 finalmask.quicParams.maxStreamReceiveWindow must be at least 16384"
+                .into(),
+        ));
+    }
+    if params.init_connection_receive_window != 0
+        && params.init_connection_receive_window < 16_384
+    {
+        return Err(Error::InvalidConfig(
+            "hysteria2 finalmask.quicParams.initConnectionReceiveWindow must be at least 16384"
                 .into(),
         ));
     }
@@ -323,7 +339,9 @@ pub(super) fn collect_hysteria2_quic_params(
         keep_alive_period: params.keep_alive_period as u64,
         disable_path_mtu_discovery: params.disable_path_mtu_discovery,
         max_incoming_streams: params.max_incoming_streams as u64,
+        init_stream_receive_window: params.init_stream_receive_window,
         max_stream_receive_window: params.max_stream_receive_window,
+        init_connection_receive_window: params.init_connection_receive_window,
         max_connection_receive_window: params.max_connection_receive_window,
         brutal_up,
         brutal_down,
@@ -1876,6 +1894,47 @@ mod tests {
                 .expect("xhttp settings should deserialize");
             let error = collect_xhttp_settings(settings)
                 .expect_err("invalid shared XHTTP field must fail");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn collect_hysteria2_quic_params_accepts_xray_initial_receive_windows() {
+        let params: QuicParamsConfig = serde_json::from_value(serde_json::json!({
+            "initStreamReceiveWindow": 32768,
+            "initConnectionReceiveWindow": 65536
+        }))
+        .expect("Xray quicParams should deserialize");
+
+        let config = collect_hysteria2_quic_params(Some(&params))
+            .expect("valid initial receive windows should pass");
+        assert_eq!(config.init_stream_receive_window, 32_768);
+        assert_eq!(config.init_connection_receive_window, 65_536);
+        assert!(config.from_finalmask);
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn collect_hysteria2_quic_params_rejects_small_initial_receive_windows() {
+        for (params, expected) in [
+            (
+                QuicParamsConfig {
+                    init_stream_receive_window: 16_383,
+                    ..QuicParamsConfig::default()
+                },
+                "initStreamReceiveWindow",
+            ),
+            (
+                QuicParamsConfig {
+                    init_connection_receive_window: 16_383,
+                    ..QuicParamsConfig::default()
+                },
+                "initConnectionReceiveWindow",
+            ),
+        ] {
+            let error = collect_hysteria2_quic_params(Some(&params))
+                .expect_err("Xray minimum receive window should be enforced");
             assert!(error.to_string().contains(expected), "{error}");
         }
     }

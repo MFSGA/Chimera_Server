@@ -66,8 +66,15 @@ pub struct Hysteria2QuicParams {
     pub disable_path_mtu_discovery: bool,
     #[serde(default)]
     pub max_incoming_streams: u64,
+    // Quinn exposes a static receive window rather than quic-go's separate
+    // initial/max auto-tuned windows. Preserve Xray's initial values for config
+    // parity while runtime applies the corresponding max/static window values.
+    #[serde(default)]
+    pub init_stream_receive_window: u64,
     #[serde(default)]
     pub max_stream_receive_window: u64,
+    #[serde(default)]
+    pub init_connection_receive_window: u64,
     #[serde(default)]
     pub max_connection_receive_window: u64,
     #[serde(default)]
