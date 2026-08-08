@@ -246,7 +246,8 @@ async fn drive_tcp_streams(
                     }
                 });
             }
-            Err(quinn::ConnectionError::ApplicationClosed { .. }) => return Ok(()),
+            Err(quinn::ConnectionError::ApplicationClosed { .. })
+            | Err(quinn::ConnectionError::ConnectionClosed(_)) => return Ok(()),
             Err(err) => {
                 return Err(Error::other(err));
             }
@@ -357,7 +358,14 @@ async fn proxy_tcp(
     );
     let mut tcp_stream =
         MeteredStream::new(tcp_stream, Some(context), TrafficDirection::Download);
-    match tokio::io::copy_bidirectional(&mut quic_stream, &mut tcp_stream).await {
+    match tokio::io::copy_bidirectional_with_sizes(
+        &mut quic_stream,
+        &mut tcp_stream,
+        32 * 1024,
+        32 * 1024,
+    )
+    .await
+    {
         Ok((client_to_server, server_to_client)) => {
             debug!(
                 "hysteria2 tcp stream forwarded {} bytes client->server and {} bytes server->client",
