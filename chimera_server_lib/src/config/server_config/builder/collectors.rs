@@ -51,10 +51,18 @@ pub(super) fn collect_hysteria2_quic_params(
                 .into(),
         ));
     }
+    if params.max_incoming_streams != 0 && params.max_incoming_streams < 8 {
+        return Err(Error::InvalidConfig(
+            "hysteria2 finalmask.quicParams.maxIncomingStreams must be at least 8"
+                .into(),
+        ));
+    }
 
     Ok(Hysteria2QuicParams {
         max_idle_timeout: params.max_idle_timeout as u64,
         keep_alive_period: params.keep_alive_period as u64,
+        disable_path_mtu_discovery: params.disable_path_mtu_discovery,
+        max_incoming_streams: params.max_incoming_streams as u64,
     })
 }
 

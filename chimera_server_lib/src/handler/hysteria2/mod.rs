@@ -27,6 +27,7 @@ pub mod connection;
 
 const MAX_QUIC_ENDPOINTS: usize = 1;
 const DEFAULT_MAX_IDLE_TIMEOUT_SECS: u64 = 30;
+const SHOES_MAX_INCOMING_BIDI_STREAMS: u64 = 4096;
 const SHOES_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -221,6 +222,24 @@ fn configured_max_idle_timeout(params: &Hysteria2QuicParams) -> Duration {
     })
 }
 
+fn configured_max_incoming_streams(
+    params: &Hysteria2QuicParams,
+) -> std::io::Result<quinn::VarInt> {
+    let value = if params.max_incoming_streams == 0 {
+        SHOES_MAX_INCOMING_BIDI_STREAMS
+    } else {
+        params.max_incoming_streams
+    };
+    quinn::VarInt::from_u64(value)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))
+}
+
+fn configured_mtu_discovery(
+    params: &Hysteria2QuicParams,
+) -> Option<quinn::MtuDiscoveryConfig> {
+    (!params.disable_path_mtu_discovery).then(quinn::MtuDiscoveryConfig::default)
+}
+
 fn build_transport_config(
     params: &Hysteria2QuicParams,
 ) -> std::io::Result<quinn::TransportConfig> {
@@ -228,8 +247,10 @@ fn build_transport_config(
     let idle_timeout = configured_max_idle_timeout(params)
         .try_into()
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+    let max_incoming_streams = configured_max_incoming_streams(params)?;
+    let mtu_discovery = configured_mtu_discovery(params);
     transport
-        .max_concurrent_bidi_streams(4096_u32.into())
+        .max_concurrent_bidi_streams(max_incoming_streams)
         // Hysteria2 uses HTTP/3, so keep enough uni streams for QPACK/control updates.
         .max_concurrent_uni_streams(1024_u32.into())
         .max_idle_timeout(Some(idle_timeout))
@@ -241,7 +262,7 @@ fn build_transport_config(
         .stream_receive_window((8u32 * 1024 * 1024).into())
         .initial_mtu(1200)
         .min_mtu(1200)
-        .mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()))
+        .mtu_discovery_config(mtu_discovery)
         .enable_segmentation_offload(true)
         .initial_rtt(Duration::from_millis(100));
     Ok(transport)
@@ -266,9 +287,35 @@ mod tests {
             configured_max_idle_timeout(&Hysteria2QuicParams {
                 max_idle_timeout: 7,
                 keep_alive_period: 11,
+                ..Hysteria2QuicParams::default()
             }),
             Duration::from_secs(7)
         );
+    }
+
+    #[test]
+    fn quic_stream_limit_and_mtu_discovery_apply_explicit_params() {
+        let default = Hysteria2QuicParams::default();
+        assert_eq!(
+            configured_max_incoming_streams(&default)
+                .expect("default stream limit")
+                .into_inner(),
+            4096
+        );
+        assert!(configured_mtu_discovery(&default).is_some());
+
+        let configured = Hysteria2QuicParams {
+            max_incoming_streams: 8,
+            disable_path_mtu_discovery: true,
+            ..Hysteria2QuicParams::default()
+        };
+        assert_eq!(
+            configured_max_incoming_streams(&configured)
+                .expect("configured stream limit")
+                .into_inner(),
+            8
+        );
+        assert!(configured_mtu_discovery(&configured).is_none());
     }
 
     #[test]

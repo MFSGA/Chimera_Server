@@ -276,6 +276,10 @@ pub struct QuicParamsConfig {
     pub max_idle_timeout: i64,
     #[serde(default)]
     pub keep_alive_period: i64,
+    #[serde(default, rename = "disablePathMTUDiscovery")]
+    pub disable_path_mtu_discovery: bool,
+    #[serde(default)]
+    pub max_incoming_streams: i64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

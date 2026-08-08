@@ -58,6 +58,10 @@ pub struct Hysteria2QuicParams {
     pub max_idle_timeout: u64,
     #[serde(default)]
     pub keep_alive_period: u64,
+    #[serde(default)]
+    pub disable_path_mtu_discovery: bool,
+    #[serde(default)]
+    pub max_incoming_streams: u64,
 }
 
 #[cfg(feature = "hysteria")]

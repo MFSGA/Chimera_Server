@@ -1535,7 +1535,9 @@ mod tests {
         let config = ServerConfig::try_from(hysteria2_inbound_with_quic_params(
             serde_json::json!({
                 "maxIdleTimeout": 7,
-                "keepAlivePeriod": 11
+                "keepAlivePeriod": 11,
+                "disablePathMTUDiscovery": true,
+                "maxIncomingStreams": 8
             }),
         ))
         .expect("valid Xray Hysteria2 quicParams should build");
@@ -1544,12 +1546,15 @@ mod tests {
         };
         assert_eq!(config.quic_params.max_idle_timeout, 7);
         assert_eq!(config.quic_params.keep_alive_period, 11);
+        assert!(config.quic_params.disable_path_mtu_discovery);
+        assert_eq!(config.quic_params.max_incoming_streams, 8);
 
         for params in [
             serde_json::json!({"maxIdleTimeout": 3}),
             serde_json::json!({"maxIdleTimeout": 121}),
             serde_json::json!({"keepAlivePeriod": 1}),
             serde_json::json!({"keepAlivePeriod": 61}),
+            serde_json::json!({"maxIncomingStreams": 7}),
         ] {
             let error =
                 ServerConfig::try_from(hysteria2_inbound_with_quic_params(params))
