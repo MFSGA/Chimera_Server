@@ -1831,7 +1831,7 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
                 )));
             }
         };
-        self.runtime.register_inbound_tasks(&inbound_tag, &handles);
+        self.runtime.register_inbound_tasks(&inbound_tag, handles);
 
         Ok(Response::new(
             proto::xray::app::proxyman::command::AddInboundResponse {},
@@ -1850,7 +1850,7 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
         let Some(_) = self.runtime.remove_inbound(&request.tag) else {
             return Err(Status::not_found("inbound not found"));
         };
-        self.runtime.abort_inbound_tasks(&request.tag);
+        self.runtime.stop_inbound_tasks(&request.tag).await;
         Ok(Response::new(
             proto::xray::app::proxyman::command::RemoveInboundResponse {},
         ))
@@ -1882,11 +1882,10 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
             .with_inbound_mut(&request.tag, |inbound| *inbound = updated.clone())
             .ok_or_else(|| Status::not_found("inbound not found"))?;
 
-        if self.runtime.abort_inbound_tasks(&request.tag) {
-            tokio::task::yield_now().await;
+        if self.runtime.stop_inbound_tasks(&request.tag).await {
             match start_servers(updated, self.runtime.clone()).await {
                 Ok(handles) => {
-                    self.runtime.register_inbound_tasks(&request.tag, &handles);
+                    self.runtime.register_inbound_tasks(&request.tag, handles);
                 }
                 Err(start_error) => {
                     self.runtime
@@ -1900,7 +1899,7 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
                     return match rollback {
                         Ok(handles) => {
                             self.runtime
-                                .register_inbound_tasks(&request.tag, &handles);
+                                .register_inbound_tasks(&request.tag, handles);
                             Err(Status::unknown(format!(
                                 "failed to restart inbound handler: {start_error}; previous inbound restored"
                             )))
@@ -2285,7 +2284,7 @@ mod tests {
         };
         let runtime = RuntimeState::new(vec![inbound], Vec::new());
         let placeholder_task = tokio::spawn(std::future::pending::<()>());
-        runtime.register_inbound_tasks(&inbound_tag, &[placeholder_task]);
+        runtime.register_inbound_tasks(&inbound_tag, vec![placeholder_task]);
         let service = HandlerServiceImpl::new(runtime.clone());
         let added_username = unique_tag("failed-user");
 
@@ -2317,7 +2316,7 @@ mod tests {
         let placeholder_task = tokio::spawn(std::future::pending::<()>());
         fixture
             .runtime
-            .register_inbound_tasks(&fixture.inbound_tag, &[placeholder_task]);
+            .register_inbound_tasks(&fixture.inbound_tag, vec![placeholder_task]);
         let service = HandlerServiceImpl::new(fixture.runtime.clone());
 
         service
@@ -2330,7 +2329,12 @@ mod tests {
             .await
             .expect("empty operation should be idempotent");
 
-        assert!(fixture.runtime.abort_inbound_tasks(&fixture.inbound_tag));
+        assert!(
+            fixture
+                .runtime
+                .stop_inbound_tasks(&fixture.inbound_tag)
+                .await
+        );
     }
 
     #[cfg(feature = "vless")]
@@ -3108,7 +3112,7 @@ mod tests {
         let handles = start_servers(inbound, runtime.clone())
             .await
             .expect("start empty vless inbound");
-        runtime.register_inbound_tasks(&inbound_tag, &handles);
+        runtime.register_inbound_tasks(&inbound_tag, handles);
         let service = HandlerServiceImpl::new(runtime.clone());
 
         let users_before_add = service
@@ -3246,7 +3250,7 @@ mod tests {
             .expect("empty vless get users count after remove failed")
             .into_inner();
         assert_eq!(count_after_remove.count, 0);
-        runtime.abort_inbound_tasks(&inbound_tag);
+        runtime.stop_inbound_tasks(&inbound_tag).await;
     }
 
     #[tokio::test]
