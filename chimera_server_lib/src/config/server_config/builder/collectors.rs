@@ -416,54 +416,29 @@ pub(super) fn collect_socks_settings(
     }
     let user_level = socks_settings.user_level.unwrap_or_default();
 
+    // Match xray-core: an omitted `auth` field falls through to NO_AUTH,
+    // even when `users` / `accounts` are present.
     let auth_mode = socks_settings
         .auth
         .as_deref()
         .map(|value| value.trim().to_lowercase())
-        .unwrap_or_else(|| {
-            if accounts.is_empty() {
-                "noauth".to_string()
-            } else {
-                "password".to_string()
-            }
-        });
+        .unwrap_or_else(|| "noauth".to_string());
 
-    match auth_mode.as_str() {
-        "noauth" | "none" => Ok(CollectedSocksSettings {
-            accounts: SocksUserStore::with_auth_required(Vec::new(), false),
-            udp_enabled,
-            udp_bind_ip,
-            user_level,
-        }),
-        "password" => {
-            if accounts.is_empty() {
-                return Err(Error::InvalidConfig(
-                    "socks inbound with password auth requires accounts".into(),
-                ));
-            }
-            Ok(CollectedSocksSettings {
-                accounts: SocksUserStore::with_auth_required(
-                    accounts
-                        .into_iter()
-                        .map(|account| SocksUser {
-                            username: account.user,
-                            password: account.pass,
-                        })
-                        .collect(),
-                    true,
-                ),
-                udp_enabled,
-                udp_bind_ip,
-                user_level,
-            })
-        }
-        _ => Ok(CollectedSocksSettings {
-            accounts: SocksUserStore::with_auth_required(Vec::new(), false),
-            udp_enabled,
-            udp_bind_ip,
-            user_level,
-        }),
-    }
+    let users = accounts
+        .into_iter()
+        .map(|account| SocksUser {
+            username: account.user,
+            password: account.pass,
+        })
+        .collect();
+    let auth_required = auth_mode == "password";
+
+    Ok(CollectedSocksSettings {
+        accounts: SocksUserStore::with_auth_required(users, auth_required),
+        udp_enabled,
+        udp_bind_ip,
+        user_level,
+    })
 }
 
 pub(super) fn collect_xhttp_settings(
@@ -1062,9 +1037,21 @@ mod tests {
         let collected = collect_socks_settings(settings, true)
             .expect("unknown socks auth should match Xray noauth fallback");
         assert!(!collected.accounts.auth_required());
-        assert!(collected.accounts.snapshot().is_empty());
+        assert_eq!(collected.accounts.snapshot()[0].username, "alice");
         assert!(collected.udp_enabled);
         assert_eq!(collected.user_level, 7);
+    }
+
+    #[test]
+    fn collect_socks_omitted_auth_defaults_to_noauth_even_with_accounts() {
+        let settings = SettingObject(serde_json::json!({
+            "accounts": [{"user": "alice", "pass": "secret"}]
+        }));
+
+        let collected = collect_socks_settings(settings, true)
+            .expect("omitted socks auth should match Xray noauth fallback");
+        assert!(!collected.accounts.auth_required());
+        assert_eq!(collected.accounts.snapshot()[0].username, "alice");
     }
 
     #[test]

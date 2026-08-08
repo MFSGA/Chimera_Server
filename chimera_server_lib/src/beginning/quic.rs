@@ -8,7 +8,7 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 #[cfg(feature = "hysteria")]
-use crate::handler::hysteria2::run_hysteria2_server;
+use crate::handler::hysteria2::{Hysteria2ListenerOptions, run_hysteria2_server};
 #[cfg(feature = "tuic")]
 use crate::handler::tuic::run_tuic_server;
 #[cfg(any(feature = "hysteria", feature = "tuic"))]
@@ -64,6 +64,25 @@ pub async fn start_quic_server(
             &client_fingerprints.into_vec(),
         )?);
 
+        let (transparent, protocol) = match protocol {
+            ServerProxyConfig::TransparentSocket { inner } => (true, *inner),
+            protocol => (false, protocol),
+        };
+        let (receive_original_destination, protocol) = match protocol {
+            ServerProxyConfig::ReceiveOriginalDestination { inner } => {
+                (true, *inner)
+            }
+            protocol => (false, protocol),
+        };
+        let (socket_mark, protocol) = match protocol {
+            ServerProxyConfig::BindMark { value, inner } => (Some(value), *inner),
+            protocol => (None, protocol),
+        };
+        let (ipv6_only, protocol) = match protocol {
+            ServerProxyConfig::Ipv6Only { inner } => (true, *inner),
+            protocol => (false, protocol),
+        };
+
         match protocol {
             #[cfg(feature = "hysteria")]
             ServerProxyConfig::Hysteria2 { config } => {
@@ -72,6 +91,12 @@ pub async fn start_quic_server(
                         bind_address,
                         server_config,
                         config,
+                        Hysteria2ListenerOptions {
+                            socket_mark,
+                            transparent,
+                            receive_original_destination,
+                            ipv6_only,
+                        },
                         tag,
                         runtime,
                     )

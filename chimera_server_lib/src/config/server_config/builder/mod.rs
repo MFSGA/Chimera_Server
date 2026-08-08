@@ -805,6 +805,50 @@ impl TryFrom<InboudItem> for ServerConfig {
                         "hysteria2 inbound missing streamSettings".into(),
                     )
                 })?;
+                let mark = stream_settings
+                    .sockopt
+                    .as_ref()
+                    .map_or(0, |settings| settings.mark);
+                #[cfg(not(target_os = "linux"))]
+                if mark != 0 {
+                    return Err(Error::InvalidConfig(
+                        "hysteria2 sockopt.mark is currently supported only on Linux".into(),
+                    ));
+                }
+                let tproxy = stream_settings
+                    .sockopt
+                    .as_ref()
+                    .map_or("", |settings| settings.tproxy.as_str())
+                    .to_ascii_lowercase();
+                let transparent = matches!(tproxy.as_str(), "tproxy" | "redirect");
+                #[cfg(not(target_os = "linux"))]
+                if transparent {
+                    return Err(Error::InvalidConfig(
+                        "hysteria2 sockopt.tproxy is currently supported only on Linux".into(),
+                    ));
+                }
+                let ipv6_only = stream_settings
+                    .sockopt
+                    .as_ref()
+                    .is_some_and(|settings| settings.v6only);
+                #[cfg(not(any(target_os = "android", target_os = "linux")))]
+                if ipv6_only {
+                    return Err(Error::InvalidConfig(
+                        "hysteria2 sockopt.v6only is currently supported only on Linux and Android"
+                            .into(),
+                    ));
+                }
+                let receive_original_destination = stream_settings
+                    .sockopt
+                    .as_ref()
+                    .is_some_and(|settings| settings.receive_original_dest_address);
+                #[cfg(not(target_os = "linux"))]
+                if receive_original_destination {
+                    return Err(Error::InvalidConfig(
+                        "hysteria2 receiveOriginalDestAddress is currently supported only on Linux"
+                            .into(),
+                    ));
+                }
                 let hysteria_settings = stream_settings.hysteria_settings.as_ref();
                 let tls_settings =
                     stream_settings.tls_settings.ok_or_else(|| {
@@ -842,10 +886,40 @@ impl TryFrom<InboudItem> for ServerConfig {
                     alpn_protocols: NoneOrSome::Some(tls_settings.alpn),
                     client_fingerprints: NoneOrSome::None,
                 });
+                let protocol = ServerProxyConfig::Hysteria2 { config };
+                let protocol = if ipv6_only {
+                    ServerProxyConfig::Ipv6Only {
+                        inner: Box::new(protocol),
+                    }
+                } else {
+                    protocol
+                };
+                let protocol = if mark != 0 {
+                    ServerProxyConfig::BindMark {
+                        value: mark,
+                        inner: Box::new(protocol),
+                    }
+                } else {
+                    protocol
+                };
+                let protocol = if receive_original_destination {
+                    ServerProxyConfig::ReceiveOriginalDestination {
+                        inner: Box::new(protocol),
+                    }
+                } else {
+                    protocol
+                };
+                let protocol = if transparent {
+                    ServerProxyConfig::TransparentSocket {
+                        inner: Box::new(protocol),
+                    }
+                } else {
+                    protocol
+                };
                 Ok(ServerConfig {
                     tag,
                     bind_location,
-                    protocol: ServerProxyConfig::Hysteria2 { config },
+                    protocol,
                     transport: Transport::Quic,
                     quic_settings,
                 })
@@ -1394,6 +1468,95 @@ mod tests {
             "tag": format!("{protocol}-planned")
         }))
         .expect("valid inbound item")
+    }
+
+    #[cfg(feature = "hysteria")]
+    fn hysteria2_inbound_with_sockopt(
+        listen: &str,
+        sockopt: serde_json::Value,
+    ) -> InboudItem {
+        serde_json::from_value(serde_json::json!({
+            "listen": listen,
+            "port": 10000,
+            "protocol": "hysteria2",
+            "tag": "hysteria2-sockopt",
+            "settings": {"clients": [{"auth": "xray-auth-token"}]},
+            "streamSettings": {
+                "network": "quic",
+                "security": "tls",
+                "sockopt": sockopt,
+                "tlsSettings": {
+                    "alpn": ["h3"],
+                    "certificates": [{
+                        "certificateFile": "cert.pem",
+                        "keyFile": "key.pem"
+                    }]
+                }
+            }
+        }))
+        .expect("literal hysteria2 inbound should parse")
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn hysteria2_socket_mark_wraps_quic_listener() {
+        let config = ServerConfig::try_from(hysteria2_inbound_with_sockopt(
+            "127.0.0.1",
+            serde_json::json!({"mark": 255}),
+        ))
+        .expect("hysteria2 mark should build");
+        let ServerProxyConfig::BindMark { value, inner } = config.protocol else {
+            panic!("hysteria2 sockopt.mark must wrap the QUIC listener");
+        };
+        assert_eq!(value, 255);
+        assert!(matches!(*inner, ServerProxyConfig::Hysteria2 { .. }));
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn hysteria2_ipv6_only_wraps_quic_listener() {
+        let config = ServerConfig::try_from(hysteria2_inbound_with_sockopt(
+            "::1",
+            serde_json::json!({"v6only": true}),
+        ))
+        .expect("hysteria2 v6only should build");
+        let ServerProxyConfig::Ipv6Only { inner } = config.protocol else {
+            panic!("hysteria2 sockopt.v6only must wrap the QUIC listener");
+        };
+        assert!(matches!(*inner, ServerProxyConfig::Hysteria2 { .. }));
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn hysteria2_tproxy_wraps_quic_listener() {
+        for mode in ["tproxy", "redirect", "TPROXY"] {
+            let config = ServerConfig::try_from(hysteria2_inbound_with_sockopt(
+                "127.0.0.1",
+                serde_json::json!({"tproxy": mode}),
+            ))
+            .expect("hysteria2 tproxy should build like Xray");
+            let ServerProxyConfig::TransparentSocket { inner } = config.protocol
+            else {
+                panic!("hysteria2 sockopt.tproxy must wrap the QUIC listener");
+            };
+            assert!(matches!(*inner, ServerProxyConfig::Hysteria2 { .. }));
+        }
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn hysteria2_receive_original_destination_wraps_quic_listener() {
+        let config = ServerConfig::try_from(hysteria2_inbound_with_sockopt(
+            "127.0.0.1",
+            serde_json::json!({"receiveOriginalDestAddress": true}),
+        ))
+        .expect("hysteria2 original destination should build like Xray");
+        let ServerProxyConfig::ReceiveOriginalDestination { inner } =
+            config.protocol
+        else {
+            panic!("receiveOriginalDestAddress must wrap the QUIC listener");
+        };
+        assert!(matches!(*inner, ServerProxyConfig::Hysteria2 { .. }));
     }
 
     #[test]
