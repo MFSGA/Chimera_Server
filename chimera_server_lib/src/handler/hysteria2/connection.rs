@@ -62,10 +62,10 @@ const MAX_ADDRESS_LEN: usize = 2048;
 const MAX_TCP_REQUEST_PADDING_LEN: u64 = 4096;
 const PADDING_SCRATCH_LEN: usize = 1024;
 const TCP_SUCCESS_STATUS: u8 = 0x00;
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const UDP_SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_FRAGMENT_CACHE_SIZE: usize = 256;
-const TCP_ERROR_STATUS: u8 = 0x01;
 
 fn hysteria2_routing_identity(client: &Hysteria2Client) -> String {
     client
@@ -361,7 +361,15 @@ async fn handle_tcp_stream(
     peer_addr: SocketAddr,
     runtime: RuntimeState,
 ) -> std::io::Result<()> {
-    let request = TcpRequest::read(&mut recv).await?;
+    let request = match TcpRequest::read(&mut recv).await {
+        Ok(request) => request,
+        Err(err) => {
+            let _ = send.finish();
+            return Err(err);
+        }
+    };
+    send_tcp_response(&mut send, TCP_SUCCESS_STATUS, "").await?;
+
     let mut context = apply_hysteria2_policy(
         hysteria2_traffic_context(&client, inbound_tag.as_str(), peer_addr),
         &runtime,
@@ -382,38 +390,42 @@ async fn handle_tcp_stream(
         }
         Ok(None) => {}
         Err(error) => {
-            let _ = send_tcp_response(&mut send, TCP_ERROR_STATUS, "access denied")
-                .await;
             let _ = send.finish();
             return Err(error);
         }
     }
 
-    let connection = match connect_tcp_outbound(
-        &resolver,
-        &request.target,
-        &runtime,
-        inbound_tag.as_str(),
-        context.routing_identity().unwrap_or_default(),
-        peer_addr,
+    let connection = match tokio::time::timeout(
+        TCP_CONNECT_TIMEOUT,
+        connect_tcp_outbound(
+            &resolver,
+            &request.target,
+            &runtime,
+            inbound_tag.as_str(),
+            context.routing_identity().unwrap_or_default(),
+            peer_addr,
+        ),
     )
     .await
     {
-        Ok(Some(connection)) => connection,
-        Ok(None) => {
+        Ok(Ok(Some(connection))) => connection,
+        Ok(Ok(None)) => {
             let _ = send.finish();
             return Ok(());
         }
-        Err(err) => {
+        Ok(Err(err)) => {
             warn!("failed to connect to {}: {}", request.target, err);
-            let _ = send_tcp_response(&mut send, TCP_ERROR_STATUS, "connect failed")
-                .await;
             let _ = send.finish();
             return Err(err);
         }
+        Err(_) => {
+            let _ = send.finish();
+            return Err(Error::new(
+                ErrorKind::TimedOut,
+                format!("client setup to {} timed out", request.target),
+            ));
+        }
     };
-
-    send_tcp_response(&mut send, TCP_SUCCESS_STATUS, "").await?;
 
     if let Some(tag) = connection.outbound_tag {
         context = context.with_outbound_tag(tag);
@@ -1555,6 +1567,8 @@ mod tests {
 
     #[test]
     fn shoes_padding_bounds_apply_to_auth_and_tcp_frames() {
+        assert_eq!(TCP_CONNECT_TIMEOUT, Duration::from_secs(60));
+
         for _ in 0..64 {
             let padding = random_padding();
             assert!((1..80).contains(&padding.len()));
