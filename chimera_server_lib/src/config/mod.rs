@@ -275,6 +275,8 @@ pub struct QuicParamsConfig {
     #[serde(default)]
     pub congestion: String,
     #[serde(default)]
+    pub debug: bool,
+    #[serde(default)]
     pub max_idle_timeout: i64,
     #[serde(default)]
     pub keep_alive_period: i64,
@@ -325,6 +327,8 @@ pub struct HysteriaMasqueradeConfig {
 pub struct HysteriaSettings {
     #[serde(default)]
     pub version: Option<u8>,
+    #[serde(default)]
+    pub auth: String,
     #[serde(default)]
     pub congestion: Option<String>,
     #[serde(default)]

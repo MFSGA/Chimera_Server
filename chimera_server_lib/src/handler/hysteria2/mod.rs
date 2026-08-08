@@ -232,8 +232,10 @@ fn configure_congestion_controller(
             transport.congestion_controller_factory(Arc::new(BbrConfig::default()));
         }
         "" | "brutal" | "force-brutal" => {
-            transport
-                .congestion_controller_factory(Arc::new(BrutalConfig::new(tx_bps)));
+            transport.congestion_controller_factory(Arc::new(BrutalConfig::new(
+                tx_bps,
+                params.debug,
+            )));
         }
         _ => unreachable!("hysteria2 congestion mode validated by config builder"),
     }

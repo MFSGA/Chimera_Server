@@ -57,6 +57,8 @@ pub struct Hysteria2QuicParams {
     #[serde(default)]
     pub congestion: String,
     #[serde(default)]
+    pub debug: bool,
+    #[serde(default)]
     pub max_idle_timeout: u64,
     #[serde(default)]
     pub keep_alive_period: u64,
@@ -95,6 +97,8 @@ pub struct Hysteria2MasqueradeConfig {
 #[serde(rename_all = "camelCase")]
 pub struct Hysteria2ServerConfig {
     pub clients: Vec<Hysteria2Client>,
+    #[serde(default)]
+    pub fallback_auth: Option<String>,
     #[serde(default)]
     pub bandwidth: Hysteria2BandwidthConfig,
     #[serde(default)]

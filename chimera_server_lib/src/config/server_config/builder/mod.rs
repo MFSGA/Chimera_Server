@@ -875,15 +875,16 @@ impl TryFrom<InboudItem> for ServerConfig {
                     )
                 })?;
 
-                let settings = settings.ok_or_else(|| {
-                    Error::InvalidConfig("hysteria2 inbound requires clients".into())
-                })?;
+                let settings = settings.unwrap_or_else(|| {
+                    crate::config::SettingObject(serde_json::json!({}))
+                });
                 let mut config =
                     collect_hysteria2_settings(settings, hysteria_settings)?;
                 config.quic_params = quic_params;
-                if config.clients.is_empty() {
+                if config.clients.is_empty() && config.fallback_auth.is_none() {
                     return Err(Error::InvalidConfig(
-                        "hysteria2 inbound requires at least one client".into(),
+                        "hysteria2 inbound requires clients or hysteriaSettings.auth"
+                            .into(),
                     ));
                 }
 
@@ -1535,6 +1536,7 @@ mod tests {
         let config = ServerConfig::try_from(hysteria2_inbound_with_quic_params(
             serde_json::json!({
                 "congestion": "BRUTAL",
+                "debug": true,
                 "maxIdleTimeout": 7,
                 "keepAlivePeriod": 11,
                 "disablePathMTUDiscovery": true,
@@ -1550,6 +1552,7 @@ mod tests {
             panic!("expected hysteria2 protocol");
         };
         assert_eq!(config.quic_params.congestion, "brutal");
+        assert!(config.quic_params.debug);
         assert_eq!(config.quic_params.max_idle_timeout, 7);
         assert_eq!(config.quic_params.keep_alive_period, 11);
         assert!(config.quic_params.disable_path_mtu_discovery);
@@ -1578,6 +1581,40 @@ mod tests {
                     .expect_err("out-of-range Xray quicParams should fail");
             assert!(error.to_string().contains("finalmask.quicParams"));
         }
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn hysteria2_accepts_xray_transport_auth_without_users() {
+        let inbound = serde_json::from_value::<InboudItem>(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "hysteria2",
+            "tag": "hysteria2-transport-auth",
+            "streamSettings": {
+                "network": "quic",
+                "security": "tls",
+                "hysteriaSettings": {
+                    "version": 2,
+                    "auth": "single-auth-token"
+                },
+                "tlsSettings": {
+                    "certificates": [{
+                        "certificateFile": "cert.pem",
+                        "keyFile": "key.pem"
+                    }]
+                }
+            }
+        }))
+        .expect("literal Xray transport auth should parse");
+
+        let config = ServerConfig::try_from(inbound)
+            .expect("hysteriaSettings.auth should replace users when absent");
+        let ServerProxyConfig::Hysteria2 { config } = config.protocol else {
+            panic!("expected hysteria2 protocol");
+        };
+        assert!(config.clients.is_empty());
+        assert_eq!(config.fallback_auth.as_deref(), Some("single-auth-token"));
     }
 
     #[cfg(feature = "hysteria")]

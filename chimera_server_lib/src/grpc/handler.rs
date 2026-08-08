@@ -7799,6 +7799,7 @@ mod tests {
                         email: Some("initial-user".to_string()),
                         user_level: 3,
                     }],
+                    fallback_auth: None,
                     bandwidth: Hysteria2BandwidthConfig::default(),
                     ignore_client_bandwidth: false,
                     udp_idle_timeout: 0,

@@ -131,6 +131,7 @@ struct AuthContext {
 struct AuthInfo {
     client: Hysteria2Client,
     client_rx_limit: Option<u64>,
+    udp_enabled: bool,
 }
 
 pub async fn process_hysteria2_connection(
@@ -240,7 +241,7 @@ async fn auth_hysteria2_connection(
                         ))
                     })?;
                 debug!(method = %req.method(), uri = %req.uri(), "hysteria2 auth request received");
-                match validate_auth_request(req, config.clients.as_ref()) {
+                match validate_auth_request(req, config) {
                     Ok(auth_info) => {
                         let (actual_tx, response_rx, response_rx_auto) =
                             resolve_bandwidth_settings(
@@ -251,7 +252,7 @@ async fn auth_hysteria2_connection(
                         debug!(status = SUCCESS_STATUS, "hysteria2 auth accepted");
                         send_auth_success(
                             &mut stream,
-                            true,
+                            auth_info.udp_enabled,
                             response_rx,
                             response_rx_auto,
                         )
@@ -264,7 +265,7 @@ async fn auth_hysteria2_connection(
                         debug!("hysteria2 auth response finished");
                         return Ok(AuthContext {
                             client: auth_info.client,
-                            udp_enabled: true,
+                            udp_enabled: auth_info.udp_enabled,
                         });
                     }
                     Err(reject) => {
@@ -532,6 +533,7 @@ impl AsyncWrite for QuicStream {
     }
 }
 
+#[derive(Debug)]
 enum AuthReject {
     NotAuthRequest,
     Unauthorized(&'static str),
@@ -578,7 +580,7 @@ fn resolve_bandwidth_settings(
 
 fn validate_auth_request(
     req: Request<()>,
-    clients: &[Hysteria2Client],
+    config: &Hysteria2ServerConfig,
 ) -> Result<AuthInfo, AuthReject> {
     if req.method() != http::Method::POST || req.uri().path() != AUTH_PATH {
         return Err(AuthReject::NotAuthRequest);
@@ -594,11 +596,31 @@ fn validate_auth_request(
 
     let provided = provided.trim();
 
-    let client = clients
-        .iter()
-        .find(|client| client.password == provided)
-        .cloned()
-        .ok_or(AuthReject::Unauthorized("password mismatch"))?;
+    let (client, udp_enabled) = if config.clients.is_empty() {
+        let fallback_auth = config
+            .fallback_auth
+            .as_deref()
+            .ok_or(AuthReject::Unauthorized("password mismatch"))?;
+        if fallback_auth != provided {
+            return Err(AuthReject::Unauthorized("password mismatch"));
+        }
+        (
+            Hysteria2Client {
+                password: fallback_auth.to_string(),
+                email: None,
+                user_level: 0,
+            },
+            false,
+        )
+    } else {
+        let client = config
+            .clients
+            .iter()
+            .find(|client| client.password == provided)
+            .cloned()
+            .ok_or(AuthReject::Unauthorized("password mismatch"))?;
+        (client, true)
+    };
 
     let client_rx_limit =
         match headers.get(CLIENT_CC_RX_HEADER) {
@@ -620,6 +642,7 @@ fn validate_auth_request(
     Ok(AuthInfo {
         client,
         client_rx_limit,
+        udp_enabled,
     })
 }
 
@@ -1450,6 +1473,46 @@ mod tests {
         },
     };
 
+    fn auth_request(auth: &str) -> Request<()> {
+        Request::builder()
+            .method(http::Method::POST)
+            .uri("https://hysteria/auth")
+            .header(AUTH_HEADER, auth)
+            .body(())
+            .expect("valid hysteria auth request")
+    }
+
+    #[test]
+    fn transport_auth_disables_udp_and_users_take_precedence() {
+        let mut config = Hysteria2ServerConfig {
+            clients: Vec::new(),
+            fallback_auth: Some("fallback-auth".into()),
+            bandwidth: Hysteria2BandwidthConfig::default(),
+            ignore_client_bandwidth: false,
+            udp_idle_timeout: 60,
+            quic_params: Hysteria2QuicParams::default(),
+            masquerade: Default::default(),
+        };
+
+        let auth = validate_auth_request(auth_request("fallback-auth"), &config)
+            .expect("fallback auth should authenticate");
+        assert!(!auth.udp_enabled);
+        assert_eq!(auth.client.password, "fallback-auth");
+
+        config.clients.push(Hysteria2Client {
+            password: "user-auth".into(),
+            email: Some("user@example.com".into()),
+            user_level: 7,
+        });
+        assert!(
+            validate_auth_request(auth_request("fallback-auth"), &config).is_err()
+        );
+        let auth = validate_auth_request(auth_request("user-auth"), &config)
+            .expect("configured users should take precedence");
+        assert!(auth.udp_enabled);
+        assert_eq!(auth.client.email.as_deref(), Some("user@example.com"));
+    }
+
     #[test]
     fn masquerade_response_matches_xray_404_and_string_modes() {
         let (response, body) =
@@ -1478,6 +1541,7 @@ mod tests {
     fn finalmask_brutal_bandwidth_matches_xray_negotiation() {
         let mut config = Hysteria2ServerConfig {
             clients: Vec::new(),
+            fallback_auth: None,
             bandwidth: Hysteria2BandwidthConfig {
                 max_tx: 9_000_000,
                 max_rx: 8_000_000,

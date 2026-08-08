@@ -27,13 +27,15 @@ const DEBUG_PRINT_INTERVAL: u64 = 2;
 pub(super) struct BrutalConfig {
     tx_bps: Arc<AtomicU64>,
     bbr_config: Arc<BbrConfig>,
+    debug: bool,
 }
 
 impl BrutalConfig {
-    pub(super) fn new(tx_bps: Arc<AtomicU64>) -> Self {
+    pub(super) fn new(tx_bps: Arc<AtomicU64>, debug: bool) -> Self {
         Self {
             tx_bps,
             bbr_config: Arc::new(BbrConfig::default()),
+            debug,
         }
     }
 }
@@ -46,7 +48,7 @@ impl ControllerFactory for BrutalConfig {
     ) -> Box<dyn Controller> {
         Box::new(BrutalController {
             tx_bps: self.tx_bps.clone(),
-            brutal: BrutalState::new(now, current_mtu),
+            brutal: BrutalState::new(now, current_mtu, self.debug),
             bbr: Bbr::new(self.bbr_config.clone(), current_mtu),
         })
     }
@@ -158,11 +160,12 @@ struct BrutalState {
 }
 
 impl BrutalState {
-    fn new(now: Instant, current_mtu: u16) -> Self {
-        let debug = std::env::var(DEBUG_ENV)
-            .ok()
-            .and_then(|value| value.parse::<bool>().ok())
-            .unwrap_or(false);
+    fn new(now: Instant, current_mtu: u16, configured_debug: bool) -> Self {
+        let debug = configured_debug
+            || std::env::var(DEBUG_ENV)
+                .ok()
+                .and_then(|value| value.parse::<bool>().ok())
+                .unwrap_or(false);
         Self {
             start: now,
             max_datagram_size: current_mtu as u64,
@@ -299,7 +302,7 @@ mod tests {
     #[test]
     fn brutal_factory_switches_after_bandwidth_negotiation() {
         let tx_bps = Arc::new(AtomicU64::new(0));
-        let factory = Arc::new(BrutalConfig::new(tx_bps.clone()));
+        let factory = Arc::new(BrutalConfig::new(tx_bps.clone(), false));
         let controller = factory.build(Instant::now(), 1200);
         let controller = controller
             .into_any()
@@ -309,5 +312,18 @@ mod tests {
         assert!(!controller.use_brutal());
         tx_bps.store(1_000_000, Ordering::Relaxed);
         assert!(controller.use_brutal());
+    }
+
+    #[test]
+    fn brutal_factory_applies_configured_debug_flag() {
+        let tx_bps = Arc::new(AtomicU64::new(0));
+        let factory = Arc::new(BrutalConfig::new(tx_bps, true));
+        let controller = factory.build(Instant::now(), 1200);
+        let controller = controller
+            .into_any()
+            .downcast::<BrutalController>()
+            .expect("BrutalConfig must build BrutalController");
+
+        assert!(controller.brutal.debug);
     }
 }

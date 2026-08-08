@@ -188,6 +188,7 @@ pub(super) fn collect_hysteria2_quic_params(
 
     Ok(Hysteria2QuicParams {
         congestion,
+        debug: params.debug,
         max_idle_timeout: params.max_idle_timeout as u64,
         keep_alive_period: params.keep_alive_period as u64,
         disable_path_mtu_discovery: params.disable_path_mtu_discovery,
@@ -358,6 +359,9 @@ pub(super) fn collect_hysteria2_settings(
             .and_then(|settings| settings.ignore_client_bandwidth)
             .unwrap_or(false)
     });
+    let fallback_auth = hysteria_settings
+        .map(|settings| settings.auth.clone())
+        .filter(|auth| !auth.is_empty());
     let udp_idle_timeout = hysteria_settings
         .and_then(|settings| settings.udp_idle_timeout)
         .unwrap_or(0);
@@ -375,6 +379,7 @@ pub(super) fn collect_hysteria2_settings(
 
     Ok(Hysteria2ServerConfig {
         clients,
+        fallback_auth,
         bandwidth,
         ignore_client_bandwidth,
         udp_idle_timeout,
@@ -1921,6 +1926,7 @@ mod tests {
         }));
         let stream_settings = HysteriaSettings {
             version: Some(3),
+            auth: String::new(),
             congestion: None,
             up: None,
             down: None,
