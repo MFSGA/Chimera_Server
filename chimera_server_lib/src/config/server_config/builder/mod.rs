@@ -1544,7 +1544,11 @@ mod tests {
                 "maxStreamReceiveWindow": 16384,
                 "maxConnectionReceiveWindow": 32768,
                 "brutalUp": "8Mbps",
-                "brutalDown": "1.5Mbps"
+                "brutalDown": "1.5Mbps",
+                "udpHop": {
+                    "ports": "443,8443-8445",
+                    "interval": "5-10"
+                }
             }),
         ))
         .expect("valid Xray Hysteria2 quicParams should build");
@@ -1575,6 +1579,10 @@ mod tests {
             serde_json::json!({"brutalDown": "oops"}),
             serde_json::json!({"congestion": "cubic"}),
             serde_json::json!({"congestion": "force-brutal"}),
+            serde_json::json!({"udpHop": {"ports": 70000}}),
+            serde_json::json!({"udpHop": {"ports": [443, 8443]}}),
+            serde_json::json!({"udpHop": {"interval": 4}}),
+            serde_json::json!({"udpHop": {"interval": "10-3"}}),
         ] {
             let error =
                 ServerConfig::try_from(hysteria2_inbound_with_quic_params(params))

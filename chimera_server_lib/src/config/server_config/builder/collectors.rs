@@ -7,7 +7,7 @@ use crate::{
 
 #[cfg(feature = "hysteria")]
 use crate::{
-    config::{HysteriaSettings, QuicParamsConfig},
+    config::{HysteriaSettings, QuicParamsConfig, UdpHopConfig},
     util::bandwidth::{BandwidthValue, parse_bandwidth},
 };
 
@@ -69,6 +69,134 @@ fn collect_hysteria2_masquerade(
 }
 
 #[cfg(feature = "hysteria")]
+fn validate_xray_udp_hop_ports(value: &serde_json::Value) -> Result<(), String> {
+    fn parse_port(value: &str) -> Result<u16, String> {
+        let value = value
+            .parse::<u32>()
+            .map_err(|_| format!("invalid port: {value}"))?;
+        u16::try_from(value).map_err(|_| format!("invalid port: {value}"))
+    }
+
+    fn parse_port_range(value: &str) -> Result<(), String> {
+        let value = if let Some(name) = value.strip_prefix("env:") {
+            std::env::var(name).unwrap_or_default()
+        } else {
+            value.to_string()
+        };
+        let mut parts = value.splitn(2, '-');
+        let from = parts.next().unwrap_or_default();
+        let Some(to) = parts.next() else {
+            parse_port(from)?;
+            return Ok(());
+        };
+        parse_port(from)?;
+        parse_port(to)?;
+        Ok(())
+    }
+
+    match value {
+        serde_json::Value::Null => Ok(()),
+        serde_json::Value::Number(number) => {
+            let value = number
+                .as_u64()
+                .ok_or_else(|| "invalid udpHop ports number".to_string())?;
+            u16::try_from(value)
+                .map(|_| ())
+                .map_err(|_| format!("invalid port: {value}"))
+        }
+        serde_json::Value::String(value) => {
+            for item in value.split(',') {
+                let item = item.trim();
+                if item.is_empty() {
+                    continue;
+                }
+                if item.contains('-') || item.starts_with("env:") {
+                    parse_port_range(item)?;
+                } else {
+                    parse_port(item)?;
+                }
+            }
+            Ok(())
+        }
+        _ => Err("udpHop.ports must be a number or string".to_string()),
+    }
+}
+
+#[cfg(feature = "hysteria")]
+fn parse_xray_i32_range(value: &serde_json::Value) -> Result<(i32, i32), String> {
+    let (left, right) = match value {
+        serde_json::Value::Null => (0, 0),
+        serde_json::Value::Number(number) => {
+            let raw = number
+                .as_i64()
+                .ok_or_else(|| "invalid udpHop interval number".to_string())?;
+            let value = i32::try_from(raw)
+                .map_err(|_| format!("invalid udpHop interval: {raw}"))?;
+            (value, value)
+        }
+        serde_json::Value::String(value) => {
+            if value.is_empty() {
+                (0, 0)
+            } else if let Ok(single) = value.parse::<i32>() {
+                (single, single)
+            } else {
+                let split = if let Some(rest) = value.strip_prefix('-') {
+                    let index =
+                        rest.find('-').map(|index| index + 1).ok_or_else(|| {
+                            format!("invalid udpHop interval: {value}")
+                        })?;
+                    (&value[..index], &value[index + 1..])
+                } else {
+                    value
+                        .split_once('-')
+                        .ok_or_else(|| format!("invalid udpHop interval: {value}"))?
+                };
+                let left = split
+                    .0
+                    .parse::<i32>()
+                    .map_err(|_| format!("invalid udpHop interval: {value}"))?;
+                let right = split
+                    .1
+                    .parse::<i32>()
+                    .map_err(|_| format!("invalid udpHop interval: {value}"))?;
+                (left, right)
+            }
+        }
+        _ => {
+            return Err(
+                "udpHop.interval must be an integer or range string".to_string()
+            );
+        }
+    };
+    Ok(if left <= right {
+        (left, right)
+    } else {
+        (right, left)
+    })
+}
+
+#[cfg(feature = "hysteria")]
+fn validate_xray_udp_hop(udp_hop: &UdpHopConfig) -> Result<(), Error> {
+    validate_xray_udp_hop_ports(&udp_hop.ports).map_err(|err| {
+        Error::InvalidConfig(format!(
+            "invalid hysteria2 finalmask.quicParams.udpHop.ports: {err}"
+        ))
+    })?;
+    let (from, to) = parse_xray_i32_range(&udp_hop.interval).map_err(|err| {
+        Error::InvalidConfig(format!(
+            "invalid hysteria2 finalmask.quicParams.udpHop.interval: {err}"
+        ))
+    })?;
+    if (from != 0 && from < 5) || (to != 0 && to < 5) {
+        return Err(Error::InvalidConfig(
+            "hysteria2 finalmask.quicParams.udpHop.interval must be at least 5"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "hysteria")]
 fn parse_xray_quic_bandwidth(value: &str) -> Result<u64, String> {
     let value = value.trim().to_ascii_lowercase();
     if value.is_empty() {
@@ -106,6 +234,8 @@ pub(super) fn collect_hysteria2_quic_params(
     let Some(params) = params else {
         return Ok(Hysteria2QuicParams::default());
     };
+
+    validate_xray_udp_hop(&params.udp_hop)?;
 
     let brutal_up = parse_xray_quic_bandwidth(&params.brutal_up).map_err(|err| {
         Error::InvalidConfig(format!(

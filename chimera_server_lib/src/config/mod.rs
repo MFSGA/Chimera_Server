@@ -271,6 +271,15 @@ pub struct WsSettings {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UdpHopConfig {
+    #[serde(default)]
+    pub ports: serde_json::Value,
+    #[serde(default)]
+    pub interval: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QuicParamsConfig {
     #[serde(default)]
     pub congestion: String,
@@ -292,6 +301,8 @@ pub struct QuicParamsConfig {
     pub brutal_up: String,
     #[serde(default)]
     pub brutal_down: String,
+    #[serde(default)]
+    pub udp_hop: UdpHopConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
