@@ -30,12 +30,67 @@ use crate::address::{Address, NetLocation};
 use super::super::types::{TrojanFallback, TrojanUser};
 
 #[cfg(feature = "hysteria")]
+fn parse_xray_quic_bandwidth(value: &str) -> Result<u64, String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return Ok(0);
+    }
+
+    let split = value
+        .char_indices()
+        .find(|(_, ch)| !ch.is_ascii_digit() && *ch != '.')
+        .map(|(index, _)| index)
+        .unwrap_or(value.len());
+    let (number, unit) = value.split_at(split);
+    let number = number
+        .parse::<f64>()
+        .map_err(|_| "invalid bandwidth value".to_string())?;
+    let multiplier = match unit.trim() {
+        "" | "b" | "bps" => 1u64,
+        "k" | "kb" | "kbps" => 1024,
+        "m" | "mb" | "mbps" => 1024 * 1024,
+        "g" | "gb" | "gbps" => 1024 * 1024 * 1024,
+        "t" | "tb" | "tbps" => 1024 * 1024 * 1024 * 1024,
+        unit => return Err(format!("unsupported bandwidth unit: {unit}")),
+    };
+    let scaled = number * multiplier as f64;
+    if !scaled.is_finite() || scaled < 0.0 || scaled > u64::MAX as f64 {
+        return Err("bandwidth value out of range".to_string());
+    }
+    Ok((scaled as u64) / 8)
+}
+
+#[cfg(feature = "hysteria")]
 pub(super) fn collect_hysteria2_quic_params(
     params: Option<&QuicParamsConfig>,
 ) -> Result<Hysteria2QuicParams, Error> {
     let Some(params) = params else {
         return Ok(Hysteria2QuicParams::default());
     };
+
+    let brutal_up = parse_xray_quic_bandwidth(&params.brutal_up).map_err(|err| {
+        Error::InvalidConfig(format!(
+            "invalid hysteria2 finalmask.quicParams.brutalUp: {err}"
+        ))
+    })?;
+    let brutal_down =
+        parse_xray_quic_bandwidth(&params.brutal_down).map_err(|err| {
+            Error::InvalidConfig(format!(
+                "invalid hysteria2 finalmask.quicParams.brutalDown: {err}"
+            ))
+        })?;
+    if brutal_up != 0 && brutal_up < 65_536 {
+        return Err(Error::InvalidConfig(
+            "hysteria2 finalmask.quicParams.brutalUp must be at least 65536 bytes per second"
+                .into(),
+        ));
+    }
+    if brutal_down != 0 && brutal_down < 65_536 {
+        return Err(Error::InvalidConfig(
+            "hysteria2 finalmask.quicParams.brutalDown must be at least 65536 bytes per second"
+                .into(),
+        ));
+    }
 
     if params.max_idle_timeout != 0 && !(4..=120).contains(&params.max_idle_timeout)
     {
@@ -81,6 +136,9 @@ pub(super) fn collect_hysteria2_quic_params(
         max_incoming_streams: params.max_incoming_streams as u64,
         max_stream_receive_window: params.max_stream_receive_window,
         max_connection_receive_window: params.max_connection_receive_window,
+        brutal_up,
+        brutal_down,
+        from_finalmask: true,
     })
 }
 

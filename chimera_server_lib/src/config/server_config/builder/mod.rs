@@ -1539,7 +1539,9 @@ mod tests {
                 "disablePathMTUDiscovery": true,
                 "maxIncomingStreams": 8,
                 "maxStreamReceiveWindow": 16384,
-                "maxConnectionReceiveWindow": 32768
+                "maxConnectionReceiveWindow": 32768,
+                "brutalUp": "8Mbps",
+                "brutalDown": "1.5Mbps"
             }),
         ))
         .expect("valid Xray Hysteria2 quicParams should build");
@@ -1552,6 +1554,9 @@ mod tests {
         assert_eq!(config.quic_params.max_incoming_streams, 8);
         assert_eq!(config.quic_params.max_stream_receive_window, 16_384);
         assert_eq!(config.quic_params.max_connection_receive_window, 32_768);
+        assert_eq!(config.quic_params.brutal_up, 1_048_576);
+        assert_eq!(config.quic_params.brutal_down, 196_608);
+        assert!(config.quic_params.from_finalmask);
 
         for params in [
             serde_json::json!({"maxIdleTimeout": 3}),
@@ -1561,6 +1566,8 @@ mod tests {
             serde_json::json!({"maxIncomingStreams": 7}),
             serde_json::json!({"maxStreamReceiveWindow": 16_383}),
             serde_json::json!({"maxConnectionReceiveWindow": 16_383}),
+            serde_json::json!({"brutalUp": "511kbps"}),
+            serde_json::json!({"brutalDown": "oops"}),
         ] {
             let error =
                 ServerConfig::try_from(hysteria2_inbound_with_quic_params(params))

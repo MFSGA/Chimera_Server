@@ -541,6 +541,17 @@ fn resolve_bandwidth_settings(
     config: &Hysteria2ServerConfig,
     client_rx_limit: Option<u64>,
 ) -> (u64, u64, bool) {
+    if config.quic_params.from_finalmask {
+        let client_rx_limit = client_rx_limit.unwrap_or(0);
+        let actual_tx = if config.quic_params.brutal_up == 0 || client_rx_limit == 0
+        {
+            0
+        } else {
+            config.quic_params.brutal_up.min(client_rx_limit)
+        };
+        return (actual_tx, config.quic_params.brutal_down, false);
+    }
+
     if config.ignore_client_bandwidth {
         return (0, config.bandwidth.max_rx, true);
     }
@@ -1393,7 +1404,56 @@ fn push_varint(buf: &mut Vec<u8>, value: u64) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    use crate::config::def::{PolicyConfig, PolicyLevelConfig, PolicySystemConfig};
+    use crate::config::{
+        def::{PolicyConfig, PolicyLevelConfig, PolicySystemConfig},
+        server_config::{Hysteria2BandwidthConfig, Hysteria2QuicParams},
+    };
+
+    #[test]
+    fn finalmask_brutal_bandwidth_matches_xray_negotiation() {
+        let config = Hysteria2ServerConfig {
+            clients: Vec::new(),
+            bandwidth: Hysteria2BandwidthConfig {
+                max_tx: 9_000_000,
+                max_rx: 8_000_000,
+            },
+            ignore_client_bandwidth: true,
+            udp_idle_timeout: 60,
+            quic_params: Hysteria2QuicParams {
+                brutal_up: 1_000_000,
+                brutal_down: 2_000_000,
+                from_finalmask: true,
+                ..Hysteria2QuicParams::default()
+            },
+        };
+
+        assert_eq!(
+            resolve_bandwidth_settings(&config, Some(1_500_000)),
+            (1_000_000, 2_000_000, false)
+        );
+        assert_eq!(
+            resolve_bandwidth_settings(&config, Some(500_000)),
+            (500_000, 2_000_000, false)
+        );
+        assert_eq!(
+            resolve_bandwidth_settings(&config, None),
+            (0, 2_000_000, false)
+        );
+
+        let no_server_up = Hysteria2ServerConfig {
+            quic_params: Hysteria2QuicParams {
+                brutal_up: 0,
+                brutal_down: 2_000_000,
+                from_finalmask: true,
+                ..Hysteria2QuicParams::default()
+            },
+            ..config
+        };
+        assert_eq!(
+            resolve_bandwidth_settings(&no_server_up, Some(500_000)),
+            (0, 2_000_000, false)
+        );
+    }
 
     #[test]
     fn fragment_cache_evicts_oldest_packet_at_capacity() {

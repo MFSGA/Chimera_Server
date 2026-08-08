@@ -284,6 +284,10 @@ pub struct QuicParamsConfig {
     pub max_stream_receive_window: u64,
     #[serde(default)]
     pub max_connection_receive_window: u64,
+    #[serde(default)]
+    pub brutal_up: String,
+    #[serde(default)]
+    pub brutal_down: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

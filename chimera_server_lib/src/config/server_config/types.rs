@@ -66,6 +66,12 @@ pub struct Hysteria2QuicParams {
     pub max_stream_receive_window: u64,
     #[serde(default)]
     pub max_connection_receive_window: u64,
+    #[serde(default)]
+    pub brutal_up: u64,
+    #[serde(default)]
+    pub brutal_down: u64,
+    #[serde(skip)]
+    pub from_finalmask: bool,
 }
 
 #[cfg(feature = "hysteria")]
