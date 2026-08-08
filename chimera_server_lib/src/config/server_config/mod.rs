@@ -19,8 +19,8 @@ pub use types::GrpcServerConfig;
 #[cfg(feature = "hysteria")]
 #[allow(unused_imports)]
 pub use types::{
-    Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2QuicParams,
-    Hysteria2ServerConfig,
+    Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2MasqueradeConfig,
+    Hysteria2QuicParams, Hysteria2ServerConfig,
 };
 pub use types::{
     ServerConfig, ServerProxyConfig, SocksUser, SocksUserStore, XhttpDataPlacement,

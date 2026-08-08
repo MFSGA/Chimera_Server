@@ -299,6 +299,27 @@ pub struct FinalMaskConfig {
     pub quic_params: Option<QuicParamsConfig>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HysteriaMasqueradeConfig {
+    #[serde(default, rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub dir: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub rewrite_host: bool,
+    #[serde(default)]
+    pub insecure: bool,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub status_code: i32,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HysteriaSettings {
@@ -314,6 +335,8 @@ pub struct HysteriaSettings {
     pub ignore_client_bandwidth: Option<bool>,
     #[serde(default)]
     pub udp_idle_timeout: Option<u64>,
+    #[serde(default)]
+    pub masquerade: HysteriaMasqueradeConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

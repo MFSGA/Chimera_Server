@@ -34,7 +34,9 @@ use crate::user_domain_access::hysteria2_password_identity;
 use crate::{
     address::NetLocation,
     async_stream::AsyncStream,
-    config::server_config::{Hysteria2Client, Hysteria2ServerConfig},
+    config::server_config::{
+        Hysteria2Client, Hysteria2MasqueradeConfig, Hysteria2ServerConfig,
+    },
     outbound::{
         DirectOutboundAction, UdpProxyAssociationRegistry, connect_tcp_outbound,
         connection_routing_input, select_direct_outbound,
@@ -275,11 +277,8 @@ async fn auth_hysteria2_connection(
                                 warn!("hysteria2 auth request invalid: {}", msg);
                             }
                         }
-                        send_simple_response(
-                            &mut stream,
-                            auth_reject_status(&reject),
-                        )
-                        .await?;
+                        send_masquerade_response(&mut stream, &config.masquerade)
+                            .await?;
                     }
                 }
             }
@@ -539,10 +538,6 @@ enum AuthReject {
     BadRequest(&'static str),
 }
 
-fn auth_reject_status(_reject: &AuthReject) -> StatusCode {
-    StatusCode::NOT_FOUND
-}
-
 fn resolve_bandwidth_settings(
     config: &Hysteria2ServerConfig,
     client_rx_limit: Option<u64>,
@@ -657,16 +652,46 @@ async fn send_auth_success(
     stream.finish().await.map_err(map_h3_error)
 }
 
-async fn send_simple_response(
+fn build_masquerade_response(
+    masquerade: &Hysteria2MasqueradeConfig,
+) -> std::io::Result<(Response<()>, Option<Bytes>)> {
+    match masquerade.mode.as_str() {
+        "" | "404" => {
+            let response = Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header(http::header::CONTENT_LENGTH, "0")
+                .body(())
+                .map_err(Error::other)?;
+            Ok((response, None))
+        }
+        "string" => {
+            let status = if masquerade.status_code == 0 {
+                StatusCode::OK
+            } else {
+                StatusCode::from_u16(masquerade.status_code).map_err(Error::other)?
+            };
+            let mut builder = Response::builder().status(status);
+            for (name, value) in &masquerade.headers {
+                builder = builder.header(name.as_str(), value.as_str());
+            }
+            let response = builder.body(()).map_err(Error::other)?;
+            Ok((response, Some(Bytes::from(masquerade.content.clone()))))
+        }
+        _ => unreachable!("hysteria2 masquerade mode validated by config builder"),
+    }
+}
+
+async fn send_masquerade_response(
     stream: &mut h3::server::RequestStream<BidiStream<Bytes>, Bytes>,
-    status: StatusCode,
+    masquerade: &Hysteria2MasqueradeConfig,
 ) -> std::io::Result<()> {
-    let response = Response::builder()
-        .status(status)
-        .header(http::header::CONTENT_LENGTH, "0")
-        .body(())
-        .map_err(Error::other)?;
+    let (response, body) = build_masquerade_response(masquerade)?;
     stream.send_response(response).await.map_err(map_h3_error)?;
+    if let Some(body) = body
+        && !body.is_empty()
+    {
+        stream.send_data(body).await.map_err(map_h3_error)?;
+    }
     stream.finish().await.map_err(map_h3_error)
 }
 
@@ -1420,23 +1445,33 @@ mod tests {
 
     use crate::config::{
         def::{PolicyConfig, PolicyLevelConfig, PolicySystemConfig},
-        server_config::{Hysteria2BandwidthConfig, Hysteria2QuicParams},
+        server_config::{
+            Hysteria2BandwidthConfig, Hysteria2MasqueradeConfig, Hysteria2QuicParams,
+        },
     };
 
     #[test]
-    fn auth_rejections_use_not_found_like_shoes_and_xray() {
-        assert_eq!(
-            auth_reject_status(&AuthReject::NotAuthRequest),
-            StatusCode::NOT_FOUND
-        );
-        assert_eq!(
-            auth_reject_status(&AuthReject::Unauthorized("bad auth")),
-            StatusCode::NOT_FOUND
-        );
-        assert_eq!(
-            auth_reject_status(&AuthReject::BadRequest("bad request")),
-            StatusCode::NOT_FOUND
-        );
+    fn masquerade_response_matches_xray_404_and_string_modes() {
+        let (response, body) =
+            build_masquerade_response(&Hysteria2MasqueradeConfig::default())
+                .expect("default masquerade response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(body.is_none());
+
+        let (response, body) =
+            build_masquerade_response(&Hysteria2MasqueradeConfig {
+                mode: "string".into(),
+                content: "hello from hysteria".into(),
+                headers: std::collections::HashMap::from([(
+                    "x-hysteria-test".into(),
+                    "yes".into(),
+                )]),
+                status_code: 201,
+            })
+            .expect("string masquerade response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.headers()["x-hysteria-test"], "yes");
+        assert_eq!(body.as_deref(), Some(&b"hello from hysteria"[..]));
     }
 
     #[test]
@@ -1449,6 +1484,7 @@ mod tests {
             },
             ignore_client_bandwidth: true,
             udp_idle_timeout: 60,
+            masquerade: Default::default(),
             quic_params: Hysteria2QuicParams {
                 brutal_up: 1_000_000,
                 brutal_down: 2_000_000,

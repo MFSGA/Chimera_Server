@@ -7803,6 +7803,7 @@ mod tests {
                     ignore_client_bandwidth: false,
                     udp_idle_timeout: 0,
                     quic_params: Default::default(),
+                    masquerade: Default::default(),
                 },
             },
             transport: Transport::Quic,

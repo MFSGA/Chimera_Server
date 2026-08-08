@@ -77,6 +77,20 @@ pub struct Hysteria2QuicParams {
 }
 
 #[cfg(feature = "hysteria")]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Hysteria2MasqueradeConfig {
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub status_code: u16,
+}
+
+#[cfg(feature = "hysteria")]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Hysteria2ServerConfig {
@@ -89,6 +103,8 @@ pub struct Hysteria2ServerConfig {
     pub udp_idle_timeout: u64,
     #[serde(default)]
     pub quic_params: Hysteria2QuicParams,
+    #[serde(default)]
+    pub masquerade: Hysteria2MasqueradeConfig,
 }
 
 #[cfg(feature = "tuic")]

@@ -15,8 +15,8 @@ use crate::{
 use super::super::types::TuicServerConfig;
 #[cfg(feature = "hysteria")]
 use super::super::types::{
-    Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2QuicParams,
-    Hysteria2ServerConfig,
+    Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2MasqueradeConfig,
+    Hysteria2QuicParams, Hysteria2ServerConfig,
 };
 use super::super::types::{
     RangeConfig, SocksUser, SocksUserStore, XhttpDataPlacement, XhttpMode,
@@ -28,6 +28,45 @@ use crate::address::{Address, NetLocation};
 
 #[cfg(feature = "trojan")]
 use super::super::types::{TrojanFallback, TrojanUser};
+
+#[cfg(feature = "hysteria")]
+fn collect_hysteria2_masquerade(
+    settings: Option<&HysteriaSettings>,
+) -> Result<Hysteria2MasqueradeConfig, Error> {
+    let Some(settings) = settings else {
+        return Ok(Hysteria2MasqueradeConfig::default());
+    };
+    let masquerade = &settings.masquerade;
+    let mode = masquerade.kind.trim().to_ascii_lowercase();
+    match mode.as_str() {
+        "" | "404" => Ok(Hysteria2MasqueradeConfig::default()),
+        "string" => {
+            let status_code = if masquerade.status_code == 0 {
+                200
+            } else if (100..=999).contains(&masquerade.status_code) {
+                masquerade.status_code as u16
+            } else {
+                return Err(Error::InvalidConfig(
+                    "hysteria2 masquerade.statusCode must be between 100 and 999"
+                        .into(),
+                ));
+            };
+            Ok(Hysteria2MasqueradeConfig {
+                mode,
+                content: masquerade.content.clone(),
+                headers: masquerade.headers.clone(),
+                status_code,
+            })
+        }
+        "file" | "proxy" => Err(Error::InvalidConfig(format!(
+            "hysteria2 masquerade type {mode} is not yet supported"
+        ))),
+        _ => Err(Error::InvalidConfig(format!(
+            "unknown hysteria2 masquerade type: {}",
+            masquerade.kind
+        ))),
+    }
+}
 
 #[cfg(feature = "hysteria")]
 fn parse_xray_quic_bandwidth(value: &str) -> Result<u64, String> {
@@ -332,6 +371,7 @@ pub(super) fn collect_hysteria2_settings(
     } else {
         udp_idle_timeout
     };
+    let masquerade = collect_hysteria2_masquerade(hysteria_settings)?;
 
     Ok(Hysteria2ServerConfig {
         clients,
@@ -339,6 +379,7 @@ pub(super) fn collect_hysteria2_settings(
         ignore_client_bandwidth,
         udp_idle_timeout,
         quic_params: Hysteria2QuicParams::default(),
+        masquerade,
     })
 }
 
@@ -1830,6 +1871,47 @@ mod tests {
 
     #[cfg(feature = "hysteria")]
     #[test]
+    fn collect_hysteria2_string_masquerade_matches_xray() {
+        let settings = || {
+            SettingObject(serde_json::json!({
+                "clients": [{"auth": "xray-auth-token"}]
+            }))
+        };
+        let stream = serde_json::from_value::<HysteriaSettings>(serde_json::json!({
+            "version": 2,
+            "masquerade": {
+                "type": "STRING",
+                "content": "hello from hysteria",
+                "headers": {"x-hysteria-test": "yes"},
+                "statusCode": 201
+            }
+        }))
+        .expect("Xray string masquerade should deserialize");
+        let config = collect_hysteria2_settings(settings(), Some(&stream))
+            .expect("Xray string masquerade should build");
+        assert_eq!(config.masquerade.mode, "string");
+        assert_eq!(config.masquerade.status_code, 201);
+        assert_eq!(config.masquerade.content, "hello from hysteria");
+        assert_eq!(config.masquerade.headers["x-hysteria-test"], "yes");
+
+        for masquerade in [
+            serde_json::json!({"type": "file", "dir": "/tmp"}),
+            serde_json::json!({"type": "proxy", "url": "https://example.com"}),
+            serde_json::json!({"type": "unknown"}),
+            serde_json::json!({"type": "string", "statusCode": 99}),
+        ] {
+            let stream =
+                serde_json::from_value::<HysteriaSettings>(serde_json::json!({
+                    "version": 2,
+                    "masquerade": masquerade
+                }))
+                .expect("Xray masquerade shape should deserialize");
+            assert!(collect_hysteria2_settings(settings(), Some(&stream)).is_err());
+        }
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
     fn collect_hysteria2_settings_rejects_conflicting_versions() {
         let settings = SettingObject(serde_json::json!({
             "version": 2,
@@ -1844,6 +1926,7 @@ mod tests {
             down: None,
             ignore_client_bandwidth: None,
             udp_idle_timeout: None,
+            masquerade: Default::default(),
         };
 
         let err = collect_hysteria2_settings(settings, Some(&stream_settings))
