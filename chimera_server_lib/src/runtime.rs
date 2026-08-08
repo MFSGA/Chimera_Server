@@ -3,12 +3,11 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use tokio::task::{AbortHandle, JoinHandle};
-
 use crate::{
     config::server_config::ServerConfig,
     routing_state::{RoutingInput, RoutingState},
 };
+use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone)]
 pub struct OutboundSummary {
@@ -22,7 +21,7 @@ pub struct OutboundSummary {
 pub struct RuntimeState {
     inbounds: Arc<RwLock<Vec<ServerConfig>>>,
     outbounds: Arc<RwLock<Vec<OutboundSummary>>>,
-    inbound_tasks: Arc<RwLock<HashMap<String, Vec<AbortHandle>>>>,
+    inbound_tasks: Arc<RwLock<HashMap<String, Vec<JoinHandle<()>>>>>,
     routing: Arc<RwLock<RoutingState>>,
 }
 
@@ -88,18 +87,14 @@ impl RuntimeState {
         Ok(())
     }
 
-    pub fn register_inbound_tasks(&self, tag: &str, handles: &[JoinHandle<()>]) {
-        let abort_handles = handles
-            .iter()
-            .map(JoinHandle::abort_handle)
-            .collect::<Vec<_>>();
+    pub fn register_inbound_tasks(&self, tag: &str, handles: Vec<JoinHandle<()>>) {
         self.inbound_tasks
             .write()
             .expect("runtime inbound tasks lock poisoned")
-            .insert(tag.to_string(), abort_handles);
+            .insert(tag.to_string(), handles);
     }
 
-    pub fn abort_inbound_tasks(&self, tag: &str) -> bool {
+    pub async fn stop_inbound_tasks(&self, tag: &str) -> bool {
         let Some(handles) = self
             .inbound_tasks
             .write()
@@ -109,8 +104,12 @@ impl RuntimeState {
             return false;
         };
 
-        for handle in handles {
+        for handle in &handles {
             handle.abort();
+        }
+
+        for handle in handles {
+            let _ = handle.await;
         }
 
         true
