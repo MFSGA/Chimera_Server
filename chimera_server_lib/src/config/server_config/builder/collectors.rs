@@ -57,12 +57,30 @@ pub(super) fn collect_hysteria2_quic_params(
                 .into(),
         ));
     }
+    if params.max_stream_receive_window != 0
+        && params.max_stream_receive_window < 16_384
+    {
+        return Err(Error::InvalidConfig(
+            "hysteria2 finalmask.quicParams.maxStreamReceiveWindow must be at least 16384"
+                .into(),
+        ));
+    }
+    if params.max_connection_receive_window != 0
+        && params.max_connection_receive_window < 16_384
+    {
+        return Err(Error::InvalidConfig(
+            "hysteria2 finalmask.quicParams.maxConnectionReceiveWindow must be at least 16384"
+                .into(),
+        ));
+    }
 
     Ok(Hysteria2QuicParams {
         max_idle_timeout: params.max_idle_timeout as u64,
         keep_alive_period: params.keep_alive_period as u64,
         disable_path_mtu_discovery: params.disable_path_mtu_discovery,
         max_incoming_streams: params.max_incoming_streams as u64,
+        max_stream_receive_window: params.max_stream_receive_window,
+        max_connection_receive_window: params.max_connection_receive_window,
     })
 }
 

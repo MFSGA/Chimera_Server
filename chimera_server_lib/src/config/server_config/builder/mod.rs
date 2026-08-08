@@ -1531,13 +1531,15 @@ mod tests {
 
     #[cfg(feature = "hysteria")]
     #[test]
-    fn hysteria2_quic_timeouts_match_xray_config_bounds() {
+    fn hysteria2_quic_params_match_xray_config_bounds() {
         let config = ServerConfig::try_from(hysteria2_inbound_with_quic_params(
             serde_json::json!({
                 "maxIdleTimeout": 7,
                 "keepAlivePeriod": 11,
                 "disablePathMTUDiscovery": true,
-                "maxIncomingStreams": 8
+                "maxIncomingStreams": 8,
+                "maxStreamReceiveWindow": 16384,
+                "maxConnectionReceiveWindow": 32768
             }),
         ))
         .expect("valid Xray Hysteria2 quicParams should build");
@@ -1548,6 +1550,8 @@ mod tests {
         assert_eq!(config.quic_params.keep_alive_period, 11);
         assert!(config.quic_params.disable_path_mtu_discovery);
         assert_eq!(config.quic_params.max_incoming_streams, 8);
+        assert_eq!(config.quic_params.max_stream_receive_window, 16_384);
+        assert_eq!(config.quic_params.max_connection_receive_window, 32_768);
 
         for params in [
             serde_json::json!({"maxIdleTimeout": 3}),
@@ -1555,6 +1559,8 @@ mod tests {
             serde_json::json!({"keepAlivePeriod": 1}),
             serde_json::json!({"keepAlivePeriod": 61}),
             serde_json::json!({"maxIncomingStreams": 7}),
+            serde_json::json!({"maxStreamReceiveWindow": 16_383}),
+            serde_json::json!({"maxConnectionReceiveWindow": 16_383}),
         ] {
             let error =
                 ServerConfig::try_from(hysteria2_inbound_with_quic_params(params))

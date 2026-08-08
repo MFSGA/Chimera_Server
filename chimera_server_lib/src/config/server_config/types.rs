@@ -62,6 +62,10 @@ pub struct Hysteria2QuicParams {
     pub disable_path_mtu_discovery: bool,
     #[serde(default)]
     pub max_incoming_streams: u64,
+    #[serde(default)]
+    pub max_stream_receive_window: u64,
+    #[serde(default)]
+    pub max_connection_receive_window: u64,
 }
 
 #[cfg(feature = "hysteria")]

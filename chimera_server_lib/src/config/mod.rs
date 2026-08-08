@@ -280,6 +280,10 @@ pub struct QuicParamsConfig {
     pub disable_path_mtu_discovery: bool,
     #[serde(default)]
     pub max_incoming_streams: i64,
+    #[serde(default)]
+    pub max_stream_receive_window: u64,
+    #[serde(default)]
+    pub max_connection_receive_window: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

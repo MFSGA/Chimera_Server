@@ -28,6 +28,8 @@ pub mod connection;
 const MAX_QUIC_ENDPOINTS: usize = 1;
 const DEFAULT_MAX_IDLE_TIMEOUT_SECS: u64 = 30;
 const SHOES_MAX_INCOMING_BIDI_STREAMS: u64 = 4096;
+const SHOES_STREAM_RECEIVE_WINDOW: u64 = 8 * 1024 * 1024;
+const SHOES_CONNECTION_RECEIVE_WINDOW: u64 = 20 * 1024 * 1024;
 const SHOES_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -240,6 +242,14 @@ fn configured_mtu_discovery(
     (!params.disable_path_mtu_discovery).then(quinn::MtuDiscoveryConfig::default)
 }
 
+fn configured_receive_window(
+    value: u64,
+    default: u64,
+) -> std::io::Result<quinn::VarInt> {
+    quinn::VarInt::from_u64(if value == 0 { default } else { value })
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))
+}
+
 fn build_transport_config(
     params: &Hysteria2QuicParams,
 ) -> std::io::Result<quinn::TransportConfig> {
@@ -248,6 +258,14 @@ fn build_transport_config(
         .try_into()
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
     let max_incoming_streams = configured_max_incoming_streams(params)?;
+    let stream_receive_window = configured_receive_window(
+        params.max_stream_receive_window,
+        SHOES_STREAM_RECEIVE_WINDOW,
+    )?;
+    let connection_receive_window = configured_receive_window(
+        params.max_connection_receive_window,
+        SHOES_CONNECTION_RECEIVE_WINDOW,
+    )?;
     let mtu_discovery = configured_mtu_discovery(params);
     transport
         .max_concurrent_bidi_streams(max_incoming_streams)
@@ -258,8 +276,8 @@ fn build_transport_config(
         // not apply it. Keep Shoes' fixed server keepalive behavior here.
         .keep_alive_interval(Some(SHOES_KEEP_ALIVE_INTERVAL))
         .send_window(16 * 1024 * 1024)
-        .receive_window((20u32 * 1024 * 1024).into())
-        .stream_receive_window((8u32 * 1024 * 1024).into())
+        .receive_window(connection_receive_window)
+        .stream_receive_window(stream_receive_window)
         .initial_mtu(1200)
         .min_mtu(1200)
         .mtu_discovery_config(mtu_discovery)
@@ -294,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn quic_stream_limit_and_mtu_discovery_apply_explicit_params() {
+    fn quic_stream_limit_windows_and_mtu_discovery_apply_explicit_params() {
         let default = Hysteria2QuicParams::default();
         assert_eq!(
             configured_max_incoming_streams(&default)
@@ -302,11 +320,25 @@ mod tests {
                 .into_inner(),
             4096
         );
+        assert_eq!(
+            configured_receive_window(0, SHOES_STREAM_RECEIVE_WINDOW)
+                .expect("default stream receive window")
+                .into_inner(),
+            SHOES_STREAM_RECEIVE_WINDOW
+        );
+        assert_eq!(
+            configured_receive_window(0, SHOES_CONNECTION_RECEIVE_WINDOW)
+                .expect("default connection receive window")
+                .into_inner(),
+            SHOES_CONNECTION_RECEIVE_WINDOW
+        );
         assert!(configured_mtu_discovery(&default).is_some());
 
         let configured = Hysteria2QuicParams {
             max_incoming_streams: 8,
             disable_path_mtu_discovery: true,
+            max_stream_receive_window: 16_384,
+            max_connection_receive_window: 32_768,
             ..Hysteria2QuicParams::default()
         };
         assert_eq!(
@@ -314,6 +346,24 @@ mod tests {
                 .expect("configured stream limit")
                 .into_inner(),
             8
+        );
+        assert_eq!(
+            configured_receive_window(
+                configured.max_stream_receive_window,
+                SHOES_STREAM_RECEIVE_WINDOW,
+            )
+            .expect("configured stream receive window")
+            .into_inner(),
+            16_384
+        );
+        assert_eq!(
+            configured_receive_window(
+                configured.max_connection_receive_window,
+                SHOES_CONNECTION_RECEIVE_WINDOW,
+            )
+            .expect("configured connection receive window")
+            .into_inner(),
+            32_768
         );
         assert!(configured_mtu_discovery(&configured).is_none());
     }
