@@ -3,18 +3,20 @@ use std::{
     convert::TryFrom,
     io::{Error, ErrorKind},
     net::SocketAddr,
+    num::NonZeroUsize,
     pin::Pin,
     sync::{
         Arc, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::{Bytes, BytesMut};
 use h3_quinn::BidiStream;
 use http::{Request, Response, StatusCode};
+use lru::LruCache;
 use rand::{
     RngExt,
     // distributions::{Alphanumeric, DistString},
@@ -24,6 +26,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::UdpSocket,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 #[cfg(feature = "user_domain_access")]
@@ -45,16 +48,20 @@ use crate::{
 };
 
 const AUTH_PATH: &str = "/auth";
+const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
+const CLOSE_ERR_CODE_OK: u32 = 0x100;
 const AUTH_HEADER: &str = "Hysteria-Auth";
 const CLIENT_CC_RX_HEADER: &str = "Hysteria-CC-RX";
 const UDP_SUPPORT_HEADER: &str = "Hysteria-UDP";
 const PADDING_HEADER: &str = "Hysteria-Padding";
 const SUCCESS_STATUS: u16 = 233;
 const TCP_REQUEST_ID: u64 = 0x401;
-const MAX_ADDRESS_LEN: usize = 1024;
+const MAX_ADDRESS_LEN: usize = 2048;
 const PADDING_SCRATCH_LEN: usize = 1024;
 const TCP_SUCCESS_STATUS: u8 = 0x00;
-const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const UDP_SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
+const MAX_FRAGMENT_CACHE_SIZE: usize = 256;
 const TCP_ERROR_STATUS: u8 = 0x01;
 
 fn hysteria2_routing_identity(client: &Hysteria2Client) -> String {
@@ -141,19 +148,42 @@ pub async fn process_hysteria2_connection(
     debug!("hysteria2 QUIC established");
     debug!("hysteria2 H3 driver created");
 
-    let auth_ctx =
-        auth_hysteria2_connection(&mut h3_conn, config.as_ref(), tx_bps.clone())
-            .await
-            .map_err(|err| {
-                Error::other(format!("hysteria2 authentication failed: {err}"))
-            })?;
+    let udp_idle_timeout = if config.udp_idle_timeout == 0 {
+        DEFAULT_UDP_SESSION_IDLE_TIMEOUT
+    } else {
+        Duration::from_secs(config.udp_idle_timeout)
+    };
+
+    let auth_ctx = match tokio::time::timeout(
+        AUTH_TIMEOUT,
+        auth_hysteria2_connection(&mut h3_conn, config.as_ref(), tx_bps.clone()),
+    )
+    .await
+    {
+        Ok(Ok(auth_ctx)) => auth_ctx,
+        Ok(Err(err)) => {
+            connection.close(CLOSE_ERR_CODE_OK.into(), b"auth failed");
+            return Err(Error::new(
+                err.kind(),
+                format!("hysteria2 authentication failed: {err}"),
+            ));
+        }
+        Err(_) => {
+            warn!("hysteria2 authentication timed out");
+            connection.close(CLOSE_ERR_CODE_OK.into(), b"auth timeout");
+            return Err(Error::new(
+                ErrorKind::TimedOut,
+                "hysteria2 authentication timeout",
+            ));
+        }
+    };
 
     // Keep the H3 driver alive because dropping it closes the underlying QUIC
     // connection. Do not poll it after authentication: Hysteria2 TCP requests
     // are raw QUIC bidi streams and would otherwise race with h3_conn.accept().
     let _h3_conn = h3_conn;
 
-    if auth_ctx.udp_enabled {
+    let result = if auth_ctx.udp_enabled {
         tokio::try_join!(
             drive_tcp_streams(
                 connection.clone(),
@@ -167,9 +197,10 @@ pub async fn process_hysteria2_connection(
                 resolver.clone(),
                 &auth_ctx,
                 inbound_tag,
+                udp_idle_timeout,
                 runtime,
             ),
-            drain_unidirectional_streams(connection),
+            drain_unidirectional_streams(connection.clone()),
         )
         .map(|_| ())
     } else {
@@ -181,10 +212,15 @@ pub async fn process_hysteria2_connection(
                 inbound_tag.clone(),
                 runtime,
             ),
-            drain_unidirectional_streams(connection),
+            drain_unidirectional_streams(connection.clone()),
         )
         .map(|_| ())
+    };
+
+    if result.is_err() {
+        connection.close(CLOSE_ERR_CODE_OK.into(), b"");
     }
+    result
 }
 
 async fn auth_hysteria2_connection(
@@ -694,9 +730,13 @@ async fn drive_udp_datagrams(
     resolver: Arc<dyn Resolver>,
     auth_ctx: &AuthContext,
     inbound_tag: Arc<String>,
+    udp_idle_timeout: Duration,
     runtime: RuntimeState,
 ) -> std::io::Result<()> {
     let mut sessions: HashMap<u32, UdpSession> = HashMap::new();
+    let mut cleanup = tokio::time::interval(UDP_SESSION_CLEANUP_INTERVAL);
+    cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    cleanup.tick().await;
     let peer_addr = connection.remote_address();
     let base_context = apply_hysteria2_policy(
         hysteria2_traffic_context(&auth_ctx.client, inbound_tag.as_str(), peer_addr),
@@ -704,18 +744,29 @@ async fn drive_udp_datagrams(
     );
 
     loop {
-        let data = match connection.read_datagram().await {
-            Ok(data) => data,
-            Err(quinn::ConnectionError::ApplicationClosed { .. })
-            | Err(quinn::ConnectionError::ConnectionClosed { .. }) => return Ok(()),
-            Err(err) => return Err(Error::other(err)),
+        let data = tokio::select! {
+            _ = cleanup.tick() => {
+                sessions.retain(|session_id, session| {
+                    if session.idle_for() > udp_idle_timeout {
+                        debug!("Removing inactive hysteria2 UDP session {session_id}");
+                        false
+                    } else {
+                        true
+                    }
+                });
+                continue;
+            }
+            result = connection.read_datagram() => match result {
+                Ok(data) => data,
+                Err(quinn::ConnectionError::ApplicationClosed { .. })
+                | Err(quinn::ConnectionError::ConnectionClosed { .. }) => return Ok(()),
+                Err(err) => return Err(Error::other(err)),
+            },
         };
 
         if data.len() < 9 {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "hysteria2 datagram too short",
-            ));
+            warn!("Ignoring short hysteria2 UDP datagram (len={})", data.len());
+            continue;
         }
 
         let session_id = u32::from_be_bytes(data[0..4].try_into().unwrap());
@@ -723,7 +774,15 @@ async fn drive_udp_datagrams(
         let fragment_id = data[6];
         let fragment_count = data[7];
 
-        let (address_len, varint_len) = decode_varint_from_slice(&data[8..])?;
+        let (address_len, varint_len) = match decode_varint_from_slice(&data[8..]) {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(
+                    "Ignoring hysteria2 UDP packet with invalid address length: {err}"
+                );
+                continue;
+            }
+        };
         if address_len == 0 || address_len > MAX_ADDRESS_LEN {
             warn!(
                 "Ignoring hysteria2 UDP packet {} with invalid address length {}",
@@ -735,10 +794,11 @@ async fn drive_udp_datagrams(
         let address_start = 8 + varint_len;
         let payload_start = address_start + address_len;
         if data.len() < payload_start {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "hysteria2 datagram truncated before payload",
-            ));
+            warn!(
+                "Ignoring truncated hysteria2 UDP packet for session {}",
+                session_id
+            );
+            continue;
         }
 
         let address_bytes = data.slice(address_start..payload_start);
@@ -798,11 +858,13 @@ async fn drive_udp_datagrams(
                     resolver.clone(),
                     connection.clone(),
                     packet_context.clone(),
+                    udp_idle_timeout,
                 )
                 .await?;
                 entry.insert(session)
             }
         };
+        session.touch();
 
         if remote_location != session.last_location {
             let updated_addr =
@@ -828,22 +890,32 @@ async fn drive_udp_datagrams(
                 continue;
             }
 
-            let entry = session.fragments.entry(packet_id).or_insert_with(|| {
-                FragmentedPacket {
-                    fragment_count,
-                    fragment_received: 0,
-                    packet_len: 0,
-                    received: vec![None; fragment_count as usize],
-                    remote_location: remote_location.clone(),
-                }
-            });
+            if !session.fragments.contains(&packet_id) {
+                session.fragments.put(
+                    packet_id,
+                    FragmentedPacket {
+                        fragment_count,
+                        fragment_received: 0,
+                        packet_len: 0,
+                        received: vec![None; fragment_count as usize],
+                        remote_location: remote_location.clone(),
+                    },
+                );
+            }
+            let Some(entry) = session.fragments.get_mut(&packet_id) else {
+                warn!(
+                    "Failed to track hysteria2 UDP fragments for session {} packet {}",
+                    session_id, packet_id
+                );
+                continue;
+            };
 
             if entry.fragment_count != fragment_count {
                 warn!(
                     "Mismatched fragment count for hysteria2 UDP packet {}",
                     session_id
                 );
-                session.fragments.remove(&packet_id);
+                session.fragments.pop(&packet_id);
                 continue;
             }
 
@@ -852,7 +924,7 @@ async fn drive_udp_datagrams(
                     "Duplicate fragment {} for hysteria2 UDP packet {}",
                     fragment_id, session_id
                 );
-                session.fragments.remove(&packet_id);
+                session.fragments.pop(&packet_id);
                 continue;
             }
 
@@ -869,7 +941,7 @@ async fn drive_udp_datagrams(
                 received,
                 packet_len,
                 ..
-            } = session.fragments.remove(&packet_id).unwrap();
+            } = session.fragments.pop(&packet_id).unwrap();
 
             let mut assembled = BytesMut::with_capacity(packet_len);
             for bytes in received.into_iter().flatten() {
@@ -968,15 +1040,46 @@ async fn drive_udp_datagrams(
     }
 }
 
+fn new_fragment_cache() -> LruCache<u16, FragmentedPacket> {
+    LruCache::new(
+        NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE)
+            .expect("fragment cache size must be non-zero"),
+    )
+}
+
 struct UdpSession {
     socket: Arc<UdpSocket>,
-    fragments: HashMap<u16, FragmentedPacket>,
+    fragments: LruCache<u16, FragmentedPacket>,
+    last_activity: Arc<RwLock<Instant>>,
+    cancel_token: CancellationToken,
     last_location: NetLocation,
     last_socket_addr: SocketAddr,
     base_context: TrafficContext,
     response_contexts: Arc<RwLock<HashMap<SocketAddr, TrafficContext>>>,
     proxy_associations: UdpProxyAssociationRegistry,
     _connection_guard: ConnectionGuard,
+}
+
+impl UdpSession {
+    fn touch(&self) {
+        *self
+            .last_activity
+            .write()
+            .expect("hysteria2 UDP activity lock poisoned") = Instant::now();
+    }
+
+    fn idle_for(&self) -> Duration {
+        self.last_activity
+            .read()
+            .expect("hysteria2 UDP activity lock poisoned")
+            .elapsed()
+    }
+}
+
+impl Drop for UdpSession {
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
+    }
 }
 
 struct FragmentedPacket {
@@ -993,6 +1096,7 @@ async fn create_udp_session(
     resolver: Arc<dyn Resolver>,
     connection: quinn::Connection,
     base_context: TrafficContext,
+    udp_idle_timeout: Duration,
 ) -> std::io::Result<UdpSession> {
     let remote_addr = resolve_single_address(&resolver, &remote_location).await?;
     let bind_addr: SocketAddr = if remote_addr.is_ipv6() {
@@ -1007,6 +1111,10 @@ async fn create_udp_session(
     let response_contexts = Arc::new(RwLock::new(HashMap::new()));
     let contexts_for_task = response_contexts.clone();
     let fallback_context = base_context.clone();
+    let last_activity = Arc::new(RwLock::new(Instant::now()));
+    let activity_for_task = last_activity.clone();
+    let cancel_token = CancellationToken::new();
+    let cancel_for_task = cancel_token.clone();
     let connection_guard = register_connection(Some(&base_context));
 
     tokio::spawn(async move {
@@ -1016,6 +1124,8 @@ async fn create_udp_session(
             socket_for_task,
             contexts_for_task,
             fallback_context,
+            activity_for_task,
+            cancel_for_task,
         )
         .await
         {
@@ -1028,14 +1138,14 @@ async fn create_udp_session(
 
     Ok(UdpSession {
         socket,
-        fragments: HashMap::new(),
+        fragments: new_fragment_cache(),
+        last_activity,
+        cancel_token,
         last_location: remote_location,
         last_socket_addr: remote_addr,
         base_context,
         response_contexts,
-        proxy_associations: UdpProxyAssociationRegistry::new(
-            UDP_SESSION_IDLE_TIMEOUT,
-        ),
+        proxy_associations: UdpProxyAssociationRegistry::new(udp_idle_timeout),
         _connection_guard: connection_guard,
     })
 }
@@ -1107,6 +1217,8 @@ async fn run_udp_remote_to_local_loop(
     socket: Arc<UdpSocket>,
     response_contexts: Arc<RwLock<HashMap<SocketAddr, TrafficContext>>>,
     fallback_context: TrafficContext,
+    last_activity: Arc<RwLock<Instant>>,
+    cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
     let max_datagram_size = connection
         .max_datagram_size()
@@ -1116,13 +1228,16 @@ async fn run_udp_remote_to_local_loop(
     let mut buf = vec![0u8; 65535];
 
     loop {
-        let (payload_len, src_addr) =
-            socket.recv_from(&mut buf).await.map_err(|err| {
-                Error::other(format!(
-                    "failed to receive hysteria2 UDP payload: {}",
-                    err
-                ))
-            })?;
+        let recv_result = tokio::select! {
+            _ = cancel_token.cancelled() => return Ok(()),
+            result = socket.recv_from(&mut buf) => result,
+        };
+        let (payload_len, src_addr) = recv_result.map_err(|err| {
+            Error::other(format!("failed to receive hysteria2 UDP payload: {}", err))
+        })?;
+        *last_activity
+            .write()
+            .expect("hysteria2 UDP activity lock poisoned") = Instant::now();
         let traffic_context = response_contexts
             .read()
             .expect("hysteria2 UDP contexts lock poisoned")
@@ -1279,6 +1394,28 @@ mod tests {
     use super::*;
 
     use crate::config::def::{PolicyConfig, PolicyLevelConfig, PolicySystemConfig};
+
+    #[test]
+    fn fragment_cache_evicts_oldest_packet_at_capacity() {
+        let mut cache = new_fragment_cache();
+        for packet_id in 0..=MAX_FRAGMENT_CACHE_SIZE as u16 {
+            cache.put(
+                packet_id,
+                FragmentedPacket {
+                    fragment_count: 2,
+                    fragment_received: 1,
+                    packet_len: 1,
+                    received: vec![Some(Bytes::from_static(b"x")), None],
+                    remote_location: NetLocation::from_str("127.0.0.1:53", None)
+                        .unwrap(),
+                },
+            );
+        }
+
+        assert_eq!(cache.len(), MAX_FRAGMENT_CACHE_SIZE);
+        assert!(!cache.contains(&0));
+        assert!(cache.contains(&(MAX_FRAGMENT_CACHE_SIZE as u16)));
+    }
 
     #[test]
     fn password_only_context_does_not_expose_plaintext() {

@@ -59,6 +59,8 @@ pub struct Hysteria2ServerConfig {
     pub bandwidth: Hysteria2BandwidthConfig,
     #[serde(default)]
     pub ignore_client_bandwidth: bool,
+    #[serde(default)]
+    pub udp_idle_timeout: u64,
 }
 
 #[cfg(feature = "tuic")]

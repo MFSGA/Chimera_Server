@@ -883,7 +883,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                 let quic_settings = Some(ServerQuicConfig {
                     cert,
                     key,
-                    alpn_protocols: NoneOrSome::Some(tls_settings.alpn),
+                    alpn_protocols: NoneOrSome::One("h3".to_string()),
                     client_fingerprints: NoneOrSome::None,
                 });
                 let protocol = ServerProxyConfig::Hysteria2 { config };
@@ -1495,6 +1495,35 @@ mod tests {
             }
         }))
         .expect("literal hysteria2 inbound should parse")
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn hysteria2_forces_h3_alpn_like_xray() {
+        let inbound = serde_json::from_value::<InboudItem>(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "hysteria2",
+            "tag": "hysteria2-alpn",
+            "settings": {"clients": [{"auth": "xray-auth-token"}]},
+            "streamSettings": {
+                "network": "quic",
+                "security": "tls",
+                "tlsSettings": {
+                    "alpn": ["h2", "http/1.1"],
+                    "certificates": [{
+                        "certificateFile": "cert.pem",
+                        "keyFile": "key.pem"
+                    }]
+                }
+            }
+        }))
+        .expect("literal hysteria2 inbound should parse");
+
+        let config =
+            ServerConfig::try_from(inbound).expect("hysteria2 should build");
+        let quic = config.quic_settings.expect("hysteria2 QUIC settings");
+        assert_eq!(quic.alpn_protocols.into_vec(), vec!["h3".to_string()]);
     }
 
     #[cfg(feature = "hysteria")]

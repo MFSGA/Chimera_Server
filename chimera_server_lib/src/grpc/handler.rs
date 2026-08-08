@@ -7801,6 +7801,7 @@ mod tests {
                     }],
                     bandwidth: Hysteria2BandwidthConfig::default(),
                     ignore_client_bandwidth: false,
+                    udp_idle_timeout: 0,
                 },
             },
             transport: Transport::Quic,

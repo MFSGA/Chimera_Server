@@ -291,3 +291,23 @@ impl BrutalState {
                 >= DEBUG_PRINT_INTERVAL
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn brutal_factory_switches_after_bandwidth_negotiation() {
+        let tx_bps = Arc::new(AtomicU64::new(0));
+        let factory = Arc::new(BrutalConfig::new(tx_bps.clone()));
+        let controller = factory.build(Instant::now(), 1200);
+        let controller = controller
+            .into_any()
+            .downcast::<BrutalController>()
+            .expect("BrutalConfig must build BrutalController");
+
+        assert!(!controller.use_brutal());
+        tx_bps.store(1_000_000, Ordering::Relaxed);
+        assert!(controller.use_brutal());
+    }
+}

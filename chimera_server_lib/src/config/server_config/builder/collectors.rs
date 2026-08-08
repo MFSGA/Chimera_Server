@@ -39,7 +39,9 @@ pub(super) fn collect_hysteria2_settings(
         #[serde(default)]
         version: Option<u8>,
         #[serde(default)]
-        clients: Vec<Hysteria2ClientSetting>,
+        users: Option<Vec<Hysteria2ClientSetting>>,
+        #[serde(default)]
+        clients: Option<Vec<Hysteria2ClientSetting>>,
         #[serde(default)]
         bandwidth: Option<Hysteria2BandwidthSetting>,
         #[serde(default)]
@@ -74,6 +76,8 @@ pub(super) fn collect_hysteria2_settings(
 
     let clients = raw
         .clients
+        .or(raw.users)
+        .unwrap_or_default()
         .into_iter()
         .map(|client| {
             let password = client
@@ -182,11 +186,25 @@ pub(super) fn collect_hysteria2_settings(
             .and_then(|settings| settings.ignore_client_bandwidth)
             .unwrap_or(false)
     });
+    let udp_idle_timeout = hysteria_settings
+        .and_then(|settings| settings.udp_idle_timeout)
+        .unwrap_or(0);
+    if udp_idle_timeout != 0 && !(2..=600).contains(&udp_idle_timeout) {
+        return Err(Error::InvalidConfig(
+            "hysteriaSettings.udpIdleTimeout must be between 2 and 600".into(),
+        ));
+    }
+    let udp_idle_timeout = if udp_idle_timeout == 0 {
+        60
+    } else {
+        udp_idle_timeout
+    };
 
     Ok(Hysteria2ServerConfig {
         clients,
         bandwidth,
         ignore_client_bandwidth,
+        udp_idle_timeout,
     })
 }
 
@@ -1573,6 +1591,34 @@ mod tests {
 
     #[cfg(feature = "hysteria")]
     #[test]
+    fn collect_hysteria2_users_alias_and_clients_override_match_xray() {
+        let users_only = SettingObject(serde_json::json!({
+            "users": [{"auth": "users-auth"}]
+        }));
+        let config = collect_hysteria2_settings(users_only, None)
+            .expect("hysteria users alias should be accepted");
+        assert_eq!(config.clients[0].password, "users-auth");
+
+        let both = SettingObject(serde_json::json!({
+            "users": [{"auth": "users-auth"}],
+            "clients": [{"auth": "clients-auth"}]
+        }));
+        let config = collect_hysteria2_settings(both, None)
+            .expect("clients should override users like Xray");
+        assert_eq!(config.clients.len(), 1);
+        assert_eq!(config.clients[0].password, "clients-auth");
+
+        let explicit_empty_clients = SettingObject(serde_json::json!({
+            "users": [{"auth": "users-auth"}],
+            "clients": []
+        }));
+        let config = collect_hysteria2_settings(explicit_empty_clients, None)
+            .expect("explicit clients list should override users");
+        assert!(config.clients.is_empty());
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
     fn collect_hysteria2_settings_accepts_xray_settings_version() {
         let settings = SettingObject(serde_json::json!({
             "version": 2,
@@ -1608,6 +1654,48 @@ mod tests {
 
     #[cfg(feature = "hysteria")]
     #[test]
+    fn collect_hysteria2_udp_idle_timeout_matches_xray_bounds_and_default() {
+        let settings = || {
+            SettingObject(serde_json::json!({
+                "clients": [{"auth": "xray-auth-token"}]
+            }))
+        };
+
+        let default_stream = serde_json::from_value::<HysteriaSettings>(
+            serde_json::json!({"version": 2}),
+        )
+        .unwrap();
+        let config =
+            collect_hysteria2_settings(settings(), Some(&default_stream)).unwrap();
+        assert_eq!(config.udp_idle_timeout, 60);
+
+        for value in [2, 600] {
+            let stream =
+                serde_json::from_value::<HysteriaSettings>(serde_json::json!({
+                    "version": 2,
+                    "udpIdleTimeout": value
+                }))
+                .unwrap();
+            let config =
+                collect_hysteria2_settings(settings(), Some(&stream)).unwrap();
+            assert_eq!(config.udp_idle_timeout, value);
+        }
+
+        for value in [1, 601] {
+            let stream =
+                serde_json::from_value::<HysteriaSettings>(serde_json::json!({
+                    "version": 2,
+                    "udpIdleTimeout": value
+                }))
+                .unwrap();
+            let error = collect_hysteria2_settings(settings(), Some(&stream))
+                .expect_err("out-of-range udpIdleTimeout must fail");
+            assert!(error.to_string().contains("between 2 and 600"));
+        }
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
     fn collect_hysteria2_settings_rejects_conflicting_versions() {
         let settings = SettingObject(serde_json::json!({
             "version": 2,
@@ -1621,6 +1709,7 @@ mod tests {
             up: None,
             down: None,
             ignore_client_bandwidth: None,
+            udp_idle_timeout: None,
         };
 
         let err = collect_hysteria2_settings(settings, Some(&stream_settings))

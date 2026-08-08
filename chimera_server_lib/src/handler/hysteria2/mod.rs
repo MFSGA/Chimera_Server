@@ -9,8 +9,8 @@ use std::{
 use socket2::SockAddr;
 
 // use congestion::BrutalConfig;
+use congestion::BrutalConfig;
 use connection::process_hysteria2_connection;
-use quinn::congestion::BbrConfig;
 
 #[cfg(target_os = "linux")]
 use crate::util::socket::{
@@ -18,7 +18,7 @@ use crate::util::socket::{
 };
 use crate::{
     config::server_config::Hysteria2ServerConfig, runtime::RuntimeState,
-    util::socket::new_socket2_udp_socket,
+    util::socket::new_socket2_udp_socket_with_buffer_size,
 };
 
 mod congestion;
@@ -38,7 +38,13 @@ fn create_hysteria2_listener_socket(
     bind_address: SocketAddr,
     options: Hysteria2ListenerOptions,
 ) -> std::io::Result<socket2::Socket> {
-    let socket = new_socket2_udp_socket(bind_address.is_ipv6(), None, None, true)?;
+    let socket = new_socket2_udp_socket_with_buffer_size(
+        bind_address.is_ipv6(),
+        None,
+        None,
+        true,
+        Some(8_625_000),
+    )?;
 
     #[cfg(target_os = "linux")]
     if let Some(mark) = options.socket_mark {
@@ -148,9 +154,9 @@ pub async fn run_hysteria2_server(
                     }
                 };
 
-                // use brutal in the future
-                transport
-                    .congestion_controller_factory(Arc::new(BbrConfig::default()));
+                transport.congestion_controller_factory(Arc::new(
+                    BrutalConfig::new(tx_bps.clone()),
+                ));
 
                 let mut server_config = base_server_config.clone();
                 server_config.transport_config(Arc::new(transport));
@@ -205,14 +211,23 @@ pub async fn run_hysteria2_server(
 
 fn build_transport_config() -> std::io::Result<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
-    let idle_timeout = Duration::from_secs(120)
+    let idle_timeout = Duration::from_secs(30)
         .try_into()
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
     transport
         .max_concurrent_bidi_streams(4096_u32.into())
+        // Hysteria2 uses HTTP/3, so keep enough uni streams for QPACK/control updates.
         .max_concurrent_uni_streams(1024_u32.into())
-        .keep_alive_interval(Some(Duration::from_secs(15)))
-        .max_idle_timeout(Some(idle_timeout));
+        .max_idle_timeout(Some(idle_timeout))
+        .keep_alive_interval(Some(Duration::from_secs(10)))
+        .send_window(16 * 1024 * 1024)
+        .receive_window((20u32 * 1024 * 1024).into())
+        .stream_receive_window((8u32 * 1024 * 1024).into())
+        .initial_mtu(1200)
+        .min_mtu(1200)
+        .mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()))
+        .enable_segmentation_offload(true)
+        .initial_rtt(Duration::from_millis(100));
     Ok(transport)
 }
 
