@@ -47,6 +47,7 @@ use crate::{
         AccessTransport, ConnectionGuard, MeteredStream, TrafficContext,
         TrafficDirection, record_transfer, register_connection,
     },
+    util::socket::new_socket2_udp_socket,
 };
 
 const AUTH_URI: &str = "https://hysteria/auth";
@@ -973,7 +974,9 @@ async fn drive_udp_datagrams(
         };
         session.touch();
 
-        if remote_location != session.last_location {
+        if session.override_remote_write_address.is_none()
+            && remote_location != session.last_location
+        {
             let updated_addr =
                 resolve_single_address(&resolver, &remote_location).await?;
             session.last_location = remote_location.clone();
@@ -1055,7 +1058,9 @@ async fn drive_udp_datagrams(
                 assembled.extend_from_slice(&bytes);
             }
 
-            if remembered_location != session.last_location {
+            if session.override_remote_write_address.is_none()
+                && remembered_location != session.last_location
+            {
                 let updated_addr =
                     resolve_single_address(&resolver, &remembered_location).await?;
                 session.last_location = remembered_location;
@@ -1065,12 +1070,15 @@ async fn drive_udp_datagrams(
             assembled.freeze()
         };
 
+        let socket_addr = session
+            .override_remote_write_address
+            .unwrap_or(session.last_socket_addr);
         let route_input = connection_routing_input(
             inbound_tag.as_str(),
             packet_context.routing_identity().unwrap_or_default(),
             3,
             peer_addr,
-            session.last_socket_addr,
+            socket_addr,
             &session.last_location,
         );
         let action = select_direct_outbound(&runtime, &route_input, "udp")?;
@@ -1127,11 +1135,11 @@ async fn drive_udp_datagrams(
             .response_contexts
             .write()
             .expect("hysteria2 UDP contexts lock poisoned")
-            .insert(session.last_socket_addr, traffic_context.clone());
+            .insert(socket_addr, traffic_context.clone());
 
         match session
             .socket
-            .send_to(complete_payload.as_ref(), session.last_socket_addr)
+            .send_to(complete_payload.as_ref(), socket_addr)
             .await
         {
             Ok(sent) => {
@@ -1161,6 +1169,7 @@ struct UdpSession {
     cancel_token: CancellationToken,
     last_location: NetLocation,
     last_socket_addr: SocketAddr,
+    override_remote_write_address: Option<SocketAddr>,
     base_context: TrafficContext,
     response_contexts: Arc<RwLock<HashMap<SocketAddr, TrafficContext>>>,
     proxy_associations: UdpProxyAssociationRegistry,
@@ -1197,6 +1206,33 @@ struct FragmentedPacket {
     remote_location: NetLocation,
 }
 
+struct UdpRemoteLoopState {
+    response_contexts: Arc<RwLock<HashMap<SocketAddr, TrafficContext>>>,
+    fallback_context: TrafficContext,
+    override_local_write_location: Option<NetLocation>,
+    last_activity: Arc<RwLock<Instant>>,
+    cancel_token: CancellationToken,
+}
+
+fn udp_session_address_overrides(
+    remote_location: &NetLocation,
+    resolved_address: SocketAddr,
+) -> (Option<NetLocation>, Option<SocketAddr>) {
+    if resolved_address.to_string() != remote_location.to_string() {
+        (Some(remote_location.clone()), Some(resolved_address))
+    } else {
+        (None, None)
+    }
+}
+
+fn new_hysteria2_udp_session_socket() -> std::io::Result<UdpSocket> {
+    let bind_address =
+        SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0);
+    let socket = new_socket2_udp_socket(true, None, Some(bind_address), false)?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    UdpSocket::from_std(std_socket)
+}
+
 async fn create_udp_session(
     session_id: u32,
     remote_location: NetLocation,
@@ -1206,22 +1242,22 @@ async fn create_udp_session(
     udp_idle_timeout: Duration,
 ) -> std::io::Result<UdpSession> {
     let remote_addr = resolve_single_address(&resolver, &remote_location).await?;
-    let bind_addr: SocketAddr = if remote_addr.is_ipv6() {
-        "[::]:0".parse().unwrap()
-    } else {
-        "0.0.0.0:0".parse().unwrap()
-    };
-
-    let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
+    let (override_local_write_location, override_remote_write_address) =
+        udp_session_address_overrides(&remote_location, remote_addr);
+    let socket = Arc::new(new_hysteria2_udp_session_socket()?);
     let socket_for_task = socket.clone();
     let connection_for_task = connection.clone();
     let response_contexts = Arc::new(RwLock::new(HashMap::new()));
-    let contexts_for_task = response_contexts.clone();
     let fallback_context = base_context.clone();
     let last_activity = Arc::new(RwLock::new(Instant::now()));
-    let activity_for_task = last_activity.clone();
     let cancel_token = CancellationToken::new();
-    let cancel_for_task = cancel_token.clone();
+    let remote_loop_state = UdpRemoteLoopState {
+        response_contexts: response_contexts.clone(),
+        fallback_context,
+        override_local_write_location: override_local_write_location.clone(),
+        last_activity: last_activity.clone(),
+        cancel_token: cancel_token.clone(),
+    };
     let connection_guard = register_connection(Some(&base_context));
 
     tokio::spawn(async move {
@@ -1229,10 +1265,7 @@ async fn create_udp_session(
             session_id,
             connection_for_task,
             socket_for_task,
-            contexts_for_task,
-            fallback_context,
-            activity_for_task,
-            cancel_for_task,
+            remote_loop_state,
         )
         .await
         {
@@ -1250,6 +1283,7 @@ async fn create_udp_session(
         cancel_token,
         last_location: remote_location,
         last_socket_addr: remote_addr,
+        override_remote_write_address,
         base_context,
         response_contexts,
         proxy_associations: UdpProxyAssociationRegistry::new(udp_idle_timeout),
@@ -1322,11 +1356,15 @@ async fn run_udp_remote_to_local_loop(
     session_id: u32,
     connection: quinn::Connection,
     socket: Arc<UdpSocket>,
-    response_contexts: Arc<RwLock<HashMap<SocketAddr, TrafficContext>>>,
-    fallback_context: TrafficContext,
-    last_activity: Arc<RwLock<Instant>>,
-    cancel_token: CancellationToken,
+    state: UdpRemoteLoopState,
 ) -> std::io::Result<()> {
+    let UdpRemoteLoopState {
+        response_contexts,
+        fallback_context,
+        override_local_write_location,
+        last_activity,
+        cancel_token,
+    } = state;
     let max_datagram_size = connection
         .max_datagram_size()
         .ok_or_else(|| Error::other("peer does not support datagrams"))?;
@@ -1352,7 +1390,11 @@ async fn run_udp_remote_to_local_loop(
             .cloned()
             .unwrap_or_else(|| fallback_context.clone());
 
-        let address_bytes = Bytes::from(src_addr.to_string().into_bytes());
+        let response_location = override_local_write_location
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| src_addr.to_string());
+        let address_bytes = Bytes::from(response_location.into_bytes());
         let mut address_len_buf = Vec::with_capacity(8);
         push_varint(&mut address_len_buf, address_bytes.len() as u64)?;
         let address_len_bytes = Bytes::from(address_len_buf);
@@ -1688,6 +1730,50 @@ mod tests {
             resolve_bandwidth_settings(&config, None),
             (1_000_000, 2_000_000, false)
         );
+    }
+
+    #[test]
+    fn udp_session_overrides_preserve_original_domain_location() {
+        let domain =
+            NetLocation::from_str("example.com:53", None).expect("domain location");
+        let resolved: SocketAddr = "127.0.0.1:53".parse().unwrap();
+        let (local_override, remote_override) =
+            udp_session_address_overrides(&domain, resolved);
+        assert_eq!(local_override, Some(domain));
+        assert_eq!(remote_override, Some(resolved));
+
+        let literal =
+            NetLocation::from_str("127.0.0.1:53", None).expect("literal location");
+        let (local_override, remote_override) =
+            udp_session_address_overrides(&literal, resolved);
+        assert!(local_override.is_none());
+        assert!(remote_override.is_none());
+    }
+
+    #[tokio::test]
+    async fn udp_session_socket_sends_to_ipv4_from_ipv6_bind() {
+        let receiver = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind IPv4 receiver");
+        let receiver_addr = receiver.local_addr().expect("receiver address");
+        let sender = new_hysteria2_udp_session_socket()
+            .expect("create Shoes-style IPv6 UDP socket");
+        assert!(sender.local_addr().expect("sender address").is_ipv6());
+
+        sender
+            .send_to(b"x", receiver_addr)
+            .await
+            .expect("IPv6 session socket should reach IPv4 target");
+        let mut buf = [0u8; 1];
+        let (len, _) = tokio::time::timeout(
+            Duration::from_secs(1),
+            receiver.recv_from(&mut buf),
+        )
+        .await
+        .expect("IPv4 receiver timed out")
+        .expect("receive IPv4 datagram");
+        assert_eq!(len, 1);
+        assert_eq!(buf, [b'x']);
     }
 
     #[test]
