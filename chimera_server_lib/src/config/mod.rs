@@ -72,6 +72,8 @@ pub struct StreamSettings {
     grpc_settings: Option<GrpcSettings>,
     #[serde(alias = "hysteriaSettings")]
     hysteria_settings: Option<HysteriaSettings>,
+    #[serde(default)]
+    finalmask: Option<FinalMaskConfig>,
     #[cfg(feature = "reality")]
     #[serde(alias = "realitySettings")]
     reality_settings: Option<RealitySettings>,
@@ -265,6 +267,22 @@ pub struct WsSettings {
     headers: std::collections::HashMap<String, String>,
     #[serde(default)]
     accept_proxy_protocol: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct QuicParamsConfig {
+    #[serde(default)]
+    pub max_idle_timeout: i64,
+    #[serde(default)]
+    pub keep_alive_period: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FinalMaskConfig {
+    #[serde(default)]
+    pub quic_params: Option<QuicParamsConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

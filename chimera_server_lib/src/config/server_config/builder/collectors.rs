@@ -7,7 +7,7 @@ use crate::{
 
 #[cfg(feature = "hysteria")]
 use crate::{
-    config::HysteriaSettings,
+    config::{HysteriaSettings, QuicParamsConfig},
     util::bandwidth::{BandwidthValue, parse_bandwidth},
 };
 
@@ -15,7 +15,8 @@ use crate::{
 use super::super::types::TuicServerConfig;
 #[cfg(feature = "hysteria")]
 use super::super::types::{
-    Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2ServerConfig,
+    Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2QuicParams,
+    Hysteria2ServerConfig,
 };
 use super::super::types::{
     RangeConfig, SocksUser, SocksUserStore, XhttpDataPlacement, XhttpMode,
@@ -27,6 +28,35 @@ use crate::address::{Address, NetLocation};
 
 #[cfg(feature = "trojan")]
 use super::super::types::{TrojanFallback, TrojanUser};
+
+#[cfg(feature = "hysteria")]
+pub(super) fn collect_hysteria2_quic_params(
+    params: Option<&QuicParamsConfig>,
+) -> Result<Hysteria2QuicParams, Error> {
+    let Some(params) = params else {
+        return Ok(Hysteria2QuicParams::default());
+    };
+
+    if params.max_idle_timeout != 0 && !(4..=120).contains(&params.max_idle_timeout)
+    {
+        return Err(Error::InvalidConfig(
+            "hysteria2 finalmask.quicParams.maxIdleTimeout must be between 4 and 120"
+                .into(),
+        ));
+    }
+    if params.keep_alive_period != 0 && !(2..=60).contains(&params.keep_alive_period)
+    {
+        return Err(Error::InvalidConfig(
+            "hysteria2 finalmask.quicParams.keepAlivePeriod must be between 2 and 60"
+                .into(),
+        ));
+    }
+
+    Ok(Hysteria2QuicParams {
+        max_idle_timeout: params.max_idle_timeout as u64,
+        keep_alive_period: params.keep_alive_period as u64,
+    })
+}
 
 #[cfg(feature = "hysteria")]
 pub(super) fn collect_hysteria2_settings(
@@ -205,6 +235,7 @@ pub(super) fn collect_hysteria2_settings(
         bandwidth,
         ignore_client_bandwidth,
         udp_idle_timeout,
+        quic_params: Hysteria2QuicParams::default(),
     })
 }
 

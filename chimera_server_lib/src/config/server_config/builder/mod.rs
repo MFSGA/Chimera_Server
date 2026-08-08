@@ -248,11 +248,11 @@ pub(crate) fn collect_xhttp_settings_from_json(
     collectors::collect_xhttp_settings(settings)
 }
 
-#[cfg(feature = "hysteria")]
-use collectors::collect_hysteria2_settings;
 use collectors::collect_socks_settings;
 #[cfg(feature = "vless")]
 use collectors::collect_xhttp_settings;
+#[cfg(feature = "hysteria")]
+use collectors::{collect_hysteria2_quic_params, collect_hysteria2_settings};
 
 #[cfg(feature = "tuic")]
 use collectors::collect_tuic_settings;
@@ -850,6 +850,12 @@ impl TryFrom<InboudItem> for ServerConfig {
                     ));
                 }
                 let hysteria_settings = stream_settings.hysteria_settings.as_ref();
+                let quic_params = collect_hysteria2_quic_params(
+                    stream_settings
+                        .finalmask
+                        .as_ref()
+                        .and_then(|settings| settings.quic_params.as_ref()),
+                )?;
                 let tls_settings =
                     stream_settings.tls_settings.ok_or_else(|| {
                         Error::InvalidConfig(
@@ -872,8 +878,9 @@ impl TryFrom<InboudItem> for ServerConfig {
                 let settings = settings.ok_or_else(|| {
                     Error::InvalidConfig("hysteria2 inbound requires clients".into())
                 })?;
-                let config =
+                let mut config =
                     collect_hysteria2_settings(settings, hysteria_settings)?;
+                config.quic_params = quic_params;
                 if config.clients.is_empty() {
                     return Err(Error::InvalidConfig(
                         "hysteria2 inbound requires at least one client".into(),
@@ -1495,6 +1502,60 @@ mod tests {
             }
         }))
         .expect("literal hysteria2 inbound should parse")
+    }
+
+    #[cfg(feature = "hysteria")]
+    fn hysteria2_inbound_with_quic_params(
+        quic_params: serde_json::Value,
+    ) -> InboudItem {
+        serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "hysteria2",
+            "tag": "hysteria2-quic-params",
+            "settings": {"clients": [{"auth": "xray-auth-token"}]},
+            "streamSettings": {
+                "network": "quic",
+                "security": "tls",
+                "finalmask": {"quicParams": quic_params},
+                "tlsSettings": {
+                    "certificates": [{
+                        "certificateFile": "cert.pem",
+                        "keyFile": "key.pem"
+                    }]
+                }
+            }
+        }))
+        .expect("literal hysteria2 quicParams inbound should parse")
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn hysteria2_quic_timeouts_match_xray_config_bounds() {
+        let config = ServerConfig::try_from(hysteria2_inbound_with_quic_params(
+            serde_json::json!({
+                "maxIdleTimeout": 7,
+                "keepAlivePeriod": 11
+            }),
+        ))
+        .expect("valid Xray Hysteria2 quicParams should build");
+        let ServerProxyConfig::Hysteria2 { config } = config.protocol else {
+            panic!("expected hysteria2 protocol");
+        };
+        assert_eq!(config.quic_params.max_idle_timeout, 7);
+        assert_eq!(config.quic_params.keep_alive_period, 11);
+
+        for params in [
+            serde_json::json!({"maxIdleTimeout": 3}),
+            serde_json::json!({"maxIdleTimeout": 121}),
+            serde_json::json!({"keepAlivePeriod": 1}),
+            serde_json::json!({"keepAlivePeriod": 61}),
+        ] {
+            let error =
+                ServerConfig::try_from(hysteria2_inbound_with_quic_params(params))
+                    .expect_err("out-of-range Xray quicParams should fail");
+            assert!(error.to_string().contains("finalmask.quicParams"));
+        }
     }
 
     #[cfg(feature = "hysteria")]

@@ -17,7 +17,8 @@ use crate::util::socket::{
     configure_ip_transparent, configure_socket_mark, enable_udp_original_destination,
 };
 use crate::{
-    config::server_config::Hysteria2ServerConfig, runtime::RuntimeState,
+    config::server_config::{Hysteria2QuicParams, Hysteria2ServerConfig},
+    runtime::RuntimeState,
     util::socket::new_socket2_udp_socket_with_buffer_size,
 };
 
@@ -25,6 +26,8 @@ mod congestion;
 pub mod connection;
 
 const MAX_QUIC_ENDPOINTS: usize = 1;
+const DEFAULT_MAX_IDLE_TIMEOUT_SECS: u64 = 30;
+const SHOES_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Hysteria2ListenerOptions {
@@ -120,7 +123,7 @@ pub async fn run_hysteria2_server(
         let inbound_tag = inbound_tag.clone();
         let runtime = runtime.clone();
 
-        let base_transport = build_transport_config()?;
+        let base_transport = build_transport_config(&config.quic_params)?;
         let mut base_server_config =
             quinn::ServerConfig::with_crypto(quic_server_config);
         base_server_config.transport_config(Arc::new(base_transport));
@@ -143,7 +146,8 @@ pub async fn run_hysteria2_server(
                 let runtime = runtime.clone();
                 let tx_bps = Arc::new(AtomicU64::new(0));
 
-                let mut transport = match build_transport_config() {
+                let mut transport = match build_transport_config(&config.quic_params)
+                {
                     Ok(transport) => transport,
                     Err(err) => {
                         tracing::error!(
@@ -209,9 +213,19 @@ pub async fn run_hysteria2_server(
     Ok(())
 }
 
-fn build_transport_config() -> std::io::Result<quinn::TransportConfig> {
+fn configured_max_idle_timeout(params: &Hysteria2QuicParams) -> Duration {
+    Duration::from_secs(if params.max_idle_timeout == 0 {
+        DEFAULT_MAX_IDLE_TIMEOUT_SECS
+    } else {
+        params.max_idle_timeout
+    })
+}
+
+fn build_transport_config(
+    params: &Hysteria2QuicParams,
+) -> std::io::Result<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
-    let idle_timeout = Duration::from_secs(30)
+    let idle_timeout = configured_max_idle_timeout(params)
         .try_into()
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
     transport
@@ -219,7 +233,9 @@ fn build_transport_config() -> std::io::Result<quinn::TransportConfig> {
         // Hysteria2 uses HTTP/3, so keep enough uni streams for QPACK/control updates.
         .max_concurrent_uni_streams(1024_u32.into())
         .max_idle_timeout(Some(idle_timeout))
-        .keep_alive_interval(Some(Duration::from_secs(10)))
+        // Xray validates keepAlivePeriod but its Hysteria2 server listener does
+        // not apply it. Keep Shoes' fixed server keepalive behavior here.
+        .keep_alive_interval(Some(SHOES_KEEP_ALIVE_INTERVAL))
         .send_window(16 * 1024 * 1024)
         .receive_window((20u32 * 1024 * 1024).into())
         .stream_receive_window((8u32 * 1024 * 1024).into())
@@ -239,6 +255,21 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn quic_idle_timeout_uses_xray_default_and_override() {
+        assert_eq!(
+            configured_max_idle_timeout(&Hysteria2QuicParams::default()),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            configured_max_idle_timeout(&Hysteria2QuicParams {
+                max_idle_timeout: 7,
+                keep_alive_period: 11,
+            }),
+            Duration::from_secs(7)
+        );
+    }
 
     #[test]
     fn marked_listener_applies_so_mark() {

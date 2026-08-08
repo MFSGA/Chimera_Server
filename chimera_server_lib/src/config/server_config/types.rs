@@ -51,6 +51,16 @@ pub struct Hysteria2BandwidthConfig {
 }
 
 #[cfg(feature = "hysteria")]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Hysteria2QuicParams {
+    #[serde(default)]
+    pub max_idle_timeout: u64,
+    #[serde(default)]
+    pub keep_alive_period: u64,
+}
+
+#[cfg(feature = "hysteria")]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Hysteria2ServerConfig {
@@ -61,6 +71,8 @@ pub struct Hysteria2ServerConfig {
     pub ignore_client_bandwidth: bool,
     #[serde(default)]
     pub udp_idle_timeout: u64,
+    #[serde(default)]
+    pub quic_params: Hysteria2QuicParams,
 }
 
 #[cfg(feature = "tuic")]

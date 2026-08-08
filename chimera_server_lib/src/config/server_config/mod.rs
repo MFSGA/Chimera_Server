@@ -18,7 +18,10 @@ pub use types::{VlessFallback, VlessUser};
 pub use types::GrpcServerConfig;
 #[cfg(feature = "hysteria")]
 #[allow(unused_imports)]
-pub use types::{Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2ServerConfig};
+pub use types::{
+    Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2QuicParams,
+    Hysteria2ServerConfig,
+};
 pub use types::{
     ServerConfig, ServerProxyConfig, SocksUser, SocksUserStore, XhttpDataPlacement,
     XhttpMode, XhttpPaddingMethod, XhttpPaddingPlacement, XhttpPlacement,
