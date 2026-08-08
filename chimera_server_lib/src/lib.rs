@@ -875,7 +875,7 @@ async fn start_async(
         // Runtime state lets UDP listeners evaluate routing and outbound policy.
         let inbound_tag = config.tag.clone();
         let handles = start_servers(config, runtime_state.clone()).await?;
-        runtime_state.register_inbound_tasks(&inbound_tag, &handles);
+        runtime_state.register_inbound_tasks(&inbound_tag, handles);
         has_started_server = true;
     }
 

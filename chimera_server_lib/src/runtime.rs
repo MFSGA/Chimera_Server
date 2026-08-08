@@ -19,10 +19,7 @@ use std::{
 #[cfg(feature = "user_domain_access")]
 use uuid::Uuid;
 
-use tokio::{
-    sync::broadcast,
-    task::{AbortHandle, JoinHandle},
-};
+use tokio::{sync::broadcast, task::JoinHandle};
 
 #[cfg(feature = "user_domain_access")]
 use crate::user_domain_access::{
@@ -350,7 +347,7 @@ struct PolicyRuntimeState {
 pub struct RuntimeState {
     inbounds: Arc<RwLock<Vec<ServerConfig>>>,
     outbounds: Arc<RwLock<OutboundRuntimeState>>,
-    inbound_tasks: Arc<RwLock<HashMap<String, Vec<AbortHandle>>>>,
+    inbound_tasks: Arc<RwLock<HashMap<String, Vec<JoinHandle<()>>>>>,
     routing: Arc<RwLock<RoutingState>>,
     balancer_overrides: Arc<RwLock<HashMap<String, String>>>,
     resolver: Arc<RwLock<ResolverRuntimeState>>,
@@ -626,18 +623,14 @@ impl RuntimeState {
         Ok(())
     }
 
-    pub fn register_inbound_tasks(&self, tag: &str, handles: &[JoinHandle<()>]) {
-        let abort_handles = handles
-            .iter()
-            .map(JoinHandle::abort_handle)
-            .collect::<Vec<_>>();
+    pub fn register_inbound_tasks(&self, tag: &str, handles: Vec<JoinHandle<()>>) {
         self.inbound_tasks
             .write()
             .expect("runtime inbound tasks lock poisoned")
-            .insert(tag.to_string(), abort_handles);
+            .insert(tag.to_string(), handles);
     }
 
-    pub fn abort_inbound_tasks(&self, tag: &str) -> bool {
+    pub async fn stop_inbound_tasks(&self, tag: &str) -> bool {
         let Some(handles) = self
             .inbound_tasks
             .write()
@@ -647,8 +640,12 @@ impl RuntimeState {
             return false;
         };
 
-        for handle in handles {
+        for handle in &handles {
             handle.abort();
+        }
+
+        for handle in handles {
+            let _ = handle.await;
         }
 
         true
