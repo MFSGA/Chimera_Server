@@ -6,9 +6,9 @@ use std::{
     time::Duration,
 };
 
+use quinn::congestion::{BbrConfig, NewRenoConfig};
 use socket2::SockAddr;
 
-// use congestion::BrutalConfig;
 use congestion::BrutalConfig;
 use connection::process_hysteria2_connection;
 
@@ -161,9 +161,11 @@ pub async fn run_hysteria2_server(
                     }
                 };
 
-                transport.congestion_controller_factory(Arc::new(
-                    BrutalConfig::new(tx_bps.clone()),
-                ));
+                configure_congestion_controller(
+                    &mut transport,
+                    &config.quic_params,
+                    tx_bps.clone(),
+                );
 
                 let mut server_config = base_server_config.clone();
                 server_config.transport_config(Arc::new(transport));
@@ -214,6 +216,27 @@ pub async fn run_hysteria2_server(
         join_handle.await.map_err(std::io::Error::other)?;
     }
     Ok(())
+}
+
+fn configure_congestion_controller(
+    transport: &mut quinn::TransportConfig,
+    params: &Hysteria2QuicParams,
+    tx_bps: Arc<AtomicU64>,
+) {
+    match params.congestion.as_str() {
+        "reno" => {
+            transport
+                .congestion_controller_factory(Arc::new(NewRenoConfig::default()));
+        }
+        "bbr" => {
+            transport.congestion_controller_factory(Arc::new(BbrConfig::default()));
+        }
+        "" | "brutal" | "force-brutal" => {
+            transport
+                .congestion_controller_factory(Arc::new(BrutalConfig::new(tx_bps)));
+        }
+        _ => unreachable!("hysteria2 congestion mode validated by config builder"),
+    }
 }
 
 fn configured_max_idle_timeout(params: &Hysteria2QuicParams) -> Duration {

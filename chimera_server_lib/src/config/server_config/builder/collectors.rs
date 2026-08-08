@@ -92,6 +92,24 @@ pub(super) fn collect_hysteria2_quic_params(
         ));
     }
 
+    let congestion = params.congestion.trim().to_ascii_lowercase();
+    match congestion.as_str() {
+        "" | "reno" | "bbr" | "brutal" => {}
+        "force-brutal" if brutal_up != 0 => {}
+        "force-brutal" => {
+            return Err(Error::InvalidConfig(
+                "hysteria2 finalmask.quicParams force-brutal requires brutalUp"
+                    .into(),
+            ));
+        }
+        _ => {
+            return Err(Error::InvalidConfig(format!(
+                "unknown hysteria2 finalmask.quicParams congestion control: {}",
+                params.congestion
+            )));
+        }
+    }
+
     if params.max_idle_timeout != 0 && !(4..=120).contains(&params.max_idle_timeout)
     {
         return Err(Error::InvalidConfig(
@@ -130,6 +148,7 @@ pub(super) fn collect_hysteria2_quic_params(
     }
 
     Ok(Hysteria2QuicParams {
+        congestion,
         max_idle_timeout: params.max_idle_timeout as u64,
         keep_alive_period: params.keep_alive_period as u64,
         disable_path_mtu_discovery: params.disable_path_mtu_discovery,

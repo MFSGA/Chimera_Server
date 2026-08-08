@@ -543,11 +543,19 @@ fn resolve_bandwidth_settings(
 ) -> (u64, u64, bool) {
     if config.quic_params.from_finalmask {
         let client_rx_limit = client_rx_limit.unwrap_or(0);
-        let actual_tx = if config.quic_params.brutal_up == 0 || client_rx_limit == 0
-        {
-            0
-        } else {
-            config.quic_params.brutal_up.min(client_rx_limit)
+        let actual_tx = match config.quic_params.congestion.as_str() {
+            "reno" | "bbr" => 0,
+            "force-brutal" => config.quic_params.brutal_up,
+            "" | "brutal" => {
+                if config.quic_params.brutal_up == 0 || client_rx_limit == 0 {
+                    0
+                } else {
+                    config.quic_params.brutal_up.min(client_rx_limit)
+                }
+            }
+            _ => {
+                unreachable!("hysteria2 congestion mode validated by config builder")
+            }
         };
         return (actual_tx, config.quic_params.brutal_down, false);
     }
@@ -1411,7 +1419,7 @@ mod tests {
 
     #[test]
     fn finalmask_brutal_bandwidth_matches_xray_negotiation() {
-        let config = Hysteria2ServerConfig {
+        let mut config = Hysteria2ServerConfig {
             clients: Vec::new(),
             bandwidth: Hysteria2BandwidthConfig {
                 max_tx: 9_000_000,
@@ -1440,18 +1448,29 @@ mod tests {
             (0, 2_000_000, false)
         );
 
-        let no_server_up = Hysteria2ServerConfig {
-            quic_params: Hysteria2QuicParams {
-                brutal_up: 0,
-                brutal_down: 2_000_000,
-                from_finalmask: true,
-                ..Hysteria2QuicParams::default()
-            },
-            ..config
-        };
+        config.quic_params.brutal_up = 0;
         assert_eq!(
-            resolve_bandwidth_settings(&no_server_up, Some(500_000)),
+            resolve_bandwidth_settings(&config, Some(500_000)),
             (0, 2_000_000, false)
+        );
+
+        config.quic_params.brutal_up = 1_000_000;
+        config.quic_params.congestion = "bbr".into();
+        assert_eq!(
+            resolve_bandwidth_settings(&config, Some(500_000)),
+            (0, 2_000_000, false)
+        );
+
+        config.quic_params.congestion = "reno".into();
+        assert_eq!(
+            resolve_bandwidth_settings(&config, Some(500_000)),
+            (0, 2_000_000, false)
+        );
+
+        config.quic_params.congestion = "force-brutal".into();
+        assert_eq!(
+            resolve_bandwidth_settings(&config, None),
+            (1_000_000, 2_000_000, false)
         );
     }
 

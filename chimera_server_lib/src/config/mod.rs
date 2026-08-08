@@ -273,6 +273,8 @@ pub struct WsSettings {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QuicParamsConfig {
     #[serde(default)]
+    pub congestion: String,
+    #[serde(default)]
     pub max_idle_timeout: i64,
     #[serde(default)]
     pub keep_alive_period: i64,

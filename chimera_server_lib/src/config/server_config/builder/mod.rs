@@ -1534,6 +1534,7 @@ mod tests {
     fn hysteria2_quic_params_match_xray_config_bounds() {
         let config = ServerConfig::try_from(hysteria2_inbound_with_quic_params(
             serde_json::json!({
+                "congestion": "BRUTAL",
                 "maxIdleTimeout": 7,
                 "keepAlivePeriod": 11,
                 "disablePathMTUDiscovery": true,
@@ -1548,6 +1549,7 @@ mod tests {
         let ServerProxyConfig::Hysteria2 { config } = config.protocol else {
             panic!("expected hysteria2 protocol");
         };
+        assert_eq!(config.quic_params.congestion, "brutal");
         assert_eq!(config.quic_params.max_idle_timeout, 7);
         assert_eq!(config.quic_params.keep_alive_period, 11);
         assert!(config.quic_params.disable_path_mtu_discovery);
@@ -1568,6 +1570,8 @@ mod tests {
             serde_json::json!({"maxConnectionReceiveWindow": 16_383}),
             serde_json::json!({"brutalUp": "511kbps"}),
             serde_json::json!({"brutalDown": "oops"}),
+            serde_json::json!({"congestion": "cubic"}),
+            serde_json::json!({"congestion": "force-brutal"}),
         ] {
             let error =
                 ServerConfig::try_from(hysteria2_inbound_with_quic_params(params))

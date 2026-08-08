@@ -55,6 +55,8 @@ pub struct Hysteria2BandwidthConfig {
 #[serde(rename_all = "camelCase")]
 pub struct Hysteria2QuicParams {
     #[serde(default)]
+    pub congestion: String,
+    #[serde(default)]
     pub max_idle_timeout: u64,
     #[serde(default)]
     pub keep_alive_period: u64,
