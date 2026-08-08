@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use tokio::task::{AbortHandle, JoinHandle};
+use tokio::task::JoinHandle;
 
 use crate::{
     config::server_config::ServerConfig,
@@ -22,7 +22,7 @@ pub struct OutboundSummary {
 pub struct RuntimeState {
     inbounds: Arc<RwLock<Vec<ServerConfig>>>,
     outbounds: Arc<RwLock<Vec<OutboundSummary>>>,
-    inbound_tasks: Arc<RwLock<HashMap<String, Vec<AbortHandle>>>>,
+    inbound_tasks: Arc<RwLock<HashMap<String, Vec<JoinHandle<()>>>>>,
     routing: Arc<RwLock<RoutingState>>,
 }
 
@@ -88,18 +88,14 @@ impl RuntimeState {
         Ok(())
     }
 
-    pub fn register_inbound_tasks(&self, tag: &str, handles: &[JoinHandle<()>]) {
-        let abort_handles = handles
-            .iter()
-            .map(JoinHandle::abort_handle)
-            .collect::<Vec<_>>();
+    pub fn register_inbound_tasks(&self, tag: &str, handles: Vec<JoinHandle<()>>) {
         self.inbound_tasks
             .write()
             .expect("runtime inbound tasks lock poisoned")
-            .insert(tag.to_string(), abort_handles);
+            .insert(tag.to_string(), handles);
     }
 
-    pub fn abort_inbound_tasks(&self, tag: &str) -> bool {
+    pub async fn stop_inbound_tasks(&self, tag: &str) -> bool {
         let Some(handles) = self
             .inbound_tasks
             .write()
@@ -109,8 +105,12 @@ impl RuntimeState {
             return false;
         };
 
-        for handle in handles {
+        for handle in &handles {
             handle.abort();
+        }
+
+        for handle in handles {
+            let _ = handle.await;
         }
 
         true
@@ -187,5 +187,32 @@ impl RuntimeState {
     {
         let mut guard = self.routing.write().expect("runtime routing lock poisoned");
         mutator(&mut guard)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use tokio::net::TcpListener;
+
+    use super::RuntimeState;
+
+    #[tokio::test]
+    async fn stopping_inbound_tasks_releases_listener_before_return() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("read test listener address");
+        let task = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        runtime.register_inbound_tasks("test", vec![task]);
+
+        assert!(runtime.stop_inbound_tasks("test").await);
+        TcpListener::bind(address)
+            .await
+            .expect("listener should be released before stop returns");
     }
 }
