@@ -9,6 +9,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
     task::{Context, Poll},
+    time::Duration,
 };
 
 use bytes::{Bytes, BytesMut};
@@ -50,7 +51,7 @@ const TCP_REQUEST_ID: u64 = 0x401;
 const MAX_ADDRESS_LEN: usize = 1024;
 const PADDING_SCRATCH_LEN: usize = 1024;
 const TCP_SUCCESS_STATUS: u8 = 0x00;
-const TCP_ERROR_STATUS: u8 = 0x01;
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 struct AuthContext {
@@ -264,33 +265,47 @@ async fn handle_tcp_stream(
     peer_addr: SocketAddr,
     runtime: RuntimeState,
 ) -> std::io::Result<()> {
-    let request = TcpRequest::read(&mut recv).await?;
-    let context_identity = client.email.clone().unwrap_or(client.password.clone());
-    let connection = match connect_tcp_outbound(
-        &resolver,
-        &request.target,
-        &runtime,
-        inbound_tag.as_str(),
-        &context_identity,
-        peer_addr,
-    )
-    .await
-    {
-        Ok(Some(connection)) => connection,
-        Ok(None) => {
-            let _ = send.finish();
-            return Ok(());
-        }
+    let request = match TcpRequest::read(&mut recv).await {
+        Ok(request) => request,
         Err(err) => {
-            warn!("failed to connect to {}: {}", request.target, err);
-            let _ = send_tcp_response(&mut send, TCP_ERROR_STATUS, "connect failed")
-                .await;
             let _ = send.finish();
             return Err(err);
         }
     };
-
     send_tcp_response(&mut send, TCP_SUCCESS_STATUS, "").await?;
+
+    let context_identity = client.email.clone().unwrap_or(client.password.clone());
+    let connection = match tokio::time::timeout(
+        TCP_CONNECT_TIMEOUT,
+        connect_tcp_outbound(
+            &resolver,
+            &request.target,
+            &runtime,
+            inbound_tag.as_str(),
+            &context_identity,
+            peer_addr,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(Some(connection))) => connection,
+        Ok(Ok(None)) => {
+            let _ = send.finish();
+            return Ok(());
+        }
+        Ok(Err(err)) => {
+            warn!("failed to connect to {}: {}", request.target, err);
+            let _ = send.finish();
+            return Err(err);
+        }
+        Err(_) => {
+            let _ = send.finish();
+            return Err(Error::new(
+                ErrorKind::TimedOut,
+                format!("client setup to {} timed out", request.target),
+            ));
+        }
+    };
 
     let mut context = TrafficContext::new("hysteria2")
         .with_identity(context_identity)
