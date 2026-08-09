@@ -152,8 +152,13 @@ fn build_transport_config(
             .map_err(|err| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, err)
             })?;
+    let max_bidi_streams =
+        quinn::VarInt::from_u64(config.xray_max_incoming_streams.unwrap_or(4096))
+            .map_err(|err| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, err)
+            })?;
     transport
-        .max_concurrent_bidi_streams(4096_u32.into())
+        .max_concurrent_bidi_streams(max_bidi_streams)
         .max_concurrent_uni_streams(1024_u32.into())
         .keep_alive_interval(Some(Duration::from_secs(15)))
         .max_idle_timeout(Some(idle_timeout));
