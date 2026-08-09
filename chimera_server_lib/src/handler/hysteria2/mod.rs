@@ -21,6 +21,9 @@ pub mod connection;
 const MAX_QUIC_ENDPOINTS: usize = 1;
 const SHOES_MAX_INCOMING_UNI_STREAMS: u32 = 1024;
 const XRAY_MAX_INCOMING_UNI_STREAMS: u32 = 100;
+const SHOES_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const SHOES_INITIAL_MTU: u16 = 1200;
+const XRAY_INITIAL_MTU: u16 = 1280;
 
 pub async fn run_hysteria2_server(
     bind_address: SocketAddr,
@@ -162,10 +165,16 @@ fn build_transport_config(
     let max_uni_streams = configured_max_incoming_uni_streams(
         config.xray_max_incoming_streams.is_some(),
     );
+    let keep_alive_interval =
+        configured_keep_alive_interval(config.xray_max_incoming_streams.is_some());
     transport
         .max_concurrent_bidi_streams(max_bidi_streams)
         .max_concurrent_uni_streams(max_uni_streams)
-        .keep_alive_interval(Some(Duration::from_secs(15)))
+        .keep_alive_interval(keep_alive_interval)
+        .initial_mtu(configured_initial_mtu(
+            config.xray_max_incoming_streams.is_some(),
+        ))
+        .min_mtu(SHOES_INITIAL_MTU)
         .max_idle_timeout(Some(idle_timeout));
     Ok(transport)
 }
@@ -178,11 +187,25 @@ fn configured_max_incoming_uni_streams(xray_compat: bool) -> quinn::VarInt {
     }
 }
 
+fn configured_keep_alive_interval(xray_compat: bool) -> Option<Duration> {
+    (!xray_compat).then_some(SHOES_KEEP_ALIVE_INTERVAL)
+}
+
+fn configured_initial_mtu(xray_compat: bool) -> u16 {
+    if xray_compat {
+        XRAY_INITIAL_MTU
+    } else {
+        SHOES_INITIAL_MTU
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        SHOES_MAX_INCOMING_UNI_STREAMS, XRAY_MAX_INCOMING_UNI_STREAMS,
-        configured_max_incoming_uni_streams,
+        SHOES_INITIAL_MTU, SHOES_KEEP_ALIVE_INTERVAL,
+        SHOES_MAX_INCOMING_UNI_STREAMS, XRAY_INITIAL_MTU,
+        XRAY_MAX_INCOMING_UNI_STREAMS, configured_initial_mtu,
+        configured_keep_alive_interval, configured_max_incoming_uni_streams,
     };
 
     #[test]
@@ -195,5 +218,20 @@ mod tests {
             configured_max_incoming_uni_streams(true).into_inner(),
             u64::from(XRAY_MAX_INCOMING_UNI_STREAMS)
         );
+    }
+
+    #[test]
+    fn keep_alive_is_disabled_for_xray_compatibility() {
+        assert_eq!(
+            configured_keep_alive_interval(false),
+            Some(SHOES_KEEP_ALIVE_INTERVAL)
+        );
+        assert_eq!(configured_keep_alive_interval(true), None);
+    }
+
+    #[test]
+    fn initial_mtu_matches_protocol_mode() {
+        assert_eq!(configured_initial_mtu(false), SHOES_INITIAL_MTU);
+        assert_eq!(configured_initial_mtu(true), XRAY_INITIAL_MTU);
     }
 }
