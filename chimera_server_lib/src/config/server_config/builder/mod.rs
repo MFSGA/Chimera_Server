@@ -718,6 +718,20 @@ impl TryFrom<InboudItem> for ServerConfig {
                     )
                 })?;
                 let hysteria_settings = stream_settings.hysteria_settings.as_ref();
+                let xray_max_idle_timeout_secs = stream_settings
+                    .final_mask
+                    .as_ref()
+                    .and_then(|final_mask| final_mask.quic_params.as_ref())
+                    .map(|quic_params| {
+                        let timeout = quic_params.max_idle_timeout;
+                        if timeout != 0 && !(4..=120).contains(&timeout) {
+                            return Err(Error::InvalidConfig(format!(
+                                "finalmask.quicParams.maxIdleTimeout must be 0 or between 4 and 120 seconds (got {timeout})"
+                            )));
+                        }
+                        Ok(if timeout == 0 { 30 } else { timeout as u64 })
+                    })
+                    .transpose()?;
                 let tls_settings =
                     stream_settings.tls_settings.ok_or_else(|| {
                         Error::InvalidConfig(
@@ -740,8 +754,9 @@ impl TryFrom<InboudItem> for ServerConfig {
                 let settings = settings.ok_or_else(|| {
                     Error::InvalidConfig("hysteria2 inbound requires clients".into())
                 })?;
-                let config =
+                let mut config =
                     collect_hysteria2_settings(settings, hysteria_settings)?;
+                config.xray_max_idle_timeout_secs = xray_max_idle_timeout_secs;
                 if config.clients.is_empty() {
                     return Err(Error::InvalidConfig(
                         "hysteria2 inbound requires at least one client".into(),
@@ -1277,6 +1292,56 @@ mod tests {
             "tag": format!("{protocol}-planned")
         }))
         .expect("valid inbound item")
+    }
+
+    #[cfg(feature = "hysteria")]
+    fn hysteria2_inbound_with_finalmask(max_idle_timeout: i64) -> InboudItem {
+        serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "hysteria2",
+            "tag": "hysteria2-finalmask",
+            "settings": {
+                "clients": [{ "auth": "secret" }]
+            },
+            "streamSettings": {
+                "network": "hysteria2",
+                "security": "tls",
+                "tlsSettings": {
+                    "certificates": [{
+                        "certificateFile": "cert.pem",
+                        "keyFile": "key.pem"
+                    }]
+                },
+                "finalmask": {
+                    "quicParams": {
+                        "maxIdleTimeout": max_idle_timeout
+                    }
+                }
+            }
+        }))
+        .expect("valid hysteria2 inbound")
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn hysteria2_finalmask_max_idle_timeout_matches_xray_default() {
+        let config = ServerConfig::try_from(hysteria2_inbound_with_finalmask(0))
+            .expect("Xray zero maxIdleTimeout should use its default");
+        match config.protocol {
+            ServerProxyConfig::Hysteria2 { config } => {
+                assert_eq!(config.xray_max_idle_timeout_secs, Some(30));
+            }
+            other => panic!("expected hysteria2 protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn hysteria2_finalmask_rejects_out_of_range_max_idle_timeout() {
+        let err = ServerConfig::try_from(hysteria2_inbound_with_finalmask(3))
+            .expect_err("Xray rejects maxIdleTimeout below four seconds");
+        assert!(err.to_string().contains("maxIdleTimeout"));
     }
 
     #[cfg(feature = "http")]
