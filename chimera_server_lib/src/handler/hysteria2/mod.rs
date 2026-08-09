@@ -46,7 +46,7 @@ pub async fn run_hysteria2_server(
         let inbound_tag = inbound_tag.clone();
         let runtime = runtime.clone();
 
-        let base_transport = build_transport_config()?;
+        let base_transport = build_transport_config(config.as_ref())?;
         let mut base_server_config =
             quinn::ServerConfig::with_crypto(quic_server_config);
         // Match Xray's Hysteria2 server behavior: do not migrate an established
@@ -76,7 +76,7 @@ pub async fn run_hysteria2_server(
                 let runtime = runtime.clone();
                 let tx_bps = Arc::new(AtomicU64::new(0));
 
-                let mut transport = match build_transport_config() {
+                let mut transport = match build_transport_config(config.as_ref()) {
                     Ok(transport) => transport,
                     Err(err) => {
                         tracing::error!(
@@ -142,11 +142,16 @@ pub async fn run_hysteria2_server(
     Ok(())
 }
 
-fn build_transport_config() -> std::io::Result<quinn::TransportConfig> {
+fn build_transport_config(
+    config: &Hysteria2ServerConfig,
+) -> std::io::Result<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
-    let idle_timeout = Duration::from_secs(120)
-        .try_into()
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+    let idle_timeout =
+        Duration::from_secs(config.xray_max_idle_timeout_secs.unwrap_or(120))
+            .try_into()
+            .map_err(|err| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, err)
+            })?;
     transport
         .max_concurrent_bidi_streams(4096_u32.into())
         .max_concurrent_uni_streams(1024_u32.into())
