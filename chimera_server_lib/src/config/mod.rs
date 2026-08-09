@@ -202,6 +202,8 @@ pub struct FinalMaskSettings {
 pub struct FinalMaskQuicParams {
     #[serde(default)]
     pub max_idle_timeout: i64,
+    #[serde(default)]
+    pub max_incoming_streams: i64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

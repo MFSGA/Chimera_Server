@@ -3559,6 +3559,7 @@ mod tests {
                     bandwidth: Hysteria2BandwidthConfig::default(),
                     ignore_client_bandwidth: false,
                     xray_max_idle_timeout_secs: None,
+                    xray_max_incoming_streams: None,
                 },
             },
             transport: Transport::Quic,

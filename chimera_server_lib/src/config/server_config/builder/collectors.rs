@@ -185,6 +185,7 @@ pub(super) fn collect_hysteria2_settings(
         bandwidth,
         ignore_client_bandwidth,
         xray_max_idle_timeout_secs: None,
+        xray_max_incoming_streams: None,
     })
 }
 

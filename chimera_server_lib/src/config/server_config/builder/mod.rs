@@ -718,11 +718,11 @@ impl TryFrom<InboudItem> for ServerConfig {
                     )
                 })?;
                 let hysteria_settings = stream_settings.hysteria_settings.as_ref();
-                let xray_max_idle_timeout_secs = stream_settings
+                let xray_quic_params = stream_settings
                     .final_mask
                     .as_ref()
-                    .and_then(|final_mask| final_mask.quic_params.as_ref())
-                    .map(|quic_params| {
+                    .and_then(|final_mask| final_mask.quic_params.as_ref());
+                let xray_max_idle_timeout_secs = xray_quic_params.map(|quic_params| {
                         let timeout = quic_params.max_idle_timeout;
                         if timeout != 0 && !(4..=120).contains(&timeout) {
                             return Err(Error::InvalidConfig(format!(
@@ -730,6 +730,18 @@ impl TryFrom<InboudItem> for ServerConfig {
                             )));
                         }
                         Ok(if timeout == 0 { 30 } else { timeout as u64 })
+                    })
+                    .transpose()?;
+                let xray_max_incoming_streams = xray_quic_params
+                    .map(|quic_params| {
+                        let streams = quic_params.max_incoming_streams;
+                        if streams != 0 && streams < 8 {
+                            return Err(Error::InvalidConfig(format!(
+                                "finalmask.quicParams.maxIncomingStreams must be 0 or at least 8 (got {streams})"
+                            )));
+                        }
+                        let streams = if streams == 0 { 1024 } else { streams as u64 };
+                        Ok(streams.min(1_u64 << 60))
                     })
                     .transpose()?;
                 let tls_settings =
@@ -757,6 +769,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                 let mut config =
                     collect_hysteria2_settings(settings, hysteria_settings)?;
                 config.xray_max_idle_timeout_secs = xray_max_idle_timeout_secs;
+                config.xray_max_incoming_streams = xray_max_incoming_streams;
                 if config.clients.is_empty() {
                     return Err(Error::InvalidConfig(
                         "hysteria2 inbound requires at least one client".into(),
@@ -1295,7 +1308,10 @@ mod tests {
     }
 
     #[cfg(feature = "hysteria")]
-    fn hysteria2_inbound_with_finalmask(max_idle_timeout: i64) -> InboudItem {
+    fn hysteria2_inbound_with_finalmask(
+        max_idle_timeout: i64,
+        max_incoming_streams: i64,
+    ) -> InboudItem {
         serde_json::from_value(serde_json::json!({
             "listen": "127.0.0.1",
             "port": 10000,
@@ -1315,7 +1331,8 @@ mod tests {
                 },
                 "finalmask": {
                     "quicParams": {
-                        "maxIdleTimeout": max_idle_timeout
+                        "maxIdleTimeout": max_idle_timeout,
+                        "maxIncomingStreams": max_incoming_streams
                     }
                 }
             }
@@ -1326,11 +1343,12 @@ mod tests {
     #[cfg(feature = "hysteria")]
     #[test]
     fn hysteria2_finalmask_max_idle_timeout_matches_xray_default() {
-        let config = ServerConfig::try_from(hysteria2_inbound_with_finalmask(0))
+        let config = ServerConfig::try_from(hysteria2_inbound_with_finalmask(0, 0))
             .expect("Xray zero maxIdleTimeout should use its default");
         match config.protocol {
             ServerProxyConfig::Hysteria2 { config } => {
                 assert_eq!(config.xray_max_idle_timeout_secs, Some(30));
+                assert_eq!(config.xray_max_incoming_streams, Some(1024));
             }
             other => panic!("expected hysteria2 protocol, got {other:?}"),
         }
@@ -1339,9 +1357,29 @@ mod tests {
     #[cfg(feature = "hysteria")]
     #[test]
     fn hysteria2_finalmask_rejects_out_of_range_max_idle_timeout() {
-        let err = ServerConfig::try_from(hysteria2_inbound_with_finalmask(3))
+        let err = ServerConfig::try_from(hysteria2_inbound_with_finalmask(3, 0))
             .expect_err("Xray rejects maxIdleTimeout below four seconds");
         assert!(err.to_string().contains("maxIdleTimeout"));
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn hysteria2_finalmask_max_incoming_streams_matches_xray_bounds() {
+        let config = ServerConfig::try_from(hysteria2_inbound_with_finalmask(
+            30,
+            1_i64 << 61,
+        ))
+        .expect("large Xray maxIncomingStreams should clamp to QUIC stream limit");
+        match config.protocol {
+            ServerProxyConfig::Hysteria2 { config } => {
+                assert_eq!(config.xray_max_incoming_streams, Some(1_u64 << 60));
+            }
+            other => panic!("expected hysteria2 protocol, got {other:?}"),
+        }
+
+        let err = ServerConfig::try_from(hysteria2_inbound_with_finalmask(30, 7))
+            .expect_err("Xray rejects maxIncomingStreams below eight");
+        assert!(err.to_string().contains("maxIncomingStreams"));
     }
 
     #[cfg(feature = "http")]
