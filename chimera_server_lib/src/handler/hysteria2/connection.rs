@@ -93,7 +93,7 @@ pub async fn process_hysteria2_connection(
     // are raw QUIC bidi streams and would otherwise race with h3_conn.accept().
     let _h3_conn = h3_conn;
 
-    let proxy_result = if auth_ctx.udp_enabled {
+    if auth_ctx.udp_enabled {
         tokio::try_join!(
             drive_tcp_streams(
                 connection.clone(),
@@ -124,9 +124,7 @@ pub async fn process_hysteria2_connection(
             drain_unidirectional_streams(connection),
         )
         .map(|_| ())
-    };
-
-    proxy_result
+    }
 }
 
 async fn auth_hysteria2_connection(
