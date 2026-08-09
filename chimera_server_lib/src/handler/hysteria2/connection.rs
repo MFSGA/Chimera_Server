@@ -943,6 +943,7 @@ async fn run_udp_remote_to_local_loop(
 
     let mut next_packet_id: u16 = 0;
     let mut buf = vec![0u8; 65535];
+    let mut loop_count: u8 = 0;
 
     loop {
         let (payload_len, src_addr) =
@@ -952,6 +953,10 @@ async fn run_udp_remote_to_local_loop(
                     err
                 ))
             })?;
+        loop_count = loop_count.wrapping_add(1);
+        if loop_count == 0 {
+            tokio::task::yield_now().await;
+        }
         let traffic_context = response_contexts
             .read()
             .expect("hysteria2 UDP contexts lock poisoned")
