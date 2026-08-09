@@ -19,6 +19,8 @@ mod congestion;
 pub mod connection;
 
 const MAX_QUIC_ENDPOINTS: usize = 1;
+const SHOES_MAX_INCOMING_UNI_STREAMS: u32 = 1024;
+const XRAY_MAX_INCOMING_UNI_STREAMS: u32 = 100;
 
 pub async fn run_hysteria2_server(
     bind_address: SocketAddr,
@@ -157,10 +159,41 @@ fn build_transport_config(
             .map_err(|err| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, err)
             })?;
+    let max_uni_streams = configured_max_incoming_uni_streams(
+        config.xray_max_incoming_streams.is_some(),
+    );
     transport
         .max_concurrent_bidi_streams(max_bidi_streams)
-        .max_concurrent_uni_streams(1024_u32.into())
+        .max_concurrent_uni_streams(max_uni_streams)
         .keep_alive_interval(Some(Duration::from_secs(15)))
         .max_idle_timeout(Some(idle_timeout));
     Ok(transport)
+}
+
+fn configured_max_incoming_uni_streams(xray_compat: bool) -> quinn::VarInt {
+    if xray_compat {
+        XRAY_MAX_INCOMING_UNI_STREAMS.into()
+    } else {
+        SHOES_MAX_INCOMING_UNI_STREAMS.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        SHOES_MAX_INCOMING_UNI_STREAMS, XRAY_MAX_INCOMING_UNI_STREAMS,
+        configured_max_incoming_uni_streams,
+    };
+
+    #[test]
+    fn max_incoming_uni_streams_follow_protocol_mode() {
+        assert_eq!(
+            configured_max_incoming_uni_streams(false).into_inner(),
+            u64::from(SHOES_MAX_INCOMING_UNI_STREAMS)
+        );
+        assert_eq!(
+            configured_max_incoming_uni_streams(true).into_inner(),
+            u64::from(XRAY_MAX_INCOMING_UNI_STREAMS)
+        );
+    }
 }
