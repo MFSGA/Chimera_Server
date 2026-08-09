@@ -49,6 +49,9 @@ pub async fn run_hysteria2_server(
         let base_transport = build_transport_config()?;
         let mut base_server_config =
             quinn::ServerConfig::with_crypto(quic_server_config);
+        // Match Xray's Hysteria2 server behavior: do not migrate an established
+        // QUIC connection to a different network path.
+        base_server_config.migration(false);
         base_server_config.transport_config(Arc::new(base_transport));
 
         let socket2_socket = new_socket2_udp_socket(
