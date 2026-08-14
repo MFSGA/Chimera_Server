@@ -14,6 +14,8 @@ use crate::config::server_config::VlessUser;
 use crate::config::server_config::ws::WebsocketServerConfig;
 #[cfg(feature = "tls")]
 use crate::config::server_config::{TlsCertificateConfig, TlsCertificateUsage};
+#[cfg(feature = "vmess")]
+use crate::config::server_config::{VmessUser, normalize_vmess_user_id};
 #[cfg(feature = "ws")]
 use crate::util::option::OneOrSome;
 use crate::{
@@ -58,6 +60,15 @@ const TYPE_PROXY_VLESS_INBOUND_CONFIG_V2RAY: &str =
 const TYPE_PROXY_VLESS_ACCOUNT: &str = "xray.proxy.vless.Account";
 #[cfg(feature = "vless")]
 const TYPE_PROXY_VLESS_ACCOUNT_V2RAY: &str = "v2ray.core.proxy.vless.Account";
+#[cfg(feature = "vmess")]
+const TYPE_PROXY_VMESS_INBOUND_CONFIG: &str = "xray.proxy.vmess.inbound.Config";
+#[cfg(feature = "vmess")]
+const TYPE_PROXY_VMESS_INBOUND_CONFIG_V2RAY: &str =
+    "v2ray.core.proxy.vmess.inbound.Config";
+#[cfg(feature = "vmess")]
+const TYPE_PROXY_VMESS_ACCOUNT: &str = "xray.proxy.vmess.Account";
+#[cfg(feature = "vmess")]
+const TYPE_PROXY_VMESS_ACCOUNT_V2RAY: &str = "v2ray.core.proxy.vmess.Account";
 #[cfg(feature = "trojan")]
 const TYPE_PROXY_TROJAN_SERVER_CONFIG: &str = "xray.proxy.trojan.ServerConfig";
 #[cfg(feature = "trojan")]
@@ -210,6 +221,31 @@ struct VlessAccountPayload {
     id: String,
     #[prost(string, tag = "2")]
     flow: String,
+}
+
+#[cfg(feature = "vmess")]
+#[derive(Clone, PartialEq, Message)]
+struct VmessInboundConfigPayload {
+    #[prost(message, repeated, tag = "1")]
+    users: Vec<proto::xray::common::protocol::User>,
+}
+
+#[cfg(feature = "vmess")]
+#[derive(Clone, PartialEq, Message)]
+struct VmessSecurityConfigPayload {
+    #[prost(int32, tag = "1")]
+    r#type: i32,
+}
+
+#[cfg(feature = "vmess")]
+#[derive(Clone, PartialEq, Message)]
+struct VmessAccountPayload {
+    #[prost(string, tag = "1")]
+    id: String,
+    #[prost(message, optional, tag = "3")]
+    security_settings: Option<VmessSecurityConfigPayload>,
+    #[prost(string, tag = "4")]
+    tests_enabled: String,
 }
 
 #[cfg(feature = "vless")]
@@ -507,6 +543,20 @@ impl HandlerServiceImpl {
                     )?;
                 self.parse_vless_inbound_config(config)
             }
+            #[cfg(feature = "vmess")]
+            TYPE_PROXY_VMESS_INBOUND_CONFIG
+            | TYPE_PROXY_VMESS_INBOUND_CONFIG_V2RAY => {
+                let config = self
+                    .decode_typed_message::<VmessInboundConfigPayload>(
+                        proxy_settings,
+                        &[
+                            TYPE_PROXY_VMESS_INBOUND_CONFIG,
+                            TYPE_PROXY_VMESS_INBOUND_CONFIG_V2RAY,
+                        ],
+                        "inbound proxy settings",
+                    )?;
+                self.parse_vmess_inbound_config(config)
+            }
             #[cfg(feature = "trojan")]
             TYPE_PROXY_TROJAN_SERVER_CONFIG
             | TYPE_PROXY_TROJAN_SERVER_CONFIG_V2RAY => {
@@ -574,6 +624,61 @@ impl HandlerServiceImpl {
                 user.email.clone()
             },
             flow: account.flow,
+        })
+    }
+
+    #[cfg(feature = "vmess")]
+    fn parse_vmess_inbound_config(
+        &self,
+        config: VmessInboundConfigPayload,
+    ) -> Result<ServerProxyConfig, Status> {
+        if config.users.is_empty() {
+            return Err(Status::invalid_argument(
+                "vmess AddInbound requires at least one user",
+            ));
+        }
+        let users = config
+            .users
+            .iter()
+            .map(|user| self.parse_vmess_user(user))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ServerProxyConfig::Vmess { users })
+    }
+
+    #[cfg(feature = "vmess")]
+    fn parse_vmess_user(
+        &self,
+        user: &proto::xray::common::protocol::User,
+    ) -> Result<VmessUser, Status> {
+        let account = user.account.as_ref().ok_or_else(|| {
+            Status::invalid_argument("vmess client account is required")
+        })?;
+        let account = self.decode_typed_message::<VmessAccountPayload>(
+            account,
+            &[TYPE_PROXY_VMESS_ACCOUNT, TYPE_PROXY_VMESS_ACCOUNT_V2RAY],
+            "vmess account",
+        )?;
+        let user_id = normalize_vmess_user_id(&account.id)
+            .map_err(Status::invalid_argument)?;
+        let cipher = match account
+            .security_settings
+            .as_ref()
+            .map(|security| security.r#type)
+            .unwrap_or(2)
+        {
+            3 => "aes-128-gcm",
+            4 => "chacha20-poly1305",
+            _ => "auto",
+        }
+        .to_string();
+        Ok(VmessUser {
+            user_label: if user.email.trim().is_empty() {
+                user_id.clone()
+            } else {
+                user.email.clone()
+            },
+            user_id,
+            cipher,
         })
     }
 
@@ -931,6 +1036,39 @@ impl HandlerServiceImpl {
                 Some(Self::typed_message(
                     TYPE_PROXY_VLESS_INBOUND_CONFIG,
                     VlessInboundConfigPayload { clients },
+                ))
+            }
+            #[cfg(feature = "vmess")]
+            ServerProxyConfig::Vmess { users } => {
+                let users = users
+                    .iter()
+                    .map(|user| {
+                        let security_type = match user.cipher.as_str() {
+                            "aes-128-gcm" => 3,
+                            "chacha20-poly1305" | "chacha20-ietf-poly1305" => 4,
+                            _ => 2,
+                        };
+                        proto::xray::common::protocol::User {
+                            level: 0,
+                            email: user.user_label.clone(),
+                            account: Some(Self::typed_message(
+                                TYPE_PROXY_VMESS_ACCOUNT,
+                                VmessAccountPayload {
+                                    id: user.user_id.clone(),
+                                    security_settings: Some(
+                                        VmessSecurityConfigPayload {
+                                            r#type: security_type,
+                                        },
+                                    ),
+                                    tests_enabled: String::new(),
+                                },
+                            )),
+                        }
+                    })
+                    .collect();
+                Some(Self::typed_message(
+                    TYPE_PROXY_VMESS_INBOUND_CONFIG,
+                    VmessInboundConfigPayload { users },
                 ))
             }
             #[cfg(feature = "trojan")]
@@ -1326,6 +1464,22 @@ impl HandlerServiceImpl {
                 }
                 Ok(true)
             }
+            #[cfg(feature = "vmess")]
+            ServerProxyConfig::Vmess { users } => {
+                let parsed = self.parse_vmess_user(user)?;
+                let email = user.email.trim();
+                if !email.is_empty()
+                    && users.iter().any(|existing| {
+                        existing.user_label.eq_ignore_ascii_case(email)
+                    })
+                {
+                    return Err(Status::already_exists(format!(
+                        "VMess user {email} already exists"
+                    )));
+                }
+                users.push(parsed);
+                Ok(true)
+            }
             #[cfg(feature = "trojan")]
             ServerProxyConfig::Trojan { users, .. } => {
                 let password = self.parse_trojan_password(user)?;
@@ -1399,6 +1553,14 @@ impl HandlerServiceImpl {
             ServerProxyConfig::Xhttp { inner, .. } => {
                 self.apply_add_user_to_protocol(inner.as_mut(), user)
             }
+            #[cfg(feature = "httpupgrade")]
+            ServerProxyConfig::HttpUpgrade(config) => {
+                self.apply_add_user_to_protocol(config.inner.as_mut(), user)
+            }
+            #[cfg(feature = "grpc_transport")]
+            ServerProxyConfig::Grpc(config) => {
+                self.apply_add_user_to_protocol(config.inner.as_mut(), user)
+            }
             _ => Ok(false),
         }
     }
@@ -1429,6 +1591,17 @@ impl HandlerServiceImpl {
                 let before = users.len();
                 users.retain(|user| user.user_label != email);
                 Ok(before != users.len())
+            }
+            #[cfg(feature = "vmess")]
+            ServerProxyConfig::Vmess { users } => {
+                let before = users.len();
+                users.retain(|user| !user.user_label.eq_ignore_ascii_case(email));
+                if before == users.len() {
+                    return Err(Status::not_found(format!(
+                        "VMess user {email} not found"
+                    )));
+                }
+                Ok(true)
             }
             #[cfg(feature = "trojan")]
             ServerProxyConfig::Trojan { users, .. } => {
@@ -1470,6 +1643,14 @@ impl HandlerServiceImpl {
             }
             ServerProxyConfig::Xhttp { inner, .. } => {
                 self.apply_remove_user_from_protocol(inner.as_mut(), email)
+            }
+            #[cfg(feature = "httpupgrade")]
+            ServerProxyConfig::HttpUpgrade(config) => {
+                self.apply_remove_user_from_protocol(config.inner.as_mut(), email)
+            }
+            #[cfg(feature = "grpc_transport")]
+            ServerProxyConfig::Grpc(config) => {
+                self.apply_remove_user_from_protocol(config.inner.as_mut(), email)
             }
             _ => Ok(false),
         }
@@ -1667,10 +1848,31 @@ impl HandlerServiceImpl {
             ServerProxyConfig::Vmess { users } => Some(
                 users
                     .iter()
-                    .map(|user| proto::xray::common::protocol::User {
-                        level: 0,
-                        email: user.user_label.clone(),
-                        account: None,
+                    .map(|user| {
+                        let security_type = match user.cipher.as_str() {
+                            "aes-128-gcm" => 3,
+                            "chacha20-poly1305" | "chacha20-ietf-poly1305" => 4,
+                            _ => 2,
+                        };
+                        proto::xray::common::protocol::User {
+                            level: 0,
+                            email: user.user_label.clone(),
+                            account: Some(
+                                proto::xray::common::serial::TypedMessage {
+                                    r#type: TYPE_PROXY_VMESS_ACCOUNT.to_string(),
+                                    value: VmessAccountPayload {
+                                        id: user.user_id.clone(),
+                                        security_settings: Some(
+                                            VmessSecurityConfigPayload {
+                                                r#type: security_type,
+                                            },
+                                        ),
+                                        tests_enabled: String::new(),
+                                    }
+                                    .encode_to_vec(),
+                                },
+                            ),
+                        }
                     })
                     .collect(),
             ),
@@ -2809,6 +3011,50 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "vmess")]
+    #[test]
+    fn handler_parse_add_inbound_supports_vmess() {
+        let fixture = build_fixture();
+        let service = HandlerServiceImpl::new(fixture.runtime);
+        let user = proto::xray::common::protocol::User {
+            level: 0,
+            email: "vmess-user@example.com".to_string(),
+            account: Some(proto::xray::common::serial::TypedMessage {
+                r#type: TYPE_PROXY_VMESS_ACCOUNT.to_string(),
+                value: VmessAccountPayload {
+                    id: "test-vmess-user".to_string(),
+                    security_settings: Some(VmessSecurityConfigPayload {
+                        r#type: 3,
+                    }),
+                    tests_enabled: String::new(),
+                }
+                .encode_to_vec(),
+            }),
+        };
+        let inbound = proto::xray::core::InboundHandlerConfig {
+            tag: unique_tag("vmess"),
+            receiver_settings: Some(build_receiver_settings(2444, None)),
+            proxy_settings: Some(proto::xray::common::serial::TypedMessage {
+                r#type: TYPE_PROXY_VMESS_INBOUND_CONFIG.to_string(),
+                value: VmessInboundConfigPayload { users: vec![user] }
+                    .encode_to_vec(),
+            }),
+        };
+
+        let parsed = service
+            .parse_add_inbound(inbound)
+            .expect("vmess inbound should parse");
+        match parsed.protocol {
+            ServerProxyConfig::Vmess { users } => {
+                assert_eq!(users.len(), 1);
+                assert_eq!(users[0].user_label, "vmess-user@example.com");
+                assert_eq!(users[0].user_id, "321d83eb-74db-554a-a630-0ad214dc332b");
+                assert_eq!(users[0].cipher, "aes-128-gcm");
+            }
+            other => panic!("unexpected protocol: {other:?}"),
+        }
+    }
+
     #[cfg(all(feature = "trojan", feature = "reality"))]
     #[test]
     fn handler_parse_add_inbound_supports_trojan_reality() {
@@ -2891,6 +3137,142 @@ mod tests {
             }
             other => panic!("unexpected protocol: {other:?}"),
         }
+    }
+
+    #[cfg(feature = "vmess")]
+    #[tokio::test]
+    async fn handler_alter_inbound_adds_and_removes_vmess_users() {
+        let inbound_tag = unique_tag("vmess-inbound");
+        let inbound = ServerConfig {
+            tag: inbound_tag.clone(),
+            bind_location: BindLocation::Address(NetLocation::new(
+                Address::Ipv4(Ipv4Addr::LOCALHOST),
+                free_localhost_port(),
+            )),
+            protocol: ServerProxyConfig::Vmess {
+                users: vec![VmessUser {
+                    user_id: "3ac9b383-75a1-431c-8184-106c80eb2273".to_string(),
+                    user_label: "first-vmess@example.com".to_string(),
+                    cipher: "aes-128-gcm".to_string(),
+                }],
+            },
+            transport: Transport::Tcp,
+            quic_settings: None,
+        };
+        let runtime = RuntimeState::new(vec![inbound], Vec::new());
+        let service = HandlerServiceImpl::new(runtime);
+
+        let initial_users = service
+            .get_inbound_users(Request::new(
+                proto::xray::app::proxyman::command::GetInboundUserRequest {
+                    tag: inbound_tag.clone(),
+                    email: String::new(),
+                },
+            ))
+            .await
+            .expect("vmess get users failed")
+            .into_inner()
+            .users;
+        assert_eq!(initial_users.len(), 1);
+        let initial_account = initial_users[0]
+            .account
+            .as_ref()
+            .expect("VMess users must include account payload");
+        assert_eq!(initial_account.r#type, TYPE_PROXY_VMESS_ACCOUNT);
+        let initial_account =
+            VmessAccountPayload::decode(initial_account.value.as_slice())
+                .expect("decode VMess account");
+        assert_eq!(initial_account.id, "3ac9b383-75a1-431c-8184-106c80eb2273");
+        assert_eq!(
+            initial_account
+                .security_settings
+                .map(|security| security.r#type),
+            Some(3)
+        );
+
+        let email = unique_tag("vmess-user");
+        let add_operation = proto::xray::app::proxyman::command::AddUserOperation {
+            user: Some(proto::xray::common::protocol::User {
+                level: 0,
+                email: email.clone(),
+                account: Some(proto::xray::common::serial::TypedMessage {
+                    r#type: TYPE_PROXY_VMESS_ACCOUNT.to_string(),
+                    value: VmessAccountPayload {
+                        id: "short-id".to_string(),
+                        security_settings: Some(VmessSecurityConfigPayload {
+                            r#type: 4,
+                        }),
+                        tests_enabled: String::new(),
+                    }
+                    .encode_to_vec(),
+                }),
+            }),
+        };
+        service
+            .alter_inbound(Request::new(
+                proto::xray::app::proxyman::command::AlterInboundRequest {
+                    tag: inbound_tag.clone(),
+                    operation: Some(proto::xray::common::serial::TypedMessage {
+                        r#type: TYPE_ADD_USER_OPERATION.to_string(),
+                        value: add_operation.encode_to_vec(),
+                    }),
+                },
+            ))
+            .await
+            .expect("vmess add user should succeed");
+
+        let users_after_add = service
+            .get_inbound_users(Request::new(
+                proto::xray::app::proxyman::command::GetInboundUserRequest {
+                    tag: inbound_tag.clone(),
+                    email: email.clone(),
+                },
+            ))
+            .await
+            .expect("vmess get added user failed")
+            .into_inner()
+            .users;
+        assert_eq!(users_after_add.len(), 1);
+        let account = users_after_add[0]
+            .account
+            .as_ref()
+            .expect("added VMess user must include account");
+        let account = VmessAccountPayload::decode(account.value.as_slice())
+            .expect("decode added VMess account");
+        assert_eq!(account.id, "bcd643ce-d9c8-50bb-b026-89d256010162");
+        assert_eq!(
+            account.security_settings.map(|security| security.r#type),
+            Some(4)
+        );
+
+        let remove_operation =
+            proto::xray::app::proxyman::command::RemoveUserOperation {
+                email: email.clone(),
+            };
+        service
+            .alter_inbound(Request::new(
+                proto::xray::app::proxyman::command::AlterInboundRequest {
+                    tag: inbound_tag.clone(),
+                    operation: Some(proto::xray::common::serial::TypedMessage {
+                        r#type: TYPE_REMOVE_USER_OPERATION.to_string(),
+                        value: remove_operation.encode_to_vec(),
+                    }),
+                },
+            ))
+            .await
+            .expect("vmess remove user should succeed");
+
+        let count_after_remove = service
+            .get_inbound_users_count(Request::new(
+                proto::xray::app::proxyman::command::GetInboundUserRequest {
+                    tag: inbound_tag,
+                    email: String::new(),
+                },
+            ))
+            .await
+            .expect("vmess get users count after remove failed")
+            .into_inner();
+        assert_eq!(count_after_remove.count, 1);
     }
 
     #[cfg(feature = "vless")]
