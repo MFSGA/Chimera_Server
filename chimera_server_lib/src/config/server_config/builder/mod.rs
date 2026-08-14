@@ -131,11 +131,11 @@ fn apply_httpupgrade_layer(
             "httpupgradeSettings.acceptProxyProtocol is not supported yet".into(),
         ));
     }
-    if settings.ed != 0 {
-        return Err(Error::InvalidConfig(
-            "httpupgradeSettings.ed is not supported yet".into(),
-        ));
-    }
+    // Xray's HTTPUpgrade server does not consume `ed`; the field only changes
+    // whether the client waits for the 101 response before sending protocol data.
+    // Accept it on inbound configs so early protocol bytes can already be queued
+    // behind the HTTP headers and consumed by the inner handler after upgrade.
+    let _ = settings.ed;
     let path = settings.path.unwrap_or_default().trim().to_string();
     let path = if path.is_empty() {
         "/".to_string()
@@ -2596,6 +2596,47 @@ mod tests {
                 error.to_string().contains("invalid VMess UUID"),
                 "unexpected error for {invalid_id:?}: {error}"
             );
+        }
+    }
+
+    #[cfg(all(feature = "vless", feature = "httpupgrade"))]
+    #[test]
+    fn httpupgrade_accepts_xray_early_data_setting() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10007,
+            "protocol": "vless",
+            "tag": "vless-httpupgrade-ed",
+            "settings": {
+                "clients": [{
+                    "id": "3ac9b383-75a1-431c-8184-106c80eb2273"
+                }],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "httpupgrade",
+                "httpupgradeSettings": {
+                    "host": "example.com",
+                    "path": "/upgrade",
+                    "ed": 2048
+                }
+            }
+        }))
+        .expect("valid VLESS HTTPUpgrade inbound item");
+
+        let config = ServerConfig::try_from(inbound)
+            .expect("Xray HTTPUpgrade ed should be accepted on inbound");
+
+        match config.protocol {
+            ServerProxyConfig::HttpUpgrade(httpupgrade) => {
+                assert_eq!(httpupgrade.host.as_deref(), Some("example.com"));
+                assert_eq!(httpupgrade.path, "/upgrade");
+                assert!(matches!(
+                    httpupgrade.inner.as_ref(),
+                    ServerProxyConfig::Vless { .. }
+                ));
+            }
+            other => panic!("expected HTTPUpgrade protocol, got {other:?}"),
         }
     }
 
