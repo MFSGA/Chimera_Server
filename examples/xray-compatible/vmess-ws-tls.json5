@@ -25,8 +25,8 @@
           "serverName": "example.com",
           "certificates": [
             {
-              "certificateFile": "cert/server.crt",
-              "keyFile": "cert/server.key"
+              "certificateFile": "cert/fullchain.pem",
+              "keyFile": "cert/privkey.pem"
             }
           ]
         }

@@ -980,13 +980,15 @@ impl TryFrom<InboudItem> for ServerConfig {
                 let users: Vec<crate::config::server_config::VmessUser> = clients
                     .into_iter()
                     .map(|client| {
+                        let user_id = super::normalize_vmess_user_id(&client.id)
+                            .map_err(Error::InvalidConfig)?;
                         let user_label = if client.email.is_empty() {
-                            client.id.clone()
+                            user_id.clone()
                         } else {
                             client.email
                         };
                         Ok(crate::config::server_config::VmessUser {
-                            user_id: client.id,
+                            user_id,
                             user_label,
                             cipher: client
                                 .security
@@ -2511,6 +2513,62 @@ mod tests {
                 assert_eq!(users[0].cipher, "aes-128-gcm");
             }
             other => panic!("expected vmess protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "vmess")]
+    #[test]
+    fn vmess_builder_normalizes_xray_short_id() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10005,
+            "protocol": "vmess",
+            "tag": "vmess-short-id",
+            "settings": {
+                "clients": [{
+                    "id": "test-vmess-user"
+                }]
+            }
+        }))
+        .expect("valid vmess short-id inbound item");
+
+        let config = ServerConfig::try_from(inbound)
+            .expect("Xray-compatible VMess short ID should build");
+
+        match config.protocol {
+            ServerProxyConfig::Vmess { users } => {
+                assert_eq!(users[0].user_id, "321d83eb-74db-554a-a630-0ad214dc332b");
+                assert_eq!(users[0].user_label, users[0].user_id);
+            }
+            other => panic!("expected vmess protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "vmess")]
+    #[test]
+    fn vmess_builder_rejects_invalid_uuid_shape() {
+        for invalid_id in [
+            "",
+            "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        ] {
+            let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+                "listen": "127.0.0.1",
+                "port": 10006,
+                "protocol": "vmess",
+                "tag": "vmess-invalid-id",
+                "settings": {
+                    "clients": [{"id": invalid_id}]
+                }
+            }))
+            .expect("vmess inbound JSON shape should deserialize");
+
+            let error = ServerConfig::try_from(inbound)
+                .expect_err("invalid VMess ID should be rejected");
+            assert!(
+                error.to_string().contains("invalid VMess UUID"),
+                "unexpected error for {invalid_id:?}: {error}"
+            );
         }
     }
 

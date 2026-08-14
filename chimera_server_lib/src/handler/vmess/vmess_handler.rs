@@ -24,7 +24,7 @@ use super::nonce::{SingleUseNonce, VmessNonceSequence};
 use super::vmess_stream::VmessStream;
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
-use crate::config::server_config::VmessUser;
+use crate::config::server_config::{VmessUser, parse_vmess_user_id};
 use crate::handler::{
     tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
     xudp::message_stream::XudpMessageStream,
@@ -43,28 +43,12 @@ const COMMAND_MUX: u8 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DataCipher {
-    Any,
     Aes128Gcm,
     ChaCha20Poly1305,
     None,
 }
 
-impl DataCipher {
-    fn from_name(name: &str) -> Self {
-        match name {
-            "" | "any" => DataCipher::Any,
-            "aes-128-gcm" => DataCipher::Aes128Gcm,
-            "chacha20-poly1305" | "chacha20-ietf-poly1305" => {
-                DataCipher::ChaCha20Poly1305
-            }
-            "none" => DataCipher::None,
-            _ => DataCipher::Any,
-        }
-    }
-}
-
 struct VmessServerUser {
-    data_cipher: DataCipher,
     instruction_key: [u8; 16],
     aead_decrypting_key: CipherDecryptingKey,
     user_label: String,
@@ -81,7 +65,6 @@ impl VmessServerUser {
         let aead_decrypting_key = CipherDecryptingKey::ecb(unbound_key).unwrap();
 
         Self {
-            data_cipher: DataCipher::from_name(&user.cipher),
             instruction_key,
             aead_decrypting_key,
             user_label: user.user_label,
@@ -215,7 +198,6 @@ impl TcpServerHandler for VmessTcpServerHandler {
 
         let user = self.authenticate_user(&cert_hash)?;
         let instruction_key = user.instruction_key;
-        let data_cipher = user.data_cipher.clone();
         let user_label = user.user_label.clone();
 
         let mut encrypted_payload_length = [0u8; 18];
@@ -474,16 +456,6 @@ impl TcpServerHandler for VmessTcpServerHandler {
             }
         };
 
-        if data_cipher != DataCipher::Any && requested_data_cipher != data_cipher {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "Server only allows {:?} but client requested {:?}",
-                    data_cipher, requested_data_cipher
-                ),
-            ));
-        }
-
         let response_header: [u8; 4] = [response_authentication_v, 0, 0, 0];
 
         let mut truncated_iv = [0u8; 16];
@@ -515,7 +487,6 @@ impl TcpServerHandler for VmessTcpServerHandler {
                 .unwrap(),
             )),
             DataCipher::None => None,
-            DataCipher::Any => unreachable!(),
         };
 
         let data_keys =
@@ -665,29 +636,13 @@ fn take_header_u8(header: &[u8], cursor: &mut usize) -> std::io::Result<u8> {
 }
 
 fn command_key_for_user_id(user_id: &str) -> [u8; 16] {
-    let mut user_id_bytes = parse_uuid(user_id);
-    user_id_bytes.extend(VMESS_COMMAND_KEY_SALT);
-    compute_md5(&user_id_bytes)
-}
-
-fn parse_uuid(uuid_str: &str) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(16);
-    let mut first_nibble: Option<u8> = None;
-    for &c in uuid_str.as_bytes() {
-        let hex = match c {
-            b'0'..=b'9' => c - b'0',
-            b'a'..=b'f' => c - b'a' + 10,
-            b'A'..=b'F' => c - b'A' + 10,
-            b'-' => continue,
-            _ => continue,
-        };
-        if let Some(first) = first_nibble.take() {
-            bytes.push((first << 4) | hex);
-        } else {
-            first_nibble = Some(hex);
-        }
-    }
-    bytes
+    let parsed = parse_vmess_user_id(user_id)
+        .expect("VMess user ID must be validated before handler construction");
+    let mut command_key_input =
+        Vec::with_capacity(16 + VMESS_COMMAND_KEY_SALT.len());
+    command_key_input.extend_from_slice(&parsed);
+    command_key_input.extend_from_slice(VMESS_COMMAND_KEY_SALT);
+    compute_md5(&command_key_input)
 }
 
 #[cfg(test)]
@@ -1033,15 +988,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_cipher_mismatch_is_rejected() {
+    async fn configured_client_security_does_not_restrict_inbound_cipher() {
         let user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
         for (configured_cipher, requested_cipher) in
             [("none", 3), ("aes-128-gcm", 4), ("chacha20-poly1305", 5)]
         {
             let handler = VmessTcpServerHandler::new(
-                vec![vmess_user(user_id, "cipher-mismatch", configured_cipher)],
+                vec![vmess_user(user_id, "cipher-parity", configured_cipher)],
                 false,
-                "vmess-cipher-mismatch",
+                "vmess-cipher-parity",
             );
             let header = build_plain_request_header_with_cipher(
                 COMMAND_TCP,
@@ -1052,18 +1007,16 @@ mod tests {
             client
                 .write_all(&request)
                 .await
-                .expect("write mismatched VMess cipher request");
+                .expect("write VMess request with independently selected cipher");
 
-            let error = match handler
+            let result = handler
                 .setup_server_stream(Box::new(TestStream(server)))
                 .await
-            {
-                Ok(_) => panic!("mismatched VMess cipher must be rejected"),
-                Err(error) => error,
-            };
+                .expect(
+                    "VMess inbound must not enforce client-side account security",
+                );
 
-            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-            assert!(error.to_string().contains("Server only allows"));
+            assert!(matches!(result, TcpServerSetupResult::TcpForward { .. }));
         }
     }
 
@@ -1423,13 +1376,11 @@ mod tests {
             .authenticate_user(&build_auth_id(user_a_id, now))
             .expect("first VMess user should authenticate");
         assert_eq!(user_a.user_label, "user-a");
-        assert_eq!(user_a.data_cipher, DataCipher::Aes128Gcm);
 
         let user_b = handler
             .authenticate_user(&build_auth_id(user_b_id, now))
             .expect("second VMess user should authenticate");
         assert_eq!(user_b.user_label, "user-b");
-        assert_eq!(user_b.data_cipher, DataCipher::ChaCha20Poly1305);
     }
 
     #[tokio::test]
@@ -1791,6 +1742,5 @@ mod tests {
             .expect("single VMess user should authenticate");
 
         assert_eq!(user.user_label, "single-user");
-        assert_eq!(user.data_cipher, DataCipher::None);
     }
 }
