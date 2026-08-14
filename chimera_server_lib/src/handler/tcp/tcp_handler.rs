@@ -38,6 +38,10 @@ pub trait TcpServerHandler: Send + Sync + Debug {
 }
 
 pub enum TcpServerSetupResult {
+    PeerAddrOverride {
+        peer_addr: std::net::SocketAddr,
+        inner: Box<TcpServerSetupResult>,
+    },
     TcpForward {
         remote_location: NetLocation,
         stream: Box<dyn AsyncStream>,

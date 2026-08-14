@@ -296,6 +296,7 @@ pub struct GrpcServerConfig {
 pub struct HttpUpgradeServerConfig {
     pub host: Option<String>,
     pub path: String,
+    pub accept_proxy_protocol: bool,
     pub inner: Box<ServerProxyConfig>,
 }
 
