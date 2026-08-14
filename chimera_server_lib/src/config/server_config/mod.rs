@@ -17,9 +17,11 @@ pub use types::GrpcServerConfig;
 #[cfg(feature = "hysteria")]
 #[allow(unused_imports)]
 pub use types::{Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2ServerConfig};
+#[allow(unused_imports)]
 pub use types::{
     ServerConfig, ServerProxyConfig, SocksUser, SocksUserStore, XhttpDataPlacement,
-    XhttpMode, XhttpPlacement, XhttpServerConfig,
+    XhttpMode, XhttpPaddingMethod, XhttpPaddingPlacement, XhttpPlacement,
+    XhttpServerConfig,
 };
 
 #[cfg(feature = "reality")]
