@@ -62,6 +62,7 @@ blake3 = { workspace = true, optional = true }
 aes = { workspace = true, optional = true }
 chacha20poly1305 = { workspace = true, optional = true }
 sha3 = { workspace = true, optional = true }
+sha1 = { workspace = true, optional = true }
 rcgen = { workspace = true, optional = true }
 subtle = { version = "2", optional = true }
 x509-parser = { version = "0.18", optional = true }
@@ -86,7 +87,7 @@ tls = []
 reality = ["rcgen", "subtle", "x509-parser"]
 shadowsocks = ["md-5", "blake3", "aes", "chacha20poly1305"]
 vless = []
-vmess = ["md-5", "sha3"]
+vmess = ["md-5", "sha3", "sha1"]
 tuic = ["dashmap", "lru", "uuid"]
 traffic = []
 api = ["tonic", "tonic-prost", "prost-types", "tokio-stream"]
