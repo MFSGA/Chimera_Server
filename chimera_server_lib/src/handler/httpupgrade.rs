@@ -20,6 +20,7 @@ const MAX_HEADER_BYTES: usize = 12 * 1024;
 pub struct HttpUpgradeTcpServerHandler {
     host: Option<String>,
     path: String,
+    accept_proxy_protocol: bool,
     inner: Box<dyn TcpServerHandler>,
 }
 
@@ -27,11 +28,13 @@ impl HttpUpgradeTcpServerHandler {
     pub fn new(
         host: Option<String>,
         path: String,
+        accept_proxy_protocol: bool,
         inner: Box<dyn TcpServerHandler>,
     ) -> Self {
         Self {
             host: host.map(|value| value.trim().to_ascii_lowercase()),
             path: normalize_path(path),
+            accept_proxy_protocol,
             inner,
         }
     }
@@ -112,10 +115,195 @@ impl TcpServerHandler for HttpUpgradeTcpServerHandler {
         mut server_stream: Box<dyn AsyncStream>,
         context: TcpServerConnectionContext,
     ) -> io::Result<TcpServerSetupResult> {
+        let peer_addr = if self.accept_proxy_protocol {
+            timeout(HANDSHAKE_TIMEOUT, read_proxy_protocol(&mut server_stream))
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "PROXY protocol handshake timed out",
+                    )
+                })??
+        } else {
+            None
+        };
         self.upgrade(&mut server_stream).await?;
-        self.inner
+        let result = self
+            .inner
             .setup_server_stream_with_context(server_stream, context)
-            .await
+            .await?;
+        Ok(match peer_addr {
+            Some(peer_addr) => TcpServerSetupResult::PeerAddrOverride {
+                peer_addr,
+                inner: Box::new(result),
+            },
+            None => result,
+        })
+    }
+}
+
+async fn read_proxy_protocol(
+    stream: &mut Box<dyn AsyncStream>,
+) -> io::Result<Option<std::net::SocketAddr>> {
+    const V2_SIGNATURE: &[u8; 12] = b"\r\n\r\n\0\r\nQUIT\n";
+
+    let mut prefix = [0u8; 12];
+    stream.read_exact(&mut prefix).await?;
+    if &prefix == V2_SIGNATURE {
+        let mut fixed = [0u8; 4];
+        stream.read_exact(&mut fixed).await?;
+        let version_command = fixed[0];
+        if version_command >> 4 != 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid PROXY protocol v2 version",
+            ));
+        }
+        let family_protocol = fixed[1];
+        let payload_len = u16::from_be_bytes([fixed[2], fixed[3]]) as usize;
+        let mut payload = vec![0u8; payload_len];
+        stream.read_exact(&mut payload).await?;
+
+        if version_command & 0x0f == 0 {
+            return Ok(None);
+        }
+        if version_command & 0x0f != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported PROXY protocol v2 command",
+            ));
+        }
+        match family_protocol >> 4 {
+            1 if payload.len() >= 12 => {
+                let source = std::net::Ipv4Addr::new(
+                    payload[0], payload[1], payload[2], payload[3],
+                );
+                let source_port = u16::from_be_bytes([payload[8], payload[9]]);
+                Ok(Some(std::net::SocketAddr::new(source.into(), source_port)))
+            }
+            2 if payload.len() >= 36 => {
+                let mut source = [0u8; 16];
+                source.copy_from_slice(&payload[..16]);
+                let source_port = u16::from_be_bytes([payload[32], payload[33]]);
+                Ok(Some(std::net::SocketAddr::new(
+                    std::net::Ipv6Addr::from(source).into(),
+                    source_port,
+                )))
+            }
+            0 => Ok(None),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported PROXY protocol v2 address family",
+            )),
+        }
+    } else if prefix.starts_with(b"PROXY ") {
+        let mut line = prefix.to_vec();
+        while !line.ends_with(b"\r\n") {
+            if line.len() >= 108 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "PROXY protocol v1 header is too long",
+                ));
+            }
+            line.push(stream.read_u8().await?);
+        }
+        let line = std::str::from_utf8(&line).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid PROXY protocol v1 encoding: {error}"),
+            )
+        })?;
+        let mut fields = line.trim_end_matches("\r\n").split_whitespace();
+        if fields.next() != Some("PROXY") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid PROXY protocol v1 header",
+            ));
+        }
+        let family = fields.next().unwrap_or_default();
+        if family == "UNKNOWN" {
+            return Ok(None);
+        }
+        if !matches!(family, "TCP4" | "TCP6") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported PROXY protocol v1 family",
+            ));
+        }
+        let source_ip = fields
+            .next()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing PROXY source IP")
+            })?
+            .parse::<std::net::IpAddr>()
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid PROXY source IP: {error}"),
+                )
+            })?;
+        let destination_ip = fields
+            .next()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing PROXY destination IP",
+                )
+            })?
+            .parse::<std::net::IpAddr>()
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid PROXY destination IP: {error}"),
+                )
+            })?;
+        let source_port = fields
+            .next()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing PROXY source port",
+                )
+            })?
+            .parse::<u16>()
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid PROXY source port: {error}"),
+                )
+            })?;
+        let _destination_port = fields
+            .next()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing PROXY destination port",
+                )
+            })?
+            .parse::<u16>()
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid PROXY destination port: {error}"),
+                )
+            })?;
+        if fields.next().is_some()
+            || (family == "TCP4"
+                && (!source_ip.is_ipv4() || !destination_ip.is_ipv4()))
+            || (family == "TCP6"
+                && (!source_ip.is_ipv6() || !destination_ip.is_ipv6()))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid PROXY protocol v1 address family",
+            ));
+        }
+        Ok(Some(std::net::SocketAddr::new(source_ip, source_port)))
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing required PROXY protocol header",
+        ))
     }
 }
 
@@ -298,6 +486,7 @@ mod tests {
         let handler = HttpUpgradeTcpServerHandler::new(
             Some("example.com".into()),
             "upgrade".into(),
+            false,
             Box::new(Inner),
         );
         let (mut client, server) = duplex(4096);
@@ -330,10 +519,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepts_proxy_protocol_v1_and_overrides_peer_address() {
+        let handler = HttpUpgradeTcpServerHandler::new(
+            None,
+            "/upgrade".into(),
+            true,
+            Box::new(Inner),
+        );
+        let (mut client, server) = duplex(4096);
+        client
+            .write_all(
+                b"PROXY TCP4 198.51.100.7 203.0.113.9 45678 443\r\n\
+                  GET /upgrade HTTP/1.1\r\n\
+                  Connection: Upgrade\r\n\
+                  Upgrade: websocket\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("HTTPUpgrade with PROXY v1");
+        let TcpServerSetupResult::PeerAddrOverride { peer_addr, inner } = result
+        else {
+            panic!("expected peer address override");
+        };
+        assert_eq!(peer_addr, "198.51.100.7:45678".parse().unwrap());
+        assert!(matches!(*inner, TcpServerSetupResult::TcpForward { .. }));
+    }
+
+    #[tokio::test]
+    async fn accepts_proxy_protocol_v2_and_overrides_peer_address() {
+        let handler = HttpUpgradeTcpServerHandler::new(
+            None,
+            "/upgrade".into(),
+            true,
+            Box::new(Inner),
+        );
+        let (mut client, server) = duplex(4096);
+        let mut request = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+        request.extend_from_slice(&[0x21, 0x11, 0x00, 0x0c]);
+        request.extend_from_slice(&[198, 51, 100, 8]);
+        request.extend_from_slice(&[203, 0, 113, 10]);
+        request.extend_from_slice(&45679u16.to_be_bytes());
+        request.extend_from_slice(&443u16.to_be_bytes());
+        request.extend_from_slice(
+            b"GET /upgrade HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        );
+        client.write_all(&request).await.unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("HTTPUpgrade with PROXY v2");
+        let TcpServerSetupResult::PeerAddrOverride { peer_addr, inner } = result
+        else {
+            panic!("expected peer address override");
+        };
+        assert_eq!(peer_addr, "198.51.100.8:45679".parse().unwrap());
+        assert!(matches!(*inner, TcpServerSetupResult::TcpForward { .. }));
+    }
+
+    #[tokio::test]
     async fn rejects_wrong_path() {
         let handler = HttpUpgradeTcpServerHandler::new(
             None,
             "/expected".into(),
+            false,
             Box::new(Inner),
         );
         let (mut client, server) = duplex(1024);

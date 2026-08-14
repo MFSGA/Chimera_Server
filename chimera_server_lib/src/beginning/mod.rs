@@ -402,7 +402,7 @@ async fn process_stream_with_context<AS>(
     stream: AS,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
     resolver: Arc<dyn Resolver>,
-    peer_addr: SocketAddr,
+    mut peer_addr: SocketAddr,
     runtime: RuntimeState,
     connection_context: TcpServerConnectionContext,
 ) -> std::io::Result<()>
@@ -415,7 +415,7 @@ where
         setup_server_stream(stream, server_handler, connection_context),
     );
     tracing::info!("prepare to setup server stream");
-    let setup_result = match setup_server_stream_future.await {
+    let mut setup_result = match setup_server_stream_future.await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             return Err(std::io::Error::new(
@@ -428,6 +428,18 @@ where
                 std::io::ErrorKind::TimedOut,
                 format!("server setup timed out: {}", elapsed),
             ));
+        }
+    };
+    let setup_result = loop {
+        match setup_result {
+            TcpServerSetupResult::PeerAddrOverride {
+                peer_addr: overridden,
+                inner,
+            } => {
+                peer_addr = overridden;
+                setup_result = *inner;
+            }
+            other => break other,
         }
     };
     let setup_result = match setup_result {
@@ -562,6 +574,11 @@ where
                 copy_result.right_to_left,
             );
             Ok(())
+        }
+        TcpServerSetupResult::PeerAddrOverride { .. } => {
+            unreachable!(
+                "peer address override must be normalized before forwarding"
+            )
         }
         TcpServerSetupResult::TcpFallback { .. } => {
             unreachable!("fallback result must be normalized before forwarding")
