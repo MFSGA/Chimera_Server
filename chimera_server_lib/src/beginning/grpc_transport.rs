@@ -88,10 +88,20 @@ pub(super) async fn start_grpc_server(
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     info!(
         service = %grpc_config.service_name,
+        multi_mode = grpc_config.multi_mode,
         address = %listen_addr,
         "Starting gRPC transport server"
     );
-    let service_path = format!("/{}/Tun", grpc_config.service_name);
+    let service_path = format!(
+        "/{}/{}",
+        grpc_config.service_name,
+        if grpc_config.multi_mode {
+            "TunMulti"
+        } else {
+            "Tun"
+        }
+    );
+    let multi_mode = grpc_config.multi_mode;
 
     let handle = tokio::spawn(async move {
         loop {
@@ -111,6 +121,7 @@ pub(super) async fn start_grpc_server(
                     tokio::spawn(serve_grpc_connection(
                         stream,
                         service_path,
+                        multi_mode,
                         server_handler,
                         resolver,
                         runtime,
@@ -126,6 +137,7 @@ pub(super) async fn start_grpc_server(
                                 serve_grpc_connection(
                                     stream,
                                     service_path,
+                                    multi_mode,
                                     server_handler,
                                     resolver,
                                     runtime,
@@ -153,6 +165,7 @@ pub(super) async fn start_grpc_server(
                                 serve_grpc_connection(
                                     stream,
                                     service_path,
+                                    multi_mode,
                                     server_handler,
                                     resolver,
                                     runtime,
@@ -254,6 +267,7 @@ fn parse_listener_protocol(
 async fn serve_grpc_connection<IO>(
     io: IO,
     service_path: String,
+    multi_mode: bool,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
     resolver: Arc<dyn Resolver>,
     runtime: RuntimeState,
@@ -266,6 +280,7 @@ async fn serve_grpc_connection<IO>(
         handle_request(
             request,
             service_path.clone(),
+            multi_mode,
             server_handler.clone(),
             resolver.clone(),
             runtime.clone(),
@@ -280,6 +295,7 @@ async fn serve_grpc_connection<IO>(
 async fn handle_request(
     request: Request<Incoming>,
     service_path: String,
+    multi_mode: bool,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
     resolver: Arc<dyn Resolver>,
     runtime: RuntimeState,
@@ -300,7 +316,9 @@ async fn handle_request(
     let (transport_read, transport_write) = tokio::io::split(transport_stream);
     let mut body = request.into_body();
     tokio::spawn(async move {
-        if let Err(error) = decode_request_body(&mut body, transport_write).await {
+        if let Err(error) =
+            decode_request_body(&mut body, transport_write, multi_mode).await
+        {
             debug!("gRPC upload decode failed: {error}");
         }
     });
@@ -318,12 +336,13 @@ async fn handle_request(
         }
     });
 
-    Ok(grpc_stream_response(transport_read))
+    Ok(grpc_stream_response(transport_read, multi_mode))
 }
 
 async fn decode_request_body(
     body: &mut Incoming,
     mut writer: tokio::io::WriteHalf<DuplexStream>,
+    multi_mode: bool,
 ) -> io::Result<()> {
     let mut buffered = BytesMut::new();
     while let Some(frame) = body.frame().await {
@@ -332,8 +351,12 @@ async fn decode_request_body(
         })?;
         if let Some(data) = frame.data_ref() {
             buffered.extend_from_slice(data);
-            while let Some(payload) = decode_grpc_hunk(&mut buffered)? {
-                writer.write_all(&payload).await?;
+            while let Some(payloads) =
+                decode_grpc_message(&mut buffered, multi_mode)?
+            {
+                for payload in payloads {
+                    writer.write_all(&payload).await?;
+                }
             }
         }
     }
@@ -348,19 +371,21 @@ async fn decode_request_body(
 
 fn grpc_stream_response(
     reader: tokio::io::ReadHalf<DuplexStream>,
+    multi_mode: bool,
 ) -> Response<ResponseBody> {
-    let data_stream = ReaderStream::new(reader).filter_map(|result| async move {
-        match result {
-            Ok(data) if !data.is_empty() => {
-                Some(Ok(Frame::data(encode_grpc_hunk(&data))))
+    let data_stream =
+        ReaderStream::new(reader).filter_map(move |result| async move {
+            match result {
+                Ok(data) if !data.is_empty() => {
+                    Some(Ok(Frame::data(encode_grpc_message(&data, multi_mode))))
+                }
+                Ok(_) => None,
+                Err(error) => {
+                    debug!("gRPC response read failed: {error}");
+                    None
+                }
             }
-            Ok(_) => None,
-            Err(error) => {
-                debug!("gRPC response read failed: {error}");
-                None
-            }
-        }
-    });
+        });
     let trailers = futures::stream::once(async {
         let mut trailers = hyper::HeaderMap::new();
         trailers.insert("grpc-status", header::HeaderValue::from_static("0"));
@@ -386,14 +411,17 @@ fn grpc_status_response(status: u8, message: &str) -> Response<ResponseBody> {
         .unwrap()
 }
 
-fn decode_grpc_hunk(buffer: &mut BytesMut) -> io::Result<Option<Vec<u8>>> {
+fn decode_grpc_message(
+    buffer: &mut BytesMut,
+    multi_mode: bool,
+) -> io::Result<Option<Vec<Vec<u8>>>> {
     if buffer.len() < 5 {
         return Ok(None);
     }
     if buffer[0] != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "compressed gRPC Hunk messages are not supported",
+            "compressed gRPC messages are not supported",
         ));
     }
     let message_len =
@@ -401,7 +429,7 @@ fn decode_grpc_hunk(buffer: &mut BytesMut) -> io::Result<Option<Vec<u8>>> {
     if message_len > MAX_GRPC_MESSAGE_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "gRPC Hunk message exceeds 4 MiB",
+            "gRPC message exceeds 4 MiB",
         ));
     }
     if buffer.len() < 5 + message_len {
@@ -409,34 +437,49 @@ fn decode_grpc_hunk(buffer: &mut BytesMut) -> io::Result<Option<Vec<u8>>> {
     }
     buffer.advance(5);
     let message = buffer.split_to(message_len);
-    decode_hunk_protobuf(&message).map(Some)
+    decode_data_fields(&message, multi_mode).map(Some)
 }
 
-fn decode_hunk_protobuf(message: &[u8]) -> io::Result<Vec<u8>> {
+fn decode_data_fields(message: &[u8], multi_mode: bool) -> io::Result<Vec<Vec<u8>>> {
     if message.is_empty() {
-        return Ok(Vec::new());
+        return Ok(vec![Vec::new()]);
     }
-    if message[0] != 0x0a {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "gRPC Hunk protobuf is missing field 1",
-        ));
+    let mut offset = 0;
+    let mut payloads = Vec::new();
+    while offset < message.len() {
+        if message[offset] != 0x0a {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "gRPC protobuf is missing bytes field 1",
+            ));
+        }
+        offset += 1;
+        let (length, varint_len) = decode_varint(&message[offset..])?;
+        offset += varint_len;
+        let end = offset.checked_add(length).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "gRPC payload length overflow",
+            )
+        })?;
+        if end > message.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated gRPC protobuf payload",
+            ));
+        }
+        payloads.push(message[offset..end].to_vec());
+        offset = end;
+        if !multi_mode {
+            break;
+        }
     }
-    let (length, varint_len) = decode_varint(&message[1..])?;
-    let start = 1 + varint_len;
-    let end = start.checked_add(length).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "Hunk length overflow")
-    })?;
-    if end > message.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "truncated Hunk protobuf payload",
-        ));
-    }
-    Ok(message[start..end].to_vec())
+    Ok(payloads)
 }
 
-fn encode_grpc_hunk(data: &[u8]) -> Bytes {
+fn encode_grpc_message(data: &[u8], _multi_mode: bool) -> Bytes {
+    // Hunk and MultiHunk both encode their data using protobuf field 1. A single
+    // field is a valid repeated-field encoding, so replies can use the same wire form.
     let mut protobuf = Vec::with_capacity(data.len() + 6);
     protobuf.push(0x0a);
     encode_varint(data.len(), &mut protobuf);
@@ -531,24 +574,41 @@ impl AsyncStream for GrpcLogicalStream {}
 mod tests {
     use bytes::BytesMut;
 
-    use super::{decode_grpc_hunk, encode_grpc_hunk};
+    use super::{decode_grpc_message, encode_grpc_message};
 
     #[test]
     fn hunk_round_trip_handles_large_payload() {
         let payload = (0..70_000).map(|value| value as u8).collect::<Vec<_>>();
-        let encoded = encode_grpc_hunk(&payload);
+        let encoded = encode_grpc_message(&payload, false);
         let mut buffer = BytesMut::from(encoded.as_ref());
-        let decoded = decode_grpc_hunk(&mut buffer)
+        let decoded = decode_grpc_message(&mut buffer, false)
             .expect("decode Hunk")
             .expect("complete Hunk");
-        assert_eq!(decoded, payload);
+        assert_eq!(decoded, vec![payload]);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn multi_hunk_decodes_repeated_data_fields_in_order() {
+        let protobuf = [
+            0x0a, 0x05, b'h', b'e', b'l', b'l', b'o', 0x0a, 0x05, b'w', b'o', b'r',
+            b'l', b'd',
+        ];
+        let mut frame = vec![0];
+        frame.extend_from_slice(&(protobuf.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&protobuf);
+        let mut buffer = BytesMut::from(frame.as_slice());
+        let decoded = decode_grpc_message(&mut buffer, true)
+            .expect("decode MultiHunk")
+            .expect("complete MultiHunk");
+        assert_eq!(decoded, vec![b"hello".to_vec(), b"world".to_vec()]);
         assert!(buffer.is_empty());
     }
 
     #[test]
     fn hunk_decoder_waits_for_complete_frame() {
-        let encoded = encode_grpc_hunk(b"hello");
+        let encoded = encode_grpc_message(b"hello", false);
         let mut buffer = BytesMut::from(&encoded[..4]);
-        assert!(decode_grpc_hunk(&mut buffer).unwrap().is_none());
+        assert!(decode_grpc_message(&mut buffer, false).unwrap().is_none());
     }
 }
