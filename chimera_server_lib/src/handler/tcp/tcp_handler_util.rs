@@ -208,6 +208,7 @@ pub fn create_tcp_server_handler(
             Ok(Box::new(HttpUpgradeTcpServerHandler::new(
                 config.host,
                 config.path,
+                config.accept_proxy_protocol,
                 inner,
             )))
         }
