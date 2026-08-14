@@ -287,6 +287,7 @@ pub enum XhttpPaddingMethod {
 #[derive(Debug, Clone, Deserialize)]
 pub struct GrpcServerConfig {
     pub service_name: String,
+    pub multi_mode: bool,
     pub inner: Box<ServerProxyConfig>,
 }
 
