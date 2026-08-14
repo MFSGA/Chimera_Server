@@ -55,6 +55,7 @@ pub struct ShadowsocksCipher {
     algorithm: &'static Algorithm,
     salt_len: usize,
     name: &'static str,
+    xchacha: bool,
 }
 
 impl ShadowsocksCipher {
@@ -64,11 +65,13 @@ impl ShadowsocksCipher {
                 algorithm: &AES_128_GCM,
                 salt_len: 16,
                 name: "aes-128-gcm",
+                xchacha: false,
             }),
             "aes-256-gcm" | "aead_aes_256_gcm" => Ok(Self {
                 algorithm: &AES_256_GCM,
                 salt_len: 32,
                 name: "aes-256-gcm",
+                xchacha: false,
             }),
             "chacha20-poly1305"
             | "aead_chacha20_poly1305"
@@ -76,13 +79,16 @@ impl ShadowsocksCipher {
                 algorithm: &CHACHA20_POLY1305,
                 salt_len: 32,
                 name: "chacha20-ietf-poly1305",
+                xchacha: false,
             }),
             "xchacha20-poly1305"
             | "aead_xchacha20_poly1305"
-            | "xchacha20-ietf-poly1305" => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "xchacha20-poly1305 Shadowsocks is not supported yet",
-            )),
+            | "xchacha20-ietf-poly1305" => Ok(Self {
+                algorithm: &CHACHA20_POLY1305,
+                salt_len: 32,
+                name: "xchacha20-ietf-poly1305",
+                xchacha: true,
+            }),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("unsupported Shadowsocks cipher method: {other}"),
@@ -92,6 +98,10 @@ impl ShadowsocksCipher {
 
     fn key_len(self) -> usize {
         self.algorithm.key_len()
+    }
+
+    fn is_xchacha(self) -> bool {
+        self.xchacha
     }
 }
 
@@ -124,6 +134,12 @@ fn parse_user_key(
     }
     if let Some(method) = user.method.strip_prefix("2022-blake3-") {
         let cipher = ShadowsocksCipher::parse(method)?;
+        if cipher.is_xchacha() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Shadowsocks 2022 does not support XChaCha20-Poly1305",
+            ));
+        }
         let key = BASE64.decode(&user.password).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -451,20 +467,39 @@ impl ShadowsocksUdpUserCodec {
         }
         let session_key =
             derive_session_key(master_key, salt, self.cipher.key_len())?;
-        let unbound_key = UnboundKey::new(self.cipher.algorithm, &session_key)
-            .map_err(|_| io::Error::other("invalid Shadowsocks UDP opening key"))?;
-        let mut opening = OpeningKey::new(unbound_key, IncreasingSequence::new());
         let mut plaintext = encrypted.to_vec();
-        let opened = opening
-            .open_in_place(Aad::empty(), &mut plaintext)
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid Shadowsocks UDP authentication tag",
-                )
-            })?
-            .len();
-        plaintext.truncate(opened);
+        if self.cipher.is_xchacha() {
+            let cipher =
+                XChaCha20Poly1305::new_from_slice(&session_key).map_err(|_| {
+                    io::Error::other("invalid Shadowsocks XChaCha UDP opening key")
+                })?;
+            let nonce = [0u8; 24];
+            cipher
+                .decrypt_in_place(XNonce::from_slice(&nonce), b"", &mut plaintext)
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid Shadowsocks UDP authentication tag",
+                    )
+                })?;
+        } else {
+            let unbound_key = UnboundKey::new(self.cipher.algorithm, &session_key)
+                .map_err(|_| {
+                io::Error::other("invalid Shadowsocks UDP opening key")
+            })?;
+            let mut opening =
+                OpeningKey::new(unbound_key, IncreasingSequence::new());
+            let opened = opening
+                .open_in_place(Aad::empty(), &mut plaintext)
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid Shadowsocks UDP authentication tag",
+                    )
+                })?
+                .len();
+            plaintext.truncate(opened);
+        }
         let (target_location, offset) = parse_socks_location_slice(&plaintext)?;
         Ok(ShadowsocksUdpRequest {
             target_location,
@@ -487,20 +522,37 @@ impl ShadowsocksUdpUserCodec {
         })?;
         let session_key =
             derive_session_key(master_key, &salt, self.cipher.key_len())?;
-        let unbound_key = UnboundKey::new(self.cipher.algorithm, &session_key)
-            .map_err(|_| io::Error::other("invalid Shadowsocks UDP sealing key"))?;
-        let mut sealing = SealingKey::new(unbound_key, IncreasingSequence::new());
         let mut plaintext = encode_socks_location(source)?;
         plaintext.extend_from_slice(payload);
-        let tag = sealing
-            .seal_in_place_separate_tag(Aad::empty(), &mut plaintext)
-            .map_err(|_| {
-                io::Error::other("failed to encrypt Shadowsocks UDP packet")
-            })?;
         let mut packet = Vec::with_capacity(salt.len() + plaintext.len() + TAG_LEN);
         packet.extend_from_slice(&salt);
-        packet.extend_from_slice(&plaintext);
-        packet.extend_from_slice(tag.as_ref());
+        if self.cipher.is_xchacha() {
+            let cipher =
+                XChaCha20Poly1305::new_from_slice(&session_key).map_err(|_| {
+                    io::Error::other("invalid Shadowsocks XChaCha UDP sealing key")
+                })?;
+            let nonce = [0u8; 24];
+            cipher
+                .encrypt_in_place(XNonce::from_slice(&nonce), b"", &mut plaintext)
+                .map_err(|_| {
+                    io::Error::other("failed to encrypt Shadowsocks UDP packet")
+                })?;
+            packet.extend_from_slice(&plaintext);
+        } else {
+            let unbound_key = UnboundKey::new(self.cipher.algorithm, &session_key)
+                .map_err(|_| {
+                io::Error::other("invalid Shadowsocks UDP sealing key")
+            })?;
+            let mut sealing =
+                SealingKey::new(unbound_key, IncreasingSequence::new());
+            let tag = sealing
+                .seal_in_place_separate_tag(Aad::empty(), &mut plaintext)
+                .map_err(|_| {
+                    io::Error::other("failed to encrypt Shadowsocks UDP packet")
+                })?;
+            packet.extend_from_slice(&plaintext);
+            packet.extend_from_slice(tag.as_ref());
+        }
         Ok(packet)
     }
 
@@ -1067,17 +1119,31 @@ fn legacy_tcp_probe_matches(user: &ShadowsocksServerUser, prefix: &[u8]) -> bool
     else {
         return false;
     };
-    let Ok(unbound_key) = UnboundKey::new(user.cipher.algorithm, &session_key)
-    else {
-        return false;
-    };
-    let mut opening_key = OpeningKey::new(unbound_key, IncreasingSequence::new());
     let mut encrypted_length = prefix[user.cipher.salt_len..length_end].to_vec();
-    if opening_key
-        .open_in_place(Aad::empty(), &mut encrypted_length)
-        .is_err()
-    {
-        return false;
+    if user.cipher.is_xchacha() {
+        let Ok(cipher) = XChaCha20Poly1305::new_from_slice(&session_key) else {
+            return false;
+        };
+        let nonce = [0u8; 24];
+        if cipher
+            .decrypt_in_place(XNonce::from_slice(&nonce), b"", &mut encrypted_length)
+            .is_err()
+        {
+            return false;
+        }
+    } else {
+        let Ok(unbound_key) = UnboundKey::new(user.cipher.algorithm, &session_key)
+        else {
+            return false;
+        };
+        let mut opening_key =
+            OpeningKey::new(unbound_key, IncreasingSequence::new());
+        if opening_key
+            .open_in_place(Aad::empty(), &mut encrypted_length)
+            .is_err()
+        {
+            return false;
+        }
     }
     let payload_len =
         u16::from_be_bytes([encrypted_length[0], encrypted_length[1]]) as usize;
@@ -1440,6 +1506,14 @@ where
     }
 
     let session_key = derive_session_key(&master_key, &salt, cipher.key_len())?;
+    if cipher.is_xchacha() {
+        return decrypt_xchacha_stream_body(
+            &mut encrypted,
+            &mut plaintext,
+            &session_key,
+        )
+        .await;
+    }
     let unbound_key = UnboundKey::new(cipher.algorithm, &session_key)
         .map_err(|_| io::Error::other("invalid Shadowsocks opening key"))?;
     let mut opening_key = OpeningKey::new(unbound_key, IncreasingSequence::new());
@@ -1502,6 +1576,15 @@ where
         .fill(&mut salt)
         .map_err(|_| io::Error::other("failed to generate Shadowsocks salt"))?;
     let session_key = derive_session_key(&master_key, &salt, cipher.key_len())?;
+    if cipher.is_xchacha() {
+        return encrypt_xchacha_stream_body(
+            &mut plaintext,
+            &mut encrypted,
+            &salt,
+            &session_key,
+        )
+        .await;
+    }
     let unbound_key = UnboundKey::new(cipher.algorithm, &session_key)
         .map_err(|_| io::Error::other("invalid Shadowsocks sealing key"))?;
     let mut sealing_key = SealingKey::new(unbound_key, IncreasingSequence::new());
@@ -1537,6 +1620,128 @@ where
     }
 
     encrypted.shutdown().await
+}
+
+async fn decrypt_xchacha_stream_body<R, W>(
+    encrypted: &mut R,
+    plaintext: &mut W,
+    session_key: &[u8],
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let cipher = XChaCha20Poly1305::new_from_slice(session_key)
+        .map_err(|_| io::Error::other("invalid Shadowsocks XChaCha opening key"))?;
+    let mut nonce = [0u8; 24];
+
+    loop {
+        let mut encrypted_length = vec![0u8; 2 + TAG_LEN];
+        match encrypted.read_exact(&mut encrypted_length).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error),
+        }
+        let current_nonce = take_xchacha_nonce(&mut nonce);
+        cipher
+            .decrypt_in_place(
+                XNonce::from_slice(&current_nonce),
+                b"",
+                &mut encrypted_length,
+            )
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid Shadowsocks encrypted length",
+                )
+            })?;
+        let payload_len =
+            u16::from_be_bytes([encrypted_length[0], encrypted_length[1]]) as usize;
+        if payload_len > MAX_PAYLOAD_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Shadowsocks payload length exceeds {MAX_PAYLOAD_LEN}"),
+            ));
+        }
+
+        let mut encrypted_payload = vec![0u8; payload_len + TAG_LEN];
+        encrypted.read_exact(&mut encrypted_payload).await?;
+        let current_nonce = take_xchacha_nonce(&mut nonce);
+        cipher
+            .decrypt_in_place(
+                XNonce::from_slice(&current_nonce),
+                b"",
+                &mut encrypted_payload,
+            )
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid Shadowsocks encrypted payload",
+                )
+            })?;
+        plaintext.write_all(&encrypted_payload).await?;
+        plaintext.flush().await?;
+    }
+
+    plaintext.shutdown().await
+}
+
+async fn encrypt_xchacha_stream_body<R, W>(
+    plaintext: &mut R,
+    encrypted: &mut W,
+    salt: &[u8],
+    session_key: &[u8],
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let cipher = XChaCha20Poly1305::new_from_slice(session_key)
+        .map_err(|_| io::Error::other("invalid Shadowsocks XChaCha sealing key"))?;
+    let mut nonce = [0u8; 24];
+    let mut sent_salt = false;
+    let mut buffer = vec![0u8; MAX_PAYLOAD_LEN];
+
+    loop {
+        let read = plaintext.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        if !sent_salt {
+            encrypted.write_all(salt).await?;
+            sent_salt = true;
+        }
+
+        let mut length = (read as u16).to_be_bytes().to_vec();
+        let current_nonce = take_xchacha_nonce(&mut nonce);
+        cipher
+            .encrypt_in_place(XNonce::from_slice(&current_nonce), b"", &mut length)
+            .map_err(|_| io::Error::other("failed to encrypt Shadowsocks length"))?;
+        encrypted.write_all(&length).await?;
+
+        let mut payload = buffer[..read].to_vec();
+        let current_nonce = take_xchacha_nonce(&mut nonce);
+        cipher
+            .encrypt_in_place(XNonce::from_slice(&current_nonce), b"", &mut payload)
+            .map_err(|_| {
+                io::Error::other("failed to encrypt Shadowsocks payload")
+            })?;
+        encrypted.write_all(&payload).await?;
+        encrypted.flush().await?;
+    }
+
+    encrypted.shutdown().await
+}
+
+fn take_xchacha_nonce(nonce: &mut [u8; 24]) -> [u8; 24] {
+    let current = *nonce;
+    for byte in nonce.iter_mut() {
+        *byte = byte.wrapping_add(1);
+        if *byte != 0 {
+            break;
+        }
+    }
+    current
 }
 
 fn aes_encrypt_block(key: &[u8], block: &mut [u8; 16]) -> io::Result<()> {
@@ -1940,9 +2145,19 @@ impl AsyncStream for TaskBackedStream {}
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+    use crate::{
+        address::{Address, NetLocation},
+        config::server_config::ShadowsocksUser,
+    };
+
     use super::{
-        ShadowsocksCipher, TimedSaltChecker, derive_aead2022_session_key,
-        derive_master_key,
+        ShadowsocksCipher, ShadowsocksUdpRequest, ShadowsocksUdpUserCodec,
+        TimedSaltChecker, decrypt_stream, derive_aead2022_session_key,
+        derive_master_key, encrypt_stream,
     };
 
     #[test]
@@ -1966,6 +2181,89 @@ mod tests {
             ShadowsocksCipher::parse("chacha20-poly1305").unwrap().name,
             "chacha20-ietf-poly1305"
         );
+        assert_eq!(
+            ShadowsocksCipher::parse("aead_xchacha20_poly1305")
+                .unwrap()
+                .name,
+            "xchacha20-ietf-poly1305"
+        );
+    }
+
+    #[tokio::test]
+    async fn xchacha_tcp_stream_roundtrips() {
+        let cipher = ShadowsocksCipher::parse("xchacha20-poly1305")
+            .expect("parse XChaCha cipher");
+        let master_key: Arc<[u8]> =
+            derive_master_key("password", cipher.key_len()).into();
+        let (mut input, input_reader) = duplex(4096);
+        let (encrypted_writer, encrypted_reader) = duplex(4096);
+        let (output_writer, mut output) = duplex(4096);
+        let payload = b"xray-compatible-xchacha-tcp".repeat(64);
+
+        let encrypt_key = master_key.clone();
+        let encrypt_task = tokio::spawn(async move {
+            encrypt_stream(input_reader, encrypted_writer, cipher, encrypt_key).await
+        });
+        let decrypt_task = tokio::spawn(async move {
+            decrypt_stream(
+                encrypted_reader,
+                output_writer,
+                cipher,
+                master_key,
+                Arc::new(Mutex::new(TimedSaltChecker::default())),
+            )
+            .await
+        });
+
+        input
+            .write_all(&payload)
+            .await
+            .expect("write XChaCha payload");
+        input.shutdown().await.expect("shutdown XChaCha input");
+        let mut decoded = Vec::new();
+        output
+            .read_to_end(&mut decoded)
+            .await
+            .expect("read XChaCha output");
+        encrypt_task
+            .await
+            .expect("join XChaCha encrypt task")
+            .expect("encrypt XChaCha stream");
+        decrypt_task
+            .await
+            .expect("join XChaCha decrypt task")
+            .expect("decrypt XChaCha stream");
+
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn xchacha_udp_packet_roundtrips() {
+        let codec = ShadowsocksUdpUserCodec::new(ShadowsocksUser {
+            method: "xchacha20-poly1305".to_string(),
+            password: "password".to_string(),
+            email: "xchacha@example.com".to_string(),
+        })
+        .expect("create XChaCha UDP codec");
+        let source = NetLocation::new(Address::from("example.com").unwrap(), 443);
+        let payload = b"xray-compatible-xchacha-udp";
+        let request = ShadowsocksUdpRequest {
+            target_location: source.clone(),
+            payload: Vec::new(),
+            identity: String::new(),
+            user_index: 0,
+            client_session_id: None,
+        };
+
+        let packet = codec
+            .encrypt_packet(&request, &source, payload)
+            .expect("encrypt XChaCha UDP packet");
+        let decoded = codec
+            .decrypt_packet(&packet)
+            .expect("decrypt XChaCha UDP packet");
+
+        assert_eq!(decoded.target_location, source);
+        assert_eq!(decoded.payload, payload);
     }
 
     #[test]
