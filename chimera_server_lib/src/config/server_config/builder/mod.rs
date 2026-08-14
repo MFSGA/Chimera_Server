@@ -126,11 +126,6 @@ fn apply_httpupgrade_layer(
                     "httpupgrade inbound requires httpupgradeSettings".into(),
                 )
             })?;
-    if settings.accept_proxy_protocol {
-        return Err(Error::InvalidConfig(
-            "httpupgradeSettings.acceptProxyProtocol is not supported yet".into(),
-        ));
-    }
     // Xray's HTTPUpgrade server does not consume `ed`; the field only changes
     // whether the client waits for the 101 response before sending protocol data.
     // Accept it on inbound configs so early protocol bytes can already be queued
@@ -154,6 +149,7 @@ fn apply_httpupgrade_layer(
     Ok(ServerProxyConfig::HttpUpgrade(HttpUpgradeServerConfig {
         host,
         path,
+        accept_proxy_protocol: settings.accept_proxy_protocol,
         inner: Box::new(protocol),
     }))
 }
@@ -2618,6 +2614,7 @@ mod tests {
                 "httpupgradeSettings": {
                     "host": "example.com",
                     "path": "/upgrade",
+                    "acceptProxyProtocol": true,
                     "ed": 2048
                 }
             }
@@ -2631,6 +2628,7 @@ mod tests {
             ServerProxyConfig::HttpUpgrade(httpupgrade) => {
                 assert_eq!(httpupgrade.host.as_deref(), Some("example.com"));
                 assert_eq!(httpupgrade.path, "/upgrade");
+                assert!(httpupgrade.accept_proxy_protocol);
                 assert!(matches!(
                     httpupgrade.inner.as_ref(),
                     ServerProxyConfig::Vless { .. }
