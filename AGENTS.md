@@ -136,6 +136,15 @@ Use the references here when you feel direction is missing rather than guessing 
 - When investigating threading issues, lean on `tokio-console` when enabled or add temporary `tracing::debug!` statements gated by verbose settings.
 - Before filing a bug, reproduce it with the config that triggered it and describe which module's handler chain is responsible.
 
+## Release Discipline
+- After `v0.7.5`, advance only one primary protocol goal per release. Do not mix unrelated protocol behavior into the same release cycle.
+- A release goal must be vertically complete before it is considered releasable: user-facing config (when applicable) → validation/defaults → `ServerConfig` → runtime/handler behavior → focused tests.
+- Parsing, validation, or field-preservation work that is not yet consumed by runtime behavior is development groundwork, not a completed protocol goal; keep it out of a stable release unless the release goal is explicitly configuration/schema alignment.
+- Prepare the workspace package version before release. The release workflow must not silently bump source versions or push `master` on behalf of the release.
+- Publish the completed goal directly as `vX.Y.Z`, then deploy and validate that released version before beginning the next primary protocol goal.
+- Every release must pass `cargo fmt --all -- --check`, `cargo build --all-features`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`, and `cargo test --locked` before a tag is created.
+- Start the next primary protocol goal only after the current released version has been validated; if validation fails, fix that same goal and publish a new patch version before moving on.
+
 ## Git & Collaboration
 - Always run `git status` before editing to understand unrelated changes; do not revert files modified by other contributors unless explicitly asked.
 - Keep commits focused; describe why the change exists rather than how it was implemented, mirroring this AGENTS file's style.
