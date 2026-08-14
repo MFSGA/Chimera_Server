@@ -71,11 +71,6 @@ fn apply_grpc_layer(
     let settings = stream_settings.grpc_settings.clone().ok_or_else(|| {
         Error::InvalidConfig("grpc inbound requires grpcSettings".into())
     })?;
-    if settings.multi_mode {
-        return Err(Error::InvalidConfig(
-            "grpcSettings.multiMode is not supported yet".into(),
-        ));
-    }
     let service_name = settings
         .service_name
         .unwrap_or_else(|| "GunService".to_string())
@@ -96,6 +91,7 @@ fn apply_grpc_layer(
     );
     Ok(ServerProxyConfig::Grpc(super::types::GrpcServerConfig {
         service_name,
+        multi_mode: settings.multi_mode,
         inner: Box::new(protocol),
     }))
 }
@@ -1319,6 +1315,37 @@ mod tests {
             "tag": format!("{protocol}-planned")
         }))
         .expect("valid inbound item")
+    }
+
+    #[cfg(feature = "grpc_transport")]
+    #[test]
+    fn grpc_inbound_preserves_multi_mode() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "socks",
+            "tag": "socks-grpc-multi",
+            "settings": {},
+            "streamSettings": {
+                "network": "grpc",
+                "security": "none",
+                "grpcSettings": {
+                    "serviceName": "chimera-multi",
+                    "multiMode": true
+                }
+            }
+        }))
+        .expect("valid gRPC multiMode inbound");
+        let config =
+            ServerConfig::try_from(inbound).expect("gRPC multiMode should build");
+        match config.protocol {
+            ServerProxyConfig::Grpc(config) => {
+                assert_eq!(config.service_name, "chimera-multi");
+                assert!(config.multi_mode);
+                assert!(matches!(*config.inner, ServerProxyConfig::Socks { .. }));
+            }
+            other => panic!("expected gRPC protocol, got {other:?}"),
+        }
     }
 
     #[cfg(feature = "hysteria")]
