@@ -269,6 +269,20 @@ pub enum XhttpDataPlacement {
     Cookie,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum XhttpPaddingPlacement {
+    Cookie,
+    Header,
+    Query,
+    QueryInHeader,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum XhttpPaddingMethod {
+    RepeatX,
+    Tokenish,
+}
+
 #[cfg(feature = "grpc_transport")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct GrpcServerConfig {
@@ -294,6 +308,13 @@ pub struct XhttpServerConfig {
     pub max_each_post_bytes: usize,
     pub max_buffered_posts: usize,
     pub session_ttl_secs: u64,
+    pub stream_up_server_secs: (usize, usize),
+    pub server_max_header_bytes: usize,
+    pub padding_obfs_mode: bool,
+    pub padding_key: String,
+    pub padding_header: String,
+    pub padding_placement: XhttpPaddingPlacement,
+    pub padding_method: XhttpPaddingMethod,
     pub no_grpc_header: bool,
     pub no_sse_header: bool,
     pub uplink_http_method: String,

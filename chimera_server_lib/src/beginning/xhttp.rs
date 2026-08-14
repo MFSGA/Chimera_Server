@@ -17,7 +17,7 @@ use futures::StreamExt;
 use http_body_util::{BodyExt, Empty, StreamBody, combinators::UnsyncBoxBody};
 use hyper::{
     Method, Request, Response, StatusCode,
-    body::{Frame, Incoming},
+    body::{Body, Frame, Incoming},
     header,
     service::service_fn,
 };
@@ -25,9 +25,10 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto,
 };
+use rand::RngExt;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex},
-    sync::Mutex,
+    sync::{Mutex, oneshot},
     time::{Duration, sleep},
 };
 #[cfg(feature = "tls")]
@@ -40,7 +41,8 @@ use crate::{
     async_stream::{AsyncPing, AsyncStream},
     config::server_config::{
         ServerConfig, ServerProxyConfig, XhttpDataPlacement, XhttpMode,
-        XhttpPlacement, XhttpServerConfig,
+        XhttpPaddingMethod, XhttpPaddingPlacement, XhttpPlacement,
+        XhttpServerConfig,
     },
     handler::tcp::{
         tcp_handler::TcpServerHandler, tcp_handler_util::create_tcp_server_handler,
@@ -254,7 +256,13 @@ async fn serve_http_connection<IO>(
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let io = TokioIo::new(io);
-    let builder = auto::Builder::new(TokioExecutor::new());
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .max_buf_size(state.server_max_header_bytes.max(8192));
+    builder
+        .http2()
+        .max_header_list_size(state.server_max_header_bytes as u32);
     let service =
         service_fn(move |request| handle_request(request, state.clone(), peer_addr));
 
@@ -271,6 +279,13 @@ struct AppState {
     min_padding: usize,
     max_padding: usize,
     max_each_post_bytes: usize,
+    stream_up_server_secs: (usize, usize),
+    server_max_header_bytes: usize,
+    padding_obfs_mode: bool,
+    padding_key: String,
+    padding_header: String,
+    padding_placement: XhttpPaddingPlacement,
+    padding_method: XhttpPaddingMethod,
     no_sse_header: bool,
     uplink_http_method: String,
     session_placement: XhttpPlacement,
@@ -299,6 +314,13 @@ impl AppState {
             min_padding: config.min_padding,
             max_padding: config.max_padding,
             max_each_post_bytes: config.max_each_post_bytes,
+            stream_up_server_secs: config.stream_up_server_secs,
+            server_max_header_bytes: config.server_max_header_bytes,
+            padding_obfs_mode: config.padding_obfs_mode,
+            padding_key: config.padding_key,
+            padding_header: config.padding_header,
+            padding_placement: config.padding_placement,
+            padding_method: config.padding_method,
             no_sse_header: config.no_sse_header,
             uplink_http_method: config.uplink_http_method,
             session_placement: config.session_placement,
@@ -389,18 +411,81 @@ impl AppState {
         path_query: Option<&str>,
         headers: &hyper::HeaderMap,
     ) -> bool {
-        let padding_len = path_query.and_then(query_padding_length).or_else(|| {
-            headers
-                .get(header::REFERER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(referer_padding_length)
-        });
-
-        let Some(padding_len) = padding_len else {
-            return true;
+        let padding = if self.padding_obfs_mode {
+            cookie_value(headers, &self.padding_key)
+                .or_else(|| {
+                    header_value(headers, &self.padding_header).and_then(|value| {
+                        match self.padding_placement {
+                            XhttpPaddingPlacement::Header => Some(value),
+                            _ => query_value_from_url(&value, &self.padding_key),
+                        }
+                    })
+                })
+                .or_else(|| query_value(path_query, &self.padding_key))
+        } else if let Some(referer) = header_value(headers, "referer") {
+            query_value_from_url(&referer, "x_padding")
+        } else {
+            query_value(path_query, "x_padding")
         };
 
-        padding_len >= self.min_padding && padding_len <= self.max_padding
+        let Some(padding) = padding else {
+            return false;
+        };
+
+        is_padding_valid(
+            &padding,
+            self.min_padding,
+            self.max_padding,
+            self.padding_method,
+        )
+    }
+
+    fn response_uses_credentials(&self) -> bool {
+        self.session_placement == XhttpPlacement::Cookie
+            || self.seq_placement == XhttpPlacement::Cookie
+            || self.padding_placement == XhttpPaddingPlacement::Cookie
+            || self.uplink_data_placement == XhttpDataPlacement::Cookie
+    }
+
+    fn decorate_response(
+        &self,
+        response: &mut Response<ResponseBody>,
+        request_method: &Method,
+        request_headers: &hyper::HeaderMap,
+    ) {
+        let origin = request_headers
+            .get(header::ORIGIN)
+            .cloned()
+            .unwrap_or_else(|| hyper::header::HeaderValue::from_static("*"));
+        response
+            .headers_mut()
+            .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+
+        if self.response_uses_credentials() {
+            response.headers_mut().insert(
+                header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+                hyper::header::HeaderValue::from_static("true"),
+            );
+        }
+
+        if request_method == Method::OPTIONS {
+            let allow_method = request_headers
+                .get(header::ACCESS_CONTROL_REQUEST_METHOD)
+                .cloned()
+                .unwrap_or_else(|| hyper::header::HeaderValue::from_static("*"));
+            response
+                .headers_mut()
+                .insert(header::ACCESS_CONTROL_ALLOW_METHODS, allow_method);
+            let allow_headers = request_headers
+                .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+                .cloned()
+                .unwrap_or_else(|| hyper::header::HeaderValue::from_static("*"));
+            response
+                .headers_mut()
+                .insert(header::ACCESS_CONTROL_ALLOW_HEADERS, allow_headers);
+        }
+
+        apply_response_padding(response.headers_mut(), self);
     }
 }
 
@@ -409,6 +494,19 @@ async fn handle_request(
     state: Arc<AppState>,
     peer_addr: std::net::SocketAddr,
 ) -> Result<Response<ResponseBody>, Infallible> {
+    let request_method = request.method().clone();
+    let request_headers = request.headers().clone();
+
+    if request_header_bytes(request.headers()) > state.server_max_header_bytes {
+        debug!(
+            method = %request.method(),
+            path = %request.uri().path(),
+            limit = state.server_max_header_bytes,
+            "xhttp request rejected by header size limit"
+        );
+        return Ok(simple_response(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE));
+    }
+
     let host_header = request
         .headers()
         .get(header::HOST)
@@ -416,15 +514,12 @@ async fn handle_request(
     let authority_host = request.uri().authority().map(|value| value.as_str());
     let request_host = host_header.or(authority_host);
 
-    if !state.validate_host(request_host)
-        || !state.validate_padding(request.uri().query(), request.headers())
-    {
+    if !state.validate_host(request_host) {
         debug!(
             method = %request.method(),
             path = %request.uri().path(),
-            query = ?request.uri().query(),
             host = ?request_host,
-            "xhttp request rejected by host/padding validation"
+            "xhttp request rejected by host validation"
         );
         return Ok(simple_response(StatusCode::NOT_FOUND));
     }
@@ -439,19 +534,41 @@ async fn handle_request(
         );
         return Ok(simple_response(StatusCode::NOT_FOUND));
     }
+
+    if request_method == Method::OPTIONS {
+        let mut response = simple_response(StatusCode::OK);
+        state.decorate_response(&mut response, &request_method, &request_headers);
+        return Ok(response);
+    }
+
+    if !state.validate_padding(request.uri().query(), request.headers()) {
+        debug!(
+            method = %request.method(),
+            path = %request.uri().path(),
+            query = ?request.uri().query(),
+            "xhttp request rejected by padding validation"
+        );
+        let mut response = simple_response(StatusCode::BAD_REQUEST);
+        state.decorate_response(&mut response, &request_method, &request_headers);
+        return Ok(response);
+    }
+
+    let stream_up_padding = state.padding_obfs_mode
+        || header_value(&request_headers, "referer").is_some();
     let (session_id, seq) = state.extract_meta(&request);
 
     let is_downlink_method = request.method() == Method::GET;
     let is_uplink_method =
         request.method().as_str() == state.uplink_http_method.as_str();
-    let response = match (is_downlink_method, is_uplink_method, session_id, seq) {
+    let mut response = match (is_downlink_method, is_uplink_method, session_id, seq)
+    {
         (true, _, Some(session_id), None)
             if matches!(
                 state.mode,
                 XhttpMode::Auto | XhttpMode::PacketUp | XhttpMode::StreamUp
             ) =>
         {
-            handle_stream_down(state, session_id, peer_addr).await
+            handle_stream_down(state.clone(), session_id, peer_addr).await
         }
         (_, true, None, None)
             if matches!(
@@ -459,21 +576,30 @@ async fn handle_request(
                 XhttpMode::Auto | XhttpMode::StreamOne | XhttpMode::StreamUp
             ) =>
         {
-            handle_stream_one(request, state, peer_addr).await
+            handle_stream_one(request, state.clone(), peer_addr).await
         }
         (_, true, Some(session_id), None)
             if matches!(state.mode, XhttpMode::Auto | XhttpMode::StreamUp) =>
         {
-            handle_stream_up(request, state, session_id, peer_addr).await
+            handle_stream_up(
+                request,
+                state.clone(),
+                session_id,
+                peer_addr,
+                stream_up_padding,
+            )
+            .await
         }
         (_, true, Some(session_id), Some(seq))
             if matches!(state.mode, XhttpMode::Auto | XhttpMode::PacketUp) =>
         {
-            handle_packet_up(request, state, session_id, seq, peer_addr).await
+            handle_packet_up(request, state.clone(), session_id, seq, peer_addr)
+                .await
         }
         _ => simple_response(StatusCode::METHOD_NOT_ALLOWED),
     };
 
+    state.decorate_response(&mut response, &request_method, &request_headers);
     Ok(response)
 }
 
@@ -514,37 +640,42 @@ async fn handle_stream_up(
     state: Arc<AppState>,
     session_id: String,
     peer_addr: std::net::SocketAddr,
+    padding_enabled: bool,
 ) -> Response<ResponseBody> {
     let session = state.sessions.get_or_create(&session_id);
     if let Some(stream) = session.take_handler_stream().await {
         spawn_handler_stream(stream, state.clone(), peer_addr);
     }
 
-    let mut body = request.into_body();
-    let mut upload_state = session.upload.lock().await;
-    while let Some(frame_result) = body.frame().await {
-        let frame = match frame_result {
-            Ok(frame) => frame,
-            Err(_) => {
-                state.sessions.remove(&session_id).await;
-                return simple_response(StatusCode::BAD_REQUEST);
+    let sessions = state.sessions.clone();
+    let upload_session_id = session_id.clone();
+    let (done_tx, done_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut body = request.into_body();
+        let mut upload_state = session.upload.lock().await;
+        while let Some(frame_result) = body.frame().await {
+            let frame = match frame_result {
+                Ok(frame) => frame,
+                Err(error) => {
+                    error!("xhttp stream-up body failed: {}", error);
+                    sessions.remove(&upload_session_id);
+                    let _ = done_tx.send(());
+                    return;
+                }
+            };
+            if let Some(chunk) = frame.data_ref()
+                && let Err(error) = upload_state.writer.write_all(chunk).await
+            {
+                error!("xhttp stream-up write failed: {}", error);
+                sessions.remove(&upload_session_id);
+                let _ = done_tx.send(());
+                return;
             }
-        };
-        if let Some(chunk) = frame.data_ref()
-            && let Err(error) = upload_state.writer.write_all(chunk).await
-        {
-            error!("xhttp stream-up write failed: {}", error);
-            state.sessions.remove(&session_id).await;
-            return simple_response(StatusCode::BAD_GATEWAY);
         }
-    }
-    if let Err(error) = upload_state.writer.shutdown().await {
-        error!("xhttp stream-up shutdown failed: {}", error);
-        state.sessions.remove(&session_id).await;
-        return simple_response(StatusCode::BAD_GATEWAY);
-    }
+        let _ = done_tx.send(());
+    });
 
-    simple_response(StatusCode::OK)
+    stream_up_response(done_rx, &state, padding_enabled)
 }
 
 async fn handle_stream_down(
@@ -563,22 +694,23 @@ async fn handle_stream_down(
         return simple_response(StatusCode::CONFLICT);
     };
 
-    let sessions = state.sessions.clone();
-    let session_id_for_drop = session_id.clone();
-    let body_stream = ReaderStream::new(reader).filter_map(move |result| {
-        let sessions = sessions.clone();
-        let session_id = session_id_for_drop.clone();
-        async move {
-            match result {
-                Ok(bytes) => Some(Ok(Frame::data(bytes))),
-                Err(err) => {
+    let cleanup = SessionCleanupGuard {
+        sessions: state.sessions.clone(),
+        session_id,
+    };
+    let body_stream = futures::stream::unfold(
+        (ReaderStream::new(reader), cleanup),
+        |(mut reader, cleanup)| async move {
+            match reader.next().await {
+                Some(Ok(bytes)) => Some((Ok(Frame::data(bytes)), (reader, cleanup))),
+                Some(Err(err)) => {
                     error!("xhttp stream-down read failed: {}", err);
-                    sessions.remove(&session_id).await;
                     None
                 }
+                None => None,
             }
-        }
-    });
+        },
+    );
 
     stream_response(StatusCode::OK, body_stream.boxed(), state.no_sse_header)
 }
@@ -621,9 +753,9 @@ async fn handle_packet_up(
         state.uplink_data_placement,
         XhttpDataPlacement::Auto | XhttpDataPlacement::Body
     ) {
-        match body.collect().await {
-            Ok(collected) => collected.to_bytes().to_vec(),
-            Err(_) => return simple_response(StatusCode::BAD_REQUEST),
+        match collect_body_limited(body, state.max_each_post_bytes).await {
+            Ok(payload) => payload,
+            Err(status) => return simple_response(status),
         }
     } else {
         Vec::new()
@@ -664,12 +796,43 @@ async fn handle_packet_up(
     while let Some(chunk) = upload_state.packet_queue.pop_ready() {
         if let Err(err) = upload_state.writer.write_all(&chunk).await {
             error!("xhttp packet-up write failed: {}", err);
-            state.sessions.remove(&session_id).await;
+            state.sessions.remove(&session_id);
             return simple_response(StatusCode::BAD_GATEWAY);
         }
     }
 
     simple_response(StatusCode::OK)
+}
+
+fn stream_up_response(
+    done_rx: oneshot::Receiver<()>,
+    state: &AppState,
+    padding_enabled: bool,
+) -> Response<ResponseBody> {
+    let (min_secs, max_secs) = state.stream_up_server_secs;
+    let min_padding = state.min_padding;
+    let max_padding = state.max_padding;
+    let body_stream =
+        futures::stream::unfold(done_rx, move |mut done_rx| async move {
+            if !padding_enabled || max_secs == 0 {
+                let _ = (&mut done_rx).await;
+                return None;
+            }
+
+            let delay_secs = random_inclusive(min_secs, max_secs);
+            tokio::select! {
+                _ = &mut done_rx => None,
+                _ = sleep(Duration::from_secs(delay_secs as u64)) => {
+                    let padding_len = random_inclusive(min_padding, max_padding);
+                    Some((
+                        Ok(Frame::data(Bytes::from(vec![b'X'; padding_len]))),
+                        done_rx,
+                    ))
+                }
+            }
+        });
+
+    stream_response(StatusCode::OK, body_stream, true)
 }
 
 fn spawn_handler_stream(
@@ -769,7 +932,7 @@ impl SessionStore {
         inserted
     }
 
-    async fn remove(&self, session_id: &str) {
+    fn remove(&self, session_id: &str) {
         self.inner.write().unwrap().remove(session_id);
     }
 
@@ -784,9 +947,20 @@ impl SessionStore {
             if let Some(session) = session
                 && !session.fully_connected.load(Ordering::Acquire)
             {
-                store.remove(&session_id).await;
+                store.remove(&session_id);
             }
         });
+    }
+}
+
+struct SessionCleanupGuard {
+    sessions: SessionStore,
+    session_id: String,
+}
+
+impl Drop for SessionCleanupGuard {
+    fn drop(&mut self) {
+        self.sessions.remove(&self.session_id);
     }
 }
 
@@ -1003,6 +1177,27 @@ fn decode_chunked_cookie_payload(
     decode_xhttp_payload(&encoded)
 }
 
+async fn collect_body_limited<B>(
+    mut body: B,
+    max_bytes: usize,
+) -> Result<Vec<u8>, StatusCode>
+where
+    B: Body<Data = Bytes> + Unpin,
+{
+    let mut payload = Vec::new();
+    while let Some(frame_result) = body.frame().await {
+        let frame = frame_result.map_err(|_| StatusCode::BAD_REQUEST)?;
+        if let Some(chunk) = frame.data_ref() {
+            let next_len = payload.len().saturating_add(chunk.len());
+            if next_len > max_bytes {
+                return Err(StatusCode::PAYLOAD_TOO_LARGE);
+            }
+            payload.extend_from_slice(chunk);
+        }
+    }
+    Ok(payload)
+}
+
 fn decode_xhttp_payload(encoded: &str) -> std::io::Result<Vec<u8>> {
     if encoded.is_empty() {
         return Ok(Vec::new());
@@ -1020,19 +1215,237 @@ fn matches_base_path(request_path: &str, base_path: &str) -> bool {
     request_path == trimmed_base_path || request_path.starts_with(base_path)
 }
 
-fn query_padding_length(query: &str) -> Option<usize> {
-    for pair in query.split('&') {
-        let Some((key, value)) = pair.split_once('=') else {
-            continue;
-        };
-        if key == "x_padding" {
-            return Some(value.len());
-        }
-    }
-    None
+fn query_value_from_url(raw_url: &str, key: &str) -> Option<String> {
+    let query = raw_url.split_once('?')?.1;
+    let query = query.split('#').next().unwrap_or(query);
+    query_value(Some(query), key)
 }
 
-fn referer_padding_length(referer: &str) -> Option<usize> {
-    let query = referer.split_once('?')?.1;
-    query_padding_length(query)
+fn request_header_bytes(headers: &hyper::HeaderMap) -> usize {
+    headers.iter().fold(2usize, |total, (name, value)| {
+        total
+            .saturating_add(name.as_str().len())
+            .saturating_add(2)
+            .saturating_add(value.as_bytes().len())
+            .saturating_add(2)
+    })
+}
+
+fn random_inclusive(from: usize, to: usize) -> usize {
+    let low = from.min(to);
+    let high = from.max(to);
+    if low == high {
+        low
+    } else {
+        rand::rng().random_range(low..=high)
+    }
+}
+
+fn is_padding_valid(
+    padding: &str,
+    min_padding: usize,
+    max_padding: usize,
+    method: XhttpPaddingMethod,
+) -> bool {
+    if padding.is_empty() {
+        return false;
+    }
+
+    match method {
+        XhttpPaddingMethod::RepeatX => {
+            padding.len() >= min_padding && padding.len() <= max_padding
+        }
+        XhttpPaddingMethod::Tokenish => {
+            let encoded_len = hpack_huffman_encoded_len(padding);
+            encoded_len >= min_padding.saturating_sub(2)
+                && encoded_len <= max_padding.saturating_add(2)
+        }
+    }
+}
+
+fn generate_padding(method: XhttpPaddingMethod, target_len: usize) -> String {
+    match method {
+        XhttpPaddingMethod::RepeatX => "X".repeat(target_len),
+        XhttpPaddingMethod::Tokenish => generate_tokenish_padding(target_len),
+    }
+}
+
+fn generate_tokenish_padding(target_len: usize) -> String {
+    const BASE62: &[u8] =
+        b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    if target_len == 0 {
+        return String::new();
+    }
+
+    let initial_len = target_len.saturating_mul(5).div_ceil(4).max(1);
+    let mut rng = rand::rng();
+    let mut padding = String::with_capacity(initial_len + 4);
+    for _ in 0..initial_len {
+        let index = rng.random_range(0..BASE62.len());
+        padding.push(BASE62[index] as char);
+    }
+    drop(rng);
+
+    let mut adjust_char = 'X';
+    for _ in 0..150 {
+        let current_len = hpack_huffman_encoded_len(&padding);
+        if current_len.abs_diff(target_len) <= 2 {
+            return padding;
+        }
+        if current_len < target_len {
+            padding.push(adjust_char);
+            adjust_char = if adjust_char == 'X' { 'Z' } else { 'X' };
+        } else if padding.pop().is_none() {
+            break;
+        }
+    }
+    padding
+}
+
+fn hpack_huffman_encoded_len(value: &str) -> usize {
+    let bits = value.bytes().fold(0usize, |total, byte| {
+        total.saturating_add(hpack_huffman_bit_len(byte))
+    });
+    bits.div_ceil(8)
+}
+
+fn hpack_huffman_bit_len(byte: u8) -> usize {
+    match byte {
+        b'0' | b'1' | b'2' | b'a' | b'c' | b'e' | b'i' | b'o' | b's' | b't' => 5,
+        b'3'..=b'9'
+        | b'A'
+        | b'b'
+        | b'd'
+        | b'f'
+        | b'g'
+        | b'h'
+        | b'l'
+        | b'm'
+        | b'n'
+        | b'p'
+        | b'r'
+        | b'u' => 6,
+        b'B'..=b'W' | b'Y' | b'j' | b'k' | b'q' | b'v'..=b'z' => 7,
+        b'X' | b'Z' => 8,
+        _ => 8,
+    }
+}
+
+fn apply_response_padding(headers: &mut hyper::HeaderMap, state: &AppState) {
+    let padding_len = random_inclusive(state.min_padding, state.max_padding);
+
+    if !state.padding_obfs_mode {
+        if let Ok(value) =
+            hyper::header::HeaderValue::from_str(&"X".repeat(padding_len))
+        {
+            headers.insert("x-padding", value);
+        }
+        return;
+    }
+
+    let padding = generate_padding(state.padding_method, padding_len);
+    match state.padding_placement {
+        XhttpPaddingPlacement::Cookie => {
+            let cookie = format!("{}={}; Path=/", state.padding_key, padding);
+            if let Ok(value) = hyper::header::HeaderValue::from_str(&cookie) {
+                headers.append(header::SET_COOKIE, value);
+            }
+        }
+        XhttpPaddingPlacement::Header => {
+            if let Ok(name) = hyper::header::HeaderName::from_bytes(
+                state.padding_header.as_bytes(),
+            ) && let Ok(value) = hyper::header::HeaderValue::from_str(&padding)
+            {
+                headers.insert(name, value);
+            }
+        }
+        XhttpPaddingPlacement::Query => {}
+        XhttpPaddingPlacement::QueryInHeader => {
+            let value = format!("?{}={}", state.padding_key, padding);
+            if let Ok(name) = hyper::header::HeaderName::from_bytes(
+                state.padding_header.as_bytes(),
+            ) && let Ok(value) = hyper::header::HeaderValue::from_str(&value)
+            {
+                headers.insert(name, value);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokenish_padding_tracks_hpack_target() {
+        for target in [1usize, 100, 1000] {
+            let padding = generate_tokenish_padding(target);
+            let encoded_len = hpack_huffman_encoded_len(&padding);
+            assert!(encoded_len.abs_diff(target) <= 2);
+        }
+    }
+
+    #[test]
+    fn padding_validation_matches_repeat_and_tokenish_rules() {
+        assert!(is_padding_valid(
+            &"X".repeat(100),
+            100,
+            1000,
+            XhttpPaddingMethod::RepeatX,
+        ));
+        assert!(!is_padding_valid(
+            &"X".repeat(99),
+            100,
+            1000,
+            XhttpPaddingMethod::RepeatX,
+        ));
+
+        let tokenish = generate_tokenish_padding(100);
+        assert!(is_padding_valid(
+            &tokenish,
+            100,
+            100,
+            XhttpPaddingMethod::Tokenish,
+        ));
+    }
+
+    #[test]
+    fn query_value_from_header_url_extracts_padding() {
+        assert_eq!(
+            query_value_from_url(
+                "https://example.com/path?pad=XXXX#fragment",
+                "pad"
+            )
+            .as_deref(),
+            Some("XXXX"),
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_body_limited_rejects_oversized_streaming_payload() {
+        let frames = futures::stream::iter([
+            Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"1234"))),
+            Ok(Frame::data(Bytes::from_static(b"5678"))),
+        ]);
+        let body = StreamBody::new(frames);
+
+        let result = collect_body_limited(body, 7).await;
+
+        assert_eq!(result, Err(StatusCode::PAYLOAD_TOO_LARGE));
+    }
+
+    #[tokio::test]
+    async fn stream_down_cleanup_guard_removes_connected_session() {
+        let store = SessionStore::new(Duration::from_secs(30), 30);
+        let session = store.get_or_create("session");
+        session.fully_connected.store(true, Ordering::Release);
+        assert!(store.inner.read().unwrap().contains_key("session"));
+
+        drop(SessionCleanupGuard {
+            sessions: store.clone(),
+            session_id: "session".to_string(),
+        });
+
+        assert!(!store.inner.read().unwrap().contains_key("session"));
+    }
 }

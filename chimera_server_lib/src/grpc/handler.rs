@@ -2357,6 +2357,15 @@ mod tests {
                     max_each_post_bytes: 1_000_000,
                     max_buffered_posts: 30,
                     session_ttl_secs: 30,
+                    stream_up_server_secs: (20, 80),
+                    server_max_header_bytes: 8192,
+                    padding_obfs_mode: false,
+                    padding_key: "x_padding".into(),
+                    padding_header: "X-Padding".into(),
+                    padding_placement:
+                        crate::config::server_config::XhttpPaddingPlacement::QueryInHeader,
+                    padding_method:
+                        crate::config::server_config::XhttpPaddingMethod::RepeatX,
                     no_grpc_header: false,
                     no_sse_header: false,
                     uplink_http_method: "POST".into(),

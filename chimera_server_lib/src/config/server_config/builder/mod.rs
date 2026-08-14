@@ -179,7 +179,19 @@ fn apply_httpupgrade_layer(
 use super::quic::ServerQuicConfig;
 #[cfg(feature = "httpupgrade")]
 use super::types::HttpUpgradeServerConfig;
-use super::types::{ServerConfig, ServerProxyConfig};
+use super::types::{ServerConfig, ServerProxyConfig, XhttpServerConfig};
+
+pub(crate) fn collect_xhttp_settings_from_json(
+    value: serde_json::Value,
+) -> Result<XhttpServerConfig, Error> {
+    let settings = serde_json::from_value::<crate::config::XhttpSettings>(value)
+        .map_err(|error| {
+            Error::InvalidConfig(format!(
+                "invalid xhttp transport settings: {error}"
+            ))
+        })?;
+    collectors::collect_xhttp_settings(settings)
+}
 
 #[cfg(feature = "hysteria")]
 use collectors::collect_hysteria2_settings;
