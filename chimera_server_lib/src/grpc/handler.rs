@@ -527,6 +527,7 @@ impl HandlerServiceImpl {
                 Ok(ServerProxyConfig::Socks {
                     accounts,
                     udp_enabled: false,
+                    udp_bind_ip: None,
                 })
             }
             #[cfg(feature = "vless")]
@@ -2332,6 +2333,7 @@ mod tests {
             }]
             .into(),
             udp_enabled: false,
+            udp_bind_ip: None,
         };
         let inbound = ServerConfig {
             tag: inbound_tag.clone(),
@@ -2480,6 +2482,7 @@ mod tests {
                 }]
                 .into(),
                 udp_enabled: false,
+                udp_bind_ip: None,
             },
             transport: Transport::Tcp,
             quic_settings: None,
