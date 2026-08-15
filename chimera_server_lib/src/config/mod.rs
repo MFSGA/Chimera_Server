@@ -243,6 +243,8 @@ pub struct HysteriaSettings {
     pub down: Option<BandwidthValue>,
     #[serde(default)]
     pub ignore_client_bandwidth: Option<bool>,
+    #[serde(default)]
+    pub udp_idle_timeout: i64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
