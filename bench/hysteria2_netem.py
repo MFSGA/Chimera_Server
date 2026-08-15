@@ -29,6 +29,7 @@ from pathlib import Path
 
 AUTH = "chimera-hysteria2-benchmark"
 SYNC_BYTE = b"\xAC"
+DOWNLOAD_GO = b"\xAD"
 DEFAULT_MODES = ("brutal", "bbr", "reno")
 CLOCK_TICKS = os.sysconf("SC_CLK_TCK")
 
@@ -131,16 +132,18 @@ def measure_throughput(sock: socket.socket, payload_size: int) -> tuple[float, f
     upload_start = time.perf_counter()
     sock.sendall(payload)
 
-    first = sock.recv(65536)
-    if not first:
-        raise RuntimeError("connection closed before benchmark sync byte")
-    sync_index = first.find(SYNC_BYTE)
-    if sync_index < 0:
-        raise RuntimeError(f"missing benchmark sync byte in first response ({len(first)} bytes)")
+    sync = sock.recv(1)
+    if sync != SYNC_BYTE:
+        raise RuntimeError(f"missing benchmark sync byte: {sync!r}")
     upload_end = time.perf_counter()
-    received = len(first) - sync_index - 1
 
+    # Keep the echo payload behind an explicit GO byte so no response bytes can
+    # be buffered before the download timer starts. Starting before sendall()
+    # makes the directional measurements symmetric: upload includes the sync
+    # response path, download includes the GO request path.
     download_start = time.perf_counter()
+    sock.sendall(DOWNLOAD_GO)
+    received = 0
     while received < payload_size:
         chunk = sock.recv(min(65536, payload_size - received))
         if not chunk:
@@ -181,6 +184,8 @@ def run_echo_server(bind: str, port: int, payload_size: int, connections: int) -
             if len(data) != payload_size:
                 return 3
             conn.sendall(SYNC_BYTE)
+            if conn.recv(1) != DOWNLOAD_GO:
+                return 4
             conn.sendall(data)
         handled += 1
     return 0
