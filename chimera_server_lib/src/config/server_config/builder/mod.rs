@@ -835,6 +835,14 @@ impl TryFrom<InboudItem> for ServerConfig {
                         Ok(if timeout == 0 { 30 } else { timeout as u64 })
                     })
                     .transpose()?;
+                if let Some(quic_params) = xray_quic_params {
+                    let keep_alive_period = quic_params.keep_alive_period;
+                    if keep_alive_period != 0 && !(2..=60).contains(&keep_alive_period) {
+                        return Err(Error::InvalidConfig(format!(
+                            "finalmask.quicParams.keepAlivePeriod must be 0 or between 2 and 60 seconds (got {keep_alive_period})"
+                        )));
+                    }
+                }
                 let xray_max_incoming_streams = xray_quic_params
                     .map(|quic_params| {
                         let streams = quic_params.max_incoming_streams;
@@ -1558,6 +1566,29 @@ mod tests {
         let err = ServerConfig::try_from(hysteria2_inbound_with_finalmask(3, 0))
             .expect_err("Xray rejects maxIdleTimeout below four seconds");
         assert!(err.to_string().contains("maxIdleTimeout"));
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn hysteria2_finalmask_keep_alive_period_matches_xray_bounds() {
+        ServerConfig::try_from(hysteria2_inbound_with_finalmask_quic_params(
+            serde_json::json!({ "keepAlivePeriod": 2 }),
+        ))
+        .expect("Xray accepts two-second keepAlivePeriod");
+        ServerConfig::try_from(hysteria2_inbound_with_finalmask_quic_params(
+            serde_json::json!({ "keepAlivePeriod": 60 }),
+        ))
+        .expect("Xray accepts sixty-second keepAlivePeriod");
+
+        for keep_alive_period in [1, 61] {
+            let err = ServerConfig::try_from(
+                hysteria2_inbound_with_finalmask_quic_params(
+                    serde_json::json!({ "keepAlivePeriod": keep_alive_period }),
+                ),
+            )
+            .expect_err("Xray rejects out-of-range keepAlivePeriod");
+            assert!(err.to_string().contains("keepAlivePeriod"));
+        }
     }
 
     #[cfg(feature = "hysteria")]
