@@ -36,7 +36,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event.inputs.source_ref || github.ref }}
-          token: ${{ secrets.ADMIN_PAT }}
+          token: ${{ github.token }}
 
       - name: Configure Git
         run: |
@@ -171,7 +171,7 @@ jobs:
             dist/chimera_server_app-${{ steps.meta.outputs.tag }}-linux-x86_64-musl
             dist/chimera_server_app-${{ steps.meta.outputs.tag }}-linux-x86_64-musl.sha256
         env:
-          GITHUB_TOKEN: ${{ secrets.ADMIN_PAT }}
+          GITHUB_TOKEN: ${{ github.token }}
 
   release-windows:
     runs-on: windows-latest
@@ -181,7 +181,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ needs.release.outputs.tag }}
-          token: ${{ secrets.ADMIN_PAT }}
+          token: ${{ github.token }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -209,4 +209,4 @@ jobs:
             dist/chimera_server_app-${{ needs.release.outputs.tag }}-windows-x86_64.exe.sha256
           generate_release_notes: false
         env:
-          GITHUB_TOKEN: ${{ secrets.ADMIN_PAT }}
+          GITHUB_TOKEN: ${{ github.token }}
