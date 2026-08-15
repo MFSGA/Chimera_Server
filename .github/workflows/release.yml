@@ -80,8 +80,14 @@ jobs:
 
           TAG="v${VERSION}"
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-            echo "tag already exists: $TAG" >&2
-            exit 1
+            TAG_COMMIT=$(git rev-parse "$TAG^{commit}")
+            if [[ "$TAG_COMMIT" != "$SOURCE_COMMIT" ]]; then
+              echo "tag $TAG points to $TAG_COMMIT, expected $SOURCE_COMMIT" >&2
+              exit 1
+            fi
+            echo "tag_preexists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag_preexists=false" >> "$GITHUB_OUTPUT"
           fi
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -145,6 +151,7 @@ jobs:
           ls -lh dist
 
       - name: Create annotated release tag
+        if: steps.meta.outputs.tag_preexists != 'true'
         shell: bash
         env:
           TAG: ${{ steps.meta.outputs.tag }}
