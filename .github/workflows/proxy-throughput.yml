@@ -40,11 +40,16 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
-      - name: Download xray-core
+      - name: Download pinned xray-core
         run: |
+          set -euo pipefail
           VERSION=$(cat bench/.xray-version)
+          EXPECTED_SHA256=$(cat bench/.xray-linux-64.sha256)
           mkdir -p xray
-          curl -L "https://github.com/XTLS/Xray-core/releases/download/$VERSION/Xray-linux-64.zip" -o /tmp/xray.zip
+          curl --fail --location --retry 3 \
+            "https://github.com/XTLS/Xray-core/releases/download/${VERSION}/Xray-linux-64.zip" \
+            -o /tmp/xray.zip
+          echo "${EXPECTED_SHA256}  /tmp/xray.zip" | sha256sum --check --strict
           unzip -o /tmp/xray.zip -d xray/
           chmod +x xray/xray
           xray/xray version
@@ -116,6 +121,7 @@ jobs:
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
+                issue_number: context.issue.number,
                 comment_id: existing.id,
                 body: body,
               });
