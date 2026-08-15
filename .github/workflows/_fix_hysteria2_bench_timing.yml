@@ -53,12 +53,14 @@ jobs:
           bench.write_text(text)
 
           workflow = Path('.github/workflows/proxy-throughput.yml')
-          text = workflow.read_text()
-          old = '''              repo: context.repo.repo,\n              issue_number: context.issue.number,\n              comment_id: existing.id,\n'''
-          new = '''              repo: context.repo.repo,\n              comment_id: existing.id,\n'''
-          if text.count(old) != 1:
-              raise SystemExit(f'expected exactly one Octokit cleanup, found {text.count(old)}')
-          workflow.write_text(text.replace(old, new, 1))
+          lines = workflow.read_text().splitlines(keepends=True)
+          start = next(i for i, line in enumerate(lines) if 'github.rest.issues.updateComment({' in line)
+          end = next(i for i in range(start + 1, len(lines)) if lines[i].strip() == '});')
+          issue_lines = [i for i in range(start, end + 1) if 'issue_number: context.issue.number,' in lines[i]]
+          if len(issue_lines) != 1:
+              raise SystemExit(f'expected one issue_number in updateComment block, found {len(issue_lines)}')
+          del lines[issue_lines[0]]
+          workflow.write_text(''.join(lines))
           PY
 
           python3 -m py_compile bench/hysteria2_netem.py
