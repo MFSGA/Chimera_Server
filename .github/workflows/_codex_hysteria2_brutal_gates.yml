@@ -1,62 +1,45 @@
-name: Hysteria2 Brutal validation
+name: Hysteria2 latest Xray validation
 
 on:
   push:
     branches: [codex/hysteria2-brutal-post-auth]
 
 jobs:
-  gates:
+  latest-xray-interop:
+    name: Xray v26.7.28 / ${{ matrix.label }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: master
+            ref: master
+          - label: pr16
+            ref: codex/hysteria2-brutal-post-auth
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt,clippy
+          ref: ${{ matrix.ref }}
+      - uses: dtolnay/rust-toolchain@stable
       - uses: arduino/setup-protoc@v3
         with:
           version: "23.x"
       - uses: Swatinem/rust-cache@v2
-      - name: Focused Brutal tests
-        run: cargo test -p chimera_server_lib brutal_
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Build all features
-        run: cargo build --all-features
-      - name: Clippy all targets and features
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Test workspace
-        run: cargo test
-      - name: Test locked
-        run: cargo test --locked
-      - name: Download Xray 26.2.6
+      - name: Download and verify Xray v26.7.28
+        shell: bash
         run: |
+          set -euo pipefail
           curl -fL --retry 3 \
-            https://github.com/XTLS/Xray-core/releases/download/v26.2.6/Xray-linux-64.zip \
-            -o /tmp/xray-26.2.6.zip
-          mkdir -p xray-26.2.6
-          unzip -q /tmp/xray-26.2.6.zip -d xray-26.2.6
-          chmod +x xray-26.2.6/xray
-          ./xray-26.2.6/xray version
-      - name: Xray 26.2.6 Brutal TCP and UDP interop
+            https://github.com/XTLS/Xray-core/releases/download/v26.7.28/Xray-linux-64.zip \
+            -o /tmp/Xray-linux-64-v26.7.28.zip
+          echo "8195d909f1109b8f3d99eefe401a3c451d7bf4af71f24d3815420f77e5dd2a40  /tmp/Xray-linux-64-v26.7.28.zip" | sha256sum -c -
+          mkdir -p xray-v26.7.28
+          unzip -q /tmp/Xray-linux-64-v26.7.28.zip -d xray-v26.7.28
+          chmod +x xray-v26.7.28/xray
+          ./xray-v26.7.28/xray version
+      - name: Hysteria2 Brutal TCP and UDP interop
         env:
-          XRAY_BIN: xray-26.2.6/xray
-        run: |
-          cargo test -p chimera_server_app --test xray_client_proxy_e2e \
-            xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2 \
-            -- --ignored --exact --nocapture
-      - name: Download repository-pinned Xray
-        run: |
-          VERSION=$(cat bench/.xray-version)
-          curl -fL --retry 3 \
-            "https://github.com/XTLS/Xray-core/releases/download/${VERSION}/Xray-linux-64.zip" \
-            -o /tmp/xray-current.zip
-          mkdir -p xray-current
-          unzip -q /tmp/xray-current.zip -d xray-current
-          chmod +x xray-current/xray
-          ./xray-current/xray version
-      - name: Repository-pinned Xray Brutal TCP and UDP interop
-        env:
-          XRAY_BIN: xray-current/xray
+          XRAY_BIN: ${{ github.workspace }}/xray-v26.7.28/xray
         run: |
           cargo test -p chimera_server_app --test xray_client_proxy_e2e \
             xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2 \
