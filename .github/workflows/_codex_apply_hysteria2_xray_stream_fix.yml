@@ -1,17 +1,49 @@
-name: Apply Brutal window compatibility fix
+name: Validate Brutal low-rtt fix
 
 on:
   push:
     branches:
       - codex/hysteria2-xray-modern-streams
 
-permissions:
-  contents: write
-
 jobs:
-  apply:
-    if: "${{ github.event.head_commit.message == 'ci: apply Brutal window compatibility fix' }}"
+  quality:
+    if: "${{ github.event.head_commit.message == 'ci: validate Brutal low-rtt fix' }}"
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/hysteria2-xray-brutal-window
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: '23.x'
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Build all features
+        run: cargo build --all-features
+      - name: Clippy all targets and features
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test
+      - name: Test locked
+        run: cargo test --locked
+
+  interop:
+    if: "${{ github.event.head_commit.message == 'ci: validate Brutal low-rtt fix' }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: v26.7.28
+            sha256: 8195d909f1109b8f3d99eefe401a3c451d7bf4af71f24d3815420f77e5dd2a40
+          - version: v26.3.27
+            sha256: 23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae
+          - version: v26.2.6
+            sha256: 29ce535b56e207a406ffa1c2d4842dcc410be003eff8ec508bb732abc9f8e385
     steps:
       - uses: actions/checkout@v6
         with:
@@ -21,38 +53,35 @@ jobs:
         with:
           version: '23.x'
       - uses: Swatinem/rust-cache@v2
-      - name: Apply fix and regression tests
-        shell: bash
-        run: |
-          python3 <<'PY'
-          from pathlib import Path
-          path = Path('chimera_server_lib/src/handler/hysteria2/congestion.rs')
-          text = path.read_text()
-          text = text.replace(
-              'const DEFAULT_CONGESTION_WINDOW: u64 = 10_240;\n',
-              '''const DEFAULT_CONGESTION_WINDOW: u64 = 10_240;\n// Xray Brutal allows another datagram when bytes-in-flight is exactly cwnd.\n// Quinn treats `window()` as a hard maximum for ack-eliciting bytes in flight,\n// so preserve Xray's effective one-extra-datagram allowance at the minimum.\nconst MIN_CONGESTION_WINDOW_DATAGRAMS: u64 = 2;\n''',
-              1,
-          )
-          text = text.replace(
-              '        (cwnd as u64).max(self.max_datagram_size)\n',
-              '''        (cwnd as u64).max(\n            self.max_datagram_size\n                .saturating_mul(MIN_CONGESTION_WINDOW_DATAGRAMS),\n        )\n''',
-              1,
-          )
-          text += '''\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn brutal_low_rtt_window_preserves_xray_send_allowance() {\n        let now = Instant::now();\n        let mut state = BrutalState::new(now, 1200);\n        state.last_rtt = Duration::from_micros(100);\n\n        // At Xray's minimum valid Brutal rate this RTT would otherwise collapse\n        // Quinn's strict in-flight window to a single datagram.\n        assert_eq!(state.window(65_536), 2400);\n\n        state.on_mtu_update(1450);\n        assert_eq!(state.window(65_536), 2900);\n    }\n\n    #[test]\n    fn brutal_rate_derived_window_is_unchanged_above_minimum() {\n        let now = Instant::now();\n        let mut state = BrutalState::new(now, 1200);\n        state.last_rtt = Duration::from_millis(100);\n\n        assert_eq!(state.window(1_000_000), 80_000);\n    }\n}\n'''
-          path.write_text(text)
-          PY
-          cargo fmt --all
-          git diff --check
-      - name: Focused Brutal tests
-        run: cargo test -p chimera_server_lib brutal_
-      - name: Commit fix
+      - name: Provision temporary test certificate
         shell: bash
         run: |
           set -euo pipefail
-          git config user.name MFSGA
-          git config user.email chimera_rust@proton.me
-          git add chimera_server_lib/src/handler/hysteria2/congestion.rs
-          git diff --cached --check
-          git diff --cached --stat
-          git commit -m 'fix(hysteria2): prevent Brutal low-rtt stalls'
-          git push origin HEAD:codex/hysteria2-xray-brutal-window
+          mkdir -p cert
+          openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
+            -keyout cert/key.pem -out cert/cert.pem -days 1 \
+            -subj '/CN=localhost' \
+            -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1'
+      - name: Download and verify Xray
+        shell: bash
+        env:
+          XRAY_VERSION: ${{ matrix.version }}
+          XRAY_SHA256: ${{ matrix.sha256 }}
+        run: |
+          set -euo pipefail
+          archive="/tmp/Xray-linux-64-${XRAY_VERSION}.zip"
+          curl -fL --retry 3 \
+            "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" \
+            -o "$archive"
+          echo "${XRAY_SHA256}  ${archive}" | sha256sum -c -
+          unzip -q "$archive" -d xray-test
+          cp xray-test/xray ./xray
+          chmod +x ./xray
+          ./xray version
+      - name: Hysteria2 Brutal TCP and UDP interop
+        env:
+          XRAY_BIN: ${{ github.workspace }}/xray
+        run: |
+          cargo test -p chimera_server_app --test xray_client_proxy_e2e \
+            xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2 \
+            -- --ignored --exact --nocapture
