@@ -17,6 +17,47 @@ use crate::util::option::OneOrSome;
 
 #[cfg(feature = "ws")]
 use super::ws::WebsocketServerConfig;
+
+#[cfg(feature = "hysteria")]
+fn parse_xray_finalmask_bandwidth(input: &str) -> Result<u64, Error> {
+    let value = input.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return Ok(0);
+    }
+    let split = value
+        .char_indices()
+        .find(|(_, c)| !c.is_ascii_digit() && *c != '.')
+        .map(|(idx, _)| idx)
+        .unwrap_or(value.len());
+    let number = value[..split].parse::<f64>().map_err(|_| {
+        Error::InvalidConfig(format!(
+            "invalid finalmask.quicParams bandwidth value: {input}"
+        ))
+    })?;
+    let multiplier = match value[split..].trim() {
+        "" | "b" | "bps" => 1_u64,
+        "k" | "kb" | "kbps" => 1024,
+        "m" | "mb" | "mbps" => 1024 * 1024,
+        "g" | "gb" | "gbps" => 1024 * 1024 * 1024,
+        "t" | "tb" | "tbps" => 1024_u64.pow(4),
+        unit => {
+            return Err(Error::InvalidConfig(format!(
+                "unsupported finalmask.quicParams bandwidth unit: {unit}"
+            )));
+        }
+    };
+    let bits_per_second = number * multiplier as f64;
+    if !bits_per_second.is_finite()
+        || bits_per_second < 0.0
+        || bits_per_second > u64::MAX as f64
+    {
+        return Err(Error::InvalidConfig(format!(
+            "invalid finalmask.quicParams bandwidth value: {input}"
+        )));
+    }
+    Ok(bits_per_second as u64 / 8)
+}
+
 #[cfg(feature = "ws")]
 fn websocket_server_config(
     ws_setting: crate::config::WsSettings,
@@ -726,6 +767,64 @@ impl TryFrom<InboudItem> for ServerConfig {
                     .final_mask
                     .as_ref()
                     .and_then(|final_mask| final_mask.quic_params.as_ref());
+                let xray_congestion = xray_quic_params
+                    .map(|quic_params| {
+                        let congestion = quic_params.congestion.to_ascii_lowercase();
+                        match congestion.as_str() {
+                            "" | "brutal" | "reno" | "bbr" | "force-brutal" => {
+                                Ok(congestion)
+                            }
+                            _ => Err(Error::InvalidConfig(format!(
+                                "finalmask.quicParams.congestion must be one of reno, bbr, brutal, force-brutal (got {})",
+                                quic_params.congestion
+                            ))),
+                        }
+                    })
+                    .transpose()?;
+                let xray_bbr_profile = xray_quic_params
+                    .map(|quic_params| {
+                        let profile = quic_params.bbr_profile.to_ascii_lowercase();
+                        match profile.as_str() {
+                            "" => Ok("standard".to_string()),
+                            "conservative" | "standard" | "aggressive" => Ok(profile),
+                            _ => Err(Error::InvalidConfig(format!(
+                                "finalmask.quicParams.bbrProfile must be one of conservative, standard, aggressive (got {})",
+                                quic_params.bbr_profile
+                            ))),
+                        }
+                    })
+                    .transpose()?;
+                let xray_brutal_up = xray_quic_params
+                    .map(|quic_params| {
+                        let up = parse_xray_finalmask_bandwidth(&quic_params.brutal_up)?;
+                        if up != 0 && up < 65_536 {
+                            return Err(Error::InvalidConfig(
+                                "finalmask.quicParams.brutalUp must be at least 65536 bytes per second"
+                                    .into(),
+                            ));
+                        }
+                        Ok(up)
+                    })
+                    .transpose()?;
+                let xray_brutal_down = xray_quic_params
+                    .map(|quic_params| {
+                        let down = parse_xray_finalmask_bandwidth(&quic_params.brutal_down)?;
+                        if down != 0 && down < 65_536 {
+                            return Err(Error::InvalidConfig(
+                                "finalmask.quicParams.brutalDown must be at least 65536 bytes per second"
+                                    .into(),
+                            ));
+                        }
+                        Ok(down)
+                    })
+                    .transpose()?;
+                if xray_congestion.as_deref() == Some("force-brutal")
+                    && xray_brutal_up == Some(0)
+                {
+                    return Err(Error::InvalidConfig(
+                        "finalmask.quicParams.force-brutal requires brutalUp".into(),
+                    ));
+                }
                 let xray_max_idle_timeout_secs = xray_quic_params.map(|quic_params| {
                         let timeout = quic_params.max_idle_timeout;
                         if timeout != 0 && !(4..=120).contains(&timeout) {
@@ -800,6 +899,10 @@ impl TryFrom<InboudItem> for ServerConfig {
                 })?;
                 let mut config =
                     collect_hysteria2_settings(settings, hysteria_settings)?;
+                config.xray_congestion = xray_congestion;
+                config.xray_bbr_profile = xray_bbr_profile;
+                config.xray_brutal_up = xray_brutal_up;
+                config.xray_brutal_down = xray_brutal_down;
                 config.xray_max_idle_timeout_secs = xray_max_idle_timeout_secs;
                 config.xray_max_incoming_streams = xray_max_incoming_streams;
                 if let Some((
@@ -1514,6 +1617,50 @@ mod tests {
             )
             .expect_err("Xray rejects receive windows below 16384");
             assert!(err.to_string().contains(field), "{err}");
+        }
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn hysteria2_finalmask_congestion_matches_xray_settings() {
+        let config = ServerConfig::try_from(
+            hysteria2_inbound_with_finalmask_quic_params(serde_json::json!({
+                "congestion": "BRUTAL",
+                "bbrProfile": "AGGRESSIVE",
+                "brutalUp": "8 mbps",
+                "brutalDown": "0.5 mbps"
+            })),
+        )
+        .expect("valid Xray Hysteria2 congestion settings should build");
+        match config.protocol {
+            ServerProxyConfig::Hysteria2 { config } => {
+                assert_eq!(config.xray_congestion.as_deref(), Some("brutal"));
+                assert_eq!(config.xray_bbr_profile.as_deref(), Some("aggressive"));
+                assert_eq!(config.xray_brutal_up, Some(1024 * 1024));
+                assert_eq!(config.xray_brutal_down, Some(65_536));
+            }
+            other => panic!("expected hysteria2 protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn hysteria2_finalmask_congestion_rejects_xray_invalid_values() {
+        for (params, expected) in [
+            (serde_json::json!({"congestion": "cubic"}), "congestion"),
+            (serde_json::json!({"bbrProfile": "turbo"}), "bbrProfile"),
+            (
+                serde_json::json!({"congestion": "force-brutal"}),
+                "requires brutalUp",
+            ),
+            (serde_json::json!({"brutalUp": "8 kbps"}), "brutalUp"),
+            (serde_json::json!({"brutalDown": "8 kbps"}), "brutalDown"),
+        ] {
+            let err = ServerConfig::try_from(
+                hysteria2_inbound_with_finalmask_quic_params(params),
+            )
+            .expect_err("invalid Xray congestion settings must be rejected");
+            assert!(err.to_string().contains(expected), "{err}");
         }
     }
 
