@@ -1057,7 +1057,13 @@ async fn drive_udp_datagrams(
             .response_contexts
             .write()
             .expect("hysteria2 UDP contexts lock poisoned")
-            .insert(session.last_socket_addr, traffic_context.clone());
+            .insert(
+                session.last_socket_addr,
+                UdpResponseContext {
+                    traffic_context: traffic_context.clone(),
+                    client_location: session.last_location.clone(),
+                },
+            );
 
         match session
             .socket
@@ -1110,7 +1116,7 @@ struct UdpSession {
     last_socket_addr: SocketAddr,
     last_active: Arc<RwLock<Instant>>,
     base_context: TrafficContext,
-    response_contexts: Arc<RwLock<HashMap<SocketAddr, TrafficContext>>>,
+    response_contexts: Arc<RwLock<HashMap<SocketAddr, UdpResponseContext>>>,
     remote_task: tokio::task::JoinHandle<()>,
     _connection_guard: ConnectionGuard,
 }
@@ -1135,6 +1141,12 @@ impl Drop for UdpSession {
     fn drop(&mut self) {
         self.remote_task.abort();
     }
+}
+
+#[derive(Clone)]
+struct UdpResponseContext {
+    traffic_context: TrafficContext,
+    client_location: NetLocation,
 }
 
 struct FragmentedPacket {
@@ -1229,7 +1241,7 @@ async fn run_udp_remote_to_local_loop(
     session_id: u32,
     connection: quinn::Connection,
     socket: Arc<UdpSocket>,
-    response_contexts: Arc<RwLock<HashMap<SocketAddr, TrafficContext>>>,
+    response_contexts: Arc<RwLock<HashMap<SocketAddr, UdpResponseContext>>>,
     last_active: Arc<RwLock<Instant>>,
     fallback_context: TrafficContext,
 ) -> std::io::Result<()> {
@@ -1254,14 +1266,19 @@ async fn run_udp_remote_to_local_loop(
         if loop_count == 0 {
             tokio::task::yield_now().await;
         }
-        let traffic_context = response_contexts
+        let response_context = response_contexts
             .read()
             .expect("hysteria2 UDP contexts lock poisoned")
             .get(&src_addr)
-            .cloned()
-            .unwrap_or_else(|| fallback_context.clone());
+            .cloned();
+        let (traffic_context, client_address) = match response_context {
+            Some(context) => {
+                (context.traffic_context, context.client_location.to_string())
+            }
+            None => (fallback_context.clone(), src_addr.to_string()),
+        };
 
-        let address_bytes = Bytes::from(src_addr.to_string().into_bytes());
+        let address_bytes = Bytes::from(client_address.into_bytes());
         let mut address_len_buf = Vec::with_capacity(8);
         push_varint(&mut address_len_buf, address_bytes.len() as u64)?;
         let address_len_bytes = Bytes::from(address_len_buf);

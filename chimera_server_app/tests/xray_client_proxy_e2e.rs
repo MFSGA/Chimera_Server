@@ -1716,6 +1716,13 @@ async fn xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2() {
         b"hysteria2 UDP through xray client",
     )
     .await;
+    assert_socks5_udp_domain_echo(
+        socks_addr,
+        "localhost",
+        udp_echo_addr.port(),
+        b"hysteria2 UDP domain through xray client",
+    )
+    .await;
 }
 
 #[test]
@@ -2426,6 +2433,77 @@ async fn assert_socks5_udp_echo(
         .expect("receive SOCKS UDP echo");
     let payload_offset = socks_udp_payload_offset(&response[..len]);
     assert_eq!(&response[payload_offset..len], payload);
+}
+
+async fn assert_socks5_udp_domain_echo(
+    socks_addr: SocketAddr,
+    target_domain: &str,
+    target_port: u16,
+    payload: &[u8],
+) {
+    let mut control = tokio::net::TcpStream::connect(socks_addr)
+        .await
+        .expect("connect xray SOCKS UDP domain control");
+    control
+        .write_all(&[0x05, 0x01, 0x00])
+        .await
+        .expect("SOCKS UDP domain hello");
+    let mut hello = [0u8; 2];
+    control
+        .read_exact(&mut hello)
+        .await
+        .expect("SOCKS UDP domain hello response");
+    assert_eq!(hello, [0x05, 0x00]);
+
+    control
+        .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+        .expect("SOCKS UDP domain associate request");
+    let mut header = [0u8; 4];
+    control
+        .read_exact(&mut header)
+        .await
+        .expect("SOCKS UDP domain associate response");
+    assert_eq!(header[1], 0x00, "SOCKS UDP domain associate failed");
+    let mut relay_addr =
+        read_async_socks_bound_address(&mut control, header[3]).await;
+    if relay_addr.ip().is_unspecified() {
+        relay_addr.set_ip(socks_addr.ip());
+    }
+
+    let udp = TokioUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind SOCKS UDP domain client");
+    let domain_bytes = target_domain.as_bytes();
+    let domain_len = u8::try_from(domain_bytes.len()).expect("SOCKS domain length");
+    let mut request = vec![0x00, 0x00, 0x00, 0x03, domain_len];
+    request.extend_from_slice(domain_bytes);
+    request.extend_from_slice(&target_port.to_be_bytes());
+    request.extend_from_slice(payload);
+    udp.send_to(&request, relay_addr)
+        .await
+        .expect("send SOCKS UDP domain payload");
+
+    let mut response = vec![0u8; payload.len() + domain_bytes.len() + 64];
+    let (len, _) = tokio::time::timeout(IO_TIMEOUT, udp.recv_from(&mut response))
+        .await
+        .expect("SOCKS UDP domain echo timeout")
+        .expect("receive SOCKS UDP domain echo");
+    assert!(
+        len >= 7 + domain_bytes.len(),
+        "SOCKS UDP domain response too short"
+    );
+    assert_eq!(&response[..3], &[0x00, 0x00, 0x00]);
+    assert_eq!(response[3], 0x03, "SOCKS UDP response lost domain identity");
+    let returned_len = response[4] as usize;
+    assert_eq!(returned_len, domain_bytes.len());
+    assert_eq!(&response[5..5 + returned_len], domain_bytes);
+    let port_start = 5 + returned_len;
+    assert_eq!(
+        u16::from_be_bytes([response[port_start], response[port_start + 1]]),
+        target_port
+    );
+    assert_eq!(&response[port_start + 2..len], payload);
 }
 
 async fn assert_tls_echo_through_socks(
