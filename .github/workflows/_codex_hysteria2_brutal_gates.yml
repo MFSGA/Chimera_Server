@@ -25,6 +25,15 @@ jobs:
         with:
           version: "23.x"
       - uses: Swatinem/rust-cache@v2
+      - name: Provision temporary test certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p cert
+          openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
+            -keyout cert/key.pem -out cert/cert.pem -days 1 \
+            -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
       - name: Download and verify Xray v26.7.28
         shell: bash
         run: |
