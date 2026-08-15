@@ -36,10 +36,12 @@ jobs:
           mkdir -p xray-v26.7.28
           unzip -q /tmp/Xray-linux-64-v26.7.28.zip -d xray-v26.7.28
           chmod +x xray-v26.7.28/xray
-          ./xray-v26.7.28/xray version
+          cp xray-v26.7.28/xray ./xray
+          chmod +x ./xray
+          ./xray version
       - name: Hysteria2 Brutal TCP and UDP interop
         env:
-          XRAY_BIN: ${{ github.workspace }}/xray-v26.7.28/xray
+          XRAY_BIN: ${{ github.workspace }}/xray
         run: |
           cargo test -p chimera_server_app --test xray_client_proxy_e2e \
             xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2 \
