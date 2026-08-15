@@ -1,4 +1,4 @@
-name: Trace Xray 26.7.28 client stages
+name: Isolate modern Xray repeated stream failure
 
 on:
   push:
@@ -6,9 +6,13 @@ on:
       - codex/hysteria2-xray-modern-streams
 
 jobs:
-  trace:
-    if: "${{ github.event.head_commit.message == 'ci: trace Xray 26.7.28 client stages' }}"
+  diagnose:
+    if: "${{ github.event.head_commit.message == 'ci: isolate modern Xray repeated stream failure' }}"
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, no-uni-drain, server-bbr]
     steps:
       - uses: actions/checkout@v6
         with:
@@ -18,23 +22,65 @@ jobs:
         with:
           version: '23.x'
       - uses: Swatinem/rust-cache@v2
-      - name: Enable diagnostic logs
+      - name: Apply diagnostic variant
         shell: bash
+        env:
+          VARIANT: ${{ matrix.variant }}
         run: |
           python3 <<'PY'
+          import os
           from pathlib import Path
+
+          variant = os.environ['VARIANT']
           path = Path('chimera_server_lib/src/handler/hysteria2/connection.rs')
           text = path.read_text()
+
+          # Correlate each QUIC stream through every TCP handling stage.
           text = text.replace(
-              '            Ok((send, recv)) => {\n',
-              '            Ok((send, recv)) => {\n                debug!(stream_id = ?recv.id(), "hysteria2 trace raw bidi accepted");\n',
+              '''            Ok((send, recv)) => {\n''',
+              '''            Ok((send, recv)) => {\n                let stream_id = recv.id();\n                debug!(?stream_id, "hy2diag accepted");\n''',
               1,
           )
           text = text.replace(
-              '        Ok(request) => request,\n',
-              '        Ok(request) => { debug!(target = %request.target, "hysteria2 trace request parsed"); request },\n',
+              '''            if let Err(err) = handle_tcp_stream(\n''',
+              '''            debug!(?stream_id, "hy2diag handler start");\n            if let Err(err) = handle_tcp_stream(\n''',
               1,
           )
+          text = text.replace(
+              '''        Ok(request) => request,\n''',
+              '''        Ok(request) => {\n            debug!(stream_id = ?recv.id(), target = %request.target, "hy2diag parsed");\n            request\n        },\n''',
+              1,
+          )
+          text = text.replace(
+              '''    send_tcp_response(&mut send, TCP_SUCCESS_STATUS, "").await?;\n''',
+              '''    debug!(stream_id = ?recv.id(), "hy2diag response start");\n    send_tcp_response(&mut send, TCP_SUCCESS_STATUS, "").await?;\n    debug!(stream_id = ?recv.id(), "hy2diag response done");\n''',
+              1,
+          )
+          text = text.replace(
+              '''    let connection = match tokio::time::timeout(\n''',
+              '''    debug!(stream_id = ?recv.id(), target = %request.target, "hy2diag connect start");\n    let connection = match tokio::time::timeout(\n''',
+              1,
+          )
+          text = text.replace(
+              '''        Ok(Ok(Some(connection))) => connection,\n''',
+              '''        Ok(Ok(Some(connection))) => {\n            debug!(stream_id = ?recv.id(), "hy2diag connect done");\n            connection\n        },\n''',
+              1,
+          )
+          text = text.replace(
+              '''    proxy_tcp(send, recv, connection.stream, context).await\n''',
+              '''    debug!(stream_id = ?recv.id(), "hy2diag proxy start");\n    let result = proxy_tcp(send, recv, connection.stream, context).await;\n    debug!(stream_id = ?stream_id_for_result, ?result, "hy2diag proxy end");\n    result\n'''.replace('stream_id_for_result', 'recv_id_placeholder'),
+              1,
+          ) if False else text
+
+          # Insert proxy-start without moving recv after reading its id.
+          old = '''    proxy_tcp(send, recv, connection.stream, context).await\n'''
+          new = '''    let stream_id = recv.id();\n    debug!(?stream_id, "hy2diag proxy start");\n    let result = proxy_tcp(send, recv, connection.stream, context).await;\n    debug!(?stream_id, ?result, "hy2diag proxy end");\n    result\n'''
+          assert old in text
+          text = text.replace(old, new, 1)
+
+          if variant == 'no-uni-drain':
+              text = text.replace('''            drain_unidirectional_streams(connection),\n''', '', 1)
+              text = text.replace('''            drain_unidirectional_streams(connection),\n''', '', 1)
           path.write_text(text)
 
           test = Path('chimera_server_app/tests/xray_client_proxy_e2e.rs')
@@ -42,7 +88,10 @@ jobs:
           start = text.index('async fn xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2()')
           end = text.index('\n#[test]\n#[ignore = "starts Chimera as server and ./xray with invalid hysteria2 auth"]', start)
           section = text[start:end]
-          section = section.replace('"loglevel": "warning"', '"loglevel": "debug"')
+          if variant == 'server-bbr':
+              marker = '"congestion": "brutal"'
+              pos = section.index(marker)
+              section = section[:pos] + '"congestion": "bbr"' + section[pos + len(marker):]
           text = text[:start] + section + text[end:]
           test.write_text(text)
           PY
@@ -68,19 +117,18 @@ jobs:
           cp xray-test/xray ./xray
           chmod +x ./xray
           ./xray version
-      - name: Hysteria2 TCP trace
+      - name: Repeated TCP and UDP interop
         shell: bash
         env:
           XRAY_BIN: ${{ github.workspace }}/xray
           RUST_BACKTRACE: '1'
+          RUST_LOG: chimera_server_lib::handler::hysteria2::connection=debug,chimera_server_lib=info,quinn=warn,rustls=warn
         run: |
           set +e
           cargo test -p chimera_server_app --test xray_client_proxy_e2e \
             xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2 \
             -- --ignored --exact --nocapture
           status=$?
-          echo '=== Hysteria2 diagnostics ==='
-          find /tmp -type f -path '*hysteria2*' \
-            \( -name '*.log' -o -name '*.json' -o -name '*.json5' \) \
-            -print -exec sh -c 'echo "--- $1 ---"; tail -n 500 "$1"' _ {} \; 2>/dev/null || true
+          echo '=== focused Hysteria2 stage trace ==='
+          find /tmp -type f -path '*hysteria2*' -name 'chimera.stderr.log' -exec grep -E 'hy2diag|hysteria2 tcp stream forwarded|auth (accepted|response finished)' {} \; || true
           exit "$status"
