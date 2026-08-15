@@ -209,8 +209,9 @@ impl Harness {
         let guard = acquire_test_lock_or_recover()?;
         trace_step("global test lock acquired");
 
-        let grpc_port = free_localhost_port()?;
-        let socks_port = free_localhost_port()?;
+        let (grpc_reservation, socks_reservation) = reserve_localhost_port_pair()?;
+        let grpc_port = grpc_reservation.local_addr()?.port();
+        let socks_port = socks_reservation.local_addr()?.port();
         let grpc_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, grpc_port);
         trace_step(format!(
             "allocated grpc_port={} socks_port={}",
@@ -218,6 +219,8 @@ impl Harness {
         ));
 
         let config = build_config(grpc_port, socks_port);
+        drop(grpc_reservation);
+        drop(socks_reservation);
         let mut server = ServerProcess::spawn(&config)?;
         server.wait_until_ready(SocketAddr::V4(grpc_addr))?;
 
@@ -254,8 +257,9 @@ impl Harness {
         let guard = acquire_test_lock_or_recover()?;
         trace_step("global test lock acquired");
 
-        let grpc_port = free_localhost_port()?;
-        let data_port = free_localhost_port()?;
+        let (grpc_reservation, data_reservation) = reserve_localhost_port_pair()?;
+        let grpc_port = grpc_reservation.local_addr()?.port();
+        let data_port = data_reservation.local_addr()?.port();
         let grpc_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, grpc_port);
         trace_step(format!(
             "allocated grpc_port={} data_port={}",
@@ -263,6 +267,8 @@ impl Harness {
         ));
 
         let config = config_builder(grpc_port, data_port);
+        drop(grpc_reservation);
+        drop(data_reservation);
         let mut server = ServerProcess::spawn(&config)?;
         server.wait_until_ready(SocketAddr::V4(grpc_addr))?;
 
@@ -363,11 +369,21 @@ fn unique_test_dir() -> io::Result<PathBuf> {
     Ok(path)
 }
 
-fn free_localhost_port() -> io::Result<u16> {
-    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
-    let port = listener.local_addr()?.port();
-    trace_step(format!("allocated localhost tcp port {}", port));
-    Ok(port)
+fn reserve_localhost_port_pair() -> io::Result<(TcpListener, TcpListener)> {
+    let first = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    let second = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    let first_port = first.local_addr()?.port();
+    let second_port = second.local_addr()?.port();
+    trace_step(format!(
+        "reserved distinct localhost tcp ports {} and {}",
+        first_port, second_port
+    ));
+    if first_port == second_port {
+        return Err(io::Error::other(format!(
+            "localhost port reservations unexpectedly collided on {first_port}"
+        )));
+    }
+    Ok((first, second))
 }
 
 fn build_config(grpc_port: u16, socks_port: u16) -> String {
