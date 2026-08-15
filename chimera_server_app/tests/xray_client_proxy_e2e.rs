@@ -1707,6 +1707,119 @@ async fn xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2() {
     .await;
 }
 
+#[test]
+#[ignore = "starts Chimera as server and ./xray with invalid hysteria2 auth"]
+fn xray_client_rejects_invalid_hysteria2_auth_without_tunnel() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("hysteria2-auth-reject");
+    let echo_addr = start_tcp_echo_server();
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let cert_path = workspace.join("cert/cert.pem");
+    let key_path = workspace.join("cert/key.pem");
+    let pinned_peer_cert_sha256 = first_cert_sha256_hex(&cert_path);
+
+    let chimera_config_path = work_dir.join("chimera-hysteria2-auth-reject.json");
+    let xray_config_path = work_dir.join("xray-hysteria2-auth-reject-client.json");
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "hysteria",
+                "tag": "chimera-hysteria2-auth-reject",
+                "settings": {
+                    "version": 2,
+                    "clients": [{"auth": HYSTERIA_AUTH}]
+                },
+                "streamSettings": {
+                    "network": "quic",
+                    "security": "tls",
+                    "hysteriaSettings": {
+                        "version": 2,
+                        "up": "10 mbps",
+                        "down": "10 mbps"
+                    },
+                    "tlsSettings": {
+                        "alpn": ["h3"],
+                        "certificates": [{
+                            "certificateFile": cert_path,
+                            "keyFile": key_path
+                        }]
+                    }
+                }
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "debug"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth"}
+            }],
+            "outbounds": [{
+                "protocol": "hysteria",
+                "settings": {
+                    "version": 2,
+                    "address": "127.0.0.1",
+                    "port": chimera_port
+                },
+                "streamSettings": {
+                    "network": "hysteria",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "pinnedPeerCertSha256": pinned_peer_cert_sha256,
+                        "alpn": ["h3"]
+                    },
+                    "hysteriaSettings": {
+                        "version": 2,
+                        "auth": "wrong-hysteria-auth-token"
+                    }
+                }
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    chimera.assert_running();
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port)));
+    xray.assert_running();
+
+    assert_socks5_echo_does_not_succeed(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port)),
+        echo_addr,
+    );
+
+    let deadline = Instant::now() + IO_TIMEOUT;
+    loop {
+        let logs = format!(
+            "{}\n{}",
+            read_lossy(&xray.stdout_path),
+            read_lossy(&xray.stderr_path)
+        );
+        if logs.contains("proxy/hysteria: failed to find an available destination")
+            && logs.contains("transport/internet/hysteria: auth failed")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Xray did not report Hysteria2 authentication failure; logs={logs}"
+        );
+        thread::sleep(CONNECT_RETRY_INTERVAL);
+    }
+}
+
 fn workspace_root() -> PathBuf {
     for ancestor in Path::new(env!("CARGO_MANIFEST_DIR")).ancestors() {
         if ancestor.join("xray").is_file()
