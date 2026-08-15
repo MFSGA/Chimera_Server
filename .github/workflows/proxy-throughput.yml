@@ -121,7 +121,6 @@ jobs:
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                issue_number: context.issue.number,
                 comment_id: existing.id,
                 body: body,
               });
