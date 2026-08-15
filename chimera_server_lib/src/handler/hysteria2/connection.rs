@@ -4,6 +4,7 @@ use std::{
     future::Future,
     io::{Error, ErrorKind},
     net::SocketAddr,
+    num::NonZeroUsize,
     pin::Pin,
     sync::{
         Arc, RwLock,
@@ -16,6 +17,7 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use h3_quinn::BidiStream;
 use http::{Request, Response, StatusCode};
+use lru::LruCache;
 use rand::{
     RngExt,
     // distributions::{Alphanumeric, DistString},
@@ -55,6 +57,7 @@ const PADDING_SCRATCH_LEN: usize = 1024;
 const TCP_SUCCESS_STATUS: u8 = 0x00;
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 const UDP_IDLE_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_FRAGMENT_CACHE_SIZE: usize = 256;
 // Match Shoes/sing-box: unauthenticated Hysteria2 QUIC connections only get a
 // short window to complete the HTTP/3 authentication exchange.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
@@ -927,22 +930,30 @@ async fn drive_udp_datagrams(
                 continue;
             }
 
-            let entry = session.fragments.entry(packet_id).or_insert_with(|| {
-                FragmentedPacket {
-                    fragment_count,
-                    fragment_received: 0,
-                    packet_len: 0,
-                    received: vec![None; fragment_count as usize],
-                    remote_location: remote_location.clone(),
-                }
-            });
+            if !session.fragments.contains(&packet_id) {
+                session.fragments.put(
+                    packet_id,
+                    FragmentedPacket {
+                        fragment_count,
+                        fragment_received: 0,
+                        packet_len: 0,
+                        received: vec![None; fragment_count as usize],
+                        remote_location: remote_location.clone(),
+                    },
+                );
+            }
+
+            let entry = session
+                .fragments
+                .get_mut(&packet_id)
+                .expect("inserted hysteria2 fragment must be cached");
 
             if entry.fragment_count != fragment_count {
                 warn!(
                     "Mismatched fragment count for hysteria2 UDP packet {}",
                     session_id
                 );
-                session.fragments.remove(&packet_id);
+                session.fragments.pop(&packet_id);
                 continue;
             }
 
@@ -951,7 +962,7 @@ async fn drive_udp_datagrams(
                     "Duplicate fragment {} for hysteria2 UDP packet {}",
                     fragment_id, session_id
                 );
-                session.fragments.remove(&packet_id);
+                session.fragments.pop(&packet_id);
                 continue;
             }
 
@@ -968,7 +979,7 @@ async fn drive_udp_datagrams(
                 received,
                 packet_len,
                 ..
-            } = session.fragments.remove(&packet_id).unwrap();
+            } = session.fragments.pop(&packet_id).unwrap();
 
             let mut assembled = BytesMut::with_capacity(packet_len);
             for bytes in received.into_iter().flatten() {
@@ -1093,7 +1104,7 @@ fn udp_session_is_idle(
 
 struct UdpSession {
     socket: Arc<UdpSocket>,
-    fragments: HashMap<u16, FragmentedPacket>,
+    fragments: LruCache<u16, FragmentedPacket>,
     last_location: NetLocation,
     last_socket_addr: SocketAddr,
     last_active: Arc<RwLock<Instant>>,
@@ -1131,6 +1142,10 @@ struct FragmentedPacket {
     packet_len: usize,
     received: Vec<Option<Bytes>>,
     remote_location: NetLocation,
+}
+
+fn hysteria2_fragment_cache() -> LruCache<u16, FragmentedPacket> {
+    LruCache::new(NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap())
 }
 
 async fn create_udp_session(
@@ -1176,7 +1191,7 @@ async fn create_udp_session(
 
     Ok(UdpSession {
         socket,
-        fragments: HashMap::new(),
+        fragments: hysteria2_fragment_cache(),
         last_location: remote_location,
         last_socket_addr: remote_addr,
         last_active,
@@ -1606,6 +1621,33 @@ mod tests {
                 "unexpected auth URI accepted: {uri}"
             );
         }
+    }
+
+    #[test]
+    fn fragment_cache_matches_shoes_bound() {
+        let mut cache = hysteria2_fragment_cache();
+        let remote_location = NetLocation::from_str("127.0.0.1:53", None)
+            .expect("valid fragment test location");
+
+        for packet_id in 0..=MAX_FRAGMENT_CACHE_SIZE as u16 {
+            cache.put(
+                packet_id,
+                FragmentedPacket {
+                    fragment_count: 2,
+                    fragment_received: 1,
+                    packet_len: 1,
+                    received: vec![Some(Bytes::from_static(b"x")), None],
+                    remote_location: remote_location.clone(),
+                },
+            );
+        }
+
+        assert_eq!(cache.len(), MAX_FRAGMENT_CACHE_SIZE);
+        assert!(
+            !cache.contains(&0),
+            "oldest incomplete packet should be evicted"
+        );
+        assert!(cache.contains(&(MAX_FRAGMENT_CACHE_SIZE as u16)));
     }
 
     #[test]
