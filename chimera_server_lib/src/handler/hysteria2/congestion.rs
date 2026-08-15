@@ -119,12 +119,7 @@ impl Controller for BrutalController {
     ) {
         self.activate_brutal_if_configured(now);
         if let Some(bbr) = self.bbr.as_mut() {
-            bbr.on_end_acks(
-                now,
-                in_flight,
-                app_limited,
-                largest_packet_num_acked,
-            );
+            bbr.on_end_acks(now, in_flight, app_limited, largest_packet_num_acked);
         }
     }
 
@@ -137,12 +132,7 @@ impl Controller for BrutalController {
     ) {
         self.activate_brutal_if_configured(now);
         if let Some(bbr) = self.bbr.as_mut() {
-            bbr.on_congestion_event(
-                now,
-                sent,
-                is_persistent_congestion,
-                lost_bytes,
-            );
+            bbr.on_congestion_event(now, sent, is_persistent_congestion, lost_bytes);
         } else {
             self.brutal.on_congestion_event(now, lost_bytes);
         }
@@ -348,10 +338,7 @@ mod tests {
         BrutalController {
             tx_bps,
             brutal: BrutalState::new(now, current_mtu),
-            bbr: Some(Bbr::new(
-                Arc::new(BbrConfig::default()),
-                current_mtu,
-            )),
+            bbr: Some(Bbr::new(Arc::new(BbrConfig::default()), current_mtu)),
             current_mtu,
             brutal_active: false,
         }
@@ -379,11 +366,13 @@ mod tests {
         assert_eq!(controller.brutal.start, activated_at);
         assert_eq!(controller.brutal.last_rtt, Duration::ZERO);
         assert_eq!(controller.brutal.ack_rate, 1.0);
-        assert!(controller
-            .brutal
-            .slots
-            .iter()
-            .all(|slot| slot.ack_count == 0 && slot.loss_count == 0));
+        assert!(
+            controller
+                .brutal
+                .slots
+                .iter()
+                .all(|slot| slot.ack_count == 0 && slot.loss_count == 0)
+        );
     }
 
     #[test]
