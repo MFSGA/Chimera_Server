@@ -42,6 +42,7 @@ use crate::{
         ConnectionGuard, MeteredStream, TrafficContext, TrafficDirection,
         record_transfer, register_connection,
     },
+    util::socket::new_socket2_udp_socket,
 };
 
 const AUTH_URI: &str = "https://hysteria/auth";
@@ -1148,6 +1149,20 @@ fn hysteria2_fragment_cache() -> LruCache<u16, FragmentedPacket> {
     LruCache::new(NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap())
 }
 
+fn new_hysteria2_socket2_udp_socket() -> std::io::Result<socket2::Socket> {
+    let socket = new_socket2_udp_socket(true, None, None, false)?;
+    socket.set_only_v6(false)?;
+    let bind_addr: SocketAddr =
+        "[::]:0".parse().expect("valid IPv6 wildcard address");
+    socket.bind(&socket2::SockAddr::from(bind_addr))?;
+    Ok(socket)
+}
+
+fn new_hysteria2_udp_socket() -> std::io::Result<UdpSocket> {
+    let std_socket: std::net::UdpSocket = new_hysteria2_socket2_udp_socket()?.into();
+    UdpSocket::from_std(std_socket)
+}
+
 async fn create_udp_session(
     session_id: u32,
     remote_location: NetLocation,
@@ -1155,13 +1170,10 @@ async fn create_udp_session(
     connection: quinn::Connection,
     base_context: TrafficContext,
 ) -> std::io::Result<UdpSession> {
-    let bind_addr: SocketAddr = if remote_addr.is_ipv6() {
-        "[::]:0".parse().unwrap()
-    } else {
-        "0.0.0.0:0".parse().unwrap()
-    };
-
-    let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
+    // Match shoes: one Hysteria UDP session can change destination address
+    // families, so keep a dual-stack socket instead of binding to the family
+    // of the first destination.
+    let socket = Arc::new(new_hysteria2_udp_socket()?);
     let socket_for_task = socket.clone();
     let connection_for_task = connection.clone();
     let response_contexts = Arc::new(RwLock::new(HashMap::new()));
@@ -1621,6 +1633,41 @@ mod tests {
                 "unexpected auth URI accepted: {uri}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn udp_session_socket_is_dual_stack_like_shoes() {
+        let socket = new_hysteria2_socket2_udp_socket()
+            .expect("create dual-stack UDP socket");
+        assert!(
+            socket
+                .local_addr()
+                .expect("dual-stack socket address")
+                .as_socket()
+                .expect("IP socket address")
+                .is_ipv6()
+        );
+        assert!(!socket.only_v6().expect("read IPV6_V6ONLY"));
+
+        let std_socket: std::net::UdpSocket = socket.into();
+        let socket =
+            UdpSocket::from_std(std_socket).expect("convert dual-stack UDP socket");
+        let ipv4 = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind IPv4 UDP receiver");
+
+        socket
+            .send_to(b"v4", ipv4.local_addr().expect("IPv4 receiver address"))
+            .await
+            .expect("dual-stack socket should send to IPv4");
+
+        let mut buf = [0u8; 2];
+        let (len, _) =
+            tokio::time::timeout(Duration::from_secs(1), ipv4.recv_from(&mut buf))
+                .await
+                .expect("IPv4 receive should not time out")
+                .expect("receive IPv4 datagram");
+        assert_eq!(&buf[..len], b"v4");
     }
 
     #[test]
