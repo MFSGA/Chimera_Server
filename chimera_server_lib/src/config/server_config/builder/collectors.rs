@@ -163,6 +163,19 @@ pub(super) fn collect_hysteria2_settings(
         }
     }
 
+    let xray_udp_idle_timeout_secs = Some(match hysteria_settings {
+        Some(settings) => {
+            let timeout = settings.udp_idle_timeout;
+            if timeout != 0 && !(2..=600).contains(&timeout) {
+                return Err(Error::InvalidConfig(format!(
+                    "hysteriaSettings.udpIdleTimeout must be 0 or between 2 and 600 seconds (got {timeout})"
+                )));
+            }
+            if timeout == 0 { 60 } else { timeout as u64 }
+        }
+        None => 60,
+    });
+
     if bandwidth.max_tx != 0 && bandwidth.max_tx < 65_536 {
         return Err(Error::InvalidConfig(
             "hysteria2 bandwidth.up must be at least 65536 bytes/s".into(),
@@ -189,6 +202,7 @@ pub(super) fn collect_hysteria2_settings(
         xray_brutal_up: None,
         xray_brutal_down: None,
         xray_max_idle_timeout_secs: None,
+        xray_udp_idle_timeout_secs,
         xray_max_incoming_streams: None,
         xray_init_stream_receive_window: None,
         xray_max_stream_receive_window: None,
@@ -1507,6 +1521,7 @@ mod tests {
         assert_eq!(config.clients.len(), 1);
         assert_eq!(config.clients[0].password, "xray-auth-token");
         assert_eq!(config.clients[0].email.as_deref(), Some("hy@example.com"));
+        assert_eq!(config.xray_udp_idle_timeout_secs, Some(60));
     }
 
     #[cfg(feature = "hysteria")]
@@ -1559,6 +1574,7 @@ mod tests {
             up: None,
             down: None,
             ignore_client_bandwidth: None,
+            udp_idle_timeout: 0,
         };
 
         let err = collect_hysteria2_settings(settings, Some(&stream_settings))
@@ -1567,5 +1583,41 @@ mod tests {
             err.to_string()
                 .contains("hysteriaSettings.version must be 2")
         );
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn collect_hysteria2_settings_matches_xray_udp_idle_timeout() {
+        let settings = || {
+            SettingObject(serde_json::json!({
+                "clients": [{"auth": "xray-auth-token"}]
+            }))
+        };
+
+        for (configured, expected) in [(0, 60), (2, 2), (600, 600)] {
+            let stream_settings =
+                serde_json::from_value::<HysteriaSettings>(serde_json::json!({
+                    "version": 2,
+                    "udpIdleTimeout": configured
+                }))
+                .expect("valid hysteriaSettings");
+            let config =
+                collect_hysteria2_settings(settings(), Some(&stream_settings))
+                    .expect("Xray UDP idle timeout should be accepted");
+            assert_eq!(config.xray_udp_idle_timeout_secs, Some(expected));
+        }
+
+        for configured in [1, 601] {
+            let stream_settings =
+                serde_json::from_value::<HysteriaSettings>(serde_json::json!({
+                    "version": 2,
+                    "udpIdleTimeout": configured
+                }))
+                .expect("hysteriaSettings should deserialize");
+            let error =
+                collect_hysteria2_settings(settings(), Some(&stream_settings))
+                    .expect_err("Xray rejects out-of-range UDP idle timeout");
+            assert!(error.to_string().contains("udpIdleTimeout"), "{error}");
+        }
     }
 }
