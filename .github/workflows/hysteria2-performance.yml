@@ -1,0 +1,166 @@
+name: Hysteria2 Performance
+
+on:
+  pull_request:
+    branches: ["master"]
+    paths:
+      - "chimera_server_lib/src/handler/hysteria2/**"
+      - "chimera_server_lib/src/config/**"
+      - "bench/hysteria2_netem.py"
+      - "bench/.xray-version"
+      - "bench/.xray-linux-64.sha256"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/hysteria2-performance.yml"
+  workflow_dispatch:
+    inputs:
+      rtts:
+        description: "Comma-separated RTTs in milliseconds"
+        required: true
+        default: "1,20,50,100,200"
+        type: string
+      losses:
+        description: "Comma-separated packet loss percentages per direction"
+        required: true
+        default: "0,0.5,1,3,5"
+        type: string
+      modes:
+        description: "Comma-separated congestion modes"
+        required: true
+        default: "brutal,bbr,reno"
+        type: string
+      bandwidth_mbps:
+        description: "Configured Hysteria2 bandwidth in Mbps"
+        required: true
+        default: "200"
+        type: string
+      payload_mib:
+        description: "TCP payload size per run in MiB"
+        required: true
+        default: "8"
+        type: string
+      runs:
+        description: "Measurements per case"
+        required: true
+        default: "1"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  netem:
+    name: Hysteria2 netem (ubuntu-latest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y iproute2 protobuf-compiler unzip
+
+      - name: Self-test benchmark harness
+        run: |
+          python3 -m py_compile bench/hysteria2_netem.py
+          python3 bench/hysteria2_netem.py --self-test
+
+      - name: Download pinned xray-core
+        run: |
+          set -euo pipefail
+          VERSION=$(cat bench/.xray-version)
+          EXPECTED_SHA256=$(cat bench/.xray-linux-64.sha256)
+          mkdir -p xray
+          curl --fail --location --retry 3 \
+            "https://github.com/XTLS/Xray-core/releases/download/${VERSION}/Xray-linux-64.zip" \
+            -o /tmp/xray.zip
+          echo "${EXPECTED_SHA256}  /tmp/xray.zip" | sha256sum --check --strict
+          unzip -q -o /tmp/xray.zip -d xray/
+          chmod +x xray/xray
+          ./xray/xray version
+
+      - name: Build Chimera release
+        run: cargo build --release --package chimera_server_app --all-features
+
+      - name: Resolve benchmark matrix
+        id: matrix
+        env:
+          INPUT_RTTS: ${{ inputs.rtts }}
+          INPUT_LOSSES: ${{ inputs.losses }}
+          INPUT_MODES: ${{ inputs.modes }}
+          INPUT_BANDWIDTH: ${{ inputs.bandwidth_mbps }}
+          INPUT_PAYLOAD_MIB: ${{ inputs.payload_mib }}
+          INPUT_RUNS: ${{ inputs.runs }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            RTTS="1,100"
+            LOSSES="0,1"
+            MODES="brutal,bbr,reno"
+            BANDWIDTH="200"
+            PAYLOAD_MIB="4"
+            RUNS="1"
+          else
+            RTTS="$INPUT_RTTS"
+            LOSSES="$INPUT_LOSSES"
+            MODES="$INPUT_MODES"
+            BANDWIDTH="$INPUT_BANDWIDTH"
+            PAYLOAD_MIB="$INPUT_PAYLOAD_MIB"
+            RUNS="$INPUT_RUNS"
+          fi
+          echo "rtts=$RTTS" >> "$GITHUB_OUTPUT"
+          echo "losses=$LOSSES" >> "$GITHUB_OUTPUT"
+          echo "modes=$MODES" >> "$GITHUB_OUTPUT"
+          echo "bandwidth=$BANDWIDTH" >> "$GITHUB_OUTPUT"
+          echo "payload_bytes=$((PAYLOAD_MIB * 1024 * 1024))" >> "$GITHUB_OUTPUT"
+          echo "runs=$RUNS" >> "$GITHUB_OUTPUT"
+          printf 'RTTs=%s\nLosses per direction=%s\nModes=%s\nBandwidth=%s Mbps\nPayload=%s MiB\nRuns=%s\n' \
+            "$RTTS" "$LOSSES" "$MODES" "$BANDWIDTH" "$PAYLOAD_MIB" "$RUNS"
+
+      - name: Run Hysteria2 RTT/loss benchmark
+        run: |
+          sudo -n true
+          python3 bench/hysteria2_netem.py \
+            --chimera-bin ./target/release/chimera_server_app \
+            --xray-bin ./xray/xray \
+            --rtts '${{ steps.matrix.outputs.rtts }}' \
+            --losses '${{ steps.matrix.outputs.losses }}' \
+            --modes '${{ steps.matrix.outputs.modes }}' \
+            --bandwidth-mbps '${{ steps.matrix.outputs.bandwidth }}' \
+            --payload-size '${{ steps.matrix.outputs.payload_bytes }}' \
+            --runs '${{ steps.matrix.outputs.runs }}' \
+            --output target/hysteria2-netem.jsonl \
+            --summary target/hysteria2-netem.md \
+            --verbose \
+            2>&1 | tee target/hysteria2-netem.log
+
+      - name: Publish benchmark summary
+        if: always()
+        run: |
+          if [[ -f target/hysteria2-netem.md ]]; then
+            cat target/hysteria2-netem.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: hysteria2-netem
+          path: |
+            target/hysteria2-netem.jsonl
+            target/hysteria2-netem.md
+            target/hysteria2-netem.log
+          if-no-files-found: warn
+          retention-days: 90
