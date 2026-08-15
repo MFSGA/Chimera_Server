@@ -220,6 +220,9 @@ fn build_transport_config(
             config.xray_max_incoming_streams.is_some(),
         ))
         .min_mtu(SHOES_INITIAL_MTU)
+        .mtu_discovery_config(configured_mtu_discovery(
+            config.xray_disable_path_mtu_discovery,
+        ))
         .max_idle_timeout(Some(idle_timeout));
     Ok(transport)
 }
@@ -234,6 +237,23 @@ fn configured_max_incoming_uni_streams(xray_compat: bool) -> quinn::VarInt {
 
 fn configured_keep_alive_interval(xray_compat: bool) -> Option<Duration> {
     (!xray_compat).then_some(SHOES_KEEP_ALIVE_INTERVAL)
+}
+
+fn configured_mtu_discovery(
+    disable_path_mtu_discovery: Option<bool>,
+) -> Option<quinn::MtuDiscoveryConfig> {
+    let platform_supports_path_mtu_discovery = cfg!(any(
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "macos"
+    ));
+    if disable_path_mtu_discovery == Some(true)
+        || !platform_supports_path_mtu_discovery
+    {
+        None
+    } else {
+        Some(quinn::MtuDiscoveryConfig::default())
+    }
 }
 
 fn configured_initial_mtu(xray_compat: bool) -> u16 {
@@ -261,7 +281,8 @@ mod tests {
         SHOES_MAX_INCOMING_UNI_STREAMS, XRAY_INITIAL_MTU,
         XRAY_MAX_INCOMING_UNI_STREAMS, configured_congestion_mode,
         configured_initial_mtu, configured_keep_alive_interval,
-        configured_max_incoming_uni_streams, configured_receive_window,
+        configured_max_incoming_uni_streams, configured_mtu_discovery,
+        configured_receive_window,
     };
 
     #[test]
@@ -283,6 +304,13 @@ mod tests {
             Some(SHOES_KEEP_ALIVE_INTERVAL)
         );
         assert_eq!(configured_keep_alive_interval(true), None);
+    }
+
+    #[test]
+    fn path_mtu_discovery_matches_xray_disable_flag() {
+        assert!(configured_mtu_discovery(None).is_some());
+        assert!(configured_mtu_discovery(Some(false)).is_some());
+        assert!(configured_mtu_discovery(Some(true)).is_none());
     }
 
     #[test]
