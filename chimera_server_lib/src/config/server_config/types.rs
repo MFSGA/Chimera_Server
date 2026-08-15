@@ -48,6 +48,11 @@ pub struct Hysteria2BandwidthConfig {
 }
 
 #[cfg(feature = "hysteria")]
+fn default_hysteria2_udp_enabled() -> bool {
+    true
+}
+
+#[cfg(feature = "hysteria")]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Hysteria2ServerConfig {
@@ -56,6 +61,8 @@ pub struct Hysteria2ServerConfig {
     pub bandwidth: Hysteria2BandwidthConfig,
     #[serde(default)]
     pub ignore_client_bandwidth: bool,
+    #[serde(default = "default_hysteria2_udp_enabled")]
+    pub udp_enabled: bool,
     #[serde(default)]
     pub xray_compat: bool,
     #[serde(default)]
