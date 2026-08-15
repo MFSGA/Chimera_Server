@@ -1,0 +1,42 @@
+name: One-shot Hysteria2 gates
+
+on:
+  push:
+    branches:
+      - codex/hysteria2-udp-idle-timeout
+
+permissions:
+  contents: write
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/hysteria2-udp-idle-timeout
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: 23.x
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Build all features
+        run: cargo build --all-features
+      - name: Clippy all targets and features
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test workspace
+        run: cargo test
+      - name: Test locked
+        run: cargo test --locked
+      - name: Remove validation workflow
+        run: |
+          rm .github/workflows/_codex_hysteria2_gates_once.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m "chore: remove Hysteria2 validation workflow"
+          git push origin HEAD:codex/hysteria2-udp-idle-timeout
