@@ -1163,6 +1163,17 @@ fn new_hysteria2_udp_socket() -> std::io::Result<UdpSocket> {
     UdpSocket::from_std(std_socket)
 }
 
+fn normalize_hysteria2_udp_peer_addr(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(addr) => addr
+            .ip()
+            .to_ipv4_mapped()
+            .map(|ip| SocketAddr::from((ip, addr.port())))
+            .unwrap_or(SocketAddr::V6(addr)),
+        SocketAddr::V4(_) => addr,
+    }
+}
+
 async fn create_udp_session(
     session_id: u32,
     remote_location: NetLocation,
@@ -1238,6 +1249,7 @@ async fn run_udp_remote_to_local_loop(
                     err
                 ))
             })?;
+        let src_addr = normalize_hysteria2_udp_peer_addr(src_addr);
         loop_count = loop_count.wrapping_add(1);
         if loop_count == 0 {
             tokio::task::yield_now().await;
@@ -1662,12 +1674,26 @@ mod tests {
             .expect("dual-stack socket should send to IPv4");
 
         let mut buf = [0u8; 2];
-        let (len, _) =
+        let (len, sender) =
             tokio::time::timeout(Duration::from_secs(1), ipv4.recv_from(&mut buf))
                 .await
                 .expect("IPv4 receive should not time out")
                 .expect("receive IPv4 datagram");
         assert_eq!(&buf[..len], b"v4");
+
+        ipv4.send_to(b"ok", sender)
+            .await
+            .expect("reply to dual-stack socket");
+        let (len, source) =
+            tokio::time::timeout(Duration::from_secs(1), socket.recv_from(&mut buf))
+                .await
+                .expect("dual-stack reply should not time out")
+                .expect("receive IPv4 reply on dual-stack socket");
+        assert_eq!(&buf[..len], b"ok");
+        assert_eq!(
+            normalize_hysteria2_udp_peer_addr(source),
+            ipv4.local_addr().expect("IPv4 receiver address")
+        );
     }
 
     #[test]
