@@ -207,7 +207,7 @@ async fn auth_hysteria2_connection(
                         debug!(status = SUCCESS_STATUS, "hysteria2 auth accepted");
                         send_auth_success(
                             &mut stream,
-                            true,
+                            config.udp_enabled,
                             response_rx,
                             response_rx_auto,
                             config.xray_compat,
@@ -221,7 +221,7 @@ async fn auth_hysteria2_connection(
                         debug!("hysteria2 auth response finished");
                         return Ok(AuthContext {
                             client: auth_info.client,
-                            udp_enabled: true,
+                            udp_enabled: config.udp_enabled,
                             vless_route: auth_info.vless_route,
                             xray_compat: config.xray_compat,
                         });

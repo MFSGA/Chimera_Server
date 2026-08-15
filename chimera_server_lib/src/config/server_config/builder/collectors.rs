@@ -46,6 +46,8 @@ pub(super) fn collect_hysteria2_settings(
         bandwidth: Option<Hysteria2BandwidthSetting>,
         #[serde(default)]
         ignore_client_bandwidth: Option<bool>,
+        #[serde(default, alias = "udp_enabled")]
+        udp_enabled: Option<bool>,
     }
 
     #[derive(Deserialize)]
@@ -221,11 +223,19 @@ pub(super) fn collect_hysteria2_settings(
             .and_then(|settings| settings.ignore_client_bandwidth)
             .unwrap_or(false)
     });
+    // Xray Hysteria always advertises/enables UDP through its inbound
+    // validator. Shoes exposes an explicit udp_enabled switch, default true.
+    let udp_enabled = if xray_compat {
+        true
+    } else {
+        raw.udp_enabled.unwrap_or(true)
+    };
 
     Ok(Hysteria2ServerConfig {
         clients,
         bandwidth,
         ignore_client_bandwidth,
+        udp_enabled,
         xray_compat,
         xray_congestion: None,
         xray_bbr_profile: None,
@@ -1596,6 +1606,33 @@ mod tests {
         );
         assert!(!config.clients[0].xray_uuid_route);
         assert!(!config.xray_compat);
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn collect_hysteria2_settings_matches_shoes_udp_switch_and_xray_udp_default() {
+        let shoes = SettingObject(serde_json::json!({
+            "clients": [{"id": "secret"}],
+            "udp_enabled": false
+        }));
+        let shoes_config = collect_hysteria2_settings(shoes, None)
+            .expect("shoes-style Hysteria UDP switch should parse");
+        assert!(!shoes_config.xray_compat);
+        assert!(!shoes_config.udp_enabled);
+
+        let xray = SettingObject(serde_json::json!({
+            "version": 2,
+            "clients": [{"auth": "secret"}],
+            "udpEnabled": false
+        }));
+        let xray_transport = serde_json::from_value::<HysteriaSettings>(
+            serde_json::json!({"version": 2}),
+        )
+        .expect("valid Xray Hysteria transport");
+        let xray_config = collect_hysteria2_settings(xray, Some(&xray_transport))
+            .expect("Xray Hysteria config should parse");
+        assert!(xray_config.xray_compat);
+        assert!(xray_config.udp_enabled);
     }
 
     #[cfg(feature = "hysteria")]

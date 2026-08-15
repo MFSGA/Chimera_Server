@@ -3954,6 +3954,7 @@ mod tests {
                     }],
                     bandwidth: Hysteria2BandwidthConfig::default(),
                     ignore_client_bandwidth: false,
+                    udp_enabled: true,
                     xray_compat: false,
                     xray_congestion: None,
                     xray_bbr_profile: None,
