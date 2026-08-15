@@ -185,7 +185,11 @@ async fn auth_hysteria2_connection(
                         ))
                     })?;
                 debug!(method = %req.method(), uri = %req.uri(), "hysteria2 auth request received");
-                match validate_auth_request(req, config.clients.as_ref()) {
+                match validate_auth_request(
+                    req,
+                    config.clients.as_ref(),
+                    config.xray_compat,
+                ) {
                     Ok(auth_info) => {
                         let (actual_tx, response_rx, response_rx_auto) =
                             resolve_bandwidth_settings(
@@ -548,8 +552,16 @@ fn resolve_bandwidth_settings(
 fn validate_auth_request(
     req: Request<()>,
     clients: &[Hysteria2Client],
+    xray_compat: bool,
 ) -> Result<AuthInfo, AuthReject> {
-    if req.method() != http::Method::POST || req.uri() != AUTH_URI {
+    let is_auth_request = if xray_compat {
+        req.method() == http::Method::POST
+            && req.uri().host() == Some("hysteria")
+            && req.uri().path() == "/auth"
+    } else {
+        req.method() == http::Method::POST && req.uri() == AUTH_URI
+    };
+    if !is_auth_request {
         return Err(AuthReject::NotAuthRequest);
     }
 
@@ -1520,10 +1532,18 @@ mod tests {
             xray_uuid_route: false,
         }];
 
-        validate_auth_request(auth_request(" spaced-secret ", AUTH_URI), &clients)
-            .expect("exact Xray Hysteria auth should match");
+        validate_auth_request(
+            auth_request(" spaced-secret ", AUTH_URI),
+            &clients,
+            false,
+        )
+        .expect("exact Xray Hysteria auth should match");
         assert!(matches!(
-            validate_auth_request(auth_request("spaced-secret", AUTH_URI), &clients),
+            validate_auth_request(
+                auth_request("spaced-secret", AUTH_URI),
+                &clients,
+                false,
+            ),
             Err(AuthReject::Unauthorized("password mismatch"))
         ));
     }
@@ -1545,6 +1565,7 @@ mod tests {
         let routed = validate_auth_request(
             auth_request("00112233-4455-abcd-8899-aabbccddeeff", AUTH_URI),
             &xray_clients,
+            true,
         )
         .expect("Xray UUID auth should ignore route bytes during lookup");
         assert_eq!(
@@ -1562,6 +1583,7 @@ mod tests {
             validate_auth_request(
                 auth_request("00112233-4455-abcd-8899-aabbccddeeff", AUTH_URI),
                 &shoes_clients,
+                false,
             ),
             Err(AuthReject::Unauthorized("password mismatch"))
         ));
@@ -1582,7 +1604,7 @@ mod tests {
             .body(())
             .expect("valid Hysteria2 auth request");
 
-        let auth = validate_auth_request(request, &clients)
+        let auth = validate_auth_request(request, &clients, true)
             .expect("malformed CC-RX should be treated as zero like Xray");
         assert_eq!(auth.client_rx_limit, None);
     }
@@ -1667,8 +1689,12 @@ mod tests {
             xray_uuid_route: false,
         }];
         assert!(
-            validate_auth_request(auth_request("secret", AUTH_URI), &clients)
-                .is_ok()
+            validate_auth_request(
+                auth_request("secret", AUTH_URI),
+                &clients,
+                false,
+            )
+            .is_ok()
         );
         for uri in [
             "https://hysteria/auth?extra=1",
@@ -1677,12 +1703,37 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    validate_auth_request(auth_request("secret", uri), &clients),
+                    validate_auth_request(
+                        auth_request("secret", uri),
+                        &clients,
+                        false,
+                    ),
                     Err(AuthReject::NotAuthRequest)
                 ),
                 "unexpected auth URI accepted: {uri}"
             );
         }
+    }
+
+    #[test]
+    fn xray_auth_uri_ignores_query_while_shoes_stays_exact() {
+        let clients = vec![Hysteria2Client {
+            password: "secret".to_string(),
+            email: None,
+            xray_uuid_route: false,
+        }];
+        let query_uri = "https://hysteria/auth?extra=1";
+
+        validate_auth_request(auth_request("secret", query_uri), &clients, true)
+            .expect("Xray matches Hysteria auth by host and path");
+        assert!(matches!(
+            validate_auth_request(
+                auth_request("secret", query_uri),
+                &clients,
+                false,
+            ),
+            Err(AuthReject::NotAuthRequest)
+        ));
     }
 
     #[tokio::test]
