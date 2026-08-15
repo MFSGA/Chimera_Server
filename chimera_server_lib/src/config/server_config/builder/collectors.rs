@@ -186,6 +186,10 @@ pub(super) fn collect_hysteria2_settings(
         ignore_client_bandwidth,
         xray_max_idle_timeout_secs: None,
         xray_max_incoming_streams: None,
+        xray_init_stream_receive_window: None,
+        xray_max_stream_receive_window: None,
+        xray_init_connection_receive_window: None,
+        xray_max_connection_receive_window: None,
     })
 }
 
