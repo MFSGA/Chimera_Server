@@ -69,6 +69,7 @@ struct AuthContext {
     client: Hysteria2Client,
     udp_enabled: bool,
     vless_route: u32,
+    xray_compat: bool,
 }
 
 struct AuthInfo {
@@ -208,6 +209,7 @@ async fn auth_hysteria2_connection(
                             true,
                             response_rx,
                             response_rx_auto,
+                            config.xray_compat,
                         )
                         .await
                         .map_err(|err| {
@@ -220,6 +222,7 @@ async fn auth_hysteria2_connection(
                             client: auth_info.client,
                             udp_enabled: true,
                             vless_route: auth_info.vless_route,
+                            xray_compat: config.xray_compat,
                         });
                     }
                     Err(reject) => {
@@ -322,7 +325,8 @@ async fn handle_tcp_stream(
             return Err(err);
         }
     };
-    send_tcp_response(&mut send, TCP_SUCCESS_STATUS, "").await?;
+    send_tcp_response(&mut send, TCP_SUCCESS_STATUS, "", auth_ctx.xray_compat)
+        .await?;
 
     let context_identity = auth_ctx
         .client
@@ -648,8 +652,9 @@ async fn send_auth_success(
     udp_enabled: bool,
     server_rx_limit: u64,
     rx_auto: bool,
+    xray_compat: bool,
 ) -> std::io::Result<()> {
-    let padding = random_padding();
+    let padding = random_auth_padding(xray_compat);
     let cc_rx_value = if rx_auto {
         "auto".to_string()
     } else {
@@ -685,9 +690,13 @@ async fn send_simple_response(
     stream.finish().await.map_err(map_h3_error)
 }
 
-fn random_padding() -> String {
+fn random_auth_padding(xray_compat: bool) -> String {
     let mut rng = rand::rng();
-    let len = rng.random_range(1..80);
+    let len = if xray_compat {
+        rng.random_range(256..2048)
+    } else {
+        rng.random_range(1..80)
+    };
     Alphanumeric.sample_string(&mut rng, len)
 }
 
@@ -761,17 +770,29 @@ async fn skip_padding(
     Ok(())
 }
 
-fn build_tcp_response(status: u8, message: &str) -> std::io::Result<Vec<u8>> {
+fn build_tcp_response(
+    status: u8,
+    message: &str,
+    xray_compat: bool,
+) -> std::io::Result<Vec<u8>> {
     let message_bytes = message.as_bytes();
     let mut rng = rand::rng();
-    let padding_len = rng.random_range(0..=63usize);
+    let padding_len = if xray_compat {
+        rng.random_range(128..1024usize)
+    } else {
+        rng.random_range(0..=63usize)
+    };
     let mut buf = Vec::with_capacity(1 + message_bytes.len() + padding_len + 16);
     buf.push(status);
     push_varint(&mut buf, message_bytes.len() as u64)?;
     buf.extend_from_slice(message_bytes);
     push_varint(&mut buf, padding_len as u64)?;
-    if padding_len > 0 {
-        let padding_start = buf.len();
+    let padding_start = buf.len();
+    if xray_compat {
+        buf.extend_from_slice(
+            Alphanumeric.sample_string(&mut rng, padding_len).as_bytes(),
+        );
+    } else if padding_len > 0 {
         buf.resize(padding_start + padding_len, 0);
         rng.fill(&mut buf[padding_start..]);
     }
@@ -782,8 +803,9 @@ async fn send_tcp_response(
     stream: &mut quinn::SendStream,
     status: u8,
     message: &str,
+    xray_compat: bool,
 ) -> std::io::Result<()> {
-    let buf = build_tcp_response(status, message)?;
+    let buf = build_tcp_response(status, message, xray_compat)?;
     stream.write_all(&buf).await.map_err(Error::other)?;
     stream.flush().await.map_err(Error::other)
 }
@@ -1840,7 +1862,7 @@ mod tests {
         assert_eq!(MAX_ADDRESS_LEN, 2048);
 
         for _ in 0..64 {
-            let padding = random_padding();
+            let padding = random_auth_padding(false);
             assert!((1..80).contains(&padding.len()));
             assert!(padding.is_ascii());
         }
@@ -1856,7 +1878,7 @@ mod tests {
         );
 
         for _ in 0..64 {
-            let frame = build_tcp_response(TCP_SUCCESS_STATUS, "ok")
+            let frame = build_tcp_response(TCP_SUCCESS_STATUS, "ok", false)
                 .expect("TCP response frame should build");
             assert_eq!(frame[0], TCP_SUCCESS_STATUS);
             let (message_len, message_varint_len) =
@@ -1873,6 +1895,33 @@ mod tests {
             assert_eq!(
                 frame.len(),
                 padding_start + padding_varint_len + padding_len
+            );
+        }
+    }
+
+    #[test]
+    fn xray_padding_bounds_and_alphabet_match_reference() {
+        for _ in 0..64 {
+            let padding = random_auth_padding(true);
+            assert!((256..2048).contains(&padding.len()));
+            assert!(padding.bytes().all(|byte| byte.is_ascii_alphanumeric()));
+
+            let frame = build_tcp_response(TCP_SUCCESS_STATUS, "ok", true)
+                .expect("Xray TCP response frame should build");
+            let (message_len, message_varint_len) =
+                decode_varint_from_slice(&frame[1..])
+                    .expect("message length varint");
+            let padding_start = 1 + message_varint_len + message_len;
+            let (padding_len, padding_varint_len) =
+                decode_varint_from_slice(&frame[padding_start..])
+                    .expect("padding length varint");
+            assert!((128..1024).contains(&padding_len));
+            let padding_bytes = &frame[padding_start + padding_varint_len
+                ..padding_start + padding_varint_len + padding_len];
+            assert!(
+                padding_bytes
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric())
             );
         }
     }
