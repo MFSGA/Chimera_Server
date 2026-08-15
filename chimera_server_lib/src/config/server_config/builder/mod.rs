@@ -1547,6 +1547,47 @@ mod tests {
 
     #[cfg(feature = "hysteria")]
     #[test]
+    fn hysteria2_accepts_xray_transport_auth_without_users() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "hysteria2",
+            "tag": "hysteria2-transport-auth",
+            "settings": {
+                "version": 2
+            },
+            "streamSettings": {
+                "network": "hysteria2",
+                "security": "tls",
+                "tlsSettings": {
+                    "certificates": [{
+                        "certificateFile": "cert.pem",
+                        "keyFile": "key.pem"
+                    }]
+                },
+                "hysteriaSettings": {
+                    "version": 2,
+                    "auth": "transport-auth-token"
+                }
+            }
+        }))
+        .expect("valid Xray hysteria2 transport auth inbound");
+
+        let config = ServerConfig::try_from(inbound).expect(
+            "Xray transport-level auth should satisfy Hysteria2 authentication",
+        );
+        match config.protocol {
+            ServerProxyConfig::Hysteria2 { config } => {
+                assert_eq!(config.clients.len(), 1);
+                assert_eq!(config.clients[0].password, "transport-auth-token");
+                assert_eq!(config.clients[0].email, None);
+            }
+            other => panic!("expected hysteria2 protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
     fn hysteria2_finalmask_max_idle_timeout_matches_xray_default() {
         let config = ServerConfig::try_from(hysteria2_inbound_with_finalmask(0, 0))
             .expect("Xray zero maxIdleTimeout should use its default");

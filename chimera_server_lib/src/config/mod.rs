@@ -236,6 +236,8 @@ pub struct HysteriaSettings {
     #[serde(default)]
     pub version: Option<u8>,
     #[serde(default)]
+    pub auth: String,
+    #[serde(default)]
     pub congestion: Option<String>,
     #[serde(default)]
     pub up: Option<BandwidthValue>,
