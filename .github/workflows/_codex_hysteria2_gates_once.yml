@@ -22,6 +22,32 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           version: 23.x
+      - name: Apply final Hysteria2 fixes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          grpc = Path('chimera_server_lib/src/grpc/handler.rs')
+          s = grpc.read_text()
+          needle = '                    xray_max_idle_timeout_secs: None,\n                    xray_max_incoming_streams: None,\n'
+          replacement = '                    xray_max_idle_timeout_secs: None,\n                    xray_udp_idle_timeout_secs: None,\n                    xray_max_incoming_streams: None,\n'
+          if needle not in s:
+              raise SystemExit('gRPC Hysteria2 fixture marker not found')
+          grpc.write_text(s.replace(needle, replacement, 1))
+
+          conn = Path('chimera_server_lib/src/handler/hysteria2/connection.rs')
+          s = conn.read_text()
+          early = '        session.mark_active();\n\n        if remote_location != session.last_location {\n'
+          if early not in s:
+              raise SystemExit('early UDP activity marker not found')
+          s = s.replace(early, '        if remote_location != session.last_location {\n', 1)
+          route = '        let route_input = connection_routing_input(\n'
+          if route not in s:
+              raise SystemExit('UDP routing marker not found')
+          s = s.replace(route, '        session.mark_active();\n\n' + route, 1)
+          conn.write_text(s)
+          PY
+          cargo fmt --all
       - name: Format
         run: cargo fmt --all -- --check
       - name: Build all features
@@ -32,11 +58,11 @@ jobs:
         run: cargo test
       - name: Test locked
         run: cargo test --locked
-      - name: Remove validation workflow
+      - name: Commit validated fixes and remove workflow
         run: |
           rm .github/workflows/_codex_hysteria2_gates_once.yml
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add -A
-          git commit -m "chore: remove Hysteria2 validation workflow"
+          git commit -m "fix(hysteria2): align UDP activity tracking"
           git push origin HEAD:codex/hysteria2-udp-idle-timeout
