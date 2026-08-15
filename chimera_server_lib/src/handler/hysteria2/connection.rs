@@ -738,7 +738,8 @@ async fn drive_udp_datagrams(
     let mut sessions: HashMap<u32, UdpSession> = HashMap::new();
     let mut cleanup_interval = udp_idle_timeout.map(|_| {
         let start = tokio::time::Instant::now() + UDP_IDLE_CLEANUP_INTERVAL;
-        let mut interval = tokio::time::interval_at(start, UDP_IDLE_CLEANUP_INTERVAL);
+        let mut interval =
+            tokio::time::interval_at(start, UDP_IDLE_CLEANUP_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         interval
     });
