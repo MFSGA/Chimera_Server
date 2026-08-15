@@ -12,7 +12,7 @@ use crate::{
     config::server_config::Hysteria2ServerConfig,
     resolver::{NativeResolver, Resolver},
     runtime::RuntimeState,
-    util::socket::new_socket2_udp_socket,
+    util::socket::new_socket2_udp_socket_with_buffer_size,
 };
 
 mod congestion;
@@ -21,7 +21,10 @@ pub mod connection;
 const MAX_QUIC_ENDPOINTS: usize = 1;
 const SHOES_MAX_INCOMING_UNI_STREAMS: u32 = 1024;
 const XRAY_MAX_INCOMING_UNI_STREAMS: u32 = 100;
-const SHOES_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const SHOES_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const SHOES_SEND_WINDOW: u64 = 16 * 1024 * 1024;
+const SHOES_INITIAL_RTT: Duration = Duration::from_millis(100);
+const SHOES_UDP_SOCKET_BUFFER_SIZE: usize = 8_625_000;
 const SHOES_INITIAL_MTU: u16 = 1200;
 const XRAY_INITIAL_MTU: u16 = 1280;
 const DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 8 * 1024 * 1024;
@@ -61,11 +64,12 @@ pub async fn run_hysteria2_server(
         base_server_config.migration(false);
         base_server_config.transport_config(Arc::new(base_transport));
 
-        let socket2_socket = new_socket2_udp_socket(
+        let socket2_socket = new_socket2_udp_socket_with_buffer_size(
             bind_address.is_ipv6(),
             None,
             Some(bind_address),
             false,
+            configured_udp_socket_buffer_size(config.xray_compat),
         )?;
 
         let endpoint = quinn::Endpoint::new(
@@ -184,7 +188,6 @@ fn build_transport_config(
 ) -> std::io::Result<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
     let idle_timeout = Duration::from_secs(configured_max_idle_timeout_secs(
-        config.xray_compat,
         config.xray_max_idle_timeout_secs,
     ))
     .try_into()
@@ -208,6 +211,12 @@ fn build_transport_config(
         config.xray_max_connection_receive_window,
         DEFAULT_CONNECTION_RECEIVE_WINDOW,
     )?;
+    if let Some(send_window) = configured_send_window(config.xray_compat) {
+        transport.send_window(send_window);
+    }
+    if let Some(initial_rtt) = configured_initial_rtt(config.xray_compat) {
+        transport.initial_rtt(initial_rtt);
+    }
     transport
         .max_concurrent_bidi_streams(max_bidi_streams)
         .max_concurrent_uni_streams(max_uni_streams)
@@ -223,11 +232,8 @@ fn build_transport_config(
     Ok(transport)
 }
 
-fn configured_max_idle_timeout_secs(
-    xray_compat: bool,
-    configured: Option<u64>,
-) -> u64 {
-    configured.unwrap_or(if xray_compat { 30 } else { 120 })
+fn configured_max_idle_timeout_secs(configured: Option<u64>) -> u64 {
+    configured.unwrap_or(30)
 }
 
 fn configured_max_incoming_bidi_streams(
@@ -247,6 +253,18 @@ fn configured_max_incoming_uni_streams(xray_compat: bool) -> quinn::VarInt {
 
 fn configured_keep_alive_interval(xray_compat: bool) -> Option<Duration> {
     (!xray_compat).then_some(SHOES_KEEP_ALIVE_INTERVAL)
+}
+
+fn configured_send_window(xray_compat: bool) -> Option<u64> {
+    (!xray_compat).then_some(SHOES_SEND_WINDOW)
+}
+
+fn configured_initial_rtt(xray_compat: bool) -> Option<Duration> {
+    (!xray_compat).then_some(SHOES_INITIAL_RTT)
+}
+
+fn configured_udp_socket_buffer_size(xray_compat: bool) -> Option<usize> {
+    (!xray_compat).then_some(SHOES_UDP_SOCKET_BUFFER_SIZE)
 }
 
 fn configured_mtu_discovery(
@@ -287,22 +305,23 @@ fn configured_receive_window(
 mod tests {
     use super::{
         CongestionMode, DEFAULT_CONNECTION_RECEIVE_WINDOW,
-        DEFAULT_STREAM_RECEIVE_WINDOW, SHOES_INITIAL_MTU, SHOES_KEEP_ALIVE_INTERVAL,
-        SHOES_MAX_INCOMING_UNI_STREAMS, XRAY_INITIAL_MTU,
+        DEFAULT_STREAM_RECEIVE_WINDOW, SHOES_INITIAL_MTU, SHOES_INITIAL_RTT,
+        SHOES_KEEP_ALIVE_INTERVAL, SHOES_MAX_INCOMING_UNI_STREAMS,
+        SHOES_SEND_WINDOW, SHOES_UDP_SOCKET_BUFFER_SIZE, XRAY_INITIAL_MTU,
         XRAY_MAX_INCOMING_UNI_STREAMS, configured_congestion_mode,
-        configured_initial_mtu, configured_keep_alive_interval,
-        configured_max_idle_timeout_secs, configured_max_incoming_bidi_streams,
-        configured_max_incoming_uni_streams, configured_mtu_discovery,
-        configured_receive_window,
+        configured_initial_mtu, configured_initial_rtt,
+        configured_keep_alive_interval, configured_max_idle_timeout_secs,
+        configured_max_incoming_bidi_streams, configured_max_incoming_uni_streams,
+        configured_mtu_discovery, configured_receive_window, configured_send_window,
+        configured_udp_socket_buffer_size,
     };
 
     #[test]
     fn transport_defaults_follow_protocol_mode_without_finalmask() {
-        assert_eq!(configured_max_idle_timeout_secs(false, None), 120);
-        assert_eq!(configured_max_idle_timeout_secs(true, None), 30);
+        assert_eq!(configured_max_idle_timeout_secs(None), 30);
+        assert_eq!(configured_max_idle_timeout_secs(Some(45)), 45);
         assert_eq!(configured_max_incoming_bidi_streams(false, None), 4096);
         assert_eq!(configured_max_incoming_bidi_streams(true, None), 1024);
-        assert_eq!(configured_max_idle_timeout_secs(true, Some(45)), 45);
         assert_eq!(configured_max_incoming_bidi_streams(true, Some(2048)), 2048);
     }
 
@@ -319,12 +338,21 @@ mod tests {
     }
 
     #[test]
-    fn keep_alive_is_disabled_for_xray_compatibility() {
+    fn shoes_transport_tuning_is_disabled_for_xray_compatibility() {
         assert_eq!(
             configured_keep_alive_interval(false),
             Some(SHOES_KEEP_ALIVE_INTERVAL)
         );
         assert_eq!(configured_keep_alive_interval(true), None);
+        assert_eq!(configured_send_window(false), Some(SHOES_SEND_WINDOW));
+        assert_eq!(configured_send_window(true), None);
+        assert_eq!(configured_initial_rtt(false), Some(SHOES_INITIAL_RTT));
+        assert_eq!(configured_initial_rtt(true), None);
+        assert_eq!(
+            configured_udp_socket_buffer_size(false),
+            Some(SHOES_UDP_SOCKET_BUFFER_SIZE)
+        );
+        assert_eq!(configured_udp_socket_buffer_size(true), None);
     }
 
     #[test]
