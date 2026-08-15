@@ -32,8 +32,29 @@ pub(crate) async fn connect_tcp_outbound(
     user: &str,
     source_addr: SocketAddr,
 ) -> std::io::Result<Option<TcpOutboundConnection>> {
+    connect_tcp_outbound_with_vless_route(
+        resolver,
+        remote_location,
+        runtime,
+        inbound_tag,
+        user,
+        source_addr,
+        0,
+    )
+    .await
+}
+
+pub(crate) async fn connect_tcp_outbound_with_vless_route(
+    resolver: &Arc<dyn Resolver>,
+    remote_location: &NetLocation,
+    runtime: &RuntimeState,
+    inbound_tag: &str,
+    user: &str,
+    source_addr: SocketAddr,
+    vless_route: u32,
+) -> std::io::Result<Option<TcpOutboundConnection>> {
     let target_addr = resolve_single_address(resolver, remote_location).await?;
-    let route_input = connection_routing_input(
+    let mut route_input = connection_routing_input(
         inbound_tag,
         user,
         2,
@@ -41,6 +62,7 @@ pub(crate) async fn connect_tcp_outbound(
         target_addr,
         remote_location,
     );
+    route_input.vless_route = vless_route;
 
     let outbound_tag = match select_direct_outbound(runtime, &route_input, "tcp")? {
         DirectOutboundAction::Freedom { tag } => tag,

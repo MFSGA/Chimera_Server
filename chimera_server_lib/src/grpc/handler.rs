@@ -1443,6 +1443,7 @@ impl HandlerServiceImpl {
         Ok(Hysteria2Client {
             password: auth.to_string(),
             email: Some(email.to_string()),
+            xray_uuid_route: true,
         })
     }
 
@@ -3949,6 +3950,7 @@ mod tests {
                     clients: vec![Hysteria2Client {
                         password: "initial-auth".to_string(),
                         email: Some("initial-user".to_string()),
+                        xray_uuid_route: true,
                     }],
                     bandwidth: Hysteria2BandwidthConfig::default(),
                     ignore_client_bandwidth: false,

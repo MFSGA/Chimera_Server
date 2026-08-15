@@ -81,6 +81,7 @@ pub(super) fn collect_hysteria2_settings(
         .unwrap_or_default()
         .into_iter()
         .map(|client| {
+            let xray_uuid_route = client.auth.is_some();
             let password = client
                 .auth
                 .or(client.id)
@@ -98,6 +99,7 @@ pub(super) fn collect_hysteria2_settings(
                 } else {
                     Some(client.email)
                 },
+                xray_uuid_route,
             })
         })
         .collect::<Result<Vec<_>, Error>>()?;
@@ -114,6 +116,7 @@ pub(super) fn collect_hysteria2_settings(
         clients.push(Hysteria2Client {
             password: auth.to_string(),
             email: None,
+            xray_uuid_route: false,
         });
     }
 
@@ -1542,6 +1545,7 @@ mod tests {
         assert_eq!(config.clients.len(), 1);
         assert_eq!(config.clients[0].password, "xray-auth-token");
         assert_eq!(config.clients[0].email.as_deref(), Some("hy@example.com"));
+        assert!(config.clients[0].xray_uuid_route);
         assert_eq!(config.xray_udp_idle_timeout_secs, Some(60));
     }
 
@@ -1563,6 +1567,23 @@ mod tests {
         assert_eq!(config.clients.len(), 1);
         assert_eq!(config.clients[0].password, "transport-auth-token");
         assert_eq!(config.clients[0].email, None);
+        assert!(!config.clients[0].xray_uuid_route);
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn collect_hysteria2_settings_keeps_shoes_id_exact() {
+        let settings = SettingObject(serde_json::json!({
+            "clients": [{"id": "00112233-4455-6677-8899-aabbccddeeff"}]
+        }));
+
+        let config = collect_hysteria2_settings(settings, None)
+            .expect("shoes-style Hysteria id should be accepted");
+        assert_eq!(
+            config.clients[0].password,
+            "00112233-4455-6677-8899-aabbccddeeff"
+        );
+        assert!(!config.clients[0].xray_uuid_route);
     }
 
     #[cfg(feature = "hysteria")]

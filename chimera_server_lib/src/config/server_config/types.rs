@@ -33,6 +33,8 @@ pub struct ServerConfig {
 pub struct Hysteria2Client {
     pub password: String,
     pub email: Option<String>,
+    #[serde(default)]
+    pub xray_uuid_route: bool,
 }
 
 #[cfg(feature = "hysteria")]
