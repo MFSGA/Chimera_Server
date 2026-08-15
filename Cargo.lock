@@ -373,7 +373,7 @@ dependencies = [
 
 [[package]]
 name = "chimera_cli"
-version = "0.7.14"
+version = "0.7.15"
 dependencies = [
  "anyhow",
  "base64",
@@ -384,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "chimera_server_app"
-version = "0.7.14"
+version = "0.7.15"
 dependencies = [
  "aws-lc-rs",
  "chimera_server_lib",
@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "chimera_server_lib"
-version = "0.7.14"
+version = "0.7.15"
 dependencies = [
  "aes",
  "async-trait",
@@ -461,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "chimera_tcp_reality_server"
-version = "0.7.14"
+version = "0.7.15"
 dependencies = [
  "chimera_server_lib",
  "clap",
