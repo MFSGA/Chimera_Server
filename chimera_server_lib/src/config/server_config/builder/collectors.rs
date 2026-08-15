@@ -163,17 +163,18 @@ pub(super) fn collect_hysteria2_settings(
         }
     }
 
-    let xray_udp_idle_timeout_secs = hysteria_settings
-        .map(|settings| {
+    let xray_udp_idle_timeout_secs = Some(match hysteria_settings {
+        Some(settings) => {
             let timeout = settings.udp_idle_timeout;
             if timeout != 0 && !(2..=600).contains(&timeout) {
                 return Err(Error::InvalidConfig(format!(
                     "hysteriaSettings.udpIdleTimeout must be 0 or between 2 and 600 seconds (got {timeout})"
                 )));
             }
-            Ok(if timeout == 0 { 60 } else { timeout as u64 })
-        })
-        .transpose()?;
+            if timeout == 0 { 60 } else { timeout as u64 }
+        }
+        None => 60,
+    });
 
     if bandwidth.max_tx != 0 && bandwidth.max_tx < 65_536 {
         return Err(Error::InvalidConfig(
@@ -1520,6 +1521,7 @@ mod tests {
         assert_eq!(config.clients.len(), 1);
         assert_eq!(config.clients[0].password, "xray-auth-token");
         assert_eq!(config.clients[0].email.as_deref(), Some("hy@example.com"));
+        assert_eq!(config.xray_udp_idle_timeout_secs, Some(60));
     }
 
     #[cfg(feature = "hysteria")]
