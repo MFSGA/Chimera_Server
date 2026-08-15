@@ -847,8 +847,6 @@ async fn drive_udp_datagrams(
                 entry.insert(session)
             }
         };
-        session.mark_active();
-
         if remote_location != session.last_location {
             let updated_addr =
                 resolve_single_address(&resolver, &remote_location).await?;
@@ -930,6 +928,8 @@ async fn drive_udp_datagrams(
 
             assembled.freeze()
         };
+
+        session.mark_active();
 
         let route_input = connection_routing_input(
             inbound_tag.as_str(),

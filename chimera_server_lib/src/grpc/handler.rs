@@ -3957,6 +3957,7 @@ mod tests {
                     xray_brutal_up: None,
                     xray_brutal_down: None,
                     xray_max_idle_timeout_secs: None,
+                    xray_udp_idle_timeout_secs: None,
                     xray_max_incoming_streams: None,
                     xray_init_stream_receive_window: None,
                     xray_max_stream_receive_window: None,
