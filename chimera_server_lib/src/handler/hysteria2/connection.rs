@@ -200,19 +200,21 @@ async fn auth_hysteria2_connection(
                             udp_enabled: true,
                         });
                     }
-                    Err(AuthReject::NotAuthRequest) => {
-                        send_simple_response(&mut stream, StatusCode::NOT_FOUND)
-                            .await?;
-                    }
-                    Err(AuthReject::Unauthorized(msg)) => {
-                        warn!("hysteria2 auth rejected: {}", msg);
-                        send_simple_response(&mut stream, StatusCode::FORBIDDEN)
-                            .await?;
-                    }
-                    Err(AuthReject::BadRequest(msg)) => {
-                        warn!("hysteria2 auth request invalid: {}", msg);
-                        send_simple_response(&mut stream, StatusCode::BAD_REQUEST)
-                            .await?;
+                    Err(reject) => {
+                        match &reject {
+                            AuthReject::NotAuthRequest => {}
+                            AuthReject::Unauthorized(msg) => {
+                                warn!("hysteria2 auth rejected: {}", msg);
+                            }
+                            AuthReject::BadRequest(msg) => {
+                                warn!("hysteria2 auth request invalid: {}", msg);
+                            }
+                        }
+                        send_simple_response(
+                            &mut stream,
+                            auth_reject_status(&reject),
+                        )
+                        .await?;
                     }
                 }
             }
@@ -468,6 +470,10 @@ enum AuthReject {
     NotAuthRequest,
     Unauthorized(&'static str),
     BadRequest(&'static str),
+}
+
+fn auth_reject_status(_reject: &AuthReject) -> StatusCode {
+    StatusCode::NOT_FOUND
 }
 
 fn resolve_bandwidth_settings(
@@ -1183,6 +1189,22 @@ mod tests {
 
         assert_eq!(err.kind(), ErrorKind::TimedOut);
         assert!(started.elapsed() >= AUTH_TIMEOUT);
+    }
+
+    #[test]
+    fn auth_rejections_use_not_found_like_shoes() {
+        assert_eq!(
+            auth_reject_status(&AuthReject::NotAuthRequest),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            auth_reject_status(&AuthReject::Unauthorized("bad auth")),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            auth_reject_status(&AuthReject::BadRequest("bad request")),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[test]
