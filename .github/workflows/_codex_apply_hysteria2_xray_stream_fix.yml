@@ -1,40 +1,73 @@
-name: Apply Xray Hysteria2 stream compatibility fix
+name: Validate modern Xray Hysteria2 interop
 
 on:
   push:
     branches:
       - codex/hysteria2-xray-modern-streams
 
-permissions:
-  contents: write
-
 jobs:
-  apply:
-    if: "${{ github.event.head_commit.message == 'ci: execute Hysteria2 compatibility edit' }}"
+  interop:
+    if: "${{ github.event.head_commit.message == 'ci: validate modern Xray Hysteria2 interop' }}"
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: v26.7.28
+            sha256: 8195d909f1109b8f3d99eefe401a3c451d7bf4af71f24d3815420f77e5dd2a40
+          - version: v26.3.27
+            sha256: 23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae
+          - version: v26.2.6
+            sha256: 29ce535b56e207a406ffa1c2d4842dcc410be003eff8ec508bb732abc9f8e385
     steps:
       - uses: actions/checkout@v6
-        with:
-          ref: codex/hysteria2-xray-modern-streams
       - uses: dtolnay/rust-toolchain@stable
       - uses: arduino/setup-protoc@v3
         with:
           version: '23.x'
       - uses: Swatinem/rust-cache@v2
-      - name: Apply compatibility fix
-        run: python3 .github/scripts/_codex_apply_hysteria2_xray_stream_fix.py
-      - name: Format
-        run: cargo fmt --all
-      - name: Focused tests
-        run: cargo test -p chimera_server_lib tcp_request_parser_accepts_xray_raw_stream_format
-      - name: Commit compatibility fix
+      - name: Provision temporary test certificate
         shell: bash
         run: |
           set -euo pipefail
-          git config user.name MFSGA
-          git config user.email chimera_rust@proton.me
-          git add chimera_server_lib/src/handler/hysteria2/connection.rs
-          git diff --cached --check
-          git diff --cached --stat
-          git commit -m 'fix(hysteria2): accept modern Xray TCP streams'
-          git push origin HEAD:codex/hysteria2-xray-modern-streams
+          mkdir -p cert
+          openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
+            -keyout cert/key.pem -out cert/cert.pem -days 1 \
+            -subj '/CN=localhost' \
+            -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1'
+      - name: Download and verify Xray
+        shell: bash
+        env:
+          XRAY_VERSION: ${{ matrix.version }}
+          XRAY_SHA256: ${{ matrix.sha256 }}
+        run: |
+          set -euo pipefail
+          archive="/tmp/Xray-linux-64-${XRAY_VERSION}.zip"
+          curl -fL --retry 3 \
+            "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" \
+            -o "$archive"
+          echo "${XRAY_SHA256}  ${archive}" | sha256sum -c -
+          mkdir -p xray-test
+          unzip -q "$archive" -d xray-test
+          chmod +x xray-test/xray
+          cp xray-test/xray ./xray
+          chmod +x ./xray
+          ./xray version
+      - name: Hysteria2 TCP and UDP interop
+        shell: bash
+        env:
+          XRAY_BIN: ${{ github.workspace }}/xray
+          RUST_BACKTRACE: '1'
+        run: |
+          set +e
+          cargo test -p chimera_server_app --test xray_client_proxy_e2e \
+            xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2 \
+            -- --ignored --exact --nocapture
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            echo '=== Hysteria2 diagnostics ==='
+            find /tmp -type f -path '*hysteria2*' \
+              \( -name '*.log' -o -name '*.json' -o -name '*.json5' \) \
+              -print -exec sh -c 'echo "--- $1 ---"; tail -n 300 "$1"' _ {} \; || true
+          fi
+          exit "$status"
