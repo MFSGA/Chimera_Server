@@ -57,6 +57,8 @@ pub struct Hysteria2ServerConfig {
     #[serde(default)]
     pub ignore_client_bandwidth: bool,
     #[serde(default)]
+    pub xray_compat: bool,
+    #[serde(default)]
     pub xray_congestion: Option<String>,
     #[serde(default)]
     pub xray_bbr_profile: Option<String>,

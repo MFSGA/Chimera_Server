@@ -120,6 +120,9 @@ pub(super) fn collect_hysteria2_settings(
         });
     }
 
+    let xray_compat = raw.version == Some(2)
+        && hysteria_settings.and_then(|settings| settings.version) == Some(2);
+
     let mut bandwidth = Hysteria2BandwidthConfig::default();
     let mut saw_up = false;
     let mut saw_down = false;
@@ -169,21 +172,23 @@ pub(super) fn collect_hysteria2_settings(
             )));
         }
 
-        if !saw_up && let Some(up) = hysteria_settings.up.clone() {
-            bandwidth.max_tx = parse_bandwidth(up).map_err(|err| {
-                Error::InvalidConfig(format!(
-                    "invalid hysteriaSettings.up value: {}",
-                    err
-                ))
-            })?;
-        }
-        if !saw_down && let Some(down) = hysteria_settings.down.clone() {
-            bandwidth.max_rx = parse_bandwidth(down).map_err(|err| {
-                Error::InvalidConfig(format!(
-                    "invalid hysteriaSettings.down value: {}",
-                    err
-                ))
-            })?;
+        if !xray_compat {
+            if !saw_up && let Some(up) = hysteria_settings.up.clone() {
+                bandwidth.max_tx = parse_bandwidth(up).map_err(|err| {
+                    Error::InvalidConfig(format!(
+                        "invalid hysteriaSettings.up value: {}",
+                        err
+                    ))
+                })?;
+            }
+            if !saw_down && let Some(down) = hysteria_settings.down.clone() {
+                bandwidth.max_rx = parse_bandwidth(down).map_err(|err| {
+                    Error::InvalidConfig(format!(
+                        "invalid hysteriaSettings.down value: {}",
+                        err
+                    ))
+                })?;
+            }
         }
     }
 
@@ -221,6 +226,7 @@ pub(super) fn collect_hysteria2_settings(
         clients,
         bandwidth,
         ignore_client_bandwidth,
+        xray_compat,
         xray_congestion: None,
         xray_bbr_profile: None,
         xray_brutal_up: None,
@@ -1558,7 +1564,9 @@ mod tests {
         let stream_settings =
             serde_json::from_value::<HysteriaSettings>(serde_json::json!({
                 "version": 2,
-                "auth": "transport-auth-token"
+                "auth": "transport-auth-token",
+                "up": "1 kbps",
+                "down": "2 kbps"
             }))
             .expect("valid hysteriaSettings auth");
 
@@ -1568,6 +1576,9 @@ mod tests {
         assert_eq!(config.clients[0].password, "transport-auth-token");
         assert_eq!(config.clients[0].email, None);
         assert!(!config.clients[0].xray_uuid_route);
+        assert!(config.xray_compat);
+        assert_eq!(config.bandwidth.max_tx, 0);
+        assert_eq!(config.bandwidth.max_rx, 0);
     }
 
     #[cfg(feature = "hysteria")]
@@ -1584,6 +1595,7 @@ mod tests {
             "00112233-4455-6677-8899-aabbccddeeff"
         );
         assert!(!config.clients[0].xray_uuid_route);
+        assert!(!config.xray_compat);
     }
 
     #[cfg(feature = "hysteria")]
