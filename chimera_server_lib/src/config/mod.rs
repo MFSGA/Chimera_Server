@@ -205,6 +205,14 @@ pub struct FinalMaskSettings {
 #[serde(rename_all = "camelCase")]
 pub struct FinalMaskQuicParams {
     #[serde(default)]
+    pub congestion: String,
+    #[serde(default)]
+    pub bbr_profile: String,
+    #[serde(default)]
+    pub brutal_up: String,
+    #[serde(default)]
+    pub brutal_down: String,
+    #[serde(default)]
     pub init_stream_receive_window: u64,
     #[serde(default)]
     pub max_stream_receive_window: u64,
