@@ -905,6 +905,8 @@ impl TryFrom<InboudItem> for ServerConfig {
                 config.xray_brutal_down = xray_brutal_down;
                 config.xray_max_idle_timeout_secs = xray_max_idle_timeout_secs;
                 config.xray_max_incoming_streams = xray_max_incoming_streams;
+                config.xray_disable_path_mtu_discovery =
+                    xray_quic_params.map(|params| params.disable_path_mtu_discovery);
                 if let Some((
                     init_stream,
                     max_stream,
@@ -1544,6 +1546,7 @@ mod tests {
             ServerProxyConfig::Hysteria2 { config } => {
                 assert_eq!(config.xray_max_idle_timeout_secs, Some(30));
                 assert_eq!(config.xray_max_incoming_streams, Some(1024));
+                assert_eq!(config.xray_disable_path_mtu_discovery, Some(false));
             }
             other => panic!("expected hysteria2 protocol, got {other:?}"),
         }
@@ -1575,6 +1578,23 @@ mod tests {
         let err = ServerConfig::try_from(hysteria2_inbound_with_finalmask(30, 7))
             .expect_err("Xray rejects maxIncomingStreams below eight");
         assert!(err.to_string().contains("maxIncomingStreams"));
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn hysteria2_finalmask_preserves_xray_path_mtu_discovery_flag() {
+        let config = ServerConfig::try_from(
+            hysteria2_inbound_with_finalmask_quic_params(serde_json::json!({
+                "disablePathMTUDiscovery": true
+            })),
+        )
+        .expect("valid Xray path MTU discovery setting should build");
+        match config.protocol {
+            ServerProxyConfig::Hysteria2 { config } => {
+                assert_eq!(config.xray_disable_path_mtu_discovery, Some(true));
+            }
+            other => panic!("expected hysteria2 protocol, got {other:?}"),
+        }
     }
 
     #[cfg(feature = "hysteria")]

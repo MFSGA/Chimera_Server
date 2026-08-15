@@ -1626,7 +1626,8 @@ async fn xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2() {
                             "initStreamReceiveWindow": 32768,
                             "maxStreamReceiveWindow": 65536,
                             "initConnectionReceiveWindow": 131072,
-                            "maxConnectionReceiveWindow": 262144
+                            "maxConnectionReceiveWindow": 262144,
+                            "disablePathMTUDiscovery": true
                         }
                     },
                     "tlsSettings": {

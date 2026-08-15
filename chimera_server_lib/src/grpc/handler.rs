@@ -3962,6 +3962,7 @@ mod tests {
                     xray_max_stream_receive_window: None,
                     xray_init_connection_receive_window: None,
                     xray_max_connection_receive_window: None,
+                    xray_disable_path_mtu_discovery: None,
                 },
             },
             transport: Transport::Quic,
