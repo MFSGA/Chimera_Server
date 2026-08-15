@@ -51,22 +51,11 @@ jobs:
                   raise SystemExit(f'expected exactly one benchmark replacement, found {text.count(old)}')
               text = text.replace(old, new, 1)
           bench.write_text(text)
-
-          workflow = Path('.github/workflows/proxy-throughput.yml')
-          lines = workflow.read_text().splitlines(keepends=True)
-          start = next(i for i, line in enumerate(lines) if 'github.rest.issues.updateComment({' in line)
-          end = next(i for i in range(start + 1, len(lines)) if lines[i].strip() == '});')
-          issue_lines = [i for i in range(start, end + 1) if 'issue_number: context.issue.number,' in lines[i]]
-          if len(issue_lines) != 1:
-              raise SystemExit(f'expected one issue_number in updateComment block, found {len(issue_lines)}')
-          del lines[issue_lines[0]]
-          workflow.write_text(''.join(lines))
           PY
 
           python3 -m py_compile bench/hysteria2_netem.py
           python3 bench/hysteria2_netem.py --self-test
-          rm .github/workflows/_fix_hysteria2_bench_timing.yml
-          git add bench/hysteria2_netem.py .github/workflows/proxy-throughput.yml .github/workflows/_fix_hysteria2_bench_timing.yml
+          git add bench/hysteria2_netem.py
           git diff --cached --check
           git diff --cached --stat
           git commit -m 'bench(hysteria2): isolate download timing'
