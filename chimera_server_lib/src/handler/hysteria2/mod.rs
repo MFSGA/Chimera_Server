@@ -24,6 +24,8 @@ const XRAY_MAX_INCOMING_UNI_STREAMS: u32 = 100;
 const SHOES_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const SHOES_INITIAL_MTU: u16 = 1200;
 const XRAY_INITIAL_MTU: u16 = 1280;
+const DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 8 * 1024 * 1024;
+const DEFAULT_CONNECTION_RECEIVE_WINDOW: u64 = 20 * 1024 * 1024;
 
 pub async fn run_hysteria2_server(
     bind_address: SocketAddr,
@@ -167,10 +169,23 @@ fn build_transport_config(
     );
     let keep_alive_interval =
         configured_keep_alive_interval(config.xray_max_incoming_streams.is_some());
+    // Quinn has a single static receive window rather than quic-go's separate
+    // initial/max auto-tuned windows. Apply Xray's max values as the closest
+    // runtime equivalent; the initial values remain validated/preserved in config.
+    let stream_receive_window = configured_receive_window(
+        config.xray_max_stream_receive_window,
+        DEFAULT_STREAM_RECEIVE_WINDOW,
+    )?;
+    let connection_receive_window = configured_receive_window(
+        config.xray_max_connection_receive_window,
+        DEFAULT_CONNECTION_RECEIVE_WINDOW,
+    )?;
     transport
         .max_concurrent_bidi_streams(max_bidi_streams)
         .max_concurrent_uni_streams(max_uni_streams)
         .keep_alive_interval(keep_alive_interval)
+        .stream_receive_window(stream_receive_window)
+        .receive_window(connection_receive_window)
         .initial_mtu(configured_initial_mtu(
             config.xray_max_incoming_streams.is_some(),
         ))
@@ -199,13 +214,24 @@ fn configured_initial_mtu(xray_compat: bool) -> u16 {
     }
 }
 
+fn configured_receive_window(
+    value: Option<u64>,
+    default: u64,
+) -> std::io::Result<quinn::VarInt> {
+    let value = value.filter(|value| *value != 0).unwrap_or(default);
+    quinn::VarInt::from_u64(value)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
+        DEFAULT_CONNECTION_RECEIVE_WINDOW, DEFAULT_STREAM_RECEIVE_WINDOW,
         SHOES_INITIAL_MTU, SHOES_KEEP_ALIVE_INTERVAL,
         SHOES_MAX_INCOMING_UNI_STREAMS, XRAY_INITIAL_MTU,
         XRAY_MAX_INCOMING_UNI_STREAMS, configured_initial_mtu,
         configured_keep_alive_interval, configured_max_incoming_uni_streams,
+        configured_receive_window,
     };
 
     #[test]
@@ -233,5 +259,36 @@ mod tests {
     fn initial_mtu_matches_protocol_mode() {
         assert_eq!(configured_initial_mtu(false), SHOES_INITIAL_MTU);
         assert_eq!(configured_initial_mtu(true), XRAY_INITIAL_MTU);
+    }
+
+    #[test]
+    fn receive_windows_use_xray_max_values_and_shared_defaults() {
+        assert_eq!(
+            configured_receive_window(None, DEFAULT_STREAM_RECEIVE_WINDOW)
+                .expect("default stream window")
+                .into_inner(),
+            DEFAULT_STREAM_RECEIVE_WINDOW
+        );
+        assert_eq!(
+            configured_receive_window(Some(0), DEFAULT_CONNECTION_RECEIVE_WINDOW)
+                .expect("zero connection window uses default")
+                .into_inner(),
+            DEFAULT_CONNECTION_RECEIVE_WINDOW
+        );
+        assert_eq!(
+            configured_receive_window(Some(65_536), DEFAULT_STREAM_RECEIVE_WINDOW)
+                .expect("explicit stream window")
+                .into_inner(),
+            65_536
+        );
+        assert_eq!(
+            configured_receive_window(
+                Some(262_144),
+                DEFAULT_CONNECTION_RECEIVE_WINDOW
+            )
+            .expect("explicit connection window")
+            .into_inner(),
+            262_144
+        );
     }
 }
