@@ -1,4 +1,4 @@
-name: Trace master Hysteria2 stream ownership
+name: Trace Xray 26.7.28 client stages
 
 on:
   push:
@@ -7,16 +7,8 @@ on:
 
 jobs:
   trace:
-    if: "${{ github.event.head_commit.message == 'ci: trace master Hysteria2 stream ownership' }}"
+    if: "${{ github.event.head_commit.message == 'ci: trace Xray 26.7.28 client stages' }}"
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - version: v26.7.28
-            sha256: 8195d909f1109b8f3d99eefe401a3c451d7bf4af71f24d3815420f77e5dd2a40
-          - version: v26.2.6
-            sha256: 29ce535b56e207a406ffa1c2d4842dcc410be003eff8ec508bb732abc9f8e385
     steps:
       - uses: actions/checkout@v6
         with:
@@ -26,35 +18,33 @@ jobs:
         with:
           version: '23.x'
       - uses: Swatinem/rust-cache@v2
-      - name: Instrument original raw Quinn TCP path
+      - name: Enable diagnostic logs
         shell: bash
         run: |
           python3 <<'PY'
           from pathlib import Path
           path = Path('chimera_server_lib/src/handler/hysteria2/connection.rs')
           text = path.read_text()
-          replacements = [
-            (
-              '''            Ok((send, recv)) => {\n''',
-              '''            Ok((send, recv)) => {\n                debug!(stream_id = ?recv.id(), "hysteria2 master trace raw bidi accepted");\n'''
-            ),
-            (
-              '''        Ok(request) => request,\n''',
-              '''        Ok(request) => {\n            debug!(target = %request.target, "hysteria2 master trace request parsed");\n            request\n        },\n'''
-            ),
-            (
-              '''    send_tcp_response(&mut send, TCP_SUCCESS_STATUS, "").await?;\n''',
-              '''    debug!("hysteria2 master trace sending response");\n    send_tcp_response(&mut send, TCP_SUCCESS_STATUS, "").await?;\n    debug!("hysteria2 master trace response sent");\n'''
-            ),
-            (
-              '''        Ok(Ok(Some(connection))) => connection,\n''',
-              '''        Ok(Ok(Some(connection))) => {\n            debug!(target = %request.target, "hysteria2 master trace outbound connected");\n            connection\n        },\n'''
-            ),
-          ]
-          for old, new in replacements:
-              assert old in text, old
-              text = text.replace(old, new, 1)
+          text = text.replace(
+              '            Ok((send, recv)) => {\n',
+              '            Ok((send, recv)) => {\n                debug!(stream_id = ?recv.id(), "hysteria2 trace raw bidi accepted");\n',
+              1,
+          )
+          text = text.replace(
+              '        Ok(request) => request,\n',
+              '        Ok(request) => { debug!(target = %request.target, "hysteria2 trace request parsed"); request },\n',
+              1,
+          )
           path.write_text(text)
+
+          test = Path('chimera_server_app/tests/xray_client_proxy_e2e.rs')
+          text = test.read_text()
+          start = text.index('async fn xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2()')
+          end = text.index('\n#[test]\n#[ignore = "starts Chimera as server and ./xray with invalid hysteria2 auth"]', start)
+          section = text[start:end]
+          section = section.replace('"loglevel": "warning"', '"loglevel": "debug"')
+          text = text[:start] + section + text[end:]
+          test.write_text(text)
           PY
           cargo fmt --all
       - name: Provision temporary test certificate
@@ -66,23 +56,19 @@ jobs:
             -keyout cert/key.pem -out cert/cert.pem -days 1 \
             -subj '/CN=localhost' \
             -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1'
-      - name: Download and verify Xray
+      - name: Download and verify Xray v26.7.28
         shell: bash
-        env:
-          XRAY_VERSION: ${{ matrix.version }}
-          XRAY_SHA256: ${{ matrix.sha256 }}
         run: |
           set -euo pipefail
-          archive="/tmp/Xray-linux-64-${XRAY_VERSION}.zip"
           curl -fL --retry 3 \
-            "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" \
-            -o "$archive"
-          echo "${XRAY_SHA256}  ${archive}" | sha256sum -c -
-          unzip -q "$archive" -d xray-test
+            'https://github.com/XTLS/Xray-core/releases/download/v26.7.28/Xray-linux-64.zip' \
+            -o /tmp/xray.zip
+          echo '8195d909f1109b8f3d99eefe401a3c451d7bf4af71f24d3815420f77e5dd2a40  /tmp/xray.zip' | sha256sum -c -
+          unzip -q /tmp/xray.zip -d xray-test
           cp xray-test/xray ./xray
           chmod +x ./xray
           ./xray version
-      - name: Hysteria2 TCP ownership trace
+      - name: Hysteria2 TCP trace
         shell: bash
         env:
           XRAY_BIN: ${{ github.workspace }}/xray
@@ -96,5 +82,5 @@ jobs:
           echo '=== Hysteria2 diagnostics ==='
           find /tmp -type f -path '*hysteria2*' \
             \( -name '*.log' -o -name '*.json' -o -name '*.json5' \) \
-            -print -exec sh -c 'echo "--- $1 ---"; tail -n 400 "$1"' _ {} \; 2>/dev/null || true
+            -print -exec sh -c 'echo "--- $1 ---"; tail -n 500 "$1"' _ {} \; 2>/dev/null || true
           exit "$status"
