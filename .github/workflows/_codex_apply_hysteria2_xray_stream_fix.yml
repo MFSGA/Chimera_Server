@@ -1,4 +1,4 @@
-name: Diagnose modern Xray Hysteria2 streams
+name: Trace modern Xray Hysteria2 TCP stages
 
 on:
   push:
@@ -6,13 +6,9 @@ on:
       - codex/hysteria2-xray-modern-streams
 
 jobs:
-  diagnose:
-    if: "${{ github.event.head_commit.message == 'ci: diagnose modern Xray Hysteria2 streams' }}"
+  trace:
+    if: "${{ github.event.head_commit.message == 'ci: trace modern Xray Hysteria2 TCP stages' }}"
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        congestion: [brutal, bbr, reno]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -20,40 +16,49 @@ jobs:
         with:
           version: '23.x'
       - uses: Swatinem/rust-cache@v2
-      - name: Instrument stream intake and select congestion
+      - name: Instrument TCP stages
         shell: bash
-        env:
-          XRAY_CONGESTION: ${{ matrix.congestion }}
         run: |
           python3 <<'PY'
-          import os
           from pathlib import Path
 
-          conn = Path('chimera_server_lib/src/handler/hysteria2/connection.rs')
-          text = conn.read_text()
-          needle = '''            Ok(stream) => stream,\n'''
-          replacement = '''            Ok(stream) => {\n                debug!(stream_id = ?H3RecvStream::recv_id(&stream), "hysteria2 diagnostic bidi stream accepted");\n                stream\n            },\n'''
-          assert needle in text
-          text = text.replace(needle, replacement, 1)
-          needle = '''                Poll::Ready(Ok(Some(data))) => this.read_buffer = data,\n'''
-          replacement = '''                Poll::Ready(Ok(Some(data))) => {\n                    debug!(len = data.len(), prefix = ?&data[..data.len().min(16)], "hysteria2 diagnostic bidi data received");\n                    this.read_buffer = data;\n                },\n'''
-          assert needle in text
-          text = text.replace(needle, replacement, 1)
-          conn.write_text(text)
+          path = Path('chimera_server_lib/src/handler/hysteria2/connection.rs')
+          text = path.read_text()
 
-          test = Path('chimera_server_app/tests/xray_client_proxy_e2e.rs')
-          text = test.read_text()
-          start = text.index('async fn xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2()')
-          end = text.index('\n#[test]\n#[ignore = "starts Chimera as server and ./xray with invalid hysteria2 auth"]', start)
-          section = text[start:end]
-          marker = '"congestion": "brutal"'
-          positions = [i for i in range(len(section)) if section.startswith(marker, i)]
-          assert len(positions) == 2, positions
-          mode = os.environ['XRAY_CONGESTION']
-          pos = positions[-1]
-          section = section[:pos] + f'"congestion": "{mode}"' + section[pos + len(marker):]
-          text = text[:start] + section + text[end:]
-          test.write_text(text)
+          replacements = [
+            (
+              '''            Ok(stream) => stream,\n''',
+              '''            Ok(stream) => {\n                debug!(stream_id = ?H3RecvStream::recv_id(&stream), "hysteria2 trace bidi accepted");\n                stream\n            },\n'''
+            ),
+            (
+              '''        Ok(request) => request,\n''',
+              '''        Ok(request) => {\n            debug!(target = %request.target, "hysteria2 trace tcp request parsed");\n            request\n        },\n'''
+            ),
+            (
+              '''    send_tcp_response(&mut stream, TCP_SUCCESS_STATUS, "").await?;\n''',
+              '''    debug!("hysteria2 trace sending tcp response");\n    send_tcp_response(&mut stream, TCP_SUCCESS_STATUS, "").await?;\n    debug!("hysteria2 trace tcp response sent");\n'''
+            ),
+            (
+              '''    let connection = match tokio::time::timeout(\n''',
+              '''    debug!(target = %request.target, "hysteria2 trace connecting outbound");\n    let connection = match tokio::time::timeout(\n'''
+            ),
+            (
+              '''        Ok(Ok(Some(connection))) => connection,\n''',
+              '''        Ok(Ok(Some(connection))) => {\n            debug!(target = %request.target, "hysteria2 trace outbound connected");\n            connection\n        },\n'''
+            ),
+            (
+              '''    proxy_tcp(stream, connection.stream, context).await\n''',
+              '''    debug!("hysteria2 trace starting tcp proxy");\n    proxy_tcp(stream, connection.stream, context).await\n'''
+            ),
+            (
+              '''        match SendStreamUnframed::poll_send(&mut this.stream, cx, &mut data) {\n            Poll::Ready(Ok(written)) => Poll::Ready(Ok(written)),\n''',
+              '''        debug!(len = buf.len(), prefix = ?&buf[..buf.len().min(16)], "hysteria2 trace poll_write");\n        match SendStreamUnframed::poll_send(&mut this.stream, cx, &mut data) {\n            Poll::Ready(Ok(written)) => {\n                debug!(written, "hysteria2 trace poll_write complete");\n                Poll::Ready(Ok(written))\n            },\n'''
+            ),
+          ]
+          for old, new in replacements:
+              assert old in text, old
+              text = text.replace(old, new, 1)
+          path.write_text(text)
           PY
           cargo fmt --all
       - name: Provision temporary test certificate
@@ -78,7 +83,7 @@ jobs:
           cp xray-test/xray ./xray
           chmod +x ./xray
           ./xray version
-      - name: Hysteria2 TCP and UDP interop
+      - name: Hysteria2 TCP trace
         shell: bash
         env:
           XRAY_BIN: ${{ github.workspace }}/xray
@@ -92,5 +97,5 @@ jobs:
           echo '=== Hysteria2 diagnostics ==='
           find /tmp -type f -path '*hysteria2*' \
             \( -name '*.log' -o -name '*.json' -o -name '*.json5' \) \
-            -print -exec sh -c 'echo "--- $1 ---"; tail -n 300 "$1"' _ {} \; 2>/dev/null || true
+            -print -exec sh -c 'echo "--- $1 ---"; tail -n 400 "$1"' _ {} \; 2>/dev/null || true
           exit "$status"
