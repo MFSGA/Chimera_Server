@@ -84,7 +84,6 @@ pub(super) fn collect_hysteria2_settings(
             let password = client
                 .auth
                 .or(client.id)
-                .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| {
                     Error::InvalidConfig(
@@ -1583,6 +1582,18 @@ mod tests {
             .expect("configured users should take precedence over transport auth");
         assert_eq!(config.clients.len(), 1);
         assert_eq!(config.clients[0].password, "user-auth-token");
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn collect_hysteria2_settings_preserves_xray_auth_whitespace() {
+        let settings = SettingObject(serde_json::json!({
+            "clients": [{"auth": " spaced-secret "}]
+        }));
+
+        let config = collect_hysteria2_settings(settings, None)
+            .expect("Xray Hysteria auth should be preserved exactly");
+        assert_eq!(config.clients[0].password, " spaced-secret ");
     }
 
     #[cfg(feature = "hysteria")]
