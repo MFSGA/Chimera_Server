@@ -51,6 +51,7 @@ pub struct SocksTcpServerHandler {
     accounts: SocksUserStore,
     inbound_tag: String,
     udp_enabled: bool,
+    udp_bind_ip: Option<std::net::IpAddr>,
 }
 
 impl SocksTcpServerHandler {
@@ -58,11 +59,13 @@ impl SocksTcpServerHandler {
         accounts: SocksUserStore,
         inbound_tag: &str,
         udp_enabled: bool,
+        udp_bind_ip: Option<std::net::IpAddr>,
     ) -> Self {
         Self {
             accounts,
             inbound_tag: inbound_tag.to_string(),
             udp_enabled,
+            udp_bind_ip,
         }
     }
 
@@ -136,7 +139,12 @@ impl TcpServerHandler for SocksTcpServerHandler {
                 })
             }
             CMD_UDP_ASSOCIATE if self.udp_enabled => {
-                handle_udp_associate(server_stream, traffic_context).await
+                handle_udp_associate(
+                    server_stream,
+                    traffic_context,
+                    self.udp_bind_ip,
+                )
+                .await
             }
             CMD_UDP_ASSOCIATE => {
                 send_command_response(&mut server_stream, REP_COMMAND_NOT_SUPPORTED)
@@ -348,6 +356,7 @@ async fn read_address_from_stream(
 async fn handle_udp_associate(
     mut server_stream: Box<dyn AsyncStream>,
     traffic_context: Option<TrafficContext>,
+    udp_bind_ip: Option<std::net::IpAddr>,
 ) -> std::io::Result<TcpServerSetupResult> {
     // The TCP peer address is authoritative. A non-zero hint port narrows the
     // UDP endpoint immediately; port zero is learned from the first datagram.
@@ -356,9 +365,12 @@ async fn handle_udp_associate(
         (client_hint.port() != 0).then_some(client_hint.port());
     tracing::debug!("SOCKS5 UDP ASSOCIATE: client hint = {:?}", client_hint);
 
-    let udp_bind_addr = SocketAddr::from(([0, 0, 0, 0], 0u16));
+    let udp_bind_addr = SocketAddr::new(
+        udp_bind_ip.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+        0,
+    );
     let udp_socket = crate::util::socket::new_socket2_udp_socket_with_buffer_size(
-        false,
+        udp_bind_addr.is_ipv6(),
         None,
         Some(udp_bind_addr),
         false,
@@ -760,6 +772,42 @@ mod tests {
         runtime::OutboundSummary,
         traffic::{active_connections, snapshot},
     };
+
+    #[tokio::test]
+    async fn udp_associate_uses_configured_bind_ip() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(listener_addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        client
+            .write_all(&[0x00, ADDR_TYPE_IPV4, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+
+        let result = handle_udp_associate(
+            Box::new(server),
+            None,
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        )
+        .await
+        .unwrap();
+
+        let TcpServerSetupResult::UdpAssociate { socket, .. } = result else {
+            panic!("expected UDP associate result");
+        };
+        assert_eq!(
+            socket.local_addr().unwrap().ip(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+
+        let mut response = [0u8; 10];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response[0], SOCKS_VERSION);
+        assert_eq!(response[1], REP_SUCCEEDED);
+        assert_eq!(response[3], ADDR_TYPE_IPV4);
+        assert_eq!(&response[4..8], &Ipv4Addr::LOCALHOST.octets());
+    }
 
     #[tokio::test]
     async fn udp_relay_routes_and_records_live_user_traffic() {

@@ -467,6 +467,8 @@ pub enum ServerProxyConfig {
         accounts: SocksUserStore,
         #[serde(default)]
         udp_enabled: bool,
+        #[serde(default)]
+        udp_bind_ip: Option<std::net::IpAddr>,
     },
     DokodemoDoor {
         config: DokodemoDoorConfig,
