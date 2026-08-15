@@ -1006,6 +1006,7 @@ async fn drive_udp_datagrams(
                     "Failed to forward hysteria2 UDP payload for session {}: {}",
                     session_id, err
                 );
+                sessions.remove(&session_id);
             }
         }
     }
