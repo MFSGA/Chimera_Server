@@ -46,9 +46,12 @@ jobs:
           path.write_text(text.replace(old, new, 1))
           PY
 
-          cargo metadata --format-version 1 --no-deps >/dev/null
-          test "$(cargo metadata --locked --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "chimera_server_app") | .version')" = "0.7.19"
+          cargo check --workspace --quiet
+          cargo metadata --locked --format-version 1 --no-deps >/tmp/metadata.json
+          test "$(jq -r '.packages[] | select(.name == "chimera_server_app") | .version' /tmp/metadata.json)" = "0.7.19"
 
+          echo '=== release preparation changes ==='
+          git status --short
           changed=$(git status --porcelain | awk '{print $2}' | sort)
           expected=$(printf '%s\n' Cargo.lock Cargo.toml | sort)
           test "$changed" = "$expected"
