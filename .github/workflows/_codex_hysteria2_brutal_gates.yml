@@ -1,12 +1,12 @@
-name: Hysteria2 latest Xray validation
+name: Hysteria2 Xray version validation
 
 on:
   push:
     branches: [codex/hysteria2-brutal-post-auth]
 
 jobs:
-  latest-xray-interop:
-    name: Xray v26.7.28 / ${{ matrix.label }}
+  xray-interop:
+    name: Xray ${{ matrix.version }} / ${{ matrix.label }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -14,8 +14,20 @@ jobs:
         include:
           - label: master
             ref: master
+            version: v26.7.28
+            sha256: 8195d909f1109b8f3d99eefe401a3c451d7bf4af71f24d3815420f77e5dd2a40
           - label: pr16
             ref: codex/hysteria2-brutal-post-auth
+            version: v26.7.28
+            sha256: 8195d909f1109b8f3d99eefe401a3c451d7bf4af71f24d3815420f77e5dd2a40
+          - label: master
+            ref: master
+            version: v26.3.27
+            sha256: 23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae
+          - label: pr16
+            ref: codex/hysteria2-brutal-post-auth
+            version: v26.3.27
+            sha256: 23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae
     steps:
       - uses: actions/checkout@v6
         with:
@@ -34,24 +46,39 @@ jobs:
             -keyout cert/key.pem -out cert/cert.pem -days 1 \
             -subj "/CN=localhost" \
             -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
-      - name: Download and verify Xray v26.7.28
+      - name: Download and verify Xray
         shell: bash
+        env:
+          XRAY_VERSION: ${{ matrix.version }}
+          XRAY_SHA256: ${{ matrix.sha256 }}
         run: |
           set -euo pipefail
+          archive="/tmp/Xray-linux-64-${XRAY_VERSION}.zip"
           curl -fL --retry 3 \
-            https://github.com/XTLS/Xray-core/releases/download/v26.7.28/Xray-linux-64.zip \
-            -o /tmp/Xray-linux-64-v26.7.28.zip
-          echo "8195d909f1109b8f3d99eefe401a3c451d7bf4af71f24d3815420f77e5dd2a40  /tmp/Xray-linux-64-v26.7.28.zip" | sha256sum -c -
-          mkdir -p xray-v26.7.28
-          unzip -q /tmp/Xray-linux-64-v26.7.28.zip -d xray-v26.7.28
-          chmod +x xray-v26.7.28/xray
-          cp xray-v26.7.28/xray ./xray
+            "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" \
+            -o "$archive"
+          echo "${XRAY_SHA256}  ${archive}" | sha256sum -c -
+          mkdir -p xray-test
+          unzip -q "$archive" -d xray-test
+          chmod +x xray-test/xray
+          cp xray-test/xray ./xray
           chmod +x ./xray
           ./xray version
       - name: Hysteria2 Brutal TCP and UDP interop
+        shell: bash
         env:
           XRAY_BIN: ${{ github.workspace }}/xray
+          RUST_BACKTRACE: "1"
         run: |
+          set +e
           cargo test -p chimera_server_app --test xray_client_proxy_e2e \
             xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2 \
             -- --ignored --exact --nocapture
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "=== Hysteria2 e2e diagnostic files ==="
+            find /tmp -type f -path '*hysteria2*' \
+              \( -name '*.log' -o -name '*.json' -o -name '*.json5' \) \
+              -print -exec sh -c 'echo "--- $1 ---"; tail -n 300 "$1"' _ {} \; || true
+          fi
+          exit "$status"
