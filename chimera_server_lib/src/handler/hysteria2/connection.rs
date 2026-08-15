@@ -42,14 +42,15 @@ use crate::{
     },
 };
 
-const AUTH_PATH: &str = "/auth";
+const AUTH_URI: &str = "https://hysteria/auth";
 const AUTH_HEADER: &str = "Hysteria-Auth";
 const CLIENT_CC_RX_HEADER: &str = "Hysteria-CC-RX";
 const UDP_SUPPORT_HEADER: &str = "Hysteria-UDP";
 const PADDING_HEADER: &str = "Hysteria-Padding";
 const SUCCESS_STATUS: u16 = 233;
 const TCP_REQUEST_ID: u64 = 0x401;
-const MAX_ADDRESS_LEN: usize = 1024;
+const MAX_ADDRESS_LEN: usize = 2048;
+const MAX_TCP_REQUEST_PADDING_LEN: u64 = 4096;
 const PADDING_SCRATCH_LEN: usize = 1024;
 const TCP_SUCCESS_STATUS: u8 = 0x00;
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -377,10 +378,8 @@ impl TcpRequest {
             .map_err(|err| Error::new(ErrorKind::InvalidData, err))?;
         let target = NetLocation::from_str(&address, None)?;
 
-        let padding_len = read_varint(stream).await?;
-        let padding_len = usize::try_from(padding_len).map_err(|_| {
-            Error::new(ErrorKind::InvalidData, "padding length too large")
-        })?;
+        let padding_len =
+            validate_tcp_request_padding_len(read_varint(stream).await?)?;
         skip_padding(stream, padding_len).await?;
 
         Ok(Self { target })
@@ -494,7 +493,7 @@ fn validate_auth_request(
     req: Request<()>,
     clients: &[Hysteria2Client],
 ) -> Result<AuthInfo, AuthReject> {
-    if req.method() != http::Method::POST || req.uri().path() != AUTH_PATH {
+    if req.method() != http::Method::POST || req.uri() != AUTH_URI {
         return Err(AuthReject::NotAuthRequest);
     }
 
@@ -581,7 +580,7 @@ async fn send_simple_response(
 
 fn random_padding() -> String {
     let mut rng = rand::rng();
-    let len = rng.random_range(16..=64);
+    let len = rng.random_range(1..80);
     Alphanumeric.sample_string(&mut rng, len)
 }
 
@@ -625,6 +624,17 @@ async fn read_varint(stream: &mut quinn::RecvStream) -> std::io::Result<u64> {
     Ok(value)
 }
 
+fn validate_tcp_request_padding_len(padding_len: u64) -> std::io::Result<usize> {
+    if padding_len > MAX_TCP_REQUEST_PADDING_LEN {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "padding length too large",
+        ));
+    }
+    usize::try_from(padding_len)
+        .map_err(|_| Error::new(ErrorKind::InvalidData, "padding length too large"))
+}
+
 async fn skip_padding(
     stream: &mut quinn::RecvStream,
     mut len: usize,
@@ -644,17 +654,29 @@ async fn skip_padding(
     Ok(())
 }
 
+fn build_tcp_response(status: u8, message: &str) -> std::io::Result<Vec<u8>> {
+    let message_bytes = message.as_bytes();
+    let mut rng = rand::rng();
+    let padding_len = rng.random_range(0..=63usize);
+    let mut buf = Vec::with_capacity(1 + message_bytes.len() + padding_len + 16);
+    buf.push(status);
+    push_varint(&mut buf, message_bytes.len() as u64)?;
+    buf.extend_from_slice(message_bytes);
+    push_varint(&mut buf, padding_len as u64)?;
+    if padding_len > 0 {
+        let padding_start = buf.len();
+        buf.resize(padding_start + padding_len, 0);
+        rng.fill(&mut buf[padding_start..]);
+    }
+    Ok(buf)
+}
+
 async fn send_tcp_response(
     stream: &mut quinn::SendStream,
     status: u8,
     message: &str,
 ) -> std::io::Result<()> {
-    let message_bytes = message.as_bytes();
-    let mut buf = Vec::with_capacity(1 + message_bytes.len() + 16);
-    buf.push(status);
-    push_varint(&mut buf, message_bytes.len() as u64)?;
-    buf.extend_from_slice(message_bytes);
-    push_varint(&mut buf, 0)?;
+    let buf = build_tcp_response(status, message)?;
     stream.write_all(&buf).await.map_err(Error::other)?;
     stream.flush().await.map_err(Error::other)
 }
@@ -1140,7 +1162,17 @@ fn push_varint(buf: &mut Vec<u8>, value: u64) -> std::io::Result<()> {
 mod tests {
     use std::{future::pending, io::ErrorKind, time::Instant};
 
-    use super::{AUTH_TIMEOUT, await_authentication};
+    use super::*;
+    use crate::config::server_config::Hysteria2Client;
+
+    fn auth_request(auth: &str, uri: &str) -> Request<()> {
+        Request::builder()
+            .method(http::Method::POST)
+            .uri(uri)
+            .header(AUTH_HEADER, auth)
+            .body(())
+            .expect("valid Hysteria2 auth request")
+    }
 
     #[tokio::test]
     async fn authentication_times_out_after_shoes_window() {
@@ -1151,5 +1183,72 @@ mod tests {
 
         assert_eq!(err.kind(), ErrorKind::TimedOut);
         assert!(started.elapsed() >= AUTH_TIMEOUT);
+    }
+
+    #[test]
+    fn auth_requires_exact_shoes_uri() {
+        let clients = vec![Hysteria2Client {
+            password: "secret".to_string(),
+            email: None,
+        }];
+        assert!(
+            validate_auth_request(auth_request("secret", AUTH_URI), &clients)
+                .is_ok()
+        );
+        for uri in [
+            "https://hysteria/auth?extra=1",
+            "https://example.com/auth",
+            "http://hysteria/auth",
+        ] {
+            assert!(
+                matches!(
+                    validate_auth_request(auth_request("secret", uri), &clients),
+                    Err(AuthReject::NotAuthRequest)
+                ),
+                "unexpected auth URI accepted: {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn shoes_padding_bounds_apply_to_auth_and_tcp_frames() {
+        assert_eq!(MAX_ADDRESS_LEN, 2048);
+
+        for _ in 0..64 {
+            let padding = random_padding();
+            assert!((1..80).contains(&padding.len()));
+            assert!(padding.is_ascii());
+        }
+
+        assert_eq!(
+            validate_tcp_request_padding_len(MAX_TCP_REQUEST_PADDING_LEN)
+                .expect("maximum Shoes request padding should pass"),
+            MAX_TCP_REQUEST_PADDING_LEN as usize
+        );
+        assert!(
+            validate_tcp_request_padding_len(MAX_TCP_REQUEST_PADDING_LEN + 1)
+                .is_err()
+        );
+
+        for _ in 0..64 {
+            let frame = build_tcp_response(TCP_SUCCESS_STATUS, "ok")
+                .expect("TCP response frame should build");
+            assert_eq!(frame[0], TCP_SUCCESS_STATUS);
+            let (message_len, message_varint_len) =
+                decode_varint_from_slice(&frame[1..])
+                    .expect("message length varint");
+            assert_eq!(message_len, 2);
+            let message_start = 1 + message_varint_len;
+            assert_eq!(&frame[message_start..message_start + message_len], b"ok");
+            let padding_start = message_start + message_len;
+            let (padding_len, padding_varint_len) =
+                decode_varint_from_slice(&frame[padding_start..])
+                    .expect("padding length varint");
+            assert!(padding_len <= 63);
+            assert_eq!(
+                frame.len(),
+                padding_start + padding_varint_len + padding_len
+            );
+        }
     }
 }
