@@ -20,6 +20,10 @@ const MIN_ACK_RATE: f64 = 0.8;
 // Quinn's pacer refills at ~1.25x cwnd per RTT, so scale cwnd to keep target rate.
 const CONGESTION_WINDOW_MULTIPLIER: f64 = 0.8;
 const DEFAULT_CONGESTION_WINDOW: u64 = 10_240;
+// Xray Brutal allows another datagram when bytes-in-flight is exactly cwnd.
+// Quinn treats `window()` as a hard maximum for ack-eliciting bytes in flight,
+// so preserve Xray's effective one-extra-datagram allowance at the minimum.
+const MIN_CONGESTION_WINDOW_DATAGRAMS: u64 = 2;
 const DEBUG_ENV: &str = "HYSTERIA_BRUTAL_DEBUG";
 const DEBUG_PRINT_INTERVAL: u64 = 2;
 
@@ -203,7 +207,10 @@ impl BrutalState {
         let cwnd =
             (tx_bps as f64) * rtt.as_secs_f64() * CONGESTION_WINDOW_MULTIPLIER
                 / self.ack_rate;
-        (cwnd as u64).max(self.max_datagram_size)
+        (cwnd as u64).max(
+            self.max_datagram_size
+                .saturating_mul(MIN_CONGESTION_WINDOW_DATAGRAMS),
+        )
     }
 
     fn initial_window(&self) -> u64 {
@@ -289,5 +296,33 @@ impl BrutalState {
         self.debug
             && timestamp.saturating_sub(self.last_debug_timestamp)
                 >= DEBUG_PRINT_INTERVAL
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn brutal_low_rtt_window_preserves_xray_send_allowance() {
+        let now = Instant::now();
+        let mut state = BrutalState::new(now, 1200);
+        state.last_rtt = Duration::from_micros(100);
+
+        // At Xray's minimum valid Brutal rate this RTT would otherwise collapse
+        // Quinn's strict in-flight window to a single datagram.
+        assert_eq!(state.window(65_536), 2400);
+
+        state.on_mtu_update(1450);
+        assert_eq!(state.window(65_536), 2900);
+    }
+
+    #[test]
+    fn brutal_rate_derived_window_is_unchanged_above_minimum() {
+        let now = Instant::now();
+        let mut state = BrutalState::new(now, 1200);
+        state.last_rtt = Duration::from_millis(100);
+
+        assert_eq!(state.window(1_000_000), 80_000);
     }
 }
