@@ -1,0 +1,70 @@
+name: A/B Brutal post-auth v2
+
+on:
+  push:
+    branches:
+      - codex/ab-brutal-v2-6229b6c
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: 6229b6c00e108fce4c27cbcff7687f095757e21a
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y iproute2 protobuf-compiler unzip
+      - name: Download verified Xray 26.7.28
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p xray target/ab
+          curl --fail --location --retry 3 \
+            https://github.com/XTLS/Xray-core/releases/download/v26.7.28/Xray-linux-64.zip \
+            -o /tmp/xray.zip
+          echo '8195d909f1109b8f3d99eefe401a3c451d7bf4af71f24d3815420f77e5dd2a40  /tmp/xray.zip' | sha256sum --check --strict
+          unzip -q -o /tmp/xray.zip -d xray/
+          chmod +x xray/xray
+          ./xray/xray version
+      - name: Build candidate and master
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --package chimera_server_app --all-features
+          cp target/release/chimera_server_app /tmp/chimera-candidate
+          git checkout ee459c0479fb9eb9ba00a33efd6d47e25b1c5128
+          cargo build --release --package chimera_server_app --all-features
+          cp target/release/chimera_server_app /tmp/chimera-master
+          chmod +x /tmp/chimera-candidate /tmp/chimera-master
+      - name: Run same-runner Brutal A/B
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n true
+          python3 bench/hysteria2_netem.py \
+            --chimera-bin /tmp/chimera-master \
+            --xray-bin ./xray/xray \
+            --modes brutal --rtts 1,100 --losses 0,1 \
+            --bandwidth-mbps 200 --payload-size 16777216 --runs 3 \
+            --output target/ab/master.jsonl --summary target/ab/master.md
+          python3 bench/hysteria2_netem.py \
+            --chimera-bin /tmp/chimera-candidate \
+            --xray-bin ./xray/xray \
+            --modes brutal --rtts 1,100 --losses 0,1 \
+            --bandwidth-mbps 200 --payload-size 16777216 --runs 3 \
+            --output target/ab/candidate.jsonl --summary target/ab/candidate.md
+          echo '## Master' >> "$GITHUB_STEP_SUMMARY"
+          cat target/ab/master.md >> "$GITHUB_STEP_SUMMARY"
+          echo '## Candidate' >> "$GITHUB_STEP_SUMMARY"
+          cat target/ab/candidate.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload A/B results
+        uses: actions/upload-artifact@v7
+        with:
+          name: brutal-post-auth-ab
+          path: target/ab
+          retention-days: 90
