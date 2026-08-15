@@ -1,4 +1,4 @@
-name: A/B Brutal post-auth v2
+name: A/B Brutal post-auth v2 long
 
 on:
   push:
@@ -17,13 +17,14 @@ jobs:
           ref: 6229b6c00e108fce4c27cbcff7687f095757e21a
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y iproute2 protobuf-compiler unzip
       - name: Download verified Xray 26.7.28
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p xray target/ab
+          mkdir -p xray target/ab-long
           curl --fail --location --retry 3 \
             https://github.com/XTLS/Xray-core/releases/download/v26.7.28/Xray-linux-64.zip \
             -o /tmp/xray.zip
@@ -41,30 +42,31 @@ jobs:
           cargo build --release --package chimera_server_app --all-features
           cp target/release/chimera_server_app /tmp/chimera-master
           chmod +x /tmp/chimera-candidate /tmp/chimera-master
-      - name: Run same-runner Brutal A/B
+      - name: Run crossed same-runner Brutal A/B
         shell: bash
         run: |
           set -euo pipefail
           sudo -n true
-          python3 bench/hysteria2_netem.py \
-            --chimera-bin /tmp/chimera-master \
-            --xray-bin ./xray/xray \
-            --modes brutal --rtts 1,100 --losses 0,1 \
-            --bandwidth-mbps 200 --payload-size 16777216 --runs 3 \
-            --output target/ab/master.jsonl --summary target/ab/master.md
-          python3 bench/hysteria2_netem.py \
-            --chimera-bin /tmp/chimera-candidate \
-            --xray-bin ./xray/xray \
-            --modes brutal --rtts 1,100 --losses 0,1 \
-            --bandwidth-mbps 200 --payload-size 16777216 --runs 3 \
-            --output target/ab/candidate.jsonl --summary target/ab/candidate.md
-          echo '## Master' >> "$GITHUB_STEP_SUMMARY"
-          cat target/ab/master.md >> "$GITHUB_STEP_SUMMARY"
-          echo '## Candidate' >> "$GITHUB_STEP_SUMMARY"
-          cat target/ab/candidate.md >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload A/B results
+          common=(
+            --xray-bin ./xray/xray
+            --modes brutal --rtts 1 --losses 0,1
+            --bandwidth-mbps 200 --payload-size 67108864 --runs 5
+          )
+          python3 bench/hysteria2_netem.py --chimera-bin /tmp/chimera-master "${common[@]}" \
+            --output target/ab-long/master-a.jsonl --summary target/ab-long/master-a.md
+          python3 bench/hysteria2_netem.py --chimera-bin /tmp/chimera-candidate "${common[@]}" \
+            --output target/ab-long/candidate-a.jsonl --summary target/ab-long/candidate-a.md
+          python3 bench/hysteria2_netem.py --chimera-bin /tmp/chimera-candidate "${common[@]}" \
+            --output target/ab-long/candidate-b.jsonl --summary target/ab-long/candidate-b.md
+          python3 bench/hysteria2_netem.py --chimera-bin /tmp/chimera-master "${common[@]}" \
+            --output target/ab-long/master-b.jsonl --summary target/ab-long/master-b.md
+          for report in master-a candidate-a candidate-b master-b; do
+            echo "## ${report}" >> "$GITHUB_STEP_SUMMARY"
+            cat "target/ab-long/${report}.md" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Upload crossed A/B results
         uses: actions/upload-artifact@v7
         with:
-          name: brutal-post-auth-ab
-          path: target/ab
+          name: brutal-post-auth-ab-long
+          path: target/ab-long
           retention-days: 90
