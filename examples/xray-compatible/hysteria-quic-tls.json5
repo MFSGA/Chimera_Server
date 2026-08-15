@@ -7,7 +7,7 @@
       "protocol": "hysteria",
       "settings": {
         "version": 2,
-        "clients": [
+        "users": [
           {
             "auth": "hysteria-auth-token",
             "email": "hy@example.com"
