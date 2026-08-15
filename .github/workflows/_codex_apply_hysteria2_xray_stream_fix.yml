@@ -1,4 +1,4 @@
-name: Validate modern Xray Hysteria2 interop
+name: Diagnose modern Xray Hysteria2 streams
 
 on:
   push:
@@ -6,19 +6,13 @@ on:
       - codex/hysteria2-xray-modern-streams
 
 jobs:
-  interop:
-    if: "${{ github.event.head_commit.message == 'ci: validate modern Xray Hysteria2 interop' }}"
+  diagnose:
+    if: "${{ github.event.head_commit.message == 'ci: diagnose modern Xray Hysteria2 streams' }}"
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - version: v26.7.28
-            sha256: 8195d909f1109b8f3d99eefe401a3c451d7bf4af71f24d3815420f77e5dd2a40
-          - version: v26.3.27
-            sha256: 23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae
-          - version: v26.2.6
-            sha256: 29ce535b56e207a406ffa1c2d4842dcc410be003eff8ec508bb732abc9f8e385
+        congestion: [brutal, bbr, reno]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -26,6 +20,42 @@ jobs:
         with:
           version: '23.x'
       - uses: Swatinem/rust-cache@v2
+      - name: Instrument stream intake and select congestion
+        shell: bash
+        env:
+          XRAY_CONGESTION: ${{ matrix.congestion }}
+        run: |
+          python3 <<'PY'
+          import os
+          from pathlib import Path
+
+          conn = Path('chimera_server_lib/src/handler/hysteria2/connection.rs')
+          text = conn.read_text()
+          needle = '''            Ok(stream) => stream,\n'''
+          replacement = '''            Ok(stream) => {\n                debug!(stream_id = ?H3RecvStream::recv_id(&stream), "hysteria2 diagnostic bidi stream accepted");\n                stream\n            },\n'''
+          assert needle in text
+          text = text.replace(needle, replacement, 1)
+          needle = '''                Poll::Ready(Ok(Some(data))) => this.read_buffer = data,\n'''
+          replacement = '''                Poll::Ready(Ok(Some(data))) => {\n                    debug!(len = data.len(), prefix = ?&data[..data.len().min(16)], "hysteria2 diagnostic bidi data received");\n                    this.read_buffer = data;\n                },\n'''
+          assert needle in text
+          text = text.replace(needle, replacement, 1)
+          conn.write_text(text)
+
+          test = Path('chimera_server_app/tests/xray_client_proxy_e2e.rs')
+          text = test.read_text()
+          start = text.index('async fn xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2()')
+          end = text.index('\n#[test]\n#[ignore = "starts Chimera as server and ./xray with invalid hysteria2 auth"]', start)
+          section = text[start:end]
+          marker = '"congestion": "brutal"'
+          positions = [i for i in range(len(section)) if section.startswith(marker, i)]
+          assert len(positions) == 2, positions
+          mode = os.environ['XRAY_CONGESTION']
+          pos = positions[-1]
+          section = section[:pos] + f'"congestion": "{mode}"' + section[pos + len(marker):]
+          text = text[:start] + section + text[end:]
+          test.write_text(text)
+          PY
+          cargo fmt --all
       - name: Provision temporary test certificate
         shell: bash
         run: |
@@ -35,21 +65,16 @@ jobs:
             -keyout cert/key.pem -out cert/cert.pem -days 1 \
             -subj '/CN=localhost' \
             -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1'
-      - name: Download and verify Xray
+      - name: Download and verify Xray v26.7.28
         shell: bash
-        env:
-          XRAY_VERSION: ${{ matrix.version }}
-          XRAY_SHA256: ${{ matrix.sha256 }}
         run: |
           set -euo pipefail
-          archive="/tmp/Xray-linux-64-${XRAY_VERSION}.zip"
+          archive=/tmp/Xray-linux-64-v26.7.28.zip
           curl -fL --retry 3 \
-            "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" \
+            'https://github.com/XTLS/Xray-core/releases/download/v26.7.28/Xray-linux-64.zip' \
             -o "$archive"
-          echo "${XRAY_SHA256}  ${archive}" | sha256sum -c -
-          mkdir -p xray-test
+          echo '8195d909f1109b8f3d99eefe401a3c451d7bf4af71f24d3815420f77e5dd2a40  /tmp/Xray-linux-64-v26.7.28.zip' | sha256sum -c -
           unzip -q "$archive" -d xray-test
-          chmod +x xray-test/xray
           cp xray-test/xray ./xray
           chmod +x ./xray
           ./xray version
@@ -64,10 +89,8 @@ jobs:
             xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2 \
             -- --ignored --exact --nocapture
           status=$?
-          if [ "$status" -ne 0 ]; then
-            echo '=== Hysteria2 diagnostics ==='
-            find /tmp -type f -path '*hysteria2*' \
-              \( -name '*.log' -o -name '*.json' -o -name '*.json5' \) \
-              -print -exec sh -c 'echo "--- $1 ---"; tail -n 300 "$1"' _ {} \; || true
-          fi
+          echo '=== Hysteria2 diagnostics ==='
+          find /tmp -type f -path '*hysteria2*' \
+            \( -name '*.log' -o -name '*.json' -o -name '*.json5' \) \
+            -print -exec sh -c 'echo "--- $1 ---"; tail -n 300 "$1"' _ {} \; 2>/dev/null || true
           exit "$status"
