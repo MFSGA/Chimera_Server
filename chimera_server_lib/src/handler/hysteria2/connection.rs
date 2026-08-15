@@ -217,9 +217,6 @@ async fn auth_hysteria2_connection(
                             AuthReject::Unauthorized(msg) => {
                                 warn!("hysteria2 auth rejected: {}", msg);
                             }
-                            AuthReject::BadRequest(msg) => {
-                                warn!("hysteria2 auth request invalid: {}", msg);
-                            }
                         }
                         send_simple_response(
                             &mut stream,
@@ -477,10 +474,10 @@ impl AsyncWrite for QuicStream {
     }
 }
 
+#[derive(Debug)]
 enum AuthReject {
     NotAuthRequest,
     Unauthorized(&'static str),
-    BadRequest(&'static str),
 }
 
 fn auth_reject_status(_reject: &AuthReject) -> StatusCode {
@@ -559,22 +556,18 @@ fn validate_auth_request(
         .cloned()
         .ok_or(AuthReject::Unauthorized("password mismatch"))?;
 
-    let client_rx_limit =
-        match headers.get(CLIENT_CC_RX_HEADER) {
-            Some(value) if !value.is_empty() => match value.to_str() {
-                Ok(val) => {
-                    if val.eq_ignore_ascii_case("auto") {
-                        None
-                    } else {
-                        Some(val.parse::<u64>().map_err(|_| {
-                            AuthReject::BadRequest("invalid cc header")
-                        })?)
-                    }
-                }
-                Err(_) => return Err(AuthReject::BadRequest("invalid cc header")),
-            },
-            _ => None,
-        };
+    // Xray ignores Hysteria-CC-RX parse errors, while shoes does not consume
+    // this header at all. Treat malformed values as an unspecified/zero limit
+    // instead of rejecting an otherwise valid authentication request.
+    let client_rx_limit = headers
+        .get(CLIENT_CC_RX_HEADER)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            (!value.eq_ignore_ascii_case("auto"))
+                .then(|| value.parse::<u64>().ok())
+                .flatten()
+        });
 
     Ok(AuthInfo {
         client,
@@ -1341,10 +1334,25 @@ mod tests {
             auth_reject_status(&AuthReject::Unauthorized("bad auth")),
             StatusCode::NOT_FOUND
         );
-        assert_eq!(
-            auth_reject_status(&AuthReject::BadRequest("bad request")),
-            StatusCode::NOT_FOUND
-        );
+    }
+
+    #[test]
+    fn malformed_cc_rx_does_not_reject_authentication() {
+        let clients = vec![Hysteria2Client {
+            password: "secret".to_string(),
+            email: None,
+        }];
+        let request = Request::builder()
+            .method(http::Method::POST)
+            .uri(AUTH_URI)
+            .header(AUTH_HEADER, "secret")
+            .header(CLIENT_CC_RX_HEADER, "not-a-number")
+            .body(())
+            .expect("valid Hysteria2 auth request");
+
+        let auth = validate_auth_request(request, &clients)
+            .expect("malformed CC-RX should be treated as zero like Xray");
+        assert_eq!(auth.client_rx_limit, None);
     }
 
     #[test]
