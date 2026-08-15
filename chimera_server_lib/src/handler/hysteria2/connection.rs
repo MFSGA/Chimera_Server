@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, hash_map::Entry},
     convert::TryFrom,
-    future::Future,
+    future::{Future, poll_fn},
     io::{Error, ErrorKind},
     net::SocketAddr,
     pin::Pin,
@@ -14,6 +14,9 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
+use h3::quic::{
+    RecvStream as H3RecvStream, SendStream as H3SendStream, SendStreamUnframed,
+};
 use h3_quinn::BidiStream;
 use http::{Request, Response, StatusCode};
 use rand::{
@@ -22,7 +25,7 @@ use rand::{
     distr::{Alphanumeric, SampleString},
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::UdpSocket,
 };
 use tracing::{debug, warn};
@@ -111,47 +114,46 @@ pub async fn process_hysteria2_connection(
         }
     };
 
-    // Keep the H3 driver alive because dropping it closes the underlying QUIC
-    // connection. Do not poll it after authentication: Hysteria2 TCP requests
-    // are raw QUIC bidi streams and would otherwise race with h3_conn.accept().
-    let _h3_conn = h3_conn;
+    // Keep accepting post-authentication Hysteria2 streams through the same
+    // h3-quinn connection that handled authentication. Xray 26.3.27+ routes
+    // custom 0x401 streams through its HTTP/3 stream dispatcher, and using a
+    // second raw Quinn accept loop here can race the H3 driver's accept queue.
     let udp_idle_timeout = config
         .xray_udp_idle_timeout_secs
         .filter(|seconds| *seconds > 0)
         .map(Duration::from_secs);
+    let peer_addr = connection.remote_address();
 
     if auth_ctx.udp_enabled {
         tokio::try_join!(
             drive_tcp_streams(
-                connection.clone(),
+                &mut h3_conn,
                 resolver.clone(),
                 &auth_ctx,
                 inbound_tag.clone(),
+                peer_addr,
                 runtime.clone(),
             ),
             drive_udp_datagrams(
-                connection.clone(),
-                resolver.clone(),
+                connection,
+                resolver,
                 &auth_ctx,
                 inbound_tag,
                 runtime,
                 udp_idle_timeout,
             ),
-            drain_unidirectional_streams(connection),
         )
         .map(|_| ())
     } else {
-        tokio::try_join!(
-            drive_tcp_streams(
-                connection.clone(),
-                resolver.clone(),
-                &auth_ctx,
-                inbound_tag.clone(),
-                runtime,
-            ),
-            drain_unidirectional_streams(connection),
+        drive_tcp_streams(
+            &mut h3_conn,
+            resolver,
+            &auth_ctx,
+            inbound_tag,
+            peer_addr,
+            runtime,
         )
-        .map(|_| ())
+        .await
     }
 }
 
@@ -239,82 +241,80 @@ async fn auth_hysteria2_connection(
     }
 }
 
-async fn drain_unidirectional_streams(
-    connection: quinn::Connection,
-) -> std::io::Result<()> {
-    loop {
-        match connection.accept_uni().await {
-            Ok(mut stream) => {
-                let _ = stream.stop(0_u32.into());
-            }
-            Err(quinn::ConnectionError::ApplicationClosed { .. })
-            | Err(quinn::ConnectionError::ConnectionClosed(_)) => return Ok(()),
-            Err(err) => {
-                return Err(Error::other(format!(
-                    "hysteria2 unidirectional stream loop failed: {err}"
-                )));
-            }
-        }
-    }
-}
-
 async fn drive_tcp_streams(
-    connection: quinn::Connection,
+    h3_conn: &mut h3::server::Connection<h3_quinn::Connection, Bytes>,
     resolver: Arc<dyn Resolver>,
     auth_ctx: &AuthContext,
     inbound_tag: Arc<String>,
+    peer_addr: SocketAddr,
     runtime: RuntimeState,
 ) -> std::io::Result<()> {
-    let peer_addr = connection.remote_address();
     loop {
-        match connection.accept_bi().await {
-            Ok((send, recv)) => {
-                let resolver = resolver.clone();
-                let client = auth_ctx.client.clone();
-                let inbound_tag = inbound_tag.clone();
-                let runtime = runtime.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = handle_tcp_stream(
-                        send,
-                        recv,
-                        resolver,
-                        client,
-                        inbound_tag,
-                        peer_addr,
-                        runtime,
-                    )
-                    .await
-                    {
-                        debug!("hysteria2 tcp stream ended with error: {}", err);
-                    }
-                });
+        let stream = match next_hysteria_stream(h3_conn).await {
+            Ok(stream) => stream,
+            Err(err) if err.is_h3_no_error() => return Ok(()),
+            Err(err) => return Err(map_h3_error(err)),
+        };
+        let resolver = resolver.clone();
+        let client = auth_ctx.client.clone();
+        let inbound_tag = inbound_tag.clone();
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            if let Err(err) = handle_tcp_stream(
+                H3RawStream::new(stream),
+                resolver,
+                client,
+                inbound_tag,
+                peer_addr,
+                runtime,
+            )
+            .await
+            {
+                debug!("hysteria2 tcp stream ended with error: {}", err);
             }
-            Err(quinn::ConnectionError::ApplicationClosed { .. })
-            | Err(quinn::ConnectionError::ConnectionClosed(_)) => return Ok(()),
-            Err(err) => {
-                return Err(Error::other(err));
-            }
-        }
+        });
     }
 }
 
+async fn next_hysteria_stream(
+    h3_conn: &mut h3::server::Connection<h3_quinn::Connection, Bytes>,
+) -> Result<BidiStream<Bytes>, h3::error::ConnectionError> {
+    poll_fn(|cx| poll_hysteria_stream(h3_conn, cx)).await
+}
+
+fn poll_hysteria_stream(
+    h3_conn: &mut h3::server::Connection<h3_quinn::Connection, Bytes>,
+    cx: &mut Context<'_>,
+) -> Poll<Result<BidiStream<Bytes>, h3::error::ConnectionError>> {
+    // Drive the HTTP/3 control and unidirectional streams from the same owner
+    // while waiting for custom Hysteria2 bidirectional streams. This replaces
+    // the old raw Quinn unidirectional drain and avoids a second accept race.
+    loop {
+        match h3_conn.inner.poll_control(cx) {
+            Poll::Ready(Ok(_)) => continue,
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => break,
+        }
+    }
+    h3_conn.inner.poll_accept_bi(cx)
+}
+
 async fn handle_tcp_stream(
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    mut stream: H3RawStream,
     resolver: Arc<dyn Resolver>,
     client: Hysteria2Client,
     inbound_tag: Arc<String>,
     peer_addr: SocketAddr,
     runtime: RuntimeState,
 ) -> std::io::Result<()> {
-    let request = match TcpRequest::read(&mut recv).await {
+    let request = match TcpRequest::read(&mut stream).await {
         Ok(request) => request,
         Err(err) => {
-            let _ = send.finish();
+            let _ = stream.shutdown().await;
             return Err(err);
         }
     };
-    send_tcp_response(&mut send, TCP_SUCCESS_STATUS, "").await?;
+    send_tcp_response(&mut stream, TCP_SUCCESS_STATUS, "").await?;
 
     let context_identity = client.email.clone().unwrap_or(client.password.clone());
     let connection = match tokio::time::timeout(
@@ -332,16 +332,16 @@ async fn handle_tcp_stream(
     {
         Ok(Ok(Some(connection))) => connection,
         Ok(Ok(None)) => {
-            let _ = send.finish();
+            let _ = stream.shutdown().await;
             return Ok(());
         }
         Ok(Err(err)) => {
             warn!("failed to connect to {}: {}", request.target, err);
-            let _ = send.finish();
+            let _ = stream.shutdown().await;
             return Err(err);
         }
         Err(_) => {
-            let _ = send.finish();
+            let _ = stream.shutdown().await;
             return Err(Error::new(
                 ErrorKind::TimedOut,
                 format!("client setup to {} timed out", request.target),
@@ -357,7 +357,7 @@ async fn handle_tcp_stream(
         context = context.with_outbound_tag(tag);
     }
 
-    proxy_tcp(send, recv, connection.stream, context).await
+    proxy_tcp(stream, connection.stream, context).await
 }
 
 struct TcpRequest {
@@ -365,7 +365,10 @@ struct TcpRequest {
 }
 
 impl TcpRequest {
-    async fn read(stream: &mut quinn::RecvStream) -> std::io::Result<Self> {
+    async fn read<S>(stream: &mut S) -> std::io::Result<Self>
+    where
+        S: AsyncRead + Unpin,
+    {
         let request_id = read_varint(stream).await?;
         if request_id != TCP_REQUEST_ID {
             return Err(Error::new(
@@ -399,15 +402,17 @@ impl TcpRequest {
     }
 }
 
-async fn proxy_tcp(
-    send: quinn::SendStream,
-    recv: quinn::RecvStream,
+async fn proxy_tcp<S>(
+    quic_stream: S,
     tcp_stream: tokio::net::TcpStream,
     context: TrafficContext,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let _connection_guard = register_connection(Some(&context));
     let mut quic_stream = MeteredStream::new(
-        QuicStream { send, recv },
+        quic_stream,
         Some(context.clone()),
         TrafficDirection::Upload,
     );
@@ -432,48 +437,82 @@ async fn proxy_tcp(
     }
 }
 
-struct QuicStream {
-    send: quinn::SendStream,
-    recv: quinn::RecvStream,
+struct H3RawStream {
+    stream: BidiStream<Bytes>,
+    read_buffer: Bytes,
 }
 
-impl AsyncRead for QuicStream {
+impl H3RawStream {
+    fn new(stream: BidiStream<Bytes>) -> Self {
+        Self {
+            stream,
+            read_buffer: Bytes::new(),
+        }
+    }
+}
+
+impl AsyncRead for H3RawStream {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().recv).poll_read(cx, buf)
+        let this = self.get_mut();
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        loop {
+            if !this.read_buffer.is_empty() {
+                let len = this.read_buffer.len().min(buf.remaining());
+                let chunk = this.read_buffer.split_to(len);
+                buf.put_slice(&chunk);
+                return Poll::Ready(Ok(()));
+            }
+
+            match H3RecvStream::poll_data(&mut this.stream, cx) {
+                Poll::Ready(Ok(Some(data))) => this.read_buffer = data,
+                Poll::Ready(Ok(None)) => return Poll::Ready(Ok(())),
+                Poll::Ready(Err(err)) => {
+                    return Poll::Ready(Err(Error::other(err)));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
     }
 }
 
-impl AsyncWrite for QuicStream {
+impl AsyncWrite for H3RawStream {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.get_mut().send)
-            .poll_write(cx, buf)
-            .map_err(Error::other)
+        let this = self.get_mut();
+        let mut data = buf;
+        match SendStreamUnframed::poll_send(&mut this.stream, cx, &mut data) {
+            Poll::Ready(Ok(written)) => Poll::Ready(Ok(written)),
+            Poll::Ready(Err(err)) => Poll::Ready(Err(Error::other(err))),
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     fn poll_flush(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        _cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().send)
-            .poll_flush(cx)
-            .map_err(Error::other)
+        Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().send)
-            .poll_shutdown(cx)
-            .map_err(Error::other)
+        match H3SendStream::poll_finish(&mut self.get_mut().stream, cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(err)) => Poll::Ready(Err(Error::other(err))),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -637,7 +676,10 @@ where
     Error::other(err)
 }
 
-async fn read_varint(stream: &mut quinn::RecvStream) -> std::io::Result<u64> {
+async fn read_varint<S>(stream: &mut S) -> std::io::Result<u64>
+where
+    S: AsyncRead + Unpin,
+{
     let mut first = [0u8; 1];
     stream.read_exact(&mut first).await.map_err(Error::other)?;
     let prefix = first[0] >> 6;
@@ -681,10 +723,10 @@ fn validate_tcp_request_padding_len(padding_len: u64) -> std::io::Result<usize> 
         .map_err(|_| Error::new(ErrorKind::InvalidData, "padding length too large"))
 }
 
-async fn skip_padding(
-    stream: &mut quinn::RecvStream,
-    mut len: usize,
-) -> std::io::Result<()> {
+async fn skip_padding<S>(stream: &mut S, mut len: usize) -> std::io::Result<()>
+where
+    S: AsyncRead + Unpin,
+{
     if len == 0 {
         return Ok(());
     }
@@ -717,11 +759,14 @@ fn build_tcp_response(status: u8, message: &str) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-async fn send_tcp_response(
-    stream: &mut quinn::SendStream,
+async fn send_tcp_response<S>(
+    stream: &mut S,
     status: u8,
     message: &str,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     let buf = build_tcp_response(status, message)?;
     stream.write_all(&buf).await.map_err(Error::other)?;
     stream.flush().await.map_err(Error::other)
@@ -1422,6 +1467,26 @@ mod tests {
                 "unexpected auth URI accepted: {uri}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn tcp_request_parser_accepts_xray_raw_stream_format() {
+        let target = "127.0.0.1:443";
+        let mut frame = Vec::new();
+        push_varint(&mut frame, TCP_REQUEST_ID).expect("request type varint");
+        push_varint(&mut frame, target.len() as u64).expect("address length varint");
+        frame.extend_from_slice(target.as_bytes());
+        push_varint(&mut frame, 3).expect("padding length varint");
+        frame.extend_from_slice(b"pad");
+
+        let (mut writer, mut reader) = tokio::io::duplex(frame.len());
+        writer.write_all(&frame).await.expect("write request frame");
+        writer.shutdown().await.expect("finish request frame");
+
+        let request = TcpRequest::read(&mut reader)
+            .await
+            .expect("parse Xray Hysteria2 TCP request");
+        assert_eq!(request.target.to_string(), target);
     }
 
     #[test]
