@@ -77,6 +77,8 @@ pub struct Hysteria2ServerConfig {
     pub xray_init_connection_receive_window: Option<u64>,
     #[serde(default)]
     pub xray_max_connection_receive_window: Option<u64>,
+    #[serde(default)]
+    pub xray_disable_path_mtu_discovery: Option<bool>,
 }
 
 #[cfg(feature = "tuic")]
