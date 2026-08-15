@@ -183,22 +183,20 @@ fn build_transport_config(
     config: &Hysteria2ServerConfig,
 ) -> std::io::Result<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
-    let idle_timeout =
-        Duration::from_secs(config.xray_max_idle_timeout_secs.unwrap_or(120))
-            .try_into()
-            .map_err(|err| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, err)
-            })?;
+    let idle_timeout = Duration::from_secs(configured_max_idle_timeout_secs(
+        config.xray_compat,
+        config.xray_max_idle_timeout_secs,
+    ))
+    .try_into()
+    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
     let max_bidi_streams =
-        quinn::VarInt::from_u64(config.xray_max_incoming_streams.unwrap_or(4096))
-            .map_err(|err| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, err)
-            })?;
-    let max_uni_streams = configured_max_incoming_uni_streams(
-        config.xray_max_incoming_streams.is_some(),
-    );
-    let keep_alive_interval =
-        configured_keep_alive_interval(config.xray_max_incoming_streams.is_some());
+        quinn::VarInt::from_u64(configured_max_incoming_bidi_streams(
+            config.xray_compat,
+            config.xray_max_incoming_streams,
+        ))
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+    let max_uni_streams = configured_max_incoming_uni_streams(config.xray_compat);
+    let keep_alive_interval = configured_keep_alive_interval(config.xray_compat);
     // Quinn has a single static receive window rather than quic-go's separate
     // initial/max auto-tuned windows. Apply Xray's max values as the closest
     // runtime equivalent; the initial values remain validated/preserved in config.
@@ -216,15 +214,27 @@ fn build_transport_config(
         .keep_alive_interval(keep_alive_interval)
         .stream_receive_window(stream_receive_window)
         .receive_window(connection_receive_window)
-        .initial_mtu(configured_initial_mtu(
-            config.xray_max_incoming_streams.is_some(),
-        ))
+        .initial_mtu(configured_initial_mtu(config.xray_compat))
         .min_mtu(SHOES_INITIAL_MTU)
         .mtu_discovery_config(configured_mtu_discovery(
             config.xray_disable_path_mtu_discovery,
         ))
         .max_idle_timeout(Some(idle_timeout));
     Ok(transport)
+}
+
+fn configured_max_idle_timeout_secs(
+    xray_compat: bool,
+    configured: Option<u64>,
+) -> u64 {
+    configured.unwrap_or(if xray_compat { 30 } else { 120 })
+}
+
+fn configured_max_incoming_bidi_streams(
+    xray_compat: bool,
+    configured: Option<u64>,
+) -> u64 {
+    configured.unwrap_or(if xray_compat { 1024 } else { 4096 })
 }
 
 fn configured_max_incoming_uni_streams(xray_compat: bool) -> quinn::VarInt {
@@ -281,9 +291,20 @@ mod tests {
         SHOES_MAX_INCOMING_UNI_STREAMS, XRAY_INITIAL_MTU,
         XRAY_MAX_INCOMING_UNI_STREAMS, configured_congestion_mode,
         configured_initial_mtu, configured_keep_alive_interval,
+        configured_max_idle_timeout_secs, configured_max_incoming_bidi_streams,
         configured_max_incoming_uni_streams, configured_mtu_discovery,
         configured_receive_window,
     };
+
+    #[test]
+    fn transport_defaults_follow_protocol_mode_without_finalmask() {
+        assert_eq!(configured_max_idle_timeout_secs(false, None), 120);
+        assert_eq!(configured_max_idle_timeout_secs(true, None), 30);
+        assert_eq!(configured_max_incoming_bidi_streams(false, None), 4096);
+        assert_eq!(configured_max_incoming_bidi_streams(true, None), 1024);
+        assert_eq!(configured_max_idle_timeout_secs(true, Some(45)), 45);
+        assert_eq!(configured_max_incoming_bidi_streams(true, Some(2048)), 2048);
+    }
 
     #[test]
     fn max_incoming_uni_streams_follow_protocol_mode() {

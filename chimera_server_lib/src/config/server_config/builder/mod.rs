@@ -907,6 +907,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                 })?;
                 let mut config =
                     collect_hysteria2_settings(settings, hysteria_settings)?;
+                config.xray_compat |= xray_quic_params.is_some();
                 config.xray_congestion = xray_congestion;
                 config.xray_bbr_profile = xray_bbr_profile;
                 config.xray_brutal_up = xray_brutal_up;
@@ -1581,6 +1582,7 @@ mod tests {
                 assert_eq!(config.clients.len(), 1);
                 assert_eq!(config.clients[0].password, "transport-auth-token");
                 assert_eq!(config.clients[0].email, None);
+                assert!(config.xray_compat);
             }
             other => panic!("expected hysteria2 protocol, got {other:?}"),
         }

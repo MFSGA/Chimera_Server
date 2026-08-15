@@ -1581,7 +1581,8 @@ async fn xray_client_can_proxy_tcp_through_chimera_httpupgrade() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts Chimera as server and ./xray as client for hysteria2"]
-async fn xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2() {
+async fn xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2_with_xray_defaults()
+ {
     let workspace = workspace_root();
     let work_dir = create_test_dir("hysteria2");
     let echo_addr = start_tcp_echo_server();
@@ -1617,18 +1618,6 @@ async fn xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2() {
                         "version": 2,
                         "up": "10 mbps",
                         "down": "10 mbps"
-                    },
-                    "finalmask": {
-                        "quicParams": {
-                            "congestion": "brutal",
-                            "brutalUp": "10 mbps",
-                            "brutalDown": "10 mbps",
-                            "initStreamReceiveWindow": 32768,
-                            "maxStreamReceiveWindow": 65536,
-                            "initConnectionReceiveWindow": 131072,
-                            "maxConnectionReceiveWindow": 262144,
-                            "disablePathMTUDiscovery": true
-                        }
                     },
                     "tlsSettings": {
                         "alpn": ["h3"],
@@ -1675,13 +1664,6 @@ async fn xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2() {
                     "hysteriaSettings": {
                         "version": 2,
                         "auth": HYSTERIA_AUTH
-                    },
-                    "finalmask": {
-                        "quicParams": {
-                            "congestion": "brutal",
-                            "brutalUp": "10 mbps",
-                            "brutalDown": "10 mbps"
-                        }
                     }
                 }
             }]

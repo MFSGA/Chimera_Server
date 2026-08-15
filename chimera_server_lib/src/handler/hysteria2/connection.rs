@@ -502,6 +502,7 @@ fn resolve_congestion_tx_bps(
     shoes_tx_bps: u64,
 ) -> u64 {
     match config.xray_congestion.as_deref() {
+        None if config.xray_compat => 0,
         None => shoes_tx_bps,
         Some("reno") | Some("bbr") => 0,
         Some("") | Some("brutal") => {
@@ -522,7 +523,7 @@ fn resolve_bandwidth_settings(
     config: &Hysteria2ServerConfig,
     client_rx_limit: Option<u64>,
 ) -> (u64, u64, bool) {
-    if config.xray_congestion.is_some() {
+    if config.xray_compat || config.xray_congestion.is_some() {
         return (
             client_rx_limit.unwrap_or(0),
             config.xray_brutal_down.unwrap_or(0),
@@ -1611,6 +1612,26 @@ mod tests {
 
         let forced = hysteria2_config(Some("force-brutal"), Some(500_000), None);
         assert_eq!(resolve_congestion_tx_bps(&forced, None, 0), 500_000);
+    }
+
+    #[test]
+    fn xray_defaults_without_finalmask_ignore_deprecated_bandwidth() {
+        let config: Hysteria2ServerConfig =
+            serde_json::from_value(serde_json::json!({
+                "clients": [{"password": "secret"}],
+                "bandwidth": {"up": 500000, "down": 750000},
+                "xrayCompat": true
+            }))
+            .expect("valid Xray-default Hysteria2 config");
+
+        assert_eq!(
+            resolve_bandwidth_settings(&config, Some(300_000)),
+            (300_000, 0, false)
+        );
+        assert_eq!(
+            resolve_congestion_tx_bps(&config, Some(300_000), 200_000),
+            0
+        );
     }
 
     #[test]
