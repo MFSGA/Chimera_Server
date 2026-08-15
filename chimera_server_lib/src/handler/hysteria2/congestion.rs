@@ -47,7 +47,9 @@ impl ControllerFactory for BrutalConfig {
         Box::new(BrutalController {
             tx_bps: self.tx_bps.clone(),
             brutal: BrutalState::new(now, current_mtu),
-            bbr: Bbr::new(self.bbr_config.clone(), current_mtu),
+            bbr: Some(Bbr::new(self.bbr_config.clone(), current_mtu)),
+            current_mtu,
+            brutal_active: false,
         })
     }
 }
@@ -56,18 +58,40 @@ impl ControllerFactory for BrutalConfig {
 struct BrutalController {
     tx_bps: Arc<AtomicU64>,
     brutal: BrutalState,
-    bbr: Bbr,
+    bbr: Option<Bbr>,
+    current_mtu: u16,
+    brutal_active: bool,
 }
 
 impl BrutalController {
-    fn use_brutal(&self) -> bool {
+    fn brutal_requested(&self) -> bool {
         self.tx_bps.load(Ordering::Relaxed) > 0
+    }
+
+    fn use_brutal(&self) -> bool {
+        self.brutal_active || self.brutal_requested()
+    }
+
+    fn activate_brutal_if_configured(&mut self, now: Instant) {
+        if self.brutal_active || !self.brutal_requested() {
+            return;
+        }
+
+        // Xray replaces BBR with a fresh Brutal sender after authentication.
+        // Reset samples at the same boundary and drop BBR so post-auth packet
+        // processing pays only for the congestion controller that is in use.
+        self.brutal = BrutalState::new(now, self.current_mtu);
+        self.bbr = None;
+        self.brutal_active = true;
     }
 }
 
 impl Controller for BrutalController {
     fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
-        self.bbr.on_sent(now, bytes, last_packet_number);
+        self.activate_brutal_if_configured(now);
+        if let Some(bbr) = self.bbr.as_mut() {
+            bbr.on_sent(now, bytes, last_packet_number);
+        }
     }
 
     fn on_ack(
@@ -78,8 +102,12 @@ impl Controller for BrutalController {
         app_limited: bool,
         rtt: &RttEstimator,
     ) {
-        self.bbr.on_ack(now, sent, bytes, app_limited, rtt);
-        self.brutal.on_ack(now, rtt);
+        self.activate_brutal_if_configured(now);
+        if let Some(bbr) = self.bbr.as_mut() {
+            bbr.on_ack(now, sent, bytes, app_limited, rtt);
+        } else {
+            self.brutal.on_ack(now, rtt);
+        }
     }
 
     fn on_end_acks(
@@ -89,8 +117,15 @@ impl Controller for BrutalController {
         app_limited: bool,
         largest_packet_num_acked: Option<u64>,
     ) {
-        self.bbr
-            .on_end_acks(now, in_flight, app_limited, largest_packet_num_acked);
+        self.activate_brutal_if_configured(now);
+        if let Some(bbr) = self.bbr.as_mut() {
+            bbr.on_end_acks(
+                now,
+                in_flight,
+                app_limited,
+                largest_packet_num_acked,
+            );
+        }
     }
 
     fn on_congestion_event(
@@ -100,25 +135,35 @@ impl Controller for BrutalController {
         is_persistent_congestion: bool,
         lost_bytes: u64,
     ) {
-        self.bbr.on_congestion_event(
-            now,
-            sent,
-            is_persistent_congestion,
-            lost_bytes,
-        );
-        self.brutal.on_congestion_event(now, lost_bytes);
+        self.activate_brutal_if_configured(now);
+        if let Some(bbr) = self.bbr.as_mut() {
+            bbr.on_congestion_event(
+                now,
+                sent,
+                is_persistent_congestion,
+                lost_bytes,
+            );
+        } else {
+            self.brutal.on_congestion_event(now, lost_bytes);
+        }
     }
 
     fn on_mtu_update(&mut self, new_mtu: u16) {
-        self.bbr.on_mtu_update(new_mtu);
-        self.brutal.on_mtu_update(new_mtu);
+        self.current_mtu = new_mtu;
+        if let Some(bbr) = self.bbr.as_mut() {
+            bbr.on_mtu_update(new_mtu);
+        } else {
+            self.brutal.on_mtu_update(new_mtu);
+        }
     }
 
     fn window(&self) -> u64 {
         if self.use_brutal() {
             self.brutal.window(self.tx_bps.load(Ordering::Relaxed))
+        } else if let Some(bbr) = self.bbr.as_ref() {
+            bbr.window()
         } else {
-            self.bbr.window()
+            self.brutal.window(self.tx_bps.load(Ordering::Relaxed))
         }
     }
 
@@ -129,8 +174,10 @@ impl Controller for BrutalController {
     fn initial_window(&self) -> u64 {
         if self.use_brutal() {
             self.brutal.initial_window()
+        } else if let Some(bbr) = self.bbr.as_ref() {
+            bbr.initial_window()
         } else {
-            self.bbr.initial_window()
+            self.brutal.initial_window()
         }
     }
 
@@ -289,5 +336,65 @@ impl BrutalState {
         self.debug
             && timestamp.saturating_sub(self.last_debug_timestamp)
                 >= DEBUG_PRINT_INTERVAL
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn controller(tx_bps: Arc<AtomicU64>, now: Instant) -> BrutalController {
+        let current_mtu = 1200;
+        BrutalController {
+            tx_bps,
+            brutal: BrutalState::new(now, current_mtu),
+            bbr: Some(Bbr::new(
+                Arc::new(BbrConfig::default()),
+                current_mtu,
+            )),
+            current_mtu,
+            brutal_active: false,
+        }
+    }
+
+    #[test]
+    fn brutal_activation_drops_bbr_and_resets_pre_auth_state() {
+        let tx_bps = Arc::new(AtomicU64::new(0));
+        let now = Instant::now();
+        let mut controller = controller(tx_bps.clone(), now);
+        controller.brutal.last_rtt = Duration::from_millis(80);
+        controller.brutal.ack_rate = MIN_ACK_RATE;
+        controller.brutal.slots[0] = PacketInfo {
+            timestamp: 1,
+            ack_count: 40,
+            loss_count: 10,
+        };
+
+        tx_bps.store(1_000_000, Ordering::Relaxed);
+        let activated_at = now + Duration::from_secs(2);
+        controller.activate_brutal_if_configured(activated_at);
+
+        assert!(controller.brutal_active);
+        assert!(controller.bbr.is_none());
+        assert_eq!(controller.brutal.start, activated_at);
+        assert_eq!(controller.brutal.last_rtt, Duration::ZERO);
+        assert_eq!(controller.brutal.ack_rate, 1.0);
+        assert!(controller
+            .brutal
+            .slots
+            .iter()
+            .all(|slot| slot.ack_count == 0 && slot.loss_count == 0));
+    }
+
+    #[test]
+    fn zero_brutal_bandwidth_keeps_bbr_fallback() {
+        let tx_bps = Arc::new(AtomicU64::new(0));
+        let now = Instant::now();
+        let mut controller = controller(tx_bps, now);
+
+        controller.activate_brutal_if_configured(now + Duration::from_secs(1));
+
+        assert!(!controller.brutal_active);
+        assert!(controller.bbr.is_some());
     }
 }
