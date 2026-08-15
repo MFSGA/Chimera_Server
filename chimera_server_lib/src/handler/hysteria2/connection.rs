@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, hash_map::Entry},
     convert::TryFrom,
+    future::Future,
     io::{Error, ErrorKind},
     net::SocketAddr,
     pin::Pin,
@@ -52,6 +53,10 @@ const MAX_ADDRESS_LEN: usize = 1024;
 const PADDING_SCRATCH_LEN: usize = 1024;
 const TCP_SUCCESS_STATUS: u8 = 0x00;
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+// Match Shoes/sing-box: unauthenticated Hysteria2 QUIC connections only get a
+// short window to complete the HTTP/3 authentication exchange.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
+const CLOSE_ERR_CODE_OK: u32 = 0x100;
 
 #[derive(Clone)]
 struct AuthContext {
@@ -81,12 +86,28 @@ pub async fn process_hysteria2_connection(
     debug!("hysteria2 QUIC established");
     debug!("hysteria2 H3 driver created");
 
-    let auth_ctx =
-        auth_hysteria2_connection(&mut h3_conn, config.as_ref(), tx_bps.clone())
-            .await
-            .map_err(|err| {
-                Error::other(format!("hysteria2 authentication failed: {err}"))
-            })?;
+    let auth_ctx = match await_authentication(auth_hysteria2_connection(
+        &mut h3_conn,
+        config.as_ref(),
+        tx_bps.clone(),
+    ))
+    .await
+    {
+        Ok(auth_ctx) => auth_ctx,
+        Err(err) => {
+            let kind = err.kind();
+            let reason: &[u8] = if kind == ErrorKind::TimedOut {
+                b"auth timeout"
+            } else {
+                b"auth failed"
+            };
+            connection.close(CLOSE_ERR_CODE_OK.into(), reason);
+            return Err(Error::new(
+                kind,
+                format!("hysteria2 authentication failed: {err}"),
+            ));
+        }
+    };
 
     // Keep the H3 driver alive because dropping it closes the underlying QUIC
     // connection. Do not poll it after authentication: Hysteria2 TCP requests
@@ -125,6 +146,15 @@ pub async fn process_hysteria2_connection(
         )
         .map(|_| ())
     }
+}
+
+async fn await_authentication<F, T>(future: F) -> std::io::Result<T>
+where
+    F: Future<Output = std::io::Result<T>>,
+{
+    tokio::time::timeout(AUTH_TIMEOUT, future)
+        .await
+        .map_err(|_| Error::new(ErrorKind::TimedOut, "authentication timeout"))?
 }
 
 async fn auth_hysteria2_connection(
@@ -1104,4 +1134,22 @@ fn push_varint(buf: &mut Vec<u8>, value: u64) -> std::io::Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{future::pending, io::ErrorKind, time::Instant};
+
+    use super::{AUTH_TIMEOUT, await_authentication};
+
+    #[tokio::test]
+    async fn authentication_times_out_after_shoes_window() {
+        let started = Instant::now();
+        let err = await_authentication(pending::<std::io::Result<()>>())
+            .await
+            .expect_err("pending Hysteria2 auth must time out");
+
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
+        assert!(started.elapsed() >= AUTH_TIMEOUT);
+    }
 }
