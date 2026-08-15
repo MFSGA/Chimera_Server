@@ -76,7 +76,7 @@ protoc-bin-vendored = { workspace = true }
 rcgen = { workspace = true }
 
 [features]
-hysteria = []
+hysteria = ["uuid"]
 http = []
 mixed = ["http"]
 httpupgrade = []

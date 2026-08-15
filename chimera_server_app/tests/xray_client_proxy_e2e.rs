@@ -1719,6 +1719,110 @@ async fn xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2() {
 }
 
 #[test]
+#[ignore = "starts Chimera and ./xray to validate Hysteria2 UUID route auth"]
+fn xray_hysteria2_uuid_auth_routes_by_embedded_vless_route() {
+    const BASE_AUTH: &str = "00112233-4455-6677-8899-aabbccddeeff";
+    const ROUTED_AUTH: &str = "00112233-4455-abcd-8899-aabbccddeeff";
+
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("hysteria2-uuid-route");
+    let echo_addr = start_tcp_echo_server();
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let cert_path = workspace.join("cert/cert.pem");
+    let key_path = workspace.join("cert/key.pem");
+    let pinned_peer_cert_sha256 = first_cert_sha256_hex(&cert_path);
+
+    let chimera_config_path = work_dir.join("chimera-hysteria2-uuid-route.json");
+    let xray_config_path = work_dir.join("xray-hysteria2-uuid-route-client.json");
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "hysteria",
+                "tag": "chimera-hysteria2-uuid-route",
+                "settings": {
+                    "version": 2,
+                    "clients": [{
+                        "auth": BASE_AUTH,
+                        "email": "uuid-route@example.test"
+                    }]
+                },
+                "streamSettings": {
+                    "network": "quic",
+                    "security": "tls",
+                    "hysteriaSettings": {"version": 2},
+                    "tlsSettings": {
+                        "alpn": ["h3"],
+                        "certificates": [{
+                            "certificateFile": cert_path,
+                            "keyFile": key_path
+                        }]
+                    }
+                }
+            }],
+            "outbounds": [
+                {"tag": "blocked", "protocol": "blackhole"},
+                {"tag": "direct", "protocol": "freedom"}
+            ],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "vlessRoute": 43981,
+                    "outboundTag": "direct"
+                }]
+            }
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth"}
+            }],
+            "outbounds": [{
+                "protocol": "hysteria",
+                "settings": {
+                    "version": 2,
+                    "address": "127.0.0.1",
+                    "port": chimera_port
+                },
+                "streamSettings": {
+                    "network": "hysteria",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "pinnedPeerCertSha256": pinned_peer_cert_sha256,
+                        "alpn": ["h3"]
+                    },
+                    "hysteriaSettings": {
+                        "version": 2,
+                        "auth": ROUTED_AUTH
+                    }
+                }
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    chimera.assert_running();
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+
+    assert_socks5_echo(socks_addr, echo_addr, b"hysteria2 UUID route through Xray");
+}
+
+#[test]
 #[ignore = "starts Chimera as server and ./xray with invalid hysteria2 auth"]
 fn xray_client_rejects_invalid_hysteria2_auth_without_tunnel() {
     let workspace = workspace_root();

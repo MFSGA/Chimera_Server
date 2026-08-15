@@ -31,8 +31,8 @@ use crate::{
     address::NetLocation,
     config::server_config::{Hysteria2Client, Hysteria2ServerConfig},
     outbound::{
-        DirectOutboundAction, connect_tcp_outbound, connection_routing_input,
-        select_direct_outbound,
+        DirectOutboundAction, connect_tcp_outbound_with_vless_route,
+        connection_routing_input, select_direct_outbound,
     },
     resolver::{Resolver, resolve_single_address},
     runtime::RuntimeState,
@@ -64,11 +64,13 @@ const CLOSE_ERR_CODE_OK: u32 = 0x100;
 struct AuthContext {
     client: Hysteria2Client,
     udp_enabled: bool,
+    vless_route: u32,
 }
 
 struct AuthInfo {
     client: Hysteria2Client,
     client_rx_limit: Option<u64>,
+    vless_route: u32,
 }
 
 pub async fn process_hysteria2_connection(
@@ -209,6 +211,7 @@ async fn auth_hysteria2_connection(
                         return Ok(AuthContext {
                             client: auth_info.client,
                             udp_enabled: true,
+                            vless_route: auth_info.vless_route,
                         });
                     }
                     Err(reject) => {
@@ -267,7 +270,7 @@ async fn drive_tcp_streams(
         match connection.accept_bi().await {
             Ok((send, recv)) => {
                 let resolver = resolver.clone();
-                let client = auth_ctx.client.clone();
+                let auth_ctx = auth_ctx.clone();
                 let inbound_tag = inbound_tag.clone();
                 let runtime = runtime.clone();
                 tokio::spawn(async move {
@@ -275,7 +278,7 @@ async fn drive_tcp_streams(
                         send,
                         recv,
                         resolver,
-                        client,
+                        auth_ctx,
                         inbound_tag,
                         peer_addr,
                         runtime,
@@ -299,7 +302,7 @@ async fn handle_tcp_stream(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     resolver: Arc<dyn Resolver>,
-    client: Hysteria2Client,
+    auth_ctx: AuthContext,
     inbound_tag: Arc<String>,
     peer_addr: SocketAddr,
     runtime: RuntimeState,
@@ -313,16 +316,21 @@ async fn handle_tcp_stream(
     };
     send_tcp_response(&mut send, TCP_SUCCESS_STATUS, "").await?;
 
-    let context_identity = client.email.clone().unwrap_or(client.password.clone());
+    let context_identity = auth_ctx
+        .client
+        .email
+        .clone()
+        .unwrap_or(auth_ctx.client.password.clone());
     let connection = match tokio::time::timeout(
         TCP_CONNECT_TIMEOUT,
-        connect_tcp_outbound(
+        connect_tcp_outbound_with_vless_route(
             &resolver,
             &request.target,
             &runtime,
             inbound_tag.as_str(),
             &context_identity,
             peer_addr,
+            auth_ctx.vless_route,
         ),
     )
     .await
@@ -548,10 +556,7 @@ fn validate_auth_request(
         .to_str()
         .map_err(|_| AuthReject::Unauthorized("invalid auth header"))?;
 
-    let client = clients
-        .iter()
-        .find(|client| client.password == provided)
-        .cloned()
+    let (client, vless_route) = match_hysteria_auth(provided, clients)
         .ok_or(AuthReject::Unauthorized("password mismatch"))?;
 
     // Xray ignores Hysteria-CC-RX parse errors, while shoes does not consume
@@ -570,7 +575,55 @@ fn validate_auth_request(
     Ok(AuthInfo {
         client,
         client_rx_limit,
+        vless_route,
     })
+}
+
+fn match_hysteria_auth(
+    provided: &str,
+    clients: &[Hysteria2Client],
+) -> Option<(Hysteria2Client, u32)> {
+    // Chimera's shoes/native `id` credentials and Xray's transport auth
+    // fallback remain exact even when they happen to look like UUIDs.
+    if let Some(client) = clients
+        .iter()
+        .rev()
+        .find(|client| !client.xray_uuid_route && client.password == provided)
+        .cloned()
+    {
+        return Some((client, 0));
+    }
+
+    if let Some((provided_key, vless_route)) = xray_uuid_auth_key(provided) {
+        // Xray's UUID validator stores the masked ID in a map, so later users
+        // replace earlier users that share the same bytes outside 6..=7.
+        if let Some(client) = clients.iter().rev().find_map(|client| {
+            if !client.xray_uuid_route {
+                return None;
+            }
+            let (configured_key, _) = xray_uuid_auth_key(&client.password)?;
+            (configured_key == provided_key).then(|| client.clone())
+        }) {
+            return Some((client, vless_route));
+        }
+    }
+
+    // Non-UUID Xray auth follows the same last-write-wins user-map behavior.
+    clients
+        .iter()
+        .rev()
+        .find(|client| client.xray_uuid_route && client.password == provided)
+        .cloned()
+        .map(|client| (client, 0))
+}
+
+fn xray_uuid_auth_key(auth: &str) -> Option<([u8; 16], u32)> {
+    let uuid = uuid::Uuid::parse_str(auth).ok()?;
+    let mut key = *uuid.as_bytes();
+    let vless_route = u16::from_be_bytes([key[6], key[7]]) as u32;
+    key[6] = 0;
+    key[7] = 0;
+    Some((key, vless_route))
 }
 
 async fn send_auth_success(
@@ -947,7 +1000,7 @@ async fn drive_udp_datagrams(
 
         session.mark_active();
 
-        let route_input = connection_routing_input(
+        let mut route_input = connection_routing_input(
             inbound_tag.as_str(),
             &identity,
             3,
@@ -955,6 +1008,7 @@ async fn drive_udp_datagrams(
             session.last_socket_addr,
             &session.last_location,
         );
+        route_input.vless_route = auth_ctx.vless_route;
         let action = match select_direct_outbound(&runtime, &route_input, "udp") {
             Ok(action) => action,
             Err(err) => {
@@ -1406,6 +1460,7 @@ mod tests {
         let clients = vec![Hysteria2Client {
             password: " spaced-secret ".to_string(),
             email: None,
+            xray_uuid_route: false,
         }];
 
         validate_auth_request(auth_request(" spaced-secret ", AUTH_URI), &clients)
@@ -1417,10 +1472,50 @@ mod tests {
     }
 
     #[test]
+    fn xray_uuid_user_auth_masks_route_bytes_but_shoes_id_stays_exact() {
+        let xray_clients = vec![
+            Hysteria2Client {
+                password: "00112233-4455-6677-8899-aabbccddeeff".to_string(),
+                email: Some("shadowed@example.com".to_string()),
+                xray_uuid_route: true,
+            },
+            Hysteria2Client {
+                password: "00112233-4455-1234-8899-aabbccddeeff".to_string(),
+                email: Some("route-user@example.com".to_string()),
+                xray_uuid_route: true,
+            },
+        ];
+        let routed = validate_auth_request(
+            auth_request("00112233-4455-abcd-8899-aabbccddeeff", AUTH_URI),
+            &xray_clients,
+        )
+        .expect("Xray UUID auth should ignore route bytes during lookup");
+        assert_eq!(
+            routed.client.email.as_deref(),
+            Some("route-user@example.com")
+        );
+        assert_eq!(routed.vless_route, 0xabcd);
+
+        let shoes_clients = vec![Hysteria2Client {
+            password: "00112233-4455-6677-8899-aabbccddeeff".to_string(),
+            email: None,
+            xray_uuid_route: false,
+        }];
+        assert!(matches!(
+            validate_auth_request(
+                auth_request("00112233-4455-abcd-8899-aabbccddeeff", AUTH_URI),
+                &shoes_clients,
+            ),
+            Err(AuthReject::Unauthorized("password mismatch"))
+        ));
+    }
+
+    #[test]
     fn malformed_cc_rx_does_not_reject_authentication() {
         let clients = vec![Hysteria2Client {
             password: "secret".to_string(),
             email: None,
+            xray_uuid_route: false,
         }];
         let request = Request::builder()
             .method(http::Method::POST)
@@ -1492,6 +1587,7 @@ mod tests {
         let clients = vec![Hysteria2Client {
             password: "secret".to_string(),
             email: None,
+            xray_uuid_route: false,
         }];
         assert!(
             validate_auth_request(auth_request("secret", AUTH_URI), &clients)
