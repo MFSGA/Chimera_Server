@@ -1618,6 +1618,14 @@ async fn xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2() {
                         "up": "10 mbps",
                         "down": "10 mbps"
                     },
+                    "finalmask": {
+                        "quicParams": {
+                            "initStreamReceiveWindow": 32768,
+                            "maxStreamReceiveWindow": 65536,
+                            "initConnectionReceiveWindow": 131072,
+                            "maxConnectionReceiveWindow": 262144
+                        }
+                    },
                     "tlsSettings": {
                         "alpn": ["h3"],
                         "certificates": [{
