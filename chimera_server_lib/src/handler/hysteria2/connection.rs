@@ -811,10 +811,25 @@ async fn drive_udp_datagrams(
         let session = match sessions.entry(session_id) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
+                let remote_addr = match resolve_single_address(
+                    &resolver,
+                    &remote_location,
+                )
+                .await
+                {
+                    Ok(addr) => addr,
+                    Err(err) => {
+                        warn!(
+                            "Failed to resolve hysteria2 UDP destination {}: {}",
+                            remote_location, err
+                        );
+                        continue;
+                    }
+                };
                 let session = create_udp_session(
                     session_id,
                     remote_location.clone(),
-                    resolver.clone(),
+                    remote_addr,
                     connection.clone(),
                     base_context.clone(),
                 )
@@ -823,8 +838,21 @@ async fn drive_udp_datagrams(
             }
         };
         if remote_location != session.last_location {
-            let updated_addr =
-                resolve_single_address(&resolver, &remote_location).await?;
+            let updated_addr = match resolve_single_address(
+                &resolver,
+                &remote_location,
+            )
+            .await
+            {
+                Ok(addr) => addr,
+                Err(err) => {
+                    warn!(
+                        "Failed to resolve updated hysteria2 UDP destination {}: {}",
+                        remote_location, err
+                    );
+                    continue;
+                }
+            };
             session.last_location = remote_location.clone();
             session.last_socket_addr = updated_addr;
         }
@@ -895,8 +923,21 @@ async fn drive_udp_datagrams(
             }
 
             if remembered_location != session.last_location {
-                let updated_addr =
-                    resolve_single_address(&resolver, &remembered_location).await?;
+                let updated_addr = match resolve_single_address(
+                    &resolver,
+                    &remembered_location,
+                )
+                .await
+                {
+                    Ok(addr) => addr,
+                    Err(err) => {
+                        warn!(
+                            "Failed to resolve fragmented hysteria2 UDP destination {}: {}",
+                            remembered_location, err
+                        );
+                        continue;
+                    }
+                };
                 session.last_location = remembered_location;
                 session.last_socket_addr = updated_addr;
             }
@@ -914,7 +955,16 @@ async fn drive_udp_datagrams(
             session.last_socket_addr,
             &session.last_location,
         );
-        let action = select_direct_outbound(&runtime, &route_input, "udp")?;
+        let action = match select_direct_outbound(&runtime, &route_input, "udp") {
+            Ok(action) => action,
+            Err(err) => {
+                warn!(
+                    "Failed to route hysteria2 UDP payload for session {}: {}",
+                    session_id, err
+                );
+                continue;
+            }
+        };
         let mut traffic_context = session.base_context.clone();
 
         match action {
@@ -1031,11 +1081,10 @@ struct FragmentedPacket {
 async fn create_udp_session(
     session_id: u32,
     remote_location: NetLocation,
-    resolver: Arc<dyn Resolver>,
+    remote_addr: SocketAddr,
     connection: quinn::Connection,
     base_context: TrafficContext,
 ) -> std::io::Result<UdpSession> {
-    let remote_addr = resolve_single_address(&resolver, &remote_location).await?;
     let bind_addr: SocketAddr = if remote_addr.is_ipv6() {
         "[::]:0".parse().unwrap()
     } else {
