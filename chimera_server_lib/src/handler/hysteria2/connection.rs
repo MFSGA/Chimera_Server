@@ -10,7 +10,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::{Bytes, BytesMut};
@@ -54,6 +54,7 @@ const MAX_TCP_REQUEST_PADDING_LEN: u64 = 4096;
 const PADDING_SCRATCH_LEN: usize = 1024;
 const TCP_SUCCESS_STATUS: u8 = 0x00;
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+const UDP_IDLE_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 // Match Shoes/sing-box: unauthenticated Hysteria2 QUIC connections only get a
 // short window to complete the HTTP/3 authentication exchange.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
@@ -114,6 +115,10 @@ pub async fn process_hysteria2_connection(
     // connection. Do not poll it after authentication: Hysteria2 TCP requests
     // are raw QUIC bidi streams and would otherwise race with h3_conn.accept().
     let _h3_conn = h3_conn;
+    let udp_idle_timeout = config
+        .xray_udp_idle_timeout_secs
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs);
 
     if auth_ctx.udp_enabled {
         tokio::try_join!(
@@ -130,6 +135,7 @@ pub async fn process_hysteria2_connection(
                 &auth_ctx,
                 inbound_tag,
                 runtime,
+                udp_idle_timeout,
             ),
             drain_unidirectional_streams(connection),
         )
@@ -727,8 +733,15 @@ async fn drive_udp_datagrams(
     auth_ctx: &AuthContext,
     inbound_tag: Arc<String>,
     runtime: RuntimeState,
+    udp_idle_timeout: Option<Duration>,
 ) -> std::io::Result<()> {
     let mut sessions: HashMap<u32, UdpSession> = HashMap::new();
+    let mut cleanup_interval = udp_idle_timeout.map(|_| {
+        let start = tokio::time::Instant::now() + UDP_IDLE_CLEANUP_INTERVAL;
+        let mut interval = tokio::time::interval_at(start, UDP_IDLE_CLEANUP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval
+    });
     let peer_addr = connection.remote_address();
     let identity = auth_ctx
         .client
@@ -741,7 +754,26 @@ async fn drive_udp_datagrams(
         .with_client_ip(peer_addr.ip());
 
     loop {
-        let data = match connection.read_datagram().await {
+        let data_result = loop {
+            if let (Some(interval), Some(timeout)) =
+                (cleanup_interval.as_mut(), udp_idle_timeout)
+            {
+                tokio::select! {
+                    result = connection.read_datagram() => break result,
+                    _ = interval.tick() => {
+                        prune_idle_udp_sessions(
+                            &mut sessions,
+                            Instant::now(),
+                            timeout,
+                        );
+                    }
+                }
+            } else {
+                break connection.read_datagram().await;
+            }
+        };
+
+        let data = match data_result {
             Ok(data) => data,
             Err(quinn::ConnectionError::ApplicationClosed { .. })
             | Err(quinn::ConnectionError::ConnectionClosed { .. }) => return Ok(()),
@@ -814,6 +846,7 @@ async fn drive_udp_datagrams(
                 entry.insert(session)
             }
         };
+        session.mark_active();
 
         if remote_location != session.last_location {
             let updated_addr =
@@ -952,14 +985,63 @@ async fn drive_udp_datagrams(
     }
 }
 
+fn prune_idle_udp_sessions(
+    sessions: &mut HashMap<u32, UdpSession>,
+    now: Instant,
+    timeout: Duration,
+) {
+    sessions.retain(|session_id, session| {
+        let active = !udp_session_is_idle(session.last_active(), now, timeout);
+        if !active {
+            debug!(
+                "hysteria2 UDP session {} expired after {:?} of inactivity",
+                session_id, timeout
+            );
+        }
+        active
+    });
+}
+
+fn udp_session_is_idle(
+    last_active: Instant,
+    now: Instant,
+    timeout: Duration,
+) -> bool {
+    now.saturating_duration_since(last_active) > timeout
+}
+
 struct UdpSession {
     socket: Arc<UdpSocket>,
     fragments: HashMap<u16, FragmentedPacket>,
     last_location: NetLocation,
     last_socket_addr: SocketAddr,
+    last_active: Arc<RwLock<Instant>>,
     base_context: TrafficContext,
     response_contexts: Arc<RwLock<HashMap<SocketAddr, TrafficContext>>>,
+    remote_task: tokio::task::JoinHandle<()>,
     _connection_guard: ConnectionGuard,
+}
+
+impl UdpSession {
+    fn mark_active(&self) {
+        *self
+            .last_active
+            .write()
+            .expect("hysteria2 UDP activity lock poisoned") = Instant::now();
+    }
+
+    fn last_active(&self) -> Instant {
+        *self
+            .last_active
+            .read()
+            .expect("hysteria2 UDP activity lock poisoned")
+    }
+}
+
+impl Drop for UdpSession {
+    fn drop(&mut self) {
+        self.remote_task.abort();
+    }
 }
 
 struct FragmentedPacket {
@@ -989,15 +1071,18 @@ async fn create_udp_session(
     let connection_for_task = connection.clone();
     let response_contexts = Arc::new(RwLock::new(HashMap::new()));
     let contexts_for_task = response_contexts.clone();
+    let last_active = Arc::new(RwLock::new(Instant::now()));
+    let activity_for_task = last_active.clone();
     let fallback_context = base_context.clone();
     let connection_guard = register_connection(Some(&base_context));
 
-    tokio::spawn(async move {
+    let remote_task = tokio::spawn(async move {
         if let Err(err) = run_udp_remote_to_local_loop(
             session_id,
             connection_for_task,
             socket_for_task,
             contexts_for_task,
+            activity_for_task,
             fallback_context,
         )
         .await
@@ -1014,8 +1099,10 @@ async fn create_udp_session(
         fragments: HashMap::new(),
         last_location: remote_location,
         last_socket_addr: remote_addr,
+        last_active,
         base_context,
         response_contexts,
+        remote_task,
         _connection_guard: connection_guard,
     })
 }
@@ -1025,6 +1112,7 @@ async fn run_udp_remote_to_local_loop(
     connection: quinn::Connection,
     socket: Arc<UdpSocket>,
     response_contexts: Arc<RwLock<HashMap<SocketAddr, TrafficContext>>>,
+    last_active: Arc<RwLock<Instant>>,
     fallback_context: TrafficContext,
 ) -> std::io::Result<()> {
     let max_datagram_size = connection
@@ -1118,6 +1206,9 @@ async fn run_udp_remote_to_local_loop(
             }
         }
 
+        *last_active
+            .write()
+            .expect("hysteria2 UDP activity lock poisoned") = Instant::now();
         record_transfer(Some(traffic_context), 0, payload_len as u64);
         next_packet_id = next_packet_id.wrapping_add(1);
     }
@@ -1289,6 +1380,22 @@ mod tests {
             resolve_bandwidth_settings(&config, Some(300_000)),
             (300_000, 750_000, false)
         );
+    }
+
+    #[test]
+    fn xray_udp_idle_timeout_uses_strict_expiry_boundary() {
+        let last_active = Instant::now();
+        let timeout = Duration::from_secs(2);
+        assert!(!udp_session_is_idle(
+            last_active,
+            last_active + timeout,
+            timeout
+        ));
+        assert!(udp_session_is_idle(
+            last_active,
+            last_active + timeout + Duration::from_millis(1),
+            timeout
+        ));
     }
 
     #[test]
