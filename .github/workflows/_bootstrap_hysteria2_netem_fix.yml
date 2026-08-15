@@ -1,0 +1,52 @@
+name: Materialize Hysteria2 netem benchmark
+
+on:
+  push:
+    branches:
+      - perf/hysteria2-netem-benchmark
+
+permissions:
+  contents: write
+
+jobs:
+  materialize:
+    if: "${{ github.event.head_commit.message == 'ci: materialize hy2 netem benchmark' }}"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: perf/hysteria2-netem-benchmark
+          token: ${{ github.token }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Materialize benchmark source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import base64, gzip
+          from pathlib import Path
+
+          source = Path('.github/workflows/_bootstrap_hysteria2_netem.yml').read_text().splitlines()
+          start = next(i for i, line in enumerate(source) if "base64 -d <<'PAYLOAD'" in line) + 1
+          end = next(i for i in range(start, len(source)) if source[i].strip() == 'PAYLOAD')
+          payload = ''.join(line.strip() for line in source[start:end])
+          data = gzip.decompress(base64.b64decode(payload))
+          Path('bench/hysteria2_netem.py').write_bytes(data)
+          PY
+          chmod +x bench/hysteria2_netem.py
+          printf '%s\n' 'v26.7.28' > bench/.xray-version
+          printf '%s\n' '8195d909f1109b8f3d99eefe401a3c451d7bf4af71f24d3815420f77e5dd2a40' > bench/.xray-linux-64.sha256
+          python3 -m py_compile bench/hysteria2_netem.py
+          python3 bench/hysteria2_netem.py --self-test
+          rm .github/workflows/_bootstrap_hysteria2_netem.yml
+          rm .github/workflows/_bootstrap_hysteria2_netem_fix.yml
+          git add bench/hysteria2_netem.py bench/.xray-version bench/.xray-linux-64.sha256 .github/workflows/_bootstrap_hysteria2_netem.yml .github/workflows/_bootstrap_hysteria2_netem_fix.yml
+          git diff --cached --check
+          git diff --cached --stat
+          git commit -m 'bench(hysteria2): add RTT loss matrix'
+          git push origin HEAD
