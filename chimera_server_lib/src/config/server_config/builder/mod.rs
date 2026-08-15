@@ -748,6 +748,34 @@ impl TryFrom<InboudItem> for ServerConfig {
                         Ok(streams.min(1_u64 << 60))
                     })
                     .transpose()?;
+                let xray_receive_windows = xray_quic_params
+                    .map(|quic_params| {
+                        for (field, value) in [
+                            ("initStreamReceiveWindow", quic_params.init_stream_receive_window),
+                            ("maxStreamReceiveWindow", quic_params.max_stream_receive_window),
+                            (
+                                "initConnectionReceiveWindow",
+                                quic_params.init_connection_receive_window,
+                            ),
+                            (
+                                "maxConnectionReceiveWindow",
+                                quic_params.max_connection_receive_window,
+                            ),
+                        ] {
+                            if value != 0 && value < 16_384 {
+                                return Err(Error::InvalidConfig(format!(
+                                    "finalmask.quicParams.{field} must be 0 or at least 16384 (got {value})"
+                                )));
+                            }
+                        }
+                        Ok((
+                            quic_params.init_stream_receive_window,
+                            quic_params.max_stream_receive_window,
+                            quic_params.init_connection_receive_window,
+                            quic_params.max_connection_receive_window,
+                        ))
+                    })
+                    .transpose()?;
                 let tls_settings =
                     stream_settings.tls_settings.ok_or_else(|| {
                         Error::InvalidConfig(
@@ -774,6 +802,18 @@ impl TryFrom<InboudItem> for ServerConfig {
                     collect_hysteria2_settings(settings, hysteria_settings)?;
                 config.xray_max_idle_timeout_secs = xray_max_idle_timeout_secs;
                 config.xray_max_incoming_streams = xray_max_incoming_streams;
+                if let Some((
+                    init_stream,
+                    max_stream,
+                    init_connection,
+                    max_connection,
+                )) = xray_receive_windows
+                {
+                    config.xray_init_stream_receive_window = Some(init_stream);
+                    config.xray_max_stream_receive_window = Some(max_stream);
+                    config.xray_init_connection_receive_window = Some(init_connection);
+                    config.xray_max_connection_receive_window = Some(max_connection);
+                }
                 if config.clients.is_empty() {
                     return Err(Error::InvalidConfig(
                         "hysteria2 inbound requires at least one client".into(),
@@ -1353,9 +1393,8 @@ mod tests {
     }
 
     #[cfg(feature = "hysteria")]
-    fn hysteria2_inbound_with_finalmask(
-        max_idle_timeout: i64,
-        max_incoming_streams: i64,
+    fn hysteria2_inbound_with_finalmask_quic_params(
+        quic_params: serde_json::Value,
     ) -> InboudItem {
         serde_json::from_value(serde_json::json!({
             "listen": "127.0.0.1",
@@ -1375,14 +1414,22 @@ mod tests {
                     }]
                 },
                 "finalmask": {
-                    "quicParams": {
-                        "maxIdleTimeout": max_idle_timeout,
-                        "maxIncomingStreams": max_incoming_streams
-                    }
+                    "quicParams": quic_params
                 }
             }
         }))
         .expect("valid hysteria2 inbound")
+    }
+
+    #[cfg(feature = "hysteria")]
+    fn hysteria2_inbound_with_finalmask(
+        max_idle_timeout: i64,
+        max_incoming_streams: i64,
+    ) -> InboudItem {
+        hysteria2_inbound_with_finalmask_quic_params(serde_json::json!({
+            "maxIdleTimeout": max_idle_timeout,
+            "maxIncomingStreams": max_incoming_streams
+        }))
     }
 
     #[cfg(feature = "hysteria")]
@@ -1425,6 +1472,49 @@ mod tests {
         let err = ServerConfig::try_from(hysteria2_inbound_with_finalmask(30, 7))
             .expect_err("Xray rejects maxIncomingStreams below eight");
         assert!(err.to_string().contains("maxIncomingStreams"));
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn hysteria2_finalmask_receive_windows_match_xray_bounds() {
+        let config = ServerConfig::try_from(
+            hysteria2_inbound_with_finalmask_quic_params(serde_json::json!({
+                "initStreamReceiveWindow": 32768,
+                "maxStreamReceiveWindow": 65536,
+                "initConnectionReceiveWindow": 131072,
+                "maxConnectionReceiveWindow": 262144
+            })),
+        )
+        .expect("valid Xray Hysteria2 receive windows should build");
+        match config.protocol {
+            ServerProxyConfig::Hysteria2 { config } => {
+                assert_eq!(config.xray_init_stream_receive_window, Some(32_768));
+                assert_eq!(config.xray_max_stream_receive_window, Some(65_536));
+                assert_eq!(
+                    config.xray_init_connection_receive_window,
+                    Some(131_072)
+                );
+                assert_eq!(config.xray_max_connection_receive_window, Some(262_144));
+            }
+            other => panic!("expected hysteria2 protocol, got {other:?}"),
+        }
+
+        for field in [
+            "initStreamReceiveWindow",
+            "maxStreamReceiveWindow",
+            "initConnectionReceiveWindow",
+            "maxConnectionReceiveWindow",
+        ] {
+            let mut params = serde_json::Map::new();
+            params.insert(field.to_string(), serde_json::json!(16_383));
+            let err = ServerConfig::try_from(
+                hysteria2_inbound_with_finalmask_quic_params(
+                    serde_json::Value::Object(params),
+                ),
+            )
+            .expect_err("Xray rejects receive windows below 16384");
+            assert!(err.to_string().contains(field), "{err}");
+        }
     }
 
     #[cfg(feature = "http")]

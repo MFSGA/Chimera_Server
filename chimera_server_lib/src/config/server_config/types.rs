@@ -58,6 +58,17 @@ pub struct Hysteria2ServerConfig {
     pub xray_max_idle_timeout_secs: Option<u64>,
     #[serde(default)]
     pub xray_max_incoming_streams: Option<u64>,
+    // quic-go exposes distinct initial/max receive windows. Quinn exposes one
+    // static receive window, so retain the initial values for Xray config parity
+    // while the Hysteria2 runtime applies the corresponding max values.
+    #[serde(default)]
+    pub xray_init_stream_receive_window: Option<u64>,
+    #[serde(default)]
+    pub xray_max_stream_receive_window: Option<u64>,
+    #[serde(default)]
+    pub xray_init_connection_receive_window: Option<u64>,
+    #[serde(default)]
+    pub xray_max_connection_receive_window: Option<u64>,
 }
 
 #[cfg(feature = "tuic")]
