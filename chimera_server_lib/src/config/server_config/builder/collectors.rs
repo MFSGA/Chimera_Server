@@ -75,7 +75,7 @@ pub(super) fn collect_hysteria2_settings(
     // Xray keeps both names for Hysteria2 inbound users. If `clients` is
     // present it replaces `users`, including when it is an explicit empty
     // array; otherwise the legacy `users` field is used.
-    let clients = raw
+    let mut clients = raw
         .clients
         .or(raw.users)
         .unwrap_or_default()
@@ -102,6 +102,21 @@ pub(super) fn collect_hysteria2_settings(
             })
         })
         .collect::<Result<Vec<_>, Error>>()?;
+
+    // Xray's transport-level hysteriaSettings.auth is a fallback credential:
+    // it is consulted only when the inbound validator has no configured users.
+    // Preserve that precedence by promoting it to the effective client list
+    // only when `clients` / `users` resolved to an empty list.
+    if clients.is_empty()
+        && let Some(auth) = hysteria_settings
+            .map(|settings| settings.auth.as_str())
+            .filter(|auth| !auth.is_empty())
+    {
+        clients.push(Hysteria2Client {
+            password: auth.to_string(),
+            email: None,
+        });
+    }
 
     let mut bandwidth = Hysteria2BandwidthConfig::default();
     let mut saw_up = false;
@@ -1533,6 +1548,45 @@ mod tests {
 
     #[cfg(feature = "hysteria")]
     #[test]
+    fn collect_hysteria2_settings_accepts_xray_transport_auth_fallback() {
+        let settings = SettingObject(serde_json::json!({
+            "version": 2
+        }));
+        let stream_settings =
+            serde_json::from_value::<HysteriaSettings>(serde_json::json!({
+                "version": 2,
+                "auth": "transport-auth-token"
+            }))
+            .expect("valid hysteriaSettings auth");
+
+        let config = collect_hysteria2_settings(settings, Some(&stream_settings))
+            .expect("Xray transport auth fallback should be accepted");
+        assert_eq!(config.clients.len(), 1);
+        assert_eq!(config.clients[0].password, "transport-auth-token");
+        assert_eq!(config.clients[0].email, None);
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn collect_hysteria2_settings_users_override_transport_auth_fallback() {
+        let settings = SettingObject(serde_json::json!({
+            "clients": [{"auth": "user-auth-token"}]
+        }));
+        let stream_settings =
+            serde_json::from_value::<HysteriaSettings>(serde_json::json!({
+                "version": 2,
+                "auth": "transport-auth-token"
+            }))
+            .expect("valid hysteriaSettings auth");
+
+        let config = collect_hysteria2_settings(settings, Some(&stream_settings))
+            .expect("configured users should take precedence over transport auth");
+        assert_eq!(config.clients.len(), 1);
+        assert_eq!(config.clients[0].password, "user-auth-token");
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
     fn collect_hysteria2_settings_accepts_xray_users_alias() {
         let settings = SettingObject(serde_json::json!({
             "users": [{
@@ -1611,6 +1665,7 @@ mod tests {
         }));
         let stream_settings = HysteriaSettings {
             version: Some(3),
+            auth: String::new(),
             congestion: None,
             up: None,
             down: None,
