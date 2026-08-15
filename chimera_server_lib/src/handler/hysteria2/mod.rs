@@ -59,9 +59,10 @@ pub async fn run_hysteria2_server(
         let base_transport = build_transport_config(config.as_ref())?;
         let mut base_server_config =
             quinn::ServerConfig::with_crypto(quic_server_config);
-        // Match Xray's Hysteria2 server behavior: do not migrate an established
-        // QUIC connection to a different network path.
-        base_server_config.migration(false);
+        // Xray disables its QUIC path manager, while shoes leaves Quinn's
+        // default migration support enabled.
+        base_server_config
+            .migration(configured_server_migration(config.xray_compat));
         base_server_config.transport_config(Arc::new(base_transport));
 
         let socket2_socket = new_socket2_udp_socket_with_buffer_size(
@@ -232,6 +233,10 @@ fn build_transport_config(
     Ok(transport)
 }
 
+fn configured_server_migration(xray_compat: bool) -> bool {
+    !xray_compat
+}
+
 fn configured_max_idle_timeout_secs(configured: Option<u64>) -> u64 {
     configured.unwrap_or(30)
 }
@@ -313,8 +318,14 @@ mod tests {
         configured_keep_alive_interval, configured_max_idle_timeout_secs,
         configured_max_incoming_bidi_streams, configured_max_incoming_uni_streams,
         configured_mtu_discovery, configured_receive_window, configured_send_window,
-        configured_udp_socket_buffer_size,
+        configured_server_migration, configured_udp_socket_buffer_size,
     };
+
+    #[test]
+    fn server_migration_matches_xray_and_shoes() {
+        assert!(configured_server_migration(false));
+        assert!(!configured_server_migration(true));
+    }
 
     #[test]
     fn transport_defaults_follow_protocol_mode_without_finalmask() {
