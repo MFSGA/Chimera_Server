@@ -1,4 +1,4 @@
-name: Trace modern Xray Hysteria2 TCP stages
+name: Trace master Hysteria2 stream ownership
 
 on:
   push:
@@ -7,52 +7,48 @@ on:
 
 jobs:
   trace:
-    if: "${{ github.event.head_commit.message == 'ci: trace modern Xray Hysteria2 TCP stages' }}"
+    if: "${{ github.event.head_commit.message == 'ci: trace master Hysteria2 stream ownership' }}"
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: v26.7.28
+            sha256: 8195d909f1109b8f3d99eefe401a3c451d7bf4af71f24d3815420f77e5dd2a40
+          - version: v26.2.6
+            sha256: 29ce535b56e207a406ffa1c2d4842dcc410be003eff8ec508bb732abc9f8e385
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: master
       - uses: dtolnay/rust-toolchain@stable
       - uses: arduino/setup-protoc@v3
         with:
           version: '23.x'
       - uses: Swatinem/rust-cache@v2
-      - name: Instrument TCP stages
+      - name: Instrument original raw Quinn TCP path
         shell: bash
         run: |
           python3 <<'PY'
           from pathlib import Path
-
           path = Path('chimera_server_lib/src/handler/hysteria2/connection.rs')
           text = path.read_text()
-
           replacements = [
             (
-              '''            Ok(stream) => stream,\n''',
-              '''            Ok(stream) => {\n                debug!(stream_id = ?H3RecvStream::recv_id(&stream), "hysteria2 trace bidi accepted");\n                stream\n            },\n'''
+              '''            Ok((send, recv)) => {\n''',
+              '''            Ok((send, recv)) => {\n                debug!(stream_id = ?recv.id(), "hysteria2 master trace raw bidi accepted");\n'''
             ),
             (
               '''        Ok(request) => request,\n''',
-              '''        Ok(request) => {\n            debug!(target = %request.target, "hysteria2 trace tcp request parsed");\n            request\n        },\n'''
+              '''        Ok(request) => {\n            debug!(target = %request.target, "hysteria2 master trace request parsed");\n            request\n        },\n'''
             ),
             (
-              '''    send_tcp_response(&mut stream, TCP_SUCCESS_STATUS, "").await?;\n''',
-              '''    debug!("hysteria2 trace sending tcp response");\n    send_tcp_response(&mut stream, TCP_SUCCESS_STATUS, "").await?;\n    debug!("hysteria2 trace tcp response sent");\n'''
-            ),
-            (
-              '''    let connection = match tokio::time::timeout(\n''',
-              '''    debug!(target = %request.target, "hysteria2 trace connecting outbound");\n    let connection = match tokio::time::timeout(\n'''
+              '''    send_tcp_response(&mut send, TCP_SUCCESS_STATUS, "").await?;\n''',
+              '''    debug!("hysteria2 master trace sending response");\n    send_tcp_response(&mut send, TCP_SUCCESS_STATUS, "").await?;\n    debug!("hysteria2 master trace response sent");\n'''
             ),
             (
               '''        Ok(Ok(Some(connection))) => connection,\n''',
-              '''        Ok(Ok(Some(connection))) => {\n            debug!(target = %request.target, "hysteria2 trace outbound connected");\n            connection\n        },\n'''
-            ),
-            (
-              '''    proxy_tcp(stream, connection.stream, context).await\n''',
-              '''    debug!("hysteria2 trace starting tcp proxy");\n    proxy_tcp(stream, connection.stream, context).await\n'''
-            ),
-            (
-              '''        match SendStreamUnframed::poll_send(&mut this.stream, cx, &mut data) {\n            Poll::Ready(Ok(written)) => Poll::Ready(Ok(written)),\n''',
-              '''        debug!(len = buf.len(), prefix = ?&buf[..buf.len().min(16)], "hysteria2 trace poll_write");\n        match SendStreamUnframed::poll_send(&mut this.stream, cx, &mut data) {\n            Poll::Ready(Ok(written)) => {\n                debug!(written, "hysteria2 trace poll_write complete");\n                Poll::Ready(Ok(written))\n            },\n'''
+              '''        Ok(Ok(Some(connection))) => {\n            debug!(target = %request.target, "hysteria2 master trace outbound connected");\n            connection\n        },\n'''
             ),
           ]
           for old, new in replacements:
@@ -70,20 +66,23 @@ jobs:
             -keyout cert/key.pem -out cert/cert.pem -days 1 \
             -subj '/CN=localhost' \
             -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1'
-      - name: Download and verify Xray v26.7.28
+      - name: Download and verify Xray
         shell: bash
+        env:
+          XRAY_VERSION: ${{ matrix.version }}
+          XRAY_SHA256: ${{ matrix.sha256 }}
         run: |
           set -euo pipefail
-          archive=/tmp/Xray-linux-64-v26.7.28.zip
+          archive="/tmp/Xray-linux-64-${XRAY_VERSION}.zip"
           curl -fL --retry 3 \
-            'https://github.com/XTLS/Xray-core/releases/download/v26.7.28/Xray-linux-64.zip' \
+            "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" \
             -o "$archive"
-          echo '8195d909f1109b8f3d99eefe401a3c451d7bf4af71f24d3815420f77e5dd2a40  /tmp/Xray-linux-64-v26.7.28.zip' | sha256sum -c -
+          echo "${XRAY_SHA256}  ${archive}" | sha256sum -c -
           unzip -q "$archive" -d xray-test
           cp xray-test/xray ./xray
           chmod +x ./xray
           ./xray version
-      - name: Hysteria2 TCP trace
+      - name: Hysteria2 TCP ownership trace
         shell: bash
         env:
           XRAY_BIN: ${{ github.workspace }}/xray
