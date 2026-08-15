@@ -180,7 +180,12 @@ async fn auth_hysteria2_connection(
                                 config,
                                 auth_info.client_rx_limit,
                             );
-                        tx_bps.store(actual_tx, Ordering::Relaxed);
+                        let congestion_tx = resolve_congestion_tx_bps(
+                            config,
+                            auth_info.client_rx_limit,
+                            actual_tx,
+                        );
+                        tx_bps.store(congestion_tx, Ordering::Relaxed);
                         debug!(status = SUCCESS_STATUS, "hysteria2 auth accepted");
                         send_auth_success(
                             &mut stream,
@@ -476,10 +481,39 @@ fn auth_reject_status(_reject: &AuthReject) -> StatusCode {
     StatusCode::NOT_FOUND
 }
 
+fn resolve_congestion_tx_bps(
+    config: &Hysteria2ServerConfig,
+    client_rx_limit: Option<u64>,
+    shoes_tx_bps: u64,
+) -> u64 {
+    match config.xray_congestion.as_deref() {
+        None => shoes_tx_bps,
+        Some("reno") | Some("bbr") => 0,
+        Some("") | Some("brutal") => {
+            let up = config.xray_brutal_up.unwrap_or(0);
+            let down = client_rx_limit.unwrap_or(0);
+            if up == 0 || down == 0 {
+                0
+            } else {
+                up.min(down)
+            }
+        }
+        Some("force-brutal") => config.xray_brutal_up.unwrap_or(0),
+        Some(_) => unreachable!("validated Xray congestion mode"),
+    }
+}
+
 fn resolve_bandwidth_settings(
     config: &Hysteria2ServerConfig,
     client_rx_limit: Option<u64>,
 ) -> (u64, u64, bool) {
+    if config.xray_congestion.is_some() {
+        return (
+            client_rx_limit.unwrap_or(0),
+            config.xray_brutal_down.unwrap_or(0),
+            false,
+        );
+    }
     if config.ignore_client_bandwidth {
         return (0, config.bandwidth.max_rx, true);
     }
@@ -1171,6 +1205,20 @@ mod tests {
     use super::*;
     use crate::config::server_config::Hysteria2Client;
 
+    fn hysteria2_config(
+        congestion: Option<&str>,
+        brutal_up: Option<u64>,
+        brutal_down: Option<u64>,
+    ) -> Hysteria2ServerConfig {
+        serde_json::from_value(serde_json::json!({
+            "clients": [{"password": "secret"}],
+            "xrayCongestion": congestion,
+            "xrayBrutalUp": brutal_up,
+            "xrayBrutalDown": brutal_down
+        }))
+        .expect("valid Hysteria2 test config")
+    }
+
     fn auth_request(auth: &str, uri: &str) -> Request<()> {
         Request::builder()
             .method(http::Method::POST)
@@ -1204,6 +1252,42 @@ mod tests {
         assert_eq!(
             auth_reject_status(&AuthReject::BadRequest("bad request")),
             StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn xray_congestion_tx_matches_hysteria_negotiation() {
+        let shoes = hysteria2_config(None, None, None);
+        assert_eq!(
+            resolve_congestion_tx_bps(&shoes, Some(300_000), 200_000),
+            200_000
+        );
+
+        for mode in ["reno", "bbr"] {
+            let config = hysteria2_config(Some(mode), Some(500_000), None);
+            assert_eq!(
+                resolve_congestion_tx_bps(&config, Some(300_000), 200_000),
+                0
+            );
+        }
+
+        let brutal = hysteria2_config(Some("brutal"), Some(500_000), None);
+        assert_eq!(
+            resolve_congestion_tx_bps(&brutal, Some(300_000), 0),
+            300_000
+        );
+        assert_eq!(resolve_congestion_tx_bps(&brutal, None, 0), 0);
+
+        let forced = hysteria2_config(Some("force-brutal"), Some(500_000), None);
+        assert_eq!(resolve_congestion_tx_bps(&forced, None, 0), 500_000);
+    }
+
+    #[test]
+    fn xray_brutal_down_replaces_shoes_bandwidth_response() {
+        let config = hysteria2_config(Some("brutal"), Some(500_000), Some(750_000));
+        assert_eq!(
+            resolve_bandwidth_settings(&config, Some(300_000)),
+            (300_000, 750_000, false)
         );
     }
 

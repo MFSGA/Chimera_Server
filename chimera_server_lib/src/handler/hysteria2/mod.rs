@@ -4,9 +4,9 @@ use std::{
     time::Duration,
 };
 
-// use congestion::BrutalConfig;
+use congestion::BrutalConfig;
 use connection::process_hysteria2_connection;
-use quinn::congestion::BbrConfig;
+use quinn::congestion::{BbrConfig, NewRenoConfig};
 
 use crate::{
     config::server_config::Hysteria2ServerConfig,
@@ -94,9 +94,23 @@ pub async fn run_hysteria2_server(
                     }
                 };
 
-                // use brutal in the future
-                transport
-                    .congestion_controller_factory(Arc::new(BbrConfig::default()));
+                match configured_congestion_mode(config.xray_congestion.as_deref()) {
+                    CongestionMode::Reno => {
+                        transport.congestion_controller_factory(Arc::new(
+                            NewRenoConfig::default(),
+                        ));
+                    }
+                    CongestionMode::Brutal => {
+                        transport.congestion_controller_factory(Arc::new(
+                            BrutalConfig::new(tx_bps.clone()),
+                        ));
+                    }
+                    CongestionMode::Bbr => {
+                        transport.congestion_controller_factory(Arc::new(
+                            BbrConfig::default(),
+                        ));
+                    }
+                }
 
                 let mut server_config = base_server_config.clone();
                 server_config.transport_config(Arc::new(transport));
@@ -147,6 +161,22 @@ pub async fn run_hysteria2_server(
         join_handle.await.map_err(std::io::Error::other)?;
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CongestionMode {
+    Bbr,
+    Reno,
+    Brutal,
+}
+
+fn configured_congestion_mode(mode: Option<&str>) -> CongestionMode {
+    match mode {
+        Some("reno") => CongestionMode::Reno,
+        Some("") | Some("brutal") | Some("force-brutal") => CongestionMode::Brutal,
+        Some("bbr") | None => CongestionMode::Bbr,
+        Some(_) => unreachable!("validated Xray congestion mode"),
+    }
 }
 
 fn build_transport_config(
@@ -226,12 +256,12 @@ fn configured_receive_window(
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_CONNECTION_RECEIVE_WINDOW, DEFAULT_STREAM_RECEIVE_WINDOW,
-        SHOES_INITIAL_MTU, SHOES_KEEP_ALIVE_INTERVAL,
+        CongestionMode, DEFAULT_CONNECTION_RECEIVE_WINDOW,
+        DEFAULT_STREAM_RECEIVE_WINDOW, SHOES_INITIAL_MTU, SHOES_KEEP_ALIVE_INTERVAL,
         SHOES_MAX_INCOMING_UNI_STREAMS, XRAY_INITIAL_MTU,
-        XRAY_MAX_INCOMING_UNI_STREAMS, configured_initial_mtu,
-        configured_keep_alive_interval, configured_max_incoming_uni_streams,
-        configured_receive_window,
+        XRAY_MAX_INCOMING_UNI_STREAMS, configured_congestion_mode,
+        configured_initial_mtu, configured_keep_alive_interval,
+        configured_max_incoming_uni_streams, configured_receive_window,
     };
 
     #[test]
@@ -259,6 +289,25 @@ mod tests {
     fn initial_mtu_matches_protocol_mode() {
         assert_eq!(configured_initial_mtu(false), SHOES_INITIAL_MTU);
         assert_eq!(configured_initial_mtu(true), XRAY_INITIAL_MTU);
+    }
+
+    #[test]
+    fn congestion_mode_matches_xray_finalmask_selection() {
+        assert_eq!(configured_congestion_mode(None), CongestionMode::Bbr);
+        assert_eq!(configured_congestion_mode(Some("bbr")), CongestionMode::Bbr);
+        assert_eq!(
+            configured_congestion_mode(Some("reno")),
+            CongestionMode::Reno
+        );
+        assert_eq!(configured_congestion_mode(Some("")), CongestionMode::Brutal);
+        assert_eq!(
+            configured_congestion_mode(Some("brutal")),
+            CongestionMode::Brutal
+        );
+        assert_eq!(
+            configured_congestion_mode(Some("force-brutal")),
+            CongestionMode::Brutal
+        );
     }
 
     #[test]

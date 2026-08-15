@@ -55,6 +55,14 @@ pub struct Hysteria2ServerConfig {
     #[serde(default)]
     pub ignore_client_bandwidth: bool,
     #[serde(default)]
+    pub xray_congestion: Option<String>,
+    #[serde(default)]
+    pub xray_bbr_profile: Option<String>,
+    #[serde(default)]
+    pub xray_brutal_up: Option<u64>,
+    #[serde(default)]
+    pub xray_brutal_down: Option<u64>,
+    #[serde(default)]
     pub xray_max_idle_timeout_secs: Option<u64>,
     #[serde(default)]
     pub xray_max_incoming_streams: Option<u64>,
