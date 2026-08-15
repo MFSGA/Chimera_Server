@@ -351,7 +351,7 @@ fn parse_trojan_fallback_dest(
 
 pub(super) fn collect_socks_settings(
     settings: SettingObject,
-) -> Result<(SocksUserStore, bool), Error> {
+) -> Result<(SocksUserStore, bool, Option<std::net::IpAddr>), Error> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct SocksInboundSettings {
@@ -362,7 +362,7 @@ pub(super) fn collect_socks_settings(
         #[serde(default)]
         udp: Option<bool>,
         #[serde(default)]
-        ip: Option<serde_json::Value>,
+        ip: Option<String>,
         #[serde(default)]
         user_level: Option<serde_json::Value>,
     }
@@ -380,11 +380,19 @@ pub(super) fn collect_socks_settings(
 
     // SOCKS UDP is implemented through UDP ASSOCIATE on the TCP control stream.
     let udp_enabled = socks_settings.udp.unwrap_or(false);
-    if socks_settings.ip.is_some() {
-        return Err(Error::InvalidConfig(
-            "socks settings.ip is not supported yet".into(),
-        ));
-    }
+    let udp_bind_ip = socks_settings
+        .ip
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value.parse::<std::net::IpAddr>().map_err(|error| {
+                Error::InvalidConfig(format!(
+                    "socks settings.ip must be an IP address: {error}"
+                ))
+            })
+        })
+        .transpose()?;
     if socks_settings.user_level.is_some() {
         return Err(Error::InvalidConfig(
             "socks settings.userLevel is not supported yet".into(),
@@ -407,6 +415,7 @@ pub(super) fn collect_socks_settings(
         "noauth" | "none" => Ok((
             SocksUserStore::with_auth_required(Vec::new(), false),
             udp_enabled,
+            udp_bind_ip,
         )),
         "password" => {
             if socks_settings.accounts.is_empty() {
@@ -427,6 +436,7 @@ pub(super) fn collect_socks_settings(
                     true,
                 ),
                 udp_enabled,
+                udp_bind_ip,
             ))
         }
         other => Err(Error::InvalidConfig(format!(
@@ -1013,24 +1023,27 @@ mod tests {
             "udp": true
         }));
 
-        let (users, udp_enabled) =
+        let (users, udp_enabled, udp_bind_ip) =
             collect_socks_settings(settings).expect("socks udp should be accepted");
         assert!(!users.auth_required());
         assert!(udp_enabled);
+        assert!(udp_bind_ip.is_none());
     }
 
     #[test]
-    fn collect_socks_accounts_rejects_ip_until_supported() {
+    fn collect_socks_settings_preserves_udp_bind_ip() {
         let settings = SettingObject(serde_json::json!({
             "auth": "noauth",
+            "udp": true,
             "ip": "127.0.0.1"
         }));
 
-        let err =
-            collect_socks_settings(settings).expect_err("socks ip unsupported");
-        assert!(
-            err.to_string()
-                .contains("socks settings.ip is not supported yet")
+        let (_, udp_enabled, udp_bind_ip) =
+            collect_socks_settings(settings).expect("socks ip should be accepted");
+        assert!(udp_enabled);
+        assert_eq!(
+            udp_bind_ip,
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
         );
     }
 
@@ -1041,10 +1054,11 @@ mod tests {
             "udp": false
         }));
 
-        let (users, udp_enabled) =
+        let (users, udp_enabled, udp_bind_ip) =
             collect_socks_settings(settings).expect("udp false is a no-op");
         assert!(!users.auth_required());
         assert!(!udp_enabled);
+        assert!(udp_bind_ip.is_none());
     }
 
     #[cfg(feature = "trojan")]

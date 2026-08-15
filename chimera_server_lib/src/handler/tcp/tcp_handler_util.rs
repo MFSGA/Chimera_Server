@@ -193,10 +193,12 @@ pub fn create_tcp_server_handler(
         ServerProxyConfig::Socks {
             accounts,
             udp_enabled,
+            udp_bind_ip,
         } => Ok(Box::new(SocksTcpServerHandler::new(
             accounts,
             inbound_tag,
             udp_enabled,
+            udp_bind_ip,
         ))),
         ServerProxyConfig::DokodemoDoor { config } => {
             Ok(Box::new(DokodemoDoorTcpHandler::new(config, inbound_tag)))
