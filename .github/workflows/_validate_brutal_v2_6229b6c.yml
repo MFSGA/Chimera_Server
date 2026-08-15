@@ -1,0 +1,50 @@
+name: Validate Brutal post-auth v2
+
+on:
+  push:
+    branches:
+      - codex/validate-brutal-v2-6229b6c
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: 6229b6c00e108fce4c27cbcff7687f095757e21a
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Exact release gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo build --all-features
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test
+          cargo test --locked
+
+      - name: Prepare official Xray 26.7.28 and test certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 \
+            https://github.com/XTLS/Xray-core/releases/download/v26.7.28/Xray-linux-64.zip \
+            -o /tmp/xray.zip
+          echo '8195d909f1109b8f3d99eefe401a3c451d7bf4af71f24d3815420f77e5dd2a40  /tmp/xray.zip' | sha256sum --check --strict
+          unzip -jo /tmp/xray.zip xray -d .
+          chmod +x ./xray
+          ./xray version
+          mkdir -p cert
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout cert/key.pem -out cert/cert.pem -days 1 \
+            -subj '/CN=localhost' \
+            -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1'
+
+      - name: Xray 26.7.28 Hysteria2 Brutal TCP+UDP interop
+        env:
+          XRAY_BIN: ./xray
+        run: cargo test -p chimera_server_app --test xray_client_proxy_e2e xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2 -- --ignored --exact --nocapture
