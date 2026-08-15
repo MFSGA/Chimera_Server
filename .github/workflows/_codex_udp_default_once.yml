@@ -25,44 +25,30 @@ jobs:
 
           p = Path('chimera_server_lib/src/config/server_config/builder/collectors.rs')
           s = p.read_text()
-          old = '''    let xray_udp_idle_timeout_secs = hysteria_settings
-              .map(|settings| {
-                  let timeout = settings.udp_idle_timeout;
-                  if timeout != 0 && !(2..=600).contains(&timeout) {
-                      return Err(Error::InvalidConfig(format!(
-                          "hysteriaSettings.udpIdleTimeout must be 0 or between 2 and 600 seconds (got {timeout})"
-                      )));
-                  }
-                  Ok(if timeout == 0 { 60 } else { timeout as u64 })
-              })
-              .transpose()?;
-          '''
-          new = '''    let xray_udp_idle_timeout_secs = Some(match hysteria_settings {
-              Some(settings) => {
-                  let timeout = settings.udp_idle_timeout;
-                  if timeout != 0 && !(2..=600).contains(&timeout) {
-                      return Err(Error::InvalidConfig(format!(
-                          "hysteriaSettings.udpIdleTimeout must be 0 or between 2 and 600 seconds (got {timeout})"
-                      )));
-                  }
-                  if timeout == 0 { 60 } else { timeout as u64 }
-              }
-              None => 60,
-          });
-          '''
-          if old not in s:
-              raise SystemExit('collector timeout block not found')
-          s = s.replace(old, new, 1)
-          old_assert = '''        assert_eq!(config.clients[0].password, "xray-auth-token");
-                  assert_eq!(config.clients[0].email.as_deref(), Some("hy@example.com"));
-          '''
-          new_assert = '''        assert_eq!(config.clients[0].password, "xray-auth-token");
-                  assert_eq!(config.clients[0].email.as_deref(), Some("hy@example.com"));
-                  assert_eq!(config.xray_udp_idle_timeout_secs, Some(60));
-          '''
-          if old_assert not in s:
-              raise SystemExit('collector auth assertions not found')
-          p.write_text(s.replace(old_assert, new_assert, 1))
+          start_marker = '    let xray_udp_idle_timeout_secs = hysteria_settings\n'
+          end_marker = '        .transpose()?;\n'
+          start = s.index(start_marker)
+          end = s.index(end_marker, start) + len(end_marker)
+          new = (
+              '    let xray_udp_idle_timeout_secs = Some(match hysteria_settings {\n'
+              '        Some(settings) => {\n'
+              '            let timeout = settings.udp_idle_timeout;\n'
+              '            if timeout != 0 && !(2..=600).contains(&timeout) {\n'
+              '                return Err(Error::InvalidConfig(format!(\n'
+              '                    "hysteriaSettings.udpIdleTimeout must be 0 or between 2 and 600 seconds (got {timeout})"\n'
+              '                )));\n'
+              '            }\n'
+              '            if timeout == 0 { 60 } else { timeout as u64 }\n'
+              '        }\n'
+              '        None => 60,\n'
+              '    });\n'
+          )
+          s = s[:start] + new + s[end:]
+          needle = '        assert_eq!(config.clients[0].email.as_deref(), Some("hy@example.com"));\n'
+          replacement = needle + '        assert_eq!(config.xray_udp_idle_timeout_secs, Some(60));\n'
+          if needle not in s:
+              raise SystemExit('collector auth assertion not found')
+          p.write_text(s.replace(needle, replacement, 1))
           PY
           cargo fmt --all
           rm .github/workflows/_codex_udp_default_once.yml
