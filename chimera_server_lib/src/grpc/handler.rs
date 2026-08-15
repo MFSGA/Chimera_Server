@@ -1433,7 +1433,7 @@ impl HandlerServiceImpl {
                     "invalid hysteria account payload: {err}"
                 ))
             })?;
-        let auth = payload.auth.trim();
+        let auth = payload.auth.as_str();
         if auth.is_empty() {
             return Err(Status::invalid_argument(
                 "hysteria account auth is required",
@@ -3972,7 +3972,7 @@ mod tests {
         let runtime = RuntimeState::new(vec![inbound], Vec::new());
         let service = HandlerServiceImpl::new(runtime);
         let email = unique_tag("hysteria-user");
-        let auth = "added-auth";
+        let auth = " added-auth ";
 
         let add_operation = proto::xray::app::proxyman::command::AddUserOperation {
             user: Some(proto::xray::common::protocol::User {
