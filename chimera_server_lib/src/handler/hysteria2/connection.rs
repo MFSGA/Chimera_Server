@@ -56,6 +56,7 @@ const MAX_ADDRESS_LEN: usize = 2048;
 const MAX_TCP_REQUEST_PADDING_LEN: u64 = 4096;
 const PADDING_SCRATCH_LEN: usize = 1024;
 const TCP_SUCCESS_STATUS: u8 = 0x00;
+const TCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 const UDP_IDLE_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_FRAGMENT_CACHE_SIZE: usize = 256;
@@ -318,7 +319,7 @@ async fn handle_tcp_stream(
     peer_addr: SocketAddr,
     runtime: RuntimeState,
 ) -> std::io::Result<()> {
-    let request = match TcpRequest::read(&mut recv).await {
+    let request = match read_tcp_request(&mut recv, auth_ctx.xray_compat).await {
         Ok(request) => request,
         Err(err) => {
             let _ = send.finish();
@@ -379,6 +380,27 @@ async fn handle_tcp_stream(
 
 struct TcpRequest {
     target: NetLocation,
+}
+
+fn configured_tcp_request_timeout(xray_compat: bool) -> Option<Duration> {
+    xray_compat.then_some(TCP_REQUEST_TIMEOUT)
+}
+
+async fn read_tcp_request(
+    stream: &mut quinn::RecvStream,
+    xray_compat: bool,
+) -> std::io::Result<TcpRequest> {
+    match configured_tcp_request_timeout(xray_compat) {
+        Some(timeout) => tokio::time::timeout(timeout, TcpRequest::read(stream))
+            .await
+            .map_err(|_| {
+                Error::new(
+                    ErrorKind::TimedOut,
+                    "hysteria2 TCP request header timed out",
+                )
+            })?,
+        None => TcpRequest::read(stream).await,
+    }
 }
 
 impl TcpRequest {
@@ -1532,6 +1554,15 @@ mod tests {
 
         assert_eq!(err.kind(), ErrorKind::TimedOut);
         assert!(started.elapsed() >= AUTH_TIMEOUT);
+    }
+
+    #[test]
+    fn tcp_request_timeout_is_xray_only() {
+        assert_eq!(
+            configured_tcp_request_timeout(true),
+            Some(TCP_REQUEST_TIMEOUT)
+        );
+        assert_eq!(configured_tcp_request_timeout(false), None);
     }
 
     #[test]
