@@ -772,35 +772,19 @@ async fn drive_udp_datagrams(
             Err(err) => return Err(Error::other(err)),
         };
 
-        if data.len() < 9 {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "hysteria2 datagram too short",
-            ));
-        }
+        let (address_start, payload_start) = match udp_datagram_address_bounds(&data)
+        {
+            Ok(bounds) => bounds,
+            Err(err) => {
+                debug!("Ignoring malformed hysteria2 UDP datagram: {}", err);
+                continue;
+            }
+        };
 
         let session_id = u32::from_be_bytes(data[0..4].try_into().unwrap());
         let packet_id = u16::from_be_bytes(data[4..6].try_into().unwrap());
         let fragment_id = data[6];
         let fragment_count = data[7];
-
-        let (address_len, varint_len) = decode_varint_from_slice(&data[8..])?;
-        if address_len == 0 || address_len > MAX_ADDRESS_LEN {
-            warn!(
-                "Ignoring hysteria2 UDP packet {} with invalid address length {}",
-                session_id, address_len
-            );
-            continue;
-        }
-
-        let address_start = 8 + varint_len;
-        let payload_start = address_start + address_len;
-        if data.len() < payload_start {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "hysteria2 datagram truncated before payload",
-            ));
-        }
 
         let address_bytes = data.slice(address_start..payload_start);
         let payload_fragment = data.slice(payload_start..);
@@ -1206,6 +1190,39 @@ async fn run_udp_remote_to_local_loop(
     }
 }
 
+fn udp_datagram_address_bounds(data: &[u8]) -> std::io::Result<(usize, usize)> {
+    if data.len() < 9 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "hysteria2 datagram too short",
+        ));
+    }
+
+    let (address_len, varint_len) = decode_varint_from_slice(&data[8..])?;
+    if address_len == 0 || address_len > MAX_ADDRESS_LEN {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("invalid hysteria2 UDP address length: {address_len}"),
+        ));
+    }
+
+    let address_start = 8 + varint_len;
+    let payload_start = address_start.checked_add(address_len).ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidData,
+            "hysteria2 UDP address length overflow",
+        )
+    })?;
+    if data.len() < payload_start {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "hysteria2 datagram truncated before payload",
+        ));
+    }
+
+    Ok((address_start, payload_start))
+}
+
 fn decode_varint_from_slice(data: &[u8]) -> std::io::Result<(usize, usize)> {
     if data.is_empty() {
         return Err(Error::new(
@@ -1443,6 +1460,29 @@ mod tests {
                 "unexpected auth URI accepted: {uri}"
             );
         }
+    }
+
+    #[test]
+    fn malformed_udp_datagram_bounds_are_rejected_without_panicking() {
+        assert!(udp_datagram_address_bounds(&[]).is_err());
+        assert!(udp_datagram_address_bounds(&[0; 8]).is_err());
+
+        let mut truncated_varint = vec![0; 9];
+        truncated_varint[8] = 0x40;
+        assert!(udp_datagram_address_bounds(&truncated_varint).is_err());
+
+        let mut truncated_address = vec![0; 9];
+        truncated_address[8] = 5;
+        assert!(udp_datagram_address_bounds(&truncated_address).is_err());
+
+        let mut valid = vec![0; 8];
+        valid.push(3);
+        valid.extend_from_slice(b"dns");
+        valid.extend_from_slice(b"payload");
+        assert_eq!(
+            udp_datagram_address_bounds(&valid).expect("valid UDP datagram bounds"),
+            (9, 12)
+        );
     }
 
     #[test]
