@@ -1,0 +1,73 @@
+name: One-shot Hysteria2 UDP default fix
+
+on:
+  push:
+    branches:
+      - codex/hysteria2-udp-idle-timeout
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/hysteria2-udp-idle-timeout
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Apply default parity fix
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('chimera_server_lib/src/config/server_config/builder/collectors.rs')
+          s = p.read_text()
+          old = '''    let xray_udp_idle_timeout_secs = hysteria_settings
+              .map(|settings| {
+                  let timeout = settings.udp_idle_timeout;
+                  if timeout != 0 && !(2..=600).contains(&timeout) {
+                      return Err(Error::InvalidConfig(format!(
+                          "hysteriaSettings.udpIdleTimeout must be 0 or between 2 and 600 seconds (got {timeout})"
+                      )));
+                  }
+                  Ok(if timeout == 0 { 60 } else { timeout as u64 })
+              })
+              .transpose()?;
+          '''
+          new = '''    let xray_udp_idle_timeout_secs = Some(match hysteria_settings {
+              Some(settings) => {
+                  let timeout = settings.udp_idle_timeout;
+                  if timeout != 0 && !(2..=600).contains(&timeout) {
+                      return Err(Error::InvalidConfig(format!(
+                          "hysteriaSettings.udpIdleTimeout must be 0 or between 2 and 600 seconds (got {timeout})"
+                      )));
+                  }
+                  if timeout == 0 { 60 } else { timeout as u64 }
+              }
+              None => 60,
+          });
+          '''
+          if old not in s:
+              raise SystemExit('collector timeout block not found')
+          s = s.replace(old, new, 1)
+          old_assert = '''        assert_eq!(config.clients[0].password, "xray-auth-token");
+                  assert_eq!(config.clients[0].email.as_deref(), Some("hy@example.com"));
+          '''
+          new_assert = '''        assert_eq!(config.clients[0].password, "xray-auth-token");
+                  assert_eq!(config.clients[0].email.as_deref(), Some("hy@example.com"));
+                  assert_eq!(config.xray_udp_idle_timeout_secs, Some(60));
+          '''
+          if old_assert not in s:
+              raise SystemExit('collector auth assertions not found')
+          p.write_text(s.replace(old_assert, new_assert, 1))
+          PY
+          cargo fmt --all
+          rm .github/workflows/_codex_udp_default_once.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m "fix(hysteria2): preserve UDP idle default"
+          git push origin HEAD:codex/hysteria2-udp-idle-timeout
