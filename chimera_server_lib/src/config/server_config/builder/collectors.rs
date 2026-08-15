@@ -39,7 +39,9 @@ pub(super) fn collect_hysteria2_settings(
         #[serde(default)]
         version: Option<u8>,
         #[serde(default)]
-        clients: Vec<Hysteria2ClientSetting>,
+        users: Option<Vec<Hysteria2ClientSetting>>,
+        #[serde(default)]
+        clients: Option<Vec<Hysteria2ClientSetting>>,
         #[serde(default)]
         bandwidth: Option<Hysteria2BandwidthSetting>,
         #[serde(default)]
@@ -70,8 +72,13 @@ pub(super) fn collect_hysteria2_settings(
         Error::InvalidConfig(format!("failed to parse hysteria2 settings: {}", e))
     })?;
 
+    // Xray keeps both names for Hysteria2 inbound users. If `clients` is
+    // present it replaces `users`, including when it is an explicit empty
+    // array; otherwise the legacy `users` field is used.
     let clients = raw
         .clients
+        .or(raw.users)
+        .unwrap_or_default()
         .into_iter()
         .map(|client| {
             let password = client
@@ -1522,6 +1529,40 @@ mod tests {
         assert_eq!(config.clients[0].password, "xray-auth-token");
         assert_eq!(config.clients[0].email.as_deref(), Some("hy@example.com"));
         assert_eq!(config.xray_udp_idle_timeout_secs, Some(60));
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn collect_hysteria2_settings_accepts_xray_users_alias() {
+        let settings = SettingObject(serde_json::json!({
+            "users": [{
+                "auth": "legacy-xray-auth",
+                "email": "legacy@example.com"
+            }]
+        }));
+
+        let config = collect_hysteria2_settings(settings, None)
+            .expect("Xray users alias should be accepted");
+        assert_eq!(config.clients.len(), 1);
+        assert_eq!(config.clients[0].password, "legacy-xray-auth");
+        assert_eq!(
+            config.clients[0].email.as_deref(),
+            Some("legacy@example.com")
+        );
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn collect_hysteria2_settings_clients_override_xray_users() {
+        let settings = SettingObject(serde_json::json!({
+            "users": [{"auth": "legacy-xray-auth"}],
+            "clients": [{"auth": "current-xray-auth"}]
+        }));
+
+        let config = collect_hysteria2_settings(settings, None)
+            .expect("Xray clients should replace users when present");
+        assert_eq!(config.clients.len(), 1);
+        assert_eq!(config.clients[0].password, "current-xray-auth");
     }
 
     #[cfg(feature = "hysteria")]
