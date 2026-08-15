@@ -1620,6 +1620,9 @@ async fn xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2() {
                     },
                     "finalmask": {
                         "quicParams": {
+                            "congestion": "brutal",
+                            "brutalUp": "10 mbps",
+                            "brutalDown": "10 mbps",
                             "initStreamReceiveWindow": 32768,
                             "maxStreamReceiveWindow": 65536,
                             "initConnectionReceiveWindow": 131072,
@@ -1671,6 +1674,13 @@ async fn xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2() {
                     "hysteriaSettings": {
                         "version": 2,
                         "auth": HYSTERIA_AUTH
+                    },
+                    "finalmask": {
+                        "quicParams": {
+                            "congestion": "brutal",
+                            "brutalUp": "10 mbps",
+                            "brutalDown": "10 mbps"
+                        }
                     }
                 }
             }]
