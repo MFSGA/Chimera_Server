@@ -1,0 +1,28 @@
+name: Validate Hysteria2 netem exact gates
+
+on:
+  push:
+    branches:
+      - codex/validate-hy2-netem-47d13f
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: 47d13fec00c36a011a3dad015f655cb15c0a5415
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Format gate
+        run: cargo fmt --all -- --check
+      - name: Build gate
+        run: cargo build --all-features
+      - name: Clippy gate
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test gate
+        run: cargo test
+      - name: Locked dependency gate
+        run: cargo test --locked
