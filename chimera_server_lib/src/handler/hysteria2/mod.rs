@@ -99,7 +99,11 @@ pub async fn run_hysteria2_server(
                     }
                 };
 
-                match configured_congestion_mode(config.xray_congestion.as_deref()) {
+                match configured_congestion_mode(
+                    config.xray_compat,
+                    config.xray_congestion.as_deref(),
+                ) {
+                    CongestionMode::Cubic => {}
                     CongestionMode::Reno => {
                         transport.congestion_controller_factory(Arc::new(
                             NewRenoConfig::default(),
@@ -170,16 +174,22 @@ pub async fn run_hysteria2_server(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CongestionMode {
+    Cubic,
     Bbr,
     Reno,
     Brutal,
 }
 
-fn configured_congestion_mode(mode: Option<&str>) -> CongestionMode {
+fn configured_congestion_mode(
+    xray_compat: bool,
+    mode: Option<&str>,
+) -> CongestionMode {
     match mode {
         Some("reno") => CongestionMode::Reno,
         Some("") | Some("brutal") | Some("force-brutal") => CongestionMode::Brutal,
-        Some("bbr") | None => CongestionMode::Bbr,
+        Some("bbr") => CongestionMode::Bbr,
+        None if xray_compat => CongestionMode::Bbr,
+        None => CongestionMode::Cubic,
         Some(_) => unreachable!("validated Xray congestion mode"),
     }
 }
@@ -380,20 +390,30 @@ mod tests {
     }
 
     #[test]
-    fn congestion_mode_matches_xray_finalmask_selection() {
-        assert_eq!(configured_congestion_mode(None), CongestionMode::Bbr);
-        assert_eq!(configured_congestion_mode(Some("bbr")), CongestionMode::Bbr);
+    fn congestion_mode_matches_xray_and_shoes_defaults() {
         assert_eq!(
-            configured_congestion_mode(Some("reno")),
+            configured_congestion_mode(false, None),
+            CongestionMode::Cubic
+        );
+        assert_eq!(configured_congestion_mode(true, None), CongestionMode::Bbr);
+        assert_eq!(
+            configured_congestion_mode(true, Some("bbr")),
+            CongestionMode::Bbr
+        );
+        assert_eq!(
+            configured_congestion_mode(true, Some("reno")),
             CongestionMode::Reno
         );
-        assert_eq!(configured_congestion_mode(Some("")), CongestionMode::Brutal);
         assert_eq!(
-            configured_congestion_mode(Some("brutal")),
+            configured_congestion_mode(true, Some("")),
             CongestionMode::Brutal
         );
         assert_eq!(
-            configured_congestion_mode(Some("force-brutal")),
+            configured_congestion_mode(true, Some("brutal")),
+            CongestionMode::Brutal
+        );
+        assert_eq!(
+            configured_congestion_mode(true, Some("force-brutal")),
             CongestionMode::Brutal
         );
     }
