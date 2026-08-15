@@ -1,0 +1,284 @@
+name: Apply Brutal post-auth v2
+
+on:
+  push:
+    branches:
+      - codex/apply-brutal-post-auth-v2
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: "${{ github.event.head_commit.message == 'ci: apply Brutal post-auth v2' }}"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: perf/hysteria2-brutal-post-auth-v2
+          token: ${{ github.token }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+      - name: Apply controller transition
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('chimera_server_lib/src/handler/hysteria2/congestion.rs')
+          text = path.read_text()
+
+          replacements = [
+              (
+'''        Box::new(BrutalController {
+            tx_bps: self.tx_bps.clone(),
+            brutal: BrutalState::new(now, current_mtu),
+            bbr: Bbr::new(self.bbr_config.clone(), current_mtu),
+        })
+''',
+'''        Box::new(BrutalController {
+            tx_bps: self.tx_bps.clone(),
+            brutal: BrutalState::new(now, current_mtu),
+            bbr: Some(Bbr::new(self.bbr_config.clone(), current_mtu)),
+            brutal_active: false,
+        })
+'''
+              ),
+              (
+'''struct BrutalController {
+    tx_bps: Arc<AtomicU64>,
+    brutal: BrutalState,
+    bbr: Bbr,
+}
+
+impl BrutalController {
+    fn use_brutal(&self) -> bool {
+        self.tx_bps.load(Ordering::Relaxed) > 0
+    }
+}
+''',
+'''struct BrutalController {
+    tx_bps: Arc<AtomicU64>,
+    brutal: BrutalState,
+    bbr: Option<Bbr>,
+    brutal_active: bool,
+}
+
+impl BrutalController {
+    fn brutal_requested(&self) -> bool {
+        self.tx_bps.load(Ordering::Relaxed) > 0
+    }
+
+    fn use_brutal(&self) -> bool {
+        self.brutal_active || self.brutal_requested()
+    }
+
+    fn activate_brutal_if_configured(&mut self, now: Instant) {
+        if self.brutal_active || !self.brutal_requested() {
+            return;
+        }
+
+        // Xray replaces BBR with a fresh Brutal sender after authentication.
+        // Clear handshake-era ACK/loss samples at the same boundary, but keep
+        // the RTT already learned by QUIC so the first Brutal window does not
+        // fall back to an uninitialized estimate.
+        self.brutal.reset_samples(now);
+        self.bbr = None;
+        self.brutal_active = true;
+    }
+}
+'''
+              ),
+              (
+'''    fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
+        self.bbr.on_sent(now, bytes, last_packet_number);
+    }
+''',
+'''    fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
+        self.activate_brutal_if_configured(now);
+        if let Some(bbr) = self.bbr.as_mut() {
+            bbr.on_sent(now, bytes, last_packet_number);
+        }
+    }
+'''
+              ),
+              (
+'''        self.bbr.on_ack(now, sent, bytes, app_limited, rtt);
+        self.brutal.on_ack(now, rtt);
+''',
+'''        self.activate_brutal_if_configured(now);
+        if let Some(bbr) = self.bbr.as_mut() {
+            bbr.on_ack(now, sent, bytes, app_limited, rtt);
+        }
+        self.brutal.on_ack(now, rtt);
+'''
+              ),
+              (
+'''        self.bbr
+            .on_end_acks(now, in_flight, app_limited, largest_packet_num_acked);
+''',
+'''        self.activate_brutal_if_configured(now);
+        if let Some(bbr) = self.bbr.as_mut() {
+            bbr.on_end_acks(now, in_flight, app_limited, largest_packet_num_acked);
+        }
+'''
+              ),
+              (
+'''        self.bbr.on_congestion_event(
+            now,
+            sent,
+            is_persistent_congestion,
+            lost_bytes,
+        );
+        self.brutal.on_congestion_event(now, lost_bytes);
+''',
+'''        self.activate_brutal_if_configured(now);
+        if let Some(bbr) = self.bbr.as_mut() {
+            bbr.on_congestion_event(now, sent, is_persistent_congestion, lost_bytes);
+        }
+        self.brutal.on_congestion_event(now, lost_bytes);
+'''
+              ),
+              (
+'''    fn on_mtu_update(&mut self, new_mtu: u16) {
+        self.bbr.on_mtu_update(new_mtu);
+        self.brutal.on_mtu_update(new_mtu);
+    }
+''',
+'''    fn on_mtu_update(&mut self, new_mtu: u16) {
+        if let Some(bbr) = self.bbr.as_mut() {
+            bbr.on_mtu_update(new_mtu);
+        }
+        self.brutal.on_mtu_update(new_mtu);
+    }
+'''
+              ),
+              (
+'''        } else {
+            self.bbr.window()
+        }
+''',
+'''        } else if let Some(bbr) = self.bbr.as_ref() {
+            bbr.window()
+        } else {
+            self.brutal.initial_window()
+        }
+'''
+              ),
+              (
+'''        } else {
+            self.bbr.initial_window()
+        }
+''',
+'''        } else if let Some(bbr) = self.bbr.as_ref() {
+            bbr.initial_window()
+        } else {
+            self.brutal.initial_window()
+        }
+'''
+              ),
+              (
+'''    fn on_ack(&mut self, now: Instant, rtt: &RttEstimator) {
+        self.last_rtt = rtt.get();
+        self.record(now, 1, 0);
+    }
+''',
+'''    fn reset_samples(&mut self, now: Instant) {
+        self.start = now;
+        self.ack_rate = 1.0;
+        self.slots = [PacketInfo::default(); PACKET_INFO_SLOT_COUNT as usize];
+        self.last_debug_timestamp = 0;
+    }
+
+    fn on_ack(&mut self, now: Instant, rtt: &RttEstimator) {
+        self.last_rtt = rtt.get();
+        self.record(now, 1, 0);
+    }
+'''
+              ),
+          ]
+
+          for old, new in replacements:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'expected exactly one replacement, found {count}: {old[:80]!r}')
+              text = text.replace(old, new, 1)
+
+          marker = '''mod tests {
+    use super::*;
+
+'''
+          tests = '''mod tests {
+    use super::*;
+
+    fn controller(tx_bps: Arc<AtomicU64>, now: Instant) -> BrutalController {
+        BrutalController {
+            tx_bps,
+            brutal: BrutalState::new(now, 1200),
+            bbr: Some(Bbr::new(Arc::new(BbrConfig::default()), 1200)),
+            brutal_active: false,
+        }
+    }
+
+    #[test]
+    fn brutal_activation_drops_bbr_but_preserves_rtt() {
+        let tx_bps = Arc::new(AtomicU64::new(0));
+        let now = Instant::now();
+        let mut controller = controller(tx_bps.clone(), now);
+        controller.brutal.last_rtt = Duration::from_millis(80);
+        controller.brutal.ack_rate = MIN_ACK_RATE;
+        controller.brutal.slots[0] = PacketInfo {
+            timestamp: 1,
+            ack_count: 40,
+            loss_count: 10,
+        };
+
+        tx_bps.store(1_000_000, Ordering::Relaxed);
+        let activated_at = now + Duration::from_secs(2);
+        controller.activate_brutal_if_configured(activated_at);
+
+        assert!(controller.brutal_active);
+        assert!(controller.bbr.is_none());
+        assert_eq!(controller.brutal.start, activated_at);
+        assert_eq!(controller.brutal.last_rtt, Duration::from_millis(80));
+        assert_eq!(controller.brutal.ack_rate, 1.0);
+        assert!(controller.brutal.slots.iter().all(|slot| {
+            slot.ack_count == 0 && slot.loss_count == 0
+        }));
+        assert_eq!(controller.window(), 64_000);
+
+        controller.activate_brutal_if_configured(activated_at + Duration::from_secs(1));
+        assert_eq!(controller.brutal.start, activated_at);
+    }
+
+    #[test]
+    fn zero_brutal_bandwidth_keeps_bbr_fallback() {
+        let tx_bps = Arc::new(AtomicU64::new(0));
+        let now = Instant::now();
+        let mut controller = controller(tx_bps, now);
+
+        controller.activate_brutal_if_configured(now + Duration::from_secs(1));
+
+        assert!(!controller.brutal_active);
+        assert!(controller.bbr.is_some());
+    }
+
+'''
+          if text.count(marker) != 1:
+              raise SystemExit('test module marker mismatch')
+          text = text.replace(marker, tests, 1)
+          path.write_text(text)
+          PY
+          cargo fmt --all
+          cargo test -p chimera_server_lib brutal_
+          cargo fmt --all -- --check
+          test "$(git status --porcelain | awk '{print $2}')" = "chimera_server_lib/src/handler/hysteria2/congestion.rs"
+          git add chimera_server_lib/src/handler/hysteria2/congestion.rs
+          git diff --cached --check
+          git diff --cached --stat
+          git commit -m 'perf(hysteria2): stop BBR after Brutal activation'
+          git push origin HEAD:perf/hysteria2-brutal-post-auth-v2
