@@ -548,8 +548,6 @@ fn validate_auth_request(
         .to_str()
         .map_err(|_| AuthReject::Unauthorized("invalid auth header"))?;
 
-    let provided = provided.trim();
-
     let client = clients
         .iter()
         .find(|client| client.password == provided)
@@ -1334,6 +1332,21 @@ mod tests {
             auth_reject_status(&AuthReject::Unauthorized("bad auth")),
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[test]
+    fn auth_password_matches_xray_and_shoes_exactly() {
+        let clients = vec![Hysteria2Client {
+            password: " spaced-secret ".to_string(),
+            email: None,
+        }];
+
+        validate_auth_request(auth_request(" spaced-secret ", AUTH_URI), &clients)
+            .expect("exact Xray Hysteria auth should match");
+        assert!(matches!(
+            validate_auth_request(auth_request("spaced-secret", AUTH_URI), &clients),
+            Err(AuthReject::Unauthorized("password mismatch"))
+        ));
     }
 
     #[test]
