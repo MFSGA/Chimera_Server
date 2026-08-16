@@ -1067,7 +1067,12 @@ async fn drive_udp_datagrams(
                 received,
                 packet_len,
                 ..
-            } = session.fragments.pop(&packet_id).unwrap();
+            } = completed_fragment_packet(
+                &mut session.fragments,
+                packet_id,
+                auth_ctx.xray_compat,
+            )
+            .expect("completed hysteria2 fragment packet must be cached");
             let completed_location = fragment_completion_location(
                 remembered_location,
                 remote_location,
@@ -1241,6 +1246,7 @@ struct UdpResponseContext {
     client_location: NetLocation,
 }
 
+#[derive(Clone)]
 struct FragmentedPacket {
     fragment_count: u8,
     fragment_received: u8,
@@ -1265,6 +1271,20 @@ fn fragment_completion_location(
         current_location
     } else {
         remembered_location
+    }
+}
+
+fn completed_fragment_packet(
+    fragments: &mut LruCache<u16, FragmentedPacket>,
+    packet_id: u16,
+    xray_compat: bool,
+) -> Option<FragmentedPacket> {
+    // Xray's Defragger keeps completed state until a different packet ID or
+    // fragment count replaces it. Shoes removes completed packets immediately.
+    if xray_compat {
+        fragments.peek(&packet_id).cloned()
+    } else {
+        fragments.pop(&packet_id)
     }
 }
 
@@ -2031,6 +2051,41 @@ mod tests {
         assert!(
             shoes_cache.contains(&10),
             "shoes should retain older partial packets"
+        );
+    }
+
+    #[test]
+    fn completed_fragment_state_matches_xray_and_shoes_semantics() {
+        let completed_packet = FragmentedPacket {
+            fragment_count: 2,
+            fragment_received: 2,
+            packet_len: 2,
+            received: vec![
+                Some(Bytes::from_static(b"a")),
+                Some(Bytes::from_static(b"b")),
+            ],
+            remote_location: NetLocation::from_str("127.0.0.1:53", None)
+                .expect("valid fragment location"),
+        };
+
+        let mut xray_cache = hysteria2_fragment_cache();
+        xray_cache.put(7, completed_packet.clone());
+        let xray_completed = completed_fragment_packet(&mut xray_cache, 7, true)
+            .expect("Xray completed packet should be readable");
+        assert_eq!(xray_completed.packet_len, 2);
+        assert!(
+            xray_cache.contains(&7),
+            "Xray retains completed defragmentation state until another packet resets it"
+        );
+
+        let mut shoes_cache = hysteria2_fragment_cache();
+        shoes_cache.put(7, completed_packet);
+        let shoes_completed = completed_fragment_packet(&mut shoes_cache, 7, false)
+            .expect("shoes completed packet should be readable");
+        assert_eq!(shoes_completed.packet_len, 2);
+        assert!(
+            !shoes_cache.contains(&7),
+            "shoes removes a packet from its fragment cache after reassembly"
         );
     }
 
