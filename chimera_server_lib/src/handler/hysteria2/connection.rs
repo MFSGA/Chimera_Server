@@ -982,13 +982,20 @@ async fn drive_udp_datagrams(
             session.last_socket_addr = updated_addr;
         }
 
-        let complete_payload = if fragment_count == 0 {
-            warn!(
-                "Ignoring hysteria2 UDP packet {} with zero fragments",
-                session_id
-            );
-            continue;
-        } else if fragment_count == 1 {
+        let complete_payload = if fragment_count <= 1 {
+            // Xray's Defragger treats FragCount 0 and 1 as complete datagrams.
+            // Keep accepting the legacy zero value in Xray compatibility mode,
+            // while shoes/native mode retains shoes' stricter zero-fragment rejection.
+            if !accept_unfragmented_udp_datagram(
+                fragment_count,
+                auth_ctx.xray_compat,
+            ) {
+                warn!(
+                    "Ignoring hysteria2 UDP packet {} with zero fragments",
+                    session_id
+                );
+                continue;
+            }
             payload_fragment
         } else {
             if fragment_id as usize >= fragment_count as usize {
@@ -1416,6 +1423,10 @@ async fn run_udp_remote_to_local_loop(
         record_transfer(Some(traffic_context), 0, payload_len as u64);
         next_packet_id = next_packet_id.wrapping_add(1);
     }
+}
+
+fn accept_unfragmented_udp_datagram(fragment_count: u8, xray_compat: bool) -> bool {
+    fragment_count == 1 || (fragment_count == 0 && xray_compat)
 }
 
 fn udp_datagram_address_bounds(data: &[u8]) -> std::io::Result<(usize, usize)> {
@@ -1880,6 +1891,16 @@ mod tests {
             "oldest incomplete packet should be evicted"
         );
         assert!(cache.contains(&(MAX_FRAGMENT_CACHE_SIZE as u16)));
+    }
+
+    #[test]
+    fn zero_fragment_udp_datagrams_match_xray_and_shoes_semantics() {
+        assert!(accept_unfragmented_udp_datagram(0, true));
+        assert!(!accept_unfragmented_udp_datagram(0, false));
+        assert!(accept_unfragmented_udp_datagram(1, true));
+        assert!(accept_unfragmented_udp_datagram(1, false));
+        assert!(!accept_unfragmented_udp_datagram(2, true));
+        assert!(!accept_unfragmented_udp_datagram(2, false));
     }
 
     #[test]
