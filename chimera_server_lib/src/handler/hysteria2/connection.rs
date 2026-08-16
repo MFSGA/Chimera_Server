@@ -1514,6 +1514,9 @@ fn xray_parse_ranges(
     value: &str,
     size: usize,
 ) -> Result<Vec<XrayByteRange>, XrayRangeError> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
     let Some(value) = value.strip_prefix("bytes=") else {
         return Err(XrayRangeError::Invalid);
     };
@@ -3665,6 +3668,21 @@ mod tests {
             nonmatching_if_none_match_body.as_deref(),
             Some(&b"hello file"[..])
         );
+
+        let mut empty_range_headers = http::HeaderMap::new();
+        empty_range_headers
+            .insert(http::header::RANGE, http::HeaderValue::from_static(""));
+        let (empty_range_response, empty_range_body) =
+            xray_file_masquerade_response(
+                &get,
+                &file_uri,
+                &empty_range_headers,
+                &root_str,
+            )
+            .await
+            .expect("ignore empty Xray Range header");
+        assert_eq!(empty_range_response.status(), StatusCode::OK);
+        assert_eq!(empty_range_body.as_deref(), Some(&b"hello file"[..]));
 
         let mut range_headers = http::HeaderMap::new();
         range_headers.insert(
