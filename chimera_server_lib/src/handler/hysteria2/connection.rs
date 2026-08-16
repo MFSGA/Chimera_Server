@@ -96,11 +96,10 @@ pub async fn process_hysteria2_connection(
     debug!("hysteria2 QUIC established");
     debug!("hysteria2 H3 driver created");
 
-    let auth_ctx = match await_authentication(auth_hysteria2_connection(
-        &mut h3_conn,
-        config.as_ref(),
-        tx_bps.clone(),
-    ))
+    let auth_ctx = match await_authentication(
+        auth_hysteria2_connection(&mut h3_conn, config.as_ref(), tx_bps.clone()),
+        config.xray_compat,
+    )
     .await
     {
         Ok(auth_ctx) => auth_ctx,
@@ -163,13 +162,25 @@ pub async fn process_hysteria2_connection(
     }
 }
 
-async fn await_authentication<F, T>(future: F) -> std::io::Result<T>
+fn configured_auth_timeout(xray_compat: bool) -> Option<Duration> {
+    (!xray_compat).then_some(AUTH_TIMEOUT)
+}
+
+async fn await_authentication<F, T>(
+    future: F,
+    xray_compat: bool,
+) -> std::io::Result<T>
 where
     F: Future<Output = std::io::Result<T>>,
 {
-    tokio::time::timeout(AUTH_TIMEOUT, future)
-        .await
-        .map_err(|_| Error::new(ErrorKind::TimedOut, "authentication timeout"))?
+    match configured_auth_timeout(xray_compat) {
+        Some(timeout) => {
+            tokio::time::timeout(timeout, future).await.map_err(|_| {
+                Error::new(ErrorKind::TimedOut, "authentication timeout")
+            })?
+        }
+        None => future.await,
+    }
 }
 
 async fn auth_hysteria2_connection(
@@ -1545,12 +1556,18 @@ mod tests {
             .expect("valid Hysteria2 auth request")
     }
 
+    #[test]
+    fn auth_timeout_matches_xray_and_shoes() {
+        assert_eq!(configured_auth_timeout(false), Some(AUTH_TIMEOUT));
+        assert_eq!(configured_auth_timeout(true), None);
+    }
+
     #[tokio::test]
     async fn authentication_times_out_after_shoes_window() {
         let started = Instant::now();
-        let err = await_authentication(pending::<std::io::Result<()>>())
+        let err = await_authentication(pending::<std::io::Result<()>>(), false)
             .await
-            .expect_err("pending Hysteria2 auth must time out");
+            .expect_err("pending shoes Hysteria2 auth must time out");
 
         assert_eq!(err.kind(), ErrorKind::TimedOut);
         assert!(started.elapsed() >= AUTH_TIMEOUT);
