@@ -900,20 +900,13 @@ async fn xray_file_masquerade_response(
 
     let metadata = tokio::fs::metadata(&path).await?;
     let modified = metadata.modified().ok();
-    let last_modified = modified.map(httpdate::fmt_http_date);
-    if matches!(*method, http::Method::GET | http::Method::HEAD)
-        && request_headers.get(http::header::IF_NONE_MATCH).is_none()
-        && let Some(value) = request_headers.get(http::header::IF_MODIFIED_SINCE)
-        && let Ok(value) = value.to_str()
-        && let Ok(since) = httpdate::parse_http_date(value)
-        && let Some(modified) = modified
-        && modified
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .zip(since.duration_since(std::time::UNIX_EPOCH).ok())
-            .is_some_and(|(modified, since)| modified.as_secs() <= since.as_secs())
+    let last_modified = modified
+        .filter(|modified| !xray_is_zero_modtime(*modified))
+        .map(httpdate::fmt_http_date);
+    if let Some(status) =
+        xray_file_precondition_status(method, request_headers, modified)
     {
-        let mut response = Response::builder().status(StatusCode::NOT_MODIFIED);
+        let mut response = Response::builder().status(status);
         if let Some(last_modified) = last_modified.as_deref() {
             response = response.header(http::header::LAST_MODIFIED, last_modified);
         }
@@ -985,6 +978,129 @@ async fn xray_file_masquerade_response(
     }
     let response = response.body(()).map_err(Error::other)?;
     Ok((response, Some(response_body)))
+}
+
+fn xray_file_precondition_status(
+    method: &http::Method,
+    request_headers: &http::HeaderMap,
+    modified: Option<std::time::SystemTime>,
+) -> Option<StatusCode> {
+    let if_match = request_headers
+        .get(http::header::IF_MATCH)
+        .filter(|value| !value.as_bytes().is_empty());
+    if let Some(if_match) = if_match {
+        // Xray's FileServer does not set ETag, so only If-Match: * can match.
+        if !xray_etag_list_has_wildcard(if_match.as_bytes()) {
+            return Some(StatusCode::PRECONDITION_FAILED);
+        }
+    } else if let Some(value) = request_headers
+        .get(http::header::IF_UNMODIFIED_SINCE)
+        .and_then(|value| value.to_str().ok())
+        && let Ok(since) = httpdate::parse_http_date(value)
+        && let Some(modified) = modified
+        && !xray_is_zero_modtime(modified)
+        && !xray_modified_not_after(modified, since)
+    {
+        return Some(StatusCode::PRECONDITION_FAILED);
+    }
+
+    let if_none_match = request_headers
+        .get(http::header::IF_NONE_MATCH)
+        .filter(|value| !value.as_bytes().is_empty());
+    if let Some(if_none_match) = if_none_match {
+        // With no server ETag, only the wildcard matches the existing file.
+        if xray_etag_list_has_wildcard(if_none_match.as_bytes()) {
+            return Some(
+                if matches!(*method, http::Method::GET | http::Method::HEAD) {
+                    StatusCode::NOT_MODIFIED
+                } else {
+                    StatusCode::PRECONDITION_FAILED
+                },
+            );
+        }
+    } else if matches!(*method, http::Method::GET | http::Method::HEAD)
+        && let Some(value) = request_headers
+            .get(http::header::IF_MODIFIED_SINCE)
+            .and_then(|value| value.to_str().ok())
+        && let Ok(since) = httpdate::parse_http_date(value)
+        && let Some(modified) = modified
+        && !xray_is_zero_modtime(modified)
+        && xray_modified_not_after(modified, since)
+    {
+        return Some(StatusCode::NOT_MODIFIED);
+    }
+
+    None
+}
+
+fn xray_is_zero_modtime(modified: std::time::SystemTime) -> bool {
+    modified == std::time::UNIX_EPOCH
+}
+
+fn xray_system_time_seconds(time: std::time::SystemTime) -> i128 {
+    match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs() as i128,
+        Err(err) => {
+            let duration = err.duration();
+            let seconds = duration.as_secs() as i128;
+            if duration.subsec_nanos() == 0 {
+                -seconds
+            } else {
+                -seconds - 1
+            }
+        }
+    }
+}
+
+fn xray_modified_not_after(
+    modified: std::time::SystemTime,
+    validator: std::time::SystemTime,
+) -> bool {
+    xray_system_time_seconds(modified) <= xray_system_time_seconds(validator)
+}
+
+fn xray_etag_list_has_wildcard(mut value: &[u8]) -> bool {
+    loop {
+        while value
+            .first()
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            value = &value[1..];
+        }
+        if value.is_empty() {
+            return false;
+        }
+        if value[0] == b',' {
+            value = &value[1..];
+            continue;
+        }
+        if value[0] == b'*' {
+            return true;
+        }
+
+        let quote = if value.starts_with(b"W/\"") {
+            2
+        } else if value.starts_with(b"\"") {
+            0
+        } else {
+            return false;
+        };
+        let mut end = None;
+        for (index, byte) in value.iter().copied().enumerate().skip(quote + 1) {
+            match byte {
+                b'!' | b'#'..=b'~' | 0x80..=0xff => {}
+                b'"' => {
+                    end = Some(index + 1);
+                    break;
+                }
+                _ => return false,
+            }
+        }
+        let Some(end) = end else {
+            return false;
+        };
+        value = &value[end..];
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2546,6 +2662,122 @@ mod tests {
                 .is_none()
         );
         assert!(not_modified_body.is_none());
+
+        let mut if_match_headers = http::HeaderMap::new();
+        if_match_headers.insert(
+            http::header::IF_MATCH,
+            http::HeaderValue::from_static("\"missing-etag\""),
+        );
+        if_match_headers.insert(
+            http::header::RANGE,
+            http::HeaderValue::from_static("bytes=0-1"),
+        );
+        let (if_match_response, if_match_body) = xray_file_masquerade_response(
+            &get,
+            &file_uri,
+            &if_match_headers,
+            &root_str,
+        )
+        .await
+        .expect("reject unmatched Xray If-Match before Range");
+        assert_eq!(if_match_response.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            if_match_response.headers().get(http::header::LAST_MODIFIED),
+            Some(&last_modified)
+        );
+        assert!(
+            if_match_response
+                .headers()
+                .get(http::header::CONTENT_RANGE)
+                .is_none()
+        );
+        assert!(if_match_body.is_none());
+
+        let mut if_unmodified_headers = http::HeaderMap::new();
+        if_unmodified_headers.insert(
+            http::header::IF_UNMODIFIED_SINCE,
+            http::HeaderValue::from_static("Thu, 01 Jan 1970 00:00:01 GMT"),
+        );
+        let (if_unmodified_response, _) = xray_file_masquerade_response(
+            &get,
+            &file_uri,
+            &if_unmodified_headers,
+            &root_str,
+        )
+        .await
+        .expect("reject stale Xray If-Unmodified-Since");
+        assert_eq!(
+            if_unmodified_response.status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+
+        if_unmodified_headers
+            .insert(http::header::IF_MATCH, http::HeaderValue::from_static("*"));
+        let (if_match_star_response, if_match_star_body) =
+            xray_file_masquerade_response(
+                &get,
+                &file_uri,
+                &if_unmodified_headers,
+                &root_str,
+            )
+            .await
+            .expect("Xray If-Match should take precedence over If-Unmodified-Since");
+        assert_eq!(if_match_star_response.status(), StatusCode::OK);
+        assert_eq!(if_match_star_body.as_deref(), Some(&b"hello file"[..]));
+
+        let mut if_none_match_headers = http::HeaderMap::new();
+        if_none_match_headers.insert(
+            http::header::IF_NONE_MATCH,
+            http::HeaderValue::from_static("*"),
+        );
+        let (if_none_match_response, if_none_match_body) =
+            xray_file_masquerade_response(
+                &get,
+                &file_uri,
+                &if_none_match_headers,
+                &root_str,
+            )
+            .await
+            .expect("honor Xray If-None-Match wildcard");
+        assert_eq!(if_none_match_response.status(), StatusCode::NOT_MODIFIED);
+        assert!(if_none_match_body.is_none());
+
+        let post = http::Method::POST;
+        let (post_if_none_match_response, post_if_none_match_body) =
+            xray_file_masquerade_response(
+                &post,
+                &file_uri,
+                &if_none_match_headers,
+                &root_str,
+            )
+            .await
+            .expect("reject matching Xray If-None-Match on non-GET request");
+        assert_eq!(
+            post_if_none_match_response.status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+        assert!(post_if_none_match_body.is_none());
+
+        if_none_match_headers.insert(
+            http::header::IF_NONE_MATCH,
+            http::HeaderValue::from_static("\"missing-etag\""),
+        );
+        if_none_match_headers
+            .insert(http::header::IF_MODIFIED_SINCE, last_modified.clone());
+        let (nonmatching_if_none_match_response, nonmatching_if_none_match_body) =
+            xray_file_masquerade_response(
+                &get,
+                &file_uri,
+                &if_none_match_headers,
+                &root_str,
+            )
+            .await
+            .expect("Xray If-None-Match presence should suppress If-Modified-Since");
+        assert_eq!(nonmatching_if_none_match_response.status(), StatusCode::OK);
+        assert_eq!(
+            nonmatching_if_none_match_body.as_deref(),
+            Some(&b"hello file"[..])
+        );
 
         let mut range_headers = http::HeaderMap::new();
         range_headers.insert(
