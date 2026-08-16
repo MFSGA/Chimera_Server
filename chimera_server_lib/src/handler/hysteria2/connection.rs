@@ -588,7 +588,7 @@ fn validate_auth_request(
         req.method() == http::Method::POST
             && req.uri().authority().map(|authority| authority.as_str())
                 == Some("hysteria")
-            && req.uri().path() == "/auth"
+            && xray_auth_path_matches(req.uri().path())
     } else {
         req.method() == http::Method::POST && req.uri() == AUTH_URI
     };
@@ -625,6 +625,49 @@ fn validate_auth_request(
         client_rx_limit,
         vless_route,
     })
+}
+
+fn xray_auth_path_matches(path: &str) -> bool {
+    const AUTH_PATH: &[u8] = b"/auth";
+    let raw = path.as_bytes();
+    let mut raw_index = 0usize;
+    let mut decoded_index = 0usize;
+
+    while raw_index < raw.len() {
+        let byte = if raw[raw_index] == b'%' {
+            if raw_index + 2 >= raw.len() {
+                return false;
+            }
+            let Some(high) = hex_nibble(raw[raw_index + 1]) else {
+                return false;
+            };
+            let Some(low) = hex_nibble(raw[raw_index + 2]) else {
+                return false;
+            };
+            raw_index += 3;
+            (high << 4) | low
+        } else {
+            let byte = raw[raw_index];
+            raw_index += 1;
+            byte
+        };
+
+        if AUTH_PATH.get(decoded_index).copied() != Some(byte) {
+            return false;
+        }
+        decoded_index += 1;
+    }
+
+    decoded_index == AUTH_PATH.len()
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn match_hysteria_auth(
@@ -2032,7 +2075,7 @@ mod tests {
     }
 
     #[test]
-    fn xray_auth_uri_matches_exact_authority_and_ignores_query() {
+    fn xray_auth_uri_matches_decoded_path_exact_authority_and_ignores_query() {
         let clients = vec![Hysteria2Client {
             password: "secret".to_string(),
             email: None,
@@ -2041,11 +2084,25 @@ mod tests {
         }];
         let query_uri = "https://hysteria/auth?extra=1";
 
-        validate_auth_request(auth_request("secret", query_uri), &clients, true)
-            .expect("Xray matches Hysteria auth by authority and path");
+        for uri in [
+            query_uri,
+            "https://hysteria/%61uth",
+            "https://hysteria/a%75th",
+        ] {
+            validate_auth_request(auth_request("secret", uri), &clients, true)
+                .expect("Xray matches Hysteria auth against Go's decoded URL.Path");
+        }
         assert!(matches!(
             validate_auth_request(
                 auth_request("secret", query_uri),
+                &clients,
+                false,
+            ),
+            Err(AuthReject::NotAuthRequest)
+        ));
+        assert!(matches!(
+            validate_auth_request(
+                auth_request("secret", "https://hysteria/%61uth"),
                 &clients,
                 false,
             ),
@@ -2059,6 +2116,12 @@ mod tests {
             ),
             Err(AuthReject::NotAuthRequest)
         ));
+        for path in ["/Auth", "/%2Fauth", "/auth%2F", "/%zzuth", "/aut%"] {
+            assert!(
+                !xray_auth_path_matches(path),
+                "unexpected Xray auth path: {path}"
+            );
+        }
     }
 
     #[tokio::test]
