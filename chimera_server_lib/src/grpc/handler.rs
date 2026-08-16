@@ -1766,7 +1766,8 @@ impl HandlerServiceImpl {
                 config
                     .clients
                     .iter()
-                    .filter_map(|client| client.email.clone())
+                    .filter(|client| !client.xray_transport_auth_fallback)
+                    .map(|client| client.email.clone().unwrap_or_default())
                     .collect(),
             ),
             #[cfg(feature = "tuic")]
@@ -1830,6 +1831,21 @@ impl HandlerServiceImpl {
             #[cfg(feature = "shadowsocks")]
             ServerProxyConfig::Shadowsocks { .. } => None,
             ServerProxyConfig::DokodemoDoor { .. } => None,
+        }
+    }
+
+    fn select_user_manager_users(
+        users: Vec<proto::xray::common::protocol::User>,
+        email: &str,
+    ) -> Vec<proto::xray::common::protocol::User> {
+        if email.is_empty() {
+            users
+        } else {
+            users
+                .into_iter()
+                .find(|user| user.email == email)
+                .into_iter()
+                .collect()
         }
     }
 
@@ -1910,23 +1926,17 @@ impl HandlerServiceImpl {
                 config
                     .clients
                     .iter()
-                    .filter_map(|client| {
-                        client.email.clone().map(|email| {
-                            proto::xray::common::protocol::User {
-                                level: 0,
-                                email,
-                                account: Some(
-                                    proto::xray::common::serial::TypedMessage {
-                                        r#type: TYPE_PROXY_HYSTERIA_ACCOUNT
-                                            .to_string(),
-                                        value: HysteriaAccountPayload {
-                                            auth: client.password.clone(),
-                                        }
-                                        .encode_to_vec(),
-                                    },
-                                ),
+                    .filter(|client| !client.xray_transport_auth_fallback)
+                    .map(|client| proto::xray::common::protocol::User {
+                        level: 0,
+                        email: client.email.clone().unwrap_or_default(),
+                        account: Some(proto::xray::common::serial::TypedMessage {
+                            r#type: TYPE_PROXY_HYSTERIA_ACCOUNT.to_string(),
+                            value: HysteriaAccountPayload {
+                                auth: client.password.clone(),
                             }
-                        })
+                            .encode_to_vec(),
+                        }),
                     })
                     .collect(),
             ),
@@ -2166,15 +2176,10 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
             .inbound_by_tag(&request.tag)
             .ok_or_else(|| Status::not_found("inbound not found"))?;
 
-        let mut users = self
+        let users = self
             .get_user_manager_users(&inbound.protocol)
-            .ok_or_else(|| Status::unknown(ERR_PROXY_NOT_USER_MANAGER))?
-            .into_iter()
-            .collect::<Vec<_>>();
-
-        if !request.email.is_empty() {
-            users.retain(|user| user.email == request.email);
-        }
+            .ok_or_else(|| Status::unknown(ERR_PROXY_NOT_USER_MANAGER))?;
+        let users = Self::select_user_manager_users(users, &request.email);
 
         Ok(Response::new(
             proto::xray::app::proxyman::command::GetInboundUserResponse { users },
@@ -3942,6 +3947,62 @@ mod tests {
             !users_after_remove
                 .iter()
                 .any(|candidate| candidate == &email)
+        );
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn hysteria_user_reads_include_empty_email_and_select_one_duplicate() {
+        let service =
+            HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+        let config: Hysteria2ServerConfig =
+            serde_json::from_value(serde_json::json!({
+                "clients": [
+                    {
+                        "password": "transport-fallback",
+                        "email": null,
+                        "xray_transport_auth_fallback": true
+                    },
+                    {"password": "empty-email-auth", "email": null},
+                    {"password": "auth-a", "email": "shared@example.com"},
+                    {"password": "auth-b", "email": "shared@example.com"}
+                ],
+                "xrayCompat": true
+            }))
+            .expect("valid Hysteria2 user-manager config");
+        let protocol = ServerProxyConfig::Hysteria2 { config };
+
+        let users = service
+            .get_user_manager_users(&protocol)
+            .expect("Hysteria2 should expose a user manager");
+        assert_eq!(users.len(), 3, "transport fallback must stay hidden");
+        assert!(
+            users.iter().any(|user| user.email.is_empty()),
+            "Xray GetUsers includes validators whose email is empty"
+        );
+        assert_eq!(
+            users
+                .iter()
+                .filter(|user| user.email == "shared@example.com")
+                .count(),
+            2,
+            "duplicate emails remain distinct auth-keyed users"
+        );
+
+        let identities = service
+            .get_user_manager_identities(&protocol)
+            .expect("Hysteria2 should expose a user count");
+        assert_eq!(identities.len(), 3);
+        assert!(identities.iter().any(String::is_empty));
+
+        let selected = HandlerServiceImpl::select_user_manager_users(
+            users,
+            "shared@example.com",
+        );
+        assert_eq!(
+            selected.len(),
+            1,
+            "Xray email-specific GetInboundUsers returns one GetUser result"
         );
     }
 
