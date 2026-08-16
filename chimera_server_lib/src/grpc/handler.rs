@@ -1514,15 +1514,16 @@ impl HandlerServiceImpl {
             #[cfg(feature = "hysteria")]
             ServerProxyConfig::Hysteria2 { config } => {
                 let client = self.parse_hysteria_client(user)?;
-                if let Some(existing) = config
-                    .clients
-                    .iter_mut()
-                    .find(|existing| existing.email == client.email)
-                {
-                    existing.password = client.password;
-                } else {
-                    config.clients.push(client);
-                }
+                // Xray's Hysteria validator is keyed by raw auth, not email.
+                // Re-adding the same auth replaces that entry, while multiple
+                // auth values with the same email are allowed to coexist. Move
+                // replacements to the end so UUID masked-ID lookup remains
+                // last-write-wins like Xray's secondary ID map.
+                config.clients.retain(|existing| {
+                    existing.xray_transport_auth_fallback
+                        || existing.password != client.password
+                });
+                config.clients.push(client);
                 Ok(true)
             }
             ServerProxyConfig::Socks { accounts, .. } => {
@@ -1613,11 +1614,17 @@ impl HandlerServiceImpl {
             }
             #[cfg(feature = "hysteria")]
             ServerProxyConfig::Hysteria2 { config } => {
-                let before = config.clients.len();
-                config
+                let Some(index) = config
                     .clients
-                    .retain(|client| client.email.as_deref() != Some(email));
-                Ok(before != config.clients.len())
+                    .iter()
+                    .position(|client| client.email.as_deref() == Some(email))
+                else {
+                    return Ok(false);
+                };
+                // Xray DelByEmail resolves one matching user and deletes only
+                // that user's auth key; duplicate emails are not bulk-removed.
+                config.clients.remove(index);
+                Ok(true)
             }
             ServerProxyConfig::Socks { accounts, .. } => Ok(accounts.remove(email)),
             #[cfg(feature = "ws")]
@@ -3934,6 +3941,132 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate == &email)
         );
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn hysteria_user_mutations_match_xray_auth_key_semantics() {
+        let service =
+            HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+        let mut protocol = ServerProxyConfig::Hysteria2 {
+            config: Hysteria2ServerConfig {
+                clients: vec![Hysteria2Client {
+                    password: "transport-fallback".to_string(),
+                    email: None,
+                    xray_uuid_route: false,
+                    xray_transport_auth_fallback: true,
+                }],
+                bandwidth: Hysteria2BandwidthConfig::default(),
+                ignore_client_bandwidth: false,
+                udp_enabled: true,
+                xray_compat: true,
+                xray_congestion: None,
+                xray_bbr_profile: None,
+                xray_brutal_up: None,
+                xray_brutal_down: None,
+                xray_max_idle_timeout_secs: None,
+                xray_udp_idle_timeout_secs: None,
+                xray_max_incoming_streams: None,
+                xray_init_stream_receive_window: None,
+                xray_max_stream_receive_window: None,
+                xray_init_connection_receive_window: None,
+                xray_max_connection_receive_window: None,
+                xray_disable_path_mtu_discovery: None,
+            },
+        };
+        let user = |email: &str, auth: &str| proto::xray::common::protocol::User {
+            level: 0,
+            email: email.to_string(),
+            account: Some(proto::xray::common::serial::TypedMessage {
+                r#type: TYPE_PROXY_HYSTERIA_ACCOUNT.to_string(),
+                value: HysteriaAccountPayload {
+                    auth: auth.to_string(),
+                }
+                .encode_to_vec(),
+            }),
+        };
+
+        service
+            .apply_add_user_to_protocol(
+                &mut protocol,
+                &user("shared@example.com", "auth-a"),
+            )
+            .expect("add first duplicate-email user");
+        service
+            .apply_add_user_to_protocol(
+                &mut protocol,
+                &user("shared@example.com", "auth-b"),
+            )
+            .expect("add second duplicate-email user");
+
+        let ServerProxyConfig::Hysteria2 { config } = &protocol else {
+            unreachable!("test protocol is hysteria2");
+        };
+        assert_eq!(
+            config
+                .clients
+                .iter()
+                .filter(
+                    |client| client.email.as_deref() == Some("shared@example.com")
+                )
+                .count(),
+            2,
+            "Xray allows different auth keys to share one email"
+        );
+        assert!(
+            config
+                .clients
+                .iter()
+                .any(|client| client.xray_transport_auth_fallback),
+            "dynamic user updates must preserve transport fallback"
+        );
+
+        assert!(
+            service
+                .apply_remove_user_from_protocol(&mut protocol, "shared@example.com")
+                .expect("remove one duplicate-email user")
+        );
+        let ServerProxyConfig::Hysteria2 { config } = &protocol else {
+            unreachable!("test protocol is hysteria2");
+        };
+        assert_eq!(
+            config
+                .clients
+                .iter()
+                .filter(
+                    |client| client.email.as_deref() == Some("shared@example.com")
+                )
+                .count(),
+            1,
+            "Xray DelByEmail removes one matching auth entry, not all"
+        );
+
+        service
+            .apply_add_user_to_protocol(
+                &mut protocol,
+                &user("replacement@example.com", "auth-b"),
+            )
+            .expect("replace existing auth key");
+        let ServerProxyConfig::Hysteria2 { config } = &protocol else {
+            unreachable!("test protocol is hysteria2");
+        };
+        assert_eq!(
+            config
+                .clients
+                .iter()
+                .filter(|client| !client.xray_transport_auth_fallback)
+                .count(),
+            1,
+            "re-adding the same auth must replace its prior validator entry"
+        );
+        let auth_b = config
+            .clients
+            .iter()
+            .find(|client| {
+                client.password == "auth-b" && !client.xray_transport_auth_fallback
+            })
+            .expect("replacement auth should remain");
+        assert_eq!(auth_b.email.as_deref(), Some("replacement@example.com"));
     }
 
     #[cfg(feature = "hysteria")]
