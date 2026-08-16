@@ -1036,6 +1036,15 @@ fn xray_proxy_connection_header(
         })
 }
 
+fn xray_proxy_bad_gateway_response() -> std::io::Result<(Response<()>, Option<Bytes>)>
+{
+    let response = Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .body(())
+        .map_err(Error::other)?;
+    Ok((response, None))
+}
+
 async fn xray_proxy_masquerade_response(
     method: &http::Method,
     uri: &http::Uri,
@@ -1043,7 +1052,13 @@ async fn xray_proxy_masquerade_response(
     body: Bytes,
     masquerade: &crate::config::server_config::Hysteria2MasqueradeProxyConfig,
 ) -> std::io::Result<(Response<()>, Option<Bytes>)> {
-    let target = xray_proxy_target_url(&masquerade.url, uri)?;
+    let target = match xray_proxy_target_url(&masquerade.url, uri) {
+        Ok(target) => target,
+        Err(err) => {
+            debug!(error = %err, url = %masquerade.url, "Xray proxy masquerade target cannot be forwarded");
+            return xray_proxy_bad_gateway_response();
+        }
+    };
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .tls_danger_accept_invalid_certs(masquerade.insecure)
@@ -1076,11 +1091,7 @@ async fn xray_proxy_masquerade_response(
         Ok(response) => response,
         Err(err) => {
             debug!(error = %err, url = %masquerade.url, "Xray proxy masquerade upstream request failed");
-            let response = Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(())
-                .map_err(Error::other)?;
-            return Ok((response, None));
+            return xray_proxy_bad_gateway_response();
         }
     };
     let status = upstream.status();
@@ -2998,6 +3009,31 @@ mod tests {
         assert!(!request_lower.contains("\r\nx-forwarded-proto:"));
         assert!(!request_lower.contains("\r\nauthorization:"));
         assert!(request.ends_with("\r\npayload"));
+    }
+
+    #[tokio::test]
+    async fn xray_proxy_masquerade_returns_bad_gateway_for_relative_target() {
+        let uri: http::Uri = "https://original.test/path?q=2"
+            .parse()
+            .expect("valid proxy request URI");
+        let config = Hysteria2MasqueradeProxyConfig {
+            url: "/relative-upstream".to_string(),
+            rewrite_host: false,
+            insecure: false,
+        };
+
+        let (response, body) = xray_proxy_masquerade_response(
+            &http::Method::GET,
+            &uri,
+            &http::HeaderMap::new(),
+            Bytes::new(),
+            &config,
+        )
+        .await
+        .expect("relative Xray proxy target should become a gateway failure");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(body.is_none());
     }
 
     #[tokio::test]
