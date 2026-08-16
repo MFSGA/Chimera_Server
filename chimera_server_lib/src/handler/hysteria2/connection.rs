@@ -1067,16 +1067,21 @@ async fn drive_udp_datagrams(
                 packet_len,
                 ..
             } = session.fragments.pop(&packet_id).unwrap();
+            let completed_location = fragment_completion_location(
+                remembered_location,
+                remote_location,
+                auth_ctx.xray_compat,
+            );
 
             let mut assembled = BytesMut::with_capacity(packet_len);
             for bytes in received.into_iter().flatten() {
                 assembled.extend_from_slice(&bytes);
             }
 
-            if remembered_location != session.last_location {
+            if completed_location != session.last_location {
                 let updated_addr = match resolve_single_address(
                     &resolver,
-                    &remembered_location,
+                    &completed_location,
                 )
                 .await
                 {
@@ -1084,12 +1089,12 @@ async fn drive_udp_datagrams(
                     Err(err) => {
                         warn!(
                             "Failed to resolve fragmented hysteria2 UDP destination {}: {}",
-                            remembered_location, err
+                            completed_location, err
                         );
                         continue;
                     }
                 };
-                session.last_location = remembered_location;
+                session.last_location = completed_location;
                 session.last_socket_addr = updated_addr;
             }
 
@@ -1245,6 +1250,21 @@ struct FragmentedPacket {
 
 fn hysteria2_fragment_cache() -> LruCache<u16, FragmentedPacket> {
     LruCache::new(NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap())
+}
+
+fn fragment_completion_location(
+    remembered_location: NetLocation,
+    current_location: NetLocation,
+    xray_compat: bool,
+) -> NetLocation {
+    // Xray's Defragger returns the fragment that completes the packet after
+    // replacing only its Data field, so the completed message keeps that
+    // fragment's address. Shoes explicitly retains the first fragment's address.
+    if xray_compat {
+        current_location
+    } else {
+        remembered_location
+    }
 }
 
 fn handle_duplicate_fragment(
@@ -2025,6 +2045,25 @@ mod tests {
         assert!(
             !shoes_cache.contains(&7),
             "shoes should discard partial state after a duplicate fragment"
+        );
+    }
+
+    #[test]
+    fn fragment_completion_address_matches_xray_and_shoes_semantics() {
+        let first = NetLocation::from_str("127.0.0.1:53", None)
+            .expect("valid first fragment location");
+        let completing = NetLocation::from_str("127.0.0.1:5353", None)
+            .expect("valid completing fragment location");
+
+        assert_eq!(
+            fragment_completion_location(first.clone(), completing.clone(), true),
+            completing,
+            "Xray keeps the address of the fragment that completes reassembly"
+        );
+        assert_eq!(
+            fragment_completion_location(first.clone(), completing, false),
+            first,
+            "shoes keeps the first fragment address for the reassembled packet"
         );
     }
 
