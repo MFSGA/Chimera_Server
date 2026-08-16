@@ -16,7 +16,8 @@ use super::super::types::TuicServerConfig;
 #[cfg(feature = "hysteria")]
 use super::super::types::{
     Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2MasqueradeFileConfig,
-    Hysteria2MasqueradeStringConfig, Hysteria2ServerConfig,
+    Hysteria2MasqueradeProxyConfig, Hysteria2MasqueradeStringConfig,
+    Hysteria2ServerConfig,
 };
 use super::super::types::{
     RangeConfig, SocksUser, SocksUserStore, XhttpDataPlacement, XhttpMode,
@@ -190,10 +191,10 @@ pub(super) fn collect_hysteria2_settings(
 
         if xray_compat && let Some(masquerade) = &hysteria_settings.masquerade {
             match masquerade.kind.to_ascii_lowercase().as_str() {
-                "" | "404" | "file" | "string" => {}
+                "" | "404" | "file" | "proxy" | "string" => {}
                 kind => {
                     return Err(Error::InvalidConfig(format!(
-                        "hysteriaSettings.masquerade.type {kind:?} is not supported; Chimera currently supports Xray 404, file, and string masquerades"
+                        "hysteriaSettings.masquerade.type {kind:?} is not supported; Chimera currently supports Xray 404, file, proxy, and string masquerades"
                     )));
                 }
             }
@@ -254,6 +255,19 @@ pub(super) fn collect_hysteria2_settings(
         None
     };
 
+    let xray_masquerade_proxy = if xray_compat {
+        hysteria_settings
+            .and_then(|settings| settings.masquerade.as_ref())
+            .filter(|masquerade| masquerade.kind.eq_ignore_ascii_case("proxy"))
+            .map(|masquerade| Hysteria2MasqueradeProxyConfig {
+                url: masquerade.url.clone(),
+                rewrite_host: masquerade.rewrite_host,
+                insecure: masquerade.insecure,
+            })
+    } else {
+        None
+    };
+
     let xray_masquerade_string = if xray_compat {
         hysteria_settings
             .and_then(|settings| settings.masquerade.as_ref())
@@ -288,6 +302,7 @@ pub(super) fn collect_hysteria2_settings(
         xray_compat,
         xray_masquerade_string,
         xray_masquerade_file,
+        xray_masquerade_proxy,
         xray_congestion: None,
         xray_bbr_profile: None,
         xray_brutal_up: None,
@@ -1738,21 +1753,40 @@ mod tests {
         );
         assert_eq!(masquerade.status_code, 201);
 
-        for kind in ["proxy", "unknown"] {
-            let stream_settings =
-                serde_json::from_value::<HysteriaSettings>(serde_json::json!({
-                    "version": 2,
-                    "masquerade": {"type": kind}
-                }))
-                .expect("valid Xray masquerade shape");
-            let err = collect_hysteria2_settings(settings(), Some(&stream_settings))
-                .expect_err("unsupported Xray masquerade must fail explicitly");
-            assert!(
-                err.to_string()
-                    .contains("supports Xray 404, file, and string masquerades"),
-                "unexpected masquerade error for {kind}: {err}"
-            );
-        }
+        let stream_settings =
+            serde_json::from_value::<HysteriaSettings>(serde_json::json!({
+                "version": 2,
+                "masquerade": {
+                    "type": "PrOxY",
+                    "url": "https://example.test/base",
+                    "rewriteHost": true,
+                    "insecure": true
+                }
+            }))
+            .expect("valid Xray proxy masquerade shape");
+        let config = collect_hysteria2_settings(settings(), Some(&stream_settings))
+            .expect("Xray proxy masquerade should be accepted case-insensitively");
+        let masquerade = config
+            .xray_masquerade_proxy
+            .expect("proxy masquerade should reach runtime config");
+        assert_eq!(masquerade.url, "https://example.test/base");
+        assert!(masquerade.rewrite_host);
+        assert!(masquerade.insecure);
+
+        let kind = "unknown";
+        let stream_settings =
+            serde_json::from_value::<HysteriaSettings>(serde_json::json!({
+                "version": 2,
+                "masquerade": {"type": kind}
+            }))
+            .expect("valid Xray masquerade shape");
+        let err = collect_hysteria2_settings(settings(), Some(&stream_settings))
+            .expect_err("unsupported Xray masquerade must fail explicitly");
+        assert!(
+            err.to_string()
+                .contains("supports Xray 404, file, proxy, and string masquerades"),
+            "unexpected masquerade error for {kind}: {err}"
+        );
     }
 
     #[cfg(feature = "hysteria")]

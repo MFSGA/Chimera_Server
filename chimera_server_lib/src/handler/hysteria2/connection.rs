@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use h3_quinn::BidiStream;
 use http::{Request, Response, StatusCode};
 use lru::LruCache;
@@ -253,9 +253,7 @@ async fn auth_hysteria2_connection(
                             &request_method,
                             &request_uri,
                             &request_headers,
-                            config.xray_compat,
-                            config.xray_masquerade_file.as_ref(),
-                            config.xray_masquerade_string.as_ref(),
+                            config,
                         )
                         .await?;
                     }
@@ -818,19 +816,31 @@ async fn send_auth_reject_response(
     method: &http::Method,
     uri: &http::Uri,
     request_headers: &http::HeaderMap,
-    xray_compat: bool,
-    xray_masquerade_file: Option<
-        &crate::config::server_config::Hysteria2MasqueradeFileConfig,
-    >,
-    xray_masquerade_string: Option<
-        &crate::config::server_config::Hysteria2MasqueradeStringConfig,
-    >,
+    config: &Hysteria2ServerConfig,
 ) -> std::io::Result<()> {
-    let (response, body) = if let Some(masquerade) = xray_masquerade_file {
+    let (response, body) = if let Some(masquerade) =
+        config.xray_masquerade_file.as_ref()
+    {
         xray_file_masquerade_response(method, uri, request_headers, &masquerade.dir)
             .await?
+    } else if let Some(masquerade) = config.xray_masquerade_proxy.as_ref() {
+        let mut request_body = BytesMut::new();
+        while let Some(mut data) = stream.recv_data().await.map_err(map_h3_error)? {
+            request_body.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+        }
+        xray_proxy_masquerade_response(
+            method,
+            uri,
+            request_headers,
+            request_body.freeze(),
+            masquerade,
+        )
+        .await?
     } else {
-        auth_reject_response(xray_compat, xray_masquerade_string)?
+        auth_reject_response(
+            config.xray_compat,
+            config.xray_masquerade_string.as_ref(),
+        )?
     };
     stream.send_response(response).await.map_err(map_h3_error)?;
     if method != http::Method::HEAD
@@ -839,6 +849,100 @@ async fn send_auth_reject_response(
         stream.send_data(body).await.map_err(map_h3_error)?;
     }
     stream.finish().await.map_err(map_h3_error)
+}
+
+fn xray_proxy_target_url(
+    base: &str,
+    uri: &http::Uri,
+) -> std::io::Result<reqwest::Url> {
+    let mut base_url = reqwest::Url::parse(base).map_err(Error::other)?;
+    let base_query = base_url.query().map(str::to_owned);
+    base_url.set_query(None);
+    base_url.set_fragment(None);
+
+    let mut raw = base_url.as_str().trim_end_matches('/').to_string();
+    if !uri.path().starts_with('/') {
+        raw.push('/');
+    }
+    raw.push_str(uri.path());
+    let mut target = reqwest::Url::parse(&raw).map_err(Error::other)?;
+    let query = match (base_query.as_deref(), uri.query()) {
+        (Some(base), Some(request)) if !base.is_empty() && !request.is_empty() => {
+            Some(format!("{base}&{request}"))
+        }
+        (Some(base), _) if !base.is_empty() => Some(base.to_string()),
+        (_, Some(request)) if !request.is_empty() => Some(request.to_string()),
+        _ => None,
+    };
+    target.set_query(query.as_deref());
+    Ok(target)
+}
+
+fn xray_proxy_hop_header(name: &http::HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "connection"
+            | "proxy-connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+async fn xray_proxy_masquerade_response(
+    method: &http::Method,
+    uri: &http::Uri,
+    request_headers: &http::HeaderMap,
+    body: Bytes,
+    masquerade: &crate::config::server_config::Hysteria2MasqueradeProxyConfig,
+) -> std::io::Result<(Response<()>, Option<Bytes>)> {
+    let target = xray_proxy_target_url(&masquerade.url, uri)?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .tls_danger_accept_invalid_certs(masquerade.insecure)
+        .build()
+        .map_err(Error::other)?;
+
+    let mut request = client.request(method.clone(), target);
+    for (name, value) in request_headers {
+        if !xray_proxy_hop_header(name) && name != http::header::HOST {
+            request = request.header(name, value);
+        }
+    }
+    if !masquerade.rewrite_host
+        && let Some(authority) = uri.authority()
+    {
+        request = request.header(http::header::HOST, authority.as_str());
+    }
+    if !body.is_empty() {
+        request = request.body(body);
+    }
+
+    let upstream = match request.send().await {
+        Ok(response) => response,
+        Err(err) => {
+            debug!(error = %err, url = %masquerade.url, "Xray proxy masquerade upstream request failed");
+            let response = Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(())
+                .map_err(Error::other)?;
+            return Ok((response, None));
+        }
+    };
+    let status = upstream.status();
+    let headers = upstream.headers().clone();
+    let body = upstream.bytes().await.map_err(Error::other)?;
+    let mut response = Response::builder().status(status);
+    for (name, value) in &headers {
+        if !xray_proxy_hop_header(name) {
+            response = response.header(name, value);
+        }
+    }
+    Ok((response.body(()).map_err(Error::other)?, Some(body)))
 }
 
 async fn xray_file_masquerade_response(
@@ -2464,8 +2568,12 @@ mod tests {
         time::{Instant, SystemTime, UNIX_EPOCH},
     };
 
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use super::*;
-    use crate::config::server_config::Hysteria2Client;
+    use crate::config::server_config::{
+        Hysteria2Client, Hysteria2MasqueradeProxyConfig,
+    };
 
     fn hysteria2_config(
         congestion: Option<&str>,
@@ -2563,6 +2671,98 @@ mod tests {
             Some(&http::HeaderValue::from_static("present"))
         );
         assert_eq!(body.as_deref(), Some(&b"hello from xray"[..]));
+    }
+
+    #[tokio::test]
+    async fn xray_proxy_masquerade_forwards_request_and_upstream_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy masquerade upstream");
+        let upstream_addr = listener
+            .local_addr()
+            .expect("read proxy masquerade upstream address");
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) =
+                listener.accept().await.expect("accept proxy request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read =
+                    stream.read(&mut buffer).await.expect("read proxy request");
+                assert_ne!(read, 0, "proxy request closed before headers");
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(header_end) =
+                    request.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    let header_end = header_end + 4;
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("content-length: ")
+                                .or_else(|| line.strip_prefix("Content-Length: "))
+                        })
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    while request.len() < header_end + content_length {
+                        let read = stream
+                            .read(&mut buffer)
+                            .await
+                            .expect("read proxy request body");
+                        assert_ne!(read, 0, "proxy request closed before body");
+                        request.extend_from_slice(&buffer[..read]);
+                    }
+                    break;
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 201 Created\r\nContent-Length: 5\r\nX-Upstream: yes\r\nConnection: close\r\n\r\nhello",
+                )
+                .await
+                .expect("write proxy response");
+            String::from_utf8(request).expect("proxy request should be utf8")
+        });
+
+        let uri: http::Uri = "https://original.test/path?q=2"
+            .parse()
+            .expect("valid proxy request URI");
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-test", http::HeaderValue::from_static("forwarded"));
+        let config = Hysteria2MasqueradeProxyConfig {
+            url: format!("http://{upstream_addr}/base?fixed=1"),
+            rewrite_host: false,
+            insecure: false,
+        };
+        let (response, body) = xray_proxy_masquerade_response(
+            &http::Method::POST,
+            &uri,
+            &headers,
+            Bytes::from_static(b"payload"),
+            &config,
+        )
+        .await
+        .expect("proxy Xray masquerade request");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            response.headers().get("x-upstream"),
+            Some(&http::HeaderValue::from_static("yes"))
+        );
+        assert!(response.headers().get(http::header::CONNECTION).is_none());
+        assert_eq!(body.as_deref(), Some(&b"hello"[..]));
+
+        let request = upstream.await.expect("join proxy upstream");
+        assert!(request.starts_with("POST /base/path?fixed=1&q=2 HTTP/1.1\r\n"));
+        assert!(
+            request.contains("host: original.test\r\n")
+                || request.contains("Host: original.test\r\n")
+        );
+        assert!(
+            request.contains("x-test: forwarded\r\n")
+                || request.contains("X-Test: forwarded\r\n")
+        );
+        assert!(request.ends_with("\r\npayload"));
     }
 
     #[tokio::test]
