@@ -859,12 +859,23 @@ fn xray_proxy_target_url(
     let base_query = base_url.query().map(str::to_owned);
     base_url.set_query(None);
     base_url.set_fragment(None);
-
-    let mut raw = base_url.as_str().trim_end_matches('/').to_string();
-    if !uri.path().starts_with('/') {
-        raw.push('/');
+    if base_url.has_authority() {
+        let _ = base_url.set_username("");
+        let _ = base_url.set_password(None);
     }
-    raw.push_str(uri.path());
+
+    let base_path_has_slash = base_url.path().ends_with('/');
+    let request_path = uri.path();
+    let request_path_has_slash = request_path.starts_with('/');
+    let mut raw = base_url.as_str().to_string();
+    match (base_path_has_slash, request_path_has_slash) {
+        (true, true) => raw.push_str(&request_path[1..]),
+        (false, false) => {
+            raw.push('/');
+            raw.push_str(request_path);
+        }
+        _ => raw.push_str(request_path),
+    }
     let mut target = reqwest::Url::parse(&raw).map_err(Error::other)?;
     let request_query = uri.query().map(xray_proxy_clean_query);
     let query = match (base_query.as_deref(), request_query.as_deref()) {
@@ -2840,6 +2851,19 @@ mod tests {
             "https://upstream.test/base/path?fixed=1&a=1&a=%25zz&b=3"
         );
 
+        let escaped_uri: http::Uri = "https://original.test/c%2Fd?q=2"
+            .parse()
+            .expect("valid escaped proxy URI");
+        let escaped_target = xray_proxy_target_url(
+            "https://user:pass@upstream.test/base//?fixed=1",
+            &escaped_uri,
+        )
+        .expect("build Xray-compatible proxy target");
+        assert_eq!(
+            escaped_target.as_str(),
+            "https://upstream.test/base//c%2Fd?fixed=1&q=2"
+        );
+
         let malformed_uri: http::Uri = "https://original.test/path?a=1&a=2;b=3&b=3"
             .parse()
             .expect("valid proxy URI with semicolon query");
@@ -2930,7 +2954,7 @@ mod tests {
         );
         headers.insert("x-forwarded-proto", http::HeaderValue::from_static("http"));
         let config = Hysteria2MasqueradeProxyConfig {
-            url: format!("http://{upstream_addr}/base?fixed=1"),
+            url: format!("http://url-user:url-pass@{upstream_addr}/base?fixed=1"),
             rewrite_host: false,
             insecure: false,
         };
@@ -2972,6 +2996,7 @@ mod tests {
         assert!(!request_lower.contains("\r\nx-forwarded-for:"));
         assert!(!request_lower.contains("\r\nx-forwarded-host:"));
         assert!(!request_lower.contains("\r\nx-forwarded-proto:"));
+        assert!(!request_lower.contains("\r\nauthorization:"));
         assert!(request.ends_with("\r\npayload"));
     }
 
