@@ -1114,11 +1114,16 @@ async fn xray_file_masquerade_response(
     request_headers: &http::HeaderMap,
     root: &str,
 ) -> std::io::Result<(Response<()>, Option<Bytes>)> {
-    if uri.path().ends_with("/index.html") {
+    let Some(decoded_uri_path) = xray_file_percent_decode_path(uri.path()) else {
+        return auth_reject_response(true, None);
+    };
+    if decoded_uri_path.ends_with("/index.html") {
         return xray_file_redirect_response(uri, "./");
     }
 
-    let Some(relative) = decode_file_masquerade_path(uri.path()) else {
+    let Some(relative) =
+        decode_file_masquerade_decoded_path(&decoded_uri_path, cfg!(windows))
+    else {
         return auth_reject_response(true, None);
     };
     let mut path = PathBuf::from(root);
@@ -1133,9 +1138,8 @@ async fn xray_file_masquerade_response(
 
     if metadata.is_dir() {
         let directory_modified = metadata.modified().ok();
-        if !uri.path().ends_with('/') {
-            let base = uri
-                .path()
+        if !decoded_uri_path.ends_with('/') {
+            let base = decoded_uri_path
                 .trim_end_matches('/')
                 .rsplit('/')
                 .next()
@@ -1174,9 +1178,8 @@ async fn xray_file_masquerade_response(
             }
         }
     } else if metadata.is_file() {
-        if uri.path().ends_with('/') {
-            let base = uri
-                .path()
+        if decoded_uri_path.ends_with('/') {
+            let base = decoded_uri_path
                 .trim_end_matches('/')
                 .rsplit('/')
                 .next()
@@ -1796,6 +1799,7 @@ fn xray_file_redirect_response(
         Some(query) => format!("{location}?{query}"),
         None => location.to_string(),
     };
+    let location = xray_file_hex_escape_non_ascii(&location);
     let response = Response::builder()
         .status(StatusCode::MOVED_PERMANENTLY)
         .header(http::header::LOCATION, location)
@@ -1924,6 +1928,11 @@ fn decode_file_masquerade_path_for_platform(
     uri_path: &str,
     windows: bool,
 ) -> Option<PathBuf> {
+    let decoded = xray_file_percent_decode_path(uri_path)?;
+    decode_file_masquerade_decoded_path(&decoded, windows)
+}
+
+fn xray_file_percent_decode_path(uri_path: &str) -> Option<String> {
     let mut decoded = Vec::with_capacity(uri_path.len());
     let bytes = uri_path.as_bytes();
     let mut index = 0;
@@ -1938,7 +1947,13 @@ fn decode_file_masquerade_path_for_platform(
             index += 1;
         }
     }
-    let decoded = std::str::from_utf8(&decoded).ok()?;
+    String::from_utf8(decoded).ok()
+}
+
+fn decode_file_masquerade_decoded_path(
+    decoded: &str,
+    windows: bool,
+) -> Option<PathBuf> {
     if windows {
         if decoded
             .as_bytes()
@@ -1963,6 +1978,23 @@ fn decode_file_masquerade_path_for_platform(
         }
     }
     Some(normalized)
+}
+
+fn xray_file_hex_escape_non_ascii(value: &str) -> String {
+    if value.is_ascii() {
+        return value.to_string();
+    }
+
+    let mut escaped = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii() {
+            escaped.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(escaped, "%{byte:02X}");
+        }
+    }
+    escaped
 }
 
 fn xray_windows_reserved_path_component(component: &str) -> bool {
@@ -3273,6 +3305,9 @@ mod tests {
         tokio::fs::create_dir_all(root.join("sub"))
             .await
             .expect("create file masquerade subdir");
+        tokio::fs::create_dir_all(root.join("encoded.dir"))
+            .await
+            .expect("create encoded directory fixture");
         tokio::fs::create_dir_all(root.join("list/dir"))
             .await
             .expect("create file masquerade listing dir");
@@ -3286,6 +3321,9 @@ mod tests {
         tokio::fs::write(root.join("hello.txt"), b"hello file")
             .await
             .expect("write file masquerade file");
+        tokio::fs::write(root.join("你好.txt"), b"unicode file")
+            .await
+            .expect("write unicode redirect fixture");
         tokio::fs::write(
             root.join("page.unknown"),
             b"<!doctype html><title>x</title>",
@@ -3353,6 +3391,51 @@ mod tests {
             Some(&http::HeaderValue::from_static("text/plain; charset=utf-8"))
         );
         assert_eq!(file_body.as_deref(), Some(&b"hello file"[..]));
+
+        let encoded_file_redirect_uri: http::Uri =
+            "https://example.test/hello%2Etxt/?keep=yes"
+                .parse()
+                .expect("valid encoded file redirect URI");
+        let (encoded_file_redirect_response, encoded_file_redirect_body) =
+            xray_file_masquerade_response(
+                &get,
+                &encoded_file_redirect_uri,
+                &headers,
+                &root_str,
+            )
+            .await
+            .expect("redirect encoded Xray file basename");
+        assert_eq!(
+            encoded_file_redirect_response.status(),
+            StatusCode::MOVED_PERMANENTLY
+        );
+        assert_eq!(
+            encoded_file_redirect_response
+                .headers()
+                .get(http::header::LOCATION),
+            Some(&http::HeaderValue::from_static("../hello.txt?keep=yes"))
+        );
+        assert!(encoded_file_redirect_body.is_none());
+
+        let unicode_file_redirect_uri: http::Uri =
+            "https://example.test/%e4%bd%a0%e5%a5%bd%2Etxt/"
+                .parse()
+                .expect("valid unicode file redirect URI");
+        let (unicode_file_redirect_response, _) = xray_file_masquerade_response(
+            &get,
+            &unicode_file_redirect_uri,
+            &headers,
+            &root_str,
+        )
+        .await
+        .expect("redirect unicode Xray file basename");
+        assert_eq!(
+            unicode_file_redirect_response
+                .headers()
+                .get(http::header::LOCATION),
+            Some(&http::HeaderValue::from_static("../%E4%BD%A0%E5%A5%BD.txt"))
+        );
+
         let last_modified = file_response
             .headers()
             .get(http::header::LAST_MODIFIED)
@@ -3651,6 +3734,67 @@ mod tests {
             Some(&http::HeaderValue::from_static("sub/?keep=yes"))
         );
 
+        let encoded_directory_redirect_uri: http::Uri =
+            "https://example.test/encoded%2Edir"
+                .parse()
+                .expect("valid encoded directory redirect URI");
+        let (encoded_directory_redirect_response, _) =
+            xray_file_masquerade_response(
+                &get,
+                &encoded_directory_redirect_uri,
+                &headers,
+                &root_str,
+            )
+            .await
+            .expect("redirect encoded Xray directory basename");
+        assert_eq!(
+            encoded_directory_redirect_response
+                .headers()
+                .get(http::header::LOCATION),
+            Some(&http::HeaderValue::from_static("encoded.dir/"))
+        );
+
+        let encoded_directory_slash_uri: http::Uri = "https://example.test/sub%2F"
+            .parse()
+            .expect("valid encoded directory slash URI");
+        let (encoded_directory_slash_response, encoded_directory_slash_body) =
+            xray_file_masquerade_response(
+                &get,
+                &encoded_directory_slash_uri,
+                &headers,
+                &root_str,
+            )
+            .await
+            .expect("treat decoded slash as Xray directory slash");
+        assert_eq!(encoded_directory_slash_response.status(), StatusCode::OK);
+        assert_eq!(
+            encoded_directory_slash_body.as_deref(),
+            Some(&b"sub index"[..])
+        );
+
+        let encoded_index_uri: http::Uri =
+            "https://example.test/sub/index%2Ehtml?keep=yes"
+                .parse()
+                .expect("valid encoded index redirect URI");
+        let (encoded_index_response, encoded_index_body) =
+            xray_file_masquerade_response(
+                &get,
+                &encoded_index_uri,
+                &headers,
+                &root_str,
+            )
+            .await
+            .expect("redirect encoded Xray index.html path");
+        assert_eq!(
+            encoded_index_response.status(),
+            StatusCode::MOVED_PERMANENTLY
+        );
+        assert_eq!(
+            encoded_index_response.headers().get(http::header::LOCATION),
+            Some(&http::HeaderValue::from_static("./?keep=yes"))
+        );
+        assert!(encoded_index_body.is_none());
+
         let index_uri: http::Uri = "https://example.test/sub/"
             .parse()
             .expect("valid index URI");
@@ -3886,7 +4030,11 @@ mod tests {
             .expect("write file masquerade root file");
         let root_str = root.to_string_lossy();
 
-        for uri in ["https://example.test/", "https://example.test/./"] {
+        for uri in [
+            "https://example.test/",
+            "https://example.test/./",
+            "https://example.test/%2E/",
+        ] {
             let uri: http::Uri = uri.parse().expect("valid root-file URI");
             let (response, body) = xray_file_masquerade_response(
                 &http::Method::GET,
