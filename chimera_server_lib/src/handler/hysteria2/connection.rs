@@ -1520,6 +1520,7 @@ fn xray_parse_ranges(
     let Some(value) = value.strip_prefix("bytes=") else {
         return Err(XrayRangeError::Invalid);
     };
+    let size_i64 = i64::try_from(size).map_err(|_| XrayRangeError::Invalid)?;
     let mut ranges = Vec::new();
     let mut no_overlap = false;
     for raw in value.split(',') {
@@ -1533,44 +1534,44 @@ fn xray_parse_ranges(
         let start = start.trim();
         let end = end.trim();
         let range = if start.is_empty() {
-            let suffix = end
-                .parse::<usize>()
-                .ok()
-                .filter(|_| !end.starts_with('-'))
-                .ok_or(XrayRangeError::Invalid)?;
-            if suffix == 0 {
-                XrayByteRange {
-                    start: size,
-                    length: 0,
-                }
-            } else {
-                let length = suffix.min(size);
-                XrayByteRange {
-                    start: size - length,
-                    length,
-                }
+            if end.starts_with('-') {
+                return Err(XrayRangeError::Invalid);
+            }
+            let suffix = end.parse::<i64>().map_err(|_| XrayRangeError::Invalid)?;
+            if suffix < 0 {
+                return Err(XrayRangeError::Invalid);
+            }
+            let length = suffix.min(size_i64);
+            let start = size_i64 - length;
+            XrayByteRange {
+                start: usize::try_from(start)
+                    .map_err(|_| XrayRangeError::Invalid)?,
+                length: usize::try_from(length)
+                    .map_err(|_| XrayRangeError::Invalid)?,
             }
         } else {
-            let start = start
-                .parse::<usize>()
-                .map_err(|_| XrayRangeError::Invalid)?;
-            if start >= size {
+            let start = start.parse::<i64>().map_err(|_| XrayRangeError::Invalid)?;
+            if start < 0 {
+                return Err(XrayRangeError::Invalid);
+            }
+            if start >= size_i64 {
                 no_overlap = true;
                 continue;
             }
             let end = if end.is_empty() {
-                size - 1
+                size_i64 - 1
             } else {
-                let end =
-                    end.parse::<usize>().map_err(|_| XrayRangeError::Invalid)?;
+                let end = end.parse::<i64>().map_err(|_| XrayRangeError::Invalid)?;
                 if start > end {
                     return Err(XrayRangeError::Invalid);
                 }
-                end.min(size - 1)
+                end.min(size_i64 - 1)
             };
             XrayByteRange {
-                start,
-                length: end - start + 1,
+                start: usize::try_from(start)
+                    .map_err(|_| XrayRangeError::Invalid)?,
+                length: usize::try_from(end - start + 1)
+                    .map_err(|_| XrayRangeError::Invalid)?,
             }
         };
         ranges.push(range);
@@ -3820,6 +3821,42 @@ mod tests {
             unsatisfied_body.as_deref(),
             Some(&b"invalid range: failed to overlap\n"[..])
         );
+
+        for overflow_range in [
+            "bytes=9223372036854775808-",
+            "bytes=0-9223372036854775808",
+            "bytes=-9223372036854775808",
+        ] {
+            range_headers.insert(
+                http::header::RANGE,
+                http::HeaderValue::from_static(overflow_range),
+            );
+            let (overflow_response, overflow_body) = xray_file_masquerade_response(
+                &get,
+                &file_uri,
+                &range_headers,
+                &root_str,
+            )
+            .await
+            .expect("reject Xray signed-int64 Range overflow");
+            assert_eq!(
+                overflow_response.status(),
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "Range {overflow_range}",
+            );
+            assert!(
+                overflow_response
+                    .headers()
+                    .get(http::header::CONTENT_RANGE)
+                    .is_none(),
+                "overflow is invalid rather than merely non-overlapping for {overflow_range}",
+            );
+            assert_eq!(
+                overflow_body.as_deref(),
+                Some(&b"invalid range\n"[..]),
+                "Range {overflow_range}",
+            );
+        }
 
         let redirect_uri: http::Uri = "https://example.test/sub?keep=yes"
             .parse()
