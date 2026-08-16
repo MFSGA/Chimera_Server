@@ -897,14 +897,14 @@ async fn drive_udp_datagrams(
             Err(err) => return Err(Error::other(err)),
         };
 
-        let (address_start, payload_start) = match udp_datagram_address_bounds(&data)
-        {
-            Ok(bounds) => bounds,
-            Err(err) => {
-                debug!("Ignoring malformed hysteria2 UDP datagram: {}", err);
-                continue;
-            }
-        };
+        let (address_start, payload_start) =
+            match udp_datagram_address_bounds(&data, auth_ctx.xray_compat) {
+                Ok(bounds) => bounds,
+                Err(err) => {
+                    debug!("Ignoring malformed hysteria2 UDP datagram: {}", err);
+                    continue;
+                }
+            };
 
         let session_id = u32::from_be_bytes(data[0..4].try_into().unwrap());
         let packet_id = u16::from_be_bytes(data[4..6].try_into().unwrap());
@@ -1429,7 +1429,10 @@ fn accept_unfragmented_udp_datagram(fragment_count: u8, xray_compat: bool) -> bo
     fragment_count == 1 || (fragment_count == 0 && xray_compat)
 }
 
-fn udp_datagram_address_bounds(data: &[u8]) -> std::io::Result<(usize, usize)> {
+fn udp_datagram_address_bounds(
+    data: &[u8],
+    xray_compat: bool,
+) -> std::io::Result<(usize, usize)> {
     if data.len() < 9 {
         return Err(Error::new(
             ErrorKind::InvalidData,
@@ -1456,6 +1459,12 @@ fn udp_datagram_address_bounds(data: &[u8]) -> std::io::Result<(usize, usize)> {
         return Err(Error::new(
             ErrorKind::InvalidData,
             "hysteria2 datagram truncated before payload",
+        ));
+    }
+    if xray_compat && data.len() == payload_start {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "xray hysteria2 UDP datagram requires a non-empty payload",
         ));
     }
 
@@ -1905,24 +1914,47 @@ mod tests {
 
     #[test]
     fn malformed_udp_datagram_bounds_are_rejected_without_panicking() {
-        assert!(udp_datagram_address_bounds(&[]).is_err());
-        assert!(udp_datagram_address_bounds(&[0; 8]).is_err());
+        assert!(udp_datagram_address_bounds(&[], false).is_err());
+        assert!(udp_datagram_address_bounds(&[0; 8], false).is_err());
 
         let mut truncated_varint = vec![0; 9];
         truncated_varint[8] = 0x40;
-        assert!(udp_datagram_address_bounds(&truncated_varint).is_err());
+        assert!(udp_datagram_address_bounds(&truncated_varint, false).is_err());
 
         let mut truncated_address = vec![0; 9];
         truncated_address[8] = 5;
-        assert!(udp_datagram_address_bounds(&truncated_address).is_err());
+        assert!(udp_datagram_address_bounds(&truncated_address, false).is_err());
 
         let mut valid = vec![0; 8];
         valid.push(3);
         valid.extend_from_slice(b"dns");
         valid.extend_from_slice(b"payload");
         assert_eq!(
-            udp_datagram_address_bounds(&valid).expect("valid UDP datagram bounds"),
+            udp_datagram_address_bounds(&valid, false)
+                .expect("valid UDP datagram bounds"),
             (9, 12)
+        );
+        assert_eq!(
+            udp_datagram_address_bounds(&valid, true)
+                .expect("valid Xray UDP datagram bounds"),
+            (9, 12)
+        );
+    }
+
+    #[test]
+    fn empty_udp_payload_matches_xray_and_shoes_semantics() {
+        let mut empty_payload = vec![0; 8];
+        empty_payload.push(3);
+        empty_payload.extend_from_slice(b"dns");
+
+        assert_eq!(
+            udp_datagram_address_bounds(&empty_payload, false)
+                .expect("shoes accepts an empty UDP payload"),
+            (9, 12)
+        );
+        assert!(
+            udp_datagram_address_bounds(&empty_payload, true).is_err(),
+            "Xray rejects UDP datagrams without payload bytes"
         );
     }
 
