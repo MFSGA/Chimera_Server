@@ -1122,7 +1122,9 @@ async fn xray_file_masquerade_response(
         return auth_reject_response(true, None);
     };
     let mut path = PathBuf::from(root);
-    path.push(relative);
+    if !relative.as_os_str().is_empty() {
+        path.push(relative);
+    }
 
     let metadata = match tokio::fs::metadata(&path).await {
         Ok(metadata) => metadata,
@@ -1179,6 +1181,9 @@ async fn xray_file_masquerade_response(
                 .rsplit('/')
                 .next()
                 .unwrap_or("");
+            if base.is_empty() || base == "." {
+                return xray_file_non_directory_traversal_response();
+            }
             return xray_file_redirect_response(uri, &format!("../{base}"));
         }
     } else {
@@ -1265,6 +1270,19 @@ async fn xray_file_masquerade_response(
     }
     let response = response.body(()).map_err(Error::other)?;
     Ok((response, Some(response_body)))
+}
+
+fn xray_file_non_directory_traversal_response()
+-> std::io::Result<(Response<()>, Option<Bytes>)> {
+    let body = Bytes::from_static(b"http: attempting to traverse a non-directory\n");
+    let response = Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header("x-content-type-options", "nosniff")
+        .header(http::header::CONTENT_LENGTH, body.len().to_string())
+        .body(())
+        .map_err(Error::other)?;
+    Ok((response, Some(body)))
 }
 
 fn xray_file_directory_error_response(
@@ -3710,6 +3728,51 @@ mod tests {
         tokio::fs::remove_dir_all(&root)
             .await
             .expect("remove file masquerade tempdir");
+    }
+
+    #[tokio::test]
+    async fn xray_file_root_file_with_slash_returns_non_directory_error() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "chimera-hysteria2-file-root-{}-{suffix}",
+            std::process::id()
+        ));
+        tokio::fs::write(&root, b"root file")
+            .await
+            .expect("write file masquerade root file");
+        let root_str = root.to_string_lossy();
+
+        for uri in ["https://example.test/", "https://example.test/./"] {
+            let uri: http::Uri = uri.parse().expect("valid root-file URI");
+            let (response, body) = xray_file_masquerade_response(
+                &http::Method::GET,
+                &uri,
+                &http::HeaderMap::new(),
+                &root_str,
+            )
+            .await
+            .expect("map root file slash to Xray non-directory error");
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(
+                response.headers().get(http::header::CONTENT_TYPE),
+                Some(&http::HeaderValue::from_static("text/plain; charset=utf-8"))
+            );
+            assert_eq!(
+                response.headers().get("x-content-type-options"),
+                Some(&http::HeaderValue::from_static("nosniff"))
+            );
+            assert_eq!(
+                body.as_deref(),
+                Some(&b"http: attempting to traverse a non-directory\n"[..])
+            );
+        }
+
+        tokio::fs::remove_file(root)
+            .await
+            .expect("remove file masquerade root file");
     }
 
     #[test]
