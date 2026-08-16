@@ -992,6 +992,12 @@ async fn drive_udp_datagrams(
                 entry.insert(session)
             }
         };
+        if refresh_udp_activity_on_datagram(auth_ctx.xray_compat) {
+            // Xray refreshes InterConn activity as soon as a session datagram is
+            // read, before UDP parsing/defragmentation completes. In particular,
+            // a stream of partial fragments must keep an active session alive.
+            session.mark_active();
+        }
         if remote_location != session.last_location {
             let updated_addr = match resolve_single_address(
                 &resolver,
@@ -1136,7 +1142,11 @@ async fn drive_udp_datagrams(
             assembled.freeze()
         };
 
-        session.mark_active();
+        if refresh_udp_activity_on_completed_payload(auth_ctx.xray_compat) {
+            // Preserve the existing shoes/native activity point at completed
+            // payload delivery; Xray has already refreshed on datagram receipt.
+            session.mark_active();
+        }
 
         let mut route_input = connection_routing_input(
             inbound_tag.as_str(),
@@ -1225,6 +1235,14 @@ fn prune_idle_udp_sessions(
         }
         active
     });
+}
+
+fn refresh_udp_activity_on_datagram(xray_compat: bool) -> bool {
+    xray_compat
+}
+
+fn refresh_udp_activity_on_completed_payload(xray_compat: bool) -> bool {
+    !xray_compat
 }
 
 fn udp_session_is_idle(
@@ -1952,6 +1970,14 @@ mod tests {
             resolve_bandwidth_settings(&config, Some(300_000)),
             (300_000, 750_000, false)
         );
+    }
+
+    #[test]
+    fn udp_activity_refresh_point_matches_xray_without_changing_shoes() {
+        assert!(refresh_udp_activity_on_datagram(true));
+        assert!(!refresh_udp_activity_on_completed_payload(true));
+        assert!(!refresh_udp_activity_on_datagram(false));
+        assert!(refresh_udp_activity_on_completed_payload(false));
     }
 
     #[test]
