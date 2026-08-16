@@ -244,11 +244,8 @@ async fn auth_hysteria2_connection(
                                 warn!("hysteria2 auth rejected: {}", msg);
                             }
                         }
-                        send_simple_response(
-                            &mut stream,
-                            auth_reject_status(&reject),
-                        )
-                        .await?;
+                        send_auth_reject_response(&mut stream, config.xray_compat)
+                            .await?;
                     }
                 }
             }
@@ -533,10 +530,6 @@ enum AuthReject {
     Unauthorized(&'static str),
 }
 
-fn auth_reject_status(_reject: &AuthReject) -> StatusCode {
-    StatusCode::NOT_FOUND
-}
-
 fn resolve_congestion_tx_bps(
     config: &Hysteria2ServerConfig,
     client_rx_limit: Option<u64>,
@@ -724,16 +717,38 @@ async fn send_auth_success(
     stream.finish().await.map_err(map_h3_error)
 }
 
-async fn send_simple_response(
+fn auth_reject_response(
+    xray_compat: bool,
+) -> std::io::Result<(Response<()>, Option<Bytes>)> {
+    if xray_compat {
+        let body = Bytes::from_static(b"404 page not found\n");
+        let response = Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .header("x-content-type-options", "nosniff")
+            .header(http::header::CONTENT_LENGTH, body.len().to_string())
+            .body(())
+            .map_err(Error::other)?;
+        Ok((response, Some(body)))
+    } else {
+        let response = Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(http::header::CONTENT_LENGTH, "0")
+            .body(())
+            .map_err(Error::other)?;
+        Ok((response, None))
+    }
+}
+
+async fn send_auth_reject_response(
     stream: &mut h3::server::RequestStream<BidiStream<Bytes>, Bytes>,
-    status: StatusCode,
+    xray_compat: bool,
 ) -> std::io::Result<()> {
-    let response = Response::builder()
-        .status(status)
-        .header(http::header::CONTENT_LENGTH, "0")
-        .body(())
-        .map_err(Error::other)?;
+    let (response, body) = auth_reject_response(xray_compat)?;
     stream.send_response(response).await.map_err(map_h3_error)?;
+    if let Some(body) = body {
+        stream.send_data(body).await.map_err(map_h3_error)?;
+    }
     stream.finish().await.map_err(map_h3_error)
 }
 
@@ -1725,15 +1740,32 @@ mod tests {
     }
 
     #[test]
-    fn auth_rejections_use_not_found_like_shoes() {
+    fn auth_rejections_match_xray_and_shoes_default_masquerade() {
+        let (shoes_response, shoes_body) =
+            auth_reject_response(false).expect("valid shoes reject response");
+        assert_eq!(shoes_response.status(), StatusCode::NOT_FOUND);
         assert_eq!(
-            auth_reject_status(&AuthReject::NotAuthRequest),
-            StatusCode::NOT_FOUND
+            shoes_response.headers().get(http::header::CONTENT_LENGTH),
+            Some(&http::HeaderValue::from_static("0"))
+        );
+        assert!(shoes_body.is_none());
+
+        let (xray_response, xray_body) =
+            auth_reject_response(true).expect("valid Xray reject response");
+        assert_eq!(xray_response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            xray_response.headers().get(http::header::CONTENT_TYPE),
+            Some(&http::HeaderValue::from_static("text/plain; charset=utf-8"))
         );
         assert_eq!(
-            auth_reject_status(&AuthReject::Unauthorized("bad auth")),
-            StatusCode::NOT_FOUND
+            xray_response.headers().get("x-content-type-options"),
+            Some(&http::HeaderValue::from_static("nosniff"))
         );
+        assert_eq!(
+            xray_response.headers().get(http::header::CONTENT_LENGTH),
+            Some(&http::HeaderValue::from_static("19"))
+        );
+        assert_eq!(xray_body.as_deref(), Some(&b"404 page not found\n"[..]));
     }
 
     #[test]
