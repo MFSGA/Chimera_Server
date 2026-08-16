@@ -1146,6 +1146,15 @@ async fn xray_file_masquerade_response(
         let index = path.join("index.html");
         match tokio::fs::metadata(&index).await {
             Ok(index_metadata) if index_metadata.is_file() => path = index,
+            Ok(index_metadata) if index_metadata.is_dir() => {
+                return xray_file_directory_response(
+                    method,
+                    request_headers,
+                    &index,
+                    index_metadata.modified().ok(),
+                )
+                .await;
+            }
             Ok(_) => {
                 return xray_file_directory_response(
                     method,
@@ -3091,6 +3100,9 @@ mod tests {
         tokio::fs::create_dir_all(root.join("list/dir"))
             .await
             .expect("create file masquerade listing dir");
+        tokio::fs::create_dir_all(root.join("indexdir/index.html"))
+            .await
+            .expect("create file masquerade index directory");
         tokio::fs::write(root.join("hello.txt"), b"hello file")
             .await
             .expect("write file masquerade file");
@@ -3124,6 +3136,12 @@ mod tests {
         tokio::fs::write(root.join("list/a&b.txt"), b"a")
             .await
             .expect("write escaped listing entry");
+        tokio::fs::write(root.join("indexdir/parent.txt"), b"parent")
+            .await
+            .expect("write parent index-directory entry");
+        tokio::fs::write(root.join("indexdir/index.html/inside.txt"), b"inside")
+            .await
+            .expect("write nested index-directory entry");
 
         let root_str = root.to_string_lossy();
         let get = http::Method::GET;
@@ -3500,6 +3518,29 @@ mod tests {
                 .is_none()
         );
         assert!(list_not_modified_body.is_none());
+
+        let index_directory_uri: http::Uri = "https://example.test/indexdir/"
+            .parse()
+            .expect("valid index-directory URI");
+        let (index_directory_response, index_directory_body) =
+            xray_file_masquerade_response(
+                &get,
+                &index_directory_uri,
+                &headers,
+                &root_str,
+            )
+            .await
+            .expect("serve Xray index.html directory listing");
+        assert_eq!(index_directory_response.status(), StatusCode::OK);
+        let index_directory_listing = std::str::from_utf8(
+            index_directory_body
+                .as_deref()
+                .expect("index-directory listing body"),
+        )
+        .expect("utf8 index-directory listing");
+        assert!(index_directory_listing.contains("inside.txt"));
+        assert!(!index_directory_listing.contains("parent.txt"));
+        assert!(!index_directory_listing.contains("index.html/"));
 
         let cleaned_uri: http::Uri = "https://example.test/../hello.txt"
             .parse()
