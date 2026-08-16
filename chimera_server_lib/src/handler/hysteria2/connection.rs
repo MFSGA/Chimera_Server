@@ -593,7 +593,8 @@ fn validate_auth_request(
 ) -> Result<AuthInfo, AuthReject> {
     let is_auth_request = if xray_compat {
         req.method() == http::Method::POST
-            && req.uri().host() == Some("hysteria")
+            && req.uri().authority().map(|authority| authority.as_str())
+                == Some("hysteria")
             && req.uri().path() == "/auth"
     } else {
         req.method() == http::Method::POST && req.uri() == AUTH_URI
@@ -1914,7 +1915,7 @@ mod tests {
     }
 
     #[test]
-    fn xray_auth_uri_ignores_query_while_shoes_stays_exact() {
+    fn xray_auth_uri_matches_exact_authority_and_ignores_query() {
         let clients = vec![Hysteria2Client {
             password: "secret".to_string(),
             email: None,
@@ -1923,12 +1924,20 @@ mod tests {
         let query_uri = "https://hysteria/auth?extra=1";
 
         validate_auth_request(auth_request("secret", query_uri), &clients, true)
-            .expect("Xray matches Hysteria auth by host and path");
+            .expect("Xray matches Hysteria auth by authority and path");
         assert!(matches!(
             validate_auth_request(
                 auth_request("secret", query_uri),
                 &clients,
                 false,
+            ),
+            Err(AuthReject::NotAuthRequest)
+        ));
+        assert!(matches!(
+            validate_auth_request(
+                auth_request("secret", "https://hysteria:443/auth"),
+                &clients,
+                true,
             ),
             Err(AuthReject::NotAuthRequest)
         ));
