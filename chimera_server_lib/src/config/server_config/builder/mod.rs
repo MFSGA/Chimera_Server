@@ -19,6 +19,23 @@ use crate::util::option::OneOrSome;
 use super::ws::WebsocketServerConfig;
 
 #[cfg(feature = "hysteria")]
+fn finalmask_udp_hop_is_inert(udp_hop: &crate::config::FinalMaskUdpHop) -> bool {
+    fn value_is_zero(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Null => true,
+            serde_json::Value::Number(number) => {
+                number.as_i64() == Some(0) || number.as_u64() == Some(0)
+            }
+            serde_json::Value::String(value) => {
+                matches!(value.as_str(), "" | "0" | "0-0")
+            }
+            _ => false,
+        }
+    }
+
+    value_is_zero(&udp_hop.ports) && value_is_zero(&udp_hop.interval)
+}
+
 fn parse_xray_finalmask_bandwidth(input: &str) -> Result<u64, Error> {
     let value = input.trim().to_ascii_lowercase();
     if value.is_empty() {
@@ -763,10 +780,26 @@ impl TryFrom<InboudItem> for ServerConfig {
                     )
                 })?;
                 let hysteria_settings = stream_settings.hysteria_settings.as_ref();
-                let xray_quic_params = stream_settings
-                    .final_mask
-                    .as_ref()
-                    .and_then(|final_mask| final_mask.quic_params.as_ref());
+                let final_mask = stream_settings.final_mask.as_ref();
+                if let Some(final_mask) = final_mask
+                    && (!final_mask.tcp.is_empty() || !final_mask.udp.is_empty())
+                {
+                    return Err(Error::InvalidConfig(
+                        "hysteria2 finalmask.tcp/udp mask chains are not supported"
+                            .into(),
+                    ));
+                }
+                let xray_quic_params =
+                    final_mask.and_then(|final_mask| final_mask.quic_params.as_ref());
+                if let Some(udp_hop) =
+                    xray_quic_params.and_then(|quic_params| quic_params.udp_hop.as_ref())
+                    && !finalmask_udp_hop_is_inert(udp_hop)
+                {
+                    return Err(Error::InvalidConfig(
+                        "finalmask.quicParams.udpHop is not supported unless it is empty/inert"
+                            .into(),
+                    ));
+                }
                 let xray_congestion = xray_quic_params
                     .map(|quic_params| {
                         let congestion = quic_params.congestion.to_ascii_lowercase();
@@ -1507,8 +1540,8 @@ mod tests {
     }
 
     #[cfg(feature = "hysteria")]
-    fn hysteria2_inbound_with_finalmask_quic_params(
-        quic_params: serde_json::Value,
+    fn hysteria2_inbound_with_finalmask_settings(
+        final_mask: serde_json::Value,
     ) -> InboudItem {
         serde_json::from_value(serde_json::json!({
             "listen": "127.0.0.1",
@@ -1527,12 +1560,19 @@ mod tests {
                         "keyFile": "key.pem"
                     }]
                 },
-                "finalmask": {
-                    "quicParams": quic_params
-                }
+                "finalmask": final_mask
             }
         }))
         .expect("valid hysteria2 inbound")
+    }
+
+    #[cfg(feature = "hysteria")]
+    fn hysteria2_inbound_with_finalmask_quic_params(
+        quic_params: serde_json::Value,
+    ) -> InboudItem {
+        hysteria2_inbound_with_finalmask_settings(serde_json::json!({
+            "quicParams": quic_params
+        }))
     }
 
     #[cfg(feature = "hysteria")]
@@ -1585,6 +1625,50 @@ mod tests {
                 assert!(config.xray_compat);
             }
             other => panic!("expected hysteria2 protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn hysteria2_finalmask_rejects_unsupported_active_transport_features() {
+        for udp_hop in [
+            serde_json::json!({"ports": 443}),
+            serde_json::json!({"ports": "443,8443"}),
+            serde_json::json!({"interval": 5}),
+            serde_json::json!({"interval": "5-10"}),
+        ] {
+            let err = ServerConfig::try_from(
+                hysteria2_inbound_with_finalmask_quic_params(
+                    serde_json::json!({"udpHop": udp_hop}),
+                ),
+            )
+            .expect_err("configured Xray UDP hop must fail explicitly");
+            assert!(err.to_string().contains("udpHop"), "{err}");
+        }
+
+        for inert_udp_hop in [
+            serde_json::json!({}),
+            serde_json::json!({"ports": 0, "interval": 0}),
+            serde_json::json!({"ports": "", "interval": "0-0"}),
+        ] {
+            ServerConfig::try_from(hysteria2_inbound_with_finalmask_quic_params(
+                serde_json::json!({"udpHop": inert_udp_hop}),
+            ))
+            .expect("empty/inert Xray UDP hop should remain compatible");
+        }
+
+        for field in ["tcp", "udp"] {
+            let mut final_mask = serde_json::Map::new();
+            final_mask.insert(
+                field.to_string(),
+                serde_json::json!([{"type": "unsupported-mask"}]),
+            );
+            let err =
+                ServerConfig::try_from(hysteria2_inbound_with_finalmask_settings(
+                    serde_json::Value::Object(final_mask),
+                ))
+                .expect_err("configured finalmask chain must fail explicitly");
+            assert!(err.to_string().contains("finalmask.tcp/udp"), "{err}");
         }
     }
 

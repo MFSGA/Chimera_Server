@@ -198,7 +198,20 @@ pub struct WsSettings {
 #[serde(rename_all = "camelCase")]
 pub struct FinalMaskSettings {
     #[serde(default)]
+    pub tcp: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub udp: Vec<serde_json::Value>,
+    #[serde(default)]
     pub quic_params: Option<FinalMaskQuicParams>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FinalMaskUdpHop {
+    #[serde(default)]
+    pub ports: serde_json::Value,
+    #[serde(default)]
+    pub interval: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -212,6 +225,8 @@ pub struct FinalMaskQuicParams {
     pub brutal_up: String,
     #[serde(default)]
     pub brutal_down: String,
+    #[serde(default)]
+    pub udp_hop: Option<FinalMaskUdpHop>,
     #[serde(default)]
     pub init_stream_receive_window: u64,
     #[serde(default)]
