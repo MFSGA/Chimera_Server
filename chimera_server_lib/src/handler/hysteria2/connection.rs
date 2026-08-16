@@ -928,15 +928,225 @@ async fn xray_file_masquerade_response(
         Some(guessed_type) => guessed_type.essence_str().to_string(),
         None => xray_detect_content_type(&body[..body.len().min(512)]).to_string(),
     };
+    let range_header = request_headers
+        .get(http::header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .filter(|_| xray_if_range_matches(request_headers, modified));
+    let mut ranges = match range_header {
+        Some(value) => match xray_parse_ranges(value, body.len()) {
+            Ok(ranges) => ranges,
+            Err(XrayRangeError::NoOverlap) if body.is_empty() => Vec::new(),
+            Err(err) => return xray_range_error_response(err, body.len()),
+        },
+        None => Vec::new(),
+    };
+    if ranges.iter().map(|range| range.length).sum::<usize>() > body.len() {
+        ranges.clear();
+    }
+
+    let (status, response_body, content_range, response_content_type) = match ranges
+        .as_slice()
+    {
+        [] => (StatusCode::OK, Bytes::from(body), None, content_type),
+        [range] => {
+            let end = range.start + range.length;
+            (
+                StatusCode::PARTIAL_CONTENT,
+                Bytes::copy_from_slice(&body[range.start..end]),
+                Some(format!("bytes {}-{}/{}", range.start, end - 1, body.len())),
+                content_type,
+            )
+        }
+        _ => {
+            let (multipart_body, multipart_content_type) =
+                xray_multipart_ranges(&ranges, &body, &content_type);
+            (
+                StatusCode::PARTIAL_CONTENT,
+                multipart_body,
+                None,
+                multipart_content_type,
+            )
+        }
+    };
+
     let mut response = Response::builder()
-        .status(StatusCode::OK)
-        .header(http::header::CONTENT_TYPE, content_type)
-        .header(http::header::CONTENT_LENGTH, body.len().to_string());
+        .status(status)
+        .header(http::header::CONTENT_TYPE, response_content_type)
+        .header(http::header::ACCEPT_RANGES, "bytes")
+        .header(
+            http::header::CONTENT_LENGTH,
+            response_body.len().to_string(),
+        );
+    if let Some(content_range) = content_range {
+        response = response.header(http::header::CONTENT_RANGE, content_range);
+    }
     if let Some(last_modified) = last_modified.as_deref() {
         response = response.header(http::header::LAST_MODIFIED, last_modified);
     }
     let response = response.body(()).map_err(Error::other)?;
-    Ok((response, Some(Bytes::from(body))))
+    Ok((response, Some(response_body)))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct XrayByteRange {
+    start: usize,
+    length: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum XrayRangeError {
+    Invalid,
+    NoOverlap,
+}
+
+fn xray_if_range_matches(
+    request_headers: &http::HeaderMap,
+    modified: Option<std::time::SystemTime>,
+) -> bool {
+    let Some(value) = request_headers.get(http::header::IF_RANGE) else {
+        return true;
+    };
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    // Xray's FileServer does not set an ETag, so an entity-tag If-Range can
+    // never match. A date validator must match Last-Modified to the second.
+    if value.trim_start().starts_with('"') || value.trim_start().starts_with("W/\"")
+    {
+        return false;
+    }
+    let Ok(if_range) = httpdate::parse_http_date(value) else {
+        return false;
+    };
+    modified.is_some_and(|modified| {
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .zip(if_range.duration_since(std::time::UNIX_EPOCH).ok())
+            .is_some_and(|(modified, if_range)| {
+                modified.as_secs() == if_range.as_secs()
+            })
+    })
+}
+
+fn xray_parse_ranges(
+    value: &str,
+    size: usize,
+) -> Result<Vec<XrayByteRange>, XrayRangeError> {
+    let Some(value) = value.strip_prefix("bytes=") else {
+        return Err(XrayRangeError::Invalid);
+    };
+    let mut ranges = Vec::new();
+    let mut no_overlap = false;
+    for raw in value.split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let Some((start, end)) = raw.split_once('-') else {
+            return Err(XrayRangeError::Invalid);
+        };
+        let start = start.trim();
+        let end = end.trim();
+        let range = if start.is_empty() {
+            let suffix = end
+                .parse::<usize>()
+                .ok()
+                .filter(|_| !end.starts_with('-'))
+                .ok_or(XrayRangeError::Invalid)?;
+            if suffix == 0 {
+                XrayByteRange {
+                    start: size,
+                    length: 0,
+                }
+            } else {
+                let length = suffix.min(size);
+                XrayByteRange {
+                    start: size - length,
+                    length,
+                }
+            }
+        } else {
+            let start = start
+                .parse::<usize>()
+                .map_err(|_| XrayRangeError::Invalid)?;
+            if start >= size {
+                no_overlap = true;
+                continue;
+            }
+            let end = if end.is_empty() {
+                size - 1
+            } else {
+                let end =
+                    end.parse::<usize>().map_err(|_| XrayRangeError::Invalid)?;
+                if start > end {
+                    return Err(XrayRangeError::Invalid);
+                }
+                end.min(size - 1)
+            };
+            XrayByteRange {
+                start,
+                length: end - start + 1,
+            }
+        };
+        ranges.push(range);
+    }
+    if no_overlap && ranges.is_empty() {
+        Err(XrayRangeError::NoOverlap)
+    } else {
+        Ok(ranges)
+    }
+}
+
+fn xray_range_error_response(
+    error: XrayRangeError,
+    size: usize,
+) -> std::io::Result<(Response<()>, Option<Bytes>)> {
+    let text = match error {
+        XrayRangeError::Invalid => "invalid range\n",
+        XrayRangeError::NoOverlap => "invalid range: failed to overlap\n",
+    };
+    let body = Bytes::from_static(text.as_bytes());
+    let mut response = Response::builder()
+        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header("x-content-type-options", "nosniff")
+        .header(http::header::CONTENT_LENGTH, body.len().to_string());
+    if matches!(error, XrayRangeError::NoOverlap) {
+        response =
+            response.header(http::header::CONTENT_RANGE, format!("bytes */{size}"));
+    }
+    Ok((response.body(()).map_err(Error::other)?, Some(body)))
+}
+
+fn xray_multipart_ranges(
+    ranges: &[XrayByteRange],
+    body: &[u8],
+    content_type: &str,
+) -> (Bytes, String) {
+    let boundary = Alphanumeric.sample_string(&mut rand::rng(), 30);
+    let mut multipart = Vec::new();
+    for range in ranges {
+        let end = range.start + range.length;
+        multipart.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        multipart.extend_from_slice(
+            format!(
+                "Content-Range: bytes {}-{}/{}\r\nContent-Type: {}\r\n\r\n",
+                range.start,
+                end.saturating_sub(1),
+                body.len(),
+                content_type
+            )
+            .as_bytes(),
+        );
+        multipart.extend_from_slice(&body[range.start..end]);
+        multipart.extend_from_slice(b"\r\n");
+    }
+    multipart.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    (
+        Bytes::from(multipart),
+        format!("multipart/byteranges; boundary={boundary}"),
+    )
 }
 
 fn xray_detect_content_type(data: &[u8]) -> &'static str {
@@ -2324,6 +2534,131 @@ mod tests {
                 .is_none()
         );
         assert!(not_modified_body.is_none());
+
+        let mut range_headers = http::HeaderMap::new();
+        range_headers.insert(
+            http::header::RANGE,
+            http::HeaderValue::from_static("bytes=1-4"),
+        );
+        let (range_response, range_body) = xray_file_masquerade_response(
+            &get,
+            &file_uri,
+            &range_headers,
+            &root_str,
+        )
+        .await
+        .expect("serve Xray byte range");
+        assert_eq!(range_response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            range_response.headers().get(http::header::ACCEPT_RANGES),
+            Some(&http::HeaderValue::from_static("bytes"))
+        );
+        assert_eq!(
+            range_response.headers().get(http::header::CONTENT_RANGE),
+            Some(&http::HeaderValue::from_static("bytes 1-4/10"))
+        );
+        assert_eq!(range_body.as_deref(), Some(&b"ello"[..]));
+
+        range_headers.insert(
+            http::header::RANGE,
+            http::HeaderValue::from_static("bytes=-4"),
+        );
+        let (_, suffix_body) = xray_file_masquerade_response(
+            &get,
+            &file_uri,
+            &range_headers,
+            &root_str,
+        )
+        .await
+        .expect("serve Xray suffix range");
+        assert_eq!(suffix_body.as_deref(), Some(&b"file"[..]));
+
+        range_headers.insert(
+            http::header::RANGE,
+            http::HeaderValue::from_static("bytes=0-1,6-9"),
+        );
+        let (multi_response, multi_body) = xray_file_masquerade_response(
+            &get,
+            &file_uri,
+            &range_headers,
+            &root_str,
+        )
+        .await
+        .expect("serve Xray multipart ranges");
+        assert_eq!(multi_response.status(), StatusCode::PARTIAL_CONTENT);
+        assert!(
+            multi_response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(
+                    |value| value.starts_with("multipart/byteranges; boundary=")
+                )
+        );
+        let multi_body = multi_body.expect("multipart range body");
+        assert!(multi_body.windows(2).any(|window| window == b"he"));
+        assert!(multi_body.windows(4).any(|window| window == b"file"));
+
+        let mut if_range_headers = http::HeaderMap::new();
+        if_range_headers.insert(
+            http::header::RANGE,
+            http::HeaderValue::from_static("bytes=0-1"),
+        );
+        if_range_headers.insert(http::header::IF_RANGE, last_modified.clone());
+        let (if_range_response, if_range_body) = xray_file_masquerade_response(
+            &get,
+            &file_uri,
+            &if_range_headers,
+            &root_str,
+        )
+        .await
+        .expect("honor matching Xray If-Range date");
+        assert_eq!(if_range_response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(if_range_body.as_deref(), Some(&b"he"[..]));
+
+        if_range_headers.insert(
+            http::header::IF_RANGE,
+            http::HeaderValue::from_static("Thu, 01 Jan 1970 00:00:01 GMT"),
+        );
+        let (stale_if_range_response, stale_if_range_body) =
+            xray_file_masquerade_response(
+                &get,
+                &file_uri,
+                &if_range_headers,
+                &root_str,
+            )
+            .await
+            .expect("ignore stale Xray If-Range range");
+        assert_eq!(stale_if_range_response.status(), StatusCode::OK);
+        assert_eq!(stale_if_range_body.as_deref(), Some(&b"hello file"[..]));
+
+        range_headers.insert(
+            http::header::RANGE,
+            http::HeaderValue::from_static("bytes=50-60"),
+        );
+        let (unsatisfied_response, unsatisfied_body) =
+            xray_file_masquerade_response(
+                &get,
+                &file_uri,
+                &range_headers,
+                &root_str,
+            )
+            .await
+            .expect("reject unsatisfied Xray range");
+        assert_eq!(
+            unsatisfied_response.status(),
+            StatusCode::RANGE_NOT_SATISFIABLE
+        );
+        assert_eq!(
+            unsatisfied_response
+                .headers()
+                .get(http::header::CONTENT_RANGE),
+            Some(&http::HeaderValue::from_static("bytes */10"))
+        );
+        assert_eq!(
+            unsatisfied_body.as_deref(),
+            Some(&b"invalid range: failed to overlap\n"[..])
+        );
 
         let redirect_uri: http::Uri = "https://example.test/sub?keep=yes"
             .parse()
