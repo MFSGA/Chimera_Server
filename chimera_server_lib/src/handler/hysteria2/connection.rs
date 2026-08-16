@@ -1858,9 +1858,17 @@ async fn xray_file_directory_response(
                 return xray_file_directory_error_response(modified);
             }
         };
+        let file_type = match entry.file_type().await {
+            Ok(file_type) => file_type,
+            Err(err) if xray_file_directory_entry_disappeared(&err) => continue,
+            Err(err) => {
+                debug!(error = %err, path = %path.display(), "Xray file masquerade directory entry stat failed");
+                return xray_file_directory_error_response(modified);
+            }
+        };
         let file_name = entry.file_name();
         let mut name = xray_file_name_bytes(&file_name);
-        if entry.file_type().await?.is_dir() {
+        if file_type.is_dir() {
             name.push(b'/');
         }
         entries.push(name);
@@ -1891,6 +1899,10 @@ async fn xray_file_directory_response(
     }
     let response = response.body(()).map_err(Error::other)?;
     Ok((response, Some(body)))
+}
+
+fn xray_file_directory_entry_disappeared(err: &std::io::Error) -> bool {
+    err.kind() == ErrorKind::NotFound
 }
 
 fn xray_file_name_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
@@ -4288,6 +4300,27 @@ mod tests {
             "space%20%3F%23%25%21%27%28%29%2A%5B%5D"
         );
         assert_eq!(xray_file_url_escape("你好.txt"), "%E4%BD%A0%E5%A5%BD.txt");
+    }
+
+    #[test]
+    fn xray_file_directory_entry_errors_match_go_readdir_behavior() {
+        assert!(xray_file_directory_entry_disappeared(&Error::new(
+            ErrorKind::NotFound,
+            "entry vanished",
+        )));
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidData,
+            ErrorKind::Other,
+        ] {
+            assert!(
+                !xray_file_directory_entry_disappeared(&Error::new(
+                    kind,
+                    "entry stat failed"
+                )),
+                "{kind:?} must fail the directory listing instead of being skipped",
+            );
+        }
     }
 
     #[tokio::test]
