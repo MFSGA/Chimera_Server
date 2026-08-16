@@ -5,6 +5,7 @@ use std::{
     io::{Error, ErrorKind},
     net::SocketAddr,
     num::NonZeroUsize,
+    path::{Component, Path, PathBuf},
     pin::Pin,
     sync::{
         Arc, RwLock,
@@ -198,6 +199,8 @@ async fn auth_hysteria2_connection(
                         ))
                     })?;
                 debug!(method = %req.method(), uri = %req.uri(), "hysteria2 auth request received");
+                let request_method = req.method().clone();
+                let request_uri = req.uri().clone();
                 match validate_auth_request(
                     req,
                     config.clients.as_ref(),
@@ -246,7 +249,10 @@ async fn auth_hysteria2_connection(
                         }
                         send_auth_reject_response(
                             &mut stream,
+                            &request_method,
+                            &request_uri,
                             config.xray_compat,
+                            config.xray_masquerade_file.as_ref(),
                             config.xray_masquerade_string.as_ref(),
                         )
                         .await?;
@@ -807,18 +813,206 @@ fn auth_reject_response(
 
 async fn send_auth_reject_response(
     stream: &mut h3::server::RequestStream<BidiStream<Bytes>, Bytes>,
+    method: &http::Method,
+    uri: &http::Uri,
     xray_compat: bool,
+    xray_masquerade_file: Option<
+        &crate::config::server_config::Hysteria2MasqueradeFileConfig,
+    >,
     xray_masquerade_string: Option<
         &crate::config::server_config::Hysteria2MasqueradeStringConfig,
     >,
 ) -> std::io::Result<()> {
-    let (response, body) =
-        auth_reject_response(xray_compat, xray_masquerade_string)?;
+    let (response, body) = if let Some(masquerade) = xray_masquerade_file {
+        xray_file_masquerade_response(method, uri, &masquerade.dir).await?
+    } else {
+        auth_reject_response(xray_compat, xray_masquerade_string)?
+    };
     stream.send_response(response).await.map_err(map_h3_error)?;
-    if let Some(body) = body {
+    if method != http::Method::HEAD
+        && let Some(body) = body
+    {
         stream.send_data(body).await.map_err(map_h3_error)?;
     }
     stream.finish().await.map_err(map_h3_error)
+}
+
+async fn xray_file_masquerade_response(
+    _method: &http::Method,
+    uri: &http::Uri,
+    root: &str,
+) -> std::io::Result<(Response<()>, Option<Bytes>)> {
+    if uri.path().ends_with("/index.html") {
+        return xray_file_redirect_response(uri, "./");
+    }
+
+    let Some(relative) = decode_file_masquerade_path(uri.path()) else {
+        return auth_reject_response(true, None);
+    };
+    let mut path = PathBuf::from(root);
+    path.push(relative);
+
+    let metadata = match tokio::fs::metadata(&path).await {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            return auth_reject_response(true, None);
+        }
+        Err(err) => return Err(err),
+    };
+
+    if metadata.is_dir() {
+        if !uri.path().ends_with('/') {
+            let base = uri
+                .path()
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or("");
+            return xray_file_redirect_response(uri, &format!("{base}/"));
+        }
+        let index = path.join("index.html");
+        match tokio::fs::metadata(&index).await {
+            Ok(index_metadata) if index_metadata.is_file() => path = index,
+            Ok(_) => return xray_file_directory_response(&path).await,
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                return xray_file_directory_response(&path).await;
+            }
+            Err(err) => return Err(err),
+        }
+    } else if metadata.is_file() {
+        if uri.path().ends_with('/') {
+            let base = uri
+                .path()
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or("");
+            return xray_file_redirect_response(uri, &format!("../{base}"));
+        }
+    } else {
+        return auth_reject_response(true, None);
+    }
+
+    let body = tokio::fs::read(&path).await?;
+    let guessed_type = mime_guess::from_path(&path).first_or_octet_stream();
+    let content_type = if guessed_type.type_() == mime_guess::mime::TEXT {
+        format!("{}; charset=utf-8", guessed_type.essence_str())
+    } else {
+        guessed_type.essence_str().to_string()
+    };
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, content_type)
+        .header(http::header::CONTENT_LENGTH, body.len().to_string())
+        .body(())
+        .map_err(Error::other)?;
+    Ok((response, Some(Bytes::from(body))))
+}
+
+fn xray_file_redirect_response(
+    uri: &http::Uri,
+    location: &str,
+) -> std::io::Result<(Response<()>, Option<Bytes>)> {
+    let location = match uri.query() {
+        Some(query) => format!("{location}?{query}"),
+        None => location.to_string(),
+    };
+    let response = Response::builder()
+        .status(StatusCode::MOVED_PERMANENTLY)
+        .header(http::header::LOCATION, location)
+        .header(http::header::CONTENT_LENGTH, "0")
+        .body(())
+        .map_err(Error::other)?;
+    Ok((response, None))
+}
+
+async fn xray_file_directory_response(
+    path: &Path,
+) -> std::io::Result<(Response<()>, Option<Bytes>)> {
+    let mut read_dir = tokio::fs::read_dir(path).await?;
+    let mut entries = Vec::new();
+    while let Some(entry) = read_dir.next_entry().await? {
+        let mut name = entry.file_name().to_string_lossy().into_owned();
+        if entry.file_type().await?.is_dir() {
+            name.push('/');
+        }
+        entries.push(name);
+    }
+    entries.sort_unstable();
+
+    let mut body = String::from(
+        "<!doctype html>\n<meta name=\"viewport\" content=\"width=device-width\">\n<pre>\n",
+    );
+    for name in entries {
+        body.push_str("<a href=\"");
+        body.push_str(&xray_file_url_escape(&name));
+        body.push_str("\">");
+        body.push_str(&xray_file_html_escape(&name));
+        body.push_str("</a>\n");
+    }
+    body.push_str("</pre>\n");
+    let body = Bytes::from(body);
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(http::header::CONTENT_LENGTH, body.len().to_string())
+        .body(())
+        .map_err(Error::other)?;
+    Ok((response, Some(body)))
+}
+
+fn xray_file_html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('\'', "&#39;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&#34;")
+}
+
+fn xray_file_url_escape(value: &str) -> String {
+    let mut escaped = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/')
+        {
+            escaped.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(escaped, "%{byte:02X}");
+        }
+    }
+    escaped
+}
+
+fn decode_file_masquerade_path(uri_path: &str) -> Option<PathBuf> {
+    let mut decoded = Vec::with_capacity(uri_path.len());
+    let bytes = uri_path.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = *bytes.get(index + 1)?;
+            let low = *bytes.get(index + 2)?;
+            decoded.push((hex_nibble(high)? << 4) | hex_nibble(low)?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    let decoded = std::str::from_utf8(&decoded).ok()?;
+    let mut normalized = PathBuf::new();
+    for component in Path::new(decoded.trim_start_matches('/')).components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(normalized)
 }
 
 fn random_auth_padding(xray_compat: bool) -> String {
@@ -1772,7 +1966,11 @@ fn push_varint(buf: &mut Vec<u8>, value: u64) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{future::pending, io::ErrorKind, time::Instant};
+    use std::{
+        future::pending,
+        io::ErrorKind,
+        time::{Instant, SystemTime, UNIX_EPOCH},
+    };
 
     use super::*;
     use crate::config::server_config::Hysteria2Client;
@@ -1873,6 +2071,119 @@ mod tests {
             Some(&http::HeaderValue::from_static("present"))
         );
         assert_eq!(body.as_deref(), Some(&b"hello from xray"[..]));
+    }
+
+    #[tokio::test]
+    async fn xray_file_masquerade_serves_files_indexes_redirects_and_listings() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "chimera-hysteria2-file-{}-{suffix}",
+            std::process::id()
+        ));
+        tokio::fs::create_dir_all(root.join("sub"))
+            .await
+            .expect("create file masquerade subdir");
+        tokio::fs::create_dir_all(root.join("list/dir"))
+            .await
+            .expect("create file masquerade listing dir");
+        tokio::fs::write(root.join("hello.txt"), b"hello file")
+            .await
+            .expect("write file masquerade file");
+        tokio::fs::write(root.join("sub/index.html"), b"sub index")
+            .await
+            .expect("write file masquerade index");
+        tokio::fs::write(root.join("list/z.txt"), b"z")
+            .await
+            .expect("write listing entry");
+        tokio::fs::write(root.join("list/a&b.txt"), b"a")
+            .await
+            .expect("write escaped listing entry");
+
+        let root_str = root.to_string_lossy();
+        let get = http::Method::GET;
+        let file_uri: http::Uri = "https://example.test/hello%2Etxt"
+            .parse()
+            .expect("valid file URI");
+        let (file_response, file_body) =
+            xray_file_masquerade_response(&get, &file_uri, &root_str)
+                .await
+                .expect("serve Xray file masquerade file");
+        assert_eq!(file_response.status(), StatusCode::OK);
+        assert_eq!(
+            file_response.headers().get(http::header::CONTENT_TYPE),
+            Some(&http::HeaderValue::from_static("text/plain; charset=utf-8"))
+        );
+        assert_eq!(file_body.as_deref(), Some(&b"hello file"[..]));
+
+        let redirect_uri: http::Uri = "https://example.test/sub?keep=yes"
+            .parse()
+            .expect("valid directory URI");
+        let (redirect_response, _) =
+            xray_file_masquerade_response(&get, &redirect_uri, &root_str)
+                .await
+                .expect("redirect Xray file masquerade directory");
+        assert_eq!(redirect_response.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            redirect_response.headers().get(http::header::LOCATION),
+            Some(&http::HeaderValue::from_static("sub/?keep=yes"))
+        );
+
+        let index_uri: http::Uri = "https://example.test/sub/"
+            .parse()
+            .expect("valid index URI");
+        let (_, index_body) =
+            xray_file_masquerade_response(&get, &index_uri, &root_str)
+                .await
+                .expect("serve Xray file masquerade index");
+        assert_eq!(index_body.as_deref(), Some(&b"sub index"[..]));
+
+        let explicit_index_uri: http::Uri =
+            "https://example.test/sub/index.html?q=1"
+                .parse()
+                .expect("valid explicit index URI");
+        let (explicit_index_response, _) =
+            xray_file_masquerade_response(&get, &explicit_index_uri, &root_str)
+                .await
+                .expect("redirect explicit Xray index path");
+        assert_eq!(
+            explicit_index_response
+                .headers()
+                .get(http::header::LOCATION),
+            Some(&http::HeaderValue::from_static("./?q=1"))
+        );
+
+        let list_uri: http::Uri = "https://example.test/list/"
+            .parse()
+            .expect("valid listing URI");
+        let (list_response, list_body) =
+            xray_file_masquerade_response(&get, &list_uri, &root_str)
+                .await
+                .expect("serve Xray directory listing");
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let listing =
+            std::str::from_utf8(list_body.as_deref().expect("listing body"))
+                .expect("utf8 directory listing");
+        assert!(listing.contains("href=\"a%26b.txt\">a&amp;b.txt</a>"));
+        assert!(listing.contains("href=\"dir/\">dir/</a>"));
+        assert!(
+            listing.find("a&amp;b.txt").unwrap() < listing.find("z.txt").unwrap()
+        );
+
+        let cleaned_uri: http::Uri = "https://example.test/../hello.txt"
+            .parse()
+            .expect("valid cleaned URI");
+        let (_, cleaned_body) =
+            xray_file_masquerade_response(&get, &cleaned_uri, &root_str)
+                .await
+                .expect("clean Xray file path within root");
+        assert_eq!(cleaned_body.as_deref(), Some(&b"hello file"[..]));
+
+        tokio::fs::remove_dir_all(&root)
+            .await
+            .expect("remove file masquerade tempdir");
     }
 
     #[test]
