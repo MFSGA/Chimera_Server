@@ -1006,6 +1006,13 @@ async fn drive_udp_datagrams(
                 continue;
             }
 
+            prepare_fragment_cache(
+                &mut session.fragments,
+                packet_id,
+                fragment_count,
+                auth_ctx.xray_compat,
+            );
+
             if !session.fragments.contains(&packet_id) {
                 session.fragments.put(
                     packet_id,
@@ -1234,6 +1241,26 @@ struct FragmentedPacket {
 
 fn hysteria2_fragment_cache() -> LruCache<u16, FragmentedPacket> {
     LruCache::new(NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap())
+}
+
+fn prepare_fragment_cache(
+    fragments: &mut LruCache<u16, FragmentedPacket>,
+    packet_id: u16,
+    fragment_count: u8,
+    xray_compat: bool,
+) {
+    if !xray_compat {
+        return;
+    }
+
+    let current_matches = fragments
+        .peek(&packet_id)
+        .is_some_and(|packet| packet.fragment_count == fragment_count);
+    if !current_matches {
+        // Xray's Defragger tracks only one in-flight packet per UDP session.
+        // A new packet ID or fragment count replaces any partial assembly.
+        fragments.clear();
+    }
 }
 
 fn new_hysteria2_socket2_udp_socket() -> std::io::Result<socket2::Socket> {
@@ -1900,6 +1927,50 @@ mod tests {
             "oldest incomplete packet should be evicted"
         );
         assert!(cache.contains(&(MAX_FRAGMENT_CACHE_SIZE as u16)));
+    }
+
+    #[test]
+    fn fragment_reassembly_matches_xray_single_packet_and_shoes_lru_semantics() {
+        let remote_location = NetLocation::from_str("127.0.0.1:53", None)
+            .expect("valid fragment test location");
+        let packet = |fragment_count| FragmentedPacket {
+            fragment_count,
+            fragment_received: 1,
+            packet_len: 1,
+            received: vec![Some(Bytes::from_static(b"x")); fragment_count as usize],
+            remote_location: remote_location.clone(),
+        };
+
+        let mut xray_cache = hysteria2_fragment_cache();
+        xray_cache.put(10, packet(2));
+        prepare_fragment_cache(&mut xray_cache, 11, 2, true);
+        assert!(
+            xray_cache.is_empty(),
+            "new Xray packet should replace partial state"
+        );
+
+        xray_cache.put(11, packet(2));
+        prepare_fragment_cache(&mut xray_cache, 11, 3, true);
+        assert!(
+            xray_cache.is_empty(),
+            "changed Xray fragment count should replace partial state"
+        );
+
+        xray_cache.put(11, packet(3));
+        prepare_fragment_cache(&mut xray_cache, 11, 3, true);
+        assert_eq!(
+            xray_cache.len(),
+            1,
+            "matching Xray fragments should retain state"
+        );
+
+        let mut shoes_cache = hysteria2_fragment_cache();
+        shoes_cache.put(10, packet(2));
+        prepare_fragment_cache(&mut shoes_cache, 11, 2, false);
+        assert!(
+            shoes_cache.contains(&10),
+            "shoes should retain older partial packets"
+        );
     }
 
     #[test]
