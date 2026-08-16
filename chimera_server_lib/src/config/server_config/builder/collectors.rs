@@ -89,15 +89,21 @@ pub(super) fn collect_hysteria2_settings(
         .into_iter()
         .map(|client| {
             let xray_uuid_route = client.auth.is_some();
-            let password = client
-                .auth
-                .or(client.id)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    Error::InvalidConfig(
-                        "hysteria client requires auth or id".into(),
-                    )
-                })?;
+            let password = match client.auth {
+                Some(auth) if xray_compat || !auth.is_empty() => auth,
+                Some(_) => {
+                    return Err(Error::InvalidConfig(
+                        "hysteria client requires non-empty auth or id".into(),
+                    ));
+                }
+                None => {
+                    client.id.filter(|value| !value.is_empty()).ok_or_else(|| {
+                        Error::InvalidConfig(
+                            "hysteria client requires auth or id".into(),
+                        )
+                    })?
+                }
+            };
 
             Ok(Hysteria2Client {
                 password,
@@ -1583,6 +1589,33 @@ mod tests {
         assert_eq!(config.clients[0].level, 7);
         assert!(config.clients[0].xray_uuid_route);
         assert_eq!(config.xray_udp_idle_timeout_secs, Some(60));
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn collect_hysteria2_settings_accepts_empty_auth_only_for_xray_users() {
+        let xray_settings = SettingObject(serde_json::json!({
+            "version": 2,
+            "clients": [{"auth": "", "email": "empty@example.com"}]
+        }));
+        let xray_stream_settings =
+            serde_json::from_value::<HysteriaSettings>(serde_json::json!({
+                "version": 2
+            }))
+            .expect("valid Xray hysteriaSettings");
+        let config =
+            collect_hysteria2_settings(xray_settings, Some(&xray_stream_settings))
+                .expect("Xray validator accepts an empty auth key");
+        assert_eq!(config.clients.len(), 1);
+        assert_eq!(config.clients[0].password, "");
+        assert!(config.clients[0].xray_uuid_route);
+
+        let shoes_settings = SettingObject(serde_json::json!({
+            "clients": [{"auth": "", "email": "empty@example.com"}]
+        }));
+        let err = collect_hysteria2_settings(shoes_settings, None)
+            .expect_err("non-Xray empty auth must stay invalid");
+        assert!(err.to_string().contains("non-empty auth or id"), "{err}");
     }
 
     #[cfg(feature = "hysteria")]

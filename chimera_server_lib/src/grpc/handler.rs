@@ -1428,11 +1428,6 @@ impl HandlerServiceImpl {
                 ))
             })?;
         let auth = payload.auth.as_str();
-        if auth.is_empty() {
-            return Err(Status::invalid_argument(
-                "hysteria account auth is required",
-            ));
-        }
 
         Ok(Hysteria2Client {
             password: auth.to_string(),
@@ -4014,12 +4009,13 @@ mod tests {
                 account: Some(proto::xray::common::serial::TypedMessage {
                     r#type: TYPE_PROXY_HYSTERIA_ACCOUNT.to_string(),
                     value: HysteriaAccountPayload {
-                        auth: "dynamic-empty-email".to_string(),
+                        auth: String::new(),
                     }
                     .encode_to_vec(),
                 }),
             })
-            .expect("Xray Hysteria AddUser permits an empty email");
+            .expect("Xray Hysteria AddUser permits empty email/auth fields");
+        assert_eq!(dynamic.password, "");
         assert_eq!(dynamic.email, None);
         assert_eq!(dynamic.level, 9);
     }

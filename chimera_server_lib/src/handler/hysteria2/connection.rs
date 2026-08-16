@@ -597,12 +597,13 @@ fn validate_auth_request(
     }
 
     let headers = req.headers();
-    let provided = headers
-        .get(AUTH_HEADER)
-        .ok_or(AuthReject::Unauthorized("missing auth header"))?;
-    let provided = provided
-        .to_str()
-        .map_err(|_| AuthReject::Unauthorized("invalid auth header"))?;
+    let provided = match headers.get(AUTH_HEADER) {
+        Some(value) => value
+            .to_str()
+            .map_err(|_| AuthReject::Unauthorized("invalid auth header"))?,
+        None if xray_compat => "",
+        None => return Err(AuthReject::Unauthorized("missing auth header")),
+    };
 
     let (client, vless_route) = match_hysteria_auth(provided, clients, xray_compat)
         .ok_or(AuthReject::Unauthorized("password mismatch"))?;
@@ -1852,6 +1853,29 @@ mod tests {
                 false,
             ),
             Err(AuthReject::Unauthorized("password mismatch"))
+        ));
+    }
+
+    #[test]
+    fn xray_empty_user_auth_matches_missing_header_without_relaxing_shoes() {
+        let clients = vec![Hysteria2Client {
+            password: String::new(),
+            email: Some("empty@example.com".to_string()),
+            level: 0,
+            xray_uuid_route: true,
+            xray_transport_auth_fallback: false,
+        }];
+        let request = Request::builder()
+            .method(http::Method::POST)
+            .uri(AUTH_URI)
+            .body(())
+            .expect("valid Hysteria2 auth request without auth header");
+
+        validate_auth_request(request.clone(), &clients, true)
+            .expect("Xray Header.Get maps a missing auth header to an empty key");
+        assert!(matches!(
+            validate_auth_request(request, &clients, false),
+            Err(AuthReject::Unauthorized("missing auth header"))
         ));
     }
 
