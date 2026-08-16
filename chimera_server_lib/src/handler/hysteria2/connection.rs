@@ -900,6 +900,22 @@ fn xray_proxy_forwarding_header(name: &http::HeaderName) -> bool {
     )
 }
 
+fn xray_proxy_connection_header(
+    name: &http::HeaderName,
+    headers: &http::HeaderMap,
+) -> bool {
+    headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .any(|value| {
+            value.to_str().ok().is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case(name.as_str()))
+            })
+        })
+}
+
 async fn xray_proxy_masquerade_response(
     method: &http::Method,
     uri: &http::Uri,
@@ -917,6 +933,7 @@ async fn xray_proxy_masquerade_response(
     let mut request = client.request(method.clone(), target);
     for (name, value) in request_headers {
         if !xray_proxy_hop_header(name)
+            && !xray_proxy_connection_header(name, request_headers)
             && !xray_proxy_forwarding_header(name)
             && name != http::header::HOST
         {
@@ -948,7 +965,9 @@ async fn xray_proxy_masquerade_response(
     let body = upstream.bytes().await.map_err(Error::other)?;
     let mut response = Response::builder().status(status);
     for (name, value) in &headers {
-        if !xray_proxy_hop_header(name) {
+        if !xray_proxy_hop_header(name)
+            && !xray_proxy_connection_header(name, &headers)
+        {
             response = response.header(name, value);
         }
     }
@@ -2727,7 +2746,7 @@ mod tests {
             }
             stream
                 .write_all(
-                    b"HTTP/1.1 201 Created\r\nContent-Length: 5\r\nX-Upstream: yes\r\nConnection: close\r\n\r\nhello",
+                    b"HTTP/1.1 201 Created\r\nContent-Length: 5\r\nX-Upstream: yes\r\nConnection: close, X-Upstream-Hop\r\nX-Upstream-Hop: hidden\r\n\r\nhello",
                 )
                 .await
                 .expect("write proxy response");
@@ -2739,6 +2758,11 @@ mod tests {
             .expect("valid proxy request URI");
         let mut headers = http::HeaderMap::new();
         headers.insert("x-test", http::HeaderValue::from_static("forwarded"));
+        headers.insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("keep-alive, X-Client-Hop"),
+        );
+        headers.insert("x-client-hop", http::HeaderValue::from_static("hidden"));
         headers.insert("forwarded", http::HeaderValue::from_static("for=spoofed"));
         headers.insert(
             "x-forwarded-for",
@@ -2770,6 +2794,7 @@ mod tests {
             Some(&http::HeaderValue::from_static("yes"))
         );
         assert!(response.headers().get(http::header::CONNECTION).is_none());
+        assert!(response.headers().get("x-upstream-hop").is_none());
         assert_eq!(body.as_deref(), Some(&b"hello"[..]));
 
         let request = upstream.await.expect("join proxy upstream");
@@ -2783,6 +2808,8 @@ mod tests {
                 || request.contains("X-Test: forwarded\r\n")
         );
         let request_lower = request.to_ascii_lowercase();
+        assert!(!request_lower.contains("\r\nx-client-hop:"));
+        assert!(!request_lower.contains("\r\nconnection:"));
         assert!(!request_lower.contains("\r\nforwarded:"));
         assert!(!request_lower.contains("\r\nx-forwarded-for:"));
         assert!(!request_lower.contains("\r\nx-forwarded-host:"));
