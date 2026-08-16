@@ -57,6 +57,18 @@ fn default_hysteria2_udp_enabled() -> bool {
 }
 
 #[cfg(feature = "hysteria")]
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Hysteria2MasqueradeStringConfig {
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub status_code: i32,
+}
+
+#[cfg(feature = "hysteria")]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Hysteria2ServerConfig {
@@ -69,6 +81,8 @@ pub struct Hysteria2ServerConfig {
     pub udp_enabled: bool,
     #[serde(default)]
     pub xray_compat: bool,
+    #[serde(default)]
+    pub xray_masquerade_string: Option<Hysteria2MasqueradeStringConfig>,
     #[serde(default)]
     pub xray_congestion: Option<String>,
     #[serde(default)]

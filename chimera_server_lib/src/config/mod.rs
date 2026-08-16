@@ -250,6 +250,20 @@ pub struct FinalMaskQuicParams {
 pub struct HysteriaMasqueradeSettings {
     #[serde(default, rename = "type")]
     pub kind: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub status_code: i32,
+    #[serde(default)]
+    pub dir: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub rewrite_host: bool,
+    #[serde(default)]
+    pub insecure: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

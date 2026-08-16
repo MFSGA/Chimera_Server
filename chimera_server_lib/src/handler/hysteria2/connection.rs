@@ -244,8 +244,12 @@ async fn auth_hysteria2_connection(
                                 warn!("hysteria2 auth rejected: {}", msg);
                             }
                         }
-                        send_auth_reject_response(&mut stream, config.xray_compat)
-                            .await?;
+                        send_auth_reject_response(
+                            &mut stream,
+                            config.xray_compat,
+                            config.xray_masquerade_string.as_ref(),
+                        )
+                        .await?;
                     }
                 }
             }
@@ -763,8 +767,25 @@ async fn send_auth_success(
 
 fn auth_reject_response(
     xray_compat: bool,
+    xray_masquerade_string: Option<
+        &crate::config::server_config::Hysteria2MasqueradeStringConfig,
+    >,
 ) -> std::io::Result<(Response<()>, Option<Bytes>)> {
-    if xray_compat {
+    if let Some(masquerade) = xray_masquerade_string {
+        let body = Bytes::copy_from_slice(masquerade.content.as_bytes());
+        let mut builder =
+            Response::builder().status(if masquerade.status_code == 0 {
+                StatusCode::OK
+            } else {
+                StatusCode::from_u16(masquerade.status_code as u16)
+                    .map_err(Error::other)?
+            });
+        for (name, value) in &masquerade.headers {
+            builder = builder.header(name, value);
+        }
+        let response = builder.body(()).map_err(Error::other)?;
+        Ok((response, Some(body)))
+    } else if xray_compat {
         let body = Bytes::from_static(b"404 page not found\n");
         let response = Response::builder()
             .status(StatusCode::NOT_FOUND)
@@ -787,8 +808,12 @@ fn auth_reject_response(
 async fn send_auth_reject_response(
     stream: &mut h3::server::RequestStream<BidiStream<Bytes>, Bytes>,
     xray_compat: bool,
+    xray_masquerade_string: Option<
+        &crate::config::server_config::Hysteria2MasqueradeStringConfig,
+    >,
 ) -> std::io::Result<()> {
-    let (response, body) = auth_reject_response(xray_compat)?;
+    let (response, body) =
+        auth_reject_response(xray_compat, xray_masquerade_string)?;
     stream.send_response(response).await.map_err(map_h3_error)?;
     if let Some(body) = body {
         stream.send_data(body).await.map_err(map_h3_error)?;
@@ -1804,7 +1829,7 @@ mod tests {
     #[test]
     fn auth_rejections_match_xray_and_shoes_default_masquerade() {
         let (shoes_response, shoes_body) =
-            auth_reject_response(false).expect("valid shoes reject response");
+            auth_reject_response(false, None).expect("valid shoes reject response");
         assert_eq!(shoes_response.status(), StatusCode::NOT_FOUND);
         assert_eq!(
             shoes_response.headers().get(http::header::CONTENT_LENGTH),
@@ -1813,7 +1838,7 @@ mod tests {
         assert!(shoes_body.is_none());
 
         let (xray_response, xray_body) =
-            auth_reject_response(true).expect("valid Xray reject response");
+            auth_reject_response(true, None).expect("valid Xray reject response");
         assert_eq!(xray_response.status(), StatusCode::NOT_FOUND);
         assert_eq!(
             xray_response.headers().get(http::header::CONTENT_TYPE),
@@ -1828,6 +1853,26 @@ mod tests {
             Some(&http::HeaderValue::from_static("19"))
         );
         assert_eq!(xray_body.as_deref(), Some(&b"404 page not found\n"[..]));
+    }
+
+    #[test]
+    fn auth_rejections_match_xray_string_masquerade() {
+        let masquerade =
+            crate::config::server_config::Hysteria2MasqueradeStringConfig {
+                content: "hello from xray".to_string(),
+                headers: [("x-test-header".to_string(), "present".to_string())]
+                    .into_iter()
+                    .collect(),
+                status_code: 418,
+            };
+        let (response, body) = auth_reject_response(true, Some(&masquerade))
+            .expect("valid Xray string masquerade response");
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+        assert_eq!(
+            response.headers().get("x-test-header"),
+            Some(&http::HeaderValue::from_static("present"))
+        );
+        assert_eq!(body.as_deref(), Some(&b"hello from xray"[..]));
     }
 
     #[test]
