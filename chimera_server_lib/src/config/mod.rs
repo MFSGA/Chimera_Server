@@ -232,6 +232,13 @@ pub struct FinalMaskQuicParams {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct HysteriaMasqueradeSettings {
+    #[serde(default, rename = "type")]
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HysteriaSettings {
     #[serde(default)]
     pub version: Option<u8>,
@@ -247,6 +254,8 @@ pub struct HysteriaSettings {
     pub ignore_client_bandwidth: Option<bool>,
     #[serde(default)]
     pub udp_idle_timeout: i64,
+    #[serde(default)]
+    pub masquerade: Option<HysteriaMasqueradeSettings>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

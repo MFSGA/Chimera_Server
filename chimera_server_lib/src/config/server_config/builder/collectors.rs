@@ -176,6 +176,17 @@ pub(super) fn collect_hysteria2_settings(
             )));
         }
 
+        if xray_compat && let Some(masquerade) = &hysteria_settings.masquerade {
+            match masquerade.kind.to_ascii_lowercase().as_str() {
+                "" | "404" => {}
+                kind => {
+                    return Err(Error::InvalidConfig(format!(
+                        "hysteriaSettings.masquerade.type {kind:?} is not supported; Chimera currently supports only Xray's default 404 masquerade"
+                    )));
+                }
+            }
+        }
+
         if !xray_compat {
             if !saw_up && let Some(up) = hysteria_settings.up.clone() {
                 bandwidth.max_tx = parse_bandwidth(up).map_err(|err| {
@@ -1596,6 +1607,44 @@ mod tests {
 
     #[cfg(feature = "hysteria")]
     #[test]
+    fn collect_hysteria2_settings_accepts_only_supported_xray_masquerade() {
+        let settings = || {
+            SettingObject(serde_json::json!({
+                "version": 2,
+                "clients": [{"auth": "xray-auth-token"}]
+            }))
+        };
+
+        for kind in ["", "404"] {
+            let stream_settings =
+                serde_json::from_value::<HysteriaSettings>(serde_json::json!({
+                    "version": 2,
+                    "masquerade": {"type": kind}
+                }))
+                .expect("valid Xray masquerade shape");
+            collect_hysteria2_settings(settings(), Some(&stream_settings))
+                .expect("Xray default 404 masquerade should be accepted");
+        }
+
+        for kind in ["string", "FILE", "proxy", "unknown"] {
+            let stream_settings =
+                serde_json::from_value::<HysteriaSettings>(serde_json::json!({
+                    "version": 2,
+                    "masquerade": {"type": kind}
+                }))
+                .expect("valid Xray masquerade shape");
+            let err = collect_hysteria2_settings(settings(), Some(&stream_settings))
+                .expect_err("unsupported Xray masquerade must fail explicitly");
+            assert!(
+                err.to_string()
+                    .contains("supports only Xray's default 404 masquerade"),
+                "unexpected masquerade error for {kind}: {err}"
+            );
+        }
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
     fn collect_hysteria2_settings_keeps_shoes_id_exact() {
         let settings = SettingObject(serde_json::json!({
             "clients": [{"id": "00112233-4455-6677-8899-aabbccddeeff"}]
@@ -1756,6 +1805,7 @@ mod tests {
             down: None,
             ignore_client_bandwidth: None,
             udp_idle_timeout: 0,
+            masquerade: None,
         };
 
         let err = collect_hysteria2_settings(settings, Some(&stream_settings))

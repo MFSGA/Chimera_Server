@@ -1617,7 +1617,8 @@ async fn xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2_with_xray_d
                     "hysteriaSettings": {
                         "version": 2,
                         "up": "10 mbps",
-                        "down": "10 mbps"
+                        "down": "10 mbps",
+                        "masquerade": {"type": "404"}
                     },
                     "tlsSettings": {
                         "alpn": ["h3"],
