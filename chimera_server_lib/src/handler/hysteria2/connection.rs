@@ -201,6 +201,7 @@ async fn auth_hysteria2_connection(
                 debug!(method = %req.method(), uri = %req.uri(), "hysteria2 auth request received");
                 let request_method = req.method().clone();
                 let request_uri = req.uri().clone();
+                let request_headers = req.headers().clone();
                 match validate_auth_request(
                     req,
                     config.clients.as_ref(),
@@ -251,6 +252,7 @@ async fn auth_hysteria2_connection(
                             &mut stream,
                             &request_method,
                             &request_uri,
+                            &request_headers,
                             config.xray_compat,
                             config.xray_masquerade_file.as_ref(),
                             config.xray_masquerade_string.as_ref(),
@@ -815,6 +817,7 @@ async fn send_auth_reject_response(
     stream: &mut h3::server::RequestStream<BidiStream<Bytes>, Bytes>,
     method: &http::Method,
     uri: &http::Uri,
+    request_headers: &http::HeaderMap,
     xray_compat: bool,
     xray_masquerade_file: Option<
         &crate::config::server_config::Hysteria2MasqueradeFileConfig,
@@ -824,7 +827,8 @@ async fn send_auth_reject_response(
     >,
 ) -> std::io::Result<()> {
     let (response, body) = if let Some(masquerade) = xray_masquerade_file {
-        xray_file_masquerade_response(method, uri, &masquerade.dir).await?
+        xray_file_masquerade_response(method, uri, request_headers, &masquerade.dir)
+            .await?
     } else {
         auth_reject_response(xray_compat, xray_masquerade_string)?
     };
@@ -838,8 +842,9 @@ async fn send_auth_reject_response(
 }
 
 async fn xray_file_masquerade_response(
-    _method: &http::Method,
+    method: &http::Method,
     uri: &http::Uri,
+    request_headers: &http::HeaderMap,
     root: &str,
 ) -> std::io::Result<(Response<()>, Option<Bytes>)> {
     if uri.path().ends_with("/index.html") {
@@ -893,6 +898,28 @@ async fn xray_file_masquerade_response(
         return auth_reject_response(true, None);
     }
 
+    let metadata = tokio::fs::metadata(&path).await?;
+    let modified = metadata.modified().ok();
+    let last_modified = modified.map(httpdate::fmt_http_date);
+    if matches!(*method, http::Method::GET | http::Method::HEAD)
+        && request_headers.get(http::header::IF_NONE_MATCH).is_none()
+        && let Some(value) = request_headers.get(http::header::IF_MODIFIED_SINCE)
+        && let Ok(value) = value.to_str()
+        && let Ok(since) = httpdate::parse_http_date(value)
+        && let Some(modified) = modified
+        && modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .zip(since.duration_since(std::time::UNIX_EPOCH).ok())
+            .is_some_and(|(modified, since)| modified.as_secs() <= since.as_secs())
+    {
+        let mut response = Response::builder().status(StatusCode::NOT_MODIFIED);
+        if let Some(last_modified) = last_modified.as_deref() {
+            response = response.header(http::header::LAST_MODIFIED, last_modified);
+        }
+        return Ok((response.body(()).map_err(Error::other)?, None));
+    }
+
     let body = tokio::fs::read(&path).await?;
     let guessed_type = mime_guess::from_path(&path).first_or_octet_stream();
     let content_type = if guessed_type.type_() == mime_guess::mime::TEXT {
@@ -900,12 +927,14 @@ async fn xray_file_masquerade_response(
     } else {
         guessed_type.essence_str().to_string()
     };
-    let response = Response::builder()
+    let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(http::header::CONTENT_TYPE, content_type)
-        .header(http::header::CONTENT_LENGTH, body.len().to_string())
-        .body(())
-        .map_err(Error::other)?;
+        .header(http::header::CONTENT_LENGTH, body.len().to_string());
+    if let Some(last_modified) = last_modified.as_deref() {
+        response = response.header(http::header::LAST_MODIFIED, last_modified);
+    }
+    let response = response.body(()).map_err(Error::other)?;
     Ok((response, Some(Bytes::from(body))))
 }
 
@@ -2104,11 +2133,12 @@ mod tests {
 
         let root_str = root.to_string_lossy();
         let get = http::Method::GET;
+        let headers = http::HeaderMap::new();
         let file_uri: http::Uri = "https://example.test/hello%2Etxt"
             .parse()
             .expect("valid file URI");
         let (file_response, file_body) =
-            xray_file_masquerade_response(&get, &file_uri, &root_str)
+            xray_file_masquerade_response(&get, &file_uri, &headers, &root_str)
                 .await
                 .expect("serve Xray file masquerade file");
         assert_eq!(file_response.status(), StatusCode::OK);
@@ -2117,12 +2147,43 @@ mod tests {
             Some(&http::HeaderValue::from_static("text/plain; charset=utf-8"))
         );
         assert_eq!(file_body.as_deref(), Some(&b"hello file"[..]));
+        let last_modified = file_response
+            .headers()
+            .get(http::header::LAST_MODIFIED)
+            .cloned()
+            .expect("Xray file response should expose Last-Modified");
+        let mut conditional_headers = http::HeaderMap::new();
+        conditional_headers
+            .insert(http::header::IF_MODIFIED_SINCE, last_modified.clone());
+        let (not_modified_response, not_modified_body) =
+            xray_file_masquerade_response(
+                &get,
+                &file_uri,
+                &conditional_headers,
+                &root_str,
+            )
+            .await
+            .expect("honor Xray If-Modified-Since condition");
+        assert_eq!(not_modified_response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            not_modified_response
+                .headers()
+                .get(http::header::LAST_MODIFIED),
+            Some(&last_modified)
+        );
+        assert!(
+            not_modified_response
+                .headers()
+                .get(http::header::CONTENT_LENGTH)
+                .is_none()
+        );
+        assert!(not_modified_body.is_none());
 
         let redirect_uri: http::Uri = "https://example.test/sub?keep=yes"
             .parse()
             .expect("valid directory URI");
         let (redirect_response, _) =
-            xray_file_masquerade_response(&get, &redirect_uri, &root_str)
+            xray_file_masquerade_response(&get, &redirect_uri, &headers, &root_str)
                 .await
                 .expect("redirect Xray file masquerade directory");
         assert_eq!(redirect_response.status(), StatusCode::MOVED_PERMANENTLY);
@@ -2135,7 +2196,7 @@ mod tests {
             .parse()
             .expect("valid index URI");
         let (_, index_body) =
-            xray_file_masquerade_response(&get, &index_uri, &root_str)
+            xray_file_masquerade_response(&get, &index_uri, &headers, &root_str)
                 .await
                 .expect("serve Xray file masquerade index");
         assert_eq!(index_body.as_deref(), Some(&b"sub index"[..]));
@@ -2144,10 +2205,14 @@ mod tests {
             "https://example.test/sub/index.html?q=1"
                 .parse()
                 .expect("valid explicit index URI");
-        let (explicit_index_response, _) =
-            xray_file_masquerade_response(&get, &explicit_index_uri, &root_str)
-                .await
-                .expect("redirect explicit Xray index path");
+        let (explicit_index_response, _) = xray_file_masquerade_response(
+            &get,
+            &explicit_index_uri,
+            &headers,
+            &root_str,
+        )
+        .await
+        .expect("redirect explicit Xray index path");
         assert_eq!(
             explicit_index_response
                 .headers()
@@ -2159,7 +2224,7 @@ mod tests {
             .parse()
             .expect("valid listing URI");
         let (list_response, list_body) =
-            xray_file_masquerade_response(&get, &list_uri, &root_str)
+            xray_file_masquerade_response(&get, &list_uri, &headers, &root_str)
                 .await
                 .expect("serve Xray directory listing");
         assert_eq!(list_response.status(), StatusCode::OK);
@@ -2176,7 +2241,7 @@ mod tests {
             .parse()
             .expect("valid cleaned URI");
         let (_, cleaned_body) =
-            xray_file_masquerade_response(&get, &cleaned_uri, &root_str)
+            xray_file_masquerade_response(&get, &cleaned_uri, &headers, &root_str)
                 .await
                 .expect("clean Xray file path within root");
         assert_eq!(cleaned_body.as_deref(), Some(&b"hello file"[..]));
