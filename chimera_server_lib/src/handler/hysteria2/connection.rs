@@ -893,6 +893,13 @@ fn xray_proxy_hop_header(name: &http::HeaderName) -> bool {
     )
 }
 
+fn xray_proxy_forwarding_header(name: &http::HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "forwarded" | "x-forwarded-for" | "x-forwarded-host" | "x-forwarded-proto"
+    )
+}
+
 async fn xray_proxy_masquerade_response(
     method: &http::Method,
     uri: &http::Uri,
@@ -909,7 +916,10 @@ async fn xray_proxy_masquerade_response(
 
     let mut request = client.request(method.clone(), target);
     for (name, value) in request_headers {
-        if !xray_proxy_hop_header(name) && name != http::header::HOST {
+        if !xray_proxy_hop_header(name)
+            && !xray_proxy_forwarding_header(name)
+            && name != http::header::HOST
+        {
             request = request.header(name, value);
         }
     }
@@ -2729,6 +2739,16 @@ mod tests {
             .expect("valid proxy request URI");
         let mut headers = http::HeaderMap::new();
         headers.insert("x-test", http::HeaderValue::from_static("forwarded"));
+        headers.insert("forwarded", http::HeaderValue::from_static("for=spoofed"));
+        headers.insert(
+            "x-forwarded-for",
+            http::HeaderValue::from_static("203.0.113.7"),
+        );
+        headers.insert(
+            "x-forwarded-host",
+            http::HeaderValue::from_static("spoofed.example"),
+        );
+        headers.insert("x-forwarded-proto", http::HeaderValue::from_static("http"));
         let config = Hysteria2MasqueradeProxyConfig {
             url: format!("http://{upstream_addr}/base?fixed=1"),
             rewrite_host: false,
@@ -2762,6 +2782,11 @@ mod tests {
             request.contains("x-test: forwarded\r\n")
                 || request.contains("X-Test: forwarded\r\n")
         );
+        let request_lower = request.to_ascii_lowercase();
+        assert!(!request_lower.contains("\r\nforwarded:"));
+        assert!(!request_lower.contains("\r\nx-forwarded-for:"));
+        assert!(!request_lower.contains("\r\nx-forwarded-host:"));
+        assert!(!request_lower.contains("\r\nx-forwarded-proto:"));
         assert!(request.ends_with("\r\npayload"));
     }
 
