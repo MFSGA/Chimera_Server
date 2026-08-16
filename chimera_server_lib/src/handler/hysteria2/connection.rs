@@ -611,7 +611,7 @@ fn validate_auth_request(
         .to_str()
         .map_err(|_| AuthReject::Unauthorized("invalid auth header"))?;
 
-    let (client, vless_route) = match_hysteria_auth(provided, clients)
+    let (client, vless_route) = match_hysteria_auth(provided, clients, xray_compat)
         .ok_or(AuthReject::Unauthorized("password mismatch"))?;
 
     // Xray ignores Hysteria-CC-RX parse errors, while shoes does not consume
@@ -637,13 +637,26 @@ fn validate_auth_request(
 fn match_hysteria_auth(
     provided: &str,
     clients: &[Hysteria2Client],
+    xray_compat: bool,
 ) -> Option<(Hysteria2Client, u32)> {
+    // Xray consults transport-level `hysteriaSettings.auth` only while its
+    // inbound user validator is empty. A dynamic AddUser therefore disables
+    // the fallback until the last real user is removed again.
+    let xray_has_users = xray_compat
+        && clients
+            .iter()
+            .any(|client| !client.xray_transport_auth_fallback);
+
     // Chimera's shoes/native `id` credentials and Xray's transport auth
     // fallback remain exact even when they happen to look like UUIDs.
     if let Some(client) = clients
         .iter()
         .rev()
-        .find(|client| !client.xray_uuid_route && client.password == provided)
+        .find(|client| {
+            !client.xray_uuid_route
+                && (!xray_has_users || !client.xray_transport_auth_fallback)
+                && client.password == provided
+        })
         .cloned()
     {
         return Some((client, 0));
@@ -1729,6 +1742,7 @@ mod tests {
             password: " spaced-secret ".to_string(),
             email: None,
             xray_uuid_route: false,
+            xray_transport_auth_fallback: false,
         }];
 
         validate_auth_request(
@@ -1748,17 +1762,59 @@ mod tests {
     }
 
     #[test]
+    fn xray_transport_auth_fallback_yields_to_validator_users() {
+        let fallback = Hysteria2Client {
+            password: "transport-fallback".to_string(),
+            email: None,
+            xray_uuid_route: false,
+            xray_transport_auth_fallback: true,
+        };
+        let dynamic_user = Hysteria2Client {
+            password: "dynamic-user-auth".to_string(),
+            email: Some("dynamic@example.com".to_string()),
+            xray_uuid_route: true,
+            xray_transport_auth_fallback: false,
+        };
+
+        let mut clients = vec![fallback];
+        assert!(
+            match_hysteria_auth("transport-fallback", &clients, true).is_some(),
+            "Xray transport auth fallback should work while the validator is empty"
+        );
+
+        clients.push(dynamic_user);
+        assert!(
+            match_hysteria_auth("transport-fallback", &clients, true).is_none(),
+            "adding an Xray user must disable transport auth fallback"
+        );
+        assert_eq!(
+            match_hysteria_auth("dynamic-user-auth", &clients, true)
+                .and_then(|(client, _)| client.email),
+            Some("dynamic@example.com".to_string())
+        );
+
+        clients
+            .retain(|client| client.email.as_deref() != Some("dynamic@example.com"));
+        assert!(
+            match_hysteria_auth("transport-fallback", &clients, true).is_some(),
+            "removing the last Xray user must re-enable transport auth fallback"
+        );
+    }
+
+    #[test]
     fn xray_uuid_user_auth_masks_route_bytes_but_shoes_id_stays_exact() {
         let xray_clients = vec![
             Hysteria2Client {
                 password: "00112233-4455-6677-8899-aabbccddeeff".to_string(),
                 email: Some("shadowed@example.com".to_string()),
                 xray_uuid_route: true,
+                xray_transport_auth_fallback: false,
             },
             Hysteria2Client {
                 password: "00112233-4455-1234-8899-aabbccddeeff".to_string(),
                 email: Some("route-user@example.com".to_string()),
                 xray_uuid_route: true,
+                xray_transport_auth_fallback: false,
             },
         ];
         let routed = validate_auth_request(
@@ -1777,6 +1833,7 @@ mod tests {
             password: "00112233-4455-6677-8899-aabbccddeeff".to_string(),
             email: None,
             xray_uuid_route: false,
+            xray_transport_auth_fallback: false,
         }];
         assert!(matches!(
             validate_auth_request(
@@ -1794,6 +1851,7 @@ mod tests {
             password: "secret".to_string(),
             email: None,
             xray_uuid_route: false,
+            xray_transport_auth_fallback: false,
         }];
         let request = Request::builder()
             .method(http::Method::POST)
@@ -1886,6 +1944,7 @@ mod tests {
             password: "secret".to_string(),
             email: None,
             xray_uuid_route: false,
+            xray_transport_auth_fallback: false,
         }];
         assert!(
             validate_auth_request(
@@ -1920,6 +1979,7 @@ mod tests {
             password: "secret".to_string(),
             email: None,
             xray_uuid_route: false,
+            xray_transport_auth_fallback: false,
         }];
         let query_uri = "https://hysteria/auth?extra=1";
 

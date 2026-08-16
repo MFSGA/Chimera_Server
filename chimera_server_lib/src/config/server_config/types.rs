@@ -35,6 +35,8 @@ pub struct Hysteria2Client {
     pub email: Option<String>,
     #[serde(default)]
     pub xray_uuid_route: bool,
+    #[serde(default)]
+    pub xray_transport_auth_fallback: bool,
 }
 
 #[cfg(feature = "hysteria")]

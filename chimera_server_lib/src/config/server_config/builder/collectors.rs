@@ -102,6 +102,7 @@ pub(super) fn collect_hysteria2_settings(
                     Some(client.email)
                 },
                 xray_uuid_route,
+                xray_transport_auth_fallback: false,
             })
         })
         .collect::<Result<Vec<_>, Error>>()?;
@@ -119,6 +120,7 @@ pub(super) fn collect_hysteria2_settings(
             password: auth.to_string(),
             email: None,
             xray_uuid_route: false,
+            xray_transport_auth_fallback: true,
         });
     }
 
@@ -1586,6 +1588,7 @@ mod tests {
         assert_eq!(config.clients[0].password, "transport-auth-token");
         assert_eq!(config.clients[0].email, None);
         assert!(!config.clients[0].xray_uuid_route);
+        assert!(config.clients[0].xray_transport_auth_fallback);
         assert!(config.xray_compat);
         assert_eq!(config.bandwidth.max_tx, 0);
         assert_eq!(config.bandwidth.max_rx, 0);
@@ -1605,6 +1608,7 @@ mod tests {
             "00112233-4455-6677-8899-aabbccddeeff"
         );
         assert!(!config.clients[0].xray_uuid_route);
+        assert!(!config.clients[0].xray_transport_auth_fallback);
         assert!(!config.xray_compat);
     }
 
