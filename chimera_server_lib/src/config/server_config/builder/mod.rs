@@ -827,6 +827,18 @@ impl TryFrom<InboudItem> for ServerConfig {
                         }
                     })
                     .transpose()?;
+                if matches!(
+                    xray_bbr_profile.as_deref(),
+                    Some("conservative" | "aggressive")
+                ) && !matches!(
+                    xray_congestion.as_deref(),
+                    Some("reno" | "force-brutal")
+                ) {
+                    return Err(Error::InvalidConfig(
+                        "finalmask.quicParams.bbrProfile conservative/aggressive is not supported when Xray may use BBR"
+                            .into(),
+                    ));
+                }
                 let xray_brutal_up = xray_quic_params
                     .map(|quic_params| {
                         let up = parse_xray_finalmask_bandwidth(&quic_params.brutal_up)?;
@@ -1803,7 +1815,7 @@ mod tests {
     fn hysteria2_finalmask_congestion_matches_xray_settings() {
         let config = ServerConfig::try_from(
             hysteria2_inbound_with_finalmask_quic_params(serde_json::json!({
-                "congestion": "BRUTAL",
+                "congestion": "FORCE-BRUTAL",
                 "bbrProfile": "AGGRESSIVE",
                 "brutalUp": "8 mbps",
                 "brutalDown": "0.5 mbps"
@@ -1812,7 +1824,7 @@ mod tests {
         .expect("valid Xray Hysteria2 congestion settings should build");
         match config.protocol {
             ServerProxyConfig::Hysteria2 { config } => {
-                assert_eq!(config.xray_congestion.as_deref(), Some("brutal"));
+                assert_eq!(config.xray_congestion.as_deref(), Some("force-brutal"));
                 assert_eq!(config.xray_bbr_profile.as_deref(), Some("aggressive"));
                 assert_eq!(config.xray_brutal_up, Some(1024 * 1024));
                 assert_eq!(config.xray_brutal_down, Some(65_536));
@@ -1827,6 +1839,20 @@ mod tests {
         for (params, expected) in [
             (serde_json::json!({"congestion": "cubic"}), "congestion"),
             (serde_json::json!({"bbrProfile": "turbo"}), "bbrProfile"),
+            (
+                serde_json::json!({
+                    "congestion": "bbr",
+                    "bbrProfile": "aggressive"
+                }),
+                "not supported when Xray may use BBR",
+            ),
+            (
+                serde_json::json!({
+                    "congestion": "brutal",
+                    "bbrProfile": "conservative"
+                }),
+                "not supported when Xray may use BBR",
+            ),
             (
                 serde_json::json!({"congestion": "force-brutal"}),
                 "requires brutalUp",
