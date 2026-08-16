@@ -1834,6 +1834,7 @@ mod tests {
         let clients = vec![Hysteria2Client {
             password: " spaced-secret ".to_string(),
             email: None,
+            level: 0,
             xray_uuid_route: false,
             xray_transport_auth_fallback: false,
         }];
@@ -1859,12 +1860,14 @@ mod tests {
         let fallback = Hysteria2Client {
             password: "transport-fallback".to_string(),
             email: None,
+            level: 0,
             xray_uuid_route: false,
             xray_transport_auth_fallback: true,
         };
         let dynamic_user = Hysteria2Client {
             password: "dynamic-user-auth".to_string(),
             email: Some("dynamic@example.com".to_string()),
+            level: 0,
             xray_uuid_route: true,
             xray_transport_auth_fallback: false,
         };
@@ -1900,12 +1903,14 @@ mod tests {
             Hysteria2Client {
                 password: "00112233-4455-6677-8899-aabbccddeeff".to_string(),
                 email: Some("shadowed@example.com".to_string()),
+                level: 0,
                 xray_uuid_route: true,
                 xray_transport_auth_fallback: false,
             },
             Hysteria2Client {
                 password: "00112233-4455-1234-8899-aabbccddeeff".to_string(),
                 email: Some("route-user@example.com".to_string()),
+                level: 0,
                 xray_uuid_route: true,
                 xray_transport_auth_fallback: false,
             },
@@ -1925,6 +1930,7 @@ mod tests {
         let shoes_clients = vec![Hysteria2Client {
             password: "00112233-4455-6677-8899-aabbccddeeff".to_string(),
             email: None,
+            level: 0,
             xray_uuid_route: false,
             xray_transport_auth_fallback: false,
         }];
@@ -1943,6 +1949,7 @@ mod tests {
         let clients = vec![Hysteria2Client {
             password: "secret".to_string(),
             email: None,
+            level: 0,
             xray_uuid_route: false,
             xray_transport_auth_fallback: false,
         }];
@@ -2044,6 +2051,7 @@ mod tests {
         let clients = vec![Hysteria2Client {
             password: "secret".to_string(),
             email: None,
+            level: 0,
             xray_uuid_route: false,
             xray_transport_auth_fallback: false,
         }];
@@ -2079,6 +2087,7 @@ mod tests {
         let clients = vec![Hysteria2Client {
             password: "secret".to_string(),
             email: None,
+            level: 0,
             xray_uuid_route: false,
             xray_transport_auth_fallback: false,
         }];

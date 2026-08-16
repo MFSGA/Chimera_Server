@@ -1409,12 +1409,6 @@ impl HandlerServiceImpl {
         &self,
         user: &proto::xray::common::protocol::User,
     ) -> Result<Hysteria2Client, Status> {
-        let email = user.email.trim();
-        if email.is_empty() {
-            return Err(Status::invalid_argument(
-                "hysteria account email is required",
-            ));
-        }
         let account = user.account.as_ref().ok_or_else(|| {
             Status::invalid_argument(
                 "AddUserOperation.user.account is required for hysteria",
@@ -1442,7 +1436,12 @@ impl HandlerServiceImpl {
 
         Ok(Hysteria2Client {
             password: auth.to_string(),
-            email: Some(email.to_string()),
+            email: if user.email.is_empty() {
+                None
+            } else {
+                Some(user.email.clone())
+            },
+            level: user.level,
             xray_uuid_route: true,
             xray_transport_auth_fallback: false,
         })
@@ -1928,7 +1927,7 @@ impl HandlerServiceImpl {
                     .iter()
                     .filter(|client| !client.xray_transport_auth_fallback)
                     .map(|client| proto::xray::common::protocol::User {
-                        level: 0,
+                        level: client.level,
                         email: client.email.clone().unwrap_or_default(),
                         account: Some(proto::xray::common::serial::TypedMessage {
                             r#type: TYPE_PROXY_HYSTERIA_ACCOUNT.to_string(),
@@ -3963,9 +3962,9 @@ mod tests {
                         "email": null,
                         "xray_transport_auth_fallback": true
                     },
-                    {"password": "empty-email-auth", "email": null},
-                    {"password": "auth-a", "email": "shared@example.com"},
-                    {"password": "auth-b", "email": "shared@example.com"}
+                    {"password": "empty-email-auth", "email": null, "level": 7},
+                    {"password": "auth-a", "email": "shared@example.com", "level": 3},
+                    {"password": "auth-b", "email": "shared@example.com", "level": 4}
                 ],
                 "xrayCompat": true
             }))
@@ -3977,8 +3976,10 @@ mod tests {
             .expect("Hysteria2 should expose a user manager");
         assert_eq!(users.len(), 3, "transport fallback must stay hidden");
         assert!(
-            users.iter().any(|user| user.email.is_empty()),
-            "Xray GetUsers includes validators whose email is empty"
+            users
+                .iter()
+                .any(|user| user.email.is_empty() && user.level == 7),
+            "Xray GetUsers includes empty-email validators and preserves level"
         );
         assert_eq!(
             users
@@ -4004,6 +4005,23 @@ mod tests {
             1,
             "Xray email-specific GetInboundUsers returns one GetUser result"
         );
+        assert!(matches!(selected[0].level, 3 | 4));
+
+        let dynamic = service
+            .parse_hysteria_client(&proto::xray::common::protocol::User {
+                level: 9,
+                email: String::new(),
+                account: Some(proto::xray::common::serial::TypedMessage {
+                    r#type: TYPE_PROXY_HYSTERIA_ACCOUNT.to_string(),
+                    value: HysteriaAccountPayload {
+                        auth: "dynamic-empty-email".to_string(),
+                    }
+                    .encode_to_vec(),
+                }),
+            })
+            .expect("Xray Hysteria AddUser permits an empty email");
+        assert_eq!(dynamic.email, None);
+        assert_eq!(dynamic.level, 9);
     }
 
     #[cfg(feature = "hysteria")]
@@ -4016,6 +4034,7 @@ mod tests {
                 clients: vec![Hysteria2Client {
                     password: "transport-fallback".to_string(),
                     email: None,
+                    level: 0,
                     xray_uuid_route: false,
                     xray_transport_auth_fallback: true,
                 }],
@@ -4156,6 +4175,7 @@ mod tests {
                     clients: vec![Hysteria2Client {
                         password: "initial-auth".to_string(),
                         email: Some("initial-user".to_string()),
+                        level: 0,
                         xray_uuid_route: true,
                         xray_transport_auth_fallback: false,
                     }],

@@ -34,6 +34,8 @@ pub struct Hysteria2Client {
     pub password: String,
     pub email: Option<String>,
     #[serde(default)]
+    pub level: u32,
+    #[serde(default)]
     pub xray_uuid_route: bool,
     #[serde(default)]
     pub xray_transport_auth_fallback: bool,
