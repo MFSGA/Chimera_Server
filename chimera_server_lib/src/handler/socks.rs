@@ -756,17 +756,16 @@ async fn send_command_response(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        net::{IpAddr, Ipv4Addr},
-        time::Duration,
-    };
+    use std::net::{IpAddr, Ipv4Addr};
 
-    use tokio::{
-        net::{TcpListener, TcpStream, UdpSocket},
-        time::timeout,
-    };
+    #[cfg(feature = "traffic")]
+    use std::time::Duration;
+    use tokio::net::{TcpListener, TcpStream};
+    #[cfg(feature = "traffic")]
+    use tokio::{net::UdpSocket, time::timeout};
 
     use super::*;
+    #[cfg(feature = "traffic")]
     use crate::{
         resolver::NativeResolver,
         runtime::OutboundSummary,
@@ -809,6 +808,7 @@ mod tests {
         assert_eq!(&response[4..8], &Ipv4Addr::LOCALHOST.octets());
     }
 
+    #[cfg(feature = "traffic")]
     #[tokio::test]
     async fn udp_relay_routes_and_records_live_user_traffic() {
         let inbound_tag = "socks-udp-e2e-in";
