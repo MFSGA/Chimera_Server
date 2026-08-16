@@ -2067,26 +2067,25 @@ fn target_domain(target_location: &NetLocation) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{net::Ipv4Addr, sync::Arc};
+
+    #[cfg(any(feature = "trojan", feature = "vless", feature = "vmess"))]
     use std::{
-        net::Ipv4Addr,
         pin::Pin,
-        sync::Arc,
         task::{Context, Poll},
     };
 
+    #[cfg(any(feature = "vless", feature = "vmess"))]
     use bytes::{BufMut, BytesMut};
-    use tokio::{
-        io::{
-            AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream,
-            ReadBuf, duplex,
-        },
-        net::UdpSocket,
-        time::timeout,
+    #[cfg(any(feature = "trojan", feature = "vless", feature = "vmess"))]
+    use tokio::io::{
+        AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf,
+        duplex,
     };
+    use tokio::{net::UdpSocket, time::timeout};
 
     use crate::{
         address::{Address, NetLocation},
-        async_stream::{AsyncPing, AsyncStream},
         config::{
             rule::{
                 BalancerConfig, NetworkListConfig, PortListConfig, PortRangeConfig,
@@ -2094,22 +2093,27 @@ mod tests {
             },
             server_config::DokodemoDoorConfig,
         },
-        handler::{
-            trojan_udp::TrojanUdpStream,
-            xudp::{
-                frame::{FrameMetadata, FrameOption, SessionStatus, TargetNetwork},
-                message_stream::XudpMessageStream,
-            },
-        },
         resolver::NativeResolver,
         routing_state::RoutingState,
         runtime::OutboundSummary,
     };
 
+    #[cfg(any(feature = "trojan", feature = "vless", feature = "vmess"))]
+    use crate::async_stream::{AsyncPing, AsyncStream};
+    #[cfg(feature = "trojan")]
+    use crate::handler::trojan_udp::TrojanUdpStream;
+    #[cfg(any(feature = "vless", feature = "vmess"))]
+    use crate::handler::xudp::{
+        frame::{FrameMetadata, FrameOption, SessionStatus, TargetNetwork},
+        message_stream::XudpMessageStream,
+    };
+
     use super::*;
 
+    #[cfg(any(feature = "trojan", feature = "vless", feature = "vmess"))]
     struct TestStream(DuplexStream);
 
+    #[cfg(any(feature = "trojan", feature = "vless", feature = "vmess"))]
     impl AsyncRead for TestStream {
         fn poll_read(
             mut self: Pin<&mut Self>,
@@ -2120,6 +2124,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "trojan", feature = "vless", feature = "vmess"))]
     impl AsyncWrite for TestStream {
         fn poll_write(
             mut self: Pin<&mut Self>,
@@ -2144,6 +2149,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "trojan", feature = "vless", feature = "vmess"))]
     impl AsyncPing for TestStream {
         fn supports_ping(&self) -> bool {
             false
@@ -2157,6 +2163,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "trojan", feature = "vless", feature = "vmess"))]
     impl AsyncStream for TestStream {}
 
     fn runtime_with_outbounds(outbounds: Vec<OutboundSummary>) -> RuntimeState {
@@ -2201,6 +2208,7 @@ mod tests {
         assert_eq!(next_generation, 43);
     }
 
+    #[cfg(any(feature = "vless", feature = "vmess"))]
     #[tokio::test]
     async fn session_udp_blackhole_drops_without_contacting_target() {
         let target = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
@@ -2253,6 +2261,7 @@ mod tests {
         relay.abort();
     }
 
+    #[cfg(any(feature = "vless", feature = "vmess"))]
     #[tokio::test]
     async fn session_udp_unsupported_outbound_fails_without_contacting_target() {
         let target = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
@@ -3199,6 +3208,7 @@ mod tests {
         assert!(!sessions.contains_key(&23));
     }
 
+    #[cfg(feature = "trojan")]
     #[tokio::test]
     async fn multi_directional_udp_relays_trojan_packets() {
         let echo_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
