@@ -1825,7 +1825,21 @@ fn xray_file_url_escape(value: &str) -> String {
     let mut escaped = String::new();
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric()
-            || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/')
+            || matches!(
+                byte,
+                b'-' | b'_'
+                    | b'.'
+                    | b'~'
+                    | b'/'
+                    | b'$'
+                    | b'&'
+                    | b'+'
+                    | b','
+                    | b':'
+                    | b';'
+                    | b'='
+                    | b'@'
+            )
         {
             escaped.push(byte as char);
         } else {
@@ -3560,7 +3574,7 @@ mod tests {
         let listing =
             std::str::from_utf8(list_body.as_deref().expect("listing body"))
                 .expect("utf8 directory listing");
-        assert!(listing.contains("href=\"a%26b.txt\">a&amp;b.txt</a>"));
+        assert!(listing.contains("href=\"a&b.txt\">a&amp;b.txt</a>"));
         assert!(listing.contains("href=\"dir/\">dir/</a>"));
         assert!(
             listing.find("a&amp;b.txt").unwrap() < listing.find("z.txt").unwrap()
@@ -3696,6 +3710,19 @@ mod tests {
         tokio::fs::remove_dir_all(&root)
             .await
             .expect("remove file masquerade tempdir");
+    }
+
+    #[test]
+    fn xray_file_url_escape_matches_go_path_encoding() {
+        assert_eq!(
+            xray_file_url_escape("azAZ09-._~/$&+,:;=@"),
+            "azAZ09-._~/$&+,:;=@"
+        );
+        assert_eq!(
+            xray_file_url_escape("space ?#%!'()*[]"),
+            "space%20%3F%23%25%21%27%28%29%2A%5B%5D"
+        );
+        assert_eq!(xray_file_url_escape("你好.txt"), "%E4%BD%A0%E5%A5%BD.txt");
     }
 
     #[tokio::test]
