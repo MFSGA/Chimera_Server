@@ -1267,6 +1267,24 @@ async fn xray_file_masquerade_response(
     Ok((response, Some(response_body)))
 }
 
+fn xray_file_directory_error_response(
+    modified: Option<std::time::SystemTime>,
+) -> std::io::Result<(Response<()>, Option<Bytes>)> {
+    let body = Bytes::from_static(b"Error reading directory\n");
+    let mut response = Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header("x-content-type-options", "nosniff")
+        .header(http::header::CONTENT_LENGTH, body.len().to_string());
+    if let Some(last_modified) = modified
+        .filter(|modified| !xray_is_zero_modtime(*modified))
+        .map(httpdate::fmt_http_date)
+    {
+        response = response.header(http::header::LAST_MODIFIED, last_modified);
+    }
+    Ok((response.body(()).map_err(Error::other)?, Some(body)))
+}
+
 fn xray_file_server_error_response(
     err: &std::io::Error,
 ) -> std::io::Result<(Response<()>, Option<Bytes>)> {
@@ -1743,9 +1761,23 @@ async fn xray_file_directory_response(
         return Ok((response, None));
     }
 
-    let mut read_dir = tokio::fs::read_dir(path).await?;
+    let mut read_dir = match tokio::fs::read_dir(path).await {
+        Ok(read_dir) => read_dir,
+        Err(err) => {
+            debug!(error = %err, path = %path.display(), "Xray file masquerade directory read failed");
+            return xray_file_directory_error_response(modified);
+        }
+    };
     let mut entries = Vec::new();
-    while let Some(entry) = read_dir.next_entry().await? {
+    loop {
+        let entry = match read_dir.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(err) => {
+                debug!(error = %err, path = %path.display(), "Xray file masquerade directory iteration failed");
+                return xray_file_directory_error_response(modified);
+            }
+        };
         let mut name = entry.file_name().to_string_lossy().into_owned();
         if entry.file_type().await?.is_dir() {
             name.push('/');
@@ -3664,6 +3696,52 @@ mod tests {
         tokio::fs::remove_dir_all(&root)
             .await
             .expect("remove file masquerade tempdir");
+    }
+
+    #[tokio::test]
+    async fn xray_file_directory_read_errors_return_http_500() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "chimera-hysteria2-not-directory-{}-{suffix}",
+            std::process::id()
+        ));
+        tokio::fs::write(&path, b"not a directory")
+            .await
+            .expect("write non-directory fixture");
+        let modified = tokio::fs::metadata(&path)
+            .await
+            .expect("stat non-directory fixture")
+            .modified()
+            .ok();
+
+        let (response, body) = xray_file_directory_response(
+            &http::Method::GET,
+            &http::HeaderMap::new(),
+            &path,
+            modified,
+        )
+        .await
+        .expect("map directory read error to HTTP response");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers().get(http::header::CONTENT_TYPE),
+            Some(&http::HeaderValue::from_static("text/plain; charset=utf-8"))
+        );
+        assert_eq!(
+            response.headers().get("x-content-type-options"),
+            Some(&http::HeaderValue::from_static("nosniff"))
+        );
+        if modified.is_some() {
+            assert!(response.headers().contains_key(http::header::LAST_MODIFIED));
+        }
+        assert_eq!(body.as_deref(), Some(&b"Error reading directory\n"[..]));
+
+        tokio::fs::remove_file(path)
+            .await
+            .expect("remove non-directory fixture");
     }
 
     #[test]
