@@ -921,11 +921,12 @@ async fn xray_file_masquerade_response(
     }
 
     let body = tokio::fs::read(&path).await?;
-    let guessed_type = mime_guess::from_path(&path).first_or_octet_stream();
-    let content_type = if guessed_type.type_() == mime_guess::mime::TEXT {
-        format!("{}; charset=utf-8", guessed_type.essence_str())
-    } else {
-        guessed_type.essence_str().to_string()
+    let content_type = match mime_guess::from_path(&path).first() {
+        Some(guessed_type) if guessed_type.type_() == mime_guess::mime::TEXT => {
+            format!("{}; charset=utf-8", guessed_type.essence_str())
+        }
+        Some(guessed_type) => guessed_type.essence_str().to_string(),
+        None => xray_detect_content_type(&body[..body.len().min(512)]).to_string(),
     };
     let mut response = Response::builder()
         .status(StatusCode::OK)
@@ -936,6 +937,130 @@ async fn xray_file_masquerade_response(
     }
     let response = response.body(()).map_err(Error::other)?;
     Ok((response, Some(Bytes::from(body))))
+}
+
+fn xray_detect_content_type(data: &[u8]) -> &'static str {
+    let data = &data[..data.len().min(512)];
+    let first_non_ws = data
+        .iter()
+        .position(|byte| !matches!(byte, b'\t' | b'\n' | 0x0c | b'\r' | b' '))
+        .unwrap_or(data.len());
+    let trimmed = &data[first_non_ws..];
+
+    const HTML_SIGNATURES: &[&[u8]] = &[
+        b"<!DOCTYPE HTML",
+        b"<HTML",
+        b"<HEAD",
+        b"<SCRIPT",
+        b"<IFRAME",
+        b"<H1",
+        b"<DIV",
+        b"<FONT",
+        b"<TABLE",
+        b"<A",
+        b"<STYLE",
+        b"<TITLE",
+        b"<B",
+        b"<BODY",
+        b"<BR",
+        b"<P",
+        b"<!--",
+    ];
+    if HTML_SIGNATURES.iter().any(|signature| {
+        trimmed.len() > signature.len()
+            && trimmed[..signature.len()].eq_ignore_ascii_case(signature)
+            && matches!(trimmed[signature.len()], b' ' | b'>')
+    }) {
+        return "text/html; charset=utf-8";
+    }
+    if trimmed.starts_with(b"<?xml") {
+        return "text/xml; charset=utf-8";
+    }
+
+    const EXACT_SIGNATURES: &[(&[u8], &str)] = &[
+        (b"%PDF-", "application/pdf"),
+        (b"%!PS-Adobe-", "application/postscript"),
+        (b"\x00\x00\x01\x00", "image/x-icon"),
+        (b"\x00\x00\x02\x00", "image/x-icon"),
+        (b"BM", "image/bmp"),
+        (b"GIF87a", "image/gif"),
+        (b"GIF89a", "image/gif"),
+        (b"\x89PNG\r\n\x1a\n", "image/png"),
+        (b"\xff\xd8\xff", "image/jpeg"),
+        (b"ID3", "audio/mpeg"),
+        (b"OggS\x00", "application/ogg"),
+        (b"MThd\x00\x00\x00\x06", "audio/midi"),
+        (b"\x1a\x45\xdf\xa3", "video/webm"),
+        (b"\x00\x01\x00\x00", "font/ttf"),
+        (b"OTTO", "font/otf"),
+        (b"ttcf", "font/collection"),
+        (b"wOFF", "font/woff"),
+        (b"wOF2", "font/woff2"),
+        (b"\x1f\x8b\x08", "application/x-gzip"),
+        (b"PK\x03\x04", "application/zip"),
+        (b"Rar!\x1a\x07\x00", "application/x-rar-compressed"),
+        (b"Rar!\x1a\x07\x01\x00", "application/x-rar-compressed"),
+        (b"\x00asm", "application/wasm"),
+    ];
+    if let Some((_, content_type)) = EXACT_SIGNATURES
+        .iter()
+        .find(|(signature, _)| data.starts_with(signature))
+    {
+        return content_type;
+    }
+
+    if data.len() >= 4 && data.starts_with(b"\xfe\xff") {
+        return "text/plain; charset=utf-16be";
+    }
+    if data.len() >= 4 && data.starts_with(b"\xff\xfe") {
+        return "text/plain; charset=utf-16le";
+    }
+    if data.len() >= 4 && data.starts_with(b"\xef\xbb\xbf") {
+        return "text/plain; charset=utf-8";
+    }
+    if data.len() >= 14 && data.starts_with(b"RIFF") && &data[8..14] == b"WEBPVP" {
+        return "image/webp";
+    }
+    if data.len() >= 12 && data.starts_with(b"RIFF") {
+        if &data[8..12] == b"AVI " {
+            return "video/avi";
+        }
+        if &data[8..12] == b"WAVE" {
+            return "audio/wave";
+        }
+    }
+    if data.len() >= 12 && data.starts_with(b"FORM") && &data[8..12] == b"AIFF" {
+        return "audio/aiff";
+    }
+    if data.len() >= 36 && &data[34..36] == b"LP" {
+        return "application/vnd.ms-fontobject";
+    }
+    if data.len() >= 12 {
+        let box_size =
+            u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        if box_size >= 12
+            && box_size <= data.len()
+            && box_size.is_multiple_of(4)
+            && &data[4..8] == b"ftyp"
+            && (8..box_size)
+                .step_by(4)
+                .filter(|offset| *offset != 12)
+                .any(|offset| data.get(offset..offset + 3) == Some(b"mp4"))
+        {
+            return "video/mp4";
+        }
+    }
+
+    if data[first_non_ws..].iter().all(|byte| {
+        !matches!(
+            *byte,
+            0x00..=0x08 | 0x0b | 0x0e..=0x1a | 0x1c..=0x1f
+        )
+    }) {
+        "text/plain; charset=utf-8"
+    } else {
+        "application/octet-stream"
+    }
 }
 
 fn xray_file_redirect_response(
@@ -2121,6 +2246,27 @@ mod tests {
         tokio::fs::write(root.join("hello.txt"), b"hello file")
             .await
             .expect("write file masquerade file");
+        tokio::fs::write(
+            root.join("page.unknown"),
+            b"<!doctype html><title>x</title>",
+        )
+        .await
+        .expect("write sniffed html file");
+        tokio::fs::write(
+            root.join("image.unknown"),
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR",
+        )
+        .await
+        .expect("write sniffed png file");
+        tokio::fs::write(
+            root.join("plain.unknown"),
+            b"plain text without extension",
+        )
+        .await
+        .expect("write sniffed text file");
+        tokio::fs::write(root.join("binary.unknown"), b"\x00\x01\x02binary")
+            .await
+            .expect("write sniffed binary file");
         tokio::fs::write(root.join("sub/index.html"), b"sub index")
             .await
             .expect("write file masquerade index");
@@ -2245,6 +2391,29 @@ mod tests {
                 .await
                 .expect("clean Xray file path within root");
         assert_eq!(cleaned_body.as_deref(), Some(&b"hello file"[..]));
+
+        for (name, expected_type) in [
+            ("page.unknown", "text/html; charset=utf-8"),
+            ("image.unknown", "image/png"),
+            ("plain.unknown", "text/plain; charset=utf-8"),
+            ("binary.unknown", "application/octet-stream"),
+        ] {
+            let uri: http::Uri = format!("https://example.test/{name}")
+                .parse()
+                .expect("valid sniffed file URI");
+            let (response, _) =
+                xray_file_masquerade_response(&get, &uri, &headers, &root_str)
+                    .await
+                    .expect("serve sniffed Xray file masquerade file");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some(expected_type),
+                "content type for {name}",
+            );
+        }
 
         tokio::fs::remove_dir_all(&root)
             .await
