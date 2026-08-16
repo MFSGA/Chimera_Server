@@ -1045,7 +1045,11 @@ async fn drive_udp_datagrams(
                     "Duplicate fragment {} for hysteria2 UDP packet {}",
                     fragment_id, session_id
                 );
-                session.fragments.pop(&packet_id);
+                handle_duplicate_fragment(
+                    &mut session.fragments,
+                    packet_id,
+                    auth_ctx.xray_compat,
+                );
                 continue;
             }
 
@@ -1241,6 +1245,18 @@ struct FragmentedPacket {
 
 fn hysteria2_fragment_cache() -> LruCache<u16, FragmentedPacket> {
     LruCache::new(NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap())
+}
+
+fn handle_duplicate_fragment(
+    fragments: &mut LruCache<u16, FragmentedPacket>,
+    packet_id: u16,
+    xray_compat: bool,
+) {
+    // Xray's Defragger ignores a duplicate fragment and retains the partial
+    // packet. Shoes discards the entire partial packet on a duplicate.
+    if !xray_compat {
+        fragments.pop(&packet_id);
+    }
 }
 
 fn prepare_fragment_cache(
@@ -1970,6 +1986,45 @@ mod tests {
         assert!(
             shoes_cache.contains(&10),
             "shoes should retain older partial packets"
+        );
+    }
+
+    #[test]
+    fn duplicate_fragments_match_xray_and_shoes_semantics() {
+        let remote_location = NetLocation::from_str("127.0.0.1:53", None)
+            .expect("valid fragment test location");
+        let packet = FragmentedPacket {
+            fragment_count: 2,
+            fragment_received: 1,
+            packet_len: 1,
+            received: vec![Some(Bytes::from_static(b"x")), None],
+            remote_location,
+        };
+
+        let mut xray_cache = hysteria2_fragment_cache();
+        xray_cache.put(7, packet);
+        handle_duplicate_fragment(&mut xray_cache, 7, true);
+        assert!(
+            xray_cache.contains(&7),
+            "Xray should ignore a duplicate fragment and retain partial state"
+        );
+
+        let mut shoes_cache = hysteria2_fragment_cache();
+        shoes_cache.put(
+            7,
+            FragmentedPacket {
+                fragment_count: 2,
+                fragment_received: 1,
+                packet_len: 1,
+                received: vec![Some(Bytes::from_static(b"x")), None],
+                remote_location: NetLocation::from_str("127.0.0.1:53", None)
+                    .expect("valid fragment test location"),
+            },
+        );
+        handle_duplicate_fragment(&mut shoes_cache, 7, false);
+        assert!(
+            !shoes_cache.contains(&7),
+            "shoes should discard partial state after a duplicate fragment"
         );
     }
 
