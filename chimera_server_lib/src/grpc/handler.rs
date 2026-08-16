@@ -1444,6 +1444,7 @@ impl HandlerServiceImpl {
             password: auth.to_string(),
             email: Some(email.to_string()),
             xray_uuid_route: true,
+            xray_transport_auth_fallback: false,
         })
     }
 
@@ -3951,6 +3952,7 @@ mod tests {
                         password: "initial-auth".to_string(),
                         email: Some("initial-user".to_string()),
                         xray_uuid_route: true,
+                        xray_transport_auth_fallback: false,
                     }],
                     bandwidth: Hysteria2BandwidthConfig::default(),
                     ignore_client_bandwidth: false,
@@ -3974,7 +3976,7 @@ mod tests {
             quic_settings: None,
         };
         let runtime = RuntimeState::new(vec![inbound], Vec::new());
-        let service = HandlerServiceImpl::new(runtime);
+        let service = HandlerServiceImpl::new(runtime.clone());
         let email = unique_tag("hysteria-user");
         let auth = " added-auth ";
 
@@ -4024,6 +4026,18 @@ mod tests {
         let account = HysteriaAccountPayload::decode(account.value.as_slice())
             .expect("decode hysteria account");
         assert_eq!(account.auth, auth);
+        let updated = runtime
+            .inbound_by_tag(&inbound_tag)
+            .expect("updated hysteria inbound should remain registered");
+        let ServerProxyConfig::Hysteria2 { config } = updated.protocol else {
+            panic!("expected hysteria2 inbound");
+        };
+        let added_client = config
+            .clients
+            .iter()
+            .find(|client| client.email.as_deref() == Some(email.as_str()))
+            .expect("added hysteria user should be in runtime config");
+        assert!(!added_client.xray_transport_auth_fallback);
 
         let remove_operation =
             proto::xray::app::proxyman::command::RemoveUserOperation {
