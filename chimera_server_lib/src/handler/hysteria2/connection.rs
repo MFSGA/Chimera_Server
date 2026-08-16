@@ -1161,7 +1161,7 @@ async fn xray_file_masquerade_response(
                 )
                 .await;
             }
-            Err(err) if err.kind() == ErrorKind::NotFound => {
+            Err(_) => {
                 return xray_file_directory_response(
                     method,
                     request_headers,
@@ -1170,7 +1170,6 @@ async fn xray_file_masquerade_response(
                 )
                 .await;
             }
-            Err(err) => return Err(err),
         }
     } else if metadata.is_file() {
         if uri.path().ends_with('/') {
@@ -3128,6 +3127,10 @@ mod tests {
         tokio::fs::create_dir_all(root.join("indexdir/index.html"))
             .await
             .expect("create file masquerade index directory");
+        #[cfg(unix)]
+        tokio::fs::create_dir_all(root.join("badindex"))
+            .await
+            .expect("create file masquerade bad-index directory");
         tokio::fs::write(root.join("hello.txt"), b"hello file")
             .await
             .expect("write file masquerade file");
@@ -3167,6 +3170,17 @@ mod tests {
         tokio::fs::write(root.join("indexdir/index.html/inside.txt"), b"inside")
             .await
             .expect("write nested index-directory entry");
+        #[cfg(unix)]
+        {
+            tokio::fs::write(root.join("badindex/visible.txt"), b"visible")
+                .await
+                .expect("write bad-index parent listing entry");
+            std::os::unix::fs::symlink(
+                "index.html",
+                root.join("badindex/index.html"),
+            )
+            .expect("create self-referential index symlink");
+        }
 
         let root_str = root.to_string_lossy();
         let get = http::Method::GET;
@@ -3569,6 +3583,26 @@ mod tests {
 
         #[cfg(unix)]
         {
+            let bad_index_uri: http::Uri = "https://example.test/badindex/"
+                .parse()
+                .expect("valid bad-index URI");
+            let (bad_index_response, bad_index_body) =
+                xray_file_masquerade_response(
+                    &get,
+                    &bad_index_uri,
+                    &headers,
+                    &root_str,
+                )
+                .await
+                .expect("ignore Xray index.html stat failure");
+            assert_eq!(bad_index_response.status(), StatusCode::OK);
+            let bad_index_listing = std::str::from_utf8(
+                bad_index_body.as_deref().expect("bad-index listing body"),
+            )
+            .expect("utf8 bad-index listing");
+            assert!(bad_index_listing.contains("visible.txt"));
+            assert!(bad_index_listing.contains("index.html"));
+
             let invalid_uri: http::Uri = "https://example.test/bad%00path"
                 .parse()
                 .expect("valid encoded-NUL URI");
