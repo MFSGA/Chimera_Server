@@ -1216,7 +1216,7 @@ async fn xray_file_masquerade_response(
     let range_header = request_headers
         .get(http::header::RANGE)
         .and_then(|value| value.to_str().ok())
-        .filter(|_| xray_if_range_matches(request_headers, modified));
+        .filter(|_| xray_if_range_matches(method, request_headers, modified));
     let mut ranges = match range_header {
         Some(value) => match xray_parse_ranges(value, body.len()) {
             Ok(ranges) => ranges,
@@ -1467,9 +1467,13 @@ enum XrayRangeError {
 }
 
 fn xray_if_range_matches(
+    method: &http::Method,
     request_headers: &http::HeaderMap,
     modified: Option<std::time::SystemTime>,
 ) -> bool {
+    if !matches!(*method, http::Method::GET | http::Method::HEAD) {
+        return true;
+    }
     let Some(value) = request_headers.get(http::header::IF_RANGE) else {
         return true;
     };
@@ -3506,6 +3510,18 @@ mod tests {
             .expect("ignore stale Xray If-Range range");
         assert_eq!(stale_if_range_response.status(), StatusCode::OK);
         assert_eq!(stale_if_range_body.as_deref(), Some(&b"hello file"[..]));
+
+        let (post_if_range_response, post_if_range_body) =
+            xray_file_masquerade_response(
+                &http::Method::POST,
+                &file_uri,
+                &if_range_headers,
+                &root_str,
+            )
+            .await
+            .expect("ignore Xray If-Range outside GET/HEAD");
+        assert_eq!(post_if_range_response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(post_if_range_body.as_deref(), Some(&b"he"[..]));
 
         range_headers.insert(
             http::header::RANGE,
