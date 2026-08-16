@@ -1126,10 +1126,7 @@ async fn xray_file_masquerade_response(
 
     let metadata = match tokio::fs::metadata(&path).await {
         Ok(metadata) => metadata,
-        Err(err) if err.kind() == ErrorKind::NotFound => {
-            return auth_reject_response(true, None);
-        }
-        Err(err) => return Err(err),
+        Err(err) => return xray_file_server_error_response(&err),
     };
 
     if metadata.is_dir() {
@@ -1269,6 +1266,34 @@ async fn xray_file_masquerade_response(
     }
     let response = response.body(()).map_err(Error::other)?;
     Ok((response, Some(response_body)))
+}
+
+fn xray_file_server_error_response(
+    err: &std::io::Error,
+) -> std::io::Result<(Response<()>, Option<Bytes>)> {
+    if err.kind() == ErrorKind::NotFound {
+        return auth_reject_response(true, None);
+    }
+
+    let (status, body) = if err.kind() == ErrorKind::PermissionDenied {
+        (
+            StatusCode::FORBIDDEN,
+            Bytes::from_static(b"403 Forbidden\n"),
+        )
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Bytes::from_static(b"500 Internal Server Error\n"),
+        )
+    };
+    let response = Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header("x-content-type-options", "nosniff")
+        .header(http::header::CONTENT_LENGTH, body.len().to_string())
+        .body(())
+        .map_err(Error::other)?;
+    Ok((response, Some(body)))
 }
 
 fn xray_file_precondition_status(
@@ -3542,6 +3567,34 @@ mod tests {
         assert!(!index_directory_listing.contains("parent.txt"));
         assert!(!index_directory_listing.contains("index.html/"));
 
+        #[cfg(unix)]
+        {
+            let invalid_uri: http::Uri = "https://example.test/bad%00path"
+                .parse()
+                .expect("valid encoded-NUL URI");
+            let (invalid_response, invalid_body) = xray_file_masquerade_response(
+                &get,
+                &invalid_uri,
+                &headers,
+                &root_str,
+            )
+            .await
+            .expect("map invalid filesystem path to Xray HTTP error");
+            assert_eq!(invalid_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(
+                invalid_response.headers().get(http::header::CONTENT_TYPE),
+                Some(&http::HeaderValue::from_static("text/plain; charset=utf-8"))
+            );
+            assert_eq!(
+                invalid_response.headers().get("x-content-type-options"),
+                Some(&http::HeaderValue::from_static("nosniff"))
+            );
+            assert_eq!(
+                invalid_body.as_deref(),
+                Some(&b"500 Internal Server Error\n"[..])
+            );
+        }
+
         let cleaned_uri: http::Uri = "https://example.test/../hello.txt"
             .parse()
             .expect("valid cleaned URI");
@@ -3577,6 +3630,48 @@ mod tests {
         tokio::fs::remove_dir_all(&root)
             .await
             .expect("remove file masquerade tempdir");
+    }
+
+    #[test]
+    fn xray_file_server_errors_match_go_http_error_responses() {
+        for (kind, status, expected_body) in [
+            (
+                ErrorKind::NotFound,
+                StatusCode::NOT_FOUND,
+                &b"404 page not found\n"[..],
+            ),
+            (
+                ErrorKind::PermissionDenied,
+                StatusCode::FORBIDDEN,
+                &b"403 Forbidden\n"[..],
+            ),
+            (
+                ErrorKind::InvalidInput,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &b"500 Internal Server Error\n"[..],
+            ),
+        ] {
+            let err = Error::new(kind, "sensitive filesystem detail");
+            let (response, body) = xray_file_server_error_response(&err)
+                .expect("build Xray file-server error response");
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers().get(http::header::CONTENT_TYPE),
+                Some(&http::HeaderValue::from_static("text/plain; charset=utf-8"))
+            );
+            assert_eq!(
+                response.headers().get("x-content-type-options"),
+                Some(&http::HeaderValue::from_static("nosniff"))
+            );
+            assert_eq!(
+                response.headers().get(http::header::CONTENT_LENGTH),
+                Some(
+                    &http::HeaderValue::from_str(&expected_body.len().to_string())
+                        .unwrap()
+                )
+            );
+            assert_eq!(body.as_deref(), Some(expected_body));
+        }
     }
 
     #[test]
