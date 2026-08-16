@@ -957,6 +957,7 @@ async fn drive_udp_datagrams(
                     remote_addr,
                     connection.clone(),
                     base_context.clone(),
+                    auth_ctx.xray_compat,
                 )
                 .await?;
                 entry.insert(session)
@@ -1330,6 +1331,7 @@ async fn create_udp_session(
     remote_addr: SocketAddr,
     connection: quinn::Connection,
     base_context: TrafficContext,
+    xray_compat: bool,
 ) -> std::io::Result<UdpSession> {
     // Match shoes: one Hysteria UDP session can change destination address
     // families, so keep a dual-stack socket instead of binding to the family
@@ -1352,6 +1354,7 @@ async fn create_udp_session(
             contexts_for_task,
             activity_for_task,
             fallback_context,
+            xray_compat,
         )
         .await
         {
@@ -1382,6 +1385,7 @@ async fn run_udp_remote_to_local_loop(
     response_contexts: Arc<RwLock<HashMap<SocketAddr, UdpResponseContext>>>,
     last_active: Arc<RwLock<Instant>>,
     fallback_context: TrafficContext,
+    xray_compat: bool,
 ) -> std::io::Result<()> {
     let max_datagram_size = connection
         .max_datagram_size()
@@ -1438,10 +1442,12 @@ async fn run_udp_remote_to_local_loop(
         }
 
         if payload_len <= available_payload {
+            let packet_id =
+                udp_response_packet_id(&mut next_packet_id, false, xray_compat);
             let mut datagram =
                 BytesMut::with_capacity(header_overhead + payload_len);
             datagram.extend_from_slice(&session_id.to_be_bytes());
-            datagram.extend_from_slice(&next_packet_id.to_be_bytes());
+            datagram.extend_from_slice(&packet_id.to_be_bytes());
             datagram.extend_from_slice(&[0, 1]);
             datagram.extend_from_slice(&address_len_bytes);
             datagram.extend_from_slice(&address_bytes);
@@ -1460,6 +1466,8 @@ async fn run_udp_remote_to_local_loop(
                 continue;
             }
 
+            let packet_id =
+                udp_response_packet_id(&mut next_packet_id, true, xray_compat);
             for fragment_id in 0..fragment_count {
                 let start = fragment_id * available_payload;
                 let end = std::cmp::min(start + available_payload, payload_len);
@@ -1467,7 +1475,7 @@ async fn run_udp_remote_to_local_loop(
                 let mut datagram =
                     BytesMut::with_capacity(header_overhead + (end - start));
                 datagram.extend_from_slice(&session_id.to_be_bytes());
-                datagram.extend_from_slice(&next_packet_id.to_be_bytes());
+                datagram.extend_from_slice(&packet_id.to_be_bytes());
                 datagram
                     .extend_from_slice(&[fragment_id as u8, fragment_count as u8]);
                 datagram.extend_from_slice(&address_len_bytes);
@@ -1484,7 +1492,24 @@ async fn run_udp_remote_to_local_loop(
             .write()
             .expect("hysteria2 UDP activity lock poisoned") = Instant::now();
         record_transfer(Some(traffic_context), 0, payload_len as u64);
-        next_packet_id = next_packet_id.wrapping_add(1);
+    }
+}
+
+fn udp_response_packet_id(
+    next_packet_id: &mut u16,
+    fragmented: bool,
+    xray_compat: bool,
+) -> u16 {
+    if xray_compat {
+        if fragmented {
+            rand::rng().random_range(1..=u16::MAX)
+        } else {
+            0
+        }
+    } else {
+        let packet_id = *next_packet_id;
+        *next_packet_id = next_packet_id.wrapping_add(1);
+        packet_id
     }
 }
 
@@ -2065,6 +2090,31 @@ mod tests {
             first,
             "shoes keeps the first fragment address for the reassembled packet"
         );
+    }
+
+    #[test]
+    fn response_packet_ids_match_xray_and_shoes_semantics() {
+        let mut xray_next = 41;
+        assert_eq!(udp_response_packet_id(&mut xray_next, false, true), 0);
+        assert_eq!(
+            xray_next, 41,
+            "Xray unfragmented packets do not consume IDs"
+        );
+        let fragmented_id = udp_response_packet_id(&mut xray_next, true, true);
+        assert_ne!(fragmented_id, 0, "Xray fragmented packets use non-zero IDs");
+        assert_eq!(
+            xray_next, 41,
+            "Xray fragmented IDs are random, not sequential"
+        );
+
+        let mut shoes_next = u16::MAX;
+        assert_eq!(
+            udp_response_packet_id(&mut shoes_next, false, false),
+            u16::MAX
+        );
+        assert_eq!(shoes_next, 0, "shoes increments IDs for every datagram");
+        assert_eq!(udp_response_packet_id(&mut shoes_next, true, false), 0);
+        assert_eq!(shoes_next, 1);
     }
 
     #[test]
