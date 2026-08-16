@@ -1939,13 +1939,17 @@ fn decode_file_masquerade_path_for_platform(
         }
     }
     let decoded = std::str::from_utf8(&decoded).ok()?;
-    if windows
-        && decoded
+    if windows {
+        if decoded
             .as_bytes()
             .iter()
             .any(|byte| matches!(*byte, b':' | b'\\' | 0))
-    {
-        return None;
+        {
+            return None;
+        }
+        if decoded.split('/').any(xray_windows_reserved_path_component) {
+            return None;
+        }
     }
     let mut normalized = PathBuf::new();
     for component in Path::new(decoded.trim_start_matches('/')).components() {
@@ -1959,6 +1963,27 @@ fn decode_file_masquerade_path_for_platform(
         }
     }
     Some(normalized)
+}
+
+fn xray_windows_reserved_path_component(component: &str) -> bool {
+    let upper = component.to_ascii_uppercase();
+    if matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+
+    let Some(suffix) = upper
+        .strip_prefix("COM")
+        .or_else(|| upper.strip_prefix("LPT"))
+    else {
+        return false;
+    };
+    matches!(
+        suffix,
+        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+    )
 }
 
 fn random_auth_padding(xray_compat: bool) -> String {
@@ -3810,17 +3835,36 @@ mod tests {
     }
 
     #[test]
-    fn xray_file_windows_paths_reject_unlocalizable_characters() {
-        for path in ["/a%5Cb", "/a:b", "/a%00b"] {
+    fn xray_file_windows_paths_match_localize_rejections() {
+        for path in [
+            "/a%5Cb",
+            "/a:b",
+            "/a%00b",
+            "/CON",
+            "/nested/prn",
+            "/AUX",
+            "/nul",
+            "/COM1",
+            "/com9",
+            "/LPT1",
+            "/lpt9",
+            "/COM¹",
+            "/com²",
+            "/LPT³",
+            "/ConIn$",
+            "/conout$",
+        ] {
             assert!(
                 decode_file_masquerade_path_for_platform(path, true).is_none(),
                 "Windows should reject Xray file path {path}",
             );
         }
-        assert_eq!(
-            decode_file_masquerade_path_for_platform("/a/b", true),
-            Some(PathBuf::from("a").join("b"))
-        );
+        for path in ["/a/b", "/COM0", "/COM10", "/LPT0", "/console"] {
+            assert!(
+                decode_file_masquerade_path_for_platform(path, true).is_some(),
+                "Windows should keep non-reserved Xray file path {path}",
+            );
+        }
         assert!(
             decode_file_masquerade_path_for_platform("/a%5Cb", false).is_some(),
             "Unix should preserve backslash as a filename character",
