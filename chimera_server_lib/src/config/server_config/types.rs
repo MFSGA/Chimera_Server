@@ -69,6 +69,14 @@ pub struct Hysteria2MasqueradeStringConfig {
 }
 
 #[cfg(feature = "hysteria")]
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Hysteria2MasqueradeFileConfig {
+    #[serde(default)]
+    pub dir: String,
+}
+
+#[cfg(feature = "hysteria")]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Hysteria2ServerConfig {
@@ -83,6 +91,8 @@ pub struct Hysteria2ServerConfig {
     pub xray_compat: bool,
     #[serde(default)]
     pub xray_masquerade_string: Option<Hysteria2MasqueradeStringConfig>,
+    #[serde(default)]
+    pub xray_masquerade_file: Option<Hysteria2MasqueradeFileConfig>,
     #[serde(default)]
     pub xray_congestion: Option<String>,
     #[serde(default)]

@@ -39,6 +39,7 @@ rustls-pemfile = { workspace = true }
 axum = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
+mime_guess = { workspace = true }
 hyper-util = { workspace = true }
 tokio-util = { workspace = true }
 
