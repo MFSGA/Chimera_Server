@@ -59,6 +59,8 @@ pub(super) fn collect_hysteria2_settings(
         auth: Option<String>,
         #[serde(default)]
         email: String,
+        #[serde(default)]
+        level: u32,
     }
 
     #[derive(Deserialize)]
@@ -104,6 +106,7 @@ pub(super) fn collect_hysteria2_settings(
                 } else {
                     Some(client.email)
                 },
+                level: client.level,
                 xray_uuid_route,
                 xray_transport_auth_fallback: false,
             })
@@ -123,6 +126,7 @@ pub(super) fn collect_hysteria2_settings(
         clients.push(Hysteria2Client {
             password: auth.to_string(),
             email: None,
+            level: 0,
             xray_uuid_route: false,
             xray_transport_auth_fallback: true,
         });
@@ -1566,7 +1570,8 @@ mod tests {
         let settings = SettingObject(serde_json::json!({
             "clients": [{
                 "auth": "xray-auth-token",
-                "email": "hy@example.com"
+                "email": "hy@example.com",
+                "level": 7
             }]
         }));
 
@@ -1575,6 +1580,7 @@ mod tests {
         assert_eq!(config.clients.len(), 1);
         assert_eq!(config.clients[0].password, "xray-auth-token");
         assert_eq!(config.clients[0].email.as_deref(), Some("hy@example.com"));
+        assert_eq!(config.clients[0].level, 7);
         assert!(config.clients[0].xray_uuid_route);
         assert_eq!(config.xray_udp_idle_timeout_secs, Some(60));
     }
