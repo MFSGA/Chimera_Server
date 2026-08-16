@@ -1206,12 +1206,20 @@ async fn xray_file_masquerade_response(
     }
 
     let body = tokio::fs::read(&path).await?;
-    let content_type = match mime_guess::from_path(&path).first() {
-        Some(guessed_type) if guessed_type.type_() == mime_guess::mime::TEXT => {
-            format!("{}; charset=utf-8", guessed_type.essence_str())
+    let content_type = if let Some(content_type) =
+        xray_file_extension_content_type(&path)
+    {
+        content_type.to_string()
+    } else {
+        match mime_guess::from_path(&path).first() {
+            Some(guessed_type) if guessed_type.type_() == mime_guess::mime::TEXT => {
+                format!("{}; charset=utf-8", guessed_type.essence_str())
+            }
+            Some(guessed_type) => guessed_type.essence_str().to_string(),
+            None => {
+                xray_detect_content_type(&body[..body.len().min(512)]).to_string()
+            }
         }
-        Some(guessed_type) => guessed_type.essence_str().to_string(),
-        None => xray_detect_content_type(&body[..body.len().min(512)]).to_string(),
     };
     let range_header = request_headers
         .get(http::header::RANGE)
@@ -1618,6 +1626,42 @@ fn xray_multipart_ranges(
         Bytes::from(multipart),
         format!("multipart/byteranges; boundary={boundary}"),
     )
+}
+
+fn xray_file_extension_content_type(path: &Path) -> Option<&'static str> {
+    // Keep only the Go builtin MIME entries that differ from mime_guess 2.0.5.
+    let extension = path.extension()?.to_str()?;
+    if extension.eq_ignore_ascii_case("com") {
+        Some("application/octet-stream")
+    } else if extension.eq_ignore_ascii_case("docx") {
+        Some(
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+    } else if extension.eq_ignore_ascii_case("ehtml") {
+        Some("text/html; charset=utf-8")
+    } else if extension.eq_ignore_ascii_case("ico") {
+        Some("image/vnd.microsoft.icon")
+    } else if extension.eq_ignore_ascii_case("m4a") {
+        Some("audio/mp4")
+    } else if extension.eq_ignore_ascii_case("mjs") {
+        Some("text/javascript; charset=utf-8")
+    } else if extension.eq_ignore_ascii_case("pjp")
+        || extension.eq_ignore_ascii_case("pjpeg")
+    {
+        Some("image/jpeg")
+    } else if extension.eq_ignore_ascii_case("pptx") {
+        Some(
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        )
+    } else if extension.eq_ignore_ascii_case("webm") {
+        Some("audio/webm")
+    } else if extension.eq_ignore_ascii_case("xbl") {
+        Some("text/xml; charset=utf-8")
+    } else if extension.eq_ignore_ascii_case("xlsx") {
+        Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    } else {
+        None
+    }
 }
 
 fn xray_detect_content_type(data: &[u8]) -> &'static str {
@@ -3223,6 +3267,9 @@ mod tests {
         tokio::fs::write(root.join("binary.unknown"), b"\x00\x01\x02binary")
             .await
             .expect("write sniffed binary file");
+        tokio::fs::write(root.join("module.mjs"), b"plain bytes")
+            .await
+            .expect("write Xray MIME override file");
         tokio::fs::write(root.join("sub/index.html"), b"sub index")
             .await
             .expect("write file masquerade index");
@@ -3723,6 +3770,7 @@ mod tests {
             ("image.unknown", "image/png"),
             ("plain.unknown", "text/plain; charset=utf-8"),
             ("binary.unknown", "application/octet-stream"),
+            ("module.mjs", "text/javascript; charset=utf-8"),
         ] {
             let uri: http::Uri = format!("https://example.test/{name}")
                 .parse()
@@ -3789,6 +3837,43 @@ mod tests {
         tokio::fs::remove_file(root)
             .await
             .expect("remove file masquerade root file");
+    }
+
+    #[test]
+    fn xray_file_extension_types_match_go_builtin_mime_differences() {
+        for (name, expected) in [
+            ("sample.com", "application/octet-stream"),
+            (
+                "sample.docx",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ),
+            ("sample.ehtml", "text/html; charset=utf-8"),
+            ("sample.ico", "image/vnd.microsoft.icon"),
+            ("sample.m4a", "audio/mp4"),
+            ("sample.MJS", "text/javascript; charset=utf-8"),
+            ("sample.pjp", "image/jpeg"),
+            ("sample.pjpeg", "image/jpeg"),
+            (
+                "sample.pptx",
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            ),
+            ("sample.webm", "audio/webm"),
+            ("sample.xbl", "text/xml; charset=utf-8"),
+            (
+                "sample.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ),
+        ] {
+            assert_eq!(
+                xray_file_extension_content_type(Path::new(name)),
+                Some(expected),
+                "Xray MIME type for {name}",
+            );
+        }
+        assert_eq!(
+            xray_file_extension_content_type(Path::new("sample.txt")),
+            None
+        );
     }
 
     #[test]
