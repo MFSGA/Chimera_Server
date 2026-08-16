@@ -7,12 +7,14 @@ use std::{
     time::Duration,
 };
 
+#[cfg(feature = "shadowsocks")]
+use tokio::time::timeout;
 use tokio::{
     io::ReadBuf,
     net::UdpSocket,
     sync::{Mutex, Notify, RwLock, mpsc, oneshot},
     task::JoinHandle,
-    time::{Instant, sleep, timeout},
+    time::{Instant, sleep},
 };
 use tracing::{debug, error, info, warn};
 
