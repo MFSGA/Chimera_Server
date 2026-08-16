@@ -1133,6 +1133,7 @@ async fn xray_file_masquerade_response(
     };
 
     if metadata.is_dir() {
+        let directory_modified = metadata.modified().ok();
         if !uri.path().ends_with('/') {
             let base = uri
                 .path()
@@ -1145,9 +1146,23 @@ async fn xray_file_masquerade_response(
         let index = path.join("index.html");
         match tokio::fs::metadata(&index).await {
             Ok(index_metadata) if index_metadata.is_file() => path = index,
-            Ok(_) => return xray_file_directory_response(&path).await,
+            Ok(_) => {
+                return xray_file_directory_response(
+                    method,
+                    request_headers,
+                    &path,
+                    directory_modified,
+                )
+                .await;
+            }
             Err(err) if err.kind() == ErrorKind::NotFound => {
-                return xray_file_directory_response(&path).await;
+                return xray_file_directory_response(
+                    method,
+                    request_headers,
+                    &path,
+                    directory_modified,
+                )
+                .await;
             }
             Err(err) => return Err(err),
         }
@@ -1674,8 +1689,27 @@ fn xray_file_redirect_response(
 }
 
 async fn xray_file_directory_response(
+    method: &http::Method,
+    request_headers: &http::HeaderMap,
     path: &Path,
+    modified: Option<std::time::SystemTime>,
 ) -> std::io::Result<(Response<()>, Option<Bytes>)> {
+    if matches!(*method, http::Method::GET | http::Method::HEAD)
+        && let Some(value) = request_headers
+            .get(http::header::IF_MODIFIED_SINCE)
+            .and_then(|value| value.to_str().ok())
+        && let Ok(since) = httpdate::parse_http_date(value)
+        && let Some(modified) = modified
+        && !xray_is_zero_modtime(modified)
+        && xray_modified_not_after(modified, since)
+    {
+        let response = Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .body(())
+            .map_err(Error::other)?;
+        return Ok((response, None));
+    }
+
     let mut read_dir = tokio::fs::read_dir(path).await?;
     let mut entries = Vec::new();
     while let Some(entry) = read_dir.next_entry().await? {
@@ -1699,12 +1733,17 @@ async fn xray_file_directory_response(
     }
     body.push_str("</pre>\n");
     let body = Bytes::from(body);
-    let response = Response::builder()
+    let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(http::header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .header(http::header::CONTENT_LENGTH, body.len().to_string())
-        .body(())
-        .map_err(Error::other)?;
+        .header(http::header::CONTENT_LENGTH, body.len().to_string());
+    if let Some(last_modified) = modified
+        .filter(|modified| !xray_is_zero_modtime(*modified))
+        .map(httpdate::fmt_http_date)
+    {
+        response = response.header(http::header::LAST_MODIFIED, last_modified);
+    }
+    let response = response.body(()).map_err(Error::other)?;
     Ok((response, Some(body)))
 }
 
@@ -3424,6 +3463,11 @@ mod tests {
                 .await
                 .expect("serve Xray directory listing");
         assert_eq!(list_response.status(), StatusCode::OK);
+        let list_last_modified = list_response
+            .headers()
+            .get(http::header::LAST_MODIFIED)
+            .cloned()
+            .expect("Xray directory listing should expose Last-Modified");
         let listing =
             std::str::from_utf8(list_body.as_deref().expect("listing body"))
                 .expect("utf8 directory listing");
@@ -3432,6 +3476,30 @@ mod tests {
         assert!(
             listing.find("a&amp;b.txt").unwrap() < listing.find("z.txt").unwrap()
         );
+
+        let mut list_conditional_headers = http::HeaderMap::new();
+        list_conditional_headers
+            .insert(http::header::IF_MODIFIED_SINCE, list_last_modified);
+        let (list_not_modified_response, list_not_modified_body) =
+            xray_file_masquerade_response(
+                &get,
+                &list_uri,
+                &list_conditional_headers,
+                &root_str,
+            )
+            .await
+            .expect("honor Xray directory If-Modified-Since condition");
+        assert_eq!(
+            list_not_modified_response.status(),
+            StatusCode::NOT_MODIFIED
+        );
+        assert!(
+            list_not_modified_response
+                .headers()
+                .get(http::header::LAST_MODIFIED)
+                .is_none()
+        );
+        assert!(list_not_modified_body.is_none());
 
         let cleaned_uri: http::Uri = "https://example.test/../hello.txt"
             .parse()
