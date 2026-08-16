@@ -1114,15 +1114,16 @@ async fn xray_file_masquerade_response(
     request_headers: &http::HeaderMap,
     root: &str,
 ) -> std::io::Result<(Response<()>, Option<Bytes>)> {
-    let Some(decoded_uri_path) = xray_file_percent_decode_path(uri.path()) else {
+    let Some(decoded_uri_path) = xray_file_percent_decode_path_bytes(uri.path())
+    else {
         return auth_reject_response(true, None);
     };
-    if decoded_uri_path.ends_with("/index.html") {
+    if decoded_uri_path.ends_with(b"/index.html") {
         return xray_file_redirect_response(uri, "./");
     }
 
     let Some(relative) =
-        decode_file_masquerade_decoded_path(&decoded_uri_path, cfg!(windows))
+        decode_file_masquerade_decoded_path_bytes(&decoded_uri_path, cfg!(windows))
     else {
         return auth_reject_response(true, None);
     };
@@ -1138,13 +1139,12 @@ async fn xray_file_masquerade_response(
 
     if metadata.is_dir() {
         let directory_modified = metadata.modified().ok();
-        if !decoded_uri_path.ends_with('/') {
-            let base = decoded_uri_path
-                .trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .unwrap_or("");
-            return xray_file_redirect_response(uri, &format!("{base}/"));
+        if !decoded_uri_path.ends_with(b"/") {
+            let base = xray_file_path_base_bytes(&decoded_uri_path);
+            let mut location = Vec::with_capacity(base.len() + 1);
+            location.extend_from_slice(base);
+            location.push(b'/');
+            return xray_file_redirect_response_bytes(uri, &location);
         }
         let index = path.join("index.html");
         match tokio::fs::metadata(&index).await {
@@ -1178,16 +1178,15 @@ async fn xray_file_masquerade_response(
             }
         }
     } else if metadata.is_file() {
-        if decoded_uri_path.ends_with('/') {
-            let base = decoded_uri_path
-                .trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .unwrap_or("");
-            if base.is_empty() || base == "." {
+        if decoded_uri_path.ends_with(b"/") {
+            let base = xray_file_path_base_bytes(&decoded_uri_path);
+            if base.is_empty() || base == b"." {
                 return xray_file_non_directory_traversal_response();
             }
-            return xray_file_redirect_response(uri, &format!("../{base}"));
+            let mut location = Vec::with_capacity(base.len() + 3);
+            location.extend_from_slice(b"../");
+            location.extend_from_slice(base);
+            return xray_file_redirect_response_bytes(uri, &location);
         }
     } else {
         return auth_reject_response(true, None);
@@ -1795,11 +1794,22 @@ fn xray_file_redirect_response(
     uri: &http::Uri,
     location: &str,
 ) -> std::io::Result<(Response<()>, Option<Bytes>)> {
-    let location = match uri.query() {
-        Some(query) => format!("{location}?{query}"),
-        None => location.to_string(),
-    };
-    let location = xray_file_hex_escape_non_ascii(&location);
+    xray_file_redirect_response_bytes(uri, location.as_bytes())
+}
+
+fn xray_file_redirect_response_bytes(
+    uri: &http::Uri,
+    location: &[u8],
+) -> std::io::Result<(Response<()>, Option<Bytes>)> {
+    let mut location_with_query = Vec::with_capacity(
+        location.len() + uri.query().map_or(0, |query| query.len() + 1),
+    );
+    location_with_query.extend_from_slice(location);
+    if let Some(query) = uri.query() {
+        location_with_query.push(b'?');
+        location_with_query.extend_from_slice(query.as_bytes());
+    }
+    let location = xray_file_hex_escape_non_ascii_bytes(&location_with_query);
     let response = Response::builder()
         .status(StatusCode::MOVED_PERMANENTLY)
         .header(http::header::LOCATION, location)
@@ -1848,25 +1858,26 @@ async fn xray_file_directory_response(
                 return xray_file_directory_error_response(modified);
             }
         };
-        let mut name = entry.file_name().to_string_lossy().into_owned();
+        let file_name = entry.file_name();
+        let mut name = xray_file_name_bytes(&file_name);
         if entry.file_type().await?.is_dir() {
-            name.push('/');
+            name.push(b'/');
         }
         entries.push(name);
     }
     entries.sort_unstable();
 
-    let mut body = String::from(
-        "<!doctype html>\n<meta name=\"viewport\" content=\"width=device-width\">\n<pre>\n",
+    let mut body = Vec::from(
+        &b"<!doctype html>\n<meta name=\"viewport\" content=\"width=device-width\">\n<pre>\n"[..],
     );
     for name in entries {
-        body.push_str("<a href=\"");
-        body.push_str(&xray_file_url_escape(&name));
-        body.push_str("\">");
-        body.push_str(&xray_file_html_escape(&name));
-        body.push_str("</a>\n");
+        body.extend_from_slice(b"<a href=\"");
+        body.extend_from_slice(xray_file_url_escape_bytes(&name).as_bytes());
+        body.extend_from_slice(b"\">");
+        body.extend_from_slice(&xray_file_html_escape_bytes(&name));
+        body.extend_from_slice(b"</a>\n");
     }
-    body.push_str("</pre>\n");
+    body.extend_from_slice(b"</pre>\n");
     let body = Bytes::from(body);
     let mut response = Response::builder()
         .status(StatusCode::OK)
@@ -1882,18 +1893,41 @@ async fn xray_file_directory_response(
     Ok((response, Some(body)))
 }
 
-fn xray_file_html_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('\'', "&#39;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&#34;")
+fn xray_file_name_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        value.as_bytes().to_vec()
+    }
+
+    #[cfg(not(unix))]
+    {
+        value.to_string_lossy().as_bytes().to_vec()
+    }
+}
+
+fn xray_file_html_escape_bytes(value: &[u8]) -> Vec<u8> {
+    let mut escaped = Vec::with_capacity(value.len());
+    for &byte in value {
+        match byte {
+            b'&' => escaped.extend_from_slice(b"&amp;"),
+            b'\'' => escaped.extend_from_slice(b"&#39;"),
+            b'<' => escaped.extend_from_slice(b"&lt;"),
+            b'>' => escaped.extend_from_slice(b"&gt;"),
+            b'"' => escaped.extend_from_slice(b"&#34;"),
+            byte => escaped.push(byte),
+        }
+    }
+    escaped
 }
 
 fn xray_file_url_escape(value: &str) -> String {
+    xray_file_url_escape_bytes(value.as_bytes())
+}
+
+fn xray_file_url_escape_bytes(value: &[u8]) -> String {
     let mut escaped = String::new();
-    for byte in value.bytes() {
+    for &byte in value {
         if byte.is_ascii_alphanumeric()
             || matches!(
                 byte,
@@ -1928,11 +1962,11 @@ fn decode_file_masquerade_path_for_platform(
     uri_path: &str,
     windows: bool,
 ) -> Option<PathBuf> {
-    let decoded = xray_file_percent_decode_path(uri_path)?;
-    decode_file_masquerade_decoded_path(&decoded, windows)
+    let decoded = xray_file_percent_decode_path_bytes(uri_path)?;
+    decode_file_masquerade_decoded_path_bytes(&decoded, windows)
 }
 
-fn xray_file_percent_decode_path(uri_path: &str) -> Option<String> {
+fn xray_file_percent_decode_path_bytes(uri_path: &str) -> Option<Vec<u8>> {
     let mut decoded = Vec::with_capacity(uri_path.len());
     let bytes = uri_path.as_bytes();
     let mut index = 0;
@@ -1947,14 +1981,15 @@ fn xray_file_percent_decode_path(uri_path: &str) -> Option<String> {
             index += 1;
         }
     }
-    String::from_utf8(decoded).ok()
+    Some(decoded)
 }
 
-fn decode_file_masquerade_decoded_path(
-    decoded: &str,
+fn decode_file_masquerade_decoded_path_bytes(
+    decoded: &[u8],
     windows: bool,
 ) -> Option<PathBuf> {
     if windows {
+        let decoded = std::str::from_utf8(decoded).ok()?;
         if decoded
             .as_bytes()
             .iter()
@@ -1965,7 +2000,37 @@ fn decode_file_masquerade_decoded_path(
         if decoded.split('/').any(xray_windows_reserved_path_component) {
             return None;
         }
+        return xray_file_normalize_utf8_path(decoded);
     }
+
+    #[cfg(unix)]
+    {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+        if decoded.contains(&0) {
+            return None;
+        }
+        let mut normalized = PathBuf::new();
+        for component in decoded.split(|byte| *byte == b'/') {
+            match component {
+                b"" | b"." => {}
+                b".." => {
+                    normalized.pop();
+                }
+                component => normalized.push(OsStr::from_bytes(component)),
+            }
+        }
+        Some(normalized)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let decoded = std::str::from_utf8(decoded).ok()?;
+        xray_file_normalize_utf8_path(decoded)
+    }
+}
+
+fn xray_file_normalize_utf8_path(decoded: &str) -> Option<PathBuf> {
     let mut normalized = PathBuf::new();
     for component in Path::new(decoded.trim_start_matches('/')).components() {
         match component {
@@ -1981,12 +2046,12 @@ fn decode_file_masquerade_decoded_path(
 }
 
 fn xray_file_hex_escape_non_ascii(value: &str) -> String {
-    if value.is_ascii() {
-        return value.to_string();
-    }
+    xray_file_hex_escape_non_ascii_bytes(value.as_bytes())
+}
 
+fn xray_file_hex_escape_non_ascii_bytes(value: &[u8]) -> String {
     let mut escaped = String::with_capacity(value.len());
-    for byte in value.bytes() {
+    for &byte in value {
         if byte.is_ascii() {
             escaped.push(byte as char);
         } else {
@@ -1995,6 +2060,11 @@ fn xray_file_hex_escape_non_ascii(value: &str) -> String {
         }
     }
     escaped
+}
+
+fn xray_file_path_base_bytes(path: &[u8]) -> &[u8] {
+    let path = path.strip_suffix(b"/").unwrap_or(path);
+    path.rsplit(|byte| *byte == b'/').next().unwrap_or_default()
 }
 
 fn xray_windows_reserved_path_component(component: &str) -> bool {
@@ -3925,7 +3995,7 @@ mod tests {
             )
             .await
             .expect("map invalid filesystem path to Xray HTTP error");
-            assert_eq!(invalid_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(invalid_response.status(), StatusCode::NOT_FOUND);
             assert_eq!(
                 invalid_response.headers().get(http::header::CONTENT_TYPE),
                 Some(&http::HeaderValue::from_static("text/plain; charset=utf-8"))
@@ -3934,10 +4004,7 @@ mod tests {
                 invalid_response.headers().get("x-content-type-options"),
                 Some(&http::HeaderValue::from_static("nosniff"))
             );
-            assert_eq!(
-                invalid_body.as_deref(),
-                Some(&b"500 Internal Server Error\n"[..])
-            );
+            assert_eq!(invalid_body.as_deref(), Some(&b"404 page not found\n"[..]));
         }
 
         let cleaned_uri: http::Uri = "https://example.test/../hello.txt"
@@ -3976,6 +4043,115 @@ mod tests {
         tokio::fs::remove_dir_all(&root)
             .await
             .expect("remove file masquerade tempdir");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn xray_file_unix_names_preserve_non_utf8_bytes() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "chimera-hysteria2-nonutf8-{}-{suffix}",
+            std::process::id()
+        ));
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("create non-UTF8 file masquerade root");
+
+        let file_name = OsString::from_vec(b"raw\xFF.bin".to_vec());
+        tokio::fs::write(root.join(&file_name), b"\0raw")
+            .await
+            .expect("write non-UTF8 file fixture");
+        let directory_name = OsString::from_vec(b"dir\xFE".to_vec());
+        tokio::fs::create_dir(root.join(&directory_name))
+            .await
+            .expect("create non-UTF8 directory fixture");
+        tokio::fs::write(root.join(&directory_name).join("inside.txt"), b"inside")
+            .await
+            .expect("write non-UTF8 directory child");
+
+        let root_str = root.to_string_lossy();
+        let headers = http::HeaderMap::new();
+        let file_uri: http::Uri = "https://example.test/raw%FF.bin"
+            .parse()
+            .expect("valid encoded non-UTF8 file URI");
+        let (file_response, file_body) = xray_file_masquerade_response(
+            &http::Method::GET,
+            &file_uri,
+            &headers,
+            &root_str,
+        )
+        .await
+        .expect("serve encoded non-UTF8 Xray file");
+        assert_eq!(file_response.status(), StatusCode::OK);
+        assert_eq!(file_body.as_deref(), Some(&b"\0raw"[..]));
+
+        let directory_uri: http::Uri = "https://example.test/dir%FE"
+            .parse()
+            .expect("valid encoded non-UTF8 directory URI");
+        let (directory_redirect, directory_redirect_body) =
+            xray_file_masquerade_response(
+                &http::Method::GET,
+                &directory_uri,
+                &headers,
+                &root_str,
+            )
+            .await
+            .expect("redirect encoded non-UTF8 Xray directory");
+        assert_eq!(directory_redirect.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            directory_redirect.headers().get(http::header::LOCATION),
+            Some(&http::HeaderValue::from_static("dir%FE/"))
+        );
+        assert!(directory_redirect_body.is_none());
+
+        let list_uri: http::Uri = "https://example.test/"
+            .parse()
+            .expect("valid non-UTF8 listing URI");
+        let (list_response, list_body) = xray_file_masquerade_response(
+            &http::Method::GET,
+            &list_uri,
+            &headers,
+            &root_str,
+        )
+        .await
+        .expect("list non-UTF8 Xray file names");
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_body = list_body.expect("non-UTF8 directory listing body");
+        for expected in [
+            &b"href=\"raw%FF.bin\">raw\xFF.bin</a>"[..],
+            &b"href=\"dir%FE/\">dir\xFE/</a>"[..],
+        ] {
+            assert!(
+                list_body
+                    .windows(expected.len())
+                    .any(|window| window == expected),
+                "directory listing should preserve {:?}",
+                expected,
+            );
+        }
+
+        let nested_uri: http::Uri = "https://example.test/dir%FE/inside.txt"
+            .parse()
+            .expect("valid nested non-UTF8 directory URI");
+        let (nested_response, nested_body) = xray_file_masquerade_response(
+            &http::Method::GET,
+            &nested_uri,
+            &headers,
+            &root_str,
+        )
+        .await
+        .expect("serve file below non-UTF8 Xray directory");
+        assert_eq!(nested_response.status(), StatusCode::OK);
+        assert_eq!(nested_body.as_deref(), Some(&b"inside"[..]));
+
+        tokio::fs::remove_dir_all(root)
+            .await
+            .expect("remove non-UTF8 file masquerade root");
     }
 
     #[test]
