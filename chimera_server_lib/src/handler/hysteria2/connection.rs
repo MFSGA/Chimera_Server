@@ -3000,6 +3000,35 @@ mod tests {
     }
 
     #[test]
+    fn xray_file_etag_wildcard_scanner_stops_on_invalid_tags() {
+        assert!(xray_etag_list_has_wildcard(b"*"));
+        assert!(xray_etag_list_has_wildcard(
+            b"\"missing\", W/\"also-missing\", *"
+        ));
+        assert!(!xray_etag_list_has_wildcard(b"\"missing\""));
+        assert!(!xray_etag_list_has_wildcard(b"\"bad tag\", *"));
+        assert!(!xray_etag_list_has_wildcard(b"W/\"unterminated, *"));
+    }
+
+    #[test]
+    fn xray_file_preconditions_ignore_unix_epoch_modtime() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::IF_MODIFIED_SINCE,
+            http::HeaderValue::from_static("Thu, 01 Jan 2099 00:00:00 GMT"),
+        );
+
+        assert_eq!(
+            xray_file_precondition_status(
+                &http::Method::GET,
+                &headers,
+                Some(std::time::UNIX_EPOCH),
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn auth_password_matches_xray_and_shoes_exactly() {
         let clients = vec![Hysteria2Client {
             password: " spaced-secret ".to_string(),
