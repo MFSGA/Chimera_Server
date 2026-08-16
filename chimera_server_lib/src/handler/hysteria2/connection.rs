@@ -900,6 +900,16 @@ fn xray_proxy_forwarding_header(name: &http::HeaderName) -> bool {
     )
 }
 
+fn xray_proxy_supports_trailers(headers: &http::HeaderMap) -> bool {
+    headers.get_all(http::header::TE).iter().any(|value| {
+        value.to_str().ok().is_some_and(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("trailers"))
+        })
+    })
+}
+
 fn xray_proxy_connection_header(
     name: &http::HeaderName,
     headers: &http::HeaderMap,
@@ -939,6 +949,9 @@ async fn xray_proxy_masquerade_response(
         {
             request = request.header(name, value);
         }
+    }
+    if xray_proxy_supports_trailers(request_headers) {
+        request = request.header(http::header::TE, "trailers");
     }
     if !masquerade.rewrite_host
         && let Some(authority) = uri.authority()
@@ -2763,6 +2776,10 @@ mod tests {
             http::HeaderValue::from_static("keep-alive, X-Client-Hop"),
         );
         headers.insert("x-client-hop", http::HeaderValue::from_static("hidden"));
+        headers.insert(
+            http::header::TE,
+            http::HeaderValue::from_static("gzip, trailers"),
+        );
         headers.insert("forwarded", http::HeaderValue::from_static("for=spoofed"));
         headers.insert(
             "x-forwarded-for",
@@ -2810,6 +2827,8 @@ mod tests {
         let request_lower = request.to_ascii_lowercase();
         assert!(!request_lower.contains("\r\nx-client-hop:"));
         assert!(!request_lower.contains("\r\nconnection:"));
+        assert!(request_lower.contains("\r\nte: trailers\r\n"));
+        assert!(!request_lower.contains("te: gzip"));
         assert!(!request_lower.contains("\r\nforwarded:"));
         assert!(!request_lower.contains("\r\nx-forwarded-for:"));
         assert!(!request_lower.contains("\r\nx-forwarded-host:"));
