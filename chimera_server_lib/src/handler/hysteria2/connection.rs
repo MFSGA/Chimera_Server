@@ -1609,7 +1609,7 @@ fn xray_multipart_ranges(
     body: &[u8],
     content_type: &str,
 ) -> (Bytes, String) {
-    let boundary = Alphanumeric.sample_string(&mut rand::rng(), 30);
+    let boundary = xray_multipart_boundary();
     let mut multipart = Vec::new();
     for range in ranges {
         let end = range.start + range.length;
@@ -1632,6 +1632,17 @@ fn xray_multipart_ranges(
         Bytes::from(multipart),
         format!("multipart/byteranges; boundary={boundary}"),
     )
+}
+
+fn xray_multipart_boundary() -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let random = rand::random::<[u8; 30]>();
+    let mut boundary = String::with_capacity(60);
+    for byte in random {
+        boundary.push(HEX[(byte >> 4) as usize] as char);
+        boundary.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    boundary
 }
 
 fn xray_file_extension_content_type(path: &Path) -> Option<&'static str> {
@@ -3736,14 +3747,20 @@ mod tests {
         .await
         .expect("serve Xray multipart ranges");
         assert_eq!(multi_response.status(), StatusCode::PARTIAL_CONTENT);
+        let multipart_content_type = multi_response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .expect("multipart Xray range Content-Type");
+        let boundary = multipart_content_type
+            .strip_prefix("multipart/byteranges; boundary=")
+            .expect("multipart Xray range boundary");
+        assert_eq!(boundary.len(), 60);
         assert!(
-            multi_response
-                .headers()
-                .get(http::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(
-                    |value| value.starts_with("multipart/byteranges; boundary=")
-                )
+            boundary
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+            "Xray multipart boundary must be lowercase hex",
         );
         let multi_body = multi_body.expect("multipart range body");
         assert!(multi_body.windows(2).any(|window| window == b"he"));
