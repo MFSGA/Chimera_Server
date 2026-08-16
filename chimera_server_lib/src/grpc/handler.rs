@@ -1614,16 +1614,18 @@ impl HandlerServiceImpl {
             }
             #[cfg(feature = "hysteria")]
             ServerProxyConfig::Hysteria2 { config } => {
-                let Some(index) = config
+                if let Some(index) = config
                     .clients
                     .iter()
                     .position(|client| client.email.as_deref() == Some(email))
-                else {
-                    return Ok(false);
-                };
-                // Xray DelByEmail resolves one matching user and deletes only
-                // that user's auth key; duplicate emails are not bulk-removed.
-                config.clients.remove(index);
+                {
+                    // Xray DelByEmail resolves one matching user and deletes only
+                    // that user's auth key; duplicate emails are not bulk-removed.
+                    config.clients.remove(index);
+                }
+                // Xray's Hysteria DelByEmail is idempotent and returns nil even
+                // when no matching email exists. `true` means this protocol did
+                // handle the user-manager operation, not that a user was found.
                 Ok(true)
             }
             ServerProxyConfig::Socks { accounts, .. } => Ok(accounts.remove(email)),
@@ -4067,6 +4069,15 @@ mod tests {
             })
             .expect("replacement auth should remain");
         assert_eq!(auth_b.email.as_deref(), Some("replacement@example.com"));
+        assert!(
+            service
+                .apply_remove_user_from_protocol(
+                    &mut protocol,
+                    "missing@example.com"
+                )
+                .expect("missing Hysteria user removal should remain idempotent"),
+            "Xray treats a Hysteria remove miss as a handled no-op"
+        );
     }
 
     #[cfg(feature = "hysteria")]
