@@ -866,7 +866,8 @@ fn xray_proxy_target_url(
     }
     raw.push_str(uri.path());
     let mut target = reqwest::Url::parse(&raw).map_err(Error::other)?;
-    let query = match (base_query.as_deref(), uri.query()) {
+    let request_query = uri.query().map(xray_proxy_clean_query);
+    let query = match (base_query.as_deref(), request_query.as_deref()) {
         (Some(base), Some(request)) if !base.is_empty() && !request.is_empty() => {
             Some(format!("{base}&{request}"))
         }
@@ -876,6 +877,104 @@ fn xray_proxy_target_url(
     };
     target.set_query(query.as_deref());
     Ok(target)
+}
+
+fn xray_proxy_clean_query(value: &str) -> String {
+    let parameter_count = value
+        .as_bytes()
+        .iter()
+        .filter(|byte| **byte == b'&')
+        .count()
+        + 1;
+    if parameter_count > 10_000 {
+        return String::new();
+    }
+    let needs_cleaning = value.as_bytes().iter().enumerate().any(|(index, byte)| {
+        *byte == b';'
+            || (*byte == b'%'
+                && (index + 2 >= value.len()
+                    || !value.as_bytes()[index + 1].is_ascii_hexdigit()
+                    || !value.as_bytes()[index + 2].is_ascii_hexdigit()))
+    });
+    if !needs_cleaning {
+        return value.to_string();
+    }
+
+    let mut pairs = std::collections::BTreeMap::<Vec<u8>, Vec<Vec<u8>>>::new();
+    for field in value.as_bytes().split(|byte| *byte == b'&') {
+        if field.contains(&b';') {
+            continue;
+        }
+        let (key, value) = match field.iter().position(|byte| *byte == b'=') {
+            Some(index) => (&field[..index], &field[index + 1..]),
+            None => (field, &[][..]),
+        };
+        let (Some(key), Some(value)) = (
+            xray_proxy_query_unescape(key),
+            xray_proxy_query_unescape(value),
+        ) else {
+            continue;
+        };
+        pairs.entry(key).or_default().push(value);
+    }
+
+    let mut clean = String::new();
+    for (key, values) in pairs {
+        for value in values {
+            if !clean.is_empty() {
+                clean.push('&');
+            }
+            xray_proxy_query_escape(&mut clean, &key);
+            clean.push('=');
+            xray_proxy_query_escape(&mut clean, &value);
+        }
+    }
+    clean
+}
+
+fn xray_proxy_query_unescape(value: &[u8]) -> Option<Vec<u8>> {
+    let mut decoded = Vec::with_capacity(value.len());
+    let mut index = 0;
+    while index < value.len() {
+        match value[index] {
+            b'+' => decoded.push(b' '),
+            b'%' => {
+                let high = *value.get(index + 1)?;
+                let low = *value.get(index + 2)?;
+                decoded.push((xray_proxy_hex(high)? << 4) | xray_proxy_hex(low)?);
+                index += 2;
+            }
+            byte => decoded.push(byte),
+        }
+        index += 1;
+    }
+    Some(decoded)
+}
+
+fn xray_proxy_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn xray_proxy_query_escape(output: &mut String, value: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for &byte in value {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                output.push(byte as char);
+            }
+            b' ' => output.push('+'),
+            _ => {
+                output.push('%');
+                output.push(HEX[(byte >> 4) as usize] as char);
+                output.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+        }
+    }
 }
 
 fn xray_proxy_hop_header(name: &http::HeaderName) -> bool {
@@ -2713,6 +2812,46 @@ mod tests {
             Some(&http::HeaderValue::from_static("present"))
         );
         assert_eq!(body.as_deref(), Some(&b"hello from xray"[..]));
+    }
+
+    #[test]
+    fn xray_proxy_query_cleaning_matches_go_reverse_proxy_rewrite() {
+        assert_eq!(xray_proxy_clean_query("a=1&a=2;b=3"), "a=1");
+        assert_eq!(xray_proxy_clean_query("a=1&a=%zz&b=3"), "a=1&b=3");
+        assert_eq!(xray_proxy_clean_query("a=%zz"), "");
+        assert_eq!(
+            xray_proxy_clean_query("b=2&a=first&a=second%20value"),
+            "b=2&a=first&a=second%20value"
+        );
+        assert_eq!(
+            xray_proxy_clean_query("b=2;a=ignored&a=first&a=second+value"),
+            "a=first&a=second+value"
+        );
+        assert_eq!(xray_proxy_clean_query(&("a=1&".repeat(10_000) + "a=1")), "");
+
+        let uri: http::Uri = "https://original.test/path?a=1&a=%25zz&b=3"
+            .parse()
+            .expect("valid encoded proxy URI");
+        let target =
+            xray_proxy_target_url("https://upstream.test/base?fixed=1", &uri)
+                .expect("build cleaned proxy target");
+        assert_eq!(
+            target.as_str(),
+            "https://upstream.test/base/path?fixed=1&a=1&a=%25zz&b=3"
+        );
+
+        let malformed_uri: http::Uri = "https://original.test/path?a=1&a=2;b=3&b=3"
+            .parse()
+            .expect("valid proxy URI with semicolon query");
+        let target = xray_proxy_target_url(
+            "https://upstream.test/base?fixed=1",
+            &malformed_uri,
+        )
+        .expect("build sanitized proxy target");
+        assert_eq!(
+            target.as_str(),
+            "https://upstream.test/base/path?fixed=1&a=1&b=3"
+        );
     }
 
     #[tokio::test]
