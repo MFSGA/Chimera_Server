@@ -1830,7 +1830,10 @@ async fn drive_udp_datagrams(
 
         match session
             .socket
-            .send_to(complete_payload.as_ref(), session.last_socket_addr)
+            .send_to(
+                complete_payload.as_ref(),
+                hysteria2_udp_send_addr(session.last_socket_addr),
+            )
             .await
         {
             Ok(sent) => {
@@ -2006,6 +2009,15 @@ fn new_hysteria2_socket2_udp_socket() -> std::io::Result<socket2::Socket> {
 fn new_hysteria2_udp_socket() -> std::io::Result<UdpSocket> {
     let std_socket: std::net::UdpSocket = new_hysteria2_socket2_udp_socket()?.into();
     UdpSocket::from_std(std_socket)
+}
+
+fn hysteria2_udp_send_addr(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V4(addr) => {
+            SocketAddr::from((addr.ip().to_ipv6_mapped(), addr.port()))
+        }
+        SocketAddr::V6(_) => addr,
+    }
 }
 
 fn normalize_hysteria2_udp_peer_addr(addr: SocketAddr) -> SocketAddr {
@@ -3103,8 +3115,9 @@ mod tests {
             .await
             .expect("bind IPv4 UDP receiver");
 
+        let ipv4_addr = ipv4.local_addr().expect("IPv4 receiver address");
         socket
-            .send_to(b"v4", ipv4.local_addr().expect("IPv4 receiver address"))
+            .send_to(b"v4", hysteria2_udp_send_addr(ipv4_addr))
             .await
             .expect("dual-stack socket should send to IPv4");
 
@@ -3125,10 +3138,18 @@ mod tests {
                 .expect("dual-stack reply should not time out")
                 .expect("receive IPv4 reply on dual-stack socket");
         assert_eq!(&buf[..len], b"ok");
-        assert_eq!(
-            normalize_hysteria2_udp_peer_addr(source),
-            ipv4.local_addr().expect("IPv4 receiver address")
-        );
+        assert_eq!(normalize_hysteria2_udp_peer_addr(source), ipv4_addr);
+    }
+
+    #[test]
+    fn udp_session_send_address_maps_ipv4_for_dual_stack_sockets() {
+        let ipv4 = SocketAddr::from(([192, 0, 2, 1], 443));
+        let mapped = hysteria2_udp_send_addr(ipv4);
+        assert_eq!(mapped, "[::ffff:192.0.2.1]:443".parse().unwrap());
+        assert_eq!(normalize_hysteria2_udp_peer_addr(mapped), ipv4);
+
+        let ipv6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        assert_eq!(hysteria2_udp_send_addr(ipv6), ipv6);
     }
 
     #[test]
