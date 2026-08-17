@@ -69,6 +69,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
         let mut request_content_length = None;
         let mut request_content_length_valid = true;
         let mut request_transfer_encoding = false;
+        let mut chunked_transfer_encoding = false;
         loop {
             let line = read_http_line(&mut server_stream, MAX_HEADER_BYTES).await?;
             header_bytes = header_bytes.saturating_add(line.len() + 2);
@@ -132,6 +133,9 @@ impl TcpServerHandler for HttpTcpServerHandler {
             }
             if name.eq_ignore_ascii_case("transfer-encoding") {
                 request_transfer_encoding = true;
+                if value.eq_ignore_ascii_case("chunked") {
+                    chunked_transfer_encoding = true;
+                }
             }
             forwarded_headers.push(line);
         }
@@ -228,6 +232,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
             if connection_hop_headers
                 .iter()
                 .any(|name| name == &header_name)
+                || (chunked_transfer_encoding && header_name == "content-length")
             {
                 continue;
             }
@@ -712,6 +717,37 @@ mod tests {
              Host: example.com:8080\r\n\
              X-Test: forwarded\r\n\
              Connection: close\r\n\r\nbody"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_request_drops_conflicting_content_length_like_xray() {
+        let handler = HttpTcpServerHandler::new(Vec::new(), false, "http-chunked");
+        let request = b"POST http://example.com/upload HTTP/1.1\r\n\
+Host: example.com\r\n\
+Content-Length: 99\r\n\
+Transfer-Encoding: chunked\r\n\r\n\
+4\r\ntest\r\n0\r\n\r\n";
+        let (mut client, server) = duplex(2048);
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("chunked HTTP proxy request should succeed");
+        let TcpServerSetupResult::TcpForward { mut stream, .. } = result else {
+            panic!("HTTP forward returned non-TCP result");
+        };
+        let mut forwarded = Vec::new();
+        stream.read_to_end(&mut forwarded).await.unwrap();
+        assert_eq!(
+            String::from_utf8(forwarded).unwrap(),
+            "POST /upload HTTP/1.1\r\n\
+Host: example.com\r\n\
+Transfer-Encoding: chunked\r\n\
+Connection: close\r\n\r\n\
+4\r\ntest\r\n0\r\n\r\n"
         );
     }
 
