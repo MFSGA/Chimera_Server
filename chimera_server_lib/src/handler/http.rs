@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
     address::NetLocation,
@@ -13,8 +13,9 @@ use crate::{
 
 const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
 const MAX_HEADER_BYTES: usize = 16 * 1024;
+const MAX_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HttpTcpServerHandler {
     accounts: Vec<HttpUser>,
     allow_transparent: bool,
@@ -63,6 +64,11 @@ impl TcpServerHandler for HttpTcpServerHandler {
         let mut host_header = None;
         let mut forwarded_headers = Vec::new();
         let mut connection_hop_headers = Vec::new();
+        let mut proxy_keep_alive = false;
+        let mut proxy_connection_seen = false;
+        let mut request_content_length = None;
+        let mut request_content_length_valid = true;
+        let mut request_transfer_encoding = false;
         loop {
             let line = read_http_line(&mut server_stream, MAX_HEADER_BYTES).await?;
             header_bytes = header_bytes.saturating_add(line.len() + 2);
@@ -85,8 +91,14 @@ impl TcpServerHandler for HttpTcpServerHandler {
                 authenticated_user = self.authenticate_basic(value);
                 continue;
             }
-            if name.eq_ignore_ascii_case("proxy-connection")
-                || name.eq_ignore_ascii_case("proxy-authenticate")
+            if name.eq_ignore_ascii_case("proxy-connection") {
+                if !proxy_connection_seen {
+                    proxy_keep_alive = value.eq_ignore_ascii_case("keep-alive");
+                    proxy_connection_seen = true;
+                }
+                continue;
+            }
+            if name.eq_ignore_ascii_case("proxy-authenticate")
                 || name.eq_ignore_ascii_case("te")
                 || name.eq_ignore_ascii_case("trailers")
                 || name.eq_ignore_ascii_case("upgrade")
@@ -105,6 +117,21 @@ impl TcpServerHandler for HttpTcpServerHandler {
             }
             if name.eq_ignore_ascii_case("host") {
                 host_header = Some(value.to_string());
+            }
+            if name.eq_ignore_ascii_case("content-length") {
+                match value.parse::<u64>() {
+                    Ok(length) => match request_content_length {
+                        Some(previous) if previous != length => {
+                            request_content_length_valid = false;
+                        }
+                        None => request_content_length = Some(length),
+                        _ => {}
+                    },
+                    Err(_) => request_content_length_valid = false,
+                }
+            }
+            if name.eq_ignore_ascii_case("transfer-encoding") {
+                request_transfer_encoding = true;
             }
             forwarded_headers.push(line);
         }
@@ -209,6 +236,23 @@ impl TcpServerHandler for HttpTcpServerHandler {
         }
         initial_request.push_str("Connection: close\r\n\r\n");
 
+        let bodyless_plain_request = request_content_length_valid
+            && request_content_length.unwrap_or(0) == 0
+            && !request_transfer_encoding
+            && (method.eq_ignore_ascii_case("GET")
+                || method.eq_ignore_ascii_case("HEAD"));
+        if proxy_keep_alive && bodyless_plain_request {
+            return Ok(TcpServerSetupResult::HttpPlainForward {
+                remote_location,
+                stream: server_stream,
+                request_head: initial_request.into_bytes().into_boxed_slice(),
+                request_method: method.to_string(),
+                keep_alive: proxy_keep_alive,
+                next_handler: Box::new(self.clone()),
+                traffic_context,
+            });
+        }
+
         Ok(TcpServerSetupResult::TcpForward {
             remote_location,
             stream: Box::new(PrefixedStream::new(
@@ -311,6 +355,171 @@ where
     }
 }
 
+pub(crate) async fn relay_plain_http_response<R, W>(
+    upstream: &mut R,
+    downstream: &mut W,
+    request_method: &str,
+) -> std::io::Result<bool>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    loop {
+        let status_line =
+            read_http_line(upstream, MAX_RESPONSE_HEADER_BYTES).await?;
+        let status_code = parse_http_status_code(&status_line)?;
+        let mut header_bytes = 0usize;
+        let mut headers = Vec::new();
+        let mut connection_hop_headers = Vec::new();
+        let mut content_length = None;
+        let mut content_length_valid = true;
+        let mut transfer_encoding = false;
+
+        loop {
+            let line = read_http_line(upstream, MAX_RESPONSE_HEADER_BYTES).await?;
+            header_bytes = header_bytes.saturating_add(line.len() + 2);
+            if header_bytes > MAX_RESPONSE_HEADER_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HTTP proxy response headers exceed 65536 bytes",
+                ));
+            }
+            if line.is_empty() {
+                break;
+            }
+
+            let Some((name, value)) = line.split_once(':') else {
+                headers.push((String::new(), line));
+                continue;
+            };
+            let name = name.trim().to_ascii_lowercase();
+            let value = value.trim();
+            if name == "connection" {
+                connection_hop_headers.extend(
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_ascii_lowercase),
+                );
+            } else if name == "content-length" {
+                match value.parse::<u64>() {
+                    Ok(length) => match content_length {
+                        Some(previous) if previous != length => {
+                            content_length_valid = false;
+                        }
+                        None => content_length = Some(length),
+                        _ => {}
+                    },
+                    Err(_) => content_length_valid = false,
+                }
+            } else if name == "transfer-encoding" {
+                transfer_encoding = true;
+            }
+            headers.push((name, line));
+        }
+
+        if (100..200).contains(&status_code) {
+            write_http_header_block(downstream, &status_line, &headers).await?;
+            continue;
+        }
+
+        let no_body = request_method.eq_ignore_ascii_case("HEAD")
+            || matches!(status_code, 204 | 304);
+        let body_length = if no_body {
+            Some(0)
+        } else if !transfer_encoding && content_length_valid {
+            content_length
+        } else {
+            None
+        };
+
+        let mut response_head = format!("{status_line}\r\n");
+        for (name, line) in headers {
+            let strip_static = matches!(
+                name.as_str(),
+                "proxy-connection"
+                    | "proxy-authenticate"
+                    | "proxy-authorization"
+                    | "te"
+                    | "trailers"
+                    | "upgrade"
+            ) || (name == "transfer-encoding"
+                && body_length.is_some());
+            if name == "connection"
+                || (body_length.is_some() && name == "keep-alive")
+                || strip_static
+                || connection_hop_headers.iter().any(|hop| hop == &name)
+            {
+                continue;
+            }
+            response_head.push_str(&line);
+            response_head.push_str("\r\n");
+        }
+        if body_length.is_some() {
+            response_head.push_str(
+                "Connection: keep-alive\r\n\
+                 Keep-Alive: timeout=60\r\n\
+                 Proxy-Connection: keep-alive\r\n",
+            );
+        } else {
+            response_head.push_str("Connection: close\r\n");
+        }
+        response_head.push_str("\r\n");
+        downstream.write_all(response_head.as_bytes()).await?;
+
+        if let Some(length) = body_length {
+            let mut body = upstream.take(length);
+            let copied = tokio::io::copy(&mut body, downstream).await?;
+            if copied != length {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "HTTP proxy upstream response body ended early",
+                ));
+            }
+        } else {
+            tokio::io::copy(upstream, downstream).await?;
+        }
+        downstream.flush().await?;
+        return Ok(body_length.is_some());
+    }
+}
+
+fn parse_http_status_code(status_line: &str) -> std::io::Result<u16> {
+    let mut parts = status_line.split_whitespace();
+    let version = parts.next().unwrap_or_default();
+    let status = parts.next().unwrap_or_default();
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid HTTP proxy upstream status line: {status_line}"),
+        ));
+    }
+    status.parse::<u16>().map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid HTTP proxy upstream status code {status}: {error}"),
+        )
+    })
+}
+
+async fn write_http_header_block<W>(
+    writer: &mut W,
+    status_line: &str,
+    headers: &[(String, String)],
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_all(status_line.as_bytes()).await?;
+    writer.write_all(b"\r\n").await?;
+    for (_, line) in headers {
+        writer.write_all(line.as_bytes()).await?;
+        writer.write_all(b"\r\n").await?;
+    }
+    writer.write_all(b"\r\n").await
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -330,7 +539,7 @@ mod tests {
         handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
     };
 
-    use super::HttpTcpServerHandler;
+    use super::{HttpTcpServerHandler, relay_plain_http_response};
 
     struct TestStream(DuplexStream);
 
@@ -503,6 +712,107 @@ mod tests {
              Host: example.com:8080\r\n\
              X-Test: forwarded\r\n\
              Connection: close\r\n\r\nbody"
+        );
+    }
+
+    #[tokio::test]
+    async fn keep_alive_get_uses_plain_http_forward() {
+        let handler = HttpTcpServerHandler::new(Vec::new(), false, "http-keepalive");
+        let request = b"GET http://example.com/one HTTP/1.1\r\n\
+                        Host: example.com\r\n\
+                        Proxy-Connection: keep-alive\r\n\r\n";
+        let (mut client, server) = duplex(2048);
+        client.write_all(request).await.unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("keep-alive GET should use the plain HTTP relay");
+        let TcpServerSetupResult::HttpPlainForward {
+            remote_location,
+            request_head,
+            request_method,
+            keep_alive,
+            traffic_context,
+            ..
+        } = result
+        else {
+            panic!("keep-alive GET returned non-HTTP plain result");
+        };
+        assert_eq!(remote_location.to_string(), "example.com:80");
+        assert_eq!(request_method, "GET");
+        assert!(keep_alive);
+        assert_eq!(
+            traffic_context.unwrap().inbound_tag.as_deref(),
+            Some("http-keepalive")
+        );
+        assert_eq!(
+            request_head.as_ref(),
+            b"GET /one HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_http_response_with_content_length_is_reusable() {
+        let upstream_response = b"HTTP/1.1 100 Continue\r\nX-Early: yes\r\n\r\n\
+                                  HTTP/1.1 200 OK\r\n\
+                                  Content-Length: 5\r\n\
+                                  Connection: close, X-Remove\r\n\
+                                  Keep-Alive: timeout=5\r\n\
+                                  X-Remove: hidden\r\n\
+                                  X-Keep: visible\r\n\r\nhello";
+        let (mut upstream_client, mut upstream_server) = duplex(4096);
+        upstream_client.write_all(upstream_response).await.unwrap();
+        upstream_client.shutdown().await.unwrap();
+        let (mut downstream_client, mut downstream_server) = duplex(4096);
+
+        let reusable = relay_plain_http_response(
+            &mut upstream_server,
+            &mut downstream_server,
+            "GET",
+        )
+        .await
+        .unwrap();
+        assert!(reusable);
+        downstream_server.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        downstream_client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(
+            String::from_utf8(response).unwrap(),
+            "HTTP/1.1 100 Continue\r\nX-Early: yes\r\n\r\n\
+             HTTP/1.1 200 OK\r\n\
+             Content-Length: 5\r\n\
+             X-Keep: visible\r\n\
+             Connection: keep-alive\r\n\
+             Keep-Alive: timeout=60\r\n\
+             Proxy-Connection: keep-alive\r\n\r\nhello"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_http_response_without_length_closes_connection() {
+        let upstream_response = b"HTTP/1.1 200 OK\r\nX-Test: yes\r\n\r\nhello";
+        let (mut upstream_client, mut upstream_server) = duplex(2048);
+        upstream_client.write_all(upstream_response).await.unwrap();
+        upstream_client.shutdown().await.unwrap();
+        let (mut downstream_client, mut downstream_server) = duplex(2048);
+
+        let reusable = relay_plain_http_response(
+            &mut upstream_server,
+            &mut downstream_server,
+            "GET",
+        )
+        .await
+        .unwrap();
+        assert!(!reusable);
+        downstream_server.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        downstream_client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(
+            String::from_utf8(response).unwrap(),
+            "HTTP/1.1 200 OK\r\nX-Test: yes\r\nConnection: close\r\n\r\nhello"
         );
     }
 

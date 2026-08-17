@@ -17,6 +17,7 @@ use crate::{
         server_config::{ServerConfig, ServerProxyConfig},
     },
     handler::{
+        http::relay_plain_http_response,
         socks::run_udp_relay,
         tcp::{
             tcp_handler::{
@@ -442,7 +443,7 @@ where
             other => break other,
         }
     };
-    let setup_result = match setup_result {
+    let mut setup_result = match setup_result {
         TcpServerSetupResult::TcpFallback {
             remote_location,
             stream,
@@ -464,6 +465,111 @@ where
         }
         other => other,
     };
+
+    while matches!(&setup_result, TcpServerSetupResult::HttpPlainForward { .. }) {
+        let TcpServerSetupResult::HttpPlainForward {
+            remote_location,
+            stream: mut server_stream,
+            request_head,
+            request_method,
+            keep_alive,
+            next_handler,
+            traffic_context,
+        } = setup_result
+        else {
+            unreachable!("HTTP plain-forward loop only accepts HTTP results");
+        };
+        let mut traffic_context =
+            traffic_context.map(|context| context.with_client_ip(peer_addr.ip()));
+        let inbound_tag = traffic_context
+            .as_ref()
+            .and_then(|context| context.inbound_tag.as_deref())
+            .unwrap_or_default()
+            .to_string();
+        let user = traffic_context
+            .as_ref()
+            .and_then(|context| context.identity.as_deref())
+            .unwrap_or_default()
+            .to_string();
+        let (client_stream, outbound_tag) = match timeout(
+            Duration::from_secs(60),
+            setup_routed_client_stream(
+                resolver.clone(),
+                remote_location.clone(),
+                &runtime,
+                &inbound_tag,
+                &user,
+                peer_addr,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(Some(result))) => result,
+            Ok(Ok(None)) => {
+                let _ = server_stream.shutdown().await;
+                return Ok(());
+            }
+            Ok(Err(error)) => {
+                let _ = server_stream.shutdown().await;
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to setup HTTP client stream to {}: {}",
+                        remote_location, error
+                    ),
+                ));
+            }
+            Err(elapsed) => {
+                let _ = server_stream.shutdown().await;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "HTTP client setup to {} timed out: {}",
+                        remote_location, elapsed
+                    ),
+                ));
+            }
+        };
+        if let Some(tag) = outbound_tag {
+            traffic_context =
+                traffic_context.map(|context| context.with_outbound_tag(tag));
+        }
+        let _connection_guard = register_connection(traffic_context.as_ref());
+        let mut client_stream = MeteredStream::new(
+            client_stream,
+            traffic_context.clone(),
+            TrafficDirection::Download,
+        );
+        client_stream.write_all(&request_head).await?;
+        client_stream.flush().await?;
+        record_transfer(traffic_context, request_head.len() as u64, 0);
+
+        let response_reusable = relay_plain_http_response(
+            &mut client_stream,
+            &mut server_stream,
+            &request_method,
+        )
+        .await?;
+        let _ = client_stream.shutdown().await;
+        if !keep_alive || !response_reusable {
+            let _ = server_stream.shutdown().await;
+            return Ok(());
+        }
+
+        setup_result = match timeout(
+            Duration::from_secs(60),
+            next_handler.setup_server_stream(server_stream),
+        )
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(());
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Ok(()),
+        };
+    }
 
     match setup_result {
         TcpServerSetupResult::TcpForward {
@@ -574,6 +680,11 @@ where
                 copy_result.right_to_left,
             );
             Ok(())
+        }
+        TcpServerSetupResult::HttpPlainForward { .. } => {
+            unreachable!(
+                "HTTP plain-forward results must be handled before generic forwarding"
+            )
         }
         TcpServerSetupResult::PeerAddrOverride { .. } => {
             unreachable!(

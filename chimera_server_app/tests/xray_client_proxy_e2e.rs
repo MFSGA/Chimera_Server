@@ -2716,12 +2716,27 @@ fn assert_http_forward_response(proxy_addr: SocketAddr, request: &str) {
         .write_all(request.as_bytes())
         .expect("write HTTP forward request");
     let mut response = Vec::new();
+    while !response.ends_with(b"\r\n\r\n") {
+        let mut byte = [0u8; 1];
+        stream
+            .read_exact(&mut byte)
+            .expect("read HTTP forward response header");
+        response.push(byte[0]);
+    }
+    let header = String::from_utf8_lossy(&response);
+    assert!(header.starts_with("HTTP/1.1 200 OK"), "{header}");
+    let content_length = header
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Content-Length:")
+                .and_then(|value| value.trim().parse::<usize>().ok())
+        })
+        .expect("HTTP forward response Content-Length");
+    let mut body = vec![0u8; content_length];
     stream
-        .read_to_end(&mut response)
-        .expect("read HTTP forward response");
-    let response = String::from_utf8_lossy(&response);
-    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-    assert!(response.ends_with("ok"), "{response}");
+        .read_exact(&mut body)
+        .expect("read HTTP forward response body");
+    assert_eq!(body, b"ok");
 }
 
 fn assert_http_connect_echo(
