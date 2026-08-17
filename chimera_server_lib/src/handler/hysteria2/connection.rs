@@ -3753,6 +3753,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn xray_proxy_masquerade_supports_https_http2_upstream() {
+        let generated_cert =
+            rcgen::generate_simple_self_signed(["localhost".to_string()])
+                .expect("generate h2 upstream certificate");
+        let cert_bytes = generated_cert.cert.pem().into_bytes();
+        let key_bytes = generated_cert.signing_key.serialize_pem().into_bytes();
+        let server_config = crate::util::rustls_util::create_server_config(
+            &cert_bytes,
+            &key_bytes,
+            &["h2".to_string()],
+            &[],
+        )
+        .expect("build h2-only TLS upstream config");
+        let acceptor =
+            tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind h2-only proxy upstream");
+        let upstream_addr = listener.local_addr().expect("read h2 upstream address");
+        let upstream = tokio::spawn(async move {
+            let (stream, _) =
+                listener.accept().await.expect("accept h2 proxy request");
+            let tls = acceptor
+                .accept(stream)
+                .await
+                .expect("accept h2 upstream TLS");
+            assert_eq!(
+                tls.get_ref().1.alpn_protocol(),
+                Some(b"h2".as_slice()),
+                "Xray DefaultTransport negotiates HTTP/2 with an h2-only HTTPS upstream",
+            );
+
+            let service = hyper::service::service_fn(
+                |request: hyper::Request<hyper::body::Incoming>| async move {
+                    assert_eq!(request.version(), http::Version::HTTP_2);
+                    Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                        http_body_util::Full::new(Bytes::from_static(
+                            b"h2 upstream",
+                        )),
+                    ))
+                },
+            );
+            hyper::server::conn::http2::Builder::new(
+                hyper_util::rt::TokioExecutor::new(),
+            )
+            .serve_connection(hyper_util::rt::TokioIo::new(tls), service)
+            .await
+            .expect("serve h2-only upstream request");
+        });
+
+        let uri: http::Uri = "https://original.test/path"
+            .parse()
+            .expect("valid h2 proxy URI");
+        let config = Hysteria2MasqueradeProxyConfig {
+            url: format!("https://localhost:{}/", upstream_addr.port()),
+            rewrite_host: true,
+            insecure: true,
+        };
+        let (response, body) = xray_proxy_masquerade_response(
+            &http::Method::GET,
+            &uri,
+            &http::HeaderMap::new(),
+            Bytes::new(),
+            &config,
+        )
+        .await
+        .expect("proxy Xray masquerade request to h2-only upstream");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body.as_deref(), Some(&b"h2 upstream"[..]));
+        upstream.await.expect("join h2 upstream");
+    }
+
+    #[tokio::test]
     async fn xray_proxy_masquerade_returns_bad_gateway_for_relative_target() {
         let uri: http::Uri = "https://original.test/path?q=2"
             .parse()

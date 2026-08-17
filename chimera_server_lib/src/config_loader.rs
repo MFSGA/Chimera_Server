@@ -78,6 +78,7 @@ fn fetch_http_content(target: &str) -> Result<String, Error> {
     // support is enabled for Xray Hysteria reverse-proxy compatibility.
     let client = reqwest::blocking::Client::builder()
         .no_gzip()
+        .http1_only()
         .build()
         .map_err(|err| {
             Error::InvalidConfig(format!(
