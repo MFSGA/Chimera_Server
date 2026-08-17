@@ -14,6 +14,7 @@ use tokio_rustls::{
             CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer,
             PrivateSec1KeyDer,
         },
+        version::{TLS12, TLS13},
     },
 };
 
@@ -186,20 +187,14 @@ fn build_server_config(
     let cert_chain = load_certs(certificate)?;
     let private_key = load_private_key(certificate)?;
 
-    let config = rustls::ServerConfig::builder()
+    let versions = tls_versions(min_version, max_version)?;
+    let mut config = rustls::ServerConfig::builder_with_protocol_versions(&versions)
         .with_no_client_auth()
         .with_single_cert(cert_chain, private_key)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
 
-    let mut config = config;
-    if !alpn_protocols.is_empty() {
-        config.alpn_protocols = alpn_protocols
-            .iter()
-            .map(|proto| proto.as_bytes().to_vec())
-            .collect();
-    }
+    config.alpn_protocols = tls_alpn_protocols(alpn_protocols);
     config.send_tls13_tickets = if enable_session_resumption { 2 } else { 0 };
-    apply_tls_version_overrides(&mut config, min_version, max_version)?;
 
     Ok(config)
 }
@@ -297,34 +292,74 @@ fn open_pem_reader(
     Ok(BufReader::new(Box::new(Cursor::new(inline_pem.to_vec()))))
 }
 
-fn apply_tls_version_overrides(
-    _config: &mut rustls::ServerConfig,
+fn tls_alpn_protocols(alpn_protocols: &[String]) -> Vec<Vec<u8>> {
+    if alpn_protocols.is_empty() {
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+    } else {
+        alpn_protocols
+            .iter()
+            .map(|proto| proto.as_bytes().to_vec())
+            .collect()
+    }
+}
+
+fn tls_versions(
     min_version: Option<&str>,
     max_version: Option<&str>,
-) -> io::Result<()> {
-    if let Some(value) = min_version {
-        match value {
-            "1.2" | "1.3" | "" => {}
-            other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unsupported tls minVersion: {other}"),
-                ));
-            }
+) -> io::Result<Vec<&'static rustls::SupportedProtocolVersion>> {
+    let parse = |value: Option<&str>, default: u8, field: &str| -> io::Result<u8> {
+        match value.unwrap_or_default().trim() {
+            "" => Ok(default),
+            "1.2" => Ok(12),
+            "1.3" => Ok(13),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported tls {field}: {other}"),
+            )),
         }
+    };
+    let minimum = parse(min_version, 12, "minVersion")?;
+    let maximum = parse(max_version, 13, "maxVersion")?;
+    if minimum > maximum {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tls minVersion exceeds maxVersion",
+        ));
     }
 
-    if let Some(value) = max_version {
-        match value {
-            "1.2" | "1.3" | "" => {}
-            other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unsupported tls maxVersion: {other}"),
-                ));
-            }
-        }
+    Ok(match (minimum, maximum) {
+        (12, 12) => vec![&TLS12],
+        (12, 13) => vec![&TLS13, &TLS12],
+        (13, 13) => vec![&TLS13],
+        _ => unreachable!("validated TLS version bounds"),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_alpn_uses_xray_server_defaults() {
+        assert_eq!(
+            tls_alpn_protocols(&[]),
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+        assert_eq!(
+            tls_alpn_protocols(&["custom".into()]),
+            vec![b"custom".to_vec()]
+        );
     }
 
-    Ok(())
+    #[test]
+    fn tls_versions_apply_xray_server_bounds() {
+        assert_eq!(tls_versions(None, None).unwrap(), vec![&TLS13, &TLS12]);
+        assert_eq!(
+            tls_versions(Some("1.2"), Some("1.2")).unwrap(),
+            vec![&TLS12]
+        );
+        assert_eq!(tls_versions(Some("1.3"), None).unwrap(), vec![&TLS13]);
+        assert!(tls_versions(Some("1.3"), Some("1.2")).is_err());
+        assert!(tls_versions(Some("1.1"), None).is_err());
+    }
 }
