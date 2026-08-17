@@ -57,7 +57,6 @@ const MAX_ADDRESS_LEN: usize = 2048;
 const MAX_TCP_REQUEST_PADDING_LEN: u64 = 4096;
 const PADDING_SCRATCH_LEN: usize = 1024;
 const TCP_SUCCESS_STATUS: u8 = 0x00;
-const TCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 const UDP_IDLE_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_FRAGMENT_CACHE_SIZE: usize = 256;
@@ -337,7 +336,12 @@ async fn handle_tcp_stream(
     peer_addr: SocketAddr,
     runtime: RuntimeState,
 ) -> std::io::Result<()> {
-    let request = match read_tcp_request(&mut recv, auth_ctx.xray_compat).await {
+    let tcp_request_timeout = configured_tcp_request_timeout(
+        auth_ctx.xray_compat,
+        auth_ctx.client.level,
+        &runtime,
+    );
+    let request = match read_tcp_request(&mut recv, tcp_request_timeout).await {
         Ok(request) => request,
         Err(err) => {
             let _ = send.finish();
@@ -400,15 +404,19 @@ struct TcpRequest {
     target: NetLocation,
 }
 
-fn configured_tcp_request_timeout(xray_compat: bool) -> Option<Duration> {
-    xray_compat.then_some(TCP_REQUEST_TIMEOUT)
+fn configured_tcp_request_timeout(
+    xray_compat: bool,
+    level: u32,
+    runtime: &RuntimeState,
+) -> Option<Duration> {
+    xray_compat.then(|| runtime.xray_handshake_timeout_for_level(level))
 }
 
 async fn read_tcp_request(
     stream: &mut quinn::RecvStream,
-    xray_compat: bool,
+    timeout: Option<Duration>,
 ) -> std::io::Result<TcpRequest> {
-    match configured_tcp_request_timeout(xray_compat) {
+    match timeout {
         Some(timeout) => tokio::time::timeout(timeout, TcpRequest::read(stream))
             .await
             .map_err(|_| {
@@ -3236,12 +3244,37 @@ mod tests {
     }
 
     #[test]
-    fn tcp_request_timeout_is_xray_only() {
+    fn tcp_request_timeout_uses_xray_user_level_policy_only() {
+        use crate::config::def::{PolicyConfig, PolicyLevelConfig};
+        use std::collections::HashMap;
+
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
         assert_eq!(
-            configured_tcp_request_timeout(true),
-            Some(TCP_REQUEST_TIMEOUT)
+            configured_tcp_request_timeout(true, 7, &runtime),
+            Some(Duration::from_secs(60))
         );
-        assert_eq!(configured_tcp_request_timeout(false), None);
+        assert_eq!(configured_tcp_request_timeout(false, 7, &runtime), None);
+
+        let mut levels = HashMap::new();
+        levels.insert(
+            7,
+            Some(PolicyLevelConfig {
+                handshake: Some(2),
+                ..PolicyLevelConfig::default()
+            }),
+        );
+        runtime.replace_policy(Some(&PolicyConfig {
+            levels,
+            ..PolicyConfig::default()
+        }));
+        assert_eq!(
+            configured_tcp_request_timeout(true, 7, &runtime),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            configured_tcp_request_timeout(true, 8, &runtime),
+            Some(Duration::from_secs(60))
+        );
     }
 
     #[test]

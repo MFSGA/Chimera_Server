@@ -109,8 +109,10 @@ pub fn prepare_server_runtime(
     cwd: Option<&str>,
     log_file: Option<&str>,
 ) -> Result<ServerRuntime, Error> {
+    let policy_config = config.policy.clone();
     let inbounds = prepare_server_inbounds(config, cwd, log_file)?;
     let runtime_state = RuntimeState::new(inbounds.clone(), Vec::new());
+    runtime_state.replace_policy(policy_config.as_ref());
 
     Ok(ServerRuntime {
         inbounds,
@@ -349,6 +351,7 @@ async fn start_async(
     let api_config = config.api.clone();
     let mcp_config = config.mcp.clone();
     let routing_config = config.routing.clone();
+    let policy_config = config.policy.clone();
     let outbounds = config
         .outbounds
         .iter()
@@ -367,6 +370,7 @@ async fn start_async(
         .collect::<Result<Vec<_>, _>>()?;
 
     let runtime_state = RuntimeState::new(all_inbounds.clone(), outbounds);
+    runtime_state.replace_policy(policy_config.as_ref());
     runtime_state.replace_routing(
         routing_state::RoutingState::from_config(config.routing.as_ref())
             .map_err(Error::InvalidConfig)?,
@@ -483,7 +487,9 @@ async fn start_async(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_api_config;
+    use std::time::Duration;
+
+    use super::{prepare_server_runtime, resolve_api_config};
     use crate::{
         address::{Address, BindLocation, NetLocation},
         config::{
@@ -493,6 +499,28 @@ mod tests {
             server_config::{DokodemoDoorConfig, ServerConfig, ServerProxyConfig},
         },
     };
+
+    #[test]
+    fn prepare_server_runtime_applies_root_xray_policy() {
+        let config: crate::config::def::LiteralConfig = serde_json::from_str(
+            r#"{
+                "inbounds": [],
+                "outbounds": [],
+                "policy": {"levels": {"7": {"handshake": 2}}}
+            }"#,
+        )
+        .expect("parse root policy config");
+        let prepared = prepare_server_runtime(config, None, None)
+            .expect("prepare server runtime");
+        assert_eq!(
+            prepared.runtime_state.xray_handshake_timeout_for_level(7),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            prepared.runtime_state.xray_handshake_timeout_for_level(8),
+            Duration::from_secs(60)
+        );
+    }
 
     fn make_inbound(tag: &str, port: u16) -> ServerConfig {
         ServerConfig {

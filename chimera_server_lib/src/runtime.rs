@@ -1,10 +1,11 @@
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
+    time::Duration,
 };
 
 use crate::{
-    config::server_config::ServerConfig,
+    config::{def::PolicyConfig, server_config::ServerConfig},
     routing_state::{RoutingInput, RoutingState},
 };
 use tokio::task::JoinHandle;
@@ -23,6 +24,7 @@ pub struct RuntimeState {
     outbounds: Arc<RwLock<Vec<OutboundSummary>>>,
     inbound_tasks: Arc<RwLock<HashMap<String, Vec<JoinHandle<()>>>>>,
     routing: Arc<RwLock<RoutingState>>,
+    policy: Arc<RwLock<PolicyConfig>>,
 }
 
 impl RuntimeState {
@@ -35,7 +37,29 @@ impl RuntimeState {
             outbounds: Arc::new(RwLock::new(outbounds)),
             inbound_tasks: Arc::new(RwLock::new(HashMap::new())),
             routing: Arc::new(RwLock::new(RoutingState::default())),
+            policy: Arc::new(RwLock::new(PolicyConfig::default())),
         }
+    }
+
+    pub fn replace_policy(&self, policy: Option<&PolicyConfig>) {
+        *self.policy.write().expect("runtime policy lock poisoned") =
+            policy.cloned().unwrap_or_default();
+    }
+
+    pub fn xray_handshake_timeout_for_level(&self, level: u32) -> Duration {
+        const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 60;
+
+        let seconds = self
+            .policy
+            .read()
+            .expect("runtime policy lock poisoned")
+            .levels
+            .get(&level)
+            .and_then(Option::as_ref)
+            .and_then(|policy| policy.handshake)
+            .map(u64::from)
+            .unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT_SECS);
+        Duration::from_secs(seconds)
     }
 
     pub fn inbounds(&self) -> Vec<ServerConfig> {
@@ -186,5 +210,61 @@ impl RuntimeState {
     {
         let mut guard = self.routing.write().expect("runtime routing lock poisoned");
         mutator(&mut guard)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RuntimeState;
+    use crate::config::def::{PolicyConfig, PolicyLevelConfig};
+    use std::{collections::HashMap, time::Duration};
+
+    #[test]
+    fn xray_handshake_policy_uses_level_override_and_default() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        assert_eq!(
+            runtime.xray_handshake_timeout_for_level(7),
+            Duration::from_secs(60)
+        );
+
+        let mut levels = HashMap::new();
+        levels.insert(
+            7,
+            Some(PolicyLevelConfig {
+                handshake: Some(5),
+                ..PolicyLevelConfig::default()
+            }),
+        );
+        levels.insert(
+            8,
+            Some(PolicyLevelConfig {
+                handshake: Some(0),
+                ..PolicyLevelConfig::default()
+            }),
+        );
+        levels.insert(9, Some(PolicyLevelConfig::default()));
+        levels.insert(10, None);
+        runtime.replace_policy(Some(&PolicyConfig {
+            levels,
+            ..PolicyConfig::default()
+        }));
+
+        assert_eq!(
+            runtime.xray_handshake_timeout_for_level(7),
+            Duration::from_secs(5)
+        );
+        assert_eq!(runtime.xray_handshake_timeout_for_level(8), Duration::ZERO);
+        assert_eq!(
+            runtime.xray_handshake_timeout_for_level(9),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            runtime.xray_handshake_timeout_for_level(10),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            runtime.xray_handshake_timeout_for_level(11),
+            Duration::from_secs(60)
+        );
     }
 }
