@@ -1238,7 +1238,6 @@ async fn xray_proxy_masquerade_response_with_transport(
             && !xray_proxy_connection_header(name, request_headers)
             && !xray_proxy_forwarding_header(name)
             && name != http::header::HOST
-            && !(auto_gzip && name == http::header::ACCEPT_ENCODING)
         {
             request = request.header(name, value);
         }
@@ -3727,6 +3726,14 @@ mod tests {
             .expect("valid proxy request URI");
         let mut headers = http::HeaderMap::new();
         headers.insert("x-test", http::HeaderValue::from_static("forwarded"));
+        headers.append(
+            http::header::ACCEPT_ENCODING,
+            http::HeaderValue::from_static(""),
+        );
+        headers.append(
+            http::header::ACCEPT_ENCODING,
+            http::HeaderValue::from_static("br"),
+        );
         headers.insert(
             http::header::CONNECTION,
             http::HeaderValue::from_static("keep-alive, X-Client-Hop"),
@@ -3785,6 +3792,8 @@ mod tests {
         assert!(!request_lower.contains("\r\nconnection:"));
         assert!(request_lower.contains("\r\nte: trailers\r\n"));
         assert!(!request_lower.contains("te: gzip"));
+        assert!(request_lower.contains("\r\naccept-encoding: \r\n"));
+        assert!(request_lower.contains("\r\naccept-encoding: br\r\n"));
         assert!(request_lower.contains("\r\naccept-encoding: gzip\r\n"));
         assert!(!request_lower.contains("\r\nforwarded:"));
         assert!(!request_lower.contains("\r\nx-forwarded-for:"));
