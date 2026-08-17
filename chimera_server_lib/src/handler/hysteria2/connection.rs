@@ -933,16 +933,14 @@ fn xray_proxy_clean_query(value: &str) -> String {
         .filter(|byte| **byte == b'&')
         .count()
         + 1;
-    if parameter_count > 10_000 {
-        return String::new();
-    }
-    let needs_cleaning = value.as_bytes().iter().enumerate().any(|(index, byte)| {
-        *byte == b';'
-            || (*byte == b'%'
-                && (index + 2 >= value.len()
-                    || !value.as_bytes()[index + 1].is_ascii_hexdigit()
-                    || !value.as_bytes()[index + 2].is_ascii_hexdigit()))
-    });
+    let needs_cleaning = parameter_count > 10_000
+        || value.as_bytes().iter().enumerate().any(|(index, byte)| {
+            *byte == b';'
+                || (*byte == b'%'
+                    && (index + 2 >= value.len()
+                        || !value.as_bytes()[index + 1].is_ascii_hexdigit()
+                        || !value.as_bytes()[index + 2].is_ascii_hexdigit()))
+        });
     if !needs_cleaning {
         return value.to_string();
     }
@@ -3460,7 +3458,18 @@ mod tests {
             xray_proxy_clean_query("b=2;a=ignored&a=first&a=second+value"),
             "a=first&a=second+value"
         );
-        assert_eq!(xray_proxy_clean_query(&("a=1&".repeat(10_000) + "a=1")), "");
+        let at_limit = "b=2&".repeat(9_999) + "a=1";
+        assert_eq!(xray_proxy_clean_query(&at_limit), at_limit);
+
+        let over_limit_same_key = "a=1&".repeat(10_000) + "a=1";
+        assert_eq!(
+            xray_proxy_clean_query(&over_limit_same_key),
+            over_limit_same_key
+        );
+        let over_limit_sorted = "b=2&".repeat(10_000) + "a=1";
+        let cleaned = xray_proxy_clean_query(&over_limit_sorted);
+        assert!(cleaned.starts_with("a=1&b=2&b=2"));
+        assert_eq!(cleaned.matches("b=2").count(), 10_000);
 
         let uri: http::Uri = "https://original.test/path?a=1&a=%25zz&b=3"
             .parse()
