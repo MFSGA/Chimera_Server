@@ -921,7 +921,7 @@ fn xray_proxy_clean_query(value: &str) -> String {
 
     let mut pairs = std::collections::BTreeMap::<Vec<u8>, Vec<Vec<u8>>>::new();
     for field in value.as_bytes().split(|byte| *byte == b'&') {
-        if field.contains(&b';') {
+        if field.contains(&b';') || field.is_empty() {
             continue;
         }
         let (key, value) = match field.iter().position(|byte| *byte == b'=') {
@@ -3365,6 +3365,9 @@ mod tests {
         assert_eq!(xray_proxy_clean_query("a=1&a=2;b=3"), "a=1");
         assert_eq!(xray_proxy_clean_query("a=1&a=%zz&b=3"), "a=1&b=3");
         assert_eq!(xray_proxy_clean_query("a=%zz"), "");
+        assert_eq!(xray_proxy_clean_query("a=%zz&&b=2"), "b=2");
+        assert_eq!(xray_proxy_clean_query("&&a=%zz"), "");
+        assert_eq!(xray_proxy_clean_query("=&&a=%zz"), "=");
         assert_eq!(
             xray_proxy_clean_query("b=2&a=first&a=second%20value"),
             "b=2&a=first&a=second%20value"
