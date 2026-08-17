@@ -12,6 +12,7 @@ use crate::{
     util::prefixed_stream::PrefixedStream,
 };
 
+const SOCKS4_VERSION: u8 = 0x04;
 const SOCKS5_VERSION: u8 = 0x05;
 
 #[derive(Debug)]
@@ -55,7 +56,7 @@ impl TcpServerHandler for MixedTcpServerHandler {
         let first = server_stream.read_u8().await?;
         let stream: Box<dyn AsyncStream> =
             Box::new(PrefixedStream::new(vec![first], server_stream));
-        if first == SOCKS5_VERSION {
+        if matches!(first, SOCKS4_VERSION | SOCKS5_VERSION) {
             self.socks.setup_server_stream(stream).await
         } else {
             self.http.setup_server_stream(stream).await
@@ -157,6 +158,36 @@ mod tests {
             panic!("mixed HTTP returned non-TCP result");
         };
         assert_eq!(remote_location.to_string(), "example.com:443");
+    }
+
+    #[tokio::test]
+    async fn detects_socks4() {
+        let handler = MixedTcpServerHandler::new(
+            SocksUserStore::new(Vec::new()),
+            false,
+            "mixed-in",
+        );
+        let (mut client, server) = duplex(1024);
+        client
+            .write_all(&[4, 1, 0, 80, 127, 0, 0, 1, 0])
+            .await
+            .unwrap();
+        let setup = tokio::spawn(async move {
+            handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+        });
+        let mut response = [0u8; 8];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response[1], 90);
+        let result = setup.await.unwrap().unwrap();
+        let TcpServerSetupResult::TcpForward {
+            remote_location, ..
+        } = result
+        else {
+            panic!("mixed SOCKS4 returned non-TCP result");
+        };
+        assert_eq!(remote_location.to_string(), "127.0.0.1:80");
     }
 
     #[tokio::test]

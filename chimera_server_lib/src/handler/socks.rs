@@ -7,9 +7,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::{
     address::{Address, NetLocation},
     async_stream::AsyncStream,
-    config::server_config::{SocksUser, SocksUserStore},
-    handler::tcp::tcp_handler::{
-        TcpServerConnectionContext, TcpServerHandler, TcpServerSetupResult,
+    config::server_config::{HttpUser, SocksUser, SocksUserStore},
+    handler::{
+        http::HttpTcpServerHandler,
+        tcp::tcp_handler::{
+            TcpServerConnectionContext, TcpServerHandler, TcpServerSetupResult,
+        },
     },
     outbound::{
         DirectOutboundAction, connection_routing_input, select_direct_outbound,
@@ -17,6 +20,7 @@ use crate::{
     resolver::{Resolver, resolve_single_address},
     runtime::RuntimeState,
     traffic::{TrafficContext, record_transfer, register_connection},
+    util::prefixed_stream::PrefixedStream,
 };
 
 const SOCKS4_VERSION: u8 = 0x04;
@@ -110,10 +114,31 @@ impl SocksTcpServerHandler {
             .await;
         }
         if version != SOCKS_VERSION {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("unsupported socks version: {}", version),
-            ));
+            // Xray's SOCKS inbound doubles as an HTTP proxy: any connection
+            // whose first byte is neither SOCKS4 nor SOCKS5 is replayed into
+            // the HTTP parser. HTTP authentication follows authType, not merely
+            // the presence of configured accounts.
+            let http_accounts = if self.requires_auth() {
+                self.accounts
+                    .snapshot()
+                    .into_iter()
+                    .map(|account| HttpUser {
+                        username: account.username,
+                        password: account.password,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let stream: Box<dyn AsyncStream> =
+                Box::new(PrefixedStream::new(vec![version], server_stream));
+            return HttpTcpServerHandler::new(
+                http_accounts,
+                false,
+                &self.inbound_tag,
+            )
+            .setup_server_stream(stream)
+            .await;
         }
 
         let method =
@@ -1003,6 +1028,108 @@ mod tests {
         let mut response = [0u8; 8];
         client.read_exact(&mut response).await.unwrap();
         assert_eq!(response, [0x00, SOCKS4_REQUEST_REJECTED, 0, 0, 0, 0, 0, 0]);
+    }
+
+    async fn http_fallback_setup(
+        handler: &SocksTcpServerHandler,
+        request: &[u8],
+    ) -> TcpServerSetupResult {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(listener_addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        client.write_all(request).await.unwrap();
+        handler.setup_server_stream(Box::new(server)).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn non_socks_first_byte_falls_back_to_http_proxy() {
+        let handler = SocksTcpServerHandler::new(
+            SocksUserStore::with_auth_required(Vec::new(), false),
+            "socks-http",
+            false,
+            None,
+        );
+        let result = http_fallback_setup(
+            &handler,
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+        )
+        .await;
+
+        let TcpServerSetupResult::TcpForward {
+            remote_location,
+            connection_success_response,
+            traffic_context,
+            ..
+        } = result
+        else {
+            panic!("expected HTTP fallback TCP forward result");
+        };
+        assert_eq!(remote_location.to_string(), "example.com:443");
+        assert_eq!(
+            connection_success_response.as_deref(),
+            Some(b"HTTP/1.1 200 Connection established\r\n\r\n".as_slice())
+        );
+        let traffic_context = traffic_context.expect("HTTP traffic context");
+        assert_eq!(traffic_context.protocol, "http");
+        assert_eq!(traffic_context.inbound_tag.as_deref(), Some("socks-http"));
+    }
+
+    #[tokio::test]
+    async fn http_fallback_auth_follows_xray_auth_type() {
+        let account = SocksUser {
+            username: "alice".into(),
+            password: "secret".into(),
+        };
+        let authenticated = SocksTcpServerHandler::new(
+            SocksUserStore::with_auth_required(vec![account.clone()], true),
+            "socks-http-auth",
+            false,
+            None,
+        );
+        let result = http_fallback_setup(
+            &authenticated,
+            b"CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic YWxpY2U6c2VjcmV0\r\n\r\n",
+        )
+        .await;
+        let TcpServerSetupResult::TcpForward {
+            traffic_context, ..
+        } = result
+        else {
+            panic!("expected authenticated HTTP fallback TCP forward result");
+        };
+        assert_eq!(
+            traffic_context
+                .expect("HTTP traffic context")
+                .identity
+                .as_deref(),
+            Some("alice")
+        );
+
+        let no_auth = SocksTcpServerHandler::new(
+            SocksUserStore::with_auth_required(vec![account], false),
+            "socks-http-noauth",
+            false,
+            None,
+        );
+        let result = http_fallback_setup(
+            &no_auth,
+            b"CONNECT example.com:443 HTTP/1.1\r\n\r\n",
+        )
+        .await;
+        let TcpServerSetupResult::TcpForward {
+            traffic_context, ..
+        } = result
+        else {
+            panic!("expected no-auth HTTP fallback TCP forward result");
+        };
+        assert!(
+            traffic_context
+                .expect("HTTP traffic context")
+                .identity
+                .is_none(),
+            "configured accounts must not force HTTP auth when Xray authType is NO_AUTH"
+        );
     }
 
     #[tokio::test]

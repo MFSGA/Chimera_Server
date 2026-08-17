@@ -1,5 +1,6 @@
 pub mod dokodemo;
-#[cfg(feature = "http")]
+// Xray's SOCKS inbound reuses the HTTP proxy parser for non-SOCKS traffic,
+// even when standalone HTTP inbound support is not enabled.
 pub mod http;
 #[cfg(feature = "httpupgrade")]
 pub mod httpupgrade;
