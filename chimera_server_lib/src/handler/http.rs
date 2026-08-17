@@ -62,6 +62,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
         let mut authenticated_user = None;
         let mut host_header = None;
         let mut forwarded_headers = Vec::new();
+        let mut connection_hop_headers = Vec::new();
         loop {
             let line = read_http_line(&mut server_stream, MAX_HEADER_BYTES).await?;
             header_bytes = header_bytes.saturating_add(line.len() + 2);
@@ -84,9 +85,17 @@ impl TcpServerHandler for HttpTcpServerHandler {
                 authenticated_user = self.authenticate_basic(value);
                 continue;
             }
-            if name.eq_ignore_ascii_case("proxy-connection")
-                || name.eq_ignore_ascii_case("connection")
-            {
+            if name.eq_ignore_ascii_case("proxy-connection") {
+                continue;
+            }
+            if name.eq_ignore_ascii_case("connection") {
+                connection_hop_headers.extend(
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_ascii_lowercase),
+                );
                 continue;
             }
             if name.eq_ignore_ascii_case("host") {
@@ -180,6 +189,16 @@ impl TcpServerHandler for HttpTcpServerHandler {
 
         let mut initial_request = format!("{method} {origin_target} {version}\r\n");
         for line in forwarded_headers {
+            let header_name = line
+                .split_once(':')
+                .map(|(name, _)| name.trim().to_ascii_lowercase())
+                .unwrap_or_default();
+            if connection_hop_headers
+                .iter()
+                .any(|name| name == &header_name)
+            {
+                continue;
+            }
             initial_request.push_str(&line);
             initial_request.push_str("\r\n");
         }
@@ -440,9 +459,11 @@ mod tests {
             "POST http://example.com:8080/upload?q=1 HTTP/1.1\r\n\
              Host: example.com:8080\r\n\
              Proxy-Authorization: Basic {token}\r\n\
+             X-Remove-Early: hidden\r\n\
              Proxy-Connection: keep-alive\r\n\
-             Connection: keep-alive\r\n\
-             X-Test: forwarded\r\n\r\nbody"
+             Connection: keep-alive, X-Remove-Early, x-remove-late\r\n\
+             X-Test: forwarded\r\n\
+             X-Remove-Late: hidden-too\r\n\r\nbody"
         );
         let (mut client, server) = duplex(4096);
         client.write_all(request.as_bytes()).await.unwrap();
