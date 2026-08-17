@@ -770,7 +770,7 @@ async fn send_auth_success(
     } else {
         server_rx_limit.to_string()
     };
-    let response = Response::builder()
+    let mut response = Response::builder()
         .status(
             StatusCode::from_u16(SUCCESS_STATUS).expect("valid hysteria2 status"),
         )
@@ -783,8 +783,22 @@ async fn send_auth_success(
         .header(http::header::CONTENT_LENGTH, "0")
         .body(())
         .map_err(Error::other)?;
+    if xray_compat {
+        xray_response_add_date(&mut response)?;
+    }
     stream.send_response(response).await.map_err(map_h3_error)?;
     stream.finish().await.map_err(map_h3_error)
+}
+
+fn xray_response_add_date(response: &mut Response<()>) -> std::io::Result<()> {
+    if !response.headers().contains_key(http::header::DATE) {
+        let date = xray_format_http_date(std::time::SystemTime::now());
+        response.headers_mut().insert(
+            http::header::DATE,
+            http::HeaderValue::from_str(&date).map_err(Error::other)?,
+        );
+    }
+    Ok(())
 }
 
 fn xray_string_masquerade_response(
@@ -808,13 +822,7 @@ fn xray_string_masquerade_response(
         response.headers_mut().insert(name, value);
     }
 
-    if !response.headers().contains_key(http::header::DATE) {
-        let date = xray_format_http_date(std::time::SystemTime::now());
-        response.headers_mut().insert(
-            http::header::DATE,
-            http::HeaderValue::from_str(&date).map_err(Error::other)?,
-        );
-    }
+    xray_response_add_date(&mut response)?;
 
     let body_allowed = !(status.is_informational()
         || status == StatusCode::NO_CONTENT
@@ -855,13 +863,14 @@ fn auth_reject_response(
 ) -> std::io::Result<(Response<()>, Option<Bytes>)> {
     if xray_compat {
         let body = Bytes::from_static(b"404 page not found\n");
-        let response = Response::builder()
+        let mut response = Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
             .header("x-content-type-options", "nosniff")
             .header(http::header::CONTENT_LENGTH, body.len().to_string())
             .body(())
             .map_err(Error::other)?;
+        xray_response_add_date(&mut response)?;
         Ok((response, Some(body)))
     } else {
         let response = Response::builder()
@@ -881,7 +890,7 @@ async fn send_auth_reject_response(
     config: &Hysteria2ServerConfig,
     xray_proxy_transport: Option<&XrayProxyTransport>,
 ) -> std::io::Result<()> {
-    let (response, body) = if let Some(masquerade) =
+    let (mut response, body) = if let Some(masquerade) =
         config.xray_masquerade_file.as_ref()
     {
         xray_file_masquerade_response(method, uri, request_headers, &masquerade.dir)
@@ -919,6 +928,9 @@ async fn send_auth_reject_response(
     } else {
         auth_reject_response(config.xray_compat)?
     };
+    if config.xray_compat {
+        xray_response_add_date(&mut response)?;
+    }
     stream.send_response(response).await.map_err(map_h3_error)?;
     if method != http::Method::HEAD
         && let Some(body) = body
@@ -3529,6 +3541,7 @@ mod tests {
             xray_response.headers().get(http::header::CONTENT_LENGTH),
             Some(&http::HeaderValue::from_static("19"))
         );
+        assert!(xray_response.headers().get(http::header::DATE).is_some());
         assert_eq!(xray_body.as_deref(), Some(&b"404 page not found\n"[..]));
     }
 
@@ -3560,6 +3573,21 @@ mod tests {
             Some(&http::HeaderValue::from_static("text/plain; charset=utf-8"))
         );
         assert_eq!(body.as_deref(), Some(&b"hello from xray"[..]));
+
+        let mut explicit_date = masquerade.clone();
+        explicit_date.headers.insert(
+            "date".to_string(),
+            "Sun, 06 Nov 1994 08:49:37 GMT".to_string(),
+        );
+        let (explicit_date_response, _) =
+            xray_string_masquerade_response(&http::Method::GET, &explicit_date)
+                .expect("preserve explicit Xray string Date header");
+        assert_eq!(
+            explicit_date_response.headers().get(http::header::DATE),
+            Some(&http::HeaderValue::from_static(
+                "Sun, 06 Nov 1994 08:49:37 GMT"
+            ))
+        );
 
         let (head_response, head_body) =
             xray_string_masquerade_response(&http::Method::HEAD, &masquerade)
