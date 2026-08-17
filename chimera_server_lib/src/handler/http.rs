@@ -1,10 +1,15 @@
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
+
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::{
     address::NetLocation,
-    async_stream::AsyncStream,
+    async_stream::{AsyncPing, AsyncStream},
     config::server_config::HttpUser,
     handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
     traffic::TrafficContext,
@@ -268,17 +273,160 @@ impl TcpServerHandler for HttpTcpServerHandler {
             });
         }
 
-        Ok(TcpServerSetupResult::TcpForward {
-            remote_location,
-            stream: Box::new(PrefixedStream::new(
+        let stream: Box<dyn AsyncStream> = if chunked_transfer_encoding {
+            Box::new(FirstChunkValidatedStream::new(
                 initial_request.into_bytes(),
                 server_stream,
-            )),
+            ))
+        } else {
+            Box::new(PrefixedStream::new(
+                initial_request.into_bytes(),
+                server_stream,
+            ))
+        };
+        Ok(TcpServerSetupResult::TcpForward {
+            remote_location,
+            stream,
             need_initial_flush: false,
             connection_success_response: None,
             traffic_context,
         })
     }
+}
+
+struct FirstChunkValidatedStream {
+    prefix: Box<[u8]>,
+    prefix_offset: usize,
+    first_chunk_line: Vec<u8>,
+    first_chunk_validated: bool,
+    inner: Box<dyn AsyncStream>,
+}
+
+impl FirstChunkValidatedStream {
+    fn new(prefix: Vec<u8>, inner: Box<dyn AsyncStream>) -> Self {
+        Self {
+            prefix: prefix.into_boxed_slice(),
+            prefix_offset: 0,
+            first_chunk_line: Vec::new(),
+            first_chunk_validated: false,
+            inner,
+        }
+    }
+
+    fn remaining_prefix(&self) -> &[u8] {
+        &self.prefix[self.prefix_offset..]
+    }
+}
+
+impl AsyncRead for FirstChunkValidatedStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if !this.first_chunk_validated {
+            loop {
+                let mut byte = [0u8; 1];
+                let mut read_buf = ReadBuf::new(&mut byte);
+                match Pin::new(&mut this.inner).poll_read(cx, &mut read_buf) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Ready(Ok(())) if read_buf.filled().is_empty() => {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "HTTP chunked body ended before first chunk size",
+                        )));
+                    }
+                    Poll::Ready(Ok(())) => {
+                        this.first_chunk_line.push(byte[0]);
+                        if this.first_chunk_line.len() > MAX_REQUEST_LINE_BYTES {
+                            return Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "HTTP chunk size line is too long",
+                            )));
+                        }
+                        if this.first_chunk_line.ends_with(b"\r\n") {
+                            validate_chunk_size_line(
+                                &this.first_chunk_line
+                                    [..this.first_chunk_line.len() - 2],
+                            )?;
+                            let mut prefix = this.prefix.to_vec();
+                            prefix.extend_from_slice(&this.first_chunk_line);
+                            this.prefix = prefix.into_boxed_slice();
+                            this.first_chunk_validated = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let remaining = this.remaining_prefix();
+        if !remaining.is_empty() {
+            let to_copy = remaining.len().min(buf.remaining());
+            if to_copy > 0 {
+                buf.put_slice(&remaining[..to_copy]);
+                this.prefix_offset += to_copy;
+                return Poll::Ready(Ok(()));
+            }
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for FirstChunkValidatedStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+impl AsyncPing for FirstChunkValidatedStream {
+    fn supports_ping(&self) -> bool {
+        self.inner.supports_ping()
+    }
+
+    fn poll_write_ping(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<bool>> {
+        Pin::new(&mut self.get_mut().inner).poll_write_ping(cx)
+    }
+}
+
+impl AsyncStream for FirstChunkValidatedStream {}
+
+fn validate_chunk_size_line(line: &[u8]) -> std::io::Result<()> {
+    let mut size = line.split(|byte| *byte == b';').next().unwrap_or_default();
+    while matches!(size.last(), Some(b' ' | b'\t')) {
+        size = &size[..size.len() - 1];
+    }
+    if size.is_empty() || size.len() > 16 || !size.iter().all(u8::is_ascii_hexdigit)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid HTTP chunk size",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_absolute_http_target(
@@ -759,6 +907,67 @@ Transfer-Encoding: chunked\r\n\
 Connection: close\r\n\r\n\
 4\r\ntest\r\n0\r\n\r\n"
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_first_chunk_size_fails_before_forwarding_bytes() {
+        for chunk_size in ["Z", "0x4", "+4", " 4", "00000000000000000"] {
+            let handler =
+                HttpTcpServerHandler::new(Vec::new(), false, "http-chunk-size");
+            let request = format!(
+                "POST http://example.com/upload HTTP/1.1\r\n\
+                 Host: example.com\r\n\
+                 Transfer-Encoding: chunked\r\n\r\n\
+                 {chunk_size}\r\ntest\r\n0\r\n\r\n"
+            );
+            let (mut client, server) = duplex(2048);
+            client.write_all(request.as_bytes()).await.unwrap();
+            client.shutdown().await.unwrap();
+
+            let result = handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+                .expect("chunk syntax validation is deferred until relay starts");
+            let TcpServerSetupResult::TcpForward { mut stream, .. } = result else {
+                panic!("chunked HTTP request returned non-TCP result");
+            };
+            let mut forwarded = Vec::new();
+            let error = stream.read_to_end(&mut forwarded).await.unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert!(forwarded.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn supported_first_chunk_size_variants_still_stream() {
+        for chunk_size in ["4 ", "4;foo=bar"] {
+            let handler =
+                HttpTcpServerHandler::new(Vec::new(), false, "http-chunk-size");
+            let request = format!(
+                "POST http://example.com/upload HTTP/1.1\r\n\
+                 Host: example.com\r\n\
+                 Transfer-Encoding: chunked\r\n\r\n\
+                 {chunk_size}\r\ntest\r\n0\r\n\r\n"
+            );
+            let (mut client, server) = duplex(2048);
+            client.write_all(request.as_bytes()).await.unwrap();
+            client.shutdown().await.unwrap();
+
+            let result = handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+                .expect("Xray-compatible first chunk size should succeed");
+            let TcpServerSetupResult::TcpForward { mut stream, .. } = result else {
+                panic!("chunked HTTP request returned non-TCP result");
+            };
+            let mut forwarded = Vec::new();
+            stream.read_to_end(&mut forwarded).await.unwrap();
+            assert!(
+                forwarded.ends_with(
+                    format!("{chunk_size}\r\ntest\r\n0\r\n\r\n").as_bytes()
+                )
+            );
+        }
     }
 
     #[tokio::test]
