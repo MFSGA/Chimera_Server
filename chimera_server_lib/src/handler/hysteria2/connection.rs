@@ -58,7 +58,8 @@ const MAX_TCP_REQUEST_PADDING_LEN: u64 = 4096;
 const PADDING_SCRATCH_LEN: usize = 1024;
 const TCP_SUCCESS_STATUS: u8 = 0x00;
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
-const UDP_IDLE_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
+const XRAY_UDP_IDLE_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
+const SHOES_UDP_IDLE_CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_FRAGMENT_CACHE_SIZE: usize = 256;
 // Match Shoes/sing-box: unauthenticated Hysteria2 QUIC connections only get a
 // short window to complete the HTTP/3 authentication exchange.
@@ -2620,10 +2621,10 @@ async fn drive_udp_datagrams(
     udp_idle_timeout: Option<Duration>,
 ) -> std::io::Result<()> {
     let mut sessions: HashMap<u32, UdpSession> = HashMap::new();
+    let cleanup_period = udp_idle_cleanup_interval(auth_ctx.xray_compat);
     let mut cleanup_interval = udp_idle_timeout.map(|_| {
-        let start = tokio::time::Instant::now() + UDP_IDLE_CLEANUP_INTERVAL;
-        let mut interval =
-            tokio::time::interval_at(start, UDP_IDLE_CLEANUP_INTERVAL);
+        let start = tokio::time::Instant::now() + cleanup_period;
+        let mut interval = tokio::time::interval_at(start, cleanup_period);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         interval
     });
@@ -2977,6 +2978,14 @@ fn prune_idle_udp_sessions(
         }
         active
     });
+}
+
+fn udp_idle_cleanup_interval(xray_compat: bool) -> Duration {
+    if xray_compat {
+        XRAY_UDP_IDLE_CLEANUP_INTERVAL
+    } else {
+        SHOES_UDP_IDLE_CLEANUP_INTERVAL
+    }
 }
 
 fn refresh_udp_activity_on_datagram(xray_compat: bool) -> bool {
@@ -5965,6 +5974,12 @@ mod tests {
             resolve_bandwidth_settings(&config, Some(300_000)),
             (300_000, 750_000, false)
         );
+    }
+
+    #[test]
+    fn udp_cleanup_interval_matches_xray_and_shoes() {
+        assert_eq!(udp_idle_cleanup_interval(true), Duration::from_secs(1));
+        assert_eq!(udp_idle_cleanup_interval(false), Duration::from_secs(10));
     }
 
     #[test]
