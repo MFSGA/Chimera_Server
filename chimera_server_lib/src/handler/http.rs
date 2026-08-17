@@ -85,7 +85,12 @@ impl TcpServerHandler for HttpTcpServerHandler {
                 authenticated_user = self.authenticate_basic(value);
                 continue;
             }
-            if name.eq_ignore_ascii_case("proxy-connection") {
+            if name.eq_ignore_ascii_case("proxy-connection")
+                || name.eq_ignore_ascii_case("proxy-authenticate")
+                || name.eq_ignore_ascii_case("te")
+                || name.eq_ignore_ascii_case("trailers")
+                || name.eq_ignore_ascii_case("upgrade")
+            {
                 continue;
             }
             if name.eq_ignore_ascii_case("connection") {
@@ -459,6 +464,10 @@ mod tests {
             "POST http://example.com:8080/upload?q=1 HTTP/1.1\r\n\
              Host: example.com:8080\r\n\
              Proxy-Authorization: Basic {token}\r\n\
+             Proxy-Authenticate: Basic realm=\"upstream\"\r\n\
+             TE: trailers\r\n\
+             Trailers: X-Checksum\r\n\
+             Upgrade: websocket\r\n\
              X-Remove-Early: hidden\r\n\
              Proxy-Connection: keep-alive\r\n\
              Connection: keep-alive, X-Remove-Early, x-remove-late\r\n\
