@@ -894,9 +894,10 @@ fn auth_reject_response(
         xray_response_add_date(&mut response)?;
         Ok((response, Some(body)))
     } else {
+        // Shoes sends the h3 response exactly as built, so an empty reject
+        // response does not gain an implicit Content-Length header.
         let response = Response::builder()
             .status(StatusCode::NOT_FOUND)
-            .header(http::header::CONTENT_LENGTH, "0")
             .body(())
             .map_err(Error::other)?;
         Ok((response, None))
@@ -3559,10 +3560,13 @@ mod tests {
         let (shoes_response, shoes_body) =
             auth_reject_response(false).expect("valid shoes reject response");
         assert_eq!(shoes_response.status(), StatusCode::NOT_FOUND);
-        assert_eq!(
-            shoes_response.headers().get(http::header::CONTENT_LENGTH),
-            Some(&http::HeaderValue::from_static("0"))
+        assert!(
+            shoes_response
+                .headers()
+                .get(http::header::CONTENT_LENGTH)
+                .is_none()
         );
+        assert!(shoes_response.headers().get(http::header::DATE).is_none());
         assert!(shoes_body.is_none());
 
         let (xray_response, xray_body) =
