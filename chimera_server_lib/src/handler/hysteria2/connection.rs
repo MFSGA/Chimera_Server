@@ -757,13 +757,12 @@ fn xray_uuid_auth_key(auth: &str) -> Option<([u8; 16], u32)> {
     Some((key, vless_route))
 }
 
-async fn send_auth_success(
-    stream: &mut h3::server::RequestStream<BidiStream<Bytes>, Bytes>,
+fn build_auth_success_response(
     udp_enabled: bool,
     server_rx_limit: u64,
     rx_auto: bool,
     xray_compat: bool,
-) -> std::io::Result<()> {
+) -> std::io::Result<Response<()>> {
     let padding = random_auth_padding(xray_compat);
     let cc_rx_value = if rx_auto {
         "auto".to_string()
@@ -780,12 +779,34 @@ async fn send_auth_success(
         )
         .header(CLIENT_CC_RX_HEADER, cc_rx_value.as_str())
         .header(PADDING_HEADER, &padding)
-        .header(http::header::CONTENT_LENGTH, "0")
         .body(())
         .map_err(Error::other)?;
     if xray_compat {
+        // Xray's quic-go response writer adds Content-Length: 0 when an
+        // empty handler response completes. Shoes sends the h3 response as
+        // built and therefore leaves Content-Length absent.
+        response.headers_mut().insert(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_static("0"),
+        );
         xray_response_add_date(&mut response)?;
     }
+    Ok(response)
+}
+
+async fn send_auth_success(
+    stream: &mut h3::server::RequestStream<BidiStream<Bytes>, Bytes>,
+    udp_enabled: bool,
+    server_rx_limit: u64,
+    rx_auto: bool,
+    xray_compat: bool,
+) -> std::io::Result<()> {
+    let response = build_auth_success_response(
+        udp_enabled,
+        server_rx_limit,
+        rx_auto,
+        xray_compat,
+    )?;
     stream.send_response(response).await.map_err(map_h3_error)?;
     stream.finish().await.map_err(map_h3_error)
 }
@@ -3513,6 +3534,24 @@ mod tests {
             configured_tcp_request_timeout(true, 8, &runtime),
             Some(Duration::from_secs(60))
         );
+    }
+
+    #[test]
+    fn auth_success_content_length_matches_xray_and_shoes_writers() {
+        let shoes = build_auth_success_response(true, 0, false, false)
+            .expect("valid shoes auth response");
+        assert_eq!(shoes.status().as_u16(), SUCCESS_STATUS);
+        assert!(shoes.headers().get(http::header::CONTENT_LENGTH).is_none());
+        assert!(shoes.headers().get(http::header::DATE).is_none());
+
+        let xray = build_auth_success_response(true, 0, false, true)
+            .expect("valid Xray auth response");
+        assert_eq!(xray.status().as_u16(), SUCCESS_STATUS);
+        assert_eq!(
+            xray.headers().get(http::header::CONTENT_LENGTH),
+            Some(&http::HeaderValue::from_static("0"))
+        );
+        assert!(xray.headers().get(http::header::DATE).is_some());
     }
 
     #[test]
