@@ -5,7 +5,7 @@ use std::{
 };
 
 use congestion::BrutalConfig;
-use connection::process_hysteria2_connection;
+use connection::{build_xray_proxy_transport, process_hysteria2_connection};
 use quinn::congestion::{BbrConfig, NewRenoConfig};
 
 use crate::{
@@ -43,6 +43,8 @@ pub async fn run_hysteria2_server(
         server_config.try_into().map_err(std::io::Error::other)?;
 
     let quic_server_config = Arc::new(quic_server_config);
+    let xray_proxy_transport =
+        build_xray_proxy_transport(config.xray_masquerade_proxy.as_ref())?;
 
     let endpoints_len = MAX_QUIC_ENDPOINTS;
     let config = Arc::new(config);
@@ -55,6 +57,7 @@ pub async fn run_hysteria2_server(
         let config = config.clone();
         let inbound_tag = inbound_tag.clone();
         let runtime = runtime.clone();
+        let xray_proxy_transport = xray_proxy_transport.clone();
 
         let base_transport = build_transport_config(config.as_ref())?;
         let mut base_server_config =
@@ -86,6 +89,7 @@ pub async fn run_hysteria2_server(
                 let config = config.clone();
                 let inbound_tag = inbound_tag.clone();
                 let runtime = runtime.clone();
+                let xray_proxy_transport = xray_proxy_transport.clone();
                 let tx_bps = Arc::new(AtomicU64::new(0));
 
                 let mut transport = match build_transport_config(config.as_ref()) {
@@ -155,6 +159,7 @@ pub async fn run_hysteria2_server(
                         connection,
                         Arc::new(inbound_tag),
                         runtime,
+                        xray_proxy_transport,
                     )
                     .await
                     {
