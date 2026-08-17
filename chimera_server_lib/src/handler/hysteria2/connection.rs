@@ -787,27 +787,73 @@ async fn send_auth_success(
     stream.finish().await.map_err(map_h3_error)
 }
 
+fn xray_string_masquerade_response(
+    method: &http::Method,
+    masquerade: &crate::config::server_config::Hysteria2MasqueradeStringConfig,
+) -> std::io::Result<(Response<()>, Option<Bytes>)> {
+    let body = Bytes::copy_from_slice(masquerade.content.as_bytes());
+    let status = if masquerade.status_code == 0 {
+        StatusCode::OK
+    } else {
+        StatusCode::from_u16(masquerade.status_code as u16).map_err(Error::other)?
+    };
+    let mut response = Response::builder()
+        .status(status)
+        .body(())
+        .map_err(Error::other)?;
+    for (name, value) in &masquerade.headers {
+        let name =
+            http::HeaderName::from_bytes(name.as_bytes()).map_err(Error::other)?;
+        let value = http::HeaderValue::from_str(value).map_err(Error::other)?;
+        response.headers_mut().insert(name, value);
+    }
+
+    if !response.headers().contains_key(http::header::DATE) {
+        let date = xray_format_http_date(std::time::SystemTime::now());
+        response.headers_mut().insert(
+            http::header::DATE,
+            http::HeaderValue::from_str(&date).map_err(Error::other)?,
+        );
+    }
+
+    let body_allowed = !(status.is_informational()
+        || status == StatusCode::NO_CONTENT
+        || status == StatusCode::NOT_MODIFIED);
+    let written_len = if body_allowed { body.len() } else { 0 };
+    if !response
+        .headers()
+        .contains_key(http::header::CONTENT_LENGTH)
+    {
+        response.headers_mut().insert(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_str(&written_len.to_string())
+                .map_err(Error::other)?,
+        );
+    }
+    if method != http::Method::HEAD
+        && body_allowed
+        && !body.is_empty()
+        && !response.headers().contains_key(http::header::CONTENT_TYPE)
+        && response
+            .headers()
+            .get(http::header::CONTENT_ENCODING)
+            .is_none_or(|value| value.as_bytes().is_empty())
+    {
+        response.headers_mut().insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static(xray_detect_content_type(
+                &body[..body.len().min(512)],
+            )),
+        );
+    }
+
+    Ok((response, body_allowed.then_some(body)))
+}
+
 fn auth_reject_response(
     xray_compat: bool,
-    xray_masquerade_string: Option<
-        &crate::config::server_config::Hysteria2MasqueradeStringConfig,
-    >,
 ) -> std::io::Result<(Response<()>, Option<Bytes>)> {
-    if let Some(masquerade) = xray_masquerade_string {
-        let body = Bytes::copy_from_slice(masquerade.content.as_bytes());
-        let mut builder =
-            Response::builder().status(if masquerade.status_code == 0 {
-                StatusCode::OK
-            } else {
-                StatusCode::from_u16(masquerade.status_code as u16)
-                    .map_err(Error::other)?
-            });
-        for (name, value) in &masquerade.headers {
-            builder = builder.header(name, value);
-        }
-        let response = builder.body(()).map_err(Error::other)?;
-        Ok((response, Some(body)))
-    } else if xray_compat {
+    if xray_compat {
         let body = Bytes::from_static(b"404 page not found\n");
         let response = Response::builder()
             .status(StatusCode::NOT_FOUND)
@@ -868,11 +914,10 @@ async fn send_auth_reject_response(
                 .await?
             }
         }
+    } else if let Some(masquerade) = config.xray_masquerade_string.as_ref() {
+        xray_string_masquerade_response(method, masquerade)?
     } else {
-        auth_reject_response(
-            config.xray_compat,
-            config.xray_masquerade_string.as_ref(),
-        )?
+        auth_reject_response(config.xray_compat)?
     };
     stream.send_response(response).await.map_err(map_h3_error)?;
     if method != http::Method::HEAD
@@ -1299,7 +1344,7 @@ async fn xray_file_masquerade_response(
 ) -> std::io::Result<(Response<()>, Option<Bytes>)> {
     let Some(decoded_uri_path) = xray_file_percent_decode_path_bytes(uri.path())
     else {
-        return auth_reject_response(true, None);
+        return auth_reject_response(true);
     };
     if decoded_uri_path.ends_with(b"/index.html") {
         return xray_file_redirect_response(uri, "./");
@@ -1308,7 +1353,7 @@ async fn xray_file_masquerade_response(
     let Some(relative) =
         decode_file_masquerade_decoded_path_bytes(&decoded_uri_path, cfg!(windows))
     else {
-        return auth_reject_response(true, None);
+        return auth_reject_response(true);
     };
     let mut path = PathBuf::from(root);
     if !relative.as_os_str().is_empty() {
@@ -1372,7 +1417,7 @@ async fn xray_file_masquerade_response(
             return xray_file_redirect_response_bytes(uri, &location);
         }
     } else {
-        return auth_reject_response(true, None);
+        return auth_reject_response(true);
     }
 
     let metadata = match tokio::fs::metadata(&path).await {
@@ -1505,7 +1550,7 @@ fn xray_file_server_error_response(
     err: &std::io::Error,
 ) -> std::io::Result<(Response<()>, Option<Bytes>)> {
     if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) {
-        return auth_reject_response(true, None);
+        return auth_reject_response(true);
     }
 
     let (status, body) = if err.kind() == ErrorKind::PermissionDenied {
@@ -3461,7 +3506,7 @@ mod tests {
     #[test]
     fn auth_rejections_match_xray_and_shoes_default_masquerade() {
         let (shoes_response, shoes_body) =
-            auth_reject_response(false, None).expect("valid shoes reject response");
+            auth_reject_response(false).expect("valid shoes reject response");
         assert_eq!(shoes_response.status(), StatusCode::NOT_FOUND);
         assert_eq!(
             shoes_response.headers().get(http::header::CONTENT_LENGTH),
@@ -3470,7 +3515,7 @@ mod tests {
         assert!(shoes_body.is_none());
 
         let (xray_response, xray_body) =
-            auth_reject_response(true, None).expect("valid Xray reject response");
+            auth_reject_response(true).expect("valid Xray reject response");
         assert_eq!(xray_response.status(), StatusCode::NOT_FOUND);
         assert_eq!(
             xray_response.headers().get(http::header::CONTENT_TYPE),
@@ -3497,14 +3542,63 @@ mod tests {
                     .collect(),
                 status_code: 418,
             };
-        let (response, body) = auth_reject_response(true, Some(&masquerade))
-            .expect("valid Xray string masquerade response");
+        let (response, body) =
+            xray_string_masquerade_response(&http::Method::GET, &masquerade)
+                .expect("valid Xray string masquerade response");
         assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
         assert_eq!(
             response.headers().get("x-test-header"),
             Some(&http::HeaderValue::from_static("present"))
         );
+        assert!(response.headers().get(http::header::DATE).is_some());
+        assert_eq!(
+            response.headers().get(http::header::CONTENT_LENGTH),
+            Some(&http::HeaderValue::from_static("15"))
+        );
+        assert_eq!(
+            response.headers().get(http::header::CONTENT_TYPE),
+            Some(&http::HeaderValue::from_static("text/plain; charset=utf-8"))
+        );
         assert_eq!(body.as_deref(), Some(&b"hello from xray"[..]));
+
+        let (head_response, head_body) =
+            xray_string_masquerade_response(&http::Method::HEAD, &masquerade)
+                .expect("valid Xray HEAD string masquerade response");
+        assert_eq!(
+            head_response.headers().get(http::header::CONTENT_LENGTH),
+            Some(&http::HeaderValue::from_static("15"))
+        );
+        assert!(
+            head_response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .is_none()
+        );
+        assert_eq!(head_body.as_deref(), Some(&b"hello from xray"[..]));
+
+        let no_content =
+            crate::config::server_config::Hysteria2MasqueradeStringConfig {
+                content: "ignored body".to_string(),
+                headers: HashMap::new(),
+                status_code: 204,
+            };
+        let (no_content_response, no_content_body) =
+            xray_string_masquerade_response(&http::Method::GET, &no_content)
+                .expect("valid Xray no-content string masquerade response");
+        assert_eq!(no_content_response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            no_content_response
+                .headers()
+                .get(http::header::CONTENT_LENGTH),
+            Some(&http::HeaderValue::from_static("0"))
+        );
+        assert!(
+            no_content_response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .is_none()
+        );
+        assert!(no_content_body.is_none());
     }
 
     #[test]
