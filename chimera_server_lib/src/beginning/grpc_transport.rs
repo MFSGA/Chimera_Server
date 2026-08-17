@@ -1,5 +1,3 @@
-#[cfg(feature = "tls")]
-use std::fs;
 use std::{
     convert::Infallible,
     io,
@@ -47,7 +45,7 @@ use crate::{
 };
 #[cfg(feature = "tls")]
 use crate::{
-    config::server_config::TlsServerConfig, util::rustls_util::create_server_config,
+    config::server_config::TlsServerConfig, handler::tls::build_server_config,
 };
 
 use super::process_stream;
@@ -198,10 +196,10 @@ fn parse_listener_protocol(
             let TlsServerConfig {
                 certificates,
                 mut alpn_protocols,
-                enable_session_resumption: _,
-                reject_unknown_sni: _,
-                min_version: _,
-                max_version: _,
+                enable_session_resumption,
+                reject_unknown_sni,
+                min_version,
+                max_version,
                 server_name: _,
                 inner,
             } = tls_config;
@@ -214,33 +212,14 @@ fn parse_listener_protocol(
             if !alpn_protocols.iter().any(|value| value == "h2") {
                 alpn_protocols.push("h2".to_string());
             }
-            let certificate = certificates
-                .into_iter()
-                .find(|certificate| {
-                    certificate.key_path.is_some() || certificate.key_pem.is_some()
-                })
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "gRPC TLS certificate and private key are required",
-                    )
-                })?;
-            let cert_bytes = match certificate.certificate_path {
-                Some(path) => fs::read(path)?,
-                None => certificate.certificate_pem,
-            };
-            let key_bytes = match (certificate.key_path, certificate.key_pem) {
-                (Some(path), _) => fs::read(path)?,
-                (None, Some(key)) => key,
-                (None, None) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "gRPC TLS private key is required",
-                    ));
-                }
-            };
-            let server_config =
-                create_server_config(&cert_bytes, &key_bytes, &alpn_protocols, &[])?;
+            let server_config = build_server_config(
+                &certificates,
+                &alpn_protocols,
+                enable_session_resumption,
+                reject_unknown_sni,
+                min_version.as_deref(),
+                max_version.as_deref(),
+            )?;
             let inner = (*config.inner).clone();
             Ok((config, inner, GrpcSecurity::Tls(Arc::new(server_config))))
         }

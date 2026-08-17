@@ -14,9 +14,12 @@ use tokio_rustls::{
             CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer,
             PrivateSec1KeyDer,
         },
+        server::{ClientHello, ResolvesServerCert},
+        sign::CertifiedKey,
         version::{TLS12, TLS13},
     },
 };
+use x509_parser::{extensions::GeneralName, prelude::FromDer};
 
 use crate::{
     async_stream::AsyncStream,
@@ -49,13 +52,58 @@ pub struct TlsServerHandler {
     inner: TlsInner,
 }
 
+#[derive(Debug)]
+struct XraySniCertificate {
+    certified_key: Arc<CertifiedKey>,
+    names: Vec<String>,
+}
+
+#[derive(Debug)]
+struct XraySniResolver {
+    certificates: Vec<XraySniCertificate>,
+    reject_unknown_sni: bool,
+}
+
+impl ResolvesServerCert for XraySniResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let sni = client_hello.server_name().unwrap_or_default();
+        let index = select_sni_certificate(
+            self.certificates
+                .iter()
+                .map(|certificate| certificate.names.as_slice()),
+            sni,
+            self.reject_unknown_sni,
+        )?;
+        Some(self.certificates[index].certified_key.clone())
+    }
+}
+
+fn select_sni_certificate<'a>(
+    certificate_names: impl Iterator<Item = &'a [String]>,
+    sni: &str,
+    reject_unknown_sni: bool,
+) -> Option<usize> {
+    certificate_names
+        .enumerate()
+        .find_map(|(index, names)| sni_matches_names(sni, names).then_some(index))
+        .or_else(|| (!reject_unknown_sni).then_some(0))
+}
+
+fn sni_matches_names(sni: &str, names: &[String]) -> bool {
+    let sni = sni.to_ascii_lowercase();
+    let wildcard = sni.find('.').map(|index| format!("*{}", &sni[index..]));
+    names
+        .iter()
+        .any(|name| name == &sni || wildcard.as_deref() == Some(name.as_str()))
+}
+
 impl TlsServerHandler {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         certificates: Vec<TlsCertificateConfig>,
         alpn_protocols: Vec<String>,
         enable_session_resumption: bool,
-        _reject_unknown_sni: bool,
+        reject_unknown_sni: bool,
         min_version: Option<String>,
         max_version: Option<String>,
         _server_name: Option<String>,
@@ -65,6 +113,7 @@ impl TlsServerHandler {
             &certificates,
             &alpn_protocols,
             enable_session_resumption,
+            reject_unknown_sni,
             min_version.as_deref(),
             max_version.as_deref(),
         )?;
@@ -80,7 +129,7 @@ impl TlsServerHandler {
         certificates: Vec<TlsCertificateConfig>,
         alpn_protocols: Vec<String>,
         enable_session_resumption: bool,
-        _reject_unknown_sni: bool,
+        reject_unknown_sni: bool,
         min_version: Option<String>,
         max_version: Option<String>,
         _server_name: Option<String>,
@@ -92,6 +141,7 @@ impl TlsServerHandler {
             &certificates,
             &alpn_protocols,
             enable_session_resumption,
+            reject_unknown_sni,
             min_version.as_deref(),
             max_version.as_deref(),
         )?;
@@ -166,24 +216,26 @@ impl TcpServerHandler for TlsServerHandler {
     }
 }
 
-fn build_server_config(
+pub(crate) fn build_server_config(
     certificates: &[TlsCertificateConfig],
     alpn_protocols: &[String],
     enable_session_resumption: bool,
+    reject_unknown_sni: bool,
     min_version: Option<&str>,
     max_version: Option<&str>,
 ) -> io::Result<rustls::ServerConfig> {
-    let certificate = certificates
+    let encipherment_certificates = certificates
         .iter()
-        .find(|certificate| {
+        .filter(|certificate| {
             matches!(certificate.usage, TlsCertificateUsage::Encipherment)
         })
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "no encipherment certificate found for TLS server",
-            )
-        })?;
+        .collect::<Vec<_>>();
+    let certificate = encipherment_certificates.first().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no encipherment certificate found for TLS server",
+        )
+    })?;
     let cert_chain = load_certs(certificate)?;
     let private_key = load_private_key(certificate)?;
 
@@ -192,11 +244,57 @@ fn build_server_config(
         .with_no_client_auth()
         .with_single_cert(cert_chain, private_key)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    if reject_unknown_sni || encipherment_certificates.len() > 1 {
+        let mut sni_certificates =
+            Vec::with_capacity(encipherment_certificates.len());
+        for certificate in encipherment_certificates {
+            let cert_chain = load_certs(certificate)?;
+            let private_key = load_private_key(certificate)?;
+            let certified_key = CertifiedKey::from_der(
+                cert_chain.clone(),
+                private_key,
+                config.crypto_provider(),
+            )
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+            sni_certificates.push(XraySniCertificate {
+                certified_key: Arc::new(certified_key),
+                names: certificate_dns_names(&cert_chain[0])?,
+            });
+        }
+        config.cert_resolver = Arc::new(XraySniResolver {
+            certificates: sni_certificates,
+            reject_unknown_sni,
+        });
+    }
 
     config.alpn_protocols = tls_alpn_protocols(alpn_protocols);
     config.send_tls13_tickets = if enable_session_resumption { 2 } else { 0 };
 
     Ok(config)
+}
+
+fn certificate_dns_names(
+    certificate: &CertificateDer<'_>,
+) -> io::Result<Vec<String>> {
+    let (_, parsed) =
+        x509_parser::certificate::X509Certificate::from_der(certificate.as_ref())
+            .map_err(|err| {
+                io::Error::new(io::ErrorKind::InvalidData, err.to_string())
+            })?;
+    let mut names = Vec::new();
+    if let Some(common_name) = parsed.subject().iter_common_name().next()
+        && let Ok(common_name) = common_name.as_str()
+    {
+        names.push(common_name.to_ascii_lowercase());
+    }
+    if let Ok(Some(subject_alt_name)) = parsed.subject_alternative_name() {
+        for name in &subject_alt_name.value.general_names {
+            if let GeneralName::DNSName(name) = name {
+                names.push(name.to_ascii_lowercase());
+            }
+        }
+    }
+    Ok(names)
 }
 
 fn load_certs(
@@ -361,5 +459,52 @@ mod tests {
         assert_eq!(tls_versions(Some("1.3"), None).unwrap(), vec![&TLS13]);
         assert!(tls_versions(Some("1.3"), Some("1.2")).is_err());
         assert!(tls_versions(Some("1.1"), None).is_err());
+    }
+
+    #[test]
+    fn multiple_certificates_follow_xray_sni_selection_and_fallback() {
+        let names = [
+            vec!["first.example".into()],
+            vec!["second.example".into(), "*.example.net".into()],
+        ];
+        let certificate_names = || names.iter().map(Vec::as_slice);
+        assert_eq!(
+            select_sni_certificate(certificate_names(), "second.example", false),
+            Some(1)
+        );
+        assert_eq!(
+            select_sni_certificate(certificate_names(), "api.example.net", false),
+            Some(1)
+        );
+        assert_eq!(
+            select_sni_certificate(certificate_names(), "unknown.example", false),
+            Some(0)
+        );
+        assert_eq!(
+            select_sni_certificate(certificate_names(), "unknown.example", true),
+            None
+        );
+    }
+
+    #[test]
+    fn sni_matching_follows_xray_exact_and_wildcard_rules() {
+        let names = vec!["proxy.example".into(), "*.example.com".into()];
+        assert!(sni_matches_names("PROXY.EXAMPLE", &names));
+        assert!(sni_matches_names("api.example.com", &names));
+        assert!(!sni_matches_names("deep.api.example.com", &names));
+        assert!(!sni_matches_names("unknown.example", &names));
+    }
+
+    #[test]
+    fn certificate_dns_names_reads_subject_alt_names() {
+        let generated = rcgen::generate_simple_self_signed([
+            "proxy.example".to_string(),
+            "api.example.com".to_string(),
+        ])
+        .unwrap();
+        let certificate = CertificateDer::from(generated.cert.der().to_vec());
+        let names = certificate_dns_names(&certificate).unwrap();
+        assert!(names.iter().any(|name| name == "proxy.example"));
+        assert!(names.iter().any(|name| name == "api.example.com"));
     }
 }
