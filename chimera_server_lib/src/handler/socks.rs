@@ -19,6 +19,7 @@ use crate::{
     traffic::{TrafficContext, record_transfer, register_connection},
 };
 
+const SOCKS4_VERSION: u8 = 0x04;
 const SOCKS_VERSION: u8 = 0x05;
 const METHOD_NO_AUTH: u8 = 0x00;
 const METHOD_USERNAME_PASSWORD: u8 = 0x02;
@@ -32,6 +33,8 @@ const ADDR_TYPE_IPV6: u8 = 0x04;
 const REP_SUCCEEDED: u8 = 0x00;
 const REP_GENERAL_FAILURE: u8 = 0x01;
 const REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
+const SOCKS4_REQUEST_GRANTED: u8 = 90;
+const SOCKS4_REQUEST_REJECTED: u8 = 91;
 
 const SUCCESS_RESPONSE: [u8; 10] = [
     SOCKS_VERSION,
@@ -97,6 +100,22 @@ impl SocksTcpServerHandler {
         mut server_stream: Box<dyn AsyncStream>,
         local_ip: Option<std::net::IpAddr>,
     ) -> std::io::Result<TcpServerSetupResult> {
+        let version = server_stream.read_u8().await?;
+        if version == SOCKS4_VERSION {
+            return setup_socks4_stream(
+                server_stream,
+                self.requires_auth(),
+                &self.inbound_tag,
+            )
+            .await;
+        }
+        if version != SOCKS_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsupported socks version: {}", version),
+            ));
+        }
+
         let method =
             negotiate_method(&mut server_stream, self.requires_auth()).await?;
 
@@ -190,18 +209,94 @@ impl TcpServerHandler for SocksTcpServerHandler {
     }
 }
 
+async fn setup_socks4_stream(
+    mut stream: Box<dyn AsyncStream>,
+    auth_required: bool,
+    inbound_tag: &str,
+) -> std::io::Result<TcpServerSetupResult> {
+    let command = stream.read_u8().await?;
+    if auth_required {
+        send_socks4_response(&mut stream, SOCKS4_REQUEST_REJECTED).await?;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "socks4 is not allowed when username/password auth is required",
+        ));
+    }
+
+    let mut port_bytes = [0u8; 2];
+    stream.read_exact(&mut port_bytes).await?;
+    let port = u16::from_be_bytes(port_bytes);
+
+    let mut address_bytes = [0u8; 4];
+    stream.read_exact(&mut address_bytes).await?;
+
+    let _user_id = read_until_null(&mut stream).await?;
+
+    let address = if address_bytes[0] == 0 {
+        let domain = read_until_null(&mut stream).await?;
+        let domain = std::str::from_utf8(&domain).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("failed to decode SOCKS4a domain: {error}"),
+            )
+        })?;
+        Address::from(domain)?
+    } else {
+        Address::Ipv4(std::net::Ipv4Addr::from(address_bytes))
+    };
+
+    if command != CMD_CONNECT {
+        send_socks4_response(&mut stream, SOCKS4_REQUEST_REJECTED).await?;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unsupported socks4 command: {command}"),
+        ));
+    }
+
+    send_socks4_response(&mut stream, SOCKS4_REQUEST_GRANTED).await?;
+    Ok(TcpServerSetupResult::TcpForward {
+        remote_location: NetLocation::new(address, port),
+        stream,
+        need_initial_flush: false,
+        connection_success_response: None,
+        traffic_context: Some(
+            TrafficContext::new("socks").with_inbound_tag(inbound_tag.to_string()),
+        ),
+    })
+}
+
+async fn read_until_null(
+    stream: &mut Box<dyn AsyncStream>,
+) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    loop {
+        let byte = stream.read_u8().await?;
+        if byte == 0 {
+            return Ok(bytes);
+        }
+        bytes.push(byte);
+        if bytes.len() >= 2048 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "SOCKS4 null-terminated field exceeds 2048 bytes",
+            ));
+        }
+    }
+}
+
+async fn send_socks4_response(
+    stream: &mut Box<dyn AsyncStream>,
+    status: u8,
+) -> std::io::Result<()> {
+    stream
+        .write_all(&[0x00, status, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+        .await
+}
+
 async fn negotiate_method(
     stream: &mut Box<dyn AsyncStream>,
     has_accounts: bool,
 ) -> std::io::Result<SocksMethod> {
-    let version = stream.read_u8().await?;
-    if version != SOCKS_VERSION {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("unsupported socks version: {}", version),
-        ));
-    }
-
     let method_len = stream.read_u8().await? as usize;
     if method_len == 0 {
         send_method_response(stream, METHOD_REJECT).await?;
@@ -795,6 +890,120 @@ mod tests {
         runtime::OutboundSummary,
         traffic::{active_connections, snapshot},
     };
+
+    async fn socks4_setup(
+        handler: &SocksTcpServerHandler,
+        request: &[u8],
+    ) -> (TcpServerSetupResult, [u8; 8]) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(listener_addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        client.write_all(request).await.unwrap();
+
+        let result = handler.setup_server_stream(Box::new(server)).await.unwrap();
+        let mut response = [0u8; 8];
+        client.read_exact(&mut response).await.unwrap();
+        (result, response)
+    }
+
+    #[tokio::test]
+    async fn socks4_connect_matches_xray_handshake() {
+        let handler = SocksTcpServerHandler::new(
+            SocksUserStore::with_auth_required(Vec::new(), false),
+            "socks4",
+            false,
+            None,
+        );
+        let request = [
+            SOCKS4_VERSION,
+            CMD_CONNECT,
+            0x01,
+            0xbb,
+            203,
+            0,
+            113,
+            7,
+            b'u',
+            b's',
+            b'e',
+            b'r',
+            0,
+        ];
+        let (result, response) = socks4_setup(&handler, &request).await;
+
+        assert_eq!(response, [0x00, SOCKS4_REQUEST_GRANTED, 0, 0, 0, 0, 0, 0]);
+        let TcpServerSetupResult::TcpForward {
+            remote_location,
+            connection_success_response,
+            traffic_context,
+            ..
+        } = result
+        else {
+            panic!("expected SOCKS4 TCP forward result");
+        };
+        assert_eq!(remote_location.to_string(), "203.0.113.7:443");
+        assert!(connection_success_response.is_none());
+        assert!(traffic_context.is_some());
+    }
+
+    #[tokio::test]
+    async fn socks4a_zero_prefix_uses_domain_like_xray() {
+        let handler = SocksTcpServerHandler::new(
+            SocksUserStore::with_auth_required(Vec::new(), false),
+            "socks4a",
+            false,
+            None,
+        );
+        let mut request =
+            vec![SOCKS4_VERSION, CMD_CONNECT, 0x00, 0x50, 0, 9, 8, 7, 0];
+        request.extend_from_slice(b"example.com\0");
+        let (result, response) = socks4_setup(&handler, &request).await;
+
+        assert_eq!(response[1], SOCKS4_REQUEST_GRANTED);
+        let TcpServerSetupResult::TcpForward {
+            remote_location, ..
+        } = result
+        else {
+            panic!("expected SOCKS4a TCP forward result");
+        };
+        assert_eq!(remote_location.to_string(), "example.com:80");
+    }
+
+    #[tokio::test]
+    async fn socks4_is_rejected_when_password_auth_is_required() {
+        let handler = SocksTcpServerHandler::new(
+            SocksUserStore::with_auth_required(
+                vec![SocksUser {
+                    username: "user".into(),
+                    password: "pass".into(),
+                }],
+                true,
+            ),
+            "socks4-auth",
+            false,
+            None,
+        );
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(listener_addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        client
+            .write_all(&[SOCKS4_VERSION, CMD_CONNECT])
+            .await
+            .unwrap();
+
+        let error = match handler.setup_server_stream(Box::new(server)).await {
+            Ok(_) => {
+                panic!("SOCKS4 must be rejected when password auth is required")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let mut response = [0u8; 8];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, [0x00, SOCKS4_REQUEST_REJECTED, 0, 0, 0, 0, 0, 0]);
+    }
 
     #[tokio::test]
     async fn udp_associate_uses_tcp_local_ip_by_default() {
