@@ -1225,10 +1225,9 @@ async fn xray_file_masquerade_response(
     };
     let range_header = request_headers
         .get(http::header::RANGE)
-        .and_then(|value| value.to_str().ok())
         .filter(|_| xray_if_range_matches(method, request_headers, modified));
     let mut ranges = match range_header {
-        Some(value) => match xray_parse_ranges(value, body.len()) {
+        Some(value) => match xray_parse_ranges(value.as_bytes(), body.len()) {
             Ok(ranges) => ranges,
             Err(XrayRangeError::NoOverlap) if body.is_empty() => Vec::new(),
             Err(err) => return xray_range_error_response(err, body.len()),
@@ -1615,9 +1614,10 @@ fn xray_format_http_date(value: std::time::SystemTime) -> String {
 }
 
 fn xray_parse_ranges(
-    value: &str,
+    value: &[u8],
     size: usize,
 ) -> Result<Vec<XrayByteRange>, XrayRangeError> {
+    let value = std::str::from_utf8(value).map_err(|_| XrayRangeError::Invalid)?;
     if value.is_empty() {
         return Ok(Vec::new());
     }
@@ -4642,6 +4642,11 @@ mod tests {
             &headers,
             Some(modified),
         ));
+    }
+
+    #[test]
+    fn xray_range_parser_rejects_non_utf8_header_bytes() {
+        assert_eq!(xray_parse_ranges(b"\x80", 5), Err(XrayRangeError::Invalid),);
     }
 
     #[test]
