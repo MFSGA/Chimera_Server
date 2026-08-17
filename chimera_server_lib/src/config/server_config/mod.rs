@@ -5,7 +5,6 @@ mod types;
 pub mod ws;
 
 pub use types::DokodemoDoorConfig;
-#[cfg(feature = "http")]
 pub use types::HttpUser;
 #[cfg(feature = "tuic")]
 pub use types::TuicServerConfig;

@@ -164,7 +164,6 @@ pub struct TrojanFallback {
     pub xver: u8,
 }
 
-#[cfg(feature = "http")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct HttpUser {
     pub username: String,

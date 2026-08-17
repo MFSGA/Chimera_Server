@@ -300,6 +300,50 @@ fn socks_roundtrip_password(
     Ok(echoed)
 }
 
+fn http_connect_roundtrip(
+    proxy_addr: SocketAddrV4,
+    target_addr: SocketAddrV4,
+    payload: &[u8],
+) -> io::Result<Vec<u8>> {
+    trace_step(format!(
+        "starting HTTP fallback roundtrip via {} to {} payload_len={}",
+        proxy_addr,
+        target_addr,
+        payload.len()
+    ));
+    let mut stream = TcpStream::connect(proxy_addr)?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    write!(
+        stream,
+        "CONNECT {target_addr} HTTP/1.1\r\nHost: {target_addr}\r\n\r\n"
+    )?;
+
+    let mut response = Vec::new();
+    let mut byte = [0u8; 1];
+    while response.len() < 4096 && !response.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte)?;
+        response.push(byte[0]);
+    }
+    if !response.ends_with(b"\r\n\r\n") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "HTTP proxy response headers exceed 4096 bytes",
+        ));
+    }
+    if !response.starts_with(b"HTTP/1.1 200 Connection established\r\n") {
+        return Err(io::Error::other(format!(
+            "unexpected HTTP proxy response: {}",
+            String::from_utf8_lossy(&response)
+        )));
+    }
+
+    stream.write_all(payload)?;
+    let mut echoed = vec![0u8; payload.len()];
+    stream.read_exact(&mut echoed)?;
+    Ok(echoed)
+}
+
 fn write_connect_request(
     stream: &mut TcpStream,
     target_addr: SocketAddrV4,
@@ -379,6 +423,60 @@ fn socks_noauth_external_roundtrip() {
     drop(server);
     let _ = echo_handle.join();
     trace_step("==== test socks_noauth_external_roundtrip done ====");
+}
+
+#[test]
+fn socks_http_fallback_external_roundtrip() {
+    trace_step("==== test socks_http_fallback_external_roundtrip start ====");
+    let _guard = global_test_lock()
+        .lock()
+        .expect("failed to acquire test lock");
+    let (echo_addr, echo_handle) =
+        spawn_echo_server().expect("failed to start echo server");
+    let socks_port = free_localhost_port().expect("failed to allocate socks port");
+    let socks_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, socks_port);
+
+    let config = format!(
+        r#"{{
+  "inbounds": [
+    {{
+      "listen": "127.0.0.1",
+      "port": {socks_port},
+      "protocol": "socks",
+      "settings": {{
+        "auth": "noauth"
+      }},
+      "tag": "socks-http-fallback"
+    }}
+  ],
+  "outbounds": [
+    {{
+      "protocol": "freedom",
+      "tag": "direct"
+    }}
+  ]
+}}"#
+    );
+
+    let mut server =
+        ServerProcess::spawn(&config).expect("failed to spawn chimera process");
+    server
+        .wait_until_ready(SocketAddr::V4(socks_addr))
+        .unwrap_or_else(|err| panic!("chimera not ready: {err}"));
+
+    let payload = b"chimera-socks-http-fallback-e2e";
+    let echoed = http_connect_roundtrip(socks_addr, echo_addr, payload)
+        .unwrap_or_else(|err| {
+            panic!(
+                "HTTP fallback roundtrip failed: {err}; logs:\n{}",
+                server.logs()
+            )
+        });
+    assert_eq!(echoed, payload);
+
+    drop(server);
+    let _ = echo_handle.join();
+    trace_step("==== test socks_http_fallback_external_roundtrip done ====");
 }
 
 #[test]
