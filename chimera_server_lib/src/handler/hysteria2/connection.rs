@@ -1375,7 +1375,10 @@ async fn xray_file_masquerade_response(
         return auth_reject_response(true, None);
     }
 
-    let metadata = tokio::fs::metadata(&path).await?;
+    let metadata = match tokio::fs::metadata(&path).await {
+        Ok(metadata) => metadata,
+        Err(err) => return xray_file_server_error_response(&err),
+    };
     let modified = metadata.modified().ok();
     let last_modified = modified
         .filter(|modified| !xray_is_zero_modtime(*modified))
@@ -1390,7 +1393,10 @@ async fn xray_file_masquerade_response(
         return Ok((response.body(()).map_err(Error::other)?, None));
     }
 
-    let body = tokio::fs::read(&path).await?;
+    let body = match tokio::fs::read(&path).await {
+        Ok(body) => body,
+        Err(err) => return xray_file_server_error_response(&err),
+    };
     let content_type = if let Some(content_type) =
         xray_file_extension_content_type(&path)
     {
@@ -5395,6 +5401,55 @@ mod tests {
         tokio::fs::remove_dir_all(root)
             .await
             .expect("remove ENOTDIR fixture root");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn xray_file_unreadable_file_maps_to_forbidden() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "chimera-hysteria2-unreadable-{}-{suffix}",
+            std::process::id()
+        ));
+        tokio::fs::create_dir(&root)
+            .await
+            .expect("create unreadable fixture root");
+        let path = root.join("secret.txt");
+        tokio::fs::write(&path, b"secret")
+            .await
+            .expect("write unreadable fixture file");
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+            .await
+            .expect("make fixture unreadable");
+        let root_str = root.to_string_lossy().into_owned();
+        let uri: http::Uri = "https://example.test/secret.txt"
+            .parse()
+            .expect("valid unreadable fixture URI");
+
+        let result = xray_file_masquerade_response(
+            &http::Method::GET,
+            &uri,
+            &http::HeaderMap::new(),
+            &root_str,
+        )
+        .await;
+
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .expect("restore fixture permissions");
+        tokio::fs::remove_dir_all(root)
+            .await
+            .expect("remove unreadable fixture root");
+
+        let (response, body) =
+            result.expect("map unreadable file to Xray HTTP error");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body.as_deref(), Some(&b"403 Forbidden\n"[..]));
     }
 
     #[test]
