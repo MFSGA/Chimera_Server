@@ -1118,13 +1118,73 @@ impl XrayProxyTransport {
     }
 }
 
+fn xray_proxy_validate_target_url(value: &str) -> std::io::Result<()> {
+    if value.bytes().any(|byte| byte < b' ' || byte == 0x7f) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "Xray proxy masquerade URL contains a control character",
+        ));
+    }
+
+    let (without_fragment, fragment) = value.split_once('#').unwrap_or((value, ""));
+    if !xray_proxy_valid_percent_escapes(fragment) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "Xray proxy masquerade URL contains an invalid fragment escape",
+        ));
+    }
+    let main = without_fragment
+        .split_once('?')
+        .map_or(without_fragment, |(main, _)| main);
+    let opaque = main.find(':').is_some_and(|colon| {
+        xray_proxy_valid_scheme(&main[..colon])
+            && !main[colon + 1..].starts_with('/')
+    });
+    if !opaque && !xray_proxy_valid_percent_escapes(main) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "Xray proxy masquerade URL contains an invalid escape",
+        ));
+    }
+    Ok(())
+}
+
+fn xray_proxy_valid_scheme(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+        && bytes.all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
+        })
+}
+
+fn xray_proxy_valid_percent_escapes(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 2;
+        }
+        index += 1;
+    }
+    true
+}
+
 pub(crate) fn build_xray_proxy_transport(
     masquerade: Option<
         &crate::config::server_config::Hysteria2MasqueradeProxyConfig,
     >,
 ) -> std::io::Result<Option<Arc<XrayProxyTransport>>> {
     masquerade
-        .map(|masquerade| XrayProxyTransport::new(masquerade.insecure).map(Arc::new))
+        .map(|masquerade| {
+            xray_proxy_validate_target_url(&masquerade.url)?;
+            XrayProxyTransport::new(masquerade.insecure).map(Arc::new)
+        })
         .transpose()
 }
 
@@ -3528,6 +3588,35 @@ mod tests {
             target_force_query.as_str(),
             "https://upstream.test/base/path"
         );
+    }
+
+    #[test]
+    fn xray_proxy_target_validation_matches_go_url_parse_escape_failures() {
+        assert!(
+            xray_proxy_validate_target_url("https://upstream.test/a%2Fb?q=%zz")
+                .is_ok()
+        );
+        assert!(xray_proxy_validate_target_url("mailto:%zz?q=%zz").is_ok());
+
+        for invalid in [
+            "https://upstream.test/a%zz?q=ok",
+            "https://upstream.test/a#frag%zz",
+            "https://upstream.test/a\u{7f}",
+        ] {
+            assert!(
+                xray_proxy_validate_target_url(invalid).is_err(),
+                "Xray net/url.Parse should reject {invalid:?}"
+            );
+            let config = Hysteria2MasqueradeProxyConfig {
+                url: invalid.to_string(),
+                rewrite_host: false,
+                insecure: false,
+            };
+            assert!(
+                build_xray_proxy_transport(Some(&config)).is_err(),
+                "invalid Xray proxy URL should fail transport setup"
+            );
+        }
     }
 
     #[test]
