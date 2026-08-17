@@ -764,7 +764,11 @@ fn build_auth_success_response(
     xray_compat: bool,
 ) -> std::io::Result<Response<()>> {
     let padding = random_auth_padding(xray_compat);
-    let cc_rx_value = if rx_auto {
+    let cc_rx_value = if !xray_compat {
+        // Shoes always advertises zero receive bandwidth in its auth response,
+        // regardless of the local bandwidth settings used by Chimera.
+        "0".to_string()
+    } else if rx_auto {
         "auto".to_string()
     } else {
         server_rx_limit.to_string()
@@ -3539,14 +3543,22 @@ mod tests {
 
     #[test]
     fn auth_success_content_length_matches_xray_and_shoes_writers() {
-        let shoes = build_auth_success_response(true, 0, false, false)
+        let shoes = build_auth_success_response(true, 750_000, false, false)
             .expect("valid shoes auth response");
         assert_eq!(shoes.status().as_u16(), SUCCESS_STATUS);
+        assert_eq!(
+            shoes.headers().get(CLIENT_CC_RX_HEADER),
+            Some(&http::HeaderValue::from_static("0"))
+        );
         assert!(shoes.headers().get(http::header::CONTENT_LENGTH).is_none());
         assert!(shoes.headers().get(http::header::DATE).is_none());
 
-        let xray = build_auth_success_response(true, 0, false, true)
+        let xray = build_auth_success_response(true, 750_000, false, true)
             .expect("valid Xray auth response");
+        assert_eq!(
+            xray.headers().get(CLIENT_CC_RX_HEADER),
+            Some(&http::HeaderValue::from_static("750000"))
+        );
         assert_eq!(xray.status().as_u16(), SUCCESS_STATUS);
         assert_eq!(
             xray.headers().get(http::header::CONTENT_LENGTH),
