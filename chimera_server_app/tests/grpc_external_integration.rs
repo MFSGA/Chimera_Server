@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     fs::{self, File},
-    io::{self, Read, Write},
+    io,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream},
     path::PathBuf,
     process::{Child, Command, Stdio},
@@ -13,7 +13,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use prost::Message;
 use tonic::{
     Request, Status,
     codegen::http::uri::PathAndQuery,
@@ -24,8 +23,6 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const SOCKS_TAG: &str = "socks-grpc-e2e";
-const SOCKS_ADDED_USER: &str = "grpc-e2e-added-user";
-const SOCKS_ADDED_PASS: &str = "grpc-e2e-added-pass";
 const DIRECT_TAG: &str = "direct";
 const BACKUP_TAG: &str = "backup";
 static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -42,8 +39,6 @@ const PATH_HANDLER_LIST_INBOUNDS: &str =
     "/xray.app.proxyman.command.HandlerService/ListInbounds";
 const PATH_HANDLER_GET_INBOUND_USERS_COUNT: &str =
     "/xray.app.proxyman.command.HandlerService/GetInboundUsersCount";
-const PATH_HANDLER_ALTER_INBOUND: &str =
-    "/xray.app.proxyman.command.HandlerService/AlterInbound";
 const PATH_HANDLER_LIST_OUTBOUNDS: &str =
     "/xray.app.proxyman.command.HandlerService/ListOutbounds";
 const PATH_ROUTING_TEST_ROUTE: &str =
@@ -287,69 +282,6 @@ where
     Ok(response.into_inner())
 }
 
-fn socks_connect_with_password(
-    socks_port: u16,
-    target_port: u16,
-    username: &str,
-    password: &str,
-) -> io::Result<()> {
-    let mut stream = TcpStream::connect_timeout(
-        &SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, socks_port)),
-        IO_TIMEOUT,
-    )?;
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
-
-    stream.write_all(&[0x05, 0x01, 0x02])?;
-    let mut method_response = [0u8; 2];
-    stream.read_exact(&mut method_response)?;
-    if method_response != [0x05, 0x02] {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("unexpected socks method response: {method_response:?}"),
-        ));
-    }
-
-    let username = username.as_bytes();
-    let password = password.as_bytes();
-    stream.write_all(&[0x01, username.len() as u8])?;
-    stream.write_all(username)?;
-    stream.write_all(&[password.len() as u8])?;
-    stream.write_all(password)?;
-    let mut auth_response = [0u8; 2];
-    stream.read_exact(&mut auth_response)?;
-    if auth_response != [0x01, 0x00] {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("unexpected socks auth response: {auth_response:?}"),
-        ));
-    }
-
-    let port_bytes = target_port.to_be_bytes();
-    stream.write_all(&[
-        0x05,
-        0x01,
-        0x00,
-        0x01,
-        127,
-        0,
-        0,
-        1,
-        port_bytes[0],
-        port_bytes[1],
-    ])?;
-    let mut connect_response = [0u8; 10];
-    stream.read_exact(&mut connect_response)?;
-    if connect_response[0] != 0x05 || connect_response[1] != 0x00 {
-        return Err(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            format!("unexpected socks connect response: {connect_response:?}"),
-        ));
-    }
-
-    Ok(())
-}
-
 #[derive(Clone, PartialEq, prost::Message)]
 struct RestartLoggerRequest {}
 
@@ -396,55 +328,6 @@ struct GetInboundUsersCountResponse {
     #[prost(int64, tag = "1")]
     count: i64,
 }
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct TypedMessage {
-    #[prost(string, tag = "1")]
-    r#type: String,
-    #[prost(bytes, tag = "2")]
-    value: Vec<u8>,
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct User {
-    #[prost(uint32, tag = "1")]
-    level: u32,
-    #[prost(string, tag = "2")]
-    email: String,
-    #[prost(message, optional, tag = "3")]
-    account: Option<TypedMessage>,
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct SocksAccount {
-    #[prost(string, tag = "1")]
-    username: String,
-    #[prost(string, tag = "2")]
-    password: String,
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct AddUserOperation {
-    #[prost(message, optional, tag = "1")]
-    user: Option<User>,
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct RemoveUserOperation {
-    #[prost(string, tag = "1")]
-    email: String,
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct AlterInboundRequest {
-    #[prost(string, tag = "1")]
-    tag: String,
-    #[prost(message, optional, tag = "2")]
-    operation: Option<TypedMessage>,
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct AlterInboundResponse {}
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct ListOutboundsRequest {}
@@ -592,7 +475,7 @@ fn grpc_services_external_end_to_end() {
     );
     trace_step("handler list inbounds rpc passed");
 
-    let users_count: GetInboundUsersCountResponse = runtime
+    let users_count: Result<GetInboundUsersCountResponse, Status> = runtime
         .block_on(grpc_unary(
             channel.clone(),
             PATH_HANDLER_GET_INBOUND_USERS_COUNT,
@@ -600,95 +483,10 @@ fn grpc_services_external_end_to_end() {
                 tag: SOCKS_TAG.to_string(),
                 email: String::new(),
             },
-        ))
-        .unwrap_or_else(|err| {
-            panic!(
-                "handler GetInboundUsersCount failed: {err}; logs:\n{}",
-                server.logs()
-            )
-        });
-    assert_eq!(users_count.count, 1);
-    trace_step(format!("handler inbound users count={}", users_count.count));
-
-    let _: AlterInboundResponse = runtime
-        .block_on(grpc_unary(
-            channel.clone(),
-            PATH_HANDLER_ALTER_INBOUND,
-            AlterInboundRequest {
-                tag: SOCKS_TAG.to_string(),
-                operation: Some(TypedMessage {
-                    r#type: "xray.app.proxyman.command.AddUserOperation".to_string(),
-                    value: AddUserOperation {
-                        user: Some(User {
-                            level: 0,
-                            email: SOCKS_ADDED_USER.to_string(),
-                            account: Some(TypedMessage {
-                                r#type: "xray.proxy.socks.Account".to_string(),
-                                value: SocksAccount {
-                                    username: SOCKS_ADDED_USER.to_string(),
-                                    password: SOCKS_ADDED_PASS.to_string(),
-                                }
-                                .encode_to_vec(),
-                            }),
-                        }),
-                    }
-                    .encode_to_vec(),
-                }),
-            },
-        ))
-        .unwrap_or_else(|err| {
-            panic!(
-                "handler AlterInbound AddUser failed: {err}; logs:\n{}",
-                server.logs()
-            )
-        });
-    socks_connect_with_password(
-        socks_port,
-        grpc_port,
-        SOCKS_ADDED_USER,
-        SOCKS_ADDED_PASS,
-    )
-    .unwrap_or_else(|err| {
-        panic!(
-            "added socks user could not authenticate: {err}; logs:\n{}",
-            server.logs()
-        )
-    });
-    trace_step("added socks user authenticated through running handler");
-
-    let _: AlterInboundResponse = runtime
-        .block_on(grpc_unary(
-            channel.clone(),
-            PATH_HANDLER_ALTER_INBOUND,
-            AlterInboundRequest {
-                tag: SOCKS_TAG.to_string(),
-                operation: Some(TypedMessage {
-                    r#type: "xray.app.proxyman.command.RemoveUserOperation"
-                        .to_string(),
-                    value: RemoveUserOperation {
-                        email: SOCKS_ADDED_USER.to_string(),
-                    }
-                    .encode_to_vec(),
-                }),
-            },
-        ))
-        .unwrap_or_else(|err| {
-            panic!(
-                "handler AlterInbound RemoveUser failed: {err}; logs:\n{}",
-                server.logs()
-            )
-        });
-    let removed_auth = socks_connect_with_password(
-        socks_port,
-        grpc_port,
-        SOCKS_ADDED_USER,
-        SOCKS_ADDED_PASS,
-    );
-    assert!(
-        removed_auth.is_err(),
-        "removed socks user should not authenticate"
-    );
-    trace_step("removed socks user was rejected by running handler");
+        ));
+    let err = users_count.expect_err("SOCKS should not expose Xray UserManager");
+    assert_eq!(err.code(), tonic::Code::Unknown);
+    trace_step("handler SOCKS user manager rejection matched Xray");
 
     let outbounds: ListOutboundsResponse = runtime
         .block_on(grpc_unary(
