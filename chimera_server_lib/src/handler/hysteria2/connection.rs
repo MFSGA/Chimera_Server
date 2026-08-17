@@ -2882,12 +2882,6 @@ async fn drive_udp_datagrams(
             assembled.freeze()
         };
 
-        if refresh_udp_activity_on_completed_payload(auth_ctx.xray_compat) {
-            // Preserve the existing shoes/native activity point at completed
-            // payload delivery; Xray has already refreshed on datagram receipt.
-            session.mark_active();
-        }
-
         let mut route_input = connection_routing_input(
             inbound_tag.as_str(),
             &identity,
@@ -2992,8 +2986,8 @@ fn refresh_udp_activity_on_datagram(xray_compat: bool) -> bool {
     xray_compat
 }
 
-fn refresh_udp_activity_on_completed_payload(xray_compat: bool) -> bool {
-    !xray_compat
+fn refresh_udp_activity_on_response(xray_compat: bool) -> bool {
+    xray_compat
 }
 
 fn udp_session_is_idle(
@@ -3315,9 +3309,11 @@ async fn run_udp_remote_to_local_loop(
             }
         }
 
-        *last_active
-            .write()
-            .expect("hysteria2 UDP activity lock poisoned") = Instant::now();
+        if refresh_udp_activity_on_response(xray_compat) {
+            *last_active
+                .write()
+                .expect("hysteria2 UDP activity lock poisoned") = Instant::now();
+        }
         record_transfer(Some(traffic_context), 0, payload_len as u64);
     }
 }
@@ -5983,11 +5979,11 @@ mod tests {
     }
 
     #[test]
-    fn udp_activity_refresh_point_matches_xray_without_changing_shoes() {
+    fn udp_activity_refresh_matches_xray_and_shoes() {
         assert!(refresh_udp_activity_on_datagram(true));
-        assert!(!refresh_udp_activity_on_completed_payload(true));
+        assert!(refresh_udp_activity_on_response(true));
         assert!(!refresh_udp_activity_on_datagram(false));
-        assert!(refresh_udp_activity_on_completed_payload(false));
+        assert!(!refresh_udp_activity_on_response(false));
     }
 
     #[test]
