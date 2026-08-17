@@ -86,6 +86,7 @@ pub async fn process_hysteria2_connection(
     connection: quinn::Connection,
     inbound_tag: Arc<String>,
     runtime: RuntimeState,
+    xray_proxy_transport: Option<Arc<XrayProxyTransport>>,
 ) -> std::io::Result<()> {
     let h3_quinn_connection = h3_quinn::Connection::new(connection.clone());
     let mut h3_conn = h3::server::Connection::new(h3_quinn_connection)
@@ -97,7 +98,12 @@ pub async fn process_hysteria2_connection(
     debug!("hysteria2 H3 driver created");
 
     let auth_ctx = match await_authentication(
-        auth_hysteria2_connection(&mut h3_conn, config.as_ref(), tx_bps.clone()),
+        auth_hysteria2_connection(
+            &mut h3_conn,
+            config.as_ref(),
+            tx_bps.clone(),
+            xray_proxy_transport.as_deref(),
+        ),
         config.xray_compat,
     )
     .await
@@ -187,6 +193,7 @@ async fn auth_hysteria2_connection(
     h3_conn: &mut h3::server::Connection<h3_quinn::Connection, Bytes>,
     config: &Hysteria2ServerConfig,
     tx_bps: Arc<AtomicU64>,
+    xray_proxy_transport: Option<&XrayProxyTransport>,
 ) -> std::io::Result<AuthContext> {
     loop {
         match h3_conn.accept().await.map_err(map_h3_error)? {
@@ -253,6 +260,7 @@ async fn auth_hysteria2_connection(
                             &request_uri,
                             &request_headers,
                             config,
+                            xray_proxy_transport,
                         )
                         .await?;
                     }
@@ -825,6 +833,7 @@ async fn send_auth_reject_response(
     uri: &http::Uri,
     request_headers: &http::HeaderMap,
     config: &Hysteria2ServerConfig,
+    xray_proxy_transport: Option<&XrayProxyTransport>,
 ) -> std::io::Result<()> {
     let (response, body) = if let Some(masquerade) =
         config.xray_masquerade_file.as_ref()
@@ -836,14 +845,29 @@ async fn send_auth_reject_response(
         while let Some(mut data) = stream.recv_data().await.map_err(map_h3_error)? {
             request_body.extend_from_slice(&data.copy_to_bytes(data.remaining()));
         }
-        xray_proxy_masquerade_response(
-            method,
-            uri,
-            request_headers,
-            request_body.freeze(),
-            masquerade,
-        )
-        .await?
+        match xray_proxy_transport {
+            Some(transport) => {
+                xray_proxy_masquerade_response_with_transport(
+                    method,
+                    uri,
+                    request_headers,
+                    request_body.freeze(),
+                    masquerade,
+                    transport,
+                )
+                .await?
+            }
+            None => {
+                xray_proxy_masquerade_response(
+                    method,
+                    uri,
+                    request_headers,
+                    request_body.freeze(),
+                    masquerade,
+                )
+                .await?
+            }
+        }
     } else {
         auth_reject_response(
             config.xray_compat,
@@ -1075,6 +1099,32 @@ fn xray_proxy_connection_header(
         })
 }
 
+pub(crate) struct XrayProxyTransport {
+    client: reqwest::Client,
+}
+
+impl XrayProxyTransport {
+    fn new(insecure: bool) -> std::io::Result<Self> {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .tls_danger_accept_invalid_certs(insecure)
+            .no_gzip()
+            .build()
+            .map_err(Error::other)?;
+        Ok(Self { client })
+    }
+}
+
+pub(crate) fn build_xray_proxy_transport(
+    masquerade: Option<
+        &crate::config::server_config::Hysteria2MasqueradeProxyConfig,
+    >,
+) -> std::io::Result<Option<Arc<XrayProxyTransport>>> {
+    masquerade
+        .map(|masquerade| XrayProxyTransport::new(masquerade.insecure).map(Arc::new))
+        .transpose()
+}
+
 fn xray_proxy_bad_gateway_response() -> std::io::Result<(Response<()>, Option<Bytes>)>
 {
     let response = Response::builder()
@@ -1091,6 +1141,26 @@ async fn xray_proxy_masquerade_response(
     body: Bytes,
     masquerade: &crate::config::server_config::Hysteria2MasqueradeProxyConfig,
 ) -> std::io::Result<(Response<()>, Option<Bytes>)> {
+    let transport = XrayProxyTransport::new(masquerade.insecure)?;
+    xray_proxy_masquerade_response_with_transport(
+        method,
+        uri,
+        request_headers,
+        body,
+        masquerade,
+        &transport,
+    )
+    .await
+}
+
+async fn xray_proxy_masquerade_response_with_transport(
+    method: &http::Method,
+    uri: &http::Uri,
+    request_headers: &http::HeaderMap,
+    body: Bytes,
+    masquerade: &crate::config::server_config::Hysteria2MasqueradeProxyConfig,
+    transport: &XrayProxyTransport,
+) -> std::io::Result<(Response<()>, Option<Bytes>)> {
     let target = match xray_proxy_target_url(&masquerade.url, uri) {
         Ok(target) => target,
         Err(err) => {
@@ -1099,14 +1169,7 @@ async fn xray_proxy_masquerade_response(
         }
     };
     let auto_gzip = xray_proxy_auto_gzip(method, request_headers);
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .tls_danger_accept_invalid_certs(masquerade.insecure)
-        .gzip(auto_gzip)
-        .build()
-        .map_err(Error::other)?;
-
-    let mut request = client.request(method.clone(), target);
+    let mut request = transport.client.request(method.clone(), target);
     for (name, value) in request_headers {
         if !xray_proxy_hop_header(name)
             && !xray_proxy_connection_header(name, request_headers)
@@ -1116,6 +1179,9 @@ async fn xray_proxy_masquerade_response(
         {
             request = request.header(name, value);
         }
+    }
+    if auto_gzip {
+        request = request.header(http::header::ACCEPT_ENCODING, "gzip");
     }
     if xray_proxy_supports_trailers(request_headers) {
         request = request.header(http::header::TE, "trailers");
@@ -1137,8 +1203,21 @@ async fn xray_proxy_masquerade_response(
         }
     };
     let status = upstream.status();
-    let headers = upstream.headers().clone();
-    let body = upstream.bytes().await.map_err(Error::other)?;
+    let mut headers = upstream.headers().clone();
+    let mut body = upstream.bytes().await.map_err(Error::other)?;
+    if auto_gzip
+        && headers
+            .get(http::header::CONTENT_ENCODING)
+            .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"gzip"))
+    {
+        let mut decoder = flate2::read::GzDecoder::new(body.as_ref());
+        let mut decoded = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut decoded)
+            .map_err(Error::other)?;
+        body = Bytes::from(decoded);
+        headers.remove(http::header::CONTENT_ENCODING);
+        headers.remove(http::header::CONTENT_LENGTH);
+    }
     let mut response = Response::builder().status(status);
     for (name, value) in &headers {
         if !xray_proxy_hop_header(name)
@@ -3750,6 +3829,89 @@ mod tests {
         );
         assert_eq!(body.as_deref(), Some(GZIP_HELLO));
         upstream.await.expect("join explicit-gzip upstream");
+    }
+
+    #[tokio::test]
+    async fn xray_proxy_masquerade_reuses_upstream_transport_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind reusable proxy upstream");
+        let upstream_addr = listener
+            .local_addr()
+            .expect("read reusable upstream address");
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepts_for_task = accepts.clone();
+        let upstream = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("accept reusable proxy request");
+                accepts_for_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    let mut pending = Vec::new();
+                    let mut buffer = [0_u8; 1024];
+                    loop {
+                        while !pending.windows(4).any(|window| window == b"\r\n\r\n")
+                        {
+                            let read = stream
+                                .read(&mut buffer)
+                                .await
+                                .expect("read reusable proxy request");
+                            if read == 0 {
+                                return;
+                            }
+                            pending.extend_from_slice(&buffer[..read]);
+                        }
+                        let header_end = pending
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                            .expect("complete reusable proxy request")
+                            + 4;
+                        pending.drain(..header_end);
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+                            )
+                            .await
+                            .expect("write reusable proxy response");
+                    }
+                });
+            }
+        });
+
+        let uri: http::Uri = "https://original.test/path"
+            .parse()
+            .expect("valid reusable proxy URI");
+        let config = Hysteria2MasqueradeProxyConfig {
+            url: format!("http://{upstream_addr}/"),
+            rewrite_host: true,
+            insecure: false,
+        };
+        let transport = XrayProxyTransport::new(false)
+            .expect("build reusable Xray proxy transport");
+        for _ in 0..2 {
+            let (response, body) = xray_proxy_masquerade_response_with_transport(
+                &http::Method::GET,
+                &uri,
+                &http::HeaderMap::new(),
+                Bytes::new(),
+                &config,
+                &transport,
+            )
+            .await
+            .expect("proxy reusable Xray masquerade request");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body.as_deref(), Some(&b"ok"[..]));
+        }
+
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Xray DefaultTransport reuses the upstream keep-alive connection",
+        );
+        upstream.abort();
     }
 
     #[tokio::test]
