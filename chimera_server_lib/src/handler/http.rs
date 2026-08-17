@@ -202,13 +202,16 @@ impl TcpServerHandler for HttpTcpServerHandler {
             });
         }
 
-        let (remote_location, origin_target) = if target.starts_with("http://") {
-            parse_absolute_http_target(target)?
+        let (remote_location, origin_target, absolute_authority) = if target
+            .starts_with("http://")
+        {
+            let (remote_location, origin_target, authority) =
+                parse_absolute_http_target(target, "http://", 80)?;
+            (remote_location, origin_target, Some(authority))
         } else if target.starts_with("https://") {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "HTTPS absolute-form requests must use CONNECT",
-            ));
+            let (remote_location, origin_target, authority) =
+                parse_absolute_http_target(target, "https://", 443)?;
+            (remote_location, origin_target, Some(authority))
         } else if self.allow_transparent && target.starts_with('/') {
             let host = host_header.as_deref().ok_or_else(|| {
                 std::io::Error::new(
@@ -223,7 +226,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
                         format!("invalid HTTP Host header {host}: {error}"),
                     )
                 })?;
-            (remote_location, target.to_string())
+            (remote_location, target.to_string(), None)
         } else {
             let response = format!(
                 "{version} 400 Bad Request\r\n\
@@ -240,14 +243,20 @@ impl TcpServerHandler for HttpTcpServerHandler {
         };
 
         let mut initial_request = format!("{method} {origin_target} {version}\r\n");
+        if let Some(authority) = absolute_authority.as_deref() {
+            initial_request.push_str("Host: ");
+            initial_request.push_str(authority);
+            initial_request.push_str("\r\n");
+        }
         for line in forwarded_headers {
             let header_name = line
                 .split_once(':')
                 .map(|(name, _)| name.trim().to_ascii_lowercase())
                 .unwrap_or_default();
-            if connection_hop_headers
-                .iter()
-                .any(|name| name == &header_name)
+            if (absolute_authority.is_some() && header_name == "host")
+                || connection_hop_headers
+                    .iter()
+                    .any(|name| name == &header_name)
                 || (chunked_transfer_encoding && header_name == "content-length")
             {
                 continue;
@@ -431,11 +440,13 @@ fn validate_chunk_size_line(line: &[u8]) -> std::io::Result<()> {
 
 fn parse_absolute_http_target(
     target: &str,
-) -> std::io::Result<(NetLocation, String)> {
-    let remainder = target.strip_prefix("http://").ok_or_else(|| {
+    scheme: &str,
+    default_port: u16,
+) -> std::io::Result<(NetLocation, String, String)> {
+    let remainder = target.strip_prefix(scheme).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "HTTP proxy target must start with http://",
+            format!("HTTP proxy target must start with {scheme}"),
         )
     })?;
     let split = remainder
@@ -459,14 +470,14 @@ fn parse_absolute_http_target(
             "HTTP absolute URI is missing an authority",
         ));
     }
-    let remote_location =
-        NetLocation::from_str(authority, Some(80)).map_err(|error| {
+    let remote_location = NetLocation::from_str(authority, Some(default_port))
+        .map_err(|error| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("invalid HTTP absolute URI authority {authority}: {error}"),
             )
         })?;
-    Ok((remote_location, path))
+    Ok((remote_location, path, authority.to_string()))
 }
 
 impl HttpTcpServerHandler {
@@ -875,6 +886,40 @@ mod tests {
              Host: example.com:8080\r\n\
              X-Test: forwarded\r\n\
              Connection: close\r\n\r\nbody"
+        );
+    }
+
+    #[tokio::test]
+    async fn https_absolute_form_uses_default_https_semantics_like_xray() {
+        let handler = HttpTcpServerHandler::new(Vec::new(), false, "http-https");
+        let request = b"GET https://example.com/secure?q=1 HTTP/1.1\r\n\
+Host: ignored.invalid\r\n\
+X-Test: forwarded\r\n\r\n";
+        let (mut client, server) = duplex(2048);
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("HTTPS absolute-form HTTP proxy request should succeed");
+        let TcpServerSetupResult::TcpForward {
+            remote_location,
+            mut stream,
+            ..
+        } = result
+        else {
+            panic!("HTTPS absolute-form request returned non-TCP result");
+        };
+        assert_eq!(remote_location.to_string(), "example.com:443");
+        let mut forwarded = Vec::new();
+        stream.read_to_end(&mut forwarded).await.unwrap();
+        assert_eq!(
+            String::from_utf8(forwarded).unwrap(),
+            "GET /secure?q=1 HTTP/1.1\r\n\
+Host: example.com\r\n\
+X-Test: forwarded\r\n\
+Connection: close\r\n\r\n"
         );
     }
 
