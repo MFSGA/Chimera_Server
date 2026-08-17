@@ -1196,7 +1196,7 @@ async fn xray_file_masquerade_response(
     let modified = metadata.modified().ok();
     let last_modified = modified
         .filter(|modified| !xray_is_zero_modtime(*modified))
-        .map(httpdate::fmt_http_date);
+        .map(xray_format_http_date);
     if let Some(status) =
         xray_file_precondition_status(method, request_headers, modified)
     {
@@ -1306,7 +1306,7 @@ fn xray_file_directory_error_response(
         .header(http::header::CONTENT_LENGTH, body.len().to_string());
     if let Some(last_modified) = modified
         .filter(|modified| !xray_is_zero_modtime(*modified))
-        .map(httpdate::fmt_http_date)
+        .map(xray_format_http_date)
     {
         response = response.header(http::header::LAST_MODIFIED, last_modified);
     }
@@ -1357,7 +1357,7 @@ fn xray_file_precondition_status(
     } else if let Some(value) = request_headers
         .get(http::header::IF_UNMODIFIED_SINCE)
         .and_then(|value| value.to_str().ok())
-        && let Ok(since) = httpdate::parse_http_date(value)
+        && let Some(since) = xray_parse_http_date(value)
         && let Some(modified) = modified
         && !xray_is_zero_modtime(modified)
         && !xray_modified_not_after(modified, since)
@@ -1383,7 +1383,7 @@ fn xray_file_precondition_status(
         && let Some(value) = request_headers
             .get(http::header::IF_MODIFIED_SINCE)
             .and_then(|value| value.to_str().ok())
-        && let Ok(since) = httpdate::parse_http_date(value)
+        && let Some(since) = xray_parse_http_date(value)
         && let Some(modified) = modified
         && !xray_is_zero_modtime(modified)
         && xray_modified_not_after(modified, since)
@@ -1539,6 +1539,45 @@ fn xray_parse_http_date(value: &str) -> Option<std::time::SystemTime> {
         std::time::UNIX_EPOCH
             .checked_sub(std::time::Duration::from_secs(seconds.unsigned_abs()))
     }
+}
+
+fn xray_format_http_date(value: std::time::SystemTime) -> String {
+    if value.duration_since(std::time::UNIX_EPOCH).is_ok() {
+        return httpdate::fmt_http_date(value);
+    }
+
+    let value = time::OffsetDateTime::from(value);
+    let weekday = match value.weekday() {
+        time::Weekday::Monday => "Mon",
+        time::Weekday::Tuesday => "Tue",
+        time::Weekday::Wednesday => "Wed",
+        time::Weekday::Thursday => "Thu",
+        time::Weekday::Friday => "Fri",
+        time::Weekday::Saturday => "Sat",
+        time::Weekday::Sunday => "Sun",
+    };
+    let month = match value.month() {
+        time::Month::January => "Jan",
+        time::Month::February => "Feb",
+        time::Month::March => "Mar",
+        time::Month::April => "Apr",
+        time::Month::May => "May",
+        time::Month::June => "Jun",
+        time::Month::July => "Jul",
+        time::Month::August => "Aug",
+        time::Month::September => "Sep",
+        time::Month::October => "Oct",
+        time::Month::November => "Nov",
+        time::Month::December => "Dec",
+    };
+    format!(
+        "{weekday}, {:02} {month} {:04} {:02}:{:02}:{:02} GMT",
+        value.day(),
+        value.year(),
+        value.hour(),
+        value.minute(),
+        value.second(),
+    )
 }
 
 fn xray_parse_ranges(
@@ -1875,7 +1914,7 @@ async fn xray_file_directory_response(
         && let Some(value) = request_headers
             .get(http::header::IF_MODIFIED_SINCE)
             .and_then(|value| value.to_str().ok())
-        && let Ok(since) = httpdate::parse_http_date(value)
+        && let Some(since) = xray_parse_http_date(value)
         && let Some(modified) = modified
         && !xray_is_zero_modtime(modified)
         && xray_modified_not_after(modified, since)
@@ -1939,7 +1978,7 @@ async fn xray_file_directory_response(
         .header(http::header::CONTENT_LENGTH, body.len().to_string());
     if let Some(last_modified) = modified
         .filter(|modified| !xray_is_zero_modtime(*modified))
-        .map(httpdate::fmt_http_date)
+        .map(xray_format_http_date)
     {
         response = response.header(http::header::LAST_MODIFIED, last_modified);
     }
@@ -4569,6 +4608,44 @@ mod tests {
             &headers,
             Some(modified),
         ));
+    }
+
+    #[test]
+    fn xray_http_dates_support_pre_epoch_file_times() {
+        let modified = UNIX_EPOCH
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("pre-epoch SystemTime");
+        let formatted = xray_format_http_date(modified);
+        assert_eq!(formatted, "Wed, 31 Dec 1969 23:59:59 GMT");
+        assert_eq!(xray_parse_http_date(&formatted), Some(modified));
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::IF_MODIFIED_SINCE,
+            http::HeaderValue::from_static("Wed, 31 Dec 1969 23:59:59 GMT"),
+        );
+        assert_eq!(
+            xray_file_precondition_status(
+                &http::Method::GET,
+                &headers,
+                Some(modified)
+            ),
+            Some(StatusCode::NOT_MODIFIED),
+        );
+
+        headers.clear();
+        headers.insert(
+            http::header::IF_UNMODIFIED_SINCE,
+            http::HeaderValue::from_static("Wed, 31 Dec 1969 23:59:58 GMT"),
+        );
+        assert_eq!(
+            xray_file_precondition_status(
+                &http::Method::GET,
+                &headers,
+                Some(modified)
+            ),
+            Some(StatusCode::PRECONDITION_FAILED),
+        );
     }
 
     #[test]
