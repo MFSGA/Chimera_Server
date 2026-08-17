@@ -2738,27 +2738,7 @@ async fn drive_udp_datagrams(
             // a stream of partial fragments must keep an active session alive.
             session.mark_active();
         }
-        if remote_location != session.last_location {
-            let updated_addr = match resolve_single_address(
-                &resolver,
-                &remote_location,
-            )
-            .await
-            {
-                Ok(addr) => addr,
-                Err(err) => {
-                    warn!(
-                        "Failed to resolve updated hysteria2 UDP destination {}: {}",
-                        remote_location, err
-                    );
-                    continue;
-                }
-            };
-            session.last_location = remote_location.clone();
-            session.last_socket_addr = updated_addr;
-        }
-
-        let complete_payload = if fragment_count <= 1 {
+        let (complete_payload, completed_location) = if fragment_count <= 1 {
             // Xray's Defragger treats FragCount 0 and 1 as complete datagrams.
             // Keep accepting the legacy zero value in Xray compatibility mode,
             // while shoes/native mode retains shoes' stricter zero-fragment rejection.
@@ -2772,7 +2752,7 @@ async fn drive_udp_datagrams(
                 );
                 continue;
             }
-            payload_fragment
+            (payload_fragment, remote_location)
         } else {
             if fragment_id as usize >= fragment_count as usize {
                 warn!(
@@ -2859,28 +2839,31 @@ async fn drive_udp_datagrams(
                 assembled.extend_from_slice(&bytes);
             }
 
-            if completed_location != session.last_location {
-                let updated_addr = match resolve_single_address(
-                    &resolver,
-                    &completed_location,
-                )
-                .await
-                {
-                    Ok(addr) => addr,
-                    Err(err) => {
-                        warn!(
-                            "Failed to resolve fragmented hysteria2 UDP destination {}: {}",
-                            completed_location, err
-                        );
-                        continue;
-                    }
-                };
-                session.last_location = completed_location;
-                session.last_socket_addr = updated_addr;
-            }
-
-            assembled.freeze()
+            (assembled.freeze(), completed_location)
         };
+
+        // Both shoes and Xray hand a destination to the forwarding path only
+        // after defragmentation completes. Incomplete fragments must not resolve
+        // or mutate the session destination on their own.
+        if completed_location != session.last_location {
+            let updated_addr = match resolve_single_address(
+                &resolver,
+                &completed_location,
+            )
+            .await
+            {
+                Ok(addr) => addr,
+                Err(err) => {
+                    warn!(
+                        "Failed to resolve updated hysteria2 UDP destination {}: {}",
+                        completed_location, err
+                    );
+                    continue;
+                }
+            };
+            session.last_location = completed_location;
+            session.last_socket_addr = updated_addr;
+        }
 
         let mut route_input = connection_routing_input(
             inbound_tag.as_str(),
