@@ -1028,6 +1028,16 @@ fn xray_proxy_supports_trailers(headers: &http::HeaderMap) -> bool {
     })
 }
 
+fn xray_proxy_auto_gzip(method: &http::Method, headers: &http::HeaderMap) -> bool {
+    *method != http::Method::HEAD
+        && headers
+            .get(http::header::ACCEPT_ENCODING)
+            .is_none_or(|value| value.as_bytes().is_empty())
+        && headers
+            .get(http::header::RANGE)
+            .is_none_or(|value| value.as_bytes().is_empty())
+}
+
 fn xray_proxy_connection_header(
     name: &http::HeaderName,
     headers: &http::HeaderMap,
@@ -1067,9 +1077,11 @@ async fn xray_proxy_masquerade_response(
             return xray_proxy_bad_gateway_response();
         }
     };
+    let auto_gzip = xray_proxy_auto_gzip(method, request_headers);
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .tls_danger_accept_invalid_certs(masquerade.insecure)
+        .gzip(auto_gzip)
         .build()
         .map_err(Error::other)?;
 
@@ -1079,6 +1091,7 @@ async fn xray_proxy_masquerade_response(
             && !xray_proxy_connection_header(name, request_headers)
             && !xray_proxy_forwarding_header(name)
             && name != http::header::HOST
+            && !(auto_gzip && name == http::header::ACCEPT_ENCODING)
         {
             request = request.header(name, value);
         }
@@ -3379,6 +3392,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn xray_proxy_auto_gzip_matches_go_transport_conditions() {
+        let mut headers = http::HeaderMap::new();
+        assert!(xray_proxy_auto_gzip(&http::Method::GET, &headers));
+        assert!(!xray_proxy_auto_gzip(&http::Method::HEAD, &headers));
+
+        headers.insert(
+            http::header::RANGE,
+            http::HeaderValue::from_static("bytes=0-1"),
+        );
+        assert!(!xray_proxy_auto_gzip(&http::Method::GET, &headers));
+        headers.insert(http::header::RANGE, http::HeaderValue::from_static(""));
+        assert!(xray_proxy_auto_gzip(&http::Method::GET, &headers));
+
+        headers.insert(
+            http::header::ACCEPT_ENCODING,
+            http::HeaderValue::from_static("br"),
+        );
+        assert!(!xray_proxy_auto_gzip(&http::Method::GET, &headers));
+        headers.insert(
+            http::header::ACCEPT_ENCODING,
+            http::HeaderValue::from_static(""),
+        );
+        assert!(xray_proxy_auto_gzip(&http::Method::GET, &headers));
+    }
+
     #[tokio::test]
     async fn xray_proxy_masquerade_forwards_request_and_upstream_response() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -3493,12 +3532,174 @@ mod tests {
         assert!(!request_lower.contains("\r\nconnection:"));
         assert!(request_lower.contains("\r\nte: trailers\r\n"));
         assert!(!request_lower.contains("te: gzip"));
+        assert!(request_lower.contains("\r\naccept-encoding: gzip\r\n"));
         assert!(!request_lower.contains("\r\nforwarded:"));
         assert!(!request_lower.contains("\r\nx-forwarded-for:"));
         assert!(!request_lower.contains("\r\nx-forwarded-host:"));
         assert!(!request_lower.contains("\r\nx-forwarded-proto:"));
         assert!(!request_lower.contains("\r\nauthorization:"));
         assert!(request.ends_with("\r\npayload"));
+    }
+
+    #[tokio::test]
+    async fn xray_proxy_masquerade_auto_decompresses_transport_gzip() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind gzip proxy upstream");
+        let upstream_addr =
+            listener.local_addr().expect("read gzip upstream address");
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) =
+                listener.accept().await.expect("accept gzip request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read =
+                    stream.read(&mut buffer).await.expect("read gzip request");
+                assert_ne!(read, 0, "gzip request closed before headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let request =
+                String::from_utf8(request).expect("gzip request should be utf8");
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("\r\naccept-encoding: gzip\r\n")
+            );
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write gzip response headers");
+            stream
+                .write_all(&[
+                    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff,
+                    0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x86, 0xa6, 0x10,
+                    0x36, 0x05, 0x00, 0x00, 0x00,
+                ])
+                .await
+                .expect("write gzip response body");
+        });
+
+        let uri: http::Uri = "https://original.test/path"
+            .parse()
+            .expect("valid gzip proxy URI");
+        let config = Hysteria2MasqueradeProxyConfig {
+            url: format!("http://{upstream_addr}/"),
+            rewrite_host: true,
+            insecure: false,
+        };
+        let (response, body) = xray_proxy_masquerade_response(
+            &http::Method::GET,
+            &uri,
+            &http::HeaderMap::new(),
+            Bytes::new(),
+            &config,
+        )
+        .await
+        .expect("proxy gzip Xray masquerade request");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(http::header::CONTENT_ENCODING)
+                .is_none()
+        );
+        assert!(
+            response
+                .headers()
+                .get(http::header::CONTENT_LENGTH)
+                .is_none()
+        );
+        assert_eq!(body.as_deref(), Some(&b"hello"[..]));
+        upstream.await.expect("join gzip upstream");
+    }
+
+    #[tokio::test]
+    async fn xray_proxy_masquerade_preserves_caller_requested_gzip() {
+        const GZIP_HELLO: &[u8] = &[
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xcb, 0x48,
+            0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x86, 0xa6, 0x10, 0x36, 0x05, 0x00, 0x00,
+            0x00,
+        ];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind explicit-gzip proxy upstream");
+        let upstream_addr = listener
+            .local_addr()
+            .expect("read explicit-gzip upstream address");
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("accept explicit-gzip request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("read explicit-gzip request");
+                assert_ne!(read, 0, "explicit-gzip request closed before headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let request = String::from_utf8(request)
+                .expect("explicit-gzip request should be utf8");
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("\r\naccept-encoding: gzip\r\n")
+            );
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write explicit-gzip response headers");
+            stream
+                .write_all(GZIP_HELLO)
+                .await
+                .expect("write explicit-gzip response body");
+        });
+
+        let uri: http::Uri = "https://original.test/path"
+            .parse()
+            .expect("valid explicit-gzip proxy URI");
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::ACCEPT_ENCODING,
+            http::HeaderValue::from_static("gzip"),
+        );
+        let config = Hysteria2MasqueradeProxyConfig {
+            url: format!("http://{upstream_addr}/"),
+            rewrite_host: true,
+            insecure: false,
+        };
+        let (response, body) = xray_proxy_masquerade_response(
+            &http::Method::GET,
+            &uri,
+            &headers,
+            Bytes::new(),
+            &config,
+        )
+        .await
+        .expect("proxy explicit-gzip Xray masquerade request");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(http::header::CONTENT_ENCODING),
+            Some(&http::HeaderValue::from_static("gzip"))
+        );
+        assert_eq!(
+            response.headers().get(http::header::CONTENT_LENGTH),
+            Some(&http::HeaderValue::from_static("25"))
+        );
+        assert_eq!(body.as_deref(), Some(GZIP_HELLO));
+        upstream.await.expect("join explicit-gzip upstream");
     }
 
     #[tokio::test]

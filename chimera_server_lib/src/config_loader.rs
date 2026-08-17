@@ -74,7 +74,17 @@ fn load_external_config_source(source: &str) -> Result<String, Error> {
 }
 
 fn fetch_http_content(target: &str) -> Result<String, Error> {
-    let response = reqwest::blocking::get(target).map_err(|err| {
+    // Preserve the historical config-loader behavior when reqwest's gzip
+    // support is enabled for Xray Hysteria reverse-proxy compatibility.
+    let client = reqwest::blocking::Client::builder()
+        .no_gzip()
+        .build()
+        .map_err(|err| {
+            Error::InvalidConfig(format!(
+                "could not build config source client for {target}: {err}"
+            ))
+        })?;
+    let response = client.get(target).send().map_err(|err| {
         Error::InvalidConfig(format!(
             "could not fetch config source {target}: {err}"
         ))
