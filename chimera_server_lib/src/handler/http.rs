@@ -67,7 +67,6 @@ impl TcpServerHandler for HttpTcpServerHandler {
         let mut proxy_keep_alive = false;
         let mut proxy_connection_seen = false;
         let mut request_content_length = None;
-        let mut request_content_length_valid = true;
         let mut request_transfer_encoding = false;
         let mut chunked_transfer_encoding = false;
         loop {
@@ -120,15 +119,21 @@ impl TcpServerHandler for HttpTcpServerHandler {
                 host_header = Some(value.to_string());
             }
             if name.eq_ignore_ascii_case("content-length") {
-                match value.parse::<u64>() {
-                    Ok(length) => match request_content_length {
-                        Some(previous) if previous != length => {
-                            request_content_length_valid = false;
-                        }
-                        None => request_content_length = Some(length),
-                        _ => {}
-                    },
-                    Err(_) => request_content_length_valid = false,
+                let length = value.parse::<u64>().map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid HTTP Content-Length {value}: {error}"),
+                    )
+                })?;
+                match request_content_length {
+                    Some(previous) if previous != length => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "conflicting HTTP Content-Length headers",
+                        ));
+                    }
+                    Some(_) => continue,
+                    None => request_content_length = Some(length),
                 }
             }
             if name.eq_ignore_ascii_case("transfer-encoding") {
@@ -241,8 +246,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
         }
         initial_request.push_str("Connection: close\r\n\r\n");
 
-        let bodyless_plain_request = request_content_length_valid
-            && request_content_length.unwrap_or(0) == 0
+        let bodyless_plain_request = request_content_length.unwrap_or(0) == 0
             && !request_transfer_encoding
             && (method.eq_ignore_ascii_case("GET")
                 || method.eq_ignore_ascii_case("HEAD"));
@@ -748,6 +752,62 @@ Host: example.com\r\n\
 Transfer-Encoding: chunked\r\n\
 Connection: close\r\n\r\n\
 4\r\ntest\r\n0\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_content_length_is_collapsed_like_xray() {
+        let handler =
+            HttpTcpServerHandler::new(Vec::new(), false, "http-content-length");
+        let request = b"POST http://example.com/upload HTTP/1.1\r\n\
+Host: example.com\r\n\
+Content-Length: 4\r\n\
+Content-Length: 4\r\n\r\nbody";
+        let (mut client, server) = duplex(2048);
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("matching duplicate Content-Length should succeed");
+        let TcpServerSetupResult::TcpForward { mut stream, .. } = result else {
+            panic!("HTTP forward returned non-TCP result");
+        };
+        let mut forwarded = Vec::new();
+        stream.read_to_end(&mut forwarded).await.unwrap();
+        assert_eq!(
+            String::from_utf8(forwarded).unwrap(),
+            "POST /upload HTTP/1.1\r\n\
+Host: example.com\r\n\
+Content-Length: 4\r\n\
+Connection: close\r\n\r\nbody"
+        );
+    }
+
+    #[tokio::test]
+    async fn conflicting_content_length_is_rejected_like_xray() {
+        let handler =
+            HttpTcpServerHandler::new(Vec::new(), false, "http-content-length");
+        let request = b"POST http://example.com/upload HTTP/1.1\r\n\
+Host: example.com\r\n\
+Content-Length: 4\r\n\
+Content-Length: 5\r\n\r\nbody";
+        let (mut client, server) = duplex(2048);
+        client.write_all(request).await.unwrap();
+
+        let error = match handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+        {
+            Ok(_) => panic!("conflicting Content-Length must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            error
+                .to_string()
+                .contains("conflicting HTTP Content-Length")
         );
     }
 
