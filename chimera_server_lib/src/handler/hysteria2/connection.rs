@@ -1507,31 +1507,65 @@ fn xray_if_range_matches(
 }
 
 fn xray_parse_http_date(value: &str) -> Option<std::time::SystemTime> {
+    // Go's time.RFC850 maps two-digit years 69..99 to 1969..1999 and 00..68
+    // to 2000..2068. httpdate instead maps 69 to 2069, so handle RFC850
+    // before its fast path.
+    if let Some(parsed) = xray_parse_rfc850_http_date(value) {
+        return Some(parsed);
+    }
     if let Ok(parsed) = httpdate::parse_http_date(value) {
         return Some(parsed);
     }
 
-    // httpdate intentionally rejects years before 1970, while Go's
-    // http.ParseTime accepts IMF-fixdate values across SystemTime's range.
-    let bytes = value.as_bytes();
-    if bytes.len() != 29
-        || bytes[3] != b','
-        || bytes[4] != b' '
-        || bytes[7] != b' '
-        || bytes[11] != b' '
-        || bytes[16] != b' '
-        || bytes[19] != b':'
-        || bytes[22] != b':'
-        || &bytes[25..] != b" GMT"
+    // httpdate rejects years before 1970 and validates weekday/date
+    // consistency. Go's http.ParseTime accepts pre-epoch dates and treats the
+    // weekday as syntax only, so use time's calendar-date parser as fallback.
+    xray_parse_http_date_with_format(
+        value,
+        "[weekday repr:short], [day padding:zero] [month repr:short] [year repr:full] [hour padding:zero]:[minute padding:zero]:[second padding:zero] GMT",
+    )
+    .or_else(|| {
+        xray_parse_http_date_with_format(
+            value,
+            "[weekday repr:short] [month repr:short] [day padding:space] [hour padding:zero]:[minute padding:zero]:[second padding:zero] [year repr:full]",
+        )
+    })
+}
+
+fn xray_parse_rfc850_http_date(value: &str) -> Option<std::time::SystemTime> {
+    let (weekday, rest) = value.split_once(", ")?;
+    if !matches!(
+        weekday,
+        "Monday"
+            | "Tuesday"
+            | "Wednesday"
+            | "Thursday"
+            | "Friday"
+            | "Saturday"
+            | "Sunday"
+    ) || rest.len() != 22
+        || rest.as_bytes().get(2) != Some(&b'-')
+        || rest.as_bytes().get(6) != Some(&b'-')
+        || rest.as_bytes().get(9) != Some(&b' ')
     {
         return None;
     }
-    let parsed = time::OffsetDateTime::parse(
-        value,
-        &time::format_description::well_known::Rfc2822,
+    let year = rest.get(7..9)?.parse::<u16>().ok()?;
+    let year = if year >= 69 { 1900 + year } else { 2000 + year };
+    let expanded = format!("{weekday}, {}{year:04}{}", &rest[..7], &rest[9..]);
+    xray_parse_http_date_with_format(
+        &expanded,
+        "[weekday repr:long], [day padding:zero]-[month repr:short]-[year repr:full] [hour padding:zero]:[minute padding:zero]:[second padding:zero] GMT",
     )
-    .ok()?;
-    let seconds = parsed.unix_timestamp();
+}
+
+fn xray_parse_http_date_with_format(
+    value: &str,
+    format: &str,
+) -> Option<std::time::SystemTime> {
+    let format = time::format_description::parse(format).ok()?;
+    let parsed = time::PrimitiveDateTime::parse(value, &format).ok()?;
+    let seconds = parsed.assume_utc().unix_timestamp();
     if seconds >= 0 {
         std::time::UNIX_EPOCH
             .checked_add(std::time::Duration::from_secs(seconds as u64))
@@ -4646,6 +4680,28 @@ mod tests {
             ),
             Some(StatusCode::PRECONDITION_FAILED),
         );
+    }
+
+    #[test]
+    fn xray_http_date_parser_accepts_pre_epoch_legacy_formats() {
+        let expected = UNIX_EPOCH
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("pre-epoch SystemTime");
+        for value in [
+            "Wednesday, 31-Dec-69 23:59:59 GMT",
+            "Thursday, 31-Dec-69 23:59:59 GMT",
+            "Wed Dec 31 23:59:59 1969",
+            "Thu Dec 31 23:59:59 1969",
+            "Wed, 31 Dec 1969 23:59:59 GMT",
+            "Thu, 31 Dec 1969 23:59:59 GMT",
+        ] {
+            assert_eq!(
+                xray_parse_http_date(value),
+                Some(expected),
+                "Xray/Go should parse HTTP date without validating weekday {value}",
+            );
+        }
+        assert!(xray_parse_http_date("Nope, 31 Dec 1969 23:59:59 GMT").is_none());
     }
 
     #[test]
