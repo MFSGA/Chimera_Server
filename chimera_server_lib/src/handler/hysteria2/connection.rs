@@ -1020,12 +1020,33 @@ fn xray_proxy_forwarding_header(name: &http::HeaderName) -> bool {
 
 fn xray_proxy_supports_trailers(headers: &http::HeaderMap) -> bool {
     headers.get_all(http::header::TE).iter().any(|value| {
-        value.to_str().ok().is_some_and(|value| {
-            value
-                .split(',')
-                .any(|token| token.trim().eq_ignore_ascii_case("trailers"))
-        })
+        xray_proxy_header_value_contains_token(value.as_bytes(), b"trailers", false)
     })
+}
+
+fn xray_proxy_header_value_contains_token(
+    value: &[u8],
+    token: &[u8],
+    trim_ascii_space: bool,
+) -> bool {
+    value.split(|byte| *byte == b',').any(|part| {
+        xray_proxy_trim_header_token(part, trim_ascii_space)
+            .eq_ignore_ascii_case(token)
+    })
+}
+
+fn xray_proxy_trim_header_token(mut value: &[u8], trim_ascii_space: bool) -> &[u8] {
+    let is_space = |byte: u8| {
+        matches!(byte, b' ' | b'\t')
+            || (trim_ascii_space && matches!(byte, b'\n' | b'\r'))
+    };
+    while value.first().copied().is_some_and(is_space) {
+        value = &value[1..];
+    }
+    while value.last().copied().is_some_and(is_space) {
+        value = &value[..value.len() - 1];
+    }
+    value
 }
 
 fn xray_proxy_auto_gzip(method: &http::Method, headers: &http::HeaderMap) -> bool {
@@ -1046,11 +1067,11 @@ fn xray_proxy_connection_header(
         .get_all(http::header::CONNECTION)
         .iter()
         .any(|value| {
-            value.to_str().ok().is_some_and(|value| {
-                value
-                    .split(',')
-                    .any(|token| token.trim().eq_ignore_ascii_case(name.as_str()))
-            })
+            xray_proxy_header_value_contains_token(
+                value.as_bytes(),
+                name.as_str().as_bytes(),
+                true,
+            )
         })
 }
 
@@ -3390,6 +3411,32 @@ mod tests {
             target.as_str(),
             "https://upstream.test/base/path?fixed=1&a=1&b=3"
         );
+    }
+
+    #[test]
+    fn xray_proxy_header_tokens_tolerate_obs_text_like_go() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_bytes(b"X-Hop,\x80")
+                .expect("obs-text connection value"),
+        );
+        let x_hop = http::HeaderName::from_static("x-hop");
+        assert!(xray_proxy_connection_header(&x_hop, &headers));
+
+        headers.insert(
+            http::header::TE,
+            http::HeaderValue::from_bytes(b"trailers,\x80")
+                .expect("obs-text TE value"),
+        );
+        assert!(xray_proxy_supports_trailers(&headers));
+
+        headers.insert(
+            http::header::TE,
+            http::HeaderValue::from_bytes(b"x-trailers,\x80")
+                .expect("obs-text non-token TE value"),
+        );
+        assert!(!xray_proxy_supports_trailers(&headers));
     }
 
     #[test]
