@@ -1496,18 +1496,49 @@ fn xray_if_range_matches(
     {
         return false;
     }
-    let Ok(if_range) = httpdate::parse_http_date(value) else {
+    let Some(if_range) = xray_parse_http_date(value) else {
         return false;
     };
     modified.is_some_and(|modified| {
         modified
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .zip(if_range.duration_since(std::time::UNIX_EPOCH).ok())
-            .is_some_and(|(modified, if_range)| {
-                modified.as_secs() == if_range.as_secs()
-            })
+            .duration_since(if_range)
+            .is_ok_and(|delta| delta.as_secs() == 0)
     })
+}
+
+fn xray_parse_http_date(value: &str) -> Option<std::time::SystemTime> {
+    if let Ok(parsed) = httpdate::parse_http_date(value) {
+        return Some(parsed);
+    }
+
+    // httpdate intentionally rejects years before 1970, while Go's
+    // http.ParseTime accepts IMF-fixdate values across SystemTime's range.
+    let bytes = value.as_bytes();
+    if bytes.len() != 29
+        || bytes[3] != b','
+        || bytes[4] != b' '
+        || bytes[7] != b' '
+        || bytes[11] != b' '
+        || bytes[16] != b' '
+        || bytes[19] != b':'
+        || bytes[22] != b':'
+        || &bytes[25..] != b" GMT"
+    {
+        return None;
+    }
+    let parsed = time::OffsetDateTime::parse(
+        value,
+        &time::format_description::well_known::Rfc2822,
+    )
+    .ok()?;
+    let seconds = parsed.unix_timestamp();
+    if seconds >= 0 {
+        std::time::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_secs(seconds as u64))
+    } else {
+        std::time::UNIX_EPOCH
+            .checked_sub(std::time::Duration::from_secs(seconds.unsigned_abs()))
+    }
 }
 
 fn xray_parse_ranges(
@@ -4510,6 +4541,34 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn xray_if_range_matches_pre_epoch_modtime() {
+        let modified = UNIX_EPOCH
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("pre-epoch SystemTime");
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::IF_RANGE,
+            http::HeaderValue::from_static("Wed, 31 Dec 1969 23:59:59 GMT"),
+        );
+
+        assert!(xray_if_range_matches(
+            &http::Method::GET,
+            &headers,
+            Some(modified),
+        ));
+
+        headers.insert(
+            http::header::IF_RANGE,
+            http::HeaderValue::from_static("Wed, 31 Dec 1969 23:59:58 GMT"),
+        );
+        assert!(!xray_if_range_matches(
+            &http::Method::GET,
+            &headers,
+            Some(modified),
+        ));
     }
 
     #[test]
