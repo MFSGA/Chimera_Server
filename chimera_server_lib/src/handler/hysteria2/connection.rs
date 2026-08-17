@@ -918,7 +918,11 @@ fn xray_proxy_target_url(
         (_, Some(request)) if !request.is_empty() => Some(request.to_string()),
         _ => None,
     };
-    target.set_query(query.as_deref());
+    if query.is_none() && uri.query() == Some("") {
+        target.set_query(Some(""));
+    } else {
+        target.set_query(query.as_deref());
+    }
     Ok(target)
 }
 
@@ -3493,6 +3497,27 @@ mod tests {
         assert_eq!(
             target.as_str(),
             "https://upstream.test/base/path?fixed=1&a=1&b=3"
+        );
+
+        let force_query_uri: http::Uri = "https://original.test/path?"
+            .parse()
+            .expect("valid explicit-empty-query proxy URI");
+        let force_query_target =
+            xray_proxy_target_url("https://upstream.test/base", &force_query_uri)
+                .expect("preserve Xray incoming ForceQuery");
+        assert_eq!(
+            force_query_target.as_str(),
+            "https://upstream.test/base/path?"
+        );
+        let plain_uri: http::Uri = "https://original.test/path"
+            .parse()
+            .expect("valid queryless proxy URI");
+        let target_force_query =
+            xray_proxy_target_url("https://upstream.test/base?", &plain_uri)
+                .expect("drop target-only ForceQuery like Xray");
+        assert_eq!(
+            target_force_query.as_str(),
+            "https://upstream.test/base/path"
         );
     }
 
