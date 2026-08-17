@@ -1109,6 +1109,7 @@ impl XrayProxyTransport {
             .redirect(reqwest::redirect::Policy::none())
             .tls_danger_accept_invalid_certs(insecure)
             .no_gzip()
+            .pool_max_idle_per_host(2)
             .build()
             .map_err(Error::other)?;
         Ok(Self { client })
@@ -3910,6 +3911,121 @@ mod tests {
             accepts.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "Xray DefaultTransport reuses the upstream keep-alive connection",
+        );
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn xray_proxy_transport_caps_idle_connections_per_host_like_go() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind pooled proxy upstream");
+        let upstream_addr =
+            listener.local_addr().expect("read pooled upstream address");
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let progress = std::sync::Arc::new(tokio::sync::Notify::new());
+        let accepts_for_task = accepts.clone();
+        let requests_for_task = requests.clone();
+        let progress_for_task = progress.clone();
+        let upstream = tokio::spawn(async move {
+            loop {
+                let (stream, _) =
+                    listener.accept().await.expect("accept pooled request");
+                accepts_for_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let requests = requests_for_task.clone();
+                let progress = progress_for_task.clone();
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    let mut pending = Vec::new();
+                    let mut buffer = [0_u8; 1024];
+                    loop {
+                        while !pending.windows(4).any(|window| window == b"\r\n\r\n")
+                        {
+                            let read = stream
+                                .read(&mut buffer)
+                                .await
+                                .expect("read pooled proxy request");
+                            if read == 0 {
+                                return;
+                            }
+                            pending.extend_from_slice(&buffer[..read]);
+                        }
+                        let header_end = pending
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                            .expect("complete pooled proxy request")
+                            + 4;
+                        pending.drain(..header_end);
+
+                        let request_number = requests
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                            + 1;
+                        progress.notify_waiters();
+                        let threshold = if request_number <= 3 { 3 } else { 6 };
+                        while requests.load(std::sync::atomic::Ordering::SeqCst)
+                            < threshold
+                        {
+                            progress.notified().await;
+                        }
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+                            )
+                            .await
+                            .expect("write pooled proxy response");
+                    }
+                });
+            }
+        });
+
+        let uri: http::Uri = "https://original.test/path"
+            .parse()
+            .expect("valid pooled proxy URI");
+        let config = Hysteria2MasqueradeProxyConfig {
+            url: format!("http://{upstream_addr}/"),
+            rewrite_host: true,
+            insecure: false,
+        };
+        let transport =
+            XrayProxyTransport::new(false).expect("build pooled proxy transport");
+        let method = http::Method::GET;
+        let headers = http::HeaderMap::new();
+        let request = || {
+            xray_proxy_masquerade_response_with_transport(
+                &method,
+                &uri,
+                &headers,
+                Bytes::new(),
+                &config,
+                &transport,
+            )
+        };
+
+        let first = tokio::join!(request(), request(), request());
+        for result in [first.0, first.1, first.2] {
+            let (response, body) = result.expect("proxy first pooled request round");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body.as_deref(), Some(&b"ok"[..]));
+        }
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "first concurrent round should establish three upstream connections",
+        );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let second = tokio::join!(request(), request(), request());
+        for result in [second.0, second.1, second.2] {
+            let (response, body) =
+                result.expect("proxy second pooled request round");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body.as_deref(), Some(&b"ok"[..]));
+        }
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "Go DefaultTransport retains only two idle connections per host",
         );
         upstream.abort();
     }
