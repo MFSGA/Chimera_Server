@@ -50,6 +50,15 @@ pub enum TcpServerSetupResult {
         connection_success_response: Option<Box<[u8]>>,
         traffic_context: Option<TrafficContext>,
     },
+    HttpPlainForward {
+        remote_location: NetLocation,
+        stream: Box<dyn AsyncStream>,
+        request_head: Box<[u8]>,
+        request_method: String,
+        keep_alive: bool,
+        next_handler: Box<dyn TcpServerHandler>,
+        traffic_context: Option<TrafficContext>,
+    },
     TcpFallback {
         remote_location: NetLocation,
         stream: Box<dyn AsyncStream>,
