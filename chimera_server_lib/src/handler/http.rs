@@ -98,9 +98,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
         if !self.accounts.is_empty() && authenticated_user.is_none() {
             let response = format!(
                 "{version} 407 Proxy Authentication Required\r\n\
-                 Proxy-Authenticate: Basic realm=\"proxy\"\r\n\
-                 Content-Length: 0\r\n\
-                 Connection: close\r\n\r\n"
+                 Proxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n"
             );
             server_stream.write_all(response.as_bytes()).await?;
             server_stream.flush().await?;
@@ -166,6 +164,14 @@ impl TcpServerHandler for HttpTcpServerHandler {
                 })?;
             (remote_location, target.to_string())
         } else {
+            let response = format!(
+                "{version} 400 Bad Request\r\n\
+                 Connection: close\r\n\
+                 Proxy-Connection: close\r\n\
+                 Content-Length: 0\r\n\r\n"
+            );
+            server_stream.write_all(response.as_bytes()).await?;
+            server_stream.flush().await?;
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "HTTP proxy request must use an absolute http:// URI unless allowTransparent is enabled",
@@ -519,6 +525,15 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("allowTransparent"));
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(
+            response,
+            b"HTTP/1.1 400 Bad Request\r\n\
+              Connection: close\r\n\
+              Proxy-Connection: close\r\n\
+              Content-Length: 0\r\n\r\n"
+        );
     }
 
     #[tokio::test]
@@ -546,10 +561,12 @@ mod tests {
         };
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
 
-        let mut response = vec![0u8; 256];
-        let len = client.read(&mut response).await.unwrap();
-        let response = String::from_utf8_lossy(&response[..len]);
-        assert!(response.starts_with("HTTP/1.1 407"));
-        assert!(response.contains("Proxy-Authenticate: Basic"));
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(
+            response,
+            b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+              Proxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n"
+        );
     }
 }
