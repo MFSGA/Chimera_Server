@@ -137,10 +137,16 @@ impl TcpServerHandler for HttpTcpServerHandler {
                 }
             }
             if name.eq_ignore_ascii_case("transfer-encoding") {
-                request_transfer_encoding = true;
-                if value.eq_ignore_ascii_case("chunked") {
-                    chunked_transfer_encoding = true;
+                if request_transfer_encoding
+                    || !value.eq_ignore_ascii_case("chunked")
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "unsupported HTTP Transfer-Encoding",
+                    ));
                 }
+                request_transfer_encoding = true;
+                chunked_transfer_encoding = true;
             }
             forwarded_headers.push(line);
         }
@@ -753,6 +759,46 @@ Transfer-Encoding: chunked\r\n\
 Connection: close\r\n\r\n\
 4\r\ntest\r\n0\r\n\r\n"
         );
+    }
+
+    #[tokio::test]
+    async fn unsupported_transfer_encoding_is_rejected_like_xray() {
+        for transfer_encoding in [
+            "gzip",
+            "chunked, gzip",
+            "gzip, chunked",
+            "chunked\r\nTransfer-Encoding: chunked",
+        ] {
+            let handler = HttpTcpServerHandler::new(
+                Vec::new(),
+                false,
+                "http-transfer-encoding",
+            );
+            let request = format!(
+                "POST http://example.com/upload HTTP/1.1\r\n\
+                 Host: example.com\r\n\
+                 Transfer-Encoding: {transfer_encoding}\r\n\r\n\
+                 4\r\ntest\r\n0\r\n\r\n"
+            );
+            let (mut client, server) = duplex(2048);
+            client.write_all(request.as_bytes()).await.unwrap();
+
+            let error = match handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+            {
+                Ok(_) => panic!(
+                    "unsupported Transfer-Encoding {transfer_encoding:?} must be rejected"
+                ),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(
+                error
+                    .to_string()
+                    .contains("unsupported HTTP Transfer-Encoding")
+            );
+        }
     }
 
     #[tokio::test]
