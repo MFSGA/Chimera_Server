@@ -1498,7 +1498,7 @@ fn xray_file_directory_error_response(
 fn xray_file_server_error_response(
     err: &std::io::Error,
 ) -> std::io::Result<(Response<()>, Option<Bytes>)> {
-    if err.kind() == ErrorKind::NotFound {
+    if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) {
         return auth_reject_response(true, None);
     }
 
@@ -5322,6 +5322,11 @@ mod tests {
                 &b"404 page not found\n"[..],
             ),
             (
+                ErrorKind::NotADirectory,
+                StatusCode::NOT_FOUND,
+                &b"404 page not found\n"[..],
+            ),
+            (
                 ErrorKind::PermissionDenied,
                 StatusCode::FORBIDDEN,
                 &b"403 Forbidden\n"[..],
@@ -5353,6 +5358,43 @@ mod tests {
             );
             assert_eq!(body.as_deref(), Some(expected_body));
         }
+    }
+
+    #[tokio::test]
+    async fn xray_file_non_directory_path_component_maps_to_not_found() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "chimera-hysteria2-enotdir-{}-{suffix}",
+            std::process::id()
+        ));
+        tokio::fs::create_dir(&root)
+            .await
+            .expect("create ENOTDIR fixture root");
+        tokio::fs::write(root.join("file"), b"leaf")
+            .await
+            .expect("write ENOTDIR fixture file");
+        let root_str = root.to_string_lossy().into_owned();
+        let uri: http::Uri = "https://example.test/file/child"
+            .parse()
+            .expect("valid ENOTDIR fixture URI");
+
+        let (response, body) = xray_file_masquerade_response(
+            &http::Method::GET,
+            &uri,
+            &http::HeaderMap::new(),
+            &root_str,
+        )
+        .await
+        .expect("map Xray intermediate non-directory path");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body.as_deref(), Some(&b"404 page not found\n"[..]));
+
+        tokio::fs::remove_dir_all(root)
+            .await
+            .expect("remove ENOTDIR fixture root");
     }
 
     #[test]
