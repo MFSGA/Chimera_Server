@@ -155,6 +155,10 @@ struct SocksServerConfigPayload {
     auth_type: i32,
     #[prost(map = "string, string", tag = "2")]
     accounts: std::collections::HashMap<String, String>,
+    #[prost(message, optional, tag = "3")]
+    address: Option<IpOrDomainPayload>,
+    #[prost(bool, tag = "4")]
+    udp_enabled: bool,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -521,13 +525,25 @@ impl HandlerServiceImpl {
                 let accounts =
                     crate::config::server_config::SocksUserStore::with_auth_required(
                         accounts,
-                        socks.auth_type != 0,
+                        socks.auth_type == 1,
                     );
+                let udp_bind_ip = match socks.address {
+                    Some(address) => match self.parse_address(Some(address))? {
+                        Address::Ipv4(ip) => Some(ip.into()),
+                        Address::Ipv6(ip) => Some(ip.into()),
+                        Address::Hostname(_) => {
+                            return Err(Status::invalid_argument(
+                                "SOCKS server address must be an IP address",
+                            ));
+                        }
+                    },
+                    None => None,
+                };
 
                 Ok(ServerProxyConfig::Socks {
                     accounts,
-                    udp_enabled: false,
-                    udp_bind_ip: None,
+                    udp_enabled: socks.udp_enabled,
+                    udp_bind_ip,
                 })
             }
             #[cfg(feature = "vless")]
@@ -1098,7 +1114,11 @@ impl HandlerServiceImpl {
                     TrojanServerConfigPayload { users, fallbacks },
                 ))
             }
-            ServerProxyConfig::Socks { accounts, .. } => {
+            ServerProxyConfig::Socks {
+                accounts,
+                udp_enabled,
+                udp_bind_ip,
+            } => {
                 let auth_type = i32::from(accounts.auth_required());
                 let account_map = accounts
                     .snapshot()
@@ -1112,6 +1132,13 @@ impl HandlerServiceImpl {
                     SocksServerConfigPayload {
                         auth_type,
                         accounts: account_map,
+                        address: udp_bind_ip.as_ref().and_then(|ip| {
+                            Self::encode_address(&match ip {
+                                std::net::IpAddr::V4(ip) => Address::Ipv4(*ip),
+                                std::net::IpAddr::V6(ip) => Address::Ipv6(*ip),
+                            })
+                        }),
+                        udp_enabled: *udp_enabled,
                     },
                 ))
             }
@@ -2404,6 +2431,8 @@ mod tests {
                     value: SocksServerConfigPayload {
                         auth_type: 1,
                         accounts,
+                        address: None,
+                        udp_enabled: false,
                     }
                     .encode_to_vec(),
                 }),
@@ -2647,6 +2676,53 @@ mod tests {
 
         assert_eq!(users.len(), 1);
         assert_eq!(users[0].email, email);
+    }
+
+    #[test]
+    fn handler_preserves_xray_socks_grpc_fields() {
+        let service =
+            HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+        let parsed = service
+            .parse_add_inbound_protocol(&HandlerServiceImpl::typed_message(
+                TYPE_PROXY_SOCKS_SERVER_CONFIG,
+                SocksServerConfigPayload {
+                    auth_type: 2,
+                    accounts: std::collections::HashMap::from([(
+                        "alice".to_string(),
+                        "secret".to_string(),
+                    )]),
+                    address: Some(localhost_ip_payload()),
+                    udp_enabled: true,
+                },
+            ))
+            .expect("SOCKS server config should parse");
+        let ServerProxyConfig::Socks {
+            accounts,
+            udp_enabled,
+            udp_bind_ip,
+        } = &parsed
+        else {
+            panic!("expected SOCKS inbound config");
+        };
+        assert!(!accounts.auth_required());
+        assert_eq!(accounts.snapshot()[0].username, "alice");
+        assert!(*udp_enabled);
+        assert_eq!(
+            *udp_bind_ip,
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        );
+
+        let (_, encoded) = service.encode_inbound_protocol_layers(&parsed);
+        let encoded = encoded.expect("SOCKS settings should encode");
+        let socks = SocksServerConfigPayload::decode(encoded.value.as_slice())
+            .expect("decode SOCKS settings");
+        assert_eq!(socks.auth_type, 0);
+        assert_eq!(
+            socks.accounts.get("alice").map(String::as_str),
+            Some("secret")
+        );
+        assert_eq!(socks.address, Some(localhost_ip_payload()));
+        assert!(socks.udp_enabled);
     }
 
     #[tokio::test]
