@@ -75,8 +75,23 @@ impl TcpServerHandler for HttpTcpServerHandler {
             }
 
             let Some((name, value)) = line.split_once(':') else {
-                continue;
+                if line.starts_with([' ', '\t']) {
+                    continue;
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "malformed HTTP header line",
+                ));
             };
+            if value
+                .bytes()
+                .any(|byte| (byte < b' ' && byte != b'\t') || byte == 0x7f)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalid control character in HTTP header value",
+                ));
+            }
             let name = name.trim();
             let value = value.trim();
             if name.eq_ignore_ascii_case("proxy-authorization") {
@@ -915,6 +930,58 @@ mod tests {
                 .expect_err("Xray rejects non-canonical request-line spacing");
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_header_lines_match_xray_rejection() {
+        let handler = HttpTcpServerHandler::new(Vec::new(), false, "http-headers");
+        for request in [
+            b"GET http://example.com/x HTTP/1.1\r\nHost: example.com\r\nNoColon\r\n\r\n"
+                .as_slice(),
+            b"GET http://example.com/x HTTP/1.1\r\nHost: example.com\r\nX-Test: a\x01b\r\n\r\n"
+                .as_slice(),
+            b"GET http://example.com/x HTTP/1.1\r\nHost: example.com\r\nX-Test: a\x7fb\r\n\r\n"
+                .as_slice(),
+        ] {
+            let (mut client, server) = duplex(1024);
+            client.write_all(request).await.unwrap();
+            client.shutdown().await.unwrap();
+
+            let error = match handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+            {
+                Ok(_) => panic!("Xray rejects malformed HTTP header framing"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[tokio::test]
+    async fn header_value_tab_remains_accepted_like_xray() {
+        let handler = HttpTcpServerHandler::new(Vec::new(), false, "http-headers");
+        let request = b"GET http://example.com/x HTTP/1.1\r\n\
+Host: example.com\r\n\
+X-Test: a\tb\r\n\r\n";
+        let (mut client, server) = duplex(1024);
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("Xray accepts horizontal tabs in HTTP header values");
+        let TcpServerSetupResult::TcpForward { mut stream, .. } = result else {
+            panic!("HTTP forward returned non-TCP result");
+        };
+        let mut forwarded = Vec::new();
+        stream.read_to_end(&mut forwarded).await.unwrap();
+        assert!(
+            forwarded
+                .windows(b"X-Test: a\tb\r\n".len())
+                .any(|window| window == b"X-Test: a\tb\r\n")
+        );
     }
 
     #[tokio::test]
