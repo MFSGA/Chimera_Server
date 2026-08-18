@@ -465,7 +465,16 @@ fn parse_absolute_http_target(
             let path = if tail.starts_with('?') {
                 format!("/{tail}")
             } else {
-                tail.to_string()
+                let (path, query) = tail
+                    .split_once('?')
+                    .map(|(path, query)| (path, Some(query)))
+                    .unwrap_or((tail, None));
+                let mut path = path.replace('#', "%23");
+                if let Some(query) = query {
+                    path.push('?');
+                    path.push_str(query);
+                }
+                path
             };
             (&remainder[..index], path)
         }
@@ -966,6 +975,38 @@ X-Test: forwarded\r\n\r\n";
             "GET /secure?q=1 HTTP/1.1\r\n\
 Host: example.com\r\n\
 X-Test: forwarded\r\n\
+Connection: close\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn absolute_form_path_hashes_are_escaped_like_xray() {
+        let handler = HttpTcpServerHandler::new(Vec::new(), false, "http-fragment");
+        let request = b"GET http://example.com/path#frag?x=#query HTTP/1.1\r\n\
+Host: ignored.invalid\r\n\r\n";
+        let (mut client, server) = duplex(2048);
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("absolute-form path hash should be normalized like Xray");
+        let TcpServerSetupResult::TcpForward {
+            remote_location,
+            mut stream,
+            ..
+        } = result
+        else {
+            panic!("absolute-form path hash returned non-TCP result");
+        };
+        assert_eq!(remote_location.to_string(), "example.com:80");
+        let mut forwarded = Vec::new();
+        stream.read_to_end(&mut forwarded).await.unwrap();
+        assert_eq!(
+            String::from_utf8(forwarded).unwrap(),
+            "GET /path%23frag?x=#query HTTP/1.1\r\n\
+Host: example.com\r\n\
 Connection: close\r\n\r\n"
         );
     }
