@@ -503,6 +503,10 @@ fn parse_http_request_line(
 }
 
 fn validate_chunk_size_line(line: &[u8]) -> std::io::Result<()> {
+    parse_chunk_size_line(line).map(|_| ())
+}
+
+fn parse_chunk_size_line(line: &[u8]) -> std::io::Result<u64> {
     let mut size = line.split(|byte| *byte == b';').next().unwrap_or_default();
     while matches!(size.last(), Some(b' ' | b'\t')) {
         size = &size[..size.len() - 1];
@@ -514,7 +518,16 @@ fn validate_chunk_size_line(line: &[u8]) -> std::io::Result<()> {
             "invalid HTTP chunk size",
         ));
     }
-    Ok(())
+    u64::from_str_radix(
+        std::str::from_utf8(size).expect("validated chunk size is ASCII"),
+        16,
+    )
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid HTTP chunk size",
+        )
+    })
 }
 
 fn parse_absolute_http_target(
@@ -888,11 +901,92 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let chunk_size_line = read_http_line(upstream, MAX_REQUEST_LINE_BYTES).await?;
-    validate_chunk_size_line(chunk_size_line.as_bytes())?;
-    downstream.write_all(chunk_size_line.as_bytes()).await?;
+    const REENCODE_BUFFER_SIZE: usize = 32 * 1024;
+
+    let mut decoded = Vec::with_capacity(REENCODE_BUFFER_SIZE);
+    loop {
+        let chunk_size_line =
+            match read_http_line(upstream, MAX_REQUEST_LINE_BYTES).await {
+                Ok(line) => line,
+                Err(error) => {
+                    write_reencoded_chunk(downstream, &mut decoded).await?;
+                    return Err(error);
+                }
+            };
+        let chunk_size = match parse_chunk_size_line(chunk_size_line.as_bytes()) {
+            Ok(size) => size,
+            Err(error) => {
+                write_reencoded_chunk(downstream, &mut decoded).await?;
+                return Err(error);
+            }
+        };
+
+        if chunk_size == 0 {
+            write_reencoded_chunk(downstream, &mut decoded).await?;
+            downstream.write_all(b"0\r\n").await?;
+            loop {
+                let trailer = read_http_line(upstream, MAX_HEADER_BYTES).await?;
+                downstream.write_all(trailer.as_bytes()).await?;
+                downstream.write_all(b"\r\n").await?;
+                if trailer.is_empty() {
+                    return Ok(());
+                }
+            }
+        }
+
+        let mut remaining = chunk_size;
+        while remaining != 0 {
+            let available = REENCODE_BUFFER_SIZE - decoded.len();
+            let read_len = available.min(remaining.min(usize::MAX as u64) as usize);
+            let start = decoded.len();
+            decoded.resize(start + read_len, 0);
+            let read = upstream.read(&mut decoded[start..]).await?;
+            if read == 0 {
+                decoded.truncate(start);
+                write_reencoded_chunk(downstream, &mut decoded).await?;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "HTTP chunked response body ended early",
+                ));
+            }
+            decoded.truncate(start + read);
+            remaining -= read as u64;
+            if decoded.len() == REENCODE_BUFFER_SIZE {
+                write_reencoded_chunk(downstream, &mut decoded).await?;
+            }
+        }
+
+        let mut chunk_terminator = [0u8; 2];
+        if let Err(error) = upstream.read_exact(&mut chunk_terminator).await {
+            write_reencoded_chunk(downstream, &mut decoded).await?;
+            return Err(error);
+        }
+        if chunk_terminator != *b"\r\n" {
+            write_reencoded_chunk(downstream, &mut decoded).await?;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid HTTP chunk data terminator",
+            ));
+        }
+    }
+}
+
+async fn write_reencoded_chunk<W>(
+    downstream: &mut W,
+    decoded: &mut Vec<u8>,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if decoded.is_empty() {
+        return Ok(());
+    }
+    downstream
+        .write_all(format!("{:x}\r\n", decoded.len()).as_bytes())
+        .await?;
+    downstream.write_all(decoded).await?;
     downstream.write_all(b"\r\n").await?;
-    tokio::io::copy(upstream, downstream).await?;
+    decoded.clear();
     Ok(())
 }
 
@@ -2017,6 +2111,74 @@ Content-Length: 5\r\n\r\nbody";
              Connection: close\r\n\r\n\
              2\r\nok\r\n0\r\n\r\n"
         );
+    }
+
+    #[tokio::test]
+    async fn chunked_plain_http_response_reencodes_payload_like_xray() {
+        let upstream_response = b"HTTP/1.1 200 OK\r\n\
+                                  Transfer-Encoding: chunked\r\n\r\n\
+                                  4;foo=bar\r\ntest\r\n3\r\nxyz\r\n0\r\n\r\n";
+        let (mut upstream_client, mut upstream_server) = duplex(2048);
+        upstream_client.write_all(upstream_response).await.unwrap();
+        upstream_client.shutdown().await.unwrap();
+        let (mut downstream_client, mut downstream_server) = duplex(2048);
+
+        let reusable = relay_plain_http_response(
+            &mut upstream_server,
+            &mut downstream_server,
+            "GET",
+        )
+        .await
+        .unwrap();
+        assert!(!reusable);
+        downstream_server.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        downstream_client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(
+            response,
+            b"HTTP/1.1 200 OK\r\n\
+              Transfer-Encoding: chunked\r\n\
+              Connection: close\r\n\r\n\
+              7\r\ntestxyz\r\n0\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_invalid_response_chunks_flush_decoded_payload_like_xray() {
+        for body in [
+            b"4\r\ntest\r\nZ\r\noops\r\n".as_slice(),
+            b"5\r\ntest".as_slice(),
+            b"4\r\ntestX\r\n0\r\n\r\n".as_slice(),
+        ] {
+            let mut upstream_response =
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+            upstream_response.extend_from_slice(body);
+            let (mut upstream_client, mut upstream_server) = duplex(2048);
+            upstream_client.write_all(&upstream_response).await.unwrap();
+            upstream_client.shutdown().await.unwrap();
+            let (mut downstream_client, mut downstream_server) = duplex(2048);
+
+            relay_plain_http_response(
+                &mut upstream_server,
+                &mut downstream_server,
+                "GET",
+            )
+            .await
+            .expect_err("malformed later chunk framing must terminate relay");
+            downstream_server.shutdown().await.unwrap();
+
+            let mut response = Vec::new();
+            downstream_client.read_to_end(&mut response).await.unwrap();
+            assert_eq!(
+                response,
+                b"HTTP/1.1 200 OK\r\n\
+                  Transfer-Encoding: chunked\r\n\
+                  Connection: close\r\n\r\n\
+                  4\r\ntest\r\n",
+                "{body:?}"
+            );
+        }
     }
 
     #[tokio::test]
