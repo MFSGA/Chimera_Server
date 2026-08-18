@@ -8,7 +8,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::{
-    address::NetLocation,
+    address::{Address, NetLocation},
     async_stream::{AsyncPing, AsyncStream},
     config::server_config::HttpUser,
     handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
@@ -530,14 +530,7 @@ fn parse_absolute_http_authority(
                     format!("invalid HTTP absolute URI authority {authority}"),
                 )
             })?;
-            raw_port.parse::<u16>().map_err(|error| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "invalid HTTP absolute URI port in {authority}: {error}"
-                    ),
-                )
-            })?
+            parse_xray_http_port(raw_port, default_port, authority)?
         };
         return Ok(NetLocation::from_ip_addr(
             std::net::IpAddr::V6(address),
@@ -545,12 +538,43 @@ fn parse_absolute_http_authority(
         ));
     }
 
-    NetLocation::from_str(authority, Some(default_port)).map_err(|error| {
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, raw_port)) => {
+            let port = parse_xray_http_port(raw_port, default_port, authority)?;
+            (host, port)
+        }
+        None => (authority, default_port),
+    };
+    let address = Address::from(host).map_err(|error| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("invalid HTTP absolute URI authority {authority}: {error}"),
         )
-    })
+    })?;
+    Ok(NetLocation::new(address, port))
+}
+
+fn parse_xray_http_port(
+    raw_port: &str,
+    default_port: u16,
+    authority: &str,
+) -> std::io::Result<u16> {
+    if raw_port.is_empty() {
+        return Ok(default_port);
+    }
+    if !raw_port.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid HTTP absolute URI port in {authority}"),
+        ));
+    }
+    let port = raw_port.parse::<usize>().map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid HTTP absolute URI port in {authority}: {error}"),
+        )
+    })?;
+    Ok(port as u16)
 }
 
 fn validate_percent_escapes(value: &str) -> std::io::Result<()> {
@@ -803,7 +827,10 @@ mod tests {
         handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
     };
 
-    use super::{HttpTcpServerHandler, relay_plain_http_response};
+    use super::{
+        HttpTcpServerHandler, parse_absolute_http_authority,
+        relay_plain_http_response,
+    };
 
     struct TestStream(DuplexStream);
 
@@ -1196,6 +1223,26 @@ Host: ignored.invalid\r\n\r\n";
 Host: example.com\r\n\
 Connection: close\r\n\r\n"
         );
+    }
+
+    #[test]
+    fn absolute_form_ports_match_xray_uint16_conversion() {
+        let defaulted = parse_absolute_http_authority("example.com:", 80)
+            .expect("empty HTTP port should use the scheme default");
+        assert_eq!(defaulted.to_string(), "example.com:80");
+
+        let wrapped_zero = parse_absolute_http_authority("example.com:65536", 80)
+            .expect("Xray wraps numeric HTTP ports to uint16");
+        assert_eq!(wrapped_zero.to_string(), "example.com:0");
+
+        let wrapped = parse_absolute_http_authority("example.com:99999", 80)
+            .expect("Xray wraps large numeric HTTP ports to uint16");
+        assert_eq!(wrapped.to_string(), "example.com:34463");
+
+        let ipv6 = parse_absolute_http_authority("[2001:db8::1]:65536", 80)
+            .expect("bracketed IPv6 uses the same Xray port conversion");
+        assert_eq!(ipv6.address().to_string(), "2001:db8::1");
+        assert_eq!(ipv6.port(), 0);
     }
 
     #[tokio::test]
