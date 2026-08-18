@@ -242,7 +242,10 @@ impl TcpServerHandler for HttpTcpServerHandler {
             ));
         };
 
-        let mut initial_request = format!("{method} {origin_target} {version}\r\n");
+        let http_10_chunked = version == "HTTP/1.0" && chunked_transfer_encoding;
+        let forwarded_version = if http_10_chunked { "HTTP/1.1" } else { version };
+        let mut initial_request =
+            format!("{method} {origin_target} {forwarded_version}\r\n");
         if let Some(authority) = absolute_authority.as_deref() {
             initial_request.push_str("Host: ");
             initial_request.push_str(authority);
@@ -258,11 +261,15 @@ impl TcpServerHandler for HttpTcpServerHandler {
                     .iter()
                     .any(|name| name == &header_name)
                 || (chunked_transfer_encoding && header_name == "content-length")
+                || (http_10_chunked && header_name == "transfer-encoding")
             {
                 continue;
             }
             initial_request.push_str(&line);
             initial_request.push_str("\r\n");
+        }
+        if http_10_chunked {
+            initial_request.push_str("Content-Length: 0\r\n");
         }
         initial_request.push_str("Connection: close\r\n\r\n");
 
@@ -270,7 +277,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
             && !request_transfer_encoding
             && (method.eq_ignore_ascii_case("GET")
                 || method.eq_ignore_ascii_case("HEAD"));
-        if proxy_keep_alive && bodyless_plain_request {
+        if http_10_chunked || (proxy_keep_alive && bodyless_plain_request) {
             return Ok(TcpServerSetupResult::HttpPlainForward {
                 remote_location,
                 stream: server_stream,
@@ -1047,6 +1054,40 @@ Connection: close\r\n\r\n\
                 )
             );
         }
+    }
+
+    #[tokio::test]
+    async fn http_10_chunked_body_is_ignored_like_xray() {
+        let handler =
+            HttpTcpServerHandler::new(Vec::new(), false, "http-10-chunked");
+        let request = b"POST http://example.com/upload HTTP/1.0\r\n\
+Host: ignored.invalid\r\n\
+Transfer-Encoding: chunked\r\n\r\n\
+4\r\ntest\r\n0\r\n\r\n";
+        let (mut client, server) = duplex(2048);
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("HTTP/1.0 chunked request should succeed");
+        let TcpServerSetupResult::HttpPlainForward {
+            request_head,
+            keep_alive,
+            ..
+        } = result
+        else {
+            panic!("HTTP/1.0 chunked request returned non-plain-HTTP result");
+        };
+        assert!(!keep_alive);
+        assert_eq!(
+            request_head.as_ref(),
+            b"POST /upload HTTP/1.1\r\n\
+Host: example.com\r\n\
+Content-Length: 0\r\n\
+Connection: close\r\n\r\n"
+        );
     }
 
     #[tokio::test]
