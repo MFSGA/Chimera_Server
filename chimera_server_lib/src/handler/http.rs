@@ -62,6 +62,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
         let mut request_content_length = None;
         let mut request_transfer_encoding = false;
         let mut chunked_transfer_encoding = false;
+        let mut request_trailer_values = Vec::new();
         let mut header_lines: Vec<String> = Vec::new();
         loop {
             let line = read_http_line(&mut server_stream, MAX_HEADER_BYTES).await?;
@@ -122,6 +123,10 @@ impl TcpServerHandler for HttpTcpServerHandler {
                 || name.eq_ignore_ascii_case("trailers")
                 || name.eq_ignore_ascii_case("upgrade")
             {
+                continue;
+            }
+            if name.eq_ignore_ascii_case("trailer") {
+                request_trailer_values.push(value.to_string());
                 continue;
             }
             if name.eq_ignore_ascii_case("connection") {
@@ -256,6 +261,16 @@ impl TcpServerHandler for HttpTcpServerHandler {
             ));
         };
 
+        let request_trailer_names = if chunked_transfer_encoding {
+            let mut names = BTreeSet::new();
+            for value in request_trailer_values {
+                names.extend(parse_http_request_trailer_names(&value)?);
+            }
+            names
+        } else {
+            BTreeSet::new()
+        };
+
         let http_10_chunked = version == "HTTP/1.0" && chunked_transfer_encoding;
         let forwarded_version = if http_10_chunked { "HTTP/1.1" } else { version };
         let mut initial_request =
@@ -284,6 +299,16 @@ impl TcpServerHandler for HttpTcpServerHandler {
         }
         if http_10_chunked {
             initial_request.push_str("Content-Length: 0\r\n");
+        } else if chunked_transfer_encoding && !request_trailer_names.is_empty() {
+            initial_request.push_str("Trailer: ");
+            initial_request.push_str(
+                &request_trailer_names
+                    .iter()
+                    .map(|name| canonical_http_header_name(name))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            initial_request.push_str("\r\n");
         }
         initial_request.push_str("Connection: close\r\n\r\n");
 
@@ -304,9 +329,10 @@ impl TcpServerHandler for HttpTcpServerHandler {
         }
 
         let stream: Box<dyn AsyncStream> = if chunked_transfer_encoding {
-            Box::new(FirstChunkValidatedStream::new(
+            Box::new(ChunkedRequestStream::new(
                 initial_request.into_bytes(),
                 server_stream,
+                request_trailer_names.into_iter().collect(),
             ))
         } else {
             Box::new(PrefixedStream::new(
@@ -324,88 +350,326 @@ impl TcpServerHandler for HttpTcpServerHandler {
     }
 }
 
-struct FirstChunkValidatedStream {
-    prefix: Box<[u8]>,
-    prefix_offset: usize,
-    first_chunk_line: Vec<u8>,
-    first_chunk_validated: bool,
+enum ChunkedRequestState {
+    ChunkSize {
+        line: Vec<u8>,
+        first: bool,
+    },
+    ChunkData {
+        remaining: u64,
+    },
+    ChunkDataTerminator {
+        bytes: [u8; 2],
+        filled: usize,
+    },
+    Trailers {
+        line: Vec<u8>,
+        lines: Vec<String>,
+        header_bytes: usize,
+    },
+    Finished,
+}
+
+struct ChunkedRequestStream {
+    request_head: Option<Box<[u8]>>,
+    trailer_names: Vec<String>,
+    decoded: Vec<u8>,
+    output: Vec<u8>,
+    output_offset: usize,
+    pending_error: Option<std::io::Error>,
+    state: ChunkedRequestState,
     inner: Box<dyn AsyncStream>,
 }
 
-impl FirstChunkValidatedStream {
-    fn new(prefix: Vec<u8>, inner: Box<dyn AsyncStream>) -> Self {
+impl ChunkedRequestStream {
+    const REENCODE_BUFFER_SIZE: usize = 32 * 1024;
+
+    fn new(
+        request_head: Vec<u8>,
+        inner: Box<dyn AsyncStream>,
+        trailer_names: Vec<String>,
+    ) -> Self {
         Self {
-            prefix: prefix.into_boxed_slice(),
-            prefix_offset: 0,
-            first_chunk_line: Vec::new(),
-            first_chunk_validated: false,
+            request_head: Some(request_head.into_boxed_slice()),
+            trailer_names,
+            decoded: Vec::with_capacity(Self::REENCODE_BUFFER_SIZE),
+            output: Vec::new(),
+            output_offset: 0,
+            pending_error: None,
+            state: ChunkedRequestState::ChunkSize {
+                line: Vec::new(),
+                first: true,
+            },
             inner,
         }
     }
 
-    fn remaining_prefix(&self) -> &[u8] {
-        &self.prefix[self.prefix_offset..]
+    fn queue_bytes(&mut self, bytes: &[u8]) {
+        if self.output_offset == self.output.len() {
+            self.output.clear();
+            self.output_offset = 0;
+        }
+        self.output.extend_from_slice(bytes);
+    }
+
+    fn queue_decoded_chunk(&mut self) {
+        if self.decoded.is_empty() {
+            return;
+        }
+        self.queue_bytes(format!("{:x}\r\n", self.decoded.len()).as_bytes());
+        let decoded = std::mem::take(&mut self.decoded);
+        self.queue_bytes(&decoded);
+        self.queue_bytes(b"\r\n");
+        self.decoded = Vec::with_capacity(Self::REENCODE_BUFFER_SIZE);
+    }
+
+    fn queue_request_head(&mut self) {
+        if let Some(head) = self.request_head.take() {
+            self.queue_bytes(&head);
+        }
+    }
+
+    fn fail_after_decoded(&mut self, error: std::io::Error) {
+        self.queue_decoded_chunk();
+        self.pending_error = Some(error);
+        self.state = ChunkedRequestState::Finished;
+    }
+
+    fn drain_output(&mut self, buf: &mut ReadBuf<'_>) -> bool {
+        let remaining = &self.output[self.output_offset..];
+        if remaining.is_empty() || buf.remaining() == 0 {
+            return false;
+        }
+        let to_copy = remaining.len().min(buf.remaining());
+        buf.put_slice(&remaining[..to_copy]);
+        self.output_offset += to_copy;
+        true
+    }
+
+    fn finish_trailers(&mut self, lines: Vec<String>) -> std::io::Result<()> {
+        let trailers =
+            normalize_chunked_request_trailers(lines, &self.trailer_names)?;
+        self.queue_bytes(b"0\r\n");
+        for trailer in trailers {
+            self.queue_bytes(trailer.as_bytes());
+            self.queue_bytes(b"\r\n");
+        }
+        self.queue_bytes(b"\r\n");
+        self.state = ChunkedRequestState::Finished;
+        Ok(())
     }
 }
 
-impl AsyncRead for FirstChunkValidatedStream {
+impl AsyncRead for ChunkedRequestStream {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        if !this.first_chunk_validated {
-            loop {
-                let mut byte = [0u8; 1];
-                let mut read_buf = ReadBuf::new(&mut byte);
-                match Pin::new(&mut this.inner).poll_read(cx, &mut read_buf) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                    Poll::Ready(Ok(())) if read_buf.filled().is_empty() => {
-                        return Poll::Ready(Err(std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            "HTTP chunked body ended before first chunk size",
-                        )));
-                    }
-                    Poll::Ready(Ok(())) => {
-                        this.first_chunk_line.push(byte[0]);
-                        if this.first_chunk_line.len() > MAX_REQUEST_LINE_BYTES {
+        loop {
+            if this.drain_output(buf) {
+                return Poll::Ready(Ok(()));
+            }
+            if let Some(error) = this.pending_error.take() {
+                return Poll::Ready(Err(error));
+            }
+
+            match &mut this.state {
+                ChunkedRequestState::ChunkSize { line, first } => {
+                    let mut byte = [0u8; 1];
+                    let mut read_buf = ReadBuf::new(&mut byte);
+                    match Pin::new(&mut this.inner).poll_read(cx, &mut read_buf) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                        Poll::Ready(Ok(())) if read_buf.filled().is_empty() => {
                             return Poll::Ready(Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "HTTP chunk size line is too long",
+                                std::io::ErrorKind::UnexpectedEof,
+                                "HTTP chunked request ended before chunk size",
                             )));
                         }
-                        if this.first_chunk_line.ends_with(b"\r\n") {
-                            validate_chunk_size_line(
-                                &this.first_chunk_line
-                                    [..this.first_chunk_line.len() - 2],
-                            )?;
-                            let mut prefix = this.prefix.to_vec();
-                            prefix.extend_from_slice(&this.first_chunk_line);
-                            this.prefix = prefix.into_boxed_slice();
-                            this.first_chunk_validated = true;
-                            break;
+                        Poll::Ready(Ok(())) => {
+                            line.push(byte[0]);
+                            if line.len() > MAX_REQUEST_LINE_BYTES {
+                                let error = std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "HTTP chunk size line is too long",
+                                );
+                                if *first {
+                                    return Poll::Ready(Err(error));
+                                }
+                                this.fail_after_decoded(error);
+                                continue;
+                            }
+                            if !line.ends_with(b"\r\n") {
+                                continue;
+                            }
+                            let size =
+                                match parse_chunk_size_line(&line[..line.len() - 2])
+                                {
+                                    Ok(size) => size,
+                                    Err(error) if *first => {
+                                        return Poll::Ready(Err(error));
+                                    }
+                                    Err(error) => {
+                                        this.fail_after_decoded(error);
+                                        continue;
+                                    }
+                                };
+                            if *first {
+                                this.queue_request_head();
+                            }
+                            if size == 0 {
+                                this.queue_decoded_chunk();
+                                this.state = ChunkedRequestState::Trailers {
+                                    line: Vec::new(),
+                                    lines: Vec::new(),
+                                    header_bytes: 0,
+                                };
+                            } else {
+                                this.state = ChunkedRequestState::ChunkData {
+                                    remaining: size,
+                                };
+                            }
                         }
                     }
                 }
+                ChunkedRequestState::ChunkData { remaining } => {
+                    let available = Self::REENCODE_BUFFER_SIZE - this.decoded.len();
+                    let read_len = available.min((*remaining).min(8192) as usize);
+                    let mut bytes = [0u8; 8192];
+                    let mut read_buf = ReadBuf::new(&mut bytes[..read_len]);
+                    match Pin::new(&mut this.inner).poll_read(cx, &mut read_buf) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Err(error)) => {
+                            this.fail_after_decoded(error);
+                        }
+                        Poll::Ready(Ok(())) if read_buf.filled().is_empty() => {
+                            this.fail_after_decoded(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "HTTP chunked request body ended early",
+                            ));
+                        }
+                        Poll::Ready(Ok(())) => {
+                            this.decoded.extend_from_slice(read_buf.filled());
+                            *remaining -= read_buf.filled().len() as u64;
+                            let chunk_complete = *remaining == 0;
+                            let buffer_full =
+                                this.decoded.len() == Self::REENCODE_BUFFER_SIZE;
+                            if buffer_full {
+                                this.queue_decoded_chunk();
+                            }
+                            if chunk_complete {
+                                this.state =
+                                    ChunkedRequestState::ChunkDataTerminator {
+                                        bytes: [0u8; 2],
+                                        filled: 0,
+                                    };
+                            }
+                        }
+                    }
+                }
+                ChunkedRequestState::ChunkDataTerminator { bytes, filled } => {
+                    let mut read_buf = ReadBuf::new(&mut bytes[*filled..]);
+                    match Pin::new(&mut this.inner).poll_read(cx, &mut read_buf) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Err(error)) => this.fail_after_decoded(error),
+                        Poll::Ready(Ok(())) if read_buf.filled().is_empty() => {
+                            this.fail_after_decoded(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "HTTP chunked request data terminator ended early",
+                            ));
+                        }
+                        Poll::Ready(Ok(())) => {
+                            *filled += read_buf.filled().len();
+                            if *filled != 2 {
+                                continue;
+                            }
+                            if *bytes != *b"\r\n" {
+                                this.fail_after_decoded(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "invalid HTTP chunk data terminator",
+                                ));
+                            } else {
+                                this.state = ChunkedRequestState::ChunkSize {
+                                    line: Vec::new(),
+                                    first: false,
+                                };
+                            }
+                        }
+                    }
+                }
+                ChunkedRequestState::Trailers {
+                    line,
+                    lines,
+                    header_bytes,
+                } => {
+                    let mut byte = [0u8; 1];
+                    let mut read_buf = ReadBuf::new(&mut byte);
+                    match Pin::new(&mut this.inner).poll_read(cx, &mut read_buf) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                        Poll::Ready(Ok(())) if read_buf.filled().is_empty() => {
+                            return Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "HTTP chunked request trailers ended early",
+                            )));
+                        }
+                        Poll::Ready(Ok(())) => {
+                            line.push(byte[0]);
+                            if !line.ends_with(b"\r\n") {
+                                continue;
+                            }
+                            *header_bytes = header_bytes.saturating_add(line.len());
+                            if *header_bytes > MAX_HEADER_BYTES {
+                                return Poll::Ready(Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "HTTP chunked request trailers exceed 16384 bytes",
+                                )));
+                            }
+                            let raw = std::mem::take(line);
+                            let value = match String::from_utf8(
+                                raw[..raw.len() - 2].to_vec(),
+                            ) {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    return Poll::Ready(Err(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        format!(
+                                            "HTTP request trailer is not UTF-8: {error}"
+                                        ),
+                                    )));
+                                }
+                            };
+                            if value.is_empty() {
+                                let lines = std::mem::take(lines);
+                                if let Err(error) = this.finish_trailers(lines) {
+                                    return Poll::Ready(Err(error));
+                                }
+                                continue;
+                            }
+                            if value.starts_with([' ', '\t']) {
+                                let Some(previous) = lines.last_mut() else {
+                                    return Poll::Ready(Err(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        "HTTP request trailer continuation has no preceding field",
+                                    )));
+                                };
+                                previous.push(' ');
+                                previous.push_str(value.trim());
+                            } else {
+                                lines.push(value);
+                            }
+                        }
+                    }
+                }
+                ChunkedRequestState::Finished => return Poll::Ready(Ok(())),
             }
         }
-
-        let remaining = this.remaining_prefix();
-        if !remaining.is_empty() {
-            let to_copy = remaining.len().min(buf.remaining());
-            if to_copy > 0 {
-                buf.put_slice(&remaining[..to_copy]);
-                this.prefix_offset += to_copy;
-                return Poll::Ready(Ok(()));
-            }
-        }
-        Pin::new(&mut this.inner).poll_read(cx, buf)
     }
 }
 
-impl AsyncWrite for FirstChunkValidatedStream {
+impl AsyncWrite for ChunkedRequestStream {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -429,7 +693,7 @@ impl AsyncWrite for FirstChunkValidatedStream {
     }
 }
 
-impl AsyncPing for FirstChunkValidatedStream {
+impl AsyncPing for ChunkedRequestStream {
     fn supports_ping(&self) -> bool {
         self.inner.supports_ping()
     }
@@ -442,7 +706,7 @@ impl AsyncPing for FirstChunkValidatedStream {
     }
 }
 
-impl AsyncStream for FirstChunkValidatedStream {}
+impl AsyncStream for ChunkedRequestStream {}
 
 fn has_invalid_http_header_value(value: &str) -> bool {
     value
@@ -994,6 +1258,67 @@ where
             ));
         }
     }
+}
+
+fn parse_http_request_trailer_names(value: &str) -> std::io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for name in value.split(',').map(str::trim) {
+        if !is_http_header_name(name)
+            || matches!(
+                name.to_ascii_lowercase().as_str(),
+                "content-length" | "transfer-encoding" | "trailer"
+            )
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid HTTP request trailer declaration",
+            ));
+        }
+        names.push(name.to_ascii_lowercase());
+    }
+    Ok(names)
+}
+
+fn normalize_chunked_request_trailers(
+    trailers: Vec<String>,
+    trailer_names: &[String],
+) -> std::io::Result<Vec<String>> {
+    let mut forwarded: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for trailer in trailers {
+        let Some((name, value)) = trailer.split_once(':') else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "malformed HTTP request trailer line",
+            ));
+        };
+        if !is_http_header_name(name) {
+            continue;
+        }
+        if has_invalid_http_header_value(value) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid control character in HTTP request trailer value",
+            ));
+        }
+        if trailer_names
+            .iter()
+            .any(|declared| declared.eq_ignore_ascii_case(name))
+        {
+            forwarded
+                .entry(name.to_ascii_lowercase())
+                .or_default()
+                .push(value.trim().to_string());
+        }
+    }
+    Ok(forwarded
+        .into_iter()
+        .flat_map(|(name, values)| {
+            let name = canonical_http_header_name(&name);
+            values
+                .into_iter()
+                .map(move |value| format!("{name}: {value}"))
+        })
+        .collect())
 }
 
 fn parse_http_trailer_names(value: &str) -> std::io::Result<Vec<String>> {
@@ -1876,6 +2201,53 @@ Connection: close\r\n\r\n\
     }
 
     #[tokio::test]
+    async fn chunked_request_trailers_match_xray_normalization() {
+        let handler = HttpTcpServerHandler::new(Vec::new(), false, "http-trailers");
+        let request = b"POST http://example.com/upload HTTP/1.1\r\n\
+Host: example.com\r\n\
+Transfer-Encoding: chunked\r\n\
+Trailer: x-foo, X-Foo\r\n\
+Trailer: X-Bar\r\n\r\n\
+4\r\ntest\r\n0\r\n\
+X-Foo: one\r\nX-Unused: hidden\r\nX-Bar: two\r\nX-Foo: three\r\n\r\n";
+        let (mut client, server) = duplex(4096);
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("declared chunked trailers should succeed");
+        let TcpServerSetupResult::TcpForward { mut stream, .. } = result else {
+            panic!("chunked HTTP request returned non-TCP result");
+        };
+        let mut forwarded = Vec::new();
+        stream.read_to_end(&mut forwarded).await.unwrap();
+        let forwarded = String::from_utf8(forwarded).unwrap();
+        assert!(forwarded.contains("Trailer: X-Bar,X-Foo\r\n"));
+        assert!(forwarded.ends_with(
+            "4\r\ntest\r\n0\r\nX-Bar: two\r\nX-Foo: one\r\nX-Foo: three\r\n\r\n"
+        ));
+        assert!(!forwarded.contains("X-Unused"));
+
+        let (mut client, server) = duplex(2048);
+        client
+            .write_all(
+                b"POST http://example.com/upload HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\nTrailer: Content-Length\r\n\r\n0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let error = match handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+        {
+            Ok(_) => panic!("forbidden request trailer declaration must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
     async fn invalid_first_chunk_size_fails_before_forwarding_bytes() {
         for chunk_size in ["Z", "0x4", "+4", " 4", "00000000000000000"] {
             let handler =
@@ -1928,11 +2300,7 @@ Connection: close\r\n\r\n\
             };
             let mut forwarded = Vec::new();
             stream.read_to_end(&mut forwarded).await.unwrap();
-            assert!(
-                forwarded.ends_with(
-                    format!("{chunk_size}\r\ntest\r\n0\r\n\r\n").as_bytes()
-                )
-            );
+            assert!(forwarded.ends_with(b"4\r\ntest\r\n0\r\n\r\n"));
         }
     }
 
