@@ -491,6 +491,12 @@ fn parse_absolute_http_target(
             "HTTP absolute URI is missing an authority",
         ));
     }
+    if !host_authority.starts_with('[') && host_authority.contains('%') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid URL escape in HTTP absolute URI host",
+        ));
+    }
     let remote_location =
         parse_absolute_http_authority(host_authority, default_port)?;
     Ok((remote_location, path, host_authority.to_string()))
@@ -1105,6 +1111,65 @@ Connection: close\r\n\r\n"
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
             assert!(error.to_string().contains("invalid URL escape"));
         }
+    }
+
+    #[tokio::test]
+    async fn absolute_form_rejects_percent_escaped_host_like_xray() {
+        let handler =
+            HttpTcpServerHandler::new(Vec::new(), false, "http-host-escape");
+        for target in [
+            "http://exa%6dple.invalid/a",
+            "http://127.0.0.1%40evil.invalid/a",
+        ] {
+            let request =
+                format!("GET {target} HTTP/1.1\r\nHost: ignored.invalid\r\n\r\n");
+            let (mut client, server) = duplex(2048);
+            client.write_all(request.as_bytes()).await.unwrap();
+            client.shutdown().await.unwrap();
+
+            let error = match handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+            {
+                Ok(_) => panic!("percent-escaped host should be rejected: {target}"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("invalid URL escape"));
+        }
+    }
+
+    #[tokio::test]
+    async fn absolute_form_accepts_percent_escaped_userinfo_like_xray() {
+        let handler =
+            HttpTcpServerHandler::new(Vec::new(), false, "http-userinfo-escape");
+        let request = b"GET http://user%40name:pass@example.com/a HTTP/1.1\r\n\
+Host: ignored.invalid\r\n\r\n";
+        let (mut client, server) = duplex(2048);
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("percent-escaped userinfo should remain accepted");
+        let TcpServerSetupResult::TcpForward {
+            remote_location,
+            mut stream,
+            ..
+        } = result
+        else {
+            panic!("percent-escaped userinfo returned non-TCP result");
+        };
+        assert_eq!(remote_location.to_string(), "example.com:80");
+        let mut forwarded = Vec::new();
+        stream.read_to_end(&mut forwarded).await.unwrap();
+        assert_eq!(
+            String::from_utf8(forwarded).unwrap(),
+            "GET /a HTTP/1.1\r\n\
+Host: example.com\r\n\
+Connection: close\r\n\r\n"
+        );
     }
 
     #[tokio::test]
