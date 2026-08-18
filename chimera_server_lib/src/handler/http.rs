@@ -923,15 +923,9 @@ where
 
         if chunk_size == 0 {
             write_reencoded_chunk(downstream, &mut decoded).await?;
-            downstream.write_all(b"0\r\n").await?;
-            loop {
-                let trailer = read_http_line(upstream, MAX_HEADER_BYTES).await?;
-                downstream.write_all(trailer.as_bytes()).await?;
-                downstream.write_all(b"\r\n").await?;
-                if trailer.is_empty() {
-                    return Ok(());
-                }
-            }
+            validate_chunked_response_trailers(upstream).await?;
+            downstream.write_all(b"0\r\n\r\n").await?;
+            return Ok(());
         }
 
         let mut remaining = chunk_size;
@@ -969,6 +963,60 @@ where
             ));
         }
     }
+}
+
+async fn validate_chunked_response_trailers<R>(
+    upstream: &mut R,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut header_bytes = 0usize;
+    let mut trailers: Vec<String> = Vec::new();
+    loop {
+        let line = read_http_line(upstream, MAX_HEADER_BYTES).await?;
+        header_bytes = header_bytes.saturating_add(line.len() + 2);
+        if header_bytes > MAX_HEADER_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP chunked response trailers exceed 16384 bytes",
+            ));
+        }
+        if line.is_empty() {
+            break;
+        }
+        if line.starts_with([' ', '\t']) {
+            let previous = trailers.last_mut().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HTTP response trailer continuation has no preceding field",
+                )
+            })?;
+            previous.push(' ');
+            previous.push_str(line.trim());
+        } else {
+            trailers.push(line);
+        }
+    }
+
+    for trailer in trailers {
+        let Some((name, value)) = trailer.split_once(':') else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "malformed HTTP response trailer line",
+            ));
+        };
+        if !is_http_header_name(name) {
+            continue;
+        }
+        if has_invalid_http_header_value(value) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid control character in HTTP response trailer value",
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn write_reencoded_chunk<W>(
@@ -2177,6 +2225,85 @@ Content-Length: 5\r\n\r\nbody";
                   Connection: close\r\n\r\n\
                   4\r\ntest\r\n",
                 "{body:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn chunked_response_trailers_are_stripped_like_xray() {
+        for trailer in [
+            b"X-Trailer: yes\r\n".as_slice(),
+            b"Bad Header: yes\r\n".as_slice(),
+            b"X-Trailer: one\r\n two\r\n".as_slice(),
+        ] {
+            let mut upstream_response =
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n"
+                    .to_vec();
+            upstream_response.extend_from_slice(trailer);
+            upstream_response.extend_from_slice(b"\r\n");
+            let (mut upstream_client, mut upstream_server) = duplex(2048);
+            upstream_client.write_all(&upstream_response).await.unwrap();
+            upstream_client.shutdown().await.unwrap();
+            let (mut downstream_client, mut downstream_server) = duplex(2048);
+
+            let reusable = relay_plain_http_response(
+                &mut upstream_server,
+                &mut downstream_server,
+                "GET",
+            )
+            .await
+            .unwrap();
+            assert!(!reusable);
+            downstream_server.shutdown().await.unwrap();
+
+            let mut response = Vec::new();
+            downstream_client.read_to_end(&mut response).await.unwrap();
+            assert_eq!(
+                response,
+                b"HTTP/1.1 200 OK\r\n\
+                  Transfer-Encoding: chunked\r\n\
+                  Connection: close\r\n\r\n\
+                  2\r\nok\r\n0\r\n\r\n",
+                "{trailer:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_chunked_response_trailer_stops_before_terminal_chunk_like_xray()
+     {
+        for trailer in [
+            b"NoColon\r\n".as_slice(),
+            b"X-Trailer: a\x01b\r\n".as_slice(),
+        ] {
+            let mut upstream_response =
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n"
+                    .to_vec();
+            upstream_response.extend_from_slice(trailer);
+            upstream_response.extend_from_slice(b"\r\n");
+            let (mut upstream_client, mut upstream_server) = duplex(2048);
+            upstream_client.write_all(&upstream_response).await.unwrap();
+            upstream_client.shutdown().await.unwrap();
+            let (mut downstream_client, mut downstream_server) = duplex(2048);
+
+            relay_plain_http_response(
+                &mut upstream_server,
+                &mut downstream_server,
+                "GET",
+            )
+            .await
+            .expect_err("malformed response trailer must terminate relay");
+            downstream_server.shutdown().await.unwrap();
+
+            let mut response = Vec::new();
+            downstream_client.read_to_end(&mut response).await.unwrap();
+            assert_eq!(
+                response,
+                b"HTTP/1.1 200 OK\r\n\
+                  Transfer-Encoding: chunked\r\n\
+                  Connection: close\r\n\r\n\
+                  2\r\nok\r\n",
+                "{trailer:?}"
             );
         }
     }
