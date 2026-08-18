@@ -49,20 +49,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
     ) -> std::io::Result<TcpServerSetupResult> {
         let request_line =
             read_http_line(&mut server_stream, MAX_REQUEST_LINE_BYTES).await?;
-        let mut parts = request_line.split_whitespace();
-        let method = parts.next().unwrap_or_default();
-        let target = parts.next().unwrap_or_default();
-        let version = parts.next().unwrap_or_default();
-        if parts.next().is_some()
-            || method.is_empty()
-            || target.is_empty()
-            || !matches!(version, "HTTP/1.0" | "HTTP/1.1")
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("invalid HTTP proxy request line: {request_line}"),
-            ));
-        }
+        let (method, target, version) = parse_http_request_line(&request_line)?;
 
         let mut header_bytes = 0usize;
         let mut authenticated_user = None;
@@ -429,6 +416,35 @@ impl AsyncPing for FirstChunkValidatedStream {
 }
 
 impl AsyncStream for FirstChunkValidatedStream {}
+
+fn parse_http_request_line(
+    request_line: &str,
+) -> std::io::Result<(&str, &str, &str)> {
+    let Some((method, remainder)) = request_line.split_once(' ') else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid HTTP proxy request line: {request_line}"),
+        ));
+    };
+    let Some((target, version)) = remainder.split_once(' ') else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid HTTP proxy request line: {request_line}"),
+        ));
+    };
+    if method.is_empty()
+        || target.is_empty()
+        || method.bytes().any(|byte| byte.is_ascii_whitespace())
+        || target.bytes().any(|byte| byte.is_ascii_whitespace())
+        || !matches!(version, "HTTP/1.0" | "HTTP/1.1")
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid HTTP proxy request line: {request_line}"),
+        ));
+    }
+    Ok((method, target, version))
+}
 
 fn validate_chunk_size_line(line: &[u8]) -> std::io::Result<()> {
     let mut size = line.split(|byte| *byte == b';').next().unwrap_or_default();
@@ -829,7 +845,7 @@ mod tests {
 
     use super::{
         HttpTcpServerHandler, parse_absolute_http_authority,
-        relay_plain_http_response,
+        parse_http_request_line, relay_plain_http_response,
     };
 
     struct TestStream(DuplexStream);
@@ -882,6 +898,24 @@ mod tests {
     }
 
     impl AsyncStream for TestStream {}
+
+    #[test]
+    fn request_line_spacing_matches_xray() {
+        assert_eq!(
+            parse_http_request_line("GET http://example.com/x HTTP/1.1").unwrap(),
+            ("GET", "http://example.com/x", "HTTP/1.1")
+        );
+        for request_line in [
+            "GET  http://example.com/x HTTP/1.1",
+            "GET\thttp://example.com/x\tHTTP/1.1",
+            " GET http://example.com/x HTTP/1.1",
+            "GET http://example.com/x HTTP/1.1 ",
+        ] {
+            let error = parse_http_request_line(request_line)
+                .expect_err("Xray rejects non-canonical request-line spacing");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
 
     #[tokio::test]
     async fn connect_preserves_early_tunnel_bytes() {
