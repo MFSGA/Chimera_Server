@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     pin::Pin,
     task::{Context, Poll},
 };
@@ -861,6 +862,7 @@ where
             ) || (name == "transfer-encoding"
                 && body_length.is_some());
             if name == "connection"
+                || name == "trailer"
                 || (body_length.is_some() && name == "keep-alive")
                 || (transfer_encoding && name == "content-length")
                 || strip_static
@@ -869,6 +871,18 @@ where
                 continue;
             }
             response_head.push_str(&line);
+            response_head.push_str("\r\n");
+        }
+        if transfer_encoding && !trailer_names.is_empty() {
+            let names = trailer_names
+                .iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(|name| canonical_http_header_name(name))
+                .collect::<Vec<_>>()
+                .join(",");
+            response_head.push_str("Trailer: ");
+            response_head.push_str(&names);
             response_head.push_str("\r\n");
         }
         if body_length.is_some() {
@@ -1036,7 +1050,7 @@ where
         }
     }
 
-    let mut forwarded = Vec::new();
+    let mut forwarded: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for trailer in trailers {
         let Some((name, value)) = trailer.split_once(':') else {
             return Err(std::io::Error::new(
@@ -1057,10 +1071,36 @@ where
             .iter()
             .any(|declared| declared.eq_ignore_ascii_case(name))
         {
-            forwarded.push(trailer);
+            forwarded
+                .entry(name.to_ascii_lowercase())
+                .or_default()
+                .push(value.trim().to_string());
         }
     }
-    Ok(forwarded)
+    Ok(forwarded
+        .into_iter()
+        .flat_map(|(name, values)| {
+            let name = canonical_http_header_name(&name);
+            values
+                .into_iter()
+                .map(move |value| format!("{name}: {value}"))
+        })
+        .collect())
+}
+
+fn canonical_http_header_name(name: &str) -> String {
+    let mut upper_next = true;
+    name.bytes()
+        .map(|byte| {
+            let byte = if upper_next {
+                byte.to_ascii_uppercase()
+            } else {
+                byte.to_ascii_lowercase()
+            };
+            upper_next = byte == b'-';
+            byte as char
+        })
+        .collect()
 }
 
 async fn write_reencoded_chunk<W>(
@@ -2343,6 +2383,46 @@ Content-Length: 5\r\n\r\nbody";
               Trailer: X-Foo\r\n\
               Connection: close\r\n\r\n\
               2\r\nok\r\n0\r\nX-Foo: bar\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_trailers_are_canonicalized_and_sorted_like_xray() {
+        let upstream_response = b"HTTP/1.1 200 OK\r\n\
+                                  Transfer-Encoding: chunked\r\n\
+                                  Trailer: x-foo, X-Foo\r\n\
+                                  Trailer: X-Bar\r\n\r\n\
+                                  2\r\nok\r\n0\r\n\
+                                  X-Foo: one\r\n\
+                                  X-Bar: two\r\n\
+                                  x-foo: three\r\n\r\n";
+        let (mut upstream_client, mut upstream_server) = duplex(2048);
+        upstream_client.write_all(upstream_response).await.unwrap();
+        upstream_client.shutdown().await.unwrap();
+        let (mut downstream_client, mut downstream_server) = duplex(2048);
+
+        let reusable = relay_plain_http_response(
+            &mut upstream_server,
+            &mut downstream_server,
+            "GET",
+        )
+        .await
+        .unwrap();
+        assert!(!reusable);
+        downstream_server.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        downstream_client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(
+            response,
+            b"HTTP/1.1 200 OK\r\n\
+              Transfer-Encoding: chunked\r\n\
+              Trailer: X-Bar,X-Foo\r\n\
+              Connection: close\r\n\r\n\
+              2\r\nok\r\n0\r\n\
+              X-Bar: two\r\n\
+              X-Foo: one\r\n\
+              X-Foo: three\r\n\r\n"
         );
     }
 
