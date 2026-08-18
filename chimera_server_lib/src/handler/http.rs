@@ -61,6 +61,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
         let mut request_content_length = None;
         let mut request_transfer_encoding = false;
         let mut chunked_transfer_encoding = false;
+        let mut header_lines: Vec<String> = Vec::new();
         loop {
             let line = read_http_line(&mut server_stream, MAX_HEADER_BYTES).await?;
             header_bytes = header_bytes.saturating_add(line.len() + 2);
@@ -73,16 +74,30 @@ impl TcpServerHandler for HttpTcpServerHandler {
             if line.is_empty() {
                 break;
             }
+            if line.starts_with([' ', '\t']) {
+                let previous = header_lines.last_mut().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "HTTP header continuation has no preceding field",
+                    )
+                })?;
+                previous.push(' ');
+                previous.push_str(line.trim());
+            } else {
+                header_lines.push(line);
+            }
+        }
 
+        for line in header_lines {
             let Some((name, value)) = line.split_once(':') else {
-                if line.starts_with([' ', '\t']) {
-                    continue;
-                }
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "malformed HTTP header line",
                 ));
             };
+            if !is_http_header_name(name) {
+                continue;
+            }
             if value
                 .bytes()
                 .any(|byte| (byte < b' ' && byte != b'\t') || byte == 0x7f)
@@ -92,7 +107,6 @@ impl TcpServerHandler for HttpTcpServerHandler {
                     "invalid control character in HTTP header value",
                 ));
             }
-            let name = name.trim();
             let value = value.trim();
             if name.eq_ignore_ascii_case("proxy-authorization") {
                 authenticated_user = self.authenticate_basic(value);
@@ -431,6 +445,30 @@ impl AsyncPing for FirstChunkValidatedStream {
 }
 
 impl AsyncStream for FirstChunkValidatedStream {}
+
+fn is_http_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
 
 fn parse_http_request_line(
     request_line: &str,
@@ -955,6 +993,72 @@ mod tests {
                 Err(error) => error,
             };
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[tokio::test]
+    async fn folded_headers_are_unfolded_like_xray() {
+        let handler = HttpTcpServerHandler::new(Vec::new(), false, "http-headers");
+        for continuation in [" two", "\ttwo"] {
+            let request = format!(
+                "GET http://example.com/x HTTP/1.1\r\n\
+                 Host: example.com\r\n\
+                 X-Test: one\r\n{continuation}\r\n\r\n"
+            );
+            let (mut client, server) = duplex(1024);
+            client.write_all(request.as_bytes()).await.unwrap();
+            client.shutdown().await.unwrap();
+
+            let result = handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+                .expect("Xray unfolds obsolete header continuations");
+            let TcpServerSetupResult::TcpForward { mut stream, .. } = result else {
+                panic!("HTTP forward returned non-TCP result");
+            };
+            let mut forwarded = Vec::new();
+            stream.read_to_end(&mut forwarded).await.unwrap();
+            assert!(
+                forwarded
+                    .windows(b"X-Test: one two\r\n".len())
+                    .any(|window| window == b"X-Test: one two\r\n")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_header_names_are_dropped_like_xray() {
+        let handler = HttpTcpServerHandler::new(Vec::new(), false, "http-headers");
+        for invalid_header in ["X-Test : hidden", "Bad Header: hidden"] {
+            let request = format!(
+                "GET http://example.com/x HTTP/1.1\r\n\
+                 Host: example.com\r\n\
+                 {invalid_header}\r\n\
+                 X-Keep: visible\r\n\r\n"
+            );
+            let (mut client, server) = duplex(1024);
+            client.write_all(request.as_bytes()).await.unwrap();
+            client.shutdown().await.unwrap();
+
+            let result = handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+                .expect("Xray drops invalid HTTP field names without rejecting the request");
+            let TcpServerSetupResult::TcpForward { mut stream, .. } = result else {
+                panic!("HTTP forward returned non-TCP result");
+            };
+            let mut forwarded = Vec::new();
+            stream.read_to_end(&mut forwarded).await.unwrap();
+            assert!(
+                !forwarded
+                    .windows(b"hidden".len())
+                    .any(|window| window == b"hidden")
+            );
+            assert!(
+                forwarded
+                    .windows(b"X-Keep: visible\r\n".len())
+                    .any(|window| window == b"X-Keep: visible\r\n")
+            );
         }
     }
 
