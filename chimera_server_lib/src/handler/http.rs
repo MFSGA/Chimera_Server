@@ -471,20 +471,26 @@ fn parse_absolute_http_target(
         }
         None => (remainder, "/".to_string()),
     };
-    if authority.is_empty() {
+    let host_authority = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    if host_authority.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "HTTP absolute URI is missing an authority",
         ));
     }
-    let remote_location = NetLocation::from_str(authority, Some(default_port))
+    let remote_location = NetLocation::from_str(host_authority, Some(default_port))
         .map_err(|error| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("invalid HTTP absolute URI authority {authority}: {error}"),
+                format!(
+                    "invalid HTTP absolute URI authority {host_authority}: {error}"
+                ),
             )
         })?;
-    Ok((remote_location, path, authority.to_string()))
+    Ok((remote_location, path, host_authority.to_string()))
 }
 
 impl HttpTcpServerHandler {
@@ -960,6 +966,39 @@ X-Test: forwarded\r\n\r\n";
             "GET /secure?q=1 HTTP/1.1\r\n\
 Host: example.com\r\n\
 X-Test: forwarded\r\n\
+Connection: close\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn absolute_form_userinfo_is_not_forwarded_like_xray() {
+        let handler = HttpTcpServerHandler::new(Vec::new(), false, "http-userinfo");
+        let request =
+            b"GET http://user:pass@example.com:8080/secret?q=1 HTTP/1.1\r\n\
+Host: ignored.invalid\r\n\r\n";
+        let (mut client, server) = duplex(2048);
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("absolute-form userinfo should be accepted like Xray");
+        let TcpServerSetupResult::TcpForward {
+            remote_location,
+            mut stream,
+            ..
+        } = result
+        else {
+            panic!("absolute-form userinfo returned non-TCP result");
+        };
+        assert_eq!(remote_location.to_string(), "example.com:8080");
+        let mut forwarded = Vec::new();
+        stream.read_to_end(&mut forwarded).await.unwrap();
+        assert_eq!(
+            String::from_utf8(forwarded).unwrap(),
+            "GET /secret?q=1 HTTP/1.1\r\n\
+Host: example.com:8080\r\n\
 Connection: close\r\n\r\n"
         );
     }
