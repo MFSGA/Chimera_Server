@@ -726,6 +726,7 @@ where
             read_http_line(upstream, MAX_RESPONSE_HEADER_BYTES).await?;
         let status_code = parse_http_status_code(&status_line)?;
         let mut header_bytes = 0usize;
+        let mut header_lines: Vec<String> = Vec::new();
         let mut headers = Vec::new();
         let mut connection_hop_headers = Vec::new();
         let mut content_length = None;
@@ -744,7 +745,21 @@ where
             if line.is_empty() {
                 break;
             }
+            if line.starts_with([' ', '\t']) {
+                let previous = header_lines.last_mut().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "HTTP response header continuation has no preceding field",
+                    )
+                })?;
+                previous.push(' ');
+                previous.push_str(line.trim());
+            } else {
+                header_lines.push(line);
+            }
+        }
 
+        for line in header_lines {
             let Some((name, value)) = line.split_once(':') else {
                 headers.push((String::new(), line));
                 continue;
@@ -1843,6 +1858,37 @@ Content-Length: 5\r\n\r\nbody";
              Connection: keep-alive\r\n\
              Keep-Alive: timeout=60\r\n\
              Proxy-Connection: keep-alive\r\n\r\nhello"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_http_response_unfolds_headers_like_xray() {
+        let upstream_response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Test: one\r\n two\r\nConnection: close\r\n\r\nok";
+        let (mut upstream_client, mut upstream_server) = duplex(2048);
+        upstream_client.write_all(upstream_response).await.unwrap();
+        upstream_client.shutdown().await.unwrap();
+        let (mut downstream_client, mut downstream_server) = duplex(2048);
+
+        let reusable = relay_plain_http_response(
+            &mut upstream_server,
+            &mut downstream_server,
+            "GET",
+        )
+        .await
+        .unwrap();
+        assert!(reusable);
+        downstream_server.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        downstream_client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(
+            String::from_utf8(response).unwrap(),
+            "HTTP/1.1 200 OK\r\n\
+             Content-Length: 2\r\n\
+             X-Test: one two\r\n\
+             Connection: keep-alive\r\n\
+             Keep-Alive: timeout=60\r\n\
+             Proxy-Connection: keep-alive\r\n\r\nok"
         );
     }
 
