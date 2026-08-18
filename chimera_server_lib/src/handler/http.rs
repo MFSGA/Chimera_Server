@@ -491,16 +491,60 @@ fn parse_absolute_http_target(
             "HTTP absolute URI is missing an authority",
         ));
     }
-    let remote_location = NetLocation::from_str(host_authority, Some(default_port))
-        .map_err(|error| {
+    let remote_location =
+        parse_absolute_http_authority(host_authority, default_port)?;
+    Ok((remote_location, path, host_authority.to_string()))
+}
+
+fn parse_absolute_http_authority(
+    authority: &str,
+    default_port: u16,
+) -> std::io::Result<NetLocation> {
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        let (literal, suffix) = bracketed.split_once(']').ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid HTTP absolute URI authority {authority}"),
+            )
+        })?;
+        let address = literal.parse::<std::net::Ipv6Addr>().map_err(|error| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "invalid HTTP absolute URI authority {host_authority}: {error}"
+                    "invalid HTTP absolute URI IPv6 authority {authority}: {error}"
                 ),
             )
         })?;
-    Ok((remote_location, path, host_authority.to_string()))
+        let port = if suffix.is_empty() {
+            default_port
+        } else {
+            let raw_port = suffix.strip_prefix(':').ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid HTTP absolute URI authority {authority}"),
+                )
+            })?;
+            raw_port.parse::<u16>().map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "invalid HTTP absolute URI port in {authority}: {error}"
+                    ),
+                )
+            })?
+        };
+        return Ok(NetLocation::from_ip_addr(
+            std::net::IpAddr::V6(address),
+            port,
+        ));
+    }
+
+    NetLocation::from_str(authority, Some(default_port)).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid HTTP absolute URI authority {authority}: {error}"),
+        )
+    })
 }
 
 fn validate_percent_escapes(value: &str) -> std::io::Result<()> {
@@ -1085,6 +1129,72 @@ Host: ignored.invalid\r\n\r\n";
             String::from_utf8(forwarded).unwrap(),
             "GET /a%2Fb?q=%25 HTTP/1.1\r\n\
 Host: example.com\r\n\
+Connection: close\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn absolute_form_ipv6_authority_is_forwarded_like_xray() {
+        let handler = HttpTcpServerHandler::new(Vec::new(), false, "http-ipv6");
+        let request = b"GET http://[2001:db8::1]:8080/ipv6?q=1 HTTP/1.1\r\n\
+Host: ignored.invalid\r\n\r\n";
+        let (mut client, server) = duplex(2048);
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("bracketed IPv6 absolute-form request should succeed");
+        let TcpServerSetupResult::TcpForward {
+            remote_location,
+            mut stream,
+            ..
+        } = result
+        else {
+            panic!("IPv6 absolute-form request returned non-TCP result");
+        };
+        assert_eq!(remote_location.address().to_string(), "2001:db8::1");
+        assert_eq!(remote_location.port(), 8080);
+        let mut forwarded = Vec::new();
+        stream.read_to_end(&mut forwarded).await.unwrap();
+        assert_eq!(
+            String::from_utf8(forwarded).unwrap(),
+            "GET /ipv6?q=1 HTTP/1.1\r\n\
+Host: [2001:db8::1]:8080\r\n\
+Connection: close\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn absolute_form_ipv6_userinfo_uses_default_port_like_xray() {
+        let handler = HttpTcpServerHandler::new(Vec::new(), false, "http-ipv6-user");
+        let request = b"GET http://user:pass@[2001:db8::2]/secret HTTP/1.1\r\n\
+Host: ignored.invalid\r\n\r\n";
+        let (mut client, server) = duplex(2048);
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("IPv6 userinfo absolute-form request should succeed");
+        let TcpServerSetupResult::TcpForward {
+            remote_location,
+            mut stream,
+            ..
+        } = result
+        else {
+            panic!("IPv6 userinfo absolute-form request returned non-TCP result");
+        };
+        assert_eq!(remote_location.address().to_string(), "2001:db8::2");
+        assert_eq!(remote_location.port(), 80);
+        let mut forwarded = Vec::new();
+        stream.read_to_end(&mut forwarded).await.unwrap();
+        assert_eq!(
+            String::from_utf8(forwarded).unwrap(),
+            "GET /secret HTTP/1.1\r\n\
+Host: [2001:db8::2]\r\n\
 Connection: close\r\n\r\n"
         );
     }
