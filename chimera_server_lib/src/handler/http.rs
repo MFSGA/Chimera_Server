@@ -870,12 +870,30 @@ where
                     "HTTP proxy upstream response body ended early",
                 ));
             }
+        } else if transfer_encoding {
+            relay_chunked_http_response_body(upstream, downstream).await?;
         } else {
             tokio::io::copy(upstream, downstream).await?;
         }
         downstream.flush().await?;
         return Ok(body_length.is_some());
     }
+}
+
+async fn relay_chunked_http_response_body<R, W>(
+    upstream: &mut R,
+    downstream: &mut W,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let chunk_size_line = read_http_line(upstream, MAX_REQUEST_LINE_BYTES).await?;
+    validate_chunk_size_line(chunk_size_line.as_bytes())?;
+    downstream.write_all(chunk_size_line.as_bytes()).await?;
+    downstream.write_all(b"\r\n").await?;
+    tokio::io::copy(upstream, downstream).await?;
+    Ok(())
 }
 
 fn parse_http_status_code(status_line: &str) -> std::io::Result<u16> {
@@ -1998,6 +2016,36 @@ Content-Length: 5\r\n\r\nbody";
              X-Test: yes\r\n\
              Connection: close\r\n\r\n\
              2\r\nok\r\n0\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_first_response_chunk_size_stops_after_headers_like_xray() {
+        let upstream_response = b"HTTP/1.1 200 OK\r\n\
+                                  Transfer-Encoding: chunked\r\n\r\n\
+                                  Z\r\nok\r\n0\r\n\r\n";
+        let (mut upstream_client, mut upstream_server) = duplex(2048);
+        upstream_client.write_all(upstream_response).await.unwrap();
+        upstream_client.shutdown().await.unwrap();
+        let (mut downstream_client, mut downstream_server) = duplex(2048);
+
+        let error = relay_plain_http_response(
+            &mut upstream_server,
+            &mut downstream_server,
+            "GET",
+        )
+        .await
+        .expect_err("invalid first response chunk size must terminate relay");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        downstream_server.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        downstream_client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(
+            response,
+            b"HTTP/1.1 200 OK\r\n\
+              Transfer-Encoding: chunked\r\n\
+              Connection: close\r\n\r\n"
         );
     }
 
