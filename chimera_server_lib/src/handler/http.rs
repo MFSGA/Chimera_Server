@@ -143,12 +143,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
                 host_header = Some(value.to_string());
             }
             if name.eq_ignore_ascii_case("content-length") {
-                let length = value.parse::<u64>().map_err(|error| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("invalid HTTP Content-Length {value}: {error}"),
-                    )
-                })?;
+                let length = parse_http_content_length(value)?;
                 match request_content_length {
                     Some(previous) if previous != length => {
                         return Err(std::io::Error::new(
@@ -159,6 +154,8 @@ impl TcpServerHandler for HttpTcpServerHandler {
                     Some(_) => continue,
                     None => request_content_length = Some(length),
                 }
+                forwarded_headers.push(format!("Content-Length: {length}"));
+                continue;
             }
             if name.eq_ignore_ascii_case("transfer-encoding") {
                 if request_transfer_encoding
@@ -708,6 +705,28 @@ impl AsyncPing for ChunkedRequestStream {
 
 impl AsyncStream for ChunkedRequestStream {}
 
+fn parse_http_content_length(value: &str) -> std::io::Result<u64> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid HTTP Content-Length {value}"),
+        ));
+    }
+    let length = value.parse::<u64>().map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid HTTP Content-Length {value}: {error}"),
+        )
+    })?;
+    if length > i64::MAX as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid HTTP Content-Length {value}"),
+        ));
+    }
+    Ok(length)
+}
+
 fn has_invalid_http_header_value(value: &str) -> bool {
     value
         .bytes()
@@ -1064,7 +1083,7 @@ where
                         .map(str::to_ascii_lowercase),
                 );
             } else if name == "content-length" {
-                let length = match value.parse::<u64>() {
+                let length = match parse_http_content_length(value) {
                     Ok(length) => length,
                     Err(_) => {
                         write_http_service_unavailable(downstream).await?;
@@ -1079,6 +1098,8 @@ where
                     Some(_) => continue,
                     None => content_length = Some(length),
                 }
+                headers.push((name, format!("Content-Length: {length}")));
+                continue;
             } else if name == "transfer-encoding" {
                 if transfer_encoding_seen || !value.eq_ignore_ascii_case("chunked") {
                     write_http_service_unavailable(downstream).await?;
@@ -2409,6 +2430,57 @@ Connection: close\r\n\r\nbody"
     }
 
     #[tokio::test]
+    async fn content_length_numeric_syntax_matches_xray() {
+        let handler =
+            HttpTcpServerHandler::new(Vec::new(), false, "http-content-length");
+        let request = b"POST http://example.com/upload HTTP/1.1\r\n\
+Host: example.com\r\n\
+Content-Length: 0004\r\n\r\nbody";
+        let (mut client, server) = duplex(2048);
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("leading-zero Content-Length should succeed");
+        let TcpServerSetupResult::TcpForward { mut stream, .. } = result else {
+            panic!("HTTP forward returned non-TCP result");
+        };
+        let mut forwarded = Vec::new();
+        stream.read_to_end(&mut forwarded).await.unwrap();
+        assert_eq!(
+            String::from_utf8(forwarded).unwrap(),
+            "POST /upload HTTP/1.1\r\n\
+Host: example.com\r\n\
+Content-Length: 4\r\n\
+Connection: close\r\n\r\nbody"
+        );
+
+        for content_length in ["+4", "9223372036854775808"] {
+            let request = format!(
+                "POST http://example.com/upload HTTP/1.1\r\n\
+Host: example.com\r\n\
+Content-Length: {content_length}\r\n\r\nbody"
+            );
+            let (mut client, server) = duplex(2048);
+            client.write_all(request.as_bytes()).await.unwrap();
+
+            let error = match handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+            {
+                Ok(_) => {
+                    panic!("invalid Content-Length {content_length:?} must fail")
+                }
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("invalid HTTP Content-Length"));
+        }
+    }
+
+    #[tokio::test]
     async fn conflicting_content_length_is_rejected_like_xray() {
         let handler =
             HttpTcpServerHandler::new(Vec::new(), false, "http-content-length");
@@ -2512,7 +2584,7 @@ Content-Length: 5\r\n\r\nbody";
     #[tokio::test]
     async fn plain_http_response_collapses_duplicate_content_length_like_xray() {
         let upstream_response =
-            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nok";
+            b"HTTP/1.1 200 OK\r\nContent-Length: 02\r\nContent-Length: 2\r\n\r\nok";
         let (mut upstream_client, mut upstream_server) = duplex(2048);
         upstream_client.write_all(upstream_response).await.unwrap();
         upstream_client.shutdown().await.unwrap();
@@ -2544,6 +2616,8 @@ Content-Length: 5\r\n\r\nbody";
     async fn invalid_plain_http_response_content_length_returns_503_like_xray() {
         for content_lengths in [
             "Content-Length: nope",
+            "Content-Length: +2",
+            "Content-Length: 9223372036854775808",
             "Content-Length: 2\r\nContent-Length: 3",
         ] {
             let upstream_response =
