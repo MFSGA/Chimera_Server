@@ -54,6 +54,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
 
         let mut header_bytes = 0usize;
         let mut authenticated_user = None;
+        let mut proxy_authorization_seen = false;
         let mut host_header = None;
         let mut host_header_seen = false;
         let mut forwarded_headers = Vec::new();
@@ -109,7 +110,10 @@ impl TcpServerHandler for HttpTcpServerHandler {
             }
             let value = value.trim();
             if name.eq_ignore_ascii_case("proxy-authorization") {
-                authenticated_user = self.authenticate_basic(value);
+                if !proxy_authorization_seen {
+                    authenticated_user = self.authenticate_basic(value);
+                    proxy_authorization_seen = true;
+                }
                 continue;
             }
             if name.eq_ignore_ascii_case("proxy-connection") {
@@ -1895,6 +1899,58 @@ X-Test: a\tb\r\n\r\n";
                 response.starts_with(b"HTTP/1.1 407 Proxy Authentication Required")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn duplicate_proxy_authorization_uses_first_value_like_xray() {
+        let handler = HttpTcpServerHandler::new(
+            vec![HttpUser {
+                username: "alice".into(),
+                password: "secret".into(),
+            }],
+            false,
+            "http-auth",
+        );
+        let valid = BASE64.encode("alice:secret");
+        let invalid = BASE64.encode("alice:wrong");
+
+        let request = format!(
+            "CONNECT 127.0.0.1:80 HTTP/1.1\r\n\
+             Proxy-Authorization: Basic {valid}\r\n\
+             Proxy-Authorization: Basic {invalid}\r\n\r\n"
+        );
+        let (mut client, server) = duplex(1024);
+        client.write_all(request.as_bytes()).await.unwrap();
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("Xray accepts when the first authorization is valid");
+        let TcpServerSetupResult::TcpForward {
+            traffic_context, ..
+        } = result
+        else {
+            panic!("HTTP CONNECT returned non-TCP result");
+        };
+        assert_eq!(traffic_context.unwrap().identity.as_deref(), Some("alice"));
+
+        let request = format!(
+            "CONNECT 127.0.0.1:80 HTTP/1.1\r\n\
+             Proxy-Authorization: Basic {invalid}\r\n\
+             Proxy-Authorization: Basic {valid}\r\n\r\n"
+        );
+        let (mut client, server) = duplex(1024);
+        client.write_all(request.as_bytes()).await.unwrap();
+        let error = match handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+        {
+            Ok(_) => panic!("Xray rejects when the first authorization is invalid"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 407 Proxy Authentication Required"));
     }
 
     #[tokio::test]
