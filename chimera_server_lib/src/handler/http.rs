@@ -482,12 +482,7 @@ fn parse_absolute_http_target(
 
 impl HttpTcpServerHandler {
     fn authenticate_basic(&self, value: &str) -> Option<String> {
-        let mut parts = value.split_whitespace();
-        let scheme = parts.next()?;
-        let token = parts.next()?;
-        if parts.next().is_some() || !scheme.eq_ignore_ascii_case("basic") {
-            return None;
-        }
+        let token = value.strip_prefix("Basic ")?;
         let decoded = BASE64.decode(token).ok()?;
         let decoded = std::str::from_utf8(&decoded).ok()?;
         let (username, password) = decoded.split_once(':')?;
@@ -830,6 +825,45 @@ mod tests {
             panic!("HTTP CONNECT returned non-TCP result");
         };
         assert_eq!(traffic_context.unwrap().identity.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn basic_auth_matches_xray_scheme_and_spacing() {
+        let handler = HttpTcpServerHandler::new(
+            vec![HttpUser {
+                username: "alice".into(),
+                password: "secret".into(),
+            }],
+            false,
+            "http-auth",
+        );
+        let token = BASE64.encode("alice:secret");
+
+        for authorization in [
+            format!("basic {token}"),
+            format!("Basic  {token}"),
+            format!("Basic\t{token}"),
+        ] {
+            let request = format!(
+                "CONNECT 127.0.0.1:80 HTTP/1.1\r\nProxy-Authorization: {authorization}\r\n\r\n"
+            );
+            let (mut client, server) = duplex(1024);
+            client.write_all(request.as_bytes()).await.unwrap();
+
+            let error = match handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+            {
+                Ok(_) => panic!("Xray rejects non-canonical Basic authorization"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            assert!(
+                response.starts_with(b"HTTP/1.1 407 Proxy Authentication Required")
+            );
+        }
     }
 
     #[tokio::test]
