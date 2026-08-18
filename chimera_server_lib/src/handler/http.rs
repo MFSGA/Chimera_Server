@@ -456,6 +456,7 @@ fn parse_absolute_http_target(
             format!("HTTP proxy target must start with {scheme}"),
         )
     })?;
+    validate_percent_escapes(remainder)?;
     let split = remainder
         .char_indices()
         .find_map(|(index, value)| matches!(value, '/' | '?').then_some(index));
@@ -500,6 +501,28 @@ fn parse_absolute_http_target(
             )
         })?;
     Ok((remote_location, path, host_authority.to_string()))
+}
+
+fn validate_percent_escapes(value: &str) -> std::io::Result<()> {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len()
+            || !bytes[index + 1].is_ascii_hexdigit()
+            || !bytes[index + 2].is_ascii_hexdigit()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid URL escape in HTTP absolute URI",
+            ));
+        }
+        index += 3;
+    }
+    Ok(())
 }
 
 impl HttpTcpServerHandler {
@@ -1006,6 +1029,61 @@ Host: ignored.invalid\r\n\r\n";
         assert_eq!(
             String::from_utf8(forwarded).unwrap(),
             "GET /path%23frag?x=#query HTTP/1.1\r\n\
+Host: example.com\r\n\
+Connection: close\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn absolute_form_rejects_invalid_percent_escapes_like_xray() {
+        let handler = HttpTcpServerHandler::new(Vec::new(), false, "http-percent");
+        for target in [
+            "http://example.com/a%zz",
+            "http://example.com/a%",
+            "http://example.com/a%2",
+            "http://example.com/ok?q=%zz",
+        ] {
+            let request =
+                format!("GET {target} HTTP/1.1\r\nHost: ignored.invalid\r\n\r\n");
+            let (mut client, server) = duplex(2048);
+            client.write_all(request.as_bytes()).await.unwrap();
+            client.shutdown().await.unwrap();
+
+            let error = match handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+            {
+                Ok(_) => {
+                    panic!("invalid percent escape should be rejected: {target}")
+                }
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("invalid URL escape"));
+        }
+    }
+
+    #[tokio::test]
+    async fn absolute_form_preserves_valid_percent_escapes_like_xray() {
+        let handler = HttpTcpServerHandler::new(Vec::new(), false, "http-percent");
+        let request = b"GET http://example.com/a%2Fb?q=%25 HTTP/1.1\r\n\
+Host: ignored.invalid\r\n\r\n";
+        let (mut client, server) = duplex(2048);
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("valid percent escapes should remain accepted");
+        let TcpServerSetupResult::TcpForward { mut stream, .. } = result else {
+            panic!("valid percent escapes returned non-TCP result");
+        };
+        let mut forwarded = Vec::new();
+        stream.read_to_end(&mut forwarded).await.unwrap();
+        assert_eq!(
+            String::from_utf8(forwarded).unwrap(),
+            "GET /a%2Fb?q=%25 HTTP/1.1\r\n\
 Host: example.com\r\n\
 Connection: close\r\n\r\n"
         );
