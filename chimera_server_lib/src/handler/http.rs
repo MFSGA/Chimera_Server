@@ -734,6 +734,7 @@ where
         let mut connection_hop_headers = Vec::new();
         let mut content_length = None;
         let mut transfer_encoding = false;
+        let mut transfer_encoding_seen = false;
 
         loop {
             let line = read_http_line(upstream, MAX_RESPONSE_HEADER_BYTES).await?;
@@ -800,6 +801,11 @@ where
                     None => content_length = Some(length),
                 }
             } else if name == "transfer-encoding" {
+                if transfer_encoding_seen || !value.eq_ignore_ascii_case("chunked") {
+                    write_http_service_unavailable(downstream).await?;
+                    return Ok(false);
+                }
+                transfer_encoding_seen = true;
                 transfer_encoding = true;
             }
             headers.push((name, line));
@@ -834,6 +840,7 @@ where
                 && body_length.is_some());
             if name == "connection"
                 || (body_length.is_some() && name == "keep-alive")
+                || (transfer_encoding && name == "content-length")
                 || strip_static
                 || connection_hop_headers.iter().any(|hop| hop == &name)
             {
@@ -1956,6 +1963,81 @@ Content-Length: 5\r\n\r\nbody";
                   Proxy-Connection: close\r\n\
                   Content-Length: 0\r\n\r\n",
                 "{content_lengths:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn chunked_plain_http_response_drops_content_length_like_xray() {
+        let upstream_response = b"HTTP/1.1 200 OK\r\n\
+                                  Transfer-Encoding: chunked\r\n\
+                                  Content-Length: 99\r\n\
+                                  X-Test: yes\r\n\r\n\
+                                  2\r\nok\r\n0\r\n\r\n";
+        let (mut upstream_client, mut upstream_server) = duplex(2048);
+        upstream_client.write_all(upstream_response).await.unwrap();
+        upstream_client.shutdown().await.unwrap();
+        let (mut downstream_client, mut downstream_server) = duplex(2048);
+
+        let reusable = relay_plain_http_response(
+            &mut upstream_server,
+            &mut downstream_server,
+            "GET",
+        )
+        .await
+        .unwrap();
+        assert!(!reusable);
+        downstream_server.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        downstream_client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(
+            String::from_utf8(response).unwrap(),
+            "HTTP/1.1 200 OK\r\n\
+             Transfer-Encoding: chunked\r\n\
+             X-Test: yes\r\n\
+             Connection: close\r\n\r\n\
+             2\r\nok\r\n0\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_plain_http_response_transfer_encoding_returns_503_like_xray() {
+        for transfer_encoding in [
+            "Transfer-Encoding: gzip",
+            "Transfer-Encoding: chunked, gzip",
+            "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked",
+        ] {
+            let upstream_response = format!(
+                "HTTP/1.1 200 OK\r\n{transfer_encoding}\r\n\r\n2\r\nok\r\n0\r\n\r\n"
+            );
+            let (mut upstream_client, mut upstream_server) = duplex(2048);
+            upstream_client
+                .write_all(upstream_response.as_bytes())
+                .await
+                .unwrap();
+            upstream_client.shutdown().await.unwrap();
+            let (mut downstream_client, mut downstream_server) = duplex(2048);
+
+            let reusable = relay_plain_http_response(
+                &mut upstream_server,
+                &mut downstream_server,
+                "GET",
+            )
+            .await
+            .unwrap();
+            assert!(!reusable, "{transfer_encoding:?} must close");
+            downstream_server.shutdown().await.unwrap();
+
+            let mut response = Vec::new();
+            downstream_client.read_to_end(&mut response).await.unwrap();
+            assert_eq!(
+                response,
+                b"HTTP/1.1 503 Service Unavailable\r\n\
+                  Connection: close\r\n\
+                  Proxy-Connection: close\r\n\
+                  Content-Length: 0\r\n\r\n",
+                "{transfer_encoding:?}"
             );
         }
     }
