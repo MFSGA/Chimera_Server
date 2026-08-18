@@ -55,6 +55,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
         let mut header_bytes = 0usize;
         let mut authenticated_user = None;
         let mut host_header = None;
+        let mut host_header_seen = false;
         let mut forwarded_headers = Vec::new();
         let mut connection_hop_headers = Vec::new();
         let mut proxy_keep_alive = false;
@@ -140,6 +141,13 @@ impl TcpServerHandler for HttpTcpServerHandler {
                 continue;
             }
             if name.eq_ignore_ascii_case("host") {
+                if host_header_seen {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "multiple HTTP Host headers",
+                    ));
+                }
+                host_header_seen = true;
                 host_header = Some(value.to_string());
             }
             if name.eq_ignore_ascii_case("content-length") {
@@ -1635,6 +1643,61 @@ mod tests {
             };
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         }
+    }
+
+    #[tokio::test]
+    async fn duplicate_host_headers_are_rejected_like_xray() {
+        let handler = HttpTcpServerHandler::new(Vec::new(), true, "http-host");
+        for headers in [
+            "Host: example.com\r\nHost: example.com\r\n",
+            "Host: example.com\r\nHost: example.net\r\n",
+            "Host:\r\nHost: example.com\r\n",
+            "Host: example.com\r\nHost:\r\n",
+        ] {
+            let request = format!("GET /x HTTP/1.1\r\n{headers}\r\n");
+            let (mut client, server) = duplex(1024);
+            client.write_all(request.as_bytes()).await.unwrap();
+            client.shutdown().await.unwrap();
+
+            let error = match handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+            {
+                Ok(_) => panic!("Xray rejects multiple Host headers"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("multiple HTTP Host headers"));
+        }
+    }
+
+    #[tokio::test]
+    async fn absolute_form_allows_one_empty_host_header_like_xray() {
+        let handler = HttpTcpServerHandler::new(Vec::new(), false, "http-host");
+        let request = b"GET http://example.com/x HTTP/1.1\r\nHost:\r\n\r\n";
+        let (mut client, server) = duplex(1024);
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("absolute-form URL authority replaces one empty Host header");
+        let TcpServerSetupResult::TcpForward {
+            remote_location,
+            mut stream,
+            ..
+        } = result
+        else {
+            panic!("HTTP forward returned non-TCP result");
+        };
+        assert_eq!(remote_location.to_string(), "example.com:80");
+        let mut forwarded = Vec::new();
+        stream.read_to_end(&mut forwarded).await.unwrap();
+        assert_eq!(
+            String::from_utf8(forwarded).unwrap(),
+            "GET /x HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+        );
     }
 
     #[tokio::test]
