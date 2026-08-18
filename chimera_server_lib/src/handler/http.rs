@@ -748,6 +748,7 @@ where
         let mut content_length = None;
         let mut transfer_encoding = false;
         let mut transfer_encoding_seen = false;
+        let mut trailer_names = Vec::new();
 
         loop {
             let line = read_http_line(upstream, MAX_RESPONSE_HEADER_BYTES).await?;
@@ -820,6 +821,14 @@ where
                 }
                 transfer_encoding_seen = true;
                 transfer_encoding = true;
+            } else if name == "trailer" {
+                match parse_http_trailer_names(value) {
+                    Ok(names) => trailer_names.extend(names),
+                    Err(_) => {
+                        write_http_service_unavailable(downstream).await?;
+                        return Ok(false);
+                    }
+                }
             }
             headers.push((name, line));
         }
@@ -884,7 +893,8 @@ where
                 ));
             }
         } else if transfer_encoding {
-            relay_chunked_http_response_body(upstream, downstream).await?;
+            relay_chunked_http_response_body(upstream, downstream, &trailer_names)
+                .await?;
         } else {
             tokio::io::copy(upstream, downstream).await?;
         }
@@ -896,6 +906,7 @@ where
 async fn relay_chunked_http_response_body<R, W>(
     upstream: &mut R,
     downstream: &mut W,
+    trailer_names: &[String],
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -923,8 +934,14 @@ where
 
         if chunk_size == 0 {
             write_reencoded_chunk(downstream, &mut decoded).await?;
-            validate_chunked_response_trailers(upstream).await?;
-            downstream.write_all(b"0\r\n\r\n").await?;
+            let trailers =
+                read_chunked_response_trailers(upstream, trailer_names).await?;
+            downstream.write_all(b"0\r\n").await?;
+            for trailer in trailers {
+                downstream.write_all(trailer.as_bytes()).await?;
+                downstream.write_all(b"\r\n").await?;
+            }
+            downstream.write_all(b"\r\n").await?;
             return Ok(());
         }
 
@@ -965,9 +982,29 @@ where
     }
 }
 
-async fn validate_chunked_response_trailers<R>(
+fn parse_http_trailer_names(value: &str) -> std::io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for name in value.split(',').map(str::trim) {
+        if !is_http_header_name(name)
+            || matches!(
+                name.to_ascii_lowercase().as_str(),
+                "content-length" | "transfer-encoding" | "trailer"
+            )
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid HTTP response trailer declaration",
+            ));
+        }
+        names.push(name.to_ascii_lowercase());
+    }
+    Ok(names)
+}
+
+async fn read_chunked_response_trailers<R>(
     upstream: &mut R,
-) -> std::io::Result<()>
+    trailer_names: &[String],
+) -> std::io::Result<Vec<String>>
 where
     R: AsyncRead + Unpin,
 {
@@ -999,6 +1036,7 @@ where
         }
     }
 
+    let mut forwarded = Vec::new();
     for trailer in trailers {
         let Some((name, value)) = trailer.split_once(':') else {
             return Err(std::io::Error::new(
@@ -1015,8 +1053,14 @@ where
                 "invalid control character in HTTP response trailer value",
             ));
         }
+        if trailer_names
+            .iter()
+            .any(|declared| declared.eq_ignore_ascii_case(name))
+        {
+            forwarded.push(trailer);
+        }
     }
-    Ok(())
+    Ok(forwarded)
 }
 
 async fn write_reencoded_chunk<W>(
@@ -2265,6 +2309,79 @@ Content-Length: 5\r\n\r\nbody";
                   Connection: close\r\n\r\n\
                   2\r\nok\r\n0\r\n\r\n",
                 "{trailer:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn declared_chunked_response_trailer_is_forwarded_like_xray() {
+        let upstream_response = b"HTTP/1.1 200 OK\r\n\
+                                  Transfer-Encoding: chunked\r\n\
+                                  Trailer: X-Foo\r\n\r\n\
+                                  2\r\nok\r\n0\r\nX-Foo: bar\r\n\r\n";
+        let (mut upstream_client, mut upstream_server) = duplex(2048);
+        upstream_client.write_all(upstream_response).await.unwrap();
+        upstream_client.shutdown().await.unwrap();
+        let (mut downstream_client, mut downstream_server) = duplex(2048);
+
+        let reusable = relay_plain_http_response(
+            &mut upstream_server,
+            &mut downstream_server,
+            "GET",
+        )
+        .await
+        .unwrap();
+        assert!(!reusable);
+        downstream_server.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        downstream_client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(
+            response,
+            b"HTTP/1.1 200 OK\r\n\
+              Transfer-Encoding: chunked\r\n\
+              Trailer: X-Foo\r\n\
+              Connection: close\r\n\r\n\
+              2\r\nok\r\n0\r\nX-Foo: bar\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn forbidden_response_trailer_declarations_return_503_like_xray() {
+        for trailer_name in ["Content-Length", "Transfer-Encoding", "Trailer"] {
+            let upstream_response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Transfer-Encoding: chunked\r\n\
+                 Trailer: {trailer_name}\r\n\r\n\
+                 2\r\nok\r\n0\r\n\r\n"
+            );
+            let (mut upstream_client, mut upstream_server) = duplex(2048);
+            upstream_client
+                .write_all(upstream_response.as_bytes())
+                .await
+                .unwrap();
+            upstream_client.shutdown().await.unwrap();
+            let (mut downstream_client, mut downstream_server) = duplex(2048);
+
+            let reusable = relay_plain_http_response(
+                &mut upstream_server,
+                &mut downstream_server,
+                "GET",
+            )
+            .await
+            .unwrap();
+            assert!(!reusable);
+            downstream_server.shutdown().await.unwrap();
+
+            let mut response = Vec::new();
+            downstream_client.read_to_end(&mut response).await.unwrap();
+            assert_eq!(
+                response,
+                b"HTTP/1.1 503 Service Unavailable\r\n\
+                  Connection: close\r\n\
+                  Proxy-Connection: close\r\n\
+                  Content-Length: 0\r\n\r\n",
+                "{trailer_name}"
             );
         }
     }
