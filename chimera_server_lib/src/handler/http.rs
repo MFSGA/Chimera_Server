@@ -733,7 +733,6 @@ where
         let mut headers = Vec::new();
         let mut connection_hop_headers = Vec::new();
         let mut content_length = None;
-        let mut content_length_valid = true;
         let mut transfer_encoding = false;
 
         loop {
@@ -785,15 +784,20 @@ where
                         .map(str::to_ascii_lowercase),
                 );
             } else if name == "content-length" {
-                match value.parse::<u64>() {
-                    Ok(length) => match content_length {
-                        Some(previous) if previous != length => {
-                            content_length_valid = false;
-                        }
-                        None => content_length = Some(length),
-                        _ => {}
-                    },
-                    Err(_) => content_length_valid = false,
+                let length = match value.parse::<u64>() {
+                    Ok(length) => length,
+                    Err(_) => {
+                        write_http_service_unavailable(downstream).await?;
+                        return Ok(false);
+                    }
+                };
+                match content_length {
+                    Some(previous) if previous != length => {
+                        write_http_service_unavailable(downstream).await?;
+                        return Ok(false);
+                    }
+                    Some(_) => continue,
+                    None => content_length = Some(length),
                 }
             } else if name == "transfer-encoding" {
                 transfer_encoding = true;
@@ -810,7 +814,7 @@ where
             || matches!(status_code, 204 | 304);
         let body_length = if no_body {
             Some(0)
-        } else if !transfer_encoding && content_length_valid {
+        } else if !transfer_encoding {
             content_length
         } else {
             None
@@ -1884,6 +1888,76 @@ Content-Length: 5\r\n\r\nbody";
              Keep-Alive: timeout=60\r\n\
              Proxy-Connection: keep-alive\r\n\r\nhello"
         );
+    }
+
+    #[tokio::test]
+    async fn plain_http_response_collapses_duplicate_content_length_like_xray() {
+        let upstream_response =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nok";
+        let (mut upstream_client, mut upstream_server) = duplex(2048);
+        upstream_client.write_all(upstream_response).await.unwrap();
+        upstream_client.shutdown().await.unwrap();
+        let (mut downstream_client, mut downstream_server) = duplex(2048);
+
+        let reusable = relay_plain_http_response(
+            &mut upstream_server,
+            &mut downstream_server,
+            "GET",
+        )
+        .await
+        .unwrap();
+        assert!(reusable);
+        downstream_server.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        downstream_client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(
+            String::from_utf8(response).unwrap(),
+            "HTTP/1.1 200 OK\r\n\
+             Content-Length: 2\r\n\
+             Connection: keep-alive\r\n\
+             Keep-Alive: timeout=60\r\n\
+             Proxy-Connection: keep-alive\r\n\r\nok"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_plain_http_response_content_length_returns_503_like_xray() {
+        for content_lengths in [
+            "Content-Length: nope",
+            "Content-Length: 2\r\nContent-Length: 3",
+        ] {
+            let upstream_response =
+                format!("HTTP/1.1 200 OK\r\n{content_lengths}\r\n\r\nok!");
+            let (mut upstream_client, mut upstream_server) = duplex(2048);
+            upstream_client
+                .write_all(upstream_response.as_bytes())
+                .await
+                .unwrap();
+            upstream_client.shutdown().await.unwrap();
+            let (mut downstream_client, mut downstream_server) = duplex(2048);
+
+            let reusable = relay_plain_http_response(
+                &mut upstream_server,
+                &mut downstream_server,
+                "GET",
+            )
+            .await
+            .unwrap();
+            assert!(!reusable, "{content_lengths:?} must close");
+            downstream_server.shutdown().await.unwrap();
+
+            let mut response = Vec::new();
+            downstream_client.read_to_end(&mut response).await.unwrap();
+            assert_eq!(
+                response,
+                b"HTTP/1.1 503 Service Unavailable\r\n\
+                  Connection: close\r\n\
+                  Proxy-Connection: close\r\n\
+                  Content-Length: 0\r\n\r\n",
+                "{content_lengths:?}"
+            );
+        }
     }
 
     #[tokio::test]
