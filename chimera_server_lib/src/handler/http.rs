@@ -98,10 +98,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
             if !is_http_header_name(name) {
                 continue;
             }
-            if value
-                .bytes()
-                .any(|byte| (byte < b' ' && byte != b'\t') || byte == 0x7f)
-            {
+            if has_invalid_http_header_value(value) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "invalid control character in HTTP header value",
@@ -446,6 +443,12 @@ impl AsyncPing for FirstChunkValidatedStream {
 
 impl AsyncStream for FirstChunkValidatedStream {}
 
+fn has_invalid_http_header_value(value: &str) -> bool {
+    value
+        .bytes()
+        .any(|byte| (byte < b' ' && byte != b'\t') || byte == 0x7f)
+}
+
 fn is_http_header_name(name: &str) -> bool {
     !name.is_empty()
         && name.bytes().all(|byte| {
@@ -761,10 +764,17 @@ where
 
         for line in header_lines {
             let Some((name, value)) = line.split_once(':') else {
-                headers.push((String::new(), line));
-                continue;
+                write_http_service_unavailable(downstream).await?;
+                return Ok(false);
             };
-            let name = name.trim().to_ascii_lowercase();
+            if !is_http_header_name(name) {
+                continue;
+            }
+            if has_invalid_http_header_value(value) {
+                write_http_service_unavailable(downstream).await?;
+                return Ok(false);
+            }
+            let name = name.to_ascii_lowercase();
             let value = value.trim();
             if name == "connection" {
                 connection_hop_headers.extend(
@@ -873,6 +883,21 @@ fn parse_http_status_code(status_line: &str) -> std::io::Result<u16> {
             format!("invalid HTTP proxy upstream status code {status}: {error}"),
         )
     })
+}
+
+async fn write_http_service_unavailable<W>(writer: &mut W) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer
+        .write_all(
+            b"HTTP/1.1 503 Service Unavailable\r\n\
+              Connection: close\r\n\
+              Proxy-Connection: close\r\n\
+              Content-Length: 0\r\n\r\n",
+        )
+        .await?;
+    writer.flush().await
 }
 
 async fn write_http_header_block<W>(
@@ -1890,6 +1915,74 @@ Content-Length: 5\r\n\r\nbody";
              Keep-Alive: timeout=60\r\n\
              Proxy-Connection: keep-alive\r\n\r\nok"
         );
+    }
+
+    #[tokio::test]
+    async fn plain_http_response_drops_invalid_header_names_like_xray() {
+        let upstream_response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nBad Header: hidden\r\nX-Keep: visible\r\n\r\nok";
+        let (mut upstream_client, mut upstream_server) = duplex(2048);
+        upstream_client.write_all(upstream_response).await.unwrap();
+        upstream_client.shutdown().await.unwrap();
+        let (mut downstream_client, mut downstream_server) = duplex(2048);
+
+        let reusable = relay_plain_http_response(
+            &mut upstream_server,
+            &mut downstream_server,
+            "GET",
+        )
+        .await
+        .unwrap();
+        assert!(reusable);
+        downstream_server.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        downstream_client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(
+            String::from_utf8(response).unwrap(),
+            "HTTP/1.1 200 OK\r\n\
+             Content-Length: 2\r\n\
+             X-Keep: visible\r\n\
+             Connection: keep-alive\r\n\
+             Keep-Alive: timeout=60\r\n\
+             Proxy-Connection: keep-alive\r\n\r\nok"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_plain_http_response_headers_return_503_like_xray() {
+        for invalid_header in ["NoColon", "X-Test: a\u{1}b", "X-Test: a\u{7f}b"] {
+            let upstream_response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n{invalid_header}\r\n\r\nok"
+            );
+            let (mut upstream_client, mut upstream_server) = duplex(2048);
+            upstream_client
+                .write_all(upstream_response.as_bytes())
+                .await
+                .unwrap();
+            upstream_client.shutdown().await.unwrap();
+            let (mut downstream_client, mut downstream_server) = duplex(2048);
+
+            let reusable = relay_plain_http_response(
+                &mut upstream_server,
+                &mut downstream_server,
+                "GET",
+            )
+            .await
+            .unwrap();
+            assert!(!reusable, "invalid header {invalid_header:?} must close");
+            downstream_server.shutdown().await.unwrap();
+
+            let mut response = Vec::new();
+            downstream_client.read_to_end(&mut response).await.unwrap();
+            assert_eq!(
+                response,
+                b"HTTP/1.1 503 Service Unavailable\r\n\
+                  Connection: close\r\n\
+                  Proxy-Connection: close\r\n\
+                  Content-Length: 0\r\n\r\n",
+                "invalid header {invalid_header:?}"
+            );
+        }
     }
 
     #[tokio::test]
