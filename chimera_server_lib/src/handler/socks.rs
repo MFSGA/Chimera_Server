@@ -485,6 +485,7 @@ async fn read_address_from_stream(
                 }
             };
 
+            validate_socks5_domain(domain_str)?;
             let mut port_bytes = [0u8; 2];
             stream.read_exact(&mut port_bytes).await?;
             let port = u16::from_be_bytes(port_bytes);
@@ -931,6 +932,7 @@ fn parse_udp_address(
                     "invalid domain name",
                 )
             })?;
+            validate_socks5_domain(domain_str)?;
             let port = u16::from_be_bytes([
                 data[offset + 2 + domain_len],
                 data[offset + 2 + domain_len + 1],
@@ -945,6 +947,20 @@ fn parse_udp_address(
             format!("unknown address type: {}", addr_type),
         )),
     }
+}
+
+fn validate_socks5_domain(domain: &str) -> std::io::Result<()> {
+    if domain.is_empty()
+        || !domain.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_')
+        })
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid SOCKS5 domain name: {domain}"),
+        ));
+    }
+    Ok(())
 }
 
 /// Build a SOCKS5 UDP response header from the response source address.
@@ -1054,6 +1070,40 @@ mod tests {
         let mut response = [0u8; 8];
         client.read_exact(&mut response).await.unwrap();
         (result, response)
+    }
+
+    #[test]
+    fn socks5_domain_validation_matches_xray() {
+        for domain in ["example.com", "srv_name-1.local", "127.0.0.1"] {
+            validate_socks5_domain(domain).unwrap();
+        }
+        for domain in ["", "bad/name", "bad name", "bad:name", "café.test"] {
+            assert!(validate_socks5_domain(domain).is_err(), "{domain}");
+        }
+
+        let domain = b"bad/name";
+        let mut packet = vec![ADDR_TYPE_DOMAIN, domain.len() as u8];
+        packet.extend_from_slice(domain);
+        packet.extend_from_slice(&53u16.to_be_bytes());
+        assert!(parse_udp_address(&packet, 0).is_err());
+    }
+
+    #[tokio::test]
+    async fn socks5_tcp_domain_parser_rejects_xray_invalid_names() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(listener_addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let domain = b"bad/name";
+        client
+            .write_all(&[ADDR_TYPE_DOMAIN, domain.len() as u8])
+            .await
+            .unwrap();
+        client.write_all(domain).await.unwrap();
+        client.write_all(&53u16.to_be_bytes()).await.unwrap();
+
+        let mut server: Box<dyn AsyncStream> = Box::new(server);
+        assert!(read_address_from_stream(&mut server).await.is_err());
     }
 
     #[test]
