@@ -502,9 +502,14 @@ async fn handle_udp_associate(
     traffic_context: Option<TrafficContext>,
     udp_bind_ip: Option<std::net::IpAddr>,
 ) -> std::io::Result<TcpServerSetupResult> {
-    // The TCP peer address is authoritative. A non-zero hint port narrows the
-    // UDP endpoint immediately; port zero is learned from the first datagram.
+    // Match Xray: a concrete UDP source IP in the ASSOCIATE request is
+    // authoritative. Domain or unspecified addresses fall back to the TCP peer.
     let client_hint = read_socks_address(&mut server_stream).await?;
+    let client_udp_ip_hint = match client_hint.address() {
+        Address::Ipv4(ip) if !ip.is_unspecified() => Some(std::net::IpAddr::V4(*ip)),
+        Address::Ipv6(ip) if !ip.is_unspecified() => Some(std::net::IpAddr::V6(*ip)),
+        Address::Ipv4(_) | Address::Ipv6(_) | Address::Hostname(_) => None,
+    };
     let client_udp_port_hint =
         (client_hint.port() != 0).then_some(client_hint.port());
     tracing::debug!("SOCKS5 UDP ASSOCIATE: client hint = {:?}", client_hint);
@@ -534,6 +539,7 @@ async fn handle_udp_associate(
     Ok(TcpServerSetupResult::UdpAssociate {
         stream: server_stream,
         socket: Arc::new(udp_socket),
+        client_udp_ip_hint,
         client_udp_port_hint,
         traffic_context,
     })
@@ -572,7 +578,7 @@ pub(crate) async fn run_udp_relay(
     resolver: Arc<dyn Resolver>,
     runtime: RuntimeState,
     tcp_peer_addr: SocketAddr,
-    client_udp_port_hint: Option<u16>,
+    client_udp_hint: (Option<std::net::IpAddr>, Option<u16>),
     traffic_context: Option<TrafficContext>,
 ) -> std::io::Result<()> {
     let udp_socket_clone = udp_socket.clone();
@@ -589,8 +595,10 @@ pub(crate) async fn run_udp_relay(
     });
 
     let mut recv_buf = vec![0u8; UDP_BUFFER_SIZE];
+    let (client_udp_ip_hint, client_udp_port_hint) = client_udp_hint;
+    let expected_client_ip = client_udp_ip_hint.unwrap_or(tcp_peer_addr.ip());
     let mut client_endpoint =
-        client_udp_port_hint.map(|port| SocketAddr::new(tcp_peer_addr.ip(), port));
+        client_udp_port_hint.map(|port| SocketAddr::new(expected_client_ip, port));
 
     loop {
         let (len, client_addr) = tokio::select! {
@@ -603,11 +611,11 @@ pub(crate) async fn run_udp_relay(
             }
         };
 
-        if client_addr.ip() != tcp_peer_addr.ip() {
+        if client_addr.ip() != expected_client_ip {
             tracing::warn!(
-                "SOCKS5 UDP relay ignored datagram from {} outside TCP peer {}",
+                "SOCKS5 UDP relay ignored datagram from {}; expected source IP {}",
                 client_addr,
-                tcp_peer_addr
+                expected_client_ip
             );
             continue;
         }
@@ -1180,6 +1188,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn udp_associate_preserves_explicit_client_ip_hint_like_xray() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(listener_addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        client
+            .write_all(&[0x00, ADDR_TYPE_IPV4, 127, 0, 0, 2, 0x12, 0x34])
+            .await
+            .unwrap();
+
+        let result = handle_udp_associate(Box::new(server), None, None)
+            .await
+            .unwrap();
+        let TcpServerSetupResult::UdpAssociate {
+            client_udp_ip_hint,
+            client_udp_port_hint,
+            ..
+        } = result
+        else {
+            panic!("expected UDP associate result");
+        };
+        assert_eq!(
+            client_udp_ip_hint,
+            Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)))
+        );
+        assert_eq!(client_udp_port_hint, Some(0x1234));
+    }
+
+    #[tokio::test]
     async fn udp_associate_uses_configured_bind_ip() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let listener_addr = listener.local_addr().unwrap();
@@ -1262,7 +1300,7 @@ mod tests {
             resolver,
             runtime,
             client_control.local_addr().unwrap(),
-            None,
+            (None, None),
             Some(traffic_context),
         ));
 
