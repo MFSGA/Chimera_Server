@@ -270,7 +270,7 @@ async fn setup_socks4_stream(
                 format!("failed to decode SOCKS4a domain: {error}"),
             )
         })?;
-        parse_xray_socks_domain_address(domain)?
+        parse_xray_socks4a_address(domain)
     } else {
         Address::Ipv4(std::net::Ipv4Addr::from(address_bytes))
     };
@@ -938,6 +938,34 @@ fn parse_udp_address(
     }
 }
 
+fn parse_xray_socks4a_address(domain: &str) -> Address {
+    let mut value = domain;
+    if value.starts_with('[') && value.ends_with(']') && value.len() >= 2 {
+        value = &value[1..value.len() - 1];
+    }
+    if value
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| !byte.is_ascii_alphanumeric())
+        || value
+            .as_bytes()
+            .last()
+            .is_some_and(|byte| !byte.is_ascii_alphanumeric())
+    {
+        value = value.trim();
+    }
+    if let Ok(ip) = value.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(ip) => Address::Ipv4(ip),
+            std::net::IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+                Some(ip) => Address::Ipv4(ip),
+                None => Address::Ipv6(ip),
+            },
+        };
+    }
+    Address::Hostname(value.to_string())
+}
+
 fn parse_xray_socks_domain_address(domain: &str) -> std::io::Result<Address> {
     let maybe_ip = if domain.starts_with('[') {
         domain
@@ -1532,6 +1560,37 @@ mod tests {
             panic!("expected SOCKS4a TCP forward result");
         };
         assert_eq!(remote_location.to_string(), "example.com:80");
+    }
+
+    #[tokio::test]
+    async fn socks4a_domains_use_xray_parse_address_semantics() {
+        let handler = SocksTcpServerHandler::new(
+            SocksUserStore::with_auth_required(Vec::new(), false),
+            "socks4a-domain-semantics",
+            false,
+            None,
+        );
+        for (domain, expected) in [
+            (b"bad/name".as_slice(), "bad/name:80"),
+            (b" bad.com ".as_slice(), "bad.com:80"),
+            (b"bad name".as_slice(), "bad name:80"),
+            (b"".as_slice(), ":80"),
+        ] {
+            let mut request =
+                vec![SOCKS4_VERSION, CMD_CONNECT, 0x00, 0x50, 0, 0, 0, 1, 0];
+            request.extend_from_slice(domain);
+            request.push(0);
+            let (result, response) = socks4_setup(&handler, &request).await;
+
+            assert_eq!(response[1], SOCKS4_REQUEST_GRANTED, "domain={domain:?}");
+            let TcpServerSetupResult::TcpForward {
+                remote_location, ..
+            } = result
+            else {
+                panic!("expected SOCKS4a TCP forward result for {domain:?}");
+            };
+            assert_eq!(remote_location.to_string(), expected, "domain={domain:?}");
+        }
     }
 
     #[tokio::test]
