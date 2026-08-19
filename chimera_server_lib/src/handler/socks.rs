@@ -651,6 +651,47 @@ fn start_udp_target_session(
     Ok(SocksUdpTargetSession { sender, task })
 }
 
+async fn send_udp_target_payload(
+    target_sessions: &mut HashMap<SocketAddr, SocksUdpTargetSession>,
+    target_addr: SocketAddr,
+    client_endpoint: SocketAddr,
+    client_socket: Arc<tokio::net::UdpSocket>,
+    payload: Vec<u8>,
+    traffic_context: Option<TrafficContext>,
+) -> std::io::Result<()> {
+    let message = (payload, traffic_context);
+    for attempt in 0..2 {
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            target_sessions.entry(target_addr)
+        {
+            entry.insert(start_udp_target_session(
+                target_addr,
+                client_endpoint,
+                client_socket.clone(),
+            )?);
+        }
+
+        let sender = &target_sessions
+            .get(&target_addr)
+            .expect("SOCKS5 UDP target session exists after insertion")
+            .sender;
+        match sender.send(message.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(_) if attempt == 0 => {
+                target_sessions.remove(&target_addr);
+            }
+            Err(_) => {
+                target_sessions.remove(&target_addr);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "SOCKS5 UDP target session closed before payload was sent",
+                ));
+            }
+        }
+    }
+    unreachable!("SOCKS5 UDP target payload retry loop is bounded")
+}
+
 pub(crate) async fn run_udp_relay(
     udp_socket: Arc<tokio::net::UdpSocket>,
     mut tcp_stream: Box<dyn AsyncStream>,
@@ -781,39 +822,20 @@ pub(crate) async fn run_udp_relay(
             DirectOutboundAction::Freedom { tag: None } => {}
         }
 
-        if let std::collections::hash_map::Entry::Vacant(entry) =
-            target_sessions.entry(target_addr)
+        if let Err(error) = send_udp_target_payload(
+            &mut target_sessions,
+            target_addr,
+            response_endpoint,
+            udp_socket_clone.clone(),
+            payload.to_vec(),
+            datagram_context,
+        )
+        .await
         {
-            let session = match start_udp_target_session(
-                target_addr,
-                response_endpoint,
-                udp_socket_clone.clone(),
-            ) {
-                Ok(session) => session,
-                Err(error) => {
-                    tracing::warn!(
-                        "SOCKS5 UDP relay: failed to create target session for {}: {}",
-                        target_addr,
-                        error
-                    );
-                    continue;
-                }
-            };
-            entry.insert(session);
-        }
-
-        let message = (payload.to_vec(), datagram_context);
-        let send_result = target_sessions
-            .get(&target_addr)
-            .expect("SOCKS5 UDP target session exists after insertion")
-            .sender
-            .send(message)
-            .await;
-        if send_result.is_err() {
-            target_sessions.remove(&target_addr);
             tracing::warn!(
-                "SOCKS5 UDP relay: target session for {} closed before payload was sent",
-                target_addr
+                "SOCKS5 UDP relay: failed to send payload to target {}: {}",
+                target_addr,
+                error
             );
         }
     }
@@ -1348,6 +1370,48 @@ mod tests {
         assert_eq!(response[1], REP_SUCCEEDED);
         assert_eq!(response[3], ADDR_TYPE_IPV4);
         assert_eq!(&response[4..8], &Ipv4Addr::LOCALHOST.octets());
+    }
+
+    #[cfg(feature = "traffic")]
+    #[tokio::test]
+    async fn udp_target_session_retries_payload_after_idle_task_closed() {
+        let origin_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let origin_addr = origin_socket.local_addr().unwrap();
+        let client_socket =
+            Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let client_endpoint = client_socket.local_addr().unwrap();
+
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let closed_task = tokio::spawn(async {});
+        closed_task.await.unwrap();
+        let closed_task = tokio::spawn(async {});
+        let mut sessions = HashMap::from([(
+            origin_addr,
+            SocksUdpTargetSession {
+                sender,
+                task: closed_task,
+            },
+        )]);
+
+        send_udp_target_payload(
+            &mut sessions,
+            origin_addr,
+            client_endpoint,
+            client_socket,
+            b"after-idle".to_vec(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut buf = [0u8; 64];
+        let (len, _) =
+            timeout(Duration::from_secs(2), origin_socket.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(&buf[..len], b"after-idle");
     }
 
     #[cfg(feature = "traffic")]
