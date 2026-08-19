@@ -369,14 +369,10 @@ async fn authenticate(
     accounts: &[SocksUser],
     stream: &mut Box<dyn AsyncStream>,
 ) -> std::io::Result<String> {
-    let version = stream.read_u8().await?;
-    if version != AUTH_VERSION {
-        send_username_auth_status(stream, 0x01).await?;
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("invalid auth version: {}", version),
-        ));
-    }
+    // Xray v26.2.6's ReadUsernamePassword reads but does not validate the
+    // RFC 1929 subnegotiation version byte. Keep method negotiation strict,
+    // but accept any auth message version once username/password was selected.
+    let _version = stream.read_u8().await?;
 
     let username_len = stream.read_u8().await? as usize;
     let mut username_buf = vec![0u8; username_len];
@@ -1195,6 +1191,82 @@ mod tests {
         let oversized =
             build_udp_response_packet(src_addr, &vec![0x5a; max_payload + 1]);
         assert!(oversized.is_empty());
+    }
+
+    #[tokio::test]
+    async fn socks5_password_auth_version_is_ignored_like_xray() {
+        for auth_version in [0x00, 0x02, 0x05] {
+            let handler = SocksTcpServerHandler::new(
+                SocksUserStore::with_auth_required(
+                    vec![SocksUser {
+                        username: "user".into(),
+                        password: "pass".into(),
+                    }],
+                    true,
+                ),
+                "socks5-auth-version",
+                false,
+                None,
+            );
+            let listener =
+                TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let listener_addr = listener.local_addr().unwrap();
+            let mut client = TcpStream::connect(listener_addr).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+
+            client
+                .write_all(&[
+                    SOCKS_VERSION,
+                    1,
+                    METHOD_USERNAME_PASSWORD,
+                    auth_version,
+                    4,
+                    b'u',
+                    b's',
+                    b'e',
+                    b'r',
+                    4,
+                    b'p',
+                    b'a',
+                    b's',
+                    b's',
+                    SOCKS_VERSION,
+                    CMD_CONNECT,
+                    0,
+                    ADDR_TYPE_IPV4,
+                    203,
+                    0,
+                    113,
+                    7,
+                    0x01,
+                    0xbb,
+                ])
+                .await
+                .unwrap();
+
+            let result =
+                handler.setup_server_stream(Box::new(server)).await.unwrap();
+            let mut responses = [0u8; 4];
+            client.read_exact(&mut responses).await.unwrap();
+            assert_eq!(
+                responses,
+                [SOCKS_VERSION, METHOD_USERNAME_PASSWORD, AUTH_VERSION, 0x00]
+            );
+
+            let TcpServerSetupResult::TcpForward {
+                remote_location,
+                traffic_context,
+                ..
+            } = result
+            else {
+                panic!("expected SOCKS5 TCP forward result");
+            };
+            assert_eq!(remote_location.to_string(), "203.0.113.7:443");
+            assert_eq!(
+                traffic_context.and_then(|context| context.identity),
+                Some("user".to_string())
+            );
+        }
     }
 
     #[tokio::test]
