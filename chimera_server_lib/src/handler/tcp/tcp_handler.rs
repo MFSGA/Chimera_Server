@@ -69,8 +69,7 @@ pub enum TcpServerSetupResult {
     UdpAssociate {
         stream: Box<dyn AsyncStream>,
         socket: Arc<UdpSocket>,
-        client_udp_ip_hint: Option<std::net::IpAddr>,
-        client_udp_port_hint: Option<u16>,
+        restrict_client_ip_to_tcp_peer: bool,
         traffic_context: Option<TrafficContext>,
     },
     BidirectionalUdp {

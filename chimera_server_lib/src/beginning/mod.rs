@@ -701,8 +701,7 @@ where
         TcpServerSetupResult::UdpAssociate {
             stream,
             socket,
-            client_udp_ip_hint,
-            client_udp_port_hint,
+            restrict_client_ip_to_tcp_peer,
             traffic_context,
         } => {
             let traffic_context = traffic_context
@@ -713,7 +712,7 @@ where
                 resolver,
                 runtime,
                 peer_addr,
-                (client_udp_ip_hint, client_udp_port_hint),
+                restrict_client_ip_to_tcp_peer,
                 traffic_context,
             )
             .await
