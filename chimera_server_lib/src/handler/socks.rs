@@ -382,25 +382,12 @@ async fn authenticate(
     let mut password_buf = vec![0u8; password_len];
     stream.read_exact(&mut password_buf).await?;
 
-    let username = String::from_utf8(username_buf).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("failed to decode username: {}", e),
-        )
-    })?;
-    let password = String::from_utf8(password_buf).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("failed to decode password: {}", e),
-        )
-    })?;
-
-    if accounts
-        .iter()
-        .any(|account| account.username == username && account.password == password)
-    {
+    if let Some(account) = accounts.iter().find(|account| {
+        account.username.as_bytes() == username_buf
+            && account.password.as_bytes() == password_buf
+    }) {
         send_username_auth_status(stream, 0x00).await?;
-        Ok(username)
+        Ok(account.username.clone())
     } else {
         // Xray v26.2.6 reports credential mismatch with RFC 1929 status 0xFF.
         send_username_auth_status(stream, 0xff).await?;
@@ -1351,6 +1338,55 @@ mod tests {
             responses,
             [SOCKS_VERSION, METHOD_USERNAME_PASSWORD, AUTH_VERSION, 0xff]
         );
+    }
+
+    #[tokio::test]
+    async fn socks5_non_utf8_credentials_fail_auth_like_xray() {
+        for (username, password) in [
+            (vec![0xff], b"pass".to_vec()),
+            (b"user".to_vec(), vec![0xff]),
+        ] {
+            let handler = SocksTcpServerHandler::new(
+                SocksUserStore::with_auth_required(
+                    vec![SocksUser {
+                        username: "user".into(),
+                        password: "pass".into(),
+                    }],
+                    true,
+                ),
+                "socks5-non-utf8-auth",
+                false,
+                None,
+            );
+            let listener =
+                TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let listener_addr = listener.local_addr().unwrap();
+            let mut client = TcpStream::connect(listener_addr).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+
+            let mut request =
+                vec![SOCKS_VERSION, 1, METHOD_USERNAME_PASSWORD, AUTH_VERSION];
+            request.push(username.len() as u8);
+            request.extend_from_slice(&username);
+            request.push(password.len() as u8);
+            request.extend_from_slice(&password);
+            client.write_all(&request).await.unwrap();
+
+            let error = match handler.setup_server_stream(Box::new(server)).await {
+                Ok(_) => {
+                    panic!("non-UTF-8 SOCKS5 credentials must fail authentication")
+                }
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+            let mut responses = [0u8; 4];
+            client.read_exact(&mut responses).await.unwrap();
+            assert_eq!(
+                responses,
+                [SOCKS_VERSION, METHOD_USERNAME_PASSWORD, AUTH_VERSION, 0xff]
+            );
+        }
     }
 
     #[tokio::test]
