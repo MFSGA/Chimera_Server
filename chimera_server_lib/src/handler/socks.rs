@@ -953,7 +953,7 @@ fn parse_socks5_domain_address(domain: &str) -> std::io::Result<Address> {
     if let Some(inner) = domain
         .strip_prefix('[')
         .and_then(|value| value.strip_suffix(']'))
-        && let Ok(ip) = inner.parse::<std::net::IpAddr>()
+        && let Ok(ip) = inner.trim().parse::<std::net::IpAddr>()
     {
         return Ok(match ip {
             std::net::IpAddr::V4(ip) => Address::Ipv4(ip),
@@ -1112,6 +1112,15 @@ mod tests {
             parse_socks5_domain_address("[::ffff:127.0.0.1]").unwrap(),
             Address::Ipv4(Ipv4Addr::LOCALHOST)
         );
+        assert_eq!(
+            parse_socks5_domain_address("[ 127.0.0.1 ]").unwrap(),
+            Address::Ipv4(Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(
+            parse_socks5_domain_address("[ ::1 ]").unwrap(),
+            Address::Ipv6(std::net::Ipv6Addr::LOCALHOST)
+        );
+        assert!(parse_socks5_domain_address("[ example.com ]").is_err());
         assert!(parse_socks5_domain_address("::1").is_err());
 
         let domain = b"bad/name";
@@ -1127,6 +1136,8 @@ mod tests {
             ("[::1]", Address::Ipv6(std::net::Ipv6Addr::LOCALHOST)),
             ("[127.0.0.1]", Address::Ipv4(Ipv4Addr::LOCALHOST)),
             ("[::ffff:127.0.0.1]", Address::Ipv4(Ipv4Addr::LOCALHOST)),
+            ("[ 127.0.0.1 ]", Address::Ipv4(Ipv4Addr::LOCALHOST)),
+            ("[ ::1 ]", Address::Ipv6(std::net::Ipv6Addr::LOCALHOST)),
         ] {
             let domain = domain.as_bytes();
             let mut packet = vec![ADDR_TYPE_DOMAIN, domain.len() as u8];
