@@ -36,6 +36,8 @@ const METHOD_REJECT: u8 = 0xff;
 const AUTH_VERSION: u8 = 0x01;
 const CMD_CONNECT: u8 = 0x01;
 const CMD_UDP_ASSOCIATE: u8 = 0x03;
+const CMD_TOR_RESOLVE: u8 = 0xf0;
+const CMD_TOR_RESOLVE_PTR: u8 = 0xf1;
 const ADDR_TYPE_IPV4: u8 = 0x01;
 const ADDR_TYPE_DOMAIN: u8 = 0x03;
 const ADDR_TYPE_IPV6: u8 = 0x04;
@@ -173,7 +175,7 @@ impl SocksTcpServerHandler {
         });
 
         match command {
-            CMD_CONNECT => {
+            CMD_CONNECT | CMD_TOR_RESOLVE | CMD_TOR_RESOLVE_PTR => {
                 let remote_location = read_socks_address(&mut server_stream).await?;
 
                 Ok(TcpServerSetupResult::TcpForward {
@@ -1219,6 +1221,61 @@ mod tests {
                     request_version,
                     CMD_CONNECT,
                     reserved,
+                    ADDR_TYPE_IPV4,
+                    203,
+                    0,
+                    113,
+                    7,
+                    0x01,
+                    0xbb,
+                ])
+                .await
+                .unwrap();
+
+            let result =
+                handler.setup_server_stream(Box::new(server)).await.unwrap();
+            let mut method_response = [0u8; 2];
+            client.read_exact(&mut method_response).await.unwrap();
+            assert_eq!(method_response, [SOCKS_VERSION, METHOD_NO_AUTH]);
+
+            let TcpServerSetupResult::TcpForward {
+                remote_location,
+                connection_success_response,
+                ..
+            } = result
+            else {
+                panic!("expected SOCKS5 TCP forward result");
+            };
+            assert_eq!(remote_location.to_string(), "203.0.113.7:443");
+            assert_eq!(
+                connection_success_response.as_deref(),
+                Some(SUCCESS_RESPONSE.as_slice())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn socks5_tor_resolve_commands_are_tcp_connect_like_xray() {
+        for command in [CMD_TOR_RESOLVE, CMD_TOR_RESOLVE_PTR] {
+            let handler = SocksTcpServerHandler::new(
+                SocksUserStore::with_auth_required(Vec::new(), false),
+                "socks5-tor-command",
+                false,
+                None,
+            );
+            let listener =
+                TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let listener_addr = listener.local_addr().unwrap();
+            let mut client = TcpStream::connect(listener_addr).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            client
+                .write_all(&[
+                    SOCKS_VERSION,
+                    1,
+                    METHOD_NO_AUTH,
+                    SOCKS_VERSION,
+                    command,
+                    0,
                     ADDR_TYPE_IPV4,
                     203,
                     0,
