@@ -60,6 +60,7 @@ const SUCCESS_RESPONSE: [u8; 10] = [
 ];
 
 const UDP_BUFFER_SIZE: usize = 2 * 1024 * 1024;
+const XRAY_SOCKS_UDP_PACKET_SIZE: usize = 8 * 1024;
 
 #[derive(Debug)]
 pub struct SocksTcpServerHandler {
@@ -625,15 +626,24 @@ fn start_udp_target_session(
                 result = target_socket.recv_from(&mut response_buf) => {
                     match result {
                         Ok((resp_len, resp_addr)) => {
-                            let mut socks5_response = build_udp_response_header(resp_addr);
-                            socks5_response.extend_from_slice(&response_buf[..resp_len]);
+                            let socks5_response =
+                                build_udp_response_packet(resp_addr, &response_buf[..resp_len]);
+                            let forwarded_payload_len = if socks5_response.is_empty() {
+                                0
+                            } else {
+                                resp_len
+                            };
                             if let Err(error) = client_socket.send_to(&socks5_response, client_endpoint).await {
                                 tracing::warn!(
                                     "SOCKS5 UDP relay: failed to send response to client: {}",
                                     error
                                 );
                             } else {
-                                record_transfer(response_context.clone(), 0, resp_len as u64);
+                                record_transfer(
+                                    response_context.clone(),
+                                    0,
+                                    forwarded_payload_len as u64,
+                                );
                                 idle.as_mut().reset(Instant::now() + UDP_TARGET_SESSION_IDLE_TIMEOUT);
                             }
                         }
@@ -955,6 +965,18 @@ fn build_udp_response_header(src_addr: SocketAddr) -> Vec<u8> {
     header
 }
 
+fn build_udp_response_packet(src_addr: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    let mut response = build_udp_response_header(src_addr);
+    if response.len().saturating_add(payload.len()) > XRAY_SOCKS_UDP_PACKET_SIZE {
+        // Xray encodes SOCKS UDP responses into an 8 KiB buf.Buffer. Oversized
+        // payloads clear that buffer, producing a zero-length UDP datagram.
+        response.clear();
+        return response;
+    }
+    response.extend_from_slice(payload);
+    response
+}
+
 /// Create a UDP socket for forwarding to the target address.
 /// Uses the same address family as the target.
 fn create_udp_socket_for_target(
@@ -1030,6 +1052,21 @@ mod tests {
         let mut response = [0u8; 8];
         client.read_exact(&mut response).await.unwrap();
         (result, response)
+    }
+
+    #[test]
+    fn udp_response_packet_matches_xray_8kib_limit() {
+        let src_addr: SocketAddr = "127.0.0.1:53".parse().unwrap();
+        let max_payload =
+            XRAY_SOCKS_UDP_PACKET_SIZE - build_udp_response_header(src_addr).len();
+
+        let at_limit = build_udp_response_packet(src_addr, &vec![0x5a; max_payload]);
+        assert_eq!(at_limit.len(), XRAY_SOCKS_UDP_PACKET_SIZE);
+        assert_eq!(&at_limit[10..], vec![0x5a; max_payload]);
+
+        let oversized =
+            build_udp_response_packet(src_addr, &vec![0x5a; max_payload + 1]);
+        assert!(oversized.is_empty());
     }
 
     #[tokio::test]
