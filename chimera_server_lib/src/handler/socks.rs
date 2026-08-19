@@ -46,6 +46,7 @@ const REP_GENERAL_FAILURE: u8 = 0x01;
 const REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 const SOCKS4_REQUEST_GRANTED: u8 = 90;
 const SOCKS4_REQUEST_REJECTED: u8 = 91;
+const XRAY_SOCKS4_NULL_FIELD_SIZE: usize = 8192;
 const UDP_TARGET_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 const SUCCESS_RESPONSE: [u8; 10] = [
@@ -304,10 +305,10 @@ async fn read_until_null(
             return Ok(bytes);
         }
         bytes.push(byte);
-        if bytes.len() >= 2048 {
+        if bytes.len() >= XRAY_SOCKS4_NULL_FIELD_SIZE {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "SOCKS4 null-terminated field exceeds 2048 bytes",
+                "SOCKS4 null-terminated field exceeds Xray buffer size",
             ));
         }
     }
@@ -1474,6 +1475,40 @@ mod tests {
         assert_eq!(remote_location.to_string(), "203.0.113.7:443");
         assert!(connection_success_response.is_none());
         assert!(traffic_context.is_some());
+    }
+
+    #[tokio::test]
+    async fn socks4_null_terminated_fields_match_xray_buffer_limit() {
+        let handler = SocksTcpServerHandler::new(
+            SocksUserStore::with_auth_required(Vec::new(), false),
+            "socks4-null-limit",
+            false,
+            None,
+        );
+        let mut accepted =
+            vec![SOCKS4_VERSION, CMD_CONNECT, 0x01, 0xbb, 203, 0, 113, 7];
+        accepted.extend(std::iter::repeat_n(b'u', XRAY_SOCKS4_NULL_FIELD_SIZE - 1));
+        accepted.push(0);
+        let (result, response) = socks4_setup(&handler, &accepted).await;
+        assert_eq!(response[1], SOCKS4_REQUEST_GRANTED);
+        assert!(matches!(result, TcpServerSetupResult::TcpForward { .. }));
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(listener_addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let mut rejected =
+            vec![SOCKS4_VERSION, CMD_CONNECT, 0x01, 0xbb, 203, 0, 113, 7];
+        rejected.extend(std::iter::repeat_n(b'u', XRAY_SOCKS4_NULL_FIELD_SIZE));
+        rejected.push(0);
+        client.write_all(&rejected).await.unwrap();
+        let error = match handler.setup_server_stream(Box::new(server)).await {
+            Ok(_) => {
+                panic!("Xray rejects an 8192-byte SOCKS4 null-terminated field")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]
