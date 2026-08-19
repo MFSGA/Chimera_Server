@@ -401,7 +401,8 @@ async fn authenticate(
         send_username_auth_status(stream, 0x00).await?;
         Ok(username)
     } else {
-        send_username_auth_status(stream, 0x01).await?;
+        // Xray v26.2.6 reports credential mismatch with RFC 1929 status 0xFF.
+        send_username_auth_status(stream, 0xff).await?;
         Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "invalid socks username/password",
@@ -1267,6 +1268,60 @@ mod tests {
                 Some("user".to_string())
             );
         }
+    }
+
+    #[tokio::test]
+    async fn socks5_password_auth_failure_uses_xray_status_ff() {
+        let handler = SocksTcpServerHandler::new(
+            SocksUserStore::with_auth_required(
+                vec![SocksUser {
+                    username: "user".into(),
+                    password: "pass".into(),
+                }],
+                true,
+            ),
+            "socks5-auth-failure-status",
+            false,
+            None,
+        );
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(listener_addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        client
+            .write_all(&[
+                SOCKS_VERSION,
+                1,
+                METHOD_USERNAME_PASSWORD,
+                AUTH_VERSION,
+                4,
+                b'u',
+                b's',
+                b'e',
+                b'r',
+                5,
+                b'w',
+                b'r',
+                b'o',
+                b'n',
+                b'g',
+            ])
+            .await
+            .unwrap();
+
+        let error = match handler.setup_server_stream(Box::new(server)).await {
+            Ok(_) => panic!("invalid SOCKS5 credentials must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let mut responses = [0u8; 4];
+        client.read_exact(&mut responses).await.unwrap();
+        assert_eq!(
+            responses,
+            [SOCKS_VERSION, METHOD_USERNAME_PASSWORD, AUTH_VERSION, 0xff]
+        );
     }
 
     #[tokio::test]
