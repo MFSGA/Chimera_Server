@@ -158,15 +158,10 @@ impl SocksTcpServerHandler {
                 .filter(|s| !s.is_empty());
         }
 
-        let version = server_stream.read_u8().await?;
-        if version != SOCKS_VERSION {
-            send_command_response(&mut server_stream, REP_GENERAL_FAILURE).await?;
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("invalid socks version: {}", version),
-            ));
-        }
-
+        // Xray v26.2.6 reads the SOCKS5 request VER/CMD/RSV triplet but
+        // only uses CMD. Keep the negotiated SOCKS version authoritative and
+        // mirror that permissive second-stage request parsing.
+        let _request_version = server_stream.read_u8().await?;
         let command = server_stream.read_u8().await?;
 
         let traffic_context = Some(match identity {
@@ -420,14 +415,8 @@ async fn authenticate(
 async fn read_socks_address(
     stream: &mut Box<dyn AsyncStream>,
 ) -> std::io::Result<NetLocation> {
-    let reserved = stream.read_u8().await?;
-    if reserved != 0x00 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "reserved byte must be zero",
-        ));
-    }
-
+    // Xray v26.2.6 ignores the request RSV byte after method negotiation.
+    let _reserved = stream.read_u8().await?;
     read_address_from_stream(stream).await
 }
 
@@ -1204,6 +1193,63 @@ mod tests {
         let oversized =
             build_udp_response_packet(src_addr, &vec![0x5a; max_payload + 1]);
         assert!(oversized.is_empty());
+    }
+
+    #[tokio::test]
+    async fn socks5_command_version_and_reserved_are_ignored_like_xray() {
+        for (request_version, reserved) in
+            [(0x04, 0x00), (0x06, 0x00), (0x05, 0x07), (0x04, 0x07)]
+        {
+            let handler = SocksTcpServerHandler::new(
+                SocksUserStore::with_auth_required(Vec::new(), false),
+                "socks5-request-header",
+                false,
+                None,
+            );
+            let listener =
+                TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let listener_addr = listener.local_addr().unwrap();
+            let mut client = TcpStream::connect(listener_addr).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            client
+                .write_all(&[
+                    SOCKS_VERSION,
+                    1,
+                    METHOD_NO_AUTH,
+                    request_version,
+                    CMD_CONNECT,
+                    reserved,
+                    ADDR_TYPE_IPV4,
+                    203,
+                    0,
+                    113,
+                    7,
+                    0x01,
+                    0xbb,
+                ])
+                .await
+                .unwrap();
+
+            let result =
+                handler.setup_server_stream(Box::new(server)).await.unwrap();
+            let mut method_response = [0u8; 2];
+            client.read_exact(&mut method_response).await.unwrap();
+            assert_eq!(method_response, [SOCKS_VERSION, METHOD_NO_AUTH]);
+
+            let TcpServerSetupResult::TcpForward {
+                remote_location,
+                connection_success_response,
+                ..
+            } = result
+            else {
+                panic!("expected SOCKS5 TCP forward result");
+            };
+            assert_eq!(remote_location.to_string(), "203.0.113.7:443");
+            assert_eq!(
+                connection_success_response.as_deref(),
+                Some(SUCCESS_RESPONSE.as_slice())
+            );
+        }
     }
 
     #[tokio::test]
