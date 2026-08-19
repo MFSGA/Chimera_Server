@@ -724,7 +724,9 @@ pub(crate) async fn run_udp_relay(
         }
     });
 
-    let mut recv_buf = vec![0u8; UDP_BUFFER_SIZE];
+    // Xray v26.2.6 reads SOCKS UDP packets through an 8 KiB buf.Buffer.
+    // Oversized datagrams are truncated to that packet size before decoding.
+    let mut recv_buf = vec![0u8; XRAY_SOCKS_UDP_PACKET_SIZE];
     let mut target_sessions = HashMap::<SocketAddr, SocksUdpTargetSession>::new();
     let (client_udp_ip_hint, client_udp_port_hint) = client_udp_hint;
     let expected_client_ip = client_udp_ip_hint.unwrap_or(tcp_peer_addr.ip());
@@ -1524,6 +1526,70 @@ mod tests {
             .unwrap()
             .unwrap();
         origin_task.await.unwrap();
+    }
+
+    #[cfg(feature = "traffic")]
+    #[tokio::test]
+    async fn udp_relay_truncates_oversized_requests_like_xray() {
+        let origin_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let origin_addr = origin_socket.local_addr().unwrap();
+
+        let relay_socket =
+            Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let relay_addr = relay_socket.local_addr().unwrap();
+        let control_listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let control_addr = control_listener.local_addr().unwrap();
+        let client_control = TcpStream::connect(control_addr).await.unwrap();
+        let (server_control, _) = control_listener.accept().await.unwrap();
+
+        let runtime = RuntimeState::new(
+            Vec::new(),
+            vec![OutboundSummary {
+                tag: "direct".into(),
+                protocol: "freedom".into(),
+                proxy_settings_type: None,
+                proxy_settings_value: None,
+            }],
+        );
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let relay_task = tokio::spawn(run_udp_relay(
+            relay_socket,
+            Box::new(server_control),
+            resolver,
+            runtime,
+            client_control.local_addr().unwrap(),
+            (None, None),
+            None,
+        ));
+
+        let client_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let mut request = vec![0, 0, 0, ADDR_TYPE_IPV4];
+        let IpAddr::V4(origin_ip) = origin_addr.ip() else {
+            unreachable!("test origin socket must use IPv4");
+        };
+        request.extend_from_slice(&origin_ip.octets());
+        request.extend_from_slice(&origin_addr.port().to_be_bytes());
+        request.extend(std::iter::repeat_n(0x5a, XRAY_SOCKS_UDP_PACKET_SIZE));
+        client_socket.send_to(&request, relay_addr).await.unwrap();
+
+        let mut received = vec![0u8; XRAY_SOCKS_UDP_PACKET_SIZE * 2];
+        let (len, _) = timeout(
+            Duration::from_secs(2),
+            origin_socket.recv_from(&mut received),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(len, XRAY_SOCKS_UDP_PACKET_SIZE - 10);
+        assert!(received[..len].iter().all(|byte| *byte == 0x5a));
+
+        drop(client_control);
+        timeout(Duration::from_secs(2), relay_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[cfg(feature = "traffic")]
