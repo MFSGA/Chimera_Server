@@ -510,8 +510,10 @@ async fn handle_udp_associate(
         Address::Ipv6(ip) if !ip.is_unspecified() => Some(std::net::IpAddr::V6(*ip)),
         Address::Ipv4(_) | Address::Ipv6(_) | Address::Hostname(_) => None,
     };
-    let client_udp_port_hint =
-        (client_hint.port() != 0).then_some(client_hint.port());
+    let client_udp_port_hint = client_udp_ip_hint
+        .is_some()
+        .then_some(client_hint.port())
+        .filter(|port| *port != 0);
     tracing::debug!("SOCKS5 UDP ASSOCIATE: client hint = {:?}", client_hint);
 
     let udp_bind_addr = SocketAddr::new(
@@ -1215,6 +1217,33 @@ mod tests {
             Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)))
         );
         assert_eq!(client_udp_port_hint, Some(0x1234));
+    }
+
+    #[tokio::test]
+    async fn udp_associate_ignores_port_hint_for_unspecified_ip_like_xray() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(listener_addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        client
+            .write_all(&[0x00, ADDR_TYPE_IPV4, 0, 0, 0, 0, 0x12, 0x34])
+            .await
+            .unwrap();
+
+        let result = handle_udp_associate(Box::new(server), None, None)
+            .await
+            .unwrap();
+        let TcpServerSetupResult::UdpAssociate {
+            client_udp_ip_hint,
+            client_udp_port_hint,
+            ..
+        } = result
+        else {
+            panic!("expected UDP associate result");
+        };
+        assert_eq!(client_udp_ip_hint, None);
+        assert_eq!(client_udp_port_hint, None);
     }
 
     #[tokio::test]
