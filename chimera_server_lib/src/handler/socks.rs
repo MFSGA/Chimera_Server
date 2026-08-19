@@ -269,7 +269,7 @@ async fn setup_socks4_stream(
                 format!("failed to decode SOCKS4a domain: {error}"),
             )
         })?;
-        Address::from(domain)?
+        parse_xray_socks_domain_address(domain)?
     } else {
         Address::Ipv4(std::net::Ipv4Addr::from(address_bytes))
     };
@@ -473,7 +473,7 @@ async fn read_address_from_stream(
                 }
             };
 
-            let address = parse_socks5_domain_address(domain_str)?;
+            let address = parse_xray_socks_domain_address(domain_str)?;
             let mut port_bytes = [0u8; 2];
             stream.read_exact(&mut port_bytes).await?;
             let port = u16::from_be_bytes(port_bytes);
@@ -920,7 +920,7 @@ fn parse_udp_address(
                     "invalid domain name",
                 )
             })?;
-            let address = parse_socks5_domain_address(domain_str)?;
+            let address = parse_xray_socks_domain_address(domain_str)?;
             let port = u16::from_be_bytes([
                 data[offset + 2 + domain_len],
                 data[offset + 2 + domain_len + 1],
@@ -937,7 +937,7 @@ fn parse_udp_address(
     }
 }
 
-fn parse_socks5_domain_address(domain: &str) -> std::io::Result<Address> {
+fn parse_xray_socks_domain_address(domain: &str) -> std::io::Result<Address> {
     let maybe_ip = if domain.starts_with('[') {
         domain
             .strip_prefix('[')
@@ -1097,37 +1097,37 @@ mod tests {
         }
 
         assert_eq!(
-            parse_socks5_domain_address("[::1]").unwrap(),
+            parse_xray_socks_domain_address("[::1]").unwrap(),
             Address::Ipv6(std::net::Ipv6Addr::LOCALHOST)
         );
         assert_eq!(
-            parse_socks5_domain_address("[127.0.0.1]").unwrap(),
+            parse_xray_socks_domain_address("[127.0.0.1]").unwrap(),
             Address::Ipv4(Ipv4Addr::LOCALHOST)
         );
         assert_eq!(
-            parse_socks5_domain_address("[::ffff:127.0.0.1]").unwrap(),
+            parse_xray_socks_domain_address("[::ffff:127.0.0.1]").unwrap(),
             Address::Ipv4(Ipv4Addr::LOCALHOST)
         );
         assert_eq!(
-            parse_socks5_domain_address("[ 127.0.0.1 ]").unwrap(),
+            parse_xray_socks_domain_address("[ 127.0.0.1 ]").unwrap(),
             Address::Ipv4(Ipv4Addr::LOCALHOST)
         );
         assert_eq!(
-            parse_socks5_domain_address("[ ::1 ]").unwrap(),
+            parse_xray_socks_domain_address("[ ::1 ]").unwrap(),
             Address::Ipv6(std::net::Ipv6Addr::LOCALHOST)
         );
         assert_eq!(
-            parse_socks5_domain_address("127.0.0.1 ").unwrap(),
+            parse_xray_socks_domain_address("127.0.0.1 ").unwrap(),
             Address::Ipv4(Ipv4Addr::LOCALHOST)
         );
         assert_eq!(
-            parse_socks5_domain_address("2001:db8::1 ").unwrap(),
+            parse_xray_socks_domain_address("2001:db8::1 ").unwrap(),
             Address::Ipv6("2001:db8::1".parse().unwrap())
         );
-        assert!(parse_socks5_domain_address("[ example.com ]").is_err());
-        assert!(parse_socks5_domain_address(" 127.0.0.1").is_err());
-        assert!(parse_socks5_domain_address("1.example.com ").is_err());
-        assert!(parse_socks5_domain_address("::1").is_err());
+        assert!(parse_xray_socks_domain_address("[ example.com ]").is_err());
+        assert!(parse_xray_socks_domain_address(" 127.0.0.1").is_err());
+        assert!(parse_xray_socks_domain_address("1.example.com ").is_err());
+        assert!(parse_xray_socks_domain_address("::1").is_err());
 
         let domain = b"bad/name";
         let mut packet = vec![ADDR_TYPE_DOMAIN, domain.len() as u8];
@@ -1497,6 +1497,29 @@ mod tests {
             panic!("expected SOCKS4a TCP forward result");
         };
         assert_eq!(remote_location.to_string(), "example.com:80");
+    }
+
+    #[tokio::test]
+    async fn socks4a_bracketed_ip_domain_matches_xray() {
+        let handler = SocksTcpServerHandler::new(
+            SocksUserStore::with_auth_required(Vec::new(), false),
+            "socks4a-bracketed-ip",
+            false,
+            None,
+        );
+        let mut request =
+            vec![SOCKS4_VERSION, CMD_CONNECT, 0x01, 0xbb, 0, 0, 0, 1, 0];
+        request.extend_from_slice(b"[127.0.0.1]\0");
+        let (result, response) = socks4_setup(&handler, &request).await;
+
+        assert_eq!(response[1], SOCKS4_REQUEST_GRANTED);
+        let TcpServerSetupResult::TcpForward {
+            remote_location, ..
+        } = result
+        else {
+            panic!("expected SOCKS4a TCP forward result");
+        };
+        assert_eq!(remote_location.to_string(), "127.0.0.1:443");
     }
 
     #[tokio::test]
