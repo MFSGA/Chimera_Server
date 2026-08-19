@@ -178,15 +178,19 @@ impl SocksTcpServerHandler {
         match command {
             CMD_CONNECT | CMD_TOR_RESOLVE | CMD_TOR_RESOLVE_PTR => {
                 let remote_location = read_socks_address(&mut server_stream).await?;
+                // Xray v26.2.6 writes the SOCKS5 success response as part of
+                // the inbound handshake, before routing or outbound dialing.
+                // Preserve that observable timing even if the target later
+                // fails to connect.
+                let response = build_socks5_response(REP_SUCCEEDED, local_addr);
+                server_stream.write_all(&response).await?;
+                server_stream.flush().await?;
 
                 Ok(TcpServerSetupResult::TcpForward {
                     remote_location,
                     stream: server_stream,
                     need_initial_flush: false,
-                    connection_success_response: Some(
-                        build_socks5_response(REP_SUCCEEDED, local_addr)
-                            .into_boxed_slice(),
-                    ),
+                    connection_success_response: None,
                     traffic_context,
                 })
             }
@@ -1441,9 +1445,10 @@ mod tests {
 
             let result =
                 handler.setup_server_stream(Box::new(server)).await.unwrap();
-            let mut method_response = [0u8; 2];
-            client.read_exact(&mut method_response).await.unwrap();
-            assert_eq!(method_response, [SOCKS_VERSION, METHOD_NO_AUTH]);
+            let mut responses = [0u8; 12];
+            client.read_exact(&mut responses).await.unwrap();
+            assert_eq!(&responses[..2], &[SOCKS_VERSION, METHOD_NO_AUTH]);
+            assert_eq!(&responses[2..], SUCCESS_RESPONSE.as_slice());
 
             let TcpServerSetupResult::TcpForward {
                 remote_location,
@@ -1454,10 +1459,7 @@ mod tests {
                 panic!("expected SOCKS5 TCP forward result");
             };
             assert_eq!(remote_location.to_string(), "203.0.113.7:443");
-            assert_eq!(
-                connection_success_response.as_deref(),
-                Some(SUCCESS_RESPONSE.as_slice())
-            );
+            assert!(connection_success_response.is_none());
         }
     }
 
@@ -1502,9 +1504,13 @@ mod tests {
             )
             .await
             .unwrap();
-        let mut method_response = [0u8; 2];
-        client.read_exact(&mut method_response).await.unwrap();
-        assert_eq!(method_response, [SOCKS_VERSION, METHOD_NO_AUTH]);
+        let mut responses = [0u8; 12];
+        client.read_exact(&mut responses).await.unwrap();
+        assert_eq!(&responses[..2], &[SOCKS_VERSION, METHOD_NO_AUTH]);
+        assert_eq!(
+            &responses[2..],
+            build_socks5_response(REP_SUCCEEDED, Some(listener_addr)).as_slice()
+        );
 
         let TcpServerSetupResult::TcpForward {
             connection_success_response,
@@ -1513,12 +1519,7 @@ mod tests {
         else {
             panic!("expected SOCKS5 TCP forward result");
         };
-        assert_eq!(
-            connection_success_response.as_deref(),
-            Some(
-                build_socks5_response(REP_SUCCEEDED, Some(listener_addr)).as_slice()
-            )
-        );
+        assert!(connection_success_response.is_none());
     }
 
     #[tokio::test]
@@ -1556,9 +1557,10 @@ mod tests {
 
             let result =
                 handler.setup_server_stream(Box::new(server)).await.unwrap();
-            let mut method_response = [0u8; 2];
-            client.read_exact(&mut method_response).await.unwrap();
-            assert_eq!(method_response, [SOCKS_VERSION, METHOD_NO_AUTH]);
+            let mut responses = [0u8; 12];
+            client.read_exact(&mut responses).await.unwrap();
+            assert_eq!(&responses[..2], &[SOCKS_VERSION, METHOD_NO_AUTH]);
+            assert_eq!(&responses[2..], SUCCESS_RESPONSE.as_slice());
 
             let TcpServerSetupResult::TcpForward {
                 remote_location,
@@ -1569,10 +1571,7 @@ mod tests {
                 panic!("expected SOCKS5 TCP forward result");
             };
             assert_eq!(remote_location.to_string(), "203.0.113.7:443");
-            assert_eq!(
-                connection_success_response.as_deref(),
-                Some(SUCCESS_RESPONSE.as_slice())
-            );
+            assert!(connection_success_response.is_none());
         }
     }
 
