@@ -203,6 +203,7 @@ impl SocksTcpServerHandler {
                     server_stream,
                     traffic_context,
                     self.udp_bind_ip.or(local_addr.map(|addr| addr.ip())),
+                    self.requires_auth(),
                 )
                 .await
             }
@@ -496,20 +497,16 @@ async fn handle_udp_associate(
     mut server_stream: Box<dyn AsyncStream>,
     traffic_context: Option<TrafficContext>,
     udp_bind_ip: Option<std::net::IpAddr>,
+    restrict_client_ip_to_tcp_peer: bool,
 ) -> std::io::Result<TcpServerSetupResult> {
-    // Match Xray: a concrete UDP source IP in the ASSOCIATE request is
-    // authoritative. Domain or unspecified addresses fall back to the TCP peer.
+    // Xray v26.2.6 parses the UDP ASSOCIATE destination but does not use it as
+    // a source endpoint hint. With password auth, its UDPFilter only authorizes
+    // the TCP peer IP; without auth, the shared UDP listener accepts any source.
     let client_hint = read_socks_address(&mut server_stream).await?;
-    let client_udp_ip_hint = match client_hint.address() {
-        Address::Ipv4(ip) if !ip.is_unspecified() => Some(std::net::IpAddr::V4(*ip)),
-        Address::Ipv6(ip) if !ip.is_unspecified() => Some(std::net::IpAddr::V6(*ip)),
-        Address::Ipv4(_) | Address::Ipv6(_) | Address::Hostname(_) => None,
-    };
-    let client_udp_port_hint = client_udp_ip_hint
-        .is_some()
-        .then_some(client_hint.port())
-        .filter(|port| *port != 0);
-    tracing::debug!("SOCKS5 UDP ASSOCIATE: client hint = {:?}", client_hint);
+    tracing::debug!(
+        "SOCKS5 UDP ASSOCIATE: ignored client hint = {:?}",
+        client_hint
+    );
 
     let udp_bind_addr = SocketAddr::new(
         udp_bind_ip.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
@@ -536,8 +533,7 @@ async fn handle_udp_associate(
     Ok(TcpServerSetupResult::UdpAssociate {
         stream: server_stream,
         socket: Arc::new(udp_socket),
-        client_udp_ip_hint,
-        client_udp_port_hint,
+        restrict_client_ip_to_tcp_peer,
         traffic_context,
     })
 }
@@ -696,7 +692,7 @@ pub(crate) async fn run_udp_relay(
     resolver: Arc<dyn Resolver>,
     runtime: RuntimeState,
     tcp_peer_addr: SocketAddr,
-    client_udp_hint: (Option<std::net::IpAddr>, Option<u16>),
+    restrict_client_ip_to_tcp_peer: bool,
     traffic_context: Option<TrafficContext>,
 ) -> std::io::Result<()> {
     let udp_socket_clone = udp_socket.clone();
@@ -716,10 +712,9 @@ pub(crate) async fn run_udp_relay(
     // Oversized datagrams are truncated to that packet size before decoding.
     let mut recv_buf = vec![0u8; XRAY_SOCKS_UDP_PACKET_SIZE];
     let mut target_sessions = HashMap::<SocketAddr, SocksUdpTargetSession>::new();
-    let (client_udp_ip_hint, client_udp_port_hint) = client_udp_hint;
-    let expected_client_ip = client_udp_ip_hint.unwrap_or(tcp_peer_addr.ip());
-    let mut client_endpoint =
-        client_udp_port_hint.map(|port| SocketAddr::new(expected_client_ip, port));
+    let expected_client_ip =
+        restrict_client_ip_to_tcp_peer.then_some(tcp_peer_addr.ip());
+    let mut client_endpoint = None;
 
     loop {
         let (len, client_addr) = tokio::select! {
@@ -732,11 +727,11 @@ pub(crate) async fn run_udp_relay(
             }
         };
 
-        if client_addr.ip() != expected_client_ip {
+        if expected_client_ip.is_some_and(|expected| client_addr.ip() != expected) {
             tracing::warn!(
-                "SOCKS5 UDP relay ignored datagram from {}; expected source IP {}",
+                "SOCKS5 UDP relay ignored datagram from {}; expected TCP peer IP {}",
                 client_addr,
-                expected_client_ip
+                tcp_peer_addr.ip()
             );
             continue;
         }
@@ -1928,7 +1923,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn udp_associate_preserves_explicit_client_ip_hint_like_xray() {
+    async fn udp_associate_ignores_explicit_client_hint_like_xray_v26_2_6() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let listener_addr = listener.local_addr().unwrap();
         let mut client = TcpStream::connect(listener_addr).await.unwrap();
@@ -1939,26 +1934,22 @@ mod tests {
             .await
             .unwrap();
 
-        let result = handle_udp_associate(Box::new(server), None, None)
+        let result = handle_udp_associate(Box::new(server), None, None, false)
             .await
             .unwrap();
         let TcpServerSetupResult::UdpAssociate {
-            client_udp_ip_hint,
-            client_udp_port_hint,
+            restrict_client_ip_to_tcp_peer,
             ..
         } = result
         else {
             panic!("expected UDP associate result");
         };
-        assert_eq!(
-            client_udp_ip_hint,
-            Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)))
-        );
-        assert_eq!(client_udp_port_hint, Some(0x1234));
+        assert!(!restrict_client_ip_to_tcp_peer);
     }
 
     #[tokio::test]
-    async fn udp_associate_ignores_port_hint_for_unspecified_ip_like_xray() {
+    async fn udp_associate_password_auth_restricts_udp_to_tcp_peer_like_xray_v26_2_6()
+     {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let listener_addr = listener.local_addr().unwrap();
         let mut client = TcpStream::connect(listener_addr).await.unwrap();
@@ -1969,19 +1960,17 @@ mod tests {
             .await
             .unwrap();
 
-        let result = handle_udp_associate(Box::new(server), None, None)
+        let result = handle_udp_associate(Box::new(server), None, None, true)
             .await
             .unwrap();
         let TcpServerSetupResult::UdpAssociate {
-            client_udp_ip_hint,
-            client_udp_port_hint,
+            restrict_client_ip_to_tcp_peer,
             ..
         } = result
         else {
             panic!("expected UDP associate result");
         };
-        assert_eq!(client_udp_ip_hint, None);
-        assert_eq!(client_udp_port_hint, None);
+        assert!(restrict_client_ip_to_tcp_peer);
     }
 
     #[tokio::test]
@@ -2000,6 +1989,7 @@ mod tests {
             Box::new(server),
             None,
             Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            false,
         )
         .await
         .unwrap();
@@ -2018,6 +2008,83 @@ mod tests {
         assert_eq!(response[1], REP_SUCCEEDED);
         assert_eq!(response[3], ADDR_TYPE_IPV4);
         assert_eq!(&response[4..8], &Ipv4Addr::LOCALHOST.octets());
+    }
+
+    #[cfg(feature = "traffic")]
+    async fn udp_source_from_alternate_loopback_is_forwarded(
+        restrict_client_ip_to_tcp_peer: bool,
+    ) -> bool {
+        let origin_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let origin_addr = origin_socket.local_addr().unwrap();
+
+        let relay_socket =
+            Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let relay_addr = relay_socket.local_addr().unwrap();
+        let control_listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let control_addr = control_listener.local_addr().unwrap();
+        let client_control = TcpStream::connect(control_addr).await.unwrap();
+        let (server_control, _) = control_listener.accept().await.unwrap();
+
+        let runtime = RuntimeState::new(
+            Vec::new(),
+            vec![OutboundSummary {
+                tag: "direct".into(),
+                protocol: "freedom".into(),
+                proxy_settings_type: None,
+                proxy_settings_value: None,
+            }],
+        );
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let relay_task = tokio::spawn(run_udp_relay(
+            relay_socket,
+            Box::new(server_control),
+            resolver,
+            runtime,
+            client_control.local_addr().unwrap(),
+            restrict_client_ip_to_tcp_peer,
+            None,
+        ));
+
+        let alternate_source = Ipv4Addr::new(127, 0, 0, 2);
+        let client_socket = UdpSocket::bind((alternate_source, 0)).await.unwrap();
+        let mut request = vec![0, 0, 0, ADDR_TYPE_IPV4];
+        let IpAddr::V4(origin_ip) = origin_addr.ip() else {
+            unreachable!("test origin socket must use IPv4");
+        };
+        request.extend_from_slice(&origin_ip.octets());
+        request.extend_from_slice(&origin_addr.port().to_be_bytes());
+        request.extend_from_slice(b"source-check");
+        client_socket.send_to(&request, relay_addr).await.unwrap();
+
+        let mut received = [0u8; 64];
+        let forwarded = timeout(
+            Duration::from_millis(300),
+            origin_socket.recv_from(&mut received),
+        )
+        .await
+        .is_ok();
+
+        drop(client_control);
+        timeout(Duration::from_secs(2), relay_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        forwarded
+    }
+
+    #[cfg(feature = "traffic")]
+    #[tokio::test]
+    async fn udp_relay_noauth_accepts_non_tcp_peer_source_like_xray_v26_2_6() {
+        assert!(udp_source_from_alternate_loopback_is_forwarded(false).await);
+    }
+
+    #[cfg(feature = "traffic")]
+    #[tokio::test]
+    async fn udp_relay_password_auth_filters_non_tcp_peer_source_like_xray_v26_2_6()
+    {
+        assert!(!udp_source_from_alternate_loopback_is_forwarded(true).await);
     }
 
     #[cfg(feature = "traffic")]
@@ -2100,7 +2167,7 @@ mod tests {
             resolver,
             runtime,
             client_control.local_addr().unwrap(),
-            (None, None),
+            false,
             None,
         ));
 
@@ -2168,7 +2235,7 @@ mod tests {
             resolver,
             runtime,
             client_control.local_addr().unwrap(),
-            (None, None),
+            false,
             None,
         ));
 
@@ -2230,7 +2297,7 @@ mod tests {
             resolver,
             runtime,
             client_control.local_addr().unwrap(),
-            (None, None),
+            false,
             None,
         ));
 
@@ -2310,7 +2377,7 @@ mod tests {
             resolver,
             runtime,
             client_control.local_addr().unwrap(),
-            (None, None),
+            false,
             Some(traffic_context),
         ));
 
