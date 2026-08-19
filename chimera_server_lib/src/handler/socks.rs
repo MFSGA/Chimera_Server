@@ -775,6 +775,11 @@ pub(crate) async fn run_udp_relay(
         };
 
         let payload = &data[payload_offset..];
+        // Xray v26.2.6 drops a successfully decoded SOCKS UDP packet when
+        // there is no payload after the address header.
+        if payload.is_empty() {
+            continue;
+        }
         let target_addr =
             match resolve_single_address(&resolver, &target_location).await {
                 Ok(addr) => addr,
@@ -2130,6 +2135,68 @@ mod tests {
             .unwrap()
             .unwrap();
         origin_task.await.unwrap();
+    }
+
+    #[cfg(feature = "traffic")]
+    #[tokio::test]
+    async fn udp_relay_drops_empty_payloads_like_xray() {
+        let origin_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let origin_addr = origin_socket.local_addr().unwrap();
+
+        let relay_socket =
+            Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let relay_addr = relay_socket.local_addr().unwrap();
+        let control_listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let control_addr = control_listener.local_addr().unwrap();
+        let client_control = TcpStream::connect(control_addr).await.unwrap();
+        let (server_control, _) = control_listener.accept().await.unwrap();
+
+        let runtime = RuntimeState::new(
+            Vec::new(),
+            vec![OutboundSummary {
+                tag: "direct".into(),
+                protocol: "freedom".into(),
+                proxy_settings_type: None,
+                proxy_settings_value: None,
+            }],
+        );
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let relay_task = tokio::spawn(run_udp_relay(
+            relay_socket,
+            Box::new(server_control),
+            resolver,
+            runtime,
+            client_control.local_addr().unwrap(),
+            (None, None),
+            None,
+        ));
+
+        let client_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let mut request = vec![0, 0, 0, ADDR_TYPE_IPV4];
+        let IpAddr::V4(origin_ip) = origin_addr.ip() else {
+            unreachable!("test origin socket must use IPv4");
+        };
+        request.extend_from_slice(&origin_ip.octets());
+        request.extend_from_slice(&origin_addr.port().to_be_bytes());
+        client_socket.send_to(&request, relay_addr).await.unwrap();
+
+        let mut received = [0u8; 1];
+        assert!(
+            timeout(
+                Duration::from_millis(200),
+                origin_socket.recv_from(&mut received)
+            )
+            .await
+            .is_err()
+        );
+
+        drop(client_control);
+        timeout(Duration::from_secs(2), relay_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[cfg(feature = "traffic")]
