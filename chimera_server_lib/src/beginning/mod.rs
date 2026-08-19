@@ -210,6 +210,7 @@ async fn run_tcp_server(
     runtime: RuntimeState,
 ) -> std::io::Result<()> {
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let listener_addr = listener.local_addr()?;
 
     loop {
         let (stream, addr) = match listener.accept().await {
@@ -231,7 +232,10 @@ async fn run_tcp_server(
                 &stream,
                 cloned_handler.as_ref().as_ref(),
             ) {
-                Ok(context) => context,
+                Ok(mut context) => {
+                    context.listener_addr = Some(listener_addr);
+                    context
+                }
                 Err(error) => {
                     error!(
                         "{}:{} failed to read original destination: {}",

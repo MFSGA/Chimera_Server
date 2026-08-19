@@ -113,6 +113,7 @@ impl SocksTcpServerHandler {
         &self,
         mut server_stream: Box<dyn AsyncStream>,
         local_addr: Option<SocketAddr>,
+        listener_addr: Option<SocketAddr>,
     ) -> std::io::Result<TcpServerSetupResult> {
         let version = server_stream.read_u8().await?;
         if version == SOCKS4_VERSION {
@@ -182,7 +183,10 @@ impl SocksTcpServerHandler {
                 // the inbound handshake, before routing or outbound dialing.
                 // Preserve that observable timing even if the target later
                 // fails to connect.
-                let response = build_socks5_response(REP_SUCCEEDED, local_addr);
+                let response = build_socks5_response(
+                    REP_SUCCEEDED,
+                    listener_addr.or(local_addr),
+                );
                 server_stream.write_all(&response).await?;
                 server_stream.flush().await?;
 
@@ -228,7 +232,8 @@ impl TcpServerHandler for SocksTcpServerHandler {
         &self,
         server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
-        self.setup_server_stream_inner(server_stream, None).await
+        self.setup_server_stream_inner(server_stream, None, None)
+            .await
     }
 
     async fn setup_server_stream_with_context(
@@ -236,8 +241,12 @@ impl TcpServerHandler for SocksTcpServerHandler {
         server_stream: Box<dyn AsyncStream>,
         context: TcpServerConnectionContext,
     ) -> std::io::Result<TcpServerSetupResult> {
-        self.setup_server_stream_inner(server_stream, context.local_addr)
-            .await
+        self.setup_server_stream_inner(
+            server_stream,
+            context.local_addr,
+            context.listener_addr,
+        )
+        .await
     }
 }
 
@@ -1464,7 +1473,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn socks5_connect_response_uses_listener_address_like_xray() {
+    async fn socks5_connect_response_uses_listener_gateway_like_xray() {
         let handler = SocksTcpServerHandler::new(
             SocksUserStore::with_auth_required(Vec::new(), false),
             "socks5-bound-address",
@@ -1473,6 +1482,8 @@ mod tests {
         );
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let listener_addr = listener.local_addr().unwrap();
+        let gateway_addr =
+            SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), listener_addr.port());
         let mut client = TcpStream::connect(listener_addr).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();
         client
@@ -1499,6 +1510,7 @@ mod tests {
                 Box::new(server),
                 TcpServerConnectionContext {
                     local_addr: Some(listener_addr),
+                    listener_addr: Some(gateway_addr),
                     ..Default::default()
                 },
             )
@@ -1509,7 +1521,7 @@ mod tests {
         assert_eq!(&responses[..2], &[SOCKS_VERSION, METHOD_NO_AUTH]);
         assert_eq!(
             &responses[2..],
-            build_socks5_response(REP_SUCCEEDED, Some(listener_addr)).as_slice()
+            build_socks5_response(REP_SUCCEEDED, Some(gateway_addr)).as_slice()
         );
 
         let TcpServerSetupResult::TcpForward {

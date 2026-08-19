@@ -13,6 +13,7 @@ use crate::{
 pub struct TcpServerConnectionContext {
     pub original_destination: Option<NetLocation>,
     pub local_addr: Option<std::net::SocketAddr>,
+    pub listener_addr: Option<std::net::SocketAddr>,
     pub server_name: Option<String>,
     pub alpn_protocol: Option<String>,
 }
