@@ -485,11 +485,11 @@ async fn read_address_from_stream(
                 }
             };
 
-            validate_socks5_domain(domain_str)?;
+            let address = parse_socks5_domain_address(domain_str)?;
             let mut port_bytes = [0u8; 2];
             stream.read_exact(&mut port_bytes).await?;
             let port = u16::from_be_bytes(port_bytes);
-            NetLocation::new(Address::from(domain_str)?, port)
+            NetLocation::new(address, port)
         }
         _ => {
             return Err(std::io::Error::new(
@@ -932,13 +932,13 @@ fn parse_udp_address(
                     "invalid domain name",
                 )
             })?;
-            validate_socks5_domain(domain_str)?;
+            let address = parse_socks5_domain_address(domain_str)?;
             let port = u16::from_be_bytes([
                 data[offset + 2 + domain_len],
                 data[offset + 2 + domain_len + 1],
             ]);
             Ok((
-                NetLocation::new(Address::from(domain_str)?, port),
+                NetLocation::new(address, port),
                 offset + 1 + 1 + domain_len + 2,
             ))
         }
@@ -947,6 +947,25 @@ fn parse_udp_address(
             format!("unknown address type: {}", addr_type),
         )),
     }
+}
+
+fn parse_socks5_domain_address(domain: &str) -> std::io::Result<Address> {
+    if let Some(inner) = domain
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        && let Ok(ip) = inner.parse::<std::net::IpAddr>()
+    {
+        return Ok(match ip {
+            std::net::IpAddr::V4(ip) => Address::Ipv4(ip),
+            std::net::IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+                Some(ip) => Address::Ipv4(ip),
+                None => Address::Ipv6(ip),
+            },
+        });
+    }
+
+    validate_socks5_domain(domain)?;
+    Address::from(domain)
 }
 
 fn validate_socks5_domain(domain: &str) -> std::io::Result<()> {
@@ -1081,11 +1100,43 @@ mod tests {
             assert!(validate_socks5_domain(domain).is_err(), "{domain}");
         }
 
+        assert_eq!(
+            parse_socks5_domain_address("[::1]").unwrap(),
+            Address::Ipv6(std::net::Ipv6Addr::LOCALHOST)
+        );
+        assert_eq!(
+            parse_socks5_domain_address("[127.0.0.1]").unwrap(),
+            Address::Ipv4(Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(
+            parse_socks5_domain_address("[::ffff:127.0.0.1]").unwrap(),
+            Address::Ipv4(Ipv4Addr::LOCALHOST)
+        );
+        assert!(parse_socks5_domain_address("::1").is_err());
+
         let domain = b"bad/name";
         let mut packet = vec![ADDR_TYPE_DOMAIN, domain.len() as u8];
         packet.extend_from_slice(domain);
         packet.extend_from_slice(&53u16.to_be_bytes());
         assert!(parse_udp_address(&packet, 0).is_err());
+    }
+
+    #[test]
+    fn socks5_udp_domain_atyp_accepts_bracketed_ip_literals_like_xray() {
+        for (domain, expected) in [
+            ("[::1]", Address::Ipv6(std::net::Ipv6Addr::LOCALHOST)),
+            ("[127.0.0.1]", Address::Ipv4(Ipv4Addr::LOCALHOST)),
+            ("[::ffff:127.0.0.1]", Address::Ipv4(Ipv4Addr::LOCALHOST)),
+        ] {
+            let domain = domain.as_bytes();
+            let mut packet = vec![ADDR_TYPE_DOMAIN, domain.len() as u8];
+            packet.extend_from_slice(domain);
+            packet.extend_from_slice(&53u16.to_be_bytes());
+            let (location, used) = parse_udp_address(&packet, 0).unwrap();
+            assert_eq!(location.address(), &expected);
+            assert_eq!(location.port(), 53);
+            assert_eq!(used, packet.len());
+        }
     }
 
     #[tokio::test]
