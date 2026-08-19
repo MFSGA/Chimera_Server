@@ -112,7 +112,7 @@ impl SocksTcpServerHandler {
     async fn setup_server_stream_inner(
         &self,
         mut server_stream: Box<dyn AsyncStream>,
-        local_ip: Option<std::net::IpAddr>,
+        local_addr: Option<SocketAddr>,
     ) -> std::io::Result<TcpServerSetupResult> {
         let version = server_stream.read_u8().await?;
         if version == SOCKS4_VERSION {
@@ -184,7 +184,8 @@ impl SocksTcpServerHandler {
                     stream: server_stream,
                     need_initial_flush: false,
                     connection_success_response: Some(
-                        SUCCESS_RESPONSE.to_vec().into_boxed_slice(),
+                        build_socks5_response(REP_SUCCEEDED, local_addr)
+                            .into_boxed_slice(),
                     ),
                     traffic_context,
                 })
@@ -193,7 +194,7 @@ impl SocksTcpServerHandler {
                 handle_udp_associate(
                     server_stream,
                     traffic_context,
-                    self.udp_bind_ip.or(local_ip),
+                    self.udp_bind_ip.or(local_addr.map(|addr| addr.ip())),
                 )
                 .await
             }
@@ -231,11 +232,8 @@ impl TcpServerHandler for SocksTcpServerHandler {
         server_stream: Box<dyn AsyncStream>,
         context: TcpServerConnectionContext,
     ) -> std::io::Result<TcpServerSetupResult> {
-        self.setup_server_stream_inner(
-            server_stream,
-            context.local_addr.map(|addr| addr.ip()),
-        )
-        .await
+        self.setup_server_stream_inner(server_stream, context.local_addr)
+            .await
     }
 }
 
@@ -1058,15 +1056,32 @@ async fn send_username_auth_status(
     stream.write_all(&[AUTH_VERSION, status]).await
 }
 
+fn build_socks5_response(reply: u8, bound_addr: Option<SocketAddr>) -> Vec<u8> {
+    let mut response = vec![SOCKS_VERSION, reply, 0x00];
+    match bound_addr {
+        Some(SocketAddr::V4(addr)) => {
+            response.push(ADDR_TYPE_IPV4);
+            response.extend_from_slice(&addr.ip().octets());
+            response.extend_from_slice(&addr.port().to_be_bytes());
+        }
+        Some(SocketAddr::V6(addr)) => {
+            response.push(ADDR_TYPE_IPV6);
+            response.extend_from_slice(&addr.ip().octets());
+            response.extend_from_slice(&addr.port().to_be_bytes());
+        }
+        None => {
+            response.push(ADDR_TYPE_IPV4);
+            response.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        }
+    }
+    response
+}
+
 async fn send_command_response(
     stream: &mut Box<dyn AsyncStream>,
     reply: u8,
 ) -> std::io::Result<()> {
-    let mut response = [0u8; 10];
-    response[0] = SOCKS_VERSION;
-    response[1] = reply;
-    response[3] = ADDR_TYPE_IPV4;
-    stream.write_all(&response).await
+    stream.write_all(&build_socks5_response(reply, None)).await
 }
 
 #[cfg(test)]
@@ -1444,6 +1459,66 @@ mod tests {
                 Some(SUCCESS_RESPONSE.as_slice())
             );
         }
+    }
+
+    #[tokio::test]
+    async fn socks5_connect_response_uses_listener_address_like_xray() {
+        let handler = SocksTcpServerHandler::new(
+            SocksUserStore::with_auth_required(Vec::new(), false),
+            "socks5-bound-address",
+            false,
+            None,
+        );
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(listener_addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        client
+            .write_all(&[
+                SOCKS_VERSION,
+                1,
+                METHOD_NO_AUTH,
+                SOCKS_VERSION,
+                CMD_CONNECT,
+                0,
+                ADDR_TYPE_IPV4,
+                203,
+                0,
+                113,
+                7,
+                0x01,
+                0xbb,
+            ])
+            .await
+            .unwrap();
+
+        let result = handler
+            .setup_server_stream_with_context(
+                Box::new(server),
+                TcpServerConnectionContext {
+                    local_addr: Some(listener_addr),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut method_response = [0u8; 2];
+        client.read_exact(&mut method_response).await.unwrap();
+        assert_eq!(method_response, [SOCKS_VERSION, METHOD_NO_AUTH]);
+
+        let TcpServerSetupResult::TcpForward {
+            connection_success_response,
+            ..
+        } = result
+        else {
+            panic!("expected SOCKS5 TCP forward result");
+        };
+        assert_eq!(
+            connection_success_response.as_deref(),
+            Some(
+                build_socks5_response(REP_SUCCEEDED, Some(listener_addr)).as_slice()
+            )
+        );
     }
 
     #[tokio::test]
