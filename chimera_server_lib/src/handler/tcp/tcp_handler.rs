@@ -1,7 +1,6 @@
-use std::{fmt::Debug, sync::Arc};
+use std::fmt::Debug;
 
 use async_trait::async_trait;
-use tokio::net::UdpSocket;
 
 use crate::{
     address::NetLocation,
@@ -69,8 +68,6 @@ pub enum TcpServerSetupResult {
     },
     UdpAssociate {
         stream: Box<dyn AsyncStream>,
-        socket: Arc<UdpSocket>,
-        restrict_client_ip_to_tcp_peer: bool,
         traffic_context: Option<TrafficContext>,
     },
     BidirectionalUdp {

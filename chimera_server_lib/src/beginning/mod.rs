@@ -3,7 +3,11 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use quic::start_quic_server;
 #[cfg(target_os = "linux")]
 use socket2::SockRef;
-use tokio::{io::AsyncWriteExt, task::JoinHandle, time::timeout};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    task::JoinHandle,
+    time::timeout,
+};
 use udp::{
     run_bidirectional_udp, run_multi_directional_udp, run_session_based_udp,
     start_udp_server,
@@ -18,7 +22,7 @@ use crate::{
     },
     handler::{
         http::relay_plain_http_response,
-        socks::{run_shared_udp_relay, run_udp_relay},
+        socks::run_shared_udp_relay,
         tcp::{
             tcp_handler::{
                 TcpServerConnectionContext, TcpServerHandler, TcpServerSetupResult,
@@ -732,23 +736,20 @@ where
             unreachable!("fallback result must be normalized before forwarding")
         }
         TcpServerSetupResult::UdpAssociate {
-            stream,
-            socket,
-            restrict_client_ip_to_tcp_peer,
+            mut stream,
             traffic_context,
         } => {
             let traffic_context = traffic_context
                 .map(|context| context.with_client_ip(peer_addr.ip()));
-            run_udp_relay(
-                socket,
-                stream,
-                resolver,
-                runtime,
-                peer_addr,
-                restrict_client_ip_to_tcp_peer,
-                traffic_context,
-            )
-            .await
+            let _connection_guard = register_connection(traffic_context.as_ref());
+            let mut buf = [0u8; 1024];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) => return Ok(()),
+                    Ok(_) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
         }
         TcpServerSetupResult::BidirectionalUdp {
             remote_location,
