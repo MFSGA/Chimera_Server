@@ -70,7 +70,7 @@ pub struct SocksTcpServerHandler {
     accounts: SocksUserStore,
     inbound_tag: String,
     udp_enabled: bool,
-    udp_response_ip: Option<std::net::IpAddr>,
+    udp_response_ip: Option<String>,
 }
 
 impl SocksTcpServerHandler {
@@ -78,7 +78,7 @@ impl SocksTcpServerHandler {
         accounts: SocksUserStore,
         inbound_tag: &str,
         udp_enabled: bool,
-        udp_response_ip: Option<std::net::IpAddr>,
+        udp_response_ip: Option<String>,
     ) -> Self {
         Self {
             accounts,
@@ -204,7 +204,7 @@ impl SocksTcpServerHandler {
                     server_stream,
                     traffic_context,
                     local_addr.map(|addr| addr.ip()),
-                    self.udp_response_ip,
+                    self.udp_response_ip.clone(),
                     self.requires_auth(),
                 )
                 .await
@@ -488,7 +488,7 @@ async fn handle_udp_associate(
     mut server_stream: Box<dyn AsyncStream>,
     traffic_context: Option<TrafficContext>,
     udp_bind_ip: Option<std::net::IpAddr>,
-    udp_response_ip: Option<std::net::IpAddr>,
+    udp_response_ip: Option<String>,
     restrict_client_ip_to_tcp_peer: bool,
 ) -> std::io::Result<TcpServerSetupResult> {
     // Xray v26.2.6 parses the UDP ASSOCIATE destination but does not use it as
@@ -518,11 +518,12 @@ async fn handle_udp_associate(
     let bound_addr = udp_socket.local_addr()?;
     tracing::info!("SOCKS5 UDP ASSOCIATE: bound UDP relay at {}", bound_addr);
 
-    let response_addr = SocketAddr::new(
-        udp_response_ip.unwrap_or(bound_addr.ip()),
-        bound_addr.port(),
-    );
-    let response = build_udp_associate_response(response_addr);
+    let response_address = match udp_response_ip {
+        Some(address) => Address::from(&address)?,
+        None => xray_ip_address(bound_addr.ip()),
+    };
+    let response =
+        build_udp_associate_response(&response_address, bound_addr.port());
     server_stream.write_all(&response).await?;
     server_stream.flush().await?;
 
@@ -535,22 +536,25 @@ async fn handle_udp_associate(
 }
 
 /// Build a SOCKS5 UDP ASSOCIATE success response.
-fn build_udp_associate_response(bound_addr: SocketAddr) -> Vec<u8> {
+fn build_udp_associate_response(address: &Address, port: u16) -> Vec<u8> {
     let mut response = vec![SOCKS_VERSION, REP_SUCCEEDED, 0x00];
 
-    match bound_addr {
-        SocketAddr::V4(v4) => {
+    match address {
+        Address::Ipv4(ip) => {
             response.push(ADDR_TYPE_IPV4);
-            response.extend_from_slice(&v4.ip().octets());
-            response.extend_from_slice(&v4.port().to_be_bytes());
+            response.extend_from_slice(&ip.octets());
         }
-        SocketAddr::V6(v6) => {
+        Address::Ipv6(ip) => {
             response.push(ADDR_TYPE_IPV6);
-            response.extend_from_slice(&v6.ip().octets());
-            response.extend_from_slice(&v6.port().to_be_bytes());
+            response.extend_from_slice(&ip.octets());
+        }
+        Address::Hostname(hostname) => {
+            response.push(ADDR_TYPE_DOMAIN);
+            response.push(hostname.len() as u8);
+            response.extend_from_slice(hostname.as_bytes());
         }
     }
-
+    response.extend_from_slice(&port.to_be_bytes());
     response
 }
 
@@ -2057,7 +2061,7 @@ mod tests {
             Box::new(server),
             None,
             Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            Some(IpAddr::V4(advertised_ip)),
+            Some(advertised_ip.to_string()),
             false,
         )
         .await
@@ -2077,6 +2081,44 @@ mod tests {
         assert_eq!(response[1], REP_SUCCEEDED);
         assert_eq!(response[3], ADDR_TYPE_IPV4);
         assert_eq!(&response[4..8], &advertised_ip.octets());
+    }
+
+    #[tokio::test]
+    async fn udp_associate_advertises_configured_domain_like_xray() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(listener_addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        client
+            .write_all(&[ADDR_TYPE_IPV4, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+
+        let result = handle_udp_associate(
+            Box::new(server),
+            None,
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            Some("localhost".to_string()),
+            false,
+        )
+        .await
+        .unwrap();
+        let TcpServerSetupResult::UdpAssociate { socket, .. } = result else {
+            panic!("expected UDP associate result");
+        };
+
+        let mut response = vec![0u8; 3 + 1 + 1 + "localhost".len() + 2];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response[0], SOCKS_VERSION);
+        assert_eq!(response[1], REP_SUCCEEDED);
+        assert_eq!(response[3], ADDR_TYPE_DOMAIN);
+        assert_eq!(response[4] as usize, "localhost".len());
+        assert_eq!(&response[5..14], b"localhost");
+        assert_eq!(
+            u16::from_be_bytes([response[14], response[15]]),
+            socket.local_addr().unwrap().port()
+        );
     }
 
     #[cfg(feature = "traffic")]

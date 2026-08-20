@@ -518,15 +518,9 @@ impl HandlerServiceImpl {
                         socks.auth_type == 1,
                     );
                 let udp_response_ip = match socks.address {
-                    Some(address) => match self.parse_address(Some(address))? {
-                        Address::Ipv4(ip) => Some(ip.into()),
-                        Address::Ipv6(ip) => Some(ip.into()),
-                        Address::Hostname(_) => {
-                            return Err(Status::invalid_argument(
-                                "SOCKS server address must be an IP address",
-                            ));
-                        }
-                    },
+                    Some(address) => {
+                        Some(self.parse_address(Some(address))?.to_string())
+                    }
                     None => None,
                 };
 
@@ -1122,11 +1116,10 @@ impl HandlerServiceImpl {
                     SocksServerConfigPayload {
                         auth_type,
                         accounts: account_map,
-                        address: udp_response_ip.as_ref().and_then(|ip| {
-                            Self::encode_address(&match ip {
-                                std::net::IpAddr::V4(ip) => Address::Ipv4(*ip),
-                                std::net::IpAddr::V6(ip) => Address::Ipv6(*ip),
-                            })
+                        address: udp_response_ip.as_deref().and_then(|address| {
+                            Address::from(address)
+                                .ok()
+                                .and_then(|address| Self::encode_address(&address))
                         }),
                         udp_enabled: *udp_enabled,
                     },
@@ -2571,10 +2564,7 @@ mod tests {
         assert!(!accounts.auth_required());
         assert_eq!(accounts.snapshot()[0].username, "alice");
         assert!(*udp_enabled);
-        assert_eq!(
-            *udp_response_ip,
-            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
-        );
+        assert_eq!(udp_response_ip.as_deref(), Some("127.0.0.1"));
 
         let (_, encoded) = service.encode_inbound_protocol_layers(&parsed);
         let encoded = encoded.expect("SOCKS settings should encode");
