@@ -47,7 +47,12 @@ const REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 const SOCKS4_REQUEST_GRANTED: u8 = 90;
 const SOCKS4_REQUEST_REJECTED: u8 = 91;
 const XRAY_SOCKS4_NULL_FIELD_SIZE: usize = 8192;
-const UDP_TARGET_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+// Xray v26.2.6's shared UDP worker checks client mappings once per minute and
+// only removes them after more than two minutes without uplink or downlink
+// activity. A newly-created mapping therefore survives roughly three minutes
+// when left completely idle; use that observable lifetime rather than the old
+// one-minute Chimera timeout, which changed NAT source ports too early.
+const UDP_TARGET_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 
 const SUCCESS_RESPONSE: [u8; 10] = [
     SOCKS_VERSION,
