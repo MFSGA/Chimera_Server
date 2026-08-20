@@ -492,7 +492,7 @@ async fn handle_udp_associate(
     mut server_stream: Box<dyn AsyncStream>,
     traffic_context: Option<TrafficContext>,
     peer_addr: Option<SocketAddr>,
-    udp_bind_ip: Option<std::net::IpAddr>,
+    response_default_ip: Option<std::net::IpAddr>,
     listener_addr: Option<SocketAddr>,
     udp_response_ip: Option<String>,
     accounts: SocksUserStore,
@@ -506,27 +506,6 @@ async fn handle_udp_associate(
         client_hint
     );
 
-    let udp_bind_addr = SocketAddr::new(
-        udp_bind_ip.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
-        0,
-    );
-    let udp_socket = crate::util::socket::new_socket2_udp_socket_with_buffer_size(
-        udp_bind_addr.is_ipv6(),
-        None,
-        Some(udp_bind_addr),
-        false,
-        Some(UDP_BUFFER_SIZE),
-    )?;
-    let std_socket: std::net::UdpSocket = udp_socket.into();
-    std_socket.set_nonblocking(true)?;
-    let udp_socket = tokio::net::UdpSocket::from_std(std_socket)?;
-
-    let bound_addr = udp_socket.local_addr()?;
-    tracing::debug!(
-        "SOCKS5 UDP ASSOCIATE: compatibility control relay at {}",
-        bound_addr
-    );
-
     if accounts.auth_required()
         && let Some(peer_addr) = peer_addr
     {
@@ -537,17 +516,18 @@ async fn handle_udp_associate(
 
     let response_address = match udp_response_ip {
         Some(address) => Address::from(&address)?,
-        None => xray_ip_address(bound_addr.ip()),
+        None => xray_ip_address(
+            response_default_ip
+                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+        ),
     };
-    let response_port = listener_addr.map_or(bound_addr.port(), |addr| addr.port());
+    let response_port = listener_addr.map_or(0, |addr| addr.port());
     let response = build_udp_associate_response(&response_address, response_port)?;
     server_stream.write_all(&response).await?;
     server_stream.flush().await?;
 
     Ok(TcpServerSetupResult::UdpAssociate {
         stream: server_stream,
-        socket: Arc::new(udp_socket),
-        restrict_client_ip_to_tcp_peer: accounts.auth_required(),
         traffic_context,
     })
 }
@@ -2067,7 +2047,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn udp_associate_uses_tcp_local_ip_by_default() {
+    async fn udp_associate_advertises_tcp_local_ip_by_default() {
         let handler = SocksTcpServerHandler::new(
             SocksUserStore::with_auth_required(Vec::new(), false),
             "socks-local",
@@ -2107,10 +2087,11 @@ mod tests {
             )
             .await
             .expect("SOCKS UDP ASSOCIATE should succeed");
-        let TcpServerSetupResult::UdpAssociate { socket, .. } = result else {
-            panic!("expected UDP associate result");
-        };
-        assert_eq!(socket.local_addr().unwrap().ip(), Ipv4Addr::LOCALHOST);
+        assert!(matches!(result, TcpServerSetupResult::UdpAssociate { .. }));
+        let mut response = [0u8; 12];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response[..2], &[SOCKS_VERSION, METHOD_NO_AUTH]);
+        assert_eq!(&response[6..10], &Ipv4Addr::LOCALHOST.octets());
     }
 
     #[tokio::test]
@@ -2136,14 +2117,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let TcpServerSetupResult::UdpAssociate {
-            restrict_client_ip_to_tcp_peer,
-            ..
-        } = result
-        else {
-            panic!("expected UDP associate result");
-        };
-        assert!(!restrict_client_ip_to_tcp_peer);
+        assert!(matches!(result, TcpServerSetupResult::UdpAssociate { .. }));
     }
 
     #[tokio::test]
@@ -2170,14 +2144,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let TcpServerSetupResult::UdpAssociate {
-            restrict_client_ip_to_tcp_peer,
-            ..
-        } = result
-        else {
-            panic!("expected UDP associate result");
-        };
-        assert!(restrict_client_ip_to_tcp_peer);
+        assert!(matches!(result, TcpServerSetupResult::UdpAssociate { .. }));
     }
 
     #[tokio::test]
@@ -2205,13 +2172,7 @@ mod tests {
         .await
         .unwrap();
 
-        let TcpServerSetupResult::UdpAssociate { socket, .. } = result else {
-            panic!("expected UDP associate result");
-        };
-        assert_eq!(
-            socket.local_addr().unwrap().ip(),
-            IpAddr::V4(Ipv4Addr::LOCALHOST)
-        );
+        assert!(matches!(result, TcpServerSetupResult::UdpAssociate { .. }));
 
         let mut response = [0u8; 10];
         client.read_exact(&mut response).await.unwrap();
@@ -2252,15 +2213,13 @@ mod tests {
             None,
             None,
             Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            None,
+            Some(listener_addr),
             Some("localhost".to_string()),
             SocksUserStore::with_auth_required(Vec::new(), false),
         )
         .await
         .unwrap();
-        let TcpServerSetupResult::UdpAssociate { socket, .. } = result else {
-            panic!("expected UDP associate result");
-        };
+        assert!(matches!(result, TcpServerSetupResult::UdpAssociate { .. }));
 
         let mut response = vec![0u8; 3 + 1 + 1 + "localhost".len() + 2];
         client.read_exact(&mut response).await.unwrap();
@@ -2271,7 +2230,7 @@ mod tests {
         assert_eq!(&response[5..14], b"localhost");
         assert_eq!(
             u16::from_be_bytes([response[14], response[15]]),
-            socket.local_addr().unwrap().port()
+            listener_addr.port()
         );
     }
 
