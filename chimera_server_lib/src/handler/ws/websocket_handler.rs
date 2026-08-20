@@ -9,7 +9,9 @@ use tracing::debug;
 use crate::{
     async_stream::AsyncStream,
     handler::{
-        tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
+        tcp::tcp_handler::{
+            TcpServerConnectionContext, TcpServerHandler, TcpServerSetupResult,
+        },
         ws::{parsed_http::ParsedHttpData, websocket_stream::WebsocketStream},
     },
 };
@@ -36,7 +38,19 @@ impl WebsocketTcpServerHandler {
 impl TcpServerHandler for WebsocketTcpServerHandler {
     async fn setup_server_stream(
         &self,
+        server_stream: Box<dyn AsyncStream>,
+    ) -> std::io::Result<TcpServerSetupResult> {
+        self.setup_server_stream_with_context(
+            server_stream,
+            TcpServerConnectionContext::default(),
+        )
+        .await
+    }
+
+    async fn setup_server_stream_with_context(
+        &self,
         mut server_stream: Box<dyn AsyncStream>,
+        context: TcpServerConnectionContext,
     ) -> std::io::Result<TcpServerSetupResult> {
         tracing::debug!("WebsocketTcpServerHandler setup_server_stream");
         let ParsedHttpData {
@@ -131,8 +145,9 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                 line_reader.unparsed_data(),
             ));
 
-            let mut target_setup_result =
-                handler.setup_server_stream(websocket_stream).await;
+            let mut target_setup_result = handler
+                .setup_server_stream_with_context(websocket_stream, context.clone())
+                .await;
 
             if let Ok(ref mut setup_result) = target_setup_result {
                 setup_result.set_need_initial_flush(true);

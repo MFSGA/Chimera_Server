@@ -157,6 +157,8 @@ struct SocksServerConfigPayload {
     address: Option<IpOrDomainPayload>,
     #[prost(bool, tag = "4")]
     udp_enabled: bool,
+    #[prost(uint32, tag = "6")]
+    user_level: u32,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -528,6 +530,7 @@ impl HandlerServiceImpl {
                     accounts,
                     udp_enabled: socks.udp_enabled,
                     udp_response_ip,
+                    user_level: socks.user_level,
                 })
             }
             #[cfg(feature = "vless")]
@@ -1102,6 +1105,7 @@ impl HandlerServiceImpl {
                 accounts,
                 udp_enabled,
                 udp_response_ip,
+                user_level,
             } => {
                 let auth_type = i32::from(accounts.auth_required());
                 let account_map = accounts
@@ -1122,6 +1126,7 @@ impl HandlerServiceImpl {
                                 .and_then(|address| Self::encode_address(&address))
                         }),
                         udp_enabled: *udp_enabled,
+                        user_level: *user_level,
                     },
                 ))
             }
@@ -2242,6 +2247,7 @@ mod tests {
             .into(),
             udp_enabled: false,
             udp_response_ip: None,
+            user_level: 0,
         };
         let inbound = ServerConfig {
             tag: inbound_tag.clone(),
@@ -2304,6 +2310,7 @@ mod tests {
                         accounts,
                         address: None,
                         udp_enabled: false,
+                        user_level: 0,
                     }
                     .encode_to_vec(),
                 }),
@@ -2550,6 +2557,7 @@ mod tests {
                     )]),
                     address: Some(localhost_ip_payload()),
                     udp_enabled: true,
+                    user_level: 7,
                 },
             ))
             .expect("SOCKS server config should parse");
@@ -2557,6 +2565,7 @@ mod tests {
             accounts,
             udp_enabled,
             udp_response_ip,
+            user_level,
         } = &parsed
         else {
             panic!("expected SOCKS inbound config");
@@ -2565,6 +2574,7 @@ mod tests {
         assert_eq!(accounts.snapshot()[0].username, "alice");
         assert!(*udp_enabled);
         assert_eq!(udp_response_ip.as_deref(), Some("127.0.0.1"));
+        assert_eq!(*user_level, 7);
 
         let (_, encoded) = service.encode_inbound_protocol_layers(&parsed);
         let encoded = encoded.expect("SOCKS settings should encode");

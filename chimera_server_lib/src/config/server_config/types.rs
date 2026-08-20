@@ -564,6 +564,8 @@ pub enum ServerProxyConfig {
         udp_enabled: bool,
         #[serde(default)]
         udp_response_ip: Option<String>,
+        #[serde(default)]
+        user_level: u32,
     },
     DokodemoDoor {
         config: DokodemoDoorConfig,
