@@ -2371,6 +2371,127 @@ mod tests {
 
     #[cfg(feature = "traffic")]
     #[tokio::test]
+    async fn password_udp_authorization_survives_control_close_like_xray_v26_2_6() {
+        let origin = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            let (len, peer) = origin.recv_from(&mut buf).await.unwrap();
+            origin.send_to(&buf[..len], peer).await.unwrap();
+        });
+
+        let relay =
+            Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let relay_addr = relay.local_addr().unwrap();
+        let accounts = SocksUserStore::with_auth_required(
+            vec![SocksUser {
+                username: "alice".into(),
+                password: "secret".into(),
+            }],
+            true,
+        );
+        let runtime = RuntimeState::new(
+            Vec::new(),
+            vec![OutboundSummary {
+                tag: "direct".into(),
+                protocol: "freedom".into(),
+                proxy_settings_type: None,
+                proxy_settings_value: None,
+            }],
+        );
+        let relay_task = tokio::spawn(run_shared_udp_relay(
+            relay,
+            Arc::new(NativeResolver::new()),
+            runtime,
+            accounts.clone(),
+            None,
+        ));
+
+        let control_listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let control_addr = control_listener.local_addr().unwrap();
+        let mut control_client = TcpStream::connect(control_addr).await.unwrap();
+        let (control_server, peer_addr) = control_listener.accept().await.unwrap();
+        let handler = SocksTcpServerHandler::new(accounts, "socks", true, None);
+        control_client
+            .write_all(&[
+                0x05,
+                0x01,
+                0x02, // username/password method
+                0x01,
+                0x05,
+                b'a',
+                b'l',
+                b'i',
+                b'c',
+                b'e',
+                0x06,
+                b's',
+                b'e',
+                b'c',
+                b'r',
+                b'e',
+                b't', // RFC1929 credentials
+                0x05,
+                CMD_UDP_ASSOCIATE,
+                0x00,
+                ADDR_TYPE_IPV4,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ])
+            .await
+            .unwrap();
+        let result = handler
+            .setup_server_stream_with_context(
+                Box::new(control_server),
+                TcpServerConnectionContext {
+                    peer_addr: Some(peer_addr),
+                    local_addr: Some(control_addr),
+                    listener_addr: Some(control_addr),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result, TcpServerSetupResult::UdpAssociate { .. }));
+
+        let mut handshake_response = [0u8; 14];
+        control_client
+            .read_exact(&mut handshake_response)
+            .await
+            .unwrap();
+        assert_eq!(&handshake_response[..4], &[0x05, 0x02, 0x01, 0x00]);
+        drop(result);
+        drop(control_client);
+
+        let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let mut request = vec![0, 0, 0, ADDR_TYPE_IPV4];
+        let IpAddr::V4(origin_ip) = origin_addr.ip() else {
+            unreachable!()
+        };
+        request.extend_from_slice(&origin_ip.octets());
+        request.extend_from_slice(&origin_addr.port().to_be_bytes());
+        request.extend_from_slice(b"after-close");
+        udp_client.send_to(&request, relay_addr).await.unwrap();
+
+        let mut response = [0u8; 64];
+        let (len, _) =
+            timeout(Duration::from_secs(2), udp_client.recv_from(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(&response[len - b"after-close".len()..len], b"after-close");
+
+        relay_task.abort();
+        origin_task.await.unwrap();
+    }
+
+    #[cfg(feature = "traffic")]
+    #[tokio::test]
     async fn udp_relay_noauth_accepts_non_tcp_peer_source_like_xray_v26_2_6() {
         assert!(udp_source_from_alternate_loopback_is_forwarded(false).await);
     }
