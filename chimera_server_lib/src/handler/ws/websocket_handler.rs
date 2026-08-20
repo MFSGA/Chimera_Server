@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use async_trait::async_trait;
 use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use tokio::io::AsyncWriteExt;
+use tokio::{io::AsyncWriteExt, time::timeout};
 use tracing::debug;
 
 use crate::{
@@ -23,6 +23,8 @@ pub struct WebsocketServerTarget {
     pub handler: Box<dyn TcpServerHandler>,
 }
 
+const XRAY_WEBSOCKET_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
+
 #[derive(Debug)]
 pub struct WebsocketTcpServerHandler {
     server_targets: Vec<WebsocketServerTarget>,
@@ -36,6 +38,14 @@ impl WebsocketTcpServerHandler {
 
 #[async_trait]
 impl TcpServerHandler for WebsocketTcpServerHandler {
+    fn manages_handshake_timeout(&self) -> bool {
+        !self.server_targets.is_empty()
+            && self
+                .server_targets
+                .iter()
+                .all(|target| target.handler.manages_handshake_timeout())
+    }
+
     async fn setup_server_stream(
         &self,
         server_stream: Box<dyn AsyncStream>,
@@ -57,7 +67,17 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             mut first_line,
             headers: mut request_headers,
             line_reader,
-        } = ParsedHttpData::parse(&mut server_stream).await?;
+        } = timeout(
+            XRAY_WEBSOCKET_HANDSHAKE_TIMEOUT,
+            ParsedHttpData::parse(&mut server_stream),
+        )
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "WebSocket handshake timed out",
+            )
+        })??;
 
         let request_path = {
             if !first_line.ends_with(" HTTP/1.0")
@@ -167,4 +187,58 @@ fn create_websocket_key_response(key: String) -> String {
     input.extend_from_slice(WS_GUID);
     let hash = digest(&SHA1_FOR_LEGACY_USE_ONLY, &input);
     BASE64.encode(hash.as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+
+    use crate::{
+        async_stream::AsyncStream,
+        handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
+    };
+
+    use super::{WebsocketServerTarget, WebsocketTcpServerHandler};
+
+    #[derive(Debug)]
+    struct Inner {
+        manages_handshake_timeout: bool,
+    }
+
+    #[async_trait]
+    impl TcpServerHandler for Inner {
+        fn manages_handshake_timeout(&self) -> bool {
+            self.manages_handshake_timeout
+        }
+
+        async fn setup_server_stream(
+            &self,
+            _server_stream: Box<dyn AsyncStream>,
+        ) -> std::io::Result<TcpServerSetupResult> {
+            unreachable!("handshake ownership test does not enter the inner handler")
+        }
+    }
+
+    fn target(manages_handshake_timeout: bool) -> WebsocketServerTarget {
+        WebsocketServerTarget {
+            matching_path: None,
+            matching_headers: None,
+            handler: Box::new(Inner {
+                manages_handshake_timeout,
+            }),
+        }
+    }
+
+    #[test]
+    fn websocket_propagates_inner_handshake_timeout_ownership() {
+        let handler = WebsocketTcpServerHandler::new(vec![target(true)]);
+        assert!(handler.manages_handshake_timeout());
+
+        let handler =
+            WebsocketTcpServerHandler::new(vec![target(true), target(false)]);
+        assert!(!handler.manages_handshake_timeout());
+
+        let handler = WebsocketTcpServerHandler::new(Vec::new());
+        assert!(!handler.manages_handshake_timeout());
+    }
 }
