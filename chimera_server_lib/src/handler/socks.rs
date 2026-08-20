@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, sleep};
+use tokio::time::{MissedTickBehavior, interval};
 
 use crate::{
     address::{Address, NetLocation},
@@ -47,12 +47,11 @@ const REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 const SOCKS4_REQUEST_GRANTED: u8 = 90;
 const SOCKS4_REQUEST_REJECTED: u8 = 91;
 const XRAY_SOCKS4_NULL_FIELD_SIZE: usize = 8192;
-// Xray v26.2.6's shared UDP worker checks client mappings once per minute and
-// only removes them after more than two minutes without uplink or downlink
-// activity. A newly-created mapping therefore survives roughly three minutes
-// when left completely idle; use that observable lifetime rather than the old
-// one-minute Chimera timeout, which changed NAT source ports too early.
-const UDP_TARGET_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(3 * 60);
+// Xray v26.2.6 transport/internet/udp uses a one-minute ActivityTimer. The
+// timer starts with one activity token and only downstream reads refresh it;
+// uplink writes do not. With no later response, a new mapping therefore closes
+// on the second one-minute check.
+const UDP_TARGET_SESSION_ACTIVITY_CHECK: Duration = Duration::from_secs(60);
 
 const SUCCESS_RESPONSE: [u8; 10] = [
     SOCKS_VERSION,
@@ -590,6 +589,27 @@ impl Drop for SocksUdpClientSession {
     }
 }
 
+#[derive(Debug)]
+struct XrayUdpActivityWindow {
+    downstream_activity: bool,
+}
+
+impl XrayUdpActivityWindow {
+    fn new() -> Self {
+        Self {
+            downstream_activity: true,
+        }
+    }
+
+    fn record_downstream(&mut self) {
+        self.downstream_activity = true;
+    }
+
+    fn keep_alive_on_check(&mut self) -> bool {
+        std::mem::replace(&mut self.downstream_activity, false)
+    }
+}
+
 fn start_udp_client_session(
     initial_target_addr: SocketAddr,
     client_endpoint: SocketAddr,
@@ -600,8 +620,12 @@ fn start_udp_client_session(
         mpsc::channel::<(SocketAddr, Vec<u8>, Option<TrafficContext>)>(32);
     let task = tokio::spawn(async move {
         let mut response_buf = vec![0u8; UDP_BUFFER_SIZE];
-        let idle = sleep(UDP_TARGET_SESSION_IDLE_TIMEOUT);
-        tokio::pin!(idle);
+        let mut activity_checks = interval(UDP_TARGET_SESSION_ACTIVITY_CHECK);
+        activity_checks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // Tokio intervals tick immediately; Xray's ActivityTimer first checks
+        // after one full timeout period.
+        activity_checks.tick().await;
+        let mut activity = XrayUdpActivityWindow::new();
         let mut response_contexts =
             HashMap::<SocketAddr, Option<TrafficContext>>::new();
 
@@ -615,7 +639,6 @@ fn start_udp_client_session(
                         Ok(sent) => {
                             record_transfer(traffic_context.clone(), sent as u64, 0);
                             response_contexts.insert(target_addr, traffic_context);
-                            idle.as_mut().reset(Instant::now() + UDP_TARGET_SESSION_IDLE_TIMEOUT);
                         }
                         Err(error) => {
                             tracing::warn!("SOCKS5 UDP relay: failed to send to target: {}", error);
@@ -625,6 +648,10 @@ fn start_udp_client_session(
                 result = target_socket.recv_from(&mut response_buf) => {
                     match result {
                         Ok((resp_len, resp_addr)) => {
+                            // Xray updates its UDP ActivityTimer as soon as a
+                            // downstream packet is read, before the SOCKS
+                            // response callback writes it to the client.
+                            activity.record_downstream();
                             let socks5_response =
                                 build_udp_response_packet(resp_addr, &response_buf[..resp_len]);
                             let forwarded_payload_len = if socks5_response.is_empty() {
@@ -643,7 +670,6 @@ fn start_udp_client_session(
                                     0,
                                     forwarded_payload_len as u64,
                                 );
-                                idle.as_mut().reset(Instant::now() + UDP_TARGET_SESSION_IDLE_TIMEOUT);
                             }
                         }
                         Err(error) => {
@@ -652,7 +678,11 @@ fn start_udp_client_session(
                         }
                     }
                 }
-                _ = &mut idle => return,
+                _ = activity_checks.tick() => {
+                    if !activity.keep_alive_on_check() {
+                        return;
+                    }
+                }
             }
         }
     });
@@ -1199,6 +1229,18 @@ mod tests {
         runtime::OutboundSummary,
         traffic::{active_connections, snapshot},
     };
+
+    #[test]
+    fn udp_activity_window_matches_xray_v26_2_6_downlink_only_refresh() {
+        let mut activity = XrayUdpActivityWindow::new();
+
+        assert!(activity.keep_alive_on_check());
+        assert!(!activity.keep_alive_on_check());
+
+        activity.record_downstream();
+        assert!(activity.keep_alive_on_check());
+        assert!(!activity.keep_alive_on_check());
+    }
 
     async fn socks4_setup(
         handler: &SocksTcpServerHandler,
