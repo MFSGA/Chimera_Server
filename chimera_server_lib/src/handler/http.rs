@@ -53,6 +53,10 @@ impl HttpTcpServerHandler {
 
 #[async_trait]
 impl TcpServerHandler for HttpTcpServerHandler {
+    fn manages_handshake_timeout(&self) -> bool {
+        true
+    }
+
     async fn setup_server_stream(
         &self,
         server_stream: Box<dyn AsyncStream>,
