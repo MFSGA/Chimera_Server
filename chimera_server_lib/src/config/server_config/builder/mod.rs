@@ -641,7 +641,7 @@ fn shadowsocks_transport(
 #[cfg(feature = "http")]
 fn collect_http_settings(
     settings: Option<crate::config::SettingObject>,
-) -> Result<(Vec<crate::config::server_config::HttpUser>, bool), Error> {
+) -> Result<(Vec<crate::config::server_config::HttpUser>, bool, u32), Error> {
     let raw = settings
         .map(|settings| settings.deserialize::<HttpInboundSettings>())
         .transpose()
@@ -649,12 +649,6 @@ fn collect_http_settings(
             Error::InvalidConfig(format!("invalid http inbound settings: {error}"))
         })?
         .unwrap_or_default();
-
-    if raw.user_level != 0 {
-        return Err(Error::InvalidConfig(
-            "http settings.userLevel is not supported yet".into(),
-        ));
-    }
 
     let accounts = raw.accounts.or(raw.users).unwrap_or_default();
     Ok((
@@ -666,6 +660,7 @@ fn collect_http_settings(
             })
             .collect(),
         raw.allow_transparent,
+        raw.user_level,
     ))
 }
 
@@ -1310,11 +1305,12 @@ impl TryFrom<InboudItem> for ServerConfig {
 
             #[cfg(feature = "http")]
             Protocol::Http => {
-                let (accounts, allow_transparent) =
+                let (accounts, allow_transparent, user_level) =
                     collect_http_settings(settings)?;
                 let mut protocol = ServerProxyConfig::Http {
                     accounts,
                     allow_transparent,
+                    user_level,
                 };
 
                 #[cfg(feature = "ws")]
@@ -1883,10 +1879,33 @@ mod tests {
             ServerProxyConfig::Http {
                 accounts,
                 allow_transparent,
+                user_level,
             } => {
                 assert!(accounts.is_empty());
                 assert!(!allow_transparent);
+                assert_eq!(user_level, 0);
             }
+            other => panic!("expected http protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn http_inbound_preserves_xray_user_level() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "http",
+            "tag": "http-policy",
+            "settings": {
+                "userLevel": 7
+            }
+        }))
+        .expect("valid HTTP policy inbound");
+        let config = ServerConfig::try_from(inbound)
+            .expect("Xray HTTP settings.userLevel should be accepted");
+        match config.protocol {
+            ServerProxyConfig::Http { user_level, .. } => assert_eq!(user_level, 7),
             other => panic!("expected http protocol, got {other:?}"),
         }
     }
