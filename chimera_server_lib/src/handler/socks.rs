@@ -523,7 +523,7 @@ async fn handle_udp_associate(
         None => xray_ip_address(bound_addr.ip()),
     };
     let response =
-        build_udp_associate_response(&response_address, bound_addr.port());
+        build_udp_associate_response(&response_address, bound_addr.port())?;
     server_stream.write_all(&response).await?;
     server_stream.flush().await?;
 
@@ -536,7 +536,10 @@ async fn handle_udp_associate(
 }
 
 /// Build a SOCKS5 UDP ASSOCIATE success response.
-fn build_udp_associate_response(address: &Address, port: u16) -> Vec<u8> {
+fn build_udp_associate_response(
+    address: &Address,
+    port: u16,
+) -> std::io::Result<Vec<u8>> {
     let mut response = vec![SOCKS_VERSION, REP_SUCCEEDED, 0x00];
 
     match address {
@@ -549,13 +552,22 @@ fn build_udp_associate_response(address: &Address, port: u16) -> Vec<u8> {
             response.extend_from_slice(&ip.octets());
         }
         Address::Hostname(hostname) => {
+            // Xray v26.2.6's AddressParser rejects domains longer than 256 bytes
+            // when serializing the UDP ASSOCIATE response. It still permits the
+            // 256-byte edge case, whose one-byte length field wraps to zero.
+            if hostname.len() > 256 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "SOCKS5 UDP response domain exceeds Xray address limit",
+                ));
+            }
             response.push(ADDR_TYPE_DOMAIN);
             response.push(hostname.len() as u8);
             response.extend_from_slice(hostname.as_bytes());
         }
     }
     response.extend_from_slice(&port.to_be_bytes());
-    response
+    Ok(response)
 }
 
 /// Run the UDP ASSOCIATE relay.
@@ -2081,6 +2093,20 @@ mod tests {
         assert_eq!(response[1], REP_SUCCEEDED);
         assert_eq!(response[3], ADDR_TYPE_IPV4);
         assert_eq!(&response[4..8], &advertised_ip.octets());
+    }
+
+    #[test]
+    fn udp_associate_response_matches_xray_domain_length_limit() {
+        let max_domain = Address::Hostname("a".repeat(256));
+        let response = build_udp_associate_response(&max_domain, 1080).unwrap();
+        assert_eq!(response[3], ADDR_TYPE_DOMAIN);
+        assert_eq!(response[4], 0);
+        assert_eq!(response.len(), 3 + 1 + 1 + 256 + 2);
+
+        let oversized_domain = Address::Hostname("a".repeat(257));
+        let error =
+            build_udp_associate_response(&oversized_domain, 1080).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[tokio::test]
