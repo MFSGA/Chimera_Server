@@ -459,7 +459,7 @@ where
     let local_addr = connection_context.local_addr;
     let setup_server_stream_future = timeout(
         Duration::from_secs(60),
-        setup_server_stream(stream, server_handler, connection_context),
+        setup_server_stream(stream, server_handler, connection_context.clone()),
     );
     tracing::info!("prepare to setup server stream");
     let mut setup_result = match setup_server_stream_future.await {
@@ -604,7 +604,10 @@ where
 
         setup_result = match timeout(
             Duration::from_secs(60),
-            next_handler.setup_server_stream(server_stream),
+            next_handler.setup_server_stream_with_context(
+                server_stream,
+                connection_context.clone(),
+            ),
         )
         .await
         {
