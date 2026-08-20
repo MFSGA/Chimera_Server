@@ -162,11 +162,12 @@ impl SocksTcpServerHandler {
                 .filter(|s| !s.is_empty());
         }
 
-        // Xray v26.2.6 reads the SOCKS5 request VER/CMD/RSV triplet but
-        // only uses CMD. Keep the negotiated SOCKS version authoritative and
-        // mirror that permissive second-stage request parsing.
+        // Xray v26.2.6 reads the complete SOCKS5 VER/CMD/RSV triplet before
+        // dispatching the command, but only uses CMD. Keep the negotiated
+        // SOCKS version authoritative while preserving that read timing.
         let _request_version = server_stream.read_u8().await?;
         let command = server_stream.read_u8().await?;
+        let _reserved = server_stream.read_u8().await?;
 
         let traffic_context = Some(match identity {
             Some(id) => TrafficContext::new("socks")
@@ -410,12 +411,10 @@ async fn authenticate(
     }
 }
 
-/// Read the address portion of a SOCKS5 request: RSV + ATYP + DST.ADDR + DST.PORT
+/// Read the address portion of a SOCKS5 request: ATYP + DST.ADDR + DST.PORT.
 async fn read_socks_address(
     stream: &mut Box<dyn AsyncStream>,
 ) -> std::io::Result<NetLocation> {
-    // Xray v26.2.6 ignores the request RSV byte after method negotiation.
-    let _reserved = stream.read_u8().await?;
     read_address_from_stream(stream).await
 }
 
@@ -1474,6 +1473,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn socks5_unsupported_command_waits_for_reserved_byte_like_xray() {
+        let handler = SocksTcpServerHandler::new(
+            SocksUserStore::with_auth_required(Vec::new(), false),
+            "socks5-command-header-timing",
+            false,
+            None,
+        );
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(listener_addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        client
+            .write_all(&[
+                SOCKS_VERSION,
+                1,
+                METHOD_NO_AUTH,
+                SOCKS_VERSION,
+                0x02, // BIND is unsupported by Xray and Chimera.
+            ])
+            .await
+            .unwrap();
+
+        let task = tokio::spawn(async move {
+            handler.setup_server_stream(Box::new(server)).await
+        });
+
+        let mut method_response = [0u8; 2];
+        client.read_exact(&mut method_response).await.unwrap();
+        assert_eq!(method_response, [SOCKS_VERSION, METHOD_NO_AUTH]);
+
+        let early_reply = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            client.read_u8(),
+        )
+        .await;
+        assert!(
+            early_reply.is_err(),
+            "Xray waits for the request RSV byte before rejecting BIND"
+        );
+
+        client.write_all(&[0x7f]).await.unwrap();
+        let mut command_response = [0u8; 10];
+        client.read_exact(&mut command_response).await.unwrap();
+        assert_eq!(
+            command_response,
+            build_socks5_response(REP_COMMAND_NOT_SUPPORTED, None).as_slice()
+        );
+
+        let error = match task.await.unwrap() {
+            Ok(_) => panic!("unsupported SOCKS5 BIND command must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
     async fn socks5_connect_response_uses_listener_gateway_like_xray() {
         let handler = SocksTcpServerHandler::new(
             SocksUserStore::with_auth_required(Vec::new(), false),
@@ -1931,7 +1987,7 @@ mod tests {
         let (server, _) = listener.accept().await.unwrap();
 
         client
-            .write_all(&[0x00, ADDR_TYPE_IPV4, 127, 0, 0, 2, 0x12, 0x34])
+            .write_all(&[ADDR_TYPE_IPV4, 127, 0, 0, 2, 0x12, 0x34])
             .await
             .unwrap();
 
@@ -1957,7 +2013,7 @@ mod tests {
         let (server, _) = listener.accept().await.unwrap();
 
         client
-            .write_all(&[0x00, ADDR_TYPE_IPV4, 0, 0, 0, 0, 0x12, 0x34])
+            .write_all(&[ADDR_TYPE_IPV4, 0, 0, 0, 0, 0x12, 0x34])
             .await
             .unwrap();
 
@@ -1982,7 +2038,7 @@ mod tests {
         let (server, _) = listener.accept().await.unwrap();
 
         client
-            .write_all(&[0x00, ADDR_TYPE_IPV4, 0, 0, 0, 0, 0, 0])
+            .write_all(&[ADDR_TYPE_IPV4, 0, 0, 0, 0, 0, 0])
             .await
             .unwrap();
 
