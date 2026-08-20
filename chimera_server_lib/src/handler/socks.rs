@@ -75,6 +75,7 @@ pub struct SocksTcpServerHandler {
     inbound_tag: String,
     udp_enabled: bool,
     udp_response_ip: Option<String>,
+    user_level: u32,
 }
 
 impl SocksTcpServerHandler {
@@ -89,7 +90,13 @@ impl SocksTcpServerHandler {
             inbound_tag: inbound_tag.to_string(),
             udp_enabled,
             udp_response_ip,
+            user_level: 0,
         }
+    }
+
+    pub fn with_user_level(mut self, user_level: u32) -> Self {
+        self.user_level = user_level;
+        self
     }
 
     fn requires_auth(&self) -> bool {
@@ -119,17 +126,10 @@ impl SocksTcpServerHandler {
         peer_addr: Option<SocketAddr>,
         local_addr: Option<SocketAddr>,
         listener_addr: Option<SocketAddr>,
+        handshake_timeout: Option<Duration>,
     ) -> std::io::Result<TcpServerSetupResult> {
         let version = server_stream.read_u8().await?;
-        if version == SOCKS4_VERSION {
-            return setup_socks4_stream(
-                server_stream,
-                self.requires_auth(),
-                &self.inbound_tag,
-            )
-            .await;
-        }
-        if version != SOCKS_VERSION {
+        if version != SOCKS4_VERSION && version != SOCKS_VERSION {
             // Xray's SOCKS inbound doubles as an HTTP proxy: any connection
             // whose first byte is neither SOCKS4 nor SOCKS5 is replayed into
             // the HTTP parser. HTTP authentication follows authType, not merely
@@ -157,81 +157,112 @@ impl SocksTcpServerHandler {
             .await;
         }
 
-        let method =
-            negotiate_method(&mut server_stream, self.requires_auth()).await?;
-
-        let mut identity = None;
-        if method == SocksMethod::UsernamePassword {
-            let accounts = self.accounts.snapshot();
-            identity = Some(authenticate(&accounts, &mut server_stream).await?)
-                .filter(|s| !s.is_empty());
-        }
-
-        // Xray v26.2.6 reads the complete SOCKS5 VER/CMD/RSV triplet before
-        // dispatching the command, but only uses CMD. Keep the negotiated
-        // SOCKS version authoritative while preserving that read timing.
-        let _request_version = server_stream.read_u8().await?;
-        let command = server_stream.read_u8().await?;
-        let _reserved = server_stream.read_u8().await?;
-
-        let traffic_context = Some(match identity {
-            Some(id) => TrafficContext::new("socks")
-                .with_identity(id)
-                .with_inbound_tag(self.inbound_tag.clone()),
-            None => TrafficContext::new("socks")
-                .with_inbound_tag(self.inbound_tag.clone()),
-        });
-
-        match command {
-            CMD_CONNECT | CMD_TOR_RESOLVE | CMD_TOR_RESOLVE_PTR => {
-                let remote_location = read_socks_address(&mut server_stream).await?;
-                // Xray v26.2.6 writes the SOCKS5 success response as part of
-                // the inbound handshake, before routing or outbound dialing.
-                // Preserve that observable timing even if the target later
-                // fails to connect.
-                let response = build_socks5_response(
-                    REP_SUCCEEDED,
-                    listener_addr.or(local_addr),
-                );
-                server_stream.write_all(&response).await?;
-                server_stream.flush().await?;
-
-                Ok(TcpServerSetupResult::TcpForward {
-                    remote_location,
-                    stream: server_stream,
-                    need_initial_flush: false,
-                    connection_success_response: None,
-                    traffic_context,
-                })
-            }
-            CMD_UDP_ASSOCIATE if self.udp_enabled => {
-                handle_udp_associate(
+        let handshake = async {
+            if version == SOCKS4_VERSION {
+                return setup_socks4_stream(
                     server_stream,
-                    traffic_context,
-                    peer_addr,
-                    local_addr.map(|addr| addr.ip()),
-                    listener_addr,
-                    self.udp_response_ip.clone(),
-                    self.accounts.clone(),
+                    self.requires_auth(),
+                    &self.inbound_tag,
                 )
+                .await;
+            }
+
+            let mut server_stream = server_stream;
+            let method =
+                negotiate_method(&mut server_stream, self.requires_auth()).await?;
+
+            let mut identity = None;
+            if method == SocksMethod::UsernamePassword {
+                let accounts = self.accounts.snapshot();
+                identity = Some(authenticate(&accounts, &mut server_stream).await?)
+                    .filter(|s| !s.is_empty());
+            }
+
+            // Xray v26.2.6 reads the complete SOCKS5 VER/CMD/RSV triplet before
+            // dispatching the command, but only uses CMD. Keep the negotiated
+            // SOCKS version authoritative while preserving that read timing.
+            let _request_version = server_stream.read_u8().await?;
+            let command = server_stream.read_u8().await?;
+            let _reserved = server_stream.read_u8().await?;
+
+            let traffic_context = Some(match identity {
+                Some(id) => TrafficContext::new("socks")
+                    .with_identity(id)
+                    .with_inbound_tag(self.inbound_tag.clone()),
+                None => TrafficContext::new("socks")
+                    .with_inbound_tag(self.inbound_tag.clone()),
+            });
+
+            match command {
+                CMD_CONNECT | CMD_TOR_RESOLVE | CMD_TOR_RESOLVE_PTR => {
+                    let remote_location =
+                        read_socks_address(&mut server_stream).await?;
+                    // Xray v26.2.6 writes the SOCKS5 success response as part of
+                    // the inbound handshake, before routing or outbound dialing.
+                    // Preserve that observable timing even if the target later
+                    // fails to connect.
+                    let response = build_socks5_response(
+                        REP_SUCCEEDED,
+                        listener_addr.or(local_addr),
+                    );
+                    server_stream.write_all(&response).await?;
+                    server_stream.flush().await?;
+
+                    Ok(TcpServerSetupResult::TcpForward {
+                        remote_location,
+                        stream: server_stream,
+                        need_initial_flush: false,
+                        connection_success_response: None,
+                        traffic_context,
+                    })
+                }
+                CMD_UDP_ASSOCIATE if self.udp_enabled => {
+                    handle_udp_associate(
+                        server_stream,
+                        traffic_context,
+                        peer_addr,
+                        local_addr.map(|addr| addr.ip()),
+                        listener_addr,
+                        self.udp_response_ip.clone(),
+                        self.accounts.clone(),
+                    )
+                    .await
+                }
+                CMD_UDP_ASSOCIATE => {
+                    send_command_response(
+                        &mut server_stream,
+                        REP_COMMAND_NOT_SUPPORTED,
+                    )
+                    .await?;
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "socks udp associate is disabled by config",
+                    ))
+                }
+                _ => {
+                    send_command_response(
+                        &mut server_stream,
+                        REP_COMMAND_NOT_SUPPORTED,
+                    )
+                    .await?;
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("unsupported socks command: {}", command),
+                    ))
+                }
+            }
+        };
+
+        match handshake_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, handshake)
                 .await
-            }
-            CMD_UDP_ASSOCIATE => {
-                send_command_response(&mut server_stream, REP_COMMAND_NOT_SUPPORTED)
-                    .await?;
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "socks udp associate is disabled by config",
-                ))
-            }
-            _ => {
-                send_command_response(&mut server_stream, REP_COMMAND_NOT_SUPPORTED)
-                    .await?;
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("unsupported socks command: {}", command),
-                ))
-            }
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "SOCKS handshake timed out",
+                    )
+                })?,
+            None => handshake.await,
         }
     }
 }
@@ -242,7 +273,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
         &self,
         server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
-        self.setup_server_stream_inner(server_stream, None, None, None)
+        self.setup_server_stream_inner(server_stream, None, None, None, None)
             .await
     }
 
@@ -251,11 +282,15 @@ impl TcpServerHandler for SocksTcpServerHandler {
         server_stream: Box<dyn AsyncStream>,
         context: TcpServerConnectionContext,
     ) -> std::io::Result<TcpServerSetupResult> {
+        let handshake_timeout = context.runtime.as_ref().map(|runtime| {
+            runtime.xray_handshake_timeout_for_level(self.user_level)
+        });
         self.setup_server_stream_inner(
             server_stream,
             context.peer_addr,
             context.local_addr,
             context.listener_addr,
+            handshake_timeout,
         )
         .await
     }
@@ -1244,6 +1279,70 @@ mod tests {
         runtime::OutboundSummary,
         traffic::{active_connections, snapshot},
     };
+
+    #[tokio::test]
+    async fn socks_handshake_policy_starts_after_protocol_discriminator_like_xray() {
+        use crate::config::def::{PolicyConfig, PolicyLevelConfig};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(listener_addr).await.unwrap();
+        let (server, peer_addr) = listener.accept().await.unwrap();
+        let local_addr = server.local_addr().unwrap();
+
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let mut levels = HashMap::new();
+        levels.insert(
+            7,
+            Some(PolicyLevelConfig {
+                handshake: Some(0),
+                ..PolicyLevelConfig::default()
+            }),
+        );
+        runtime.replace_policy(Some(&PolicyConfig {
+            levels,
+            ..PolicyConfig::default()
+        }));
+
+        let handler = SocksTcpServerHandler::new(
+            SocksUserStore::with_auth_required(Vec::new(), false),
+            "socks",
+            false,
+            None,
+        )
+        .with_user_level(7);
+        let context = TcpServerConnectionContext {
+            peer_addr: Some(peer_addr),
+            local_addr: Some(local_addr),
+            listener_addr: Some(listener_addr),
+            runtime: Some(runtime),
+            ..TcpServerConnectionContext::default()
+        };
+        let mut task = tokio::spawn(async move {
+            handler
+                .setup_server_stream_with_context(Box::new(server), context)
+                .await
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut task)
+                .await
+                .is_err(),
+            "Xray does not start the SOCKS handshake deadline before the first byte"
+        );
+
+        client.write_all(&[SOCKS_VERSION]).await.unwrap();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut task)
+                .await
+                .expect("zero-second policy must terminate the SOCKS handshake")
+                .expect("handler task must not panic");
+        let error = match result {
+            Ok(_) => panic!("incomplete SOCKS handshake must time out"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
 
     #[test]
     fn udp_activity_window_matches_xray_v26_2_6_downlink_only_refresh() {

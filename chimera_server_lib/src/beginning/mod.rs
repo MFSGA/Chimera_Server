@@ -271,6 +271,7 @@ async fn run_tcp_server(
                 Ok(mut context) => {
                     context.peer_addr = Some(addr);
                     context.listener_addr = Some(listener_addr);
+                    context.runtime = Some(runtime.clone());
                     context
                 }
                 Err(error) => {
@@ -429,13 +430,17 @@ pub(super) async fn process_stream<AS>(
 where
     AS: AsyncStream + 'static,
 {
+    let connection_context = TcpServerConnectionContext {
+        runtime: Some(runtime.clone()),
+        ..TcpServerConnectionContext::default()
+    };
     process_stream_with_context(
         stream,
         server_handler,
         resolver,
         peer_addr,
         runtime,
-        TcpServerConnectionContext::default(),
+        connection_context,
     )
     .await
 }

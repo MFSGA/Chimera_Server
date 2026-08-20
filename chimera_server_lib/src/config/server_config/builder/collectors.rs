@@ -481,7 +481,7 @@ fn parse_trojan_fallback_dest(
 
 pub(super) fn collect_socks_settings(
     settings: SettingObject,
-) -> Result<(SocksUserStore, bool, Option<String>), Error> {
+) -> Result<(SocksUserStore, bool, Option<String>, u32), Error> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct SocksInboundSettings {
@@ -496,7 +496,7 @@ pub(super) fn collect_socks_settings(
         #[serde(default)]
         ip: Option<String>,
         #[serde(default)]
-        user_level: Option<serde_json::Value>,
+        user_level: Option<u32>,
     }
 
     #[derive(Deserialize)]
@@ -534,11 +534,7 @@ pub(super) fn collect_socks_settings(
                 })
         })
         .transpose()?;
-    if socks_settings.user_level.is_some() {
-        return Err(Error::InvalidConfig(
-            "socks settings.userLevel is not supported yet".into(),
-        ));
-    }
+    let user_level = socks_settings.user_level.unwrap_or(0);
 
     let auth_mode = socks_settings
         .auth
@@ -565,6 +561,7 @@ pub(super) fn collect_socks_settings(
             SocksUserStore::with_auth_required(accounts, false),
             udp_enabled,
             udp_response_ip,
+            user_level,
         )),
         "password" => {
             if accounts.is_empty() {
@@ -576,12 +573,14 @@ pub(super) fn collect_socks_settings(
                 SocksUserStore::with_auth_required(accounts, true),
                 udp_enabled,
                 udp_response_ip,
+                user_level,
             ))
         }
         _ => Ok((
             SocksUserStore::with_auth_required(accounts, false),
             udp_enabled,
             udp_response_ip,
+            user_level,
         )),
     }
 }
@@ -1163,7 +1162,7 @@ mod tests {
             "udp": true
         }));
 
-        let (users, udp_enabled, udp_response_ip) =
+        let (users, udp_enabled, udp_response_ip, _) =
             collect_socks_settings(settings).expect("socks udp should be accepted");
         assert!(!users.auth_required());
         assert!(udp_enabled);
@@ -1179,8 +1178,9 @@ mod tests {
             "ip": "127.0.0.1"
         }));
 
-        let (users, udp_enabled, udp_response_ip) = collect_socks_settings(settings)
-            .expect("unknown socks auth should match Xray noauth fallback");
+        let (users, udp_enabled, udp_response_ip, _) =
+            collect_socks_settings(settings)
+                .expect("unknown socks auth should match Xray noauth fallback");
         assert!(!users.auth_required());
         assert_eq!(users.snapshot()[0].username, "alice");
         assert!(udp_enabled);
@@ -1193,7 +1193,7 @@ mod tests {
             "auth": "password",
             "users": [{"user": "legacy", "pass": "secret"}]
         }));
-        let (users, _, _) = collect_socks_settings(users_only)
+        let (users, _, _, _) = collect_socks_settings(users_only)
             .expect("legacy socks users should be accepted");
         assert!(users.auth_required());
         assert_eq!(users.snapshot()[0].username, "legacy");
@@ -1202,10 +1202,22 @@ mod tests {
             "users": [{"user": "legacy", "pass": "secret"}],
             "accounts": []
         }));
-        let (users, _, _) = collect_socks_settings(accounts_override)
+        let (users, _, _, _) = collect_socks_settings(accounts_override)
             .expect("explicit accounts should override legacy users");
         assert!(!users.auth_required());
         assert!(users.snapshot().is_empty());
+    }
+
+    #[test]
+    fn collect_socks_settings_preserves_xray_user_level() {
+        let settings = SettingObject(serde_json::json!({
+            "auth": "noauth",
+            "userLevel": 7
+        }));
+
+        let (_, _, _, user_level) = collect_socks_settings(settings)
+            .expect("Xray userLevel should be accepted");
+        assert_eq!(user_level, 7);
     }
 
     #[test]
@@ -1216,7 +1228,7 @@ mod tests {
             "ip": "127.0.0.1"
         }));
 
-        let (_, udp_enabled, udp_response_ip) =
+        let (_, udp_enabled, udp_response_ip, _) =
             collect_socks_settings(settings).expect("socks ip should be accepted");
         assert!(udp_enabled);
         assert_eq!(udp_response_ip.as_deref(), Some("127.0.0.1"));
@@ -1230,7 +1242,7 @@ mod tests {
             "ip": "localhost"
         }));
 
-        let (_, udp_enabled, udp_response_ip) = collect_socks_settings(settings)
+        let (_, udp_enabled, udp_response_ip, _) = collect_socks_settings(settings)
             .expect("Xray accepts domain settings.ip");
         assert!(udp_enabled);
         assert_eq!(udp_response_ip.as_deref(), Some("localhost"));
@@ -1243,7 +1255,7 @@ mod tests {
             "udp": false
         }));
 
-        let (users, udp_enabled, udp_response_ip) =
+        let (users, udp_enabled, udp_response_ip, _) =
             collect_socks_settings(settings).expect("udp false is a no-op");
         assert!(!users.auth_required());
         assert!(!udp_enabled);
