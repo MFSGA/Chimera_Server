@@ -12,7 +12,9 @@ use crate::{
     address::{Address, NetLocation},
     async_stream::{AsyncPing, AsyncStream},
     config::server_config::HttpUser,
-    handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
+    handler::tcp::tcp_handler::{
+        TcpServerConnectionContext, TcpServerHandler, TcpServerSetupResult,
+    },
     traffic::TrafficContext,
     util::prefixed_stream::PrefixedStream,
 };
@@ -26,6 +28,7 @@ pub struct HttpTcpServerHandler {
     accounts: Vec<HttpUser>,
     allow_transparent: bool,
     inbound_tag: String,
+    user_level: u32,
 }
 
 impl HttpTcpServerHandler {
@@ -38,13 +41,47 @@ impl HttpTcpServerHandler {
             accounts,
             allow_transparent,
             inbound_tag: inbound_tag.to_string(),
+            user_level: 0,
         }
+    }
+
+    pub fn with_user_level(mut self, user_level: u32) -> Self {
+        self.user_level = user_level;
+        self
     }
 }
 
 #[async_trait]
 impl TcpServerHandler for HttpTcpServerHandler {
     async fn setup_server_stream(
+        &self,
+        server_stream: Box<dyn AsyncStream>,
+    ) -> std::io::Result<TcpServerSetupResult> {
+        self.setup_server_stream_inner(server_stream).await
+    }
+
+    async fn setup_server_stream_with_context(
+        &self,
+        server_stream: Box<dyn AsyncStream>,
+        context: TcpServerConnectionContext,
+    ) -> std::io::Result<TcpServerSetupResult> {
+        let Some(runtime) = context.runtime.as_ref() else {
+            return self.setup_server_stream_inner(server_stream).await;
+        };
+        let timeout = runtime.xray_handshake_timeout_for_level(self.user_level);
+        tokio::time::timeout(timeout, self.setup_server_stream_inner(server_stream))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "HTTP handshake timed out",
+                )
+            })?
+    }
+}
+
+impl HttpTcpServerHandler {
+    async fn setup_server_stream_inner(
         &self,
         mut server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
@@ -1533,6 +1570,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
         pin::Pin,
         task::{Context, Poll},
     };
@@ -1545,8 +1583,14 @@ mod tests {
 
     use crate::{
         async_stream::{AsyncPing, AsyncStream},
-        config::server_config::HttpUser,
-        handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
+        config::{
+            def::{PolicyConfig, PolicyLevelConfig},
+            server_config::HttpUser,
+        },
+        handler::tcp::tcp_handler::{
+            TcpServerConnectionContext, TcpServerHandler, TcpServerSetupResult,
+        },
+        runtime::RuntimeState,
     };
 
     use super::{
@@ -1604,6 +1648,43 @@ mod tests {
     }
 
     impl AsyncStream for TestStream {}
+
+    #[tokio::test]
+    async fn http_handshake_policy_covers_first_byte_like_xray() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let mut levels = HashMap::new();
+        levels.insert(
+            7,
+            Some(PolicyLevelConfig {
+                handshake: Some(0),
+                ..PolicyLevelConfig::default()
+            }),
+        );
+        runtime.replace_policy(Some(&PolicyConfig {
+            levels,
+            ..PolicyConfig::default()
+        }));
+
+        let (_client, server) = duplex(1024);
+        let handler = HttpTcpServerHandler::new(Vec::new(), false, "http-policy")
+            .with_user_level(7);
+        let result = handler
+            .setup_server_stream_with_context(
+                Box::new(TestStream(server)),
+                TcpServerConnectionContext {
+                    runtime: Some(runtime),
+                    ..TcpServerConnectionContext::default()
+                },
+            )
+            .await;
+        let error = match result {
+            Ok(_) => panic!(
+                "zero-second Xray HTTP handshake policy must time out before first byte"
+            ),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
 
     #[test]
     fn request_line_spacing_matches_xray() {
