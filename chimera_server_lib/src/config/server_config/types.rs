@@ -543,7 +543,7 @@ pub enum ServerProxyConfig {
         #[serde(default)]
         udp_enabled: bool,
         #[serde(default)]
-        udp_response_ip: Option<std::net::IpAddr>,
+        udp_response_ip: Option<String>,
     },
     DokodemoDoor {
         config: DokodemoDoorConfig,

@@ -2,6 +2,7 @@ use serde::Deserialize;
 
 use crate::{
     Error,
+    address::Address,
     config::{SettingObject, XhttpRange, XhttpSettings},
 };
 
@@ -25,7 +26,7 @@ use super::super::types::{
 };
 
 #[cfg(feature = "trojan")]
-use crate::address::{Address, NetLocation};
+use crate::address::NetLocation;
 
 #[cfg(feature = "trojan")]
 use super::super::types::{TrojanFallback, TrojanUser};
@@ -480,7 +481,7 @@ fn parse_trojan_fallback_dest(
 
 pub(super) fn collect_socks_settings(
     settings: SettingObject,
-) -> Result<(SocksUserStore, bool, Option<std::net::IpAddr>), Error> {
+) -> Result<(SocksUserStore, bool, Option<String>), Error> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct SocksInboundSettings {
@@ -524,11 +525,13 @@ pub(super) fn collect_socks_settings(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| {
-            value.parse::<std::net::IpAddr>().map_err(|error| {
-                Error::InvalidConfig(format!(
-                    "socks settings.ip must be an IP address: {error}"
-                ))
-            })
+            Address::from(value)
+                .map(|_| value.to_string())
+                .map_err(|error| {
+                    Error::InvalidConfig(format!(
+                        "invalid socks settings.ip address: {error}"
+                    ))
+                })
         })
         .transpose()?;
     if socks_settings.user_level.is_some() {
@@ -1181,10 +1184,7 @@ mod tests {
         assert!(!users.auth_required());
         assert_eq!(users.snapshot()[0].username, "alice");
         assert!(udp_enabled);
-        assert_eq!(
-            udp_response_ip,
-            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
-        );
+        assert_eq!(udp_response_ip.as_deref(), Some("127.0.0.1"));
     }
 
     #[test]
@@ -1219,10 +1219,21 @@ mod tests {
         let (_, udp_enabled, udp_response_ip) =
             collect_socks_settings(settings).expect("socks ip should be accepted");
         assert!(udp_enabled);
-        assert_eq!(
-            udp_response_ip,
-            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
-        );
+        assert_eq!(udp_response_ip.as_deref(), Some("127.0.0.1"));
+    }
+
+    #[test]
+    fn collect_socks_settings_accepts_domain_udp_response_address() {
+        let settings = SettingObject(serde_json::json!({
+            "auth": "noauth",
+            "udp": true,
+            "ip": "localhost"
+        }));
+
+        let (_, udp_enabled, udp_response_ip) = collect_socks_settings(settings)
+            .expect("Xray accepts domain settings.ip");
+        assert!(udp_enabled);
+        assert_eq!(udp_response_ip.as_deref(), Some("localhost"));
     }
 
     #[test]
