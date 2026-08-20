@@ -732,6 +732,12 @@ async fn send_udp_target_payload(
     unreachable!("SOCKS5 UDP target payload retry loop is bounded")
 }
 
+fn prune_closed_udp_sessions(
+    client_sessions: &mut HashMap<(SocketAddr, bool), SocksUdpClientSession>,
+) {
+    client_sessions.retain(|_, session| !session.sender.is_closed());
+}
+
 pub(crate) async fn run_shared_udp_relay(
     udp_socket: Arc<tokio::net::UdpSocket>,
     resolver: Arc<dyn Resolver>,
@@ -742,9 +748,18 @@ pub(crate) async fn run_shared_udp_relay(
     let mut recv_buf = vec![0u8; XRAY_SOCKS_UDP_PACKET_SIZE];
     let mut client_sessions =
         HashMap::<(SocketAddr, bool), SocksUdpClientSession>::new();
+    let mut session_cleanup = interval(UDP_TARGET_SESSION_ACTIVITY_CHECK);
+    session_cleanup.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    session_cleanup.tick().await;
 
     loop {
-        let (len, client_addr) = udp_socket.recv_from(&mut recv_buf).await?;
+        let (len, client_addr) = tokio::select! {
+            result = udp_socket.recv_from(&mut recv_buf) => result?,
+            _ = session_cleanup.tick() => {
+                prune_closed_udp_sessions(&mut client_sessions);
+                continue;
+            }
+        };
         if accounts.auth_required()
             && !accounts.is_udp_ip_authorized(client_addr.ip())
         {
@@ -1240,6 +1255,40 @@ mod tests {
         activity.record_downstream();
         assert!(activity.keep_alive_on_check());
         assert!(!activity.keep_alive_on_check());
+    }
+
+    #[tokio::test]
+    async fn closed_udp_sessions_are_pruned_like_xray_dispatcher_rays() {
+        let (closed_sender, closed_receiver) = mpsc::channel(1);
+        drop(closed_receiver);
+        let closed_task = tokio::spawn(std::future::pending::<()>());
+
+        let (open_sender, _open_receiver) = mpsc::channel(1);
+        let open_task = tokio::spawn(std::future::pending::<()>());
+
+        let closed_key = ("127.0.0.1:10001".parse().unwrap(), false);
+        let open_key = ("127.0.0.1:10002".parse().unwrap(), false);
+        let mut sessions = HashMap::from([
+            (
+                closed_key,
+                SocksUdpClientSession {
+                    sender: closed_sender,
+                    task: closed_task,
+                },
+            ),
+            (
+                open_key,
+                SocksUdpClientSession {
+                    sender: open_sender,
+                    task: open_task,
+                },
+            ),
+        ]);
+
+        prune_closed_udp_sessions(&mut sessions);
+
+        assert!(!sessions.contains_key(&closed_key));
+        assert!(sessions.contains_key(&open_key));
     }
 
     async fn socks4_setup(
