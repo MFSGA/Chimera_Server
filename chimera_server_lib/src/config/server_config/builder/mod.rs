@@ -1360,9 +1360,9 @@ impl TryFrom<InboudItem> for ServerConfig {
                 let settings = settings.unwrap_or_else(|| {
                     crate::config::SettingObject(serde_json::json!({}))
                 });
-                let (accounts, udp_enabled, udp_bind_ip) =
+                let (accounts, udp_enabled, udp_response_ip) =
                     collect_socks_settings(settings)?;
-                if udp_bind_ip.is_some() {
+                if udp_response_ip.is_some() {
                     return Err(Error::InvalidConfig(
                         "mixed settings.ip is not supported".into(),
                     ));
@@ -1469,12 +1469,12 @@ impl TryFrom<InboudItem> for ServerConfig {
                 let settings = settings.ok_or_else(|| {
                     Error::InvalidConfig("socks inbound requires settings".into())
                 })?;
-                let (accounts, udp_enabled, udp_bind_ip) =
+                let (accounts, udp_enabled, udp_response_ip) =
                     collect_socks_settings(settings)?;
                 let mut protocol = ServerProxyConfig::Socks {
                     accounts,
                     udp_enabled,
-                    udp_bind_ip,
+                    udp_response_ip,
                 };
 
                 #[cfg(feature = "ws")]

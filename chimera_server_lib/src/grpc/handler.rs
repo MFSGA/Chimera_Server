@@ -517,7 +517,7 @@ impl HandlerServiceImpl {
                         accounts,
                         socks.auth_type == 1,
                     );
-                let udp_bind_ip = match socks.address {
+                let udp_response_ip = match socks.address {
                     Some(address) => match self.parse_address(Some(address))? {
                         Address::Ipv4(ip) => Some(ip.into()),
                         Address::Ipv6(ip) => Some(ip.into()),
@@ -533,7 +533,7 @@ impl HandlerServiceImpl {
                 Ok(ServerProxyConfig::Socks {
                     accounts,
                     udp_enabled: socks.udp_enabled,
-                    udp_bind_ip,
+                    udp_response_ip,
                 })
             }
             #[cfg(feature = "vless")]
@@ -1107,7 +1107,7 @@ impl HandlerServiceImpl {
             ServerProxyConfig::Socks {
                 accounts,
                 udp_enabled,
-                udp_bind_ip,
+                udp_response_ip,
             } => {
                 let auth_type = i32::from(accounts.auth_required());
                 let account_map = accounts
@@ -1122,7 +1122,7 @@ impl HandlerServiceImpl {
                     SocksServerConfigPayload {
                         auth_type,
                         accounts: account_map,
-                        address: udp_bind_ip.as_ref().and_then(|ip| {
+                        address: udp_response_ip.as_ref().and_then(|ip| {
                             Self::encode_address(&match ip {
                                 std::net::IpAddr::V4(ip) => Address::Ipv4(*ip),
                                 std::net::IpAddr::V6(ip) => Address::Ipv6(*ip),
@@ -2248,7 +2248,7 @@ mod tests {
             }]
             .into(),
             udp_enabled: false,
-            udp_bind_ip: None,
+            udp_response_ip: None,
         };
         let inbound = ServerConfig {
             tag: inbound_tag.clone(),
@@ -2563,7 +2563,7 @@ mod tests {
         let ServerProxyConfig::Socks {
             accounts,
             udp_enabled,
-            udp_bind_ip,
+            udp_response_ip,
         } = &parsed
         else {
             panic!("expected SOCKS inbound config");
@@ -2572,7 +2572,7 @@ mod tests {
         assert_eq!(accounts.snapshot()[0].username, "alice");
         assert!(*udp_enabled);
         assert_eq!(
-            *udp_bind_ip,
+            *udp_response_ip,
             Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
         );
 
