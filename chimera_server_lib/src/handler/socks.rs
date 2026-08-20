@@ -561,41 +561,42 @@ fn build_udp_associate_response(bound_addr: SocketAddr) -> Vec<u8> {
 /// 3. Monitors the TCP connection for termination
 ///
 /// When the TCP connection closes, the UDP relay is terminated.
-struct SocksUdpTargetSession {
-    sender: mpsc::Sender<(Vec<u8>, Option<TrafficContext>)>,
+struct SocksUdpClientSession {
+    sender: mpsc::Sender<(SocketAddr, Vec<u8>, Option<TrafficContext>)>,
     task: JoinHandle<()>,
 }
 
-impl Drop for SocksUdpTargetSession {
+impl Drop for SocksUdpClientSession {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
 
-fn start_udp_target_session(
-    target_addr: SocketAddr,
+fn start_udp_client_session(
+    initial_target_addr: SocketAddr,
     client_endpoint: SocketAddr,
     client_socket: Arc<tokio::net::UdpSocket>,
-) -> std::io::Result<SocksUdpTargetSession> {
-    let target_socket = create_udp_socket_for_target(&target_addr)?;
+) -> std::io::Result<SocksUdpClientSession> {
+    let target_socket = create_udp_socket_for_target(&initial_target_addr)?;
     let (sender, mut receiver) =
-        mpsc::channel::<(Vec<u8>, Option<TrafficContext>)>(32);
+        mpsc::channel::<(SocketAddr, Vec<u8>, Option<TrafficContext>)>(32);
     let task = tokio::spawn(async move {
         let mut response_buf = vec![0u8; UDP_BUFFER_SIZE];
         let idle = sleep(UDP_TARGET_SESSION_IDLE_TIMEOUT);
         tokio::pin!(idle);
-        let mut response_context = None;
+        let mut response_contexts =
+            HashMap::<SocketAddr, Option<TrafficContext>>::new();
 
         loop {
             tokio::select! {
                 message = receiver.recv() => {
-                    let Some((payload, traffic_context)) = message else {
+                    let Some((target_addr, payload, traffic_context)) = message else {
                         return;
                     };
                     match target_socket.send_to(&payload, target_addr).await {
                         Ok(sent) => {
                             record_transfer(traffic_context.clone(), sent as u64, 0);
-                            response_context = traffic_context;
+                            response_contexts.insert(target_addr, traffic_context);
                             idle.as_mut().reset(Instant::now() + UDP_TARGET_SESSION_IDLE_TIMEOUT);
                         }
                         Err(error) => {
@@ -620,7 +621,7 @@ fn start_udp_target_session(
                                 );
                             } else {
                                 record_transfer(
-                                    response_context.clone(),
+                                    response_contexts.get(&resp_addr).cloned().flatten(),
                                     0,
                                     forwarded_payload_len as u64,
                                 );
@@ -638,44 +639,44 @@ fn start_udp_target_session(
         }
     });
 
-    Ok(SocksUdpTargetSession { sender, task })
+    Ok(SocksUdpClientSession { sender, task })
 }
 
 async fn send_udp_target_payload(
-    target_sessions: &mut HashMap<(SocketAddr, SocketAddr), SocksUdpTargetSession>,
+    client_sessions: &mut HashMap<(SocketAddr, bool), SocksUdpClientSession>,
     target_addr: SocketAddr,
     client_endpoint: SocketAddr,
     client_socket: Arc<tokio::net::UdpSocket>,
     payload: Vec<u8>,
     traffic_context: Option<TrafficContext>,
 ) -> std::io::Result<()> {
-    let message = (payload, traffic_context);
-    let session_key = (client_endpoint, target_addr);
+    let message = (target_addr, payload, traffic_context);
+    let session_key = (client_endpoint, target_addr.is_ipv6());
     for attempt in 0..2 {
         if let std::collections::hash_map::Entry::Vacant(entry) =
-            target_sessions.entry(session_key)
+            client_sessions.entry(session_key)
         {
-            entry.insert(start_udp_target_session(
+            entry.insert(start_udp_client_session(
                 target_addr,
                 client_endpoint,
                 client_socket.clone(),
             )?);
         }
 
-        let sender = &target_sessions
+        let sender = &client_sessions
             .get(&session_key)
-            .expect("SOCKS5 UDP target session exists after insertion")
+            .expect("SOCKS5 UDP client session exists after insertion")
             .sender;
         match sender.send(message.clone()).await {
             Ok(()) => return Ok(()),
             Err(_) if attempt == 0 => {
-                target_sessions.remove(&session_key);
+                client_sessions.remove(&session_key);
             }
             Err(_) => {
-                target_sessions.remove(&session_key);
+                client_sessions.remove(&session_key);
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
-                    "SOCKS5 UDP target session closed before payload was sent",
+                    "SOCKS5 UDP client session closed before payload was sent",
                 ));
             }
         }
@@ -708,8 +709,11 @@ pub(crate) async fn run_udp_relay(
     // Xray v26.2.6 reads SOCKS UDP packets through an 8 KiB buf.Buffer.
     // Oversized datagrams are truncated to that packet size before decoding.
     let mut recv_buf = vec![0u8; XRAY_SOCKS_UDP_PACKET_SIZE];
-    let mut target_sessions =
-        HashMap::<(SocketAddr, SocketAddr), SocksUdpTargetSession>::new();
+    // Xray v26.2.6 full-cone UDP reuses an outbound mapping for different
+    // targets from one client endpoint. Keep one socket per IP family so a
+    // first IPv4 target cannot make a later IPv6 target unusable (or vice versa).
+    let mut client_sessions =
+        HashMap::<(SocketAddr, bool), SocksUdpClientSession>::new();
     let expected_client_ip =
         restrict_client_ip_to_tcp_peer.then_some(tcp_peer_addr.ip());
 
@@ -807,7 +811,7 @@ pub(crate) async fn run_udp_relay(
         }
 
         if let Err(error) = send_udp_target_payload(
-            &mut target_sessions,
+            &mut client_sessions,
             target_addr,
             response_endpoint,
             udp_socket_clone.clone(),
@@ -2240,6 +2244,88 @@ mod tests {
 
     #[cfg(feature = "traffic")]
     #[tokio::test]
+    async fn udp_relay_reuses_outbound_source_port_across_targets_like_xray_v26_2_6()
+    {
+        let first_origin = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let first_origin_addr = first_origin.local_addr().unwrap();
+        let second_origin = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let second_origin_addr = second_origin.local_addr().unwrap();
+
+        let relay_socket =
+            Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let relay_addr = relay_socket.local_addr().unwrap();
+        let control_listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let control_addr = control_listener.local_addr().unwrap();
+        let client_control = TcpStream::connect(control_addr).await.unwrap();
+        let (server_control, _) = control_listener.accept().await.unwrap();
+
+        let runtime = RuntimeState::new(
+            Vec::new(),
+            vec![OutboundSummary {
+                tag: "direct".into(),
+                protocol: "freedom".into(),
+                proxy_settings_type: None,
+                proxy_settings_value: None,
+            }],
+        );
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let relay_task = tokio::spawn(run_udp_relay(
+            relay_socket,
+            Box::new(server_control),
+            resolver,
+            runtime,
+            client_control.local_addr().unwrap(),
+            false,
+            None,
+        ));
+
+        let client_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let make_request = |target: SocketAddr, payload: &[u8]| {
+            let mut request = vec![0, 0, 0, ADDR_TYPE_IPV4];
+            let IpAddr::V4(target_ip) = target.ip() else {
+                unreachable!("test origin socket must use IPv4");
+            };
+            request.extend_from_slice(&target_ip.octets());
+            request.extend_from_slice(&target.port().to_be_bytes());
+            request.extend_from_slice(payload);
+            request
+        };
+
+        client_socket
+            .send_to(&make_request(first_origin_addr, b"one"), relay_addr)
+            .await
+            .unwrap();
+        client_socket
+            .send_to(&make_request(second_origin_addr, b"two"), relay_addr)
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 64];
+        let (first_len, first_peer) =
+            timeout(Duration::from_secs(2), first_origin.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(&buf[..first_len], b"one");
+        let (second_len, second_peer) =
+            timeout(Duration::from_secs(2), second_origin.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(&buf[..second_len], b"two");
+        assert_eq!(first_peer.port(), second_peer.port());
+
+        drop(client_control);
+        timeout(Duration::from_secs(2), relay_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(feature = "traffic")]
+    #[tokio::test]
     async fn udp_target_session_retries_payload_after_idle_task_closed() {
         let origin_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let origin_addr = origin_socket.local_addr().unwrap();
@@ -2253,8 +2339,8 @@ mod tests {
         closed_task.await.unwrap();
         let closed_task = tokio::spawn(async {});
         let mut sessions = HashMap::from([(
-            (client_endpoint, origin_addr),
-            SocksUdpTargetSession {
+            (client_endpoint, origin_addr.is_ipv6()),
+            SocksUdpClientSession {
                 sender,
                 task: closed_task,
             },
