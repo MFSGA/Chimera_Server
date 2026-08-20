@@ -26,6 +26,10 @@ pub trait TcpServerHandler: Send + Sync + Debug {
         false
     }
 
+    fn manages_handshake_timeout(&self) -> bool {
+        false
+    }
+
     async fn setup_server_stream(
         &self,
         server_stream: Box<dyn AsyncStream>,

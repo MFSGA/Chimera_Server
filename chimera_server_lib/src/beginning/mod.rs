@@ -457,24 +457,38 @@ where
     AS: AsyncStream + 'static,
 {
     let local_addr = connection_context.local_addr;
-    let setup_server_stream_future = timeout(
-        Duration::from_secs(60),
-        setup_server_stream(stream, server_handler, connection_context.clone()),
-    );
+    let handler_manages_handshake_timeout =
+        server_handler.manages_handshake_timeout();
     tracing::info!("prepare to setup server stream");
-    let mut setup_result = match setup_server_stream_future.await {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
-            return Err(std::io::Error::new(
-                e.kind(),
-                format!("failed to setup server stream: {}", e),
-            ));
-        }
-        Err(elapsed) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("server setup timed out: {}", elapsed),
-            ));
+    let mut setup_result = if handler_manages_handshake_timeout {
+        setup_server_stream(stream, server_handler, connection_context.clone())
+            .await
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("failed to setup server stream: {}", e),
+                )
+            })?
+    } else {
+        match timeout(
+            Duration::from_secs(60),
+            setup_server_stream(stream, server_handler, connection_context.clone()),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("failed to setup server stream: {}", e),
+                ));
+            }
+            Err(elapsed) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("server setup timed out: {}", elapsed),
+                ));
+            }
         }
     };
     let setup_result = loop {
@@ -602,21 +616,39 @@ where
             return Ok(());
         }
 
-        setup_result = match timeout(
-            Duration::from_secs(60),
-            next_handler.setup_server_stream_with_context(
-                server_stream,
-                connection_context.clone(),
-            ),
-        )
-        .await
-        {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Ok(());
+        setup_result = if next_handler.manages_handshake_timeout() {
+            match next_handler
+                .setup_server_stream_with_context(
+                    server_stream,
+                    connection_context.clone(),
+                )
+                .await
+            {
+                Ok(result) => result,
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
             }
-            Ok(Err(error)) => return Err(error),
-            Err(_) => return Ok(()),
+        } else {
+            match timeout(
+                Duration::from_secs(60),
+                next_handler.setup_server_stream_with_context(
+                    server_stream,
+                    connection_context.clone(),
+                ),
+            )
+            .await
+            {
+                Ok(Ok(result)) => result,
+                Ok(Err(error))
+                    if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    return Ok(());
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(_) => return Ok(()),
+            }
         };
     }
 

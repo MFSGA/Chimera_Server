@@ -269,6 +269,10 @@ impl SocksTcpServerHandler {
 
 #[async_trait]
 impl TcpServerHandler for SocksTcpServerHandler {
+    fn manages_handshake_timeout(&self) -> bool {
+        true
+    }
+
     async fn setup_server_stream(
         &self,
         server_stream: Box<dyn AsyncStream>,
