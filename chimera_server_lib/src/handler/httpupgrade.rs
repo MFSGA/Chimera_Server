@@ -13,7 +13,7 @@ use crate::{
     },
 };
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
+const PROXY_PROTOCOL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_HEADER_BYTES: usize = 12 * 1024;
 
 #[derive(Debug)]
@@ -40,14 +40,11 @@ impl HttpUpgradeTcpServerHandler {
     }
 
     async fn upgrade(&self, stream: &mut Box<dyn AsyncStream>) -> io::Result<()> {
-        let request = timeout(HANDSHAKE_TIMEOUT, read_http_header(stream))
-            .await
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "HTTPUpgrade handshake timed out",
-                )
-            })??;
+        // Xray v26.2.6 calls http.ReadRequest directly here. Unlike its
+        // WebSocket transport, HTTPUpgrade does not impose a transport-level
+        // four-second header timeout; the inner inbound owns its handshake
+        // policy after the upgrade completes.
+        let request = read_http_header(stream).await?;
         let (method, target, version, headers) = parse_request(&request)?;
         if method != "GET" || version != "HTTP/1.1" {
             return Err(io::Error::new(
@@ -99,6 +96,10 @@ impl HttpUpgradeTcpServerHandler {
 
 #[async_trait]
 impl TcpServerHandler for HttpUpgradeTcpServerHandler {
+    fn manages_handshake_timeout(&self) -> bool {
+        self.inner.manages_handshake_timeout()
+    }
+
     async fn setup_server_stream(
         &self,
         server_stream: Box<dyn AsyncStream>,
@@ -116,14 +117,17 @@ impl TcpServerHandler for HttpUpgradeTcpServerHandler {
         context: TcpServerConnectionContext,
     ) -> io::Result<TcpServerSetupResult> {
         let peer_addr = if self.accept_proxy_protocol {
-            timeout(HANDSHAKE_TIMEOUT, read_proxy_protocol(&mut server_stream))
-                .await
-                .map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "PROXY protocol handshake timed out",
-                    )
-                })??
+            timeout(
+                PROXY_PROTOCOL_HANDSHAKE_TIMEOUT,
+                read_proxy_protocol(&mut server_stream),
+            )
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "PROXY protocol handshake timed out",
+                )
+            })??
         } else {
             None
         };
@@ -392,6 +396,7 @@ mod tests {
     use std::{
         pin::Pin,
         task::{Context, Poll},
+        time::Duration,
     };
 
     use async_trait::async_trait;
@@ -427,6 +432,23 @@ mod tests {
                 connection_success_response: None,
                 traffic_context: None,
             })
+        }
+    }
+
+    #[derive(Debug)]
+    struct TimeoutManagingInner;
+
+    #[async_trait]
+    impl TcpServerHandler for TimeoutManagingInner {
+        fn manages_handshake_timeout(&self) -> bool {
+            true
+        }
+
+        async fn setup_server_stream(
+            &self,
+            stream: Box<dyn AsyncStream>,
+        ) -> std::io::Result<TcpServerSetupResult> {
+            Inner.setup_server_stream(stream).await
         }
     }
 
@@ -480,6 +502,58 @@ mod tests {
     }
 
     impl AsyncStream for TestStream {}
+
+    #[test]
+    fn propagates_inner_handshake_timeout_ownership() {
+        let unmanaged = HttpUpgradeTcpServerHandler::new(
+            None,
+            "/upgrade".into(),
+            false,
+            Box::new(Inner),
+        );
+        assert!(!unmanaged.manages_handshake_timeout());
+
+        let managed = HttpUpgradeTcpServerHandler::new(
+            None,
+            "/upgrade".into(),
+            false,
+            Box::new(TimeoutManagingInner),
+        );
+        assert!(managed.manages_handshake_timeout());
+    }
+
+    #[tokio::test]
+    async fn does_not_apply_websocket_four_second_header_timeout() {
+        let handler = HttpUpgradeTcpServerHandler::new(
+            None,
+            "/upgrade".into(),
+            false,
+            Box::new(Inner),
+        );
+        let (mut client, server) = duplex(4096);
+        client
+            .write_all(b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .unwrap();
+
+        let setup = tokio::spawn(async move {
+            handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(4_100)).await;
+        assert!(
+            !setup.is_finished(),
+            "Xray HTTPUpgrade remains pending past the WebSocket four-second deadline"
+        );
+
+        client
+            .write_all(b"Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+            .await
+            .unwrap();
+        let result = setup.await.unwrap().expect("HTTPUpgrade handshake");
+        assert!(matches!(result, TcpServerSetupResult::TcpForward { .. }));
+    }
 
     #[tokio::test]
     async fn upgrades_and_preserves_first_protocol_bytes() {
