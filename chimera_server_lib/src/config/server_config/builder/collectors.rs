@@ -518,7 +518,7 @@ pub(super) fn collect_socks_settings(
 
     // SOCKS UDP is implemented through UDP ASSOCIATE on the TCP control stream.
     let udp_enabled = socks_settings.udp.unwrap_or(false);
-    let udp_bind_ip = socks_settings
+    let udp_response_ip = socks_settings
         .ip
         .as_deref()
         .map(str::trim)
@@ -561,7 +561,7 @@ pub(super) fn collect_socks_settings(
         "noauth" | "none" => Ok((
             SocksUserStore::with_auth_required(accounts, false),
             udp_enabled,
-            udp_bind_ip,
+            udp_response_ip,
         )),
         "password" => {
             if accounts.is_empty() {
@@ -572,13 +572,13 @@ pub(super) fn collect_socks_settings(
             Ok((
                 SocksUserStore::with_auth_required(accounts, true),
                 udp_enabled,
-                udp_bind_ip,
+                udp_response_ip,
             ))
         }
         _ => Ok((
             SocksUserStore::with_auth_required(accounts, false),
             udp_enabled,
-            udp_bind_ip,
+            udp_response_ip,
         )),
     }
 }
@@ -1160,11 +1160,11 @@ mod tests {
             "udp": true
         }));
 
-        let (users, udp_enabled, udp_bind_ip) =
+        let (users, udp_enabled, udp_response_ip) =
             collect_socks_settings(settings).expect("socks udp should be accepted");
         assert!(!users.auth_required());
         assert!(udp_enabled);
-        assert!(udp_bind_ip.is_none());
+        assert!(udp_response_ip.is_none());
     }
 
     #[test]
@@ -1176,13 +1176,13 @@ mod tests {
             "ip": "127.0.0.1"
         }));
 
-        let (users, udp_enabled, udp_bind_ip) = collect_socks_settings(settings)
+        let (users, udp_enabled, udp_response_ip) = collect_socks_settings(settings)
             .expect("unknown socks auth should match Xray noauth fallback");
         assert!(!users.auth_required());
         assert_eq!(users.snapshot()[0].username, "alice");
         assert!(udp_enabled);
         assert_eq!(
-            udp_bind_ip,
+            udp_response_ip,
             Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
         );
     }
@@ -1209,18 +1209,18 @@ mod tests {
     }
 
     #[test]
-    fn collect_socks_settings_preserves_udp_bind_ip() {
+    fn collect_socks_settings_preserves_udp_response_ip() {
         let settings = SettingObject(serde_json::json!({
             "auth": "noauth",
             "udp": true,
             "ip": "127.0.0.1"
         }));
 
-        let (_, udp_enabled, udp_bind_ip) =
+        let (_, udp_enabled, udp_response_ip) =
             collect_socks_settings(settings).expect("socks ip should be accepted");
         assert!(udp_enabled);
         assert_eq!(
-            udp_bind_ip,
+            udp_response_ip,
             Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
         );
     }
@@ -1232,11 +1232,11 @@ mod tests {
             "udp": false
         }));
 
-        let (users, udp_enabled, udp_bind_ip) =
+        let (users, udp_enabled, udp_response_ip) =
             collect_socks_settings(settings).expect("udp false is a no-op");
         assert!(!users.auth_required());
         assert!(!udp_enabled);
-        assert!(udp_bind_ip.is_none());
+        assert!(udp_response_ip.is_none());
     }
 
     #[cfg(feature = "trojan")]

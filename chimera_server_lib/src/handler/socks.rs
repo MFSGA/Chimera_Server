@@ -70,7 +70,7 @@ pub struct SocksTcpServerHandler {
     accounts: SocksUserStore,
     inbound_tag: String,
     udp_enabled: bool,
-    udp_bind_ip: Option<std::net::IpAddr>,
+    udp_response_ip: Option<std::net::IpAddr>,
 }
 
 impl SocksTcpServerHandler {
@@ -78,13 +78,13 @@ impl SocksTcpServerHandler {
         accounts: SocksUserStore,
         inbound_tag: &str,
         udp_enabled: bool,
-        udp_bind_ip: Option<std::net::IpAddr>,
+        udp_response_ip: Option<std::net::IpAddr>,
     ) -> Self {
         Self {
             accounts,
             inbound_tag: inbound_tag.to_string(),
             udp_enabled,
-            udp_bind_ip,
+            udp_response_ip,
         }
     }
 
@@ -203,7 +203,8 @@ impl SocksTcpServerHandler {
                 handle_udp_associate(
                     server_stream,
                     traffic_context,
-                    self.udp_bind_ip.or(local_addr.map(|addr| addr.ip())),
+                    local_addr.map(|addr| addr.ip()),
+                    self.udp_response_ip,
                     self.requires_auth(),
                 )
                 .await
@@ -487,6 +488,7 @@ async fn handle_udp_associate(
     mut server_stream: Box<dyn AsyncStream>,
     traffic_context: Option<TrafficContext>,
     udp_bind_ip: Option<std::net::IpAddr>,
+    udp_response_ip: Option<std::net::IpAddr>,
     restrict_client_ip_to_tcp_peer: bool,
 ) -> std::io::Result<TcpServerSetupResult> {
     // Xray v26.2.6 parses the UDP ASSOCIATE destination but does not use it as
@@ -516,7 +518,11 @@ async fn handle_udp_associate(
     let bound_addr = udp_socket.local_addr()?;
     tracing::info!("SOCKS5 UDP ASSOCIATE: bound UDP relay at {}", bound_addr);
 
-    let response = build_udp_associate_response(bound_addr);
+    let response_addr = SocketAddr::new(
+        udp_response_ip.unwrap_or(bound_addr.ip()),
+        bound_addr.port(),
+    );
+    let response = build_udp_associate_response(response_addr);
     server_stream.write_all(&response).await?;
     server_stream.flush().await?;
 
@@ -1991,7 +1997,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = handle_udp_associate(Box::new(server), None, None, false)
+        let result = handle_udp_associate(Box::new(server), None, None, None, false)
             .await
             .unwrap();
         let TcpServerSetupResult::UdpAssociate {
@@ -2017,7 +2023,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = handle_udp_associate(Box::new(server), None, None, true)
+        let result = handle_udp_associate(Box::new(server), None, None, None, true)
             .await
             .unwrap();
         let TcpServerSetupResult::UdpAssociate {
@@ -2031,7 +2037,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn udp_associate_uses_configured_bind_ip() {
+    async fn udp_associate_advertises_configured_response_ip_without_binding_it() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let listener_addr = listener.local_addr().unwrap();
         let mut client = TcpStream::connect(listener_addr).await.unwrap();
@@ -2042,10 +2048,12 @@ mod tests {
             .await
             .unwrap();
 
+        let advertised_ip = Ipv4Addr::new(203, 0, 113, 7);
         let result = handle_udp_associate(
             Box::new(server),
             None,
             Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            Some(IpAddr::V4(advertised_ip)),
             false,
         )
         .await
@@ -2064,7 +2072,7 @@ mod tests {
         assert_eq!(response[0], SOCKS_VERSION);
         assert_eq!(response[1], REP_SUCCEEDED);
         assert_eq!(response[3], ADDR_TYPE_IPV4);
-        assert_eq!(&response[4..8], &Ipv4Addr::LOCALHOST.octets());
+        assert_eq!(&response[4..8], &advertised_ip.octets());
     }
 
     #[cfg(feature = "traffic")]
