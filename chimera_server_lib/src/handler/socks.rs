@@ -440,17 +440,8 @@ async fn read_address_from_stream(
             stream.read_exact(&mut address).await?;
             let mut port_bytes = [0u8; 2];
             stream.read_exact(&mut port_bytes).await?;
-            let ipv6 = std::net::Ipv6Addr::new(
-                u16::from_be_bytes([address[0], address[1]]),
-                u16::from_be_bytes([address[2], address[3]]),
-                u16::from_be_bytes([address[4], address[5]]),
-                u16::from_be_bytes([address[6], address[7]]),
-                u16::from_be_bytes([address[8], address[9]]),
-                u16::from_be_bytes([address[10], address[11]]),
-                u16::from_be_bytes([address[12], address[13]]),
-                u16::from_be_bytes([address[14], address[15]]),
-            );
-            NetLocation::new(Address::Ipv6(ipv6), u16::from_be_bytes(port_bytes))
+            let address = xray_ip_address(std::net::Ipv6Addr::from(address).into());
+            NetLocation::new(address, u16::from_be_bytes(port_bytes))
         }
         ADDR_TYPE_DOMAIN => {
             let domain_len = stream.read_u8().await? as usize;
@@ -870,21 +861,11 @@ fn parse_udp_address(
                     "truncated IPv6 address",
                 ));
             }
-            let ip = std::net::Ipv6Addr::new(
-                u16::from_be_bytes([data[offset + 1], data[offset + 2]]),
-                u16::from_be_bytes([data[offset + 3], data[offset + 4]]),
-                u16::from_be_bytes([data[offset + 5], data[offset + 6]]),
-                u16::from_be_bytes([data[offset + 7], data[offset + 8]]),
-                u16::from_be_bytes([data[offset + 9], data[offset + 10]]),
-                u16::from_be_bytes([data[offset + 11], data[offset + 12]]),
-                u16::from_be_bytes([data[offset + 13], data[offset + 14]]),
-                u16::from_be_bytes([data[offset + 15], data[offset + 16]]),
-            );
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&data[offset + 1..offset + 17]);
+            let address = xray_ip_address(std::net::Ipv6Addr::from(octets).into());
             let port = u16::from_be_bytes([data[offset + 17], data[offset + 18]]);
-            Ok((
-                NetLocation::new(Address::Ipv6(ip), port),
-                offset + 1 + 16 + 2,
-            ))
+            Ok((NetLocation::new(address, port), offset + 1 + 16 + 2))
         }
         ADDR_TYPE_DOMAIN => {
             if offset + 1 >= data.len() {
@@ -924,6 +905,16 @@ fn parse_udp_address(
     }
 }
 
+fn xray_ip_address(ip: std::net::IpAddr) -> Address {
+    match ip {
+        std::net::IpAddr::V4(ip) => Address::Ipv4(ip),
+        std::net::IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(ip) => Address::Ipv4(ip),
+            None => Address::Ipv6(ip),
+        },
+    }
+}
+
 fn parse_xray_socks4a_address(domain: &str) -> Address {
     let mut value = domain;
     if value.starts_with('[') && value.ends_with(']') && value.len() >= 2 {
@@ -941,13 +932,7 @@ fn parse_xray_socks4a_address(domain: &str) -> Address {
         value = value.trim();
     }
     if let Ok(ip) = value.parse::<std::net::IpAddr>() {
-        return match ip {
-            std::net::IpAddr::V4(ip) => Address::Ipv4(ip),
-            std::net::IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
-                Some(ip) => Address::Ipv4(ip),
-                None => Address::Ipv6(ip),
-            },
-        };
+        return xray_ip_address(ip);
     }
     Address::Hostname(value.to_string())
 }
@@ -966,13 +951,7 @@ fn parse_xray_socks_domain_address(domain: &str) -> std::io::Result<Address> {
     if let Some(value) = maybe_ip
         && let Ok(ip) = value.parse::<std::net::IpAddr>()
     {
-        return Ok(match ip {
-            std::net::IpAddr::V4(ip) => Address::Ipv4(ip),
-            std::net::IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
-                Some(ip) => Address::Ipv4(ip),
-                None => Address::Ipv6(ip),
-            },
-        });
+        return Ok(xray_ip_address(ip));
     }
 
     validate_socks5_domain(domain)?;
@@ -1209,6 +1188,40 @@ mod tests {
 
         let mut server: Box<dyn AsyncStream> = Box::new(server);
         assert!(read_address_from_stream(&mut server).await.is_err());
+    }
+
+    #[test]
+    fn socks5_udp_ipv4_mapped_ipv6_is_canonicalized_like_xray() {
+        let mapped = std::net::Ipv6Addr::from([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1,
+        ]);
+        let mut packet = vec![ADDR_TYPE_IPV6];
+        packet.extend_from_slice(&mapped.octets());
+        packet.extend_from_slice(&53u16.to_be_bytes());
+
+        let (location, used) = parse_udp_address(&packet, 0).unwrap();
+        assert_eq!(location.address(), &Address::Ipv4(Ipv4Addr::LOCALHOST));
+        assert_eq!(location.port(), 53);
+        assert_eq!(used, packet.len());
+    }
+
+    #[tokio::test]
+    async fn socks5_tcp_ipv4_mapped_ipv6_is_canonicalized_like_xray() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(listener_addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let mapped = std::net::Ipv6Addr::from([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1,
+        ]);
+        client.write_all(&[ADDR_TYPE_IPV6]).await.unwrap();
+        client.write_all(&mapped.octets()).await.unwrap();
+        client.write_all(&443u16.to_be_bytes()).await.unwrap();
+
+        let mut server: Box<dyn AsyncStream> = Box::new(server);
+        let location = read_address_from_stream(&mut server).await.unwrap();
+        assert_eq!(location.address(), &Address::Ipv4(Ipv4Addr::LOCALHOST));
+        assert_eq!(location.port(), 443);
     }
 
     #[test]
