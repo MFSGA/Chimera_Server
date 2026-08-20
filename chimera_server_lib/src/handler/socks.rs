@@ -112,6 +112,7 @@ impl SocksTcpServerHandler {
     async fn setup_server_stream_inner(
         &self,
         mut server_stream: Box<dyn AsyncStream>,
+        peer_addr: Option<SocketAddr>,
         local_addr: Option<SocketAddr>,
         listener_addr: Option<SocketAddr>,
     ) -> std::io::Result<TcpServerSetupResult> {
@@ -203,9 +204,11 @@ impl SocksTcpServerHandler {
                 handle_udp_associate(
                     server_stream,
                     traffic_context,
+                    peer_addr,
                     local_addr.map(|addr| addr.ip()),
+                    listener_addr,
                     self.udp_response_ip.clone(),
-                    self.requires_auth(),
+                    self.accounts.clone(),
                 )
                 .await
             }
@@ -235,7 +238,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
         &self,
         server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
-        self.setup_server_stream_inner(server_stream, None, None)
+        self.setup_server_stream_inner(server_stream, None, None, None)
             .await
     }
 
@@ -246,6 +249,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
     ) -> std::io::Result<TcpServerSetupResult> {
         self.setup_server_stream_inner(
             server_stream,
+            context.peer_addr,
             context.local_addr,
             context.listener_addr,
         )
@@ -487,9 +491,11 @@ async fn read_address_from_stream(
 async fn handle_udp_associate(
     mut server_stream: Box<dyn AsyncStream>,
     traffic_context: Option<TrafficContext>,
+    peer_addr: Option<SocketAddr>,
     udp_bind_ip: Option<std::net::IpAddr>,
+    listener_addr: Option<SocketAddr>,
     udp_response_ip: Option<String>,
-    restrict_client_ip_to_tcp_peer: bool,
+    accounts: SocksUserStore,
 ) -> std::io::Result<TcpServerSetupResult> {
     // Xray v26.2.6 parses the UDP ASSOCIATE destination but does not use it as
     // a source endpoint hint. With password auth, its UDPFilter only authorizes
@@ -516,21 +522,32 @@ async fn handle_udp_associate(
     let udp_socket = tokio::net::UdpSocket::from_std(std_socket)?;
 
     let bound_addr = udp_socket.local_addr()?;
-    tracing::info!("SOCKS5 UDP ASSOCIATE: bound UDP relay at {}", bound_addr);
+    tracing::debug!(
+        "SOCKS5 UDP ASSOCIATE: compatibility control relay at {}",
+        bound_addr
+    );
+
+    if accounts.auth_required()
+        && let Some(peer_addr) = peer_addr
+    {
+        // Xray v26.2.6 keeps a server-wide, non-expiring set of source IPs
+        // authorized by successful password-authenticated UDP ASSOCIATE requests.
+        accounts.authorize_udp_ip(peer_addr.ip());
+    }
 
     let response_address = match udp_response_ip {
         Some(address) => Address::from(&address)?,
         None => xray_ip_address(bound_addr.ip()),
     };
-    let response =
-        build_udp_associate_response(&response_address, bound_addr.port())?;
+    let response_port = listener_addr.map_or(bound_addr.port(), |addr| addr.port());
+    let response = build_udp_associate_response(&response_address, response_port)?;
     server_stream.write_all(&response).await?;
     server_stream.flush().await?;
 
     Ok(TcpServerSetupResult::UdpAssociate {
         stream: server_stream,
         socket: Arc::new(udp_socket),
-        restrict_client_ip_to_tcp_peer,
+        restrict_client_ip_to_tcp_peer: accounts.auth_required(),
         traffic_context,
     })
 }
@@ -698,6 +715,97 @@ async fn send_udp_target_payload(
         }
     }
     unreachable!("SOCKS5 UDP target payload retry loop is bounded")
+}
+
+pub(crate) async fn run_shared_udp_relay(
+    udp_socket: Arc<tokio::net::UdpSocket>,
+    resolver: Arc<dyn Resolver>,
+    runtime: RuntimeState,
+    accounts: SocksUserStore,
+    traffic_context: Option<TrafficContext>,
+) -> std::io::Result<()> {
+    let mut recv_buf = vec![0u8; XRAY_SOCKS_UDP_PACKET_SIZE];
+    let mut client_sessions =
+        HashMap::<(SocketAddr, bool), SocksUdpClientSession>::new();
+
+    loop {
+        let (len, client_addr) = udp_socket.recv_from(&mut recv_buf).await?;
+        if accounts.auth_required()
+            && !accounts.is_udp_ip_authorized(client_addr.ip())
+        {
+            tracing::debug!(
+                "SOCKS5 shared UDP listener ignored unauthorized source {}",
+                client_addr
+            );
+            continue;
+        }
+
+        let data = &recv_buf[..len];
+        if data.len() < 4 || data[2] != 0 {
+            continue;
+        }
+        let (target_location, payload_offset) = match parse_udp_address(data, 3) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let payload = &data[payload_offset..];
+        if payload.is_empty() {
+            continue;
+        }
+        let target_addr =
+            match resolve_single_address(&resolver, &target_location).await {
+                Ok(addr) => addr,
+                Err(error) => {
+                    tracing::warn!(
+                        "SOCKS5 shared UDP target resolution failed: {}",
+                        error
+                    );
+                    continue;
+                }
+            };
+        let datagram_context = traffic_context
+            .clone()
+            .map(|context| context.with_client_ip(client_addr.ip()));
+        let inbound_tag = datagram_context
+            .as_ref()
+            .and_then(|context| context.inbound_tag.as_deref())
+            .unwrap_or_default();
+        let route_input = connection_routing_input(
+            inbound_tag,
+            "",
+            3,
+            client_addr,
+            target_addr,
+            &target_location,
+        );
+        let action = select_direct_outbound(&runtime, &route_input, "udp")?;
+        let mut datagram_context = datagram_context;
+        match action {
+            DirectOutboundAction::Blackhole { tag } => {
+                datagram_context = datagram_context
+                    .map(|context| context.with_outbound_tag(tag.clone()));
+                record_transfer(datagram_context, payload.len() as u64, 0);
+                continue;
+            }
+            DirectOutboundAction::Freedom { tag: Some(tag) } => {
+                datagram_context =
+                    datagram_context.map(|context| context.with_outbound_tag(tag));
+            }
+            DirectOutboundAction::Freedom { tag: None } => {}
+        }
+        if let Err(error) = send_udp_target_payload(
+            &mut client_sessions,
+            target_addr,
+            client_addr,
+            udp_socket.clone(),
+            payload.to_vec(),
+            datagram_context,
+        )
+        .await
+        {
+            tracing::warn!("SOCKS5 shared UDP forwarding failed: {}", error);
+        }
+    }
 }
 
 pub(crate) async fn run_udp_relay(
@@ -2017,9 +2125,17 @@ mod tests {
             .await
             .unwrap();
 
-        let result = handle_udp_associate(Box::new(server), None, None, None, false)
-            .await
-            .unwrap();
+        let result = handle_udp_associate(
+            Box::new(server),
+            None,
+            None,
+            None,
+            None,
+            None,
+            SocksUserStore::with_auth_required(Vec::new(), false),
+        )
+        .await
+        .unwrap();
         let TcpServerSetupResult::UdpAssociate {
             restrict_client_ip_to_tcp_peer,
             ..
@@ -2043,9 +2159,17 @@ mod tests {
             .await
             .unwrap();
 
-        let result = handle_udp_associate(Box::new(server), None, None, None, true)
-            .await
-            .unwrap();
+        let result = handle_udp_associate(
+            Box::new(server),
+            None,
+            None,
+            None,
+            None,
+            None,
+            SocksUserStore::with_auth_required(Vec::new(), true),
+        )
+        .await
+        .unwrap();
         let TcpServerSetupResult::UdpAssociate {
             restrict_client_ip_to_tcp_peer,
             ..
@@ -2072,9 +2196,11 @@ mod tests {
         let result = handle_udp_associate(
             Box::new(server),
             None,
+            None,
             Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            None,
             Some(advertised_ip.to_string()),
-            false,
+            SocksUserStore::with_auth_required(Vec::new(), false),
         )
         .await
         .unwrap();
@@ -2124,9 +2250,11 @@ mod tests {
         let result = handle_udp_associate(
             Box::new(server),
             None,
+            None,
             Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            None,
             Some("localhost".to_string()),
-            false,
+            SocksUserStore::with_auth_required(Vec::new(), false),
         )
         .await
         .unwrap();
@@ -2209,6 +2337,77 @@ mod tests {
             .unwrap()
             .unwrap();
         forwarded
+    }
+
+    #[cfg(feature = "traffic")]
+    #[tokio::test]
+    async fn shared_udp_listener_matches_xray_noauth_and_password_filtering() {
+        let origin = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            for _ in 0..2 {
+                let (len, peer) = origin.recv_from(&mut buf).await.unwrap();
+                origin.send_to(&buf[..len], peer).await.unwrap();
+            }
+        });
+
+        for auth_required in [false, true] {
+            let relay =
+                Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+            let relay_addr = relay.local_addr().unwrap();
+            let accounts =
+                SocksUserStore::with_auth_required(Vec::new(), auth_required);
+            let runtime = RuntimeState::new(
+                Vec::new(),
+                vec![OutboundSummary {
+                    tag: "direct".into(),
+                    protocol: "freedom".into(),
+                    proxy_settings_type: None,
+                    proxy_settings_value: None,
+                }],
+            );
+            let task = tokio::spawn(run_shared_udp_relay(
+                relay,
+                Arc::new(NativeResolver::new()),
+                runtime,
+                accounts.clone(),
+                None,
+            ));
+            let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let mut request = vec![0, 0, 0, ADDR_TYPE_IPV4];
+            let IpAddr::V4(origin_ip) = origin_addr.ip() else {
+                unreachable!()
+            };
+            request.extend_from_slice(&origin_ip.octets());
+            request.extend_from_slice(&origin_addr.port().to_be_bytes());
+            request.extend_from_slice(b"shared");
+
+            if auth_required {
+                client.send_to(&request, relay_addr).await.unwrap();
+                let mut dropped = [0u8; 64];
+                assert!(
+                    timeout(
+                        Duration::from_millis(150),
+                        client.recv_from(&mut dropped)
+                    )
+                    .await
+                    .is_err()
+                );
+                accounts.authorize_udp_ip(client.local_addr().unwrap().ip());
+            }
+
+            client.send_to(&request, relay_addr).await.unwrap();
+            let mut response = [0u8; 64];
+            let (len, _) =
+                timeout(Duration::from_secs(2), client.recv_from(&mut response))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(&response[len - b"shared".len()..len], b"shared");
+            task.abort();
+        }
+        origin_task.await.unwrap();
     }
 
     #[cfg(feature = "traffic")]

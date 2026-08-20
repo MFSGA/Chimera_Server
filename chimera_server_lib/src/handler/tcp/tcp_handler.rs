@@ -12,6 +12,7 @@ use crate::{
 #[derive(Debug, Clone, Default)]
 pub struct TcpServerConnectionContext {
     pub original_destination: Option<NetLocation>,
+    pub peer_addr: Option<std::net::SocketAddr>,
     pub local_addr: Option<std::net::SocketAddr>,
     pub listener_addr: Option<std::net::SocketAddr>,
     pub server_name: Option<String>,

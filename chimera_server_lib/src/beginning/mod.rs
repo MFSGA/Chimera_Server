@@ -18,7 +18,7 @@ use crate::{
     },
     handler::{
         http::relay_plain_http_response,
-        socks::run_udp_relay,
+        socks::{run_shared_udp_relay, run_udp_relay},
         tcp::{
             tcp_handler::{
                 TcpServerConnectionContext, TcpServerHandler, TcpServerSetupResult,
@@ -57,6 +57,38 @@ pub async fn start_servers(
     }
 
     let mut join_handles = Vec::with_capacity(3);
+
+    if let ServerProxyConfig::Socks {
+        accounts,
+        udp_enabled: true,
+        ..
+    } = &config.protocol
+    {
+        let bind_addr = match &config.bind_location {
+            BindLocation::Address(address) => address.to_socket_addr()?,
+        };
+        let socket = Arc::new(tokio::net::UdpSocket::bind(bind_addr).await?);
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let runtime = runtime.clone();
+        let accounts = accounts.clone();
+        let traffic_context = Some(
+            crate::traffic::TrafficContext::new("socks")
+                .with_inbound_tag(config.tag.clone()),
+        );
+        join_handles.push(tokio::spawn(async move {
+            if let Err(error) = run_shared_udp_relay(
+                socket,
+                resolver,
+                runtime,
+                accounts,
+                traffic_context,
+            )
+            .await
+            {
+                error!("SOCKS5 shared UDP listener stopped with error: {}", error);
+            }
+        }));
+    }
 
     match config.transport {
         Transport::Tcp => {
@@ -233,6 +265,7 @@ async fn run_tcp_server(
                 cloned_handler.as_ref().as_ref(),
             ) {
                 Ok(mut context) => {
+                    context.peer_addr = Some(addr);
                     context.listener_addr = Some(listener_addr);
                     context
                 }

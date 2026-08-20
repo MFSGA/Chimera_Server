@@ -1,4 +1,8 @@
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::HashSet,
+    net::IpAddr,
+    sync::{Arc, RwLock},
+};
 
 use serde::Deserialize;
 
@@ -196,6 +200,7 @@ pub struct SocksUser {
 pub struct SocksUserStore {
     users: Arc<RwLock<Vec<SocksUser>>>,
     auth_required: Arc<RwLock<bool>>,
+    udp_authorized_ips: Arc<RwLock<HashSet<IpAddr>>>,
 }
 
 impl SocksUserStore {
@@ -208,6 +213,7 @@ impl SocksUserStore {
         Self {
             users: Arc::new(RwLock::new(users)),
             auth_required: Arc::new(RwLock::new(auth_required)),
+            udp_authorized_ips: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -223,6 +229,20 @@ impl SocksUserStore {
             .auth_required
             .read()
             .expect("socks auth mode lock poisoned")
+    }
+
+    pub fn authorize_udp_ip(&self, ip: IpAddr) {
+        self.udp_authorized_ips
+            .write()
+            .expect("socks UDP authorization lock poisoned")
+            .insert(ip);
+    }
+
+    pub fn is_udp_ip_authorized(&self, ip: IpAddr) -> bool {
+        self.udp_authorized_ips
+            .read()
+            .expect("socks UDP authorization lock poisoned")
+            .contains(&ip)
     }
 
     pub fn upsert(&self, user: SocksUser) {
