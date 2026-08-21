@@ -356,6 +356,7 @@ async fn handle_request(
     runtime: RuntimeState,
     peer_addr: std::net::SocketAddr,
 ) -> Result<Response<ResponseBody>, Infallible> {
+    let logical_peer_addr = grpc_logical_peer_addr(request.headers(), peer_addr);
     let multi_mode = match request.uri().path() {
         path if path == tun_service_path => false,
         path if path == tun_multi_service_path => true,
@@ -386,16 +387,57 @@ async fn handle_request(
             GrpcLogicalStream(handler_stream),
             server_handler,
             resolver,
-            peer_addr,
+            logical_peer_addr,
             runtime,
         )
         .await
         {
-            debug!("gRPC logical stream {peer_addr} ended: {error}");
+            debug!("gRPC logical stream {logical_peer_addr} ended: {error}");
         }
     });
 
     Ok(grpc_stream_response(transport_read, multi_mode))
+}
+
+fn grpc_logical_peer_addr(
+    headers: &hyper::HeaderMap,
+    peer_addr: std::net::SocketAddr,
+) -> std::net::SocketAddr {
+    let Some(value) = headers
+        .get("x-real-ip")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return peer_addr;
+    };
+    let value = if value.starts_with('[') && value.ends_with(']') {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    };
+    let value = if value
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| !byte.is_ascii_alphanumeric())
+        || value
+            .as_bytes()
+            .last()
+            .is_some_and(|byte| !byte.is_ascii_alphanumeric())
+    {
+        value.trim()
+    } else {
+        value
+    };
+    value
+        .parse::<std::net::IpAddr>()
+        .map(|ip| match ip {
+            std::net::IpAddr::V6(ip) => ip
+                .to_ipv4_mapped()
+                .map(std::net::IpAddr::V4)
+                .unwrap_or(std::net::IpAddr::V6(ip)),
+            ip => ip,
+        })
+        .map(|ip| std::net::SocketAddr::new(ip, 0))
+        .unwrap_or(peer_addr)
 }
 
 async fn decode_request_body(
@@ -704,8 +746,12 @@ impl AsyncStream for GrpcLogicalStream {}
 #[cfg(test)]
 mod tests {
     use bytes::BytesMut;
+    use hyper::HeaderMap;
 
-    use super::{decode_grpc_message, encode_grpc_message, grpc_service_paths};
+    use super::{
+        decode_grpc_message, encode_grpc_message, grpc_logical_peer_addr,
+        grpc_service_paths,
+    };
 
     #[test]
     fn grpc_server_exposes_tun_and_tun_multi_like_xray_v26_2_6() {
@@ -728,6 +774,32 @@ mod tests {
         let (tun, tun_multi) = grpc_service_paths("hello/world!");
         assert_eq!(tun, "/hello%2Fworld%21/Tun");
         assert_eq!(tun_multi, "/hello%2Fworld%21/TunMulti");
+    }
+
+    #[test]
+    fn grpc_x_real_ip_overrides_logical_peer_like_xray_v26_2_6() {
+        let peer_addr = "127.0.0.1:34567".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "203.0.113.9".parse().unwrap());
+        assert_eq!(
+            grpc_logical_peer_addr(&headers, peer_addr),
+            "203.0.113.9:0".parse().unwrap()
+        );
+
+        headers.insert("x-real-ip", "[ 2001:db8::7 ]".parse().unwrap());
+        assert_eq!(
+            grpc_logical_peer_addr(&headers, peer_addr),
+            "[2001:db8::7]:0".parse().unwrap()
+        );
+
+        headers.insert("x-real-ip", "::ffff:192.0.2.10".parse().unwrap());
+        assert_eq!(
+            grpc_logical_peer_addr(&headers, peer_addr),
+            "192.0.2.10:0".parse().unwrap()
+        );
+
+        headers.insert("x-real-ip", "not-an-ip".parse().unwrap());
+        assert_eq!(grpc_logical_peer_addr(&headers, peer_addr), peer_addr);
     }
 
     #[test]
