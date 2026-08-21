@@ -131,10 +131,7 @@ fn apply_grpc_layer(
     })?;
     let service_name = settings
         .service_name
-        .unwrap_or_else(|| "GunService".to_string())
-        .trim_matches('/')
-        .trim()
-        .to_string();
+        .unwrap_or_else(|| "GunService".to_string());
     if service_name.is_empty() {
         return Err(Error::InvalidConfig(
             "grpcSettings.serviceName cannot be empty".into(),
@@ -1520,6 +1517,37 @@ mod tests {
             "tag": format!("{protocol}-planned")
         }))
         .expect("valid inbound item")
+    }
+
+    #[cfg(feature = "grpc_transport")]
+    #[test]
+    fn grpc_inbound_preserves_xray_custom_service_name() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "socks",
+            "tag": "socks-grpc-custom",
+            "settings": {},
+            "streamSettings": {
+                "network": "grpc",
+                "security": "none",
+                "grpcSettings": {
+                    "serviceName": "/my/sample path/tun service|multi service"
+                }
+            }
+        }))
+        .expect("valid gRPC custom service inbound");
+        let config = ServerConfig::try_from(inbound)
+            .expect("custom gRPC service should build");
+        match config.protocol {
+            ServerProxyConfig::Grpc(config) => {
+                assert_eq!(
+                    config.service_name,
+                    "/my/sample path/tun service|multi service"
+                );
+            }
+            other => panic!("expected gRPC protocol, got {other:?}"),
+        }
     }
 
     #[cfg(feature = "grpc_transport")]

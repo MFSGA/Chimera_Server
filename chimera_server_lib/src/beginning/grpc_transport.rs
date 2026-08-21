@@ -237,10 +237,56 @@ fn parse_listener_protocol(
 }
 
 fn grpc_service_paths(service_name: &str) -> (String, String) {
+    let (service, tun, tun_multi) = grpc_service_parts(service_name);
     (
-        format!("/{service_name}/Tun"),
-        format!("/{service_name}/TunMulti"),
+        format!("/{service}/{tun}"),
+        format!("/{service}/{tun_multi}"),
     )
+}
+
+fn grpc_service_parts(service_name: &str) -> (String, String, String) {
+    if !service_name.starts_with('/') {
+        return (
+            grpc_path_escape(service_name),
+            "Tun".to_string(),
+            "TunMulti".to_string(),
+        );
+    }
+
+    let last_slash = service_name.rfind('/').unwrap_or(0);
+    let service = if last_slash <= 1 {
+        String::new()
+    } else {
+        service_name[1..last_slash]
+            .split('/')
+            .map(grpc_path_escape)
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+    let ending = &service_name[last_slash + 1..];
+    let mut stream_names = ending.split('|');
+    let tun = grpc_path_escape(stream_names.next().unwrap_or_default());
+    let tun_multi = grpc_path_escape(stream_names.next().unwrap_or(ending));
+    (service, tun, tun_multi)
+}
+
+fn grpc_path_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'_' | b'.' | b'~' | b'$' | b'&' | b'+' | b':' | b'=' | b'@'
+            )
+        {
+            escaped.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            write!(&mut escaped, "%{byte:02X}")
+                .expect("writing to String cannot fail");
+        }
+    }
+    escaped
 }
 
 async fn serve_grpc_connection<IO>(
@@ -564,6 +610,18 @@ mod tests {
         let (tun, tun_multi) = grpc_service_paths("GunService");
         assert_eq!(tun, "/GunService/Tun");
         assert_eq!(tun_multi, "/GunService/TunMulti");
+    }
+
+    #[test]
+    fn grpc_custom_service_paths_match_xray_v26_2_6() {
+        let (tun, tun_multi) =
+            grpc_service_paths("/my/sample path/tun service|multi service");
+        assert_eq!(tun, "/my/sample%20path/tun%20service");
+        assert_eq!(tun_multi, "/my/sample%20path/multi%20service");
+
+        let (tun, tun_multi) = grpc_service_paths("hello/world!");
+        assert_eq!(tun, "/hello%2Fworld%21/Tun");
+        assert_eq!(tun_multi, "/hello%2Fworld%21/TunMulti");
     }
 
     #[test]
