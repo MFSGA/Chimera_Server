@@ -118,9 +118,7 @@ pub async fn start_xhttp_server(
                         XhttpSecurityLayer::None => Ok(stream),
                         #[cfg(feature = "tls")]
                         XhttpSecurityLayer::Tls(acceptor) => {
-                            acceptor.accept(stream).await.map(|tls_stream| {
-                                Box::new(tls_stream) as Box<dyn AsyncStream>
-                            })
+                            accept_xhttp_tls(acceptor, stream).await
                         }
                         #[cfg(feature = "reality")]
                         XhttpSecurityLayer::Reality(config) => {
@@ -158,6 +156,24 @@ enum XhttpSecurityLayer {
     Tls(TlsAcceptor),
     #[cfg(feature = "reality")]
     Reality(RealityTransportConfig),
+}
+
+#[cfg(feature = "tls")]
+async fn accept_xhttp_tls(
+    acceptor: TlsAcceptor,
+    stream: Box<dyn AsyncStream>,
+) -> std::io::Result<Box<dyn AsyncStream>> {
+    match tokio::time::timeout(XHTTP_HEADER_READ_TIMEOUT, acceptor.accept(stream))
+        .await
+    {
+        Ok(result) => {
+            result.map(|tls_stream| Box::new(tls_stream) as Box<dyn AsyncStream>)
+        }
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "xhttp tls handshake timeout",
+        )),
+    }
 }
 
 fn parse_listener_protocol(
@@ -1396,6 +1412,62 @@ mod tests {
                 .contains("read header from client timeout"),
             "expected Hyper header timeout, got {error}"
         );
+    }
+
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn tls_xhttp_times_out_handshake_like_xray_v26_2_6() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let generated =
+            rcgen::generate_simple_self_signed(["localhost".to_string()])
+                .expect("generate test certificate");
+        let tls_config = build_server_config(
+            &[crate::config::server_config::TlsCertificateConfig {
+                certificate_path: None,
+                certificate_pem: generated.cert.pem().into_bytes(),
+                key_path: None,
+                key_pem: Some(generated.signing_key.serialize_pem().into_bytes()),
+                usage:
+                    crate::config::server_config::TlsCertificateUsage::Encipherment,
+            }],
+            &["h2".to_string()],
+            true,
+            false,
+            None,
+            None,
+        )
+        .expect("build TLS config");
+        let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let client = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect test client");
+        let (server, _) = listener.accept().await.expect("accept test client");
+        let mut server_task = tokio::spawn(async move {
+            accept_xhttp_tls(acceptor, Box::new(server) as Box<dyn AsyncStream>)
+                .await
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(3500), &mut server_task)
+                .await
+                .is_err(),
+            "XHTTP TLS timeout must not fire before Xray's four-second window"
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("XHTTP TLS timeout should fire near four seconds")
+            .expect("server task should not panic");
+        let error = match result {
+            Ok(_) => panic!("idle TLS handshake must time out"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        drop(client);
     }
 
     #[cfg(feature = "tls")]
