@@ -90,16 +90,8 @@ pub(super) async fn start_grpc_server(
         address = %listen_addr,
         "Starting gRPC transport server"
     );
-    let service_path = format!(
-        "/{}/{}",
-        grpc_config.service_name,
-        if grpc_config.multi_mode {
-            "TunMulti"
-        } else {
-            "Tun"
-        }
-    );
-    let multi_mode = grpc_config.multi_mode;
+    let (tun_service_path, tun_multi_service_path) =
+        grpc_service_paths(&grpc_config.service_name);
 
     let handle = tokio::spawn(async move {
         loop {
@@ -110,7 +102,8 @@ pub(super) async fn start_grpc_server(
                     continue;
                 }
             };
-            let service_path = service_path.clone();
+            let tun_service_path = tun_service_path.clone();
+            let tun_multi_service_path = tun_multi_service_path.clone();
             let server_handler = server_handler.clone();
             let resolver = resolver.clone();
             let runtime = runtime.clone();
@@ -118,8 +111,8 @@ pub(super) async fn start_grpc_server(
                 GrpcSecurity::Plain => {
                     tokio::spawn(serve_grpc_connection(
                         stream,
-                        service_path,
-                        multi_mode,
+                        tun_service_path,
+                        tun_multi_service_path,
                         server_handler,
                         resolver,
                         runtime,
@@ -134,8 +127,8 @@ pub(super) async fn start_grpc_server(
                             Ok(stream) => {
                                 serve_grpc_connection(
                                     stream,
-                                    service_path,
-                                    multi_mode,
+                                    tun_service_path,
+                                    tun_multi_service_path,
                                     server_handler,
                                     resolver,
                                     runtime,
@@ -162,8 +155,8 @@ pub(super) async fn start_grpc_server(
                             Ok(stream) => {
                                 serve_grpc_connection(
                                     stream,
-                                    service_path,
-                                    multi_mode,
+                                    tun_service_path,
+                                    tun_multi_service_path,
                                     server_handler,
                                     resolver,
                                     runtime,
@@ -243,10 +236,17 @@ fn parse_listener_protocol(
     }
 }
 
+fn grpc_service_paths(service_name: &str) -> (String, String) {
+    (
+        format!("/{service_name}/Tun"),
+        format!("/{service_name}/TunMulti"),
+    )
+}
+
 async fn serve_grpc_connection<IO>(
     io: IO,
-    service_path: String,
-    multi_mode: bool,
+    tun_service_path: String,
+    tun_multi_service_path: String,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
     resolver: Arc<dyn Resolver>,
     runtime: RuntimeState,
@@ -258,8 +258,8 @@ async fn serve_grpc_connection<IO>(
     let service = service_fn(move |request| {
         handle_request(
             request,
-            service_path.clone(),
-            multi_mode,
+            tun_service_path.clone(),
+            tun_multi_service_path.clone(),
             server_handler.clone(),
             resolver.clone(),
             runtime.clone(),
@@ -273,15 +273,19 @@ async fn serve_grpc_connection<IO>(
 
 async fn handle_request(
     request: Request<Incoming>,
-    service_path: String,
-    multi_mode: bool,
+    tun_service_path: String,
+    tun_multi_service_path: String,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
     resolver: Arc<dyn Resolver>,
     runtime: RuntimeState,
     peer_addr: std::net::SocketAddr,
 ) -> Result<Response<ResponseBody>, Infallible> {
+    let multi_mode = match request.uri().path() {
+        path if path == tun_service_path => false,
+        path if path == tun_multi_service_path => true,
+        _ => return Ok(grpc_status_response(12, "unimplemented gRPC method")),
+    };
     if request.method() != Method::POST
-        || request.uri().path() != service_path
         || !request
             .headers()
             .get(header::CONTENT_TYPE)
@@ -553,7 +557,14 @@ impl AsyncStream for GrpcLogicalStream {}
 mod tests {
     use bytes::BytesMut;
 
-    use super::{decode_grpc_message, encode_grpc_message};
+    use super::{decode_grpc_message, encode_grpc_message, grpc_service_paths};
+
+    #[test]
+    fn grpc_server_exposes_tun_and_tun_multi_like_xray_v26_2_6() {
+        let (tun, tun_multi) = grpc_service_paths("GunService");
+        assert_eq!(tun, "/GunService/Tun");
+        assert_eq!(tun_multi, "/GunService/TunMulti");
+    }
 
     #[test]
     fn hunk_round_trip_handles_large_payload() {
