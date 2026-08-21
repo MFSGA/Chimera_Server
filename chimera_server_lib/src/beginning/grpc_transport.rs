@@ -500,40 +500,112 @@ fn decode_grpc_message(
 }
 
 fn decode_data_fields(message: &[u8], multi_mode: bool) -> io::Result<Vec<Vec<u8>>> {
-    if message.is_empty() {
-        return Ok(vec![Vec::new()]);
-    }
     let mut offset = 0;
     let mut payloads = Vec::new();
     while offset < message.len() {
-        if message[offset] != 0x0a {
+        let (key, key_len) = decode_varint(&message[offset..])?;
+        offset += key_len;
+        let field_number = key >> 3;
+        let wire_type = key & 0x07;
+        if field_number == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "gRPC protobuf is missing bytes field 1",
+                "protobuf field number cannot be zero",
             ));
         }
-        offset += 1;
-        let (length, varint_len) = decode_varint(&message[offset..])?;
-        offset += varint_len;
-        let end = offset.checked_add(length).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "gRPC payload length overflow",
-            )
-        })?;
-        if end > message.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "truncated gRPC protobuf payload",
-            ));
+
+        if field_number == 1 {
+            if wire_type != 2 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "gRPC data field has invalid protobuf wire type",
+                ));
+            }
+            let (length, varint_len) = decode_varint(&message[offset..])?;
+            offset += varint_len;
+            let end = offset.checked_add(length).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "gRPC payload length overflow",
+                )
+            })?;
+            if end > message.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated gRPC protobuf payload",
+                ));
+            }
+            let payload = message[offset..end].to_vec();
+            offset = end;
+            if multi_mode {
+                payloads.push(payload);
+            } else if let Some(existing) = payloads.first_mut() {
+                *existing = payload;
+            } else {
+                payloads.push(payload);
+            }
+            continue;
         }
-        payloads.push(message[offset..end].to_vec());
-        offset = end;
-        if !multi_mode {
-            break;
-        }
+
+        offset = skip_protobuf_field(message, offset, wire_type)?;
+    }
+
+    if payloads.is_empty() {
+        payloads.push(Vec::new());
     }
     Ok(payloads)
+}
+
+fn skip_protobuf_field(
+    message: &[u8],
+    mut offset: usize,
+    wire_type: usize,
+) -> io::Result<usize> {
+    match wire_type {
+        0 => {
+            let (_, len) = decode_varint(&message[offset..])?;
+            offset += len;
+        }
+        1 => {
+            offset = offset.checked_add(8).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "protobuf field length overflow",
+                )
+            })?;
+        }
+        2 => {
+            let (length, len) = decode_varint(&message[offset..])?;
+            offset += len;
+            offset = offset.checked_add(length).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "protobuf field length overflow",
+                )
+            })?;
+        }
+        5 => {
+            offset = offset.checked_add(4).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "protobuf field length overflow",
+                )
+            })?;
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported protobuf wire type",
+            ));
+        }
+    }
+    if offset > message.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated protobuf field",
+        ));
+    }
+    Ok(offset)
 }
 
 fn encode_grpc_message(data: &[u8], _multi_mode: bool) -> Bytes {
@@ -684,6 +756,43 @@ mod tests {
             .expect("decode MultiHunk")
             .expect("complete MultiHunk");
         assert_eq!(decoded, vec![b"hello".to_vec(), b"world".to_vec()]);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn hunk_decoder_matches_protobuf_unknown_and_duplicate_field_semantics() {
+        let protobuf = [
+            0x10, 0x01, // unknown varint field 2
+            0x0a, 0x05, b'f', b'i', b'r', b's', b't', 0x1a, 0x03, b'x', b'y',
+            b'z', // unknown bytes field 3
+            0x0a, 0x04, b'l', b'a', b's', b't',
+        ];
+        let mut frame = vec![0];
+        frame.extend_from_slice(&(protobuf.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&protobuf);
+        let mut buffer = BytesMut::from(frame.as_slice());
+        let decoded = decode_grpc_message(&mut buffer, false)
+            .expect("decode Hunk with protobuf-compatible unknown fields")
+            .expect("complete Hunk");
+        assert_eq!(decoded, vec![b"last".to_vec()]);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn multi_hunk_ignores_unknown_fields_and_keeps_all_data_fields() {
+        let protobuf = [
+            0x0a, 0x03, b'o', b'n', b'e', 0x2d, 0x01, 0x02, 0x03,
+            0x04, // unknown fixed32 field 5
+            0x0a, 0x03, b't', b'w', b'o',
+        ];
+        let mut frame = vec![0];
+        frame.extend_from_slice(&(protobuf.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&protobuf);
+        let mut buffer = BytesMut::from(frame.as_slice());
+        let decoded = decode_grpc_message(&mut buffer, true)
+            .expect("decode MultiHunk with protobuf-compatible unknown fields")
+            .expect("complete MultiHunk");
+        assert_eq!(decoded, vec![b"one".to_vec(), b"two".to_vec()]);
         assert!(buffer.is_empty());
     }
 
