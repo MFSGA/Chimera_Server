@@ -575,14 +575,13 @@ fn grpc_stream_response(
     let trailers = futures::stream::once(async {
         let mut trailers = hyper::HeaderMap::new();
         trailers.insert("grpc-status", header::HeaderValue::from_static("0"));
+        trailers.insert("grpc-message", header::HeaderValue::from_static(""));
         Ok(Frame::trailers(trailers))
     });
     let body = StreamBody::new(data_stream.chain(trailers));
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/grpc")
-        .header("grpc-encoding", "identity")
-        .header("grpc-accept-encoding", "identity")
         .body(BodyExt::boxed_unsync(body))
         .unwrap_or_else(|_| grpc_status_response(13, "internal response error"))
 }
@@ -836,7 +835,7 @@ mod tests {
     use super::{
         decode_grpc_message, encode_grpc_message, grpc_content_type_is_valid,
         grpc_invalid_content_type_response, grpc_logical_peer_addr,
-        grpc_method_not_allowed_response, grpc_service_paths,
+        grpc_method_not_allowed_response, grpc_service_paths, grpc_stream_response,
         grpc_unimplemented_path_response, grpc_unsupported_encoding,
     };
 
@@ -931,6 +930,26 @@ mod tests {
             response.headers()["grpc-message"],
             "unknown method Nope for service GunService"
         );
+    }
+
+    #[tokio::test]
+    async fn grpc_success_metadata_matches_xray_v26_2_6() {
+        let (transport_stream, handler_stream) = tokio::io::duplex(64);
+        let (transport_read, _transport_write) = tokio::io::split(transport_stream);
+        drop(handler_stream);
+
+        let response = grpc_stream_response(transport_read, false);
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "application/grpc");
+        assert!(!response.headers().contains_key("grpc-encoding"));
+        assert!(!response.headers().contains_key("grpc-accept-encoding"));
+
+        let collected = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("collect gRPC response");
+        let trailers = collected.trailers().expect("gRPC success trailers");
+        assert_eq!(trailers["grpc-status"], "0");
+        assert_eq!(trailers["grpc-message"], "");
     }
 
     #[test]
