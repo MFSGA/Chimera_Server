@@ -362,14 +362,16 @@ async fn handle_request(
         path if path == tun_multi_service_path => true,
         _ => return Ok(grpc_status_response(12, "unimplemented gRPC method")),
     };
-    if request.method() != Method::POST
-        || !request
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.starts_with("application/grpc"))
-    {
+    if request.method() != Method::POST {
         return Ok(grpc_status_response(12, "unimplemented gRPC method"));
+    }
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if !grpc_content_type_is_valid(content_type) {
+        return Ok(grpc_invalid_content_type_response(content_type));
     }
     if let Some(encoding) = grpc_unsupported_encoding(request.headers()) {
         return Ok(grpc_status_response(
@@ -405,6 +407,27 @@ async fn handle_request(
     });
 
     Ok(grpc_stream_response(transport_read, multi_mode))
+}
+
+fn grpc_content_type_is_valid(content_type: &str) -> bool {
+    const BASE: &str = "application/grpc";
+    content_type == BASE
+        || content_type
+            .strip_prefix(BASE)
+            .is_some_and(|suffix| suffix.starts_with('+') || suffix.starts_with(';'))
+}
+
+fn grpc_invalid_content_type_response(content_type: &str) -> Response<ResponseBody> {
+    Response::builder()
+        .status(StatusCode::UNSUPPORTED_MEDIA_TYPE)
+        .header(header::CONTENT_TYPE, "application/grpc")
+        .header("grpc-status", "3")
+        .header(
+            "grpc-message",
+            format!("invalid gRPC request content-type \"{content_type}\""),
+        )
+        .body(BodyExt::boxed_unsync(Empty::<Bytes>::new()))
+        .unwrap()
 }
 
 fn grpc_unsupported_encoding(headers: &hyper::HeaderMap) -> Option<&str> {
@@ -764,7 +787,8 @@ mod tests {
     use hyper::HeaderMap;
 
     use super::{
-        decode_grpc_message, encode_grpc_message, grpc_logical_peer_addr,
+        decode_grpc_message, encode_grpc_message, grpc_content_type_is_valid,
+        grpc_invalid_content_type_response, grpc_logical_peer_addr,
         grpc_service_paths, grpc_unsupported_encoding,
     };
 
@@ -789,6 +813,38 @@ mod tests {
         let (tun, tun_multi) = grpc_service_paths("hello/world!");
         assert_eq!(tun, "/hello%2Fworld%21/Tun");
         assert_eq!(tun_multi, "/hello%2Fworld%21/TunMulti");
+    }
+
+    #[test]
+    fn grpc_content_type_validation_matches_xray_v26_2_6() {
+        for valid in [
+            "application/grpc",
+            "application/grpc+proto",
+            "application/grpc+xml",
+            "application/grpc; charset=utf-8",
+        ] {
+            assert!(grpc_content_type_is_valid(valid), "{valid}");
+        }
+        for invalid in [
+            "",
+            "application/grpcfoo",
+            "application/grpcx+proto",
+            "application/grpc ",
+            "application/grpc/",
+            "APPLICATION/GRPC",
+            "text/plain",
+        ] {
+            assert!(!grpc_content_type_is_valid(invalid), "{invalid}");
+        }
+
+        let response = grpc_invalid_content_type_response("application/grpcfoo");
+        assert_eq!(response.status(), hyper::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(response.headers()["content-type"], "application/grpc");
+        assert_eq!(response.headers()["grpc-status"], "3");
+        assert_eq!(
+            response.headers()["grpc-message"],
+            "invalid gRPC request content-type \"application/grpcfoo\""
+        );
     }
 
     #[test]
