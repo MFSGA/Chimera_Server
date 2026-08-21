@@ -357,14 +357,6 @@ async fn handle_request(
     peer_addr: std::net::SocketAddr,
 ) -> Result<Response<ResponseBody>, Infallible> {
     let logical_peer_addr = grpc_logical_peer_addr(request.headers(), peer_addr);
-    let multi_mode = match request.uri().path() {
-        path if path == tun_service_path => false,
-        path if path == tun_multi_service_path => true,
-        _ => return Ok(grpc_status_response(12, "unimplemented gRPC method")),
-    };
-    if request.method() != Method::POST {
-        return Ok(grpc_status_response(12, "unimplemented gRPC method"));
-    }
     let content_type = request
         .headers()
         .get(header::CONTENT_TYPE)
@@ -373,6 +365,14 @@ async fn handle_request(
     if !grpc_content_type_is_valid(content_type) {
         return Ok(grpc_invalid_content_type_response(content_type));
     }
+    if request.method() != Method::POST {
+        return Ok(grpc_method_not_allowed_response(request.method()));
+    }
+    let multi_mode = match request.uri().path() {
+        path if path == tun_service_path => false,
+        path if path == tun_multi_service_path => true,
+        _ => return Ok(grpc_status_response(12, "unimplemented gRPC method")),
+    };
     if let Some(encoding) = grpc_unsupported_encoding(request.headers()) {
         return Ok(grpc_status_response(
             12,
@@ -425,6 +425,21 @@ fn grpc_invalid_content_type_response(content_type: &str) -> Response<ResponseBo
         .header(
             "grpc-message",
             format!("invalid gRPC request content-type \"{content_type}\""),
+        )
+        .body(BodyExt::boxed_unsync(Empty::<Bytes>::new()))
+        .unwrap()
+}
+
+fn grpc_method_not_allowed_response(method: &Method) -> Response<ResponseBody> {
+    Response::builder()
+        .status(StatusCode::METHOD_NOT_ALLOWED)
+        .header(header::CONTENT_TYPE, "application/grpc")
+        .header("grpc-status", "13")
+        .header(
+            "grpc-message",
+            format!(
+                "Received a HEADERS frame with :method \"{method}\" which should be POST"
+            ),
         )
         .body(BodyExt::boxed_unsync(Empty::<Bytes>::new()))
         .unwrap()
@@ -789,7 +804,8 @@ mod tests {
     use super::{
         decode_grpc_message, encode_grpc_message, grpc_content_type_is_valid,
         grpc_invalid_content_type_response, grpc_logical_peer_addr,
-        grpc_service_paths, grpc_unsupported_encoding,
+        grpc_method_not_allowed_response, grpc_service_paths,
+        grpc_unsupported_encoding,
     };
 
     #[test]
@@ -845,6 +861,22 @@ mod tests {
             response.headers()["grpc-message"],
             "invalid gRPC request content-type \"application/grpcfoo\""
         );
+    }
+
+    #[test]
+    fn grpc_non_post_response_matches_xray_v26_2_6() {
+        for method in [hyper::Method::GET, hyper::Method::PUT] {
+            let response = grpc_method_not_allowed_response(&method);
+            assert_eq!(response.status(), hyper::StatusCode::METHOD_NOT_ALLOWED);
+            assert_eq!(response.headers()["content-type"], "application/grpc");
+            assert_eq!(response.headers()["grpc-status"], "13");
+            assert_eq!(
+                response.headers()["grpc-message"],
+                format!(
+                    "Received a HEADERS frame with :method \"{method}\" which should be POST"
+                )
+            );
+        }
     }
 
     #[test]
