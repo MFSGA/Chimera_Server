@@ -383,6 +383,8 @@ pub enum XhttpPaddingMethod {
 pub struct GrpcServerConfig {
     pub service_name: String,
     pub multi_mode: bool,
+    pub idle_timeout: u32,
+    pub health_check_timeout: u32,
     pub inner: Box<ServerProxyConfig>,
 }
 

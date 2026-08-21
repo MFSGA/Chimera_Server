@@ -4,6 +4,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -16,7 +17,7 @@ use hyper::{
     service::service_fn,
 };
 use hyper_util::{
-    rt::{TokioExecutor, TokioIo},
+    rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto,
 };
 use tokio::{
@@ -54,6 +55,12 @@ const GRPC_PIPE_CAPACITY: usize = 64 * 1024;
 const MAX_GRPC_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
 type ResponseBody = UnsyncBoxBody<Bytes, Infallible>;
+
+#[derive(Debug, Clone, Copy)]
+struct GrpcKeepalive {
+    idle_timeout: u32,
+    health_check_timeout: u32,
+}
 
 #[derive(Debug)]
 enum GrpcSecurity {
@@ -104,6 +111,10 @@ pub(super) async fn start_grpc_server(
             };
             let tun_service_path = tun_service_path.clone();
             let tun_multi_service_path = tun_multi_service_path.clone();
+            let keepalive = GrpcKeepalive {
+                idle_timeout: grpc_config.idle_timeout,
+                health_check_timeout: grpc_config.health_check_timeout,
+            };
             let server_handler = server_handler.clone();
             let resolver = resolver.clone();
             let runtime = runtime.clone();
@@ -111,8 +122,8 @@ pub(super) async fn start_grpc_server(
                 GrpcSecurity::Plain => {
                     tokio::spawn(serve_grpc_connection(
                         stream,
-                        tun_service_path,
-                        tun_multi_service_path,
+                        (tun_service_path, tun_multi_service_path),
+                        keepalive,
                         server_handler,
                         resolver,
                         runtime,
@@ -127,8 +138,8 @@ pub(super) async fn start_grpc_server(
                             Ok(stream) => {
                                 serve_grpc_connection(
                                     stream,
-                                    tun_service_path,
-                                    tun_multi_service_path,
+                                    (tun_service_path, tun_multi_service_path),
+                                    keepalive,
                                     server_handler,
                                     resolver,
                                     runtime,
@@ -155,8 +166,8 @@ pub(super) async fn start_grpc_server(
                             Ok(stream) => {
                                 serve_grpc_connection(
                                     stream,
-                                    tun_service_path,
-                                    tun_multi_service_path,
+                                    (tun_service_path, tun_multi_service_path),
+                                    keepalive,
                                     server_handler,
                                     resolver,
                                     runtime,
@@ -291,8 +302,8 @@ fn grpc_path_escape(value: &str) -> String {
 
 async fn serve_grpc_connection<IO>(
     io: IO,
-    tun_service_path: String,
-    tun_multi_service_path: String,
+    service_paths: (String, String),
+    keepalive: GrpcKeepalive,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
     resolver: Arc<dyn Resolver>,
     runtime: RuntimeState,
@@ -300,7 +311,26 @@ async fn serve_grpc_connection<IO>(
 ) where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let builder = auto::Builder::new(TokioExecutor::new());
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    if keepalive.idle_timeout > 0 || keepalive.health_check_timeout > 0 {
+        let mut http2 = builder.http2();
+        http2.timer(TokioTimer::new());
+        http2.keep_alive_interval(Duration::from_secs(
+            if keepalive.idle_timeout > 0 {
+                u64::from(keepalive.idle_timeout)
+            } else {
+                2 * 60 * 60
+            },
+        ));
+        http2.keep_alive_timeout(Duration::from_secs(
+            if keepalive.health_check_timeout > 0 {
+                u64::from(keepalive.health_check_timeout)
+            } else {
+                20
+            },
+        ));
+    }
+    let (tun_service_path, tun_multi_service_path) = service_paths;
     let service = service_fn(move |request| {
         handle_request(
             request,
