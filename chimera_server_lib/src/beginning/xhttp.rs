@@ -1,5 +1,3 @@
-#[cfg(feature = "tls")]
-use std::fs;
 use std::{
     collections::{BTreeMap, HashMap},
     convert::Infallible,
@@ -57,7 +55,7 @@ use crate::{
 };
 #[cfg(feature = "tls")]
 use crate::{
-    config::server_config::TlsServerConfig, util::rustls_util::create_server_config,
+    config::server_config::TlsServerConfig, handler::tls::build_server_config,
 };
 
 use super::process_stream;
@@ -174,10 +172,10 @@ fn parse_listener_protocol(
         ServerProxyConfig::Tls(TlsServerConfig {
             certificates,
             mut alpn_protocols,
-            enable_session_resumption: _,
-            reject_unknown_sni: _,
-            min_version: _,
-            max_version: _,
+            enable_session_resumption,
+            reject_unknown_sni,
+            min_version,
+            max_version,
             server_name: _,
             inner,
         }) => match *inner {
@@ -186,35 +184,13 @@ fn parse_listener_protocol(
                     alpn_protocols.push("h2".to_string());
                 }
 
-                let certificate = certificates
-                    .into_iter()
-                    .find(|certificate| {
-                        certificate.key_path.is_some()
-                            || certificate.key_pem.is_some()
-                    })
-                    .ok_or_else(|| {
-                        std::io::Error::other(
-                            "missing tls key material for xhttp server",
-                        )
-                    })?;
-                let cert_bytes = match certificate.certificate_path {
-                    Some(path) => fs::read(path)?,
-                    None => certificate.certificate_pem,
-                };
-                let key_bytes = match (certificate.key_path, certificate.key_pem) {
-                    (Some(path), _) => fs::read(path)?,
-                    (None, Some(key)) => key,
-                    (None, None) => {
-                        return Err(std::io::Error::other(
-                            "missing tls private key for xhttp server",
-                        ));
-                    }
-                };
-                let tls_config = create_server_config(
-                    &cert_bytes,
-                    &key_bytes,
+                let tls_config = build_server_config(
+                    &certificates,
                     &alpn_protocols,
-                    &[],
+                    enable_session_resumption,
+                    reject_unknown_sni,
+                    min_version.as_deref(),
+                    max_version.as_deref(),
                 )?;
 
                 Ok(XhttpListenerConfig {
@@ -1375,6 +1351,105 @@ fn apply_response_padding(headers: &mut hyper::HeaderMap, state: &AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn tls_xhttp_honors_xray_tls_version_settings() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let generated =
+            rcgen::generate_simple_self_signed(["localhost".to_string()])
+                .expect("generate test certificate");
+        let xhttp_config = XhttpServerConfig {
+            mode: XhttpMode::Auto,
+            host: None,
+            path: "/xhttp".to_string(),
+            min_padding: 100,
+            max_padding: 1000,
+            max_each_post_bytes: 1_000_000,
+            max_buffered_posts: 30,
+            session_ttl_secs: 300,
+            stream_up_server_secs: (20, 80),
+            server_max_header_bytes: 8192,
+            padding_obfs_mode: false,
+            padding_key: "x_padding".to_string(),
+            padding_header: "X-Padding".to_string(),
+            padding_placement: XhttpPaddingPlacement::QueryInHeader,
+            padding_method: XhttpPaddingMethod::RepeatX,
+            no_grpc_header: false,
+            no_sse_header: false,
+            uplink_http_method: "POST".to_string(),
+            min_posts_interval_ms: (30, 30),
+            session_placement: XhttpPlacement::Path,
+            session_key: String::new(),
+            seq_placement: XhttpPlacement::Path,
+            seq_key: String::new(),
+            uplink_data_placement: XhttpDataPlacement::Auto,
+            uplink_data_key: "x_data".to_string(),
+        };
+        let protocol = ServerProxyConfig::Tls(TlsServerConfig {
+            certificates: vec![crate::config::server_config::TlsCertificateConfig {
+                certificate_path: None,
+                certificate_pem: generated.cert.pem().into_bytes(),
+                key_path: None,
+                key_pem: Some(generated.signing_key.serialize_pem().into_bytes()),
+                usage:
+                    crate::config::server_config::TlsCertificateUsage::Encipherment,
+            }],
+            alpn_protocols: vec![],
+            enable_session_resumption: true,
+            reject_unknown_sni: false,
+            min_version: Some("1.3".to_string()),
+            max_version: None,
+            server_name: None,
+            inner: Box::new(ServerProxyConfig::Xhttp {
+                config: xhttp_config,
+                inner: Box::new(ServerProxyConfig::Socks {
+                    accounts: crate::config::server_config::SocksUserStore::new(
+                        vec![],
+                    ),
+                    udp_enabled: false,
+                    udp_response_ip: None,
+                    user_level: 0,
+                }),
+            }),
+        });
+
+        let parsed = parse_listener_protocol(protocol).expect("valid TLS XHTTP");
+        let XhttpSecurityLayer::Tls(acceptor) = parsed.security else {
+            panic!("expected TLS XHTTP security");
+        };
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(
+                generated.cert.der().to_vec(),
+            ))
+            .expect("trust test certificate");
+        let client_config = rustls::ClientConfig::builder_with_protocol_versions(&[
+            &rustls::version::TLS12,
+        ])
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move { acceptor.accept(server_io).await });
+        let client = connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost")
+                    .expect("valid server name"),
+                client_io,
+            )
+            .await;
+
+        assert!(
+            client.is_err(),
+            "TLS 1.2 must be rejected by minVersion=1.3"
+        );
+        assert!(
+            server.await.expect("server task").is_err(),
+            "server must reject a TLS 1.2 client"
+        );
+    }
 
     #[test]
     fn tokenish_padding_tracks_hpack_target() {
