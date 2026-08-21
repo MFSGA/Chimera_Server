@@ -12,7 +12,9 @@ use tokio::time::{Instant, timeout_at};
 use crate::async_stream::AsyncStream;
 use crate::config::server_config::RealityTransportConfig;
 use crate::config::server_config::{VlessFallback, VlessUser};
-use crate::handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
+use crate::handler::tcp::tcp_handler::{
+    TcpServerConnectionContext, TcpServerHandler, TcpServerSetupResult,
+};
 use crate::handler::tls_deframer::TlsDeframer;
 use crate::handler::vless_handler::setup_reality_mixed_vless_server_stream;
 use crate::reality::{BufReader, RealityServerConnection, RealityTlsStream};
@@ -668,15 +670,43 @@ impl RealityServerHandler {
 
 #[async_trait]
 impl TcpServerHandler for RealityServerHandler {
+    fn manages_handshake_timeout(&self) -> bool {
+        self.inner.manages_handshake_timeout()
+    }
+
     async fn setup_server_stream(
         &self,
         server_stream: Box<dyn AsyncStream>,
     ) -> io::Result<TcpServerSetupResult> {
-        let wrapped_stream =
-            accept_reality_stream(server_stream, &self.transport_config).await?;
-        self.inner
-            .setup_server_stream(Box::new(wrapped_stream))
-            .await
+        self.setup_server_stream_with_context(
+            server_stream,
+            TcpServerConnectionContext::default(),
+        )
+        .await
+    }
+
+    async fn setup_server_stream_with_context(
+        &self,
+        server_stream: Box<dyn AsyncStream>,
+        context: TcpServerConnectionContext,
+    ) -> io::Result<TcpServerSetupResult> {
+        let timeout = self.inner.pre_transport_handshake_timeout(&context);
+        let setup = async {
+            let wrapped_stream =
+                accept_reality_stream(server_stream, &self.transport_config).await?;
+            self.inner
+                .setup_server_stream_with_context(Box::new(wrapped_stream), context)
+                .await
+        };
+        let Some(timeout) = timeout else {
+            return setup.await;
+        };
+        tokio::time::timeout(timeout, setup).await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "REALITY inner handshake timed out",
+            )
+        })?
     }
 }
 
