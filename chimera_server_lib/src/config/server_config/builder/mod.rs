@@ -134,14 +134,14 @@ fn apply_grpc_layer(
         .unwrap_or_else(|| "GunService".to_string());
     let _ = (
         settings.authority,
-        settings.idle_timeout,
-        settings.health_check_timeout,
         settings.permit_without_stream,
         settings.initial_windows_size,
     );
     Ok(ServerProxyConfig::Grpc(super::types::GrpcServerConfig {
         service_name,
         multi_mode: settings.multi_mode,
+        idle_timeout: settings.idle_timeout,
+        health_check_timeout: settings.health_check_timeout,
         inner: Box::new(protocol),
     }))
 }
@@ -1587,7 +1587,9 @@ mod tests {
                 "security": "none",
                 "grpcSettings": {
                     "serviceName": "chimera-multi",
-                    "multiMode": true
+                    "multiMode": true,
+                    "idleTimeout": 7,
+                    "healthCheckTimeout": 3
                 }
             }
         }))
@@ -1598,6 +1600,8 @@ mod tests {
             ServerProxyConfig::Grpc(config) => {
                 assert_eq!(config.service_name, "chimera-multi");
                 assert!(config.multi_mode);
+                assert_eq!(config.idle_timeout, 7);
+                assert_eq!(config.health_check_timeout, 3);
                 assert!(matches!(*config.inner, ServerProxyConfig::Socks { .. }));
             }
             other => panic!("expected gRPC protocol, got {other:?}"),
