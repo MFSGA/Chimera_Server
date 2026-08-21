@@ -74,10 +74,25 @@ fn ensure_reality_inbound_supported_fields(
 }
 
 #[cfg(feature = "reality")]
+fn ensure_reality_network_supported(
+    stream_settings: &StreamSettings,
+) -> Result<(), Error> {
+    let network = stream_settings.network.trim().to_ascii_lowercase();
+    if matches!(network.as_str(), "" | "tcp" | "raw" | "xhttp" | "grpc") {
+        return Ok(());
+    }
+
+    Err(Error::InvalidConfig(
+        "REALITY only supports RAW, XHTTP and gRPC for now.".into(),
+    ))
+}
+
+#[cfg(feature = "reality")]
 fn build_reality_layer(
     protocol: ServerProxyConfig,
     stream_settings: &StreamSettings,
 ) -> Result<ServerProxyConfig, Error> {
+    ensure_reality_network_supported(stream_settings)?;
     let settings = stream_settings.reality_settings.as_ref().ok_or_else(|| {
         Error::InvalidConfig("reality inbound requires realitySettings".into())
     })?;
@@ -276,5 +291,64 @@ pub(super) fn apply_security_layers(
         Some(unsupported) => Err(Error::InvalidConfig(format!(
             "unsupported streamSettings.security={unsupported}"
         ))),
+    }
+}
+
+#[cfg(all(test, feature = "reality"))]
+mod tests {
+    use super::*;
+    use crate::config::server_config::SocksUserStore;
+
+    fn socks_protocol() -> ServerProxyConfig {
+        ServerProxyConfig::Socks {
+            accounts: SocksUserStore::new(Vec::new()),
+            udp_enabled: false,
+            udp_response_ip: None,
+            user_level: 0,
+        }
+    }
+
+    fn reality_stream_settings(network: &str) -> StreamSettings {
+        serde_json::from_value(serde_json::json!({
+            "network": network,
+            "security": "reality"
+        }))
+        .expect("stream settings")
+    }
+
+    #[test]
+    fn reality_rejects_websocket_and_httpupgrade_like_xray_v26_2_6() {
+        for network in ["ws", "websocket", "httpupgrade"] {
+            let error = apply_security_layers(
+                socks_protocol(),
+                &reality_stream_settings(network),
+            )
+            .expect_err("unsupported REALITY transport");
+            assert!(
+                error
+                    .to_string()
+                    .contains("REALITY only supports RAW, XHTTP and gRPC for now."),
+                "network={network}, error={error}"
+            );
+        }
+    }
+
+    #[test]
+    fn reality_allows_xray_v26_2_6_supported_network_names() {
+        for network in ["", "tcp", "raw", "xhttp", "grpc"] {
+            let error = apply_security_layers(
+                socks_protocol(),
+                &reality_stream_settings(network),
+            )
+            .expect_err(
+                "missing realitySettings should be the next validation error",
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("reality inbound requires realitySettings"),
+                "network={network}, error={error}"
+            );
+        }
     }
 }
