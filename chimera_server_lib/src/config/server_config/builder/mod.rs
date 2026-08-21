@@ -132,11 +132,6 @@ fn apply_grpc_layer(
     let service_name = settings
         .service_name
         .unwrap_or_else(|| "GunService".to_string());
-    if service_name.is_empty() {
-        return Err(Error::InvalidConfig(
-            "grpcSettings.serviceName cannot be empty".into(),
-        ));
-    }
     let _ = (
         settings.authority,
         settings.idle_timeout,
@@ -1545,6 +1540,34 @@ mod tests {
                     config.service_name,
                     "/my/sample path/tun service|multi service"
                 );
+            }
+            other => panic!("expected gRPC protocol, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "grpc_transport")]
+    #[test]
+    fn grpc_inbound_accepts_empty_service_name_like_xray_v26_2_6() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "socks",
+            "tag": "socks-grpc-empty",
+            "settings": {},
+            "streamSettings": {
+                "network": "grpc",
+                "security": "none",
+                "grpcSettings": {
+                    "serviceName": ""
+                }
+            }
+        }))
+        .expect("valid empty gRPC service inbound");
+        let config = ServerConfig::try_from(inbound)
+            .expect("Xray accepts an explicitly empty gRPC serviceName");
+        match config.protocol {
+            ServerProxyConfig::Grpc(config) => {
+                assert!(config.service_name.is_empty())
             }
             other => panic!("expected gRPC protocol, got {other:?}"),
         }

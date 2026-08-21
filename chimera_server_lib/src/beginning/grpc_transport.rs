@@ -614,6 +614,10 @@ mod tests {
 
     #[test]
     fn grpc_custom_service_paths_match_xray_v26_2_6() {
+        let (tun, tun_multi) = grpc_service_paths("");
+        assert_eq!(tun, "//Tun");
+        assert_eq!(tun_multi, "//TunMulti");
+
         let (tun, tun_multi) =
             grpc_service_paths("/my/sample path/tun service|multi service");
         assert_eq!(tun, "/my/sample%20path/tun%20service");
