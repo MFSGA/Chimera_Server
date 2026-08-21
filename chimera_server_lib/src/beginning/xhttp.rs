@@ -20,7 +20,7 @@ use hyper::{
     service::service_fn,
 };
 use hyper_util::{
-    rt::{TokioExecutor, TokioIo},
+    rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto,
 };
 use rand::RngExt;
@@ -61,6 +61,7 @@ use crate::{
 use super::process_stream;
 
 const XHTTP_PIPE_CAPACITY: usize = 64 * 1024;
+const XHTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(4);
 
 type ResponseBody = UnsyncBoxBody<Bytes, Infallible>;
 
@@ -224,6 +225,20 @@ fn parse_listener_protocol(
     }
 }
 
+fn configure_http_builder(
+    builder: &mut auto::Builder<TokioExecutor>,
+    server_max_header_bytes: usize,
+) {
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(XHTTP_HEADER_READ_TIMEOUT)
+        .max_buf_size(server_max_header_bytes.max(8192));
+    builder
+        .http2()
+        .max_header_list_size(server_max_header_bytes as u32);
+}
+
 async fn serve_http_connection<IO>(
     io: IO,
     state: Arc<AppState>,
@@ -233,12 +248,7 @@ async fn serve_http_connection<IO>(
 {
     let io = TokioIo::new(io);
     let mut builder = auto::Builder::new(TokioExecutor::new());
-    builder
-        .http1()
-        .max_buf_size(state.server_max_header_bytes.max(8192));
-    builder
-        .http2()
-        .max_header_list_size(state.server_max_header_bytes as u32);
+    configure_http_builder(&mut builder, state.server_max_header_bytes);
     let service =
         service_fn(move |request| handle_request(request, state.clone(), peer_addr));
 
@@ -1351,6 +1361,42 @@ fn apply_response_padding(headers: &mut hyper::HeaderMap, state: &AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn xhttp_times_out_incomplete_headers_like_xray_v26_2_6() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let io = TokioIo::new(server);
+        let mut builder = auto::Builder::new(TokioExecutor::new());
+        configure_http_builder(&mut builder, 8192);
+        let service = service_fn(|_request| async {
+            Ok::<_, Infallible>(Response::new(Empty::<Bytes>::new()))
+        });
+        let mut server_task =
+            tokio::spawn(async move { builder.serve_connection(io, service).await });
+
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example\r\n")
+            .await
+            .expect("write incomplete XHTTP request");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(3500), &mut server_task)
+                .await
+                .is_err(),
+            "XHTTP header timeout must not fire before Xray's four-second window"
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("XHTTP header timeout should fire near four seconds")
+            .expect("server task should not panic");
+        let error = result.expect_err("incomplete XHTTP headers must time out");
+        assert!(
+            error
+                .to_string()
+                .contains("read header from client timeout"),
+            "expected Hyper header timeout, got {error}"
+        );
+    }
 
     #[cfg(feature = "tls")]
     #[tokio::test]
