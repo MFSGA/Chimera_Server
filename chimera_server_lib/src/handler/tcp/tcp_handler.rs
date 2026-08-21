@@ -1,4 +1,4 @@
-use std::fmt::Debug;
+use std::{fmt::Debug, time::Duration};
 
 use async_trait::async_trait;
 
@@ -28,6 +28,13 @@ pub trait TcpServerHandler: Send + Sync + Debug {
 
     fn manages_handshake_timeout(&self) -> bool {
         false
+    }
+
+    fn pre_transport_handshake_timeout(
+        &self,
+        _context: &TcpServerConnectionContext,
+    ) -> Option<Duration> {
+        None
     }
 
     async fn setup_server_stream(

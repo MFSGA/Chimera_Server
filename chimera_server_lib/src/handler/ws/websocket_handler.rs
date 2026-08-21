@@ -46,6 +46,13 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                 .all(|target| target.handler.manages_handshake_timeout())
     }
 
+    fn pre_transport_handshake_timeout(
+        &self,
+        _context: &TcpServerConnectionContext,
+    ) -> Option<Duration> {
+        Some(XRAY_WEBSOCKET_HANDSHAKE_TIMEOUT)
+    }
+
     async fn setup_server_stream(
         &self,
         server_stream: Box<dyn AsyncStream>,
@@ -195,10 +202,15 @@ mod tests {
 
     use crate::{
         async_stream::AsyncStream,
-        handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
+        handler::tcp::tcp_handler::{
+            TcpServerConnectionContext, TcpServerHandler, TcpServerSetupResult,
+        },
     };
 
-    use super::{WebsocketServerTarget, WebsocketTcpServerHandler};
+    use super::{
+        WebsocketServerTarget, WebsocketTcpServerHandler,
+        XRAY_WEBSOCKET_HANDSHAKE_TIMEOUT,
+    };
 
     #[derive(Debug)]
     struct Inner {
@@ -233,6 +245,12 @@ mod tests {
     fn websocket_propagates_inner_handshake_timeout_ownership() {
         let handler = WebsocketTcpServerHandler::new(vec![target(true)]);
         assert!(handler.manages_handshake_timeout());
+        assert_eq!(
+            handler.pre_transport_handshake_timeout(
+                &TcpServerConnectionContext::default()
+            ),
+            Some(XRAY_WEBSOCKET_HANDSHAKE_TIMEOUT)
+        );
 
         let handler =
             WebsocketTcpServerHandler::new(vec![target(true), target(false)]);

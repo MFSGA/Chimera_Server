@@ -57,6 +57,16 @@ impl TcpServerHandler for HttpTcpServerHandler {
         true
     }
 
+    fn pre_transport_handshake_timeout(
+        &self,
+        context: &TcpServerConnectionContext,
+    ) -> Option<std::time::Duration> {
+        context
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.xray_handshake_timeout_for_level(self.user_level))
+    }
+
     async fn setup_server_stream(
         &self,
         server_stream: Box<dyn AsyncStream>,
@@ -1672,14 +1682,16 @@ mod tests {
         let (_client, server) = duplex(1024);
         let handler = HttpTcpServerHandler::new(Vec::new(), false, "http-policy")
             .with_user_level(7);
+        let context = TcpServerConnectionContext {
+            runtime: Some(runtime),
+            ..TcpServerConnectionContext::default()
+        };
+        assert_eq!(
+            handler.pre_transport_handshake_timeout(&context),
+            Some(std::time::Duration::ZERO)
+        );
         let result = handler
-            .setup_server_stream_with_context(
-                Box::new(TestStream(server)),
-                TcpServerConnectionContext {
-                    runtime: Some(runtime),
-                    ..TcpServerConnectionContext::default()
-                },
-            )
+            .setup_server_stream_with_context(Box::new(TestStream(server)), context)
             .await;
         let error = match result {
             Ok(_) => panic!(
