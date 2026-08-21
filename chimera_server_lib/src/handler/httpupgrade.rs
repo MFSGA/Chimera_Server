@@ -1,10 +1,7 @@
-use std::{collections::HashMap, io, time::Duration};
+use std::{collections::HashMap, io};
 
 use async_trait::async_trait;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    time::timeout,
-};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
     async_stream::AsyncStream,
@@ -13,7 +10,6 @@ use crate::{
     },
 };
 
-const PROXY_PROTOCOL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_HEADER_BYTES: usize = 12 * 1024;
 
 #[derive(Debug)]
@@ -116,18 +112,12 @@ impl TcpServerHandler for HttpUpgradeTcpServerHandler {
         mut server_stream: Box<dyn AsyncStream>,
         context: TcpServerConnectionContext,
     ) -> io::Result<TcpServerSetupResult> {
+        // Xray v26.2.6 enables PROXY protocol on the system listener via
+        // go-proxyproto. That listener does not impose the WebSocket
+        // transport's four-second handshake deadline, so a partial PROXY
+        // header remains pending until the connection itself is closed.
         let peer_addr = if self.accept_proxy_protocol {
-            timeout(
-                PROXY_PROTOCOL_HANDSHAKE_TIMEOUT,
-                read_proxy_protocol(&mut server_stream),
-            )
-            .await
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "PROXY protocol handshake timed out",
-                )
-            })??
+            read_proxy_protocol(&mut server_stream).await?
         } else {
             None
         };
@@ -590,6 +580,49 @@ mod tests {
         let mut protocol = [0u8; 8];
         stream.read_exact(&mut protocol).await.unwrap();
         assert_eq!(&protocol, b"protocol");
+    }
+
+    #[tokio::test]
+    async fn proxy_protocol_does_not_inherit_websocket_four_second_timeout() {
+        let handler = HttpUpgradeTcpServerHandler::new(
+            None,
+            "/upgrade".into(),
+            true,
+            Box::new(Inner),
+        );
+        let (mut client, server) = duplex(4096);
+        client.write_all(b"PROXY ").await.unwrap();
+
+        let setup = tokio::spawn(async move {
+            handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(4_100)).await;
+        assert!(
+            !setup.is_finished(),
+            "Xray system listener keeps a partial PROXY header pending past four seconds"
+        );
+
+        client
+            .write_all(
+                b"TCP4 198.51.100.7 203.0.113.9 45678 443\r\n\
+                  GET /upgrade HTTP/1.1\r\n\
+                  Connection: Upgrade\r\n\
+                  Upgrade: websocket\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let result = setup
+            .await
+            .unwrap()
+            .expect("HTTPUpgrade with delayed PROXY v1");
+        let TcpServerSetupResult::PeerAddrOverride { peer_addr, inner } = result
+        else {
+            panic!("expected peer address override");
+        };
+        assert_eq!(peer_addr, "198.51.100.7:45678".parse().unwrap());
+        assert!(matches!(*inner, TcpServerSetupResult::TcpForward { .. }));
     }
 
     #[tokio::test]
