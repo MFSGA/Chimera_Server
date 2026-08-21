@@ -156,6 +156,14 @@ impl TlsServerHandler {
     }
 }
 
+fn tls_inner_manages_handshake_timeout(inner: &TlsInner) -> bool {
+    match inner {
+        TlsInner::Handler(inner) => inner.manages_handshake_timeout(),
+        #[cfg(feature = "vless")]
+        TlsInner::VisionVless { .. } => false,
+    }
+}
+
 impl std::fmt::Debug for TlsServerHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TlsServerHandler").finish()
@@ -164,6 +172,10 @@ impl std::fmt::Debug for TlsServerHandler {
 
 #[async_trait]
 impl TcpServerHandler for TlsServerHandler {
+    fn manages_handshake_timeout(&self) -> bool {
+        tls_inner_manages_handshake_timeout(&self.inner)
+    }
+
     async fn setup_server_stream(
         &self,
         server_stream: Box<dyn AsyncStream>,
@@ -182,17 +194,32 @@ impl TcpServerHandler for TlsServerHandler {
     ) -> io::Result<TcpServerSetupResult> {
         match &self.inner {
             TlsInner::Handler(inner) => {
-                let tls_stream = self.acceptor.accept(server_stream).await?;
-                let connection = tls_stream.get_ref().1;
-                context.server_name =
-                    connection.server_name().map(ToOwned::to_owned);
-                context.alpn_protocol = connection
-                    .alpn_protocol()
-                    .and_then(|value| std::str::from_utf8(value).ok())
-                    .map(ToOwned::to_owned);
-                inner
-                    .setup_server_stream_with_context(Box::new(tls_stream), context)
-                    .await
+                let timeout = inner.pre_transport_handshake_timeout(&context);
+                let setup = async {
+                    let tls_stream = self.acceptor.accept(server_stream).await?;
+                    let connection = tls_stream.get_ref().1;
+                    context.server_name =
+                        connection.server_name().map(ToOwned::to_owned);
+                    context.alpn_protocol = connection
+                        .alpn_protocol()
+                        .and_then(|value| std::str::from_utf8(value).ok())
+                        .map(ToOwned::to_owned);
+                    inner
+                        .setup_server_stream_with_context(
+                            Box::new(tls_stream),
+                            context,
+                        )
+                        .await
+                };
+                let Some(timeout) = timeout else {
+                    return setup.await;
+                };
+                tokio::time::timeout(timeout, setup).await.map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "TLS inner handshake timed out",
+                    )
+                })?
             }
             #[cfg(feature = "vless")]
             TlsInner::VisionVless {
@@ -436,6 +463,29 @@ fn tls_versions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct ManagedTestHandler;
+
+    #[async_trait]
+    impl TcpServerHandler for ManagedTestHandler {
+        fn manages_handshake_timeout(&self) -> bool {
+            true
+        }
+
+        async fn setup_server_stream(
+            &self,
+            _server_stream: Box<dyn AsyncStream>,
+        ) -> io::Result<TcpServerSetupResult> {
+            Err(io::Error::other("test handler is not executed"))
+        }
+    }
+
+    #[test]
+    fn tls_propagates_inner_handshake_timeout_ownership() {
+        let inner = TlsInner::Handler(Box::new(ManagedTestHandler));
+        assert!(tls_inner_manages_handshake_timeout(&inner));
+    }
 
     #[test]
     fn empty_alpn_uses_xray_server_defaults() {
