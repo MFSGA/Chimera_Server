@@ -368,10 +368,16 @@ async fn handle_request(
     if request.method() != Method::POST {
         return Ok(grpc_method_not_allowed_response(request.method()));
     }
-    let multi_mode = match request.uri().path() {
+    let request_path = request.uri().path();
+    let multi_mode = match request_path {
         path if path == tun_service_path => false,
         path if path == tun_multi_service_path => true,
-        _ => return Ok(grpc_status_response(12, "unimplemented gRPC method")),
+        _ => {
+            return Ok(grpc_unimplemented_path_response(
+                request_path,
+                &tun_service_path,
+            ));
+        }
     };
     if let Some(encoding) = grpc_unsupported_encoding(request.headers()) {
         return Ok(grpc_status_response(
@@ -443,6 +449,32 @@ fn grpc_method_not_allowed_response(method: &Method) -> Response<ResponseBody> {
         )
         .body(BodyExt::boxed_unsync(Empty::<Bytes>::new()))
         .unwrap()
+}
+
+fn grpc_unimplemented_path_response(
+    request_path: &str,
+    tun_service_path: &str,
+) -> Response<ResponseBody> {
+    let registered_service = tun_service_path
+        .strip_prefix('/')
+        .and_then(|path| path.rsplit_once('/'))
+        .map(|(service, _)| service)
+        .unwrap_or_default();
+    let (requested_service, requested_method) = request_path
+        .strip_prefix('/')
+        .and_then(|path| path.rsplit_once('/'))
+        .unwrap_or((request_path.trim_start_matches('/'), ""));
+
+    if requested_service == registered_service {
+        grpc_status_response(
+            12,
+            &format!(
+                "unknown method {requested_method} for service {registered_service}"
+            ),
+        )
+    } else {
+        grpc_status_response(12, &format!("unknown service {requested_service}"))
+    }
 }
 
 fn grpc_unsupported_encoding(headers: &hyper::HeaderMap) -> Option<&str> {
@@ -805,7 +837,7 @@ mod tests {
         decode_grpc_message, encode_grpc_message, grpc_content_type_is_valid,
         grpc_invalid_content_type_response, grpc_logical_peer_addr,
         grpc_method_not_allowed_response, grpc_service_paths,
-        grpc_unsupported_encoding,
+        grpc_unimplemented_path_response, grpc_unsupported_encoding,
     };
 
     #[test]
@@ -877,6 +909,28 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn grpc_unknown_service_and_method_match_xray_v26_2_6() {
+        let tun_path = "/GunService/Tun";
+
+        let response = grpc_unimplemented_path_response("/NoService/Tun", tun_path);
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+        assert_eq!(response.headers()["grpc-status"], "12");
+        assert_eq!(
+            response.headers()["grpc-message"],
+            "unknown service NoService"
+        );
+
+        let response =
+            grpc_unimplemented_path_response("/GunService/Nope", tun_path);
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+        assert_eq!(response.headers()["grpc-status"], "12");
+        assert_eq!(
+            response.headers()["grpc-message"],
+            "unknown method Nope for service GunService"
+        );
     }
 
     #[test]
