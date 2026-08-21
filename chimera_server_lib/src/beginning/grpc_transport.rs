@@ -2,7 +2,10 @@ use std::{
     convert::Infallible,
     io,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -54,7 +57,7 @@ use super::process_stream;
 const GRPC_PIPE_CAPACITY: usize = 64 * 1024;
 const MAX_GRPC_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
-type ResponseBody = UnsyncBoxBody<Bytes, Infallible>;
+type ResponseBody = UnsyncBoxBody<Bytes, h2::Error>;
 
 #[derive(Debug, Clone, Copy)]
 struct GrpcKeepalive {
@@ -365,6 +368,10 @@ async fn handle_request(
     if !grpc_content_type_is_valid(content_type) {
         return Ok(grpc_invalid_content_type_response(content_type));
     }
+    let grpc_timeout = match grpc_timeout_duration(request.headers()) {
+        Ok(timeout) => timeout,
+        Err(message) => return Ok(grpc_malformed_timeout_response(&message)),
+    };
     if request.method() != Method::POST {
         return Ok(grpc_method_not_allowed_response(request.method()));
     }
@@ -390,15 +397,16 @@ async fn handle_request(
 
     let (handler_stream, transport_stream) = duplex(GRPC_PIPE_CAPACITY);
     let (transport_read, transport_write) = tokio::io::split(transport_stream);
+    let timed_out = Arc::new(AtomicBool::new(false));
     let mut body = request.into_body();
-    tokio::spawn(async move {
+    let upload_task = tokio::spawn(async move {
         if let Err(error) =
             decode_request_body(&mut body, transport_write, multi_mode).await
         {
             debug!("gRPC upload decode failed: {error}");
         }
     });
-    tokio::spawn(async move {
+    let stream_task = tokio::spawn(async move {
         if let Err(error) = process_stream(
             GrpcLogicalStream(handler_stream),
             server_handler,
@@ -411,8 +419,92 @@ async fn handle_request(
             debug!("gRPC logical stream {logical_peer_addr} ended: {error}");
         }
     });
+    if let Some(timeout) = grpc_timeout {
+        let upload_abort = upload_task.abort_handle();
+        let stream_abort = stream_task.abort_handle();
+        let timed_out = timed_out.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            timed_out.store(true, Ordering::Release);
+            upload_abort.abort();
+            stream_abort.abort();
+        });
+    }
 
-    Ok(grpc_stream_response(transport_read, multi_mode))
+    Ok(grpc_stream_response(transport_read, multi_mode, timed_out))
+}
+
+fn grpc_timeout_duration(
+    headers: &hyper::HeaderMap,
+) -> Result<Option<Duration>, String> {
+    let Some(value) = headers.get("grpc-timeout") else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| {
+        "malformed grpc-timeout: transport: timeout contains non-ASCII bytes"
+            .to_string()
+    })?;
+    let size = value.len();
+    if size < 2 {
+        return Err(format!(
+            "malformed grpc-timeout: transport: timeout string is too short: \"{value}\""
+        ));
+    }
+    if size > 9 {
+        return Err(format!(
+            "malformed grpc-timeout: transport: timeout string is too long: \"{value}\""
+        ));
+    }
+
+    let (digits, unit_text) = value.split_at(size - 1);
+    let unit = match unit_text.as_bytes()[0] {
+        b'H' => Duration::from_secs(60 * 60),
+        b'M' => Duration::from_secs(60),
+        b'S' => Duration::from_secs(1),
+        b'm' => Duration::from_millis(1),
+        b'u' => Duration::from_micros(1),
+        b'n' => Duration::from_nanos(1),
+        _ => {
+            return Err(format!(
+                "malformed grpc-timeout: transport: timeout unit is not recognized: \"{value}\""
+            ));
+        }
+    };
+    if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!(
+            "malformed grpc-timeout: strconv.ParseUint: parsing \"{digits}\": invalid syntax"
+        ));
+    }
+    let amount = digits
+        .bytes()
+        .fold(0_u64, |value, byte| value * 10 + u64::from(byte - b'0'));
+    let timeout = if unit_text == "H" {
+        const MAX_HOURS: u64 = i64::MAX as u64 / (60 * 60 * 1_000_000_000);
+        if amount > MAX_HOURS {
+            Duration::from_nanos(i64::MAX as u64)
+        } else {
+            unit * amount as u32
+        }
+    } else {
+        unit * amount as u32
+    };
+    Ok(Some(timeout))
+}
+
+fn grpc_malformed_timeout_response(message: &str) -> Response<ResponseBody> {
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header(header::CONTENT_TYPE, "application/grpc")
+        .header("grpc-status", "13")
+        .header("grpc-message", message)
+        .body(empty_grpc_body())
+        .unwrap()
+}
+
+fn empty_grpc_body() -> ResponseBody {
+    BodyExt::boxed_unsync(
+        Empty::<Bytes>::new().map_err(|never| -> h2::Error { match never {} }),
+    )
 }
 
 fn grpc_content_type_is_valid(content_type: &str) -> bool {
@@ -432,7 +524,7 @@ fn grpc_invalid_content_type_response(content_type: &str) -> Response<ResponseBo
             "grpc-message",
             format!("invalid gRPC request content-type \"{content_type}\""),
         )
-        .body(BodyExt::boxed_unsync(Empty::<Bytes>::new()))
+        .body(empty_grpc_body())
         .unwrap()
 }
 
@@ -447,7 +539,7 @@ fn grpc_method_not_allowed_response(method: &Method) -> Response<ResponseBody> {
                 "Received a HEADERS frame with :method \"{method}\" which should be POST"
             ),
         )
-        .body(BodyExt::boxed_unsync(Empty::<Bytes>::new()))
+        .body(empty_grpc_body())
         .unwrap()
 }
 
@@ -558,27 +650,62 @@ async fn decode_request_body(
 fn grpc_stream_response(
     reader: tokio::io::ReadHalf<DuplexStream>,
     multi_mode: bool,
+    timed_out: Arc<AtomicBool>,
 ) -> Response<ResponseBody> {
-    let data_stream =
-        ReaderStream::new(reader).filter_map(move |result| async move {
-            match result {
-                Ok(data) if !data.is_empty() => {
-                    Some(Ok(Frame::data(encode_grpc_message(&data, multi_mode))))
+    let stream = futures::stream::unfold(
+        (ReaderStream::new(reader), timed_out, false),
+        move |(mut reader, timed_out, finished)| async move {
+            if finished {
+                return None;
+            }
+            loop {
+                if timed_out.load(Ordering::Acquire) {
+                    return Some((
+                        Err(h2::Error::from(h2::Reason::CANCEL)),
+                        (reader, timed_out, true),
+                    ));
                 }
-                Ok(_) => None,
-                Err(error) => {
-                    debug!("gRPC response read failed: {error}");
-                    None
+                match reader.next().await {
+                    Some(Ok(data)) if data.is_empty() => continue,
+                    Some(Ok(data)) => {
+                        return Some((
+                            Ok(Frame::data(encode_grpc_message(&data, multi_mode))),
+                            (reader, timed_out, false),
+                        ));
+                    }
+                    Some(Err(error)) => {
+                        debug!("gRPC response read failed: {error}");
+                        return Some((
+                            Err(h2::Error::from(h2::Reason::INTERNAL_ERROR)),
+                            (reader, timed_out, true),
+                        ));
+                    }
+                    None if timed_out.load(Ordering::Acquire) => {
+                        return Some((
+                            Err(h2::Error::from(h2::Reason::CANCEL)),
+                            (reader, timed_out, true),
+                        ));
+                    }
+                    None => {
+                        let mut trailers = hyper::HeaderMap::new();
+                        trailers.insert(
+                            "grpc-status",
+                            header::HeaderValue::from_static("0"),
+                        );
+                        trailers.insert(
+                            "grpc-message",
+                            header::HeaderValue::from_static(""),
+                        );
+                        return Some((
+                            Ok(Frame::trailers(trailers)),
+                            (reader, timed_out, true),
+                        ));
+                    }
                 }
             }
-        });
-    let trailers = futures::stream::once(async {
-        let mut trailers = hyper::HeaderMap::new();
-        trailers.insert("grpc-status", header::HeaderValue::from_static("0"));
-        trailers.insert("grpc-message", header::HeaderValue::from_static(""));
-        Ok(Frame::trailers(trailers))
-    });
-    let body = StreamBody::new(data_stream.chain(trailers));
+        },
+    );
+    let body = StreamBody::new(stream);
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/grpc")
@@ -592,7 +719,7 @@ fn grpc_status_response(status: u8, message: &str) -> Response<ResponseBody> {
         .header(header::CONTENT_TYPE, "application/grpc")
         .header("grpc-status", status.to_string())
         .header("grpc-message", message)
-        .body(BodyExt::boxed_unsync(Empty::<Bytes>::new()))
+        .body(empty_grpc_body())
         .unwrap()
 }
 
@@ -829,13 +956,16 @@ impl AsyncStream for GrpcLogicalStream {}
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, atomic::AtomicBool};
+
     use bytes::BytesMut;
     use hyper::HeaderMap;
 
     use super::{
         decode_grpc_message, encode_grpc_message, grpc_content_type_is_valid,
         grpc_invalid_content_type_response, grpc_logical_peer_addr,
-        grpc_method_not_allowed_response, grpc_service_paths, grpc_stream_response,
+        grpc_malformed_timeout_response, grpc_method_not_allowed_response,
+        grpc_service_paths, grpc_stream_response, grpc_timeout_duration,
         grpc_unimplemented_path_response, grpc_unsupported_encoding,
     };
 
@@ -938,7 +1068,11 @@ mod tests {
         let (transport_read, _transport_write) = tokio::io::split(transport_stream);
         drop(handler_stream);
 
-        let response = grpc_stream_response(transport_read, false);
+        let response = grpc_stream_response(
+            transport_read,
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
         assert_eq!(response.status(), hyper::StatusCode::OK);
         assert_eq!(response.headers()["content-type"], "application/grpc");
         assert!(!response.headers().contains_key("grpc-encoding"));
@@ -950,6 +1084,60 @@ mod tests {
         let trailers = collected.trailers().expect("gRPC success trailers");
         assert_eq!(trailers["grpc-status"], "0");
         assert_eq!(trailers["grpc-message"], "");
+    }
+
+    #[tokio::test]
+    async fn grpc_deadline_ends_stream_without_success_trailers() {
+        let (transport_stream, handler_stream) = tokio::io::duplex(64);
+        let (transport_read, _transport_write) = tokio::io::split(transport_stream);
+        drop(handler_stream);
+        let timed_out = Arc::new(AtomicBool::new(true));
+
+        let response = grpc_stream_response(transport_read, false, timed_out);
+        let error = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect_err("expired gRPC stream must end with a body error");
+        assert_eq!(error.reason(), Some(h2::Reason::CANCEL));
+    }
+
+    #[test]
+    fn grpc_timeout_parser_matches_grpc_go_syntax() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(grpc_timeout_duration(&headers).unwrap(), None);
+
+        headers.insert("grpc-timeout", "1S".parse().unwrap());
+        assert_eq!(
+            grpc_timeout_duration(&headers).unwrap(),
+            Some(std::time::Duration::from_secs(1))
+        );
+
+        headers.insert("grpc-timeout", "250m".parse().unwrap());
+        assert_eq!(
+            grpc_timeout_duration(&headers).unwrap(),
+            Some(std::time::Duration::from_millis(250))
+        );
+
+        headers.insert("grpc-timeout", "nope".parse().unwrap());
+        let message = grpc_timeout_duration(&headers).unwrap_err();
+        assert_eq!(
+            message,
+            "malformed grpc-timeout: transport: timeout unit is not recognized: \"nope\""
+        );
+        let response = grpc_malformed_timeout_response(&message);
+        assert_eq!(response.status(), hyper::StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()["grpc-status"], "13");
+        assert_eq!(response.headers()["grpc-message"], message);
+
+        headers.insert("grpc-timeout", "xS".parse().unwrap());
+        let message = grpc_timeout_duration(&headers).unwrap_err();
+        assert_eq!(
+            message,
+            "malformed grpc-timeout: strconv.ParseUint: parsing \"x\": invalid syntax"
+        );
+        let response = grpc_malformed_timeout_response(&message);
+        assert_eq!(response.status(), hyper::StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()["grpc-status"], "13");
+        assert_eq!(response.headers()["grpc-message"], message);
     }
 
     #[test]

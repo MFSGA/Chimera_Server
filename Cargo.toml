@@ -86,6 +86,7 @@ axum = { version = "0.8.9", features = [
     "macros",
 ], default-features = false }
 http-body-util = "0.1"
+h2 = "0.4"
 hyper = { version = "1", features = ["full"] }
 mime_guess = "2"
 hyper-util = { version = "0.1", features = ["full"] }
