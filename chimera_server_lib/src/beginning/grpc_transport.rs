@@ -371,6 +371,14 @@ async fn handle_request(
     {
         return Ok(grpc_status_response(12, "unimplemented gRPC method"));
     }
+    if let Some(encoding) = grpc_unsupported_encoding(request.headers()) {
+        return Ok(grpc_status_response(
+            12,
+            &format!(
+                "grpc: Decompressor is not installed for grpc-encoding \"{encoding}\""
+            ),
+        ));
+    }
 
     let (handler_stream, transport_stream) = duplex(GRPC_PIPE_CAPACITY);
     let (transport_read, transport_write) = tokio::io::split(transport_stream);
@@ -397,6 +405,13 @@ async fn handle_request(
     });
 
     Ok(grpc_stream_response(transport_read, multi_mode))
+}
+
+fn grpc_unsupported_encoding(headers: &hyper::HeaderMap) -> Option<&str> {
+    headers
+        .get("grpc-encoding")
+        .and_then(|value| value.to_str().ok())
+        .filter(|encoding| !encoding.is_empty() && *encoding != "identity")
 }
 
 fn grpc_logical_peer_addr(
@@ -750,7 +765,7 @@ mod tests {
 
     use super::{
         decode_grpc_message, encode_grpc_message, grpc_logical_peer_addr,
-        grpc_service_paths,
+        grpc_service_paths, grpc_unsupported_encoding,
     };
 
     #[test]
@@ -774,6 +789,24 @@ mod tests {
         let (tun, tun_multi) = grpc_service_paths("hello/world!");
         assert_eq!(tun, "/hello%2Fworld%21/Tun");
         assert_eq!(tun_multi, "/hello%2Fworld%21/TunMulti");
+    }
+
+    #[test]
+    fn grpc_rejects_non_identity_encoding_like_xray_v26_2_6() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(grpc_unsupported_encoding(&headers), None);
+
+        headers.insert("grpc-encoding", "identity".parse().unwrap());
+        assert_eq!(grpc_unsupported_encoding(&headers), None);
+
+        headers.insert("grpc-encoding", "".parse().unwrap());
+        assert_eq!(grpc_unsupported_encoding(&headers), None);
+
+        headers.insert("grpc-encoding", "gzip".parse().unwrap());
+        assert_eq!(grpc_unsupported_encoding(&headers), Some("gzip"));
+
+        headers.insert("grpc-encoding", "deflate".parse().unwrap());
+        assert_eq!(grpc_unsupported_encoding(&headers), Some("deflate"));
     }
 
     #[test]
