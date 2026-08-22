@@ -29,6 +29,7 @@ pub struct WebsocketStream {
     read_frame_length: u64,
     read_frame_mask: [u8; 4],
     read_frame_mask_offset: usize,
+    read_message_fragmented: bool,
 
     unprocessed_buf: Box<[u8]>,
     unprocessed_start_offset: usize,
@@ -117,6 +118,7 @@ impl WebsocketStream {
             read_frame_length: 0,
             read_frame_mask: [0u8; 4],
             read_frame_mask_offset: 0,
+            read_message_fragmented: false,
             unprocessed_buf,
             unprocessed_start_offset: 0,
             unprocessed_end_offset,
@@ -154,7 +156,7 @@ impl WebsocketStream {
             self.unprocessed_end_offset = 0;
         }
 
-        let _read_frame_final = first & 0x80 != 0;
+        let read_frame_final = first & 0x80 != 0;
 
         let reserved_bits = first & 0x70;
         if reserved_bits != 0 {
@@ -180,14 +182,32 @@ impl WebsocketStream {
 
         self.read_frame_opcode = OpCode::from(first & 0x0f);
 
-        if !_read_frame_final
-            && self.read_frame_opcode != OpCode::Binary
-            && self.read_frame_opcode != OpCode::Continue
-        {
-            return Err(std::io::Error::other(format!(
-                "cannot handle non-final frames of type {:?}",
-                self.read_frame_opcode
-            )));
+        match self.read_frame_opcode {
+            OpCode::Continue => {
+                if !self.read_message_fragmented {
+                    self.queue_protocol_error("continuation after FIN")?;
+                    return Err(std::io::Error::other(
+                        "websocket: continuation after FIN",
+                    ));
+                }
+                if read_frame_final {
+                    self.read_message_fragmented = false;
+                }
+            }
+            OpCode::Binary => {
+                if self.read_message_fragmented {
+                    self.queue_protocol_error("data before FIN")?;
+                    return Err(std::io::Error::other("websocket: data before FIN"));
+                }
+                self.read_message_fragmented = !read_frame_final;
+            }
+            _ if !read_frame_final => {
+                return Err(std::io::Error::other(format!(
+                    "cannot handle non-final frames of type {:?}",
+                    self.read_frame_opcode
+                )));
+            }
+            _ => {}
         }
 
         let length = second & 0x7f;
@@ -1046,6 +1066,37 @@ mod tests {
         WebsocketStream::new(Box::new(TestStream(transport)), false, &[])
     }
 
+    fn masked_frame(first: u8, payload: &[u8]) -> Vec<u8> {
+        let mask = [1u8, 2, 3, 4];
+        let mut frame = Vec::with_capacity(6 + payload.len());
+        frame.extend_from_slice(&[first, 0x80 | payload.len() as u8]);
+        frame.extend_from_slice(&mask);
+        frame.extend(
+            payload
+                .iter()
+                .enumerate()
+                .map(|(i, byte)| byte ^ mask[i % 4]),
+        );
+        frame
+    }
+
+    async fn assert_protocol_close(
+        peer: &mut tokio::io::DuplexStream,
+        websocket: &mut WebsocketStream,
+        reason: &str,
+    ) {
+        let mut application_data = [0u8; 8];
+        let error = websocket.read(&mut application_data).await.unwrap_err();
+        assert_eq!(error.to_string(), format!("websocket: {reason}"));
+
+        let mut response = vec![0u8; 4 + reason.len()];
+        peer.read_exact(&mut response).await.unwrap();
+        assert_eq!(response[0], 0x88);
+        assert_eq!(response[1] as usize, reason.len() + 2);
+        assert_eq!(&response[2..4], &1002u16.to_be_bytes());
+        assert_eq!(&response[4..], reason.as_bytes());
+    }
+
     #[tokio::test]
     async fn server_rejects_unmasked_client_frame_like_xray() {
         let (mut peer, transport) = tokio::io::duplex(64);
@@ -1113,6 +1164,35 @@ mod tests {
             assert_eq!(&response[2..4], &1002u16.to_be_bytes());
             assert_eq!(&response[4..], reason.as_bytes());
         }
+    }
+
+    #[tokio::test]
+    async fn server_rejects_invalid_fragmentation_sequence_like_xray() {
+        let (mut peer, transport) = tokio::io::duplex(128);
+        let mut websocket = websocket_over(transport);
+        peer.write_all(&masked_frame(0x80, b"x")).await.unwrap();
+        assert_protocol_close(&mut peer, &mut websocket, "continuation after FIN")
+            .await;
+
+        let (mut peer, transport) = tokio::io::duplex(128);
+        let mut websocket = websocket_over(transport);
+        let mut frames = masked_frame(0x02, b"");
+        frames.extend_from_slice(&masked_frame(0x82, b"x"));
+        peer.write_all(&frames).await.unwrap();
+        assert_protocol_close(&mut peer, &mut websocket, "data before FIN").await;
+    }
+
+    #[tokio::test]
+    async fn server_accepts_binary_fragmentation_sequence() {
+        let (mut peer, transport) = tokio::io::duplex(128);
+        let mut websocket = websocket_over(transport);
+        let mut frames = masked_frame(0x02, b"pi");
+        frames.extend_from_slice(&masked_frame(0x80, b"ng"));
+        peer.write_all(&frames).await.unwrap();
+
+        let mut application_data = [0u8; 4];
+        websocket.read_exact(&mut application_data).await.unwrap();
+        assert_eq!(&application_data, b"ping");
     }
 
     #[tokio::test]
