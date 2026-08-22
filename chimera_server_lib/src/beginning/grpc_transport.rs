@@ -1625,7 +1625,9 @@ mod tests {
         assert_eq!(payload.len() % 6, 0);
         assert!(
             payload
-                .chunks_exact(6)
+                .as_chunks::<6>()
+                .0
+                .iter()
                 .all(|setting| u16::from_be_bytes([setting[0], setting[1]]) != 0x03),
             "Xray/grpc-go does not advertise SETTINGS_MAX_CONCURRENT_STREAMS by default"
         );
@@ -1658,7 +1660,7 @@ mod tests {
         assert_eq!(header[3], 0x04, "first HTTP/2 frame must be SETTINGS");
         let mut payload = vec![0u8; payload_len];
         client.read_exact(&mut payload).await.unwrap();
-        for setting in payload.chunks_exact(6) {
+        for setting in payload.as_chunks::<6>().0 {
             if u16::from_be_bytes([setting[0], setting[1]]) == 0x04 {
                 assert_eq!(
                     u32::from_be_bytes([

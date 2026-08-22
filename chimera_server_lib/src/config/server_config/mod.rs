@@ -73,7 +73,7 @@ pub(crate) fn parse_vmess_user_id(value: &str) -> Result<[u8; 16], String> {
         let group = text
             .get(text_offset..text_offset + group_len)
             .ok_or_else(|| format!("invalid VMess UUID: {value}"))?;
-        for pair in group.chunks_exact(2) {
+        for pair in group.as_chunks::<2>().0 {
             let high = vmess_hex_nibble(pair[0])
                 .ok_or_else(|| format!("invalid VMess UUID: {value}"))?;
             let low = vmess_hex_nibble(pair[1])
