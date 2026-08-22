@@ -41,6 +41,11 @@ pub struct WebsocketStream {
     ping_data: Box<[u8]>,
     ping_data_size: usize,
     pending_write_pong: bool,
+
+    close_data: [u8; 125],
+    close_data_size: usize,
+    close_received: bool,
+    close_sent: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -50,6 +55,7 @@ enum ReadState {
     ReadMask,
     ReadBinaryContent,
     ReadPingContent,
+    ReadCloseContent,
     SkipContent,
 }
 
@@ -118,6 +124,10 @@ impl WebsocketStream {
             ping_data,
             ping_data_size: 0,
             pending_write_pong: false,
+            close_data: [0; 125],
+            close_data_size: 0,
+            close_received: false,
+            close_sent: false,
         }
     }
 
@@ -289,6 +299,29 @@ impl WebsocketStream {
                 self.read_state = ReadState::Init;
                 self.step_init(cx, buf)
             }
+            OpCode::Close => {
+                if self.read_frame_length > self.close_data.len() as u64 {
+                    return Err(std::io::Error::other(format!(
+                        "invalid close frame length ({})",
+                        self.read_frame_length
+                    )));
+                }
+                if self.read_frame_length == 1 {
+                    return Err(std::io::Error::other(
+                        "invalid close frame payload length (1)",
+                    ));
+                }
+
+                self.close_data_size = 0;
+                if self.read_frame_length == 0 {
+                    self.read_state = ReadState::Init;
+                    self.close_received = true;
+                    Ok(())
+                } else {
+                    self.read_state = ReadState::ReadCloseContent;
+                    self.step_read_close_content()
+                }
+            }
             _ => {
                 warn!("Ignoring unknown frame type: {:?}", self.read_frame_opcode);
                 if self.read_frame_length == 0 {
@@ -366,6 +399,50 @@ impl WebsocketStream {
             self.read_state = ReadState::Init;
             self.pending_write_pong = true;
             return self.step_init(cx, buf);
+        }
+
+        Ok(())
+    }
+
+    fn step_read_close_content(&mut self) -> std::io::Result<()> {
+        let unprocessed_len =
+            self.unprocessed_end_offset - self.unprocessed_start_offset;
+        let read_amount =
+            std::cmp::min(unprocessed_len, self.read_frame_length as usize);
+        if read_amount == 0 {
+            return Ok(());
+        }
+
+        let content_bytes = &mut self.unprocessed_buf[self.unprocessed_start_offset
+            ..self.unprocessed_start_offset + read_amount];
+        if self.read_frame_masked {
+            let iter = content_bytes.iter_mut().zip(
+                self.read_frame_mask
+                    .iter()
+                    .cycle()
+                    .skip(self.read_frame_mask_offset),
+            );
+            for (byte, &key) in iter {
+                *byte ^= key;
+            }
+            self.read_frame_mask_offset =
+                (self.read_frame_mask_offset + read_amount) % 4;
+        }
+
+        self.close_data[self.close_data_size..self.close_data_size + read_amount]
+            .copy_from_slice(content_bytes);
+        self.close_data_size += read_amount;
+        self.unprocessed_start_offset += read_amount;
+        if self.unprocessed_start_offset == self.unprocessed_end_offset {
+            self.unprocessed_start_offset = 0;
+            self.unprocessed_end_offset = 0;
+        }
+        self.read_frame_length -= read_amount as u64;
+
+        if self.read_frame_length == 0 {
+            self.read_frame_mask_offset = 0;
+            self.read_state = ReadState::Init;
+            self.close_received = true;
         }
 
         Ok(())
@@ -479,6 +556,27 @@ impl WebsocketStream {
         true
     }
 
+    fn pack_write_close_frame(&mut self) -> bool {
+        let payload: &[u8] = if self.close_received {
+            &self.close_data[..self.close_data_size]
+        } else {
+            &1000u16.to_be_bytes()
+        };
+        let available_space = self.write_frame.len() - self.write_frame_end_offset;
+        if available_space < payload.len() + 14 {
+            return false;
+        }
+
+        let written = pack_frame(
+            0x08,
+            self.is_client,
+            payload,
+            &mut self.write_frame[self.write_frame_end_offset..],
+        );
+        self.write_frame_end_offset += written;
+        true
+    }
+
     fn pack_write_frame(&mut self, input: &[u8]) -> usize {
         let available_space = self.write_frame.len() - self.write_frame_end_offset;
 
@@ -554,6 +652,10 @@ impl AsyncRead for WebsocketStream {
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
 
+        if this.close_received {
+            return Poll::Ready(Ok(()));
+        }
+
         if this.unprocessed_end_offset > 0
             && this.read_state == ReadState::ReadBinaryContent
         {
@@ -605,6 +707,7 @@ impl AsyncRead for WebsocketStream {
                     this.step_read_binary_content(cx, buf)
                 }
                 ReadState::ReadPingContent => this.step_read_ping_content(cx, buf),
+                ReadState::ReadCloseContent => this.step_read_close_content(),
             };
 
             if read_result.is_err() {
@@ -612,6 +715,9 @@ impl AsyncRead for WebsocketStream {
             }
 
             if !buf.filled().is_empty() {
+                return Poll::Ready(Ok(()));
+            }
+            if this.close_received {
                 return Poll::Ready(Ok(()));
             }
         }
@@ -694,10 +800,31 @@ impl AsyncWrite for WebsocketStream {
     }
 
     fn poll_shutdown(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        Pin::new(&mut self.stream).poll_shutdown(cx)
+        let this = self.get_mut();
+
+        while this.write_frame_end_offset > 0 {
+            this.do_write_frame(cx)?;
+            if this.write_frame_end_offset > 0 {
+                return Poll::Pending;
+            }
+        }
+
+        if !this.close_sent {
+            if !this.pack_write_close_frame() {
+                return Poll::Pending;
+            }
+            this.close_sent = true;
+            this.do_write_frame(cx)?;
+            if this.write_frame_end_offset > 0 {
+                return Poll::Pending;
+            }
+        }
+
+        ready!(Pin::new(&mut this.stream).poll_flush(cx))?;
+        Pin::new(&mut this.stream).poll_shutdown(cx)
     }
 }
 
@@ -790,4 +917,114 @@ fn pack_frame(opcode: u8, use_mask: bool, input: &[u8], output: &mut [u8]) -> us
     }
 
     offset + input_len
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+
+    struct TestStream(tokio::io::DuplexStream);
+
+    impl AsyncRead for TestStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for TestStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    impl AsyncPing for TestStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for TestStream {}
+
+    fn websocket_over(transport: tokio::io::DuplexStream) -> WebsocketStream {
+        WebsocketStream::new(Box::new(TestStream(transport)), false, &[])
+    }
+
+    #[tokio::test]
+    async fn shutdown_sends_close_frame_before_transport_eof() {
+        let (mut peer, transport) = tokio::io::duplex(64);
+        let mut websocket = websocket_over(transport);
+
+        websocket.shutdown().await.unwrap();
+
+        let mut wire = Vec::new();
+        peer.read_to_end(&mut wire).await.unwrap();
+        assert_eq!(wire, [0x88, 0x02, 0x03, 0xe8]);
+    }
+
+    #[tokio::test]
+    async fn received_close_is_echoed_during_shutdown() {
+        let (mut peer, transport) = tokio::io::duplex(64);
+        let mut websocket = websocket_over(transport);
+        let close_payload = [0x03, 0xe8, b'b', b'y', b'e'];
+        let mut frame = [0u8; 32];
+        let frame_len = pack_frame(0x08, true, &close_payload, &mut frame);
+        peer.write_all(&frame[..frame_len]).await.unwrap();
+
+        let mut application_data = [0u8; 1];
+        assert_eq!(websocket.read(&mut application_data).await.unwrap(), 0);
+        websocket.shutdown().await.unwrap();
+
+        let mut response = [0u8; 7];
+        peer.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, [0x88, 0x05, 0x03, 0xe8, b'b', b'y', b'e']);
+    }
+
+    #[tokio::test]
+    async fn repeated_shutdown_does_not_send_duplicate_close_frames() {
+        let (mut peer, transport) = tokio::io::duplex(64);
+        let mut websocket = websocket_over(transport);
+
+        websocket.shutdown().await.unwrap();
+        websocket.shutdown().await.unwrap();
+
+        let mut wire = Vec::new();
+        peer.read_to_end(&mut wire).await.unwrap();
+        assert_eq!(wire, [0x88, 0x02, 0x03, 0xe8]);
+    }
 }
