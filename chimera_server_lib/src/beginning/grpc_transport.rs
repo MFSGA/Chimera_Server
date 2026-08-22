@@ -759,12 +759,26 @@ fn grpc_timeout_duration(
     Ok(Some(timeout))
 }
 
+fn grpc_encode_message(message: &str) -> String {
+    let mut encoded = String::with_capacity(message.len());
+    for byte in message.bytes() {
+        if (0x20..=0x7e).contains(&byte) && byte != b'%' {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "%{byte:02X}")
+                .expect("writing to String cannot fail");
+        }
+    }
+    encoded
+}
+
 fn grpc_malformed_timeout_response(message: &str) -> Response<ResponseBody> {
     Response::builder()
         .status(StatusCode::BAD_REQUEST)
         .header(header::CONTENT_TYPE, "application/grpc")
         .header("grpc-status", "13")
-        .header("grpc-message", message)
+        .header("grpc-message", grpc_encode_message(message))
         .body(empty_grpc_body())
         .unwrap()
 }
@@ -790,7 +804,9 @@ fn grpc_invalid_content_type_response(content_type: &str) -> Response<ResponseBo
         .header("grpc-status", "3")
         .header(
             "grpc-message",
-            format!("invalid gRPC request content-type \"{content_type}\""),
+            grpc_encode_message(&format!(
+                "invalid gRPC request content-type \"{content_type}\""
+            )),
         )
         .body(empty_grpc_body())
         .unwrap()
@@ -803,9 +819,9 @@ fn grpc_method_not_allowed_response(method: &Method) -> Response<ResponseBody> {
         .header("grpc-status", "13")
         .header(
             "grpc-message",
-            format!(
+            grpc_encode_message(&format!(
                 "Received a HEADERS frame with :method \"{method}\" which should be POST"
-            ),
+            )),
         )
         .body(empty_grpc_body())
         .unwrap()
@@ -1009,7 +1025,7 @@ fn grpc_stream_response(
                             );
                             trailers.insert(
                                 "grpc-message",
-                                header::HeaderValue::from_str(&status.message)
+                                header::HeaderValue::from_str(&grpc_encode_message(&status.message))
                                     .expect("valid gRPC status message"),
                             );
                             return Some((
@@ -1074,7 +1090,7 @@ fn grpc_status_response(status: u8, message: &str) -> Response<ResponseBody> {
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/grpc")
         .header("grpc-status", status.to_string())
-        .header("grpc-message", message)
+        .header("grpc-message", grpc_encode_message(message))
         .body(empty_grpc_body())
         .unwrap()
 }
@@ -1387,12 +1403,12 @@ mod tests {
 
     use super::{
         GrpcKeepalive, GrpcSetupTimeoutIo, GrpcStreamTaskGuard, decode_grpc_message,
-        encode_grpc_message, grpc_content_type_is_valid, grpc_http2_builder,
-        grpc_invalid_content_type_response, grpc_logical_peer_addr,
-        grpc_malformed_timeout_response, grpc_method_not_allowed_response,
-        grpc_service_paths, grpc_stream_response, grpc_timeout_duration,
-        grpc_unimplemented_path_response, grpc_unsupported_encoding,
-        grpc_upload_status_from_error,
+        encode_grpc_message, grpc_content_type_is_valid, grpc_encode_message,
+        grpc_http2_builder, grpc_invalid_content_type_response,
+        grpc_logical_peer_addr, grpc_malformed_timeout_response,
+        grpc_method_not_allowed_response, grpc_service_paths, grpc_stream_response,
+        grpc_timeout_duration, grpc_unimplemented_path_response,
+        grpc_unsupported_encoding, grpc_upload_status_from_error,
     };
 
     #[tokio::test]
@@ -1675,6 +1691,12 @@ mod tests {
             response.headers()["grpc-message"],
             "invalid gRPC request content-type \"application/grpcfoo\""
         );
+
+        let response = grpc_invalid_content_type_response("application/grpc%foo");
+        assert_eq!(
+            response.headers()["grpc-message"],
+            "invalid gRPC request content-type \"application/grpc%25foo\""
+        );
     }
 
     #[test]
@@ -1713,6 +1735,22 @@ mod tests {
             response.headers()["grpc-message"],
             "unknown method Nope for service GunService"
         );
+
+        let response =
+            grpc_unimplemented_path_response("/No%25Service/Tun", tun_path);
+        assert_eq!(response.headers()["grpc-status"], "12");
+        assert_eq!(
+            response.headers()["grpc-message"],
+            "unknown service No%2525Service"
+        );
+    }
+
+    #[test]
+    fn grpc_message_encoding_matches_grpc_go() {
+        assert_eq!(grpc_encode_message("plain text"), "plain text");
+        assert_eq!(grpc_encode_message("50% done"), "50%25 done");
+        assert_eq!(grpc_encode_message("line\nbreak"), "line%0Abreak");
+        assert_eq!(grpc_encode_message("é"), "%C3%A9");
     }
 
     #[tokio::test]
