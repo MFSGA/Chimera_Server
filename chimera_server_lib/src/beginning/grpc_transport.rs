@@ -17,12 +17,10 @@ use hyper::{
     Method, Request, Response, StatusCode,
     body::{Frame, Incoming},
     header,
+    server::conn::http2,
     service::service_fn,
 };
-use hyper_util::{
-    rt::{TokioExecutor, TokioIo, TokioTimer},
-    server::conn::auto,
-};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex},
     sync::mpsc,
@@ -367,6 +365,28 @@ fn grpc_path_escape(value: &str) -> String {
     escaped
 }
 
+fn grpc_http2_builder(keepalive: GrpcKeepalive) -> http2::Builder<TokioExecutor> {
+    let mut builder = http2::Builder::new(TokioExecutor::new());
+    if keepalive.idle_timeout > 0 || keepalive.health_check_timeout > 0 {
+        builder.timer(TokioTimer::new());
+        builder.keep_alive_interval(Duration::from_secs(
+            if keepalive.idle_timeout > 0 {
+                u64::from(keepalive.idle_timeout)
+            } else {
+                2 * 60 * 60
+            },
+        ));
+        builder.keep_alive_timeout(Duration::from_secs(
+            if keepalive.health_check_timeout > 0 {
+                u64::from(keepalive.health_check_timeout)
+            } else {
+                20
+            },
+        ));
+    }
+    builder
+}
+
 async fn serve_grpc_connection<IO>(
     io: IO,
     service_paths: (String, String),
@@ -378,25 +398,7 @@ async fn serve_grpc_connection<IO>(
 ) where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut builder = auto::Builder::new(TokioExecutor::new());
-    if keepalive.idle_timeout > 0 || keepalive.health_check_timeout > 0 {
-        let mut http2 = builder.http2();
-        http2.timer(TokioTimer::new());
-        http2.keep_alive_interval(Duration::from_secs(
-            if keepalive.idle_timeout > 0 {
-                u64::from(keepalive.idle_timeout)
-            } else {
-                2 * 60 * 60
-            },
-        ));
-        http2.keep_alive_timeout(Duration::from_secs(
-            if keepalive.health_check_timeout > 0 {
-                u64::from(keepalive.health_check_timeout)
-            } else {
-                20
-            },
-        ));
-    }
+    let builder = grpc_http2_builder(keepalive);
     let (tun_service_path, tun_multi_service_path) = service_paths;
     let service = service_fn(move |request| {
         handle_request(
@@ -1189,19 +1191,61 @@ impl AsyncStream for GrpcLogicalStream {}
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, atomic::AtomicBool};
+    use std::{
+        convert::Infallible,
+        sync::{Arc, atomic::AtomicBool},
+    };
 
-    use bytes::BytesMut;
-    use hyper::HeaderMap;
+    use bytes::{Bytes, BytesMut};
+    use http_body_util::Full;
+    use hyper::{HeaderMap, Response, service::service_fn};
+    use hyper_util::rt::TokioIo;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{
-        GrpcStreamTaskGuard, decode_grpc_message, encode_grpc_message,
-        grpc_content_type_is_valid, grpc_invalid_content_type_response,
-        grpc_logical_peer_addr, grpc_malformed_timeout_response,
-        grpc_method_not_allowed_response, grpc_service_paths, grpc_stream_response,
-        grpc_timeout_duration, grpc_unimplemented_path_response,
-        grpc_unsupported_encoding, grpc_upload_status_from_error,
+        GrpcKeepalive, GrpcStreamTaskGuard, decode_grpc_message,
+        encode_grpc_message, grpc_content_type_is_valid, grpc_http2_builder,
+        grpc_invalid_content_type_response, grpc_logical_peer_addr,
+        grpc_malformed_timeout_response, grpc_method_not_allowed_response,
+        grpc_service_paths, grpc_stream_response, grpc_timeout_duration,
+        grpc_unimplemented_path_response, grpc_unsupported_encoding,
+        grpc_upload_status_from_error,
     };
+
+    #[tokio::test]
+    async fn grpc_server_rejects_http1_like_xray_v26_2_6() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let builder = grpc_http2_builder(GrpcKeepalive {
+            idle_timeout: 0,
+            health_check_timeout: 0,
+        });
+        let server = tokio::spawn(async move {
+            let service = service_fn(|_| async {
+                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(
+                    b"unexpected HTTP/1 response",
+                ))))
+            });
+            builder
+                .serve_connection(TokioIo::new(server), service)
+                .await
+        });
+
+        client
+            .write_all(
+                b"POST /svc/Tun HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/grpc\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+
+        assert!(server.await.unwrap().is_err());
+        assert!(
+            !response.starts_with(b"HTTP/1.1 200"),
+            "gRPC transport must stay HTTP/2-only"
+        );
+    }
 
     #[test]
     fn grpc_server_exposes_tun_and_tun_multi_like_xray_v26_2_6() {
