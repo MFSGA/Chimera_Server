@@ -68,6 +68,7 @@ const SUCCESS_RESPONSE: [u8; 10] = [
 
 const UDP_BUFFER_SIZE: usize = 2 * 1024 * 1024;
 const XRAY_SOCKS_UDP_PACKET_SIZE: usize = 8 * 1024;
+const MAX_UDP_DATAGRAM_SIZE: usize = u16::MAX as usize;
 
 #[derive(Debug)]
 pub struct SocksTcpServerHandler {
@@ -784,7 +785,7 @@ pub(crate) async fn run_shared_udp_relay(
     accounts: SocksUserStore,
     traffic_context: Option<TrafficContext>,
 ) -> std::io::Result<()> {
-    let mut recv_buf = vec![0u8; XRAY_SOCKS_UDP_PACKET_SIZE];
+    let mut recv_buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
     let mut client_sessions =
         HashMap::<(SocketAddr, bool), SocksUdpClientSession>::new();
     let mut session_cleanup = interval(UDP_TARGET_SESSION_ACTIVITY_CHECK);
@@ -809,7 +810,9 @@ pub(crate) async fn run_shared_udp_relay(
             continue;
         }
 
-        let data = &recv_buf[..len];
+        // Winsock returns WSAEMSGSIZE instead of truncating an oversized UDP
+        // datagram. Receive it in full, then apply Xray's 8 KiB buffer limit.
+        let data = &recv_buf[..len.min(XRAY_SOCKS_UDP_PACKET_SIZE)];
         if data.len() < 4 || data[2] != 0 {
             continue;
         }
@@ -901,7 +904,7 @@ pub(crate) async fn run_udp_relay(
 
     // Xray v26.2.6 reads SOCKS UDP packets through an 8 KiB buf.Buffer.
     // Oversized datagrams are truncated to that packet size before decoding.
-    let mut recv_buf = vec![0u8; XRAY_SOCKS_UDP_PACKET_SIZE];
+    let mut recv_buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
     // Xray v26.2.6 full-cone UDP reuses an outbound mapping for different
     // targets from one client endpoint. Keep one socket per IP family so a
     // first IPv4 target cannot make a later IPv6 target unusable (or vice versa).
@@ -930,7 +933,9 @@ pub(crate) async fn run_udp_relay(
             continue;
         }
         let response_endpoint = client_addr;
-        let data = &recv_buf[..len];
+        // Apply Xray's packet limit explicitly so Windows and Unix truncate
+        // oversized datagrams identically.
+        let data = &recv_buf[..len.min(XRAY_SOCKS_UDP_PACKET_SIZE)];
 
         // Parse SOCKS5 UDP request header: RSV(2) + FRAG(1) + ATYP(1) + DST.ADDR + DST.PORT(2)
         if data.len() < 4 {
