@@ -181,6 +181,23 @@ impl WebsocketStream {
         }
 
         self.read_frame_opcode = OpCode::from(first & 0x0f);
+        if let OpCode::Unknown(code) = self.read_frame_opcode {
+            let reason = match code {
+                3 => "bad opcode 3",
+                4 => "bad opcode 4",
+                5 => "bad opcode 5",
+                6 => "bad opcode 6",
+                7 => "bad opcode 7",
+                11 => "bad opcode 11",
+                12 => "bad opcode 12",
+                13 => "bad opcode 13",
+                14 => "bad opcode 14",
+                15 => "bad opcode 15",
+                _ => unreachable!(),
+            };
+            self.queue_protocol_error(reason)?;
+            return Err(std::io::Error::other(format!("websocket: {reason}")));
+        }
 
         match self.read_frame_opcode {
             OpCode::Continue => {
@@ -1163,6 +1180,20 @@ mod tests {
             assert_eq!(response[1] as usize, reason.len() + 2);
             assert_eq!(&response[2..4], &1002u16.to_be_bytes());
             assert_eq!(&response[4..], reason.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn server_rejects_reserved_opcodes_like_xray() {
+        for opcode in [3u8, 4, 5, 6, 7, 11, 12, 13, 14, 15] {
+            let (mut peer, transport) = tokio::io::duplex(128);
+            let mut websocket = websocket_over(transport);
+            peer.write_all(&masked_frame(0x80 | opcode, b"x"))
+                .await
+                .unwrap();
+
+            let reason = format!("bad opcode {opcode}");
+            assert_protocol_close(&mut peer, &mut websocket, &reason).await;
         }
     }
 
