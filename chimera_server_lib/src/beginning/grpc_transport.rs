@@ -526,6 +526,11 @@ fn grpc_path_escape(value: &str) -> String {
 
 fn grpc_http2_builder(keepalive: GrpcKeepalive) -> http2::Builder<TokioExecutor> {
     let mut builder = http2::Builder::new(TokioExecutor::new());
+    // grpc-go leaves HTTP/2 flow control at the RFC defaults, so Xray neither
+    // advertises SETTINGS_INITIAL_WINDOW_SIZE nor sends an initial connection
+    // WINDOW_UPDATE. Hyper defaults both receive windows to 1 MiB.
+    builder.initial_stream_window_size(65_535);
+    builder.initial_connection_window_size(65_535);
     // grpc-go does not configure MaxConcurrentStreams by default, so Xray does not
     // advertise a SETTINGS_MAX_CONCURRENT_STREAMS limit. Hyper defaults to 200.
     builder.max_concurrent_streams(None);
@@ -1479,6 +1484,70 @@ mod tests {
 
         drop(client);
         assert!(server.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn grpc_server_uses_xray_default_flow_control_windows() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let builder = grpc_http2_builder(GrpcKeepalive {
+            idle_timeout: 0,
+            health_check_timeout: 0,
+        });
+        let server = tokio::spawn(async move {
+            let service = service_fn(|_| async {
+                Ok::<_, Infallible>(Response::new(Full::new(Bytes::new())))
+            });
+            builder
+                .serve_connection(TokioIo::new(server), service)
+                .await
+        });
+
+        let mut header = [0u8; 9];
+        client.read_exact(&mut header).await.unwrap();
+        let payload_len = (usize::from(header[0]) << 16)
+            | (usize::from(header[1]) << 8)
+            | usize::from(header[2]);
+        assert_eq!(header[3], 0x04, "first HTTP/2 frame must be SETTINGS");
+        let mut payload = vec![0u8; payload_len];
+        client.read_exact(&mut payload).await.unwrap();
+        for setting in payload.chunks_exact(6) {
+            if u16::from_be_bytes([setting[0], setting[1]]) == 0x04 {
+                assert_eq!(
+                    u32::from_be_bytes([
+                        setting[2], setting[3], setting[4], setting[5]
+                    ]),
+                    65_535,
+                    "Hyper may advertise the RFC-default stream window explicitly"
+                );
+            }
+        }
+
+        let mut preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        preface.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+        client.write_all(&preface).await.unwrap();
+
+        let next = tokio::time::timeout(Duration::from_millis(100), async {
+            let mut frame = [0u8; 9];
+            loop {
+                client.read_exact(&mut frame).await.unwrap();
+                let payload_len = (usize::from(frame[0]) << 16)
+                    | (usize::from(frame[1]) << 8)
+                    | usize::from(frame[2]);
+                let mut payload = vec![0u8; payload_len];
+                client.read_exact(&mut payload).await.unwrap();
+                if frame[3] != 0x04 || frame[4] & 0x01 == 0 {
+                    return frame[3];
+                }
+            }
+        })
+        .await;
+        assert!(
+            next.is_err(),
+            "Xray/grpc-go does not send an initial connection WINDOW_UPDATE"
+        );
+
+        drop(client);
+        let _ = server.await.unwrap();
     }
 
     #[tokio::test]
