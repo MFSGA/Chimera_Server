@@ -57,6 +57,7 @@ use super::process_stream;
 
 const GRPC_PIPE_CAPACITY: usize = 64 * 1024;
 const MAX_GRPC_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+const GRPC_MAX_HEADER_LIST_BYTES: u32 = 16 * 1024 * 1024;
 const GRPC_CONNECTION_SETUP_TIMEOUT: Duration = Duration::from_secs(120);
 const HTTP2_CLIENT_PREFACE_LEN: usize = 24;
 const HTTP2_FRAME_HEADER_LEN: usize = 9;
@@ -528,6 +529,10 @@ fn grpc_http2_builder(keepalive: GrpcKeepalive) -> http2::Builder<TokioExecutor>
     // grpc-go does not configure MaxConcurrentStreams by default, so Xray does not
     // advertise a SETTINGS_MAX_CONCURRENT_STREAMS limit. Hyper defaults to 200.
     builder.max_concurrent_streams(None);
+    // grpc-go v1.78 defaults to a 16 MiB inbound header-list limit when Xray does
+    // not configure MaxHeaderListSize. Hyper defaults to 16 KiB, which rejects
+    // valid Xray gRPC metadata long before grpc-go would.
+    builder.max_header_list_size(GRPC_MAX_HEADER_LIST_BYTES);
     if keepalive.idle_timeout > 0 || keepalive.health_check_timeout > 0 {
         builder.timer(TokioTimer::new());
         builder.keep_alive_interval(Duration::from_secs(
@@ -1364,9 +1369,12 @@ mod tests {
     };
 
     use bytes::{Bytes, BytesMut};
-    use http_body_util::Full;
-    use hyper::{HeaderMap, Response, service::service_fn};
-    use hyper_util::rt::TokioIo;
+    use http_body_util::{Empty, Full};
+    use hyper::{
+        HeaderMap, Request, Response, client::conn::http2 as client_http2,
+        service::service_fn,
+    };
+    use hyper_util::rt::{TokioExecutor, TokioIo};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         time::Instant,
@@ -1471,6 +1479,43 @@ mod tests {
 
         drop(client);
         assert!(server.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn grpc_server_accepts_xray_sized_metadata_headers() {
+        let (client, server) = tokio::io::duplex(128 * 1024);
+        let builder = grpc_http2_builder(GrpcKeepalive {
+            idle_timeout: 0,
+            health_check_timeout: 0,
+        });
+        let server = tokio::spawn(async move {
+            let service = service_fn(|_| async {
+                Ok::<_, Infallible>(Response::new(Full::new(Bytes::new())))
+            });
+            builder
+                .serve_connection(TokioIo::new(server), service)
+                .await
+        });
+        let (mut sender, connection) =
+            client_http2::Builder::new(TokioExecutor::new())
+                .handshake(TokioIo::new(client))
+                .await
+                .unwrap();
+        let client = tokio::spawn(connection);
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://localhost/GunService/Tun")
+            .header("content-type", "application/grpc")
+            .header("x-large-metadata", "x".repeat(40 * 1024))
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        let response = sender.send_request(request).await.unwrap();
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+
+        drop(sender);
+        client.abort();
+        server.abort();
     }
 
     #[tokio::test]
