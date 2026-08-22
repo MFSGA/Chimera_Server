@@ -525,6 +525,9 @@ fn grpc_path_escape(value: &str) -> String {
 
 fn grpc_http2_builder(keepalive: GrpcKeepalive) -> http2::Builder<TokioExecutor> {
     let mut builder = http2::Builder::new(TokioExecutor::new());
+    // grpc-go does not configure MaxConcurrentStreams by default, so Xray does not
+    // advertise a SETTINGS_MAX_CONCURRENT_STREAMS limit. Hyper defaults to 200.
+    builder.max_concurrent_streams(None);
     if keepalive.idle_timeout > 0 || keepalive.health_check_timeout > 0 {
         builder.timer(TokioTimer::new());
         builder.keep_alive_interval(Duration::from_secs(
@@ -1432,6 +1435,42 @@ mod tests {
         client.write_u8(0x7f).await.unwrap();
 
         assert_eq!(reader.await.unwrap(), 0x7f);
+    }
+
+    #[tokio::test]
+    async fn grpc_server_does_not_advertise_hyper_stream_limit_like_xray_v26_2_6() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let builder = grpc_http2_builder(GrpcKeepalive {
+            idle_timeout: 0,
+            health_check_timeout: 0,
+        });
+        let server = tokio::spawn(async move {
+            let service = service_fn(|_| async {
+                Ok::<_, Infallible>(Response::new(Full::new(Bytes::new())))
+            });
+            builder
+                .serve_connection(TokioIo::new(server), service)
+                .await
+        });
+
+        let mut header = [0u8; 9];
+        client.read_exact(&mut header).await.unwrap();
+        let payload_len = (usize::from(header[0]) << 16)
+            | (usize::from(header[1]) << 8)
+            | usize::from(header[2]);
+        assert_eq!(header[3], 0x04, "first HTTP/2 frame must be SETTINGS");
+        let mut payload = vec![0u8; payload_len];
+        client.read_exact(&mut payload).await.unwrap();
+        assert_eq!(payload.len() % 6, 0);
+        assert!(
+            payload
+                .chunks_exact(6)
+                .all(|setting| u16::from_be_bytes([setting[0], setting[1]]) != 0x03),
+            "Xray/grpc-go does not advertise SETTINGS_MAX_CONCURRENT_STREAMS by default"
+        );
+
+        drop(client);
+        assert!(server.await.unwrap().is_err());
     }
 
     #[tokio::test]
