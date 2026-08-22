@@ -46,6 +46,7 @@ pub struct WebsocketStream {
     close_data_size: usize,
     close_received: bool,
     close_sent: bool,
+    protocol_error_pending: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -128,6 +129,7 @@ impl WebsocketStream {
             close_data_size: 0,
             close_received: false,
             close_sent: false,
+            protocol_error_pending: false,
         }
     }
 
@@ -153,6 +155,20 @@ impl WebsocketStream {
         let _read_frame_final = first & 0x80 != 0;
 
         self.read_frame_masked = second & 0x80 != 0;
+        if self.read_frame_masked == self.is_client {
+            self.close_data[..2].copy_from_slice(&1002u16.to_be_bytes());
+            self.close_data[2..10].copy_from_slice(b"bad MASK");
+            self.close_data_size = 10;
+            self.close_received = true;
+            self.protocol_error_pending = true;
+            if !self.pack_write_close_frame() {
+                return Err(std::io::Error::other(
+                    "failed to queue websocket protocol error close frame",
+                ));
+            }
+            self.close_sent = true;
+            return Err(std::io::Error::other("websocket: bad MASK"));
+        }
 
         self.read_frame_opcode = OpCode::from(first & 0x0f);
 
@@ -652,6 +668,15 @@ impl AsyncRead for WebsocketStream {
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
 
+        if this.protocol_error_pending {
+            this.do_write_frame(cx)?;
+            if this.write_frame_end_offset > 0 {
+                return Poll::Pending;
+            }
+            this.protocol_error_pending = false;
+            return Poll::Ready(Err(std::io::Error::other("websocket: bad MASK")));
+        }
+
         if this.close_received {
             return Poll::Ready(Ok(()));
         }
@@ -711,6 +736,13 @@ impl AsyncRead for WebsocketStream {
             };
 
             if read_result.is_err() {
+                if this.protocol_error_pending {
+                    this.do_write_frame(cx)?;
+                    if this.write_frame_end_offset > 0 {
+                        return Poll::Pending;
+                    }
+                    this.protocol_error_pending = false;
+                }
                 return Poll::Ready(read_result);
             }
 
@@ -983,6 +1015,29 @@ mod tests {
 
     fn websocket_over(transport: tokio::io::DuplexStream) -> WebsocketStream {
         WebsocketStream::new(Box::new(TestStream(transport)), false, &[])
+    }
+
+    #[tokio::test]
+    async fn server_rejects_unmasked_client_frame_like_xray() {
+        let (mut peer, transport) = tokio::io::duplex(64);
+        let mut websocket = websocket_over(transport);
+        peer.write_all(&[0x82, 0x04, b'p', b'i', b'n', b'g'])
+            .await
+            .unwrap();
+
+        let mut application_data = [0u8; 4];
+        let error = websocket.read(&mut application_data).await.unwrap_err();
+        assert_eq!(error.to_string(), "websocket: bad MASK");
+
+        let mut response = [0u8; 12];
+        peer.read_exact(&mut response).await.unwrap();
+        assert_eq!(
+            response,
+            [
+                0x88, 0x0a, 0x03, 0xea, b'b', b'a', b'd', b' ', b'M', b'A', b'S',
+                b'K'
+            ]
+        );
     }
 
     #[tokio::test]
