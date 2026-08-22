@@ -726,6 +726,13 @@ impl Drop for GrpcStreamTaskGuard {
 }
 
 fn grpc_upload_status_from_error(error: &io::Error) -> Option<GrpcUploadStatus> {
+    if error.kind() == io::ErrorKind::UnexpectedEof {
+        return Some(GrpcUploadStatus {
+            code: 13,
+            message: "unexpected EOF".to_string(),
+        });
+    }
+
     let source = error.get_ref()?;
     if let Some(too_large) = source.downcast_ref::<GrpcMessageTooLarge>() {
         return Some(GrpcUploadStatus {
@@ -1194,6 +1201,39 @@ mod tests {
             response.headers()["grpc-message"],
             "unknown method Nope for service GunService"
         );
+    }
+
+    #[tokio::test]
+    async fn grpc_truncated_message_reports_unexpected_eof_like_xray_v26_2_6() {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "truncated gRPC message",
+        );
+        let status = grpc_upload_status_from_error(&error)
+            .expect("truncated gRPC message must map to a status");
+        assert_eq!(status.code, 13);
+        assert_eq!(status.message, "unexpected EOF");
+
+        let (transport_stream, handler_stream) = tokio::io::duplex(64);
+        let (transport_read, _transport_write) = tokio::io::split(transport_stream);
+        drop(handler_stream);
+        let (status_tx, status_rx) = tokio::sync::mpsc::unbounded_channel();
+        status_tx.send(status).unwrap();
+        drop(status_tx);
+
+        let response = grpc_stream_response(
+            transport_read,
+            false,
+            Arc::new(AtomicBool::new(false)),
+            Some(status_rx),
+            None,
+        );
+        let collected = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("collect truncated-message response");
+        let trailers = collected.trailers().expect("truncated-message trailers");
+        assert_eq!(trailers["grpc-status"], "13");
+        assert_eq!(trailers["grpc-message"], "unexpected EOF");
     }
 
     #[tokio::test]
