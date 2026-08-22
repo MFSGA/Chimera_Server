@@ -235,9 +235,7 @@ fn client_hello_supports_tls13(client_hello: &[u8]) -> io::Result<bool> {
                 ));
             }
             let version_list = reader.read_slice(version_list_len)?;
-            return Ok(version_list
-                .chunks_exact(2)
-                .any(|version| version == [0x03, 0x04]));
+            return Ok(version_list.as_chunks::<2>().0.contains(&[0x03, 0x04]));
         }
 
         reader.skip(ext_len)?;
