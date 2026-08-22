@@ -602,6 +602,11 @@ async fn handle_request(
     peer_addr: std::net::SocketAddr,
 ) -> Result<Response<ResponseBody>, Infallible> {
     let logical_peer_addr = grpc_logical_peer_addr(request.headers(), peer_addr);
+    if let Some(message) =
+        grpc_duplicate_host_error(request.headers(), request.uri())
+    {
+        return Ok(grpc_duplicate_host_response(&message));
+    }
     let content_type = request
         .headers()
         .get(header::CONTENT_TYPE)
@@ -840,6 +845,29 @@ fn grpc_invalid_base64_offset(value: &[u8]) -> Option<usize> {
     }
 
     None
+}
+
+fn grpc_duplicate_host_error(
+    headers: &hyper::HeaderMap,
+    uri: &hyper::Uri,
+) -> Option<String> {
+    let authority_count = usize::from(uri.authority().is_some());
+    let host_count = headers.get_all(header::HOST).iter().count();
+    (authority_count > 1 || host_count > 1).then(|| {
+        format!(
+            "num values of :authority: {authority_count}, num values of host: {host_count}, both must only have 1 value as per HTTP/2 spec"
+        )
+    })
+}
+
+fn grpc_duplicate_host_response(message: &str) -> Response<ResponseBody> {
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header(header::CONTENT_TYPE, "application/grpc")
+        .header("grpc-status", "13")
+        .header("grpc-message", grpc_encode_message(message))
+        .body(empty_grpc_body())
+        .unwrap()
 }
 
 fn grpc_malformed_binary_metadata_response(message: &str) -> Response<ResponseBody> {
@@ -1484,14 +1512,14 @@ mod tests {
 
     use super::{
         GrpcKeepalive, GrpcSetupTimeoutIo, GrpcStreamTaskGuard, decode_grpc_message,
-        encode_grpc_message, grpc_content_type_is_valid, grpc_encode_message,
-        grpc_http2_builder, grpc_invalid_base64_offset,
-        grpc_invalid_content_type_response, grpc_logical_peer_addr,
-        grpc_malformed_binary_metadata, grpc_malformed_binary_metadata_response,
-        grpc_malformed_timeout_response, grpc_method_not_allowed_response,
-        grpc_service_paths, grpc_stream_response, grpc_timeout_duration,
-        grpc_unimplemented_path_response, grpc_unsupported_encoding,
-        grpc_upload_status_from_error,
+        encode_grpc_message, grpc_content_type_is_valid, grpc_duplicate_host_error,
+        grpc_duplicate_host_response, grpc_encode_message, grpc_http2_builder,
+        grpc_invalid_base64_offset, grpc_invalid_content_type_response,
+        grpc_logical_peer_addr, grpc_malformed_binary_metadata,
+        grpc_malformed_binary_metadata_response, grpc_malformed_timeout_response,
+        grpc_method_not_allowed_response, grpc_service_paths, grpc_stream_response,
+        grpc_timeout_duration, grpc_unimplemented_path_response,
+        grpc_unsupported_encoding, grpc_upload_status_from_error,
     };
 
     #[tokio::test]
@@ -1742,6 +1770,27 @@ mod tests {
         let (tun, tun_multi) = grpc_service_paths("hello/world!");
         assert_eq!(tun, "/hello%2Fworld%21/Tun");
         assert_eq!(tun_multi, "/hello%2Fworld%21/TunMulti");
+    }
+
+    #[test]
+    fn grpc_duplicate_host_validation_matches_xray_v26_2_6() {
+        let uri: hyper::Uri = "http://proxy.example/NoService/Tun".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.append(hyper::header::HOST, "a.example".parse().unwrap());
+        assert_eq!(grpc_duplicate_host_error(&headers, &uri), None);
+
+        headers.append(hyper::header::HOST, "b.example".parse().unwrap());
+        let message = grpc_duplicate_host_error(&headers, &uri)
+            .expect("duplicate Host headers must be rejected before gRPC dispatch");
+        assert_eq!(
+            message,
+            "num values of :authority: 1, num values of host: 2, both must only have 1 value as per HTTP/2 spec"
+        );
+        let response = grpc_duplicate_host_response(&message);
+        assert_eq!(response.status(), hyper::StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()["content-type"], "application/grpc");
+        assert_eq!(response.headers()["grpc-status"], "13");
+        assert_eq!(response.headers()["grpc-message"], message);
     }
 
     #[test]
