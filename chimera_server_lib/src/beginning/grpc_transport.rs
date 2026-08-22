@@ -610,6 +610,9 @@ async fn handle_request(
     if !grpc_content_type_is_valid(content_type) {
         return Ok(grpc_invalid_content_type_response(content_type));
     }
+    if let Some(message) = grpc_malformed_binary_metadata(request.headers()) {
+        return Ok(grpc_malformed_binary_metadata_response(&message));
+    }
     let grpc_timeout = match grpc_timeout_duration(request.headers()) {
         Ok(timeout) => timeout,
         Err(message) => return Ok(grpc_malformed_timeout_response(&message)),
@@ -771,6 +774,71 @@ fn grpc_encode_message(message: &str) -> String {
         }
     }
     encoded
+}
+
+fn grpc_malformed_binary_metadata(headers: &hyper::HeaderMap) -> Option<String> {
+    for (name, value) in headers {
+        if !name.as_str().ends_with("-bin") {
+            continue;
+        }
+        let bytes = value.as_bytes();
+        let Some(offset) = grpc_invalid_base64_offset(bytes) else {
+            continue;
+        };
+        let value = String::from_utf8_lossy(bytes);
+        return Some(format!(
+            "malformed binary metadata \"{value}\" in header \"{name}\": illegal base64 data at input byte {offset}"
+        ));
+    }
+    None
+}
+
+fn grpc_invalid_base64_offset(value: &[u8]) -> Option<usize> {
+    let mut symbols = 0usize;
+    let mut padding_start = None;
+    let mut padding = 0usize;
+
+    for (index, byte) in value.iter().copied().enumerate() {
+        let is_symbol = byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/');
+        if is_symbol {
+            if let Some(start) = padding_start {
+                return Some(start);
+            }
+            symbols += 1;
+        } else if byte == b'=' {
+            padding_start.get_or_insert(index);
+            padding += 1;
+        } else {
+            return Some(index);
+        }
+    }
+
+    if let Some(start) = padding_start {
+        let expected_padding = match symbols % 4 {
+            0 => 0,
+            2 => 2,
+            3 => 1,
+            1 => return Some(start),
+            _ => unreachable!(),
+        };
+        if padding != expected_padding || !(symbols + padding).is_multiple_of(4) {
+            return Some(start);
+        }
+    } else if symbols % 4 == 1 {
+        return Some(symbols.saturating_sub(1));
+    }
+
+    None
+}
+
+fn grpc_malformed_binary_metadata_response(message: &str) -> Response<ResponseBody> {
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header(header::CONTENT_TYPE, "application/grpc")
+        .header("grpc-status", "13")
+        .header("grpc-message", grpc_encode_message(message))
+        .body(empty_grpc_body())
+        .unwrap()
 }
 
 fn grpc_malformed_timeout_response(message: &str) -> Response<ResponseBody> {
@@ -1404,11 +1472,13 @@ mod tests {
     use super::{
         GrpcKeepalive, GrpcSetupTimeoutIo, GrpcStreamTaskGuard, decode_grpc_message,
         encode_grpc_message, grpc_content_type_is_valid, grpc_encode_message,
-        grpc_http2_builder, grpc_invalid_content_type_response,
-        grpc_logical_peer_addr, grpc_malformed_timeout_response,
-        grpc_method_not_allowed_response, grpc_service_paths, grpc_stream_response,
-        grpc_timeout_duration, grpc_unimplemented_path_response,
-        grpc_unsupported_encoding, grpc_upload_status_from_error,
+        grpc_http2_builder, grpc_invalid_base64_offset,
+        grpc_invalid_content_type_response, grpc_logical_peer_addr,
+        grpc_malformed_binary_metadata, grpc_malformed_binary_metadata_response,
+        grpc_malformed_timeout_response, grpc_method_not_allowed_response,
+        grpc_service_paths, grpc_stream_response, grpc_timeout_duration,
+        grpc_unimplemented_path_response, grpc_unsupported_encoding,
+        grpc_upload_status_from_error,
     };
 
     #[tokio::test]
@@ -1697,6 +1767,36 @@ mod tests {
             response.headers()["grpc-message"],
             "invalid gRPC request content-type \"application/grpc%25foo\""
         );
+    }
+
+    #[test]
+    fn grpc_binary_metadata_validation_matches_xray_v26_2_6() {
+        for valid in [b"".as_slice(), b"AQI=", b"AQI", b"AB", b"AB=="] {
+            assert_eq!(grpc_invalid_base64_offset(valid), None, "{valid:?}");
+        }
+        for (invalid, offset) in [
+            (b"A".as_slice(), 0),
+            (b"A=".as_slice(), 1),
+            (b"A===".as_slice(), 1),
+            (b"AQI==".as_slice(), 3),
+            (b"AQI*".as_slice(), 3),
+            (b"!!!".as_slice(), 0),
+        ] {
+            assert_eq!(grpc_invalid_base64_offset(invalid), Some(offset));
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-test-bin", "!!!".parse().unwrap());
+        let message = grpc_malformed_binary_metadata(&headers)
+            .expect("invalid binary metadata must be rejected");
+        assert_eq!(
+            message,
+            "malformed binary metadata \"!!!\" in header \"x-test-bin\": illegal base64 data at input byte 0"
+        );
+        let response = grpc_malformed_binary_metadata_response(&message);
+        assert_eq!(response.status(), hyper::StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()["grpc-status"], "13");
+        assert_eq!(response.headers()["grpc-message"], message);
     }
 
     #[test]
