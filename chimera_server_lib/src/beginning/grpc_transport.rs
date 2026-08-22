@@ -1105,6 +1105,12 @@ fn encode_grpc_message(data: &[u8], _multi_mode: bool) -> Bytes {
 fn decode_varint(data: &[u8]) -> io::Result<(usize, usize)> {
     let mut value = 0usize;
     for (index, byte) in data.iter().copied().enumerate().take(10) {
+        if index == 9 && byte > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid protobuf varint",
+            ));
+        }
         value |= ((byte & 0x7f) as usize) << (index * 7);
         if byte & 0x80 == 0 {
             return Ok((value, index + 1));
@@ -1329,6 +1335,41 @@ mod tests {
         assert_eq!(
             trailers["grpc-message"],
             "grpc: failed to unmarshal the received message: proto: cannot parse invalid wire-format data"
+        );
+    }
+
+    #[test]
+    fn grpc_rejects_overflowing_protobuf_varints_like_xray_v26_2_6() {
+        let protobuf = [
+            0x10_u8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02,
+            0x0a, 0x02, b'o', b'k',
+        ];
+        let mut frame = vec![0];
+        frame.extend_from_slice(&(protobuf.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&protobuf);
+        let mut buffer = BytesMut::from(frame.as_slice());
+
+        let error = decode_grpc_message(&mut buffer, false)
+            .expect_err("protobuf varints wider than uint64 must be rejected");
+        let status = grpc_upload_status_from_error(&error)
+            .expect("overflowing protobuf varint must map to an internal status");
+        assert_eq!(status.code, 13);
+        assert_eq!(
+            status.message,
+            "grpc: failed to unmarshal the received message: proto: cannot parse invalid wire-format data"
+        );
+
+        let protobuf = [
+            0x10_u8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01,
+            0x0a, 0x02, b'o', b'k',
+        ];
+        let mut frame = vec![0];
+        frame.extend_from_slice(&(protobuf.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&protobuf);
+        let mut buffer = BytesMut::from(frame.as_slice());
+        assert_eq!(
+            decode_grpc_message(&mut buffer, false).unwrap(),
+            Some(vec![b"ok".to_vec()])
         );
     }
 
