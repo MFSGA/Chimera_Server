@@ -607,13 +607,8 @@ async fn handle_request(
     {
         return Ok(grpc_duplicate_host_response(&message));
     }
-    let content_type = request
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
-    if !grpc_content_type_is_valid(content_type) {
-        return Ok(grpc_invalid_content_type_response(content_type));
+    if let Err(content_type) = grpc_content_type(request.headers()) {
+        return Ok(grpc_invalid_content_type_response(&content_type));
     }
     if let Some(message) = grpc_malformed_binary_metadata(request.headers()) {
         return Ok(grpc_malformed_binary_metadata_response(&message));
@@ -894,6 +889,21 @@ fn empty_grpc_body() -> ResponseBody {
     BodyExt::boxed_unsync(
         Empty::<Bytes>::new().map_err(|never| -> h2::Error { match never {} }),
     )
+}
+
+fn grpc_content_type(headers: &hyper::HeaderMap) -> Result<&str, String> {
+    let mut last_invalid = String::new();
+    for value in headers.get_all(header::CONTENT_TYPE) {
+        let Ok(content_type) = value.to_str() else {
+            continue;
+        };
+        if grpc_content_type_is_valid(content_type) {
+            return Ok(content_type);
+        }
+        last_invalid.clear();
+        last_invalid.push_str(content_type);
+    }
+    Err(last_invalid)
 }
 
 fn grpc_content_type_is_valid(content_type: &str) -> bool {
@@ -1512,14 +1522,15 @@ mod tests {
 
     use super::{
         GrpcKeepalive, GrpcSetupTimeoutIo, GrpcStreamTaskGuard, decode_grpc_message,
-        encode_grpc_message, grpc_content_type_is_valid, grpc_duplicate_host_error,
-        grpc_duplicate_host_response, grpc_encode_message, grpc_http2_builder,
-        grpc_invalid_base64_offset, grpc_invalid_content_type_response,
-        grpc_logical_peer_addr, grpc_malformed_binary_metadata,
-        grpc_malformed_binary_metadata_response, grpc_malformed_timeout_response,
-        grpc_method_not_allowed_response, grpc_service_paths, grpc_stream_response,
-        grpc_timeout_duration, grpc_unimplemented_path_response,
-        grpc_unsupported_encoding, grpc_upload_status_from_error,
+        encode_grpc_message, grpc_content_type, grpc_content_type_is_valid,
+        grpc_duplicate_host_error, grpc_duplicate_host_response,
+        grpc_encode_message, grpc_http2_builder, grpc_invalid_base64_offset,
+        grpc_invalid_content_type_response, grpc_logical_peer_addr,
+        grpc_malformed_binary_metadata, grpc_malformed_binary_metadata_response,
+        grpc_malformed_timeout_response, grpc_method_not_allowed_response,
+        grpc_service_paths, grpc_stream_response, grpc_timeout_duration,
+        grpc_unimplemented_path_response, grpc_unsupported_encoding,
+        grpc_upload_status_from_error,
     };
 
     #[tokio::test]
@@ -1814,6 +1825,24 @@ mod tests {
         ] {
             assert!(!grpc_content_type_is_valid(invalid), "{invalid}");
         }
+
+        let mut headers = HeaderMap::new();
+        headers.append("content-type", "text/plain".parse().unwrap());
+        headers.append("content-type", "application/grpc".parse().unwrap());
+        assert_eq!(grpc_content_type(&headers), Ok("application/grpc"));
+
+        let mut headers = HeaderMap::new();
+        headers.append("content-type", "application/grpc".parse().unwrap());
+        headers.append("content-type", "application/grpcfoo".parse().unwrap());
+        assert_eq!(grpc_content_type(&headers), Ok("application/grpc"));
+
+        let mut headers = HeaderMap::new();
+        headers.append("content-type", "text/plain".parse().unwrap());
+        headers.append("content-type", "application/grpcfoo".parse().unwrap());
+        assert_eq!(
+            grpc_content_type(&headers),
+            Err("application/grpcfoo".into())
+        );
 
         let response = grpc_invalid_content_type_response("application/grpcfoo");
         assert_eq!(response.status(), hyper::StatusCode::UNSUPPORTED_MEDIA_TYPE);
