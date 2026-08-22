@@ -90,6 +90,19 @@ impl std::fmt::Display for GrpcCompressedMessage {
 impl std::error::Error for GrpcCompressedMessage {}
 
 #[derive(Debug)]
+struct GrpcInvalidProtobuf;
+
+impl std::fmt::Display for GrpcInvalidProtobuf {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "grpc: failed to unmarshal the received message: proto: cannot parse invalid wire-format data",
+        )
+    }
+}
+
+impl std::error::Error for GrpcInvalidProtobuf {}
+
+#[derive(Debug)]
 struct GrpcUploadStatus {
     code: u8,
     message: String,
@@ -740,11 +753,17 @@ fn grpc_upload_status_from_error(error: &io::Error) -> Option<GrpcUploadStatus> 
             message: too_large.to_string(),
         });
     }
-    source
-        .downcast_ref::<GrpcCompressedMessage>()
-        .map(|compressed| GrpcUploadStatus {
+    if let Some(compressed) = source.downcast_ref::<GrpcCompressedMessage>() {
+        return Some(GrpcUploadStatus {
             code: 13,
             message: compressed.to_string(),
+        });
+    }
+    source
+        .downcast_ref::<GrpcInvalidProtobuf>()
+        .map(|invalid| GrpcUploadStatus {
+            code: 13,
+            message: invalid.to_string(),
         })
 }
 
@@ -889,7 +908,9 @@ fn decode_grpc_message(
     }
     buffer.advance(5);
     let message = buffer.split_to(message_len);
-    decode_data_fields(&message, multi_mode).map(Some)
+    decode_data_fields(&message, multi_mode)
+        .map(Some)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, GrpcInvalidProtobuf))
 }
 
 fn decode_data_fields(message: &[u8], multi_mode: bool) -> io::Result<Vec<Vec<u8>>> {
@@ -907,13 +928,7 @@ fn decode_data_fields(message: &[u8], multi_mode: bool) -> io::Result<Vec<Vec<u8
             ));
         }
 
-        if field_number == 1 {
-            if wire_type != 2 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "gRPC data field has invalid protobuf wire type",
-                ));
-            }
+        if field_number == 1 && wire_type == 2 {
             let (length, varint_len) = decode_varint(&message[offset..])?;
             offset += varint_len;
             let end = offset.checked_add(length).ok_or_else(|| {
@@ -940,6 +955,8 @@ fn decode_data_fields(message: &[u8], multi_mode: bool) -> io::Result<Vec<Vec<u8
             continue;
         }
 
+        // Generated protobuf decoders treat a known field with the wrong wire
+        // type as an unknown field. Xray therefore skips it instead of failing.
         offset = skip_protobuf_field(message, offset, wire_type)?;
     }
 
@@ -1200,6 +1217,48 @@ mod tests {
         assert_eq!(
             response.headers()["grpc-message"],
             "unknown method Nope for service GunService"
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_invalid_protobuf_reports_internal_like_xray_v26_2_6() {
+        let protobuf = [0x00_u8];
+        let mut frame = vec![0];
+        frame.extend_from_slice(&(protobuf.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&protobuf);
+        let mut buffer = BytesMut::from(frame.as_slice());
+        let error = decode_grpc_message(&mut buffer, false)
+            .expect_err("invalid protobuf wire format must be rejected");
+        let status = grpc_upload_status_from_error(&error)
+            .expect("invalid protobuf wire format must map to a status");
+        assert_eq!(status.code, 13);
+        assert_eq!(
+            status.message,
+            "grpc: failed to unmarshal the received message: proto: cannot parse invalid wire-format data"
+        );
+
+        let (transport_stream, handler_stream) = tokio::io::duplex(64);
+        let (transport_read, _transport_write) = tokio::io::split(transport_stream);
+        drop(handler_stream);
+        let (status_tx, status_rx) = tokio::sync::mpsc::unbounded_channel();
+        status_tx.send(status).unwrap();
+        drop(status_tx);
+
+        let response = grpc_stream_response(
+            transport_read,
+            false,
+            Arc::new(AtomicBool::new(false)),
+            Some(status_rx),
+            None,
+        );
+        let collected = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("collect invalid-protobuf response");
+        let trailers = collected.trailers().expect("invalid-protobuf trailers");
+        assert_eq!(trailers["grpc-status"], "13");
+        assert_eq!(
+            trailers["grpc-message"],
+            "grpc: failed to unmarshal the received message: proto: cannot parse invalid wire-format data"
         );
     }
 
@@ -1520,6 +1579,20 @@ mod tests {
             .expect("decode Hunk with protobuf-compatible unknown fields")
             .expect("complete Hunk");
         assert_eq!(decoded, vec![b"last".to_vec()]);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn hunk_ignores_known_data_field_with_wrong_wire_type_like_xray_v26_2_6() {
+        let protobuf = [0x08_u8, 0x01];
+        let mut frame = vec![0];
+        frame.extend_from_slice(&(protobuf.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&protobuf);
+        let mut buffer = BytesMut::from(frame.as_slice());
+        let decoded = decode_grpc_message(&mut buffer, false)
+            .expect("wrong-wire data field is skipped by generated protobuf decoder")
+            .expect("complete Hunk");
+        assert_eq!(decoded, vec![Vec::<u8>::new()]);
         assert!(buffer.is_empty());
     }
 
