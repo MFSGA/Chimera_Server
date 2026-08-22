@@ -47,6 +47,7 @@ pub struct WebsocketStream {
     close_received: bool,
     close_sent: bool,
     protocol_error_pending: bool,
+    protocol_error_reason: &'static str,
 }
 
 #[derive(Debug, PartialEq)]
@@ -130,6 +131,7 @@ impl WebsocketStream {
             close_received: false,
             close_sent: false,
             protocol_error_pending: false,
+            protocol_error_reason: "",
         }
     }
 
@@ -154,19 +156,25 @@ impl WebsocketStream {
 
         let _read_frame_final = first & 0x80 != 0;
 
+        let reserved_bits = first & 0x70;
+        if reserved_bits != 0 {
+            let reason = match reserved_bits {
+                0x40 => "RSV1 set",
+                0x20 => "RSV2 set",
+                0x10 => "RSV3 set",
+                0x60 => "RSV1 set, RSV2 set",
+                0x50 => "RSV1 set, RSV3 set",
+                0x30 => "RSV2 set, RSV3 set",
+                0x70 => "RSV1 set, RSV2 set, RSV3 set",
+                _ => unreachable!(),
+            };
+            self.queue_protocol_error(reason)?;
+            return Err(std::io::Error::other(format!("websocket: {reason}")));
+        }
+
         self.read_frame_masked = second & 0x80 != 0;
         if self.read_frame_masked == self.is_client {
-            self.close_data[..2].copy_from_slice(&1002u16.to_be_bytes());
-            self.close_data[2..10].copy_from_slice(b"bad MASK");
-            self.close_data_size = 10;
-            self.close_received = true;
-            self.protocol_error_pending = true;
-            if !self.pack_write_close_frame() {
-                return Err(std::io::Error::other(
-                    "failed to queue websocket protocol error close frame",
-                ));
-            }
-            self.close_sent = true;
+            self.queue_protocol_error("bad MASK")?;
             return Err(std::io::Error::other("websocket: bad MASK"));
         }
 
@@ -645,6 +653,24 @@ impl WebsocketStream {
         Ok(())
     }
 
+    fn queue_protocol_error(&mut self, reason: &'static str) -> std::io::Result<()> {
+        let reason_bytes = reason.as_bytes();
+        debug_assert!(reason_bytes.len() <= self.close_data.len() - 2);
+        self.close_data[..2].copy_from_slice(&1002u16.to_be_bytes());
+        self.close_data[2..2 + reason_bytes.len()].copy_from_slice(reason_bytes);
+        self.close_data_size = 2 + reason_bytes.len();
+        self.close_received = true;
+        self.protocol_error_pending = true;
+        self.protocol_error_reason = reason;
+        if !self.pack_write_close_frame() {
+            return Err(std::io::Error::other(
+                "failed to queue websocket protocol error close frame",
+            ));
+        }
+        self.close_sent = true;
+        Ok(())
+    }
+
     fn reset_unprocessed_buf_offset(&mut self) {
         assert!(
             self.unprocessed_start_offset > 0
@@ -674,7 +700,10 @@ impl AsyncRead for WebsocketStream {
                 return Poll::Pending;
             }
             this.protocol_error_pending = false;
-            return Poll::Ready(Err(std::io::Error::other("websocket: bad MASK")));
+            return Poll::Ready(Err(std::io::Error::other(format!(
+                "websocket: {}",
+                this.protocol_error_reason
+            ))));
         }
 
         if this.close_received {
@@ -1038,6 +1067,52 @@ mod tests {
                 b'K'
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn server_rejects_reserved_bits_like_xray() {
+        for (reserved_bits, reason) in [
+            (0x40, "RSV1 set"),
+            (0x20, "RSV2 set"),
+            (0x10, "RSV3 set"),
+            (0x60, "RSV1 set, RSV2 set"),
+            (0x70, "RSV1 set, RSV2 set, RSV3 set"),
+        ] {
+            let (mut peer, transport) = tokio::io::duplex(128);
+            let mut websocket = websocket_over(transport);
+            let mask = [1u8, 2, 3, 4];
+            let payload = [
+                b'p' ^ mask[0],
+                b'i' ^ mask[1],
+                b'n' ^ mask[2],
+                b'g' ^ mask[3],
+            ];
+            peer.write_all(&[
+                0x82 | reserved_bits,
+                0x84,
+                mask[0],
+                mask[1],
+                mask[2],
+                mask[3],
+                payload[0],
+                payload[1],
+                payload[2],
+                payload[3],
+            ])
+            .await
+            .unwrap();
+
+            let mut application_data = [0u8; 4];
+            let error = websocket.read(&mut application_data).await.unwrap_err();
+            assert_eq!(error.to_string(), format!("websocket: {reason}"));
+
+            let mut response = vec![0u8; 4 + reason.len()];
+            peer.read_exact(&mut response).await.unwrap();
+            assert_eq!(response[0], 0x88);
+            assert_eq!(response[1] as usize, reason.len() + 2);
+            assert_eq!(&response[2..4], &1002u16.to_be_bytes());
+            assert_eq!(&response[4..], reason.as_bytes());
+        }
     }
 
     #[tokio::test]
