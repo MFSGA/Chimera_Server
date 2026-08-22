@@ -78,6 +78,18 @@ impl std::fmt::Display for GrpcMessageTooLarge {
 impl std::error::Error for GrpcMessageTooLarge {}
 
 #[derive(Debug)]
+struct GrpcCompressedMessage;
+
+impl std::fmt::Display for GrpcCompressedMessage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .write_str("grpc: compressed flag set with identity or empty encoding")
+    }
+}
+
+impl std::error::Error for GrpcCompressedMessage {}
+
+#[derive(Debug)]
 struct GrpcUploadStatus {
     code: u8,
     message: String,
@@ -714,13 +726,19 @@ impl Drop for GrpcStreamTaskGuard {
 }
 
 fn grpc_upload_status_from_error(error: &io::Error) -> Option<GrpcUploadStatus> {
-    let too_large = error
-        .get_ref()
-        .and_then(|source| source.downcast_ref::<GrpcMessageTooLarge>())?;
-    Some(GrpcUploadStatus {
-        code: 8,
-        message: too_large.to_string(),
-    })
+    let source = error.get_ref()?;
+    if let Some(too_large) = source.downcast_ref::<GrpcMessageTooLarge>() {
+        return Some(GrpcUploadStatus {
+            code: 8,
+            message: too_large.to_string(),
+        });
+    }
+    source
+        .downcast_ref::<GrpcCompressedMessage>()
+        .map(|compressed| GrpcUploadStatus {
+            code: 13,
+            message: compressed.to_string(),
+        })
 }
 
 fn grpc_stream_response(
@@ -846,7 +864,7 @@ fn decode_grpc_message(
     if buffer[0] != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "compressed gRPC messages are not supported",
+            GrpcCompressedMessage,
         ));
     }
     let message_len =
@@ -1175,6 +1193,45 @@ mod tests {
         assert_eq!(
             response.headers()["grpc-message"],
             "unknown method Nope for service GunService"
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_compressed_flag_reports_internal_like_xray_v26_2_6() {
+        let mut buffer = BytesMut::from(&[1_u8, 0, 0, 0, 0][..]);
+        let error = decode_grpc_message(&mut buffer, false).expect_err(
+            "compressed gRPC message must be rejected without a decompressor",
+        );
+        let status = grpc_upload_status_from_error(&error)
+            .expect("compressed gRPC message must map to a status");
+        assert_eq!(status.code, 13);
+        assert_eq!(
+            status.message,
+            "grpc: compressed flag set with identity or empty encoding"
+        );
+
+        let (transport_stream, handler_stream) = tokio::io::duplex(64);
+        let (transport_read, _transport_write) = tokio::io::split(transport_stream);
+        drop(handler_stream);
+        let (status_tx, status_rx) = tokio::sync::mpsc::unbounded_channel();
+        status_tx.send(status).unwrap();
+        drop(status_tx);
+
+        let response = grpc_stream_response(
+            transport_read,
+            false,
+            Arc::new(AtomicBool::new(false)),
+            Some(status_rx),
+            None,
+        );
+        let collected = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("collect compressed-message response");
+        let trailers = collected.trailers().expect("compressed-message trailers");
+        assert_eq!(trailers["grpc-status"], "13");
+        assert_eq!(
+            trailers["grpc-message"],
+            "grpc: compressed flag set with identity or empty encoding"
         );
     }
 
