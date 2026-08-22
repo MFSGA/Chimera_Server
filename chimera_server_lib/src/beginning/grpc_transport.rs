@@ -25,6 +25,7 @@ use hyper_util::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex},
+    sync::mpsc,
     task::{AbortHandle, JoinHandle},
 };
 #[cfg(feature = "tls")]
@@ -58,6 +59,29 @@ const GRPC_PIPE_CAPACITY: usize = 64 * 1024;
 const MAX_GRPC_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
 type ResponseBody = UnsyncBoxBody<Bytes, h2::Error>;
+
+#[derive(Debug)]
+struct GrpcMessageTooLarge {
+    received: usize,
+}
+
+impl std::fmt::Display for GrpcMessageTooLarge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "grpc: received message larger than max ({} vs. {})",
+            self.received, MAX_GRPC_MESSAGE_BYTES
+        )
+    }
+}
+
+impl std::error::Error for GrpcMessageTooLarge {}
+
+#[derive(Debug)]
+struct GrpcUploadStatus {
+    code: u8,
+    message: String,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct GrpcKeepalive {
@@ -413,6 +437,7 @@ async fn handle_request(
     });
     let stream_abort = stream_task.abort_handle();
     let upload_stream_abort = stream_abort.clone();
+    let (upload_status_tx, upload_status_rx) = mpsc::unbounded_channel();
     let mut body = request.into_body();
     let upload_task = tokio::spawn(async move {
         match decode_request_body(&mut body, &mut transport_write, multi_mode).await
@@ -424,6 +449,9 @@ async fn handle_request(
             }
             Err(error) => {
                 debug!("gRPC upload decode failed: {error}");
+                if let Some(status) = grpc_upload_status_from_error(&error) {
+                    let _ = upload_status_tx.send(status);
+                }
                 upload_stream_abort.abort();
             }
         }
@@ -451,6 +479,7 @@ async fn handle_request(
         transport_read,
         multi_mode,
         timed_out,
+        Some(upload_status_rx),
         Some(task_guard),
     ))
 }
@@ -684,15 +713,32 @@ impl Drop for GrpcStreamTaskGuard {
     }
 }
 
+fn grpc_upload_status_from_error(error: &io::Error) -> Option<GrpcUploadStatus> {
+    let too_large = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<GrpcMessageTooLarge>())?;
+    Some(GrpcUploadStatus {
+        code: 8,
+        message: too_large.to_string(),
+    })
+}
+
 fn grpc_stream_response(
     reader: tokio::io::ReadHalf<DuplexStream>,
     multi_mode: bool,
     timed_out: Arc<AtomicBool>,
+    upload_status: Option<mpsc::UnboundedReceiver<GrpcUploadStatus>>,
     task_guard: Option<GrpcStreamTaskGuard>,
 ) -> Response<ResponseBody> {
     let stream = futures::stream::unfold(
-        (ReaderStream::new(reader), timed_out, false, task_guard),
-        move |(mut reader, timed_out, finished, task_guard)| async move {
+        (
+            ReaderStream::new(reader),
+            timed_out,
+            false,
+            upload_status,
+            task_guard,
+        ),
+        move |(mut reader, timed_out, finished, mut upload_status, task_guard)| async move {
             if finished {
                 return None;
             }
@@ -700,44 +746,73 @@ fn grpc_stream_response(
                 if timed_out.load(Ordering::Acquire) {
                     return Some((
                         Err(h2::Error::from(h2::Reason::CANCEL)),
-                        (reader, timed_out, true, task_guard),
+                        (reader, timed_out, true, upload_status, task_guard),
                     ));
                 }
-                match reader.next().await {
-                    Some(Ok(data)) if data.is_empty() => continue,
-                    Some(Ok(data)) => {
-                        return Some((
-                            Ok(Frame::data(encode_grpc_message(&data, multi_mode))),
-                            (reader, timed_out, false, task_guard),
-                        ));
+                tokio::select! {
+                    biased;
+                    status = async {
+                        match upload_status.as_mut() {
+                            Some(receiver) => receiver.recv().await,
+                            None => futures::future::pending().await,
+                        }
+                    } => {
+                        if let Some(status) = status {
+                            let mut trailers = hyper::HeaderMap::new();
+                            trailers.insert(
+                                "grpc-status",
+                                header::HeaderValue::from_str(&status.code.to_string())
+                                    .expect("valid gRPC status"),
+                            );
+                            trailers.insert(
+                                "grpc-message",
+                                header::HeaderValue::from_str(&status.message)
+                                    .expect("valid gRPC status message"),
+                            );
+                            return Some((
+                                Ok(Frame::trailers(trailers)),
+                                (reader, timed_out, true, upload_status, task_guard),
+                            ));
+                        }
+                        upload_status = None;
+                        continue;
                     }
-                    Some(Err(error)) => {
-                        debug!("gRPC response read failed: {error}");
-                        return Some((
-                            Err(h2::Error::from(h2::Reason::INTERNAL_ERROR)),
-                            (reader, timed_out, true, task_guard),
-                        ));
-                    }
-                    None if timed_out.load(Ordering::Acquire) => {
-                        return Some((
-                            Err(h2::Error::from(h2::Reason::CANCEL)),
-                            (reader, timed_out, true, task_guard),
-                        ));
-                    }
-                    None => {
-                        let mut trailers = hyper::HeaderMap::new();
-                        trailers.insert(
-                            "grpc-status",
-                            header::HeaderValue::from_static("0"),
-                        );
-                        trailers.insert(
-                            "grpc-message",
-                            header::HeaderValue::from_static(""),
-                        );
-                        return Some((
-                            Ok(Frame::trailers(trailers)),
-                            (reader, timed_out, true, task_guard),
-                        ));
+                    next = reader.next() => match next {
+                        Some(Ok(data)) if data.is_empty() => continue,
+                        Some(Ok(data)) => {
+                            return Some((
+                                Ok(Frame::data(encode_grpc_message(&data, multi_mode))),
+                                (reader, timed_out, false, upload_status, task_guard),
+                            ));
+                        }
+                        Some(Err(error)) => {
+                            debug!("gRPC response read failed: {error}");
+                            return Some((
+                                Err(h2::Error::from(h2::Reason::INTERNAL_ERROR)),
+                                (reader, timed_out, true, upload_status, task_guard),
+                            ));
+                        }
+                        None if timed_out.load(Ordering::Acquire) => {
+                            return Some((
+                                Err(h2::Error::from(h2::Reason::CANCEL)),
+                                (reader, timed_out, true, upload_status, task_guard),
+                            ));
+                        }
+                        None => {
+                            let mut trailers = hyper::HeaderMap::new();
+                            trailers.insert(
+                                "grpc-status",
+                                header::HeaderValue::from_static("0"),
+                            );
+                            trailers.insert(
+                                "grpc-message",
+                                header::HeaderValue::from_static(""),
+                            );
+                            return Some((
+                                Ok(Frame::trailers(trailers)),
+                                (reader, timed_out, true, upload_status, task_guard),
+                            ));
+                        }
                     }
                 }
             }
@@ -779,7 +854,9 @@ fn decode_grpc_message(
     if message_len > MAX_GRPC_MESSAGE_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "gRPC message exceeds 4 MiB",
+            GrpcMessageTooLarge {
+                received: message_len,
+            },
         ));
     }
     if buffer.len() < 5 + message_len {
@@ -1005,7 +1082,7 @@ mod tests {
         grpc_logical_peer_addr, grpc_malformed_timeout_response,
         grpc_method_not_allowed_response, grpc_service_paths, grpc_stream_response,
         grpc_timeout_duration, grpc_unimplemented_path_response,
-        grpc_unsupported_encoding,
+        grpc_unsupported_encoding, grpc_upload_status_from_error,
     };
 
     #[test]
@@ -1102,6 +1179,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grpc_oversized_message_reports_resource_exhausted_like_xray_v26_2_6() {
+        let mut buffer = BytesMut::from(&[0_u8, 0, 0x40, 0, 1][..]);
+        let error = decode_grpc_message(&mut buffer, false)
+            .expect_err("4 MiB + 1 gRPC message must be rejected");
+        let status = grpc_upload_status_from_error(&error)
+            .expect("oversized gRPC message must map to a status");
+        assert_eq!(status.code, 8);
+        assert_eq!(
+            status.message,
+            "grpc: received message larger than max (4194305 vs. 4194304)"
+        );
+
+        let (transport_stream, handler_stream) = tokio::io::duplex(64);
+        let (transport_read, _transport_write) = tokio::io::split(transport_stream);
+        drop(handler_stream);
+        let (status_tx, status_rx) = tokio::sync::mpsc::unbounded_channel();
+        status_tx.send(status).unwrap();
+        drop(status_tx);
+
+        let response = grpc_stream_response(
+            transport_read,
+            false,
+            Arc::new(AtomicBool::new(false)),
+            Some(status_rx),
+            None,
+        );
+        let collected = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("collect resource exhausted response");
+        let trailers = collected.trailers().expect("resource exhausted trailers");
+        assert_eq!(trailers["grpc-status"], "8");
+        assert_eq!(
+            trailers["grpc-message"],
+            "grpc: received message larger than max (4194305 vs. 4194304)"
+        );
+    }
+
+    #[tokio::test]
     async fn grpc_success_metadata_matches_xray_v26_2_6() {
         let (transport_stream, handler_stream) = tokio::io::duplex(64);
         let (transport_read, _transport_write) = tokio::io::split(transport_stream);
@@ -1111,6 +1226,7 @@ mod tests {
             transport_read,
             false,
             Arc::new(AtomicBool::new(false)),
+            None,
             None,
         );
         assert_eq!(response.status(), hyper::StatusCode::OK);
@@ -1144,6 +1260,7 @@ mod tests {
             transport_read,
             false,
             Arc::new(AtomicBool::new(false)),
+            None,
             Some(guard),
         );
         drop(response);
@@ -1169,7 +1286,8 @@ mod tests {
         drop(handler_stream);
         let timed_out = Arc::new(AtomicBool::new(true));
 
-        let response = grpc_stream_response(transport_read, false, timed_out, None);
+        let response =
+            grpc_stream_response(transport_read, false, timed_out, None, None);
         let error = http_body_util::BodyExt::collect(response.into_body())
             .await
             .expect_err("expired gRPC stream must end with a body error");
