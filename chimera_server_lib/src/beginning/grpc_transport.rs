@@ -934,7 +934,9 @@ fn grpc_unimplemented_path_response(
 
 fn grpc_unsupported_encoding(headers: &hyper::HeaderMap) -> Option<&str> {
     headers
-        .get("grpc-encoding")
+        .get_all("grpc-encoding")
+        .iter()
+        .next_back()
         .and_then(|value| value.to_str().ok())
         .filter(|encoding| !encoding.is_empty() && *encoding != "identity")
 }
@@ -2219,6 +2221,16 @@ mod tests {
 
         headers.insert("grpc-encoding", "deflate".parse().unwrap());
         assert_eq!(grpc_unsupported_encoding(&headers), Some("deflate"));
+
+        headers.clear();
+        headers.append("grpc-encoding", "identity".parse().unwrap());
+        headers.append("grpc-encoding", "gzip".parse().unwrap());
+        assert_eq!(grpc_unsupported_encoding(&headers), Some("gzip"));
+
+        headers.clear();
+        headers.append("grpc-encoding", "gzip".parse().unwrap());
+        headers.append("grpc-encoding", "identity".parse().unwrap());
+        assert_eq!(grpc_unsupported_encoding(&headers), None);
     }
 
     #[test]
