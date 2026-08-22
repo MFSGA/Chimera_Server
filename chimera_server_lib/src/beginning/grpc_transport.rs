@@ -90,6 +90,21 @@ impl std::fmt::Display for GrpcCompressedMessage {
 impl std::error::Error for GrpcCompressedMessage {}
 
 #[derive(Debug)]
+struct GrpcUnexpectedPayloadFormat(u8);
+
+impl std::fmt::Display for GrpcUnexpectedPayloadFormat {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "grpc: received unexpected payload format {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for GrpcUnexpectedPayloadFormat {}
+
+#[derive(Debug)]
 struct GrpcInvalidProtobuf;
 
 impl std::fmt::Display for GrpcInvalidProtobuf {
@@ -759,6 +774,12 @@ fn grpc_upload_status_from_error(error: &io::Error) -> Option<GrpcUploadStatus> 
             message: compressed.to_string(),
         });
     }
+    if let Some(format) = source.downcast_ref::<GrpcUnexpectedPayloadFormat>() {
+        return Some(GrpcUploadStatus {
+            code: 13,
+            message: format.to_string(),
+        });
+    }
     source
         .downcast_ref::<GrpcInvalidProtobuf>()
         .map(|invalid| GrpcUploadStatus {
@@ -887,11 +908,20 @@ fn decode_grpc_message(
     if buffer.len() < 5 {
         return Ok(None);
     }
-    if buffer[0] != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            GrpcCompressedMessage,
-        ));
+    match buffer[0] {
+        0 => {}
+        1 => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                GrpcCompressedMessage,
+            ));
+        }
+        format => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                GrpcUnexpectedPayloadFormat(format),
+            ));
+        }
     }
     let message_len =
         u32::from_be_bytes(buffer[1..5].try_into().expect("gRPC length")) as usize;
@@ -1372,6 +1402,22 @@ mod tests {
             trailers["grpc-message"],
             "grpc: compressed flag set with identity or empty encoding"
         );
+    }
+
+    #[tokio::test]
+    async fn grpc_invalid_payload_format_reports_internal_like_xray_v26_2_6() {
+        for format in [2_u8, u8::MAX] {
+            let mut buffer = BytesMut::from(&[format, 0, 0, 0, 0][..]);
+            let error = decode_grpc_message(&mut buffer, false)
+                .expect_err("unsupported gRPC payload format must be rejected");
+            let status = grpc_upload_status_from_error(&error)
+                .expect("unsupported gRPC payload format must map to a status");
+            assert_eq!(status.code, 13);
+            assert_eq!(
+                status.message,
+                format!("grpc: received unexpected payload format {format}")
+            );
+        }
     }
 
     #[tokio::test]
