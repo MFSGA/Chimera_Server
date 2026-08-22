@@ -1,5 +1,6 @@
 use std::{
     convert::Infallible,
+    future::Future,
     io,
     pin::Pin,
     sync::{
@@ -25,6 +26,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex},
     sync::mpsc,
     task::{AbortHandle, JoinHandle},
+    time::{Instant, Sleep},
 };
 #[cfg(feature = "tls")]
 use tokio_rustls::TlsAcceptor;
@@ -55,6 +57,9 @@ use super::process_stream;
 
 const GRPC_PIPE_CAPACITY: usize = 64 * 1024;
 const MAX_GRPC_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+const GRPC_CONNECTION_SETUP_TIMEOUT: Duration = Duration::from_secs(120);
+const HTTP2_CLIENT_PREFACE_LEN: usize = 24;
+const HTTP2_FRAME_HEADER_LEN: usize = 9;
 
 type ResponseBody = UnsyncBoxBody<Bytes, h2::Error>;
 
@@ -127,6 +132,138 @@ struct GrpcKeepalive {
     health_check_timeout: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct GrpcConnectionContext {
+    peer_addr: std::net::SocketAddr,
+    setup_deadline: Instant,
+}
+
+#[derive(Debug)]
+enum GrpcSetupState {
+    Preface(usize),
+    FrameHeader {
+        bytes: [u8; HTTP2_FRAME_HEADER_LEN],
+        filled: usize,
+    },
+    FramePayload(usize),
+    Complete,
+}
+
+struct GrpcSetupTimeoutIo<IO> {
+    inner: IO,
+    deadline: Pin<Box<Sleep>>,
+    state: GrpcSetupState,
+}
+
+impl<IO> GrpcSetupTimeoutIo<IO> {
+    fn new(inner: IO, deadline: Instant) -> Self {
+        Self {
+            inner,
+            deadline: Box::pin(tokio::time::sleep_until(deadline)),
+            state: GrpcSetupState::Preface(0),
+        }
+    }
+
+    fn observe_read(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            match &mut self.state {
+                GrpcSetupState::Preface(read) => {
+                    let take = (HTTP2_CLIENT_PREFACE_LEN - *read).min(bytes.len());
+                    *read += take;
+                    bytes = &bytes[take..];
+                    if *read == HTTP2_CLIENT_PREFACE_LEN {
+                        self.state = GrpcSetupState::FrameHeader {
+                            bytes: [0; HTTP2_FRAME_HEADER_LEN],
+                            filled: 0,
+                        };
+                    }
+                }
+                GrpcSetupState::FrameHeader {
+                    bytes: header,
+                    filled,
+                } => {
+                    let take = (HTTP2_FRAME_HEADER_LEN - *filled).min(bytes.len());
+                    header[*filled..*filled + take].copy_from_slice(&bytes[..take]);
+                    *filled += take;
+                    bytes = &bytes[take..];
+                    if *filled == HTTP2_FRAME_HEADER_LEN {
+                        let payload_len = (usize::from(header[0]) << 16)
+                            | (usize::from(header[1]) << 8)
+                            | usize::from(header[2]);
+                        self.state = if payload_len == 0 {
+                            GrpcSetupState::Complete
+                        } else {
+                            GrpcSetupState::FramePayload(payload_len)
+                        };
+                    }
+                }
+                GrpcSetupState::FramePayload(remaining) => {
+                    let take = (*remaining).min(bytes.len());
+                    *remaining -= take;
+                    bytes = &bytes[take..];
+                    if *remaining == 0 {
+                        self.state = GrpcSetupState::Complete;
+                    }
+                }
+                GrpcSetupState::Complete => break,
+            }
+        }
+    }
+}
+
+impl<IO: AsyncRead + Unpin> AsyncRead for GrpcSetupTimeoutIo<IO> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if !matches!(self.state, GrpcSetupState::Complete)
+            && self.deadline.as_mut().poll(cx).is_ready()
+        {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "gRPC HTTP/2 connection setup timed out",
+            )));
+        }
+
+        let before = buf.filled().len();
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                let after = buf.filled().len();
+                if after > before {
+                    self.observe_read(&buf.filled()[before..after]);
+                }
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+impl<IO: AsyncWrite + Unpin> AsyncWrite for GrpcSetupTimeoutIo<IO> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 #[derive(Debug)]
 enum GrpcSecurity {
     Plain,
@@ -187,33 +324,50 @@ pub(super) async fn start_grpc_server(
                 GrpcSecurity::Plain => {
                     tokio::spawn(serve_grpc_connection(
                         stream,
+                        GrpcConnectionContext {
+                            peer_addr,
+                            setup_deadline: Instant::now()
+                                + GRPC_CONNECTION_SETUP_TIMEOUT,
+                        },
                         (tun_service_path, tun_multi_service_path),
                         keepalive,
                         server_handler,
                         resolver,
                         runtime,
-                        peer_addr,
                     ));
                 }
                 #[cfg(feature = "tls")]
                 GrpcSecurity::Tls(server_config) => {
                     let acceptor = TlsAcceptor::from(server_config.clone());
                     tokio::spawn(async move {
-                        match acceptor.accept(stream).await {
-                            Ok(stream) => {
+                        let setup_deadline =
+                            Instant::now() + GRPC_CONNECTION_SETUP_TIMEOUT;
+                        match tokio::time::timeout_at(
+                            setup_deadline,
+                            acceptor.accept(stream),
+                        )
+                        .await
+                        {
+                            Ok(Ok(stream)) => {
                                 serve_grpc_connection(
                                     stream,
+                                    GrpcConnectionContext {
+                                        peer_addr,
+                                        setup_deadline,
+                                    },
                                     (tun_service_path, tun_multi_service_path),
                                     keepalive,
                                     server_handler,
                                     resolver,
                                     runtime,
-                                    peer_addr,
                                 )
                                 .await;
                             }
-                            Err(error) => {
+                            Ok(Err(error)) => {
                                 debug!("gRPC TLS handshake failed: {error}");
+                            }
+                            Err(_) => {
+                                debug!("gRPC TLS handshake timed out");
                             }
                         }
                     });
@@ -231,12 +385,16 @@ pub(super) async fn start_grpc_server(
                             Ok(stream) => {
                                 serve_grpc_connection(
                                     stream,
+                                    GrpcConnectionContext {
+                                        peer_addr,
+                                        setup_deadline: Instant::now()
+                                            + GRPC_CONNECTION_SETUP_TIMEOUT,
+                                    },
                                     (tun_service_path, tun_multi_service_path),
                                     keepalive,
                                     server_handler,
                                     resolver,
                                     runtime,
-                                    peer_addr,
                                 )
                                 .await;
                             }
@@ -389,16 +547,20 @@ fn grpc_http2_builder(keepalive: GrpcKeepalive) -> http2::Builder<TokioExecutor>
 
 async fn serve_grpc_connection<IO>(
     io: IO,
+    connection: GrpcConnectionContext,
     service_paths: (String, String),
     keepalive: GrpcKeepalive,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
     resolver: Arc<dyn Resolver>,
     runtime: RuntimeState,
-    peer_addr: std::net::SocketAddr,
 ) where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let builder = grpc_http2_builder(keepalive);
+    let GrpcConnectionContext {
+        peer_addr,
+        setup_deadline,
+    } = connection;
     let (tun_service_path, tun_multi_service_path) = service_paths;
     let service = service_fn(move |request| {
         handle_request(
@@ -411,6 +573,7 @@ async fn serve_grpc_connection<IO>(
             peer_addr,
         )
     });
+    let io = GrpcSetupTimeoutIo::new(io, setup_deadline);
     if let Err(error) = builder.serve_connection(TokioIo::new(io), service).await {
         debug!("gRPC transport connection {peer_addr} ended: {error}");
     }
@@ -1194,16 +1357,20 @@ mod tests {
     use std::{
         convert::Infallible,
         sync::{Arc, atomic::AtomicBool},
+        time::Duration,
     };
 
     use bytes::{Bytes, BytesMut};
     use http_body_util::Full;
     use hyper::{HeaderMap, Response, service::service_fn};
     use hyper_util::rt::TokioIo;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        time::Instant,
+    };
 
     use super::{
-        GrpcKeepalive, GrpcStreamTaskGuard, decode_grpc_message,
+        GrpcKeepalive, GrpcSetupTimeoutIo, GrpcStreamTaskGuard, decode_grpc_message,
         encode_grpc_message, grpc_content_type_is_valid, grpc_http2_builder,
         grpc_invalid_content_type_response, grpc_logical_peer_addr,
         grpc_malformed_timeout_response, grpc_method_not_allowed_response,
@@ -1211,6 +1378,61 @@ mod tests {
         grpc_unimplemented_path_response, grpc_unsupported_encoding,
         grpc_upload_status_from_error,
     };
+
+    #[tokio::test]
+    async fn grpc_setup_timeout_expires_before_http2_handshake() {
+        let (_client, server) = tokio::io::duplex(64);
+        let mut server = GrpcSetupTimeoutIo::new(
+            server,
+            Instant::now() + Duration::from_millis(20),
+        );
+
+        let error = server.read_u8().await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn grpc_setup_timeout_includes_initial_settings_frame() {
+        let (mut client, server) = tokio::io::duplex(128);
+        let mut server = GrpcSetupTimeoutIo::new(
+            server,
+            Instant::now() + Duration::from_millis(30),
+        );
+        let reader = tokio::spawn(async move {
+            let mut setup = [0u8; 33];
+            server.read_exact(&mut setup).await.unwrap();
+            server.read_u8().await
+        });
+
+        client
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x06\x04\x00\x00\x00\x00\x00")
+            .await
+            .unwrap();
+
+        let error = reader.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn grpc_setup_timeout_clears_after_preface_and_settings() {
+        let (mut client, server) = tokio::io::duplex(128);
+        let deadline = Instant::now() + Duration::from_millis(40);
+        let mut server = GrpcSetupTimeoutIo::new(server, deadline);
+        let reader = tokio::spawn(async move {
+            let mut setup = [0u8; 33];
+            server.read_exact(&mut setup).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            server.read_u8().await.unwrap()
+        });
+
+        let mut setup = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        setup.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+        client.write_all(&setup).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        client.write_u8(0x7f).await.unwrap();
+
+        assert_eq!(reader.await.unwrap(), 0x7f);
+    }
 
     #[tokio::test]
     async fn grpc_server_rejects_http1_like_xray_v26_2_6() {
