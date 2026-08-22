@@ -25,7 +25,7 @@ use hyper_util::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex},
-    task::JoinHandle,
+    task::{AbortHandle, JoinHandle},
 };
 #[cfg(feature = "tls")]
 use tokio_rustls::TlsAcceptor;
@@ -396,16 +396,8 @@ async fn handle_request(
     }
 
     let (handler_stream, transport_stream) = duplex(GRPC_PIPE_CAPACITY);
-    let (transport_read, transport_write) = tokio::io::split(transport_stream);
+    let (transport_read, mut transport_write) = tokio::io::split(transport_stream);
     let timed_out = Arc::new(AtomicBool::new(false));
-    let mut body = request.into_body();
-    let upload_task = tokio::spawn(async move {
-        if let Err(error) =
-            decode_request_body(&mut body, transport_write, multi_mode).await
-        {
-            debug!("gRPC upload decode failed: {error}");
-        }
-    });
     let stream_task = tokio::spawn(async move {
         if let Err(error) = process_stream(
             GrpcLogicalStream(handler_stream),
@@ -419,19 +411,48 @@ async fn handle_request(
             debug!("gRPC logical stream {logical_peer_addr} ended: {error}");
         }
     });
-    if let Some(timeout) = grpc_timeout {
-        let upload_abort = upload_task.abort_handle();
-        let stream_abort = stream_task.abort_handle();
+    let stream_abort = stream_task.abort_handle();
+    let upload_stream_abort = stream_abort.clone();
+    let mut body = request.into_body();
+    let upload_task = tokio::spawn(async move {
+        match decode_request_body(&mut body, &mut transport_write, multi_mode).await
+        {
+            Ok(()) => {
+                // grpc-go keeps the logical transport open after request END_STREAM;
+                // only RPC cancellation or the logical stream ending closes it.
+                futures::future::pending::<()>().await;
+            }
+            Err(error) => {
+                debug!("gRPC upload decode failed: {error}");
+                upload_stream_abort.abort();
+            }
+        }
+    });
+    let upload_abort = upload_task.abort_handle();
+    let deadline_abort = grpc_timeout.map(|timeout| {
+        let upload_abort = upload_abort.clone();
+        let stream_abort = stream_abort.clone();
         let timed_out = timed_out.clone();
         tokio::spawn(async move {
             tokio::time::sleep(timeout).await;
             timed_out.store(true, Ordering::Release);
             upload_abort.abort();
             stream_abort.abort();
-        });
-    }
+        })
+        .abort_handle()
+    });
+    let task_guard = GrpcStreamTaskGuard {
+        upload_abort,
+        stream_abort,
+        deadline_abort,
+    };
 
-    Ok(grpc_stream_response(transport_read, multi_mode, timed_out))
+    Ok(grpc_stream_response(
+        transport_read,
+        multi_mode,
+        timed_out,
+        Some(task_guard),
+    ))
 }
 
 fn grpc_timeout_duration(
@@ -619,7 +640,7 @@ fn grpc_logical_peer_addr(
 
 async fn decode_request_body(
     body: &mut Incoming,
-    mut writer: tokio::io::WriteHalf<DuplexStream>,
+    writer: &mut tokio::io::WriteHalf<DuplexStream>,
     multi_mode: bool,
 ) -> io::Result<()> {
     let mut buffered = BytesMut::new();
@@ -644,17 +665,34 @@ async fn decode_request_body(
             "truncated gRPC message",
         ));
     }
-    writer.shutdown().await
+    Ok(())
+}
+
+struct GrpcStreamTaskGuard {
+    upload_abort: AbortHandle,
+    stream_abort: AbortHandle,
+    deadline_abort: Option<AbortHandle>,
+}
+
+impl Drop for GrpcStreamTaskGuard {
+    fn drop(&mut self) {
+        self.upload_abort.abort();
+        self.stream_abort.abort();
+        if let Some(deadline_abort) = &self.deadline_abort {
+            deadline_abort.abort();
+        }
+    }
 }
 
 fn grpc_stream_response(
     reader: tokio::io::ReadHalf<DuplexStream>,
     multi_mode: bool,
     timed_out: Arc<AtomicBool>,
+    task_guard: Option<GrpcStreamTaskGuard>,
 ) -> Response<ResponseBody> {
     let stream = futures::stream::unfold(
-        (ReaderStream::new(reader), timed_out, false),
-        move |(mut reader, timed_out, finished)| async move {
+        (ReaderStream::new(reader), timed_out, false, task_guard),
+        move |(mut reader, timed_out, finished, task_guard)| async move {
             if finished {
                 return None;
             }
@@ -662,7 +700,7 @@ fn grpc_stream_response(
                 if timed_out.load(Ordering::Acquire) {
                     return Some((
                         Err(h2::Error::from(h2::Reason::CANCEL)),
-                        (reader, timed_out, true),
+                        (reader, timed_out, true, task_guard),
                     ));
                 }
                 match reader.next().await {
@@ -670,20 +708,20 @@ fn grpc_stream_response(
                     Some(Ok(data)) => {
                         return Some((
                             Ok(Frame::data(encode_grpc_message(&data, multi_mode))),
-                            (reader, timed_out, false),
+                            (reader, timed_out, false, task_guard),
                         ));
                     }
                     Some(Err(error)) => {
                         debug!("gRPC response read failed: {error}");
                         return Some((
                             Err(h2::Error::from(h2::Reason::INTERNAL_ERROR)),
-                            (reader, timed_out, true),
+                            (reader, timed_out, true, task_guard),
                         ));
                     }
                     None if timed_out.load(Ordering::Acquire) => {
                         return Some((
                             Err(h2::Error::from(h2::Reason::CANCEL)),
-                            (reader, timed_out, true),
+                            (reader, timed_out, true, task_guard),
                         ));
                     }
                     None => {
@@ -698,7 +736,7 @@ fn grpc_stream_response(
                         );
                         return Some((
                             Ok(Frame::trailers(trailers)),
-                            (reader, timed_out, true),
+                            (reader, timed_out, true, task_guard),
                         ));
                     }
                 }
@@ -962,11 +1000,12 @@ mod tests {
     use hyper::HeaderMap;
 
     use super::{
-        decode_grpc_message, encode_grpc_message, grpc_content_type_is_valid,
-        grpc_invalid_content_type_response, grpc_logical_peer_addr,
-        grpc_malformed_timeout_response, grpc_method_not_allowed_response,
-        grpc_service_paths, grpc_stream_response, grpc_timeout_duration,
-        grpc_unimplemented_path_response, grpc_unsupported_encoding,
+        GrpcStreamTaskGuard, decode_grpc_message, encode_grpc_message,
+        grpc_content_type_is_valid, grpc_invalid_content_type_response,
+        grpc_logical_peer_addr, grpc_malformed_timeout_response,
+        grpc_method_not_allowed_response, grpc_service_paths, grpc_stream_response,
+        grpc_timeout_duration, grpc_unimplemented_path_response,
+        grpc_unsupported_encoding,
     };
 
     #[test]
@@ -1072,6 +1111,7 @@ mod tests {
             transport_read,
             false,
             Arc::new(AtomicBool::new(false)),
+            None,
         );
         assert_eq!(response.status(), hyper::StatusCode::OK);
         assert_eq!(response.headers()["content-type"], "application/grpc");
@@ -1087,13 +1127,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_grpc_response_aborts_logical_stream_tasks() {
+        let (transport_stream, _handler_stream) = tokio::io::duplex(64);
+        let (transport_read, _transport_write) = tokio::io::split(transport_stream);
+        let upload_task = tokio::spawn(futures::future::pending::<()>());
+        let stream_task = tokio::spawn(futures::future::pending::<()>());
+        let upload_abort = upload_task.abort_handle();
+        let stream_abort = stream_task.abort_handle();
+        let guard = GrpcStreamTaskGuard {
+            upload_abort,
+            stream_abort,
+            deadline_abort: None,
+        };
+
+        let response = grpc_stream_response(
+            transport_read,
+            false,
+            Arc::new(AtomicBool::new(false)),
+            Some(guard),
+        );
+        drop(response);
+
+        assert!(
+            upload_task
+                .await
+                .expect_err("upload task must be aborted")
+                .is_cancelled()
+        );
+        assert!(
+            stream_task
+                .await
+                .expect_err("logical stream task must be aborted")
+                .is_cancelled()
+        );
+    }
+
+    #[tokio::test]
     async fn grpc_deadline_ends_stream_without_success_trailers() {
         let (transport_stream, handler_stream) = tokio::io::duplex(64);
         let (transport_read, _transport_write) = tokio::io::split(transport_stream);
         drop(handler_stream);
         let timed_out = Arc::new(AtomicBool::new(true));
 
-        let response = grpc_stream_response(transport_read, false, timed_out);
+        let response = grpc_stream_response(transport_read, false, timed_out, None);
         let error = http_body_util::BodyExt::collect(response.into_body())
             .await
             .expect_err("expired gRPC stream must end with a body error");
