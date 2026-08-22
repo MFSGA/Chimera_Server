@@ -957,7 +957,7 @@ fn decode_data_fields(message: &[u8], multi_mode: bool) -> io::Result<Vec<Vec<u8
 
         // Generated protobuf decoders treat a known field with the wrong wire
         // type as an unknown field. Xray therefore skips it instead of failing.
-        offset = skip_protobuf_field(message, offset, wire_type)?;
+        offset = skip_protobuf_field(message, offset, field_number, wire_type)?;
     }
 
     if payloads.is_empty() {
@@ -969,6 +969,7 @@ fn decode_data_fields(message: &[u8], multi_mode: bool) -> io::Result<Vec<Vec<u8
 fn skip_protobuf_field(
     message: &[u8],
     mut offset: usize,
+    field_number: usize,
     wire_type: usize,
 ) -> io::Result<usize> {
     match wire_type {
@@ -993,6 +994,45 @@ fn skip_protobuf_field(
                     "protobuf field length overflow",
                 )
             })?;
+        }
+        3 => loop {
+            if offset >= message.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated protobuf group",
+                ));
+            }
+            let (key, key_len) = decode_varint(&message[offset..])?;
+            offset += key_len;
+            let nested_field_number = key >> 3;
+            let nested_wire_type = key & 0x07;
+            if nested_field_number == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "protobuf field number cannot be zero",
+                ));
+            }
+            if nested_wire_type == 4 {
+                if nested_field_number != field_number {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "protobuf group end field mismatch",
+                    ));
+                }
+                break;
+            }
+            offset = skip_protobuf_field(
+                message,
+                offset,
+                nested_field_number,
+                nested_wire_type,
+            )?;
+        },
+        4 => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected protobuf end group",
+            ));
         }
         5 => {
             offset = offset.checked_add(4).ok_or_else(|| {
@@ -1579,6 +1619,25 @@ mod tests {
             .expect("decode Hunk with protobuf-compatible unknown fields")
             .expect("complete Hunk");
         assert_eq!(decoded, vec![b"last".to_vec()]);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn hunk_skips_unknown_group_fields_like_xray_v26_2_6() {
+        let protobuf = [
+            0x13, // unknown field 2, start group
+            0x18, 0x01, // nested unknown varint field 3
+            0x14, // field 2, end group
+            0x0a, 0x02, b'o', b'k',
+        ];
+        let mut frame = vec![0];
+        frame.extend_from_slice(&(protobuf.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&protobuf);
+        let mut buffer = BytesMut::from(frame.as_slice());
+        let decoded = decode_grpc_message(&mut buffer, false)
+            .expect("unknown protobuf group is skipped by generated decoder")
+            .expect("complete Hunk");
+        assert_eq!(decoded, vec![b"ok".to_vec()]);
         assert!(buffer.is_empty());
     }
 
