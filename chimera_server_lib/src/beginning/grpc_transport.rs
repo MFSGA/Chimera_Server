@@ -708,9 +708,20 @@ async fn handle_request(
 fn grpc_timeout_duration(
     headers: &hyper::HeaderMap,
 ) -> Result<Option<Duration>, String> {
-    let Some(value) = headers.get("grpc-timeout") else {
+    let mut values = headers.get_all("grpc-timeout").iter();
+    let Some(first) = values.next() else {
         return Ok(None);
     };
+    let first_timeout = parse_grpc_timeout_value(first)?;
+    for value in values {
+        parse_grpc_timeout_value(value)?;
+    }
+    Ok(Some(first_timeout))
+}
+
+fn parse_grpc_timeout_value(
+    value: &hyper::header::HeaderValue,
+) -> Result<Duration, String> {
     let value = value.to_str().map_err(|_| {
         "malformed grpc-timeout: transport: timeout contains non-ASCII bytes"
             .to_string()
@@ -759,7 +770,7 @@ fn grpc_timeout_duration(
     } else {
         unit * amount as u32
     };
-    Ok(Some(timeout))
+    Ok(timeout)
 }
 
 fn grpc_encode_message(message: &str) -> String {
@@ -2172,6 +2183,24 @@ mod tests {
         assert_eq!(response.status(), hyper::StatusCode::BAD_REQUEST);
         assert_eq!(response.headers()["grpc-status"], "13");
         assert_eq!(response.headers()["grpc-message"], message);
+    }
+
+    #[test]
+    fn grpc_duplicate_timeouts_validate_all_values_but_use_first_like_xray_v26_2_6()
+    {
+        let mut headers = HeaderMap::new();
+        headers.append("grpc-timeout", "1S".parse().unwrap());
+        headers.append("grpc-timeout", "2S".parse().unwrap());
+        assert_eq!(
+            grpc_timeout_duration(&headers).unwrap(),
+            Some(std::time::Duration::from_secs(1))
+        );
+
+        headers.append("grpc-timeout", "nope".parse().unwrap());
+        assert_eq!(
+            grpc_timeout_duration(&headers).unwrap_err(),
+            "malformed grpc-timeout: transport: timeout unit is not recognized: \"nope\""
+        );
     }
 
     #[test]
