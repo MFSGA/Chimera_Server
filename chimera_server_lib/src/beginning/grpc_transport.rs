@@ -617,8 +617,14 @@ async fn handle_request(
         Ok(timeout) => timeout,
         Err(message) => return Ok(grpc_malformed_timeout_response(&message)),
     };
+    let grpc_deadline =
+        grpc_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
     if request.method() != Method::POST {
         return Ok(grpc_method_not_allowed_response(request.method()));
+    }
+    if grpc_deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+    {
+        return Ok(grpc_deadline_exceeded_response());
     }
     let request_path = request.uri().path();
     let multi_mode = match request_path {
@@ -678,12 +684,12 @@ async fn handle_request(
         }
     });
     let upload_abort = upload_task.abort_handle();
-    let deadline_abort = grpc_timeout.map(|timeout| {
+    let deadline_abort = grpc_deadline.map(|deadline| {
         let upload_abort = upload_abort.clone();
         let stream_abort = stream_abort.clone();
         let timed_out = timed_out.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(timeout).await;
+            tokio::time::sleep_until(deadline).await;
             timed_out.store(true, Ordering::Release);
             upload_abort.abort();
             stream_abort.abort();
@@ -883,6 +889,10 @@ fn grpc_malformed_timeout_response(message: &str) -> Response<ResponseBody> {
         .header("grpc-message", grpc_encode_message(message))
         .body(empty_grpc_body())
         .unwrap()
+}
+
+fn grpc_deadline_exceeded_response() -> Response<ResponseBody> {
+    grpc_status_response(4, "context deadline exceeded")
 }
 
 fn empty_grpc_body() -> ResponseBody {
@@ -1523,14 +1533,14 @@ mod tests {
     use super::{
         GrpcKeepalive, GrpcSetupTimeoutIo, GrpcStreamTaskGuard, decode_grpc_message,
         encode_grpc_message, grpc_content_type, grpc_content_type_is_valid,
-        grpc_duplicate_host_error, grpc_duplicate_host_response,
-        grpc_encode_message, grpc_http2_builder, grpc_invalid_base64_offset,
-        grpc_invalid_content_type_response, grpc_logical_peer_addr,
-        grpc_malformed_binary_metadata, grpc_malformed_binary_metadata_response,
-        grpc_malformed_timeout_response, grpc_method_not_allowed_response,
-        grpc_service_paths, grpc_stream_response, grpc_timeout_duration,
-        grpc_unimplemented_path_response, grpc_unsupported_encoding,
-        grpc_upload_status_from_error,
+        grpc_deadline_exceeded_response, grpc_duplicate_host_error,
+        grpc_duplicate_host_response, grpc_encode_message, grpc_http2_builder,
+        grpc_invalid_base64_offset, grpc_invalid_content_type_response,
+        grpc_logical_peer_addr, grpc_malformed_binary_metadata,
+        grpc_malformed_binary_metadata_response, grpc_malformed_timeout_response,
+        grpc_method_not_allowed_response, grpc_service_paths, grpc_stream_response,
+        grpc_timeout_duration, grpc_unimplemented_path_response,
+        grpc_unsupported_encoding, grpc_upload_status_from_error,
     };
 
     #[tokio::test]
@@ -2263,6 +2273,17 @@ mod tests {
         assert_eq!(response.status(), hyper::StatusCode::BAD_REQUEST);
         assert_eq!(response.headers()["grpc-status"], "13");
         assert_eq!(response.headers()["grpc-message"], message);
+    }
+
+    #[test]
+    fn grpc_expired_deadline_uses_xray_status() {
+        let response = grpc_deadline_exceeded_response();
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+        assert_eq!(response.headers()["grpc-status"], "4");
+        assert_eq!(
+            response.headers()["grpc-message"],
+            "context deadline exceeded"
+        );
     }
 
     #[test]
