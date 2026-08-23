@@ -199,6 +199,21 @@ impl WebsocketStream {
             return Err(std::io::Error::other(format!("websocket: {reason}")));
         }
 
+        let is_control = matches!(
+            self.read_frame_opcode,
+            OpCode::Close | OpCode::Ping | OpCode::Pong
+        );
+        if is_control && !read_frame_final {
+            self.queue_protocol_error("FIN not set on control")?;
+            return Err(std::io::Error::other("websocket: FIN not set on control"));
+        }
+
+        let length = second & 0x7f;
+        if is_control && length > 125 {
+            self.queue_protocol_error("len > 125 for control")?;
+            return Err(std::io::Error::other("websocket: len > 125 for control"));
+        }
+
         match self.read_frame_opcode {
             OpCode::Continue => {
                 if !self.read_message_fragmented {
@@ -226,8 +241,6 @@ impl WebsocketStream {
             }
             _ => {}
         }
-
-        let length = second & 0x7f;
 
         if length == 126 {
             self.read_state = ReadState::ReadLength {
@@ -1194,6 +1207,31 @@ mod tests {
 
             let reason = format!("bad opcode {opcode}");
             assert_protocol_close(&mut peer, &mut websocket, &reason).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn server_rejects_invalid_control_frames_like_xray() {
+        for opcode in [0x08u8, 0x09, 0x0a] {
+            let (mut peer, transport) = tokio::io::duplex(128);
+            let mut websocket = websocket_over(transport);
+            peer.write_all(&masked_frame(opcode, b"x")).await.unwrap();
+            assert_protocol_close(
+                &mut peer,
+                &mut websocket,
+                "FIN not set on control",
+            )
+            .await;
+
+            let (mut peer, transport) = tokio::io::duplex(128);
+            let mut websocket = websocket_over(transport);
+            peer.write_all(&[0x80 | opcode, 0xfe]).await.unwrap();
+            assert_protocol_close(
+                &mut peer,
+                &mut websocket,
+                "len > 125 for control",
+            )
+            .await;
         }
     }
 
