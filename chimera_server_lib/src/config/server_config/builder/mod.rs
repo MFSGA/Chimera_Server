@@ -76,6 +76,15 @@ fn parse_xray_finalmask_bandwidth(input: &str) -> Result<u64, Error> {
 }
 
 #[cfg(feature = "ws")]
+fn normalize_xray_websocket_path(path: Option<String>) -> String {
+    match path {
+        Some(path) if path.starts_with('/') => path,
+        Some(path) if !path.is_empty() => format!("/{path}"),
+        _ => "/".to_string(),
+    }
+}
+
+#[cfg(feature = "ws")]
 fn websocket_server_config(
     ws_setting: crate::config::WsSettings,
     protocol: ServerProxyConfig,
@@ -108,7 +117,7 @@ fn websocket_server_config(
     }
 
     WebsocketServerConfig {
-        matching_path: ws_setting.path,
+        matching_path: Some(normalize_xray_websocket_path(ws_setting.path)),
         matching_headers: if matching_headers.is_empty() {
             None
         } else {
@@ -3165,6 +3174,21 @@ mod tests {
             }
             other => panic!("expected HTTPUpgrade protocol, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "ws")]
+    #[test]
+    fn websocket_path_matches_xray_normalization() {
+        assert_eq!(normalize_xray_websocket_path(None), "/");
+        assert_eq!(normalize_xray_websocket_path(Some(String::new())), "/");
+        assert_eq!(
+            normalize_xray_websocket_path(Some("chat".to_string())),
+            "/chat"
+        );
+        assert_eq!(
+            normalize_xray_websocket_path(Some("/chat".to_string())),
+            "/chat"
+        );
     }
 
     #[cfg(all(feature = "vless", feature = "ws"))]
