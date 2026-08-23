@@ -226,7 +226,7 @@ impl WebsocketStream {
                     self.read_message_fragmented = false;
                 }
             }
-            OpCode::Binary => {
+            OpCode::Text | OpCode::Binary => {
                 if self.read_message_fragmented {
                     self.queue_protocol_error("data before FIN")?;
                     return Err(std::io::Error::other("websocket: data before FIN"));
@@ -334,7 +334,7 @@ impl WebsocketStream {
         buf: &mut ReadBuf<'_>,
     ) -> std::io::Result<()> {
         match self.read_frame_opcode {
-            OpCode::Binary | OpCode::Continue => {
+            OpCode::Text | OpCode::Binary | OpCode::Continue => {
                 if self.read_frame_length == 0 {
                     self.read_state = ReadState::Init;
                     self.step_init(cx, buf)
@@ -1362,6 +1362,19 @@ mod tests {
         let (mut peer, transport) = tokio::io::duplex(128);
         let mut websocket = websocket_over(transport);
         let mut frames = masked_frame(0x02, b"pi");
+        frames.extend_from_slice(&masked_frame(0x80, b"ng"));
+        peer.write_all(&frames).await.unwrap();
+
+        let mut application_data = [0u8; 4];
+        websocket.read_exact(&mut application_data).await.unwrap();
+        assert_eq!(&application_data, b"ping");
+    }
+
+    #[tokio::test]
+    async fn server_accepts_text_frames_as_xray_byte_stream() {
+        let (mut peer, transport) = tokio::io::duplex(128);
+        let mut websocket = websocket_over(transport);
+        let mut frames = masked_frame(0x01, b"pi");
         frames.extend_from_slice(&masked_frame(0x80, b"ng"));
         peer.write_all(&frames).await.unwrap();
 
