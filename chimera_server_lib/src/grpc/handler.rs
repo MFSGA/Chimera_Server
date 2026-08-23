@@ -763,12 +763,13 @@ impl HandlerServiceImpl {
                         ],
                         "websocket transport settings",
                     )?;
-                let mut headers = websocket.header;
-                if !websocket.host.trim().is_empty() {
-                    headers
-                        .entry("Host".to_string())
-                        .or_insert(websocket.host.clone());
-                }
+                let matching_headers =
+                    (!websocket.host.trim().is_empty()).then(|| {
+                        std::collections::HashMap::from([(
+                            "host".to_string(),
+                            websocket.host.trim().to_string(),
+                        )])
+                    });
                 protocol = ServerProxyConfig::Websocket {
                     targets: Box::new(OneOrSome::One(WebsocketServerConfig {
                         matching_path: Some(if websocket.path.is_empty() {
@@ -778,8 +779,8 @@ impl HandlerServiceImpl {
                         } else {
                             format!("/{}", websocket.path)
                         }),
-                        matching_headers: (!headers.is_empty()).then_some(headers),
-                        xray_path_mismatch_404: true,
+                        matching_headers,
+                        xray_mismatch_404: true,
                         protocol,
                     })),
                 };
@@ -2874,7 +2875,10 @@ mod tests {
                             value: WebsocketConfigPayload {
                                 host: "example.com".to_string(),
                                 path: "/ws".to_string(),
-                                header: Default::default(),
+                                header: std::collections::HashMap::from([(
+                                    "X-Test".to_string(),
+                                    "ignored-inbound".to_string(),
+                                )]),
                             }
                             .encode_to_vec(),
                         }),
@@ -2933,14 +2937,16 @@ mod tests {
                     {
                         OneOrSome::One(target) => {
                             assert_eq!(target.matching_path.as_deref(), Some("/ws"));
+                            let matching_headers = target
+                                .matching_headers
+                                .as_ref()
+                                .expect("websocket host should be preserved");
                             assert_eq!(
-                                target
-                                    .matching_headers
-                                    .as_ref()
-                                    .and_then(|headers| headers.get("Host"))
-                                    .map(String::as_str),
+                                matching_headers.get("host").map(String::as_str),
                                 Some("example.com")
                             );
+                            assert!(!matching_headers.contains_key("X-Test"));
+                            assert!(!matching_headers.contains_key("x-test"));
                             match &target.protocol {
                                 ServerProxyConfig::Vless { users, .. } => {
                                     assert_eq!(users.len(), 1);
