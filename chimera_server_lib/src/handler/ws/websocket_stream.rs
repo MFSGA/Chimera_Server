@@ -96,7 +96,7 @@ impl WebsocketStream {
         let mut unprocessed_buf = allocate_vec(16384).into_boxed_slice();
         let mut unprocessed_end_offset = 0;
         let write_frame = allocate_vec(32768).into_boxed_slice();
-        let ping_data = allocate_vec(80).into_boxed_slice();
+        let ping_data = allocate_vec(125).into_boxed_slice();
 
         let pending_initial_data = if !unprocessed_data.is_empty() {
             unprocessed_buf[0..unprocessed_data.len()]
@@ -460,6 +460,11 @@ impl WebsocketStream {
         self.ping_data[self.ping_data_size..self.ping_data_size + read_amount]
             .copy_from_slice(content_bytes);
         self.ping_data_size += read_amount;
+        self.unprocessed_start_offset += read_amount;
+        if self.unprocessed_start_offset == self.unprocessed_end_offset {
+            self.unprocessed_start_offset = 0;
+            self.unprocessed_end_offset = 0;
+        }
         self.read_frame_length -= read_amount as u64;
 
         if self.read_frame_length == 0 {
@@ -654,6 +659,21 @@ impl WebsocketStream {
         true
     }
 
+    fn flush_pending_pong(&mut self, cx: &mut Context<'_>) -> std::io::Result<bool> {
+        if !self.pending_write_pong {
+            return Ok(true);
+        }
+        if !self.pack_write_pong_frame() {
+            self.do_write_frame(cx)?;
+            if self.write_frame_end_offset > 0 || !self.pack_write_pong_frame() {
+                return Ok(false);
+            }
+        }
+        self.pending_write_pong = false;
+        self.do_write_frame(cx)?;
+        Ok(self.write_frame_end_offset == 0)
+    }
+
     fn pack_write_close_frame(&mut self) -> bool {
         let normal_close = 1000u16.to_be_bytes();
         let payload: &[u8] = if self.protocol_error_pending
@@ -787,6 +807,10 @@ impl AsyncRead for WebsocketStream {
             ))));
         }
 
+        if !this.flush_pending_pong(cx)? {
+            return Poll::Pending;
+        }
+
         if this.close_received {
             if !this.close_sent {
                 if !this.pack_write_close_frame() {
@@ -866,6 +890,9 @@ impl AsyncRead for WebsocketStream {
                 return Poll::Ready(read_result);
             }
 
+            if !this.flush_pending_pong(cx)? {
+                return Poll::Pending;
+            }
             if !buf.filled().is_empty() {
                 return Poll::Ready(Ok(()));
             }
@@ -1259,6 +1286,27 @@ mod tests {
             let reason = format!("bad opcode {opcode}");
             assert_protocol_close(&mut peer, &mut websocket, &reason).await;
         }
+    }
+
+    #[tokio::test]
+    async fn server_immediately_pongs_full_control_payload_like_xray() {
+        let (mut peer, transport) = tokio::io::duplex(512);
+        let mut websocket = websocket_over(transport);
+        let payload: Vec<u8> = (0..125).collect();
+        peer.write_all(&masked_frame(0x89, &payload)).await.unwrap();
+
+        let mut application_data = [0u8; 1];
+        let mut application_read = Box::pin(websocket.read(&mut application_data));
+        let mut pong = vec![0u8; 2 + payload.len()];
+        tokio::select! {
+            result = peer.read_exact(&mut pong) => { result.unwrap(); },
+            result = &mut application_read => panic!("ping unexpectedly completed application read: {result:?}"),
+        }
+        drop(application_read);
+
+        assert_eq!(pong[0], 0x8a);
+        assert_eq!(pong[1], 125);
+        assert_eq!(&pong[2..], payload.as_slice());
     }
 
     #[tokio::test]
