@@ -215,6 +215,7 @@ pub fn create_tcp_server_handler(
                 config.host,
                 config.path,
                 config.accept_proxy_protocol,
+                config.trusted_x_forwarded_for,
                 inner,
             )))
         }
