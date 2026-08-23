@@ -48,7 +48,7 @@ pub struct WebsocketStream {
     close_received: bool,
     close_sent: bool,
     protocol_error_pending: bool,
-    protocol_error_reason: &'static str,
+    protocol_error_reason: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -133,7 +133,7 @@ impl WebsocketStream {
             close_received: false,
             close_sent: false,
             protocol_error_pending: false,
-            protocol_error_reason: "",
+            protocol_error_reason: String::new(),
         }
     }
 
@@ -516,7 +516,28 @@ impl WebsocketStream {
         if self.read_frame_length == 0 {
             self.read_frame_mask_offset = 0;
             self.read_state = ReadState::Init;
+            self.validate_close_payload()?;
             self.close_received = true;
+        }
+
+        Ok(())
+    }
+
+    fn validate_close_payload(&mut self) -> std::io::Result<()> {
+        debug_assert!(self.close_data_size >= 2);
+        let code = u16::from_be_bytes([self.close_data[0], self.close_data[1]]);
+        let valid_code = matches!(code, 1000..=1003 | 1007..=1013)
+            || (3000..=4999).contains(&code);
+        if !valid_code {
+            let reason = format!("bad close code {code}");
+            self.queue_protocol_error(reason.clone())?;
+            return Err(std::io::Error::other(format!("websocket: {reason}")));
+        }
+
+        if std::str::from_utf8(&self.close_data[2..self.close_data_size]).is_err() {
+            let reason = "invalid utf8 payload in close frame";
+            self.queue_protocol_error(reason)?;
+            return Err(std::io::Error::other(format!("websocket: {reason}")));
         }
 
         Ok(())
@@ -703,7 +724,11 @@ impl WebsocketStream {
         Ok(())
     }
 
-    fn queue_protocol_error(&mut self, reason: &'static str) -> std::io::Result<()> {
+    fn queue_protocol_error(
+        &mut self,
+        reason: impl Into<String>,
+    ) -> std::io::Result<()> {
+        let reason = reason.into();
         let reason_bytes = reason.as_bytes();
         debug_assert!(reason_bytes.len() <= self.close_data.len() - 2);
         self.close_data[..2].copy_from_slice(&1002u16.to_be_bytes());
@@ -1233,6 +1258,47 @@ mod tests {
             )
             .await;
         }
+    }
+
+    #[tokio::test]
+    async fn server_rejects_invalid_close_codes_like_xray() {
+        for code in [999u16, 1004, 1005, 1006, 1014, 1015, 1016, 2999] {
+            let (mut peer, transport) = tokio::io::duplex(128);
+            let mut websocket = websocket_over(transport);
+            peer.write_all(&masked_frame(0x88, &code.to_be_bytes()))
+                .await
+                .unwrap();
+
+            let reason = format!("bad close code {code}");
+            assert_protocol_close(&mut peer, &mut websocket, &reason).await;
+        }
+
+        for code in [1000u16, 1003, 1007, 1013, 3000, 4999] {
+            let (mut peer, transport) = tokio::io::duplex(128);
+            let mut websocket = websocket_over(transport);
+            peer.write_all(&masked_frame(0x88, &code.to_be_bytes()))
+                .await
+                .unwrap();
+
+            let mut application_data = [0u8; 1];
+            assert_eq!(websocket.read(&mut application_data).await.unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn server_rejects_invalid_close_reason_utf8_like_xray() {
+        let (mut peer, transport) = tokio::io::duplex(128);
+        let mut websocket = websocket_over(transport);
+        let mut payload = 1000u16.to_be_bytes().to_vec();
+        payload.push(0xff);
+        peer.write_all(&masked_frame(0x88, &payload)).await.unwrap();
+
+        assert_protocol_close(
+            &mut peer,
+            &mut websocket,
+            "invalid utf8 payload in close frame",
+        )
+        .await;
     }
 
     #[tokio::test]
