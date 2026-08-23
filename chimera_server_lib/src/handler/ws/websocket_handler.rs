@@ -113,13 +113,15 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
         debug!("request path is {}", request_path);
         let websocket_key = request_headers
             .remove("sec-websocket-key")
+            .and_then(|values| values.into_iter().next())
             .ok_or_else(|| std::io::Error::other("missing websocket key header"))?;
         if !header_contains_token(&request_headers, "upgrade", "websocket")
             || !header_contains_token(&request_headers, "connection", "upgrade")
-            || request_headers
-                .get("sec-websocket-version")
-                .map(String::as_str)
-                != Some("13")
+            || !header_contains_token(
+                &request_headers,
+                "sec-websocket-version",
+                "13",
+            )
             || !valid_websocket_key(&websocket_key)
         {
             write_bad_websocket_request(&mut server_stream).await?;
@@ -143,7 +145,11 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             debug!("matching headers is {:?}", matching_headers);
             if let Some(headers) = matching_headers {
                 for (header_key, header_val) in headers {
-                    if request_headers.get(header_key) != Some(header_val) {
+                    if request_headers
+                        .get(header_key)
+                        .and_then(|values| values.first())
+                        != Some(header_val)
+                    {
                         continue 'outer;
                     }
                 }
@@ -188,14 +194,16 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
 }
 
 fn header_contains_token(
-    headers: &HashMap<String, String>,
+    headers: &HashMap<String, Vec<String>>,
     name: &str,
     token: &str,
 ) -> bool {
-    headers.get(name).is_some_and(|value| {
-        value
-            .split(',')
-            .any(|value| value.trim().eq_ignore_ascii_case(token))
+    headers.get(name).is_some_and(|values| {
+        values.iter().any(|value| {
+            value
+                .split(',')
+                .any(|value| value.trim().eq_ignore_ascii_case(token))
+        })
     })
 }
 
@@ -405,6 +413,42 @@ mod tests {
             assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
             assert!(response.contains("Sec-Websocket-Version: 13\r\n"));
             assert!(response.ends_with("\r\n\r\nBad Request\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_handshake_matches_xray_duplicate_header_semantics() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let other_key = "MDEyMzQ1Njc4OWFiY2RlZg==";
+
+        let valid_first_key = format!(
+            "GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Key: bad\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        let (result, response) = run_handshake(&valid_first_key).await;
+        assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
+        assert!(
+            response
+                .contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n")
+        );
+
+        let invalid_first_key = format!(
+            "GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: bad\r\nSec-WebSocket-Key: {other_key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        let (result, response) = run_handshake(&invalid_first_key).await;
+        assert!(result.is_err());
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+
+        for request in [
+            format!(
+                "GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Version: 12\r\n\r\n"
+            ),
+            format!(
+                "GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: nope\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            ),
+        ] {
+            let (result, response) = run_handshake(&request).await;
+            assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
+            assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
         }
     }
 

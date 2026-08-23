@@ -4,7 +4,7 @@ use crate::{async_stream::AsyncStream, util::line_reader::LineReader};
 
 pub struct ParsedHttpData {
     pub first_line: String,
-    pub headers: HashMap<String, String>,
+    pub headers: HashMap<String, Vec<String>>,
     pub line_reader: LineReader,
 }
 
@@ -12,7 +12,7 @@ impl ParsedHttpData {
     pub async fn parse(stream: &mut Box<dyn AsyncStream>) -> std::io::Result<Self> {
         let mut line_reader = LineReader::new();
         let mut first_line: Option<String> = None;
-        let mut headers: HashMap<String, String> = HashMap::new();
+        let mut headers: HashMap<String, Vec<String>> = HashMap::new();
 
         let mut line_count = 0;
         loop {
@@ -37,7 +37,7 @@ impl ParsedHttpData {
                 }
                 let header_key = tokens[0].trim().to_lowercase();
                 let header_value = tokens[1].trim().to_string();
-                headers.insert(header_key, header_value);
+                headers.entry(header_key).or_default().push(header_value);
             }
 
             line_count += 1;
