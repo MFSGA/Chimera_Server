@@ -290,6 +290,11 @@ impl WebsocketStream {
         self.read_frame_length = length;
 
         if self.read_frame_length > 0x7fffffffffffffffu64 {
+            if !self.is_client {
+                self.read_state = ReadState::Init;
+                self.close_received = true;
+                return Ok(());
+            }
             return Err(std::io::Error::other(format!(
                 "Invalid frame length ({})",
                 self.read_frame_length
@@ -1321,6 +1326,21 @@ mod tests {
         let mut application_data = [0u8; 4];
         websocket.read_exact(&mut application_data).await.unwrap();
         assert_eq!(&application_data, b"ping");
+    }
+
+    #[tokio::test]
+    async fn server_normally_closes_on_invalid_63_bit_length_like_xray() {
+        let (mut peer, transport) = tokio::io::duplex(64);
+        let mut websocket = websocket_over(transport);
+        peer.write_all(&[0x82, 0xff]).await.unwrap();
+        peer.write_all(&(1u64 << 63).to_be_bytes()).await.unwrap();
+
+        let mut application_data = [0u8; 1];
+        assert_eq!(websocket.read(&mut application_data).await.unwrap(), 0);
+
+        let mut response = [0u8; 4];
+        peer.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, [0x88, 0x02, 0x03, 0xe8]);
     }
 
     #[tokio::test]
