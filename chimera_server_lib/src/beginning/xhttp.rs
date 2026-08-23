@@ -455,7 +455,6 @@ async fn handle_request(
     state: Arc<AppState>,
     peer_addr: std::net::SocketAddr,
 ) -> Result<Response<ResponseBody>, Infallible> {
-    let request_method = request.method().clone();
     let request_headers = request.headers().clone();
 
     if request_header_bytes(request.headers()) > state.server_max_header_bytes {
@@ -496,12 +495,6 @@ async fn handle_request(
         return Ok(simple_response(StatusCode::NOT_FOUND));
     }
 
-    if request_method == Method::OPTIONS {
-        let mut response = simple_response(StatusCode::OK);
-        state.decorate_response(&mut response);
-        return Ok(response);
-    }
-
     if !state.validate_padding(request.uri().query(), request.headers()) {
         debug!(
             method = %request.method(),
@@ -523,46 +516,44 @@ async fn handle_request(
     let is_downlink_method = request.method() == Method::GET;
     let is_uplink_method =
         request.method().as_str() == state.uplink_http_method.as_str();
-    if let Some(status) = request_shape_error(
+    let dispatch = classify_request(
         state.mode,
+        is_downlink_method,
         is_uplink_method,
         session_id.is_some(),
         seq.is_some(),
-    ) {
-        let mut response = simple_response(status);
-        state.decorate_response(&mut response);
-        return Ok(response);
-    }
-    let mut response = match (is_downlink_method, is_uplink_method, session_id, seq)
-    {
-        (true, _, Some(session_id), None)
-            if matches!(
-                state.mode,
-                XhttpMode::Auto | XhttpMode::PacketUp | XhttpMode::StreamUp
-            ) =>
-        {
-            handle_stream_down(state.clone(), session_id, logical_peer_addr).await
+    );
+    let mut response = match dispatch {
+        Ok(XhttpRequestDispatch::StreamDown) => {
+            handle_stream_down(
+                state.clone(),
+                session_id.expect("stream-down requires a session id"),
+                logical_peer_addr,
+            )
+            .await
         }
-        (_, true, None, None)
-            if matches!(
-                state.mode,
-                XhttpMode::Auto | XhttpMode::StreamOne | XhttpMode::StreamUp
-            ) =>
-        {
+        Ok(XhttpRequestDispatch::StreamOne) => {
             handle_stream_one(request, state.clone(), logical_peer_addr).await
         }
-        (_, true, Some(session_id), None)
-            if matches!(state.mode, XhttpMode::Auto | XhttpMode::StreamUp) =>
-        {
-            handle_stream_up(request, state.clone(), session_id, stream_up_padding)
-                .await
+        Ok(XhttpRequestDispatch::StreamUp) => {
+            handle_stream_up(
+                request,
+                state.clone(),
+                session_id.expect("stream-up requires a session id"),
+                stream_up_padding,
+            )
+            .await
         }
-        (_, true, Some(session_id), Some(seq))
-            if matches!(state.mode, XhttpMode::Auto | XhttpMode::PacketUp) =>
-        {
-            handle_packet_up(request, state.clone(), session_id, seq).await
+        Ok(XhttpRequestDispatch::PacketUp) => {
+            handle_packet_up(
+                request,
+                state.clone(),
+                session_id.expect("packet-up requires a session id"),
+                seq.expect("packet-up requires a sequence"),
+            )
+            .await
         }
-        _ => simple_response(StatusCode::METHOD_NOT_ALLOWED),
+        Err(status) => simple_response(status),
     };
 
     state.decorate_response(&mut response);
@@ -1336,19 +1327,48 @@ fn hpack_huffman_bit_len(byte: u8) -> usize {
     }
 }
 
-fn request_shape_error(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XhttpRequestDispatch {
+    StreamDown,
+    StreamOne,
+    StreamUp,
+    PacketUp,
+}
+
+fn classify_request(
     mode: XhttpMode,
+    is_get: bool,
     is_uplink_method: bool,
     has_session_id: bool,
     has_seq: bool,
-) -> Option<StatusCode> {
-    if mode != XhttpMode::PacketUp {
-        return None;
+) -> Result<XhttpRequestDispatch, StatusCode> {
+    if !has_session_id && mode == XhttpMode::PacketUp {
+        return Err(StatusCode::BAD_REQUEST);
     }
-    if !has_session_id || (is_uplink_method && !has_seq) {
-        return Some(StatusCode::BAD_REQUEST);
+
+    if is_uplink_method && has_session_id {
+        if !has_seq {
+            if !matches!(mode, XhttpMode::Auto | XhttpMode::StreamUp) {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            return Ok(XhttpRequestDispatch::StreamUp);
+        }
+
+        if !matches!(mode, XhttpMode::Auto | XhttpMode::PacketUp) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        return Ok(XhttpRequestDispatch::PacketUp);
     }
-    None
+
+    if is_get || !has_session_id {
+        return Ok(if has_session_id {
+            XhttpRequestDispatch::StreamDown
+        } else {
+            XhttpRequestDispatch::StreamOne
+        });
+    }
+
+    Err(StatusCode::METHOD_NOT_ALLOWED)
 }
 
 fn apply_xray_cors_headers(headers: &mut hyper::HeaderMap) {
@@ -1411,30 +1431,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn packet_up_request_shape_matches_xray_v26_2_6() {
+    fn request_dispatch_matches_xray_v26_2_6() {
         assert_eq!(
-            request_shape_error(XhttpMode::PacketUp, true, false, false),
-            Some(StatusCode::BAD_REQUEST),
+            classify_request(XhttpMode::Auto, false, false, false, false),
+            Ok(XhttpRequestDispatch::StreamOne),
+            "a non-uplink method without a session is still stream-one"
+        );
+        assert_eq!(
+            classify_request(XhttpMode::Auto, true, false, false, false),
+            Ok(XhttpRequestDispatch::StreamOne),
+            "GET without a session is stream-one"
+        );
+        assert_eq!(
+            classify_request(XhttpMode::StreamOne, true, false, true, true),
+            Ok(XhttpRequestDispatch::StreamDown),
+            "GET with a session wins the stream-down fallback even in stream-one mode"
+        );
+        assert_eq!(
+            classify_request(XhttpMode::Auto, true, true, true, false),
+            Ok(XhttpRequestDispatch::StreamUp),
+            "configured GET uplink must dispatch before the GET stream-down fallback"
+        );
+        assert_eq!(
+            classify_request(XhttpMode::PacketUp, false, true, false, false),
+            Err(StatusCode::BAD_REQUEST),
             "explicit packet-up requires a session id"
         );
         assert_eq!(
-            request_shape_error(XhttpMode::PacketUp, true, true, false),
-            Some(StatusCode::BAD_REQUEST),
-            "stream-up shaped POST is invalid in packet-up mode"
+            classify_request(XhttpMode::PacketUp, false, true, true, false),
+            Err(StatusCode::BAD_REQUEST),
+            "stream-up shaped request is invalid in packet-up mode"
         );
         assert_eq!(
-            request_shape_error(XhttpMode::PacketUp, true, true, true),
-            None
+            classify_request(XhttpMode::StreamUp, false, true, true, true),
+            Err(StatusCode::BAD_REQUEST),
+            "packet-up shaped request is invalid in stream-up mode"
         );
         assert_eq!(
-            request_shape_error(XhttpMode::PacketUp, false, true, false),
-            None,
-            "stream-down GET remains valid without a sequence"
-        );
-        assert_eq!(
-            request_shape_error(XhttpMode::Auto, true, false, false),
-            None,
-            "auto mode still permits stream-one without a session"
+            classify_request(XhttpMode::Auto, false, false, true, false),
+            Err(StatusCode::METHOD_NOT_ALLOWED),
+            "non-uplink non-GET request with a session remains unsupported"
         );
     }
 
