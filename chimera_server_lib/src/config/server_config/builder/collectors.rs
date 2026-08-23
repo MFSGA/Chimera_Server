@@ -706,6 +706,7 @@ pub(super) fn collect_xhttp_settings(
         mode,
         host: raw.host.map(|h| h.to_ascii_lowercase()),
         path: normalized_path,
+        trusted_x_forwarded_for: Vec::new(),
         min_padding,
         max_padding,
         max_each_post_bytes,

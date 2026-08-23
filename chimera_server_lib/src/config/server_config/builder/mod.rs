@@ -1120,8 +1120,11 @@ impl TryFrom<InboudItem> for ServerConfig {
                                 )
                             })?;
 
+                        let mut xhttp_config = collect_xhttp_settings(xhttp_settings)?;
+                        xhttp_config.trusted_x_forwarded_for =
+                            xray_trusted_x_forwarded_for(stream_setting);
                         protocol = ServerProxyConfig::Xhttp {
-                            config: collect_xhttp_settings(xhttp_settings)?,
+                            config: xhttp_config,
                             inner: Box::new(protocol),
                         };
 
@@ -2720,6 +2723,9 @@ mod tests {
             "streamSettings": {
                 "network": "xhttp",
                 "security": "reality",
+                "sockopt": {
+                    "trustedXForwardedFor": ["X-Trusted-CDN"]
+                },
                 "realitySettings": {
                     "show": false,
                     "dest": "www.apple.com:443",
@@ -2743,7 +2749,11 @@ mod tests {
 
         match config.protocol {
             ServerProxyConfig::Reality(reality) => match reality.inner.as_ref() {
-                ServerProxyConfig::Xhttp { inner, .. } => {
+                ServerProxyConfig::Xhttp { config, inner } => {
+                    assert_eq!(
+                        config.trusted_x_forwarded_for,
+                        vec!["X-Trusted-CDN".to_string()]
+                    );
                     assert!(matches!(
                         inner.as_ref(),
                         ServerProxyConfig::Vless { .. }

@@ -288,6 +288,7 @@ mod tests {
                     mode: crate::config::server_config::XhttpMode::Auto,
                     host: Some("example.com".into()),
                     path: "/xhttp".into(),
+                    trusted_x_forwarded_for: Vec::new(),
                     min_padding: 0,
                     max_padding: 0,
                     max_each_post_bytes: 1_000_000,
