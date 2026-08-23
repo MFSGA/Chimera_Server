@@ -781,6 +781,7 @@ impl HandlerServiceImpl {
                         }),
                         matching_headers,
                         xray_mismatch_404: true,
+                        trusted_x_forwarded_for: Vec::new(),
                         protocol,
                     })),
                 };

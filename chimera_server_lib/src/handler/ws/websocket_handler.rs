@@ -29,6 +29,7 @@ pub struct WebsocketServerTarget {
     pub matching_path: Option<String>,
     pub matching_headers: Option<HashMap<String, String>>,
     pub xray_mismatch_404: bool,
+    pub trusted_x_forwarded_for: Vec<String>,
     pub handler: Box<dyn TcpServerHandler>,
 }
 
@@ -125,9 +126,6 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             .get("sec-websocket-protocol")
             .and_then(|values| values.first())
             .and_then(|value| decode_xray_websocket_early_data(value));
-        if let Some(peer_addr) = xray_websocket_forwarded_peer(&request_headers) {
-            context.peer_addr = Some(peer_addr);
-        }
         if !header_contains_token(&request_headers, "upgrade", "websocket")
             || !header_contains_token(&request_headers, "connection", "upgrade")
             || !header_contains_token(
@@ -149,6 +147,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                 matching_path,
                 matching_headers,
                 xray_mismatch_404,
+                trusted_x_forwarded_for,
                 handler,
             } = server_target;
             debug!("matching path is {:?} {:?}", matching_path, &request_path);
@@ -171,6 +170,13 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                         continue 'outer;
                     }
                 }
+            }
+
+            if let Some(peer_addr) = xray_websocket_forwarded_peer(
+                &request_headers,
+                trusted_x_forwarded_for,
+            ) {
+                context.peer_addr = Some(peer_addr);
             }
 
             let websocket_key_response =
@@ -313,7 +319,16 @@ fn valid_websocket_key(key: &str) -> bool {
 
 fn xray_websocket_forwarded_peer(
     headers: &HashMap<String, Vec<String>>,
+    trusted_x_forwarded_for: &[String],
 ) -> Option<SocketAddr> {
+    if !trusted_x_forwarded_for.is_empty()
+        && !trusted_x_forwarded_for
+            .iter()
+            .any(|header| headers.contains_key(&header.trim().to_ascii_lowercase()))
+    {
+        return None;
+    }
+
     let first = headers.get("x-forwarded-for")?.first()?.split(',').next()?;
     let mut candidate = first;
     if candidate.starts_with('[') && candidate.ends_with(']') {
@@ -599,6 +614,7 @@ mod tests {
             matching_path: None,
             matching_headers: None,
             xray_mismatch_404: false,
+            trusted_x_forwarded_for: Vec::new(),
             handler: Box::new(Inner {
                 manages_handshake_timeout,
             }),
@@ -610,6 +626,7 @@ mod tests {
             matching_path: Some("/".to_string()),
             matching_headers: None,
             xray_mismatch_404: false,
+            trusted_x_forwarded_for: Vec::new(),
             handler: Box::new(AcceptingInner),
         }])
     }
@@ -759,6 +776,7 @@ mod tests {
             matching_path: Some("/".to_string()),
             matching_headers: None,
             xray_mismatch_404: false,
+            trusted_x_forwarded_for: Vec::new(),
             handler: Box::new(ContextCapturingInner {
                 captured_peer: captured_peer.clone(),
             }),
@@ -826,11 +844,32 @@ mod tests {
                 vec![value.to_string()],
             )]);
             assert_eq!(
-                xray_websocket_forwarded_peer(&headers),
+                xray_websocket_forwarded_peer(&headers, &[]),
                 expected.map(|value| value.parse().unwrap()),
                 "{value}"
             );
         }
+
+        let mut headers = HashMap::from([(
+            "x-forwarded-for".to_string(),
+            vec!["203.0.113.77".to_string()],
+        )]);
+        assert_eq!(
+            xray_websocket_forwarded_peer(&headers, &["X-Trusted-CDN".to_string()]),
+            None
+        );
+        headers.insert("x-trusted-cdn".to_string(), vec![String::new()]);
+        assert_eq!(
+            xray_websocket_forwarded_peer(&headers, &["X-Trusted-CDN".to_string()]),
+            Some("203.0.113.77:0".parse().unwrap())
+        );
+        assert_eq!(
+            xray_websocket_forwarded_peer(
+                &headers,
+                &["X-Forwarded-For".to_string()]
+            ),
+            Some("203.0.113.77:0".parse().unwrap())
+        );
     }
 
     #[tokio::test]
@@ -841,6 +880,7 @@ mod tests {
             matching_path: Some("/".to_string()),
             matching_headers: None,
             xray_mismatch_404: false,
+            trusted_x_forwarded_for: Vec::new(),
             handler: Box::new(CapturingInner {
                 captured: captured.clone(),
             }),
@@ -931,6 +971,7 @@ mod tests {
                     matching_path: Some("/ws".to_string()),
                     matching_headers: None,
                     xray_mismatch_404,
+                    trusted_x_forwarded_for: Vec::new(),
                     handler: Box::new(AcceptingInner),
                 }]);
             let task = tokio::spawn(async move {
@@ -980,6 +1021,7 @@ mod tests {
                         "expected.example".to_string(),
                     )])),
                     xray_mismatch_404,
+                    trusted_x_forwarded_for: Vec::new(),
                     handler: Box::new(AcceptingInner),
                 }]);
             let task = tokio::spawn(async move {
