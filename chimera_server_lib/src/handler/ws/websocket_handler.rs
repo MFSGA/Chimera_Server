@@ -80,7 +80,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
         tracing::debug!("WebsocketTcpServerHandler setup_server_stream");
         let ParsedHttpData {
             first_line,
-            headers: mut request_headers,
+            headers: request_headers,
             line_reader,
         } = timeout(
             XRAY_WEBSOCKET_HANDSHAKE_TIMEOUT,
@@ -117,9 +117,9 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
         let request_path = xray_websocket_request_path(request_target);
         debug!("request path is {}", request_path);
         let websocket_key = request_headers
-            .remove("sec-websocket-key")
-            .and_then(|values| values.into_iter().next())
-            .ok_or_else(|| std::io::Error::other("missing websocket key header"))?;
+            .get("sec-websocket-key")
+            .and_then(|values| values.first())
+            .cloned();
         let websocket_early_data = request_headers
             .get("sec-websocket-protocol")
             .and_then(|values| values.first())
@@ -131,11 +131,12 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                 "sec-websocket-version",
                 "13",
             )
-            || !valid_websocket_key(&websocket_key)
+            || !websocket_key.as_deref().is_some_and(valid_websocket_key)
         {
             write_bad_websocket_request(&mut server_stream).await?;
             return Err(std::io::Error::other("invalid websocket handshake"));
         }
+        let websocket_key = websocket_key.expect("validated websocket key");
 
         let mut saw_xray_mismatch = false;
         'outer: for server_target in self.server_targets.iter() {
@@ -680,6 +681,8 @@ mod tests {
                 "GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 12\r\n\r\n"
             ),
             "GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: abc\r\nSec-WebSocket-Version: 13\r\n\r\n".to_string(),
+            "GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\r\n".to_string(),
+            "GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key:\r\nSec-WebSocket-Version: 13\r\n\r\n".to_string(),
         ] {
             let (result, response) = run_handshake(&invalid).await;
             assert!(result.is_err());
