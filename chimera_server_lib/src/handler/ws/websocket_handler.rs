@@ -112,7 +112,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
 
             first_line.truncate(first_line.len() - 9);
 
-            first_line.split_off(4)
+            xray_websocket_request_path(&first_line[4..])
         };
         debug!("request path is {}", request_path);
         let websocket_key = request_headers
@@ -218,6 +218,21 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
     }
 }
 
+fn xray_websocket_request_path(request_target: &str) -> String {
+    let origin_target = if let Some(rest) = request_target.strip_prefix("http://") {
+        rest.find('/').map_or("/", |path_start| &rest[path_start..])
+    } else if let Some(rest) = request_target.strip_prefix("https://") {
+        rest.find('/').map_or("/", |path_start| &rest[path_start..])
+    } else {
+        request_target
+    };
+
+    origin_target
+        .split_once('?')
+        .map_or(origin_target, |(path, _)| path)
+        .to_string()
+}
+
 fn header_contains_token(
     headers: &HashMap<String, Vec<String>>,
     name: &str,
@@ -297,7 +312,7 @@ mod tests {
 
     use super::{
         WebsocketServerTarget, WebsocketTcpServerHandler,
-        XRAY_WEBSOCKET_HANDSHAKE_TIMEOUT,
+        XRAY_WEBSOCKET_HANDSHAKE_TIMEOUT, xray_websocket_request_path,
     };
 
     struct TestStream(DuplexStream);
@@ -434,6 +449,43 @@ mod tests {
         let mut response = Vec::new();
         peer.read_to_end(&mut response).await.unwrap();
         (task.await.unwrap(), String::from_utf8(response).unwrap())
+    }
+
+    #[test]
+    fn websocket_request_path_matches_xray_query_and_absolute_form() {
+        assert_eq!(xray_websocket_request_path("/ws"), "/ws");
+        assert_eq!(xray_websocket_request_path("/ws?foo=bar"), "/ws");
+        assert_eq!(xray_websocket_request_path("/ws?"), "/ws");
+        assert_eq!(
+            xray_websocket_request_path("http://example.com/ws?foo=bar"),
+            "/ws"
+        );
+        assert_eq!(
+            xray_websocket_request_path("https://example.com/ws?foo=bar"),
+            "/ws"
+        );
+        assert_eq!(
+            xray_websocket_request_path("/ws%3Ffoo=bar"),
+            "/ws%3Ffoo=bar"
+        );
+        assert_eq!(xray_websocket_request_path("/ws#frag"), "/ws#frag");
+    }
+
+    #[tokio::test]
+    async fn websocket_handshake_matches_xray_request_target_paths() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        for target in [
+            "/?foo=bar",
+            "http://example.com/?foo=bar",
+            "https://example.com/?foo=bar",
+        ] {
+            let request = format!(
+                "GET {target} HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            );
+            let (result, response) = run_handshake(&request).await;
+            assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
+            assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+        }
     }
 
     #[tokio::test]
