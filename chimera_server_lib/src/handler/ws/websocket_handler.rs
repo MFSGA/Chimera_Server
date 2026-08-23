@@ -27,6 +27,7 @@ use crate::{
 pub struct WebsocketServerTarget {
     pub matching_path: Option<String>,
     pub matching_headers: Option<HashMap<String, String>>,
+    pub xray_path_mismatch_404: bool,
     pub handler: Box<dyn TcpServerHandler>,
 }
 
@@ -136,11 +137,13 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             return Err(std::io::Error::other("invalid websocket handshake"));
         }
 
+        let mut saw_xray_path_mismatch = false;
         'outer: for server_target in self.server_targets.iter() {
             debug!("checking server target {:?}", server_target);
             let WebsocketServerTarget {
                 matching_path,
                 matching_headers,
+                xray_path_mismatch_404,
                 handler,
             } = server_target;
             debug!("matching path is {:?} {:?}", matching_path, &request_path);
@@ -148,6 +151,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                 && path != &request_path
             {
                 debug!("path not match");
+                saw_xray_path_mismatch |= *xray_path_mismatch_404;
                 continue;
             }
             debug!("matching headers is {:?}", matching_headers);
@@ -214,6 +218,9 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             return target_setup_result;
         }
 
+        if saw_xray_path_mismatch {
+            write_xray_websocket_not_found(&mut server_stream).await?;
+        }
         Err(std::io::Error::other("No matching websocket targets"))
     }
 }
@@ -257,6 +264,22 @@ fn decode_xray_websocket_early_data(value: &str) -> Option<Vec<u8>> {
         .decode(normalized)
         .ok()
         .filter(|decoded| !decoded.is_empty())
+}
+
+async fn write_xray_websocket_not_found(
+    stream: &mut Box<dyn AsyncStream>,
+) -> std::io::Result<()> {
+    let response = format!(
+        concat!(
+            "HTTP/1.1 404 Not Found\r\n",
+            "Date: {}\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n"
+        ),
+        httpdate::fmt_http_date(SystemTime::now()),
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await
 }
 
 async fn write_bad_websocket_request(
@@ -420,6 +443,7 @@ mod tests {
         WebsocketServerTarget {
             matching_path: None,
             matching_headers: None,
+            xray_path_mismatch_404: false,
             handler: Box::new(Inner {
                 manages_handshake_timeout,
             }),
@@ -430,6 +454,7 @@ mod tests {
         WebsocketTcpServerHandler::new(vec![WebsocketServerTarget {
             matching_path: Some("/".to_string()),
             matching_headers: None,
+            xray_path_mismatch_404: false,
             handler: Box::new(AcceptingInner),
         }])
     }
@@ -527,6 +552,7 @@ mod tests {
         let handler = WebsocketTcpServerHandler::new(vec![WebsocketServerTarget {
             matching_path: Some("/".to_string()),
             matching_headers: None,
+            xray_path_mismatch_404: false,
             handler: Box::new(CapturingInner {
                 captured: captured.clone(),
             }),
@@ -594,6 +620,52 @@ mod tests {
             let (result, response) = run_handshake(&request).await;
             assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
             assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_xray_path_mismatch_returns_not_found_without_changing_generic_targets()
+     {
+        let request = concat!(
+            "GET /other HTTP/1.1\r\n",
+            "Host: example.com\r\n",
+            "Upgrade: websocket\r\n",
+            "Connection: Upgrade\r\n",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            "Sec-WebSocket-Version: 13\r\n",
+            "\r\n"
+        );
+
+        for (xray_path_mismatch_404, expect_404) in [(true, true), (false, false)] {
+            let (client, mut peer) = tokio::io::duplex(8192);
+            let handler =
+                WebsocketTcpServerHandler::new(vec![WebsocketServerTarget {
+                    matching_path: Some("/ws".to_string()),
+                    matching_headers: None,
+                    xray_path_mismatch_404,
+                    handler: Box::new(AcceptingInner),
+                }]);
+            let task = tokio::spawn(async move {
+                handler
+                    .setup_server_stream(Box::new(TestStream(client)))
+                    .await
+            });
+
+            peer.write_all(request.as_bytes()).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            peer.read_to_end(&mut response).await.unwrap();
+            let result = task.await.unwrap();
+            assert!(result.is_err());
+
+            if expect_404 {
+                let response = String::from_utf8(response).unwrap();
+                assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
+                assert!(response.contains("Content-Length: 0\r\n"));
+                assert!(response.ends_with("\r\n\r\n"));
+            } else {
+                assert!(response.is_empty());
+            }
         }
     }
 

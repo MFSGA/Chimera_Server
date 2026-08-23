@@ -771,9 +771,15 @@ impl HandlerServiceImpl {
                 }
                 protocol = ServerProxyConfig::Websocket {
                     targets: Box::new(OneOrSome::One(WebsocketServerConfig {
-                        matching_path: (!websocket.path.is_empty())
-                            .then_some(websocket.path),
+                        matching_path: Some(if websocket.path.is_empty() {
+                            "/".to_string()
+                        } else if websocket.path.starts_with('/') {
+                            websocket.path
+                        } else {
+                            format!("/{}", websocket.path)
+                        }),
                         matching_headers: (!headers.is_empty()).then_some(headers),
+                        xray_path_mismatch_404: true,
                         protocol,
                     })),
                 };

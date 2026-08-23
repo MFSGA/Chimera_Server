@@ -10,5 +10,7 @@ pub struct WebsocketServerConfig {
     pub matching_path: Option<String>,
     #[serde(default)]
     pub matching_headers: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub xray_path_mismatch_404: bool,
     pub protocol: ServerProxyConfig,
 }
