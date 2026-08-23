@@ -123,6 +123,7 @@ fn websocket_server_config(
         } else {
             Some(matching_headers)
         },
+        xray_path_mismatch_404: true,
         protocol,
     }
 }
