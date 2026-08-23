@@ -278,6 +278,7 @@ struct AppState {
     mode: XhttpMode,
     host: Option<String>,
     base_path: String,
+    trusted_x_forwarded_for: Vec<String>,
     min_padding: usize,
     max_padding: usize,
     max_each_post_bytes: usize,
@@ -313,6 +314,7 @@ impl AppState {
             mode: config.mode,
             host: config.host,
             base_path: normalize_base_path(config.path),
+            trusted_x_forwarded_for: config.trusted_x_forwarded_for,
             min_padding: config.min_padding,
             max_padding: config.max_padding,
             max_each_post_bytes: config.max_each_post_bytes,
@@ -555,6 +557,9 @@ async fn handle_request(
         return Ok(response);
     }
 
+    let logical_peer_addr =
+        trusted_forwarded_peer(&request_headers, &state.trusted_x_forwarded_for)
+            .unwrap_or(peer_addr);
     let stream_up_padding = state.padding_obfs_mode
         || header_value(&request_headers, "referer").is_some();
     let (session_id, seq) = state.extract_meta(&request);
@@ -570,7 +575,7 @@ async fn handle_request(
                 XhttpMode::Auto | XhttpMode::PacketUp | XhttpMode::StreamUp
             ) =>
         {
-            handle_stream_down(state.clone(), session_id, peer_addr).await
+            handle_stream_down(state.clone(), session_id, logical_peer_addr).await
         }
         (_, true, None, None)
             if matches!(
@@ -578,7 +583,7 @@ async fn handle_request(
                 XhttpMode::Auto | XhttpMode::StreamOne | XhttpMode::StreamUp
             ) =>
         {
-            handle_stream_one(request, state.clone(), peer_addr).await
+            handle_stream_one(request, state.clone(), logical_peer_addr).await
         }
         (_, true, Some(session_id), None)
             if matches!(state.mode, XhttpMode::Auto | XhttpMode::StreamUp) =>
@@ -587,7 +592,7 @@ async fn handle_request(
                 request,
                 state.clone(),
                 session_id,
-                peer_addr,
+                logical_peer_addr,
                 stream_up_padding,
             )
             .await
@@ -595,8 +600,14 @@ async fn handle_request(
         (_, true, Some(session_id), Some(seq))
             if matches!(state.mode, XhttpMode::Auto | XhttpMode::PacketUp) =>
         {
-            handle_packet_up(request, state.clone(), session_id, seq, peer_addr)
-                .await
+            handle_packet_up(
+                request,
+                state.clone(),
+                session_id,
+                seq,
+                logical_peer_addr,
+            )
+            .await
         }
         _ => simple_response(StatusCode::METHOD_NOT_ALLOWED),
     };
@@ -1139,6 +1150,50 @@ fn header_value(headers: &hyper::HeaderMap, key: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn trusted_forwarded_peer(
+    headers: &hyper::HeaderMap,
+    trusted_x_forwarded_for: &[String],
+) -> Option<std::net::SocketAddr> {
+    if !trusted_x_forwarded_for.is_empty()
+        && !trusted_x_forwarded_for
+            .iter()
+            .any(|header| headers.contains_key(header.trim()))
+    {
+        return None;
+    }
+
+    let first = headers
+        .get("x-forwarded-for")?
+        .to_str()
+        .ok()?
+        .split(',')
+        .next()?;
+    let mut candidate = first;
+    if candidate.starts_with('[') && candidate.ends_with(']') {
+        candidate = &candidate[1..candidate.len() - 1];
+    }
+    if candidate
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| !byte.is_ascii_alphanumeric())
+        || candidate
+            .as_bytes()
+            .last()
+            .is_some_and(|byte| !byte.is_ascii_alphanumeric())
+    {
+        candidate = candidate.trim();
+    }
+
+    let ip = candidate.parse::<std::net::IpAddr>().ok()?;
+    let ip = match ip {
+        std::net::IpAddr::V6(ipv6) => ipv6
+            .to_ipv4_mapped()
+            .map_or(std::net::IpAddr::V6(ipv6), std::net::IpAddr::V4),
+        ip => ip,
+    };
+    Some(std::net::SocketAddr::new(ip, 0))
+}
+
 fn cookie_value(headers: &hyper::HeaderMap, key: &str) -> Option<String> {
     headers.get_all(header::COOKIE).iter().find_map(|value| {
         let value = value.to_str().ok()?;
@@ -1378,6 +1433,33 @@ fn apply_response_padding(headers: &mut hyper::HeaderMap, state: &AppState) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn xhttp_trusted_forwarded_peer_matches_xray_v26_2_6() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            hyper::header::HeaderValue::from_static("203.0.113.77, 198.51.100.2"),
+        );
+
+        assert_eq!(
+            trusted_forwarded_peer(&headers, &[]),
+            Some("203.0.113.77:0".parse().expect("forwarded peer"))
+        );
+        assert_eq!(
+            trusted_forwarded_peer(&headers, &["X-Trusted-CDN".to_string()]),
+            None
+        );
+
+        headers.insert(
+            "x-trusted-cdn",
+            hyper::header::HeaderValue::from_static("yes"),
+        );
+        assert_eq!(
+            trusted_forwarded_peer(&headers, &["X-Trusted-CDN".to_string()]),
+            Some("203.0.113.77:0".parse().expect("trusted forwarded peer"))
+        );
+    }
+
     #[tokio::test]
     async fn xhttp_times_out_incomplete_headers_like_xray_v26_2_6() {
         let (mut client, server) = tokio::io::duplex(4096);
@@ -1481,6 +1563,7 @@ mod tests {
             mode: XhttpMode::Auto,
             host: None,
             path: "/xhttp".to_string(),
+            trusted_x_forwarded_for: Vec::new(),
             min_padding: 100,
             max_padding: 1000,
             max_each_post_bytes: 1_000_000,

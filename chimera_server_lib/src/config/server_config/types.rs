@@ -403,6 +403,8 @@ pub struct XhttpServerConfig {
     pub mode: XhttpMode,
     pub host: Option<String>,
     pub path: String,
+    #[serde(default)]
+    pub trusted_x_forwarded_for: Vec<String>,
     pub min_padding: usize,
     pub max_padding: usize,
     pub max_each_post_bytes: usize,

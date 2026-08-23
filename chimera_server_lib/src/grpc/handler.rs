@@ -2468,6 +2468,7 @@ mod tests {
                     mode: crate::config::server_config::XhttpMode::Auto,
                     host: None,
                     path: "/control".to_string(),
+                    trusted_x_forwarded_for: Vec::new(),
                     min_padding: 0,
                     max_padding: 0,
                     max_each_post_bytes: 1_000_000,
