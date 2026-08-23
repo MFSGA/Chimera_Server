@@ -364,14 +364,13 @@ impl WebsocketStream {
                 }
             }
             OpCode::Pong => {
-                if self.read_frame_length != 0 {
-                    return Err(std::io::Error::other(format!(
-                        "unexpected pong data length ({})",
-                        self.read_frame_length
-                    )));
+                if self.read_frame_length == 0 {
+                    self.read_state = ReadState::Init;
+                    self.step_init(cx, buf)
+                } else {
+                    self.read_state = ReadState::SkipContent;
+                    self.step_skip_content(cx, buf)
                 }
-                self.read_state = ReadState::Init;
-                self.step_init(cx, buf)
             }
             OpCode::Close => {
                 if self.read_frame_length > self.close_data.len() as u64 {
@@ -1307,6 +1306,21 @@ mod tests {
         assert_eq!(pong[0], 0x8a);
         assert_eq!(pong[1], 125);
         assert_eq!(&pong[2..], payload.as_slice());
+    }
+
+    #[tokio::test]
+    async fn server_ignores_pong_payload_like_xray() {
+        let (mut peer, transport) = tokio::io::duplex(512);
+        let mut websocket = websocket_over(transport);
+        let pong_payload: Vec<u8> = (0..125).collect();
+        peer.write_all(&masked_frame(0x8a, &pong_payload))
+            .await
+            .unwrap();
+        peer.write_all(&masked_frame(0x82, b"ping")).await.unwrap();
+
+        let mut application_data = [0u8; 4];
+        websocket.read_exact(&mut application_data).await.unwrap();
+        assert_eq!(&application_data, b"ping");
     }
 
     #[tokio::test]
