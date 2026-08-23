@@ -20,7 +20,7 @@ pub fn create_websocket_server_target(
     let WebsocketServerConfig {
         matching_path,
         matching_headers,
-        xray_path_mismatch_404,
+        xray_mismatch_404,
         protocol,
     } = websocket_server_config;
 
@@ -39,7 +39,7 @@ pub fn create_websocket_server_target(
     Ok(WebsocketServerTarget {
         matching_path,
         matching_headers,
-        xray_path_mismatch_404,
+        xray_mismatch_404,
         handler,
     })
 }

@@ -89,41 +89,30 @@ fn websocket_server_config(
     ws_setting: crate::config::WsSettings,
     protocol: ServerProxyConfig,
 ) -> WebsocketServerConfig {
-    let mut matching_headers = std::collections::HashMap::new();
     let mut host = ws_setting
         .host
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
-    for (key, value) in ws_setting.headers {
-        let key = key.trim().to_ascii_lowercase();
-        if key.is_empty() {
-            continue;
-        }
-        if key == "host" {
-            if host.is_none() {
+    if host.is_none() {
+        for (key, value) in ws_setting.headers {
+            if key.trim().eq_ignore_ascii_case("host") {
                 let value = value.trim().to_string();
                 if !value.is_empty() {
                     host = Some(value);
                 }
+                break;
             }
-        } else {
-            matching_headers.insert(key, value);
         }
     }
 
-    if let Some(host) = host {
-        matching_headers.insert("host".to_string(), host);
-    }
+    let matching_headers = host
+        .map(|host| std::collections::HashMap::from([("host".to_string(), host)]));
 
     WebsocketServerConfig {
         matching_path: Some(normalize_xray_websocket_path(ws_setting.path)),
-        matching_headers: if matching_headers.is_empty() {
-            None
-        } else {
-            Some(matching_headers)
-        },
-        xray_path_mismatch_404: true,
+        matching_headers,
+        xray_mismatch_404: true,
         protocol,
     }
 }
@@ -3194,7 +3183,7 @@ mod tests {
 
     #[cfg(all(feature = "vless", feature = "ws"))]
     #[test]
-    fn websocket_settings_headers_enter_matching_config() {
+    fn websocket_settings_only_host_enters_matching_config() {
         let inbound: InboudItem = serde_json::from_value(serde_json::json!({
             "listen": "127.0.0.1",
             "port": 10005,
@@ -3229,12 +3218,12 @@ mod tests {
                     assert_eq!(target.matching_path.as_deref(), Some("/ws"));
                     let headers = target
                         .matching_headers
-                        .expect("websocket headers should be preserved");
+                        .expect("websocket host should be preserved");
                     assert_eq!(
                         headers.get("host"),
                         Some(&"example.com".to_string())
                     );
-                    assert_eq!(headers.get("x-test"), Some(&"ok".to_string()));
+                    assert!(!headers.contains_key("x-test"));
                     assert!(!headers.contains_key("Host"));
                 }
                 OneOrSome::Some(_) => panic!("expected one websocket target"),
