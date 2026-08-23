@@ -1,4 +1,7 @@
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    time::{Duration, SystemTime},
+};
 
 use async_trait::async_trait;
 use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
@@ -111,6 +114,17 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
         let websocket_key = request_headers
             .remove("sec-websocket-key")
             .ok_or_else(|| std::io::Error::other("missing websocket key header"))?;
+        if !header_contains_token(&request_headers, "upgrade", "websocket")
+            || !header_contains_token(&request_headers, "connection", "upgrade")
+            || request_headers
+                .get("sec-websocket-version")
+                .map(String::as_str)
+                != Some("13")
+            || !valid_websocket_key(&websocket_key)
+        {
+            write_bad_websocket_request(&mut server_stream).await?;
+            return Err(std::io::Error::other("invalid websocket handshake"));
+        }
 
         'outer: for server_target in self.server_targets.iter() {
             debug!("checking server target {:?}", server_target);
@@ -138,29 +152,14 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             let websocket_key_response =
                 create_websocket_key_response(websocket_key);
 
-            let host_response_header = match request_headers.get("host") {
-                Some(v) => format!("Host: {}\r\n", v),
-                None => "".to_string(),
-            };
-
-            let websocket_version_response_header =
-                match request_headers.get("sec-websocket_version") {
-                    Some(v) => format!("Sec-WebSocket-Version: {}\r\n", v),
-                    None => "".to_string(),
-                };
-
             let http_response = format!(
                 concat!(
-                    "HTTP/1.1 101 Switching Protocol\r\n",
-                    "{}",
+                    "HTTP/1.1 101 Switching Protocols\r\n",
                     "Upgrade: websocket\r\n",
                     "Connection: Upgrade\r\n",
-                    "{}",
                     "Sec-WebSocket-Accept: {}\r\n",
                     "\r\n"
                 ),
-                host_response_header,
-                websocket_version_response_header,
                 websocket_key_response,
             );
 
@@ -188,6 +187,45 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
     }
 }
 
+fn header_contains_token(
+    headers: &HashMap<String, String>,
+    name: &str,
+    token: &str,
+) -> bool {
+    headers.get(name).is_some_and(|value| {
+        value
+            .split(',')
+            .any(|value| value.trim().eq_ignore_ascii_case(token))
+    })
+}
+
+fn valid_websocket_key(key: &str) -> bool {
+    BASE64.decode(key).is_ok_and(|decoded| decoded.len() == 16)
+}
+
+async fn write_bad_websocket_request(
+    stream: &mut Box<dyn AsyncStream>,
+) -> std::io::Result<()> {
+    const BODY: &str = "Bad Request\n";
+    let response = format!(
+        concat!(
+            "HTTP/1.1 400 Bad Request\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            "Sec-Websocket-Version: 13\r\n",
+            "X-Content-Type-Options: nosniff\r\n",
+            "Date: {}\r\n",
+            "Content-Length: {}\r\n",
+            "\r\n",
+            "{}"
+        ),
+        httpdate::fmt_http_date(SystemTime::now()),
+        BODY.len(),
+        BODY,
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await
+}
+
 fn create_websocket_key_response(key: String) -> String {
     const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     let mut input = key.into_bytes();
@@ -198,10 +236,18 @@ fn create_websocket_key_response(key: String) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
     use async_trait::async_trait;
+    use tokio::io::{
+        AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf,
+    };
 
     use crate::{
-        async_stream::AsyncStream,
+        async_stream::{AsyncPing, AsyncStream},
         handler::tcp::tcp_handler::{
             TcpServerConnectionContext, TcpServerHandler, TcpServerSetupResult,
         },
@@ -211,6 +257,57 @@ mod tests {
         WebsocketServerTarget, WebsocketTcpServerHandler,
         XRAY_WEBSOCKET_HANDSHAKE_TIMEOUT,
     };
+
+    struct TestStream(DuplexStream);
+
+    impl AsyncRead for TestStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for TestStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    impl AsyncPing for TestStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for TestStream {}
 
     #[derive(Debug)]
     struct Inner {
@@ -231,6 +328,19 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct AcceptingInner;
+
+    #[async_trait]
+    impl TcpServerHandler for AcceptingInner {
+        async fn setup_server_stream(
+            &self,
+            _server_stream: Box<dyn AsyncStream>,
+        ) -> std::io::Result<TcpServerSetupResult> {
+            Ok(TcpServerSetupResult::AlreadyHandled)
+        }
+    }
+
     fn target(manages_handshake_timeout: bool) -> WebsocketServerTarget {
         WebsocketServerTarget {
             matching_path: None,
@@ -238,6 +348,63 @@ mod tests {
             handler: Box::new(Inner {
                 manages_handshake_timeout,
             }),
+        }
+    }
+
+    fn accepting_handler() -> WebsocketTcpServerHandler {
+        WebsocketTcpServerHandler::new(vec![WebsocketServerTarget {
+            matching_path: Some("/".to_string()),
+            matching_headers: None,
+            handler: Box::new(AcceptingInner),
+        }])
+    }
+
+    async fn run_handshake(
+        request: &str,
+    ) -> (std::io::Result<TcpServerSetupResult>, String) {
+        let (client, mut peer) = tokio::io::duplex(8192);
+        let handler = accepting_handler();
+        let task = tokio::spawn(async move {
+            handler
+                .setup_server_stream(Box::new(TestStream(client)))
+                .await
+        });
+        peer.write_all(request.as_bytes()).await.unwrap();
+        peer.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        peer.read_to_end(&mut response).await.unwrap();
+        (task.await.unwrap(), String::from_utf8(response).unwrap())
+    }
+
+    #[tokio::test]
+    async fn websocket_handshake_validates_xray_upgrade_headers() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let valid = format!(
+            "GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: WebSocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        let (result, response) = run_handshake(&valid).await;
+        assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
+        assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+        assert!(!response.contains("Host: example.com\r\n"));
+        assert!(!response.contains("Sec-WebSocket-Version: 13\r\n"));
+
+        for invalid in [
+            format!(
+                "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            ),
+            format!(
+                "GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: keep-alive\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            ),
+            format!(
+                "GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 12\r\n\r\n"
+            ),
+            "GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: abc\r\nSec-WebSocket-Version: 13\r\n\r\n".to_string(),
+        ] {
+            let (result, response) = run_handshake(&invalid).await;
+            assert!(result.is_err());
+            assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+            assert!(response.contains("Sec-Websocket-Version: 13\r\n"));
+            assert!(response.ends_with("\r\n\r\nBad Request\n"));
         }
     }
 
