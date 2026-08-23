@@ -588,26 +588,13 @@ async fn handle_request(
         (_, true, Some(session_id), None)
             if matches!(state.mode, XhttpMode::Auto | XhttpMode::StreamUp) =>
         {
-            handle_stream_up(
-                request,
-                state.clone(),
-                session_id,
-                logical_peer_addr,
-                stream_up_padding,
-            )
-            .await
+            handle_stream_up(request, state.clone(), session_id, stream_up_padding)
+                .await
         }
         (_, true, Some(session_id), Some(seq))
             if matches!(state.mode, XhttpMode::Auto | XhttpMode::PacketUp) =>
         {
-            handle_packet_up(
-                request,
-                state.clone(),
-                session_id,
-                seq,
-                logical_peer_addr,
-            )
-            .await
+            handle_packet_up(request, state.clone(), session_id, seq).await
         }
         _ => simple_response(StatusCode::METHOD_NOT_ALLOWED),
     };
@@ -652,13 +639,9 @@ async fn handle_stream_up(
     request: Request<Incoming>,
     state: Arc<AppState>,
     session_id: String,
-    peer_addr: std::net::SocketAddr,
     padding_enabled: bool,
 ) -> Response<ResponseBody> {
     let session = state.sessions.get_or_create(&session_id);
-    if let Some(stream) = session.take_handler_stream().await {
-        spawn_handler_stream(stream, state.clone(), peer_addr);
-    }
 
     let sessions = state.sessions.clone();
     let upload_session_id = session_id.clone();
@@ -699,7 +682,7 @@ async fn handle_stream_down(
     let session = state.sessions.get_or_create(&session_id);
     session.fully_connected.store(true, Ordering::Release);
 
-    if let Some(stream) = session.take_handler_stream().await {
+    if let Some(stream) = session.take_handler_stream_for_downlink().await {
         spawn_handler_stream(stream, state.clone(), peer_addr);
     }
 
@@ -733,7 +716,6 @@ async fn handle_packet_up(
     state: Arc<AppState>,
     session_id: String,
     seq: String,
-    peer_addr: std::net::SocketAddr,
 ) -> Response<ResponseBody> {
     let Ok(seq) = seq.parse::<u64>() else {
         return simple_response(StatusCode::BAD_REQUEST);
@@ -794,10 +776,6 @@ async fn handle_packet_up(
     let collected = Bytes::from(payload);
 
     let session = state.sessions.get_or_create(&session_id);
-    if let Some(stream) = session.take_handler_stream().await {
-        spawn_handler_stream(stream, state.clone(), peer_addr);
-    }
-
     let mut upload_state = session.upload.lock().await;
     match upload_state.packet_queue.push_packet(seq, collected) {
         Ok(()) => {}
@@ -1003,7 +981,11 @@ impl XhttpSession {
         }
     }
 
-    async fn take_handler_stream(&self) -> Option<XhttpLogicalStream> {
+    async fn take_handler_stream_for_downlink(&self) -> Option<XhttpLogicalStream> {
+        // Xray v26.2.6 only exposes a split XHTTP connection to the inbound
+        // listener when the stream-down GET arrives. Earlier uplink requests
+        // may create the session and queue bytes, but must not choose the
+        // logical peer address.
         self.handler_stream.lock().await.take()
     }
 
@@ -1708,6 +1690,30 @@ mod tests {
         let result = collect_body_limited(body, 7).await;
 
         assert_eq!(result, Err(StatusCode::PAYLOAD_TOO_LARGE));
+    }
+
+    #[tokio::test]
+    async fn split_session_keeps_handler_pending_until_downlink() {
+        let session = XhttpSession::new(4);
+        {
+            let mut upload = session.upload.lock().await;
+            assert!(
+                upload
+                    .packet_queue
+                    .push_packet(0, Bytes::from_static(b"ping"))
+                    .is_ok(),
+                "queue packet-up payload"
+            );
+        }
+
+        assert!(
+            session.handler_stream.lock().await.is_some(),
+            "packet-up must not consume the logical handler stream"
+        );
+        assert!(
+            session.take_handler_stream_for_downlink().await.is_some(),
+            "stream-down must still own logical connection creation"
+        );
     }
 
     #[tokio::test]
