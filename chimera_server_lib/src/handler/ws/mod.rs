@@ -21,6 +21,7 @@ pub fn create_websocket_server_target(
         matching_path,
         matching_headers,
         xray_mismatch_404,
+        trusted_x_forwarded_for,
         protocol,
     } = websocket_server_config;
 
@@ -40,6 +41,7 @@ pub fn create_websocket_server_target(
         matching_path,
         matching_headers,
         xray_mismatch_404,
+        trusted_x_forwarded_for,
         handler,
     })
 }

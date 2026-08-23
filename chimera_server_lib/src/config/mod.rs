@@ -73,6 +73,15 @@ pub struct StreamSettings {
     #[cfg(feature = "reality")]
     #[serde(alias = "realitySettings")]
     reality_settings: Option<RealitySettings>,
+    #[serde(default)]
+    sockopt: Option<SocketSettings>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SocketSettings {
+    #[serde(default)]
+    trusted_x_forwarded_for: Vec<String>,
 }
 
 #[cfg(feature = "grpc_transport")]
