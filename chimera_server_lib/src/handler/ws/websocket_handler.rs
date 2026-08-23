@@ -79,7 +79,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
     ) -> std::io::Result<TcpServerSetupResult> {
         tracing::debug!("WebsocketTcpServerHandler setup_server_stream");
         let ParsedHttpData {
-            mut first_line,
+            first_line,
             headers: mut request_headers,
             line_reader,
         } = timeout(
@@ -94,27 +94,27 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             )
         })??;
 
-        let request_path = {
-            if !first_line.ends_with(" HTTP/1.0")
-                && !first_line.ends_with(" HTTP/1.1")
-            {
-                return Err(std::io::Error::other(format!(
-                    "invalid http request version: {}",
-                    first_line
-                )));
-            }
-
-            if !first_line.starts_with("GET ") {
-                return Err(std::io::Error::other(format!(
-                    "invalid http request: {}",
-                    first_line
-                )));
-            }
-
-            first_line.truncate(first_line.len() - 9);
-
-            xray_websocket_request_path(&first_line[4..])
-        };
+        let (method, request_target) =
+            match parse_xray_websocket_request_line(&first_line) {
+                Ok(parsed) => parsed,
+                Err(WebsocketRequestLineError::Malformed) => {
+                    write_xray_bad_request_line(&mut server_stream).await?;
+                    return Err(std::io::Error::other(
+                        "malformed HTTP request line",
+                    ));
+                }
+                Err(WebsocketRequestLineError::UnsupportedVersion) => {
+                    write_xray_unsupported_http_version(&mut server_stream).await?;
+                    return Err(std::io::Error::other(
+                        "unsupported HTTP protocol version",
+                    ));
+                }
+            };
+        if method != "GET" {
+            write_xray_method_not_allowed(&mut server_stream).await?;
+            return Err(std::io::Error::other("websocket method is not GET"));
+        }
+        let request_path = xray_websocket_request_path(request_target);
         debug!("request path is {}", request_path);
         let websocket_key = request_headers
             .remove("sec-websocket-key")
@@ -226,6 +226,53 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebsocketRequestLineError {
+    Malformed,
+    UnsupportedVersion,
+}
+
+fn parse_xray_websocket_request_line(
+    line: &str,
+) -> Result<(&str, &str), WebsocketRequestLineError> {
+    let (method, rest) = line
+        .split_once(' ')
+        .ok_or(WebsocketRequestLineError::Malformed)?;
+    let (request_target, version) = rest
+        .split_once(' ')
+        .ok_or(WebsocketRequestLineError::Malformed)?;
+    if method.is_empty()
+        || request_target.is_empty()
+        || version.is_empty()
+        || method.bytes().any(|byte| byte.is_ascii_whitespace())
+        || request_target
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace())
+        || version.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
+        return Err(WebsocketRequestLineError::Malformed);
+    }
+
+    let version = version
+        .strip_prefix("HTTP/")
+        .ok_or(WebsocketRequestLineError::Malformed)?;
+    let (major, minor) = version
+        .split_once('.')
+        .ok_or(WebsocketRequestLineError::Malformed)?;
+    if major.len() != 1
+        || minor.len() != 1
+        || !major.bytes().all(|byte| byte.is_ascii_digit())
+        || !minor.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(WebsocketRequestLineError::Malformed);
+    }
+    if major != "1" {
+        return Err(WebsocketRequestLineError::UnsupportedVersion);
+    }
+
+    Ok((method, request_target))
+}
+
 fn xray_websocket_request_path(request_target: &str) -> String {
     let origin_target = if let Some(rest) = request_target.strip_prefix("http://") {
         rest.find('/').map_or("/", |path_start| &rest[path_start..])
@@ -278,6 +325,52 @@ async fn write_xray_websocket_not_found(
             "\r\n"
         ),
         httpdate::fmt_http_date(SystemTime::now()),
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await
+}
+
+async fn write_xray_method_not_allowed(
+    stream: &mut Box<dyn AsyncStream>,
+) -> std::io::Result<()> {
+    const BODY: &str = "Method Not Allowed\n";
+    let response = format!(
+        concat!(
+            "HTTP/1.1 405 Method Not Allowed\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            "Sec-Websocket-Version: 13\r\n",
+            "X-Content-Type-Options: nosniff\r\n",
+            "Date: {}\r\n",
+            "Content-Length: {}\r\n",
+            "\r\n",
+            "{}"
+        ),
+        httpdate::fmt_http_date(SystemTime::now()),
+        BODY.len(),
+        BODY,
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await
+}
+
+async fn write_xray_bad_request_line(
+    stream: &mut Box<dyn AsyncStream>,
+) -> std::io::Result<()> {
+    stream
+        .write_all(
+            b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request",
+        )
+        .await?;
+    stream.flush().await
+}
+
+async fn write_xray_unsupported_http_version(
+    stream: &mut Box<dyn AsyncStream>,
+) -> std::io::Result<()> {
+    const STATUS: &str =
+        "505 HTTP Version Not Supported: unsupported protocol version";
+    let response = format!(
+        "HTTP/1.1 {STATUS}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n{STATUS}"
     );
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await
@@ -512,6 +605,55 @@ mod tests {
             let (result, response) = run_handshake(&request).await;
             assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
             assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_handshake_matches_xray_request_line_semantics() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let headers = format!(
+            "Host: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+
+        for version in ["HTTP/1.0", "HTTP/1.1", "HTTP/1.2"] {
+            let (result, response) =
+                run_handshake(&format!("GET / {version}\r\n{headers}")).await;
+            assert!(result.is_ok(), "{version}");
+            assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+        }
+
+        for method in ["POST", "PUT"] {
+            let (result, response) =
+                run_handshake(&format!("{method} / HTTP/1.1\r\n{headers}")).await;
+            assert!(result.is_err());
+            assert!(response.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
+            assert!(response.ends_with("\r\n\r\nMethod Not Allowed\n"));
+        }
+
+        for version in ["HTTP/0.9", "HTTP/2.0", "HTTP/9.9"] {
+            let (result, response) =
+                run_handshake(&format!("GET / {version}\r\n{headers}")).await;
+            assert!(result.is_err());
+            assert!(response.starts_with(
+                "HTTP/1.1 505 HTTP Version Not Supported: unsupported protocol version\r\n"
+            ));
+        }
+
+        for request_line in [
+            "GET  / HTTP/1.1",
+            "GET\t/\tHTTP/1.1",
+            "GET / HTTP/1.x",
+            "GET / HTTP/1.10",
+            "GET / HTTP/01.1",
+            "GET / HTTP/1.01",
+        ] {
+            let (result, response) =
+                run_handshake(&format!("{request_line}\r\n{headers}")).await;
+            assert!(result.is_err());
+            assert_eq!(
+                response,
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request"
+            );
         }
     }
 
