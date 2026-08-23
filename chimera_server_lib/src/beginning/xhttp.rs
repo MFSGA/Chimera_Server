@@ -520,10 +520,19 @@ async fn handle_request(
     let stream_up_padding = state.padding_obfs_mode
         || header_value(&request_headers, "referer").is_some();
     let (session_id, seq) = state.extract_meta(&request);
-
     let is_downlink_method = request.method() == Method::GET;
     let is_uplink_method =
         request.method().as_str() == state.uplink_http_method.as_str();
+    if let Some(status) = request_shape_error(
+        state.mode,
+        is_uplink_method,
+        session_id.is_some(),
+        seq.is_some(),
+    ) {
+        let mut response = simple_response(status);
+        state.decorate_response(&mut response);
+        return Ok(response);
+    }
     let mut response = match (is_downlink_method, is_uplink_method, session_id, seq)
     {
         (true, _, Some(session_id), None)
@@ -675,7 +684,7 @@ async fn handle_packet_up(
     seq: String,
 ) -> Response<ResponseBody> {
     let Ok(seq) = seq.parse::<u64>() else {
-        return simple_response(StatusCode::BAD_REQUEST);
+        return simple_response(StatusCode::INTERNAL_SERVER_ERROR);
     };
 
     let (parts, body) = request.into_parts();
@@ -1327,6 +1336,21 @@ fn hpack_huffman_bit_len(byte: u8) -> usize {
     }
 }
 
+fn request_shape_error(
+    mode: XhttpMode,
+    is_uplink_method: bool,
+    has_session_id: bool,
+    has_seq: bool,
+) -> Option<StatusCode> {
+    if mode != XhttpMode::PacketUp {
+        return None;
+    }
+    if !has_session_id || (is_uplink_method && !has_seq) {
+        return Some(StatusCode::BAD_REQUEST);
+    }
+    None
+}
+
 fn apply_xray_cors_headers(headers: &mut hyper::HeaderMap) {
     // Xray v26.2.6 writes these two CORS headers unconditionally for XHTTP
     // requests after host/path validation. It does not echo Origin, advertise
@@ -1385,6 +1409,34 @@ fn apply_response_padding(headers: &mut hyper::HeaderMap, state: &AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packet_up_request_shape_matches_xray_v26_2_6() {
+        assert_eq!(
+            request_shape_error(XhttpMode::PacketUp, true, false, false),
+            Some(StatusCode::BAD_REQUEST),
+            "explicit packet-up requires a session id"
+        );
+        assert_eq!(
+            request_shape_error(XhttpMode::PacketUp, true, true, false),
+            Some(StatusCode::BAD_REQUEST),
+            "stream-up shaped POST is invalid in packet-up mode"
+        );
+        assert_eq!(
+            request_shape_error(XhttpMode::PacketUp, true, true, true),
+            None
+        );
+        assert_eq!(
+            request_shape_error(XhttpMode::PacketUp, false, true, false),
+            None,
+            "stream-down GET remains valid without a sequence"
+        );
+        assert_eq!(
+            request_shape_error(XhttpMode::Auto, true, false, false),
+            None,
+            "auto mode still permits stream-one without a session"
+        );
+    }
 
     #[test]
     fn xhttp_cors_headers_match_xray_v26_2_6() {
