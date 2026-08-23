@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    net::{IpAddr, SocketAddr},
     time::{Duration, SystemTime},
 };
 
@@ -75,7 +76,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
     async fn setup_server_stream_with_context(
         &self,
         mut server_stream: Box<dyn AsyncStream>,
-        context: TcpServerConnectionContext,
+        mut context: TcpServerConnectionContext,
     ) -> std::io::Result<TcpServerSetupResult> {
         tracing::debug!("WebsocketTcpServerHandler setup_server_stream");
         let ParsedHttpData {
@@ -124,6 +125,9 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             .get("sec-websocket-protocol")
             .and_then(|values| values.first())
             .and_then(|value| decode_xray_websocket_early_data(value));
+        if let Some(peer_addr) = xray_websocket_forwarded_peer(&request_headers) {
+            context.peer_addr = Some(peer_addr);
+        }
         if !header_contains_token(&request_headers, "upgrade", "websocket")
             || !header_contains_token(&request_headers, "connection", "upgrade")
             || !header_contains_token(
@@ -307,6 +311,36 @@ fn valid_websocket_key(key: &str) -> bool {
     BASE64.decode(key).is_ok_and(|decoded| decoded.len() == 16)
 }
 
+fn xray_websocket_forwarded_peer(
+    headers: &HashMap<String, Vec<String>>,
+) -> Option<SocketAddr> {
+    let first = headers.get("x-forwarded-for")?.first()?.split(',').next()?;
+    let mut candidate = first;
+    if candidate.starts_with('[') && candidate.ends_with(']') {
+        candidate = &candidate[1..candidate.len() - 1];
+    }
+    if candidate
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| !byte.is_ascii_alphanumeric())
+        || candidate
+            .as_bytes()
+            .last()
+            .is_some_and(|byte| !byte.is_ascii_alphanumeric())
+    {
+        candidate = candidate.trim();
+    }
+
+    let ip = candidate.parse::<IpAddr>().ok()?;
+    let ip = match ip {
+        IpAddr::V6(ipv6) => {
+            ipv6.to_ipv4_mapped().map_or(IpAddr::V6(ipv6), IpAddr::V4)
+        }
+        ip => ip,
+    };
+    Some(SocketAddr::new(ip, 0))
+}
+
 fn decode_xray_websocket_early_data(value: &str) -> Option<Vec<u8>> {
     let normalized = value.replace('+', "-").replace('/', "_").replace('=', "");
     URL_SAFE_NO_PAD
@@ -412,6 +446,7 @@ fn create_websocket_key_response(key: String) -> String {
 mod tests {
     use std::{
         collections::HashMap,
+        net::SocketAddr,
         pin::Pin,
         sync::{Arc, Mutex},
         task::{Context, Poll},
@@ -512,6 +547,11 @@ mod tests {
         captured: Arc<Mutex<Vec<u8>>>,
     }
 
+    #[derive(Debug)]
+    struct ContextCapturingInner {
+        captured_peer: Arc<Mutex<Option<SocketAddr>>>,
+    }
+
     #[async_trait]
     impl TcpServerHandler for AcceptingInner {
         async fn setup_server_stream(
@@ -531,6 +571,25 @@ mod tests {
             let mut data = [0u8; 4];
             server_stream.read_exact(&mut data).await?;
             self.captured.lock().unwrap().extend_from_slice(&data);
+            Ok(TcpServerSetupResult::AlreadyHandled)
+        }
+    }
+
+    #[async_trait]
+    impl TcpServerHandler for ContextCapturingInner {
+        async fn setup_server_stream(
+            &self,
+            _server_stream: Box<dyn AsyncStream>,
+        ) -> std::io::Result<TcpServerSetupResult> {
+            unreachable!("context-aware setup should be used")
+        }
+
+        async fn setup_server_stream_with_context(
+            &self,
+            _server_stream: Box<dyn AsyncStream>,
+            context: TcpServerConnectionContext,
+        ) -> std::io::Result<TcpServerSetupResult> {
+            *self.captured_peer.lock().unwrap() = context.peer_addr;
             Ok(TcpServerSetupResult::AlreadyHandled)
         }
     }
@@ -689,6 +748,88 @@ mod tests {
             assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
             assert!(response.contains("Sec-Websocket-Version: 13\r\n"));
             assert!(response.ends_with("\r\n\r\nBad Request\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_x_forwarded_for_overrides_inner_peer_like_xray() {
+        let (client, mut peer) = tokio::io::duplex(8192);
+        let captured_peer = Arc::new(Mutex::new(None));
+        let handler = WebsocketTcpServerHandler::new(vec![WebsocketServerTarget {
+            matching_path: Some("/".to_string()),
+            matching_headers: None,
+            xray_mismatch_404: false,
+            handler: Box::new(ContextCapturingInner {
+                captured_peer: captured_peer.clone(),
+            }),
+        }]);
+        let task = tokio::spawn(async move {
+            handler
+                .setup_server_stream_with_context(
+                    Box::new(TestStream(client)),
+                    TcpServerConnectionContext {
+                        peer_addr: Some("127.0.0.1:45678".parse().unwrap()),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+
+        peer.write_all(
+            concat!(
+                "GET / HTTP/1.1\r\n",
+                "Host: example.com\r\n",
+                "Upgrade: websocket\r\n",
+                "Connection: Upgrade\r\n",
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+                "Sec-WebSocket-Version: 13\r\n",
+                "X-Forwarded-For: 203.0.113.77, 198.51.100.2\r\n",
+                "\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        peer.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        peer.read_to_end(&mut response).await.unwrap();
+
+        assert!(matches!(
+            task.await.unwrap(),
+            Ok(TcpServerSetupResult::AlreadyHandled)
+        ));
+        assert!(
+            String::from_utf8(response)
+                .unwrap()
+                .starts_with("HTTP/1.1 101 Switching Protocols\r\n")
+        );
+        assert_eq!(
+            *captured_peer.lock().unwrap(),
+            Some("203.0.113.77:0".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn websocket_x_forwarded_for_matches_xray_first_ip_rules() {
+        use super::xray_websocket_forwarded_peer;
+
+        for (value, expected) in [
+            ("203.0.113.77, 198.51.100.2", Some("203.0.113.77:0")),
+            (" 203.0.113.77 ", Some("203.0.113.77:0")),
+            ("[2001:db8::1]", Some("[2001:db8::1]:0")),
+            ("[::ffff:192.0.2.1]", Some("192.0.2.1:0")),
+            ("example.com, 203.0.113.77", None),
+            (" [2001:db8::1] ", None),
+        ] {
+            let headers = HashMap::from([(
+                "x-forwarded-for".to_string(),
+                vec![value.to_string()],
+            )]);
+            assert_eq!(
+                xray_websocket_forwarded_peer(&headers),
+                expected.map(|value| value.parse().unwrap()),
+                "{value}"
+            );
         }
     }
 
