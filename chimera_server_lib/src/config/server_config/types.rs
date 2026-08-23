@@ -394,6 +394,7 @@ pub struct HttpUpgradeServerConfig {
     pub host: Option<String>,
     pub path: String,
     pub accept_proxy_protocol: bool,
+    pub trusted_x_forwarded_for: Vec<String>,
     pub inner: Box<ServerProxyConfig>,
 }
 

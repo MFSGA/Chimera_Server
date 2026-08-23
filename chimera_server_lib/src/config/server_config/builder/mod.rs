@@ -84,7 +84,7 @@ fn normalize_xray_websocket_path(path: Option<String>) -> String {
     }
 }
 
-#[cfg(feature = "ws")]
+#[cfg(any(feature = "ws", feature = "httpupgrade"))]
 fn xray_trusted_x_forwarded_for(
     stream_settings: &crate::config::StreamSettings,
 ) -> Vec<String> {
@@ -212,6 +212,7 @@ fn apply_httpupgrade_layer(
         host,
         path,
         accept_proxy_protocol: settings.accept_proxy_protocol,
+        trusted_x_forwarded_for: xray_trusted_x_forwarded_for(stream_settings),
         inner: Box::new(protocol),
     }))
 }

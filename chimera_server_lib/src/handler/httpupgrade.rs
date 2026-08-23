@@ -17,6 +17,7 @@ pub struct HttpUpgradeTcpServerHandler {
     host: Option<String>,
     path: String,
     accept_proxy_protocol: bool,
+    trusted_x_forwarded_for: Vec<String>,
     inner: Box<dyn TcpServerHandler>,
 }
 
@@ -25,17 +26,22 @@ impl HttpUpgradeTcpServerHandler {
         host: Option<String>,
         path: String,
         accept_proxy_protocol: bool,
+        trusted_x_forwarded_for: Vec<String>,
         inner: Box<dyn TcpServerHandler>,
     ) -> Self {
         Self {
             host: host.map(|value| value.trim().to_ascii_lowercase()),
             path: normalize_path(path),
             accept_proxy_protocol,
+            trusted_x_forwarded_for,
             inner,
         }
     }
 
-    async fn upgrade(&self, stream: &mut Box<dyn AsyncStream>) -> io::Result<()> {
+    async fn upgrade(
+        &self,
+        stream: &mut Box<dyn AsyncStream>,
+    ) -> io::Result<Option<std::net::SocketAddr>> {
         // Xray v26.2.6 calls http.ReadRequest directly here. Unlike its
         // WebSocket transport, HTTPUpgrade does not impose a transport-level
         // four-second header timeout; the inner inbound owns its handshake
@@ -79,6 +85,8 @@ impl HttpUpgradeTcpServerHandler {
             ));
         }
 
+        let forwarded_peer =
+            trusted_forwarded_peer(&headers, &self.trusted_x_forwarded_for);
         stream
             .write_all(
                 b"HTTP/1.1 101 Switching Protocols\r\n\
@@ -86,7 +94,8 @@ impl HttpUpgradeTcpServerHandler {
                   Upgrade: websocket\r\n\r\n",
             )
             .await?;
-        stream.flush().await
+        stream.flush().await?;
+        Ok(forwarded_peer)
     }
 }
 
@@ -121,12 +130,17 @@ impl TcpServerHandler for HttpUpgradeTcpServerHandler {
         } else {
             None
         };
-        self.upgrade(&mut server_stream).await?;
+        let forwarded_peer = self.upgrade(&mut server_stream).await?;
+        let effective_peer = forwarded_peer.or(peer_addr);
+        let mut context = context;
+        if let Some(peer_addr) = effective_peer {
+            context.peer_addr = Some(peer_addr);
+        }
         let result = self
             .inner
             .setup_server_stream_with_context(server_stream, context)
             .await?;
-        Ok(match peer_addr {
+        Ok(match effective_peer {
             Some(peer_addr) => TcpServerSetupResult::PeerAddrOverride {
                 peer_addr,
                 inner: Box::new(result),
@@ -354,6 +368,45 @@ fn parse_request(
     Ok((method, target, version, headers))
 }
 
+fn trusted_forwarded_peer(
+    headers: &HashMap<String, String>,
+    trusted_x_forwarded_for: &[String],
+) -> Option<std::net::SocketAddr> {
+    if !trusted_x_forwarded_for.is_empty()
+        && !trusted_x_forwarded_for
+            .iter()
+            .any(|header| headers.contains_key(&header.trim().to_ascii_lowercase()))
+    {
+        return None;
+    }
+
+    let first = headers.get("x-forwarded-for")?.split(',').next()?;
+    let mut candidate = first;
+    if candidate.starts_with('[') && candidate.ends_with(']') {
+        candidate = &candidate[1..candidate.len() - 1];
+    }
+    if candidate
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| !byte.is_ascii_alphanumeric())
+        || candidate
+            .as_bytes()
+            .last()
+            .is_some_and(|byte| !byte.is_ascii_alphanumeric())
+    {
+        candidate = candidate.trim();
+    }
+
+    let ip = candidate.parse::<std::net::IpAddr>().ok()?;
+    let ip = match ip {
+        std::net::IpAddr::V6(ipv6) => ipv6
+            .to_ipv4_mapped()
+            .map_or(std::net::IpAddr::V6(ipv6), std::net::IpAddr::V4),
+        ip => ip,
+    };
+    Some(std::net::SocketAddr::new(ip, 0))
+}
+
 fn normalize_path(path: String) -> String {
     let path = path.trim();
     if path.is_empty() {
@@ -384,6 +437,7 @@ fn http_host_matches(actual: &str, expected: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
         pin::Pin,
         task::{Context, Poll},
         time::Duration,
@@ -401,7 +455,7 @@ mod tests {
         handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
     };
 
-    use super::HttpUpgradeTcpServerHandler;
+    use super::{HttpUpgradeTcpServerHandler, trusted_forwarded_peer};
 
     #[derive(Debug)]
     struct Inner;
@@ -494,11 +548,35 @@ mod tests {
     impl AsyncStream for TestStream {}
 
     #[test]
+    fn honors_xray_trusted_forwarded_headers() {
+        let headers = HashMap::from([
+            (
+                "x-forwarded-for".to_string(),
+                "203.0.113.77, 198.51.100.2".to_string(),
+            ),
+            ("x-trusted-cdn".to_string(), "yes".to_string()),
+        ]);
+        assert_eq!(
+            trusted_forwarded_peer(&headers, &[]),
+            Some("203.0.113.77:0".parse().unwrap())
+        );
+        assert_eq!(
+            trusted_forwarded_peer(&headers, &["X-Missing".into()]),
+            None
+        );
+        assert_eq!(
+            trusted_forwarded_peer(&headers, &["X-Trusted-CDN".into()]),
+            Some("203.0.113.77:0".parse().unwrap())
+        );
+    }
+
+    #[test]
     fn propagates_inner_handshake_timeout_ownership() {
         let unmanaged = HttpUpgradeTcpServerHandler::new(
             None,
             "/upgrade".into(),
             false,
+            Vec::new(),
             Box::new(Inner),
         );
         assert!(!unmanaged.manages_handshake_timeout());
@@ -507,6 +585,7 @@ mod tests {
             None,
             "/upgrade".into(),
             false,
+            Vec::new(),
             Box::new(TimeoutManagingInner),
         );
         assert!(managed.manages_handshake_timeout());
@@ -518,6 +597,7 @@ mod tests {
             None,
             "/upgrade".into(),
             false,
+            Vec::new(),
             Box::new(Inner),
         );
         let (mut client, server) = duplex(4096);
@@ -551,6 +631,7 @@ mod tests {
             Some("example.com".into()),
             "upgrade".into(),
             false,
+            Vec::new(),
             Box::new(Inner),
         );
         let (mut client, server) = duplex(4096);
@@ -588,6 +669,7 @@ mod tests {
             None,
             "/upgrade".into(),
             true,
+            Vec::new(),
             Box::new(Inner),
         );
         let (mut client, server) = duplex(4096);
@@ -631,6 +713,7 @@ mod tests {
             None,
             "/upgrade".into(),
             true,
+            Vec::new(),
             Box::new(Inner),
         );
         let (mut client, server) = duplex(4096);
@@ -662,6 +745,7 @@ mod tests {
             None,
             "/upgrade".into(),
             true,
+            Vec::new(),
             Box::new(Inner),
         );
         let (mut client, server) = duplex(4096);
@@ -694,6 +778,7 @@ mod tests {
             None,
             "/expected".into(),
             false,
+            Vec::new(),
             Box::new(Inner),
         );
         let (mut client, server) = duplex(1024);
