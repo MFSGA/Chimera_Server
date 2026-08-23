@@ -5,7 +5,10 @@ use std::{
 
 use async_trait::async_trait;
 use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD},
+};
 use tokio::{io::AsyncWriteExt, time::timeout};
 use tracing::debug;
 
@@ -17,6 +20,7 @@ use crate::{
         },
         ws::{parsed_http::ParsedHttpData, websocket_stream::WebsocketStream},
     },
+    util::prefixed_stream::PrefixedStream,
 };
 
 #[derive(Debug)]
@@ -115,6 +119,10 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             .remove("sec-websocket-key")
             .and_then(|values| values.into_iter().next())
             .ok_or_else(|| std::io::Error::other("missing websocket key header"))?;
+        let websocket_early_data = request_headers
+            .get("sec-websocket-protocol")
+            .and_then(|values| values.first())
+            .and_then(|value| decode_xray_websocket_early_data(value));
         if !header_contains_token(&request_headers, "upgrade", "websocket")
             || !header_contains_token(&request_headers, "connection", "upgrade")
             || !header_contains_token(
@@ -158,24 +166,41 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             let websocket_key_response =
                 create_websocket_key_response(websocket_key);
 
-            let http_response = format!(
+            let mut http_response = format!(
                 concat!(
                     "HTTP/1.1 101 Switching Protocols\r\n",
                     "Upgrade: websocket\r\n",
                     "Connection: Upgrade\r\n",
-                    "Sec-WebSocket-Accept: {}\r\n",
-                    "\r\n"
+                    "Sec-WebSocket-Accept: {}\r\n"
                 ),
                 websocket_key_response,
             );
+            if websocket_early_data.is_some()
+                && let Some(protocol) = request_headers
+                    .get("sec-websocket-protocol")
+                    .and_then(|values| values.first())
+            {
+                http_response.push_str("Sec-WebSocket-Protocol: ");
+                http_response.push_str(protocol);
+                http_response.push_str("\r\n");
+            }
+            http_response.push_str("\r\n");
 
             server_stream.write_all(http_response.as_bytes()).await?;
 
-            let websocket_stream = Box::new(WebsocketStream::new(
-                server_stream,
-                false,
-                line_reader.unparsed_data(),
-            ));
+            let websocket_stream: Box<dyn AsyncStream> =
+                Box::new(WebsocketStream::new(
+                    server_stream,
+                    false,
+                    line_reader.unparsed_data(),
+                ));
+            let websocket_stream =
+                if let Some(early_data) = websocket_early_data.clone() {
+                    Box::new(PrefixedStream::new(early_data, websocket_stream))
+                        as Box<dyn AsyncStream>
+                } else {
+                    websocket_stream
+                };
 
             let mut target_setup_result = handler
                 .setup_server_stream_with_context(websocket_stream, context.clone())
@@ -209,6 +234,14 @@ fn header_contains_token(
 
 fn valid_websocket_key(key: &str) -> bool {
     BASE64.decode(key).is_ok_and(|decoded| decoded.len() == 16)
+}
+
+fn decode_xray_websocket_early_data(value: &str) -> Option<Vec<u8>> {
+    let normalized = value.replace('+', "-").replace('/', "_").replace('=', "");
+    URL_SAFE_NO_PAD
+        .decode(normalized)
+        .ok()
+        .filter(|decoded| !decoded.is_empty())
 }
 
 async fn write_bad_websocket_request(
@@ -246,6 +279,7 @@ fn create_websocket_key_response(key: String) -> String {
 mod tests {
     use std::{
         pin::Pin,
+        sync::{Arc, Mutex},
         task::{Context, Poll},
     };
 
@@ -339,12 +373,30 @@ mod tests {
     #[derive(Debug)]
     struct AcceptingInner;
 
+    #[derive(Debug)]
+    struct CapturingInner {
+        captured: Arc<Mutex<Vec<u8>>>,
+    }
+
     #[async_trait]
     impl TcpServerHandler for AcceptingInner {
         async fn setup_server_stream(
             &self,
             _server_stream: Box<dyn AsyncStream>,
         ) -> std::io::Result<TcpServerSetupResult> {
+            Ok(TcpServerSetupResult::AlreadyHandled)
+        }
+    }
+
+    #[async_trait]
+    impl TcpServerHandler for CapturingInner {
+        async fn setup_server_stream(
+            &self,
+            mut server_stream: Box<dyn AsyncStream>,
+        ) -> std::io::Result<TcpServerSetupResult> {
+            let mut data = [0u8; 4];
+            server_stream.read_exact(&mut data).await?;
+            self.captured.lock().unwrap().extend_from_slice(&data);
             Ok(TcpServerSetupResult::AlreadyHandled)
         }
     }
@@ -414,6 +466,47 @@ mod tests {
             assert!(response.contains("Sec-Websocket-Version: 13\r\n"));
             assert!(response.ends_with("\r\n\r\nBad Request\n"));
         }
+    }
+
+    #[tokio::test]
+    async fn websocket_handshake_matches_xray_early_data_subprotocol() {
+        let (client, mut peer) = tokio::io::duplex(8192);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let handler = WebsocketTcpServerHandler::new(vec![WebsocketServerTarget {
+            matching_path: Some("/".to_string()),
+            matching_headers: None,
+            handler: Box::new(CapturingInner {
+                captured: captured.clone(),
+            }),
+        }]);
+        let task = tokio::spawn(async move {
+            handler
+                .setup_server_stream(Box::new(TestStream(client)))
+                .await
+        });
+
+        let request = concat!(
+            "GET / HTTP/1.1\r\n",
+            "Host: example.com\r\n",
+            "Upgrade: websocket\r\n",
+            "Connection: Upgrade\r\n",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            "Sec-WebSocket-Version: 13\r\n",
+            "Sec-WebSocket-Protocol: cGluZw==\r\n",
+            "\r\n"
+        );
+        peer.write_all(request.as_bytes()).await.unwrap();
+        peer.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        peer.read_to_end(&mut response).await.unwrap();
+
+        assert!(matches!(
+            task.await.unwrap(),
+            Ok(TcpServerSetupResult::AlreadyHandled)
+        ));
+        assert_eq!(&*captured.lock().unwrap(), b"ping");
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.contains("Sec-WebSocket-Protocol: cGluZw==\r\n"));
     }
 
     #[tokio::test]
