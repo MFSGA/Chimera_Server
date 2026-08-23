@@ -380,12 +380,6 @@ impl WebsocketStream {
                         self.read_frame_length
                     )));
                 }
-                if self.read_frame_length == 1 {
-                    return Err(std::io::Error::other(
-                        "invalid close frame payload length (1)",
-                    ));
-                }
-
                 self.close_data_size = 0;
                 if self.read_frame_length == 0 {
                     self.read_state = ReadState::Init;
@@ -524,6 +518,15 @@ impl WebsocketStream {
     }
 
     fn validate_close_payload(&mut self) -> std::io::Result<()> {
+        if self.close_data_size == 1 {
+            if self.is_client {
+                return Err(std::io::Error::other(
+                    "invalid close frame payload length (1)",
+                ));
+            }
+            return Ok(());
+        }
+
         debug_assert!(self.close_data_size >= 2);
         let code = u16::from_be_bytes([self.close_data[0], self.close_data[1]]);
         let valid_code = matches!(code, 1000..=1003 | 1007..=1013)
@@ -652,10 +655,13 @@ impl WebsocketStream {
     }
 
     fn pack_write_close_frame(&mut self) -> bool {
-        let payload: &[u8] = if self.close_received {
+        let normal_close = 1000u16.to_be_bytes();
+        let payload: &[u8] = if self.protocol_error_pending
+            || (self.is_client && self.close_received)
+        {
             &self.close_data[..self.close_data_size]
         } else {
-            &1000u16.to_be_bytes()
+            &normal_close
         };
         let available_space = self.write_frame.len() - self.write_frame_end_offset;
         if available_space < payload.len() + 14 {
@@ -782,6 +788,16 @@ impl AsyncRead for WebsocketStream {
         }
 
         if this.close_received {
+            if !this.close_sent {
+                if !this.pack_write_close_frame() {
+                    return Poll::Pending;
+                }
+                this.close_sent = true;
+            }
+            this.do_write_frame(cx)?;
+            if this.write_frame_end_offset > 0 {
+                return Poll::Pending;
+            }
             return Poll::Ready(Ok(()));
         }
 
@@ -854,6 +870,16 @@ impl AsyncRead for WebsocketStream {
                 return Poll::Ready(Ok(()));
             }
             if this.close_received {
+                if !this.close_sent {
+                    if !this.pack_write_close_frame() {
+                        return Poll::Pending;
+                    }
+                    this.close_sent = true;
+                }
+                this.do_write_frame(cx)?;
+                if this.write_frame_end_offset > 0 {
+                    return Poll::Pending;
+                }
                 return Poll::Ready(Ok(()));
             }
         }
@@ -1286,6 +1312,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_replies_normally_to_one_byte_close_like_xray() {
+        let (mut peer, transport) = tokio::io::duplex(64);
+        let mut websocket = websocket_over(transport);
+        peer.write_all(&masked_frame(0x88, &[0x01])).await.unwrap();
+
+        let mut application_data = [0u8; 1];
+        assert_eq!(websocket.read(&mut application_data).await.unwrap(), 0);
+
+        let mut response = [0u8; 4];
+        peer.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, [0x88, 0x02, 0x03, 0xe8]);
+    }
+
+    #[tokio::test]
     async fn server_rejects_invalid_close_reason_utf8_like_xray() {
         let (mut peer, transport) = tokio::io::duplex(128);
         let mut websocket = websocket_over(transport);
@@ -1343,7 +1383,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn received_close_is_echoed_during_shutdown() {
+    async fn received_close_gets_xray_normal_reply_before_read_eof() {
         let (mut peer, transport) = tokio::io::duplex(64);
         let mut websocket = websocket_over(transport);
         let close_payload = [0x03, 0xe8, b'b', b'y', b'e'];
@@ -1353,11 +1393,14 @@ mod tests {
 
         let mut application_data = [0u8; 1];
         assert_eq!(websocket.read(&mut application_data).await.unwrap(), 0);
-        websocket.shutdown().await.unwrap();
 
-        let mut response = [0u8; 7];
+        let mut response = [0u8; 4];
         peer.read_exact(&mut response).await.unwrap();
-        assert_eq!(response, [0x88, 0x05, 0x03, 0xe8, b'b', b'y', b'e']);
+        assert_eq!(response, [0x88, 0x02, 0x03, 0xe8]);
+
+        websocket.shutdown().await.unwrap();
+        let mut extra = [0u8; 1];
+        assert_eq!(peer.read(&mut extra).await.unwrap(), 0);
     }
 
     #[tokio::test]
