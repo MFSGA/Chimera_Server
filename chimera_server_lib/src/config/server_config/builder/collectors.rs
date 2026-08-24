@@ -710,7 +710,10 @@ pub(super) fn collect_xhttp_settings(
         min_padding,
         max_padding,
         max_each_post_bytes,
-        max_buffered_posts: raw.sc_max_buffered_posts.unwrap_or(30).max(1) as usize,
+        max_buffered_posts: match raw.sc_max_buffered_posts.unwrap_or(0) {
+            0 => 30,
+            value => value.max(1) as usize,
+        },
         session_ttl_secs: 30,
         stream_up_server_secs,
         server_max_header_bytes,
@@ -1347,6 +1350,17 @@ mod tests {
         assert!(config.seq_key.is_empty());
         assert_eq!(config.uplink_data_placement, XhttpDataPlacement::Body);
         assert!(config.uplink_data_key.is_empty());
+    }
+
+    #[test]
+    fn collect_xhttp_settings_normalizes_zero_buffered_posts_like_xray_v26_2_6() {
+        let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
+            "scMaxBufferedPosts": 0
+        }))
+        .expect("xhttp settings");
+
+        let config = collect_xhttp_settings(settings).expect("valid xhttp settings");
+        assert_eq!(config.max_buffered_posts, 30);
     }
 
     #[test]
