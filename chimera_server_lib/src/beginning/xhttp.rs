@@ -514,8 +514,13 @@ async fn handle_request(
         || header_value(&request_headers, "referer").is_some();
     let (session_id, seq) = state.extract_meta(&request);
     let is_downlink_method = request.method() == Method::GET;
-    let is_uplink_method =
-        request.method().as_str() == state.uplink_http_method.as_str();
+    let is_uplink_method = request.method().as_str()
+        == state.uplink_http_method.as_str()
+        || has_uplink_marker(
+            &request_headers,
+            state.uplink_data_placement,
+            &state.uplink_data_key,
+        );
     let dispatch = classify_request(
         state.mode,
         is_downlink_method,
@@ -1143,6 +1148,22 @@ fn cookie_value(headers: &hyper::HeaderMap, key: &str) -> Option<String> {
     })
 }
 
+fn has_uplink_marker(
+    headers: &hyper::HeaderMap,
+    placement: XhttpDataPlacement,
+    key: &str,
+) -> bool {
+    match placement {
+        XhttpDataPlacement::Header => {
+            header_value(headers, &format!("{key}-Upstream")).as_deref() == Some("1")
+        }
+        XhttpDataPlacement::Cookie => {
+            cookie_value(headers, &format!("{key}_upstream")).as_deref() == Some("1")
+        }
+        XhttpDataPlacement::Auto | XhttpDataPlacement::Body => false,
+    }
+}
+
 fn decode_chunked_header_payload(
     headers: &hyper::HeaderMap,
     key: &str,
@@ -1472,6 +1493,56 @@ mod tests {
             Err(StatusCode::METHOD_NOT_ALLOWED),
             "non-uplink non-GET request with a session remains unsupported"
         );
+    }
+
+    #[test]
+    fn uplink_markers_match_xray_v26_2_6() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "x-data-upstream",
+            hyper::header::HeaderValue::from_static("1"),
+        );
+        assert!(has_uplink_marker(
+            &headers,
+            XhttpDataPlacement::Header,
+            "X-Data"
+        ));
+        assert!(!has_uplink_marker(
+            &headers,
+            XhttpDataPlacement::Body,
+            "X-Data"
+        ));
+
+        headers.insert(
+            "x-data-upstream",
+            hyper::header::HeaderValue::from_static("2"),
+        );
+        assert!(!has_uplink_marker(
+            &headers,
+            XhttpDataPlacement::Header,
+            "X-Data"
+        ));
+
+        let mut cookie_headers = hyper::HeaderMap::new();
+        cookie_headers.insert(
+            header::COOKIE,
+            hyper::header::HeaderValue::from_static("other=0; x_data_upstream=1"),
+        );
+        assert!(has_uplink_marker(
+            &cookie_headers,
+            XhttpDataPlacement::Cookie,
+            "x_data"
+        ));
+
+        cookie_headers.insert(
+            header::COOKIE,
+            hyper::header::HeaderValue::from_static("x_data_upstream=0"),
+        );
+        assert!(!has_uplink_marker(
+            &cookie_headers,
+            XhttpDataPlacement::Cookie,
+            "x_data"
+        ));
     }
 
     #[test]
