@@ -1282,9 +1282,52 @@ fn normalize_base_path(mut path: String) -> String {
 
 fn query_value(query: Option<&str>, key: &str) -> Option<String> {
     query?.split('&').find_map(|pair| {
-        let (name, value) = pair.split_once('=')?;
-        (name == key && !value.is_empty()).then(|| value.to_string())
+        let (raw_name, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        let name = decode_query_component(raw_name)?;
+        if name != key {
+            return None;
+        }
+        let value = decode_query_component(raw_value)?;
+        (!value.is_empty()).then_some(value)
     })
+}
+
+fn decode_query_component(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' => {
+                if index + 2 >= bytes.len() {
+                    return None;
+                }
+                let high = hex_value(bytes[index + 1])?;
+                let low = hex_value(bytes[index + 2])?;
+                decoded.push((high << 4) | low);
+                index += 3;
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn header_value(headers: &hyper::HeaderMap, key: &str) -> Option<String> {
@@ -2141,6 +2184,23 @@ mod tests {
             100,
             XhttpPaddingMethod::Tokenish,
         ));
+    }
+
+    #[test]
+    fn query_value_matches_xray_url_query_decoding() {
+        assert_eq!(
+            query_value(Some("x_session=abc%2Fdef"), "x_session").as_deref(),
+            Some("abc/def"),
+        );
+        assert_eq!(
+            query_value(Some("x%5Fsession=hello+world"), "x_session").as_deref(),
+            Some("hello world"),
+        );
+        assert_eq!(query_value(Some("x_session=bad%ZZ"), "x_session"), None);
+        assert_eq!(
+            query_value(Some("other=bad%ZZ&x_session=ok"), "x_session").as_deref(),
+            Some("ok"),
+        );
     }
 
     #[test]
