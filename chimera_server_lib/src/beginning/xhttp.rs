@@ -1404,8 +1404,7 @@ fn decode_xhttp_payload(encoded: &str) -> std::io::Result<Vec<u8>> {
 }
 
 fn matches_base_path(request_path: &str, base_path: &str) -> bool {
-    let trimmed_base_path = base_path.trim_end_matches('/');
-    request_path == trimmed_base_path || request_path.starts_with(base_path)
+    request_path.starts_with(base_path)
 }
 
 fn query_value_from_url(raw_url: &str, key: &str) -> Option<String> {

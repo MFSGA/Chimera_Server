@@ -643,11 +643,9 @@ pub(super) fn collect_xhttp_settings(
             "xhttpSettings.xPaddingBytes cannot be disabled".into(),
         ));
     }
-    let normalized_path = normalize_path(
-        raw.path,
-        session_placement == XhttpPlacement::Path
-            || seq_placement == XhttpPlacement::Path,
-    );
+    // Xray v26.2.6 normalizes every XHTTP base path with a trailing slash,
+    // even when session/sequence metadata is carried outside the path.
+    let normalized_path = normalize_path(raw.path, true);
     let (min_padding, max_padding) = clamp_xhttp_range(
         raw.x_padding_bytes.unwrap_or(XhttpRange {
             from: 100,
@@ -1553,6 +1551,21 @@ mod tests {
         assert!(error.to_string().contains(
             "xhttpSettings.uplinkDataPlacement=header requires mode=packet-up"
         ));
+    }
+
+    #[test]
+    fn collect_xhttp_settings_normalizes_trailing_slash_with_query_meta() {
+        let settings: XhttpSettings = serde_json::from_value(serde_json::json!({
+            "path": "/x",
+            "mode": "packet-up",
+            "sessionPlacement": "query",
+            "seqPlacement": "query"
+        }))
+        .expect("valid xhttp settings");
+
+        let config =
+            collect_xhttp_settings(settings).expect("xhttp settings should parse");
+        assert_eq!(config.path, "/x/");
     }
 
     #[test]
