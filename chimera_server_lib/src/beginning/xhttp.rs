@@ -1280,15 +1280,20 @@ fn normalize_base_path(mut path: String) -> String {
 }
 
 fn query_value(query: Option<&str>, key: &str) -> Option<String> {
-    query?.split('&').find_map(|pair| {
+    for pair in query?.split('&') {
         let (raw_name, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
-        let name = decode_query_component(raw_name)?;
+        let Some(name) = decode_query_component(raw_name) else {
+            continue;
+        };
         if name != key {
-            return None;
+            continue;
         }
-        let value = decode_query_component(raw_value)?;
-        (!value.is_empty()).then_some(value)
-    })
+        let Some(value) = decode_query_component(raw_value) else {
+            continue;
+        };
+        return (!value.is_empty()).then_some(value);
+    }
+    None
 }
 
 fn decode_query_component(value: &str) -> Option<String> {
@@ -2295,8 +2300,21 @@ mod tests {
         );
         assert_eq!(query_value(Some("x_session=bad%ZZ"), "x_session"), None);
         assert_eq!(
+            query_value(Some("x_session=bad%ZZ&x_session=ok"), "x_session")
+                .as_deref(),
+            Some("ok"),
+        );
+        assert_eq!(
             query_value(Some("other=bad%ZZ&x_session=ok"), "x_session").as_deref(),
             Some("ok"),
+        );
+        assert_eq!(
+            query_value(Some("x_session=&x_session=ok"), "x_session"),
+            None,
+        );
+        assert_eq!(
+            query_value(Some("x_session=first&x_session="), "x_session").as_deref(),
+            Some("first"),
         );
     }
 
