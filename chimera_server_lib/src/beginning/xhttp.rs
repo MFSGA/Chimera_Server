@@ -1387,9 +1387,26 @@ fn cookie_value(headers: &hyper::HeaderMap, key: &str) -> Option<String> {
         let value = value.to_str().ok()?;
         value.split(';').find_map(|cookie| {
             let (name, value) = cookie.trim().split_once('=')?;
-            (name == key && !value.is_empty()).then(|| value.to_string())
+            if name != key {
+                return None;
+            }
+            parse_cookie_value_like_go(value).filter(|value| !value.is_empty())
         })
     })
+}
+
+fn parse_cookie_value_like_go(raw: &str) -> Option<String> {
+    let value = raw
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(raw);
+    if value.bytes().all(|byte| {
+        (0x20..0x7f).contains(&byte) && byte != b'"' && byte != b';' && byte != b'\\'
+    }) {
+        Some(value.to_string())
+    } else {
+        None
+    }
 }
 
 fn has_uplink_marker(
@@ -2184,6 +2201,21 @@ mod tests {
             100,
             XhttpPaddingMethod::Tokenish,
         ));
+    }
+
+    #[test]
+    fn cookie_value_matches_xray_quoted_cookie_parsing() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            hyper::header::HeaderValue::from_static(
+                "x_session=\"abc\"; x_seq=\"0\"; invalid=\"a\\\\b\"",
+            ),
+        );
+
+        assert_eq!(cookie_value(&headers, "x_session").as_deref(), Some("abc"));
+        assert_eq!(cookie_value(&headers, "x_seq").as_deref(), Some("0"));
+        assert_eq!(cookie_value(&headers, "invalid"), None);
     }
 
     #[test]
