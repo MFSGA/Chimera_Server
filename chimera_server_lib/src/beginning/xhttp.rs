@@ -417,18 +417,10 @@ impl AppState {
         } else {
             decoded_path.strip_prefix(&self.base_path).unwrap_or("")
         };
-        let path_segments = path_tail
-            .split('/')
-            .filter(|segment| !segment.is_empty())
-            .collect::<Vec<_>>();
         let mut path_index = 0usize;
         let mut next_path_value = || {
-            let value = path_segments
-                .get(path_index)
-                .map(|value| (*value).to_string());
-            if value.is_some() {
-                path_index += 1;
-            }
+            let value = xray_path_metadata_value(path_tail, path_index);
+            path_index += 1;
             value
         };
 
@@ -1526,6 +1518,14 @@ fn matches_base_path(request_path: &str, base_path: &str) -> bool {
     request_path.starts_with(base_path)
 }
 
+fn xray_path_metadata_value(path_tail: &str, index: usize) -> Option<String> {
+    path_tail
+        .split('/')
+        .nth(index)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 fn decode_xray_url_path(raw_path: &str) -> Result<String, ()> {
     if !raw_path.as_bytes().contains(&b'%') {
         return Ok(raw_path.to_string());
@@ -2267,6 +2267,20 @@ mod tests {
             Ok("/x/abc%2Fdef/0"),
         );
         assert!(decode_xray_url_path("/x/abc%ZZ/0").is_err());
+    }
+
+    #[test]
+    fn path_metadata_preserves_empty_segments_like_xray_v26_2_6() {
+        assert_eq!(xray_path_metadata_value("abc/0", 0).as_deref(), Some("abc"));
+        assert_eq!(xray_path_metadata_value("abc/0", 1).as_deref(), Some("0"));
+        assert_eq!(
+            xray_path_metadata_value("abc//0", 0).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(xray_path_metadata_value("abc//0", 1), None);
+        assert_eq!(xray_path_metadata_value("abc//0", 2).as_deref(), Some("0"));
+        assert_eq!(xray_path_metadata_value("/0", 0), None);
+        assert_eq!(xray_path_metadata_value("/0", 1).as_deref(), Some("0"));
     }
 
     #[test]
