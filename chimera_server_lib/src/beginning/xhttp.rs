@@ -243,6 +243,8 @@ fn parse_listener_protocol(
 
 const XHTTP_HTTP1_HEADER_SLOP_BYTES: usize = 4096;
 const XHTTP_HTTP2_HEADER_LIST_OVERHEAD_BYTES: usize = 320;
+const XRAY_XHTTP_HTTP2_MAX_CONCURRENT_STREAMS: u32 = 250;
+const XRAY_XHTTP_HTTP2_MAX_FRAME_SIZE: u32 = 1_048_576;
 
 fn xray_http1_header_read_limit(server_max_header_bytes: usize) -> usize {
     server_max_header_bytes
@@ -275,7 +277,9 @@ fn configure_http_builder(
     // accounting overhead), rather than the raw MaxHeaderBytes value.
     builder
         .http2()
-        .max_header_list_size(xray_http2_header_list_limit(server_max_header_bytes));
+        .max_header_list_size(xray_http2_header_list_limit(server_max_header_bytes))
+        .max_concurrent_streams(XRAY_XHTTP_HTTP2_MAX_CONCURRENT_STREAMS)
+        .max_frame_size(XRAY_XHTTP_HTTP2_MAX_FRAME_SIZE);
 }
 
 async fn serve_http_connection<IO>(
@@ -1674,9 +1678,11 @@ mod tests {
     }
 
     #[test]
-    fn http2_header_list_limit_matches_xray_v26_2_6() {
+    fn http2_settings_match_xray_v26_2_6() {
         assert_eq!(xray_http2_header_list_limit(8192), 8512);
         assert_eq!(xray_http2_header_list_limit(16_384), 16_704);
+        assert_eq!(XRAY_XHTTP_HTTP2_MAX_CONCURRENT_STREAMS, 250);
+        assert_eq!(XRAY_XHTTP_HTTP2_MAX_FRAME_SIZE, 1_048_576);
     }
 
     #[test]
