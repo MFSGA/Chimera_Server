@@ -597,12 +597,18 @@ async fn handle_stream_one(
     reader_response(StatusCode::OK, client_download, state.no_sse_header)
 }
 
+fn stream_up_can_flush_while_uploading(version: hyper::Version) -> bool {
+    version == hyper::Version::HTTP_2
+}
+
 async fn handle_stream_up(
     request: Request<Incoming>,
     state: Arc<AppState>,
     session_id: String,
     padding_enabled: bool,
 ) -> Response<ResponseBody> {
+    let response_can_flush_while_uploading =
+        stream_up_can_flush_while_uploading(request.version());
     let session = state.sessions.get_or_create(&session_id);
     if session.stream_up_claimed.swap(true, Ordering::AcqRel) {
         return simple_response(StatusCode::CONFLICT);
@@ -636,7 +642,12 @@ async fn handle_stream_up(
         let _ = done_tx.send(());
     });
 
-    stream_up_response(done_rx, &state, padding_enabled)
+    stream_up_response(
+        done_rx,
+        &state,
+        padding_enabled && response_can_flush_while_uploading,
+    )
+    .await
 }
 
 async fn handle_stream_down(
@@ -763,19 +774,57 @@ async fn handle_packet_up(
     simple_response(StatusCode::OK)
 }
 
-fn stream_up_response(
+async fn wait_for_stream_up_response_start(
+    mut done_rx: oneshot::Receiver<()>,
+    padding_delay: Option<Duration>,
+    min_padding: usize,
+    max_padding: usize,
+) -> Option<(oneshot::Receiver<()>, Bytes)> {
+    let Some(padding_delay) = padding_delay else {
+        let _ = done_rx.await;
+        return None;
+    };
+
+    tokio::select! {
+        _ = &mut done_rx => None,
+        _ = sleep(padding_delay) => {
+            let padding_len = random_inclusive(min_padding, max_padding);
+            Some((done_rx, Bytes::from(vec![b'X'; padding_len])))
+        }
+    }
+}
+
+async fn stream_up_response(
     done_rx: oneshot::Receiver<()>,
     state: &AppState,
     padding_enabled: bool,
 ) -> Response<ResponseBody> {
     let (min_secs, max_secs) = state.stream_up_server_secs;
+    let padding_delay = (padding_enabled && max_secs > 0)
+        .then(|| Duration::from_secs(random_inclusive(min_secs, max_secs) as u64));
+
+    let Some((done_rx, first_padding)) = wait_for_stream_up_response_start(
+        done_rx,
+        padding_delay,
+        state.min_padding,
+        state.max_padding,
+    )
+    .await
+    else {
+        return stream_response(
+            StatusCode::OK,
+            futures::stream::empty::<Result<Frame<Bytes>, Infallible>>(),
+            true,
+        );
+    };
+
     let min_padding = state.min_padding;
     let max_padding = state.max_padding;
-    let body_stream =
-        futures::stream::unfold(done_rx, move |mut done_rx| async move {
-            if !padding_enabled || max_secs == 0 {
-                let _ = (&mut done_rx).await;
-                return None;
+    let body_stream = futures::stream::unfold(
+        (done_rx, Some(first_padding)),
+        move |(mut done_rx, first_padding)| async move {
+            if let Some(first_padding) = first_padding {
+                return Some((Ok(Frame::data(first_padding)), (done_rx, None)));
             }
 
             let delay_secs = random_inclusive(min_secs, max_secs);
@@ -785,11 +834,12 @@ fn stream_up_response(
                     let padding_len = random_inclusive(min_padding, max_padding);
                     Some((
                         Ok(Frame::data(Bytes::from(vec![b'X'; padding_len]))),
-                        done_rx,
+                        (done_rx, None),
                     ))
                 }
             }
-        });
+        },
+    );
 
     stream_response(StatusCode::OK, body_stream, true)
 }
@@ -1937,6 +1987,53 @@ mod tests {
         let result = collect_body_limited(body, 7).await;
 
         assert_eq!(result, Err(StatusCode::PAYLOAD_TOO_LARGE));
+    }
+
+    #[test]
+    fn stream_up_padding_flush_scope_matches_xray_v26_2_6() {
+        assert!(!stream_up_can_flush_while_uploading(
+            hyper::Version::HTTP_10
+        ));
+        assert!(!stream_up_can_flush_while_uploading(
+            hyper::Version::HTTP_11
+        ));
+        assert!(stream_up_can_flush_while_uploading(hyper::Version::HTTP_2));
+    }
+
+    #[tokio::test]
+    async fn stream_up_response_waits_for_body_without_padding_like_xray_v26_2_6() {
+        let (done_tx, done_rx) = oneshot::channel();
+        let mut wait =
+            Box::pin(wait_for_stream_up_response_start(done_rx, None, 100, 100));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut wait)
+                .await
+                .is_err(),
+            "stream-up response must stay pending while the request body is still open"
+        );
+
+        done_tx.send(()).expect("finish stream-up body");
+        assert!(
+            wait.await.is_none(),
+            "completed stream-up without padding should return headers only after body EOF"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_up_padding_can_flush_response_before_body_eof_like_xray_v26_2_6()
+    {
+        let (_done_tx, done_rx) = oneshot::channel();
+        let started = wait_for_stream_up_response_start(
+            done_rx,
+            Some(Duration::from_millis(10)),
+            7,
+            7,
+        )
+        .await
+        .expect("padding should start the response while upload remains open");
+
+        assert_eq!(started.1, Bytes::from_static(b"XXXXXXX"));
     }
 
     #[tokio::test]
