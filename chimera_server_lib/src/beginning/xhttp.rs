@@ -242,11 +242,18 @@ fn parse_listener_protocol(
 }
 
 const XHTTP_HTTP1_HEADER_SLOP_BYTES: usize = 4096;
+const XHTTP_HTTP2_HEADER_LIST_OVERHEAD_BYTES: usize = 320;
 
 fn xray_http1_header_read_limit(server_max_header_bytes: usize) -> usize {
     server_max_header_bytes
         .saturating_add(XHTTP_HTTP1_HEADER_SLOP_BYTES)
         .max(8192)
+}
+
+fn xray_http2_header_list_limit(server_max_header_bytes: usize) -> u32 {
+    server_max_header_bytes
+        .saturating_add(XHTTP_HTTP2_HEADER_LIST_OVERHEAD_BYTES)
+        .min(u32::MAX as usize) as u32
 }
 
 fn configure_http_builder(
@@ -262,9 +269,13 @@ fn configure_http_builder(
         .timer(TokioTimer::new())
         .header_read_timeout(XHTTP_HEADER_READ_TIMEOUT)
         .max_buf_size(http1_read_limit);
+    // Go's bundled HTTP/2 server adjusts MaxHeaderBytes before advertising
+    // SETTINGS_MAX_HEADER_LIST_SIZE. Xray v26.2.6 advertises 8512 for its
+    // 8192-byte XHTTP MaxHeaderBytes value (8192 + 320 bytes of HTTP/2 field
+    // accounting overhead), rather than the raw MaxHeaderBytes value.
     builder
         .http2()
-        .max_header_list_size(server_max_header_bytes as u32);
+        .max_header_list_size(xray_http2_header_list_limit(server_max_header_bytes));
 }
 
 async fn serve_http_connection<IO>(
@@ -1660,6 +1671,12 @@ mod tests {
             http::HeaderValue::from_str(&"a".repeat(13_000)).unwrap(),
         );
         assert!(request_header_bytes(&headers) > xray_http1_header_read_limit(8192));
+    }
+
+    #[test]
+    fn http2_header_list_limit_matches_xray_v26_2_6() {
+        assert_eq!(xray_http2_header_list_limit(8192), 8512);
+        assert_eq!(xray_http2_header_list_limit(16_384), 16_704);
     }
 
     #[test]
