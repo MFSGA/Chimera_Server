@@ -690,7 +690,7 @@ async fn handle_packet_up(
     ) {
         match decode_chunked_header_payload(&parts.headers, &state.uplink_data_key) {
             Ok(payload) => payload,
-            Err(_) => return simple_response(StatusCode::BAD_REQUEST),
+            Err(_) => return simple_response(StatusCode::INTERNAL_SERVER_ERROR),
         }
     } else {
         Vec::new()
@@ -1168,6 +1168,21 @@ fn decode_chunked_header_payload(
     headers: &hyper::HeaderMap,
     key: &str,
 ) -> std::io::Result<Vec<u8>> {
+    let declared_len = header_value(headers, &format!("{key}-Length"))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "missing uplink data length",
+            )
+        })?
+        .parse::<usize>()
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid uplink data length",
+            )
+        })?;
+
     let mut encoded = String::new();
     for index in 0usize.. {
         let header_name = format!("{key}-{index}");
@@ -1175,6 +1190,12 @@ fn decode_chunked_header_payload(
             break;
         };
         encoded.push_str(&chunk);
+    }
+    if encoded.is_empty() || encoded.len() != declared_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "uplink data length mismatch",
+        ));
     }
     decode_xhttp_payload(&encoded)
 }
@@ -1543,6 +1564,39 @@ mod tests {
             XhttpDataPlacement::Cookie,
             "x_data"
         ));
+    }
+
+    #[test]
+    fn header_uplink_length_matches_xray_v26_2_6() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "x-data-0",
+            hyper::header::HeaderValue::from_static("cGluZw"),
+        );
+
+        assert!(decode_chunked_header_payload(&headers, "X-Data").is_err());
+
+        headers.insert(
+            "x-data-length",
+            hyper::header::HeaderValue::from_static("5"),
+        );
+        assert!(decode_chunked_header_payload(&headers, "X-Data").is_err());
+
+        headers.insert(
+            "x-data-length",
+            hyper::header::HeaderValue::from_static("nope"),
+        );
+        assert!(decode_chunked_header_payload(&headers, "X-Data").is_err());
+
+        headers.insert(
+            "x-data-length",
+            hyper::header::HeaderValue::from_static("6"),
+        );
+        assert_eq!(
+            decode_chunked_header_payload(&headers, "X-Data")
+                .expect("valid header payload"),
+            b"ping"
+        );
     }
 
     #[test]
