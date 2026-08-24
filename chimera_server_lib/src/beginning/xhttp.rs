@@ -258,6 +258,34 @@ fn xray_http2_header_list_limit(server_max_header_bytes: usize) -> u32 {
         .min(u32::MAX as usize) as u32
 }
 
+fn xray_valid_http_host(request: &str, config: &str) -> bool {
+    let request = request.to_ascii_lowercase();
+    let config = config.to_ascii_lowercase();
+    if !request.contains(':') {
+        return request == config;
+    }
+
+    let host = if let Some(rest) = request.strip_prefix('[') {
+        let Some((host, suffix)) = rest.split_once(']') else {
+            return false;
+        };
+        if !suffix.starts_with(':') || suffix[1..].contains(':') {
+            return false;
+        }
+        host
+    } else {
+        let Some((host, _port)) = request.rsplit_once(':') else {
+            return false;
+        };
+        if host.contains(':') {
+            return false;
+        }
+        host
+    };
+
+    host == config
+}
+
 fn configure_http_builder(
     builder: &mut auto::Builder<TokioExecutor>,
     server_max_header_bytes: usize,
@@ -373,14 +401,7 @@ impl AppState {
     fn validate_host(&self, header_host: Option<&str>) -> bool {
         match (&self.host, header_host) {
             (None, _) => true,
-            (Some(expected), Some(actual)) => {
-                let normalized = actual
-                    .split(':')
-                    .next()
-                    .map(|host| host.to_ascii_lowercase())
-                    .unwrap_or_default();
-                &normalized == expected
-            }
+            (Some(expected), Some(actual)) => xray_valid_http_host(actual, expected),
             _ => false,
         }
     }
@@ -1683,6 +1704,16 @@ mod tests {
         assert_eq!(xray_http2_header_list_limit(16_384), 16_704);
         assert_eq!(XRAY_XHTTP_HTTP2_MAX_CONCURRENT_STREAMS, 250);
         assert_eq!(XRAY_XHTTP_HTTP2_MAX_FRAME_SIZE, 1_048_576);
+    }
+
+    #[test]
+    fn http_host_validation_matches_xray_v26_2_6() {
+        assert!(xray_valid_http_host("example.com", "example.com"));
+        assert!(xray_valid_http_host("EXAMPLE.COM:443", "example.com"));
+        assert!(xray_valid_http_host("[::1]:443", "::1"));
+        assert!(!xray_valid_http_host("::1", "::1"));
+        assert!(!xray_valid_http_host("[::1]", "::1"));
+        assert!(!xray_valid_http_host("[::2]:443", "::1"));
     }
 
     #[test]
