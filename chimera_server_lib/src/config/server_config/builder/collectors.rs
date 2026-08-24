@@ -881,22 +881,18 @@ fn parse_xhttp_data_placement(
     placement: Option<&str>,
     mode: XhttpMode,
 ) -> Result<XhttpDataPlacement, Error> {
-    let placement = match placement
-        .unwrap_or("auto")
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "" | "auto" => XhttpDataPlacement::Auto,
-        "body" => XhttpDataPlacement::Body,
-        "header" => XhttpDataPlacement::Header,
-        "cookie" => XhttpDataPlacement::Cookie,
-        unsupported => {
-            return Err(Error::InvalidConfig(format!(
-                "unsupported xhttpSettings.uplinkDataPlacement: {unsupported}"
-            )));
-        }
-    };
+    let placement =
+        match placement.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+            "" | "body" => XhttpDataPlacement::Body,
+            "auto" => XhttpDataPlacement::Auto,
+            "header" => XhttpDataPlacement::Header,
+            "cookie" => XhttpDataPlacement::Cookie,
+            unsupported => {
+                return Err(Error::InvalidConfig(format!(
+                    "unsupported xhttpSettings.uplinkDataPlacement: {unsupported}"
+                )));
+            }
+        };
     if matches!(
         placement,
         XhttpDataPlacement::Header | XhttpDataPlacement::Cookie
@@ -1349,8 +1345,8 @@ mod tests {
         assert!(config.session_key.is_empty());
         assert_eq!(config.seq_placement, XhttpPlacement::Path);
         assert!(config.seq_key.is_empty());
-        assert_eq!(config.uplink_data_placement, XhttpDataPlacement::Auto);
-        assert_eq!(config.uplink_data_key, "X-Data");
+        assert_eq!(config.uplink_data_placement, XhttpDataPlacement::Body);
+        assert!(config.uplink_data_key.is_empty());
     }
 
     #[test]
@@ -1460,6 +1456,21 @@ mod tests {
         assert_eq!(config.session_key, "X-Session");
         assert_eq!(config.seq_placement, XhttpPlacement::Query);
         assert_eq!(config.seq_key, "x_seq");
+    }
+
+    #[test]
+    fn collect_xhttp_settings_keeps_explicit_auto_data_placement() {
+        let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
+            "path": "/xhttp",
+            "mode": "packet-up",
+            "uplinkDataPlacement": "auto"
+        }))
+        .expect("xhttp settings");
+
+        let config = collect_xhttp_settings(settings)
+            .expect("explicit auto placement remains a supported Chimera extension");
+        assert_eq!(config.uplink_data_placement, XhttpDataPlacement::Auto);
+        assert_eq!(config.uplink_data_key, "X-Data");
     }
 
     #[test]
