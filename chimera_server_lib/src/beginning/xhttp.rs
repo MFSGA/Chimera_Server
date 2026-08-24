@@ -604,6 +604,9 @@ async fn handle_stream_up(
     padding_enabled: bool,
 ) -> Response<ResponseBody> {
     let session = state.sessions.get_or_create(&session_id);
+    if session.stream_up_claimed.swap(true, Ordering::AcqRel) {
+        return simple_response(StatusCode::CONFLICT);
+    }
 
     let sessions = state.sessions.clone();
     let upload_session_id = session_id.clone();
@@ -738,6 +741,9 @@ async fn handle_packet_up(
     let collected = Bytes::from(payload);
 
     let session = state.sessions.get_or_create(&session_id);
+    if session.stream_up_claimed.load(Ordering::Acquire) {
+        return simple_response(StatusCode::INTERNAL_SERVER_ERROR);
+    }
     let mut upload_state = session.upload.lock().await;
     match upload_state.packet_queue.push_packet(seq, collected) {
         Ok(()) => {}
@@ -922,6 +928,7 @@ struct XhttpSession {
     downlink_reader: Mutex<Option<DuplexStream>>,
     handler_stream: Mutex<Option<XhttpLogicalStream>>,
     fully_connected: AtomicBool,
+    stream_up_claimed: AtomicBool,
 }
 
 impl XhttpSession {
@@ -940,6 +947,7 @@ impl XhttpSession {
                 server_write,
             ))),
             fully_connected: AtomicBool::new(false),
+            stream_up_claimed: AtomicBool::new(false),
         }
     }
 
@@ -1952,6 +1960,15 @@ mod tests {
             session.take_handler_stream_for_downlink().await.is_some(),
             "stream-down must still own logical connection creation"
         );
+    }
+
+    #[test]
+    fn stream_up_claim_is_single_use_like_xray_v26_2_6() {
+        let session = XhttpSession::new(4);
+
+        assert!(!session.stream_up_claimed.swap(true, Ordering::AcqRel));
+        assert!(session.stream_up_claimed.swap(true, Ordering::AcqRel));
+        assert!(session.stream_up_claimed.load(Ordering::Acquire));
     }
 
     #[tokio::test]
