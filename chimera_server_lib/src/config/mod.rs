@@ -185,12 +185,85 @@ pub struct XhttpSettings {
     x_padding_obfs_mode: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct XhttpRange {
     #[serde(default)]
     from: i32,
     #[serde(default)]
     to: i32,
+}
+
+impl<'de> Deserialize<'de> for XhttpRange {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Integer(i32),
+            String(String),
+            Object {
+                #[serde(default)]
+                from: i32,
+                #[serde(default)]
+                to: i32,
+            },
+        }
+
+        let (mut from, mut to) = match Repr::deserialize(deserializer)? {
+            Repr::Integer(value) => (value, value),
+            Repr::String(value) => parse_xray_range_string(&value)
+                .ok_or_else(|| serde::de::Error::custom("invalid integer range"))?,
+            Repr::Object { from, to } => (from, to),
+        };
+        if from > to {
+            std::mem::swap(&mut from, &mut to);
+        }
+        Ok(Self { from, to })
+    }
+}
+
+fn parse_xray_range_string(value: &str) -> Option<(i32, i32)> {
+    if let Ok(value) = value.parse::<i32>() {
+        return Some((value, value));
+    }
+    if value.is_empty() {
+        return Some((0, 0));
+    }
+
+    let search_from = usize::from(value.starts_with('-'));
+    let separator = value[search_from..].find('-')? + search_from;
+    let left = value[..separator].parse::<i32>().ok()?;
+    let right = value[separator + 1..].parse::<i32>().ok()?;
+    Some((left, right))
+}
+
+#[cfg(test)]
+mod xhttp_range_tests {
+    use super::XhttpRange;
+
+    #[test]
+    fn xhttp_range_accepts_xray_integer_and_string_forms() {
+        let integer: XhttpRange =
+            serde_json::from_str("128").expect("plain integer range");
+        assert_eq!((integer.from, integer.to), (128, 128));
+
+        let range: XhttpRange =
+            serde_json::from_str("\"256-128\"").expect("string range");
+        assert_eq!((range.from, range.to), (128, 256));
+
+        let negative: XhttpRange =
+            serde_json::from_str("\"-1919--810\"").expect("negative string range");
+        assert_eq!((negative.from, negative.to), (-1919, -810));
+    }
+
+    #[test]
+    fn xhttp_range_keeps_legacy_object_form() {
+        let range: XhttpRange =
+            serde_json::from_str(r#"{"from": 20, "to": 80}"#).expect("object range");
+        assert_eq!((range.from, range.to), (20, 80));
+    }
 }
 
 #[cfg(feature = "ws")]
