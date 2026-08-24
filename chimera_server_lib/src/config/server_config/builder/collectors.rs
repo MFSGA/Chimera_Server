@@ -604,6 +604,13 @@ pub(super) fn collect_xhttp_settings(
         parse_xhttp_placement(raw.session_placement.as_deref(), "sessionPlacement")?;
     let seq_placement =
         parse_xhttp_placement(raw.seq_placement.as_deref(), "seqPlacement")?;
+    if session_placement == XhttpPlacement::Path
+        && seq_placement != XhttpPlacement::Path
+    {
+        return Err(Error::InvalidConfig(
+            "SeqPlacement must be path when SessionPlacement is path".into(),
+        ));
+    }
     let session_key = normalize_xhttp_meta_key(
         raw.session_key.as_deref(),
         session_placement,
@@ -1464,6 +1471,25 @@ mod tests {
             });
             assert_eq!(config.mode, expected);
         }
+    }
+
+    #[test]
+    fn collect_xhttp_settings_rejects_non_path_sequence_with_path_session_like_xray_v26_2_6()
+     {
+        let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
+            "mode": "packet-up",
+            "sessionPlacement": "path",
+            "seqPlacement": "query"
+        }))
+        .expect("xhttp settings");
+
+        let err = collect_xhttp_settings(settings).expect_err(
+            "Xray rejects a non-path sequence when the session is in the path",
+        );
+        assert!(
+            err.to_string()
+                .contains("SeqPlacement must be path when SessionPlacement is path")
+        );
     }
 
     #[test]
