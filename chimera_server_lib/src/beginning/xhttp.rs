@@ -241,15 +241,27 @@ fn parse_listener_protocol(
     }
 }
 
+const XHTTP_HTTP1_HEADER_SLOP_BYTES: usize = 4096;
+
+fn xray_http1_header_read_limit(server_max_header_bytes: usize) -> usize {
+    server_max_header_bytes
+        .saturating_add(XHTTP_HTTP1_HEADER_SLOP_BYTES)
+        .max(8192)
+}
+
 fn configure_http_builder(
     builder: &mut auto::Builder<TokioExecutor>,
     server_max_header_bytes: usize,
 ) {
+    // Go net/http reads MaxHeaderBytes plus 4 KiB of bufio slop before it
+    // decides an HTTP/1 request header is too large. Xray wires the normalized
+    // XHTTP serverMaxHeaderBytes directly into http.Server.MaxHeaderBytes.
+    let http1_read_limit = xray_http1_header_read_limit(server_max_header_bytes);
     builder
         .http1()
         .timer(TokioTimer::new())
         .header_read_timeout(XHTTP_HEADER_READ_TIMEOUT)
-        .max_buf_size(server_max_header_bytes.max(8192));
+        .max_buf_size(http1_read_limit);
     builder
         .http2()
         .max_header_list_size(server_max_header_bytes as u32);
@@ -457,12 +469,16 @@ async fn handle_request(
 ) -> Result<Response<ResponseBody>, Infallible> {
     let request_headers = request.headers().clone();
 
-    if request_header_bytes(request.headers()) > state.server_max_header_bytes {
+    let http1_header_limit =
+        xray_http1_header_read_limit(state.server_max_header_bytes);
+    if request.version() != hyper::Version::HTTP_2
+        && request_header_bytes(request.headers()) > http1_header_limit
+    {
         debug!(
             method = %request.method(),
             path = %request.uri().path(),
-            limit = state.server_max_header_bytes,
-            "xhttp request rejected by header size limit"
+            limit = http1_header_limit,
+            "xhttp request rejected by HTTP/1 header size limit"
         );
         return Ok(simple_response(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE));
     }
@@ -1625,6 +1641,26 @@ fn apply_response_padding(headers: &mut hyper::HeaderMap, state: &AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http1_header_read_limit_includes_xray_bufio_slop() {
+        assert_eq!(xray_http1_header_read_limit(8192), 12_288);
+        assert_eq!(xray_http1_header_read_limit(16_384), 20_480);
+
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "x-test",
+            http::HeaderValue::from_str(&"a".repeat(12_000)).unwrap(),
+        );
+        assert!(
+            request_header_bytes(&headers) <= xray_http1_header_read_limit(8192)
+        );
+        headers.insert(
+            "x-test",
+            http::HeaderValue::from_str(&"a".repeat(13_000)).unwrap(),
+        );
+        assert!(request_header_bytes(&headers) > xray_http1_header_read_limit(8192));
+    }
 
     #[test]
     fn request_dispatch_matches_xray_v26_2_6() {
