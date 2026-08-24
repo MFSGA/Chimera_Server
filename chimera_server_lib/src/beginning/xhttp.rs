@@ -409,16 +409,13 @@ impl AppState {
     fn extract_meta(
         &self,
         request: &Request<Incoming>,
+        decoded_path: &str,
     ) -> (Option<String>, Option<String>) {
         let trimmed_base_path = self.base_path.trim_end_matches('/');
-        let path_tail = if request.uri().path() == trimmed_base_path {
+        let path_tail = if decoded_path == trimmed_base_path {
             ""
         } else {
-            request
-                .uri()
-                .path()
-                .strip_prefix(&self.base_path)
-                .unwrap_or("")
+            decoded_path.strip_prefix(&self.base_path).unwrap_or("")
         };
         let path_segments = path_tail
             .split('/')
@@ -536,7 +533,17 @@ async fn handle_request(
         return Ok(simple_response(StatusCode::NOT_FOUND));
     }
 
-    let path = request.uri().path().to_string();
+    let path = match decode_xray_url_path(request.uri().path()) {
+        Ok(path) => path,
+        Err(()) => {
+            debug!(
+                method = %request.method(),
+                path = %request.uri().path(),
+                "xhttp request rejected by malformed URL path escape"
+            );
+            return Ok(simple_response(StatusCode::BAD_REQUEST));
+        }
+    };
     if !matches_base_path(&path, &state.base_path) {
         debug!(
             method = %request.method(),
@@ -564,7 +571,7 @@ async fn handle_request(
             .unwrap_or(peer_addr);
     let stream_up_padding = state.padding_obfs_mode
         || header_value(&request_headers, "referer").is_some();
-    let (session_id, seq) = state.extract_meta(&request);
+    let (session_id, seq) = state.extract_meta(&request, &path);
     let is_downlink_method = request.method() == Method::GET;
     let is_uplink_method = request.method().as_str()
         == state.uplink_http_method.as_str()
@@ -1519,6 +1526,32 @@ fn matches_base_path(request_path: &str, base_path: &str) -> bool {
     request_path.starts_with(base_path)
 }
 
+fn decode_xray_url_path(raw_path: &str) -> Result<String, ()> {
+    if !raw_path.as_bytes().contains(&b'%') {
+        return Ok(raw_path.to_string());
+    }
+
+    let bytes = raw_path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len() {
+            return Err(());
+        }
+        let high = hex_value(bytes[index + 1]).ok_or(())?;
+        let low = hex_value(bytes[index + 2]).ok_or(())?;
+        decoded.push((high << 4) | low);
+        index += 3;
+    }
+
+    String::from_utf8(decoded).or_else(|_| Ok(raw_path.to_string()))
+}
+
 fn query_value_from_url(raw_url: &str, key: &str) -> Option<String> {
     let query = raw_url.split_once('?')?.1;
     let query = query.split('#').next().unwrap_or(query);
@@ -2216,6 +2249,24 @@ mod tests {
         assert_eq!(cookie_value(&headers, "x_session").as_deref(), Some("abc"));
         assert_eq!(cookie_value(&headers, "x_seq").as_deref(), Some("0"));
         assert_eq!(cookie_value(&headers, "invalid"), None);
+    }
+
+    #[test]
+    fn url_path_decoding_matches_xray_v26_2_6() {
+        assert_eq!(decode_xray_url_path("/x/abc/0").as_deref(), Ok("/x/abc/0"));
+        assert_eq!(
+            decode_xray_url_path("/x/abc%2Fdef/0").as_deref(),
+            Ok("/x/abc/def/0"),
+        );
+        assert_eq!(
+            decode_xray_url_path("/x%2Fabc/0").as_deref(),
+            Ok("/x/abc/0"),
+        );
+        assert_eq!(
+            decode_xray_url_path("/x/abc%252Fdef/0").as_deref(),
+            Ok("/x/abc%2Fdef/0"),
+        );
+        assert!(decode_xray_url_path("/x/abc%ZZ/0").is_err());
     }
 
     #[test]
