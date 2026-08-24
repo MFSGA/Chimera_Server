@@ -777,14 +777,6 @@ fn validate_xhttp_client_fields(
         ));
     }
 
-    if let Some(value) = raw.uplink_chunk_size.as_ref() {
-        serde_json::from_value::<XhttpRange>(value.clone()).map_err(|error| {
-            Error::InvalidConfig(format!(
-                "invalid xhttpSettings.uplinkChunkSize: {error}"
-            ))
-        })?;
-    }
-
     if let Some(value) = raw.xmux.as_ref() {
         #[derive(Deserialize, Default)]
         #[serde(rename_all = "camelCase")]
@@ -1685,7 +1677,7 @@ mod tests {
                 "maxConnections": {"from": 2, "to": 3},
                 "hMaxRequestTimes": {"from": 100, "to": 200}
             },
-            "uplinkChunkSize": {"from": 1024, "to": 2048},
+            "uplinkChunkSize": 2048,
             "sessionIDTable": "Base62",
             "sessionIDLength": {"from": 6, "to": 8}
         }))
@@ -1693,6 +1685,35 @@ mod tests {
 
         collect_xhttp_settings(settings).expect(
             "server should accept valid XHTTP fields consumed by the client",
+        );
+    }
+
+    #[test]
+    fn xhttp_uplink_chunk_size_matches_xray_uint32_schema() {
+        let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
+            "mode": "packet-up",
+            "uplinkChunkSize": 63
+        }))
+        .expect("Xray accepts uint32 uplinkChunkSize values");
+        collect_xhttp_settings(settings)
+            .expect("uint32 uplinkChunkSize should be accepted");
+
+        let range = serde_json::from_value::<XhttpSettings>(serde_json::json!({
+            "mode": "packet-up",
+            "uplinkChunkSize": {"from": 1024, "to": 2048}
+        }));
+        assert!(
+            range.is_err(),
+            "Xray rejects range objects for uplinkChunkSize"
+        );
+
+        let negative = serde_json::from_value::<XhttpSettings>(serde_json::json!({
+            "mode": "packet-up",
+            "uplinkChunkSize": -1
+        }));
+        assert!(
+            negative.is_err(),
+            "Xray rejects negative uplinkChunkSize values"
         );
     }
 

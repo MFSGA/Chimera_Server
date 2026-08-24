@@ -170,7 +170,7 @@ pub struct XhttpSettings {
     #[serde(default)]
     uplink_data_key: Option<String>,
     #[serde(default)]
-    uplink_chunk_size: Option<serde_json::Value>,
+    uplink_chunk_size: Option<u32>,
     #[serde(default)]
     sc_min_posts_interval_ms: Option<XhttpRange>,
     #[serde(default)]
