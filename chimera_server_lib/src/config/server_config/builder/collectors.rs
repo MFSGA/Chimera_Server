@@ -711,8 +711,13 @@ pub(super) fn collect_xhttp_settings(
         max_padding,
         max_each_post_bytes,
         max_buffered_posts: match raw.sc_max_buffered_posts.unwrap_or(0) {
+            value if value < 0 => {
+                return Err(Error::InvalidConfig(
+                    "xhttpSettings.scMaxBufferedPosts cannot be negative".into(),
+                ));
+            }
             0 => 30,
-            value => value.max(1) as usize,
+            value => value as usize,
         },
         session_ttl_secs: 30,
         stream_up_server_secs,
@@ -1361,6 +1366,23 @@ mod tests {
 
         let config = collect_xhttp_settings(settings).expect("valid xhttp settings");
         assert_eq!(config.max_buffered_posts, 30);
+    }
+
+    #[test]
+    fn collect_xhttp_settings_rejects_negative_buffered_posts_like_xray_v26_2_6() {
+        let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
+            "scMaxBufferedPosts": -1
+        }))
+        .expect("xhttp settings");
+
+        let error = collect_xhttp_settings(settings)
+            .expect_err("negative scMaxBufferedPosts must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("xhttpSettings.scMaxBufferedPosts cannot be negative"),
+            "{error}"
+        );
     }
 
     #[test]
