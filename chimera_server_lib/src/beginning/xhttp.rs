@@ -26,7 +26,7 @@ use hyper_util::{
 use rand::RngExt;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex},
-    sync::{Mutex, oneshot},
+    sync::{Mutex, mpsc, oneshot},
     time::{Duration, sleep},
 };
 #[cfg(feature = "tls")]
@@ -610,37 +610,16 @@ async fn handle_stream_up(
     let response_can_flush_while_uploading =
         stream_up_can_flush_while_uploading(request.version());
     let session = state.sessions.get_or_create(&session_id);
-    if session.stream_up_claimed.swap(true, Ordering::AcqRel) {
+    let (done_tx, done_rx) = oneshot::channel();
+    let reader = IncomingBodyReader::new(request.into_body(), done_tx);
+    if session
+        .upload_queue
+        .push_reader(Box::pin(reader))
+        .await
+        .is_err()
+    {
         return simple_response(StatusCode::CONFLICT);
     }
-
-    let sessions = state.sessions.clone();
-    let upload_session_id = session_id.clone();
-    let (done_tx, done_rx) = oneshot::channel();
-    tokio::spawn(async move {
-        let mut body = request.into_body();
-        let mut upload_state = session.upload.lock().await;
-        while let Some(frame_result) = body.frame().await {
-            let frame = match frame_result {
-                Ok(frame) => frame,
-                Err(error) => {
-                    error!("xhttp stream-up body failed: {}", error);
-                    sessions.remove(&upload_session_id);
-                    let _ = done_tx.send(());
-                    return;
-                }
-            };
-            if let Some(chunk) = frame.data_ref()
-                && let Err(error) = upload_state.writer.write_all(chunk).await
-            {
-                error!("xhttp stream-up write failed: {}", error);
-                sessions.remove(&upload_session_id);
-                let _ = done_tx.send(());
-                return;
-            }
-        }
-        let _ = done_tx.send(());
-    });
 
     stream_up_response(
         done_rx,
@@ -752,26 +731,10 @@ async fn handle_packet_up(
     let collected = Bytes::from(payload);
 
     let session = state.sessions.get_or_create(&session_id);
-    if session.stream_up_claimed.load(Ordering::Acquire) {
-        return simple_response(StatusCode::INTERNAL_SERVER_ERROR);
+    match session.upload_queue.push_payload(seq, collected).await {
+        Ok(()) => simple_response(StatusCode::OK),
+        Err(_) => simple_response(StatusCode::INTERNAL_SERVER_ERROR),
     }
-    let mut upload_state = session.upload.lock().await;
-    match upload_state.packet_queue.push_packet(seq, collected) {
-        Ok(()) => {}
-        Err(QueueError::TooManyBuffered) => {
-            return simple_response(StatusCode::CONFLICT);
-        }
-    }
-
-    while let Some(chunk) = upload_state.packet_queue.pop_ready() {
-        if let Err(err) = upload_state.writer.write_all(&chunk).await {
-            error!("xhttp packet-up write failed: {}", err);
-            state.sessions.remove(&session_id);
-            return simple_response(StatusCode::BAD_GATEWAY);
-        }
-    }
-
-    simple_response(StatusCode::OK)
 }
 
 async fn wait_for_stream_up_response_start(
@@ -973,31 +936,206 @@ impl Drop for SessionCleanupGuard {
     }
 }
 
+struct IncomingBodyReader {
+    body: Incoming,
+    current: Bytes,
+    done_tx: Option<oneshot::Sender<()>>,
+}
+
+impl IncomingBodyReader {
+    fn new(body: Incoming, done_tx: oneshot::Sender<()>) -> Self {
+        Self {
+            body,
+            current: Bytes::new(),
+            done_tx: Some(done_tx),
+        }
+    }
+
+    fn finish(&mut self) {
+        if let Some(done_tx) = self.done_tx.take() {
+            let _ = done_tx.send(());
+        }
+    }
+}
+
+impl AsyncRead for IncomingBodyReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            if !self.current.is_empty() {
+                let len = self.current.len().min(buf.remaining());
+                buf.put_slice(&self.current.split_to(len));
+                return Poll::Ready(Ok(()));
+            }
+
+            match Pin::new(&mut self.body).poll_frame(cx) {
+                Poll::Ready(Some(Ok(frame))) => {
+                    if let Ok(data) = frame.into_data() {
+                        self.current = data;
+                    }
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    self.finish();
+                    return Poll::Ready(Err(std::io::Error::other(error)));
+                }
+                Poll::Ready(None) => {
+                    self.finish();
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+type BoxedUploadReader = Pin<Box<dyn AsyncRead + Send>>;
+
+enum UploadPacket {
+    Reader(BoxedUploadReader),
+    Payload { seq: u64, data: Bytes },
+}
+
+struct UploadPushState {
+    sender: mpsc::Sender<UploadPacket>,
+    reader_claimed: bool,
+}
+
+struct UploadQueueSender {
+    state: Mutex<UploadPushState>,
+}
+
+impl UploadQueueSender {
+    async fn push_reader(&self, reader: BoxedUploadReader) -> std::io::Result<()> {
+        let mut state = self.state.lock().await;
+        if state.reader_claimed {
+            return Err(std::io::Error::other("h.reader already exists"));
+        }
+        state.reader_claimed = true;
+        state
+            .sender
+            .send(UploadPacket::Reader(reader))
+            .await
+            .map_err(|_| std::io::Error::other("packet queue closed"))
+    }
+
+    async fn push_payload(&self, seq: u64, data: Bytes) -> std::io::Result<()> {
+        let state = self.state.lock().await;
+        if state.reader_claimed {
+            return Err(std::io::Error::other("h.reader already exists"));
+        }
+        state
+            .sender
+            .send(UploadPacket::Payload { seq, data })
+            .await
+            .map_err(|_| std::io::Error::other("packet queue closed"))
+    }
+}
+
+struct XhttpUploadReader {
+    receiver: mpsc::Receiver<UploadPacket>,
+    reader: Option<BoxedUploadReader>,
+    current_payload: Option<Bytes>,
+    buffered: BTreeMap<u64, Bytes>,
+    next_seq: u64,
+    max_buffered_posts: usize,
+}
+
+impl XhttpUploadReader {
+    fn new(max_buffered_posts: usize) -> (UploadQueueSender, Self) {
+        let (sender, receiver) = mpsc::channel(max_buffered_posts);
+        (
+            UploadQueueSender {
+                state: Mutex::new(UploadPushState {
+                    sender,
+                    reader_claimed: false,
+                }),
+            },
+            Self {
+                receiver,
+                reader: None,
+                current_payload: None,
+                buffered: BTreeMap::new(),
+                next_seq: 0,
+                max_buffered_posts,
+            },
+        )
+    }
+}
+
+impl AsyncRead for XhttpUploadReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            if let Some(reader) = self.reader.as_mut() {
+                return reader.as_mut().poll_read(cx, buf);
+            }
+
+            if let Some(mut payload) = self.current_payload.take() {
+                let len = payload.len().min(buf.remaining());
+                buf.put_slice(&payload.split_to(len));
+                if payload.is_empty() {
+                    self.next_seq += 1;
+                } else {
+                    self.current_payload = Some(payload);
+                }
+                return Poll::Ready(Ok(()));
+            }
+
+            let next_seq = self.next_seq;
+            if let Some(payload) = self.buffered.remove(&next_seq) {
+                self.current_payload = Some(payload);
+                continue;
+            }
+
+            if self.buffered.len() > self.max_buffered_posts + 1 {
+                return Poll::Ready(Err(std::io::Error::other(
+                    "packet queue is too large",
+                )));
+            }
+
+            match Pin::new(&mut self.receiver).poll_recv(cx) {
+                Poll::Ready(Some(UploadPacket::Reader(reader))) => {
+                    self.reader = Some(reader);
+                }
+                Poll::Ready(Some(UploadPacket::Payload { seq, data })) => {
+                    if seq >= self.next_seq {
+                        self.buffered.entry(seq).or_insert(data);
+                    }
+                }
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
 struct XhttpSession {
-    upload: Mutex<UploadState>,
+    upload_queue: UploadQueueSender,
     downlink_reader: Mutex<Option<DuplexStream>>,
     handler_stream: Mutex<Option<XhttpLogicalStream>>,
     fully_connected: AtomicBool,
-    stream_up_claimed: AtomicBool,
 }
 
 impl XhttpSession {
     fn new(max_buffered_posts: usize) -> Self {
-        let (client_upload, server_read) = duplex(XHTTP_PIPE_CAPACITY);
+        let (upload_queue, upload_reader) =
+            XhttpUploadReader::new(max_buffered_posts);
         let (server_write, client_download) = duplex(XHTTP_PIPE_CAPACITY);
 
         Self {
-            upload: Mutex::new(UploadState {
-                writer: client_upload,
-                packet_queue: PacketQueue::new(max_buffered_posts),
-            }),
+            upload_queue,
             downlink_reader: Mutex::new(Some(client_download)),
             handler_stream: Mutex::new(Some(XhttpLogicalStream::new(
-                server_read,
+                upload_reader,
                 server_write,
             ))),
             fully_connected: AtomicBool::new(false),
-            stream_up_claimed: AtomicBool::new(false),
         }
     }
 
@@ -1014,19 +1152,20 @@ impl XhttpSession {
     }
 }
 
-struct UploadState {
-    writer: DuplexStream,
-    packet_queue: PacketQueue,
-}
-
 struct XhttpLogicalStream {
-    reader: DuplexStream,
+    reader: BoxedUploadReader,
     writer: DuplexStream,
 }
 
 impl XhttpLogicalStream {
-    fn new(reader: DuplexStream, writer: DuplexStream) -> Self {
-        Self { reader, writer }
+    fn new<R>(reader: R, writer: DuplexStream) -> Self
+    where
+        R: AsyncRead + Send + 'static,
+    {
+        Self {
+            reader: Box::pin(reader),
+            writer,
+        }
     }
 }
 
@@ -1078,55 +1217,6 @@ impl AsyncPing for XhttpLogicalStream {
 }
 
 impl AsyncStream for XhttpLogicalStream {}
-
-struct PacketQueue {
-    next_seq: u64,
-    buffered: BTreeMap<u64, Bytes>,
-    ready: Vec<Bytes>,
-    max_buffered_posts: usize,
-}
-
-impl PacketQueue {
-    fn new(max_buffered_posts: usize) -> Self {
-        Self {
-            next_seq: 0,
-            buffered: BTreeMap::new(),
-            ready: Vec::new(),
-            max_buffered_posts,
-        }
-    }
-
-    fn push_packet(&mut self, seq: u64, data: Bytes) -> Result<(), QueueError> {
-        if seq < self.next_seq {
-            return Ok(());
-        }
-        if self.buffered.contains_key(&seq) {
-            return Ok(());
-        }
-        if self.buffered.len() >= self.max_buffered_posts {
-            return Err(QueueError::TooManyBuffered);
-        }
-
-        self.buffered.insert(seq, data);
-        while let Some(chunk) = self.buffered.remove(&self.next_seq) {
-            self.ready.push(chunk);
-            self.next_seq += 1;
-        }
-
-        Ok(())
-    }
-
-    fn pop_ready(&mut self) -> Option<Bytes> {
-        if self.ready.is_empty() {
-            return None;
-        }
-        Some(self.ready.remove(0))
-    }
-}
-
-enum QueueError {
-    TooManyBuffered,
-}
 
 fn normalize_base_path(mut path: String) -> String {
     if !path.starts_with('/') {
@@ -2039,16 +2129,11 @@ mod tests {
     #[tokio::test]
     async fn split_session_keeps_handler_pending_until_downlink() {
         let session = XhttpSession::new(4);
-        {
-            let mut upload = session.upload.lock().await;
-            assert!(
-                upload
-                    .packet_queue
-                    .push_packet(0, Bytes::from_static(b"ping"))
-                    .is_ok(),
-                "queue packet-up payload"
-            );
-        }
+        session
+            .upload_queue
+            .push_payload(0, Bytes::from_static(b"ping"))
+            .await
+            .expect("queue packet-up payload");
 
         assert!(
             session.handler_stream.lock().await.is_some(),
@@ -2060,26 +2145,90 @@ mod tests {
         );
     }
 
-    #[test]
-    fn duplicate_packet_sequence_keeps_first_payload_like_xray_v26_2_6() {
-        let mut queue = PacketQueue::new(4);
+    #[tokio::test]
+    async fn duplicate_packet_sequence_keeps_first_payload_like_xray_v26_2_6() {
+        use tokio::io::AsyncReadExt;
 
-        assert!(queue.push_packet(1, Bytes::from_static(b"first")).is_ok());
-        assert!(queue.push_packet(1, Bytes::from_static(b"second")).is_ok());
-        assert!(queue.push_packet(0, Bytes::from_static(b"zero")).is_ok());
+        let (queue, mut reader) = XhttpUploadReader::new(4);
+        queue
+            .push_payload(1, Bytes::from_static(b"first"))
+            .await
+            .unwrap();
+        queue
+            .push_payload(1, Bytes::from_static(b"second"))
+            .await
+            .unwrap();
+        queue
+            .push_payload(0, Bytes::from_static(b"zero"))
+            .await
+            .unwrap();
 
-        assert_eq!(queue.pop_ready(), Some(Bytes::from_static(b"zero")));
-        assert_eq!(queue.pop_ready(), Some(Bytes::from_static(b"first")));
-        assert_eq!(queue.pop_ready(), None);
+        let mut output = [0u8; 9];
+        reader.read_exact(&mut output).await.unwrap();
+        assert_eq!(&output, b"zerofirst");
     }
 
-    #[test]
-    fn stream_up_claim_is_single_use_like_xray_v26_2_6() {
-        let session = XhttpSession::new(4);
+    #[tokio::test]
+    async fn stream_up_claim_is_single_use_like_xray_v26_2_6() {
+        let (queue, _reader) = XhttpUploadReader::new(4);
 
-        assert!(!session.stream_up_claimed.swap(true, Ordering::AcqRel));
-        assert!(session.stream_up_claimed.swap(true, Ordering::AcqRel));
-        assert!(session.stream_up_claimed.load(Ordering::Acquire));
+        queue
+            .push_reader(Box::pin(tokio::io::empty()))
+            .await
+            .expect("first stream-up reader");
+        assert!(
+            queue
+                .push_reader(Box::pin(tokio::io::empty()))
+                .await
+                .is_err(),
+            "a second stream-up reader must conflict"
+        );
+        assert!(
+            queue
+                .push_payload(0, Bytes::from_static(b"packet"))
+                .await
+                .is_err(),
+            "packet-up must fail after stream-up claims the upload queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_packet_posts_backpressure_until_reader_consumes_like_xray_v26_2_6()
+     {
+        use tokio::io::AsyncReadExt;
+
+        let (queue, mut reader) = XhttpUploadReader::new(1);
+        let queue = Arc::new(queue);
+        queue
+            .push_payload(1, Bytes::from_static(b"1"))
+            .await
+            .expect("first buffered post fills Xray channel");
+
+        let second = tokio::spawn({
+            let queue = queue.clone();
+            async move { queue.push_payload(2, Bytes::from_static(b"2")).await }
+        });
+        sleep(Duration::from_millis(20)).await;
+        assert!(
+            !second.is_finished(),
+            "a full scMaxBufferedPosts channel must backpressure the HTTP request"
+        );
+
+        let read = tokio::spawn(async move {
+            let mut output = [0u8; 3];
+            reader.read_exact(&mut output).await.unwrap();
+            output
+        });
+        second
+            .await
+            .expect("second packet task")
+            .expect("reader consumption should release one channel slot");
+        queue
+            .push_payload(0, Bytes::from_static(b"0"))
+            .await
+            .expect("missing packet completes reorder sequence");
+
+        assert_eq!(read.await.expect("ordered read task"), *b"012");
     }
 
     #[tokio::test]
