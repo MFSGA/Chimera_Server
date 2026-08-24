@@ -701,7 +701,7 @@ async fn handle_packet_up(
     ) {
         match decode_chunked_cookie_payload(&parts.headers, &state.uplink_data_key) {
             Ok(payload) => payload,
-            Err(_) => return simple_response(StatusCode::BAD_REQUEST),
+            Err(_) => return simple_response(StatusCode::INTERNAL_SERVER_ERROR),
         }
     } else {
         Vec::new()
@@ -1212,6 +1212,12 @@ fn decode_chunked_cookie_payload(
         };
         encoded.push_str(&chunk);
     }
+    if encoded.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "missing uplink cookie payload",
+        ));
+    }
     decode_xhttp_payload(&encoded)
 }
 
@@ -1564,6 +1570,29 @@ mod tests {
             XhttpDataPlacement::Cookie,
             "x_data"
         ));
+    }
+
+    #[test]
+    fn cookie_uplink_payload_errors_match_xray_v26_2_6() {
+        let headers = hyper::HeaderMap::new();
+        assert!(decode_chunked_cookie_payload(&headers, "x_data").is_err());
+
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            hyper::header::HeaderValue::from_static("x_data_0=!!!"),
+        );
+        assert!(decode_chunked_cookie_payload(&headers, "x_data").is_err());
+
+        headers.insert(
+            header::COOKIE,
+            hyper::header::HeaderValue::from_static("x_data_0=cGluZw"),
+        );
+        assert_eq!(
+            decode_chunked_cookie_payload(&headers, "x_data")
+                .expect("valid cookie payload"),
+            b"ping"
+        );
     }
 
     #[test]
