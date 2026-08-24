@@ -1050,9 +1050,10 @@ impl PacketQueue {
         if seq < self.next_seq {
             return Ok(());
         }
-        if self.buffered.len() >= self.max_buffered_posts
-            && !self.buffered.contains_key(&seq)
-        {
+        if self.buffered.contains_key(&seq) {
+            return Ok(());
+        }
+        if self.buffered.len() >= self.max_buffered_posts {
             return Err(QueueError::TooManyBuffered);
         }
 
@@ -1960,6 +1961,19 @@ mod tests {
             session.take_handler_stream_for_downlink().await.is_some(),
             "stream-down must still own logical connection creation"
         );
+    }
+
+    #[test]
+    fn duplicate_packet_sequence_keeps_first_payload_like_xray_v26_2_6() {
+        let mut queue = PacketQueue::new(4);
+
+        assert!(queue.push_packet(1, Bytes::from_static(b"first")).is_ok());
+        assert!(queue.push_packet(1, Bytes::from_static(b"second")).is_ok());
+        assert!(queue.push_packet(0, Bytes::from_static(b"zero")).is_ok());
+
+        assert_eq!(queue.pop_ready(), Some(Bytes::from_static(b"zero")));
+        assert_eq!(queue.pop_ready(), Some(Bytes::from_static(b"first")));
+        assert_eq!(queue.pop_ready(), None);
     }
 
     #[test]
