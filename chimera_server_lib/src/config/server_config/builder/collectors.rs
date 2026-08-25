@@ -641,11 +641,9 @@ pub(super) fn collect_xhttp_settings(
                 .into(),
         ));
     }
-    if raw
-        .x_padding_bytes
-        .as_ref()
-        .is_some_and(|range| range.from <= 0 || range.to <= 0)
-    {
+    if raw.x_padding_bytes.as_ref().is_some_and(|range| {
+        (range.from != 0 || range.to != 0) && (range.from <= 0 || range.to <= 0)
+    }) {
         return Err(Error::InvalidConfig(
             "xhttpSettings.xPaddingBytes cannot be disabled".into(),
         ));
@@ -1416,6 +1414,18 @@ mod tests {
                 .contains("xhttpSettings.scMaxBufferedPosts cannot be negative"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn collect_xhttp_settings_treats_zero_padding_range_as_xray_default() {
+        let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
+            "xPaddingBytes": 0
+        }))
+        .expect("xhttp settings");
+
+        let config = collect_xhttp_settings(settings)
+            .expect("Xray v26.2.6 accepts zero xPaddingBytes as the default range");
+        assert_eq!((config.min_padding, config.max_padding), (100, 1000));
     }
 
     #[test]
