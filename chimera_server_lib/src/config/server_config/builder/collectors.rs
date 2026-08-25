@@ -593,13 +593,8 @@ pub(super) fn collect_xhttp_settings(
     validate_xhttp_client_fields(&raw, mode)?;
     let uplink_http_method =
         normalize_xhttp_uplink_method(raw.uplink_http_method.as_deref(), mode)?;
-    let min_posts_interval_ms = clamp_xhttp_range(
-        raw.sc_min_posts_interval_ms
-            .clone()
-            .unwrap_or(XhttpRange { from: 30, to: 30 }),
-        30,
-        30,
-    );
+    let min_posts_interval_ms =
+        normalize_xhttp_min_posts_interval_ms(raw.sc_min_posts_interval_ms.clone());
     let session_placement =
         parse_xhttp_placement(raw.session_placement.as_deref(), "sessionPlacement")?;
     let seq_placement =
@@ -1055,6 +1050,22 @@ fn clamp_xhttp_range(
     .clamp_with_defaults(default_from, default_to)
 }
 
+fn normalize_xhttp_min_posts_interval_ms(
+    range: Option<XhttpRange>,
+) -> (usize, usize) {
+    let range = range.unwrap_or(XhttpRange { from: 30, to: 30 });
+    if range.to == 0 {
+        return (30, 30);
+    }
+    if range.to < 0 {
+        // Xray v26.2.6 preserves negative sentinels here. Its client-side
+        // scheduler only sleeps when From > 0, so represent that disabled
+        // state explicitly in the unsigned server config.
+        return (0, 0);
+    }
+    (range.from.max(0) as usize, range.to as usize)
+}
+
 fn normalize_xhttp_stream_up_server_secs(
     range: Option<XhttpRange>,
 ) -> (usize, usize) {
@@ -1370,6 +1381,29 @@ mod tests {
 
         let config = collect_xhttp_settings(settings).expect("valid xhttp settings");
         assert_eq!(config.max_each_post_bytes, -1);
+    }
+
+    #[test]
+    fn collect_xhttp_settings_disables_min_post_delay_for_negative_range_like_xray_v26_2_6()
+     {
+        for value in [serde_json::json!(-1), serde_json::json!("-5--1")] {
+            let settings =
+                serde_json::from_value::<XhttpSettings>(serde_json::json!({
+                    "scMinPostsIntervalMs": value
+                }))
+                .expect("xhttp settings");
+
+            let config =
+                collect_xhttp_settings(settings).expect("valid xhttp settings");
+            assert_eq!(config.min_posts_interval_ms, (0, 0));
+        }
+
+        let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
+            "scMinPostsIntervalMs": 0
+        }))
+        .expect("xhttp settings");
+        let config = collect_xhttp_settings(settings).expect("valid xhttp settings");
+        assert_eq!(config.min_posts_interval_ms, (30, 30));
     }
 
     #[test]
