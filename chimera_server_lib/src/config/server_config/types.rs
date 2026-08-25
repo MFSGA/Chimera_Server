@@ -407,7 +407,7 @@ pub struct XhttpServerConfig {
     pub trusted_x_forwarded_for: Vec<String>,
     pub min_padding: usize,
     pub max_padding: usize,
-    pub max_each_post_bytes: usize,
+    pub max_each_post_bytes: i64,
     pub max_buffered_posts: usize,
     pub session_ttl_secs: u64,
     pub stream_up_server_secs: (usize, usize),

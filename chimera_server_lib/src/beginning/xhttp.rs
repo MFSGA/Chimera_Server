@@ -336,7 +336,7 @@ struct AppState {
     trusted_x_forwarded_for: Vec<String>,
     min_padding: usize,
     max_padding: usize,
-    max_each_post_bytes: usize,
+    max_each_post_bytes: i64,
     stream_up_server_secs: (usize, usize),
     server_max_header_bytes: usize,
     padding_obfs_mode: bool,
@@ -756,7 +756,9 @@ async fn handle_packet_up(
         state.uplink_data_placement,
         XhttpDataPlacement::Auto | XhttpDataPlacement::Body
     ) {
-        match collect_body_limited(body, state.max_each_post_bytes).await {
+        match collect_body_limited(body, state.max_each_post_bytes.max(0) as usize)
+            .await
+        {
             Ok(payload) => payload,
             Err(status) => return simple_response(status),
         }
@@ -778,7 +780,7 @@ async fn handle_packet_up(
         XhttpDataPlacement::Header => header_payload,
         XhttpDataPlacement::Cookie => cookie_payload,
     };
-    if payload.len() > state.max_each_post_bytes {
+    if payload_exceeds_post_limit(payload.len(), state.max_each_post_bytes) {
         return simple_response(StatusCode::PAYLOAD_TOO_LARGE);
     }
     let collected = Bytes::from(payload);
@@ -1486,6 +1488,10 @@ fn decode_chunked_cookie_payload(
         ));
     }
     decode_xhttp_payload(&encoded)
+}
+
+fn payload_exceeds_post_limit(payload_len: usize, max_bytes: i64) -> bool {
+    i64::try_from(payload_len).unwrap_or(i64::MAX) > max_bytes
 }
 
 async fn collect_body_limited<B>(
@@ -2330,6 +2336,13 @@ mod tests {
             .as_deref(),
             Some("XXXX"),
         );
+    }
+
+    #[test]
+    fn negative_post_limit_rejects_every_payload_like_xray_v26_2_6() {
+        assert!(payload_exceeds_post_limit(0, -1));
+        assert!(payload_exceeds_post_limit(1, -1));
+        assert!(!payload_exceeds_post_limit(0, 0));
     }
 
     #[tokio::test]
