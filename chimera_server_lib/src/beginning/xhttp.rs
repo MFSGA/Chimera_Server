@@ -567,13 +567,17 @@ async fn handle_request(
     let stream_up_padding = header_value(&request_headers, "referer").is_some();
     let (session_id, seq) = state.extract_meta(&request, &path);
     let is_downlink_method = request.method() == Method::GET;
-    let is_uplink_method = request.method().as_str()
-        == state.uplink_http_method.as_str()
-        || has_uplink_marker(
-            &request_headers,
-            state.uplink_data_placement,
-            &state.uplink_data_key,
-        );
+    // Xray v26.2.6 deliberately excludes GET from the plain method match.
+    // A GET becomes an uplink only through the header/cookie upstream marker;
+    // otherwise it remains the stream-down request even when configured as the
+    // uplink HTTP method.
+    let is_uplink_method = is_xray_uplink_request(
+        request.method(),
+        &state.uplink_http_method,
+        &request_headers,
+        state.uplink_data_placement,
+        &state.uplink_data_key,
+    );
     let dispatch = classify_request(
         state.mode,
         is_downlink_method,
@@ -1700,6 +1704,17 @@ enum XhttpRequestDispatch {
     PacketUp,
 }
 
+fn is_xray_uplink_request(
+    method: &Method,
+    uplink_http_method: &str,
+    headers: &hyper::HeaderMap,
+    uplink_data_placement: XhttpDataPlacement,
+    uplink_data_key: &str,
+) -> bool {
+    (uplink_http_method != "GET" && method.as_str() == uplink_http_method)
+        || has_uplink_marker(headers, uplink_data_placement, uplink_data_key)
+}
+
 fn classify_request(
     mode: XhttpMode,
     is_get: bool,
@@ -1851,9 +1866,9 @@ mod tests {
             "GET with a session wins the stream-down fallback even in stream-one mode"
         );
         assert_eq!(
-            classify_request(XhttpMode::Auto, true, true, true, false),
-            Ok(XhttpRequestDispatch::StreamUp),
-            "configured GET uplink must dispatch before the GET stream-down fallback"
+            classify_request(XhttpMode::Auto, true, false, true, false),
+            Ok(XhttpRequestDispatch::StreamDown),
+            "plain GET with a session remains stream-down"
         );
         assert_eq!(
             classify_request(XhttpMode::PacketUp, false, true, false, false),
@@ -1880,6 +1895,20 @@ mod tests {
     #[test]
     fn uplink_markers_match_xray_v26_2_6() {
         let mut headers = hyper::HeaderMap::new();
+        assert!(!is_xray_uplink_request(
+            &Method::GET,
+            "GET",
+            &headers,
+            XhttpDataPlacement::Body,
+            ""
+        ));
+        assert!(is_xray_uplink_request(
+            &Method::POST,
+            "POST",
+            &headers,
+            XhttpDataPlacement::Body,
+            ""
+        ));
         headers.insert(
             "x-data-upstream",
             hyper::header::HeaderValue::from_static("1"),
