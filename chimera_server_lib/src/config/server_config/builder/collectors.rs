@@ -800,17 +800,16 @@ fn parse_xhttp_data_placement(
     placement: Option<&str>,
     mode: XhttpMode,
 ) -> Result<XhttpDataPlacement, Error> {
-    let placement =
-        match placement.unwrap_or("").trim().to_ascii_lowercase().as_str() {
-            "" | "body" => XhttpDataPlacement::Body,
-            "header" => XhttpDataPlacement::Header,
-            "cookie" => XhttpDataPlacement::Cookie,
-            unsupported => {
-                return Err(Error::InvalidConfig(format!(
-                    "unsupported xhttpSettings.uplinkDataPlacement: {unsupported}"
-                )));
-            }
-        };
+    let placement = match placement.unwrap_or("") {
+        "" | "body" => XhttpDataPlacement::Body,
+        "header" => XhttpDataPlacement::Header,
+        "cookie" => XhttpDataPlacement::Cookie,
+        unsupported => {
+            return Err(Error::InvalidConfig(format!(
+                "unsupported xhttpSettings.uplinkDataPlacement: {unsupported}"
+            )));
+        }
+    };
     if matches!(
         placement,
         XhttpDataPlacement::Header | XhttpDataPlacement::Cookie
@@ -848,16 +847,11 @@ fn normalize_xhttp_data_key(
 fn parse_xhttp_padding_placement(
     placement: Option<&str>,
 ) -> Result<XhttpPaddingPlacement, Error> {
-    match placement
-        .unwrap_or("queryInHeader")
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
+    match placement.unwrap_or("queryInHeader") {
         "cookie" => Ok(XhttpPaddingPlacement::Cookie),
         "header" => Ok(XhttpPaddingPlacement::Header),
         "query" => Ok(XhttpPaddingPlacement::Query),
-        "" | "queryinheader" => Ok(XhttpPaddingPlacement::QueryInHeader),
+        "" | "queryInHeader" => Ok(XhttpPaddingPlacement::QueryInHeader),
         unsupported => Err(Error::InvalidConfig(format!(
             "unsupported xhttpSettings.xPaddingPlacement: {unsupported}"
         ))),
@@ -867,12 +861,7 @@ fn parse_xhttp_padding_placement(
 fn parse_xhttp_padding_method(
     method: Option<&str>,
 ) -> Result<XhttpPaddingMethod, Error> {
-    match method
-        .unwrap_or("repeat-x")
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
+    match method.unwrap_or("repeat-x") {
         "" | "repeat-x" => Ok(XhttpPaddingMethod::RepeatX),
         "tokenish" => Ok(XhttpPaddingMethod::Tokenish),
         unsupported => Err(Error::InvalidConfig(format!(
@@ -885,12 +874,7 @@ fn parse_xhttp_placement(
     placement: Option<&str>,
     field: &str,
 ) -> Result<XhttpPlacement, Error> {
-    match placement
-        .unwrap_or("path")
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
+    match placement.unwrap_or("path") {
         "" | "path" => Ok(XhttpPlacement::Path),
         "query" => Ok(XhttpPlacement::Query),
         "header" => Ok(XhttpPlacement::Header),
@@ -952,7 +936,7 @@ fn normalize_xhttp_uplink_method(
 }
 
 fn parse_xhttp_mode(mode: Option<&str>) -> Result<XhttpMode, Error> {
-    match mode.unwrap_or("auto").trim() {
+    match mode.unwrap_or("auto") {
         "" | "auto" => Ok(XhttpMode::Auto),
         "packet-up" => Ok(XhttpMode::PacketUp),
         "stream-up" => Ok(XhttpMode::StreamUp),
@@ -1678,6 +1662,47 @@ mod tests {
                 "xhttpSettings.uplinkHTTPMethod=GET requires mode=packet-up"
             )
         );
+    }
+
+    #[test]
+    fn collect_xhttp_settings_rejects_noncanonical_selector_text_like_xray_v26_2_6()
+    {
+        let cases = [
+            ("mode", "Packet-Up"),
+            ("mode", " packet-up "),
+            ("sessionPlacement", "Query"),
+            ("sessionPlacement", " query "),
+            ("seqPlacement", "Header"),
+            ("seqPlacement", " header "),
+            ("uplinkDataPlacement", "Header"),
+            ("uplinkDataPlacement", " header "),
+            ("xPaddingPlacement", "Header"),
+            ("xPaddingPlacement", " header "),
+            ("xPaddingMethod", "Tokenish"),
+            ("xPaddingMethod", " tokenish "),
+        ];
+
+        for (field, value) in cases {
+            let mut object = serde_json::json!({
+                "path": "/xhttp",
+                "mode": "packet-up",
+                "sessionPlacement": "query"
+            });
+            object.as_object_mut().expect("xhttp object").insert(
+                field.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+            let settings = serde_json::from_value::<XhttpSettings>(object)
+                .expect("xhttp settings should deserialize before validation");
+
+            let error = collect_xhttp_settings(settings).expect_err(
+                "Xray v26.2.6 treats selector values as exact case-sensitive text",
+            );
+            assert!(
+                error.to_string().contains("unsupported xhttpSettings"),
+                "{field}={value:?} returned unexpected error: {error}"
+            );
+        }
     }
 
     #[test]
