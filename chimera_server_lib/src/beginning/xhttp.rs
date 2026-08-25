@@ -1868,8 +1868,27 @@ fn apply_xray_cors_headers(headers: &mut hyper::HeaderMap) {
 
 fn apply_response_padding(headers: &mut hyper::HeaderMap, state: &AppState) {
     let padding_len = random_inclusive(state.min_padding, state.max_padding);
+    apply_response_padding_value(
+        headers,
+        state.padding_obfs_mode,
+        state.padding_placement,
+        &state.padding_key,
+        &state.padding_header,
+        state.padding_method,
+        padding_len,
+    );
+}
 
-    if !state.padding_obfs_mode {
+fn apply_response_padding_value(
+    headers: &mut hyper::HeaderMap,
+    padding_obfs_mode: bool,
+    padding_placement: XhttpPaddingPlacement,
+    padding_key: &str,
+    padding_header: &str,
+    padding_method: XhttpPaddingMethod,
+    padding_len: usize,
+) {
+    if !padding_obfs_mode {
         if let Ok(value) =
             hyper::header::HeaderValue::from_str(&"X".repeat(padding_len))
         {
@@ -1878,28 +1897,24 @@ fn apply_response_padding(headers: &mut hyper::HeaderMap, state: &AppState) {
         return;
     }
 
-    let padding = generate_padding(state.padding_method, padding_len);
-    match state.padding_placement {
-        XhttpPaddingPlacement::Cookie => {
-            let cookie = format!("{}={}; Path=/", state.padding_key, padding);
-            if let Ok(value) = hyper::header::HeaderValue::from_str(&cookie) {
-                headers.append(header::SET_COOKIE, value);
-            }
-        }
+    let padding = generate_padding(padding_method, padding_len);
+    match padding_placement {
+        // Xray v26.2.6 applies response padding through ApplyXPaddingToHeader,
+        // which intentionally has no cookie/query response cases.
+        XhttpPaddingPlacement::Cookie | XhttpPaddingPlacement::Query => {}
         XhttpPaddingPlacement::Header => {
-            if let Ok(name) = hyper::header::HeaderName::from_bytes(
-                state.padding_header.as_bytes(),
-            ) && let Ok(value) = hyper::header::HeaderValue::from_str(&padding)
+            if let Ok(name) =
+                hyper::header::HeaderName::from_bytes(padding_header.as_bytes())
+                && let Ok(value) = hyper::header::HeaderValue::from_str(&padding)
             {
                 headers.insert(name, value);
             }
         }
-        XhttpPaddingPlacement::Query => {}
         XhttpPaddingPlacement::QueryInHeader => {
-            let value = format!("?{}={}", state.padding_key, padding);
-            if let Ok(name) = hyper::header::HeaderName::from_bytes(
-                state.padding_header.as_bytes(),
-            ) && let Ok(value) = hyper::header::HeaderValue::from_str(&value)
+            let value = format!("?{padding_key}={padding}");
+            if let Ok(name) =
+                hyper::header::HeaderName::from_bytes(padding_header.as_bytes())
+                && let Ok(value) = hyper::header::HeaderValue::from_str(&value)
             {
                 headers.insert(name, value);
             }
@@ -1910,6 +1925,35 @@ fn apply_response_padding(headers: &mut hyper::HeaderMap, state: &AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_padding_placements_match_xray_v26_2_6() {
+        let mut headers = hyper::HeaderMap::new();
+        apply_response_padding_value(
+            &mut headers,
+            true,
+            XhttpPaddingPlacement::Cookie,
+            "pad",
+            "x-pad",
+            XhttpPaddingMethod::RepeatX,
+            4,
+        );
+        assert!(
+            headers.is_empty(),
+            "Xray does not emit response cookies for padding"
+        );
+
+        apply_response_padding_value(
+            &mut headers,
+            true,
+            XhttpPaddingPlacement::Header,
+            "pad",
+            "x-pad",
+            XhttpPaddingMethod::RepeatX,
+            4,
+        );
+        assert_eq!(headers.get("x-pad").unwrap(), "XXXX");
+    }
 
     #[test]
     fn http1_header_read_limit_includes_xray_bufio_slop() {
