@@ -452,22 +452,14 @@ impl AppState {
         path_query: Option<&str>,
         headers: &hyper::HeaderMap,
     ) -> bool {
-        let padding = if self.padding_obfs_mode {
-            cookie_value(headers, &self.padding_key)
-                .or_else(|| {
-                    header_value(headers, &self.padding_header).and_then(|value| {
-                        match self.padding_placement {
-                            XhttpPaddingPlacement::Header => Some(value),
-                            _ => query_value_from_url(&value, &self.padding_key),
-                        }
-                    })
-                })
-                .or_else(|| query_value(path_query, &self.padding_key))
-        } else if let Some(referer) = header_value(headers, "referer") {
-            query_value_from_url(&referer, "x_padding")
-        } else {
-            query_value(path_query, "x_padding")
-        };
+        let padding = extract_xray_request_padding(
+            self.padding_obfs_mode,
+            &self.padding_key,
+            &self.padding_header,
+            self.padding_placement,
+            path_query,
+            headers,
+        );
 
         let Some(padding) = padding else {
             return false;
@@ -1588,6 +1580,61 @@ fn decode_xray_url_path(raw_path: &str) -> Result<String, ()> {
     String::from_utf8(decoded).or_else(|_| Ok(raw_path.to_string()))
 }
 
+fn extract_xray_request_padding(
+    obfs_mode: bool,
+    padding_key: &str,
+    padding_header: &str,
+    padding_placement: XhttpPaddingPlacement,
+    path_query: Option<&str>,
+    headers: &hyper::HeaderMap,
+) -> Option<String> {
+    if !obfs_mode {
+        if let Some(referer) = header_value(headers, "referer") {
+            // Xray v26.2.6 returns immediately when url.Parse succeeds, even
+            // if Referer does not contain x_padding. Only a parse failure falls
+            // through to the configurable cookie/header/query extraction below.
+            if xray_url_parse_succeeds(&referer) {
+                return query_value_from_url(&referer, "x_padding");
+            }
+        } else {
+            return query_value(path_query, "x_padding");
+        }
+    }
+
+    cookie_value(headers, padding_key)
+        .or_else(|| {
+            header_value(headers, padding_header).and_then(|value| {
+                match padding_placement {
+                    XhttpPaddingPlacement::Header => Some(value),
+                    _ => query_value_from_url(&value, padding_key),
+                }
+            })
+        })
+        .or_else(|| query_value(path_query, padding_key))
+}
+
+fn xray_url_parse_succeeds(raw_url: &str) -> bool {
+    let bytes = raw_url.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] < b' ' || bytes[index] == 0x7f {
+            return false;
+        }
+        if bytes[index] != b'%' {
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len()
+            || hex_value(bytes[index + 1]).is_none()
+            || hex_value(bytes[index + 2]).is_none()
+        {
+            return false;
+        }
+        index += 3;
+    }
+    true
+}
+
 fn query_value_from_url(raw_url: &str, key: &str) -> Option<String> {
     let query = raw_url.split_once('?')?.1;
     let query = query.split('#').next().unwrap_or(query);
@@ -2437,6 +2484,42 @@ mod tests {
             )
             .as_deref(),
             Some("XXXX"),
+        );
+    }
+
+    #[test]
+    fn malformed_referer_falls_back_to_xray_padding_sources() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("referer", hyper::header::HeaderValue::from_static("%"));
+
+        assert_eq!(
+            extract_xray_request_padding(
+                false,
+                "x_padding",
+                "X-Padding",
+                XhttpPaddingPlacement::Header,
+                Some("x_padding=XXXX"),
+                &headers,
+            )
+            .as_deref(),
+            Some("XXXX"),
+        );
+
+        headers.insert(
+            "referer",
+            hyper::header::HeaderValue::from_static("https://example.com/"),
+        );
+        assert_eq!(
+            extract_xray_request_padding(
+                false,
+                "x_padding",
+                "X-Padding",
+                XhttpPaddingPlacement::Header,
+                Some("x_padding=XXXX"),
+                &headers,
+            ),
+            None,
+            "a successfully parsed Referer must suppress query fallback even without x_padding",
         );
     }
 
