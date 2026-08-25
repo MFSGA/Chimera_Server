@@ -1391,16 +1391,27 @@ fn trusted_forwarded_peer(
 }
 
 fn cookie_value(headers: &hyper::HeaderMap, key: &str) -> Option<String> {
-    headers.get_all(header::COOKIE).iter().find_map(|value| {
-        let value = value.to_str().ok()?;
-        value.split(';').find_map(|cookie| {
-            let (name, value) = cookie.trim().split_once('=')?;
+    for header_value in headers.get_all(header::COOKIE) {
+        let Ok(header_value) = header_value.to_str() else {
+            continue;
+        };
+        for cookie in header_value.split(';') {
+            let Some((name, raw_value)) = cookie.trim().split_once('=') else {
+                continue;
+            };
             if name != key {
-                return None;
+                continue;
             }
-            parse_cookie_value_like_go(value).filter(|value| !value.is_empty())
-        })
-    })
+            let Some(value) = parse_cookie_value_like_go(raw_value) else {
+                continue;
+            };
+            // Go's Request.Cookie returns the first successfully parsed cookie
+            // with this name. An empty first value therefore means "missing"
+            // to XHTTP and must not fall through to a later duplicate.
+            return (!value.is_empty()).then_some(value);
+        }
+    }
+    None
 }
 
 fn parse_cookie_value_like_go(raw: &str) -> Option<String> {
@@ -2262,6 +2273,24 @@ mod tests {
         assert_eq!(cookie_value(&headers, "x_session").as_deref(), Some("abc"));
         assert_eq!(cookie_value(&headers, "x_seq").as_deref(), Some("0"));
         assert_eq!(cookie_value(&headers, "invalid"), None);
+
+        headers.insert(
+            header::COOKIE,
+            hyper::header::HeaderValue::from_static(
+                "x_session=; x_session=abc; x_seq=; x_seq=0",
+            ),
+        );
+        assert_eq!(cookie_value(&headers, "x_session"), None);
+        assert_eq!(cookie_value(&headers, "x_seq"), None);
+
+        headers.insert(
+            header::COOKIE,
+            hyper::header::HeaderValue::from_static(
+                "x_session=abc; x_session=; x_seq=0; x_seq=",
+            ),
+        );
+        assert_eq!(cookie_value(&headers, "x_session").as_deref(), Some("abc"));
+        assert_eq!(cookie_value(&headers, "x_seq").as_deref(), Some("0"));
     }
 
     #[test]
