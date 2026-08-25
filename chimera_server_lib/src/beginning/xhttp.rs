@@ -561,8 +561,10 @@ async fn handle_request(
     let logical_peer_addr =
         trusted_forwarded_peer(&request_headers, &state.trusted_x_forwarded_for)
             .unwrap_or(peer_addr);
-    let stream_up_padding = state.padding_obfs_mode
-        || header_value(&request_headers, "referer").is_some();
+    // Xray v26.2.6 only starts stream-up server padding when the client sends
+    // Referer. xPaddingObfsMode changes where padding is encoded, but does not
+    // itself enable the periodic stream-up padding writer.
+    let stream_up_padding = header_value(&request_headers, "referer").is_some();
     let (session_id, seq) = state.extract_meta(&request, &path);
     let is_downlink_method = request.method() == Method::GET;
     let is_uplink_method = request.method().as_str()
@@ -2341,6 +2343,18 @@ mod tests {
         let result = collect_body_limited(body, 7).await;
 
         assert_eq!(result, Err(StatusCode::PAYLOAD_TOO_LARGE));
+    }
+
+    #[test]
+    fn stream_up_padding_requires_referer_like_xray_v26_2_6() {
+        let mut headers = hyper::HeaderMap::new();
+        assert!(header_value(&headers, "referer").is_none());
+
+        headers.insert(
+            "referer",
+            hyper::header::HeaderValue::from_static("https://example.com/"),
+        );
+        assert!(header_value(&headers, "referer").is_some());
     }
 
     #[test]
