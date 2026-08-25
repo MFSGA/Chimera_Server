@@ -934,17 +934,15 @@ fn normalize_xhttp_uplink_method(
     method: Option<&str>,
     mode: XhttpMode,
 ) -> Result<String, Error> {
-    let method = method.unwrap_or("").trim();
+    let method = method.unwrap_or("");
     let method = if method.is_empty() {
         "POST".to_string()
     } else {
+        // Xray v26.2.6 applies strings.ToUpper without trimming or validating
+        // the value as an HTTP token. Preserve that exact config semantics;
+        // odd values simply never match a real request method at runtime.
         method.to_ascii_uppercase()
     };
-    if http::Method::from_bytes(method.as_bytes()).is_err() {
-        return Err(Error::InvalidConfig(format!(
-            "invalid xhttpSettings.uplinkHTTPMethod: {method}"
-        )));
-    }
     if method == "GET" && mode != XhttpMode::PacketUp {
         return Err(Error::InvalidConfig(
             "xhttpSettings.uplinkHTTPMethod=GET requires mode=packet-up".into(),
@@ -1537,6 +1535,33 @@ mod tests {
         assert_eq!(config.session_key, "X-Session");
         assert_eq!(config.seq_placement, XhttpPlacement::Query);
         assert_eq!(config.seq_key, "x_seq");
+    }
+
+    #[test]
+    fn collect_xhttp_settings_preserves_xray_uplink_method_text_semantics() {
+        for (raw_method, expected) in
+            [("FOO BAR", "FOO BAR"), (":", ":"), (" get ", " GET ")]
+        {
+            let settings =
+                serde_json::from_value::<XhttpSettings>(serde_json::json!({
+                    "path": "/xhttp",
+                    "mode": "stream-one",
+                    "uplinkHTTPMethod": raw_method
+                }))
+                .expect("xhttp settings");
+
+            let config = collect_xhttp_settings(settings)
+                .expect("Xray v26.2.6 accepts arbitrary uplink method text");
+            assert_eq!(config.uplink_http_method, expected);
+        }
+
+        let exact_get = serde_json::from_value::<XhttpSettings>(serde_json::json!({
+            "path": "/xhttp",
+            "mode": "stream-one",
+            "uplinkHTTPMethod": "get"
+        }))
+        .expect("xhttp settings");
+        assert!(collect_xhttp_settings(exact_get).is_err());
     }
 
     #[test]
