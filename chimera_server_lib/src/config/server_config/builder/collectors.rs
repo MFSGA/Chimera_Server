@@ -697,12 +697,8 @@ pub(super) fn collect_xhttp_settings(
         Some(range) if range.to == 0 => 1_000_000,
         Some(range) => i64::from(range.to),
     };
-    let stream_up_server_secs = clamp_xhttp_range(
-        raw.sc_stream_up_server_secs
-            .unwrap_or(XhttpRange { from: 20, to: 80 }),
-        20,
-        80,
-    );
+    let stream_up_server_secs =
+        normalize_xhttp_stream_up_server_secs(raw.sc_stream_up_server_secs);
 
     Ok(XhttpServerConfig {
         mode,
@@ -1061,6 +1057,22 @@ fn clamp_xhttp_range(
     .clamp_with_defaults(default_from, default_to)
 }
 
+fn normalize_xhttp_stream_up_server_secs(
+    range: Option<XhttpRange>,
+) -> (usize, usize) {
+    let range = range.unwrap_or(XhttpRange { from: 20, to: 80 });
+    if range.to == 0 {
+        return (20, 80);
+    }
+    if range.to < 0 {
+        // Xray v26.2.6 preserves a negative range here and then gates the
+        // stream-up padding writer on To > 0. Represent that disabled state
+        // explicitly because the runtime duration type is unsigned.
+        return (0, 0);
+    }
+    (range.from.max(0) as usize, range.to as usize)
+}
+
 #[cfg(feature = "tuic")]
 pub(super) fn collect_tuic_settings(
     settings: SettingObject,
@@ -1360,6 +1372,22 @@ mod tests {
 
         let config = collect_xhttp_settings(settings).expect("valid xhttp settings");
         assert_eq!(config.max_each_post_bytes, -1);
+    }
+
+    #[test]
+    fn collect_xhttp_settings_disables_stream_up_padding_for_negative_range_like_xray_v26_2_6()
+     {
+        for value in [serde_json::json!(-1), serde_json::json!("-5--1")] {
+            let settings =
+                serde_json::from_value::<XhttpSettings>(serde_json::json!({
+                    "scStreamUpServerSecs": value
+                }))
+                .expect("xhttp settings");
+
+            let config =
+                collect_xhttp_settings(settings).expect("valid xhttp settings");
+            assert_eq!(config.stream_up_server_secs, (0, 0));
+        }
     }
 
     #[test]
