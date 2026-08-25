@@ -793,79 +793,7 @@ fn validate_xhttp_client_fields(
         }
     }
 
-    validate_xhttp_session_id(raw)
-}
-
-fn validate_xhttp_session_id(raw: &XhttpSettings) -> Result<(), Error> {
-    let Some(configured_table) = raw
-        .session_id_table
-        .as_deref()
-        .filter(|table| !table.is_empty())
-    else {
-        return Ok(());
-    };
-    let table =
-        predefined_session_id_table(configured_table).unwrap_or(configured_table);
-    if !table.is_ascii() {
-        return Err(Error::InvalidConfig(
-            "xhttpSettings.sessionIDTable must contain only ASCII characters".into(),
-        ));
-    }
-
-    let length = raw
-        .session_id_length
-        .clone()
-        .unwrap_or(XhttpRange { from: 0, to: 0 });
-    let room = xhttp_session_id_room(table.len(), length.from, length.to);
-    if room < 2_147_483_648 {
-        return Err(Error::InvalidConfig(
-            "xhttpSettings.sessionIDTable or sessionIDLength is too small".into(),
-        ));
-    }
-    if length.from <= 0 {
-        return Err(Error::InvalidConfig(
-            "xhttpSettings.sessionIDLength.from must be greater than 0".into(),
-        ));
-    }
     Ok(())
-}
-
-fn predefined_session_id_table(name: &str) -> Option<&'static str> {
-    match name {
-        "ALPHABET" => Some("ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
-        "Alphabet" => Some("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"),
-        "BASE36" => Some("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
-        "Base62" => {
-            Some("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
-        }
-        "HEX" => Some("0123456789ABCDEF"),
-        "alphabet" => Some("abcdefghijklmnopqrstuvwxyz"),
-        "base36" => Some("0123456789abcdefghijklmnopqrstuvwxyz"),
-        "hex" => Some("0123456789abcdef"),
-        "number" => Some("0123456789"),
-        _ => None,
-    }
-}
-
-fn xhttp_session_id_room(table_size: usize, from: i32, to: i32) -> u128 {
-    const REQUIRED_ROOM: u128 = 2_147_483_648;
-    if table_size == 0 || from <= 0 || to < from {
-        return 0;
-    }
-
-    let base = table_size as u128;
-    let mut total = 0u128;
-    for length in from..=to {
-        let mut term = 1u128;
-        for _ in 0..length {
-            term = term.saturating_mul(base).min(REQUIRED_ROOM);
-        }
-        total = total.saturating_add(term).min(REQUIRED_ROOM);
-        if total >= REQUIRED_ROOM {
-            return REQUIRED_ROOM;
-        }
-    }
-    total
 }
 
 fn parse_xhttp_data_placement(
@@ -1565,6 +1493,28 @@ mod tests {
     }
 
     #[test]
+    fn collect_xhttp_settings_accepts_xray_server_side_session_id_fields() {
+        for settings_value in [
+            serde_json::json!({
+                "path": "/xhttp",
+                "sessionIDTable": "number",
+                "sessionIDLength": 1
+            }),
+            serde_json::json!({
+                "path": "/xhttp",
+                "sessionIDTable": "表格",
+                "sessionIDLength": 0
+            }),
+        ] {
+            let settings = serde_json::from_value::<XhttpSettings>(settings_value)
+                .expect("xhttp settings should deserialize");
+            collect_xhttp_settings(settings).expect(
+                "Xray v26.2.6 accepts inbound session ID generator settings without client-side validation",
+            );
+        }
+    }
+
+    #[test]
     fn collect_xhttp_settings_accepts_reference_header_and_method_options() {
         let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
             "path": "/xhttp",
@@ -1846,22 +1796,6 @@ mod tests {
                     }
                 }),
                 "maxConnections cannot be specified together with maxConcurrency",
-            ),
-            (
-                serde_json::json!({
-                    "path": "/xhttp",
-                    "sessionIDTable": "number",
-                    "sessionIDLength": {"from": 1, "to": 8}
-                }),
-                "sessionIDTable or sessionIDLength is too small",
-            ),
-            (
-                serde_json::json!({
-                    "path": "/xhttp",
-                    "sessionIDTable": "表格",
-                    "sessionIDLength": {"from": 10, "to": 10}
-                }),
-                "sessionIDTable must contain only ASCII characters",
             ),
         ] {
             let settings = serde_json::from_value::<XhttpSettings>(settings_value)
