@@ -324,7 +324,7 @@ fn xray_websocket_forwarded_peer(
     if !trusted_x_forwarded_for.is_empty()
         && !trusted_x_forwarded_for
             .iter()
-            .any(|header| headers.contains_key(&header.trim().to_ascii_lowercase()))
+            .any(|header| headers.contains_key(&header.to_ascii_lowercase()))
     {
         return None;
     }
@@ -862,6 +862,13 @@ mod tests {
         assert_eq!(
             xray_websocket_forwarded_peer(&headers, &["X-Trusted-CDN".to_string()]),
             Some("203.0.113.77:0".parse().unwrap())
+        );
+        assert_eq!(
+            xray_websocket_forwarded_peer(
+                &headers,
+                &[" X-Trusted-CDN ".to_string()]
+            ),
+            None
         );
         assert_eq!(
             xray_websocket_forwarded_peer(
