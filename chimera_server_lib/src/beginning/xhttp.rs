@@ -3,7 +3,7 @@ use std::{
     convert::Infallible,
     pin::Pin,
     sync::{
-        Arc, RwLock,
+        Arc, Mutex as StdMutex, RwLock,
         atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll},
@@ -686,13 +686,8 @@ async fn handle_stream_down(
     let session = state.sessions.get_or_create(&session_id);
     session.fully_connected.store(true, Ordering::Release);
 
-    if let Some(stream) = session.take_handler_stream_for_downlink().await {
-        spawn_handler_stream(stream, state.clone(), peer_addr);
-    }
-
-    let Some(reader) = session.take_downlink_reader().await else {
-        return simple_response(StatusCode::CONFLICT);
-    };
+    let (stream, reader) = session.new_downlink_connection();
+    spawn_handler_stream(stream, state.clone(), peer_addr);
 
     let cleanup = SessionCleanupGuard {
         sessions: state.sessions.clone(),
@@ -1168,10 +1163,27 @@ impl AsyncRead for XhttpUploadReader {
     }
 }
 
+struct SharedUploadReader {
+    inner: Arc<StdMutex<XhttpUploadReader>>,
+}
+
+impl AsyncRead for SharedUploadReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let mut reader = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Pin::new(&mut *reader).poll_read(cx, buf)
+    }
+}
+
 struct XhttpSession {
     upload_queue: UploadQueueSender,
-    downlink_reader: Mutex<Option<DuplexStream>>,
-    handler_stream: Mutex<Option<XhttpLogicalStream>>,
+    upload_reader: Arc<StdMutex<XhttpUploadReader>>,
     fully_connected: AtomicBool,
 }
 
@@ -1179,29 +1191,25 @@ impl XhttpSession {
     fn new(max_buffered_posts: usize) -> Self {
         let (upload_queue, upload_reader) =
             XhttpUploadReader::new(max_buffered_posts);
-        let (server_write, client_download) = duplex(XHTTP_PIPE_CAPACITY);
 
         Self {
             upload_queue,
-            downlink_reader: Mutex::new(Some(client_download)),
-            handler_stream: Mutex::new(Some(XhttpLogicalStream::new(
-                upload_reader,
-                server_write,
-            ))),
+            upload_reader: Arc::new(StdMutex::new(upload_reader)),
             fully_connected: AtomicBool::new(false),
         }
     }
 
-    async fn take_handler_stream_for_downlink(&self) -> Option<XhttpLogicalStream> {
-        // Xray v26.2.6 only exposes a split XHTTP connection to the inbound
-        // listener when the stream-down GET arrives. Earlier uplink requests
-        // may create the session and queue bytes, but must not choose the
-        // logical peer address.
-        self.handler_stream.lock().await.take()
-    }
-
-    async fn take_downlink_reader(&self) -> Option<DuplexStream> {
-        self.downlink_reader.lock().await.take()
+    fn new_downlink_connection(&self) -> (XhttpLogicalStream, DuplexStream) {
+        // Xray v26.2.6 creates a fresh logical inbound connection for every
+        // stream-down GET while all of them compete on the same uploadQueue.
+        let (server_write, client_download) = duplex(XHTTP_PIPE_CAPACITY);
+        let reader = SharedUploadReader {
+            inner: self.upload_reader.clone(),
+        };
+        (
+            XhttpLogicalStream::new(reader, server_write),
+            client_download,
+        )
     }
 }
 
@@ -2603,22 +2611,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn split_session_keeps_handler_pending_until_downlink() {
+    async fn split_session_creates_each_logical_connection_on_downlink() {
+        use tokio::io::AsyncReadExt;
+
         let session = XhttpSession::new(4);
         session
             .upload_queue
             .push_payload(0, Bytes::from_static(b"ping"))
             .await
-            .expect("queue packet-up payload");
+            .expect("queue first packet-up payload");
 
-        assert!(
-            session.handler_stream.lock().await.is_some(),
-            "packet-up must not consume the logical handler stream"
-        );
-        assert!(
-            session.take_handler_stream_for_downlink().await.is_some(),
-            "stream-down must still own logical connection creation"
-        );
+        let (mut first_stream, _first_downlink) = session.new_downlink_connection();
+        let (mut second_stream, _second_downlink) =
+            session.new_downlink_connection();
+
+        let mut first_payload = [0u8; 4];
+        first_stream.read_exact(&mut first_payload).await.unwrap();
+        assert_eq!(&first_payload, b"ping");
+
+        session
+            .upload_queue
+            .push_payload(1, Bytes::from_static(b"pong"))
+            .await
+            .expect("queue second packet-up payload");
+        let mut second_payload = [0u8; 4];
+        second_stream.read_exact(&mut second_payload).await.unwrap();
+        assert_eq!(&second_payload, b"pong");
     }
 
     #[tokio::test]
