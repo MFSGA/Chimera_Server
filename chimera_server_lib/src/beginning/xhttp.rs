@@ -497,7 +497,7 @@ async fn handle_request(
     let http1_header_limit =
         xray_http1_header_read_limit(state.server_max_header_bytes);
     if request.version() != hyper::Version::HTTP_2
-        && request_header_bytes(request.headers()) > http1_header_limit
+        && request_head_bytes(&request) > http1_header_limit
     {
         debug!(
             method = %request.method(),
@@ -1586,14 +1586,29 @@ fn query_value_from_url(raw_url: &str, key: &str) -> Option<String> {
     query_value(Some(query), key)
 }
 
-fn request_header_bytes(headers: &hyper::HeaderMap) -> usize {
-    headers.iter().fold(2usize, |total, (name, value)| {
-        total
-            .saturating_add(name.as_str().len())
-            .saturating_add(2)
-            .saturating_add(value.as_bytes().len())
-            .saturating_add(2)
-    })
+fn request_head_bytes<B>(request: &Request<B>) -> usize {
+    // XHTTP's HTTP/1 paths use HTTP/1.0 or HTTP/1.1; both protocol tokens are
+    // eight bytes long and count against Go net/http's MaxHeaderBytes budget.
+    let request_line_bytes = request
+        .method()
+        .as_str()
+        .len()
+        .saturating_add(1)
+        .saturating_add(request.uri().to_string().len())
+        .saturating_add(1)
+        .saturating_add(8)
+        .saturating_add(2);
+
+    request.headers().iter().fold(
+        request_line_bytes.saturating_add(2),
+        |total, (name, value)| {
+            total
+                .saturating_add(name.as_str().len())
+                .saturating_add(2)
+                .saturating_add(value.as_bytes().len())
+                .saturating_add(2)
+        },
+    )
 }
 
 fn random_inclusive(from: usize, to: usize) -> usize {
@@ -1815,19 +1830,31 @@ mod tests {
         assert_eq!(xray_http1_header_read_limit(8192), 12_288);
         assert_eq!(xray_http1_header_read_limit(16_384), 20_480);
 
-        let mut headers = hyper::HeaderMap::new();
-        headers.insert(
-            "x-test",
-            http::HeaderValue::from_str(&"a".repeat(12_000)).unwrap(),
-        );
-        assert!(
-            request_header_bytes(&headers) <= xray_http1_header_read_limit(8192)
-        );
-        headers.insert(
-            "x-test",
-            http::HeaderValue::from_str(&"a".repeat(13_000)).unwrap(),
-        );
-        assert!(request_header_bytes(&headers) > xray_http1_header_read_limit(8192));
+        let request = Request::builder()
+            .uri("/x/")
+            .header("x-test", "a".repeat(12_000))
+            .body(())
+            .unwrap();
+        assert!(request_head_bytes(&request) <= xray_http1_header_read_limit(8192));
+        let request = Request::builder()
+            .uri("/x/")
+            .header("x-test", "a".repeat(13_000))
+            .body(())
+            .unwrap();
+        assert!(request_head_bytes(&request) > xray_http1_header_read_limit(8192));
+
+        let request = Request::builder()
+            .uri(format!("/x/?q={}", "a".repeat(12_000)))
+            .header("host", "localhost")
+            .body(())
+            .unwrap();
+        assert!(request_head_bytes(&request) <= xray_http1_header_read_limit(8192));
+        let request = Request::builder()
+            .uri(format!("/x/?q={}", "a".repeat(13_000)))
+            .header("host", "localhost")
+            .body(())
+            .unwrap();
+        assert!(request_head_bytes(&request) > xray_http1_header_read_limit(8192));
     }
 
     #[test]
