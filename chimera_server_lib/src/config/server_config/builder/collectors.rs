@@ -692,14 +692,11 @@ pub(super) fn collect_xhttp_settings(
         0 => 8192,
         value => value as usize,
     };
-    let (_, max_each_post_bytes) = clamp_xhttp_range(
-        raw.sc_max_each_post_bytes.unwrap_or(XhttpRange {
-            from: 1_000_000,
-            to: 1_000_000,
-        }),
-        1_000_000,
-        1_000_000,
-    );
+    let max_each_post_bytes = match raw.sc_max_each_post_bytes {
+        None => 1_000_000,
+        Some(range) if range.to == 0 => 1_000_000,
+        Some(range) => i64::from(range.to),
+    };
     let stream_up_server_secs = clamp_xhttp_range(
         raw.sc_stream_up_server_secs
             .unwrap_or(XhttpRange { from: 20, to: 80 }),
@@ -1352,6 +1349,17 @@ mod tests {
         assert!(config.seq_key.is_empty());
         assert_eq!(config.uplink_data_placement, XhttpDataPlacement::Body);
         assert!(config.uplink_data_key.is_empty());
+    }
+
+    #[test]
+    fn collect_xhttp_settings_preserves_negative_post_limit_like_xray_v26_2_6() {
+        let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
+            "scMaxEachPostBytes": -1
+        }))
+        .expect("xhttp settings");
+
+        let config = collect_xhttp_settings(settings).expect("valid xhttp settings");
+        assert_eq!(config.max_each_post_bytes, -1);
     }
 
     #[test]
