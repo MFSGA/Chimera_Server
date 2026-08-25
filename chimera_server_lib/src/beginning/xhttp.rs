@@ -1370,7 +1370,7 @@ fn trusted_forwarded_peer(
     if !trusted_x_forwarded_for.is_empty()
         && !trusted_x_forwarded_for
             .iter()
-            .any(|header| headers.contains_key(header.trim()))
+            .any(|header| headers.contains_key(header))
     {
         return None;
     }
@@ -2218,6 +2218,11 @@ mod tests {
         assert_eq!(
             trusted_forwarded_peer(&headers, &["X-Trusted-CDN".to_string()]),
             Some("203.0.113.77:0".parse().expect("trusted forwarded peer"))
+        );
+        assert_eq!(
+            trusted_forwarded_peer(&headers, &[" X-Trusted-CDN ".to_string()]),
+            None,
+            "Xray v26.2.6 matches trusted marker names exactly and does not trim config text"
         );
     }
 
