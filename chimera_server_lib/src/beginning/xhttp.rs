@@ -1664,6 +1664,9 @@ fn xray_url_parse_succeeds(raw_url: &str) -> bool {
 }
 
 fn query_value_from_url(raw_url: &str, key: &str) -> Option<String> {
+    if !xray_url_parse_succeeds(raw_url) {
+        return None;
+    }
     let query = raw_url.split_once('?')?.1;
     let query = query.split('#').next().unwrap_or(query);
     query_value(Some(query), key)
@@ -2537,7 +2540,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_referer_falls_back_to_xray_padding_sources() {
+    fn malformed_padding_urls_fall_back_like_xray_v26_2_6() {
         let mut headers = hyper::HeaderMap::new();
         headers.insert("referer", hyper::header::HeaderValue::from_static("%"));
 
@@ -2569,6 +2572,25 @@ mod tests {
             ),
             None,
             "a successfully parsed Referer must suppress query fallback even without x_padding",
+        );
+
+        headers.remove("referer");
+        headers.insert(
+            "x-padding",
+            hyper::header::HeaderValue::from_static("%ZZ?x_padding=BAD"),
+        );
+        assert_eq!(
+            extract_xray_request_padding(
+                true,
+                "x_padding",
+                "X-Padding",
+                XhttpPaddingPlacement::QueryInHeader,
+                Some("x_padding=X"),
+                &headers,
+            )
+            .as_deref(),
+            Some("X"),
+            "a malformed query-in-header URL must be ignored before falling back to request query",
         );
     }
 
