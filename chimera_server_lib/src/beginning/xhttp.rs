@@ -952,32 +952,34 @@ impl SessionStore {
         }
 
         let session = Arc::new(XhttpSession::new(self.max_buffered_posts));
-        let inserted = self
-            .inner
-            .write()
-            .unwrap()
-            .entry(session_id.to_string())
-            .or_insert_with(|| session.clone())
-            .clone();
-        self.spawn_ttl_cleanup(session_id.to_string());
-        inserted
+        let mut sessions = self.inner.write().unwrap();
+        if let Some(existing) = sessions.get(session_id) {
+            return existing.clone();
+        }
+        sessions.insert(session_id.to_string(), session.clone());
+        drop(sessions);
+        self.spawn_ttl_cleanup(session_id.to_string(), session.clone());
+        session
     }
 
     fn remove(&self, session_id: &str) {
         self.inner.write().unwrap().remove(session_id);
     }
 
-    fn spawn_ttl_cleanup(&self, session_id: String) {
+    fn spawn_ttl_cleanup(&self, session_id: String, session: Arc<XhttpSession>) {
         let ttl = self.ttl;
         let store = self.clone();
         tokio::spawn(async move {
             sleep(ttl).await;
 
-            let session = { store.inner.read().unwrap().get(&session_id).cloned() };
-
-            if let Some(session) = session
-                && !session.fully_connected.load(Ordering::Acquire)
-            {
+            let should_remove =
+                store.inner.read().unwrap().get(&session_id).is_some_and(
+                    |current| {
+                        Arc::ptr_eq(current, &session)
+                            && !session.fully_connected.load(Ordering::Acquire)
+                    },
+                );
+            if should_remove {
                 store.remove(&session_id);
             }
         });
@@ -2605,6 +2607,33 @@ mod tests {
             .expect("missing packet completes reorder sequence");
 
         assert_eq!(read.await.expect("ordered read task"), *b"012");
+    }
+
+    #[tokio::test]
+    async fn expired_session_timer_does_not_reap_reused_session_id() {
+        let store = SessionStore::new(Duration::from_millis(60), 30);
+        let old = store.get_or_create("session");
+        old.fully_connected.store(true, Ordering::Release);
+        store.remove("session");
+
+        sleep(Duration::from_millis(20)).await;
+        let reused = store.get_or_create("session");
+        sleep(Duration::from_millis(50)).await;
+
+        let current = store
+            .inner
+            .read()
+            .unwrap()
+            .get("session")
+            .cloned()
+            .expect("old timer must not reap reused session id");
+        assert!(Arc::ptr_eq(&current, &reused));
+
+        sleep(Duration::from_millis(30)).await;
+        assert!(
+            !store.inner.read().unwrap().contains_key("session"),
+            "reused session must still expire on its own TTL"
+        );
     }
 
     #[tokio::test]
