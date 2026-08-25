@@ -611,15 +611,13 @@ pub(super) fn collect_xhttp_settings(
         session_placement,
         "X-Session",
         "x_session",
-        "sessionKey",
-    )?;
+    );
     let seq_key = normalize_xhttp_meta_key(
         raw.seq_key.as_deref(),
         seq_placement,
         "X-Seq",
         "x_seq",
-        "seqKey",
-    )?;
+    );
     let uplink_data_placement =
         parse_xhttp_data_placement(raw.uplink_data_placement.as_deref(), mode)?;
     let uplink_data_key = normalize_xhttp_data_key(
@@ -831,7 +829,7 @@ fn normalize_xhttp_data_key(
     key: Option<&str>,
     placement: XhttpDataPlacement,
 ) -> String {
-    let key = key.unwrap_or("").trim();
+    let key = key.unwrap_or("");
     if !key.is_empty() {
         return key.to_string();
     }
@@ -890,28 +888,18 @@ fn normalize_xhttp_meta_key(
     placement: XhttpPlacement,
     default_header: &str,
     default_query_cookie: &str,
-    field: &str,
-) -> Result<String, Error> {
-    let key = key.unwrap_or("").trim();
-    let normalized = if key.is_empty() {
-        match placement {
-            XhttpPlacement::Path => String::new(),
-            XhttpPlacement::Header => default_header.to_string(),
-            XhttpPlacement::Query | XhttpPlacement::Cookie => {
-                default_query_cookie.to_string()
-            }
-        }
-    } else {
-        key.to_string()
-    };
-    if placement == XhttpPlacement::Header
-        && http::header::HeaderName::from_bytes(normalized.as_bytes()).is_err()
-    {
-        return Err(Error::InvalidConfig(format!(
-            "invalid xhttpSettings.{field} header name: {normalized}"
-        )));
+) -> String {
+    let key = key.unwrap_or("");
+    if !key.is_empty() {
+        return key.to_string();
     }
-    Ok(normalized)
+    match placement {
+        XhttpPlacement::Path => String::new(),
+        XhttpPlacement::Header => default_header.to_string(),
+        XhttpPlacement::Query | XhttpPlacement::Cookie => {
+            default_query_cookie.to_string()
+        }
+    }
 }
 
 fn normalize_xhttp_uplink_method(
@@ -1627,6 +1615,27 @@ mod tests {
         let config =
             collect_xhttp_settings(settings).expect("xhttp settings should parse");
         assert_eq!(config.path, "/x/");
+    }
+
+    #[test]
+    fn collect_xhttp_settings_preserves_key_text_like_xray_v26_2_6() {
+        let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
+            "path": "/xhttp",
+            "mode": "packet-up",
+            "sessionPlacement": "query",
+            "sessionKey": " x_session ",
+            "seqPlacement": "query",
+            "seqKey": " x_seq ",
+            "uplinkDataPlacement": "header",
+            "uplinkDataKey": " X-Data "
+        }))
+        .expect("xhttp settings");
+
+        let config = collect_xhttp_settings(settings)
+            .expect("Xray v26.2.6 preserves non-empty key text verbatim");
+        assert_eq!(config.session_key, " x_session ");
+        assert_eq!(config.seq_key, " x_seq ");
+        assert_eq!(config.uplink_data_key, " X-Data ");
     }
 
     #[test]
