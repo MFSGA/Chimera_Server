@@ -1291,6 +1291,12 @@ fn normalize_base_path(mut path: String) -> String {
 
 fn query_value(query: Option<&str>, key: &str) -> Option<String> {
     for pair in query?.split('&') {
+        // Go's url.ParseQuery rejects a value containing an unescaped semicolon
+        // and URL.Query silently discards that malformed pair. Percent-encoded
+        // semicolons remain valid data because the rejection happens first.
+        if pair.contains(';') {
+            continue;
+        }
         let (raw_name, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
         let Some(name) = decode_query_component(raw_name) else {
             continue;
@@ -2410,6 +2416,15 @@ mod tests {
         assert_eq!(
             query_value(Some("x_session=first&x_session="), "x_session").as_deref(),
             Some("first"),
+        );
+        assert_eq!(
+            query_value(Some("x_session=bad;raw&x_session=ok"), "x_session")
+                .as_deref(),
+            Some("ok"),
+        );
+        assert_eq!(
+            query_value(Some("x_session=abc%3Bdef"), "x_session").as_deref(),
+            Some("abc;def"),
         );
     }
 
