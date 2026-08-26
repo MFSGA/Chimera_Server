@@ -54,7 +54,7 @@ impl HttpUpgradeTcpServerHandler {
                 "HTTPUpgrade requires GET over HTTP/1.1",
             ));
         }
-        let path = target.split(['?', '#']).next().unwrap_or(target);
+        let path = decode_request_path(target)?;
         if path != self.path {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -408,14 +408,49 @@ fn trusted_forwarded_peer(
 }
 
 fn normalize_path(path: String) -> String {
-    let path = path.trim();
     if path.is_empty() {
         "/".to_string()
     } else if path.starts_with('/') {
-        path.to_string()
+        path
     } else {
         format!("/{path}")
     }
+}
+
+fn decode_request_path(target: &str) -> io::Result<String> {
+    let raw_path = target.split(['?', '#']).next().unwrap_or(target);
+    let bytes = raw_path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid HTTPUpgrade path escape",
+            ));
+        }
+        let high = (bytes[index + 1] as char).to_digit(16);
+        let low = (bytes[index + 2] as char).to_digit(16);
+        let (Some(high), Some(low)) = (high, low) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid HTTPUpgrade path escape",
+            ));
+        };
+        decoded.push(((high << 4) | low) as u8);
+        index += 3;
+    }
+    String::from_utf8(decoded).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "HTTPUpgrade path is not valid UTF-8",
+        )
+    })
 }
 
 fn http_host_matches(actual: &str, expected: &str) -> bool {
@@ -665,6 +700,39 @@ mod tests {
         let mut protocol = [0u8; 8];
         stream.read_exact(&mut protocol).await.unwrap();
         assert_eq!(&protocol, b"protocol");
+    }
+
+    #[tokio::test]
+    async fn preserves_xray_httpupgrade_path_whitespace() {
+        let handler = HttpUpgradeTcpServerHandler::new(
+            None,
+            "ws ".into(),
+            false,
+            Vec::new(),
+            Box::new(Inner),
+        );
+        let (mut client, server) = duplex(4096);
+        client
+            .write_all(
+                b"GET /ws%20 HTTP/1.1\r\n\
+                  Host: localhost\r\n\
+                  Connection: Upgrade\r\n\
+                  Upgrade: websocket\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("percent-encoded Xray HTTPUpgrade path should match");
+        assert!(matches!(result, TcpServerSetupResult::TcpForward { .. }));
+        let mut response = vec![0u8; 77];
+        client.read_exact(&mut response).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&response)
+                .starts_with("HTTP/1.1 101 Switching Protocols")
+        );
     }
 
     #[tokio::test]
