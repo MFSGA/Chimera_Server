@@ -171,6 +171,22 @@ async fn read_proxy_protocol(
         stream.read_exact(&mut payload).await?;
 
         if version_command & 0x0f == 0 {
+            // go-proxyproto v0.9.2 (used by Xray v26.2.6) still validates the
+            // address-block length for LOCAL frames when the family nibble is
+            // IPv4, IPv6, or UNIX. The transport nibble itself is ignored for
+            // this check. UNSPEC/unknown families remain length-agnostic.
+            let minimum_address_len = match family_protocol >> 4 {
+                1 => Some(12),
+                2 => Some(36),
+                3 => Some(216),
+                _ => None,
+            };
+            if minimum_address_len.is_some_and(|minimum| payload_len < minimum) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid PROXY protocol v2 LOCAL address length",
+                ));
+            }
             return Ok(None);
         }
         if version_command & 0x0f != 1 {
@@ -1467,6 +1483,57 @@ mod tests {
         };
         assert_eq!(peer_addr, "198.51.100.8:45679".parse().unwrap());
         assert!(matches!(*inner, TcpServerSetupResult::TcpForward { .. }));
+    }
+
+    #[tokio::test]
+    async fn proxy_v2_local_validates_known_family_length_like_xray_v26_2_6() {
+        let handler = HttpUpgradeTcpServerHandler::new(
+            None,
+            "/upgrade".into(),
+            true,
+            Vec::new(),
+            Box::new(Inner),
+        );
+
+        for family_protocol in [0x11, 0x13] {
+            let (mut client, server) = duplex(4096);
+            let mut request = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+            request.extend_from_slice(&[0x20, family_protocol, 0x00, 0x00]);
+            request.extend_from_slice(
+                b"GET /upgrade HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+            );
+            client.write_all(&request).await.unwrap();
+
+            let error = match handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+            {
+                Ok(_) => panic!("Xray v26.2.6 rejects short LOCAL IPv4 blocks"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("PROXY protocol v2 LOCAL address length")
+            );
+        }
+
+        let (mut client, server) = duplex(4096);
+        let mut request = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+        request.extend_from_slice(&[0x20, 0x13, 0x00, 0x0c]);
+        request.extend_from_slice(&[0; 12]);
+        request.extend_from_slice(
+            b"GET /upgrade HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        );
+        client.write_all(&request).await.unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect(
+                "Xray v26.2.6 accepts LOCAL IPv4 blocks once length is sufficient",
+            );
+        assert!(matches!(result, TcpServerSetupResult::TcpForward { .. }));
     }
 
     #[tokio::test]
