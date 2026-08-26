@@ -30,7 +30,7 @@ impl HttpUpgradeTcpServerHandler {
         inner: Box<dyn TcpServerHandler>,
     ) -> Self {
         Self {
-            host: host.map(|value| value.trim().to_ascii_lowercase()),
+            host: host.map(|value| value.to_ascii_lowercase()),
             path: normalize_path(path),
             accept_proxy_protocol,
             trusted_x_forwarded_for,
@@ -612,6 +612,34 @@ mod tests {
             trusted_forwarded_peer(&headers, &[" X-Trusted-CDN ".into()]),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn preserves_xray_httpupgrade_host_text() {
+        let handler = HttpUpgradeTcpServerHandler::new(
+            Some(" Example.COM ".into()),
+            "/upgrade".into(),
+            false,
+            Vec::new(),
+            Box::new(Inner),
+        );
+        let (mut client, server) = duplex(4096);
+        client
+            .write_all(
+                b"GET /upgrade HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let error = match handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+        {
+            Ok(_) => panic!("Xray does not trim configured HTTPUpgrade host text"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("host mismatch"));
     }
 
     #[test]

@@ -203,7 +203,7 @@ fn apply_httpupgrade_layer(
     };
     let host = settings
         .host
-        .map(|value| value.trim().to_ascii_lowercase())
+        .map(|value| value.to_ascii_lowercase())
         .filter(|value| !value.is_empty());
     // Xray's server uses host/path for validation. Custom headers are a
     // client-side request construction option and do not alter inbound matching.
@@ -3235,6 +3235,7 @@ mod tests {
             "streamSettings": {
                 "network": "httpupgrade",
                 "httpupgradeSettings": {
+                    "host": " Example.COM ",
                     "path": "ws "
                 }
             }
@@ -3246,6 +3247,7 @@ mod tests {
 
         match config.protocol {
             ServerProxyConfig::HttpUpgrade(httpupgrade) => {
+                assert_eq!(httpupgrade.host.as_deref(), Some(" example.com "));
                 assert_eq!(httpupgrade.path, "/ws ");
             }
             other => panic!("expected HTTPUpgrade protocol, got {other:?}"),
