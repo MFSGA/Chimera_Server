@@ -411,25 +411,43 @@ fn parse_request(
             "invalid HTTPUpgrade request line",
         ));
     }
+    enum ContinuationTarget {
+        Header(String, bool),
+        ContentLength,
+    }
+
     let mut headers: HashMap<String, String> = HashMap::new();
-    let mut continuation_target: Option<(String, bool)> = None;
+    let mut content_lengths: Vec<String> = Vec::new();
+    let mut continuation_target: Option<ContinuationTarget> = None;
     for line in lines {
         if line.is_empty() {
             break;
         }
         if line.starts_with([' ', '\t']) {
-            let Some((name, keep_value)) = continuation_target.as_ref() else {
+            let Some(target) = continuation_target.as_ref() else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "invalid HTTPUpgrade header continuation",
                 ));
             };
             let continuation = line.trim();
-            if *keep_value && let Some(value) = headers.get_mut(name) {
-                if !value.is_empty() && !continuation.is_empty() {
-                    value.push(' ');
+            match target {
+                ContinuationTarget::Header(name, keep_value) => {
+                    if *keep_value && let Some(value) = headers.get_mut(name) {
+                        if !value.is_empty() && !continuation.is_empty() {
+                            value.push(' ');
+                        }
+                        value.push_str(continuation);
+                    }
                 }
-                value.push_str(continuation);
+                ContinuationTarget::ContentLength => {
+                    if let Some(value) = content_lengths.last_mut() {
+                        if !value.is_empty() && !continuation.is_empty() {
+                            value.push(' ');
+                        }
+                        value.push_str(continuation);
+                    }
+                }
             }
             continue;
         }
@@ -452,6 +470,11 @@ fn parse_request(
             ));
         }
         let name = name.to_ascii_lowercase();
+        if name == "content-length" {
+            content_lengths.push(value.trim().to_string());
+            continuation_target = Some(ContinuationTarget::ContentLength);
+            continue;
+        }
         if headers.contains_key(&name) {
             // Go's http.ReadRequest rejects duplicate Host headers before the
             // HTTPUpgrade handler runs, while ordinary MIME headers keep the
@@ -466,13 +489,42 @@ fn parse_request(
             // most recent duplicate value, while Header.Get() keeps returning
             // the first value. We can discard the duplicate payload itself,
             // but its continuation lines must remain syntactically valid.
-            continuation_target = Some((name, false));
+            continuation_target = Some(ContinuationTarget::Header(name, false));
             continue;
         }
         headers.insert(name.clone(), value.trim().to_string());
-        continuation_target = Some((name, true));
+        continuation_target = Some(ContinuationTarget::Header(name, true));
     }
+
+    if let Some(first) = content_lengths.first() {
+        for value in &content_lengths {
+            validate_content_length(value)?;
+            if value != first {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "http: message cannot contain multiple Content-Length headers; got {content_lengths:?}"
+                    ),
+                ));
+            }
+        }
+        headers.insert("content-length".to_string(), first.clone());
+    }
+
     Ok((method, target, version, headers))
+}
+
+fn validate_content_length(value: &str) -> io::Result<()> {
+    if value.is_empty()
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || value.parse::<i64>().is_err()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("bad Content-Length {value:?}"),
+        ));
+    }
+    Ok(())
 }
 
 fn is_invalid_http_header_name_byte(byte: u8) -> bool {
@@ -1160,6 +1212,80 @@ mod tests {
             };
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
             assert_eq!(error.to_string(), "too many Host headers");
+        }
+    }
+
+    #[tokio::test]
+    async fn validates_content_length_like_xray_v26_2_6() {
+        for extra_headers in [
+            "Content-Length: 0\r\n",
+            "Content-Length:   0  \r\n",
+            "Content-Length: 00\r\n",
+            "Content-Length: 0\r\nContent-Length: 0\r\n",
+            "Content-Length: 0\r\nContent-Length:   0  \r\n",
+        ] {
+            let handler = HttpUpgradeTcpServerHandler::new(
+                None,
+                "/upgrade".into(),
+                false,
+                Vec::new(),
+                Box::new(Inner),
+            );
+            let (mut client, server) = duplex(4096);
+            client
+                .write_all(
+                    format!(
+                        "GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n{extra_headers}\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let result = handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+                .expect("Xray accepts valid HTTP Content-Length forms");
+            assert!(matches!(result, TcpServerSetupResult::TcpForward { .. }));
+        }
+
+        for extra_headers in [
+            "Content-Length: +0\r\n",
+            "Content-Length: -0\r\n",
+            "Content-Length: nope\r\n",
+            "Content-Length: 0, 0\r\n",
+            "Content-Length: 0\r\nContent-Length: 00\r\n",
+            "Content-Length: 0\r\nContent-Length: 1\r\n",
+            "Content-Length: 0\r\n 0\r\n",
+        ] {
+            let handler = HttpUpgradeTcpServerHandler::new(
+                None,
+                "/upgrade".into(),
+                false,
+                Vec::new(),
+                Box::new(Inner),
+            );
+            let (mut client, server) = duplex(4096);
+            client
+                .write_all(
+                    format!(
+                        "GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n{extra_headers}\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let error = match handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+            {
+                Ok(_) => {
+                    panic!("Xray rejects malformed HTTP Content-Length headers")
+                }
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         }
     }
 
