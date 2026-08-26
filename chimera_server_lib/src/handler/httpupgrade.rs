@@ -357,7 +357,9 @@ fn parse_request(
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
-        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        headers
+            .entry(name.trim().to_ascii_lowercase())
+            .or_insert_with(|| value.trim().to_string());
     }
     Ok((method, target, version, headers))
 }
@@ -765,6 +767,60 @@ mod tests {
                 Ok(_) => {
                     panic!("Xray http.ReadRequest rejects malformed HTTP versions")
                 }
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[tokio::test]
+    async fn keeps_first_duplicate_upgrade_headers_like_xray_v26_2_6() {
+        for request in [
+            b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nConnection: nope\r\nUpgrade: websocket\r\n\r\n".as_slice(),
+            b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nUpgrade: nope\r\n\r\n".as_slice(),
+        ] {
+            let handler = HttpUpgradeTcpServerHandler::new(
+                None,
+                "/upgrade".into(),
+                false,
+                Vec::new(),
+                Box::new(Inner),
+            );
+            let (mut client, server) = duplex(4096);
+            client.write_all(request).await.unwrap();
+
+            let result = handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+                .expect("Xray uses the first duplicate HTTPUpgrade header value");
+            assert!(matches!(result, TcpServerSetupResult::TcpForward { .. }));
+            let mut response = vec![0u8; 77];
+            client.read_exact(&mut response).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&response)
+                    .starts_with("HTTP/1.1 101 Switching Protocols")
+            );
+        }
+
+        for request in [
+            b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: nope\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n".as_slice(),
+            b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: nope\r\nUpgrade: websocket\r\n\r\n".as_slice(),
+        ] {
+            let handler = HttpUpgradeTcpServerHandler::new(
+                None,
+                "/upgrade".into(),
+                false,
+                Vec::new(),
+                Box::new(Inner),
+            );
+            let (mut client, server) = duplex(4096);
+            client.write_all(request).await.unwrap();
+
+            let error = match handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+            {
+                Ok(_) => panic!("Xray rejects when the first duplicate header is invalid"),
                 Err(error) => error,
             };
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
