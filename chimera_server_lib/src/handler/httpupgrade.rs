@@ -315,13 +315,14 @@ async fn read_proxy_protocol(
 
 async fn read_http_header(stream: &mut Box<dyn AsyncStream>) -> io::Result<Vec<u8>> {
     // Xray v26.2.6 passes the connection directly to bufio.Reader +
-    // http.ReadRequest without the WebSocket transport's 12 KiB LimitReader.
-    // Keep reading until the HTTP header terminator or connection EOF.
+    // http.ReadRequest. Go's textproto reader accepts either CRLF or bare LF
+    // line endings, so HTTPUpgrade must not wait forever for a CRLF-only
+    // terminator when a valid LF-only request has already completed.
     let mut header = Vec::with_capacity(512);
     loop {
         let byte = stream.read_u8().await?;
         header.push(byte);
-        if header.ends_with(b"\r\n\r\n") {
+        if header.ends_with(b"\r\n\r\n") || header.ends_with(b"\n\n") {
             return Ok(header);
         }
     }
@@ -336,7 +337,9 @@ fn parse_request(
             format!("invalid HTTPUpgrade header encoding: {error}"),
         )
     })?;
-    let mut lines = request.split("\r\n");
+    let mut lines = request
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line));
     let request_line = lines.next().unwrap_or_default();
     let mut parts = request_line.split(' ');
     let method = parts.next().unwrap_or_default();
@@ -932,6 +935,36 @@ mod tests {
                 Err(error) => error,
             };
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[tokio::test]
+    async fn accepts_bare_lf_http_headers_like_xray_v26_2_6() {
+        for request in [
+            b"GET /upgrade HTTP/1.1\nHost: localhost\nConnection: Upgrade\nUpgrade: websocket\n\n".as_slice(),
+            b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\n\n".as_slice(),
+        ] {
+            let handler = HttpUpgradeTcpServerHandler::new(
+                None,
+                "/upgrade".into(),
+                false,
+                Vec::new(),
+                Box::new(Inner),
+            );
+            let (mut client, server) = duplex(4096);
+            client.write_all(request).await.unwrap();
+
+            let result = handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+                .expect("Xray http.ReadRequest accepts bare LF line endings");
+            assert!(matches!(result, TcpServerSetupResult::TcpForward { .. }));
+            let mut response = vec![0u8; 77];
+            client.read_exact(&mut response).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&response)
+                    .starts_with("HTTP/1.1 101 Switching Protocols")
+            );
         }
     }
 
