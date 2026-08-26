@@ -47,13 +47,7 @@ impl HttpUpgradeTcpServerHandler {
         // four-second header timeout; the inner inbound owns its handshake
         // policy after the upgrade completes.
         let request = read_http_header(stream).await?;
-        let (method, target, version, headers) = parse_request(&request)?;
-        if method != "GET" || version != "HTTP/1.1" {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "HTTPUpgrade requires GET over HTTP/1.1",
-            ));
-        }
+        let (_method, target, _version, headers) = parse_request(&request)?;
         let path = decode_request_path(target)?;
         if path != self.path {
             return Err(io::Error::new(
@@ -347,7 +341,7 @@ fn parse_request(
     let version = parts.next().unwrap_or_default();
     if method.is_empty()
         || target.is_empty()
-        || version.is_empty()
+        || !is_xray_http_version(version)
         || parts.next().is_some()
     {
         return Err(io::Error::new(
@@ -366,6 +360,15 @@ fn parse_request(
         headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
     }
     Ok((method, target, version, headers))
+}
+
+fn is_xray_http_version(version: &str) -> bool {
+    let bytes = version.as_bytes();
+    bytes.len() == 8
+        && &bytes[..5] == b"HTTP/"
+        && bytes[5].is_ascii_digit()
+        && bytes[6] == b'.'
+        && bytes[7].is_ascii_digit()
 }
 
 fn trusted_forwarded_peer(
@@ -700,6 +703,72 @@ mod tests {
         let mut protocol = [0u8; 8];
         stream.read_exact(&mut protocol).await.unwrap();
         assert_eq!(&protocol, b"protocol");
+    }
+
+    #[tokio::test]
+    async fn accepts_xray_httpupgrade_methods_and_http_versions() {
+        for request_line in ["POST /upgrade HTTP/1.0", "FOO /upgrade HTTP/9.9"] {
+            let handler = HttpUpgradeTcpServerHandler::new(
+                None,
+                "/upgrade".into(),
+                false,
+                Vec::new(),
+                Box::new(Inner),
+            );
+            let (mut client, server) = duplex(4096);
+            client
+                .write_all(
+                    format!(
+                        "{request_line}\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let result = handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+                .expect("Xray accepts any parsed method and one-digit HTTP version");
+            assert!(matches!(result, TcpServerSetupResult::TcpForward { .. }));
+            let mut response = vec![0u8; 77];
+            client.read_exact(&mut response).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&response)
+                    .starts_with("HTTP/1.1 101 Switching Protocols")
+            );
+        }
+
+        for request_line in ["GET /upgrade HTTP/1.10", "GET /upgrade BLAH"] {
+            let handler = HttpUpgradeTcpServerHandler::new(
+                None,
+                "/upgrade".into(),
+                false,
+                Vec::new(),
+                Box::new(Inner),
+            );
+            let (mut client, server) = duplex(4096);
+            client
+                .write_all(
+                    format!(
+                        "{request_line}\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let error = match handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+            {
+                Ok(_) => {
+                    panic!("Xray http.ReadRequest rejects malformed HTTP versions")
+                }
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
     }
 
     #[tokio::test]
