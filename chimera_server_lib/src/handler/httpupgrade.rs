@@ -335,7 +335,7 @@ fn parse_request(
     })?;
     let mut lines = request.split("\r\n");
     let request_line = lines.next().unwrap_or_default();
-    let mut parts = request_line.split_whitespace();
+    let mut parts = request_line.split(' ');
     let method = parts.next().unwrap_or_default();
     let target = parts.next().unwrap_or_default();
     let version = parts.next().unwrap_or_default();
@@ -819,7 +819,14 @@ mod tests {
             );
         }
 
-        for request_line in ["GET /upgrade HTTP/1.10", "GET /upgrade BLAH"] {
+        for request_line in [
+            "GET /upgrade HTTP/1.10",
+            "GET /upgrade BLAH",
+            "GET  /upgrade HTTP/1.1",
+            "GET /upgrade  HTTP/1.1",
+            "GET\t/upgrade HTTP/1.1",
+            "GET /upgrade\tHTTP/1.1",
+        ] {
             let handler = HttpUpgradeTcpServerHandler::new(
                 None,
                 "/upgrade".into(),
