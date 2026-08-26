@@ -459,19 +459,27 @@ fn decode_request_path(target: &str) -> io::Result<String> {
 }
 
 fn http_host_matches(actual: &str, expected: &str) -> bool {
-    let actual = actual.trim().to_ascii_lowercase();
-    if actual == expected {
-        return true;
+    let actual = actual.to_ascii_lowercase();
+    if !actual.contains(':') {
+        return actual == expected;
     }
-    if expected.starts_with('[') {
-        return actual
-            .strip_suffix(']')
-            .is_some_and(|value| format!("{value}]") == expected);
+
+    split_http_host_port(&actual).is_some_and(|host| host == expected)
+}
+
+fn split_http_host_port(authority: &str) -> Option<&str> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let closing = rest.find(']')?;
+        let host = &rest[..closing];
+        let suffix = &rest[closing + 1..];
+        return (suffix.starts_with(':') && !suffix[1..].contains(':'))
+            .then_some(host);
     }
-    actual
-        .split_once(':')
-        .map(|(host, _)| host == expected)
-        .unwrap_or(false)
+
+    let mut parts = authority.split(':');
+    let host = parts.next()?;
+    parts.next()?;
+    parts.next().is_none().then_some(host)
 }
 
 #[cfg(test)]
@@ -495,7 +503,9 @@ mod tests {
         handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
     };
 
-    use super::{HttpUpgradeTcpServerHandler, trusted_forwarded_peer};
+    use super::{
+        HttpUpgradeTcpServerHandler, http_host_matches, trusted_forwarded_peer,
+    };
 
     #[derive(Debug)]
     struct Inner;
@@ -640,6 +650,16 @@ mod tests {
         };
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(error.to_string().contains("host mismatch"));
+    }
+
+    #[test]
+    fn matches_xray_ipv6_httpupgrade_host_authorities() {
+        assert!(http_host_matches("[::1]:443", "::1"));
+        assert!(http_host_matches("[::1]:80", "::1"));
+        assert!(!http_host_matches("::1", "::1"));
+        assert!(!http_host_matches("[::1]", "::1"));
+        assert!(!http_host_matches("[::2]:443", "::1"));
+        assert!(http_host_matches("Example.COM:443", "example.com"));
     }
 
     #[test]
