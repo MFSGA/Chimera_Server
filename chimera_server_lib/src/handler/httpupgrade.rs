@@ -229,7 +229,7 @@ async fn read_proxy_protocol(
                 "unsupported PROXY protocol v2 address family",
             )),
         }
-    } else if prefix.starts_with(b"PROXY ") {
+    } else if prefix.starts_with(b"PROXY") {
         let mut line = prefix.to_vec();
         while !line.ends_with(b"\r\n") {
             // go-proxyproto v0.9.2 caps the complete PROXY v1 line at 107
@@ -253,12 +253,10 @@ async fn read_proxy_protocol(
         // literal single spaces. Repeated whitespace therefore produces empty
         // fields instead of being collapsed like `split_whitespace()` would.
         let mut fields = line.trim_end_matches("\r\n").split(' ');
-        if fields.next() != Some("PROXY") {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid PROXY protocol v1 header",
-            ));
-        }
+        // go-proxyproto v0.9.2 dispatches v1 after peeking only the first five
+        // bytes ("PROXY") and does not revalidate the complete first token.
+        // Xray v26.2.6 therefore accepts quirks such as "PROXYjunk TCP4 ...".
+        let _signature_token = fields.next();
         let family = fields.next().unwrap_or_default();
         if family == "UNKNOWN" {
             return Ok(None);
@@ -1470,6 +1468,63 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("PROXY protocol v1 family"));
+    }
+
+    #[tokio::test]
+    async fn proxy_protocol_v1_signature_prefix_matches_xray_v26_2_6() {
+        let request = b"GET /upgrade HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+
+        for prefix in ["PROXYjunk", "PROXY:"] {
+            let handler = HttpUpgradeTcpServerHandler::new(
+                None,
+                "/upgrade".into(),
+                true,
+                Vec::new(),
+                Box::new(Inner),
+            );
+            let (mut client, server) = duplex(4096);
+            client
+                .write_all(
+                    format!("{prefix} TCP4 198.51.100.7 203.0.113.9 45678 443\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            client.write_all(request).await.unwrap();
+
+            let result = handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+                .expect("Xray v26.2.6 only checks the five-byte PROXY v1 prefix");
+            let TcpServerSetupResult::PeerAddrOverride { peer_addr, inner } = result
+            else {
+                panic!("expected peer address override");
+            };
+            assert_eq!(peer_addr, "198.51.100.7:45678".parse().unwrap());
+            assert!(matches!(*inner, TcpServerSetupResult::TcpForward { .. }));
+        }
+
+        let handler = HttpUpgradeTcpServerHandler::new(
+            None,
+            "/upgrade".into(),
+            true,
+            Vec::new(),
+            Box::new(Inner),
+        );
+        let (mut client, server) = duplex(4096);
+        client
+            .write_all(b"proxy TCP4 198.51.100.7 203.0.113.9 45678 443\r\n")
+            .await
+            .unwrap();
+        client.write_all(request).await.unwrap();
+        let error = match handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+        {
+            Ok(_) => panic!("Xray v26.2.6 keeps the PROXY signature case-sensitive"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("missing required PROXY"));
     }
 
     #[tokio::test]
