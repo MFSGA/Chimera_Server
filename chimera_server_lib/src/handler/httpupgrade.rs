@@ -349,17 +349,47 @@ fn parse_request(
             "invalid HTTPUpgrade request line",
         ));
     }
-    let mut headers = HashMap::new();
+    let mut headers: HashMap<String, String> = HashMap::new();
+    let mut continuation_target = None;
     for line in lines {
         if line.is_empty() {
             break;
         }
-        let Some((name, value)) = line.split_once(':') else {
+        if line.starts_with([' ', '\t']) {
+            let Some(name) = continuation_target.as_ref() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid HTTPUpgrade header continuation",
+                ));
+            };
+            let continuation = line.trim();
+            if let Some(value) = headers.get_mut(name) {
+                if !value.is_empty() && !continuation.is_empty() {
+                    value.push(' ');
+                }
+                value.push_str(continuation);
+            }
             continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid HTTPUpgrade header line",
+            ));
         };
-        headers
-            .entry(name.trim().to_ascii_lowercase())
-            .or_insert_with(|| value.trim().to_string());
+        if name.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid HTTPUpgrade header name",
+            ));
+        }
+        let name = name.to_ascii_lowercase();
+        if headers.contains_key(&name) {
+            continuation_target = None;
+            continue;
+        }
+        headers.insert(name.clone(), value.trim().to_string());
+        continuation_target = Some(name);
     }
     Ok((method, target, version, headers))
 }
@@ -869,6 +899,60 @@ mod tests {
                 .await
             {
                 Ok(_) => panic!("Xray rejects when the first duplicate header is invalid"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[tokio::test]
+    async fn matches_xray_httpupgrade_mime_header_parsing() {
+        for request in [
+            b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection:\r\n Upgrade\r\nUpgrade: websocket\r\n\r\n".as_slice(),
+            b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade:\r\n websocket\r\n\r\n".as_slice(),
+        ] {
+            let handler = HttpUpgradeTcpServerHandler::new(
+                None,
+                "/upgrade".into(),
+                false,
+                Vec::new(),
+                Box::new(Inner),
+            );
+            let (mut client, server) = duplex(4096);
+            client.write_all(request).await.unwrap();
+
+            let result = handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+                .expect("Xray accepts folded MIME header values");
+            assert!(matches!(result, TcpServerSetupResult::TcpForward { .. }));
+            let mut response = vec![0u8; 77];
+            client.read_exact(&mut response).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&response)
+                    .starts_with("HTTP/1.1 101 Switching Protocols")
+            );
+        }
+
+        for request in [
+            b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection : Upgrade\r\nUpgrade: websocket\r\n\r\n".as_slice(),
+            b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nBadHeader\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n".as_slice(),
+        ] {
+            let handler = HttpUpgradeTcpServerHandler::new(
+                None,
+                "/upgrade".into(),
+                false,
+                Vec::new(),
+                Box::new(Inner),
+            );
+            let (mut client, server) = duplex(4096);
+            client.write_all(request).await.unwrap();
+
+            let error = match handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+            {
+                Ok(_) => panic!("Xray rejects malformed HTTPUpgrade MIME headers"),
                 Err(error) => error,
             };
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
