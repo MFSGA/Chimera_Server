@@ -414,10 +414,12 @@ fn parse_request(
     enum ContinuationTarget {
         Header(String, bool),
         ContentLength,
+        TransferEncoding,
     }
 
     let mut headers: HashMap<String, String> = HashMap::new();
     let mut content_lengths: Vec<String> = Vec::new();
+    let mut transfer_encodings: Vec<String> = Vec::new();
     let mut continuation_target: Option<ContinuationTarget> = None;
     for line in lines {
         if line.is_empty() {
@@ -442,6 +444,14 @@ fn parse_request(
                 }
                 ContinuationTarget::ContentLength => {
                     if let Some(value) = content_lengths.last_mut() {
+                        if !value.is_empty() && !continuation.is_empty() {
+                            value.push(' ');
+                        }
+                        value.push_str(continuation);
+                    }
+                }
+                ContinuationTarget::TransferEncoding => {
+                    if let Some(value) = transfer_encodings.last_mut() {
                         if !value.is_empty() && !continuation.is_empty() {
                             value.push(' ');
                         }
@@ -473,6 +483,11 @@ fn parse_request(
         if name == "content-length" {
             content_lengths.push(value.trim().to_string());
             continuation_target = Some(ContinuationTarget::ContentLength);
+            continue;
+        }
+        if name == "transfer-encoding" {
+            transfer_encodings.push(value.trim().to_string());
+            continuation_target = Some(ContinuationTarget::TransferEncoding);
             continue;
         }
         if headers.contains_key(&name) {
@@ -511,7 +526,30 @@ fn parse_request(
         headers.insert("content-length".to_string(), first.clone());
     }
 
+    validate_transfer_encoding(&transfer_encodings)?;
+    if let Some(value) = transfer_encodings.first() {
+        headers.insert("transfer-encoding".to_string(), value.clone());
+    }
+
     Ok((method, target, version, headers))
+}
+
+fn validate_transfer_encoding(values: &[String]) -> io::Result<()> {
+    if values.len() > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("too many transfer encodings: {values:?}"),
+        ));
+    }
+    if let Some(value) = values.first()
+        && !value.eq_ignore_ascii_case("chunked")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported transfer encoding: {value:?}"),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_content_length(value: &str) -> io::Result<()> {
@@ -1283,6 +1321,79 @@ mod tests {
                 Ok(_) => {
                     panic!("Xray rejects malformed HTTP Content-Length headers")
                 }
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[tokio::test]
+    async fn validates_transfer_encoding_like_xray_v26_2_6() {
+        for extra_headers in [
+            "Transfer-Encoding: chunked\r\n",
+            "Transfer-Encoding: Chunked\r\n",
+            "Transfer-Encoding:   chunked  \r\n",
+            "Transfer-Encoding:\r\n chunked\r\n",
+            "Content-Length: 0\r\nTransfer-Encoding: chunked\r\n",
+        ] {
+            let handler = HttpUpgradeTcpServerHandler::new(
+                None,
+                "/upgrade".into(),
+                false,
+                Vec::new(),
+                Box::new(Inner),
+            );
+            let (mut client, server) = duplex(4096);
+            client
+                .write_all(
+                    format!(
+                        "GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n{extra_headers}\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let result = handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+                .expect("Xray accepts a single chunked transfer encoding");
+            assert!(matches!(result, TcpServerSetupResult::TcpForward { .. }));
+        }
+
+        for extra_headers in [
+            "Transfer-Encoding:\r\n",
+            "Transfer-Encoding: identity\r\n",
+            "Transfer-Encoding: gzip\r\n",
+            "Transfer-Encoding: chunked;foo\r\n",
+            "Transfer-Encoding: gzip, chunked\r\n",
+            "Transfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n",
+            "Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n",
+            "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n",
+        ] {
+            let handler = HttpUpgradeTcpServerHandler::new(
+                None,
+                "/upgrade".into(),
+                false,
+                Vec::new(),
+                Box::new(Inner),
+            );
+            let (mut client, server) = duplex(4096);
+            client
+                .write_all(
+                    format!(
+                        "GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n{extra_headers}\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let error = match handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+            {
+                Ok(_) => panic!("Xray rejects unsupported HTTP transfer encodings"),
                 Err(error) => error,
             };
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
