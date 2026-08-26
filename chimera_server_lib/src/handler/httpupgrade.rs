@@ -383,10 +383,16 @@ fn parse_request(
                 "invalid HTTPUpgrade header line",
             ));
         };
-        if name.is_empty() {
+        if name.is_empty() || name.bytes().any(is_invalid_http_header_name_byte) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid HTTPUpgrade header name",
+            ));
+        }
+        if value.bytes().any(is_invalid_http_header_value_byte) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid HTTPUpgrade header value",
             ));
         }
         let name = name.to_ascii_lowercase();
@@ -398,6 +404,14 @@ fn parse_request(
         continuation_target = Some(name);
     }
     Ok((method, target, version, headers))
+}
+
+fn is_invalid_http_header_name_byte(byte: u8) -> bool {
+    byte <= 0x1f || byte == 0x7f
+}
+
+fn is_invalid_http_header_value_byte(byte: u8) -> bool {
+    (byte < b' ' && byte != b'\t') || byte == 0x7f
 }
 
 fn is_xray_http_version(version: &str) -> bool {
@@ -1027,6 +1041,7 @@ mod tests {
         for request in [
             b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection:\r\n Upgrade\r\nUpgrade: websocket\r\n\r\n".as_slice(),
             b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade:\r\n websocket\r\n\r\n".as_slice(),
+            b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nBad Header: ok\r\nX-Test: a\tb\r\n\r\n".as_slice(),
         ] {
             let handler = HttpUpgradeTcpServerHandler::new(
                 None,
@@ -1054,6 +1069,10 @@ mod tests {
         for request in [
             b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection : Upgrade\r\nUpgrade: websocket\r\n\r\n".as_slice(),
             b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nBadHeader\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n".as_slice(),
+            b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nBad\tHeader: ok\r\n\r\n".as_slice(),
+            b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nX-Test: a\x0bb\r\n\r\n".as_slice(),
+            b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nX-Test: a\x00b\r\n\r\n".as_slice(),
+            b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nX-Test: a\x7fb\r\n\r\n".as_slice(),
         ] {
             let handler = HttpUpgradeTcpServerHandler::new(
                 None,
