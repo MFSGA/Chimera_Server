@@ -48,7 +48,8 @@ impl HttpUpgradeTcpServerHandler {
         // policy after the upgrade completes.
         let request = read_http_header(stream).await?;
         let (_method, target, _version, headers) = parse_request(&request)?;
-        let path = decode_request_path(target)?;
+        let target = parse_request_target(target)?;
+        let path = decode_request_path(target.path)?;
         if path != self.path {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -56,7 +57,12 @@ impl HttpUpgradeTcpServerHandler {
             ));
         }
         if let Some(expected) = &self.host {
-            let actual = headers.get("host").map(String::as_str).unwrap_or("");
+            // Go's http.ReadRequest gives absolute-form request-target authority
+            // precedence over the Host header via req.Host.
+            let actual = target
+                .authority
+                .or_else(|| headers.get("host").map(String::as_str))
+                .unwrap_or("");
             if !http_host_matches(actual, expected) {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -450,6 +456,51 @@ fn normalize_path(path: String) -> String {
     } else {
         format!("/{path}")
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HttpUpgradeRequestTarget<'a> {
+    path: &'a str,
+    authority: Option<&'a str>,
+}
+
+fn parse_request_target(target: &str) -> io::Result<HttpUpgradeRequestTarget<'_>> {
+    let Some(scheme_end) = target.find("://") else {
+        return Ok(HttpUpgradeRequestTarget {
+            path: target,
+            authority: None,
+        });
+    };
+    let scheme = &target[..scheme_end];
+    let valid_scheme = scheme
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphabetic)
+        && scheme.as_bytes().iter().skip(1).all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
+        });
+    if !valid_scheme {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid HTTPUpgrade absolute request target",
+        ));
+    }
+
+    let rest = &target[scheme_end + 3..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty() || authority.contains('@') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid HTTPUpgrade absolute request target",
+        ));
+    }
+    let suffix = &rest[authority_end..];
+    let path = if suffix.starts_with('/') { suffix } else { "" };
+    Ok(HttpUpgradeRequestTarget {
+        path,
+        authority: Some(authority),
+    })
 }
 
 fn decode_request_path(target: &str) -> io::Result<String> {
@@ -963,6 +1014,76 @@ mod tests {
                 Err(error) => error,
             };
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[tokio::test]
+    async fn matches_xray_absolute_form_request_targets() {
+        for request_line in [
+            "GET http://example.com/upgrade HTTP/1.1",
+            "GET HTTP://example.com/upgrade HTTP/1.1",
+            "GET ftp://example.com/upgrade HTTP/1.1",
+        ] {
+            let handler = HttpUpgradeTcpServerHandler::new(
+                Some("example.com".into()),
+                "/upgrade".into(),
+                false,
+                Vec::new(),
+                Box::new(Inner),
+            );
+            let (mut client, server) = duplex(4096);
+            client
+                .write_all(
+                    format!(
+                        "{request_line}\r\nHost: wrong.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let result = handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+                .expect("Xray uses absolute request-target authority and path");
+            assert!(matches!(result, TcpServerSetupResult::TcpForward { .. }));
+            let mut response = vec![0u8; 77];
+            client.read_exact(&mut response).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&response)
+                    .starts_with("HTTP/1.1 101 Switching Protocols")
+            );
+        }
+
+        for request_line in [
+            "GET http://wrong.example/upgrade HTTP/1.1",
+            "GET http://example.com/wrong HTTP/1.1",
+        ] {
+            let handler = HttpUpgradeTcpServerHandler::new(
+                Some("example.com".into()),
+                "/upgrade".into(),
+                false,
+                Vec::new(),
+                Box::new(Inner),
+            );
+            let (mut client, server) = duplex(4096);
+            client
+                .write_all(
+                    format!(
+                        "{request_line}\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            assert!(
+                handler
+                    .setup_server_stream(Box::new(TestStream(server)))
+                    .await
+                    .is_err(),
+                "Xray rejects mismatched absolute-form authority or path"
+            );
         }
     }
 
