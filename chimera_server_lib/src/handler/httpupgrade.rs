@@ -10,8 +10,6 @@ use crate::{
     },
 };
 
-const MAX_HEADER_BYTES: usize = 12 * 1024;
-
 #[derive(Debug)]
 pub struct HttpUpgradeTcpServerHandler {
     host: Option<String>,
@@ -316,18 +314,17 @@ async fn read_proxy_protocol(
 }
 
 async fn read_http_header(stream: &mut Box<dyn AsyncStream>) -> io::Result<Vec<u8>> {
+    // Xray v26.2.6 passes the connection directly to bufio.Reader +
+    // http.ReadRequest without the WebSocket transport's 12 KiB LimitReader.
+    // Keep reading until the HTTP header terminator or connection EOF.
     let mut header = Vec::with_capacity(512);
-    while header.len() < MAX_HEADER_BYTES {
+    loop {
         let byte = stream.read_u8().await?;
         header.push(byte);
         if header.ends_with(b"\r\n\r\n") {
             return Ok(header);
         }
     }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        "HTTPUpgrade headers exceed 12288 bytes",
-    ))
 }
 
 fn parse_request(
@@ -796,6 +793,35 @@ mod tests {
             .unwrap();
         let result = setup.await.unwrap().expect("HTTPUpgrade handshake");
         assert!(matches!(result, TcpServerSetupResult::TcpForward { .. }));
+    }
+
+    #[tokio::test]
+    async fn accepts_large_headers_like_xray_v26_2_6() {
+        let handler = HttpUpgradeTcpServerHandler::new(
+            None,
+            "/upgrade".into(),
+            false,
+            Vec::new(),
+            Box::new(Inner),
+        );
+        let (mut client, server) = duplex(128 * 1024);
+        let large_value = "A".repeat(64 * 1024);
+        let request = format!(
+            "GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nX-Large: {large_value}\r\n\r\n"
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("Xray v26.2.6 accepts HTTPUpgrade headers beyond 12 KiB");
+        assert!(matches!(result, TcpServerSetupResult::TcpForward { .. }));
+        let mut response = vec![0u8; 77];
+        client.read_exact(&mut response).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&response)
+                .starts_with("HTTP/1.1 101 Switching Protocols")
+        );
     }
 
     #[tokio::test]
