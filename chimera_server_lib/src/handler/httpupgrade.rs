@@ -314,18 +314,40 @@ async fn read_proxy_protocol(
 }
 
 async fn read_http_header(stream: &mut Box<dyn AsyncStream>) -> io::Result<Vec<u8>> {
-    // Xray v26.2.6 passes the connection directly to bufio.Reader +
-    // http.ReadRequest. Go's textproto reader accepts either CRLF or bare LF
-    // line endings, so HTTPUpgrade must not wait forever for a CRLF-only
-    // terminator when a valid LF-only request has already completed.
-    let mut header = Vec::with_capacity(512);
+    // Xray v26.2.6 parses HTTPUpgrade with a default 4096-byte bufio.Reader,
+    // then discards that reader after http.ReadRequest. Any inner-protocol
+    // bytes read ahead into the same buffer are therefore lost. Mirror that
+    // observable behavior instead of preserving bytes that arrive together
+    // with the upgrade request.
+    let mut header = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
     loop {
-        let byte = stream.read_u8().await?;
-        header.push(byte);
-        if header.ends_with(b"\r\n\r\n") || header.ends_with(b"\n\n") {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "HTTPUpgrade request ended before headers completed",
+            ));
+        }
+        header.extend_from_slice(&chunk[..read]);
+        if let Some(end) = http_header_end(&header) {
+            header.truncate(end);
             return Ok(header);
         }
     }
+}
+
+fn http_header_end(header: &[u8]) -> Option<usize> {
+    header
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
+        .or_else(|| {
+            header
+                .windows(2)
+                .position(|window| window == b"\n\n")
+                .map(|position| position + 2)
+        })
 }
 
 fn parse_request(
@@ -857,7 +879,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upgrades_and_preserves_first_protocol_bytes() {
+    async fn drops_buffered_first_protocol_bytes_like_xray_v26_2_6() {
         let handler = HttpUpgradeTcpServerHandler::new(
             Some("example.com".into()),
             "upgrade".into(),
@@ -889,9 +911,22 @@ mod tests {
         let TcpServerSetupResult::TcpForward { mut stream, .. } = result else {
             panic!("expected forwarded upgraded stream");
         };
-        let mut protocol = [0u8; 8];
-        stream.read_exact(&mut protocol).await.unwrap();
-        assert_eq!(&protocol, b"protocol");
+
+        let mut buffered = [0u8; 8];
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                stream.read_exact(&mut buffered),
+            )
+            .await
+            .is_err(),
+            "Xray drops inner bytes buffered by http.ReadRequest"
+        );
+
+        client.write_all(b"late").await.unwrap();
+        let mut late = [0u8; 4];
+        stream.read_exact(&mut late).await.unwrap();
+        assert_eq!(&late, b"late");
     }
 
     #[tokio::test]
