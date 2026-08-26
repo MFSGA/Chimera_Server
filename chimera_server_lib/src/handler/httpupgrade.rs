@@ -232,7 +232,10 @@ async fn read_proxy_protocol(
     } else if prefix.starts_with(b"PROXY ") {
         let mut line = prefix.to_vec();
         while !line.ends_with(b"\r\n") {
-            if line.len() >= 108 {
+            // go-proxyproto v0.9.2 caps the complete PROXY v1 line at 107
+            // bytes, including CRLF. Reject before reading byte 108 so the
+            // boundary matches Xray v26.2.6 exactly.
+            if line.len() >= 107 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "PROXY protocol v1 header is too long",
@@ -1467,6 +1470,52 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("PROXY protocol v1 family"));
+    }
+
+    #[tokio::test]
+    async fn proxy_protocol_v1_length_limit_matches_xray_v26_2_6() {
+        let request = b"GET /upgrade HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+
+        for (line_len, should_accept) in [(107usize, true), (108usize, false)] {
+            let mut proxy = b"PROXY UNKNOWN ".to_vec();
+            proxy.extend(std::iter::repeat_n(
+                b'A',
+                line_len - proxy.len() - b"\r\n".len(),
+            ));
+            proxy.extend_from_slice(b"\r\n");
+            assert_eq!(proxy.len(), line_len);
+
+            let handler = HttpUpgradeTcpServerHandler::new(
+                None,
+                "/upgrade".into(),
+                true,
+                Vec::new(),
+                Box::new(Inner),
+            );
+            let (mut client, server) = duplex(4096);
+            client.write_all(&proxy).await.unwrap();
+            client.write_all(request).await.unwrap();
+
+            let result = handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await;
+            if should_accept {
+                assert!(
+                    result.is_ok(),
+                    "Xray v26.2.6 accepts a {line_len}-byte PROXY v1 line"
+                );
+            } else {
+                let error = match result {
+                    Ok(_) => panic!("Xray v26.2.6 rejects byte 108"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error
+                        .to_string()
+                        .contains("PROXY protocol v1 header is too long")
+                );
+            }
+        }
     }
 
     #[tokio::test]
