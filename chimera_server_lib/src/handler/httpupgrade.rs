@@ -576,8 +576,11 @@ fn parse_request_target(target: &str) -> io::Result<HttpUpgradeRequestTarget<'_>
 
     let rest = &target[scheme_end + 3..];
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
-    if authority.is_empty() || authority.contains('@') {
+    let raw_authority = &rest[..authority_end];
+    let authority = raw_authority
+        .rsplit_once('@')
+        .map_or(raw_authority, |(_, host)| host);
+    if authority.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid HTTPUpgrade absolute request target",
@@ -1190,6 +1193,9 @@ mod tests {
             "GET http://example.com/upgrade HTTP/1.1",
             "GET HTTP://example.com/upgrade HTTP/1.1",
             "GET ftp://example.com/upgrade HTTP/1.1",
+            "GET http://user@example.com/upgrade HTTP/1.1",
+            "GET http://user:pass@example.com/upgrade HTTP/1.1",
+            "GET http://user@@example.com/upgrade HTTP/1.1",
         ] {
             let handler = HttpUpgradeTcpServerHandler::new(
                 Some("example.com".into()),
