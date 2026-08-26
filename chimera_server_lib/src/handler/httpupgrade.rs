@@ -212,7 +212,6 @@ async fn read_proxy_protocol(
                     source_port,
                 )))
             }
-            0 => Ok(None),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unsupported PROXY protocol v2 address family",
@@ -1534,6 +1533,37 @@ mod tests {
                 "Xray v26.2.6 accepts LOCAL IPv4 blocks once length is sufficient",
             );
         assert!(matches!(result, TcpServerSetupResult::TcpForward { .. }));
+    }
+
+    #[tokio::test]
+    async fn proxy_v2_proxy_rejects_unspec_family_like_xray_v26_2_6() {
+        let handler = HttpUpgradeTcpServerHandler::new(
+            None,
+            "/upgrade".into(),
+            true,
+            Vec::new(),
+            Box::new(Inner),
+        );
+        let (mut client, server) = duplex(4096);
+        let mut request = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+        request.extend_from_slice(&[0x21, 0x00, 0x00, 0x00]);
+        request.extend_from_slice(
+            b"GET /upgrade HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        );
+        client.write_all(&request).await.unwrap();
+
+        let error = match handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+        {
+            Ok(_) => panic!("Xray v26.2.6 rejects PROXY command with UNSPEC family"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported PROXY protocol v2 address family")
+        );
     }
 
     #[tokio::test]
