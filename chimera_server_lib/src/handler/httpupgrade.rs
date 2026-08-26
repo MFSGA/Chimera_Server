@@ -195,7 +195,9 @@ async fn read_proxy_protocol(
                 "unsupported PROXY protocol v2 command",
             ));
         }
-        match family_protocol >> 4 {
+        let family = family_protocol >> 4;
+        let transport = family_protocol & 0x0f;
+        match family {
             1 if payload.len() >= 12 => {
                 let source = std::net::Ipv4Addr::new(
                     payload[0], payload[1], payload[2], payload[3],
@@ -212,6 +214,16 @@ async fn read_proxy_protocol(
                     source_port,
                 )))
             }
+            // go-proxyproto v0.9.2 accepts UNIX addresses but Xray's
+            // HTTPUpgrade path only needs the connection to proceed. Chimera's
+            // logical peer type is SocketAddr, so consume the address block and
+            // keep the underlying TCP peer instead of rejecting the handshake.
+            3 if payload.len() >= 216 => Ok(None),
+            // The v0.9.2 parser also accepts the odd half-specified family /
+            // transport combinations where exactly one nibble is UNSPEC. They
+            // carry no IP endpoint, so there is nothing to override locally.
+            0 if transport != 0 => Ok(None),
+            4..=15 if transport == 0 => Ok(None),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unsupported PROXY protocol v2 address family",
@@ -1536,7 +1548,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxy_v2_proxy_rejects_unspec_family_like_xray_v26_2_6() {
+    async fn proxy_v2_non_ip_families_match_xray_v26_2_6() {
         let handler = HttpUpgradeTcpServerHandler::new(
             None,
             "/upgrade".into(),
@@ -1544,26 +1556,55 @@ mod tests {
             Vec::new(),
             Box::new(Inner),
         );
-        let (mut client, server) = duplex(4096);
-        let mut request = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
-        request.extend_from_slice(&[0x21, 0x00, 0x00, 0x00]);
-        request.extend_from_slice(
-            b"GET /upgrade HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
-        );
-        client.write_all(&request).await.unwrap();
 
-        let error = match handler
-            .setup_server_stream(Box::new(TestStream(server)))
-            .await
+        for (family_protocol, payload) in
+            [(0x01, Vec::new()), (0x40, Vec::new()), (0x31, vec![0; 216])]
         {
-            Ok(_) => panic!("Xray v26.2.6 rejects PROXY command with UNSPEC family"),
-            Err(error) => error,
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("unsupported PROXY protocol v2 address family")
-        );
+            let (mut client, server) = duplex(4096);
+            let mut request = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+            request.extend_from_slice(&[
+                0x21,
+                family_protocol,
+                (payload.len() >> 8) as u8,
+                payload.len() as u8,
+            ]);
+            request.extend_from_slice(&payload);
+            request.extend_from_slice(
+                b"GET /upgrade HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+            );
+            client.write_all(&request).await.unwrap();
+
+            let result = handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+                .expect("Xray v26.2.6 accepts non-IP PROXY v2 family combinations");
+            assert!(matches!(result, TcpServerSetupResult::TcpForward { .. }));
+        }
+
+        for family_protocol in [0x00, 0x41] {
+            let (mut client, server) = duplex(4096);
+            let mut request = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+            request.extend_from_slice(&[0x21, family_protocol, 0x00, 0x00]);
+            request.extend_from_slice(
+                b"GET /upgrade HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+            );
+            client.write_all(&request).await.unwrap();
+
+            let error = match handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+            {
+                Ok(_) => {
+                    panic!("Xray v26.2.6 rejects this PROXY v2 family combination")
+                }
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("unsupported PROXY protocol v2 address family")
+            );
+        }
     }
 
     #[tokio::test]
