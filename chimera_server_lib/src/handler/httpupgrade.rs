@@ -453,6 +453,15 @@ fn parse_request(
         }
         let name = name.to_ascii_lowercase();
         if headers.contains_key(&name) {
+            // Go's http.ReadRequest rejects duplicate Host headers before the
+            // HTTPUpgrade handler runs, while ordinary MIME headers keep the
+            // first value visible through Header.Get().
+            if name == "host" {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "too many Host headers",
+                ));
+            }
             // Go's textproto reader still folds continuation lines into the
             // most recent duplicate value, while Header.Get() keeps returning
             // the first value. We can discard the duplicate payload itself,
@@ -1123,6 +1132,34 @@ mod tests {
                 Err(error) => error,
             };
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_host_headers_like_xray_v26_2_6() {
+        for request in [
+            b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n".as_slice(),
+            b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nHost: wrong.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n".as_slice(),
+        ] {
+            let handler = HttpUpgradeTcpServerHandler::new(
+                Some("localhost".into()),
+                "/upgrade".into(),
+                false,
+                Vec::new(),
+                Box::new(Inner),
+            );
+            let (mut client, server) = duplex(4096);
+            client.write_all(request).await.unwrap();
+
+            let error = match handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+            {
+                Ok(_) => panic!("Xray http.ReadRequest rejects duplicate Host headers"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), "too many Host headers");
         }
     }
 
