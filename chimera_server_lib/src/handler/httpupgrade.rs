@@ -479,6 +479,17 @@ struct HttpUpgradeRequestTarget<'a> {
 }
 
 fn parse_request_target(target: &str) -> io::Result<HttpUpgradeRequestTarget<'_>> {
+    // Go's http.ReadRequest rejects request-target fragments before the
+    // HTTPUpgrade handler sees req.URL.Path. A literal '#' therefore must not
+    // be treated like a removable URL fragment here; percent-encoded %23 is
+    // still decoded later as an ordinary path byte.
+    if target.contains('#') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid HTTPUpgrade request target fragment",
+        ));
+    }
+
     let Some(scheme_end) = target.find("://") else {
         return Ok(HttpUpgradeRequestTarget {
             path: target,
@@ -1136,6 +1147,7 @@ mod tests {
         for request_line in [
             "GET http://wrong.example/upgrade HTTP/1.1",
             "GET http://example.com/wrong HTTP/1.1",
+            "GET http://example.com/upgrade#fragment HTTP/1.1",
         ] {
             let handler = HttpUpgradeTcpServerHandler::new(
                 Some("example.com".into()),
@@ -1163,6 +1175,61 @@ mod tests {
                 "Xray rejects mismatched absolute-form authority or path"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_literal_request_target_fragments_like_xray_v26_2_6() {
+        for target in ["/upgrade#fragment", "/upgrade?x=1#fragment"] {
+            let handler = HttpUpgradeTcpServerHandler::new(
+                None,
+                "/upgrade".into(),
+                false,
+                Vec::new(),
+                Box::new(Inner),
+            );
+            let (mut client, server) = duplex(4096);
+            client
+                .write_all(
+                    format!(
+                        "GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let error = match handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+            {
+                Ok(_) => {
+                    panic!("Xray rejects literal fragments in HTTP request-targets")
+                }
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+
+        let handler = HttpUpgradeTcpServerHandler::new(
+            None,
+            "/upgrade#fragment".into(),
+            false,
+            Vec::new(),
+            Box::new(Inner),
+        );
+        let (mut client, server) = duplex(4096);
+        client
+            .write_all(
+                b"GET /upgrade%23fragment HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("percent-encoded hash remains an ordinary Xray path byte");
+        assert!(matches!(result, TcpServerSetupResult::TcpForward { .. }));
     }
 
     #[tokio::test]
