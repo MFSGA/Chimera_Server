@@ -356,20 +356,20 @@ fn parse_request(
         ));
     }
     let mut headers: HashMap<String, String> = HashMap::new();
-    let mut continuation_target = None;
+    let mut continuation_target: Option<(String, bool)> = None;
     for line in lines {
         if line.is_empty() {
             break;
         }
         if line.starts_with([' ', '\t']) {
-            let Some(name) = continuation_target.as_ref() else {
+            let Some((name, keep_value)) = continuation_target.as_ref() else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "invalid HTTPUpgrade header continuation",
                 ));
             };
             let continuation = line.trim();
-            if let Some(value) = headers.get_mut(name) {
+            if *keep_value && let Some(value) = headers.get_mut(name) {
                 if !value.is_empty() && !continuation.is_empty() {
                     value.push(' ');
                 }
@@ -397,11 +397,15 @@ fn parse_request(
         }
         let name = name.to_ascii_lowercase();
         if headers.contains_key(&name) {
-            continuation_target = None;
+            // Go's textproto reader still folds continuation lines into the
+            // most recent duplicate value, while Header.Get() keeps returning
+            // the first value. We can discard the duplicate payload itself,
+            // but its continuation lines must remain syntactically valid.
+            continuation_target = Some((name, false));
             continue;
         }
         headers.insert(name.clone(), value.trim().to_string());
-        continuation_target = Some(name);
+        continuation_target = Some((name, true));
     }
     Ok((method, target, version, headers))
 }
@@ -1053,6 +1057,8 @@ mod tests {
             b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection:\r\n Upgrade\r\nUpgrade: websocket\r\n\r\n".as_slice(),
             b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade:\r\n websocket\r\n\r\n".as_slice(),
             b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nBad Header: ok\r\nX-Test: a\tb\r\n\r\n".as_slice(),
+            b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nConnection: nope\r\n more\r\nUpgrade: websocket\r\n\r\n".as_slice(),
+            b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nUpgrade: nope\r\n more\r\n\r\n".as_slice(),
         ] {
             let handler = HttpUpgradeTcpServerHandler::new(
                 None,
