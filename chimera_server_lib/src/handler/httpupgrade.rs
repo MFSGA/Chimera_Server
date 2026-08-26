@@ -210,7 +210,7 @@ async fn read_proxy_protocol(
                 source.copy_from_slice(&payload[..16]);
                 let source_port = u16::from_be_bytes([payload[32], payload[33]]);
                 Ok(Some(std::net::SocketAddr::new(
-                    std::net::Ipv6Addr::from(source).into(),
+                    canonicalize_xray_ip(std::net::Ipv6Addr::from(source).into()),
                     source_port,
                 )))
             }
@@ -334,7 +334,10 @@ async fn read_proxy_protocol(
                 "invalid PROXY protocol v1 address family",
             ));
         }
-        Ok(Some(std::net::SocketAddr::new(source_ip, source_port)))
+        Ok(Some(std::net::SocketAddr::new(
+            canonicalize_xray_ip(source_ip),
+            source_port,
+        )))
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -509,13 +512,16 @@ fn trusted_forwarded_peer(
     }
 
     let ip = candidate.parse::<std::net::IpAddr>().ok()?;
-    let ip = match ip {
+    Some(std::net::SocketAddr::new(canonicalize_xray_ip(ip), 0))
+}
+
+fn canonicalize_xray_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
         std::net::IpAddr::V6(ipv6) => ipv6
             .to_ipv4_mapped()
             .map_or(std::net::IpAddr::V6(ipv6), std::net::IpAddr::V4),
         ip => ip,
-    };
-    Some(std::net::SocketAddr::new(ip, 0))
+    }
 }
 
 fn normalize_path(path: String) -> String {
@@ -1494,6 +1500,64 @@ mod tests {
         };
         assert_eq!(peer_addr, "198.51.100.8:45679".parse().unwrap());
         assert!(matches!(*inner, TcpServerSetupResult::TcpForward { .. }));
+    }
+
+    #[tokio::test]
+    async fn proxy_ipv4_mapped_ipv6_is_canonicalized_like_xray_v26_2_6() {
+        let request =
+            b"GET /upgrade HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+
+        let handler = HttpUpgradeTcpServerHandler::new(
+            None,
+            "/upgrade".into(),
+            true,
+            Vec::new(),
+            Box::new(Inner),
+        );
+        let (mut client, server) = duplex(4096);
+        client
+            .write_all(b"PROXY TCP6 ::ffff:203.0.113.7 ::1 12345 80\r\n")
+            .await
+            .unwrap();
+        client.write_all(request).await.unwrap();
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("Xray accepts mapped IPv6 in PROXY v1 TCP6");
+        let TcpServerSetupResult::PeerAddrOverride { peer_addr, .. } = result else {
+            panic!("expected peer address override");
+        };
+        assert_eq!(peer_addr, "203.0.113.7:12345".parse().unwrap());
+
+        let handler = HttpUpgradeTcpServerHandler::new(
+            None,
+            "/upgrade".into(),
+            true,
+            Vec::new(),
+            Box::new(Inner),
+        );
+        let (mut client, server) = duplex(4096);
+        let mut proxy = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+        proxy.extend_from_slice(&[0x21, 0x21, 0x00, 0x24]);
+        proxy.extend_from_slice(
+            &"::ffff:203.0.113.7"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets(),
+        );
+        proxy.extend_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
+        proxy.extend_from_slice(&12345u16.to_be_bytes());
+        proxy.extend_from_slice(&80u16.to_be_bytes());
+        proxy.extend_from_slice(request);
+        client.write_all(&proxy).await.unwrap();
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("Xray accepts mapped IPv6 in PROXY v2 IPv6 family");
+        let TcpServerSetupResult::PeerAddrOverride { peer_addr, .. } = result else {
+            panic!("expected peer address override");
+        };
+        assert_eq!(peer_addr, "203.0.113.7:12345".parse().unwrap());
     }
 
     #[tokio::test]
