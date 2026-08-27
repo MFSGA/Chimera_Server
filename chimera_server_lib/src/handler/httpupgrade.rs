@@ -664,9 +664,13 @@ fn trusted_forwarded_peer(
     trusted_x_forwarded_for: &[String],
 ) -> Option<std::net::SocketAddr> {
     if !trusted_x_forwarded_for.is_empty()
-        && !trusted_x_forwarded_for
-            .iter()
-            .any(|header| headers.contains_key(&header.to_ascii_lowercase()))
+        && !trusted_x_forwarded_for.iter().any(|header| {
+            // Go's http.ReadRequest promotes Host into req.Host and removes it
+            // from req.Header. Xray therefore never treats the ordinary Host
+            // request field as a trusted-XFF marker.
+            !header.eq_ignore_ascii_case("host")
+                && headers.contains_key(&header.to_ascii_lowercase())
+        })
     {
         return None;
     }
@@ -953,6 +957,7 @@ mod tests {
                 "203.0.113.77, 198.51.100.2".to_string(),
             ),
             ("x-trusted-cdn".to_string(), "yes".to_string()),
+            ("host".to_string(), "example.com".to_string()),
         ]);
         assert_eq!(
             trusted_forwarded_peer(&headers, &[]),
@@ -969,6 +974,11 @@ mod tests {
         assert_eq!(
             trusted_forwarded_peer(&headers, &[" X-Trusted-CDN ".into()]),
             None
+        );
+        assert_eq!(
+            trusted_forwarded_peer(&headers, &["Host".into()]),
+            None,
+            "Xray's http.ReadRequest removes Host from req.Header before trusted marker checks",
         );
     }
 
