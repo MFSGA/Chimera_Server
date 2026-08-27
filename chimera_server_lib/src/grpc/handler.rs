@@ -279,6 +279,8 @@ struct WebsocketConfigPayload {
     path: String,
     #[prost(map = "string, string", tag = "3")]
     header: std::collections::HashMap<String, String>,
+    #[prost(bool, tag = "4")]
+    accept_proxy_protocol: bool,
 }
 
 #[cfg(feature = "tls")]
@@ -781,6 +783,7 @@ impl HandlerServiceImpl {
                         matching_headers,
                         xray_mismatch_404: true,
                         trusted_x_forwarded_for: Vec::new(),
+                        accept_proxy_protocol: websocket.accept_proxy_protocol,
                         protocol,
                     })),
                 };
@@ -1203,6 +1206,7 @@ impl HandlerServiceImpl {
                         host,
                         path: target.matching_path.clone().unwrap_or_default(),
                         header: headers,
+                        accept_proxy_protocol: target.accept_proxy_protocol,
                     },
                 );
                 let (mut stream_settings, proxy_settings) =
@@ -2880,6 +2884,7 @@ mod tests {
                                     "X-Test".to_string(),
                                     "ignored-inbound".to_string(),
                                 )]),
+                                accept_proxy_protocol: false,
                             }
                             .encode_to_vec(),
                         }),

@@ -16,6 +16,7 @@ use tracing::debug;
 use crate::{
     async_stream::AsyncStream,
     handler::{
+        proxy_protocol::read_proxy_protocol,
         tcp::tcp_handler::{
             TcpServerConnectionContext, TcpServerHandler, TcpServerSetupResult,
         },
@@ -33,6 +34,7 @@ pub struct WebsocketServerTarget {
     pub matching_headers: Option<HashMap<String, String>>,
     pub xray_mismatch_404: bool,
     pub trusted_x_forwarded_for: Vec<String>,
+    pub accept_proxy_protocol: bool,
     pub handler: Box<dyn TcpServerHandler>,
 }
 
@@ -83,6 +85,20 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
         mut context: TcpServerConnectionContext,
     ) -> std::io::Result<TcpServerSetupResult> {
         tracing::debug!("WebsocketTcpServerHandler setup_server_stream");
+        if self
+            .server_targets
+            .iter()
+            .any(|target| target.accept_proxy_protocol)
+        {
+            match read_proxy_protocol(&mut server_stream).await {
+                Ok(Some(peer_addr)) => context.peer_addr = Some(peer_addr),
+                Ok(None) => {}
+                Err(error) => {
+                    write_xray_bad_request_line(&mut server_stream).await?;
+                    return Err(error);
+                }
+            }
+        }
         let parsed = timeout(
             XRAY_WEBSOCKET_HANDSHAKE_TIMEOUT,
             ParsedHttpData::parse(&mut server_stream),
@@ -217,6 +233,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                 matching_headers,
                 xray_mismatch_404,
                 trusted_x_forwarded_for,
+                accept_proxy_protocol: _,
                 handler,
             } = server_target;
             debug!(
@@ -971,6 +988,7 @@ mod tests {
             matching_headers: None,
             xray_mismatch_404: false,
             trusted_x_forwarded_for: Vec::new(),
+            accept_proxy_protocol: false,
             handler: Box::new(Inner {
                 manages_handshake_timeout,
             }),
@@ -983,6 +1001,7 @@ mod tests {
             matching_headers: None,
             xray_mismatch_404: false,
             trusted_x_forwarded_for: Vec::new(),
+            accept_proxy_protocol: false,
             handler: Box::new(AcceptingInner),
         }])
     }
@@ -1078,6 +1097,7 @@ mod tests {
                     matching_headers: None,
                     xray_mismatch_404: true,
                     trusted_x_forwarded_for: Vec::new(),
+                    accept_proxy_protocol: false,
                     handler: Box::new(AcceptingInner),
                 }]);
             let task = tokio::spawn(async move {
@@ -1515,6 +1535,7 @@ mod tests {
             matching_headers: None,
             xray_mismatch_404: false,
             trusted_x_forwarded_for: Vec::new(),
+            accept_proxy_protocol: false,
             handler: Box::new(ContextCapturingInner {
                 captured_peer: captured_peer.clone(),
             }),
@@ -1626,6 +1647,7 @@ mod tests {
             matching_headers: None,
             xray_mismatch_404: false,
             trusted_x_forwarded_for: Vec::new(),
+            accept_proxy_protocol: false,
             handler: Box::new(CapturingInner {
                 captured: captured.clone(),
             }),
@@ -1717,6 +1739,7 @@ mod tests {
                     matching_headers: None,
                     xray_mismatch_404,
                     trusted_x_forwarded_for: Vec::new(),
+                    accept_proxy_protocol: false,
                     handler: Box::new(AcceptingInner),
                 }]);
             let task = tokio::spawn(async move {
@@ -1766,6 +1789,7 @@ mod tests {
                     )])),
                     xray_mismatch_404: true,
                     trusted_x_forwarded_for: Vec::new(),
+                    accept_proxy_protocol: false,
                     handler: Box::new(AcceptingInner),
                 }]);
             let task = tokio::spawn(async move {
@@ -1830,6 +1854,7 @@ mod tests {
                     )])),
                     xray_mismatch_404,
                     trusted_x_forwarded_for: Vec::new(),
+                    accept_proxy_protocol: false,
                     handler: Box::new(AcceptingInner),
                 }]);
             let task = tokio::spawn(async move {
