@@ -19,7 +19,10 @@ use crate::{
         tcp::tcp_handler::{
             TcpServerConnectionContext, TcpServerHandler, TcpServerSetupResult,
         },
-        ws::{parsed_http::ParsedHttpData, websocket_stream::WebsocketStream},
+        ws::{
+            parsed_http::{ParsedHttpData, ParsedHttpError},
+            websocket_stream::WebsocketStream,
+        },
     },
     util::prefixed_stream::PrefixedStream,
 };
@@ -80,11 +83,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
         mut context: TcpServerConnectionContext,
     ) -> std::io::Result<TcpServerSetupResult> {
         tracing::debug!("WebsocketTcpServerHandler setup_server_stream");
-        let ParsedHttpData {
-            first_line,
-            headers: request_headers,
-            line_reader,
-        } = timeout(
+        let parsed = timeout(
             XRAY_WEBSOCKET_HANDSHAKE_TIMEOUT,
             ParsedHttpData::parse(&mut server_stream),
         )
@@ -94,7 +93,21 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                 std::io::ErrorKind::TimedOut,
                 "WebSocket handshake timed out",
             )
-        })??;
+        })?;
+        let ParsedHttpData {
+            first_line,
+            headers: request_headers,
+            line_reader,
+        } = match parsed {
+            Ok(parsed) => parsed,
+            Err(ParsedHttpError::Io(error)) => return Err(error),
+            Err(ParsedHttpError::HeaderTooLarge) => {
+                write_xray_websocket_header_too_large(&mut server_stream).await?;
+                return Err(std::io::Error::other(
+                    "websocket request header is too large",
+                ));
+            }
+        };
 
         let (method, request_target) =
             match parse_xray_websocket_request_line(&first_line) {
@@ -409,6 +422,17 @@ async fn write_xray_bad_request_line(
     stream
         .write_all(
             b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request",
+        )
+        .await?;
+    stream.flush().await
+}
+
+async fn write_xray_websocket_header_too_large(
+    stream: &mut Box<dyn AsyncStream>,
+) -> std::io::Result<()> {
+    stream
+        .write_all(
+            b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n431 Request Header Fields Too Large",
         )
         .await?;
     stream.flush().await
@@ -732,6 +756,38 @@ mod tests {
                 "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn websocket_handshake_matches_xray_header_budget() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let base = format!(
+            "GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
+        );
+
+        let large_but_valid =
+            format!("{base}X-Fill: {}\r\n\r\n", "a".repeat(12_000));
+        let (result, response) = run_handshake(&large_but_valid).await;
+        assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
+        assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+
+        let many_headers = format!(
+            "{base}{}\r\n",
+            (0..100)
+                .map(|index| format!("X-{index}: a\r\n"))
+                .collect::<String>()
+        );
+        let (result, response) = run_handshake(&many_headers).await;
+        assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
+        assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+
+        let oversized = format!("{base}X-Fill: {}\r\n\r\n", "a".repeat(13_000));
+        let (result, response) = run_handshake(&oversized).await;
+        assert!(result.is_err());
+        assert_eq!(
+            response,
+            "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n431 Request Header Fields Too Large"
+        );
     }
 
     #[tokio::test]
