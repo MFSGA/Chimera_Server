@@ -115,6 +115,10 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                 }
                 return Err(std::io::Error::other("invalid HTTP header name"));
             }
+            Err(ParsedHttpError::InvalidHeaderValue) => {
+                write_xray_bad_request_line(&mut server_stream).await?;
+                return Err(std::io::Error::other("invalid HTTP header value"));
+            }
         };
 
         if !valid_xray_content_length(&request_headers) {
@@ -751,6 +755,12 @@ mod tests {
     async fn run_handshake(
         request: &str,
     ) -> (std::io::Result<TcpServerSetupResult>, String) {
+        run_handshake_bytes(request.as_bytes()).await
+    }
+
+    async fn run_handshake_bytes(
+        request: &[u8],
+    ) -> (std::io::Result<TcpServerSetupResult>, String) {
         let (client, mut peer) = tokio::io::duplex(8192);
         let handler = accepting_handler();
         let task = tokio::spawn(async move {
@@ -758,7 +768,7 @@ mod tests {
                 .setup_server_stream(Box::new(TestStream(client)))
                 .await
         });
-        peer.write_all(request.as_bytes()).await.unwrap();
+        peer.write_all(request).await.unwrap();
         peer.shutdown().await.unwrap();
         let mut response = Vec::new();
         peer.read_to_end(&mut response).await.unwrap();
@@ -887,6 +897,32 @@ mod tests {
                 response,
                 "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request",
                 "{invalid_header}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_handshake_validates_header_values_like_xray_v26_2_6() {
+        let base = b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nX-Test: ";
+
+        for value in [b"ok".as_slice(), b"a\tb", b"\x80", b"\xff"] {
+            let mut request = base.to_vec();
+            request.extend_from_slice(value);
+            request.extend_from_slice(b"\r\n\r\n");
+            let (result, response) = run_handshake_bytes(&request).await;
+            assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
+            assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+        }
+
+        for value in [b"a\x0bb".as_slice(), b"a\x00b", b"a\x7fb"] {
+            let mut request = base.to_vec();
+            request.extend_from_slice(value);
+            request.extend_from_slice(b"\r\n\r\n");
+            let (result, response) = run_handshake_bytes(&request).await;
+            assert!(result.is_err());
+            assert_eq!(
+                response,
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request"
             );
         }
     }
