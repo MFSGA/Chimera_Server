@@ -28,7 +28,7 @@ impl HttpUpgradeTcpServerHandler {
         inner: Box<dyn TcpServerHandler>,
     ) -> Self {
         Self {
-            host: host.map(|value| value.to_ascii_lowercase()),
+            host: host.map(|value| xray_unicode_lowercase(&value)),
             path: normalize_path(path),
             accept_proxy_protocol,
             trusted_x_forwarded_for,
@@ -834,12 +834,23 @@ fn decode_request_path(target: &str) -> io::Result<String> {
 }
 
 fn http_host_matches(actual: &str, expected: &str) -> bool {
-    let actual = actual.to_ascii_lowercase();
+    let actual = xray_unicode_lowercase(actual);
+    let expected = xray_unicode_lowercase(expected);
     if !actual.contains(':') {
         return actual == expected;
     }
 
     split_http_host_port(&actual).is_some_and(|host| host == expected)
+}
+
+fn xray_unicode_lowercase(value: &str) -> String {
+    // Go's strings.ToLower applies unicode.ToLower to each rune. Unlike Rust's
+    // full lowercase mapping, that never expands one input rune into multiple
+    // output runes (for example, U+0130 LATIN CAPITAL I WITH DOT ABOVE -> "i").
+    value
+        .chars()
+        .map(|ch| ch.to_lowercase().next().unwrap_or(ch))
+        .collect()
 }
 
 fn split_http_host_port(authority: &str) -> Option<&str> {
@@ -1041,6 +1052,10 @@ mod tests {
         assert!(!http_host_matches("[::1]", "::1"));
         assert!(!http_host_matches("[::2]:443", "::1"));
         assert!(http_host_matches("Example.COM:443", "example.com"));
+        assert!(http_host_matches("ä.example", "Ä.example"));
+        assert!(http_host_matches("σ.example", "Σ.example"));
+        assert!(http_host_matches("i.example", "İ.example"));
+        assert!(!http_host_matches("i\u{307}.example", "İ.example"));
     }
 
     #[test]
