@@ -404,6 +404,7 @@ fn parse_request(
     if method.is_empty()
         || !method.bytes().all(is_xray_http_method_token_byte)
         || target.is_empty()
+        || target.bytes().any(is_xray_http_request_target_ctl_byte)
         || !is_xray_http_version(version)
         || parts.next().is_some()
     {
@@ -622,6 +623,10 @@ fn is_invalid_http_header_name_byte(byte: u8) -> bool {
 
 fn is_invalid_http_header_value_byte(byte: u8) -> bool {
     (byte < b' ' && byte != b'\t') || byte == 0x7f
+}
+
+fn is_xray_http_request_target_ctl_byte(byte: u8) -> bool {
+    byte <= 0x1f || byte == 0x7f
 }
 
 fn is_xray_http_method_token_byte(byte: u8) -> bool {
@@ -1223,6 +1228,21 @@ mod tests {
                 }
                 Err(error) => error,
             };
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn rejects_request_target_control_bytes_like_xray_v26_2_6() {
+        for control in [b'\t', 0x00, 0x1f, 0x7f, 0x0b] {
+            let mut request = b"GET /up".to_vec();
+            request.push(control);
+            request.extend_from_slice(
+                b"grade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+            );
+            let error = super::parse_request(&request).expect_err(
+                "Xray http.ReadRequest rejects control bytes in request-target",
+            );
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         }
     }
