@@ -415,11 +415,13 @@ fn parse_request(
         Header(String, bool),
         ContentLength,
         TransferEncoding,
+        Trailer,
     }
 
     let mut headers: HashMap<String, String> = HashMap::new();
     let mut content_lengths: Vec<String> = Vec::new();
     let mut transfer_encodings: Vec<String> = Vec::new();
+    let mut trailers: Vec<String> = Vec::new();
     let mut continuation_target: Option<ContinuationTarget> = None;
     for line in lines {
         if line.is_empty() {
@@ -458,6 +460,14 @@ fn parse_request(
                         value.push_str(continuation);
                     }
                 }
+                ContinuationTarget::Trailer => {
+                    if let Some(value) = trailers.last_mut() {
+                        if !value.is_empty() && !continuation.is_empty() {
+                            value.push(' ');
+                        }
+                        value.push_str(continuation);
+                    }
+                }
             }
             continue;
         }
@@ -488,6 +498,11 @@ fn parse_request(
         if name == "transfer-encoding" {
             transfer_encodings.push(value.trim().to_string());
             continuation_target = Some(ContinuationTarget::TransferEncoding);
+            continue;
+        }
+        if name == "trailer" {
+            trailers.push(value.trim().to_string());
+            continuation_target = Some(ContinuationTarget::Trailer);
             continue;
         }
         if headers.contains_key(&name) {
@@ -529,9 +544,30 @@ fn parse_request(
     validate_transfer_encoding(&transfer_encodings)?;
     if let Some(value) = transfer_encodings.first() {
         headers.insert("transfer-encoding".to_string(), value.clone());
+        validate_chunked_trailers(&trailers)?;
+    }
+    if let Some(value) = trailers.first() {
+        headers.insert("trailer".to_string(), value.clone());
     }
 
     Ok((method, target, version, headers))
+}
+
+fn validate_chunked_trailers(values: &[String]) -> io::Result<()> {
+    for value in values {
+        for key in value.split(',').map(str::trim) {
+            if key.eq_ignore_ascii_case("transfer-encoding")
+                || key.eq_ignore_ascii_case("trailer")
+                || key.eq_ignore_ascii_case("content-length")
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("bad trailer key {key:?}"),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_transfer_encoding(values: &[String]) -> io::Result<()> {
@@ -1394,6 +1430,78 @@ mod tests {
                 .await
             {
                 Ok(_) => panic!("Xray rejects unsupported HTTP transfer encodings"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[tokio::test]
+    async fn validates_chunked_trailers_like_xray_v26_2_6() {
+        for extra_headers in [
+            "Trailer: Content-Length\r\n",
+            "Trailer: Transfer-Encoding\r\n",
+            "Transfer-Encoding: chunked\r\nTrailer: X-Foo\r\n",
+            "Transfer-Encoding: chunked\r\nTrailer: Host\r\n",
+            "Transfer-Encoding: chunked\r\nTrailer: X-Foo, X-Bar\r\n",
+            "Transfer-Encoding: chunked\r\nTrailer:\r\n",
+        ] {
+            let handler = HttpUpgradeTcpServerHandler::new(
+                None,
+                "/upgrade".into(),
+                false,
+                Vec::new(),
+                Box::new(Inner),
+            );
+            let (mut client, server) = duplex(4096);
+            client
+                .write_all(
+                    format!(
+                        "GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n{extra_headers}\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let result = handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+                .expect("Xray accepts non-forbidden trailer declarations");
+            assert!(matches!(result, TcpServerSetupResult::TcpForward { .. }));
+        }
+
+        for extra_headers in [
+            "Transfer-Encoding: chunked\r\nTrailer: Content-Length\r\n",
+            "Transfer-Encoding: chunked\r\nTrailer: Transfer-Encoding\r\n",
+            "Transfer-Encoding: chunked\r\nTrailer: Trailer\r\n",
+            "Transfer-Encoding: chunked\r\nTrailer: X-Foo, Content-Length\r\n",
+            "Transfer-Encoding: chunked\r\nTrailer: X-Foo\r\nTrailer: Content-Length\r\n",
+            "Transfer-Encoding: chunked\r\nTrailer:\r\n Content-Length\r\n",
+        ] {
+            let handler = HttpUpgradeTcpServerHandler::new(
+                None,
+                "/upgrade".into(),
+                false,
+                Vec::new(),
+                Box::new(Inner),
+            );
+            let (mut client, server) = duplex(4096);
+            client
+                .write_all(
+                    format!(
+                        "GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n{extra_headers}\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let error = match handler
+                .setup_server_stream(Box::new(TestStream(server)))
+                .await
+            {
+                Ok(_) => panic!("Xray rejects forbidden chunked trailer keys"),
                 Err(error) => error,
             };
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
