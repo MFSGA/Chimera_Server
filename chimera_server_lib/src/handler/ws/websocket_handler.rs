@@ -107,6 +107,14 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                     "websocket request header is too large",
                 ));
             }
+            Err(ParsedHttpError::InvalidHeaderName { trailing_space }) => {
+                if trailing_space {
+                    write_xray_invalid_header_name(&mut server_stream).await?;
+                } else {
+                    write_xray_bad_request_line(&mut server_stream).await?;
+                }
+                return Err(std::io::Error::other("invalid HTTP header name"));
+            }
         };
 
         if !valid_xray_content_length(&request_headers) {
@@ -490,6 +498,17 @@ async fn write_xray_bad_request_line(
     stream.flush().await
 }
 
+async fn write_xray_invalid_header_name(
+    stream: &mut Box<dyn AsyncStream>,
+) -> std::io::Result<()> {
+    const STATUS: &str = "400 Bad Request: invalid header name";
+    let response = format!(
+        "HTTP/1.1 {STATUS}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n{STATUS}"
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await
+}
+
 async fn write_xray_unsupported_transfer_encoding(
     stream: &mut Box<dyn AsyncStream>,
 ) -> std::io::Result<()> {
@@ -828,6 +847,46 @@ mod tests {
             assert_eq!(
                 response,
                 "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_handshake_validates_header_names_like_xray_v26_2_6() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let suffix = format!(
+            "Upgrade: websocket\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+
+        let (result, response) = run_handshake(&format!(
+            "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\n{suffix}"
+        ))
+        .await;
+        assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
+        assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+
+        let (result, response) = run_handshake(&format!(
+            "GET / HTTP/1.1\r\nHost: example.com\r\nConnection : Upgrade\r\n{suffix}"
+        ))
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            response,
+            "HTTP/1.1 400 Bad Request: invalid header name\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request: invalid header name"
+        );
+
+        for invalid_header in
+            ["Connection\t: Upgrade", "Connec@tion: Upgrade", "X Foo: ok"]
+        {
+            let (result, response) = run_handshake(&format!(
+                "GET / HTTP/1.1\r\nHost: example.com\r\n{invalid_header}\r\nConnection: Upgrade\r\n{suffix}"
+            ))
+            .await;
+            assert!(result.is_err(), "{invalid_header}");
+            assert_eq!(
+                response,
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request",
+                "{invalid_header}"
             );
         }
     }
