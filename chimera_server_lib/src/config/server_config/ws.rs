@@ -14,5 +14,7 @@ pub struct WebsocketServerConfig {
     pub xray_mismatch_404: bool,
     #[serde(default)]
     pub trusted_x_forwarded_for: Vec<String>,
+    #[serde(default)]
+    pub accept_proxy_protocol: bool,
     pub protocol: ServerProxyConfig,
 }

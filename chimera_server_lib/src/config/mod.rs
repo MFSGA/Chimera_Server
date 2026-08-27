@@ -81,6 +81,8 @@ pub struct StreamSettings {
 #[serde(rename_all = "camelCase")]
 pub struct SocketSettings {
     #[serde(default)]
+    accept_proxy_protocol: bool,
+    #[serde(default)]
     trusted_x_forwarded_for: Vec<String>,
 }
 
@@ -274,6 +276,8 @@ pub struct WsSettings {
     path: Option<String>,
     #[serde(default)]
     headers: std::collections::HashMap<String, String>,
+    #[serde(default, rename = "acceptProxyProtocol")]
+    accept_proxy_protocol: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]

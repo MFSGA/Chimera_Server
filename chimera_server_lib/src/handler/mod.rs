@@ -6,6 +6,8 @@ pub mod http;
 pub mod httpupgrade;
 #[cfg(feature = "mixed")]
 pub mod mixed;
+#[cfg(any(feature = "httpupgrade", feature = "ws"))]
+pub(crate) mod proxy_protocol;
 pub mod tcp;
 #[cfg(feature = "tls")]
 pub mod tls;

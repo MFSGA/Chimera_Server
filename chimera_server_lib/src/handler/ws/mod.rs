@@ -22,6 +22,7 @@ pub fn create_websocket_server_target(
         matching_headers,
         xray_mismatch_404,
         trusted_x_forwarded_for,
+        accept_proxy_protocol,
         protocol,
     } = websocket_server_config;
 
@@ -42,6 +43,7 @@ pub fn create_websocket_server_target(
         matching_headers,
         xray_mismatch_404,
         trusted_x_forwarded_for,
+        accept_proxy_protocol,
         handler,
     })
 }

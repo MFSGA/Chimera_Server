@@ -98,9 +98,15 @@ fn xray_trusted_x_forwarded_for(
 #[cfg(feature = "ws")]
 fn websocket_server_config(
     ws_setting: crate::config::WsSettings,
-    trusted_x_forwarded_for: Vec<String>,
+    stream_settings: &crate::config::StreamSettings,
     protocol: ServerProxyConfig,
 ) -> WebsocketServerConfig {
+    let accept_proxy_protocol = ws_setting.accept_proxy_protocol
+        || stream_settings
+            .sockopt
+            .as_ref()
+            .is_some_and(|settings| settings.accept_proxy_protocol);
+    let trusted_x_forwarded_for = xray_trusted_x_forwarded_for(stream_settings);
     let mut host = ws_setting.host.filter(|value| !value.is_empty());
 
     if host.is_none() {
@@ -123,6 +129,7 @@ fn websocket_server_config(
         matching_headers,
         xray_mismatch_404: true,
         trusted_x_forwarded_for,
+        accept_proxy_protocol,
         protocol,
     }
 }
@@ -1101,7 +1108,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                                 targets: Box::new(OneOrSome::One(
                                     websocket_server_config(
                                     ws_setting,
-                                    xray_trusted_x_forwarded_for(stream_setting),
+                                    stream_setting,
                                     protocol,
                                 ),
                                 )),
@@ -1202,7 +1209,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                             targets: Box::new(OneOrSome::One(
                                 websocket_server_config(
                                     ws_setting,
-                                    xray_trusted_x_forwarded_for(stream_setting),
+                                    stream_setting,
                                     protocol,
                                 ),
                             )),
@@ -1244,7 +1251,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                             targets: Box::new(OneOrSome::One(
                                 websocket_server_config(
                                     ws_setting,
-                                    xray_trusted_x_forwarded_for(stream_setting),
+                                    stream_setting,
                                     protocol,
                                 ),
                             )),
@@ -1338,7 +1345,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                         targets: Box::new(OneOrSome::One(
                             websocket_server_config(
                                     ws_setting,
-                                    xray_trusted_x_forwarded_for(stream_setting),
+                                    stream_setting,
                                     protocol,
                                 ),
                         )),
@@ -1402,7 +1409,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                         targets: Box::new(OneOrSome::One(
                             websocket_server_config(
                                     ws_setting,
-                                    xray_trusted_x_forwarded_for(stream_setting),
+                                    stream_setting,
                                     protocol,
                                 ),
                         )),
@@ -1460,7 +1467,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                         targets: Box::new(OneOrSome::One(
                             websocket_server_config(
                                     ws_setting,
-                                    xray_trusted_x_forwarded_for(stream_setting),
+                                    stream_setting,
                                     protocol,
                                 ),
                         )),
@@ -1516,7 +1523,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                             targets: Box::new(OneOrSome::One(
                                 websocket_server_config(
                                     ws_setting,
-                                    xray_trusted_x_forwarded_for(stream_setting),
+                                    stream_setting,
                                     protocol,
                                 ),
                             )),
@@ -3285,12 +3292,14 @@ mod tests {
                 "wsSettings": {
                     "host": " Example.COM ",
                     "path": "/ws",
+                    "acceptProxyProtocol": false,
                     "headers": {
                         "Host": "edge.example.com",
                         "X-Test": "ok"
                     }
                 },
                 "sockopt": {
+                    "acceptProxyProtocol": true,
                     "trustedXForwardedFor": ["X-Trusted-CDN"]
                 }
             }
@@ -3317,6 +3326,7 @@ mod tests {
                         target.trusted_x_forwarded_for,
                         vec!["X-Trusted-CDN".to_string()]
                     );
+                    assert!(target.accept_proxy_protocol);
                 }
                 OneOrSome::Some(_) => panic!("expected one websocket target"),
             },
