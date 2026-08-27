@@ -16,5 +16,7 @@ pub struct WebsocketServerConfig {
     pub trusted_x_forwarded_for: Vec<String>,
     #[serde(default)]
     pub accept_proxy_protocol: bool,
+    #[serde(default)]
+    pub heartbeat_period: u32,
     pub protocol: ServerProxyConfig,
 }

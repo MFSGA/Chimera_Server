@@ -35,6 +35,7 @@ pub struct WebsocketServerTarget {
     pub xray_mismatch_404: bool,
     pub trusted_x_forwarded_for: Vec<String>,
     pub accept_proxy_protocol: bool,
+    pub heartbeat_period: u32,
     pub handler: Box<dyn TcpServerHandler>,
 }
 
@@ -234,6 +235,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                 xray_mismatch_404,
                 trusted_x_forwarded_for,
                 accept_proxy_protocol: _,
+                heartbeat_period,
                 handler,
             } = server_target;
             debug!(
@@ -305,10 +307,11 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             server_stream.write_all(http_response.as_bytes()).await?;
 
             let websocket_stream: Box<dyn AsyncStream> =
-                Box::new(WebsocketStream::new(
+                Box::new(WebsocketStream::new_with_heartbeat(
                     server_stream,
                     false,
                     line_reader.unparsed_data(),
+                    *heartbeat_period,
                 ));
             let websocket_stream =
                 if let Some(early_data) = websocket_early_data.clone() {
@@ -989,6 +992,7 @@ mod tests {
             xray_mismatch_404: false,
             trusted_x_forwarded_for: Vec::new(),
             accept_proxy_protocol: false,
+            heartbeat_period: 0,
             handler: Box::new(Inner {
                 manages_handshake_timeout,
             }),
@@ -1002,6 +1006,7 @@ mod tests {
             xray_mismatch_404: false,
             trusted_x_forwarded_for: Vec::new(),
             accept_proxy_protocol: false,
+            heartbeat_period: 0,
             handler: Box::new(AcceptingInner),
         }])
     }
@@ -1098,6 +1103,7 @@ mod tests {
                     xray_mismatch_404: true,
                     trusted_x_forwarded_for: Vec::new(),
                     accept_proxy_protocol: false,
+                    heartbeat_period: 0,
                     handler: Box::new(AcceptingInner),
                 }]);
             let task = tokio::spawn(async move {
@@ -1536,6 +1542,7 @@ mod tests {
             xray_mismatch_404: false,
             trusted_x_forwarded_for: Vec::new(),
             accept_proxy_protocol: false,
+            heartbeat_period: 0,
             handler: Box::new(ContextCapturingInner {
                 captured_peer: captured_peer.clone(),
             }),
@@ -1648,6 +1655,7 @@ mod tests {
             xray_mismatch_404: false,
             trusted_x_forwarded_for: Vec::new(),
             accept_proxy_protocol: false,
+            heartbeat_period: 0,
             handler: Box::new(CapturingInner {
                 captured: captured.clone(),
             }),
@@ -1740,6 +1748,7 @@ mod tests {
                     xray_mismatch_404,
                     trusted_x_forwarded_for: Vec::new(),
                     accept_proxy_protocol: false,
+                    heartbeat_period: 0,
                     handler: Box::new(AcceptingInner),
                 }]);
             let task = tokio::spawn(async move {
@@ -1790,6 +1799,7 @@ mod tests {
                     xray_mismatch_404: true,
                     trusted_x_forwarded_for: Vec::new(),
                     accept_proxy_protocol: false,
+                    heartbeat_period: 0,
                     handler: Box::new(AcceptingInner),
                 }]);
             let task = tokio::spawn(async move {
@@ -1855,6 +1865,7 @@ mod tests {
                     xray_mismatch_404,
                     trusted_x_forwarded_for: Vec::new(),
                     accept_proxy_protocol: false,
+                    heartbeat_period: 0,
                     handler: Box::new(AcceptingInner),
                 }]);
             let task = tokio::spawn(async move {

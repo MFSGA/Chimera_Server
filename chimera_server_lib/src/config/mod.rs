@@ -278,6 +278,8 @@ pub struct WsSettings {
     headers: std::collections::HashMap<String, String>,
     #[serde(default, rename = "acceptProxyProtocol")]
     accept_proxy_protocol: bool,
+    #[serde(default, rename = "heartbeatPeriod")]
+    heartbeat_period: u32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]

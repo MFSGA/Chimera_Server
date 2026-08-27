@@ -23,6 +23,7 @@ pub fn create_websocket_server_target(
         xray_mismatch_404,
         trusted_x_forwarded_for,
         accept_proxy_protocol,
+        heartbeat_period,
         protocol,
     } = websocket_server_config;
 
@@ -44,6 +45,7 @@ pub fn create_websocket_server_target(
         xray_mismatch_404,
         trusted_x_forwarded_for,
         accept_proxy_protocol,
+        heartbeat_period,
         handler,
     })
 }
