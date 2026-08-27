@@ -281,6 +281,8 @@ struct WebsocketConfigPayload {
     header: std::collections::HashMap<String, String>,
     #[prost(bool, tag = "4")]
     accept_proxy_protocol: bool,
+    #[prost(uint32, tag = "6")]
+    heartbeat_period: u32,
 }
 
 #[cfg(feature = "tls")]
@@ -784,6 +786,7 @@ impl HandlerServiceImpl {
                         xray_mismatch_404: true,
                         trusted_x_forwarded_for: Vec::new(),
                         accept_proxy_protocol: websocket.accept_proxy_protocol,
+                        heartbeat_period: websocket.heartbeat_period,
                         protocol,
                     })),
                 };
@@ -1207,6 +1210,7 @@ impl HandlerServiceImpl {
                         path: target.matching_path.clone().unwrap_or_default(),
                         header: headers,
                         accept_proxy_protocol: target.accept_proxy_protocol,
+                        heartbeat_period: target.heartbeat_period,
                     },
                 );
                 let (mut stream_settings, proxy_settings) =
@@ -2885,6 +2889,7 @@ mod tests {
                                     "ignored-inbound".to_string(),
                                 )]),
                                 accept_proxy_protocol: false,
+                                heartbeat_period: 0,
                             }
                             .encode_to_vec(),
                         }),

@@ -130,6 +130,7 @@ fn websocket_server_config(
         xray_mismatch_404: true,
         trusted_x_forwarded_for,
         accept_proxy_protocol,
+        heartbeat_period: ws_setting.heartbeat_period,
         protocol,
     }
 }
@@ -3293,6 +3294,7 @@ mod tests {
                     "host": " Example.COM ",
                     "path": "/ws",
                     "acceptProxyProtocol": false,
+                    "heartbeatPeriod": 7,
                     "headers": {
                         "Host": "edge.example.com",
                         "X-Test": "ok"
@@ -3327,6 +3329,7 @@ mod tests {
                         vec!["X-Trusted-CDN".to_string()]
                     );
                     assert!(target.accept_proxy_protocol);
+                    assert_eq!(target.heartbeat_period, 7);
                 }
                 OneOrSome::Some(_) => panic!("expected one websocket target"),
             },

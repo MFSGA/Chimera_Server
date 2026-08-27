@@ -3,7 +3,10 @@ use std::task::{Context, Poll};
 
 use futures::ready;
 use rand::Rng;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    time::{Duration, Instant, Interval, MissedTickBehavior, interval_at},
+};
 use tracing::warn;
 
 use crate::async_stream::{AsyncPing, AsyncStream};
@@ -21,6 +24,8 @@ pub struct WebsocketStream {
     stream: Box<dyn AsyncStream>,
     is_client: bool,
     ping_type: WebsocketPingType,
+    heartbeat_interval: Option<Interval>,
+    heartbeat_ping_pending: bool,
     pending_initial_data: bool,
 
     read_state: ReadState,
@@ -93,6 +98,15 @@ impl WebsocketStream {
         is_client: bool,
         unprocessed_data: &[u8],
     ) -> Self {
+        Self::new_with_heartbeat(stream, is_client, unprocessed_data, 0)
+    }
+
+    pub fn new_with_heartbeat(
+        stream: Box<dyn AsyncStream>,
+        is_client: bool,
+        unprocessed_data: &[u8],
+        heartbeat_period_secs: u32,
+    ) -> Self {
         let mut unprocessed_buf = allocate_vec(16384).into_boxed_slice();
         let mut unprocessed_end_offset = 0;
         let write_frame = allocate_vec(32768).into_boxed_slice();
@@ -107,10 +121,21 @@ impl WebsocketStream {
             false
         };
 
+        let heartbeat_interval = if heartbeat_period_secs == 0 {
+            None
+        } else {
+            let period = Duration::from_secs(heartbeat_period_secs as u64);
+            let mut interval = interval_at(Instant::now() + period, period);
+            interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            Some(interval)
+        };
+
         Self {
             stream,
             is_client,
             ping_type: WebsocketPingType::PingFrame,
+            heartbeat_interval,
+            heartbeat_ping_pending: false,
             pending_initial_data,
             read_state: ReadState::Init,
             read_frame_masked: false,
@@ -678,6 +703,26 @@ impl WebsocketStream {
         Ok(self.write_frame_end_offset == 0)
     }
 
+    fn flush_heartbeat(&mut self, cx: &mut Context<'_>) -> std::io::Result<bool> {
+        if let Some(interval) = self.heartbeat_interval.as_mut()
+            && Pin::new(interval).poll_tick(cx).is_ready()
+        {
+            self.heartbeat_ping_pending = true;
+        }
+        if !self.heartbeat_ping_pending {
+            return Ok(true);
+        }
+        if !self.pack_write_ping_frame() {
+            self.do_write_frame(cx)?;
+            if self.write_frame_end_offset > 0 || !self.pack_write_ping_frame() {
+                return Ok(false);
+            }
+        }
+        self.heartbeat_ping_pending = false;
+        self.do_write_frame(cx)?;
+        Ok(self.write_frame_end_offset == 0)
+    }
+
     fn pack_write_close_frame(&mut self) -> bool {
         let normal_close = 1000u16.to_be_bytes();
         let payload: &[u8] = if self.protocol_error_pending
@@ -814,6 +859,9 @@ impl AsyncRead for WebsocketStream {
         if !this.flush_pending_pong(cx)? {
             return Poll::Pending;
         }
+        if !this.flush_heartbeat(cx)? {
+            return Poll::Pending;
+        }
 
         if this.close_received {
             if !this.close_sent {
@@ -924,6 +972,10 @@ impl AsyncWrite for WebsocketStream {
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         let this = self.get_mut();
+
+        if !this.flush_heartbeat(cx)? {
+            return Poll::Pending;
+        }
 
         if this.pending_write_pong {
             if this.pack_write_pong_frame() {
@@ -1207,6 +1259,34 @@ mod tests {
         assert_eq!(response[1] as usize, reason.len() + 2);
         assert_eq!(&response[2..4], &1002u16.to_be_bytes());
         assert_eq!(&response[4..], reason.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn server_sends_configured_heartbeat_ping_like_xray() {
+        let (mut peer, transport) = tokio::io::duplex(64);
+        let mut websocket = WebsocketStream::new_with_heartbeat(
+            Box::new(TestStream(transport)),
+            false,
+            &[],
+            1,
+        );
+
+        let reader = tokio::spawn(async move {
+            let mut application_data = [0u8; 1];
+            websocket.read(&mut application_data).await
+        });
+
+        let mut ping = [0u8; 2];
+        tokio::time::timeout(
+            Duration::from_millis(1500),
+            peer.read_exact(&mut ping),
+        )
+        .await
+        .expect("heartbeat ping should arrive within Xray's one-second period")
+        .unwrap();
+        assert_eq!(ping, [0x89, 0x00]);
+
+        reader.abort();
     }
 
     #[tokio::test]
