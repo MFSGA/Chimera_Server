@@ -387,7 +387,37 @@ fn xray_websocket_absolute_authority_has_malformed_escape(
     let rest = &request_target[scheme_end + 3..];
     let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
-    let bytes = authority.as_bytes();
+    let (userinfo, host) = authority
+        .rsplit_once('@')
+        .map_or((None, authority), |(userinfo, host)| (Some(userinfo), host));
+
+    if userinfo.is_some_and(has_malformed_percent_escape) {
+        return true;
+    }
+
+    let bytes = host.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len()
+            || decode_hex_nibble(bytes[index + 1]).is_none()
+            || decode_hex_nibble(bytes[index + 2]).is_none()
+        {
+            return true;
+        }
+        if !bytes[index + 1..index + 3].eq_ignore_ascii_case(b"25") {
+            return true;
+        }
+        index += 3;
+    }
+    false
+}
+
+fn has_malformed_percent_escape(value: &str) -> bool {
+    let bytes = value.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] != b'%' {
@@ -1151,6 +1181,8 @@ mod tests {
             "G[T / HTTP/1.1",
             "G{T / HTTP/1.1",
             "GET http://exa%ZZmple.com/ HTTP/1.1",
+            "GET http://exa%65mple.com/ HTTP/1.1",
+            "GET http://example%2Ecom/ HTTP/1.1",
             "GET http://user%ZZ@example.com/ HTTP/1.1",
         ] {
             let (result, response) =
@@ -1162,12 +1194,21 @@ mod tests {
             );
         }
 
-        let (result, response) = run_handshake(&format!(
-            "GET http://example.com/?x=%ZZ HTTP/1.1\r\n{headers}"
-        ))
-        .await;
-        assert!(result.is_ok());
-        assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+        for request_target in [
+            "http://example.com/?x=%ZZ",
+            "http://user%40name@example.com/",
+            "http://user%2Fpass@example.com/",
+        ] {
+            let (result, response) = run_handshake(&format!(
+                "GET {request_target} HTTP/1.1\r\n{headers}"
+            ))
+            .await;
+            assert!(result.is_ok(), "{request_target}");
+            assert!(
+                response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+                "{request_target}"
+            );
+        }
     }
 
     #[tokio::test]
