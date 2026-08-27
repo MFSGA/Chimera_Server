@@ -109,6 +109,14 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             }
         };
 
+        if request_headers
+            .get("host")
+            .is_some_and(|values| values.len() > 1)
+        {
+            write_xray_bad_request_line(&mut server_stream).await?;
+            return Err(std::io::Error::other("too many Host headers"));
+        }
+
         let (method, request_target) =
             match parse_xray_websocket_request_line(&first_line) {
                 Ok(parsed) => parsed,
@@ -750,6 +758,26 @@ mod tests {
         ] {
             let (result, response) =
                 run_handshake(&format!("{request_line}\r\n{headers}")).await;
+            assert!(result.is_err());
+            assert_eq!(
+                response,
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_handshake_rejects_duplicate_host_like_xray_v26_2_6() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        for hosts in [
+            "Host: example.com\r\nHost: example.com\r\n",
+            "Host: example.com\r\nHost: wrong.com\r\n",
+            "Host: wrong.com\r\nHost: example.com\r\n",
+        ] {
+            let request = format!(
+                "GET / HTTP/1.1\r\n{hosts}Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            );
+            let (result, response) = run_handshake(&request).await;
             assert!(result.is_err());
             assert_eq!(
                 response,
