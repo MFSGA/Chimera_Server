@@ -757,6 +757,7 @@ fn parse_request_target(target: &str) -> io::Result<HttpUpgradeRequestTarget<'_>
     let rest = &target[scheme_end + 3..];
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let raw_authority = &rest[..authority_end];
+    validate_absolute_authority_escapes(raw_authority)?;
     let authority = raw_authority
         .rsplit_once('@')
         .map_or(raw_authority, |(_, host)| host);
@@ -772,6 +773,28 @@ fn parse_request_target(target: &str) -> io::Result<HttpUpgradeRequestTarget<'_>
         path,
         authority: Some(authority),
     })
+}
+
+fn validate_absolute_authority_escapes(authority: &str) -> io::Result<()> {
+    let bytes = authority.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len()
+            || !(bytes[index + 1] as char).is_ascii_hexdigit()
+            || !(bytes[index + 2] as char).is_ascii_hexdigit()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid HTTPUpgrade authority escape",
+            ));
+        }
+        index += 3;
+    }
+    Ok(())
 }
 
 fn decode_request_path(target: &str) -> io::Result<String> {
@@ -1696,6 +1719,8 @@ mod tests {
             "GET http://wrong.example/upgrade HTTP/1.1",
             "GET http://example.com/wrong HTTP/1.1",
             "GET http://example.com/upgrade#fragment HTTP/1.1",
+            "GET http://exa%ZZmple.com/upgrade HTTP/1.1",
+            "GET http://user%ZZ@example.com/upgrade HTTP/1.1",
         ] {
             let handler = HttpUpgradeTcpServerHandler::new(
                 Some("example.com".into()),
