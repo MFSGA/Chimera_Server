@@ -902,6 +902,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_handshake_accepts_folded_headers_like_xray_v26_2_6() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        for request in [
+            format!(
+                "GET / HTTP/1.1\r\nHost: example.com\r\nConnection:\r\n Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            ),
+            format!(
+                "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade:\r\n websocket\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            ),
+            format!(
+                "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key:\r\n {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            ),
+        ] {
+            let (result, response) = run_handshake(&request).await;
+            assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
+            assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+        }
+
+        let orphan = format!(
+            "GET / HTTP/1.1\r\n continuation\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        let (result, response) = run_handshake(&orphan).await;
+        assert!(result.is_err());
+        assert_eq!(
+            response,
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request"
+        );
+    }
+
+    #[tokio::test]
     async fn websocket_handshake_validates_header_values_like_xray_v26_2_6() {
         let base = b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nX-Test: ";
 

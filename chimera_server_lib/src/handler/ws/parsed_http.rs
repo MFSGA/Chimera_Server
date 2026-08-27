@@ -52,6 +52,7 @@ impl ParsedHttpData {
         let mut line_reader = LineReader::new();
         let mut first_line: Option<String> = None;
         let mut headers: HashMap<String, Vec<String>> = HashMap::new();
+        let mut last_header: Option<(String, usize)> = None;
         let mut header_bytes = 0usize;
 
         loop {
@@ -80,6 +81,38 @@ impl ParsedHttpData {
                         .to_string(),
                 );
             } else {
+                if matches!(line.first(), Some(b' ' | b'\t')) {
+                    let Some((header_key, value_index)) = last_header.as_ref()
+                    else {
+                        return Err(ParsedHttpError::InvalidHeaderValue);
+                    };
+                    if !line
+                        .iter()
+                        .copied()
+                        .all(|byte| byte == b'\t' || (byte >= b' ' && byte != 0x7f))
+                    {
+                        return Err(ParsedHttpError::InvalidHeaderValue);
+                    }
+                    let start = line
+                        .iter()
+                        .position(|byte| !matches!(*byte, b' ' | b'\t'))
+                        .unwrap_or(line.len());
+                    let end = line
+                        .iter()
+                        .rposition(|byte| !matches!(*byte, b' ' | b'\t'))
+                        .map_or(start, |position| position + 1);
+                    let continuation = String::from_utf8_lossy(&line[start..end]);
+                    let value = headers
+                        .get_mut(header_key)
+                        .and_then(|values| values.get_mut(*value_index))
+                        .expect("last parsed HTTP header must still exist");
+                    if !value.is_empty() && !continuation.is_empty() {
+                        value.push(' ');
+                    }
+                    value.push_str(&continuation);
+                    continue;
+                }
+
                 let Some(colon) = line.iter().position(|byte| *byte == b':') else {
                     return Err(io::Error::other("invalid http header line").into());
                 };
@@ -115,7 +148,9 @@ impl ParsedHttpData {
                 let header_value =
                     String::from_utf8_lossy(&raw_header_value[start..end])
                         .into_owned();
-                headers.entry(header_key).or_default().push(header_value);
+                let values = headers.entry(header_key.clone()).or_default();
+                values.push(header_value);
+                last_header = Some((header_key, values.len() - 1));
             }
         }
 
