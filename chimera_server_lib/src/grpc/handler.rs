@@ -763,13 +763,12 @@ impl HandlerServiceImpl {
                         ],
                         "websocket transport settings",
                     )?;
-                let matching_headers =
-                    (!websocket.host.trim().is_empty()).then(|| {
-                        std::collections::HashMap::from([(
-                            "host".to_string(),
-                            websocket.host.trim().to_string(),
-                        )])
-                    });
+                let matching_headers = (!websocket.host.is_empty()).then(|| {
+                    std::collections::HashMap::from([(
+                        "host".to_string(),
+                        websocket.host.clone(),
+                    )])
+                });
                 protocol = ServerProxyConfig::Websocket {
                     targets: Box::new(OneOrSome::One(WebsocketServerConfig {
                         matching_path: Some(if websocket.path.is_empty() {
