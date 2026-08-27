@@ -173,8 +173,20 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             write_xray_method_not_allowed(&mut server_stream).await?;
             return Err(std::io::Error::other("websocket method is not GET"));
         }
-        let request_path = xray_websocket_request_path(request_target);
-        debug!("request path is {}", request_path);
+        let raw_request_path = websocket_request_path_raw(request_target);
+        let xray_request_path = match xray_websocket_request_path(request_target) {
+            Ok(path) => path,
+            Err(()) => {
+                write_xray_bad_request_line(&mut server_stream).await?;
+                return Err(std::io::Error::other(
+                    "malformed request target escape",
+                ));
+            }
+        };
+        debug!(
+            "request path is {}",
+            String::from_utf8_lossy(&xray_request_path)
+        );
         let websocket_key = request_headers
             .get("sec-websocket-key")
             .and_then(|values| values.first())
@@ -207,9 +219,17 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                 trusted_x_forwarded_for,
                 handler,
             } = server_target;
-            debug!("matching path is {:?} {:?}", matching_path, &request_path);
+            debug!(
+                "matching path is {:?} {:?}",
+                matching_path,
+                String::from_utf8_lossy(&xray_request_path)
+            );
             if let Some(path) = matching_path
-                && path != &request_path
+                && if *xray_mismatch_404 {
+                    path.as_bytes() != xray_request_path.as_slice()
+                } else {
+                    path != &raw_request_path
+                }
             {
                 debug!("path not match");
                 saw_xray_mismatch |= *xray_mismatch_404;
@@ -439,7 +459,7 @@ fn is_http_method_token_byte(byte: u8) -> bool {
         )
 }
 
-fn xray_websocket_request_path(request_target: &str) -> String {
+fn websocket_request_path_raw(request_target: &str) -> String {
     if let Some((_, path)) = xray_websocket_absolute_parts(request_target) {
         return path.to_string();
     }
@@ -448,6 +468,37 @@ fn xray_websocket_request_path(request_target: &str) -> String {
         .split_once('?')
         .map_or(request_target, |(path, _)| path)
         .to_string()
+}
+
+fn xray_websocket_request_path(request_target: &str) -> Result<Vec<u8>, ()> {
+    let raw = websocket_request_path_raw(request_target);
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len() {
+            return Err(());
+        }
+        let high = decode_hex_nibble(bytes[index + 1]).ok_or(())?;
+        let low = decode_hex_nibble(bytes[index + 2]).ok_or(())?;
+        decoded.push((high << 4) | low);
+        index += 3;
+    }
+    Ok(decoded)
+}
+
+fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn valid_xray_content_length(headers: &HashMap<String, Vec<String>>) -> bool {
@@ -892,31 +943,92 @@ mod tests {
     }
 
     #[test]
-    fn websocket_request_path_matches_xray_query_and_absolute_form() {
-        assert_eq!(xray_websocket_request_path("/ws"), "/ws");
-        assert_eq!(xray_websocket_request_path("/ws?foo=bar"), "/ws");
-        assert_eq!(xray_websocket_request_path("/ws?"), "/ws");
+    fn websocket_request_path_matches_xray_query_absolute_and_escape_semantics() {
+        assert_eq!(xray_websocket_request_path("/ws").unwrap(), b"/ws");
+        assert_eq!(xray_websocket_request_path("/ws?foo=bar").unwrap(), b"/ws");
+        assert_eq!(xray_websocket_request_path("/ws?").unwrap(), b"/ws");
         assert_eq!(
-            xray_websocket_request_path("http://example.com/ws?foo=bar"),
-            "/ws"
+            xray_websocket_request_path("http://example.com/ws?foo=bar").unwrap(),
+            b"/ws"
         );
         assert_eq!(
-            xray_websocket_request_path("https://example.com/ws?foo=bar"),
-            "/ws"
+            xray_websocket_request_path("https://example.com/ws?foo=bar").unwrap(),
+            b"/ws"
         );
         assert_eq!(
-            xray_websocket_request_path("ftp://example.com/ws?foo=bar"),
-            "/ws"
+            xray_websocket_request_path("ftp://example.com/ws?foo=bar").unwrap(),
+            b"/ws"
         );
         assert_eq!(
-            xray_websocket_request_path("HTTP://user@example.com/ws?foo=bar"),
-            "/ws"
+            xray_websocket_request_path("HTTP://user@example.com/ws?foo=bar")
+                .unwrap(),
+            b"/ws"
         );
         assert_eq!(
-            xray_websocket_request_path("/ws%3Ffoo=bar"),
-            "/ws%3Ffoo=bar"
+            xray_websocket_request_path("/ws%3Ffoo=bar").unwrap(),
+            b"/ws?foo=bar"
         );
-        assert_eq!(xray_websocket_request_path("/ws#frag"), "/ws#frag");
+        assert_eq!(
+            xray_websocket_request_path("/ws%2Ffoo").unwrap(),
+            b"/ws/foo"
+        );
+        assert_eq!(
+            xray_websocket_request_path("/ws%252Ffoo").unwrap(),
+            b"/ws%2Ffoo"
+        );
+        assert!(xray_websocket_request_path("/ws%ZZfoo").is_err());
+        assert_eq!(
+            xray_websocket_request_path("/ws/foo?x=%ZZ").unwrap(),
+            b"/ws/foo"
+        );
+        assert_eq!(
+            xray_websocket_request_path("/ws#frag").unwrap(),
+            b"/ws#frag"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_xray_path_matching_decodes_percent_escapes() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        for (target, expected_status) in [
+            ("/ws/foo", "101 Switching Protocols"),
+            ("/ws%2Ffoo", "101 Switching Protocols"),
+            ("/ws%252Ffoo", "404 Not Found"),
+            ("/ws%ZZfoo", "400 Bad Request"),
+            (
+                "http://example.com/ws%2Ffoo?x=%ZZ",
+                "101 Switching Protocols",
+            ),
+        ] {
+            let request = format!(
+                "GET {target} HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            );
+            let (client, mut peer) = tokio::io::duplex(8192);
+            let handler =
+                WebsocketTcpServerHandler::new(vec![WebsocketServerTarget {
+                    matching_path: Some("/ws/foo".to_string()),
+                    matching_headers: None,
+                    xray_mismatch_404: true,
+                    trusted_x_forwarded_for: Vec::new(),
+                    handler: Box::new(AcceptingInner),
+                }]);
+            let task = tokio::spawn(async move {
+                handler
+                    .setup_server_stream(Box::new(TestStream(client)))
+                    .await
+            });
+
+            peer.write_all(request.as_bytes()).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            peer.read_to_end(&mut response).await.unwrap();
+            let _ = task.await.unwrap();
+            let response = String::from_utf8(response).unwrap();
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {expected_status}\r\n")),
+                "{target}: {response:?}"
+            );
+        }
     }
 
     #[tokio::test]
