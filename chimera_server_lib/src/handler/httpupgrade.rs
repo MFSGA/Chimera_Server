@@ -402,6 +402,7 @@ fn parse_request(
     let target = parts.next().unwrap_or_default();
     let version = parts.next().unwrap_or_default();
     if method.is_empty()
+        || !method.bytes().all(is_xray_http_method_token_byte)
         || target.is_empty()
         || !is_xray_http_version(version)
         || parts.next().is_some()
@@ -621,6 +622,27 @@ fn is_invalid_http_header_name_byte(byte: u8) -> bool {
 
 fn is_invalid_http_header_value_byte(byte: u8) -> bool {
     (byte < b' ' && byte != b'\t') || byte == 0x7f
+}
+
+fn is_xray_http_method_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 fn is_xray_http_version(version: &str) -> bool {
@@ -1120,7 +1142,12 @@ mod tests {
 
     #[tokio::test]
     async fn accepts_xray_httpupgrade_methods_and_http_versions() {
-        for request_line in ["POST /upgrade HTTP/1.0", "FOO /upgrade HTTP/9.9"] {
+        for request_line in [
+            "POST /upgrade HTTP/1.0",
+            "FOO /upgrade HTTP/9.9",
+            "F~O /upgrade HTTP/1.1",
+            "F!O /upgrade HTTP/1.1",
+        ] {
             let handler = HttpUpgradeTcpServerHandler::new(
                 None,
                 "/upgrade".into(),
@@ -1159,6 +1186,15 @@ mod tests {
             "GET /upgrade  HTTP/1.1",
             "GET\t/upgrade HTTP/1.1",
             "GET /upgrade\tHTTP/1.1",
+            "F@O /upgrade HTTP/1.1",
+            "F:O /upgrade HTTP/1.1",
+            "F,O /upgrade HTTP/1.1",
+            "F/O /upgrade HTTP/1.1",
+            "F\\O /upgrade HTTP/1.1",
+            "F[O /upgrade HTTP/1.1",
+            "F]O /upgrade HTTP/1.1",
+            "F{O /upgrade HTTP/1.1",
+            "F}O /upgrade HTTP/1.1",
         ] {
             let handler = HttpUpgradeTcpServerHandler::new(
                 None,
