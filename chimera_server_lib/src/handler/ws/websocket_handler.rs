@@ -143,7 +143,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             return Err(std::io::Error::other("too many Host headers"));
         }
 
-        let (method, request_target) =
+        let (method, request_target, host_required) =
             match parse_xray_websocket_request_line(&first_line) {
                 Ok(parsed) => parsed,
                 Err(WebsocketRequestLineError::Malformed) => {
@@ -159,6 +159,16 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                     ));
                 }
             };
+        let request_host = request_headers
+            .get("host")
+            .and_then(|values| values.first())
+            .map(String::as_str);
+        if host_required && request_host.is_none() {
+            write_xray_missing_host(&mut server_stream).await?;
+            return Err(std::io::Error::other("missing required Host header"));
+        }
+        let effective_host =
+            xray_websocket_absolute_host(request_target).or(request_host);
         if method != "GET" {
             write_xray_method_not_allowed(&mut server_stream).await?;
             return Err(std::io::Error::other("websocket method is not GET"));
@@ -208,16 +218,16 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             debug!("matching headers is {:?}", matching_headers);
             if let Some(headers) = matching_headers {
                 for (header_key, header_val) in headers {
-                    let matches = request_headers
-                        .get(header_key)
-                        .and_then(|values| values.first())
-                        .is_some_and(|actual| {
-                            if *xray_mismatch_404 && header_key == "host" {
-                                xray_websocket_host_matches(actual, header_val)
-                            } else {
-                                actual == header_val
-                            }
-                        });
+                    let matches = if *xray_mismatch_404 && header_key == "host" {
+                        effective_host.is_some_and(|actual| {
+                            xray_websocket_host_matches(actual, header_val)
+                        })
+                    } else {
+                        request_headers
+                            .get(header_key)
+                            .and_then(|values| values.first())
+                            .is_some_and(|actual| actual == header_val)
+                    };
                     if !matches {
                         saw_xray_mismatch |= *xray_mismatch_404;
                         continue 'outer;
@@ -298,7 +308,7 @@ enum WebsocketRequestLineError {
 
 fn parse_xray_websocket_request_line(
     line: &str,
-) -> Result<(&str, &str), WebsocketRequestLineError> {
+) -> Result<(&str, &str, bool), WebsocketRequestLineError> {
     let (method, rest) = line
         .split_once(' ')
         .ok_or(WebsocketRequestLineError::Malformed)?;
@@ -334,7 +344,46 @@ fn parse_xray_websocket_request_line(
         return Err(WebsocketRequestLineError::UnsupportedVersion);
     }
 
-    Ok((method, request_target))
+    Ok((method, request_target, minor != "0"))
+}
+
+fn xray_websocket_absolute_parts(request_target: &str) -> Option<(&str, &str)> {
+    let scheme_end = request_target.find("://")?;
+    let scheme = &request_target[..scheme_end];
+    if scheme.is_empty()
+        || !scheme.as_bytes()[0].is_ascii_alphabetic()
+        || !scheme.bytes().skip(1).all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
+        })
+    {
+        return None;
+    }
+
+    let rest = &request_target[scheme_end + 3..];
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty() {
+        return None;
+    }
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if host.is_empty() {
+        return None;
+    }
+
+    let path = rest.get(authority_end..).and_then(|remainder| {
+        remainder.starts_with('/').then(|| {
+            remainder
+                .split_once('?')
+                .map_or(remainder, |(path, _)| path)
+        })
+    });
+    Some((host, path.unwrap_or("/")))
+}
+
+fn xray_websocket_absolute_host(request_target: &str) -> Option<&str> {
+    xray_websocket_absolute_parts(request_target).map(|(host, _)| host)
 }
 
 fn xray_websocket_host_matches(actual: &str, expected: &str) -> bool {
@@ -391,17 +440,13 @@ fn is_http_method_token_byte(byte: u8) -> bool {
 }
 
 fn xray_websocket_request_path(request_target: &str) -> String {
-    let origin_target = if let Some(rest) = request_target.strip_prefix("http://") {
-        rest.find('/').map_or("/", |path_start| &rest[path_start..])
-    } else if let Some(rest) = request_target.strip_prefix("https://") {
-        rest.find('/').map_or("/", |path_start| &rest[path_start..])
-    } else {
-        request_target
-    };
+    if let Some((_, path)) = xray_websocket_absolute_parts(request_target) {
+        return path.to_string();
+    }
 
-    origin_target
+    request_target
         .split_once('?')
-        .map_or(origin_target, |(path, _)| path)
+        .map_or(request_target, |(path, _)| path)
         .to_string()
 }
 
@@ -558,6 +603,17 @@ async fn write_xray_bad_request_line(
             b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request",
         )
         .await?;
+    stream.flush().await
+}
+
+async fn write_xray_missing_host(
+    stream: &mut Box<dyn AsyncStream>,
+) -> std::io::Result<()> {
+    const STATUS: &str = "400 Bad Request: missing required Host header";
+    let response = format!(
+        "HTTP/1.1 {STATUS}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n{STATUS}"
+    );
+    stream.write_all(response.as_bytes()).await?;
     stream.flush().await
 }
 
@@ -849,6 +905,14 @@ mod tests {
             "/ws"
         );
         assert_eq!(
+            xray_websocket_request_path("ftp://example.com/ws?foo=bar"),
+            "/ws"
+        );
+        assert_eq!(
+            xray_websocket_request_path("HTTP://user@example.com/ws?foo=bar"),
+            "/ws"
+        );
+        assert_eq!(
             xray_websocket_request_path("/ws%3Ffoo=bar"),
             "/ws%3Ffoo=bar"
         );
@@ -884,6 +948,25 @@ mod tests {
                 run_handshake(&format!("GET / {version}\r\n{headers}")).await;
             assert!(result.is_ok(), "{version}");
             assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+        }
+
+        let headers_without_host = format!(
+            "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        let (result, response) =
+            run_handshake(&format!("GET / HTTP/1.0\r\n{headers_without_host}"))
+                .await;
+        assert!(result.is_ok());
+        assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+        for version in ["HTTP/1.1", "HTTP/1.2"] {
+            let (result, response) =
+                run_handshake(&format!("GET / {version}\r\n{headers_without_host}"))
+                    .await;
+            assert!(result.is_err(), "{version}");
+            assert_eq!(
+                response,
+                "HTTP/1.1 400 Bad Request: missing required Host header\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request: missing required Host header"
+            );
         }
 
         for method in ["POST", "PUT", "G!T", "G~T"] {
@@ -1456,6 +1539,56 @@ mod tests {
                 assert!(response.ends_with("\r\n\r\n"));
             } else {
                 assert!(response.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_absolute_request_target_host_matches_xray_v26_2_6() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        for (target, host_header, expect_ok) in [
+            ("http://example.com/ws", "wrong.example", true),
+            ("ftp://example.com/ws", "wrong.example", true),
+            ("HTTP://example.com/ws", "wrong.example", true),
+            ("http://user@example.com/ws", "wrong.example", true),
+            ("http://wrong.example/ws", "example.com", false),
+        ] {
+            let request = format!(
+                "GET {target} HTTP/1.1\r\nHost: {host_header}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            );
+            let (client, mut peer) = tokio::io::duplex(8192);
+            let handler =
+                WebsocketTcpServerHandler::new(vec![WebsocketServerTarget {
+                    matching_path: Some("/ws".to_string()),
+                    matching_headers: Some(HashMap::from([(
+                        "host".to_string(),
+                        "example.com".to_string(),
+                    )])),
+                    xray_mismatch_404: true,
+                    trusted_x_forwarded_for: Vec::new(),
+                    handler: Box::new(AcceptingInner),
+                }]);
+            let task = tokio::spawn(async move {
+                handler
+                    .setup_server_stream(Box::new(TestStream(client)))
+                    .await
+            });
+
+            peer.write_all(request.as_bytes()).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            peer.read_to_end(&mut response).await.unwrap();
+            let result = task.await.unwrap();
+            let response = String::from_utf8(response).unwrap();
+            if expect_ok {
+                assert!(result.is_ok(), "{target}");
+                assert!(
+                    response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+                    "{target}"
+                );
+            } else {
+                assert!(result.is_err(), "{target}");
+                assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
             }
         }
     }
