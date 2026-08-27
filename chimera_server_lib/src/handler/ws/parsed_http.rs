@@ -9,6 +9,7 @@ pub enum ParsedHttpError {
     Io(io::Error),
     HeaderTooLarge,
     InvalidHeaderName { trailing_space: bool },
+    InvalidHeaderValue,
 }
 
 impl From<io::Error> for ParsedHttpError {
@@ -54,7 +55,7 @@ impl ParsedHttpData {
         let mut header_bytes = 0usize;
 
         loop {
-            let line = line_reader.read_line(stream).await?;
+            let line = line_reader.read_line_bytes(stream).await?;
             // Xray v26.2.6 configures net/http MaxHeaderBytes=8192. Go's
             // HTTP/1 server adds 4096 bytes of read slop, and that budget
             // includes the request line and terminating CRLF. Do not impose
@@ -68,29 +69,52 @@ impl ParsedHttpData {
             }
 
             if first_line.is_none() {
-                first_line = Some(line.to_string());
+                first_line = Some(
+                    std::str::from_utf8(line)
+                        .map_err(|error| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("Failed to decode utf8: {error}"),
+                            )
+                        })?
+                        .to_string(),
+                );
             } else {
-                let tokens: Vec<&str> = line.splitn(2, ':').collect();
-                if tokens.len() != 2 {
-                    return Err(std::io::Error::other(format!(
-                        "invalid http request line: {}",
-                        line
-                    ))
-                    .into());
-                }
-                let raw_header_key = tokens[0];
-                if !raw_header_key
-                    .as_bytes()
-                    .iter()
-                    .copied()
-                    .all(is_http_token_byte)
-                {
+                let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+                    return Err(io::Error::other("invalid http header line").into());
+                };
+                let raw_header_key = &line[..colon];
+                if !raw_header_key.iter().copied().all(is_http_token_byte) {
                     return Err(ParsedHttpError::InvalidHeaderName {
-                        trailing_space: raw_header_key.ends_with(' '),
+                        trailing_space: raw_header_key.ends_with(b" "),
                     });
                 }
-                let header_key = raw_header_key.to_ascii_lowercase();
-                let header_value = tokens[1].trim().to_string();
+                let header_key = std::str::from_utf8(raw_header_key)
+                    .expect("validated HTTP token is ASCII")
+                    .to_ascii_lowercase();
+                let raw_header_value = &line[colon + 1..];
+                if !raw_header_value
+                    .iter()
+                    .copied()
+                    .all(|byte| byte == b'\t' || (byte >= b' ' && byte != 0x7f))
+                {
+                    return Err(ParsedHttpError::InvalidHeaderValue);
+                }
+                let start = raw_header_value
+                    .iter()
+                    .position(|byte| !matches!(*byte, b' ' | b'\t'))
+                    .unwrap_or(raw_header_value.len());
+                let end = raw_header_value
+                    .iter()
+                    .rposition(|byte| !matches!(*byte, b' ' | b'\t'))
+                    .map_or(start, |position| position + 1);
+                // Go header values are byte strings and permit obs-text. Rust's
+                // String cannot preserve arbitrary invalid UTF-8, but lossy
+                // decoding keeps ASCII protocol tokens exact while accepting
+                // the same wire bytes instead of rejecting the request early.
+                let header_value =
+                    String::from_utf8_lossy(&raw_header_value[start..end])
+                        .into_owned();
                 headers.entry(header_key).or_default().push(header_value);
             }
         }
