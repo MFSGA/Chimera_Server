@@ -118,6 +118,10 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             write_xray_unsupported_transfer_encoding(&mut server_stream).await?;
             return Err(std::io::Error::other("unsupported transfer encoding"));
         }
+        if !valid_xray_chunked_trailers(&request_headers) {
+            write_xray_bad_request_line(&mut server_stream).await?;
+            return Err(std::io::Error::other("invalid chunked trailer"));
+        }
 
         if request_headers
             .get("host")
@@ -353,6 +357,22 @@ fn valid_xray_transfer_encoding(headers: &HashMap<String, Vec<String>>) -> bool 
             values.len() == 1 && values[0].eq_ignore_ascii_case("chunked")
         }
     }
+}
+
+fn valid_xray_chunked_trailers(headers: &HashMap<String, Vec<String>>) -> bool {
+    if !headers.contains_key("transfer-encoding") {
+        return true;
+    }
+
+    headers.get("trailer").is_none_or(|values| {
+        values.iter().all(|value| {
+            value.split(',').map(str::trim).all(|key| {
+                !key.eq_ignore_ascii_case("content-length")
+                    && !key.eq_ignore_ascii_case("transfer-encoding")
+                    && !key.eq_ignore_ascii_case("trailer")
+            })
+        })
+    })
 }
 
 fn header_contains_token(
@@ -905,6 +925,42 @@ mod tests {
             assert_eq!(
                 response,
                 "HTTP/1.1 501 Not Implemented\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\nUnsupported transfer encoding"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_handshake_validates_chunked_trailers_like_xray_v26_2_6() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let base = format!(
+            "GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
+        );
+
+        for trailers in [
+            "Trailer: Content-Length\r\n",
+            "Transfer-Encoding: chunked\r\nTrailer: X-Foo\r\n",
+            "Transfer-Encoding: chunked\r\nTrailer: Host\r\n",
+            "Transfer-Encoding: chunked\r\nTrailer: X-Foo, X-Bar\r\n",
+        ] {
+            let (result, response) =
+                run_handshake(&format!("{base}{trailers}\r\n")).await;
+            assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
+            assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+        }
+
+        for trailers in [
+            "Transfer-Encoding: chunked\r\nTrailer: Content-Length\r\n",
+            "Transfer-Encoding: chunked\r\nTrailer: Transfer-Encoding\r\n",
+            "Transfer-Encoding: chunked\r\nTrailer: Trailer\r\n",
+            "Transfer-Encoding: chunked\r\nTrailer: X-Foo, Content-Length\r\n",
+            "Transfer-Encoding: chunked\r\nTrailer: X-Foo\r\nTrailer: Content-Length\r\n",
+        ] {
+            let (result, response) =
+                run_handshake(&format!("{base}{trailers}\r\n")).await;
+            assert!(result.is_err());
+            assert_eq!(
+                response,
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request"
             );
         }
     }
