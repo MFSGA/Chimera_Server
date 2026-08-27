@@ -300,9 +300,9 @@ fn parse_xray_websocket_request_line(
         .split_once(' ')
         .ok_or(WebsocketRequestLineError::Malformed)?;
     if method.is_empty()
+        || !method.bytes().all(is_http_method_token_byte)
         || request_target.is_empty()
         || version.is_empty()
-        || method.bytes().any(|byte| byte.is_ascii_whitespace())
         || request_target
             .bytes()
             .any(|byte| byte.is_ascii_whitespace())
@@ -329,6 +329,27 @@ fn parse_xray_websocket_request_line(
     }
 
     Ok((method, request_target))
+}
+
+fn is_http_method_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 fn xray_websocket_request_path(request_target: &str) -> String {
@@ -826,7 +847,7 @@ mod tests {
             assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
         }
 
-        for method in ["POST", "PUT"] {
+        for method in ["POST", "PUT", "G!T", "G~T"] {
             let (result, response) =
                 run_handshake(&format!("{method} / HTTP/1.1\r\n{headers}")).await;
             assert!(result.is_err());
@@ -850,6 +871,13 @@ mod tests {
             "GET / HTTP/1.10",
             "GET / HTTP/01.1",
             "GET / HTTP/1.01",
+            "G@T / HTTP/1.1",
+            "G:T / HTTP/1.1",
+            "G,T / HTTP/1.1",
+            "G/T / HTTP/1.1",
+            "G\\T / HTTP/1.1",
+            "G[T / HTTP/1.1",
+            "G{T / HTTP/1.1",
         ] {
             let (result, response) =
                 run_handshake(&format!("{request_line}\r\n{headers}")).await;
