@@ -114,6 +114,11 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             return Err(std::io::Error::other("invalid Content-Length header"));
         }
 
+        if !valid_xray_transfer_encoding(&request_headers) {
+            write_xray_unsupported_transfer_encoding(&mut server_stream).await?;
+            return Err(std::io::Error::other("unsupported transfer encoding"));
+        }
+
         if request_headers
             .get("host")
             .is_some_and(|values| values.len() > 1)
@@ -341,6 +346,15 @@ fn valid_xray_content_length(headers: &HashMap<String, Vec<String>>) -> bool {
     values.iter().skip(1).all(|value| value == first)
 }
 
+fn valid_xray_transfer_encoding(headers: &HashMap<String, Vec<String>>) -> bool {
+    match headers.get("transfer-encoding") {
+        None => true,
+        Some(values) => {
+            values.len() == 1 && values[0].eq_ignore_ascii_case("chunked")
+        }
+    }
+}
+
 fn header_contains_token(
     headers: &HashMap<String, Vec<String>>,
     name: &str,
@@ -451,6 +465,17 @@ async fn write_xray_bad_request_line(
     stream
         .write_all(
             b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request",
+        )
+        .await?;
+    stream.flush().await
+}
+
+async fn write_xray_unsupported_transfer_encoding(
+    stream: &mut Box<dyn AsyncStream>,
+) -> std::io::Result<()> {
+    stream
+        .write_all(
+            b"HTTP/1.1 501 Not Implemented\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\nUnsupported transfer encoding",
         )
         .await?;
     stream.flush().await
@@ -843,6 +868,43 @@ mod tests {
             assert_eq!(
                 response,
                 "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_handshake_validates_transfer_encoding_like_xray_v26_2_6() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let base = format!(
+            "GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
+        );
+
+        for transfer_encoding in [
+            "",
+            "Transfer-Encoding: chunked\r\n",
+            "Transfer-Encoding: Chunked\r\n",
+            "Content-Length: 0\r\nTransfer-Encoding: chunked\r\n",
+        ] {
+            let (result, response) =
+                run_handshake(&format!("{base}{transfer_encoding}\r\n")).await;
+            assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
+            assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+        }
+
+        for transfer_encoding in [
+            "Transfer-Encoding:\r\n",
+            "Transfer-Encoding: identity\r\n",
+            "Transfer-Encoding: gzip\r\n",
+            "Transfer-Encoding: chunked;foo\r\n",
+            "Transfer-Encoding: gzip, chunked\r\n",
+            "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n",
+        ] {
+            let (result, response) =
+                run_handshake(&format!("{base}{transfer_encoding}\r\n")).await;
+            assert!(result.is_err());
+            assert_eq!(
+                response,
+                "HTTP/1.1 501 Not Implemented\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\nUnsupported transfer encoding"
             );
         }
     }
