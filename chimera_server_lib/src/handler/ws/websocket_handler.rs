@@ -343,6 +343,7 @@ fn parse_xray_websocket_request_line(
             .bytes()
             .any(|byte| byte.is_ascii_whitespace())
         || version.bytes().any(|byte| byte.is_ascii_whitespace())
+        || xray_websocket_absolute_authority_has_malformed_escape(request_target)
     {
         return Err(WebsocketRequestLineError::Malformed);
     }
@@ -365,6 +366,43 @@ fn parse_xray_websocket_request_line(
     }
 
     Ok((method, request_target, minor != "0"))
+}
+
+fn xray_websocket_absolute_authority_has_malformed_escape(
+    request_target: &str,
+) -> bool {
+    let Some(scheme_end) = request_target.find("://") else {
+        return false;
+    };
+    let scheme = &request_target[..scheme_end];
+    if scheme.is_empty()
+        || !scheme.as_bytes()[0].is_ascii_alphabetic()
+        || !scheme.bytes().skip(1).all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
+        })
+    {
+        return false;
+    }
+
+    let rest = &request_target[scheme_end + 3..];
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let bytes = authority.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len()
+            || decode_hex_nibble(bytes[index + 1]).is_none()
+            || decode_hex_nibble(bytes[index + 2]).is_none()
+        {
+            return true;
+        }
+        index += 3;
+    }
+    false
 }
 
 fn xray_websocket_absolute_parts(request_target: &str) -> Option<(&str, &str)> {
@@ -1112,6 +1150,8 @@ mod tests {
             "G\\T / HTTP/1.1",
             "G[T / HTTP/1.1",
             "G{T / HTTP/1.1",
+            "GET http://exa%ZZmple.com/ HTTP/1.1",
+            "GET http://user%ZZ@example.com/ HTTP/1.1",
         ] {
             let (result, response) =
                 run_handshake(&format!("{request_line}\r\n{headers}")).await;
@@ -1121,6 +1161,13 @@ mod tests {
                 "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request"
             );
         }
+
+        let (result, response) = run_handshake(&format!(
+            "GET http://example.com/?x=%ZZ HTTP/1.1\r\n{headers}"
+        ))
+        .await;
+        assert!(result.is_ok());
+        assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
     }
 
     #[tokio::test]
