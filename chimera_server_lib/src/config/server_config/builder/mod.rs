@@ -101,10 +101,7 @@ fn websocket_server_config(
     trusted_x_forwarded_for: Vec<String>,
     protocol: ServerProxyConfig,
 ) -> WebsocketServerConfig {
-    let mut host = ws_setting
-        .host
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    let mut host = ws_setting.host.filter(|value| !value.is_empty());
 
     if host.is_none() {
         for (key, value) in ws_setting.headers {
@@ -3286,7 +3283,7 @@ mod tests {
             "streamSettings": {
                 "network": "ws",
                 "wsSettings": {
-                    "host": "example.com",
+                    "host": " Example.COM ",
                     "path": "/ws",
                     "headers": {
                         "Host": "edge.example.com",
@@ -3312,7 +3309,7 @@ mod tests {
                         .expect("websocket host should be preserved");
                     assert_eq!(
                         headers.get("host"),
-                        Some(&"example.com".to_string())
+                        Some(&" Example.COM ".to_string())
                     );
                     assert!(!headers.contains_key("x-test"));
                     assert!(!headers.contains_key("Host"));

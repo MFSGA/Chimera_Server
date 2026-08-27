@@ -208,11 +208,17 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             debug!("matching headers is {:?}", matching_headers);
             if let Some(headers) = matching_headers {
                 for (header_key, header_val) in headers {
-                    if request_headers
+                    let matches = request_headers
                         .get(header_key)
                         .and_then(|values| values.first())
-                        != Some(header_val)
-                    {
+                        .is_some_and(|actual| {
+                            if *xray_mismatch_404 && header_key == "host" {
+                                xray_websocket_host_matches(actual, header_val)
+                            } else {
+                                actual == header_val
+                            }
+                        });
+                    if !matches {
                         saw_xray_mismatch |= *xray_mismatch_404;
                         continue 'outer;
                     }
@@ -329,6 +335,38 @@ fn parse_xray_websocket_request_line(
     }
 
     Ok((method, request_target))
+}
+
+fn xray_websocket_host_matches(actual: &str, expected: &str) -> bool {
+    let actual = xray_unicode_lowercase(actual);
+    let expected = xray_unicode_lowercase(expected);
+    if !actual.contains(':') {
+        return actual == expected;
+    }
+
+    split_http_host_port(&actual).is_some_and(|host| host == expected)
+}
+
+fn xray_unicode_lowercase(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| ch.to_lowercase().next().unwrap_or(ch))
+        .collect()
+}
+
+fn split_http_host_port(authority: &str) -> Option<&str> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let closing = rest.find(']')?;
+        let host = &rest[..closing];
+        let suffix = &rest[closing + 1..];
+        return (suffix.starts_with(':') && !suffix[1..].contains(':'))
+            .then_some(host);
+    }
+
+    let mut parts = authority.split(':');
+    let host = parts.next()?;
+    parts.next()?;
+    parts.next().is_none().then_some(host)
 }
 
 fn is_http_method_token_byte(byte: u8) -> bool {
@@ -623,7 +661,8 @@ mod tests {
 
     use super::{
         WebsocketServerTarget, WebsocketTcpServerHandler,
-        XRAY_WEBSOCKET_HANDSHAKE_TIMEOUT, xray_websocket_request_path,
+        XRAY_WEBSOCKET_HANDSHAKE_TIMEOUT, xray_websocket_host_matches,
+        xray_websocket_request_path,
     };
 
     struct TestStream(DuplexStream);
@@ -1419,6 +1458,19 @@ mod tests {
                 assert!(response.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn websocket_xray_host_matching_matches_xray_v26_2_6() {
+        assert!(xray_websocket_host_matches("example.com", "example.com"));
+        assert!(xray_websocket_host_matches("EXAMPLE.COM", "example.com"));
+        assert!(xray_websocket_host_matches(
+            "example.com:443",
+            "example.com"
+        ));
+        assert!(xray_websocket_host_matches("[::1]:443", "::1"));
+        assert!(!xray_websocket_host_matches("example.com", " Example.COM "));
+        assert!(!xray_websocket_host_matches("[::1]", "::1"));
     }
 
     #[tokio::test]
