@@ -387,16 +387,16 @@ fn http_header_end(header: &[u8]) -> Option<usize> {
 fn parse_request(
     request: &[u8],
 ) -> io::Result<(&str, &str, &str, HashMap<String, String>)> {
-    let request = std::str::from_utf8(request).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid HTTPUpgrade header encoding: {error}"),
-        )
-    })?;
     let mut lines = request
-        .split('\n')
-        .map(|line| line.strip_suffix('\r').unwrap_or(line));
-    let request_line = lines.next().unwrap_or_default();
+        .split(|byte| *byte == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line));
+    let request_line = std::str::from_utf8(lines.next().unwrap_or_default())
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid HTTPUpgrade request line encoding: {error}"),
+            )
+        })?;
     let mut parts = request_line.split(' ');
     let method = parts.next().unwrap_or_default();
     let target = parts.next().unwrap_or_default();
@@ -427,21 +427,27 @@ fn parse_request(
         if line.is_empty() {
             break;
         }
-        if line.starts_with([' ', '\t']) {
+        if line.starts_with(b" ") || line.starts_with(b"\t") {
+            if line.iter().copied().any(is_invalid_http_header_value_byte) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid HTTPUpgrade header value",
+                ));
+            }
             let Some(target) = continuation_target.as_ref() else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "invalid HTTPUpgrade header continuation",
                 ));
             };
-            let continuation = line.trim();
+            let continuation = String::from_utf8_lossy(line).trim().to_string();
             match target {
                 ContinuationTarget::Header(name, keep_value) => {
                     if *keep_value && let Some(value) = headers.get_mut(name) {
                         if !value.is_empty() && !continuation.is_empty() {
                             value.push(' ');
                         }
-                        value.push_str(continuation);
+                        value.push_str(&continuation);
                     }
                 }
                 ContinuationTarget::ContentLength => {
@@ -449,7 +455,7 @@ fn parse_request(
                         if !value.is_empty() && !continuation.is_empty() {
                             value.push(' ');
                         }
-                        value.push_str(continuation);
+                        value.push_str(&continuation);
                     }
                 }
                 ContinuationTarget::TransferEncoding => {
@@ -457,7 +463,7 @@ fn parse_request(
                         if !value.is_empty() && !continuation.is_empty() {
                             value.push(' ');
                         }
-                        value.push_str(continuation);
+                        value.push_str(&continuation);
                     }
                 }
                 ContinuationTarget::Trailer => {
@@ -465,30 +471,38 @@ fn parse_request(
                         if !value.is_empty() && !continuation.is_empty() {
                             value.push(' ');
                         }
-                        value.push_str(continuation);
+                        value.push_str(&continuation);
                     }
                 }
             }
             continue;
         }
-        let Some((name, value)) = line.split_once(':') else {
+        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid HTTPUpgrade header line",
             ));
         };
+        let (name, value) = (&line[..colon], &line[colon + 1..]);
+        let name = std::str::from_utf8(name).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid HTTPUpgrade header name encoding: {error}"),
+            )
+        })?;
         if name.is_empty() || name.bytes().any(is_invalid_http_header_name_byte) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid HTTPUpgrade header name",
             ));
         }
-        if value.bytes().any(is_invalid_http_header_value_byte) {
+        if value.iter().copied().any(is_invalid_http_header_value_byte) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid HTTPUpgrade header value",
             ));
         }
+        let value = String::from_utf8_lossy(value);
         let name = name.to_ascii_lowercase();
         if name == "content-length" {
             content_lengths.push(value.trim().to_string());
@@ -1514,6 +1528,8 @@ mod tests {
             b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection:\r\n Upgrade\r\nUpgrade: websocket\r\n\r\n".as_slice(),
             b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade:\r\n websocket\r\n\r\n".as_slice(),
             b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nBad Header: ok\r\nX-Test: a\tb\r\n\r\n".as_slice(),
+            b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nX-Test: \xff\r\n\r\n".as_slice(),
+            b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nX-Test: \x80\r\n\r\n".as_slice(),
             b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nConnection: nope\r\n more\r\nUpgrade: websocket\r\n\r\n".as_slice(),
             b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nUpgrade: nope\r\n more\r\n\r\n".as_slice(),
         ] {
