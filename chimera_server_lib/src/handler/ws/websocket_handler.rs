@@ -109,6 +109,11 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             }
         };
 
+        if !valid_xray_content_length(&request_headers) {
+            write_xray_bad_request_line(&mut server_stream).await?;
+            return Err(std::io::Error::other("invalid Content-Length header"));
+        }
+
         if request_headers
             .get("host")
             .is_some_and(|values| values.len() > 1)
@@ -318,6 +323,22 @@ fn xray_websocket_request_path(request_target: &str) -> String {
         .split_once('?')
         .map_or(origin_target, |(path, _)| path)
         .to_string()
+}
+
+fn valid_xray_content_length(headers: &HashMap<String, Vec<String>>) -> bool {
+    let Some(values) = headers.get("content-length") else {
+        return true;
+    };
+    let Some(first) = values.first() else {
+        return false;
+    };
+    if first.is_empty()
+        || !first.bytes().all(|byte| byte.is_ascii_digit())
+        || first.parse::<i64>().is_err()
+    {
+        return false;
+    }
+    values.iter().skip(1).all(|value| value == first)
 }
 
 fn header_contains_token(
@@ -778,6 +799,46 @@ mod tests {
                 "GET / HTTP/1.1\r\n{hosts}Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
             );
             let (result, response) = run_handshake(&request).await;
+            assert!(result.is_err());
+            assert_eq!(
+                response,
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_handshake_validates_content_length_like_xray_v26_2_6() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let base = format!(
+            "GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
+        );
+
+        for content_length in [
+            "Content-Length: 0\r\n",
+            "Content-Length: 00\r\n",
+            "Content-Length: 0\r\nContent-Length: 0\r\n",
+            "Content-Length:   0  \r\nContent-Length:\t0\t\r\n",
+            "Content-Length: 9223372036854775807\r\n",
+        ] {
+            let (result, response) =
+                run_handshake(&format!("{base}{content_length}\r\n")).await;
+            assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
+            assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+        }
+
+        for content_length in [
+            "Content-Length:\r\n",
+            "Content-Length: nope\r\n",
+            "Content-Length: +0\r\n",
+            "Content-Length: -0\r\n",
+            "Content-Length: 0, 0\r\n",
+            "Content-Length: 0\r\nContent-Length: 00\r\n",
+            "Content-Length: 0\r\nContent-Length: 1\r\n",
+            "Content-Length: 9223372036854775808\r\n",
+        ] {
+            let (result, response) =
+                run_handshake(&format!("{base}{content_length}\r\n")).await;
             assert!(result.is_err());
             assert_eq!(
                 response,
