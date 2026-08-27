@@ -618,7 +618,7 @@ fn validate_content_length(value: &str) -> io::Result<()> {
 }
 
 fn is_invalid_http_header_name_byte(byte: u8) -> bool {
-    byte <= 0x1f || byte == 0x7f
+    !byte.is_ascii() || byte <= 0x1f || byte == 0x7f
 }
 
 fn is_invalid_http_header_value_byte(byte: u8) -> bool {
@@ -1293,6 +1293,24 @@ mod tests {
             );
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         }
+    }
+
+    #[test]
+    fn rejects_non_ascii_header_names_like_xray_v26_2_6() {
+        for name in ["X-Ä", "X-é"] {
+            let request = format!(
+                "GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n{name}: ok\r\n\r\n"
+            );
+            let error = super::parse_request(request.as_bytes()).expect_err(
+                "Xray http.ReadRequest rejects non-ASCII MIME header names",
+            );
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+
+        super::parse_request(
+            b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nX Foo: ok\r\n\r\n",
+        )
+        .expect("Xray v26.2.6 still accepts an ASCII space in an unrelated header name");
     }
 
     #[tokio::test]
