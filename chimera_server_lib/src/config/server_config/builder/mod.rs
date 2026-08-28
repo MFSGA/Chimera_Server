@@ -182,8 +182,7 @@ fn websocket_server_config(
 
     if host.is_none() {
         for (key, value) in ws_setting.headers {
-            if key.trim().eq_ignore_ascii_case("host") {
-                let value = value.trim().to_string();
+            if key.eq_ignore_ascii_case("host") {
                 if !value.is_empty() {
                     host = Some(value);
                 }
@@ -3440,5 +3439,58 @@ mod tests {
             },
             other => panic!("expected websocket protocol, got {other:?}"),
         }
+    }
+
+    #[cfg(all(feature = "vless", feature = "ws"))]
+    #[test]
+    fn websocket_deprecated_header_host_preserves_xray_text_semantics() {
+        fn matching_host(headers: serde_json::Value) -> Option<String> {
+            let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+                "listen": "127.0.0.1",
+                "port": 10005,
+                "protocol": "vless",
+                "tag": "vless-ws-header-fallback",
+                "settings": {
+                    "clients": [{
+                        "id": "3ac9b383-75a1-431c-8184-106c80eb2273"
+                    }],
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "ws",
+                    "wsSettings": {
+                        "path": "/ws",
+                        "headers": headers
+                    }
+                }
+            }))
+            .expect("valid vless websocket inbound item");
+
+            let config = ServerConfig::try_from(inbound)
+                .expect("vless websocket inbound config should build");
+            let ServerProxyConfig::Websocket { targets } = config.protocol else {
+                panic!("expected websocket protocol");
+            };
+            let OneOrSome::One(target) = *targets else {
+                panic!("expected one websocket target");
+            };
+            target
+                .matching_headers
+                .and_then(|headers| headers.get("host").cloned())
+        }
+
+        assert_eq!(
+            matching_host(serde_json::json!({"Host": " Example.COM "})),
+            Some(" Example.COM ".to_string())
+        );
+        assert_eq!(
+            matching_host(serde_json::json!({"hOsT": "example.com"})),
+            Some("example.com".to_string())
+        );
+        assert_eq!(
+            matching_host(serde_json::json!({" Host ": "example.com"})),
+            None
+        );
+        assert_eq!(matching_host(serde_json::json!({"Host": ""})), None);
     }
 }
