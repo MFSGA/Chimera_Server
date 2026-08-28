@@ -193,8 +193,8 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             write_xray_missing_host(&mut server_stream).await?;
             return Err(std::io::Error::other("missing required Host header"));
         }
-        let effective_host =
-            xray_websocket_absolute_host(request_target).or(request_host);
+        let absolute_host = xray_websocket_absolute_host(request_target);
+        let effective_host = absolute_host.as_deref().or(request_host);
         if method != "GET" {
             write_xray_method_not_allowed(&mut server_stream).await?;
             return Err(std::io::Error::other("websocket method is not GET"));
@@ -487,6 +487,7 @@ fn xray_websocket_absolute_authority_has_malformed_escape(
         };
         let decoded = high << 4 | low;
         if !bytes[index + 1..index + 3].eq_ignore_ascii_case(b"25")
+            && decoded.is_ascii()
             && !zone_start.is_some_and(|start| {
                 index >= start && xray_websocket_zone_escape_allowed(decoded)
             })
@@ -715,10 +716,32 @@ fn xray_websocket_absolute_parts(request_target: &str) -> Option<(&str, &str)> {
     Some((host, path.unwrap_or("")))
 }
 
-fn xray_websocket_absolute_host(request_target: &str) -> Option<&str> {
-    xray_websocket_absolute_parts(request_target)
-        .map(|(host, _)| host)
-        .filter(|host| !host.is_empty())
+fn xray_websocket_absolute_host(request_target: &str) -> Option<String> {
+    let (host, _) = xray_websocket_absolute_parts(request_target)?;
+    if host.is_empty() {
+        return None;
+    }
+
+    let bytes = host.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let Some(high) = decode_hex_nibble(bytes[index + 1]) else {
+                return Some(host.to_string());
+            };
+            let Some(low) = decode_hex_nibble(bytes[index + 2]) else {
+                return Some(host.to_string());
+            };
+            decoded.push(high << 4 | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+
+    Some(String::from_utf8_lossy(&decoded).into_owned())
 }
 
 fn xray_websocket_host_matches(actual: &str, expected: &str) -> bool {
@@ -1809,6 +1832,8 @@ mod tests {
             "http://[fe80::1%25eth%5D]/",
             "http://[fe80::1%25eth%3A]/",
             "http://[fe80::1%25eth%20]/",
+            "http://exam%C3%A9ple.com/",
+            "http://exam%FFple.com/",
         ] {
             let (result, response) = run_handshake(&format!(
                 "GET {request_target} HTTP/1.1\r\n{headers}"
@@ -2368,12 +2393,44 @@ mod tests {
     #[tokio::test]
     async fn websocket_absolute_request_target_host_matches_xray_v26_2_6() {
         let key = "dGhlIHNhbXBsZSBub25jZQ==";
-        for (target, host_header, expect_ok) in [
-            ("http://example.com/ws", "wrong.example", true),
-            ("ftp://example.com/ws", "wrong.example", true),
-            ("HTTP://example.com/ws", "wrong.example", true),
-            ("http://user@example.com/ws", "wrong.example", true),
-            ("http://wrong.example/ws", "example.com", false),
+        for (target, host_header, configured_host, expect_ok) in [
+            (
+                "http://example.com/ws",
+                "wrong.example",
+                "example.com",
+                true,
+            ),
+            ("ftp://example.com/ws", "wrong.example", "example.com", true),
+            (
+                "HTTP://example.com/ws",
+                "wrong.example",
+                "example.com",
+                true,
+            ),
+            (
+                "http://user@example.com/ws",
+                "wrong.example",
+                "example.com",
+                true,
+            ),
+            (
+                "http://wrong.example/ws",
+                "example.com",
+                "example.com",
+                false,
+            ),
+            (
+                "http://exam%C3%A9ple.com/ws",
+                "wrong.example",
+                "examéple.com",
+                true,
+            ),
+            (
+                "http://exam%FFple.com/ws",
+                "wrong.example",
+                "exam�ple.com",
+                true,
+            ),
         ] {
             let request = format!(
                 "GET {target} HTTP/1.1\r\nHost: {host_header}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
@@ -2384,7 +2441,7 @@ mod tests {
                     matching_path: Some("/ws".to_string()),
                     matching_headers: Some(HashMap::from([(
                         "host".to_string(),
-                        "example.com".to_string(),
+                        configured_host.to_string(),
                     )])),
                     xray_mismatch_404: true,
                     trusted_x_forwarded_for: Vec::new(),
