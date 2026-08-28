@@ -183,86 +183,62 @@ impl WebsocketStream {
 
         let read_frame_final = first & 0x80 != 0;
 
-        let reserved_bits = first & 0x70;
-        if reserved_bits != 0 {
-            let reason = match reserved_bits {
-                0x40 => "RSV1 set",
-                0x20 => "RSV2 set",
-                0x10 => "RSV3 set",
-                0x60 => "RSV1 set, RSV2 set",
-                0x50 => "RSV1 set, RSV3 set",
-                0x30 => "RSV2 set, RSV3 set",
-                0x70 => "RSV1 set, RSV2 set, RSV3 set",
-                _ => unreachable!(),
-            };
-            self.queue_protocol_error(reason)?;
-            return Err(std::io::Error::other(format!("websocket: {reason}")));
+        let mut header_errors = Vec::new();
+        if first & 0x40 != 0 {
+            header_errors.push("RSV1 set".to_string());
+        }
+        if first & 0x20 != 0 {
+            header_errors.push("RSV2 set".to_string());
+        }
+        if first & 0x10 != 0 {
+            header_errors.push("RSV3 set".to_string());
+        }
+
+        self.read_frame_opcode = OpCode::from(first & 0x0f);
+        let length = second & 0x7f;
+        match self.read_frame_opcode {
+            OpCode::Close | OpCode::Ping | OpCode::Pong => {
+                if length > 125 {
+                    header_errors.push("len > 125 for control".to_string());
+                }
+                if !read_frame_final {
+                    header_errors.push("FIN not set on control".to_string());
+                }
+            }
+            OpCode::Text | OpCode::Binary => {
+                if self.read_message_fragmented {
+                    header_errors.push("data before FIN".to_string());
+                }
+            }
+            OpCode::Continue => {
+                if !self.read_message_fragmented {
+                    header_errors.push("continuation after FIN".to_string());
+                }
+            }
+            OpCode::Unknown(code) => {
+                header_errors.push(format!("bad opcode {code}"));
+            }
         }
 
         self.read_frame_masked = second & 0x80 != 0;
         if self.read_frame_masked == self.is_client {
-            self.queue_protocol_error("bad MASK")?;
-            return Err(std::io::Error::other("websocket: bad MASK"));
+            header_errors.push("bad MASK".to_string());
         }
 
-        self.read_frame_opcode = OpCode::from(first & 0x0f);
-        if let OpCode::Unknown(code) = self.read_frame_opcode {
-            let reason = match code {
-                3 => "bad opcode 3",
-                4 => "bad opcode 4",
-                5 => "bad opcode 5",
-                6 => "bad opcode 6",
-                7 => "bad opcode 7",
-                11 => "bad opcode 11",
-                12 => "bad opcode 12",
-                13 => "bad opcode 13",
-                14 => "bad opcode 14",
-                15 => "bad opcode 15",
-                _ => unreachable!(),
-            };
-            self.queue_protocol_error(reason)?;
+        if !header_errors.is_empty() {
+            let reason = header_errors.join(", ");
+            self.queue_protocol_error(&reason)?;
             return Err(std::io::Error::other(format!("websocket: {reason}")));
-        }
-
-        let is_control = matches!(
-            self.read_frame_opcode,
-            OpCode::Close | OpCode::Ping | OpCode::Pong
-        );
-        if is_control && !read_frame_final {
-            self.queue_protocol_error("FIN not set on control")?;
-            return Err(std::io::Error::other("websocket: FIN not set on control"));
-        }
-
-        let length = second & 0x7f;
-        if is_control && length > 125 {
-            self.queue_protocol_error("len > 125 for control")?;
-            return Err(std::io::Error::other("websocket: len > 125 for control"));
         }
 
         match self.read_frame_opcode {
             OpCode::Continue => {
-                if !self.read_message_fragmented {
-                    self.queue_protocol_error("continuation after FIN")?;
-                    return Err(std::io::Error::other(
-                        "websocket: continuation after FIN",
-                    ));
-                }
                 if read_frame_final {
                     self.read_message_fragmented = false;
                 }
             }
             OpCode::Text | OpCode::Binary => {
-                if self.read_message_fragmented {
-                    self.queue_protocol_error("data before FIN")?;
-                    return Err(std::io::Error::other("websocket: data before FIN"));
-                }
                 self.read_message_fragmented = !read_frame_final;
-            }
-            _ if !read_frame_final => {
-                return Err(std::io::Error::other(format!(
-                    "cannot handle non-final frames of type {:?}",
-                    self.read_frame_opcode
-                )));
             }
             _ => {}
         }
@@ -1457,6 +1433,24 @@ mod tests {
             )
             .await;
         }
+    }
+
+    #[tokio::test]
+    async fn server_aggregates_frame_header_errors_like_xray() {
+        let (mut peer, transport) = tokio::io::duplex(128);
+        let mut websocket = websocket_over(transport);
+        peer.write_all(&[0xc2, 0x00]).await.unwrap();
+        assert_protocol_close(&mut peer, &mut websocket, "RSV1 set, bad MASK").await;
+
+        let (mut peer, transport) = tokio::io::duplex(128);
+        let mut websocket = websocket_over(transport);
+        peer.write_all(&[0x08, 0x7e]).await.unwrap();
+        assert_protocol_close(
+            &mut peer,
+            &mut websocket,
+            "len > 125 for control, FIN not set on control, bad MASK",
+        )
+        .await;
     }
 
     #[tokio::test]
