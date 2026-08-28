@@ -430,24 +430,62 @@ fn xray_websocket_absolute_authority_has_malformed_escape(
     }
 
     let bytes = host.as_bytes();
+    let zone_start = host
+        .strip_prefix('[')
+        .and_then(|bracketed| bracketed.find(']'))
+        .and_then(|closing| host[..=closing].find("%25"))
+        .map(|index| index + 3);
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] != b'%' {
             index += 1;
             continue;
         }
-        if index + 2 >= bytes.len()
-            || decode_hex_nibble(bytes[index + 1]).is_none()
-            || decode_hex_nibble(bytes[index + 2]).is_none()
-        {
+        if index + 2 >= bytes.len() {
             return true;
         }
-        if !bytes[index + 1..index + 3].eq_ignore_ascii_case(b"25") {
+        let Some(high) = decode_hex_nibble(bytes[index + 1]) else {
+            return true;
+        };
+        let Some(low) = decode_hex_nibble(bytes[index + 2]) else {
+            return true;
+        };
+        let decoded = high << 4 | low;
+        if !bytes[index + 1..index + 3].eq_ignore_ascii_case(b"25")
+            && !zone_start.is_some_and(|start| {
+                index >= start && xray_websocket_zone_escape_allowed(decoded)
+            })
+        {
             return true;
         }
         index += 3;
     }
     false
+}
+
+fn xray_websocket_zone_escape_allowed(byte: u8) -> bool {
+    byte == b' '
+        || byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'-' | b'.'
+                | b'_'
+                | b'~'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b':'
+                | b'['
+                | b']'
+        )
 }
 
 fn xray_websocket_absolute_authority_has_invalid_bracketed_host(
@@ -1353,6 +1391,11 @@ mod tests {
             "GET http://[abc]/ HTTP/1.1",
             "GET http://[::1]x/ HTTP/1.1",
             "GET http://exa[mple.com/ HTTP/1.1",
+            "GET http://[fe80::1%25eth%2F]/ HTTP/1.1",
+            "GET http://[fe80::1%25eth%3F]/ HTTP/1.1",
+            "GET http://[fe80::1%25eth%23]/ HTTP/1.1",
+            "GET http://[fe80::1%25eth%00]/ HTTP/1.1",
+            "GET http://[fe80::1%25eth%7F]/ HTTP/1.1",
             "GET /w\0s HTTP/1.1",
             "GET /w\x0bs HTTP/1.1",
             "GET /w\x1fs HTTP/1.1",
@@ -1377,6 +1420,13 @@ mod tests {
             "http://[::1]:80/",
             "http://[::ffff:192.0.2.1]/",
             "http://[fe80::1%25eth0]/",
+            "http://[fe80::1%25eth%30]/",
+            "http://[fe80::1%25eth%2D0]/",
+            "http://[fe80::1%25%41]/",
+            "http://[fe80::1%25eth%5B]/",
+            "http://[fe80::1%25eth%5D]/",
+            "http://[fe80::1%25eth%3A]/",
+            "http://[fe80::1%25eth%20]/",
         ] {
             let (result, response) = run_handshake(&format!(
                 "GET {request_target} HTTP/1.1\r\n{headers}"
