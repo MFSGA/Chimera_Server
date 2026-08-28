@@ -177,6 +177,14 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                     ));
                 }
             };
+        let raw_request_target = raw_xray_request_target(&first_line_raw)
+            .unwrap_or(request_target.as_bytes());
+        if xray_websocket_absolute_authority_has_non_ascii_userinfo(
+            raw_request_target,
+        ) {
+            write_xray_bad_request_line(&mut server_stream).await?;
+            return Err(std::io::Error::other("non-ASCII absolute URI userinfo"));
+        }
         let request_host = request_headers
             .get("host")
             .and_then(|values| values.first())
@@ -192,8 +200,6 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             return Err(std::io::Error::other("websocket method is not GET"));
         }
         let raw_request_path = websocket_request_path_raw(request_target);
-        let raw_request_target = raw_xray_request_target(&first_line_raw)
-            .unwrap_or(request_target.as_bytes());
         let xray_request_path = match xray_websocket_request_path_raw_bytes(
             request_target,
             raw_request_target,
@@ -555,6 +561,27 @@ fn xray_websocket_absolute_authority_has_invalid_bracketed_host(
         .map_or((literal, None), |(address, zone)| (address, Some(zone)));
 
     address.parse::<Ipv6Addr>().is_err() || zone.is_some_and(str::is_empty)
+}
+
+fn xray_websocket_absolute_authority_has_non_ascii_userinfo(
+    request_target: &[u8],
+) -> bool {
+    let Some(scheme_end) =
+        request_target.windows(3).position(|bytes| bytes == b"://")
+    else {
+        return false;
+    };
+    let rest = &request_target[scheme_end + 3..];
+    let authority_end = rest
+        .iter()
+        .position(|byte| matches!(byte, b'/' | b'?'))
+        .unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let Some(last_at) = authority.iter().rposition(|byte| *byte == b'@') else {
+        return false;
+    };
+
+    !authority[..last_at].is_ascii()
 }
 
 fn xray_websocket_absolute_authority_has_invalid_userinfo_character(
@@ -1458,6 +1485,53 @@ mod tests {
             let response = String::from_utf8(response).unwrap();
             assert!(
                 response.starts_with(&format!("HTTP/1.1 {expected_status}\r\n")),
+                "{target:?}: {response:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_xray_absolute_uri_rejects_non_ascii_userinfo() {
+        let key = b"dGhlIHNhbXBsZSBub25jZQ==";
+        for target in [
+            b"http://user\xff@example.com/ws".as_slice(),
+            "http://user\u{fffd}@example.com/ws".as_bytes(),
+            "http://\u{00e9}@example.com/ws".as_bytes(),
+        ] {
+            let mut request = b"GET ".to_vec();
+            request.extend_from_slice(target);
+            request.extend_from_slice(b" HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ");
+            request.extend_from_slice(key);
+            request.extend_from_slice(b"\r\nSec-WebSocket-Version: 13\r\n\r\n");
+
+            let (client, mut peer) = tokio::io::duplex(8192);
+            let handler =
+                WebsocketTcpServerHandler::new(vec![WebsocketServerTarget {
+                    matching_path: Some("/ws".to_string()),
+                    matching_headers: Some(HashMap::from([(
+                        "host".to_string(),
+                        "example.com".to_string(),
+                    )])),
+                    xray_mismatch_404: true,
+                    trusted_x_forwarded_for: Vec::new(),
+                    accept_proxy_protocol: false,
+                    heartbeat_period: 0,
+                    handler: Box::new(AcceptingInner),
+                }]);
+            let task = tokio::spawn(async move {
+                handler
+                    .setup_server_stream(Box::new(TestStream(client)))
+                    .await
+            });
+
+            peer.write_all(&request).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            peer.read_to_end(&mut response).await.unwrap();
+            let _ = task.await.unwrap();
+            let response = String::from_utf8(response).unwrap();
+            assert!(
+                response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
                 "{target:?}: {response:?}"
             );
         }
