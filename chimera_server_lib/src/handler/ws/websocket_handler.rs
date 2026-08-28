@@ -203,10 +203,6 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
         }
         let absolute_host = xray_websocket_absolute_host(request_target);
         let effective_host = absolute_host.as_deref().or(request_host);
-        if method != "GET" {
-            write_xray_method_not_allowed(&mut server_stream).await?;
-            return Err(std::io::Error::other("websocket method is not GET"));
-        }
         let raw_request_path = websocket_request_path_raw(request_target);
         let xray_request_path = match xray_websocket_request_path_raw_bytes(
             request_target,
@@ -292,6 +288,11 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                         continue 'outer;
                     }
                 }
+            }
+
+            if method != "GET" {
+                write_xray_method_not_allowed(&mut server_stream).await?;
+                return Err(std::io::Error::other("websocket method is not GET"));
             }
 
             if let Some(peer_addr) = xray_websocket_forwarded_peer(
@@ -2493,6 +2494,50 @@ mod tests {
             } else {
                 assert!(response.is_empty());
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_xray_target_mismatch_precedes_method_validation() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        for (path, host, expected_status) in [
+            ("/ws", "example.com", "405 Method Not Allowed"),
+            ("/wrong", "example.com", "404 Not Found"),
+            ("/ws", "wrong.example", "404 Not Found"),
+        ] {
+            let request = format!(
+                "POST {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            );
+            let (client, mut peer) = tokio::io::duplex(8192);
+            let handler =
+                WebsocketTcpServerHandler::new(vec![WebsocketServerTarget {
+                    matching_path: Some("/ws".to_string()),
+                    matching_headers: Some(HashMap::from([(
+                        "host".to_string(),
+                        "example.com".to_string(),
+                    )])),
+                    xray_mismatch_404: true,
+                    trusted_x_forwarded_for: Vec::new(),
+                    accept_proxy_protocol: false,
+                    heartbeat_period: 0,
+                    handler: Box::new(AcceptingInner),
+                }]);
+            let task = tokio::spawn(async move {
+                handler
+                    .setup_server_stream(Box::new(TestStream(client)))
+                    .await
+            });
+
+            peer.write_all(request.as_bytes()).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            peer.read_to_end(&mut response).await.unwrap();
+            assert!(task.await.unwrap().is_err());
+            let response = String::from_utf8(response).unwrap();
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {expected_status}\r\n")),
+                "{path} {host}: {response:?}"
+            );
         }
     }
 
