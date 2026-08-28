@@ -371,7 +371,7 @@ fn parse_xray_websocket_request_line(
         || version.is_empty()
         || request_target
             .bytes()
-            .any(|byte| byte.is_ascii_whitespace())
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
         || version.bytes().any(|byte| byte.is_ascii_whitespace())
         || xray_websocket_absolute_authority_has_malformed_escape(request_target)
     {
@@ -1248,6 +1248,10 @@ mod tests {
             "GET http://exa%65mple.com/ HTTP/1.1",
             "GET http://example%2Ecom/ HTTP/1.1",
             "GET http://user%ZZ@example.com/ HTTP/1.1",
+            "GET /w\0s HTTP/1.1",
+            "GET /w\x0bs HTTP/1.1",
+            "GET /w\x1fs HTTP/1.1",
+            "GET /w\x7fs HTTP/1.1",
         ] {
             let (result, response) =
                 run_handshake(&format!("{request_line}\r\n{headers}")).await;
