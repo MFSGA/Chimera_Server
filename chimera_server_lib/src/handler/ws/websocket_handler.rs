@@ -653,9 +653,10 @@ fn xray_websocket_forwarded_peer(
     trusted_x_forwarded_for: &[String],
 ) -> Option<SocketAddr> {
     if !trusted_x_forwarded_for.is_empty()
-        && !trusted_x_forwarded_for
-            .iter()
-            .any(|header| headers.contains_key(&header.to_ascii_lowercase()))
+        && !trusted_x_forwarded_for.iter().any(|header| {
+            !header.eq_ignore_ascii_case("host")
+                && headers.contains_key(&header.to_ascii_lowercase())
+        })
     {
         return None;
     }
@@ -1642,6 +1643,11 @@ mod tests {
                 &["X-Forwarded-For".to_string()]
             ),
             Some("203.0.113.77:0".parse().unwrap())
+        );
+        headers.insert("host".to_string(), vec!["example.com".to_string()]);
+        assert_eq!(
+            xray_websocket_forwarded_peer(&headers, &["Host".to_string()]),
+            None
         );
     }
 
