@@ -372,6 +372,7 @@ fn parse_xray_websocket_request_line(
         || request_target
             .bytes()
             .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        || !xray_websocket_request_target_has_valid_form(request_target)
         || version.bytes().any(|byte| byte.is_ascii_whitespace())
         || xray_websocket_absolute_authority_has_malformed_escape(request_target)
         || xray_websocket_absolute_authority_has_invalid_bracketed_host(
@@ -400,6 +401,22 @@ fn parse_xray_websocket_request_line(
     }
 
     Ok((method, request_target, minor != "0"))
+}
+
+fn xray_websocket_request_target_has_valid_form(request_target: &str) -> bool {
+    if request_target == "*" || request_target.starts_with('/') {
+        return true;
+    }
+
+    let Some(colon) = request_target.find(':') else {
+        return false;
+    };
+    let scheme = &request_target[..colon];
+    !scheme.is_empty()
+        && scheme.as_bytes()[0].is_ascii_alphabetic()
+        && scheme.bytes().skip(1).all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
+        })
 }
 
 fn xray_websocket_absolute_authority_has_malformed_escape(
@@ -1396,6 +1413,12 @@ mod tests {
             "GET http://[fe80::1%25eth%23]/ HTTP/1.1",
             "GET http://[fe80::1%25eth%00]/ HTTP/1.1",
             "GET http://[fe80::1%25eth%7F]/ HTTP/1.1",
+            "GET ws HTTP/1.1",
+            "GET ws?x HTTP/1.1",
+            "GET ?x HTTP/1.1",
+            "GET #x HTTP/1.1",
+            "GET 1a:b HTTP/1.1",
+            "GET a_b:c HTTP/1.1",
             "GET /w\0s HTTP/1.1",
             "GET /w\x0bs HTTP/1.1",
             "GET /w\x1fs HTTP/1.1",
@@ -1408,6 +1431,17 @@ mod tests {
                 response,
                 "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request"
             );
+        }
+
+        for request_target in
+            ["*", "a:b", "a+b:c", "a-b:c", "a.b:c", "example.com:80"]
+        {
+            let (result, response) = run_handshake(&format!(
+                "GET {request_target} HTTP/1.1\r\n{headers}"
+            ))
+            .await;
+            assert!(result.is_err(), "{request_target}");
+            assert!(response.is_empty(), "{request_target}: {response:?}");
         }
 
         for request_target in [
