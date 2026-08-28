@@ -497,7 +497,7 @@ fn xray_websocket_absolute_parts(request_target: &str) -> Option<(&str, &str)> {
                 .map_or(remainder, |(path, _)| path)
         })
     });
-    Some((host, path.unwrap_or("/")))
+    Some((host, path.unwrap_or("")))
 }
 
 fn xray_websocket_absolute_host(request_target: &str) -> Option<&str> {
@@ -1095,6 +1095,14 @@ mod tests {
             b"/ws"
         );
         assert_eq!(
+            xray_websocket_request_path("http://example.com").unwrap(),
+            b""
+        );
+        assert_eq!(
+            xray_websocket_request_path("http://example.com?foo=bar").unwrap(),
+            b""
+        );
+        assert_eq!(
             xray_websocket_request_path("/ws%3Ffoo=bar").unwrap(),
             b"/ws?foo=bar"
         );
@@ -1177,6 +1185,15 @@ mod tests {
             let (result, response) = run_handshake(&request).await;
             assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
             assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+        }
+
+        for target in ["http://example.com", "http://example.com?foo=bar"] {
+            let request = format!(
+                "GET {target} HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            );
+            let (result, response) = run_handshake(&request).await;
+            assert!(result.is_err(), "{target}");
+            assert!(response.is_empty(), "{target}: {response:?}");
         }
     }
 
