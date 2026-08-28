@@ -378,6 +378,9 @@ fn parse_xray_websocket_request_line(
         || xray_websocket_absolute_authority_has_invalid_bracketed_host(
             request_target,
         )
+        || xray_websocket_absolute_authority_has_invalid_userinfo_character(
+            request_target,
+        )
         || xray_websocket_absolute_authority_has_invalid_host_character(
             request_target,
         )
@@ -546,6 +549,37 @@ fn xray_websocket_absolute_authority_has_invalid_bracketed_host(
         .map_or((literal, None), |(address, zone)| (address, Some(zone)));
 
     address.parse::<Ipv6Addr>().is_err() || zone.is_some_and(str::is_empty)
+}
+
+fn xray_websocket_absolute_authority_has_invalid_userinfo_character(
+    request_target: &str,
+) -> bool {
+    let Some(scheme_end) = request_target.find("://") else {
+        return false;
+    };
+    let rest = &request_target[scheme_end + 3..];
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let Some((userinfo, _)) = authority.rsplit_once('@') else {
+        return false;
+    };
+
+    userinfo.bytes().any(|byte| {
+        matches!(
+            byte,
+            b'"' | b'#'
+                | b'<'
+                | b'>'
+                | b'['
+                | b'\\'
+                | b']'
+                | b'^'
+                | b'`'
+                | b'{'
+                | b'|'
+                | b'}'
+        )
+    })
 }
 
 fn xray_websocket_absolute_authority_has_invalid_host_character(
@@ -1424,6 +1458,18 @@ mod tests {
             "GET http://exa%65mple.com/ HTTP/1.1",
             "GET http://example%2Ecom/ HTTP/1.1",
             "GET http://user%ZZ@example.com/ HTTP/1.1",
+            "GET http://u\"ser@example.com/ HTTP/1.1",
+            "GET http://u#ser@example.com/ HTTP/1.1",
+            "GET http://u<ser@example.com/ HTTP/1.1",
+            "GET http://u>ser@example.com/ HTTP/1.1",
+            "GET http://u[ser@example.com/ HTTP/1.1",
+            "GET http://u\\ser@example.com/ HTTP/1.1",
+            "GET http://u]ser@example.com/ HTTP/1.1",
+            "GET http://u^ser@example.com/ HTTP/1.1",
+            "GET http://u`ser@example.com/ HTTP/1.1",
+            "GET http://u{ser@example.com/ HTTP/1.1",
+            "GET http://u|ser@example.com/ HTTP/1.1",
+            "GET http://u}ser@example.com/ HTTP/1.1",
             "GET http://example.com:bad/ HTTP/1.1",
             "GET http://example.com:+80/ HTTP/1.1",
             "GET http://example.com:-1/ HTTP/1.1",
@@ -1480,6 +1526,9 @@ mod tests {
             "http://example.com/?x=%ZZ",
             "http://user%40name@example.com/",
             "http://user%2Fpass@example.com/",
+            "http://u!$&'()*+,-.:;=_~ser@example.com/",
+            "http://u@ser@example.com/",
+            "http://u%22%23%5B%5C%5D%5E%60%7B%7C%7Dser@example.com/",
             "http://example.com:/",
             "http://example.com:99999/",
             "http://[::1]:/",
