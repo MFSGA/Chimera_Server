@@ -160,6 +160,14 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             write_xray_bad_request_line(&mut server_stream).await?;
             return Err(std::io::Error::other("too many Host headers"));
         }
+        if request_headers
+            .get("host")
+            .and_then(|values| values.first())
+            .is_some_and(|host| !valid_xray_host_header(host))
+        {
+            write_xray_malformed_host(&mut server_stream).await?;
+            return Err(std::io::Error::other("malformed Host header"));
+        }
 
         let (method, request_target, host_required) =
             match parse_xray_websocket_request_line(&first_line) {
@@ -419,6 +427,33 @@ fn parse_xray_websocket_request_line(
     }
 
     Ok((method, request_target, minor != "0"))
+}
+
+fn valid_xray_host_header(host: &str) -> bool {
+    host.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'!' | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b'-'
+                    | b'.'
+                    | b':'
+                    | b';'
+                    | b'='
+                    | b'['
+                    | b']'
+                    | b'_'
+                    | b'~'
+            )
+    })
 }
 
 fn xray_websocket_request_target_has_valid_form(request_target: &str) -> bool {
@@ -1043,6 +1078,17 @@ async fn write_xray_bad_request_line(
             b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request",
         )
         .await?;
+    stream.flush().await
+}
+
+async fn write_xray_malformed_host(
+    stream: &mut Box<dyn AsyncStream>,
+) -> std::io::Result<()> {
+    const STATUS: &str = "400 Bad Request: malformed Host header";
+    let response = format!(
+        "HTTP/1.1 {STATUS}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n{STATUS}"
+    );
+    stream.write_all(response.as_bytes()).await?;
     stream.flush().await
 }
 
@@ -1693,6 +1739,66 @@ mod tests {
             assert!(result.is_ok(), "{version}");
             assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
         }
+
+        for host in [
+            "a\"b",
+            "a#b",
+            "a/b",
+            "a<b",
+            "a>b",
+            "a?b",
+            "a@b",
+            "a\\b",
+            "a^b",
+            "a`b",
+            "a{b",
+            "a|b",
+            "a}b",
+            "a b",
+            "a\tb",
+            "exam�ple.com",
+        ] {
+            let request = format!(
+                "GET / HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            );
+            let (result, response) = run_handshake(&request).await;
+            assert!(result.is_err(), "{host:?}");
+            assert_eq!(
+                response,
+                "HTTP/1.1 400 Bad Request: malformed Host header\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request: malformed Host header",
+                "{host:?}"
+            );
+        }
+
+        for host in [
+            "", "a!b", "a$b", "a%b", "a&b", "a'b", "a(b", "a)b", "a*b", "a+b",
+            "a,b", "a-b", "a.b", "a:b", "a;b", "a=b", "a[b", "a]b", "a_b", "a~b",
+        ] {
+            let request = format!(
+                "GET / HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            );
+            let (result, response) = run_handshake(&request).await;
+            assert!(result.is_ok(), "{host:?}: {response:?}");
+            assert!(
+                response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+                "{host:?}: {response:?}"
+            );
+        }
+
+        let mut raw_non_ascii_host = b"GET / HTTP/1.1\r\nHost: exam".to_vec();
+        raw_non_ascii_host.push(0xff);
+        raw_non_ascii_host.extend_from_slice(
+            format!(
+                "ple.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        let (result, response) = run_handshake_bytes(&raw_non_ascii_host).await;
+        assert!(result.is_err());
+        assert_eq!(
+            response,
+            "HTTP/1.1 400 Bad Request: malformed Host header\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request: malformed Host header"
+        );
 
         let headers_without_host = format!(
             "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
