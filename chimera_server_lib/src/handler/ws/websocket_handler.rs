@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     time::{Duration, SystemTime},
 };
 
@@ -374,6 +374,9 @@ fn parse_xray_websocket_request_line(
             .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
         || version.bytes().any(|byte| byte.is_ascii_whitespace())
         || xray_websocket_absolute_authority_has_malformed_escape(request_target)
+        || xray_websocket_absolute_authority_has_invalid_bracketed_host(
+            request_target,
+        )
         || xray_websocket_absolute_authority_has_invalid_port(request_target)
     {
         return Err(WebsocketRequestLineError::Malformed);
@@ -445,6 +448,46 @@ fn xray_websocket_absolute_authority_has_malformed_escape(
         index += 3;
     }
     false
+}
+
+fn xray_websocket_absolute_authority_has_invalid_bracketed_host(
+    request_target: &str,
+) -> bool {
+    let Some(scheme_end) = request_target.find("://") else {
+        return false;
+    };
+    let scheme = &request_target[..scheme_end];
+    if scheme.is_empty()
+        || !scheme.as_bytes()[0].is_ascii_alphabetic()
+        || !scheme.bytes().skip(1).all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
+        })
+    {
+        return false;
+    }
+
+    let rest = &request_target[scheme_end + 3..];
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+
+    if host.contains('[') && !host.starts_with('[') {
+        return true;
+    }
+    let Some(bracketed) = host.strip_prefix('[') else {
+        return false;
+    };
+    let Some(closing) = bracketed.find(']') else {
+        return true;
+    };
+    let literal = &bracketed[..closing];
+    let (address, zone) = literal
+        .split_once("%25")
+        .map_or((literal, None), |(address, zone)| (address, Some(zone)));
+
+    address.parse::<Ipv6Addr>().is_err() || zone.is_some_and(str::is_empty)
 }
 
 fn xray_websocket_absolute_authority_has_invalid_port(request_target: &str) -> bool {
@@ -1305,6 +1348,11 @@ mod tests {
             "GET http://example.com:+80/ HTTP/1.1",
             "GET http://example.com:-1/ HTTP/1.1",
             "GET http://[::1]:bad/ HTTP/1.1",
+            "GET http://[::1/ HTTP/1.1",
+            "GET http://[]/ HTTP/1.1",
+            "GET http://[abc]/ HTTP/1.1",
+            "GET http://[::1]x/ HTTP/1.1",
+            "GET http://exa[mple.com/ HTTP/1.1",
             "GET /w\0s HTTP/1.1",
             "GET /w\x0bs HTTP/1.1",
             "GET /w\x1fs HTTP/1.1",
@@ -1327,6 +1375,8 @@ mod tests {
             "http://example.com:99999/",
             "http://[::1]:/",
             "http://[::1]:80/",
+            "http://[::ffff:192.0.2.1]/",
+            "http://[fe80::1%25eth0]/",
         ] {
             let (result, response) = run_handshake(&format!(
                 "GET {request_target} HTTP/1.1\r\n{headers}"
