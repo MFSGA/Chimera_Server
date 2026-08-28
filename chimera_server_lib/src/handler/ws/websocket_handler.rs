@@ -753,7 +753,9 @@ fn websocket_request_path_raw(request_target: &str) -> String {
 }
 
 fn xray_websocket_request_path(request_target: &str) -> Result<Vec<u8>, ()> {
-    let raw = websocket_request_path_raw(request_target);
+    let raw = xray_websocket_scheme_path(request_target)
+        .map(str::to_owned)
+        .unwrap_or_else(|| websocket_request_path_raw(request_target));
     let bytes = raw.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -772,6 +774,29 @@ fn xray_websocket_request_path(request_target: &str) -> Result<Vec<u8>, ()> {
         index += 3;
     }
     Ok(decoded)
+}
+
+fn xray_websocket_scheme_path(request_target: &str) -> Option<&str> {
+    let colon = request_target.find(':')?;
+    let scheme = &request_target[..colon];
+    if scheme.is_empty()
+        || !scheme.as_bytes()[0].is_ascii_alphabetic()
+        || !scheme.bytes().skip(1).all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
+        })
+    {
+        return None;
+    }
+
+    let remainder = &request_target[colon + 1..];
+    if !remainder.starts_with('/') || remainder.starts_with("//") {
+        return None;
+    }
+    Some(
+        remainder
+            .split_once('?')
+            .map_or(remainder, |(path, _)| path),
+    )
 }
 
 fn decode_hex_nibble(byte: u8) -> Option<u8> {
@@ -1282,6 +1307,9 @@ mod tests {
             xray_websocket_request_path("http://example.com").unwrap(),
             b""
         );
+        assert_eq!(xray_websocket_request_path("http:/ws").unwrap(), b"/ws");
+        assert_eq!(xray_websocket_request_path("foo:/ws?x=1").unwrap(), b"/ws");
+        assert_eq!(xray_websocket_request_path("http:ws").unwrap(), b"http:ws");
         assert_eq!(
             xray_websocket_request_path("http://example.com?foo=bar").unwrap(),
             b""
@@ -1320,6 +1348,9 @@ mod tests {
         let key = "dGhlIHNhbXBsZSBub25jZQ==";
         for (target, expected_status) in [
             ("/ws/foo", "101 Switching Protocols"),
+            ("http:/ws/foo", "101 Switching Protocols"),
+            ("foo:/ws/foo?x=1", "101 Switching Protocols"),
+            ("http:ws/foo", "404 Not Found"),
             ("/ws%2Ffoo", "101 Switching Protocols"),
             ("/ws%252Ffoo", "404 Not Found"),
             ("/ws%ZZfoo", "400 Bad Request"),
