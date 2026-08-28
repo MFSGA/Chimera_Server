@@ -801,15 +801,12 @@ fn xray_websocket_request_path_raw_bytes(
     raw_request_target: &[u8],
 ) -> Result<Vec<u8>, ()> {
     let raw_owned;
-    let bytes = if raw_request_target.starts_with(b"/") {
-        raw_request_target
-            .split(|byte| *byte == b'?')
-            .next()
-            .unwrap_or(raw_request_target)
+    let bytes = if let Some(path) =
+        xray_websocket_raw_hierarchical_path(raw_request_target)
+    {
+        path
     } else {
-        raw_owned = xray_websocket_scheme_path(request_target)
-            .map(str::to_owned)
-            .unwrap_or_else(|| websocket_request_path_raw(request_target));
+        raw_owned = websocket_request_path_raw(request_target);
         raw_owned.as_bytes()
     };
     let mut decoded = Vec::with_capacity(bytes.len());
@@ -831,27 +828,33 @@ fn xray_websocket_request_path_raw_bytes(
     Ok(decoded)
 }
 
-fn xray_websocket_scheme_path(request_target: &str) -> Option<&str> {
-    let colon = request_target.find(':')?;
-    let scheme = &request_target[..colon];
-    if scheme.is_empty()
-        || !scheme.as_bytes()[0].is_ascii_alphabetic()
-        || !scheme.bytes().skip(1).all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
-        })
-    {
-        return None;
+fn xray_websocket_raw_hierarchical_path(request_target: &[u8]) -> Option<&[u8]> {
+    if request_target.starts_with(b"/") {
+        return Some(
+            request_target
+                .split(|byte| *byte == b'?')
+                .next()
+                .unwrap_or(request_target),
+        );
     }
 
+    let colon = request_target.iter().position(|byte| *byte == b':')?;
     let remainder = &request_target[colon + 1..];
-    if !remainder.starts_with('/') || remainder.starts_with("//") {
-        return None;
-    }
-    Some(
+    let path = if let Some(authority) = remainder.strip_prefix(b"//") {
+        let path_start = authority
+            .iter()
+            .position(|byte| matches!(byte, b'/' | b'?'))?;
+        if authority[path_start] == b'?' {
+            return Some(b"");
+        }
+        &authority[path_start..]
+    } else if remainder.starts_with(b"/") {
         remainder
-            .split_once('?')
-            .map_or(remainder, |(path, _)| path),
-    )
+    } else {
+        return None;
+    };
+
+    Some(path.split(|byte| *byte == b'?').next().unwrap_or(path))
 }
 
 fn decode_hex_nibble(byte: u8) -> Option<u8> {
@@ -1464,6 +1467,54 @@ mod tests {
             let handler =
                 WebsocketTcpServerHandler::new(vec![WebsocketServerTarget {
                     matching_path: Some("/socks\u{fffd}".to_string()),
+                    matching_headers: None,
+                    xray_mismatch_404: true,
+                    trusted_x_forwarded_for: Vec::new(),
+                    accept_proxy_protocol: false,
+                    heartbeat_period: 0,
+                    handler: Box::new(AcceptingInner),
+                }]);
+            let task = tokio::spawn(async move {
+                handler
+                    .setup_server_stream(Box::new(TestStream(client)))
+                    .await
+            });
+
+            peer.write_all(&request).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            peer.read_to_end(&mut response).await.unwrap();
+            let _ = task.await.unwrap();
+            let response = String::from_utf8(response).unwrap();
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {expected_status}\r\n")),
+                "{target:?}: {response:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_xray_hierarchical_uri_preserves_non_utf8_path_bytes() {
+        let key = b"dGhlIHNhbXBsZSBub25jZQ==";
+        for (target, expected_status) in [
+            (b"http://example.com/ws\xff".as_slice(), "404 Not Found"),
+            (
+                "http://example.com/ws\u{fffd}".as_bytes(),
+                "101 Switching Protocols",
+            ),
+            (b"foo:/ws\xff".as_slice(), "404 Not Found"),
+            ("foo:/ws\u{fffd}".as_bytes(), "101 Switching Protocols"),
+        ] {
+            let mut request = b"GET ".to_vec();
+            request.extend_from_slice(target);
+            request.extend_from_slice(b" HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ");
+            request.extend_from_slice(key);
+            request.extend_from_slice(b"\r\nSec-WebSocket-Version: 13\r\n\r\n");
+
+            let (client, mut peer) = tokio::io::duplex(8192);
+            let handler =
+                WebsocketTcpServerHandler::new(vec![WebsocketServerTarget {
+                    matching_path: Some("/ws\u{fffd}".to_string()),
                     matching_headers: None,
                     xray_mismatch_404: true,
                     trusted_x_forwarded_for: Vec::new(),
