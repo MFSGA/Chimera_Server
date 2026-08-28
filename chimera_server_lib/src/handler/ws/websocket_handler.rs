@@ -1393,6 +1393,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_xray_non_utf8_request_target_reaches_path_matching() {
+        let key = b"dGhlIHNhbXBsZSBub25jZQ==";
+        for target in [b"/socks\xff".as_slice(), b"/sock\xc3(".as_slice()] {
+            let mut request = b"GET ".to_vec();
+            request.extend_from_slice(target);
+            request.extend_from_slice(b" HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ");
+            request.extend_from_slice(key);
+            request.extend_from_slice(b"\r\nSec-WebSocket-Version: 13\r\n\r\n");
+
+            let (client, mut peer) = tokio::io::duplex(8192);
+            let handler =
+                WebsocketTcpServerHandler::new(vec![WebsocketServerTarget {
+                    matching_path: Some("/socks".to_string()),
+                    matching_headers: None,
+                    xray_mismatch_404: true,
+                    trusted_x_forwarded_for: Vec::new(),
+                    accept_proxy_protocol: false,
+                    heartbeat_period: 0,
+                    handler: Box::new(AcceptingInner),
+                }]);
+            let task = tokio::spawn(async move {
+                handler
+                    .setup_server_stream(Box::new(TestStream(client)))
+                    .await
+            });
+
+            peer.write_all(&request).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            peer.read_to_end(&mut response).await.unwrap();
+            let _ = task.await.unwrap();
+            let response = String::from_utf8(response).unwrap();
+            assert!(
+                response.starts_with("HTTP/1.1 404 Not Found\r\n"),
+                "{target:?}: {response:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn websocket_handshake_matches_xray_request_target_paths() {
         let key = "dGhlIHNhbXBsZSBub25jZQ==";
         for target in [

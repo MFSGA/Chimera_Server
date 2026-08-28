@@ -70,16 +70,12 @@ impl ParsedHttpData {
             }
 
             if first_line.is_none() {
-                first_line = Some(
-                    std::str::from_utf8(line)
-                        .map_err(|error| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!("Failed to decode utf8: {error}"),
-                            )
-                        })?
-                        .to_string(),
-                );
+                // Go's net/http keeps the request line as a byte string and can
+                // therefore route request-targets containing non-UTF-8 bytes.
+                // Chimera's downstream parser is string-based, so preserve the
+                // parse flow with lossy decoding instead of rejecting the whole
+                // handshake before Xray's path-mismatch handling can run.
+                first_line = Some(String::from_utf8_lossy(line).into_owned());
             } else {
                 if matches!(line.first(), Some(b' ' | b'\t')) {
                     let Some((header_key, value_index)) = last_header.as_ref()
