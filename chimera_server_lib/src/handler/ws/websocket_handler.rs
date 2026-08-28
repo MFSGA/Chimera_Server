@@ -374,6 +374,7 @@ fn parse_xray_websocket_request_line(
             .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
         || version.bytes().any(|byte| byte.is_ascii_whitespace())
         || xray_websocket_absolute_authority_has_malformed_escape(request_target)
+        || xray_websocket_absolute_authority_has_invalid_port(request_target)
     {
         return Err(WebsocketRequestLineError::Malformed);
     }
@@ -444,6 +445,41 @@ fn xray_websocket_absolute_authority_has_malformed_escape(
         index += 3;
     }
     false
+}
+
+fn xray_websocket_absolute_authority_has_invalid_port(request_target: &str) -> bool {
+    let Some(scheme_end) = request_target.find("://") else {
+        return false;
+    };
+    let scheme = &request_target[..scheme_end];
+    if scheme.is_empty()
+        || !scheme.as_bytes()[0].is_ascii_alphabetic()
+        || !scheme.bytes().skip(1).all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
+        })
+    {
+        return false;
+    }
+
+    let rest = &request_target[scheme_end + 3..];
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+
+    let port = if let Some(bracketed) = host.strip_prefix('[') {
+        let Some(closing) = bracketed.find(']') else {
+            return false;
+        };
+        &bracketed[closing + 1..]
+    } else {
+        host.rfind(':').map_or("", |colon| &host[colon..])
+    };
+
+    !port.is_empty()
+        && (!port.starts_with(':')
+            || !port[1..].bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn has_malformed_percent_escape(value: &str) -> bool {
@@ -1265,6 +1301,10 @@ mod tests {
             "GET http://exa%65mple.com/ HTTP/1.1",
             "GET http://example%2Ecom/ HTTP/1.1",
             "GET http://user%ZZ@example.com/ HTTP/1.1",
+            "GET http://example.com:bad/ HTTP/1.1",
+            "GET http://example.com:+80/ HTTP/1.1",
+            "GET http://example.com:-1/ HTTP/1.1",
+            "GET http://[::1]:bad/ HTTP/1.1",
             "GET /w\0s HTTP/1.1",
             "GET /w\x0bs HTTP/1.1",
             "GET /w\x1fs HTTP/1.1",
@@ -1283,6 +1323,10 @@ mod tests {
             "http://example.com/?x=%ZZ",
             "http://user%40name@example.com/",
             "http://user%2Fpass@example.com/",
+            "http://example.com:/",
+            "http://example.com:99999/",
+            "http://[::1]:/",
+            "http://[::1]:80/",
         ] {
             let (result, response) = run_handshake(&format!(
                 "GET {request_target} HTTP/1.1\r\n{headers}"
