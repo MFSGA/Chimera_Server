@@ -281,6 +281,16 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                 context.peer_addr = Some(peer_addr);
             }
 
+            // Gorilla v1.5.3 rejects a WebSocket upgrade when net/http has
+            // already buffered bytes beyond the HTTP request headers. Xray
+            // v26.2.6 therefore closes without a 101 response instead of
+            // treating pipelined bytes as the first WebSocket frame.
+            if !line_reader.unparsed_data().is_empty() {
+                return Err(std::io::Error::other(
+                    "websocket: client sent data before handshake is complete",
+                ));
+            }
+
             let websocket_key_response =
                 create_websocket_key_response(websocket_key);
 
@@ -310,7 +320,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                 Box::new(WebsocketStream::new_with_heartbeat(
                     server_stream,
                     false,
-                    line_reader.unparsed_data(),
+                    &[],
                     *heartbeat_period,
                 ));
             let websocket_stream =
@@ -1033,6 +1043,33 @@ mod tests {
         let mut response = Vec::new();
         peer.read_to_end(&mut response).await.unwrap();
         (task.await.unwrap(), String::from_utf8(response).unwrap())
+    }
+
+    #[tokio::test]
+    async fn websocket_rejects_pipelined_frame_before_upgrade_like_xray_v26_2_6() {
+        let mut request = concat!(
+            "GET / HTTP/1.1\r\n",
+            "Host: example.com\r\n",
+            "Upgrade: websocket\r\n",
+            "Connection: Upgrade\r\n",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            "Sec-WebSocket-Version: 13\r\n",
+            "\r\n"
+        )
+        .as_bytes()
+        .to_vec();
+        request.extend_from_slice(&[0x82, 0x81, 1, 2, 3, 4, b'A' ^ 1]);
+
+        let (result, response) = run_handshake_bytes(&request).await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("pipelined WebSocket data must abort the upgrade"),
+        };
+        assert_eq!(
+            error.to_string(),
+            "websocket: client sent data before handshake is complete"
+        );
+        assert!(response.is_empty(), "Xray closes without a 101 response");
     }
 
     #[test]
