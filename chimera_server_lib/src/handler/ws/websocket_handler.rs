@@ -378,6 +378,9 @@ fn parse_xray_websocket_request_line(
         || xray_websocket_absolute_authority_has_invalid_bracketed_host(
             request_target,
         )
+        || xray_websocket_absolute_authority_has_invalid_host_character(
+            request_target,
+        )
         || xray_websocket_absolute_authority_has_invalid_port(request_target)
     {
         return Err(WebsocketRequestLineError::Malformed);
@@ -543,6 +546,23 @@ fn xray_websocket_absolute_authority_has_invalid_bracketed_host(
         .map_or((literal, None), |(address, zone)| (address, Some(zone)));
 
     address.parse::<Ipv6Addr>().is_err() || zone.is_some_and(str::is_empty)
+}
+
+fn xray_websocket_absolute_authority_has_invalid_host_character(
+    request_target: &str,
+) -> bool {
+    let Some(scheme_end) = request_target.find("://") else {
+        return false;
+    };
+    let rest = &request_target[scheme_end + 3..];
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+
+    host.bytes()
+        .any(|byte| matches!(byte, b'#' | b'\\' | b'^' | b'`' | b'{' | b'|' | b'}'))
 }
 
 fn xray_websocket_absolute_authority_has_invalid_port(request_target: &str) -> bool {
@@ -1413,6 +1433,13 @@ mod tests {
             "GET http://[abc]/ HTTP/1.1",
             "GET http://[::1]x/ HTTP/1.1",
             "GET http://exa[mple.com/ HTTP/1.1",
+            "GET http://exa#mple.com/ HTTP/1.1",
+            "GET http://exa\\mple.com/ HTTP/1.1",
+            "GET http://exa^mple.com/ HTTP/1.1",
+            "GET http://exa`mple.com/ HTTP/1.1",
+            "GET http://exa{mple.com/ HTTP/1.1",
+            "GET http://exa|mple.com/ HTTP/1.1",
+            "GET http://exa}mple.com/ HTTP/1.1",
             "GET http://[fe80::1%25eth%2F]/ HTTP/1.1",
             "GET http://[fe80::1%25eth%3F]/ HTTP/1.1",
             "GET http://[fe80::1%25eth%23]/ HTTP/1.1",
