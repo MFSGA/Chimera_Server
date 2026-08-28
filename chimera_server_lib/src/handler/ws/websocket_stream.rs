@@ -317,6 +317,8 @@ impl WebsocketStream {
         if self.read_frame_length > 0x7fffffffffffffffu64 {
             if !self.is_client {
                 self.read_state = ReadState::Init;
+                self.close_data[..2].copy_from_slice(&1000u16.to_be_bytes());
+                self.close_data_size = 2;
                 self.close_received = true;
                 return Ok(());
             }
@@ -729,6 +731,15 @@ impl WebsocketStream {
             || (self.is_client && self.close_received)
         {
             &self.close_data[..self.close_data_size]
+        } else if self.close_received {
+            // Gorilla's default close handler mirrors the received close code
+            // without the reason text. A missing/one-byte status is answered
+            // with an empty close payload (CloseNoStatusReceived).
+            if self.close_data_size >= 2 {
+                &self.close_data[..2]
+            } else {
+                &[]
+            }
         } else {
             &normal_close
         };
@@ -1474,17 +1485,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_replies_normally_to_one_byte_close_like_xray() {
-        let (mut peer, transport) = tokio::io::duplex(64);
-        let mut websocket = websocket_over(transport);
-        peer.write_all(&masked_frame(0x88, &[0x01])).await.unwrap();
+    async fn server_replies_without_status_to_short_close_like_xray() {
+        for payload in [&[][..], &[0x01][..]] {
+            let (mut peer, transport) = tokio::io::duplex(64);
+            let mut websocket = websocket_over(transport);
+            peer.write_all(&masked_frame(0x88, payload)).await.unwrap();
 
-        let mut application_data = [0u8; 1];
-        assert_eq!(websocket.read(&mut application_data).await.unwrap(), 0);
+            let mut application_data = [0u8; 1];
+            assert_eq!(websocket.read(&mut application_data).await.unwrap(), 0);
 
-        let mut response = [0u8; 4];
-        peer.read_exact(&mut response).await.unwrap();
-        assert_eq!(response, [0x88, 0x02, 0x03, 0xe8]);
+            let mut response = [0u8; 2];
+            peer.read_exact(&mut response).await.unwrap();
+            assert_eq!(response, [0x88, 0x00]);
+        }
     }
 
     #[tokio::test]
@@ -1558,10 +1571,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn received_close_gets_xray_normal_reply_before_read_eof() {
+    async fn received_close_echoes_xray_code_without_reason_before_read_eof() {
         let (mut peer, transport) = tokio::io::duplex(64);
         let mut websocket = websocket_over(transport);
-        let close_payload = [0x03, 0xe8, b'b', b'y', b'e'];
+        let close_payload = [0x03, 0xe9, b'b', b'y', b'e'];
         let mut frame = [0u8; 32];
         let frame_len = pack_frame(0x08, true, &close_payload, &mut frame);
         peer.write_all(&frame[..frame_len]).await.unwrap();
@@ -1571,7 +1584,7 @@ mod tests {
 
         let mut response = [0u8; 4];
         peer.read_exact(&mut response).await.unwrap();
-        assert_eq!(response, [0x88, 0x02, 0x03, 0xe8]);
+        assert_eq!(response, [0x88, 0x02, 0x03, 0xe9]);
 
         websocket.shutdown().await.unwrap();
         let mut extra = [0u8; 1];
