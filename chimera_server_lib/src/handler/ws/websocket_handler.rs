@@ -113,6 +113,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
         })?;
         let ParsedHttpData {
             first_line,
+            first_line_raw,
             headers: request_headers,
             line_reader,
         } = match parsed {
@@ -191,7 +192,12 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             return Err(std::io::Error::other("websocket method is not GET"));
         }
         let raw_request_path = websocket_request_path_raw(request_target);
-        let xray_request_path = match xray_websocket_request_path(request_target) {
+        let raw_request_target = raw_xray_request_target(&first_line_raw)
+            .unwrap_or(request_target.as_bytes());
+        let xray_request_path = match xray_websocket_request_path_raw_bytes(
+            request_target,
+            raw_request_target,
+        ) {
             Ok(path) => path,
             Err(()) => {
                 write_xray_bad_request_line(&mut server_stream).await?;
@@ -752,11 +758,33 @@ fn websocket_request_path_raw(request_target: &str) -> String {
         .to_string()
 }
 
+fn raw_xray_request_target(first_line: &[u8]) -> Option<&[u8]> {
+    let first_space = first_line.iter().position(|byte| *byte == b' ')?;
+    let rest = &first_line[first_space + 1..];
+    let second_space = rest.iter().position(|byte| *byte == b' ')?;
+    Some(&rest[..second_space])
+}
+
 fn xray_websocket_request_path(request_target: &str) -> Result<Vec<u8>, ()> {
-    let raw = xray_websocket_scheme_path(request_target)
-        .map(str::to_owned)
-        .unwrap_or_else(|| websocket_request_path_raw(request_target));
-    let bytes = raw.as_bytes();
+    xray_websocket_request_path_raw_bytes(request_target, request_target.as_bytes())
+}
+
+fn xray_websocket_request_path_raw_bytes(
+    request_target: &str,
+    raw_request_target: &[u8],
+) -> Result<Vec<u8>, ()> {
+    let raw_owned;
+    let bytes = if raw_request_target.starts_with(b"/") {
+        raw_request_target
+            .split(|byte| *byte == b'?')
+            .next()
+            .unwrap_or(raw_request_target)
+    } else {
+        raw_owned = xray_websocket_scheme_path(request_target)
+            .map(str::to_owned)
+            .unwrap_or_else(|| websocket_request_path_raw(request_target));
+        raw_owned.as_bytes()
+    };
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
@@ -1388,6 +1416,49 @@ mod tests {
             assert!(
                 response.starts_with(&format!("HTTP/1.1 {expected_status}\r\n")),
                 "{target}: {response:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_xray_non_utf8_target_does_not_alias_replacement_character() {
+        let key = b"dGhlIHNhbXBsZSBub25jZQ==";
+        for (target, expected_status) in [
+            (b"/socks\xff".as_slice(), "404 Not Found"),
+            ("/socks\u{fffd}".as_bytes(), "101 Switching Protocols"),
+        ] {
+            let mut request = b"GET ".to_vec();
+            request.extend_from_slice(target);
+            request.extend_from_slice(b" HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ");
+            request.extend_from_slice(key);
+            request.extend_from_slice(b"\r\nSec-WebSocket-Version: 13\r\n\r\n");
+
+            let (client, mut peer) = tokio::io::duplex(8192);
+            let handler =
+                WebsocketTcpServerHandler::new(vec![WebsocketServerTarget {
+                    matching_path: Some("/socks\u{fffd}".to_string()),
+                    matching_headers: None,
+                    xray_mismatch_404: true,
+                    trusted_x_forwarded_for: Vec::new(),
+                    accept_proxy_protocol: false,
+                    heartbeat_period: 0,
+                    handler: Box::new(AcceptingInner),
+                }]);
+            let task = tokio::spawn(async move {
+                handler
+                    .setup_server_stream(Box::new(TestStream(client)))
+                    .await
+            });
+
+            peer.write_all(&request).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            peer.read_to_end(&mut response).await.unwrap();
+            let _ = task.await.unwrap();
+            let response = String::from_utf8(response).unwrap();
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {expected_status}\r\n")),
+                "{target:?}: {response:?}"
             );
         }
     }

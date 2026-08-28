@@ -41,6 +41,7 @@ fn is_http_token_byte(byte: u8) -> bool {
 
 pub struct ParsedHttpData {
     pub first_line: String,
+    pub first_line_raw: Vec<u8>,
     pub headers: HashMap<String, Vec<String>>,
     pub line_reader: LineReader,
 }
@@ -51,6 +52,7 @@ impl ParsedHttpData {
     ) -> Result<Self, ParsedHttpError> {
         let mut line_reader = LineReader::new();
         let mut first_line: Option<String> = None;
+        let mut first_line_raw: Option<Vec<u8>> = None;
         let mut headers: HashMap<String, Vec<String>> = HashMap::new();
         let mut last_header: Option<(String, usize)> = None;
         let mut header_bytes = 0usize;
@@ -76,6 +78,7 @@ impl ParsedHttpData {
                 // parse flow with lossy decoding instead of rejecting the whole
                 // handshake before Xray's path-mismatch handling can run.
                 first_line = Some(String::from_utf8_lossy(line).into_owned());
+                first_line_raw = Some(line.to_vec());
             } else {
                 if matches!(line.first(), Some(b' ' | b'\t')) {
                     let Some((header_key, value_index)) = last_header.as_ref()
@@ -152,9 +155,12 @@ impl ParsedHttpData {
 
         let first_line =
             first_line.ok_or_else(|| std::io::Error::other("empty http request"))?;
+        let first_line_raw = first_line_raw
+            .expect("raw HTTP request line is captured together with decoded text");
 
         Ok(Self {
             first_line,
+            first_line_raw,
             headers,
             line_reader,
         })
