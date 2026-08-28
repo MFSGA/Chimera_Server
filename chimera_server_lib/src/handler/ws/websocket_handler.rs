@@ -614,15 +614,9 @@ fn xray_websocket_absolute_parts(request_target: &str) -> Option<(&str, &str)> {
     let rest = &request_target[scheme_end + 3..];
     let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
-    if authority.is_empty() {
-        return None;
-    }
     let host = authority
         .rsplit_once('@')
         .map_or(authority, |(_, host)| host);
-    if host.is_empty() {
-        return None;
-    }
 
     let path = rest.get(authority_end..).and_then(|remainder| {
         remainder.starts_with('/').then(|| {
@@ -635,7 +629,9 @@ fn xray_websocket_absolute_parts(request_target: &str) -> Option<(&str, &str)> {
 }
 
 fn xray_websocket_absolute_host(request_target: &str) -> Option<&str> {
-    xray_websocket_absolute_parts(request_target).map(|(host, _)| host)
+    xray_websocket_absolute_parts(request_target)
+        .map(|(host, _)| host)
+        .filter(|host| !host.is_empty())
 }
 
 fn xray_websocket_host_matches(actual: &str, expected: &str) -> bool {
@@ -1236,6 +1232,12 @@ mod tests {
             xray_websocket_request_path("http://example.com?foo=bar").unwrap(),
             b""
         );
+        assert_eq!(xray_websocket_request_path("http:///ws").unwrap(), b"/ws");
+        assert_eq!(xray_websocket_request_path("http://@/ws").unwrap(), b"/ws");
+        assert_eq!(
+            xray_websocket_request_path("http://user@/ws").unwrap(),
+            b"/ws"
+        );
         assert_eq!(
             xray_websocket_request_path("/ws%3Ffoo=bar").unwrap(),
             b"/ws?foo=bar"
@@ -1312,6 +1314,9 @@ mod tests {
             "/?foo=bar",
             "http://example.com/?foo=bar",
             "https://example.com/?foo=bar",
+            "http:///",
+            "http://@/",
+            "http://user@/",
         ] {
             let request = format!(
                 "GET {target} HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
