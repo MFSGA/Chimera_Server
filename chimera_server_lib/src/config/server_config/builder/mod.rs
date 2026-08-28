@@ -77,11 +77,82 @@ fn parse_xray_finalmask_bandwidth(input: &str) -> Result<u64, Error> {
 
 #[cfg(feature = "ws")]
 fn normalize_xray_websocket_path(path: Option<String>) -> String {
+    let path = path.map(strip_xray_websocket_early_data_query);
     match path {
         Some(path) if path.starts_with('/') => path,
         Some(path) if !path.is_empty() => format!("/{path}"),
         _ => "/".to_string(),
     }
+}
+
+fn strip_xray_websocket_early_data_query(path: String) -> String {
+    let Some(query_start) = path.find('?') else {
+        return path;
+    };
+    let query_end = path[query_start + 1..]
+        .find('#')
+        .map(|offset| query_start + 1 + offset)
+        .unwrap_or(path.len());
+    let query = &path[query_start + 1..query_end];
+
+    let has_early_data = query.split('&').any(|pair| {
+        parse_xray_websocket_query_pair(pair)
+            .is_some_and(|(key, value)| key == "ed" && !value.is_empty())
+    });
+    if !has_early_data {
+        return path;
+    }
+
+    let remaining = query
+        .split('&')
+        .filter(|pair| {
+            parse_xray_websocket_query_pair(pair).is_some_and(|(key, _)| key != "ed")
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    let suffix = &path[query_end..];
+    if remaining.is_empty() {
+        format!("{}{}", &path[..query_start], suffix)
+    } else {
+        format!("{}?{}{}", &path[..query_start], remaining, suffix)
+    }
+}
+
+fn parse_xray_websocket_query_pair(pair: &str) -> Option<(String, String)> {
+    if pair.contains(';') {
+        return None;
+    }
+    let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+    Some((
+        decode_xray_websocket_query_component(key)?,
+        decode_xray_websocket_query_component(value)?,
+    ))
+}
+
+fn decode_xray_websocket_query_component(value: &str) -> Option<String> {
+    let mut decoded = Vec::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match bytes[offset] {
+            b'+' => {
+                decoded.push(b' ');
+                offset += 1;
+            }
+            b'%' if offset + 2 < bytes.len() => {
+                let high = (bytes[offset + 1] as char).to_digit(16)? as u8;
+                let low = (bytes[offset + 2] as char).to_digit(16)? as u8;
+                decoded.push((high << 4) | low);
+                offset += 3;
+            }
+            b'%' => return None,
+            byte => {
+                decoded.push(byte);
+                offset += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).ok()
 }
 
 #[cfg(any(feature = "ws", feature = "httpupgrade"))]
@@ -3271,6 +3342,40 @@ mod tests {
         assert_eq!(
             normalize_xray_websocket_path(Some("/chat".to_string())),
             "/chat"
+        );
+        assert_eq!(
+            normalize_xray_websocket_path(Some("/chat?ed=2048".to_string())),
+            "/chat"
+        );
+        assert_eq!(
+            normalize_xray_websocket_path(Some("/chat?%65d=2048".to_string())),
+            "/chat"
+        );
+        assert_eq!(
+            normalize_xray_websocket_path(Some("chat?ed=2048".to_string())),
+            "/chat"
+        );
+        assert_eq!(
+            normalize_xray_websocket_path(Some("/chat?foo=bar&ed=2048".to_string())),
+            "/chat?foo=bar"
+        );
+        assert_eq!(
+            normalize_xray_websocket_path(Some("/chat?ed=".to_string())),
+            "/chat?ed="
+        );
+        assert_eq!(
+            normalize_xray_websocket_path(Some("/chat?ed=%".to_string())),
+            "/chat?ed=%"
+        );
+        assert_eq!(
+            normalize_xray_websocket_path(Some(
+                "/chat?ed=2048&bad%ZZ=x".to_string()
+            )),
+            "/chat"
+        );
+        assert_eq!(
+            normalize_xray_websocket_path(Some("/chat?ed=2048;bad".to_string())),
+            "/chat?ed=2048;bad"
         );
     }
 
