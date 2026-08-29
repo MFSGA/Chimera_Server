@@ -17,6 +17,7 @@ use crate::{
 };
 
 const XRAY_HTTPUPGRADE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
+const XRAY_HTTPUPGRADE_HEADER_LIMIT: usize = 12_288;
 
 #[derive(Debug)]
 pub struct HttpUpgradeTcpServerHandler {
@@ -165,15 +166,21 @@ impl TcpServerHandler for HttpUpgradeTcpServerHandler {
 }
 
 async fn read_http_header(stream: &mut Box<dyn AsyncStream>) -> io::Result<Vec<u8>> {
-    // Xray v26.2.6 parses HTTPUpgrade with a default 4096-byte bufio.Reader,
-    // then discards that reader after http.ReadRequest. Any inner-protocol
-    // bytes read ahead into the same buffer are therefore lost. Mirror that
-    // observable behavior instead of preserving bytes that arrive together
-    // with the upgrade request.
+    // Current Xray wraps HTTPUpgrade parsing in io.LimitReader(conn, 12288),
+    // while bufio.ReadRequest may still read ahead within that bound. Discard
+    // any such bytes after the request just like Xray's short-lived reader.
     let mut header = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
     loop {
-        let read = stream.read(&mut chunk).await?;
+        let remaining = XRAY_HTTPUPGRADE_HEADER_LIMIT.saturating_sub(header.len());
+        if remaining == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "HTTPUpgrade request exceeded Xray's 12 KiB header limit",
+            ));
+        }
+        let max_read = remaining.min(chunk.len());
+        let read = stream.read(&mut chunk[..max_read]).await?;
         if read == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -935,7 +942,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepts_large_headers_like_xray_v26_2_6() {
+    async fn rejects_headers_beyond_current_xray_12_kib_limit() {
         let handler = HttpUpgradeTcpServerHandler::new(
             None,
             "/upgrade".into(),
@@ -950,17 +957,16 @@ mod tests {
         );
         client.write_all(request.as_bytes()).await.unwrap();
 
-        let result = handler
+        let error = match handler
             .setup_server_stream(Box::new(TestStream(server)))
             .await
-            .expect("Xray v26.2.6 accepts HTTPUpgrade headers beyond 12 KiB");
-        assert!(matches!(result, TcpServerSetupResult::TcpForward { .. }));
-        let mut response = vec![0u8; 77];
-        client.read_exact(&mut response).await.unwrap();
-        assert!(
-            String::from_utf8_lossy(&response)
-                .starts_with("HTTP/1.1 101 Switching Protocols")
-        );
+        {
+            Ok(_) => {
+                panic!("current Xray rejects HTTPUpgrade headers beyond 12 KiB")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[tokio::test]
