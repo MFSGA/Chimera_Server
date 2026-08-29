@@ -10,8 +10,7 @@ use super::reality_reader_writer::{RealityReader, RealityWriter};
 use super::reality_records::RecordEncryptor;
 use super::slide_buffer::SlideBuffer;
 use crate::reality::common::{
-    self, CIPHERTEXT_READ_BUF_CAPACITY, OUTGOING_BUFFER_LIMIT,
-    PLAINTEXT_READ_BUF_CAPACITY,
+    self, CIPHERTEXT_READ_BUF_CAPACITY, PLAINTEXT_READ_BUF_CAPACITY,
 };
 use handshake::generate_client_hello;
 use process::{
@@ -107,9 +106,9 @@ impl RealityClientConnection {
             cipher_suite: None,
             tls_read_buffer: Box::new([0u8; common::TLS_MAX_RECORD_SIZE]),
             ciphertext_read_buf: SlideBuffer::new(CIPHERTEXT_READ_BUF_CAPACITY),
-            ciphertext_write_buf: Vec::with_capacity(OUTGOING_BUFFER_LIMIT),
+            ciphertext_write_buf: Vec::new(),
             plaintext_read_buf: SlideBuffer::new(PLAINTEXT_READ_BUF_CAPACITY),
-            plaintext_write_buf: Vec::with_capacity(OUTGOING_BUFFER_LIMIT),
+            plaintext_write_buf: Vec::new(),
             received_close_notify: false,
             fatal_error: None,
         };
@@ -209,7 +208,10 @@ impl RealityClientConnection {
 
     /// Get a writer for buffering plaintext to be encrypted
     pub fn writer(&mut self) -> RealityWriter<'_> {
-        RealityWriter::new(&mut self.plaintext_write_buf)
+        RealityWriter::new(
+            &mut self.plaintext_write_buf,
+            self.ciphertext_write_buf.len(),
+        )
     }
 
     /// Write buffered TLS messages to the provided writer
@@ -396,6 +398,24 @@ mod tests {
         let cipher_suites =
             extract_client_cipher_suites(&conn.ciphertext_write_buf).unwrap();
         assert_eq!(cipher_suites, vec![0x1303]);
+    }
+
+    #[test]
+    fn writer_counts_pending_tls_output_toward_combined_limit() {
+        let mut conn = RealityClientConnection::new(RealityClientConfig {
+            public_key: test_server_public_key(),
+            short_id: [0u8; 8],
+            server_name: "example.com".to_string(),
+            cipher_suites: Vec::new(),
+        })
+        .unwrap();
+        conn.ciphertext_write_buf =
+            vec![0; crate::reality::common::OUTGOING_BUFFER_LIMIT - 3];
+
+        let mut writer = conn.writer();
+        assert_eq!(writer.write(b"hello").unwrap(), 3);
+        assert_eq!(writer.write(b"world").unwrap(), 0);
+        assert_eq!(conn.plaintext_write_buf, b"hel");
     }
 
     #[test]
