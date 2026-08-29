@@ -3,11 +3,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use quic::start_quic_server;
 #[cfg(target_os = "linux")]
 use socket2::SockRef;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    task::JoinHandle,
-    time::timeout,
-};
+use tokio::{io::AsyncWriteExt, task::JoinHandle, time::timeout};
 use udp::{
     run_bidirectional_udp, run_multi_directional_udp, run_session_based_udp,
     start_udp_server,
@@ -22,7 +18,7 @@ use crate::{
     },
     handler::{
         http::relay_plain_http_response,
-        socks::run_shared_udp_relay,
+        socks::run_udp_relay_with_expected_client,
         tcp::{
             tcp_handler::{
                 TcpServerConnectionContext, TcpServerHandler, TcpServerSetupResult,
@@ -61,38 +57,6 @@ pub async fn start_servers(
     }
 
     let mut join_handles = Vec::with_capacity(3);
-
-    if let ServerProxyConfig::Socks {
-        accounts,
-        udp_enabled: true,
-        ..
-    } = &config.protocol
-    {
-        let bind_addr = match &config.bind_location {
-            BindLocation::Address(address) => address.to_socket_addr()?,
-        };
-        let socket = Arc::new(tokio::net::UdpSocket::bind(bind_addr).await?);
-        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
-        let runtime = runtime.clone();
-        let accounts = accounts.clone();
-        let traffic_context = Some(
-            crate::traffic::TrafficContext::new("socks")
-                .with_inbound_tag(config.tag.clone()),
-        );
-        join_handles.push(tokio::spawn(async move {
-            if let Err(error) = run_shared_udp_relay(
-                socket,
-                resolver,
-                runtime,
-                accounts,
-                traffic_context,
-            )
-            .await
-            {
-                error!("SOCKS5 shared UDP listener stopped with error: {}", error);
-            }
-        }));
-    }
 
     match config.transport {
         Transport::Tcp => {
@@ -806,20 +770,23 @@ where
             unreachable!("fallback result must be normalized before forwarding")
         }
         TcpServerSetupResult::UdpAssociate {
-            mut stream,
+            stream,
+            udp_socket,
+            expected_client,
             traffic_context,
         } => {
             let traffic_context = traffic_context
                 .map(|context| context.with_client_ip(peer_addr.ip()));
-            let _connection_guard = register_connection(traffic_context.as_ref());
-            let mut buf = [0u8; 1024];
-            loop {
-                match stream.read(&mut buf).await {
-                    Ok(0) => return Ok(()),
-                    Ok(_) => continue,
-                    Err(error) => return Err(error),
-                }
-            }
+            let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+            run_udp_relay_with_expected_client(
+                udp_socket,
+                stream,
+                resolver,
+                runtime,
+                Some(expected_client),
+                traffic_context,
+            )
+            .await
         }
         TcpServerSetupResult::BidirectionalUdp {
             remote_location,
