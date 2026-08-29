@@ -1,7 +1,10 @@
-use std::{collections::HashMap, io};
+use std::{collections::HashMap, io, time::Duration};
 
 use async_trait::async_trait;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    time::timeout,
+};
 
 use crate::{
     async_stream::AsyncStream,
@@ -12,6 +15,8 @@ use crate::{
         },
     },
 };
+
+const XRAY_HTTPUPGRADE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[derive(Debug)]
 pub struct HttpUpgradeTcpServerHandler {
@@ -43,11 +48,19 @@ impl HttpUpgradeTcpServerHandler {
         &self,
         stream: &mut Box<dyn AsyncStream>,
     ) -> io::Result<Option<std::net::SocketAddr>> {
-        // Xray v26.2.6 calls http.ReadRequest directly here. Unlike its
-        // WebSocket transport, HTTPUpgrade does not impose a transport-level
-        // four-second header timeout; the inner inbound owns its handshake
-        // policy after the upgrade completes.
-        let request = read_http_header(stream).await?;
+        // Current Xray applies the same four-second request-header read
+        // deadline used by WebSocket before parsing the HTTPUpgrade request.
+        // Keep the timeout scoped to the HTTP upgrade itself so PROXY protocol
+        // parsing and the inner inbound retain their own timeout policies.
+        let request =
+            timeout(XRAY_HTTPUPGRADE_HANDSHAKE_TIMEOUT, read_http_header(stream))
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "HTTPUpgrade handshake timed out",
+                    )
+                })??;
         let (_method, target, _version, headers) = parse_request(&request)?;
         let target = parse_request_target(target)?;
         let path = decode_request_path(target.path)?;
@@ -884,7 +897,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn does_not_apply_websocket_four_second_header_timeout() {
+    async fn applies_xray_four_second_header_timeout() {
         let handler = HttpUpgradeTcpServerHandler::new(
             None,
             "/upgrade".into(),
@@ -903,18 +916,21 @@ mod tests {
                 .setup_server_stream(Box::new(TestStream(server)))
                 .await
         });
-        tokio::time::sleep(Duration::from_millis(4_100)).await;
+        tokio::time::sleep(Duration::from_millis(3_500)).await;
         assert!(
             !setup.is_finished(),
-            "Xray HTTPUpgrade remains pending past the WebSocket four-second deadline"
+            "HTTPUpgrade timeout must not fire before Xray's four-second window"
         );
 
-        client
-            .write_all(b"Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+        let result = tokio::time::timeout(Duration::from_secs(1), setup)
             .await
+            .expect("HTTPUpgrade timeout should fire near four seconds")
             .unwrap();
-        let result = setup.await.unwrap().expect("HTTPUpgrade handshake");
-        assert!(matches!(result, TcpServerSetupResult::TcpForward { .. }));
+        let error = match result {
+            Ok(_) => panic!("partial HTTPUpgrade request must time out"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 
     #[tokio::test]
