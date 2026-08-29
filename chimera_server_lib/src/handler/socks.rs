@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -445,8 +446,9 @@ async fn authenticate(
     stream.read_exact(&mut password_buf).await?;
 
     if let Some(account) = accounts.iter().find(|account| {
-        account.username.as_bytes() == username_buf
-            && account.password.as_bytes() == password_buf
+        let username_match = account.username.as_bytes().ct_eq(&username_buf);
+        let password_match = account.password.as_bytes().ct_eq(&password_buf);
+        (username_match & password_match).unwrap_u8() == 1
     }) {
         send_username_auth_status(stream, 0x00).await?;
         Ok(account.username.clone())
