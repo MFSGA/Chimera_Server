@@ -641,9 +641,13 @@ pub(super) fn collect_xhttp_settings(
             "xhttpSettings.xPaddingBytes cannot be disabled".into(),
         ));
     }
-    // Xray v26.2.6 normalizes every XHTTP base path with a trailing slash,
-    // even when session/sequence metadata is carried outside the path.
-    let normalized_path = normalize_path(raw.path, true);
+    // Current Xray only requires a trailing slash when session or sequence
+    // metadata is encoded in the path. Preserve file-like paths otherwise.
+    let normalized_path = normalize_path(
+        raw.path,
+        session_placement == XhttpPlacement::Path
+            || seq_placement == XhttpPlacement::Path,
+    );
     let (min_padding, max_padding) = clamp_xhttp_range(
         raw.x_padding_bytes.unwrap_or(XhttpRange {
             from: 100,
@@ -1484,6 +1488,48 @@ mod tests {
     }
 
     #[test]
+    fn collect_xhttp_settings_matches_current_xray_path_normalization() {
+        for (settings_value, expected_path) in [
+            (
+                serde_json::json!({
+                    "path": "/stream",
+                    "sessionIDPlacement": "query",
+                    "seqPlacement": "query"
+                }),
+                "/stream",
+            ),
+            (
+                serde_json::json!({
+                    "path": "/stream/filename.extension",
+                    "sessionIDPlacement": "query",
+                    "seqPlacement": "header"
+                }),
+                "/stream/filename.extension",
+            ),
+            (
+                serde_json::json!({
+                    "path": "/stream",
+                    "sessionIDPlacement": "query",
+                    "seqPlacement": "path"
+                }),
+                "/stream/",
+            ),
+            (
+                serde_json::json!({
+                    "path": "/stream"
+                }),
+                "/stream/",
+            ),
+        ] {
+            let settings = serde_json::from_value::<XhttpSettings>(settings_value)
+                .expect("xhttp settings");
+            let config = collect_xhttp_settings(settings)
+                .expect("current Xray path placement should be accepted");
+            assert_eq!(config.path, expected_path);
+        }
+    }
+
+    #[test]
     fn collect_xhttp_settings_accepts_reference_header_and_method_options() {
         let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
             "path": "/xhttp",
@@ -1603,18 +1649,18 @@ mod tests {
     }
 
     #[test]
-    fn collect_xhttp_settings_normalizes_trailing_slash_with_query_meta() {
+    fn collect_xhttp_settings_preserves_path_without_path_metadata() {
         let settings: XhttpSettings = serde_json::from_value(serde_json::json!({
             "path": "/x",
             "mode": "packet-up",
-            "sessionPlacement": "query",
+            "sessionIDPlacement": "query",
             "seqPlacement": "query"
         }))
         .expect("valid xhttp settings");
 
         let config =
             collect_xhttp_settings(settings).expect("xhttp settings should parse");
-        assert_eq!(config.path, "/x/");
+        assert_eq!(config.path, "/x");
     }
 
     #[test]
