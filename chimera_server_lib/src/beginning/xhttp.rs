@@ -751,6 +751,12 @@ async fn handle_packet_up(
     };
 
     let (parts, body) = request.into_parts();
+    if declared_content_length_exceeds_post_limit(
+        &parts.headers,
+        state.max_each_post_bytes,
+    ) {
+        return simple_response(StatusCode::PAYLOAD_TOO_LARGE);
+    }
     let header_payload = if matches!(
         state.uplink_data_placement,
         XhttpDataPlacement::Auto | XhttpDataPlacement::Header
@@ -1550,6 +1556,17 @@ fn decode_chunked_cookie_payload(
 
 fn payload_exceeds_post_limit(payload_len: usize, max_bytes: i64) -> bool {
     i64::try_from(payload_len).unwrap_or(i64::MAX) > max_bytes
+}
+
+fn declared_content_length_exceeds_post_limit(
+    headers: &hyper::HeaderMap,
+    max_bytes: i64,
+) -> bool {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| i128::from(length) > i128::from(max_bytes))
 }
 
 async fn collect_body_limited<B>(
@@ -2719,6 +2736,19 @@ mod tests {
         assert!(payload_exceeds_post_limit(0, -1));
         assert!(payload_exceeds_post_limit(1, -1));
         assert!(!payload_exceeds_post_limit(0, 0));
+    }
+
+    #[test]
+    fn declared_content_length_rejects_oversized_packet_before_body_read() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            header::CONTENT_LENGTH,
+            hyper::header::HeaderValue::from_static("8"),
+        );
+        assert!(declared_content_length_exceeds_post_limit(&headers, 7));
+        assert!(!declared_content_length_exceeds_post_limit(&headers, 8));
+        headers.remove(header::CONTENT_LENGTH);
+        assert!(!declared_content_length_exceeds_post_limit(&headers, 7));
     }
 
     #[tokio::test]
