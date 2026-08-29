@@ -432,19 +432,16 @@ impl AppState {
             decoded_path.strip_prefix(&self.base_path).unwrap_or("")
         };
 
-        // Xray v26.2.6 only reads path metadata when both session and sequence
-        // placements are path. A path sequence paired with a non-path session
-        // is a valid configuration, but the server leaves seq empty.
-        if let Some(path_meta) = xray_path_metadata_pair(
-            path_tail,
-            self.session_placement,
-            self.seq_placement,
-        ) {
-            return path_meta;
-        }
-
+        // Current Xray consumes path metadata in placement order. Each path
+        // placement advances the path segment index independently, so mixed
+        // path/query/header/cookie configurations remain valid.
+        let mut path_part = 0usize;
         let session_id = match self.session_placement {
-            XhttpPlacement::Path => None,
+            XhttpPlacement::Path => xray_path_metadata_value_for_placement(
+                path_tail,
+                &mut path_part,
+                self.session_placement,
+            ),
             XhttpPlacement::Query => {
                 query_value(request.uri().query(), &self.session_key)
             }
@@ -456,7 +453,11 @@ impl AppState {
             }
         };
         let seq = match self.seq_placement {
-            XhttpPlacement::Path => None,
+            XhttpPlacement::Path => xray_path_metadata_value_for_placement(
+                path_tail,
+                &mut path_part,
+                self.seq_placement,
+            ),
             XhttpPlacement::Query => {
                 query_value(request.uri().query(), &self.seq_key)
             }
@@ -1579,19 +1580,17 @@ fn matches_base_path(request_path: &str, base_path: &str) -> bool {
     request_path.starts_with(base_path)
 }
 
-fn xray_path_metadata_pair(
+fn xray_path_metadata_value_for_placement(
     path_tail: &str,
-    session_placement: XhttpPlacement,
-    seq_placement: XhttpPlacement,
-) -> Option<(Option<String>, Option<String>)> {
-    (session_placement == XhttpPlacement::Path
-        && seq_placement == XhttpPlacement::Path)
-        .then(|| {
-            (
-                xray_path_metadata_value(path_tail, 0),
-                xray_path_metadata_value(path_tail, 1),
-            )
-        })
+    path_part: &mut usize,
+    placement: XhttpPlacement,
+) -> Option<String> {
+    if placement != XhttpPlacement::Path {
+        return None;
+    }
+    let value = xray_path_metadata_value(path_tail, *path_part);
+    *path_part += 1;
+    value
 }
 
 fn xray_path_metadata_value(path_tail: &str, index: usize) -> Option<String> {
@@ -2571,23 +2570,54 @@ mod tests {
     }
 
     #[test]
-    fn path_sequence_requires_path_session_like_xray_v26_2_6() {
+    fn path_metadata_advances_only_for_path_placements_like_current_xray() {
+        let mut path_part = 0;
         assert_eq!(
-            xray_path_metadata_pair(
-                "abc/0",
+            xray_path_metadata_value_for_placement(
+                "session/0",
+                &mut path_part,
                 XhttpPlacement::Path,
-                XhttpPlacement::Path
+            )
+            .as_deref(),
+            Some("session")
+        );
+        assert_eq!(path_part, 1);
+        assert_eq!(
+            xray_path_metadata_value_for_placement(
+                "session/0",
+                &mut path_part,
+                XhttpPlacement::Query,
             ),
-            Some((Some("abc".to_string()), Some("0".to_string())))
+            None
+        );
+        assert_eq!(path_part, 1);
+        assert_eq!(
+            xray_path_metadata_value_for_placement(
+                "session/0",
+                &mut path_part,
+                XhttpPlacement::Path,
+            )
+            .as_deref(),
+            Some("0")
+        );
+
+        let mut path_part = 0;
+        assert_eq!(
+            xray_path_metadata_value_for_placement(
+                "0",
+                &mut path_part,
+                XhttpPlacement::Query
+            ),
+            None
         );
         assert_eq!(
-            xray_path_metadata_pair(
+            xray_path_metadata_value_for_placement(
                 "0",
-                XhttpPlacement::Query,
+                &mut path_part,
                 XhttpPlacement::Path
-            ),
-            None,
-            "Xray accepts query-session/path-seq config but does not extract the path seq"
+            )
+            .as_deref(),
+            Some("0")
         );
     }
 
