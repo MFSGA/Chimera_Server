@@ -2,6 +2,7 @@ use std::{
     convert::Infallible,
     future::Future,
     io,
+    net::SocketAddr,
     pin::Pin,
     sync::{
         Arc,
@@ -52,8 +53,6 @@ use crate::{
 use crate::{
     config::server_config::TlsServerConfig, handler::tls::build_server_config,
 };
-
-use super::process_stream;
 
 const GRPC_PIPE_CAPACITY: usize = 64 * 1024;
 const MAX_GRPC_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
@@ -135,14 +134,16 @@ struct GrpcKeepalive {
 
 #[derive(Debug, Clone)]
 struct GrpcConnectionContext {
-    peer_addr: std::net::SocketAddr,
+    peer_addr: SocketAddr,
+    local_addr: SocketAddr,
     setup_deadline: Instant,
     trusted_x_forwarded_for: Arc<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
 struct GrpcPeerContext {
-    peer_addr: std::net::SocketAddr,
+    peer_addr: SocketAddr,
+    local_addr: SocketAddr,
     trusted_x_forwarded_for: Arc<Vec<String>>,
 }
 
@@ -319,6 +320,13 @@ pub(super) async fn start_grpc_server(
                     continue;
                 }
             };
+            let local_addr = match stream.local_addr() {
+                Ok(value) => value,
+                Err(error) => {
+                    error!("gRPC transport local address lookup failed: {error}");
+                    continue;
+                }
+            };
             let tun_service_path = tun_service_path.clone();
             let tun_multi_service_path = tun_multi_service_path.clone();
             let keepalive = GrpcKeepalive {
@@ -336,6 +344,7 @@ pub(super) async fn start_grpc_server(
                         stream,
                         GrpcConnectionContext {
                             peer_addr,
+                            local_addr,
                             setup_deadline: Instant::now()
                                 + GRPC_CONNECTION_SETUP_TIMEOUT,
                             trusted_x_forwarded_for,
@@ -364,6 +373,7 @@ pub(super) async fn start_grpc_server(
                                     stream,
                                     GrpcConnectionContext {
                                         peer_addr,
+                                        local_addr,
                                         setup_deadline,
                                         trusted_x_forwarded_for,
                                     },
@@ -399,6 +409,7 @@ pub(super) async fn start_grpc_server(
                                     stream,
                                     GrpcConnectionContext {
                                         peer_addr,
+                                        local_addr,
                                         setup_deadline: Instant::now()
                                             + GRPC_CONNECTION_SETUP_TIMEOUT,
                                         trusted_x_forwarded_for,
@@ -584,6 +595,7 @@ async fn serve_grpc_connection<IO>(
     let builder = grpc_http2_builder(keepalive);
     let GrpcConnectionContext {
         peer_addr,
+        local_addr,
         setup_deadline,
         trusted_x_forwarded_for,
     } = connection;
@@ -598,6 +610,7 @@ async fn serve_grpc_connection<IO>(
             runtime.clone(),
             GrpcPeerContext {
                 peer_addr,
+                local_addr,
                 trusted_x_forwarded_for: trusted_x_forwarded_for.clone(),
             },
         )
@@ -617,11 +630,8 @@ async fn handle_request(
     runtime: RuntimeState,
     peer_context: GrpcPeerContext,
 ) -> Result<Response<ResponseBody>, Infallible> {
-    let logical_peer_addr = grpc_logical_peer_addr(
-        request.headers(),
-        peer_context.peer_addr,
-        &peer_context.trusted_x_forwarded_for,
-    );
+    let (logical_peer_addr, logical_local_addr) =
+        grpc_logical_addrs(request.headers(), &peer_context);
     if let Some(message) =
         grpc_duplicate_host_error(request.headers(), request.uri())
     {
@@ -670,11 +680,12 @@ async fn handle_request(
     let (transport_read, mut transport_write) = tokio::io::split(transport_stream);
     let timed_out = Arc::new(AtomicBool::new(false));
     let stream_task = tokio::spawn(async move {
-        if let Err(error) = process_stream(
+        if let Err(error) = super::process_stream_with_local_addr(
             GrpcLogicalStream(handler_stream),
             server_handler,
             resolver,
             logical_peer_addr,
+            Some(logical_local_addr),
             runtime,
         )
         .await
@@ -1007,6 +1018,20 @@ fn grpc_unsupported_encoding(headers: &hyper::HeaderMap) -> Option<&str> {
         .next_back()
         .and_then(|value| value.to_str().ok())
         .filter(|encoding| !encoding.is_empty() && *encoding != "identity")
+}
+
+fn grpc_logical_addrs(
+    headers: &hyper::HeaderMap,
+    peer_context: &GrpcPeerContext,
+) -> (SocketAddr, SocketAddr) {
+    (
+        grpc_logical_peer_addr(
+            headers,
+            peer_context.peer_addr,
+            &peer_context.trusted_x_forwarded_for,
+        ),
+        peer_context.local_addr,
+    )
 }
 
 fn grpc_logical_peer_addr(
@@ -1561,11 +1586,12 @@ mod tests {
     };
 
     use super::{
-        GrpcKeepalive, GrpcSetupTimeoutIo, GrpcStreamTaskGuard, decode_grpc_message,
-        encode_grpc_message, grpc_content_type, grpc_content_type_is_valid,
-        grpc_deadline_exceeded_response, grpc_duplicate_host_error,
-        grpc_duplicate_host_response, grpc_encode_message, grpc_http2_builder,
-        grpc_invalid_base64_offset, grpc_invalid_content_type_response,
+        GrpcKeepalive, GrpcPeerContext, GrpcSetupTimeoutIo, GrpcStreamTaskGuard,
+        decode_grpc_message, encode_grpc_message, grpc_content_type,
+        grpc_content_type_is_valid, grpc_deadline_exceeded_response,
+        grpc_duplicate_host_error, grpc_duplicate_host_response,
+        grpc_encode_message, grpc_http2_builder, grpc_invalid_base64_offset,
+        grpc_invalid_content_type_response, grpc_logical_addrs,
         grpc_logical_peer_addr, grpc_malformed_binary_metadata,
         grpc_malformed_binary_metadata_response, grpc_malformed_timeout_response,
         grpc_method_not_allowed_response, grpc_service_paths, grpc_stream_response,
@@ -2411,6 +2437,26 @@ mod tests {
             ),
             peer_addr
         );
+    }
+
+    #[test]
+    fn grpc_logical_addrs_preserve_accepted_local_addr() {
+        let peer_addr = "127.0.0.1:34567".parse().unwrap();
+        let local_addr = "127.0.0.1:8443".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        headers.insert("x-trusted-cdn", "".parse().unwrap());
+        let context = GrpcPeerContext {
+            peer_addr,
+            local_addr,
+            trusted_x_forwarded_for: Arc::new(vec!["X-Trusted-CDN".to_string()]),
+        };
+
+        let (logical_peer_addr, logical_local_addr) =
+            grpc_logical_addrs(&headers, &context);
+
+        assert_eq!(logical_peer_addr, "203.0.113.9:0".parse().unwrap());
+        assert_eq!(logical_local_addr, local_addr);
     }
 
     #[test]
