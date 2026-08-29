@@ -2498,7 +2498,7 @@ mod tests {
 
         match config.protocol {
             ServerProxyConfig::Reality(reality) => {
-                assert_eq!(reality.min_client_version, None);
+                assert_eq!(reality.min_client_version, Some([26, 3, 27]));
                 assert_eq!(
                     reality.cipher_suites,
                     vec![
@@ -2530,6 +2530,22 @@ mod tests {
             err.to_string()
                 .contains("reality inbound requires at least one shortId")
         );
+    }
+
+    #[cfg(all(feature = "reality", feature = "vless"))]
+    #[test]
+    fn vless_reality_preserves_explicit_min_client_version() {
+        let mut settings = base_reality_settings();
+        settings["minClient"] = serde_json::json!("25.1.2");
+
+        let config = ServerConfig::try_from(vless_reality_inbound(settings))
+            .expect("explicit minClient should override the Xray default");
+        match config.protocol {
+            ServerProxyConfig::Reality(reality) => {
+                assert_eq!(reality.min_client_version, Some([25, 1, 2]));
+            }
+            other => panic!("expected reality protocol, got {other:?}"),
+        }
     }
 
     #[cfg(all(feature = "reality", feature = "vless"))]

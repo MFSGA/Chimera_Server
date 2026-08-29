@@ -3,8 +3,8 @@ mod reality_vision_support;
 use reality_vision_support::{
     CURRENT_XRAY_VERSION, REALITY_PUBLIC_KEY, REALITY_SERVER_NAME, REALITY_SHORT_ID,
     TEST_UUID, VisionClientOptions, VisionServerOptions, WRONG_REALITY_PUBLIC_KEY,
-    WRONG_UUID, assert_socks5_echo, assert_socks5_proxy_fails, serial_guard,
-    start_tcp_echo_server, start_vision_harness, wait_for_counter, wait_for_log,
+    WRONG_UUID, assert_socks5_proxy_fails, serial_guard, start_tcp_echo_server,
+    start_vision_harness, wait_for_counter, wait_for_log,
 };
 
 async fn run_rejected_case(
@@ -20,26 +20,20 @@ async fn run_rejected_case(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "starts Chimera and Xray and validates omitted REALITY version bounds"]
-async fn reality_omitted_minimum_accepts_bundled_xray_26_2_6() {
+#[ignore = "starts Chimera and bundled Xray and validates the current Xray default REALITY version floor"]
+async fn reality_omitted_minimum_rejects_bundled_xray_26_2_6() {
     let _serial = serial_guard().await;
-    let target = start_tcp_echo_server();
     let server = VisionServerOptions {
         min_client_ver: None,
         ..VisionServerOptions::default()
     };
-    let mut harness = start_vision_harness(
+    let harness = run_rejected_case(
         "omitted-minimum-version",
         server,
         VisionClientOptions::default(),
     )
     .await;
-    harness.assert_running();
-    assert_socks5_echo(
-        harness.socks_addr,
-        target,
-        b"omitted REALITY minimum accepts bundled Xray",
-    );
+    wait_for_log(&harness.chimera, "Client version is below minimum");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
