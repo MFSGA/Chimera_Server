@@ -763,7 +763,7 @@ async fn handle_packet_up(
     ) {
         match decode_chunked_header_payload(&parts.headers, &state.uplink_data_key) {
             Ok(payload) => payload,
-            Err(_) => return simple_response(StatusCode::INTERNAL_SERVER_ERROR),
+            Err(_) => return simple_response(StatusCode::BAD_REQUEST),
         }
     } else {
         Vec::new()
@@ -774,7 +774,7 @@ async fn handle_packet_up(
     ) {
         match decode_chunked_cookie_payload(&parts.headers, &state.uplink_data_key) {
             Ok(payload) => payload,
-            Err(_) => return simple_response(StatusCode::INTERNAL_SERVER_ERROR),
+            Err(_) => return simple_response(StatusCode::BAD_REQUEST),
         }
     } else {
         Vec::new()
@@ -1501,21 +1501,6 @@ fn decode_chunked_header_payload(
     headers: &hyper::HeaderMap,
     key: &str,
 ) -> std::io::Result<Vec<u8>> {
-    let declared_len = header_value(headers, &format!("{key}-Length"))
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "missing uplink data length",
-            )
-        })?
-        .parse::<usize>()
-        .map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid uplink data length",
-            )
-        })?;
-
     let mut encoded = String::new();
     for index in 0usize.. {
         let header_name = format!("{key}-{index}");
@@ -1523,12 +1508,6 @@ fn decode_chunked_header_payload(
             break;
         };
         encoded.push_str(&chunk);
-    }
-    if encoded.is_empty() || encoded.len() != declared_len {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "uplink data length mismatch",
-        ));
     }
     decode_xhttp_payload(&encoded)
 }
@@ -1544,12 +1523,6 @@ fn decode_chunked_cookie_payload(
             break;
         };
         encoded.push_str(&chunk);
-    }
-    if encoded.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "missing uplink cookie payload",
-        ));
     }
     decode_xhttp_payload(&encoded)
 }
@@ -2205,9 +2178,13 @@ mod tests {
     }
 
     #[test]
-    fn cookie_uplink_payload_errors_match_xray_v26_2_6() {
+    fn cookie_uplink_payload_matches_current_xray_chunks() {
         let headers = hyper::HeaderMap::new();
-        assert!(decode_chunked_cookie_payload(&headers, "x_data").is_err());
+        assert_eq!(
+            decode_chunked_cookie_payload(&headers, "x_data")
+                .expect("empty cookie payload is valid"),
+            b""
+        );
 
         let mut headers = hyper::HeaderMap::new();
         headers.insert(
@@ -2218,7 +2195,7 @@ mod tests {
 
         headers.insert(
             header::COOKIE,
-            hyper::header::HeaderValue::from_static("x_data_0=cGluZw"),
+            hyper::header::HeaderValue::from_static("x_data_0=cGlu; x_data_1=Zw"),
         );
         assert_eq!(
             decode_chunked_cookie_payload(&headers, "x_data")
@@ -2228,36 +2205,25 @@ mod tests {
     }
 
     #[test]
-    fn header_uplink_length_matches_xray_v26_2_6() {
-        let mut headers = hyper::HeaderMap::new();
-        headers.insert(
-            "x-data-0",
-            hyper::header::HeaderValue::from_static("cGluZw"),
-        );
-
-        assert!(decode_chunked_header_payload(&headers, "X-Data").is_err());
-
-        headers.insert(
-            "x-data-length",
-            hyper::header::HeaderValue::from_static("5"),
-        );
-        assert!(decode_chunked_header_payload(&headers, "X-Data").is_err());
-
-        headers.insert(
-            "x-data-length",
-            hyper::header::HeaderValue::from_static("nope"),
-        );
-        assert!(decode_chunked_header_payload(&headers, "X-Data").is_err());
-
-        headers.insert(
-            "x-data-length",
-            hyper::header::HeaderValue::from_static("6"),
-        );
+    fn header_uplink_payload_matches_current_xray_chunks_without_length_marker() {
+        let headers = hyper::HeaderMap::new();
         assert_eq!(
             decode_chunked_header_payload(&headers, "X-Data")
-                .expect("valid header payload"),
+                .expect("empty header payload is valid"),
+            b""
+        );
+
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-data-0", hyper::header::HeaderValue::from_static("cGlu"));
+        headers.insert("x-data-1", hyper::header::HeaderValue::from_static("Zw"));
+        assert_eq!(
+            decode_chunked_header_payload(&headers, "X-Data")
+                .expect("current Xray does not send a data length marker"),
             b"ping"
         );
+
+        headers.insert("x-data-0", hyper::header::HeaderValue::from_static("!!!"));
+        assert!(decode_chunked_header_payload(&headers, "X-Data").is_err());
     }
 
     #[test]
