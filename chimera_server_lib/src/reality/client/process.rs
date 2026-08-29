@@ -8,7 +8,7 @@ use crate::reality::common::{
     CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_CHANGE_CIPHER_SPEC,
     HANDSHAKE_TYPE_CERTIFICATE, HANDSHAKE_TYPE_CERTIFICATE_VERIFY,
     HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS, HANDSHAKE_TYPE_FINISHED,
-    TLS_RECORD_HEADER_SIZE,
+    MAX_TLS_PLAINTEXT_LEN, TLS_RECORD_HEADER_SIZE,
 };
 use crate::reality::reality_aead::{AeadKey, decrypt_handshake_message_for_suite};
 use crate::reality::reality_cipher_suite::CipherSuite;
@@ -26,6 +26,24 @@ use crate::reality::reality_tls13_messages::construct_finished;
 use crate::reality::reality_util::{
     extract_server_cipher_suite, extract_server_public_key,
 };
+
+// Matches the maximum handshake size accepted by shoes/Xray REALITY clients.
+const MAX_HANDSHAKE_PLAINTEXT: usize = 4 * MAX_TLS_PLAINTEXT_LEN;
+
+fn append_handshake_plaintext(
+    accumulated: &mut Vec<u8>,
+    plaintext: &[u8],
+) -> io::Result<usize> {
+    let previous_len = accumulated.len();
+    if previous_len.saturating_add(plaintext.len()) > MAX_HANDSHAKE_PLAINTEXT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "REALITY handshake exceeds maximum size",
+        ));
+    }
+    accumulated.extend_from_slice(plaintext);
+    Ok(previous_len)
+}
 
 pub(super) fn process_server_hello(
     conn: &mut RealityClientConnection,
@@ -297,8 +315,8 @@ pub(super) fn process_encrypted_handshake(
         io::Error::other("TLS handshake sequence number exhausted")
     })?;
 
-    let prev_accumulated_len = accumulated_plaintext.len();
-    accumulated_plaintext.extend_from_slice(&plaintext);
+    let prev_accumulated_len =
+        append_handshake_plaintext(&mut accumulated_plaintext, &plaintext)?;
 
     tracing::debug!(
         "REALITY CLIENT: Decrypted handshake record, accumulated {} bytes",
@@ -585,4 +603,19 @@ pub(super) fn process_application_data(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handshake_plaintext_is_bounded_like_current_shoes() {
+        let mut accumulated = vec![0; MAX_HANDSHAKE_PLAINTEXT];
+
+        let error = append_handshake_plaintext(&mut accumulated, &[0]).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(accumulated.len(), MAX_HANDSHAKE_PLAINTEXT);
+    }
 }
