@@ -197,6 +197,29 @@ fn missing_or_short_padding_returns_400() {
 }
 
 #[test]
+#[ignore = "starts Chimera and validates current Xray uplink method dispatch"]
+fn current_xray_packet_uplink_method_dispatch_returns_200() {
+    let _serial = serial_xray_guard();
+    let options = ServerOptions {
+        mode: "packet-up",
+        ..ServerOptions::default()
+    };
+    let (_server, addr) = start_server("current-uplink-method", options);
+
+    for (method, session) in [("DELETE", "session-method"), ("GET", "session-get")] {
+        let headers = [
+            ("X-Session", session.to_string()),
+            ("X-Seq", "0".to_string()),
+        ];
+        let head = send_http_request(
+            addr,
+            &request(method, &padded_path(), "localhost", &headers, 0, b""),
+        );
+        assert_eq!(head.status, 200, "{method} packet-up should be accepted");
+    }
+}
+
+#[test]
 #[ignore = "starts Chimera and validates packet-up sequence parsing"]
 fn invalid_packet_sequence_returns_500() {
     let _serial = serial_xray_guard();
