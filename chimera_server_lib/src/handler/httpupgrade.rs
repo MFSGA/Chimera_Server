@@ -480,8 +480,8 @@ fn trusted_forwarded_peer(
     headers: &HashMap<String, String>,
     trusted_x_forwarded_for: &[String],
 ) -> Option<std::net::SocketAddr> {
-    if !trusted_x_forwarded_for.is_empty()
-        && !trusted_x_forwarded_for.iter().any(|header| {
+    if trusted_x_forwarded_for.is_empty()
+        || !trusted_x_forwarded_for.iter().any(|header| {
             // Go's http.ReadRequest promotes Host into req.Host and removes it
             // from req.Header. Xray therefore never treats the ordinary Host
             // request field as a trusted-XFF marker.
@@ -812,7 +812,8 @@ mod tests {
         ]);
         assert_eq!(
             trusted_forwarded_peer(&headers, &[]),
-            Some("203.0.113.77:0".parse().unwrap())
+            None,
+            "current Xray requires an explicit trusted-XFF marker configuration",
         );
         assert_eq!(
             trusted_forwarded_peer(&headers, &["X-Missing".into()]),
