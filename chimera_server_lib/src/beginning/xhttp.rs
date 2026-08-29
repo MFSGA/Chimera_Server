@@ -1367,8 +1367,8 @@ fn trusted_forwarded_peer(
     headers: &hyper::HeaderMap,
     trusted_x_forwarded_for: &[String],
 ) -> Option<std::net::SocketAddr> {
-    if !trusted_x_forwarded_for.is_empty()
-        && !trusted_x_forwarded_for
+    if trusted_x_forwarded_for.is_empty()
+        || !trusted_x_forwarded_for
             .iter()
             .any(|header| headers.contains_key(header))
     {
@@ -2195,17 +2195,14 @@ mod tests {
     }
 
     #[test]
-    fn xhttp_trusted_forwarded_peer_matches_xray_v26_2_6() {
+    fn xhttp_trusted_forwarded_peer_requires_xray_trusted_marker() {
         let mut headers = hyper::HeaderMap::new();
         headers.insert(
             "x-forwarded-for",
             hyper::header::HeaderValue::from_static("203.0.113.77, 198.51.100.2"),
         );
 
-        assert_eq!(
-            trusted_forwarded_peer(&headers, &[]),
-            Some("203.0.113.77:0".parse().expect("forwarded peer"))
-        );
+        assert_eq!(trusted_forwarded_peer(&headers, &[]), None);
         assert_eq!(
             trusted_forwarded_peer(&headers, &["X-Trusted-CDN".to_string()]),
             None
