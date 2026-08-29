@@ -141,8 +141,10 @@ fn build_reality_layer(
 
     // Keep xray-core style behavior: maxTimeDiff = 0 means disabled.
     let max_time_diff = settings.max_time_diff.filter(|diff| *diff > 0);
-    let min_client_version =
-        parse_version_triplet(&settings.min_client_ver, "minClientVer")?;
+    let min_client_version = Some(
+        parse_version_triplet(&settings.min_client_ver, "minClientVer")?
+            .unwrap_or([26, 3, 27]),
+    );
     let max_client_version =
         parse_version_triplet(&settings.max_client_ver, "maxClientVer")?;
 
