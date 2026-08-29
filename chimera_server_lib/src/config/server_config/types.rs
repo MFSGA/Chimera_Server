@@ -385,6 +385,8 @@ pub struct GrpcServerConfig {
     pub multi_mode: bool,
     pub idle_timeout: u32,
     pub health_check_timeout: u32,
+    #[serde(default)]
+    pub trusted_x_forwarded_for: Vec<String>,
     pub inner: Box<ServerProxyConfig>,
 }
 
