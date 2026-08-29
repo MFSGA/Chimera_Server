@@ -378,7 +378,11 @@ impl AppState {
         Self {
             mode: config.mode,
             host: config.host,
-            base_path: normalize_base_path(config.path),
+            base_path: normalize_base_path(
+                config.path,
+                config.session_placement,
+                config.seq_placement,
+            ),
             trusted_x_forwarded_for: config.trusted_x_forwarded_for,
             min_padding: config.min_padding,
             max_padding: config.max_padding,
@@ -1301,11 +1305,21 @@ impl AsyncPing for XhttpLogicalStream {
 
 impl AsyncStream for XhttpLogicalStream {}
 
-fn normalize_base_path(mut path: String) -> String {
-    if !path.starts_with('/') {
+fn normalize_base_path(
+    mut path: String,
+    session_placement: XhttpPlacement,
+    seq_placement: XhttpPlacement,
+) -> String {
+    if let Some(query_index) = path.find('?') {
+        path.truncate(query_index);
+    }
+    if path.is_empty() || !path.starts_with('/') {
         path.insert(0, '/');
     }
-    if !path.ends_with('/') {
+    if (session_placement == XhttpPlacement::Path
+        || seq_placement == XhttpPlacement::Path)
+        && !path.ends_with('/')
+    {
         path.push('/');
     }
     path
@@ -1942,6 +1956,50 @@ fn apply_response_padding_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalized_path_only_requires_trailing_slash_for_path_metadata() {
+        assert_eq!(
+            normalize_base_path(
+                "stream".to_string(),
+                XhttpPlacement::Path,
+                XhttpPlacement::Path,
+            ),
+            "/stream/"
+        );
+        assert_eq!(
+            normalize_base_path(
+                "/stream".to_string(),
+                XhttpPlacement::Query,
+                XhttpPlacement::Query,
+            ),
+            "/stream"
+        );
+        assert_eq!(
+            normalize_base_path(
+                "/stream/filename.extension".to_string(),
+                XhttpPlacement::Query,
+                XhttpPlacement::Header,
+            ),
+            "/stream/filename.extension"
+        );
+        assert_eq!(
+            normalize_base_path(
+                "/stream?ignored=1".to_string(),
+                XhttpPlacement::Query,
+                XhttpPlacement::Cookie,
+            ),
+            "/stream"
+        );
+        assert_eq!(
+            normalize_base_path(
+                "?ignored=1".to_string(),
+                XhttpPlacement::Query,
+                XhttpPlacement::Header,
+            ),
+            "/"
+        );
+    }
 
     #[test]
     fn response_padding_placements_match_xray_v26_2_6() {
