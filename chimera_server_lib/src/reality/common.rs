@@ -75,9 +75,9 @@ pub const CIPHERTEXT_READ_BUF_CAPACITY: usize = TLS_MAX_RECORD_SIZE * 2;
 /// Buffer capacity for plaintext read
 pub const PLAINTEXT_READ_BUF_CAPACITY: usize = TLS_MAX_RECORD_SIZE * 2;
 
-/// Buffer capacity for outgoing plaintext and ciphertext.
+/// Combined limit for queued plaintext and ciphertext.
 ///
-/// Mirrors rustls' default buffer limit and matches shoes' REALITY buffers.
+/// Mirrors rustls' default buffer limit and current shoes REALITY backpressure.
 pub const OUTGOING_BUFFER_LIMIT: usize = 64 * 1024;
 
 /// Strip TLS 1.3 content type trailer from decrypted plaintext.
