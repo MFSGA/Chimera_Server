@@ -81,6 +81,8 @@ pub enum TcpServerSetupResult {
     },
     UdpAssociate {
         stream: Box<dyn AsyncStream>,
+        udp_socket: std::sync::Arc<tokio::net::UdpSocket>,
+        expected_client: std::net::SocketAddr,
         traffic_context: Option<TrafficContext>,
     },
     BidirectionalUdp {
