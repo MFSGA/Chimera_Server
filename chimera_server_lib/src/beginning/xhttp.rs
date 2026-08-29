@@ -26,7 +26,7 @@ use hyper_util::{
 use rand::RngExt;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex},
-    sync::{Mutex, mpsc, oneshot},
+    sync::{mpsc, oneshot},
     time::{Duration, sleep},
 };
 #[cfg(feature = "tls")]
@@ -1078,36 +1078,31 @@ enum UploadPacket {
     Payload { seq: u64, data: Bytes },
 }
 
-struct UploadPushState {
-    sender: mpsc::Sender<UploadPacket>,
-    reader_claimed: bool,
-}
-
 struct UploadQueueSender {
-    state: Mutex<UploadPushState>,
+    sender: mpsc::Sender<UploadPacket>,
+    reader_claimed: AtomicBool,
 }
 
 impl UploadQueueSender {
     async fn push_reader(&self, reader: BoxedUploadReader) -> std::io::Result<()> {
-        let mut state = self.state.lock().await;
-        if state.reader_claimed {
+        if self
+            .reader_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return Err(std::io::Error::other("h.reader already exists"));
         }
-        state.reader_claimed = true;
-        state
-            .sender
+        self.sender
             .send(UploadPacket::Reader(reader))
             .await
             .map_err(|_| std::io::Error::other("packet queue closed"))
     }
 
     async fn push_payload(&self, seq: u64, data: Bytes) -> std::io::Result<()> {
-        let state = self.state.lock().await;
-        if state.reader_claimed {
+        if self.reader_claimed.load(Ordering::Acquire) {
             return Err(std::io::Error::other("h.reader already exists"));
         }
-        state
-            .sender
+        self.sender
             .send(UploadPacket::Payload { seq, data })
             .await
             .map_err(|_| std::io::Error::other("packet queue closed"))
@@ -1128,10 +1123,8 @@ impl XhttpUploadReader {
         let (sender, receiver) = mpsc::channel(max_buffered_posts);
         (
             UploadQueueSender {
-                state: Mutex::new(UploadPushState {
-                    sender,
-                    reader_claimed: false,
-                }),
+                sender,
+                reader_claimed: AtomicBool::new(false),
             },
             Self {
                 receiver,
@@ -2875,6 +2868,55 @@ mod tests {
                 .is_err(),
             "packet-up must fail after stream-up claims the upload queue"
         );
+    }
+
+    #[tokio::test]
+    async fn stream_up_claim_remains_visible_while_queue_is_backpressured_like_current_xray()
+     {
+        let (queue, _reader) = XhttpUploadReader::new(1);
+        let queue = Arc::new(queue);
+        queue
+            .push_payload(0, Bytes::from_static(b"0"))
+            .await
+            .expect("first packet fills upload channel");
+
+        let blocked_packet = tokio::spawn({
+            let queue = queue.clone();
+            async move { queue.push_payload(1, Bytes::from_static(b"1")).await }
+        });
+        sleep(Duration::from_millis(20)).await;
+        assert!(!blocked_packet.is_finished());
+
+        let blocked_stream = tokio::spawn({
+            let queue = queue.clone();
+            async move { queue.push_reader(Box::pin(tokio::io::empty())).await }
+        });
+        for _ in 0..20 {
+            if queue.reader_claimed.load(Ordering::Acquire) {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            queue.reader_claimed.load(Ordering::Acquire),
+            "current Xray claims stream-up before waiting for channel capacity"
+        );
+
+        let later_packet = tokio::time::timeout(
+            Duration::from_millis(100),
+            queue.push_payload(2, Bytes::from_static(b"2")),
+        )
+        .await
+        .expect(
+            "packet after stream-up claim must not block behind the full channel",
+        );
+        assert!(
+            later_packet.is_err(),
+            "packet-up must fail once stream-up has claimed the session"
+        );
+
+        blocked_packet.abort();
+        blocked_stream.abort();
     }
 
     #[tokio::test]
