@@ -58,7 +58,7 @@ use crate::{
     config::server_config::TlsServerConfig, handler::tls::build_server_config,
 };
 
-use super::process_stream;
+use super::process_stream_with_local_addr;
 
 const XHTTP_PIPE_CAPACITY: usize = 64 * 1024;
 const XHTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(4);
@@ -108,6 +108,13 @@ pub async fn start_xhttp_server(
                 }
             };
             let _ = stream.set_nodelay(true);
+            let local_addr = match stream.local_addr() {
+                Ok(addr) => addr,
+                Err(err) => {
+                    error!("xhttp local address for {} failed: {}", peer_addr, err);
+                    continue;
+                }
+            };
 
             let state = state.clone();
             let security = security.clone();
@@ -130,7 +137,8 @@ pub async fn start_xhttp_server(
 
                 match wrapped_stream {
                     Ok(stream) => {
-                        serve_http_connection(stream, state, peer_addr).await
+                        serve_http_connection(stream, state, peer_addr, local_addr)
+                            .await
                     }
                     Err(err) => {
                         error!("xhttp accept {} failed: {}", peer_addr, err);
@@ -314,14 +322,16 @@ async fn serve_http_connection<IO>(
     io: IO,
     state: Arc<AppState>,
     peer_addr: std::net::SocketAddr,
+    local_addr: std::net::SocketAddr,
 ) where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let io = TokioIo::new(io);
     let mut builder = auto::Builder::new(TokioExecutor::new());
     configure_http_builder(&mut builder, state.server_max_header_bytes);
-    let service =
-        service_fn(move |request| handle_request(request, state.clone(), peer_addr));
+    let service = service_fn(move |request| {
+        handle_request(request, state.clone(), peer_addr, local_addr)
+    });
 
     if let Err(err) = builder.serve_connection(io, service).await {
         error!("xhttp connection {} exited: {}", peer_addr, err);
@@ -488,6 +498,7 @@ async fn handle_request(
     request: Request<Incoming>,
     state: Arc<AppState>,
     peer_addr: std::net::SocketAddr,
+    local_addr: std::net::SocketAddr,
 ) -> Result<Response<ResponseBody>, Infallible> {
     let request_headers = request.headers().clone();
 
@@ -588,11 +599,13 @@ async fn handle_request(
                 state.clone(),
                 session_id.expect("stream-down requires a session id"),
                 logical_peer_addr,
+                local_addr,
             )
             .await
         }
         Ok(XhttpRequestDispatch::StreamOne) => {
-            handle_stream_one(request, state.clone(), logical_peer_addr).await
+            handle_stream_one(request, state.clone(), logical_peer_addr, local_addr)
+                .await
         }
         Ok(XhttpRequestDispatch::StreamUp) => {
             handle_stream_up(
@@ -623,12 +636,13 @@ async fn handle_stream_one(
     request: Request<Incoming>,
     state: Arc<AppState>,
     peer_addr: std::net::SocketAddr,
+    local_addr: std::net::SocketAddr,
 ) -> Response<ResponseBody> {
     let (client_upload, server_read) = duplex(XHTTP_PIPE_CAPACITY);
     let (server_write, client_download) = duplex(XHTTP_PIPE_CAPACITY);
     let logical_stream = XhttpLogicalStream::new(server_read, server_write);
 
-    spawn_handler_stream(logical_stream, state.clone(), peer_addr);
+    spawn_handler_stream(logical_stream, state.clone(), peer_addr, local_addr);
 
     let mut upload_writer = client_upload;
     let mut body = request.into_body();
@@ -687,12 +701,13 @@ async fn handle_stream_down(
     state: Arc<AppState>,
     session_id: String,
     peer_addr: std::net::SocketAddr,
+    local_addr: std::net::SocketAddr,
 ) -> Response<ResponseBody> {
     let session = state.sessions.get_or_create(&session_id);
     session.fully_connected.store(true, Ordering::Release);
 
     let (stream, reader) = session.new_downlink_connection();
-    spawn_handler_stream(stream, state.clone(), peer_addr);
+    spawn_handler_stream(stream, state.clone(), peer_addr, local_addr);
 
     let cleanup = SessionCleanupGuard {
         sessions: state.sessions.clone(),
@@ -862,13 +877,15 @@ fn spawn_handler_stream(
     stream: XhttpLogicalStream,
     state: Arc<AppState>,
     peer_addr: std::net::SocketAddr,
+    local_addr: std::net::SocketAddr,
 ) {
     tokio::spawn(async move {
-        if let Err(err) = process_stream(
+        if let Err(err) = process_stream_with_local_addr(
             stream,
             state.server_handler.clone(),
             state.resolver.clone(),
             peer_addr,
+            Some(local_addr),
             state.runtime.clone(),
         )
         .await

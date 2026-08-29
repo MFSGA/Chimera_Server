@@ -430,10 +430,29 @@ pub(super) async fn process_stream<AS>(
 where
     AS: AsyncStream + 'static,
 {
-    let connection_context = TcpServerConnectionContext {
-        runtime: Some(runtime.clone()),
-        ..TcpServerConnectionContext::default()
-    };
+    process_stream_with_local_addr(
+        stream,
+        server_handler,
+        resolver,
+        peer_addr,
+        None,
+        runtime,
+    )
+    .await
+}
+
+pub(super) async fn process_stream_with_local_addr<AS>(
+    stream: AS,
+    server_handler: Arc<Box<dyn TcpServerHandler>>,
+    resolver: Arc<dyn Resolver>,
+    peer_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
+    runtime: RuntimeState,
+) -> std::io::Result<()>
+where
+    AS: AsyncStream + 'static,
+{
+    let connection_context = stream_connection_context(&runtime, local_addr);
     process_stream_with_context(
         stream,
         server_handler,
@@ -443,6 +462,17 @@ where
         connection_context,
     )
     .await
+}
+
+fn stream_connection_context(
+    runtime: &RuntimeState,
+    local_addr: Option<SocketAddr>,
+) -> TcpServerConnectionContext {
+    TcpServerConnectionContext {
+        local_addr,
+        runtime: Some(runtime.clone()),
+        ..TcpServerConnectionContext::default()
+    }
 }
 
 async fn process_stream_with_context<AS>(
@@ -907,6 +937,16 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn logical_stream_context_preserves_local_addr() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let local_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let context = stream_connection_context(&runtime, Some(local_addr));
+
+        assert_eq!(context.local_addr, Some(local_addr));
+        assert!(context.runtime.is_some());
+    }
 
     #[test]
     fn proxy_protocol_v1_encodes_ipv4_addresses_and_ports() {
