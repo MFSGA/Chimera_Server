@@ -988,8 +988,8 @@ fn xray_websocket_forwarded_peer(
     headers: &HashMap<String, Vec<String>>,
     trusted_x_forwarded_for: &[String],
 ) -> Option<SocketAddr> {
-    if !trusted_x_forwarded_for.is_empty()
-        && !trusted_x_forwarded_for.iter().any(|header| {
+    if trusted_x_forwarded_for.is_empty()
+        || !trusted_x_forwarded_for.iter().any(|header| {
             !header.eq_ignore_ascii_case("host")
                 && headers.contains_key(&header.to_ascii_lowercase())
         })
@@ -2257,7 +2257,7 @@ mod tests {
             matching_path: Some("/".to_string()),
             matching_headers: None,
             xray_mismatch_404: false,
-            trusted_x_forwarded_for: Vec::new(),
+            trusted_x_forwarded_for: vec!["X-Trusted-CDN".to_string()],
             accept_proxy_protocol: false,
             heartbeat_period: 0,
             handler: Box::new(ContextCapturingInner {
@@ -2285,6 +2285,7 @@ mod tests {
                 "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
                 "Sec-WebSocket-Version: 13\r\n",
                 "X-Forwarded-For: 203.0.113.77, 198.51.100.2\r\n",
+                "X-Trusted-CDN: present\r\n",
                 "\r\n"
             )
             .as_bytes(),
@@ -2322,16 +2323,25 @@ mod tests {
             ("example.com, 203.0.113.77", None),
             (" [2001:db8::1] ", None),
         ] {
-            let headers = HashMap::from([(
-                "x-forwarded-for".to_string(),
-                vec![value.to_string()],
-            )]);
+            let headers = HashMap::from([
+                ("x-forwarded-for".to_string(), vec![value.to_string()]),
+                ("x-trusted-cdn".to_string(), vec![String::new()]),
+            ]);
             assert_eq!(
-                xray_websocket_forwarded_peer(&headers, &[]),
+                xray_websocket_forwarded_peer(
+                    &headers,
+                    &["X-Trusted-CDN".to_string()]
+                ),
                 expected.map(|value| value.parse().unwrap()),
                 "{value}"
             );
         }
+
+        let untrusted_headers = HashMap::from([(
+            "x-forwarded-for".to_string(),
+            vec!["203.0.113.77".to_string()],
+        )]);
+        assert_eq!(xray_websocket_forwarded_peer(&untrusted_headers, &[]), None);
 
         let mut headers = HashMap::from([(
             "x-forwarded-for".to_string(),
