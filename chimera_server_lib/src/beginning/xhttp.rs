@@ -470,7 +470,7 @@ impl AppState {
         &self,
         path_query: Option<&str>,
         headers: &hyper::HeaderMap,
-    ) -> bool {
+    ) -> Option<bool> {
         let padding = extract_xray_request_padding(
             self.padding_obfs_mode,
             &self.padding_key,
@@ -478,11 +478,7 @@ impl AppState {
             self.padding_placement,
             path_query,
             headers,
-        );
-
-        let Some(padding) = padding else {
-            return false;
-        };
+        )?;
 
         is_padding_valid(
             &padding,
@@ -490,6 +486,7 @@ impl AppState {
             self.max_padding,
             self.padding_method,
         )
+        .then_some(self.padding_obfs_mode && !padding.is_empty())
     }
 
     fn decorate_response(&self, response: &mut Response<ResponseBody>) {
@@ -558,7 +555,9 @@ async fn handle_request(
         return Ok(simple_response(StatusCode::NOT_FOUND));
     }
 
-    if !state.validate_padding(request.uri().query(), request.headers()) {
+    let Some(obfs_padding_accepted) =
+        state.validate_padding(request.uri().query(), request.headers())
+    else {
         debug!(
             method = %request.method(),
             path = %request.uri().path(),
@@ -568,15 +567,15 @@ async fn handle_request(
         let mut response = simple_response(StatusCode::BAD_REQUEST);
         state.decorate_response(&mut response);
         return Ok(response);
-    }
+    };
 
     let logical_peer_addr =
         trusted_forwarded_peer(&request_headers, &state.trusted_x_forwarded_for)
             .unwrap_or(peer_addr);
-    // Xray v26.2.6 only starts stream-up server padding when the client sends
-    // Referer. xPaddingObfsMode changes where padding is encoded, but does not
-    // itself enable the periodic stream-up padding writer.
-    let stream_up_padding = header_value(&request_headers, "referer").is_some();
+    // Current Xray keeps the legacy Referer compatibility marker, and also
+    // enables stream-up padding when xPaddingObfsMode accepted non-empty padding.
+    let stream_up_padding =
+        stream_up_padding_enabled(&request_headers, obfs_padding_accepted);
     let (session_id, seq) = state.extract_meta(&request, &path);
     let is_downlink_method = request.method() == Method::GET;
     // Xray v26.2.6 deliberately excludes GET from the plain method match.
@@ -667,6 +666,13 @@ async fn handle_stream_one(
     });
 
     reader_response(StatusCode::OK, client_download, state.no_sse_header)
+}
+
+fn stream_up_padding_enabled(
+    headers: &hyper::HeaderMap,
+    obfs_padding_accepted: bool,
+) -> bool {
+    header_value(headers, "referer").is_some() || obfs_padding_accepted
 }
 
 fn stream_up_can_flush_while_uploading(version: hyper::Version) -> bool {
@@ -2736,15 +2742,16 @@ mod tests {
     }
 
     #[test]
-    fn stream_up_padding_requires_referer_like_xray_v26_2_6() {
+    fn stream_up_padding_accepts_current_xray_obfs_marker() {
         let mut headers = hyper::HeaderMap::new();
-        assert!(header_value(&headers, "referer").is_none());
+        assert!(!stream_up_padding_enabled(&headers, false));
+        assert!(stream_up_padding_enabled(&headers, true));
 
         headers.insert(
             "referer",
             hyper::header::HeaderValue::from_static("https://example.com/"),
         );
-        assert!(header_value(&headers, "referer").is_some());
+        assert!(stream_up_padding_enabled(&headers, false));
     }
 
     #[test]
