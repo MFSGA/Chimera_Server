@@ -591,6 +591,7 @@ pub(super) fn collect_xhttp_settings(
     let raw = apply_xhttp_extra(raw)?;
     let mode = parse_xhttp_mode(raw.mode.as_deref())?;
     validate_xhttp_client_fields(&raw, mode)?;
+    validate_xhttp_session_id_generator(&raw)?;
     let uplink_http_method =
         normalize_xhttp_uplink_method(raw.uplink_http_method.as_deref(), mode)?;
     let min_posts_interval_ms =
@@ -724,6 +725,62 @@ pub(super) fn collect_xhttp_settings(
         uplink_data_placement,
         uplink_data_key,
     })
+}
+
+fn validate_xhttp_session_id_generator(raw: &XhttpSettings) -> Result<(), Error> {
+    let Some(table) = raw
+        .session_id_table
+        .as_deref()
+        .filter(|table| !table.is_empty())
+    else {
+        return Ok(());
+    };
+    let table = match table {
+        "ALPHABET" => "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        "Alphabet" => "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+        "BASE36" => "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        "Base62" => "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+        "HEX" => "0123456789ABCDEF",
+        "alphabet" => "abcdefghijklmnopqrstuvwxyz",
+        "base36" => "0123456789abcdefghijklmnopqrstuvwxyz",
+        "hex" => "0123456789abcdef",
+        "number" => "0123456789",
+        table => table,
+    };
+    let length = raw.session_id_length.clone().unwrap_or_default();
+    if length.from <= 0 {
+        return Err(Error::InvalidConfig(
+            "xhttpSettings.sessionIDLength.from must be greater than 0".into(),
+        ));
+    }
+    if !table.is_ascii() {
+        return Err(Error::InvalidConfig(
+            "xhttpSettings.sessionIDTable must contain only ASCII characters".into(),
+        ));
+    }
+
+    const MIN_SESSION_ID_ROOM: u128 = 1_u128 << 31;
+    let base = table.len() as u128;
+    let mut room = 0_u128;
+    for length in length.from..=length.to {
+        let mut term = 1_u128;
+        for _ in 0..length {
+            term = term.saturating_mul(base).min(MIN_SESSION_ID_ROOM);
+            if term == MIN_SESSION_ID_ROOM {
+                break;
+            }
+        }
+        room = room.saturating_add(term).min(MIN_SESSION_ID_ROOM);
+        if room == MIN_SESSION_ID_ROOM {
+            break;
+        }
+    }
+    if room < MIN_SESSION_ID_ROOM {
+        return Err(Error::InvalidConfig(
+            "xhttpSettings.sessionIDTable or sessionIDLength is too small".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn apply_xhttp_extra(mut raw: XhttpSettings) -> Result<XhttpSettings, Error> {
@@ -1473,7 +1530,25 @@ mod tests {
     }
 
     #[test]
-    fn collect_xhttp_settings_accepts_xray_server_side_session_id_fields() {
+    fn collect_xhttp_settings_validates_session_id_generator_like_current_xray() {
+        for settings_value in [
+            serde_json::json!({
+                "path": "/xhttp",
+                "sessionIDTable": "Base62",
+                "sessionIDLength": 6
+            }),
+            serde_json::json!({
+                "path": "/xhttp",
+                "sessionIDTable": "0123456789abcdef",
+                "sessionIDLength": {"from": 8, "to": 10}
+            }),
+        ] {
+            let settings = serde_json::from_value::<XhttpSettings>(settings_value)
+                .expect("xhttp settings should deserialize");
+            collect_xhttp_settings(settings)
+                .expect("current Xray accepts sufficiently large ASCII session ID generators");
+        }
+
         for settings_value in [
             serde_json::json!({
                 "path": "/xhttp",
@@ -1483,13 +1558,19 @@ mod tests {
             serde_json::json!({
                 "path": "/xhttp",
                 "sessionIDTable": "表格",
+                "sessionIDLength": 16
+            }),
+            serde_json::json!({
+                "path": "/xhttp",
+                "sessionIDTable": "Base62",
                 "sessionIDLength": 0
             }),
         ] {
             let settings = serde_json::from_value::<XhttpSettings>(settings_value)
                 .expect("xhttp settings should deserialize");
-            collect_xhttp_settings(settings).expect(
-                "Xray v26.2.6 accepts inbound session ID generator settings without client-side validation",
+            assert!(
+                collect_xhttp_settings(settings).is_err(),
+                "current Xray rejects undersized, non-ASCII, and non-positive session ID generators"
             );
         }
     }
