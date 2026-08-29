@@ -155,7 +155,7 @@ fn decode_xray_websocket_query_component(value: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
-#[cfg(any(feature = "ws", feature = "httpupgrade"))]
+#[cfg(any(feature = "ws", feature = "httpupgrade", feature = "grpc_transport"))]
 fn xray_trusted_x_forwarded_for(
     stream_settings: &crate::config::StreamSettings,
 ) -> Vec<String> {
@@ -229,6 +229,7 @@ fn apply_grpc_layer(
         multi_mode: settings.multi_mode,
         idle_timeout: settings.idle_timeout,
         health_check_timeout: settings.health_check_timeout,
+        trusted_x_forwarded_for: xray_trusted_x_forwarded_for(stream_settings),
         inner: Box::new(protocol),
     }))
 }
@@ -1709,6 +1710,9 @@ mod tests {
                     "multiMode": true,
                     "idleTimeout": 7,
                     "healthCheckTimeout": 3
+                },
+                "sockopt": {
+                    "trustedXForwardedFor": ["X-Trusted-CDN"]
                 }
             }
         }))
@@ -1721,6 +1725,10 @@ mod tests {
                 assert!(config.multi_mode);
                 assert_eq!(config.idle_timeout, 7);
                 assert_eq!(config.health_check_timeout, 3);
+                assert_eq!(
+                    config.trusted_x_forwarded_for,
+                    vec!["X-Trusted-CDN".to_string()]
+                );
                 assert!(matches!(*config.inner, ServerProxyConfig::Socks { .. }));
             }
             other => panic!("expected gRPC protocol, got {other:?}"),

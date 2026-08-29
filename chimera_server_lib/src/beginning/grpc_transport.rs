@@ -133,10 +133,17 @@ struct GrpcKeepalive {
     health_check_timeout: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct GrpcConnectionContext {
     peer_addr: std::net::SocketAddr,
     setup_deadline: Instant,
+    trusted_x_forwarded_for: Arc<Vec<String>>,
+}
+
+#[derive(Debug, Clone)]
+struct GrpcPeerContext {
+    peer_addr: std::net::SocketAddr,
+    trusted_x_forwarded_for: Arc<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -318,6 +325,8 @@ pub(super) async fn start_grpc_server(
                 idle_timeout: grpc_config.idle_timeout,
                 health_check_timeout: grpc_config.health_check_timeout,
             };
+            let trusted_x_forwarded_for =
+                Arc::new(grpc_config.trusted_x_forwarded_for.clone());
             let server_handler = server_handler.clone();
             let resolver = resolver.clone();
             let runtime = runtime.clone();
@@ -329,6 +338,7 @@ pub(super) async fn start_grpc_server(
                             peer_addr,
                             setup_deadline: Instant::now()
                                 + GRPC_CONNECTION_SETUP_TIMEOUT,
+                            trusted_x_forwarded_for,
                         },
                         (tun_service_path, tun_multi_service_path),
                         keepalive,
@@ -355,6 +365,7 @@ pub(super) async fn start_grpc_server(
                                     GrpcConnectionContext {
                                         peer_addr,
                                         setup_deadline,
+                                        trusted_x_forwarded_for,
                                     },
                                     (tun_service_path, tun_multi_service_path),
                                     keepalive,
@@ -390,6 +401,7 @@ pub(super) async fn start_grpc_server(
                                         peer_addr,
                                         setup_deadline: Instant::now()
                                             + GRPC_CONNECTION_SETUP_TIMEOUT,
+                                        trusted_x_forwarded_for,
                                     },
                                     (tun_service_path, tun_multi_service_path),
                                     keepalive,
@@ -573,6 +585,7 @@ async fn serve_grpc_connection<IO>(
     let GrpcConnectionContext {
         peer_addr,
         setup_deadline,
+        trusted_x_forwarded_for,
     } = connection;
     let (tun_service_path, tun_multi_service_path) = service_paths;
     let service = service_fn(move |request| {
@@ -583,7 +596,10 @@ async fn serve_grpc_connection<IO>(
             server_handler.clone(),
             resolver.clone(),
             runtime.clone(),
-            peer_addr,
+            GrpcPeerContext {
+                peer_addr,
+                trusted_x_forwarded_for: trusted_x_forwarded_for.clone(),
+            },
         )
     });
     let io = GrpcSetupTimeoutIo::new(io, setup_deadline);
@@ -599,9 +615,13 @@ async fn handle_request(
     server_handler: Arc<Box<dyn TcpServerHandler>>,
     resolver: Arc<dyn Resolver>,
     runtime: RuntimeState,
-    peer_addr: std::net::SocketAddr,
+    peer_context: GrpcPeerContext,
 ) -> Result<Response<ResponseBody>, Infallible> {
-    let logical_peer_addr = grpc_logical_peer_addr(request.headers(), peer_addr);
+    let logical_peer_addr = grpc_logical_peer_addr(
+        request.headers(),
+        peer_context.peer_addr,
+        &peer_context.trusted_x_forwarded_for,
+    );
     if let Some(message) =
         grpc_duplicate_host_error(request.headers(), request.uri())
     {
@@ -992,13 +1012,23 @@ fn grpc_unsupported_encoding(headers: &hyper::HeaderMap) -> Option<&str> {
 fn grpc_logical_peer_addr(
     headers: &hyper::HeaderMap,
     peer_addr: std::net::SocketAddr,
+    trusted_x_forwarded_for: &[String],
 ) -> std::net::SocketAddr {
     let Some(value) = headers
-        .get("x-real-ip")
+        .get("x-forwarded-for")
         .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
     else {
         return peer_addr;
     };
+    if trusted_x_forwarded_for.is_empty()
+        || !trusted_x_forwarded_for
+            .iter()
+            .any(|header| headers.contains_key(header.as_str()))
+    {
+        return peer_addr;
+    }
+    let value = value.split_once(',').map_or(value, |(first, _)| first);
     let value = if value.starts_with('[') && value.ends_with(']') {
         &value[1..value.len() - 1]
     } else {
@@ -2335,29 +2365,52 @@ mod tests {
     }
 
     #[test]
-    fn grpc_x_real_ip_overrides_logical_peer_like_xray_v26_2_6() {
+    fn grpc_trusted_x_forwarded_for_matches_current_xray() {
         let peer_addr = "127.0.0.1:34567".parse().unwrap();
         let mut headers = HeaderMap::new();
-        headers.insert("x-real-ip", "203.0.113.9".parse().unwrap());
+        headers.insert(
+            "x-forwarded-for",
+            "203.0.113.9, 198.51.100.2".parse().unwrap(),
+        );
+        assert_eq!(grpc_logical_peer_addr(&headers, peer_addr, &[]), peer_addr);
         assert_eq!(
-            grpc_logical_peer_addr(&headers, peer_addr),
+            grpc_logical_peer_addr(
+                &headers,
+                peer_addr,
+                &["X-Trusted-CDN".to_string()]
+            ),
+            peer_addr
+        );
+
+        headers.insert("x-trusted-cdn", "".parse().unwrap());
+        assert_eq!(
+            grpc_logical_peer_addr(
+                &headers,
+                peer_addr,
+                &["X-Trusted-CDN".to_string()]
+            ),
             "203.0.113.9:0".parse().unwrap()
         );
 
-        headers.insert("x-real-ip", "[ 2001:db8::7 ]".parse().unwrap());
         assert_eq!(
-            grpc_logical_peer_addr(&headers, peer_addr),
-            "[2001:db8::7]:0".parse().unwrap()
+            grpc_logical_peer_addr(
+                &headers,
+                peer_addr,
+                &["X-Forwarded-For".to_string()]
+            ),
+            "203.0.113.9:0".parse().unwrap()
         );
 
-        headers.insert("x-real-ip", "::ffff:192.0.2.10".parse().unwrap());
+        headers.insert("x-real-ip", "192.0.2.10".parse().unwrap());
+        headers.remove("x-forwarded-for");
         assert_eq!(
-            grpc_logical_peer_addr(&headers, peer_addr),
-            "192.0.2.10:0".parse().unwrap()
+            grpc_logical_peer_addr(
+                &headers,
+                peer_addr,
+                &["X-Trusted-CDN".to_string()]
+            ),
+            peer_addr
         );
-
-        headers.insert("x-real-ip", "not-an-ip".parse().unwrap());
-        assert_eq!(grpc_logical_peer_addr(&headers, peer_addr), peer_addr);
     }
 
     #[test]
