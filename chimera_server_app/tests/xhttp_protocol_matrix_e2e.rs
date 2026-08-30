@@ -1,12 +1,13 @@
 mod xhttp_support;
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::time::Duration;
 
 use serde_json::json;
 use xhttp_support::{
-    ChildGuard, TEST_UUID, create_test_dir, free_localhost_port, open_http_request,
-    send_http_request, serial_xray_guard, start_chimera, wait_for_tcp,
-    workspace_root, write_json,
+    ChildGuard, TEST_UUID, create_test_dir, free_localhost_port, send_http_request,
+    serial_xray_guard, start_chimera, wait_for_tcp, workspace_root, write_json,
 };
 
 const VALID_PADDING: &str = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
@@ -328,18 +329,31 @@ fn duplicate_stream_up_returns_409() {
     };
     let (_server, addr) = start_server("duplicate-stream-up", options);
     let headers = [("X-Session", "session-e".to_string())];
-    let request = request("POST", &padded_path(), "localhost", &headers, 1024, b"");
-    let (_first_stream, first) = open_http_request(addr, &request);
-    let second = send_http_request(addr, &request);
-    assert_eq!(first.status, 200);
+    let request_head =
+        request("POST", &padded_path(), "localhost", &headers, 1024, b"");
+
+    // Current Xray does not flush an HTTP/1 stream-up 200 while its request
+    // body remains open. Keep the first upload pending without waiting for its
+    // response, then complete the duplicate request so the 409 can be flushed.
+    let mut first_stream =
+        TcpStream::connect(addr).expect("connect first stream-up");
+    first_stream
+        .write_all(&request_head)
+        .expect("write first stream-up request head");
+    std::thread::sleep(Duration::from_millis(50));
+
+    let mut duplicate = request_head;
+    duplicate.extend(std::iter::repeat_n(b'x', 1024));
+    let second = send_http_request(addr, &duplicate);
     assert_eq!(second.status, 409);
 }
 
 #[test]
-#[ignore = "starts Chimera and validates permanent per-session upload mode"]
-fn packet_then_stream_up_returns_409() {
+#[ignore = "starts Chimera and validates current Xray packet-to-stream upload transition"]
+fn packet_then_stream_up_is_allowed_like_current_xray() {
     let _serial = serial_xray_guard();
-    let (_server, addr) = start_server("uplink-mode-lock", ServerOptions::default());
+    let (_server, addr) =
+        start_server("uplink-mode-transition", ServerOptions::default());
     let packet_headers = [
         ("X-Session", "session-f".to_string()),
         ("X-Seq", "0".to_string()),
@@ -348,20 +362,38 @@ fn packet_then_stream_up_returns_409() {
         addr,
         &request("POST", &padded_path(), "localhost", &packet_headers, 0, b""),
     );
-    let stream_headers = [("X-Session", "session-f".to_string())];
-    let stream = send_http_request(
-        addr,
-        &request(
-            "POST",
-            &padded_path(),
-            "localhost",
-            &stream_headers,
-            1024,
-            b"",
-        ),
-    );
     assert_eq!(packet.status, 200);
-    assert_eq!(stream.status, 409);
+
+    let stream_headers = [("X-Session", "session-f".to_string())];
+    let mut stream_request = request(
+        "POST",
+        &padded_path(),
+        "localhost",
+        &stream_headers,
+        1024,
+        b"",
+    );
+    stream_request.extend(std::iter::repeat_n(b'x', 1024));
+
+    let mut stream =
+        TcpStream::connect(addr).expect("connect stream-up after packet-up");
+    stream
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .expect("set stream-up read timeout");
+    stream
+        .write_all(&stream_request)
+        .expect("write stream-up after packet-up");
+    let mut byte = [0u8; 1];
+    let error = stream.read_exact(&mut byte).expect_err(
+        "current Xray accepts the reader and keeps HTTP/1 stream-up open",
+    );
+    assert!(
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        "unexpected stream-up read error: {error}"
+    );
 }
 
 #[test]
