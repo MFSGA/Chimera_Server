@@ -53,19 +53,18 @@ impl SecurityCase {
 
 async fn run_security_case(case: SecurityCase) {
     let workspace = workspace_root();
+    let work_dir = create_test_dir(&format!("security-{}", case.name()));
+    let (cert_path, key_path) = generate_test_certificate(&work_dir);
     let reality_dest = match case {
-        SecurityCase::Reality => Some(start_tls13_dest(&workspace).await),
+        SecurityCase::Reality => Some(start_tls13_dest(&cert_path, &key_path).await),
         _ => None,
     };
     let _serial = serial_xray_guard();
-    let work_dir = create_test_dir(&format!("security-{}", case.name()));
     let echo_addr = start_tcp_echo_server();
     let chimera_port = free_localhost_port();
     let xray_socks_port = free_localhost_port();
     let chimera_config_path = work_dir.join("chimera.json");
     let xray_config_path = work_dir.join("xray.json");
-    let cert_path = workspace.join("cert/cert.pem");
-    let key_path = workspace.join("cert/key.pem");
     let pinned_cert = first_cert_sha256_hex(&cert_path);
     let xhttp_settings = json!({
         "path": "/xhttp",
@@ -85,6 +84,8 @@ async fn run_security_case(case: SecurityCase) {
         "noGRPCHeader": true,
         "sessionPlacement": "header",
         "sessionKey": "X-Security-Session",
+        "sessionIDPlacement": "header",
+        "sessionIDKey": "X-Security-Session",
         "seqPlacement": "query",
         "seqKey": "x_security_seq",
         "uplinkDataPlacement": "body"
@@ -257,9 +258,10 @@ async fn xhttp_security_reality() {
     run_security_case(SecurityCase::Reality).await;
 }
 
-async fn start_tls13_dest(workspace: &Path) -> SocketAddr {
+async fn start_tls13_dest(cert_path: &Path, key_path: &Path) -> SocketAddr {
     install_rustls_provider();
-    let acceptor = TlsAcceptor::from(Arc::new(tls_server_config(workspace)));
+    let acceptor =
+        TlsAcceptor::from(Arc::new(tls_server_config(cert_path, key_path)));
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .expect("bind REALITY TLS destination");
@@ -277,10 +279,26 @@ async fn start_tls13_dest(workspace: &Path) -> SocketAddr {
     addr
 }
 
-fn tls_server_config(workspace: &Path) -> RustlsServerConfig {
-    let cert_file =
-        File::open(workspace.join("cert/cert.pem")).expect("open TLS cert");
-    let key_file = File::open(workspace.join("cert/key.pem")).expect("open TLS key");
+fn generate_test_certificate(
+    work_dir: &Path,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let signing_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)
+        .expect("generate XHTTP security RSA key");
+    let cert = rcgen::CertificateParams::new(["localhost".to_string()])
+        .expect("build XHTTP security certificate params")
+        .self_signed(&signing_key)
+        .expect("generate XHTTP security test certificate");
+    let cert_path = work_dir.join("cert.pem");
+    let key_path = work_dir.join("key.pem");
+    std::fs::write(&cert_path, cert.pem()).expect("write XHTTP test certificate");
+    std::fs::write(&key_path, signing_key.serialize_pem())
+        .expect("write XHTTP test private key");
+    (cert_path, key_path)
+}
+
+fn tls_server_config(cert_path: &Path, key_path: &Path) -> RustlsServerConfig {
+    let cert_file = File::open(cert_path).expect("open TLS cert");
+    let key_file = File::open(key_path).expect("open TLS key");
     let cert_chain = certs(&mut BufReader::new(cert_file))
         .collect::<Result<Vec<_>, _>>()
         .expect("parse TLS certificates");
