@@ -769,7 +769,8 @@ async fn handle_packet_up(
     };
 
     let (parts, body) = request.into_parts();
-    if declared_content_length_exceeds_post_limit(
+    if declared_body_length_exceeds_post_limit(
+        state.uplink_data_placement,
         &parts.headers,
         state.max_each_post_bytes,
     ) {
@@ -1590,10 +1591,18 @@ fn payload_exceeds_post_limit(payload_len: usize, max_bytes: i64) -> bool {
     i64::try_from(payload_len).unwrap_or(i64::MAX) > max_bytes
 }
 
-fn declared_content_length_exceeds_post_limit(
+fn declared_body_length_exceeds_post_limit(
+    data_placement: XhttpDataPlacement,
     headers: &hyper::HeaderMap,
     max_bytes: i64,
 ) -> bool {
+    if !matches!(
+        data_placement,
+        XhttpDataPlacement::Auto | XhttpDataPlacement::Body
+    ) {
+        return false;
+    }
+
     headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
@@ -2854,16 +2863,33 @@ mod tests {
     }
 
     #[test]
-    fn declared_content_length_rejects_oversized_packet_before_body_read() {
+    fn declared_content_length_only_limits_body_placements_like_current_xray() {
         let mut headers = hyper::HeaderMap::new();
         headers.insert(
             header::CONTENT_LENGTH,
             hyper::header::HeaderValue::from_static("8"),
         );
-        assert!(declared_content_length_exceeds_post_limit(&headers, 7));
-        assert!(!declared_content_length_exceeds_post_limit(&headers, 8));
+
+        for placement in [XhttpDataPlacement::Auto, XhttpDataPlacement::Body] {
+            assert!(declared_body_length_exceeds_post_limit(
+                placement, &headers, 7
+            ));
+            assert!(!declared_body_length_exceeds_post_limit(
+                placement, &headers, 8
+            ));
+        }
+        for placement in [XhttpDataPlacement::Header, XhttpDataPlacement::Cookie] {
+            assert!(!declared_body_length_exceeds_post_limit(
+                placement, &headers, 7
+            ));
+        }
+
         headers.remove(header::CONTENT_LENGTH);
-        assert!(!declared_content_length_exceeds_post_limit(&headers, 7));
+        assert!(!declared_body_length_exceeds_post_limit(
+            XhttpDataPlacement::Body,
+            &headers,
+            7,
+        ));
     }
 
     #[tokio::test]
