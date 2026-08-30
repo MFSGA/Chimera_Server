@@ -1121,6 +1121,7 @@ struct UploadQueueSender {
     sender: mpsc::Sender<UploadPacket>,
     reader_claimed: AtomicBool,
     reader: Arc<StdMutex<Option<BoxedUploadReader>>>,
+    closed: Arc<AtomicBool>,
 }
 
 impl UploadQueueSender {
@@ -1139,7 +1140,11 @@ impl UploadQueueSender {
         self.sender
             .send(UploadPacket::ReaderClaim)
             .await
-            .map_err(|_| std::io::Error::other("packet queue closed"))
+            .map_err(|_| std::io::Error::other("packet queue closed"))?;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(std::io::Error::other("packet queue closed"));
+        }
+        Ok(())
     }
 
     async fn push_payload(&self, seq: u64, data: Bytes) -> std::io::Result<()> {
@@ -1149,14 +1154,18 @@ impl UploadQueueSender {
         self.sender
             .send(UploadPacket::Payload { seq, data })
             .await
-            .map_err(|_| std::io::Error::other("packet queue closed"))
+            .map_err(|_| std::io::Error::other("packet queue closed"))?;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(std::io::Error::other("packet queue closed"));
+        }
+        Ok(())
     }
 }
 
 struct XhttpUploadReader {
     receiver: mpsc::Receiver<UploadPacket>,
     reader: Arc<StdMutex<Option<BoxedUploadReader>>>,
-    closed: AtomicBool,
+    closed: Arc<AtomicBool>,
     current_payload: Option<Bytes>,
     buffered: BTreeMap<u64, VecDeque<Bytes>>,
     buffered_packets: usize,
@@ -1168,16 +1177,18 @@ impl XhttpUploadReader {
     fn new(max_buffered_posts: usize) -> (UploadQueueSender, Self) {
         let (sender, receiver) = mpsc::channel(max_buffered_posts);
         let reader = Arc::new(StdMutex::new(None));
+        let closed = Arc::new(AtomicBool::new(false));
         (
             UploadQueueSender {
                 sender,
                 reader_claimed: AtomicBool::new(false),
                 reader: reader.clone(),
+                closed: closed.clone(),
             },
             Self {
                 receiver,
                 reader,
-                closed: AtomicBool::new(false),
+                closed,
                 current_payload: None,
                 buffered: BTreeMap::new(),
                 buffered_packets: 0,
@@ -3292,6 +3303,31 @@ mod tests {
             "packet queue closed"
         );
         assert!(!store.inner.read().unwrap().contains_key("session"));
+    }
+
+    #[tokio::test]
+    async fn successful_upload_push_rechecks_closed_state_like_current_xray() {
+        let (packet_queue, _packet_reader) = XhttpUploadReader::new(4);
+        packet_queue.closed.store(true, Ordering::Release);
+
+        let packet_error = packet_queue
+            .push_payload(0, Bytes::from_static(b"raced"))
+            .await
+            .expect_err(
+                "a packet push that races queue close must not report success",
+            );
+        assert_eq!(packet_error.to_string(), "packet queue closed");
+
+        let (stream_queue, _stream_reader) = XhttpUploadReader::new(4);
+        stream_queue.closed.store(true, Ordering::Release);
+
+        let stream_error = stream_queue
+            .push_reader(Box::pin(tokio::io::empty()))
+            .await
+            .expect_err(
+                "a stream push that races queue close must not report success",
+            );
+        assert_eq!(stream_error.to_string(), "packet queue closed");
     }
 
     #[tokio::test]
