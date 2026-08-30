@@ -490,9 +490,26 @@ impl AppState {
         .then_some(self.padding_obfs_mode && !padding.is_empty())
     }
 
-    fn decorate_response(&self, response: &mut Response<ResponseBody>) {
-        apply_xray_cors_headers(response.headers_mut());
+    fn decorate_response(
+        &self,
+        response: &mut Response<ResponseBody>,
+        request_method: &Method,
+        request_headers: &hyper::HeaderMap,
+    ) {
+        apply_xray_cors_headers(
+            response.headers_mut(),
+            request_method,
+            request_headers,
+            self.uses_cookie_request_metadata(),
+        );
         apply_response_padding(response.headers_mut(), self);
+    }
+
+    fn uses_cookie_request_metadata(&self) -> bool {
+        self.session_placement == XhttpPlacement::Cookie
+            || self.seq_placement == XhttpPlacement::Cookie
+            || self.padding_placement == XhttpPaddingPlacement::Cookie
+            || self.uplink_data_placement == XhttpDataPlacement::Cookie
     }
 }
 
@@ -556,6 +573,12 @@ async fn handle_request(
         return Ok(simple_response(StatusCode::NOT_FOUND));
     }
 
+    if request.method() == Method::OPTIONS {
+        let mut response = simple_response(StatusCode::OK);
+        state.decorate_response(&mut response, request.method(), request.headers());
+        return Ok(response);
+    }
+
     let Some(obfs_padding_accepted) =
         state.validate_padding(request.uri().query(), request.headers())
     else {
@@ -566,10 +589,11 @@ async fn handle_request(
             "xhttp request rejected by padding validation"
         );
         let mut response = simple_response(StatusCode::BAD_REQUEST);
-        state.decorate_response(&mut response);
+        state.decorate_response(&mut response, request.method(), request.headers());
         return Ok(response);
     };
 
+    let request_method = request.method().clone();
     let logical_peer_addr =
         trusted_forwarded_peer(&request_headers, &state.trusted_x_forwarded_for)
             .unwrap_or(peer_addr);
@@ -625,7 +649,7 @@ async fn handle_request(
         Err(status) => simple_response(status),
     };
 
-    state.decorate_response(&mut response);
+    state.decorate_response(&mut response, &request_method, &request_headers);
     Ok(response)
 }
 
@@ -1881,18 +1905,40 @@ fn classify_request(
     Err(StatusCode::METHOD_NOT_ALLOWED)
 }
 
-fn apply_xray_cors_headers(headers: &mut hyper::HeaderMap) {
-    // Xray v26.2.6 writes these two CORS headers unconditionally for XHTTP
-    // requests after host/path validation. It does not echo Origin, advertise
-    // requested headers, or enable credentials.
-    headers.insert(
-        header::ACCESS_CONTROL_ALLOW_ORIGIN,
-        hyper::header::HeaderValue::from_static("*"),
-    );
-    headers.insert(
-        header::ACCESS_CONTROL_ALLOW_METHODS,
-        hyper::header::HeaderValue::from_static("*"),
-    );
+fn apply_xray_cors_headers(
+    headers: &mut hyper::HeaderMap,
+    request_method: &Method,
+    request_headers: &hyper::HeaderMap,
+    allow_credentials: bool,
+) {
+    // Current Xray mirrors the browser request Origin when present because
+    // wildcard origins cannot be combined with credentialed cookie requests.
+    let allow_origin = request_headers
+        .get(header::ORIGIN)
+        .cloned()
+        .unwrap_or_else(|| HeaderValue::from_static("*"));
+    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, allow_origin);
+
+    if allow_credentials {
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+            HeaderValue::from_static("true"),
+        );
+    }
+
+    if request_method == Method::OPTIONS {
+        let allow_method = request_headers
+            .get(header::ACCESS_CONTROL_REQUEST_METHOD)
+            .cloned()
+            .unwrap_or_else(|| HeaderValue::from_static("*"));
+        headers.insert(header::ACCESS_CONTROL_ALLOW_METHODS, allow_method);
+
+        let allow_headers = request_headers
+            .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+            .cloned()
+            .unwrap_or_else(|| HeaderValue::from_static("*"));
+        headers.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, allow_headers);
+    }
 }
 
 fn apply_response_padding(headers: &mut hyper::HeaderMap, state: &AppState) {
@@ -2242,27 +2288,67 @@ mod tests {
     }
 
     #[test]
-    fn xhttp_cors_headers_match_xray_v26_2_6() {
+    fn xhttp_cors_headers_match_current_xray_browser_preflight() {
+        let mut request_headers = hyper::HeaderMap::new();
+        request_headers.insert(
+            header::ORIGIN,
+            hyper::header::HeaderValue::from_static("https://example.com"),
+        );
+        request_headers.insert(
+            header::ACCESS_CONTROL_REQUEST_METHOD,
+            hyper::header::HeaderValue::from_static("POST"),
+        );
+        request_headers.insert(
+            header::ACCESS_CONTROL_REQUEST_HEADERS,
+            hyper::header::HeaderValue::from_static("content-type, x-session"),
+        );
+
         let mut headers = hyper::HeaderMap::new();
-        apply_xray_cors_headers(&mut headers);
+        apply_xray_cors_headers(
+            &mut headers,
+            &Method::OPTIONS,
+            &request_headers,
+            true,
+        );
+
+        assert_eq!(
+            headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&hyper::header::HeaderValue::from_static(
+                "https://example.com"
+            ))
+        );
+        assert_eq!(
+            headers.get(header::ACCESS_CONTROL_ALLOW_METHODS),
+            Some(&hyper::header::HeaderValue::from_static("POST"))
+        );
+        assert_eq!(
+            headers.get(header::ACCESS_CONTROL_ALLOW_HEADERS),
+            Some(&hyper::header::HeaderValue::from_static(
+                "content-type, x-session"
+            ))
+        );
+        assert_eq!(
+            headers.get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS),
+            Some(&hyper::header::HeaderValue::from_static("true"))
+        );
+    }
+
+    #[test]
+    fn xhttp_cors_non_preflight_keeps_current_xray_minimal_headers() {
+        let request_headers = hyper::HeaderMap::new();
+        let mut headers = hyper::HeaderMap::new();
+        apply_xray_cors_headers(&mut headers, &Method::GET, &request_headers, false);
 
         assert_eq!(
             headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
             Some(&hyper::header::HeaderValue::from_static("*"))
         );
-        assert_eq!(
-            headers.get(header::ACCESS_CONTROL_ALLOW_METHODS),
-            Some(&hyper::header::HeaderValue::from_static("*"))
-        );
+        assert!(headers.get(header::ACCESS_CONTROL_ALLOW_METHODS).is_none());
+        assert!(headers.get(header::ACCESS_CONTROL_ALLOW_HEADERS).is_none());
         assert!(
             headers
                 .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
-                .is_none(),
-            "Xray v26.2.6 does not advertise credentialed CORS"
-        );
-        assert!(
-            headers.get(header::ACCESS_CONTROL_ALLOW_HEADERS).is_none(),
-            "Xray v26.2.6 does not echo requested CORS headers"
+                .is_none()
         );
     }
 
