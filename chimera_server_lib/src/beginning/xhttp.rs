@@ -1038,6 +1038,7 @@ impl SessionStore {
                 );
             if should_remove {
                 store.remove(&session_id);
+                session.close_upload_queue();
             }
         });
     }
@@ -1310,6 +1311,19 @@ impl XhttpSession {
             XhttpLogicalStream::new(reader, server_write),
             client_download,
         )
+    }
+
+    fn close_upload_queue(&self) {
+        let mut reader = self
+            .upload_reader
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reader.receiver.close();
+        reader
+            .reader
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 }
 
@@ -3235,6 +3249,39 @@ mod tests {
             .expect("missing packet completes reorder sequence");
 
         assert_eq!(read.await.expect("ordered read task"), *b"012");
+    }
+
+    #[tokio::test]
+    async fn expired_session_closes_upload_queue_like_current_xray() {
+        let store = SessionStore::new(Duration::from_millis(20), 1);
+        let session = store.get_or_create("session");
+        session
+            .upload_queue
+            .push_payload(1, Bytes::from_static(b"first"))
+            .await
+            .expect("first packet fills upload channel");
+
+        let blocked_session = session.clone();
+        let blocked_push = tokio::spawn(async move {
+            blocked_session
+                .upload_queue
+                .push_payload(2, Bytes::from_static(b"second"))
+                .await
+        });
+        sleep(Duration::from_millis(5)).await;
+        assert!(!blocked_push.is_finished(), "second push should be blocked");
+
+        let result = tokio::time::timeout(Duration::from_millis(100), blocked_push)
+            .await
+            .expect("expired session should wake blocked upload")
+            .expect("blocked upload task should finish");
+        assert_eq!(
+            result
+                .expect_err("expired upload queue should reject pending push")
+                .to_string(),
+            "packet queue closed"
+        );
+        assert!(!store.inner.read().unwrap().contains_key("session"));
     }
 
     #[tokio::test]
