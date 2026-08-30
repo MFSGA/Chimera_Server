@@ -1203,6 +1203,15 @@ impl AsyncRead for XhttpUploadReader {
             }
 
             if let Some(mut payload) = self.current_payload.take() {
+                if payload.is_empty() {
+                    // Xray advances past an empty packet with (0, nil). Tokio
+                    // interprets a successful zero-byte AsyncRead as EOF, so
+                    // consume the empty sequence internally instead of exposing
+                    // a false end-of-stream to the logical connection.
+                    self.next_seq += 1;
+                    continue;
+                }
+
                 let len = payload.len().min(buf.remaining());
                 buf.put_slice(&payload.split_to(len));
                 if payload.is_empty() {
@@ -2992,6 +3001,23 @@ mod tests {
         let mut second_payload = [0u8; 4];
         second_stream.read_exact(&mut second_payload).await.unwrap();
         assert_eq!(&second_payload, b"pong");
+    }
+
+    #[tokio::test]
+    async fn empty_packet_advances_sequence_without_signaling_eof_like_current_xray()
+    {
+        use tokio::io::AsyncReadExt;
+
+        let (queue, mut reader) = XhttpUploadReader::new(4);
+        queue.push_payload(0, Bytes::new()).await.unwrap();
+        queue
+            .push_payload(1, Bytes::from_static(b"next"))
+            .await
+            .unwrap();
+
+        let mut output = [0u8; 4];
+        reader.read_exact(&mut output).await.unwrap();
+        assert_eq!(&output, b"next");
     }
 
     #[tokio::test]
