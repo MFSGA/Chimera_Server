@@ -1156,6 +1156,7 @@ impl UploadQueueSender {
 struct XhttpUploadReader {
     receiver: mpsc::Receiver<UploadPacket>,
     reader: Arc<StdMutex<Option<BoxedUploadReader>>>,
+    closed: AtomicBool,
     current_payload: Option<Bytes>,
     buffered: BTreeMap<u64, VecDeque<Bytes>>,
     buffered_packets: usize,
@@ -1176,6 +1177,7 @@ impl XhttpUploadReader {
             Self {
                 receiver,
                 reader,
+                closed: AtomicBool::new(false),
                 current_payload: None,
                 buffered: BTreeMap::new(),
                 buffered_packets: 0,
@@ -1201,6 +1203,13 @@ impl AsyncRead for XhttpUploadReader {
                 if let Some(reader) = reader.as_mut() {
                     return reader.as_mut().poll_read(cx, buf);
                 }
+            }
+
+            // Xray's uploadQueue checks its closed signal before consulting
+            // any buffered packet heap. Once session reaping closes the queue,
+            // queued packet data must not leak into the logical stream.
+            if self.closed.load(Ordering::Acquire) {
+                return Poll::Ready(Ok(()));
             }
 
             if let Some(mut payload) = self.current_payload.take() {
@@ -1318,6 +1327,7 @@ impl XhttpSession {
             .upload_reader
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reader.closed.store(true, Ordering::Release);
         reader.receiver.close();
         reader
             .reader
@@ -3282,6 +3292,34 @@ mod tests {
             "packet queue closed"
         );
         assert!(!store.inner.read().unwrap().contains_key("session"));
+    }
+
+    #[tokio::test]
+    async fn closed_upload_queue_discards_buffered_packets_like_current_xray() {
+        use tokio::io::AsyncReadExt;
+
+        let session = XhttpSession::new(4);
+        session
+            .upload_queue
+            .push_payload(0, Bytes::from_static(b"stale"))
+            .await
+            .expect("packet should queue before session closes");
+
+        session.close_upload_queue();
+
+        let mut reader = SharedUploadReader {
+            inner: session.upload_reader.clone(),
+        };
+        let mut output = [0u8; 5];
+        let read = tokio::time::timeout(
+            Duration::from_millis(50),
+            reader.read(&mut output),
+        )
+        .await
+        .expect("closed upload queue should return promptly")
+        .expect("closed upload queue should report EOF");
+
+        assert_eq!(read, 0, "buffered packet must be discarded after close");
     }
 
     #[tokio::test]
