@@ -16,7 +16,7 @@ use http_body_util::{BodyExt, Empty, StreamBody, combinators::UnsyncBoxBody};
 use hyper::{
     Method, Request, Response, StatusCode,
     body::{Body, Frame, Incoming},
-    header,
+    header::{self, HeaderValue},
     service::service_fn,
 };
 use hyper_util::{
@@ -787,6 +787,7 @@ async fn handle_packet_up(
         Vec::new()
     };
 
+    let body_payload_is_empty = body_payload.is_empty();
     let payload = match state.uplink_data_placement {
         XhttpDataPlacement::Auto => {
             let mut payload = Vec::with_capacity(
@@ -808,9 +809,21 @@ async fn handle_packet_up(
 
     let session = state.sessions.get_or_create(&session_id);
     match session.upload_queue.push_payload(seq, collected).await {
-        Ok(()) => simple_response(StatusCode::OK),
+        Ok(()) => packet_up_success_response(body_payload_is_empty),
         Err(_) => simple_response(StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+fn packet_up_success_response(
+    body_payload_is_empty: bool,
+) -> Response<ResponseBody> {
+    let mut response = simple_response(StatusCode::OK);
+    if body_payload_is_empty {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    response
 }
 
 async fn wait_for_stream_up_response_start(
@@ -1984,6 +1997,20 @@ mod tests {
             ),
             "/"
         );
+    }
+
+    #[test]
+    fn packet_up_without_body_disables_caching_like_current_xray() {
+        let response = packet_up_success_response(true);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+
+        let response = packet_up_success_response(false);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(header::CACHE_CONTROL).is_none());
     }
 
     #[test]
