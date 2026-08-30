@@ -125,6 +125,8 @@ fn run_xhttp_case(case: XhttpCase) {
                         "scMinPostsIntervalMs": 1,
                         "sessionPlacement": if case.session_placement == "path" { "" } else { case.session_placement },
                         "sessionKey": "x_matrix_session",
+                        "sessionIDPlacement": if case.session_placement == "path" { "" } else { case.session_placement },
+                        "sessionIDKey": "x_matrix_session",
                         "sessionIDTable": "Base62",
                         "sessionIDLength": 16,
                         "seqPlacement": if case.seq_placement == "path" { "" } else { case.seq_placement },

@@ -78,12 +78,14 @@ pub fn serial_xray_guard() -> MutexGuard<'static, ()> {
 
 pub fn workspace_root() -> PathBuf {
     for ancestor in Path::new(env!("CARGO_MANIFEST_DIR")).ancestors() {
-        if ancestor.join("xray").is_file() && ancestor.join("Cargo.toml").is_file() {
+        if ancestor.join("Cargo.toml").is_file()
+            && ancestor.join("chimera_server_app/Cargo.toml").is_file()
+        {
             return ancestor.to_path_buf();
         }
     }
     panic!(
-        "failed to find workspace root containing xray from {}",
+        "failed to find Chimera workspace root from {}",
         env!("CARGO_MANIFEST_DIR")
     );
 }
