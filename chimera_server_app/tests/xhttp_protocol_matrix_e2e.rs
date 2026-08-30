@@ -131,7 +131,7 @@ fn options_reflects_cors_and_returns_padding() {
     ];
     let head = send_http_request(
         addr,
-        &request("OPTIONS", &padded_path(), "localhost", &headers, 0, b""),
+        &request("OPTIONS", "/xhttp", "localhost", &headers, 0, b""),
     );
     assert_eq!(head.status, 200);
     assert_eq!(
