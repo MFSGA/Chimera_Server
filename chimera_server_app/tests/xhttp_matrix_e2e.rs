@@ -17,7 +17,7 @@ struct XhttpCase {
     session_placement: &'static str,
     seq_placement: &'static str,
     data_placement: &'static str,
-    server_max_header_bytes: usize,
+    server_max_header_bytes: i32,
     padding_obfs: bool,
     padding_placement: &'static str,
     padding_method: &'static str,
@@ -182,7 +182,7 @@ macro_rules! xhttp_case {
 #[rustfmt::skip]
 xhttp_case!(stream_one_patch_body, "stream-one", "PATCH", "header", "header", "body", 8192, false, "queryInHeader", "repeat-x", true, true);
 #[rustfmt::skip]
-xhttp_case!(stream_one_post_auto, "stream-one", "POST", "path", "path", "auto", 8192, false, "queryInHeader", "repeat-x", false, false);
+xhttp_case!(stream_one_post_auto, "stream-one", "POST", "path", "path", "auto", -1, false, "queryInHeader", "repeat-x", false, false);
 #[rustfmt::skip]
 xhttp_case!(packet_post_body_path, "packet-up", "POST", "path", "path", "body", 8192, false, "queryInHeader", "repeat-x", true, false);
 #[rustfmt::skip]
