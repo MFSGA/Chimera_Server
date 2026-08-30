@@ -1074,13 +1074,14 @@ impl AsyncRead for IncomingBodyReader {
 type BoxedUploadReader = Pin<Box<dyn AsyncRead + Send>>;
 
 enum UploadPacket {
-    Reader(BoxedUploadReader),
+    ReaderClaim,
     Payload { seq: u64, data: Bytes },
 }
 
 struct UploadQueueSender {
     sender: mpsc::Sender<UploadPacket>,
     reader_claimed: AtomicBool,
+    reader: Arc<StdMutex<Option<BoxedUploadReader>>>,
 }
 
 impl UploadQueueSender {
@@ -1092,8 +1093,12 @@ impl UploadQueueSender {
         {
             return Err(std::io::Error::other("h.reader already exists"));
         }
+        *self
+            .reader
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reader);
         self.sender
-            .send(UploadPacket::Reader(reader))
+            .send(UploadPacket::ReaderClaim)
             .await
             .map_err(|_| std::io::Error::other("packet queue closed"))
     }
@@ -1111,7 +1116,7 @@ impl UploadQueueSender {
 
 struct XhttpUploadReader {
     receiver: mpsc::Receiver<UploadPacket>,
-    reader: Option<BoxedUploadReader>,
+    reader: Arc<StdMutex<Option<BoxedUploadReader>>>,
     current_payload: Option<Bytes>,
     buffered: BTreeMap<u64, Bytes>,
     next_seq: u64,
@@ -1121,14 +1126,16 @@ struct XhttpUploadReader {
 impl XhttpUploadReader {
     fn new(max_buffered_posts: usize) -> (UploadQueueSender, Self) {
         let (sender, receiver) = mpsc::channel(max_buffered_posts);
+        let reader = Arc::new(StdMutex::new(None));
         (
             UploadQueueSender {
                 sender,
                 reader_claimed: AtomicBool::new(false),
+                reader: reader.clone(),
             },
             Self {
                 receiver,
-                reader: None,
+                reader,
                 current_payload: None,
                 buffered: BTreeMap::new(),
                 next_seq: 0,
@@ -1145,8 +1152,14 @@ impl AsyncRead for XhttpUploadReader {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         loop {
-            if let Some(reader) = self.reader.as_mut() {
-                return reader.as_mut().poll_read(cx, buf);
+            {
+                let mut reader = self
+                    .reader
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(reader) = reader.as_mut() {
+                    return reader.as_mut().poll_read(cx, buf);
+                }
             }
 
             if let Some(mut payload) = self.current_payload.take() {
@@ -1173,9 +1186,7 @@ impl AsyncRead for XhttpUploadReader {
             }
 
             match Pin::new(&mut self.receiver).poll_recv(cx) {
-                Poll::Ready(Some(UploadPacket::Reader(reader))) => {
-                    self.reader = Some(reader);
-                }
+                Poll::Ready(Some(UploadPacket::ReaderClaim)) => continue,
                 Poll::Ready(Some(UploadPacket::Payload { seq, data })) => {
                     if seq >= self.next_seq {
                         self.buffered.entry(seq).or_insert(data);
@@ -2920,6 +2931,52 @@ mod tests {
         );
 
         blocked_packet.abort();
+        blocked_stream.abort();
+    }
+
+    #[tokio::test]
+    async fn stream_up_reader_preempts_buffered_packets_like_current_xray() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (queue, mut reader) = XhttpUploadReader::new(1);
+        let queue = Arc::new(queue);
+        queue
+            .push_payload(0, Bytes::from_static(b"packet"))
+            .await
+            .expect("packet fills upload channel");
+
+        let (mut stream_writer, stream_reader) = tokio::io::duplex(32);
+        stream_writer
+            .write_all(b"stream")
+            .await
+            .expect("seed stream-up body");
+
+        let blocked_stream = tokio::spawn({
+            let queue = queue.clone();
+            async move { queue.push_reader(Box::pin(stream_reader)).await }
+        });
+        for _ in 0..20 {
+            if queue.reader_claimed.load(Ordering::Acquire) {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(queue.reader_claimed.load(Ordering::Acquire));
+        assert!(
+            !blocked_stream.is_finished(),
+            "stream-up response should still wait for channel capacity"
+        );
+
+        let mut output = [0u8; 6];
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            reader.read_exact(&mut output),
+        )
+        .await
+        .expect("claimed stream reader must bypass buffered packet queue")
+        .expect("read stream-up body");
+        assert_eq!(&output, b"stream");
+
         blocked_stream.abort();
     }
 
