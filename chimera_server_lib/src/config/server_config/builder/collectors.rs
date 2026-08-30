@@ -853,7 +853,8 @@ fn parse_xhttp_data_placement(
     mode: XhttpMode,
 ) -> Result<XhttpDataPlacement, Error> {
     let placement = match placement.unwrap_or("") {
-        "" | "body" => XhttpDataPlacement::Body,
+        "" | "auto" => XhttpDataPlacement::Auto,
+        "body" => XhttpDataPlacement::Body,
         "header" => XhttpDataPlacement::Header,
         "cookie" => XhttpDataPlacement::Cookie,
         unsupported => {
@@ -1319,8 +1320,8 @@ mod tests {
         assert!(config.session_key.is_empty());
         assert_eq!(config.seq_placement, XhttpPlacement::Path);
         assert!(config.seq_key.is_empty());
-        assert_eq!(config.uplink_data_placement, XhttpDataPlacement::Body);
-        assert!(config.uplink_data_key.is_empty());
+        assert_eq!(config.uplink_data_placement, XhttpDataPlacement::Auto);
+        assert_eq!(config.uplink_data_key, "X-Data");
     }
 
     #[test]
@@ -1671,7 +1672,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_xhttp_settings_rejects_explicit_auto_data_placement_like_xray_v26_2_6()
+    fn collect_xhttp_settings_accepts_explicit_auto_data_placement_like_current_xray()
      {
         let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
             "path": "/xhttp",
@@ -1680,14 +1681,10 @@ mod tests {
         }))
         .expect("xhttp settings");
 
-        let error = collect_xhttp_settings(settings)
-            .expect_err("Xray v26.2.6 rejects explicit auto uplink data placement");
-        assert!(
-            error
-                .to_string()
-                .contains("unsupported xhttpSettings.uplinkDataPlacement: auto"),
-            "unexpected error: {error}"
-        );
+        let config = collect_xhttp_settings(settings)
+            .expect("current Xray accepts explicit auto uplink data placement");
+        assert_eq!(config.uplink_data_placement, XhttpDataPlacement::Auto);
+        assert_eq!(config.uplink_data_key, "X-Data");
     }
 
     #[test]
