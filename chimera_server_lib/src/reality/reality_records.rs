@@ -169,6 +169,9 @@ impl<'a> RecordEncryptor<'a> {
     ) -> io::Result<()> {
         let next_seq = checked_next_sequence(*self.seq)?;
 
+        // Match shoes: reserve only the TLS inner content-type byte and AEAD tag
+        // so a full plaintext record does not double its retained Vec capacity.
+        buf.reserve_exact(1 + 16);
         buf.push(content_type);
         let ciphertext_len = buf.len() + 16;
         debug_assert!(
@@ -667,6 +670,11 @@ mod tests {
         );
         assert!(result.is_ok());
         assert!(plaintext.is_empty());
+        assert!(
+            plaintext.capacity() <= MAX_TLS_CIPHERTEXT_LEN,
+            "plaintext staging buffer retained {} bytes",
+            plaintext.capacity()
+        );
 
         // Should have one record
         let expected_len = TLS_RECORD_HEADER_SIZE + MAX_TLS_PLAINTEXT_LEN + 1 + 16;
