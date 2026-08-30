@@ -166,6 +166,9 @@ where
     fn drain_all_writes(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while self.session.wants_write() {
             match self.write_tls_direct(cx) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+                }
                 Poll::Ready(Ok(_)) => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
@@ -404,4 +407,114 @@ where
     IO: AsyncStream,
     S: RealitySession + Unpin + Send,
 {
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ZeroWriteIo;
+
+    impl AsyncRead for ZeroWriteIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for ZeroWriteIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(0))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for ZeroWriteIo {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for ZeroWriteIo {}
+
+    struct PendingTlsSession;
+
+    impl RealitySession for PendingTlsSession {
+        type Reader<'a> = io::Cursor<&'a [u8]>;
+        type Writer<'a> = io::Sink;
+
+        fn read_tls(&mut self, _rd: &mut dyn Read) -> io::Result<usize> {
+            unreachable!()
+        }
+
+        fn process_new_packets(&mut self) -> io::Result<RealityIoState> {
+            unreachable!()
+        }
+
+        fn reader(&mut self) -> Self::Reader<'_> {
+            io::Cursor::new(&[])
+        }
+
+        fn writer(&mut self) -> Self::Writer<'_> {
+            io::sink()
+        }
+
+        fn write_tls(&mut self, wr: &mut dyn Write) -> io::Result<usize> {
+            wr.write(&[1])
+        }
+
+        fn wants_write(&self) -> bool {
+            true
+        }
+
+        fn wants_read(&self) -> bool {
+            false
+        }
+
+        fn is_handshaking(&self) -> bool {
+            false
+        }
+
+        fn send_close_notify(&mut self) {}
+    }
+
+    #[test]
+    fn tls_drain_returns_write_zero_like_current_shoes() {
+        let mut stream = RealityTlsStream::new(ZeroWriteIo, PendingTlsSession);
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        let result = stream.drain_all_writes(&mut cx);
+        assert!(matches!(
+            result,
+            Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::WriteZero
+        ));
+    }
 }
