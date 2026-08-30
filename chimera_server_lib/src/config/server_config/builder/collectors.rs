@@ -673,7 +673,12 @@ pub(super) fn collect_xhttp_settings(
         )));
     }
     let server_max_header_bytes = match raw.server_max_header_bytes.unwrap_or(0) {
-        value if value <= 0 => 8192,
+        value if value < 0 => {
+            return Err(Error::InvalidConfig(
+                "xhttpSettings.serverMaxHeaderBytes cannot be negative".into(),
+            ));
+        }
+        0 => 8192,
         value => value as usize,
     };
     let max_each_post_bytes = match raw.sc_max_each_post_bytes {
@@ -1466,9 +1471,21 @@ mod tests {
     }
 
     #[test]
-    fn collect_xhttp_settings_defaults_non_positive_header_limit_like_current_xray()
-    {
-        for value in [0, -1, i32::MIN] {
+    fn collect_xhttp_settings_defaults_zero_header_limit_like_current_xray() {
+        let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
+            "path": "/xhttp",
+            "serverMaxHeaderBytes": 0
+        }))
+        .expect("xhttp settings");
+
+        let config = collect_xhttp_settings(settings)
+            .expect("current Xray defaults zero serverMaxHeaderBytes");
+        assert_eq!(config.server_max_header_bytes, 8192);
+    }
+
+    #[test]
+    fn collect_xhttp_settings_rejects_negative_header_limit_like_current_xray() {
+        for value in [-1, i32::MIN] {
             let settings =
                 serde_json::from_value::<XhttpSettings>(serde_json::json!({
                     "path": "/xhttp",
@@ -1476,9 +1493,14 @@ mod tests {
                 }))
                 .expect("xhttp settings");
 
-            let config = collect_xhttp_settings(settings)
-                .expect("current Xray defaults non-positive serverMaxHeaderBytes");
-            assert_eq!(config.server_max_header_bytes, 8192);
+            let error = collect_xhttp_settings(settings)
+                .expect_err("current Xray rejects negative serverMaxHeaderBytes");
+            assert!(
+                error.to_string().contains(
+                    "xhttpSettings.serverMaxHeaderBytes cannot be negative"
+                ),
+                "{error}"
+            );
         }
     }
 
