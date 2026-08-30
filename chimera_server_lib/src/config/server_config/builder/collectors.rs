@@ -1913,32 +1913,22 @@ mod tests {
     }
 
     #[test]
-    fn xhttp_uplink_chunk_size_matches_xray_uint32_schema() {
-        let settings = serde_json::from_value::<XhttpSettings>(serde_json::json!({
-            "mode": "packet-up",
-            "uplinkChunkSize": 63
-        }))
-        .expect("Xray accepts uint32 uplinkChunkSize values");
-        collect_xhttp_settings(settings)
-            .expect("uint32 uplinkChunkSize should be accepted");
-
-        let range = serde_json::from_value::<XhttpSettings>(serde_json::json!({
-            "mode": "packet-up",
-            "uplinkChunkSize": {"from": 1024, "to": 2048}
-        }));
-        assert!(
-            range.is_err(),
-            "Xray rejects range objects for uplinkChunkSize"
-        );
-
-        let negative = serde_json::from_value::<XhttpSettings>(serde_json::json!({
-            "mode": "packet-up",
-            "uplinkChunkSize": -1
-        }));
-        assert!(
-            negative.is_err(),
-            "Xray rejects negative uplinkChunkSize values"
-        );
+    fn xhttp_uplink_chunk_size_matches_current_xray_range_schema() {
+        for value in [
+            serde_json::json!(63),
+            serde_json::json!({"from": 1024, "to": 2048}),
+            serde_json::json!(-1),
+        ] {
+            let settings =
+                serde_json::from_value::<XhttpSettings>(serde_json::json!({
+                    "mode": "packet-up",
+                    "uplinkChunkSize": value
+                }))
+                .expect("current Xray Int32Range forms should deserialize");
+            collect_xhttp_settings(settings).expect(
+                "current Xray uplinkChunkSize range form should be accepted",
+            );
+        }
     }
 
     #[test]

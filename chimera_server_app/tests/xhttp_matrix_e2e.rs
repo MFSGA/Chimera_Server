@@ -79,7 +79,7 @@ fn run_xhttp_case(case: XhttpCase) {
                         "seqKey": "x_matrix_seq",
                         "uplinkDataPlacement": case.data_placement,
                         "uplinkDataKey": "x_matrix_data",
-                        "uplinkChunkSize": 2048
+                        "uplinkChunkSize": {"from": 2048, "to": 3072}
                     }
                 }
             }],
