@@ -2044,9 +2044,18 @@ fn apply_response_padding_value(
 
     let padding = generate_padding(padding_method, padding_len);
     match padding_placement {
-        // Xray v26.2.6 applies response padding through ApplyXPaddingToHeader,
-        // which intentionally has no cookie/query response cases.
-        XhttpPaddingPlacement::Cookie | XhttpPaddingPlacement::Query => {}
+        XhttpPaddingPlacement::Cookie => {
+            if !padding_key.is_empty()
+                && !padding.is_empty()
+                && let Ok(value) = hyper::header::HeaderValue::from_str(&format!(
+                    "{padding_key}={padding}; Path=/"
+                ))
+            {
+                headers.append(header::SET_COOKIE, value);
+            }
+        }
+        // Current Xray has no response-side query padding representation.
+        XhttpPaddingPlacement::Query => {}
         XhttpPaddingPlacement::Header => {
             if let Ok(name) =
                 hyper::header::HeaderName::from_bytes(padding_header.as_bytes())
@@ -2130,7 +2139,7 @@ mod tests {
     }
 
     #[test]
-    fn response_padding_placements_match_xray_v26_2_6() {
+    fn response_padding_placements_match_current_xray() {
         let mut headers = hyper::HeaderMap::new();
         apply_response_padding_value(
             &mut headers,
@@ -2141,9 +2150,9 @@ mod tests {
             XhttpPaddingMethod::RepeatX,
             4,
         );
-        assert!(
-            headers.is_empty(),
-            "Xray does not emit response cookies for padding"
+        assert_eq!(
+            headers.get(header::SET_COOKIE),
+            Some(&HeaderValue::from_static("pad=XXXX; Path=/"))
         );
 
         apply_response_padding_value(
