@@ -274,22 +274,9 @@ where
             let io_state = match this.session.process_new_packets() {
                 Ok(state) => state,
                 Err(e) => {
-                    // Attempt to flush pending alerts before returning the error
-                    while this.session.wants_write() {
-                        let mut adapter = SyncWriteAdapter {
-                            io: &mut this.io,
-                            cx,
-                        };
-                        match this.session.write_tls(&mut adapter) {
-                            Ok(_) => {}
-                            Err(ref write_err)
-                                if write_err.kind() == io::ErrorKind::WouldBlock =>
-                            {
-                                break;
-                            }
-                            Err(_) => break,
-                        }
-                    }
+                    // Best-effort pending alerts without spinning if the transport
+                    // reports a zero-byte write. Preserve the packet-processing error.
+                    let _ = this.drain_all_writes(cx);
                     return Poll::Ready(Err(e));
                 }
             };
@@ -419,9 +406,12 @@ mod tests {
         fn poll_read(
             self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
-            _buf: &mut ReadBuf<'_>,
+            buf: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
-            Poll::Pending
+            if buf.remaining() > 0 {
+                buf.put_slice(&[1]);
+            }
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -515,6 +505,68 @@ mod tests {
         assert!(matches!(
             result,
             Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::WriteZero
+        ));
+    }
+
+    struct ErrorAlertSession;
+
+    impl RealitySession for ErrorAlertSession {
+        type Reader<'a> = io::Cursor<&'a [u8]>;
+        type Writer<'a> = io::Sink;
+
+        fn read_tls(&mut self, rd: &mut dyn Read) -> io::Result<usize> {
+            let mut byte = [0u8; 1];
+            rd.read(&mut byte)
+        }
+
+        fn process_new_packets(&mut self) -> io::Result<RealityIoState> {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "synthetic TLS processing error",
+            ))
+        }
+
+        fn reader(&mut self) -> Self::Reader<'_> {
+            io::Cursor::new(&[])
+        }
+
+        fn writer(&mut self) -> Self::Writer<'_> {
+            io::sink()
+        }
+
+        fn write_tls(&mut self, wr: &mut dyn Write) -> io::Result<usize> {
+            wr.write(&[1])
+        }
+
+        fn wants_write(&self) -> bool {
+            true
+        }
+
+        fn wants_read(&self) -> bool {
+            true
+        }
+
+        fn is_handshaking(&self) -> bool {
+            false
+        }
+
+        fn send_close_notify(&mut self) {}
+    }
+
+    #[test]
+    fn packet_error_alert_zero_write_does_not_spin() {
+        let mut stream = RealityTlsStream::new(ZeroWriteIo, ErrorAlertSession);
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut storage = [0u8; 1];
+        let mut read_buf = ReadBuf::new(&mut storage);
+
+        let result = Pin::new(&mut stream).poll_read(&mut cx, &mut read_buf);
+        assert!(matches!(
+            result,
+            Poll::Ready(Err(error))
+                if error.kind() == io::ErrorKind::InvalidData
+                    && error.to_string() == "synthetic TLS processing error"
         ));
     }
 }
