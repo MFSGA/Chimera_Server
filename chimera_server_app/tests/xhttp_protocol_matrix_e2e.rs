@@ -220,6 +220,30 @@ fn current_xray_packet_uplink_method_dispatch_returns_200() {
 }
 
 #[test]
+#[ignore = "starts Chimera and validates current Xray packet-up cache headers"]
+fn packet_up_without_body_disables_caching_like_current_xray() {
+    let _serial = serial_xray_guard();
+    let options = ServerOptions {
+        mode: "packet-up",
+        ..ServerOptions::default()
+    };
+    let (_server, addr) = start_server("packet-cache-control", options);
+    let headers = [
+        ("X-Session", "session-cache".to_string()),
+        ("X-Seq", "0".to_string()),
+    ];
+    let head = send_http_request(
+        addr,
+        &request("POST", &padded_path(), "localhost", &headers, 0, b""),
+    );
+    assert_eq!(head.status, 200);
+    assert_eq!(
+        head.headers.get("cache-control").map(String::as_str),
+        Some("no-store")
+    );
+}
+
+#[test]
 #[ignore = "starts Chimera and validates packet-up sequence parsing"]
 fn invalid_packet_sequence_returns_500() {
     let _serial = serial_xray_guard();
