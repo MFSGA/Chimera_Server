@@ -120,8 +120,11 @@ pub struct RealityServerConnection {
     vision_direct_transition: bool,
 }
 
-fn max_time_diff_secs(max_diff_ms: u64) -> u64 {
-    max_diff_ms.div_ceil(1000)
+fn timestamp_diff(
+    now: std::time::Duration,
+    client_timestamp: u64,
+) -> std::time::Duration {
+    now.abs_diff(std::time::Duration::from_secs(client_timestamp))
 }
 
 impl RealityServerConnection {
@@ -417,23 +420,22 @@ impl RealityServerConnection {
         if let Some(max_diff_ms) = self.config.max_time_diff {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|_| io::Error::other("System time error"))?
-                .as_secs();
+                .map_err(|_| io::Error::other("System time error"))?;
+            let time_diff = timestamp_diff(now, client_timestamp);
+            let max_diff = std::time::Duration::from_millis(max_diff_ms);
 
-            let time_diff_secs = now.abs_diff(client_timestamp);
-            let max_diff_secs = max_time_diff_secs(max_diff_ms);
-
-            if time_diff_secs > max_diff_secs {
+            if time_diff > max_diff {
                 tracing::warn!(
-                    time_diff_secs,
-                    max_diff_secs,
+                    time_diff_ms = time_diff.as_millis(),
+                    max_diff_ms,
                     "REALITY: Client timestamp outside allowed skew"
                 );
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     format!(
-                        "Timestamp difference {} seconds exceeds maximum {} seconds",
-                        time_diff_secs, max_diff_secs
+                        "Timestamp difference {} ms exceeds maximum {} ms",
+                        time_diff.as_millis(),
+                        max_diff_ms
                     ),
                 ));
             }
@@ -1397,12 +1399,26 @@ mod tests {
     }
 
     #[test]
-    fn max_time_diff_millis_rounds_up_to_seconds() {
-        assert_eq!(max_time_diff_secs(1), 1);
-        assert_eq!(max_time_diff_secs(999), 1);
-        assert_eq!(max_time_diff_secs(1000), 1);
-        assert_eq!(max_time_diff_secs(1001), 2);
-        assert_eq!(max_time_diff_secs(60_000), 60);
+    fn timestamp_diff_preserves_xray_millisecond_precision() {
+        let now = std::time::Duration::new(1_000, 750_000_000);
+
+        assert_eq!(
+            timestamp_diff(now, 1_000),
+            std::time::Duration::from_millis(750)
+        );
+        assert_eq!(
+            timestamp_diff(now, 1_001),
+            std::time::Duration::from_millis(250)
+        );
+        assert!(
+            timestamp_diff(now, 1_000) > std::time::Duration::from_millis(749),
+            "current Xray compares the exact duration rather than rounded seconds"
+        );
+        assert_eq!(
+            timestamp_diff(now, 1_000),
+            std::time::Duration::from_millis(750),
+            "the exact maxTimeDiff boundary remains accepted"
+        );
     }
 
     #[test]
