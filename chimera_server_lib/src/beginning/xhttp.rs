@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     convert::Infallible,
     pin::Pin,
     sync::{
@@ -1155,7 +1155,8 @@ struct XhttpUploadReader {
     receiver: mpsc::Receiver<UploadPacket>,
     reader: Arc<StdMutex<Option<BoxedUploadReader>>>,
     current_payload: Option<Bytes>,
-    buffered: BTreeMap<u64, Bytes>,
+    buffered: BTreeMap<u64, VecDeque<Bytes>>,
+    buffered_packets: usize,
     next_seq: u64,
     max_buffered_posts: usize,
 }
@@ -1175,6 +1176,7 @@ impl XhttpUploadReader {
                 reader,
                 current_payload: None,
                 buffered: BTreeMap::new(),
+                buffered_packets: 0,
                 next_seq: 0,
                 max_buffered_posts,
             },
@@ -1211,12 +1213,26 @@ impl AsyncRead for XhttpUploadReader {
             }
 
             let next_seq = self.next_seq;
-            if let Some(payload) = self.buffered.remove(&next_seq) {
+            let mut remove_entry = false;
+            let next_payload =
+                self.buffered.get_mut(&next_seq).and_then(|payloads| {
+                    let payload = payloads.pop_front();
+                    remove_entry = payloads.is_empty();
+                    payload
+                });
+            if let Some(payload) = next_payload {
+                self.buffered_packets -= 1;
+                if remove_entry {
+                    self.buffered.remove(&next_seq);
+                }
                 self.current_payload = Some(payload);
                 continue;
             }
 
-            if self.buffered.len() > self.max_buffered_posts + 1 {
+            // Current Xray's upload heap retains duplicate future sequence
+            // packets, so every queued packet counts toward the reassembly
+            // limit even when its sequence number is already buffered.
+            if self.buffered_packets > self.max_buffered_posts + 1 {
                 return Poll::Ready(Err(std::io::Error::other(
                     "packet queue is too large",
                 )));
@@ -1226,7 +1242,8 @@ impl AsyncRead for XhttpUploadReader {
                 Poll::Ready(Some(UploadPacket::ReaderClaim)) => continue,
                 Poll::Ready(Some(UploadPacket::Payload { seq, data })) => {
                     if seq >= self.next_seq {
-                        self.buffered.entry(seq).or_insert(data);
+                        self.buffered.entry(seq).or_default().push_back(data);
+                        self.buffered_packets += 1;
                     }
                 }
                 Poll::Ready(None) => return Poll::Ready(Ok(())),
@@ -2972,6 +2989,42 @@ mod tests {
         let mut output = [0u8; 9];
         reader.read_exact(&mut output).await.unwrap();
         assert_eq!(&output, b"zerofirst");
+    }
+
+    #[tokio::test]
+    async fn duplicate_future_packets_count_toward_current_xray_reassembly_limit() {
+        use tokio::io::AsyncReadExt;
+
+        let (queue, mut reader) = XhttpUploadReader::new(2);
+        let queue = Arc::new(queue);
+
+        let pushes = (0..4)
+            .map(|_| {
+                let queue = queue.clone();
+                tokio::spawn(async move {
+                    queue
+                        .push_payload(1, Bytes::from_static(b"duplicate"))
+                        .await
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut byte = [0u8; 1];
+        let error = tokio::time::timeout(
+            Duration::from_millis(200),
+            reader.read_exact(&mut byte),
+        )
+        .await
+        .expect("duplicate future packets should trip the reassembly limit")
+        .expect_err("current Xray rejects an oversized reassembly heap");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "packet queue is too large");
+
+        for push in pushes {
+            push.await
+                .expect("packet push task")
+                .expect("queue remains open until reader is dropped");
+        }
     }
 
     #[tokio::test]
