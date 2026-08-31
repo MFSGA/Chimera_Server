@@ -1206,7 +1206,19 @@ impl TryFrom<InboudItem> for ServerConfig {
 
                         match security.as_str() {
                             "none" => {}
-                            "tls" | "reality" => {
+                            "tls" => {
+                                if stream_setting.tls_settings.as_ref().is_some_and(|tls| {
+                                    tls.alpn.len() == 1 && tls.alpn[0] == "h3"
+                                }) {
+                                    return Err(Error::InvalidConfig(
+                                        "xhttp inbound over HTTP/3 is not supported yet; current Xray selects XHTTP/3 when tlsSettings.alpn is exactly [\"h3\"]"
+                                            .into(),
+                                    ));
+                                }
+                                protocol =
+                                    apply_security_layers(protocol, stream_setting)?;
+                            }
+                            "reality" => {
                                 protocol =
                                     apply_security_layers(protocol, stream_setting)?;
                             }
@@ -2800,6 +2812,43 @@ mod tests {
             err.to_string()
                 .contains("xtls-rprx-vision does not support websocket transport")
         );
+    }
+
+    #[cfg(all(feature = "tls", feature = "vless"))]
+    #[test]
+    fn vless_xhttp_rejects_http3_until_udp_listener_is_supported() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "xhttp-http3",
+            "settings": {
+                "clients": [{
+                    "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+                    "email": "user@example.com"
+                }],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "xhttp",
+                "security": "tls",
+                "tlsSettings": {
+                    "alpn": ["h3"],
+                    "certificates": []
+                },
+                "xhttpSettings": {
+                    "path": "/xhttp"
+                }
+            }
+        }))
+        .expect("valid inbound item");
+
+        let err = ServerConfig::try_from(inbound).expect_err(
+            "XHTTP/3 must fail fast until Chimera has an HTTP/3 listener",
+        );
+        assert!(err.to_string().contains(
+            "xhttp inbound over HTTP/3 is not supported yet; current Xray selects XHTTP/3"
+        ));
     }
 
     #[cfg(all(feature = "reality", feature = "vless"))]
