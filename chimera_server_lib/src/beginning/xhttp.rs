@@ -852,23 +852,18 @@ fn packet_up_success_response(
 }
 
 async fn wait_for_stream_up_response_start(
-    mut done_rx: oneshot::Receiver<()>,
-    padding_delay: Option<Duration>,
+    done_rx: oneshot::Receiver<()>,
+    padding_enabled: bool,
     min_padding: usize,
     max_padding: usize,
 ) -> Option<(oneshot::Receiver<()>, Bytes)> {
-    let Some(padding_delay) = padding_delay else {
-        let _ = done_rx.await;
-        return None;
-    };
-
-    tokio::select! {
-        _ = &mut done_rx => None,
-        _ = sleep(padding_delay) => {
-            let padding_len = random_inclusive(min_padding, max_padding);
-            Some((done_rx, Bytes::from(vec![b'X'; padding_len])))
-        }
+    if padding_enabled {
+        let padding_len = random_inclusive(min_padding, max_padding);
+        return Some((done_rx, Bytes::from(vec![b'X'; padding_len])));
     }
+
+    let _ = done_rx.await;
+    None
 }
 
 async fn stream_up_response(
@@ -877,12 +872,11 @@ async fn stream_up_response(
     padding_enabled: bool,
 ) -> Response<ResponseBody> {
     let (min_secs, max_secs) = state.stream_up_server_secs;
-    let padding_delay = (padding_enabled && max_secs > 0)
-        .then(|| Duration::from_secs(random_inclusive(min_secs, max_secs) as u64));
+    let padding_enabled = padding_enabled && max_secs > 0;
 
     let Some((done_rx, first_padding)) = wait_for_stream_up_response_start(
         done_rx,
-        padding_delay,
+        padding_enabled,
         state.min_padding,
         state.max_padding,
     )
@@ -2986,7 +2980,7 @@ mod tests {
     async fn stream_up_response_waits_for_body_without_padding_like_xray_v26_2_6() {
         let (done_tx, done_rx) = oneshot::channel();
         let mut wait =
-            Box::pin(wait_for_stream_up_response_start(done_rx, None, 100, 100));
+            Box::pin(wait_for_stream_up_response_start(done_rx, false, 100, 100));
 
         assert!(
             tokio::time::timeout(Duration::from_millis(20), &mut wait)
@@ -3003,16 +2997,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_up_padding_can_flush_response_before_body_eof_like_xray_v26_2_6()
-    {
+    async fn stream_up_padding_starts_immediately_like_current_xray() {
         let (_done_tx, done_rx) = oneshot::channel();
-        let started = wait_for_stream_up_response_start(
-            done_rx,
-            Some(Duration::from_millis(10)),
-            7,
-            7,
+        let started = tokio::time::timeout(
+            Duration::from_millis(20),
+            wait_for_stream_up_response_start(done_rx, true, 7, 7),
         )
         .await
+        .expect("current Xray writes the first stream-up padding chunk immediately")
         .expect("padding should start the response while upload remains open");
 
         assert_eq!(started.1, Bytes::from_static(b"XXXXXXX"));
