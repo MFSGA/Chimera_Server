@@ -167,9 +167,11 @@ impl TransportParameters {
                 CidQueue::LEN as u32
             }
             .into(),
-            max_datagram_frame_size: config
-                .datagram_receive_buffer_size
-                .map(|x| (x.min(u16::MAX.into()) as u16).into()),
+            max_datagram_frame_size: config.max_datagram_frame_size.or_else(|| {
+                config
+                    .datagram_receive_buffer_size
+                    .map(|x| (x.min(u16::MAX.into()) as u16).into())
+            }),
             grease_quic_bit: endpoint_config.grease_quic_bit,
             min_ack_delay: Some(
                 VarInt::from_u64(u64::try_from(TIMER_GRANULARITY.as_micros()).unwrap()).unwrap(),
@@ -721,6 +723,24 @@ fn decode_cid(len: usize, value: &mut Option<ConnectionId>, r: &mut impl Buf) ->
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::cid_generator::RandomConnectionIdGenerator;
+
+    #[test]
+    fn explicit_datagram_frame_size_is_independent_of_receive_buffer() {
+        let mut config = TransportConfig::default();
+        config.datagram_receive_buffer_size(Some(64 * 1024));
+        config.max_datagram_frame_size(Some(1200u32.into()));
+        let params = TransportParameters::new(
+            &config,
+            &EndpointConfig::default(),
+            &RandomConnectionIdGenerator::new(8),
+            ConnectionId::new(&[]),
+            None,
+            &mut StepRng(0),
+        );
+
+        assert_eq!(params.max_datagram_frame_size, Some(1200u32.into()));
+    }
 
     #[test]
     fn coding() {
