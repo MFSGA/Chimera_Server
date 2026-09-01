@@ -1966,6 +1966,30 @@ fn datagram_unsupported() {
 }
 
 #[test]
+fn datagram_assumed_peer_support() {
+    let _guard = subscribe();
+    let server = ServerConfig {
+        transport: Arc::new(TransportConfig {
+            datagram_receive_buffer_size: None,
+            ..TransportConfig::default()
+        }),
+        ..server_config()
+    };
+    let mut client = client_config();
+    let mut transport = TransportConfig::default();
+    transport.assume_peer_max_datagram_frame_size(Some(1200u32.into()));
+    client.transport = Arc::new(transport);
+
+    let mut pair = Pair::new(Default::default(), server);
+    let (client_ch, server_ch) = pair.connect_with(client);
+    assert_matches!(pair.server_conn_mut(server_ch).poll(), None);
+    assert_matches!(pair.client_datagrams(client_ch).max_size(), Some(x) if x > 0);
+    pair.client_datagrams(client_ch)
+        .send(Bytes::from_static(b"xray-compatible datagram"), true)
+        .expect("assumed peer DATAGRAM support should allow enqueueing");
+}
+
+#[test]
 fn large_initial() {
     let _guard = subscribe();
     let server_config =
