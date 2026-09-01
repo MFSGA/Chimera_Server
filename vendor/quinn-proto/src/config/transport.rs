@@ -48,6 +48,7 @@ pub struct TransportConfig {
     pub(crate) allow_spin: bool,
     pub(crate) datagram_receive_buffer_size: Option<usize>,
     pub(crate) datagram_send_buffer_size: usize,
+    pub(crate) max_datagram_frame_size: Option<VarInt>,
     pub(crate) assume_peer_max_datagram_frame_size: Option<VarInt>,
     #[cfg(test)]
     pub(crate) deterministic_packet_numbers: bool,
@@ -299,6 +300,16 @@ impl TransportConfig {
         self
     }
 
+    /// Maximum DATAGRAM frame size to advertise to the peer.
+    ///
+    /// When unset, this remains derived from `datagram_receive_buffer_size` for backwards
+    /// compatibility. Setting it allows protocols to advertise a stricter per-frame limit without
+    /// shrinking the aggregate receive queue.
+    pub fn max_datagram_frame_size(&mut self, value: Option<VarInt>) -> &mut Self {
+        self.max_datagram_frame_size = value;
+        self
+    }
+
     /// Assume a peer DATAGRAM frame size when the peer omits the transport parameter.
     ///
     /// This is a non-standard compatibility escape hatch for peers that intentionally omit
@@ -393,6 +404,7 @@ impl Default for TransportConfig {
             allow_spin: true,
             datagram_receive_buffer_size: Some(STREAM_RWND as usize),
             datagram_send_buffer_size: 1024 * 1024,
+            max_datagram_frame_size: None,
             assume_peer_max_datagram_frame_size: None,
             #[cfg(test)]
             deterministic_packet_numbers: false,
@@ -430,6 +442,7 @@ impl fmt::Debug for TransportConfig {
             allow_spin,
             datagram_receive_buffer_size,
             datagram_send_buffer_size,
+            max_datagram_frame_size,
             assume_peer_max_datagram_frame_size,
             #[cfg(test)]
                 deterministic_packet_numbers: _,
@@ -463,6 +476,7 @@ impl fmt::Debug for TransportConfig {
             .field("allow_spin", allow_spin)
             .field("datagram_receive_buffer_size", datagram_receive_buffer_size)
             .field("datagram_send_buffer_size", datagram_send_buffer_size)
+            .field("max_datagram_frame_size", max_datagram_frame_size)
             .field(
                 "assume_peer_max_datagram_frame_size",
                 assume_peer_max_datagram_frame_size,
