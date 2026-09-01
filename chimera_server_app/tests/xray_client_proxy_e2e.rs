@@ -1589,8 +1589,7 @@ async fn xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2_with_xray_d
     let udp_echo_addr = start_udp_echo_server().await;
     let chimera_port = free_localhost_port();
     let xray_socks_port = free_localhost_port();
-    let cert_path = workspace.join("cert/cert.pem");
-    let key_path = workspace.join("cert/key.pem");
+    let (cert_path, key_path) = generate_test_certificate(&work_dir);
     let pinned_peer_cert_sha256 = first_cert_sha256_hex(&cert_path);
 
     let chimera_config_path = work_dir.join("chimera-hysteria2.json");
@@ -1716,8 +1715,7 @@ fn xray_hysteria2_empty_user_auth_can_proxy_tcp() {
     let echo_addr = start_tcp_echo_server();
     let chimera_port = free_localhost_port();
     let xray_socks_port = free_localhost_port();
-    let cert_path = workspace.join("cert/cert.pem");
-    let key_path = workspace.join("cert/key.pem");
+    let (cert_path, key_path) = generate_test_certificate(&work_dir);
     let pinned_peer_cert_sha256 = first_cert_sha256_hex(&cert_path);
 
     let chimera_config_path = work_dir.join("chimera-hysteria2-empty-auth.json");
@@ -1813,8 +1811,7 @@ fn xray_hysteria2_uuid_auth_routes_by_embedded_vless_route() {
     let echo_addr = start_tcp_echo_server();
     let chimera_port = free_localhost_port();
     let xray_socks_port = free_localhost_port();
-    let cert_path = workspace.join("cert/cert.pem");
-    let key_path = workspace.join("cert/key.pem");
+    let (cert_path, key_path) = generate_test_certificate(&work_dir);
     let pinned_peer_cert_sha256 = first_cert_sha256_hex(&cert_path);
 
     let chimera_config_path = work_dir.join("chimera-hysteria2-uuid-route.json");
@@ -1914,8 +1911,7 @@ fn xray_client_rejects_invalid_hysteria2_auth_without_tunnel() {
     let echo_addr = start_tcp_echo_server();
     let chimera_port = free_localhost_port();
     let xray_socks_port = free_localhost_port();
-    let cert_path = workspace.join("cert/cert.pem");
-    let key_path = workspace.join("cert/key.pem");
+    let (cert_path, key_path) = generate_test_certificate(&work_dir);
     let pinned_peer_cert_sha256 = first_cert_sha256_hex(&cert_path);
 
     let chimera_config_path = work_dir.join("chimera-hysteria2-auth-reject.json");
@@ -2021,16 +2017,32 @@ fn xray_client_rejects_invalid_hysteria2_auth_without_tunnel() {
 
 fn workspace_root() -> PathBuf {
     for ancestor in Path::new(env!("CARGO_MANIFEST_DIR")).ancestors() {
-        if ancestor.join("xray").is_file()
-            && ancestor.join("cert/cert.pem").is_file()
+        if ancestor.join("Cargo.toml").is_file()
+            && ancestor.join("chimera_server_lib").is_dir()
         {
             return ancestor.to_path_buf();
         }
     }
     panic!(
-        "failed to find workspace root containing xray and cert/cert.pem from {}",
+        "failed to find Chimera workspace root from {}",
         env!("CARGO_MANIFEST_DIR")
     );
+}
+
+fn generate_test_certificate(work_dir: &Path) -> (PathBuf, PathBuf) {
+    let signing_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)
+        .expect("generate Hysteria2 interoperability RSA key");
+    let cert = rcgen::CertificateParams::new(["localhost".to_string()])
+        .expect("build Hysteria2 interoperability certificate params")
+        .self_signed(&signing_key)
+        .expect("generate Hysteria2 interoperability certificate");
+    let cert_path = work_dir.join("cert.pem");
+    let key_path = work_dir.join("key.pem");
+    fs::write(&cert_path, cert.pem())
+        .expect("write Hysteria2 interoperability certificate");
+    fs::write(&key_path, signing_key.serialize_pem())
+        .expect("write Hysteria2 interoperability private key");
+    (cert_path, key_path)
 }
 
 fn create_test_dir(name: &str) -> PathBuf {
