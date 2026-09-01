@@ -129,3 +129,6 @@ aes = "0.8"
 chacha20poly1305 = "0.10"
 sha3 = "0.10"
 sha1 = "0.10"
+
+[patch.crates-io]
+quinn-proto = { path = "vendor/quinn-proto" }

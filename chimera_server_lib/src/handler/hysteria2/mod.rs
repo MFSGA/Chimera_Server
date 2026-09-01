@@ -27,6 +27,7 @@ const SHOES_INITIAL_RTT: Duration = Duration::from_millis(100);
 const SHOES_UDP_SOCKET_BUFFER_SIZE: usize = 8_625_000;
 const SHOES_INITIAL_MTU: u16 = 1200;
 const XRAY_INITIAL_MTU: u16 = 1280;
+const XRAY_ASSUME_PEER_MAX_DATAGRAM_FRAME_SIZE: u32 = 1200;
 const DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 8 * 1024 * 1024;
 const DEFAULT_CONNECTION_RECEIVE_WINDOW: u64 = 20 * 1024 * 1024;
 
@@ -233,6 +234,9 @@ fn build_transport_config(
     if let Some(initial_rtt) = configured_initial_rtt(config.xray_compat) {
         transport.initial_rtt(initial_rtt);
     }
+    transport.assume_peer_max_datagram_frame_size(
+        configured_assume_peer_max_datagram_frame_size(config.xray_compat),
+    );
     transport
         .max_concurrent_bidi_streams(max_bidi_streams)
         .max_concurrent_uni_streams(max_uni_streams)
@@ -287,6 +291,12 @@ fn configured_udp_socket_buffer_size(xray_compat: bool) -> Option<usize> {
     (!xray_compat).then_some(SHOES_UDP_SOCKET_BUFFER_SIZE)
 }
 
+fn configured_assume_peer_max_datagram_frame_size(
+    xray_compat: bool,
+) -> Option<quinn::VarInt> {
+    xray_compat.then_some(XRAY_ASSUME_PEER_MAX_DATAGRAM_FRAME_SIZE.into())
+}
+
 fn configured_mtu_discovery(
     disable_path_mtu_discovery: Option<bool>,
 ) -> Option<quinn::MtuDiscoveryConfig> {
@@ -327,8 +337,10 @@ mod tests {
         CongestionMode, DEFAULT_CONNECTION_RECEIVE_WINDOW,
         DEFAULT_STREAM_RECEIVE_WINDOW, SHOES_INITIAL_MTU, SHOES_INITIAL_RTT,
         SHOES_KEEP_ALIVE_INTERVAL, SHOES_MAX_INCOMING_UNI_STREAMS,
-        SHOES_SEND_WINDOW, SHOES_UDP_SOCKET_BUFFER_SIZE, XRAY_INITIAL_MTU,
-        XRAY_MAX_INCOMING_UNI_STREAMS, configured_congestion_mode,
+        SHOES_SEND_WINDOW, SHOES_UDP_SOCKET_BUFFER_SIZE,
+        XRAY_ASSUME_PEER_MAX_DATAGRAM_FRAME_SIZE, XRAY_INITIAL_MTU,
+        XRAY_MAX_INCOMING_UNI_STREAMS,
+        configured_assume_peer_max_datagram_frame_size, configured_congestion_mode,
         configured_initial_mtu, configured_initial_rtt,
         configured_keep_alive_interval, configured_max_idle_timeout_secs,
         configured_max_incoming_bidi_streams, configured_max_incoming_uni_streams,
@@ -379,6 +391,17 @@ mod tests {
             Some(SHOES_UDP_SOCKET_BUFFER_SIZE)
         );
         assert_eq!(configured_udp_socket_buffer_size(true), None);
+    }
+
+    #[test]
+    fn xray_compat_assumes_peer_datagram_support() {
+        assert_eq!(configured_assume_peer_max_datagram_frame_size(false), None);
+        assert_eq!(
+            configured_assume_peer_max_datagram_frame_size(true)
+                .expect("Xray compatibility must assume peer DATAGRAM support")
+                .into_inner(),
+            u64::from(XRAY_ASSUME_PEER_MAX_DATAGRAM_FRAME_SIZE)
+        );
     }
 
     #[test]
