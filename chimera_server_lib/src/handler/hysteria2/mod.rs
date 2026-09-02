@@ -216,10 +216,7 @@ fn build_transport_config(
         ))
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
     let max_uni_streams = configured_max_incoming_uni_streams(config.xray_compat);
-    let keep_alive_interval = configured_keep_alive_interval(
-        config.xray_compat,
-        config.xray_keep_alive_period_secs,
-    );
+    let keep_alive_interval = configured_keep_alive_interval(config.xray_compat);
     // Quinn has a single static receive window rather than quic-go's separate
     // initial/max auto-tuned windows. Apply Xray's max values as the closest
     // runtime equivalent; the initial values remain validated/preserved in config.
@@ -281,17 +278,8 @@ fn configured_max_incoming_uni_streams(xray_compat: bool) -> quinn::VarInt {
     }
 }
 
-fn configured_keep_alive_interval(
-    xray_compat: bool,
-    configured: Option<u64>,
-) -> Option<Duration> {
-    if xray_compat {
-        configured
-            .filter(|period| *period != 0)
-            .map(Duration::from_secs)
-    } else {
-        Some(SHOES_KEEP_ALIVE_INTERVAL)
-    }
+fn configured_keep_alive_interval(xray_compat: bool) -> Option<Duration> {
+    (!xray_compat).then_some(SHOES_KEEP_ALIVE_INTERVAL)
 }
 
 fn configured_send_window(xray_compat: bool) -> Option<u64> {
@@ -352,8 +340,6 @@ fn configured_receive_window(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::{
         CongestionMode, DEFAULT_CONNECTION_RECEIVE_WINDOW,
         DEFAULT_STREAM_RECEIVE_WINDOW, SHOES_INITIAL_MTU, SHOES_INITIAL_RTT,
@@ -400,10 +386,10 @@ mod tests {
     #[test]
     fn shoes_transport_tuning_is_disabled_for_xray_compatibility() {
         assert_eq!(
-            configured_keep_alive_interval(false, None),
+            configured_keep_alive_interval(false),
             Some(SHOES_KEEP_ALIVE_INTERVAL)
         );
-        assert_eq!(configured_keep_alive_interval(true, None), None);
+        assert_eq!(configured_keep_alive_interval(true), None);
         assert_eq!(configured_send_window(false), Some(SHOES_SEND_WINDOW));
         assert_eq!(configured_send_window(true), None);
         assert_eq!(configured_initial_rtt(false), Some(SHOES_INITIAL_RTT));
@@ -413,15 +399,6 @@ mod tests {
             Some(SHOES_UDP_SOCKET_BUFFER_SIZE)
         );
         assert_eq!(configured_udp_socket_buffer_size(true), None);
-    }
-
-    #[test]
-    fn xray_keep_alive_period_matches_configured_value() {
-        assert_eq!(configured_keep_alive_interval(true, Some(0)), None);
-        assert_eq!(
-            configured_keep_alive_interval(true, Some(12)),
-            Some(Duration::from_secs(12))
-        );
     }
 
     #[test]
