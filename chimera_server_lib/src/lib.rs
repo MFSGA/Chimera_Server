@@ -109,15 +109,44 @@ pub struct ServerRuntime {
     pub runtime_state: RuntimeState,
 }
 
+fn install_configured_user_domain_policy(
+    runtime_state: &RuntimeState,
+    policy: Option<&serde_json::Value>,
+) -> Result<(), Error> {
+    let Some(policy) = policy else {
+        return Ok(());
+    };
+
+    let json_config = serde_json::to_string(policy).map_err(|error| {
+        Error::InvalidConfig(format!(
+            "could not serialize userDomainAccess configuration: {error}"
+        ))
+    })?;
+    runtime_state
+        .apply_user_domain_policy(&json_config)
+        .map(|_| ())
+        .map_err(|failure| {
+            Error::InvalidConfig(format!(
+                "invalid userDomainAccess configuration: {}",
+                failure.message
+            ))
+        })
+}
+
 pub fn prepare_server_runtime(
     config: LiteralConfig,
     cwd: Option<&str>,
     log_file: Option<&str>,
 ) -> Result<ServerRuntime, Error> {
     let policy_config = config.policy.clone();
+    let user_domain_access = config.user_domain_access.clone();
     let inbounds = prepare_server_inbounds(config, cwd, log_file)?;
     let runtime_state = RuntimeState::new(inbounds.clone(), Vec::new());
     runtime_state.replace_policy(policy_config.as_ref());
+    install_configured_user_domain_policy(
+        &runtime_state,
+        user_domain_access.as_ref(),
+    )?;
 
     Ok(ServerRuntime {
         inbounds,
@@ -294,6 +323,12 @@ pub fn validate(opts: Options) -> Result<(), Error> {
     // 1. config parse
     let config = opts.config.try_parse(opts.config_format)?;
 
+    let validation_runtime = RuntimeState::new(Vec::new(), Vec::new());
+    install_configured_user_domain_policy(
+        &validation_runtime,
+        config.user_domain_access.as_ref(),
+    )?;
+
     // 2. api/mcp config validation
     let api_config = config.api.clone();
     let mcp_config = config.mcp.clone();
@@ -362,6 +397,7 @@ async fn start_async(
     let mcp_config = config.mcp.clone();
     let routing_config = config.routing.clone();
     let policy_config = config.policy.clone();
+    let user_domain_access = config.user_domain_access.clone();
     let observatory_config = config.observatory.clone();
     let burst_observatory_config = config.burst_observatory.clone();
     routing_observer::validate_observatory_config(
@@ -388,6 +424,10 @@ async fn start_async(
 
     let runtime_state = RuntimeState::new(all_inbounds.clone(), outbounds);
     runtime_state.replace_policy(policy_config.as_ref());
+    install_configured_user_domain_policy(
+        &runtime_state,
+        user_domain_access.as_ref(),
+    )?;
     runtime_state.replace_routing(
         routing_state::RoutingState::from_config(config.routing.as_ref())
             .map_err(Error::InvalidConfig)?,

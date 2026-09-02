@@ -23,6 +23,8 @@ pub struct LiteralConfig {
     pub policy: Option<PolicyConfig>,
     #[serde(default)]
     pub routing: Option<RoutingConfig>,
+    #[serde(default, rename = "userDomainAccess")]
+    pub user_domain_access: Option<Value>,
     #[serde(default)]
     pub observatory: Option<ObservatoryConfig>,
     #[serde(default, rename = "burstObservatory")]
@@ -405,6 +407,31 @@ mod tests {
         "#;
         let c = cfg.parse::<LiteralConfig>().expect("should parse");
         println!("{:?}", c);
+    }
+
+    #[test]
+    fn parses_user_domain_access_config() {
+        let config: LiteralConfig = serde_json::from_str(
+            r#"{
+                "inbounds": [],
+                "outbounds": [],
+                "userDomainAccess": {
+                    "version": 1,
+                    "defaultAction": "allow",
+                    "users": []
+                }
+            }"#,
+        )
+        .expect("userDomainAccess should parse");
+
+        assert_eq!(
+            config
+                .user_domain_access
+                .as_ref()
+                .and_then(|value| value.get("version"))
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
     }
 
     #[test]
