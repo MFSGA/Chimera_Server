@@ -4,10 +4,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::{
-    sync::broadcast,
-    task::JoinHandle,
-};
+use tokio::{sync::broadcast, task::JoinHandle};
 
 use crate::{
     config::{def::PolicyConfig, server_config::ServerConfig},
@@ -15,8 +12,8 @@ use crate::{
         OutboundObservation, RouteMatch, RoutingEvent, RoutingInput, RoutingState,
     },
     user_domain::{
-        parse_publication, UserDomainAccessFailure, UserDomainAccessRevision,
-        UserDomainAccessStatus, UserDomainAccessStore,
+        UserDomainAccessFailure, UserDomainAccessRevision, UserDomainAccessStatus,
+        UserDomainAccessStore, parse_publication,
     },
 };
 
