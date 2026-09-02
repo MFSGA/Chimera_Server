@@ -1163,7 +1163,7 @@ async fn wait_for_stream_up_response_start(
     max_padding: usize,
 ) -> Option<(oneshot::Receiver<()>, Bytes)> {
     if padding_enabled {
-        let padding_len = random_inclusive(min_padding, max_padding);
+        let padding_len = random_xray_range(min_padding, max_padding);
         return Some((done_rx, Bytes::from(vec![b'X'; padding_len])));
     }
 
@@ -1203,11 +1203,11 @@ async fn stream_up_response(
                 return Some((Ok(Frame::data(first_padding)), (done_rx, None)));
             }
 
-            let delay_secs = random_inclusive(min_secs, max_secs);
+            let delay_secs = random_xray_range(min_secs, max_secs);
             tokio::select! {
                 _ = &mut done_rx => None,
                 _ = sleep(Duration::from_secs(delay_secs as u64)) => {
-                    let padding_len = random_inclusive(min_padding, max_padding);
+                    let padding_len = random_xray_range(min_padding, max_padding);
                     Some((
                         Ok(Frame::data(Bytes::from(vec![b'X'; padding_len]))),
                         (done_rx, None),
@@ -2130,13 +2130,14 @@ fn request_head_bytes<B>(request: &Request<B>) -> usize {
     )
 }
 
-fn random_inclusive(from: usize, to: usize) -> usize {
+fn random_xray_range(from: usize, to: usize) -> usize {
     let low = from.min(to);
     let high = from.max(to);
     if low == high {
         low
     } else {
-        rand::rng().random_range(low..=high)
+        // Xray's crypto.RandBetween swaps reversed bounds and samples [from, to).
+        rand::rng().random_range(low..high)
     }
 }
 
@@ -2315,7 +2316,7 @@ fn apply_xray_cors_headers(
 }
 
 fn apply_response_padding(headers: &mut hyper::HeaderMap, state: &AppState) {
-    let padding_len = random_inclusive(state.min_padding, state.max_padding);
+    let padding_len = random_xray_range(state.min_padding, state.max_padding);
     apply_response_padding_value(
         headers,
         state.padding_obfs_mode,
@@ -3042,6 +3043,17 @@ mod tests {
             let padding = generate_tokenish_padding(target);
             let encoded_len = hpack_huffman_encoded_len(&padding);
             assert!(encoded_len.abs_diff(target) <= 2);
+        }
+    }
+
+    #[test]
+    fn random_range_matches_xray_half_open_bounds() {
+        assert_eq!(random_xray_range(7, 7), 7);
+        for _ in 0..64 {
+            assert_eq!(random_xray_range(7, 8), 7);
+            assert_eq!(random_xray_range(8, 7), 7);
+            let sampled = random_xray_range(7, 10);
+            assert!((7..10).contains(&sampled));
         }
     }
 
