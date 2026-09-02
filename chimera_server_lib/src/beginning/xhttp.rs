@@ -15,7 +15,7 @@ use futures::StreamExt;
 use http_body_util::{BodyExt, Empty, StreamBody, combinators::UnsyncBoxBody};
 use hyper::{
     Method, Request, Response, StatusCode,
-    body::{Body, Frame, Incoming},
+    body::{Body, Frame},
     header::{self, HeaderValue},
     service::service_fn,
 };
@@ -513,12 +513,16 @@ impl AppState {
     }
 }
 
-async fn handle_request(
-    request: Request<Incoming>,
+async fn handle_request<B>(
+    request: Request<B>,
     state: Arc<AppState>,
     peer_addr: std::net::SocketAddr,
     local_addr: std::net::SocketAddr,
-) -> Result<Response<ResponseBody>, Infallible> {
+) -> Result<Response<ResponseBody>, Infallible>
+where
+    B: Body<Data = Bytes> + Unpin + Send + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     let request_headers = request.headers().clone();
 
     let http1_header_limit =
@@ -2095,6 +2099,19 @@ fn apply_response_padding_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_dispatch_accepts_transport_neutral_http_body() {
+        fn assert_body<B>()
+        where
+            B: Body<Data = Bytes> + Unpin + Send + 'static,
+            B::Error: std::error::Error + Send + Sync + 'static,
+        {
+            let _ = handle_request::<B>;
+        }
+
+        assert_body::<http_body_util::Full<Bytes>>();
+    }
 
     #[test]
     fn normalized_path_only_requires_trailing_slash_for_path_metadata() {
