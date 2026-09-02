@@ -187,6 +187,17 @@ fn chimera_stream_settings(
             "network": "xhttp",
             "security": "tls",
             "xhttpSettings": xhttp_settings,
+            "finalmask": if matches!(case, SecurityCase::Http3) {
+                json!({
+                    "quicParams": {
+                        "maxIdleTimeout": 45,
+                        "maxIncomingStreams": 64,
+                        "disablePathMTUDiscovery": true
+                    }
+                })
+            } else {
+                Value::Null
+            },
             "tlsSettings": {
                 "serverName": "localhost",
                 "alpn": if matches!(case, SecurityCase::Http3) {

@@ -431,6 +431,12 @@ pub struct XhttpServerConfig {
     pub seq_key: String,
     pub uplink_data_placement: XhttpDataPlacement,
     pub uplink_data_key: String,
+    #[serde(default)]
+    pub xray_max_idle_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub xray_max_incoming_streams: Option<u64>,
+    #[serde(default)]
+    pub xray_disable_path_mtu_discovery: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
