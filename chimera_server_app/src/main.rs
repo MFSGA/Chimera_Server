@@ -126,7 +126,7 @@ fn normalize_legacy_flag(arg: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
 
     use super::{Cli, normalize_legacy_flag};
 
@@ -146,5 +146,26 @@ mod tests {
         );
         assert_eq!(normalize_legacy_flag("-check"), Some("--check".to_string()));
         assert_eq!(normalize_legacy_flag("--check"), None);
+    }
+
+    #[test]
+    fn cli_accepts_rnode_directory_and_config_contract() {
+        let cli = Cli::try_parse_from([
+            "chimera-server",
+            "/var/lib/chimera",
+            "--config",
+            "config.json",
+        ])
+        .expect("rnode Chimera CLI arguments should parse");
+
+        assert_eq!(cli.config, "config.json");
+        assert!(
+            Cli::try_parse_from([
+                "chimera-server",
+                "/var/lib/chimera",
+                "config.json",
+            ])
+            .is_err()
+        );
     }
 }

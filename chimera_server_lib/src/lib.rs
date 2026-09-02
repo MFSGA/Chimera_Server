@@ -399,6 +399,47 @@ async fn start_async(
 
     let mut join_handles = Vec::with_capacity(3);
     let mut has_started_server = false;
+    if let Some(mcp) = mcp_config.as_ref() {
+        if let Some(listen) = mcp.listen.as_ref() {
+            let listen = listen.parse::<std::net::SocketAddr>().map_err(|err| {
+                Error::InvalidConfig(format!(
+                    "invalid mcp.listen {}: {}",
+                    listen, err
+                ))
+            })?;
+            let interval_ms = mcp.update_interval_ms.max(100);
+            let mcp_handle = mcp::start_mcp_server(mcp::McpServerConfig {
+                listen,
+                path: mcp.path.clone(),
+                update_interval: Duration::from_millis(interval_ms),
+            })
+            .await?;
+            join_handles.push(mcp_handle);
+            has_started_server = true;
+        } else {
+            tracing::warn!("mcp is configured but no listen address was resolved");
+        }
+    }
+
+    // Bind every configured data-plane listener before advertising the control
+    // plane. rnode uses GetSysStats as its readiness probe, so starting gRPC
+    // first would allow a process with a failed inbound bind to look healthy.
+    for config in all_inbounds {
+        // Skip the API inbound if it's configured to avoid port conflicts
+        if skip_inbound_tag.as_deref() == Some(config.tag.as_str()) {
+            tracing::info!(
+                "skip api inbound {} to avoid grpc port conflict",
+                config.tag
+            );
+            continue;
+        }
+        // Runtime state lets UDP listeners evaluate routing and outbound policy.
+        let inbound_tag = config.tag.clone();
+        let handles = start_servers(config, runtime_state.clone()).await?;
+        runtime_state.register_inbound_tasks(&inbound_tag, handles);
+        has_started_server = true;
+    }
+
     #[cfg(feature = "api")]
     if let Some(api) = api_config.as_ref()
         && let Some(listen) = api_addr
@@ -426,44 +467,6 @@ async fn start_async(
         tracing::warn!(
             "api services configured but the \"api\" feature is disabled; grpc support is unavailable"
         );
-    }
-
-    if let Some(mcp) = mcp_config.as_ref() {
-        if let Some(listen) = mcp.listen.as_ref() {
-            let listen = listen.parse::<std::net::SocketAddr>().map_err(|err| {
-                Error::InvalidConfig(format!(
-                    "invalid mcp.listen {}: {}",
-                    listen, err
-                ))
-            })?;
-            let interval_ms = mcp.update_interval_ms.max(100);
-            let mcp_handle = mcp::start_mcp_server(mcp::McpServerConfig {
-                listen,
-                path: mcp.path.clone(),
-                update_interval: Duration::from_millis(interval_ms),
-            })
-            .await?;
-            join_handles.push(mcp_handle);
-            has_started_server = true;
-        } else {
-            tracing::warn!("mcp is configured but no listen address was resolved");
-        }
-    }
-
-    for config in all_inbounds {
-        // Skip the API inbound if it's configured to avoid port conflicts
-        if skip_inbound_tag.as_deref() == Some(config.tag.as_str()) {
-            tracing::info!(
-                "skip api inbound {} to avoid grpc port conflict",
-                config.tag
-            );
-            continue;
-        }
-        // Runtime state lets UDP listeners evaluate routing and outbound policy.
-        let inbound_tag = config.tag.clone();
-        let handles = start_servers(config, runtime_state.clone()).await?;
-        runtime_state.register_inbound_tasks(&inbound_tag, handles);
-        has_started_server = true;
     }
 
     if !has_started_server {
