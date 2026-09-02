@@ -290,6 +290,8 @@ enum XhttpSecurityLayer {
 #[cfg(feature = "tls")]
 const XRAY_XHTTP_H3_INITIAL_MTU: u16 = 1280;
 #[cfg(feature = "tls")]
+const XRAY_XHTTP_H3_MAX_FIELD_SECTION_SIZE: u64 = 1 << 20;
+#[cfg(feature = "tls")]
 const XRAY_XHTTP_H3_MAX_STREAM_RECEIVE_WINDOW: u64 = 6 * 1024 * 1024;
 #[cfg(feature = "tls")]
 const XRAY_XHTTP_H3_MAX_CONNECTION_RECEIVE_WINDOW: u64 = 15 * 1024 * 1024;
@@ -381,8 +383,12 @@ async fn start_xhttp_h3_server(
                 };
                 let peer_addr = connection.remote_address();
                 let h3_quinn_connection = h3_quinn::Connection::new(connection);
+                let mut h3_builder = h3::server::builder();
+                // Xray's quic-go HTTP/3 server uses Go's http.DefaultMaxHeaderBytes.
+                h3_builder
+                    .max_field_section_size(XRAY_XHTTP_H3_MAX_FIELD_SECTION_SIZE);
                 let mut h3_connection =
-                    match h3::server::Connection::new(h3_quinn_connection).await {
+                    match h3_builder.build(h3_quinn_connection).await {
                         Ok(connection) => connection,
                         Err(err) => {
                             debug!(
