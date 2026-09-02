@@ -114,6 +114,58 @@ fn split_h3_request_stream(
     (send, H3RequestBody::new(recv))
 }
 
+/// Bridges an accepted HTTP/3 request into the transport-neutral XHTTP
+/// dispatcher and streams its response back over the retained H3 send half.
+#[allow(dead_code)]
+async fn handle_h3_request_stream(
+    request: Request<()>,
+    stream: H3BidiRequestStream,
+    state: Arc<AppState>,
+    peer_addr: std::net::SocketAddr,
+    local_addr: std::net::SocketAddr,
+) -> Result<(), h3::error::StreamError> {
+    let (send, body) = split_h3_request_stream(stream);
+    let (parts, ()) = request.into_parts();
+    let request = Request::from_parts(parts, body);
+    let response = match handle_request(request, state, peer_addr, local_addr).await
+    {
+        Ok(response) => response,
+        Err(infallible) => match infallible {},
+    };
+
+    send_h3_response(send, response).await
+}
+
+#[allow(dead_code)]
+async fn send_h3_response(
+    mut stream: H3SendRequestStream,
+    response: Response<ResponseBody>,
+) -> Result<(), h3::error::StreamError> {
+    let (parts, mut body) = response.into_parts();
+    stream
+        .send_response(Response::from_parts(parts, ()))
+        .await?;
+
+    while let Some(frame) = body.frame().await {
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(infallible) => match infallible {},
+        };
+        let frame = match frame.into_data() {
+            Ok(data) => {
+                stream.send_data(data).await?;
+                continue;
+            }
+            Err(frame) => frame,
+        };
+        if let Ok(trailers) = frame.into_trailers() {
+            stream.send_trailers(trailers).await?;
+        }
+    }
+
+    stream.finish().await
+}
+
 pub async fn start_xhttp_server(
     config: ServerConfig,
     runtime: RuntimeState,
