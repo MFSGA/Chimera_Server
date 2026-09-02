@@ -3781,7 +3781,6 @@ mod tests {
                     outbound_selector: vec!["missing-prefix".into()],
                     strategy: Default::default(),
                     fallback_tag: None,
-                    strategy: Default::default(),
                 }],
                 ..RoutingConfig::default()
             }))
