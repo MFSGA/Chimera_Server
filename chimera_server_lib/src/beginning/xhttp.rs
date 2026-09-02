@@ -420,9 +420,9 @@ impl AppState {
         }
     }
 
-    fn extract_meta(
+    fn extract_meta<B>(
         &self,
-        request: &Request<Incoming>,
+        request: &Request<B>,
         decoded_path: &str,
     ) -> (Option<String>, Option<String>) {
         let trimmed_base_path = self.base_path.trim_end_matches('/');
@@ -773,12 +773,15 @@ async fn handle_stream_down(
     stream_response(StatusCode::OK, body_stream.boxed(), state.no_sse_header)
 }
 
-async fn handle_packet_up(
-    request: Request<Incoming>,
+async fn handle_packet_up<B>(
+    request: Request<B>,
     state: Arc<AppState>,
     session_id: String,
     seq: String,
-) -> Response<ResponseBody> {
+) -> Response<ResponseBody>
+where
+    B: Body<Data = Bytes> + Unpin,
+{
     let Ok(seq) = seq.parse::<u64>() else {
         return simple_response(StatusCode::INTERNAL_SERVER_ERROR);
     };
