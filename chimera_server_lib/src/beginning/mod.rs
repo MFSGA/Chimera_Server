@@ -31,6 +31,7 @@ use crate::{
     runtime::RuntimeState,
     traffic::{
         MeteredStream, TrafficDirection, record_transfer, register_connection,
+        register_identity,
     },
     util::{prefixed_stream::PrefixedStream, socket::new_tcp_socket},
 };
@@ -48,6 +49,8 @@ pub async fn start_servers(
     config: ServerConfig,
     runtime: RuntimeState,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
+    register_configured_identities(&config.protocol);
+
     if is_xhttp_server_protocol(&config.protocol) {
         return xhttp::start_xhttp_server(config, runtime).await;
     }
@@ -127,6 +130,78 @@ pub async fn start_servers(
     }
 
     Ok(join_handles)
+}
+
+fn register_configured_identities(protocol: &ServerProxyConfig) {
+    match protocol {
+        #[cfg(feature = "http")]
+        ServerProxyConfig::Http { accounts, .. } => {
+            for account in accounts {
+                register_identity(account.username.clone());
+            }
+        }
+        #[cfg(feature = "mixed")]
+        ServerProxyConfig::Mixed { accounts, .. } => {
+            for account in accounts.snapshot() {
+                register_identity(account.username);
+            }
+        }
+        ServerProxyConfig::Socks { accounts, .. } => {
+            for account in accounts.snapshot() {
+                register_identity(account.username);
+            }
+        }
+        #[cfg(feature = "vless")]
+        ServerProxyConfig::Vless { users, .. } => {
+            for user in users {
+                if !user.user_label.is_empty() {
+                    register_identity(user.user_label.clone());
+                }
+            }
+        }
+        #[cfg(feature = "vmess")]
+        ServerProxyConfig::Vmess { users } => {
+            for user in users {
+                if !user.user_label.is_empty() {
+                    register_identity(user.user_label.clone());
+                }
+            }
+        }
+        #[cfg(feature = "trojan")]
+        ServerProxyConfig::Trojan { users, .. } => {
+            for user in users {
+                if let Some(email) = user.email.as_deref() {
+                    register_identity(email.to_string());
+                }
+            }
+        }
+        #[cfg(feature = "shadowsocks")]
+        ServerProxyConfig::Shadowsocks { users, .. } => {
+            for user in users {
+                if !user.email.is_empty() {
+                    register_identity(user.email.clone());
+                }
+            }
+        }
+        #[cfg(feature = "hysteria")]
+        ServerProxyConfig::Hysteria2 { config } => {
+            for user in &config.clients {
+                if let Some(email) = user.email.as_deref() {
+                    register_identity(email.to_string());
+                }
+            }
+        }
+        ServerProxyConfig::Xhttp { inner, .. } => {
+            register_configured_identities(inner);
+        }
+        #[cfg(feature = "tls")]
+        ServerProxyConfig::Tls(config) => {
+            register_configured_identities(config.inner.as_ref());
+        }
+        #[cfg(feature = "reality")]
+        ServerProxyConfig::Reality(_) => {}
+        _ => {}
+    }
 }
 
 #[cfg(feature = "grpc_transport")]

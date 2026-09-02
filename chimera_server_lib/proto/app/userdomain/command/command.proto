@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package chimera.app.userdomain.command;
+
+message RevisionInfo {
+  uint64 version = 1;
+  string generated_at = 2;
+  string target_node_uuid = 3;
+  string checksum = 4;
+  string source_backend_version = 5;
+}
+
+message DecisionStats {
+  uint64 evaluations = 1;
+  uint64 allowed = 2;
+  uint64 rejected = 3;
+  uint64 matched_rule = 4;
+  uint64 no_user_policy = 5;
+  uint64 unknown_target = 6;
+  uint64 allow_all_default = 7;
+  uint64 allowlist_miss = 8;
+  uint64 denylist_miss = 9;
+}
+
+message ApplyPolicyRequest {
+  string json_config = 1;
+}
+
+message ApplyPolicyResponse {
+  RevisionInfo revision = 1;
+}
+
+message RollbackPolicyRequest {
+  uint64 version = 1;
+}
+
+message RollbackPolicyResponse {
+  RevisionInfo revision = 1;
+}
+
+message GetPolicyStatusRequest {}
+
+message GetPolicyStatusResponse {
+  RevisionInfo revision = 1;
+  DecisionStats stats = 2;
+}
+
+service UserDomainAccessService {
+  rpc ApplyPolicy(ApplyPolicyRequest) returns (ApplyPolicyResponse);
+  rpc RollbackPolicy(RollbackPolicyRequest) returns (RollbackPolicyResponse);
+  rpc GetPolicyStatus(GetPolicyStatusRequest) returns (GetPolicyStatusResponse);
+}

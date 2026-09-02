@@ -19,6 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "proto/app/router/command/command.proto",
                 "proto/app/observatory/command/command.proto",
                 "proto/app/observatory/config.proto",
+                "proto/app/userdomain/command/command.proto",
                 "proto/core/config.proto",
                 "proto/common/serial/typed_message.proto",
                 "proto/common/protocol/user.proto",

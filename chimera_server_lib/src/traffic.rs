@@ -183,6 +183,7 @@ mod traffic_noop {
         pub per_inbound: HashMap<String, TransferTotals>,
         pub per_outbound: HashMap<String, TransferTotals>,
         pub per_inbound_user: HashMap<(String, String), TransferTotals>,
+        pub known_identities: std::collections::HashSet<String>,
     }
 
     #[derive(Debug, Clone)]
@@ -208,6 +209,8 @@ mod traffic_noop {
         );
     }
 
+    pub fn register_identity(_: impl Into<String>) {}
+
     pub fn snapshot() -> TrafficSnapshot {
         TrafficSnapshot::default()
     }
@@ -229,7 +232,7 @@ mod traffic_noop {
 pub use traffic_noop::{
     ActiveConnectionSnapshot, ConnectionGuard, TrafficContext, TrafficSnapshot,
     TransferTotals, active_connection_count, active_connections, record_transfer,
-    register_connection, snapshot,
+    register_connection, register_identity, snapshot,
 };
 
 #[cfg(all(test, feature = "traffic"))]

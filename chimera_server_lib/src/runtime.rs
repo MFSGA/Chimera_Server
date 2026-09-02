@@ -7,6 +7,10 @@ use std::{
 use crate::{
     config::{def::PolicyConfig, server_config::ServerConfig},
     routing_state::{RoutingInput, RoutingState},
+    user_domain::{
+        UserDomainAccessFailure, UserDomainAccessRevision, UserDomainAccessStatus,
+        UserDomainAccessStore, parse_publication,
+    },
 };
 use tokio::task::JoinHandle;
 
@@ -25,6 +29,7 @@ pub struct RuntimeState {
     inbound_tasks: Arc<RwLock<HashMap<String, Vec<JoinHandle<()>>>>>,
     routing: Arc<RwLock<RoutingState>>,
     policy: Arc<RwLock<PolicyConfig>>,
+    user_domain_access: UserDomainAccessStore,
 }
 
 impl RuntimeState {
@@ -38,6 +43,7 @@ impl RuntimeState {
             inbound_tasks: Arc::new(RwLock::new(HashMap::new())),
             routing: Arc::new(RwLock::new(RoutingState::default())),
             policy: Arc::new(RwLock::new(PolicyConfig::default())),
+            user_domain_access: UserDomainAccessStore::default(),
         }
     }
 
@@ -210,6 +216,33 @@ impl RuntimeState {
     {
         let mut guard = self.routing.write().expect("runtime routing lock poisoned");
         mutator(&mut guard)
+    }
+
+    pub(crate) fn apply_user_domain_policy(
+        &self,
+        json_config: &str,
+    ) -> Result<UserDomainAccessRevision, UserDomainAccessFailure> {
+        let publication = parse_publication(json_config)?;
+        self.user_domain_access.apply(publication)
+    }
+
+    pub(crate) fn rollback_user_domain_policy(
+        &self,
+        version: u64,
+    ) -> Result<UserDomainAccessRevision, UserDomainAccessFailure> {
+        self.user_domain_access.rollback(version)
+    }
+
+    pub(crate) fn user_domain_policy_status(&self) -> UserDomainAccessStatus {
+        self.user_domain_access.status()
+    }
+
+    pub(crate) fn allows_user_domain_access(
+        &self,
+        identity: &str,
+        target_domain: &str,
+    ) -> bool {
+        self.user_domain_access.allows(identity, target_domain)
     }
 }
 

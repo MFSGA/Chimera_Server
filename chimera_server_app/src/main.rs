@@ -110,6 +110,10 @@ fn normalized_args() -> Vec<OsString> {
 }
 
 fn normalize_legacy_flag(arg: &str) -> Option<String> {
+    if arg == "-version" {
+        return Some("--version".to_string());
+    }
+
     for name in ["config", "format", "check"] {
         let long = format!("--{name}");
         let legacy = format!("-{name}");
@@ -146,6 +150,10 @@ mod tests {
         );
         assert_eq!(normalize_legacy_flag("-check"), Some("--check".to_string()));
         assert_eq!(normalize_legacy_flag("--check"), None);
+        assert_eq!(
+            normalize_legacy_flag("-version"),
+            Some("--version".to_string())
+        );
     }
 
     #[test]
@@ -158,6 +166,10 @@ mod tests {
         ])
         .expect("rnode Chimera CLI arguments should parse");
 
+        assert_eq!(
+            cli.directory.as_deref(),
+            Some(std::path::Path::new("/var/lib/chimera"))
+        );
         assert_eq!(cli.config, "config.json");
         assert!(
             Cli::try_parse_from([
