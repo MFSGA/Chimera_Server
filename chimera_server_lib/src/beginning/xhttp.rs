@@ -10,7 +10,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use futures::StreamExt;
 use http_body_util::{BodyExt, Empty, StreamBody, combinators::UnsyncBoxBody};
 use hyper::{
@@ -64,6 +64,55 @@ const XHTTP_PIPE_CAPACITY: usize = 64 * 1024;
 const XHTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(4);
 
 type ResponseBody = UnsyncBoxBody<Bytes, Infallible>;
+type H3BidiRequestStream =
+    h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
+type H3SendRequestStream =
+    h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
+type H3RecvRequestStream = h3::server::RequestStream<h3_quinn::RecvStream, Bytes>;
+
+/// Adapts the receive half of an HTTP/3 request stream to the `http_body::Body`
+/// interface used by the transport-neutral XHTTP request dispatcher.
+#[allow(dead_code)]
+struct H3RequestBody {
+    stream: H3RecvRequestStream,
+}
+
+#[allow(dead_code)]
+impl H3RequestBody {
+    fn new(stream: H3RecvRequestStream) -> Self {
+        Self { stream }
+    }
+}
+
+impl Body for H3RequestBody {
+    type Data = Bytes;
+    type Error = h3::error::StreamError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match self.stream.poll_recv_data(cx) {
+            Poll::Ready(Ok(Some(mut data))) => {
+                let len = data.remaining();
+                Poll::Ready(Some(Ok(Frame::data(data.copy_to_bytes(len)))))
+            }
+            Poll::Ready(Ok(None)) => Poll::Ready(None),
+            Poll::Ready(Err(err)) => Poll::Ready(Some(Err(err))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Splits an accepted H3 request so XHTTP can consume the request body while
+/// retaining the send half for the HTTP/3 response path.
+#[allow(dead_code)]
+fn split_h3_request_stream(
+    stream: H3BidiRequestStream,
+) -> (H3SendRequestStream, H3RequestBody) {
+    let (send, recv) = stream.split();
+    (send, H3RequestBody::new(recv))
+}
 
 pub async fn start_xhttp_server(
     config: ServerConfig,
@@ -2111,6 +2160,19 @@ mod tests {
         }
 
         assert_body::<http_body_util::Full<Bytes>>();
+        assert_body::<H3RequestBody>();
+    }
+
+    #[test]
+    fn h3_request_stream_split_preserves_response_half_type() {
+        fn assert_splitter(
+            _splitter: fn(
+                H3BidiRequestStream,
+            ) -> (H3SendRequestStream, H3RequestBody),
+        ) {
+        }
+
+        assert_splitter(split_h3_request_stream);
     }
 
     #[test]
