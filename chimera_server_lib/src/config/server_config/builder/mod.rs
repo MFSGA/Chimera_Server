@@ -1203,6 +1203,32 @@ impl TryFrom<InboudItem> for ServerConfig {
                         let mut xhttp_config = collect_xhttp_settings(xhttp_settings)?;
                         xhttp_config.trusted_x_forwarded_for =
                             xray_trusted_x_forwarded_for(stream_setting);
+                        if let Some(quic_params) = stream_setting
+                            .final_mask
+                            .as_ref()
+                            .and_then(|final_mask| final_mask.quic_params.as_ref())
+                        {
+                            let max_idle_timeout = quic_params.max_idle_timeout;
+                            if max_idle_timeout != 0 && !(4..=120).contains(&max_idle_timeout) {
+                                return Err(Error::InvalidConfig(format!(
+                                    "finalmask.quicParams.maxIdleTimeout must be 0 or between 4 and 120 seconds (got {max_idle_timeout})"
+                                )));
+                            }
+                            let max_incoming_streams = quic_params.max_incoming_streams;
+                            if max_incoming_streams != 0 && max_incoming_streams < 8 {
+                                return Err(Error::InvalidConfig(format!(
+                                    "finalmask.quicParams.maxIncomingStreams must be 0 or at least 8 (got {max_incoming_streams})"
+                                )));
+                            }
+                            xhttp_config.xray_max_idle_timeout_secs =
+                                (max_idle_timeout != 0).then_some(max_idle_timeout as u64);
+                            xhttp_config.xray_max_incoming_streams =
+                                (max_incoming_streams != 0).then_some(
+                                    (max_incoming_streams as u64).min(1_u64 << 60),
+                                );
+                            xhttp_config.xray_disable_path_mtu_discovery =
+                                Some(quic_params.disable_path_mtu_discovery);
+                        }
                         protocol = ServerProxyConfig::Xhttp {
                             config: xhttp_config,
                             inner: Box::new(protocol),
@@ -2846,6 +2872,13 @@ mod tests {
                 },
                 "xhttpSettings": {
                     "path": "/xhttp"
+                },
+                "finalmask": {
+                    "quicParams": {
+                        "maxIdleTimeout": 45,
+                        "maxIncomingStreams": 64,
+                        "disablePathMTUDiscovery": true
+                    }
                 }
             }
         }))
@@ -2857,7 +2890,12 @@ mod tests {
             panic!("expected TLS-wrapped XHTTP protocol");
         };
         assert_eq!(tls.alpn_protocols, vec!["h3"]);
-        assert!(matches!(*tls.inner, ServerProxyConfig::Xhttp { .. }));
+        let ServerProxyConfig::Xhttp { config, .. } = *tls.inner else {
+            panic!("expected XHTTP inside TLS");
+        };
+        assert_eq!(config.xray_max_idle_timeout_secs, Some(45));
+        assert_eq!(config.xray_max_incoming_streams, Some(64));
+        assert_eq!(config.xray_disable_path_mtu_discovery, Some(true));
     }
 
     #[cfg(all(feature = "reality", feature = "vless"))]

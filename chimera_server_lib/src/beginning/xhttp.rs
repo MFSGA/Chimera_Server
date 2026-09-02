@@ -190,6 +190,9 @@ pub async fn start_xhttp_server(
         &mut rules_stack,
     )?);
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    #[cfg(feature = "tls")]
+    let h3_transport_config =
+        build_xhttp_h3_transport_config(&listener_config.xhttp_config)?;
     let state = Arc::new(AppState::new(
         listener_config.xhttp_config,
         server_handler,
@@ -198,7 +201,13 @@ pub async fn start_xhttp_server(
     ));
     #[cfg(feature = "tls")]
     if let XhttpSecurityLayer::H3Tls(server_config) = listener_config.security {
-        return start_xhttp_h3_server(bind_addr, server_config, state).await;
+        return start_xhttp_h3_server(
+            bind_addr,
+            server_config,
+            h3_transport_config,
+            state,
+        )
+        .await;
     }
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
@@ -279,14 +288,49 @@ enum XhttpSecurityLayer {
 }
 
 #[cfg(feature = "tls")]
+fn build_xhttp_h3_transport_config(
+    config: &XhttpServerConfig,
+) -> std::io::Result<quinn::TransportConfig> {
+    let mut transport = quinn::TransportConfig::default();
+    if let Some(max_idle_timeout_secs) = config.xray_max_idle_timeout_secs {
+        let idle_timeout = std::time::Duration::from_secs(max_idle_timeout_secs)
+            .try_into()
+            .map_err(|err| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, err)
+            })?;
+        transport.max_idle_timeout(Some(idle_timeout));
+    }
+    if let Some(max_incoming_streams) = config.xray_max_incoming_streams {
+        let max_incoming_streams = quinn::VarInt::from_u64(max_incoming_streams)
+            .map_err(|err| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, err)
+            })?;
+        transport.max_concurrent_bidi_streams(max_incoming_streams);
+    }
+    let platform_supports_path_mtu_discovery = cfg!(any(
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "macos"
+    ));
+    if config.xray_disable_path_mtu_discovery == Some(true)
+        || !platform_supports_path_mtu_discovery
+    {
+        transport.mtu_discovery_config(None);
+    }
+    Ok(transport)
+}
+
+#[cfg(feature = "tls")]
 async fn start_xhttp_h3_server(
     bind_addr: std::net::SocketAddr,
     tls_config: Arc<rustls::ServerConfig>,
+    transport_config: quinn::TransportConfig,
     state: Arc<AppState>,
 ) -> std::io::Result<Vec<tokio::task::JoinHandle<()>>> {
     let quic_crypto: quinn::crypto::rustls::QuicServerConfig =
         tls_config.try_into().map_err(std::io::Error::other)?;
-    let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
+    server_config.transport_config(Arc::new(transport_config));
     let endpoint = quinn::Endpoint::server(server_config, bind_addr)?;
     let local_addr = endpoint.local_addr()?;
 
@@ -2828,6 +2872,9 @@ mod tests {
             seq_key: String::new(),
             uplink_data_placement: XhttpDataPlacement::Auto,
             uplink_data_key: "x_data".to_string(),
+            xray_max_idle_timeout_secs: None,
+            xray_max_incoming_streams: None,
+            xray_disable_path_mtu_discovery: None,
         };
         let protocol = ServerProxyConfig::Tls(TlsServerConfig {
             certificates: vec![crate::config::server_config::TlsCertificateConfig {

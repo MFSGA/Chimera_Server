@@ -725,6 +725,9 @@ pub(super) fn collect_xhttp_settings(
         seq_key,
         uplink_data_placement,
         uplink_data_key,
+        xray_max_idle_timeout_secs: None,
+        xray_max_incoming_streams: None,
+        xray_disable_path_mtu_discovery: None,
     })
 }
 
