@@ -88,7 +88,7 @@ fn format_proc_address(ip: IpAddr, port: u16) -> String {
         }
         IpAddr::V6(ip) => {
             let mut bytes = ip.octets().to_vec();
-            for word in bytes.chunks_exact_mut(4) {
+            for word in bytes.as_chunks_mut::<4>().0 {
                 word.reverse();
             }
             bytes
