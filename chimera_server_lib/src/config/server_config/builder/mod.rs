@@ -1214,6 +1214,12 @@ impl TryFrom<InboudItem> for ServerConfig {
                                     "finalmask.quicParams.maxIdleTimeout must be 0 or between 4 and 120 seconds (got {max_idle_timeout})"
                                 )));
                             }
+                            let keep_alive_period = quic_params.keep_alive_period;
+                            if keep_alive_period != 0 && !(2..=60).contains(&keep_alive_period) {
+                                return Err(Error::InvalidConfig(format!(
+                                    "finalmask.quicParams.keepAlivePeriod must be 0 or between 2 and 60 seconds (got {keep_alive_period})"
+                                )));
+                            }
                             let max_incoming_streams = quic_params.max_incoming_streams;
                             if max_incoming_streams != 0 && max_incoming_streams < 8 {
                                 return Err(Error::InvalidConfig(format!(
@@ -2930,6 +2936,80 @@ mod tests {
         assert_eq!(config.xray_init_connection_receive_window, Some(131_072));
         assert_eq!(config.xray_max_connection_receive_window, Some(262_144));
         assert_eq!(config.xray_disable_path_mtu_discovery, Some(true));
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn vless_xhttp_finalmask_keep_alive_period_matches_xray_bounds() {
+        for keep_alive_period in [0_i64, 2, 60] {
+            let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+                "listen": "127.0.0.1",
+                "port": 443,
+                "protocol": "vless",
+                "tag": "xhttp-keepalive",
+                "settings": {
+                    "clients": [{
+                        "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+                        "email": "user@example.com"
+                    }],
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "xhttp",
+                    "security": "none",
+                    "xhttpSettings": {
+                        "path": "/xhttp"
+                    },
+                    "finalmask": {
+                        "quicParams": {
+                            "keepAlivePeriod": keep_alive_period
+                        }
+                    }
+                }
+            }))
+            .expect("valid inbound item");
+
+            ServerConfig::try_from(inbound)
+                .expect("Xray-valid XHTTP keepAlivePeriod should build");
+        }
+
+        for keep_alive_period in [1_i64, 61] {
+            let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+                "listen": "127.0.0.1",
+                "port": 443,
+                "protocol": "vless",
+                "tag": "xhttp-keepalive",
+                "settings": {
+                    "clients": [{
+                        "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+                        "email": "user@example.com"
+                    }],
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "xhttp",
+                    "security": "none",
+                    "xhttpSettings": {
+                        "path": "/xhttp"
+                    },
+                    "finalmask": {
+                        "quicParams": {
+                            "keepAlivePeriod": keep_alive_period
+                        }
+                    }
+                }
+            }))
+            .expect("valid inbound item");
+
+            let err = ServerConfig::try_from(inbound)
+                .expect_err("Xray-invalid XHTTP keepAlivePeriod should fail");
+            assert!(
+                err.to_string().contains(
+                    "finalmask.quicParams.keepAlivePeriod must be 0 or between 2 and 60 seconds"
+                ),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     #[cfg(all(feature = "reality", feature = "vless"))]
