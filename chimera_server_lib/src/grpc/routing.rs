@@ -1199,7 +1199,6 @@ mod tests {
                 outbound_selector: vec!["missing-prefix".into()],
                 strategy: Default::default(),
                 fallback_tag: None,
-                strategy: Default::default(),
             }],
         );
         let service = RoutingServiceImpl::new(runtime);
@@ -1243,7 +1242,6 @@ mod tests {
                 outbound_selector: vec!["missing-prefix".into()],
                 strategy: Default::default(),
                 fallback_tag: Some("direct".into()),
-                strategy: Default::default(),
             }],
         );
         let service = RoutingServiceImpl::new(runtime);
@@ -1280,7 +1278,6 @@ mod tests {
                 outbound_selector: vec!["back".into(), "direct".into()],
                 strategy: Default::default(),
                 fallback_tag: None,
-                strategy: Default::default(),
             }],
         );
         let service = RoutingServiceImpl::new(runtime);
