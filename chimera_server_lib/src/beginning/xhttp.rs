@@ -307,6 +307,16 @@ fn build_xhttp_h3_transport_config(
             })?;
         transport.max_concurrent_bidi_streams(max_incoming_streams);
     }
+    if let Some(stream_receive_window) =
+        configured_xhttp_receive_window(config.xray_max_stream_receive_window)?
+    {
+        transport.stream_receive_window(stream_receive_window);
+    }
+    if let Some(connection_receive_window) =
+        configured_xhttp_receive_window(config.xray_max_connection_receive_window)?
+    {
+        transport.receive_window(connection_receive_window);
+    }
     let platform_supports_path_mtu_discovery = cfg!(any(
         target_os = "linux",
         target_os = "windows",
@@ -318,6 +328,20 @@ fn build_xhttp_h3_transport_config(
         transport.mtu_discovery_config(None);
     }
     Ok(transport)
+}
+
+#[cfg(feature = "tls")]
+fn configured_xhttp_receive_window(
+    value: Option<u64>,
+) -> std::io::Result<Option<quinn::VarInt>> {
+    value
+        .filter(|value| *value != 0)
+        .map(|value| {
+            quinn::VarInt::from_u64(value).map_err(|err| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, err)
+            })
+        })
+        .transpose()
 }
 
 #[cfg(feature = "tls")]
@@ -2340,6 +2364,26 @@ fn apply_response_padding_value(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "tls")]
+    #[test]
+    fn h3_receive_window_uses_explicit_xray_max_value_only() {
+        assert_eq!(
+            configured_xhttp_receive_window(None).expect("unset receive window"),
+            None
+        );
+        assert_eq!(
+            configured_xhttp_receive_window(Some(0)).expect("zero receive window"),
+            None
+        );
+        assert_eq!(
+            configured_xhttp_receive_window(Some(65_536))
+                .expect("explicit receive window")
+                .map(quinn::VarInt::into_inner),
+            Some(65_536)
+        );
+        assert!(configured_xhttp_receive_window(Some(1_u64 << 62)).is_err());
+    }
+
     #[test]
     fn request_dispatch_accepts_transport_neutral_http_body() {
         fn assert_body<B>()
@@ -2874,6 +2918,10 @@ mod tests {
             uplink_data_key: "x_data".to_string(),
             xray_max_idle_timeout_secs: None,
             xray_max_incoming_streams: None,
+            xray_init_stream_receive_window: None,
+            xray_max_stream_receive_window: None,
+            xray_init_connection_receive_window: None,
+            xray_max_connection_receive_window: None,
             xray_disable_path_mtu_discovery: None,
         };
         let protocol = ServerProxyConfig::Tls(TlsServerConfig {

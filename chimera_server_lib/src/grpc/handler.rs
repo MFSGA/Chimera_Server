@@ -2505,6 +2505,10 @@ mod tests {
                     uplink_data_key: "X-Data".into(),
                     xray_max_idle_timeout_secs: None,
                     xray_max_incoming_streams: None,
+                    xray_init_stream_receive_window: None,
+                    xray_max_stream_receive_window: None,
+                    xray_init_connection_receive_window: None,
+                    xray_max_connection_receive_window: None,
                     xray_disable_path_mtu_discovery: None,
                 },
                 inner: Box::new(ServerProxyConfig::Vless {
