@@ -625,12 +625,19 @@ async fn handle_request(
             .await
         }
         Ok(XhttpRequestDispatch::StreamOne) => {
-            handle_stream_one(request, state.clone(), logical_peer_addr, local_addr)
-                .await
+            handle_stream_one(
+                request.into_body(),
+                state.clone(),
+                logical_peer_addr,
+                local_addr,
+            )
+            .await
         }
         Ok(XhttpRequestDispatch::StreamUp) => {
+            let request_version = request.version();
             handle_stream_up(
-                request,
+                request.into_body(),
+                request_version,
                 state.clone(),
                 session_id.expect("stream-up requires a session id"),
                 stream_up_padding,
@@ -653,12 +660,16 @@ async fn handle_request(
     Ok(response)
 }
 
-async fn handle_stream_one(
-    request: Request<Incoming>,
+async fn handle_stream_one<B>(
+    mut body: B,
     state: Arc<AppState>,
     peer_addr: std::net::SocketAddr,
     local_addr: std::net::SocketAddr,
-) -> Response<ResponseBody> {
+) -> Response<ResponseBody>
+where
+    B: Body<Data = Bytes> + Unpin + Send + 'static,
+    B::Error: Send + 'static,
+{
     let (client_upload, server_read) = duplex(XHTTP_PIPE_CAPACITY);
     let (server_write, client_download) = duplex(XHTTP_PIPE_CAPACITY);
     let logical_stream = XhttpLogicalStream::new(server_read, server_write);
@@ -666,7 +677,6 @@ async fn handle_stream_one(
     spawn_handler_stream(logical_stream, state.clone(), peer_addr, local_addr);
 
     let mut upload_writer = client_upload;
-    let mut body = request.into_body();
     tokio::spawn(async move {
         while let Some(frame_result) = body.frame().await {
             match frame_result {
@@ -697,17 +707,22 @@ fn stream_up_can_flush_while_uploading(version: hyper::Version) -> bool {
     version == hyper::Version::HTTP_2
 }
 
-async fn handle_stream_up(
-    request: Request<Incoming>,
+async fn handle_stream_up<B>(
+    body: B,
+    request_version: hyper::Version,
     state: Arc<AppState>,
     session_id: String,
     padding_enabled: bool,
-) -> Response<ResponseBody> {
+) -> Response<ResponseBody>
+where
+    B: Body<Data = Bytes> + Unpin + Send + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     let response_can_flush_while_uploading =
-        stream_up_can_flush_while_uploading(request.version());
+        stream_up_can_flush_while_uploading(request_version);
     let session = state.sessions.get_or_create(&session_id);
     let (done_tx, done_rx) = oneshot::channel();
-    let reader = IncomingBodyReader::new(request.into_body(), done_tx);
+    let reader = IncomingBodyReader::new(body, done_tx);
     if session
         .upload_queue
         .push_reader(Box::pin(reader))
@@ -1049,14 +1064,14 @@ impl Drop for SessionCleanupGuard {
     }
 }
 
-struct IncomingBodyReader {
-    body: Incoming,
+struct IncomingBodyReader<B> {
+    body: B,
     current: Bytes,
     done_tx: Option<oneshot::Sender<()>>,
 }
 
-impl IncomingBodyReader {
-    fn new(body: Incoming, done_tx: oneshot::Sender<()>) -> Self {
+impl<B> IncomingBodyReader<B> {
+    fn new(body: B, done_tx: oneshot::Sender<()>) -> Self {
         Self {
             body,
             current: Bytes::new(),
@@ -1071,7 +1086,11 @@ impl IncomingBodyReader {
     }
 }
 
-impl AsyncRead for IncomingBodyReader {
+impl<B> AsyncRead for IncomingBodyReader<B>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
