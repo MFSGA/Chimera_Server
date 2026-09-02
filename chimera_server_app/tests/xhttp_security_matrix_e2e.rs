@@ -6,6 +6,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     path::Path,
     sync::{Arc, Once},
+    time::Duration,
 };
 
 use aws_lc_rs::digest::{SHA256, digest};
@@ -30,6 +31,7 @@ static RUSTLS_PROVIDER: Once = Once::new();
 enum SecurityCase {
     None,
     Tls,
+    Http3,
     Reality,
 }
 
@@ -38,6 +40,7 @@ impl SecurityCase {
         match self {
             Self::None => "none",
             Self::Tls => "tls",
+            Self::Http3 => "h3",
             Self::Reality => "reality",
         }
     }
@@ -45,7 +48,7 @@ impl SecurityCase {
     fn mode(self) -> &'static str {
         match self {
             Self::None => "packet-up",
-            Self::Tls => "stream-one",
+            Self::Tls | Self::Http3 => "stream-one",
             Self::Reality => "stream-up",
         }
     }
@@ -148,7 +151,11 @@ async fn run_security_case(case: SecurityCase) {
     );
 
     let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
-    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    if matches!(case, SecurityCase::Http3) {
+        std::thread::sleep(Duration::from_millis(250));
+    } else {
+        wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    }
     chimera.assert_running();
     let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
     let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
@@ -176,13 +183,17 @@ fn chimera_stream_settings(
             "security": "none",
             "xhttpSettings": xhttp_settings
         }),
-        SecurityCase::Tls => json!({
+        SecurityCase::Tls | SecurityCase::Http3 => json!({
             "network": "xhttp",
             "security": "tls",
             "xhttpSettings": xhttp_settings,
             "tlsSettings": {
                 "serverName": "localhost",
-                "alpn": ["h2", "http/1.1"],
+                "alpn": if matches!(case, SecurityCase::Http3) {
+                    json!(["h3"])
+                } else {
+                    json!(["h2", "http/1.1"])
+                },
                 "certificates": [{
                     "certificateFile": cert_path,
                     "keyFile": key_path
@@ -216,14 +227,18 @@ fn xray_stream_settings(
             "security": "none",
             "xhttpSettings": xhttp_settings
         }),
-        SecurityCase::Tls => json!({
+        SecurityCase::Tls | SecurityCase::Http3 => json!({
             "network": "xhttp",
             "security": "tls",
             "xhttpSettings": xhttp_settings,
             "tlsSettings": {
                 "serverName": "localhost",
                 "pinnedPeerCertSha256": pinned_cert,
-                "alpn": ["h2", "http/1.1"]
+                "alpn": if matches!(case, SecurityCase::Http3) {
+                    json!(["h3"])
+                } else {
+                    json!(["h2", "http/1.1"])
+                }
             }
         }),
         SecurityCase::Reality => json!({
@@ -250,6 +265,12 @@ async fn xhttp_security_none() {
 #[ignore = "starts Chimera and Xray for XHTTP over TLS"]
 async fn xhttp_security_tls() {
     run_security_case(SecurityCase::Tls).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "starts Chimera and Xray for XHTTP over HTTP/3"]
+async fn xhttp_security_http3() {
+    run_security_case(SecurityCase::Http3).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

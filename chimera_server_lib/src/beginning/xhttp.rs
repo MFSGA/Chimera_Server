@@ -196,6 +196,11 @@ pub async fn start_xhttp_server(
         resolver,
         runtime,
     ));
+    #[cfg(feature = "tls")]
+    if let XhttpSecurityLayer::H3Tls(server_config) = listener_config.security {
+        return start_xhttp_h3_server(bind_addr, server_config, state).await;
+    }
+
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     let security = listener_config.security.clone();
 
@@ -228,6 +233,10 @@ pub async fn start_xhttp_server(
                         XhttpSecurityLayer::Tls(acceptor) => {
                             accept_xhttp_tls(acceptor, stream).await
                         }
+                        #[cfg(feature = "tls")]
+                        XhttpSecurityLayer::H3Tls(_) => unreachable!(
+                            "HTTP/3 XHTTP listener is dispatched before TCP accept"
+                        ),
                         #[cfg(feature = "reality")]
                         XhttpSecurityLayer::Reality(config) => {
                             accept_reality_stream(stream, &config).await.map(
@@ -263,8 +272,90 @@ enum XhttpSecurityLayer {
     None,
     #[cfg(feature = "tls")]
     Tls(TlsAcceptor),
+    #[cfg(feature = "tls")]
+    H3Tls(Arc<rustls::ServerConfig>),
     #[cfg(feature = "reality")]
     Reality(RealityTransportConfig),
+}
+
+#[cfg(feature = "tls")]
+async fn start_xhttp_h3_server(
+    bind_addr: std::net::SocketAddr,
+    tls_config: Arc<rustls::ServerConfig>,
+    state: Arc<AppState>,
+) -> std::io::Result<Vec<tokio::task::JoinHandle<()>>> {
+    let quic_crypto: quinn::crypto::rustls::QuicServerConfig =
+        tls_config.try_into().map_err(std::io::Error::other)?;
+    let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
+    let endpoint = quinn::Endpoint::server(server_config, bind_addr)?;
+    let local_addr = endpoint.local_addr()?;
+
+    let handle = tokio::spawn(async move {
+        while let Some(incoming) = endpoint.accept().await {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let connection = match incoming.await {
+                    Ok(connection) => connection,
+                    Err(err) => {
+                        debug!("xhttp H3 QUIC handshake failed: {}", err);
+                        return;
+                    }
+                };
+                let peer_addr = connection.remote_address();
+                let h3_quinn_connection = h3_quinn::Connection::new(connection);
+                let mut h3_connection =
+                    match h3::server::Connection::new(h3_quinn_connection).await {
+                        Ok(connection) => connection,
+                        Err(err) => {
+                            debug!(
+                                "xhttp H3 connection setup from {} failed: {}",
+                                peer_addr, err
+                            );
+                            return;
+                        }
+                    };
+
+                loop {
+                    let resolver = match h3_connection.accept().await {
+                        Ok(Some(resolver)) => resolver,
+                        Ok(None) => break,
+                        Err(err) => {
+                            debug!(
+                                "xhttp H3 accept from {} failed: {}",
+                                peer_addr, err
+                            );
+                            break;
+                        }
+                    };
+                    let (request, stream) = match resolver.resolve_request().await {
+                        Ok(request) => request,
+                        Err(err) => {
+                            debug!(
+                                "xhttp H3 request from {} failed: {}",
+                                peer_addr, err
+                            );
+                            continue;
+                        }
+                    };
+                    let state = state.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) = handle_h3_request_stream(
+                            request, stream, state, peer_addr, local_addr,
+                        )
+                        .await
+                        {
+                            debug!(
+                                "xhttp H3 response to {} failed: {}",
+                                peer_addr, err
+                            );
+                        }
+                    });
+                }
+            });
+        }
+    });
+
+    Ok(vec![handle])
 }
 
 #[cfg(feature = "tls")]
@@ -306,7 +397,8 @@ fn parse_listener_protocol(
             inner,
         }) => match *inner {
             ServerProxyConfig::Xhttp { config, inner } => {
-                if !alpn_protocols.iter().any(|proto| proto == "h2") {
+                let is_h3 = alpn_protocols.as_slice() == ["h3"];
+                if !is_h3 && !alpn_protocols.iter().any(|proto| proto == "h2") {
                     alpn_protocols.push("h2".to_string());
                 }
 
@@ -319,12 +411,15 @@ fn parse_listener_protocol(
                     max_version.as_deref(),
                 )?;
 
+                let tls_config = Arc::new(tls_config);
                 Ok(XhttpListenerConfig {
                     xhttp_config: config,
                     inner: *inner,
-                    security: XhttpSecurityLayer::Tls(TlsAcceptor::from(Arc::new(
-                        tls_config,
-                    ))),
+                    security: if is_h3 {
+                        XhttpSecurityLayer::H3Tls(tls_config)
+                    } else {
+                        XhttpSecurityLayer::Tls(TlsAcceptor::from(tls_config))
+                    },
                 })
             }
             _ => Err(std::io::Error::other(
