@@ -53,6 +53,8 @@ mod util;
 
 mod xudp_registry;
 
+mod user_domain;
+
 #[allow(clippy::large_enum_variant)]
 pub enum ConfigType {
     File(String),

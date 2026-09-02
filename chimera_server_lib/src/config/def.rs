@@ -262,7 +262,7 @@ fn default_mcp_update_interval_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{LiteralConfig, PolicyConfig};
+    use super::{LiteralConfig, PolicyConfig, Protocol};
 
     #[test]
     fn policy_levels_match_xray_uint32_json_semantics() {
@@ -362,5 +362,27 @@ mod tests {
         "#;
         let c = cfg.parse::<LiteralConfig>().expect("should parse");
         println!("{:?}", c);
+    }
+
+    #[test]
+    fn parse_xray_internal_tunnel_protocol() {
+        let config: LiteralConfig = serde_json::from_str(
+            r#"{
+                "inbounds": [{
+                    "listen": "127.0.0.1",
+                    "port": 62789,
+                    "protocol": "tunnel",
+                    "settings": {"rewriteAddress": "127.0.0.1"},
+                    "tag": "api"
+                }],
+                "outbounds": []
+            }"#,
+        )
+        .expect("parse Xray internal tunnel inbound");
+
+        assert!(matches!(
+            config.inbounds.first().map(|inbound| &inbound.protocol),
+            Some(Protocol::Tunnel)
+        ));
     }
 }

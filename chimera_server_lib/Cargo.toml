@@ -60,6 +60,7 @@ http = { workspace = true }
 httpdate = { workspace = true }
 time = { workspace = true }
 rand = { workspace = true }
+sha2 = { workspace = true }
 reqwest = { workspace = true }
 flate2 = { workspace = true, optional = true }
 md-5 = { workspace = true, optional = true }

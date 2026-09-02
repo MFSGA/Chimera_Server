@@ -5,7 +5,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 
 use crate::runtime::RuntimeState;
 
-use super::{handler, logger, observatory, routing, stats};
+use super::{handler, logger, observatory, routing, stats, user_domain};
 
 #[derive(Debug, Clone)]
 pub struct GrpcServerConfig {
@@ -65,6 +65,15 @@ pub async fn start_grpc_server(
             builder.take(),
             router.take(),
             observatory::build_service(runtime.clone()),
+        ));
+        service_count += 1;
+    }
+
+    if has_service(&config.services, "UserDomainAccessService") {
+        router = Some(add_service(
+            builder.take(),
+            router.take(),
+            user_domain::build_service(runtime.clone()),
         ));
         service_count += 1;
     }

@@ -34,6 +34,7 @@ pub mod xray {
             }
         }
     }
+
     pub mod common {
         pub mod serial {
             tonic::include_proto!("xray.common.serial");
@@ -43,6 +44,14 @@ pub mod xray {
         }
         pub mod net {
             tonic::include_proto!("xray.common.net");
+        }
+    }
+}
+
+pub mod chimera {
+    pub mod app {
+        pub mod user_domain_access {
+            tonic::include_proto!("chimera.app.userdomain.command");
         }
     }
 }

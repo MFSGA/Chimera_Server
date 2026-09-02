@@ -48,6 +48,15 @@ impl StatsServiceImpl {
         let snapshot = traffic::snapshot();
         let mut stats = HashMap::new();
 
+        for identity in snapshot.known_identities {
+            stats
+                .entry(format!("user>>>{identity}>>>traffic>>>uplink"))
+                .or_insert(0);
+            stats
+                .entry(format!("user>>>{identity}>>>traffic>>>downlink"))
+                .or_insert(0);
+        }
+
         for (tag, totals) in snapshot.per_inbound {
             stats.insert(
                 format!("inbound>>>{}>>>traffic>>>uplink", tag),
@@ -572,6 +581,33 @@ mod tests {
 
     fn name_inbound(tag: &str, suffix: &str) -> String {
         format!("inbound>>>{tag}>>>traffic>>>{suffix}")
+    }
+
+    #[tokio::test]
+    async fn registered_identity_is_visible_before_first_transfer() {
+        let service = StatsServiceImpl::new();
+        let user = unique_tag("configured-user");
+        traffic::register_identity(user.clone());
+
+        let response = service
+            .query_stats(Request::new(
+                proto::xray::app::stats::command::QueryStatsRequest {
+                    pattern: format!("user>>>{user}>>>traffic>>>"),
+                    reset: false,
+                },
+            ))
+            .await
+            .expect("query configured user stats failed")
+            .into_inner();
+
+        let stats = response
+            .stat
+            .into_iter()
+            .map(|stat| (stat.name, stat.value))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats[&format!("user>>>{user}>>>traffic>>>uplink")], 0);
+        assert_eq!(stats[&format!("user>>>{user}>>>traffic>>>downlink")], 0);
     }
 
     #[tokio::test]

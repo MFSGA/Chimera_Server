@@ -393,7 +393,7 @@ struct HttpAccountSetting {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DokodemoDoorSettings {
-    #[serde(default)]
+    #[serde(default, alias = "rewriteAddress")]
     address: Option<String>,
     #[serde(default)]
     port: Option<u16>,
@@ -777,7 +777,7 @@ impl TryFrom<InboudItem> for ServerConfig {
         let bind_location = BindLocation::Address(NetLocation::new(address, port));
 
         match protocol {
-            Protocol::DokodemoDoor => {
+            Protocol::DokodemoDoor | Protocol::Tunnel => {
                 let settings = settings
                     .map(|value| value.deserialize::<DokodemoDoorSettings>())
                     .transpose()
@@ -2384,6 +2384,28 @@ mod tests {
         assert!(err.to_string().contains(
             "dokodemo-door udp transport does not support streamSettings.security"
         ));
+    }
+
+    #[test]
+    fn xray_internal_tunnel_uses_rewrite_address_and_dokodemo_semantics() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 62789,
+            "protocol": "tunnel",
+            "settings": {"rewriteAddress": "127.0.0.1"},
+            "tag": "api"
+        }))
+        .expect("valid Xray internal tunnel inbound");
+
+        let config = ServerConfig::try_from(inbound)
+            .expect("Xray internal tunnel should build");
+        match config.protocol {
+            ServerProxyConfig::DokodemoDoor { config } => {
+                assert_eq!(config.target.port(), 62789);
+                assert_eq!(config.target.address().to_string(), "127.0.0.1");
+            }
+            other => panic!("expected dokodemo-door semantics, got {other:?}"),
+        }
     }
 
     #[cfg(all(feature = "reality", feature = "vless"))]

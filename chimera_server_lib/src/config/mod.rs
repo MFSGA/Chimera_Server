@@ -37,6 +37,9 @@ pub enum Protocol {
     Hysteria2,
     #[serde(alias = "dokodemo-door")]
     DokodemoDoor,
+    /// Xray's internal API tunnel inbound. It is consumed by the control
+    /// plane and must never be started as a user-facing proxy listener.
+    Tunnel,
     #[cfg(feature = "trojan")]
     Trojan,
     #[cfg(feature = "tuic")]

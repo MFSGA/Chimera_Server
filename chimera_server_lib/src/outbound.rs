@@ -13,6 +13,8 @@ use crate::{
     util::socket::new_tcp_socket,
 };
 
+const USER_DOMAIN_ACCESS_BLACKHOLE_TAG: &str = "user-domain-access";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DirectOutboundAction {
     Freedom { tag: Option<String> },
@@ -110,6 +112,12 @@ pub(crate) fn select_direct_outbound(
     input: &RoutingInput,
     network_name: &str,
 ) -> std::io::Result<DirectOutboundAction> {
+    if !runtime.allows_user_domain_access(&input.user, &input.target_domain) {
+        return Ok(DirectOutboundAction::Blackhole {
+            tag: USER_DOMAIN_ACCESS_BLACKHOLE_TAG.to_string(),
+        });
+    }
+
     let Some(outbound) =
         runtime.select_outbound_checked(input).map_err(|error| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, error)

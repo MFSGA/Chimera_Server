@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::IpAddr,
     sync::{
         OnceLock, RwLock,
@@ -84,6 +84,7 @@ pub struct TrafficSnapshot {
     pub per_inbound: HashMap<String, TransferTotals>,
     pub per_outbound: HashMap<String, TransferTotals>,
     pub per_inbound_user: HashMap<(String, String), TransferTotals>,
+    pub known_identities: HashSet<String>,
 }
 
 #[derive(Debug, Default)]
@@ -94,6 +95,7 @@ struct StatsInner {
     per_inbound: HashMap<String, TransferTotals>,
     per_outbound: HashMap<String, TransferTotals>,
     per_inbound_user: HashMap<(String, String), TransferTotals>,
+    known_identities: HashSet<String>,
 }
 
 impl StatsInner {
@@ -103,6 +105,10 @@ impl StatsInner {
         let identity = context.identity.clone();
         let inbound_tag = context.inbound_tag.clone();
         let outbound_tag = context.outbound_tag.clone();
+
+        if let Some(identity) = identity.clone() {
+            self.known_identities.insert(identity);
+        }
 
         let protocol_entry = self
             .per_protocol
@@ -141,6 +147,7 @@ impl StatsInner {
             per_inbound: self.per_inbound.clone(),
             per_outbound: self.per_outbound.clone(),
             per_inbound_user: self.per_inbound_user.clone(),
+            known_identities: self.known_identities.clone(),
         }
     }
 }
@@ -161,6 +168,18 @@ impl TrafficRecorder {
         guard.record(context, upload, download);
     }
 
+    fn register_identity(&self, identity: impl Into<String>) {
+        let identity = identity.into();
+        if identity.is_empty() {
+            return;
+        }
+        self.inner
+            .write()
+            .expect("traffic stats poisoned")
+            .known_identities
+            .insert(identity);
+    }
+
     fn snapshot(&self) -> TrafficSnapshot {
         let guard = self.inner.read().expect("traffic stats poisoned");
         guard.snapshot()
@@ -170,6 +189,13 @@ impl TrafficRecorder {
 pub fn record_transfer(context: Option<TrafficContext>, upload: u64, download: u64) {
     let context = context.unwrap_or_default();
     TrafficRecorder::global().record(context, upload, download);
+}
+
+/// Register identities known from configuration before they generate traffic.
+/// Xray exposes zero-valued user stats immediately, which lets panel clients
+/// establish a baseline without dropping the first live sample.
+pub fn register_identity(identity: impl Into<String>) {
+    TrafficRecorder::global().register_identity(identity);
 }
 
 pub fn snapshot() -> TrafficSnapshot {
