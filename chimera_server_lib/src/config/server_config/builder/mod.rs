@@ -1211,14 +1211,6 @@ impl TryFrom<InboudItem> for ServerConfig {
                         match security.as_str() {
                             "none" => {}
                             "tls" => {
-                                if stream_setting.tls_settings.as_ref().is_some_and(|tls| {
-                                    tls.alpn.len() == 1 && tls.alpn[0] == "h3"
-                                }) {
-                                    return Err(Error::InvalidConfig(
-                                        "xhttp inbound over HTTP/3 is not supported yet; current Xray selects XHTTP/3 when tlsSettings.alpn is exactly [\"h3\"]"
-                                            .into(),
-                                    ));
-                                }
                                 protocol =
                                     apply_security_layers(protocol, stream_setting)?;
                             }
@@ -2829,7 +2821,7 @@ mod tests {
 
     #[cfg(all(feature = "tls", feature = "vless"))]
     #[test]
-    fn vless_xhttp_rejects_http3_until_udp_listener_is_supported() {
+    fn vless_xhttp_accepts_http3_tls_configuration() {
         let inbound: InboudItem = serde_json::from_value(serde_json::json!({
             "listen": "127.0.0.1",
             "port": 443,
@@ -2847,7 +2839,10 @@ mod tests {
                 "security": "tls",
                 "tlsSettings": {
                     "alpn": ["h3"],
-                    "certificates": []
+                    "certificates": [{
+                        "certificate": ["-----BEGIN CERTIFICATE-----","MIIB","-----END CERTIFICATE-----"],
+                        "key": ["-----BEGIN PRIVATE KEY-----","MIIB","-----END PRIVATE KEY-----"]
+                    }]
                 },
                 "xhttpSettings": {
                     "path": "/xhttp"
@@ -2856,12 +2851,13 @@ mod tests {
         }))
         .expect("valid inbound item");
 
-        let err = ServerConfig::try_from(inbound).expect_err(
-            "XHTTP/3 must fail fast until Chimera has an HTTP/3 listener",
-        );
-        assert!(err.to_string().contains(
-            "xhttp inbound over HTTP/3 is not supported yet; current Xray selects XHTTP/3"
-        ));
+        let server = ServerConfig::try_from(inbound)
+            .expect("XHTTP/3 TLS configuration should build");
+        let ServerProxyConfig::Tls(tls) = server.protocol else {
+            panic!("expected TLS-wrapped XHTTP protocol");
+        };
+        assert_eq!(tls.alpn_protocols, vec!["h3"]);
+        assert!(matches!(*tls.inner, ServerProxyConfig::Xhttp { .. }));
     }
 
     #[cfg(all(feature = "reality", feature = "vless"))]
