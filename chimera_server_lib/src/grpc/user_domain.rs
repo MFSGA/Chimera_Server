@@ -28,10 +28,21 @@ impl user_domain_access::user_domain_access_service_server::UserDomainAccessServ
         &self,
         request: Request<user_domain_access::ApplyPolicyRequest>,
     ) -> Result<Response<user_domain_access::ApplyPolicyResponse>, Status> {
-        let revision = self
-            .runtime
-            .apply_user_domain_policy(&request.into_inner().json_config)
-            .map_err(status_from_failure)?;
+        let json_config = request.into_inner().json_config;
+        if json_config.trim().is_empty() {
+            return Err(Status::invalid_argument("json_config is required"));
+        }
+        let runtime = self.runtime.clone();
+        let revision = tokio::task::spawn_blocking(move || {
+            runtime.apply_user_domain_policy(&json_config)
+        })
+        .await
+        .map_err(|error| {
+            Status::internal(format!(
+                "user-domain access policy task failed: {error}"
+            ))
+        })?
+        .map_err(status_from_failure)?;
         Ok(Response::new(user_domain_access::ApplyPolicyResponse {
             revision: Some(revision_info(&revision)),
         }))
@@ -41,10 +52,18 @@ impl user_domain_access::user_domain_access_service_server::UserDomainAccessServ
         &self,
         request: Request<user_domain_access::RollbackPolicyRequest>,
     ) -> Result<Response<user_domain_access::RollbackPolicyResponse>, Status> {
-        let revision = self
-            .runtime
-            .rollback_user_domain_policy(request.into_inner().version)
-            .map_err(status_from_failure)?;
+        let version = request.into_inner().version;
+        let runtime = self.runtime.clone();
+        let revision = tokio::task::spawn_blocking(move || {
+            runtime.rollback_user_domain_policy(version)
+        })
+        .await
+        .map_err(|error| {
+            Status::internal(format!(
+                "user-domain access rollback task failed: {error}"
+            ))
+        })?
+        .map_err(status_from_failure)?;
         Ok(Response::new(user_domain_access::RollbackPolicyResponse {
             revision: Some(revision_info(&revision)),
         }))
