@@ -288,10 +288,20 @@ enum XhttpSecurityLayer {
 }
 
 #[cfg(feature = "tls")]
+const XRAY_XHTTP_H3_INITIAL_MTU: u16 = 1280;
+
+#[cfg(feature = "tls")]
+fn apply_xray_xhttp_h3_initial_mtu(transport: &mut quinn::TransportConfig) {
+    // Current Xray uses quic-go's 1280-byte InitialPacketSize for XHTTP/3.
+    transport.initial_mtu(XRAY_XHTTP_H3_INITIAL_MTU);
+}
+
+#[cfg(feature = "tls")]
 fn build_xhttp_h3_transport_config(
     config: &XhttpServerConfig,
 ) -> std::io::Result<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
+    apply_xray_xhttp_h3_initial_mtu(&mut transport);
     if let Some(max_idle_timeout_secs) = config.xray_max_idle_timeout_secs {
         let idle_timeout = std::time::Duration::from_secs(max_idle_timeout_secs)
             .try_into()
@@ -2363,6 +2373,15 @@ fn apply_response_padding_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn h3_transport_uses_xray_initial_mtu() {
+        let mut transport = quinn::TransportConfig::default();
+        apply_xray_xhttp_h3_initial_mtu(&mut transport);
+        let debug = format!("{transport:?}");
+        assert!(debug.contains("initial_mtu: 1280"), "{debug}");
+    }
 
     #[cfg(feature = "tls")]
     #[test]
