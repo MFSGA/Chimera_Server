@@ -384,9 +384,11 @@ async fn start_xhttp_h3_server(
                 let peer_addr = connection.remote_address();
                 let h3_quinn_connection = h3_quinn::Connection::new(connection);
                 let mut h3_builder = h3::server::builder();
-                // Xray's quic-go HTTP/3 server uses Go's http.DefaultMaxHeaderBytes.
+                // Xray's quic-go HTTP/3 server uses Go's http.DefaultMaxHeaderBytes and
+                // advertises extended CONNECT support on every server connection.
                 h3_builder
-                    .max_field_section_size(XRAY_XHTTP_H3_MAX_FIELD_SECTION_SIZE);
+                    .max_field_section_size(XRAY_XHTTP_H3_MAX_FIELD_SECTION_SIZE)
+                    .enable_extended_connect(true);
                 let mut h3_connection =
                     match h3_builder.build(h3_quinn_connection).await {
                         Ok(connection) => connection,
