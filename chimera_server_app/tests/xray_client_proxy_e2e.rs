@@ -1698,6 +1698,12 @@ async fn xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2_with_xray_d
         b"hysteria2 UDP through xray client",
     )
     .await;
+    assert_socks5_udp_echo(
+        socks_addr,
+        udp_echo_addr,
+        &deterministic_payload(4 * 1024),
+    )
+    .await;
     assert_socks5_udp_domain_echo(
         socks_addr,
         "localhost",
