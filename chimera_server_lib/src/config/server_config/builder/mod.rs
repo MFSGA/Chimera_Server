@@ -1220,12 +1220,38 @@ impl TryFrom<InboudItem> for ServerConfig {
                                     "finalmask.quicParams.maxIncomingStreams must be 0 or at least 8 (got {max_incoming_streams})"
                                 )));
                             }
+                            for (field, value) in [
+                                ("initStreamReceiveWindow", quic_params.init_stream_receive_window),
+                                ("maxStreamReceiveWindow", quic_params.max_stream_receive_window),
+                                (
+                                    "initConnectionReceiveWindow",
+                                    quic_params.init_connection_receive_window,
+                                ),
+                                (
+                                    "maxConnectionReceiveWindow",
+                                    quic_params.max_connection_receive_window,
+                                ),
+                            ] {
+                                if value != 0 && value < 16_384 {
+                                    return Err(Error::InvalidConfig(format!(
+                                        "finalmask.quicParams.{field} must be 0 or at least 16384 (got {value})"
+                                    )));
+                                }
+                            }
                             xhttp_config.xray_max_idle_timeout_secs =
                                 (max_idle_timeout != 0).then_some(max_idle_timeout as u64);
                             xhttp_config.xray_max_incoming_streams =
                                 (max_incoming_streams != 0).then_some(
                                     (max_incoming_streams as u64).min(1_u64 << 60),
                                 );
+                            xhttp_config.xray_init_stream_receive_window =
+                                Some(quic_params.init_stream_receive_window);
+                            xhttp_config.xray_max_stream_receive_window =
+                                Some(quic_params.max_stream_receive_window);
+                            xhttp_config.xray_init_connection_receive_window =
+                                Some(quic_params.init_connection_receive_window);
+                            xhttp_config.xray_max_connection_receive_window =
+                                Some(quic_params.max_connection_receive_window);
                             xhttp_config.xray_disable_path_mtu_discovery =
                                 Some(quic_params.disable_path_mtu_discovery);
                         }
@@ -2877,6 +2903,10 @@ mod tests {
                     "quicParams": {
                         "maxIdleTimeout": 45,
                         "maxIncomingStreams": 64,
+                        "initStreamReceiveWindow": 32768,
+                        "maxStreamReceiveWindow": 65536,
+                        "initConnectionReceiveWindow": 131072,
+                        "maxConnectionReceiveWindow": 262144,
                         "disablePathMTUDiscovery": true
                     }
                 }
@@ -2895,6 +2925,10 @@ mod tests {
         };
         assert_eq!(config.xray_max_idle_timeout_secs, Some(45));
         assert_eq!(config.xray_max_incoming_streams, Some(64));
+        assert_eq!(config.xray_init_stream_receive_window, Some(32_768));
+        assert_eq!(config.xray_max_stream_receive_window, Some(65_536));
+        assert_eq!(config.xray_init_connection_receive_window, Some(131_072));
+        assert_eq!(config.xray_max_connection_receive_window, Some(262_144));
         assert_eq!(config.xray_disable_path_mtu_discovery, Some(true));
     }
 

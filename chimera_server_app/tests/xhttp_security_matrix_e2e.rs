@@ -192,6 +192,10 @@ fn chimera_stream_settings(
                     "quicParams": {
                         "maxIdleTimeout": 45,
                         "maxIncomingStreams": 64,
+                        "initStreamReceiveWindow": 32768,
+                        "maxStreamReceiveWindow": 65536,
+                        "initConnectionReceiveWindow": 131072,
+                        "maxConnectionReceiveWindow": 262144,
                         "disablePathMTUDiscovery": true
                     }
                 })
