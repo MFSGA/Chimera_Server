@@ -289,6 +289,10 @@ enum XhttpSecurityLayer {
 
 #[cfg(feature = "tls")]
 const XRAY_XHTTP_H3_INITIAL_MTU: u16 = 1280;
+#[cfg(feature = "tls")]
+const XRAY_XHTTP_H3_MAX_STREAM_RECEIVE_WINDOW: u64 = 6 * 1024 * 1024;
+#[cfg(feature = "tls")]
+const XRAY_XHTTP_H3_MAX_CONNECTION_RECEIVE_WINDOW: u64 = 15 * 1024 * 1024;
 
 #[cfg(feature = "tls")]
 fn apply_xray_xhttp_h3_initial_mtu(transport: &mut quinn::TransportConfig) {
@@ -317,16 +321,16 @@ fn build_xhttp_h3_transport_config(
             })?;
         transport.max_concurrent_bidi_streams(max_incoming_streams);
     }
-    if let Some(stream_receive_window) =
-        configured_xhttp_receive_window(config.xray_max_stream_receive_window)?
-    {
-        transport.stream_receive_window(stream_receive_window);
-    }
-    if let Some(connection_receive_window) =
-        configured_xhttp_receive_window(config.xray_max_connection_receive_window)?
-    {
-        transport.receive_window(connection_receive_window);
-    }
+    let stream_receive_window = configured_xhttp_receive_window(
+        config.xray_max_stream_receive_window,
+        XRAY_XHTTP_H3_MAX_STREAM_RECEIVE_WINDOW,
+    )?;
+    transport.stream_receive_window(stream_receive_window);
+    let connection_receive_window = configured_xhttp_receive_window(
+        config.xray_max_connection_receive_window,
+        XRAY_XHTTP_H3_MAX_CONNECTION_RECEIVE_WINDOW,
+    )?;
+    transport.receive_window(connection_receive_window);
     let platform_supports_path_mtu_discovery = cfg!(any(
         target_os = "linux",
         target_os = "windows",
@@ -343,15 +347,11 @@ fn build_xhttp_h3_transport_config(
 #[cfg(feature = "tls")]
 fn configured_xhttp_receive_window(
     value: Option<u64>,
-) -> std::io::Result<Option<quinn::VarInt>> {
-    value
-        .filter(|value| *value != 0)
-        .map(|value| {
-            quinn::VarInt::from_u64(value).map_err(|err| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, err)
-            })
-        })
-        .transpose()
+    xray_default: u64,
+) -> std::io::Result<quinn::VarInt> {
+    let value = value.filter(|value| *value != 0).unwrap_or(xray_default);
+    quinn::VarInt::from_u64(value)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))
 }
 
 #[cfg(feature = "tls")]
@@ -2385,22 +2385,41 @@ mod tests {
 
     #[cfg(feature = "tls")]
     #[test]
-    fn h3_receive_window_uses_explicit_xray_max_value_only() {
+    fn h3_receive_window_uses_xray_max_value_and_defaults() {
         assert_eq!(
-            configured_xhttp_receive_window(None).expect("unset receive window"),
-            None
+            configured_xhttp_receive_window(
+                None,
+                XRAY_XHTTP_H3_MAX_STREAM_RECEIVE_WINDOW
+            )
+            .expect("unset receive window")
+            .into_inner(),
+            XRAY_XHTTP_H3_MAX_STREAM_RECEIVE_WINDOW
         );
         assert_eq!(
-            configured_xhttp_receive_window(Some(0)).expect("zero receive window"),
-            None
+            configured_xhttp_receive_window(
+                Some(0),
+                XRAY_XHTTP_H3_MAX_CONNECTION_RECEIVE_WINDOW
+            )
+            .expect("zero receive window")
+            .into_inner(),
+            XRAY_XHTTP_H3_MAX_CONNECTION_RECEIVE_WINDOW
         );
         assert_eq!(
-            configured_xhttp_receive_window(Some(65_536))
-                .expect("explicit receive window")
-                .map(quinn::VarInt::into_inner),
-            Some(65_536)
+            configured_xhttp_receive_window(
+                Some(65_536),
+                XRAY_XHTTP_H3_MAX_STREAM_RECEIVE_WINDOW
+            )
+            .expect("explicit receive window")
+            .into_inner(),
+            65_536
         );
-        assert!(configured_xhttp_receive_window(Some(1_u64 << 62)).is_err());
+        assert!(
+            configured_xhttp_receive_window(
+                Some(1_u64 << 62),
+                XRAY_XHTTP_H3_MAX_STREAM_RECEIVE_WINDOW
+            )
+            .is_err()
+        );
     }
 
     #[test]
