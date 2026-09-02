@@ -991,7 +991,7 @@ fn stream_up_padding_enabled(
 }
 
 fn stream_up_can_flush_while_uploading(version: hyper::Version) -> bool {
-    version == hyper::Version::HTTP_2
+    matches!(version, hyper::Version::HTTP_2 | hyper::Version::HTTP_3)
 }
 
 async fn handle_stream_up<B>(
@@ -3376,6 +3376,7 @@ mod tests {
             hyper::Version::HTTP_11
         ));
         assert!(stream_up_can_flush_while_uploading(hyper::Version::HTTP_2));
+        assert!(stream_up_can_flush_while_uploading(hyper::Version::HTTP_3));
     }
 
     #[tokio::test]
