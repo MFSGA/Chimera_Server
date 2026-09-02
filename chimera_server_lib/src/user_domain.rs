@@ -43,6 +43,8 @@ pub(crate) struct UserDomainAccessPublication {
     pub(crate) target_node_uuid: String,
     pub(crate) checksum: String,
     pub(crate) default_action: UserDomainAccessAction,
+    #[serde(default)]
+    pub(crate) enforcement_mode: UserDomainEnforcementMode,
     pub(crate) users: Vec<UserDomainAccessPublicationUser>,
 }
 
@@ -92,6 +94,16 @@ impl UserDomainAccessAction {
     fn is_allowed(self) -> bool {
         matches!(self, Self::Allow)
     }
+}
+
+/// Controls whether a rejected policy decision affects outbound traffic.
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum UserDomainEnforcementMode {
+    #[default]
+    Enforce,
+    Shadow,
+    Disabled,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -231,6 +243,10 @@ impl UserDomainAccessStore {
         let Some(publication) = inner.active.as_ref() else {
             return true;
         };
+        if publication.enforcement_mode == UserDomainEnforcementMode::Disabled {
+            return true;
+        }
+        let enforcement_mode = publication.enforcement_mode;
 
         let (allowed, reason) =
             evaluate_publication(publication, identity, target_domain);
@@ -245,7 +261,12 @@ impl UserDomainAccessStore {
             DecisionReason::AllowlistMiss => bump(&mut inner.stats.allowlist_miss),
             DecisionReason::DenylistMiss => bump(&mut inner.stats.denylist_miss),
         };
-        record_decision(&mut inner.stats, allowed)
+        let decision_allowed = record_decision(&mut inner.stats, allowed);
+        if enforcement_mode == UserDomainEnforcementMode::Shadow {
+            true
+        } else {
+            decision_allowed
+        }
     }
 }
 
@@ -673,5 +694,44 @@ mod tests {
         assert_eq!(stats.matched_rule, 1);
         assert_eq!(stats.allowlist_miss, 1);
         assert_eq!(stats.no_user_policy, 1);
+    }
+
+    #[test]
+    fn shadow_records_rejections_without_blocking_and_disabled_skips_evaluation() {
+        let mut shadow_value: Value =
+            serde_json::from_str(&publication_json(1, None)).unwrap();
+        shadow_value["enforcementMode"] = Value::String("shadow".to_string());
+        shadow_value["users"][0]["rules"][0]["action"] =
+            Value::String("reject".to_string());
+        shadow_value["checksum"] =
+            Value::String(checksum_for_value(&shadow_value).unwrap());
+
+        let shadow = UserDomainAccessStore::default();
+        shadow
+            .apply(parse_publication(&shadow_value.to_string()).unwrap())
+            .unwrap();
+
+        assert!(shadow.allows("vless-1", "api.example.com"));
+        let shadow_stats = shadow.status().stats;
+        assert_eq!(shadow_stats.evaluations, 1);
+        assert_eq!(shadow_stats.rejected, 1);
+
+        let mut disabled_value = shadow_value;
+        disabled_value["version"] = Value::from(2);
+        disabled_value["enforcementMode"] = Value::String("disabled".to_string());
+        disabled_value
+            .as_object_mut()
+            .expect("publication should be an object")
+            .remove("checksum");
+        disabled_value["checksum"] =
+            Value::String(checksum_for_value(&disabled_value).unwrap());
+
+        let disabled = UserDomainAccessStore::default();
+        disabled
+            .apply(parse_publication(&disabled_value.to_string()).unwrap())
+            .unwrap();
+
+        assert!(disabled.allows("vless-1", "api.example.com"));
+        assert_eq!(disabled.status().stats.evaluations, 0);
     }
 }
