@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 const MAX_POLICY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_USERS: usize = 100_000;
 const MAX_RULES_PER_USER: usize = 1_000;
+const MAX_TOTAL_RULES: usize = 1_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UserDomainAccessError {
@@ -411,6 +412,7 @@ fn validate_publication(
             "user-domain access policy contains more than {MAX_USERS} users"
         )));
     }
+    validate_policy_scale(publication.users.iter().map(|user| user.rules.len()))?;
     if let Some(local_node_uuid) = configured_node_uuid()
         && publication.target_node_uuid != local_node_uuid
     {
@@ -477,6 +479,31 @@ fn validate_publication(
                     rule.domain
                 )));
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_policy_scale<I>(rule_counts: I) -> Result<(), UserDomainAccessFailure>
+where
+    I: IntoIterator<Item = usize>,
+{
+    let mut total_rules = 0usize;
+    for rule_count in rule_counts {
+        if rule_count > MAX_RULES_PER_USER {
+            return Err(UserDomainAccessError::Invalid.message(format!(
+                "rules must contain at most {MAX_RULES_PER_USER} entries"
+            )));
+        }
+        total_rules = total_rules.checked_add(rule_count).ok_or_else(|| {
+            UserDomainAccessError::Invalid.message(format!(
+                "user-domain access policy contains more than {MAX_TOTAL_RULES} rules"
+            ))
+        })?;
+        if total_rules > MAX_TOTAL_RULES {
+            return Err(UserDomainAccessError::Invalid.message(format!(
+                "user-domain access policy contains more than {MAX_TOTAL_RULES} rules"
+            )));
         }
     }
     Ok(())
@@ -733,5 +760,25 @@ mod tests {
 
         assert!(disabled.allows("vless-1", "api.example.com"));
         assert_eq!(disabled.status().stats.evaluations, 0);
+    }
+
+    #[test]
+    fn policy_total_rule_limit_is_checked_before_compilation() {
+        validate_policy_scale(std::iter::repeat_n(
+            MAX_RULES_PER_USER,
+            MAX_TOTAL_RULES / MAX_RULES_PER_USER,
+        ))
+        .expect("maximum total rule count should be accepted");
+
+        assert!(matches!(
+            validate_policy_scale(std::iter::repeat_n(
+                MAX_RULES_PER_USER,
+                MAX_TOTAL_RULES / MAX_RULES_PER_USER + 1,
+            )),
+            Err(UserDomainAccessFailure {
+                kind: UserDomainAccessError::Invalid,
+                ..
+            })
+        ));
     }
 }
