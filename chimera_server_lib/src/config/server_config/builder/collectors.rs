@@ -309,6 +309,7 @@ pub(super) fn collect_hysteria2_settings(
         xray_brutal_up: None,
         xray_brutal_down: None,
         xray_max_idle_timeout_secs: None,
+        xray_keep_alive_period_secs: None,
         xray_udp_idle_timeout_secs,
         xray_max_incoming_streams: None,
         xray_init_stream_receive_window: None,

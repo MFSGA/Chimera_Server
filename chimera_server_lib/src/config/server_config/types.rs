@@ -122,6 +122,8 @@ pub struct Hysteria2ServerConfig {
     #[serde(default)]
     pub xray_max_idle_timeout_secs: Option<u64>,
     #[serde(default)]
+    pub xray_keep_alive_period_secs: Option<u64>,
+    #[serde(default)]
     pub xray_udp_idle_timeout_secs: Option<u64>,
     #[serde(default)]
     pub xray_max_incoming_streams: Option<u64>,

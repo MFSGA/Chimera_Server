@@ -956,14 +956,17 @@ impl TryFrom<InboudItem> for ServerConfig {
                         Ok(if timeout == 0 { 30 } else { timeout as u64 })
                     })
                     .transpose()?;
-                if let Some(quic_params) = xray_quic_params {
-                    let keep_alive_period = quic_params.keep_alive_period;
-                    if keep_alive_period != 0 && !(2..=60).contains(&keep_alive_period) {
-                        return Err(Error::InvalidConfig(format!(
-                            "finalmask.quicParams.keepAlivePeriod must be 0 or between 2 and 60 seconds (got {keep_alive_period})"
-                        )));
-                    }
-                }
+                let xray_keep_alive_period_secs = xray_quic_params
+                    .map(|quic_params| {
+                        let keep_alive_period = quic_params.keep_alive_period;
+                        if keep_alive_period != 0 && !(2..=60).contains(&keep_alive_period) {
+                            return Err(Error::InvalidConfig(format!(
+                                "finalmask.quicParams.keepAlivePeriod must be 0 or between 2 and 60 seconds (got {keep_alive_period})"
+                            )));
+                        }
+                        Ok(keep_alive_period as u64)
+                    })
+                    .transpose()?;
                 let xray_max_incoming_streams = xray_quic_params
                     .map(|quic_params| {
                         let streams = quic_params.max_incoming_streams;
@@ -1034,6 +1037,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                 config.xray_brutal_up = xray_brutal_up;
                 config.xray_brutal_down = xray_brutal_down;
                 config.xray_max_idle_timeout_secs = xray_max_idle_timeout_secs;
+                config.xray_keep_alive_period_secs = xray_keep_alive_period_secs;
                 config.xray_max_incoming_streams = xray_max_incoming_streams;
                 config.xray_disable_path_mtu_discovery =
                     xray_quic_params.map(|params| params.disable_path_mtu_discovery);
@@ -1906,14 +1910,23 @@ mod tests {
     #[cfg(feature = "hysteria")]
     #[test]
     fn hysteria2_finalmask_keep_alive_period_matches_xray_bounds() {
-        ServerConfig::try_from(hysteria2_inbound_with_finalmask_quic_params(
-            serde_json::json!({ "keepAlivePeriod": 2 }),
-        ))
-        .expect("Xray accepts two-second keepAlivePeriod");
-        ServerConfig::try_from(hysteria2_inbound_with_finalmask_quic_params(
-            serde_json::json!({ "keepAlivePeriod": 60 }),
-        ))
-        .expect("Xray accepts sixty-second keepAlivePeriod");
+        for keep_alive_period in [0_u64, 2, 60] {
+            let config = ServerConfig::try_from(
+                hysteria2_inbound_with_finalmask_quic_params(
+                    serde_json::json!({ "keepAlivePeriod": keep_alive_period }),
+                ),
+            )
+            .expect("Xray accepts zero or bounded keepAlivePeriod");
+            match config.protocol {
+                ServerProxyConfig::Hysteria2 { config } => {
+                    assert_eq!(
+                        config.xray_keep_alive_period_secs,
+                        Some(keep_alive_period)
+                    );
+                }
+                other => panic!("expected hysteria2 protocol, got {other:?}"),
+            }
+        }
 
         for keep_alive_period in [1, 61] {
             let err = ServerConfig::try_from(
