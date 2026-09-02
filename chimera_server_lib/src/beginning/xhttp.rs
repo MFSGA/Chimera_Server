@@ -368,12 +368,16 @@ async fn start_xhttp_h3_server(
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
     server_config.transport_config(Arc::new(transport_config));
     let endpoint = quinn::Endpoint::server(server_config, bind_addr)?;
-    let local_addr = endpoint.local_addr()?;
+    let listener_addr = endpoint.local_addr()?;
 
     let handle = tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             let state = state.clone();
             tokio::spawn(async move {
+                let local_addr = xhttp_h3_connection_local_addr(
+                    listener_addr,
+                    incoming.local_ip(),
+                );
                 let connection = match incoming.await {
                     Ok(connection) => connection,
                     Err(err) => {
@@ -443,6 +447,16 @@ async fn start_xhttp_h3_server(
     });
 
     Ok(vec![handle])
+}
+
+#[cfg(feature = "tls")]
+fn xhttp_h3_connection_local_addr(
+    listener_addr: std::net::SocketAddr,
+    local_ip: Option<std::net::IpAddr>,
+) -> std::net::SocketAddr {
+    local_ip
+        .map(|local_ip| std::net::SocketAddr::new(local_ip, listener_addr.port()))
+        .unwrap_or(listener_addr)
 }
 
 #[cfg(feature = "tls")]
@@ -3365,6 +3379,21 @@ mod tests {
             hyper::header::HeaderValue::from_static("https://example.com/"),
         );
         assert!(stream_up_padding_enabled(&headers, false));
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn h3_local_addr_prefers_connection_destination_like_current_xray() {
+        let listener_addr = "0.0.0.0:8443".parse().unwrap();
+        let destination_ip = "192.0.2.10".parse().unwrap();
+        assert_eq!(
+            xhttp_h3_connection_local_addr(listener_addr, Some(destination_ip)),
+            "192.0.2.10:8443".parse().unwrap()
+        );
+        assert_eq!(
+            xhttp_h3_connection_local_addr(listener_addr, None),
+            listener_addr
+        );
     }
 
     #[test]
