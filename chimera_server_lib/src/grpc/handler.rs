@@ -965,6 +965,14 @@ impl HandlerServiceImpl {
         let proxy_settings = outbound.proxy_settings.as_ref().ok_or_else(|| {
             Status::invalid_argument("outbound.proxy_settings is required")
         })?;
+        if matches!(
+            Self::parse_typed_message_type(proxy_settings),
+            "xray.proxy.socks.ClientConfig" | "v2ray.core.proxy.socks.ClientConfig"
+        ) {
+            return Err(Status::unimplemented(
+                "socks outbound is parsed but its data-plane connector is not implemented",
+            ));
+        }
         let _ = self.decode_typed_message::<FreedomConfigPayload>(
             proxy_settings,
             &[TYPE_PROXY_FREEDOM_CONFIG, TYPE_PROXY_FREEDOM_CONFIG_V2RAY],
@@ -2368,6 +2376,28 @@ mod tests {
                 comment: String::new(),
             }),
         }
+    }
+
+    #[test]
+    fn handler_rejects_socks_outbound_until_connector_exists() {
+        let service =
+            HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+        let error = service
+            .parse_add_outbound(proto::xray::core::OutboundHandlerConfig {
+                tag: "socks-outbound".to_string(),
+                proxy_settings: Some(proto::xray::common::serial::TypedMessage {
+                    r#type: "xray.proxy.socks.ClientConfig".to_string(),
+                    value: Vec::new(),
+                }),
+                ..proto::xray::core::OutboundHandlerConfig::default()
+            })
+            .expect_err("SOCKS outbound must not be advertised as executable yet");
+
+        assert_eq!(error.code(), Code::Unimplemented);
+        assert_eq!(
+            error.message(),
+            "socks outbound is parsed but its data-plane connector is not implemented"
+        );
     }
 
     #[cfg(feature = "vless")]
