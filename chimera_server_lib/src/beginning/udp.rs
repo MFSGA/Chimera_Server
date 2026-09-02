@@ -3723,6 +3723,7 @@ mod tests {
                     tag: "empty".into(),
                     outbound_selector: vec!["missing-prefix".into()],
                     fallback_tag: None,
+                    strategy: Default::default(),
                 }],
                 ..RoutingConfig::default()
             }))

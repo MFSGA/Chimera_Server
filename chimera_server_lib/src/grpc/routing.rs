@@ -1198,6 +1198,7 @@ mod tests {
                 tag: "empty".into(),
                 outbound_selector: vec!["missing-prefix".into()],
                 fallback_tag: None,
+                strategy: Default::default(),
             }],
         );
         let service = RoutingServiceImpl::new(runtime);
@@ -1240,6 +1241,7 @@ mod tests {
                 tag: "auto".into(),
                 outbound_selector: vec!["missing-prefix".into()],
                 fallback_tag: Some("direct".into()),
+                strategy: Default::default(),
             }],
         );
         let service = RoutingServiceImpl::new(runtime);
@@ -1275,6 +1277,7 @@ mod tests {
                 tag: "balancer-a".into(),
                 outbound_selector: vec!["back".into(), "direct".into()],
                 fallback_tag: None,
+                strategy: Default::default(),
             }],
         );
         let service = RoutingServiceImpl::new(runtime);
