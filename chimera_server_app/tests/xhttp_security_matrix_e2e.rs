@@ -18,7 +18,7 @@ use tokio_rustls::TlsAcceptor;
 use xhttp_support::{
     TEST_UUID, assert_socks5_echo, create_test_dir, deterministic_payload,
     free_localhost_port, serial_xray_guard, start_chimera, start_tcp_echo_server,
-    start_xray, wait_for_tcp, workspace_root, write_json,
+    start_xray, wait_for_tcp, workspace_root, write_json, xray_binary,
 };
 
 const REALITY_PRIVATE_KEY: &str = "dnprBfWdJgo5yaGClSaZ12TZW-SiD988YmjDKOhXLKI";
@@ -290,8 +290,16 @@ async fn xhttp_security_tls() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "starts Chimera and Xray for XHTTP over HTTP/3"]
 async fn xhttp_security_http3() {
+    let workspace = workspace_root();
+    let xray = xray_binary(&workspace);
+    if !xray.is_file() {
+        eprintln!(
+            "skipping XHTTP/3 Xray interoperability test because {} is unavailable; set XRAY_BIN to enable it",
+            xray.display()
+        );
+        return;
+    }
     run_security_case(SecurityCase::Http3).await;
 }
 

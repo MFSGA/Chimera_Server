@@ -132,8 +132,8 @@ pub fn start_chimera(
     })
 }
 
-pub fn start_xray(workspace: &Path, work_dir: &Path, config: &Path) -> ChildGuard {
-    let binary = env::var_os("XRAY_BIN")
+pub fn xray_binary(workspace: &Path) -> PathBuf {
+    env::var_os("XRAY_BIN")
         .map(PathBuf::from)
         .map(|path| {
             if path.is_absolute() {
@@ -142,7 +142,11 @@ pub fn start_xray(workspace: &Path, work_dir: &Path, config: &Path) -> ChildGuar
                 workspace.join(path)
             }
         })
-        .unwrap_or_else(|| workspace.join("xray"));
+        .unwrap_or_else(|| workspace.join("xray"))
+}
+
+pub fn start_xray(workspace: &Path, work_dir: &Path, config: &Path) -> ChildGuard {
+    let binary = xray_binary(workspace);
     ChildGuard::spawn(
         "xray",
         &binary,
