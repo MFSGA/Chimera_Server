@@ -104,6 +104,9 @@ const TYPE_TRANSPORT_TLS_CONFIG_V2RAY: &str =
     "v2ray.core.transport.internet.tls.Config";
 #[cfg(feature = "reality")]
 const TYPE_TRANSPORT_REALITY_CONFIG: &str = "xray.transport.internet.reality.Config";
+const TYPE_TRANSPORT_XHTTP_CONFIG: &str = "xray.transport.internet.splithttp.Config";
+const TYPE_TRANSPORT_XHTTP_CONFIG_V2RAY: &str =
+    "v2ray.core.transport.internet.splithttp.Config";
 
 #[cfg(feature = "trojan")]
 #[derive(Clone, PartialEq, Message)]
@@ -157,6 +160,30 @@ struct ReceiverConfigPayload {
     listen: Option<IpOrDomainPayload>,
     #[prost(message, optional, tag = "3")]
     stream_settings: Option<StreamConfigPayload>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct QuicParamsPayload {
+    #[prost(string, tag = "1")]
+    congestion: String,
+    #[prost(string, tag = "2")]
+    bbr_profile: String,
+    #[prost(uint64, tag = "6")]
+    init_stream_receive_window: u64,
+    #[prost(uint64, tag = "7")]
+    max_stream_receive_window: u64,
+    #[prost(uint64, tag = "8")]
+    init_connection_receive_window: u64,
+    #[prost(uint64, tag = "9")]
+    max_connection_receive_window: u64,
+    #[prost(int64, tag = "10")]
+    max_idle_timeout: i64,
+    #[prost(int64, tag = "11")]
+    keep_alive_period: i64,
+    #[prost(bool, tag = "12")]
+    disable_path_mtu_discovery: bool,
+    #[prost(int64, tag = "13")]
+    max_incoming_streams: i64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -221,6 +248,8 @@ struct StreamConfigPayload {
     security_type: String,
     #[prost(message, repeated, tag = "4")]
     security_settings: Vec<proto::xray::common::serial::TypedMessage>,
+    #[prost(message, optional, tag = "12")]
+    quic_params: Option<QuicParamsPayload>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -229,6 +258,92 @@ struct TransportConfigPayload {
     settings: Option<proto::xray::common::serial::TypedMessage>,
     #[prost(string, tag = "3")]
     protocol_name: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct XhttpRangePayload {
+    #[prost(int32, tag = "1")]
+    from: i32,
+    #[prost(int32, tag = "2")]
+    to: i32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct XhttpXmuxPayload {
+    #[prost(message, optional, tag = "1")]
+    max_concurrency: Option<XhttpRangePayload>,
+    #[prost(message, optional, tag = "2")]
+    max_connections: Option<XhttpRangePayload>,
+    #[prost(message, optional, tag = "3")]
+    c_max_reuse_times: Option<XhttpRangePayload>,
+    #[prost(message, optional, tag = "4")]
+    h_max_request_times: Option<XhttpRangePayload>,
+    #[prost(message, optional, tag = "5")]
+    h_max_reusable_secs: Option<XhttpRangePayload>,
+    #[prost(int64, tag = "6")]
+    h_keep_alive_period: i64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct XhttpConfigPayload {
+    #[prost(string, tag = "1")]
+    host: String,
+    #[prost(string, tag = "2")]
+    path: String,
+    #[prost(string, tag = "3")]
+    mode: String,
+    #[prost(map = "string, string", tag = "4")]
+    headers: std::collections::HashMap<String, String>,
+    #[prost(message, optional, tag = "5")]
+    x_padding_bytes: Option<XhttpRangePayload>,
+    #[prost(bool, tag = "6")]
+    no_grpc_header: bool,
+    #[prost(bool, tag = "7")]
+    no_sse_header: bool,
+    #[prost(message, optional, tag = "8")]
+    sc_max_each_post_bytes: Option<XhttpRangePayload>,
+    #[prost(message, optional, tag = "9")]
+    sc_min_posts_interval_ms: Option<XhttpRangePayload>,
+    #[prost(int64, tag = "10")]
+    sc_max_buffered_posts: i64,
+    #[prost(message, optional, tag = "11")]
+    sc_stream_up_server_secs: Option<XhttpRangePayload>,
+    #[prost(message, optional, tag = "12")]
+    xmux: Option<XhttpXmuxPayload>,
+    #[prost(message, optional, tag = "13")]
+    download_settings: Option<StreamConfigPayload>,
+    #[prost(bool, tag = "14")]
+    x_padding_obfs_mode: bool,
+    #[prost(string, tag = "15")]
+    x_padding_key: String,
+    #[prost(string, tag = "16")]
+    x_padding_header: String,
+    #[prost(string, tag = "17")]
+    x_padding_placement: String,
+    #[prost(string, tag = "18")]
+    x_padding_method: String,
+    #[prost(string, tag = "19")]
+    uplink_http_method: String,
+    #[prost(string, tag = "20")]
+    session_id_placement: String,
+    #[prost(string, tag = "21")]
+    session_id_key: String,
+    #[prost(string, tag = "22")]
+    seq_placement: String,
+    #[prost(string, tag = "23")]
+    seq_key: String,
+    #[prost(string, tag = "24")]
+    uplink_data_placement: String,
+    #[prost(string, tag = "25")]
+    uplink_data_key: String,
+    #[prost(message, optional, tag = "26")]
+    uplink_chunk_size: Option<XhttpRangePayload>,
+    #[prost(int32, tag = "27")]
+    server_max_header_bytes: i32,
+    #[prost(string, tag = "28")]
+    session_id_table: String,
+    #[prost(message, optional, tag = "29")]
+    session_id_length: Option<XhttpRangePayload>,
 }
 
 #[cfg(feature = "vless")]
@@ -867,6 +982,172 @@ impl HandlerServiceImpl {
         Ok(ServerProxyConfig::Trojan { users, fallbacks })
     }
 
+    fn xhttp_settings_json(config: XhttpConfigPayload) -> serde_json::Value {
+        fn range_value(range: XhttpRangePayload) -> serde_json::Value {
+            serde_json::json!({ "from": range.from, "to": range.to })
+        }
+
+        let mut settings = serde_json::Map::new();
+        if !config.host.is_empty() {
+            settings.insert("host".to_string(), config.host.into());
+        }
+        if !config.path.is_empty() {
+            settings.insert("path".to_string(), config.path.into());
+        }
+        if !config.mode.is_empty() {
+            settings.insert("mode".to_string(), config.mode.into());
+        }
+        if !config.headers.is_empty() {
+            settings
+                .insert("headers".to_string(), serde_json::json!(config.headers));
+        }
+        if let Some(range) = config.x_padding_bytes {
+            settings.insert("xPaddingBytes".to_string(), range_value(range));
+        }
+        if config.no_grpc_header {
+            settings.insert("noGRPCHeader".to_string(), true.into());
+        }
+        if config.no_sse_header {
+            settings.insert("noSSEHeader".to_string(), true.into());
+        }
+        if let Some(range) = config.sc_max_each_post_bytes {
+            settings.insert("scMaxEachPostBytes".to_string(), range_value(range));
+        }
+        if let Some(range) = config.sc_min_posts_interval_ms {
+            settings.insert("scMinPostsIntervalMs".to_string(), range_value(range));
+        }
+        if config.sc_max_buffered_posts != 0 {
+            settings.insert(
+                "scMaxBufferedPosts".to_string(),
+                config.sc_max_buffered_posts.into(),
+            );
+        }
+        if let Some(range) = config.sc_stream_up_server_secs {
+            settings.insert("scStreamUpServerSecs".to_string(), range_value(range));
+        }
+        if let Some(xmux) = config.xmux {
+            let mut xmux_settings = serde_json::Map::new();
+            if let Some(range) = xmux.max_concurrency {
+                xmux_settings
+                    .insert("maxConcurrency".to_string(), range_value(range));
+            }
+            if let Some(range) = xmux.max_connections {
+                xmux_settings
+                    .insert("maxConnections".to_string(), range_value(range));
+            }
+            if !xmux_settings.is_empty() {
+                settings.insert("xmux".to_string(), xmux_settings.into());
+            }
+        }
+        if config.download_settings.is_some() {
+            settings.insert("downloadSettings".to_string(), serde_json::json!({}));
+        }
+        if config.x_padding_obfs_mode {
+            settings.insert("xPaddingObfsMode".to_string(), true.into());
+        }
+        for (key, value) in [
+            ("xPaddingKey", config.x_padding_key),
+            ("xPaddingHeader", config.x_padding_header),
+            ("xPaddingPlacement", config.x_padding_placement),
+            ("xPaddingMethod", config.x_padding_method),
+            ("uplinkHTTPMethod", config.uplink_http_method),
+            ("sessionIDPlacement", config.session_id_placement),
+            ("sessionIDKey", config.session_id_key),
+            ("seqPlacement", config.seq_placement),
+            ("seqKey", config.seq_key),
+            ("uplinkDataPlacement", config.uplink_data_placement),
+            ("uplinkDataKey", config.uplink_data_key),
+            ("sessionIDTable", config.session_id_table),
+        ] {
+            if !value.is_empty() {
+                settings.insert(key.to_string(), value.into());
+            }
+        }
+        if let Some(range) = config.uplink_chunk_size {
+            settings.insert("uplinkChunkSize".to_string(), range_value(range));
+        }
+        if config.server_max_header_bytes != 0 {
+            settings.insert(
+                "serverMaxHeaderBytes".to_string(),
+                config.server_max_header_bytes.into(),
+            );
+        }
+        if let Some(range) = config.session_id_length {
+            settings.insert("sessionIDLength".to_string(), range_value(range));
+        }
+        serde_json::Value::Object(settings)
+    }
+
+    fn apply_add_inbound_xhttp_quic_params(
+        config: &mut crate::config::server_config::XhttpServerConfig,
+        params: Option<QuicParamsPayload>,
+    ) -> Result<(), Status> {
+        let Some(params) = params else {
+            return Ok(());
+        };
+
+        match params.congestion.to_ascii_lowercase().as_str() {
+            "" | "brutal" | "reno" | "bbr" | "force-brutal" => {}
+            congestion => {
+                return Err(Status::invalid_argument(format!(
+                    "streamSettings.quicParams.congestion is unsupported: {congestion}"
+                )));
+            }
+        }
+        if params.max_idle_timeout != 0
+            && !(4..=120).contains(&params.max_idle_timeout)
+        {
+            return Err(Status::invalid_argument(
+                "streamSettings.quicParams.maxIdleTimeout must be 0 or between 4 and 120 seconds",
+            ));
+        }
+        if params.keep_alive_period != 0
+            && !(2..=60).contains(&params.keep_alive_period)
+        {
+            return Err(Status::invalid_argument(
+                "streamSettings.quicParams.keepAlivePeriod must be 0 or between 2 and 60 seconds",
+            ));
+        }
+        if params.max_incoming_streams != 0 && params.max_incoming_streams < 8 {
+            return Err(Status::invalid_argument(
+                "streamSettings.quicParams.maxIncomingStreams must be 0 or at least 8",
+            ));
+        }
+        for (field, value) in [
+            ("initStreamReceiveWindow", params.init_stream_receive_window),
+            ("maxStreamReceiveWindow", params.max_stream_receive_window),
+            (
+                "initConnectionReceiveWindow",
+                params.init_connection_receive_window,
+            ),
+            (
+                "maxConnectionReceiveWindow",
+                params.max_connection_receive_window,
+            ),
+        ] {
+            if value != 0 && value < 16_384 {
+                return Err(Status::invalid_argument(format!(
+                    "streamSettings.quicParams.{field} must be 0 or at least 16384"
+                )));
+            }
+        }
+        config.xray_max_idle_timeout_secs =
+            (params.max_idle_timeout != 0).then_some(params.max_idle_timeout as u64);
+        config.xray_max_incoming_streams = (params.max_incoming_streams != 0)
+            .then_some((params.max_incoming_streams as u64).min(1_u64 << 60));
+        config.xray_init_stream_receive_window =
+            Some(params.init_stream_receive_window);
+        config.xray_max_stream_receive_window =
+            Some(params.max_stream_receive_window);
+        config.xray_init_connection_receive_window =
+            Some(params.init_connection_receive_window);
+        config.xray_max_connection_receive_window =
+            Some(params.max_connection_receive_window);
+        config.xray_disable_path_mtu_discovery =
+            Some(params.disable_path_mtu_discovery);
+        Ok(())
+    }
+
     fn apply_add_inbound_stream_settings(
         &self,
         mut protocol: ServerProxyConfig,
@@ -924,10 +1205,42 @@ impl HandlerServiceImpl {
                     })),
                 };
             }
-            "xhttp" => {
-                return Err(Status::invalid_argument(
-                    "xhttp AddInbound is not supported yet",
-                ));
+            "xhttp" | "splithttp" => {
+                let transport = stream_settings
+                    .transport_settings
+                    .iter()
+                    .find_map(|item| {
+                        let name = item.protocol_name.trim().to_ascii_lowercase();
+                        (name == "xhttp" || name == "splithttp")
+                            .then_some(item.settings.as_ref())
+                            .flatten()
+                    })
+                    .ok_or_else(|| {
+                        Status::invalid_argument(
+                            "xhttp transport settings are required",
+                        )
+                    })?;
+                let xhttp = self.decode_typed_message::<XhttpConfigPayload>(
+                    transport,
+                    &[
+                        TYPE_TRANSPORT_XHTTP_CONFIG,
+                        TYPE_TRANSPORT_XHTTP_CONFIG_V2RAY,
+                    ],
+                    "xhttp transport settings",
+                )?;
+                let mut config =
+                    crate::config::server_config::collect_xhttp_settings_from_json(
+                        Self::xhttp_settings_json(xhttp),
+                    )
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+                Self::apply_add_inbound_xhttp_quic_params(
+                    &mut config,
+                    stream_settings.quic_params,
+                )?;
+                protocol = ServerProxyConfig::Xhttp {
+                    config,
+                    inner: Box::new(protocol),
+                };
             }
             unsupported => {
                 return Err(Status::invalid_argument(format!(
@@ -1360,6 +1673,104 @@ impl HandlerServiceImpl {
         }
     }
 
+    fn encode_xhttp_config(
+        config: &crate::config::server_config::XhttpServerConfig,
+    ) -> XhttpConfigPayload {
+        fn range(from: usize, to: usize) -> XhttpRangePayload {
+            XhttpRangePayload {
+                from: from.min(i32::MAX as usize) as i32,
+                to: to.min(i32::MAX as usize) as i32,
+            }
+        }
+
+        let xhttp_mode = match config.mode {
+            crate::config::server_config::XhttpMode::Auto => "auto",
+            crate::config::server_config::XhttpMode::PacketUp => "packet-up",
+            crate::config::server_config::XhttpMode::StreamUp => "stream-up",
+            crate::config::server_config::XhttpMode::StreamOne => "stream-one",
+        };
+        let padding_placement = match config.padding_placement {
+            crate::config::server_config::XhttpPaddingPlacement::Cookie => "cookie",
+            crate::config::server_config::XhttpPaddingPlacement::Header => "header",
+            crate::config::server_config::XhttpPaddingPlacement::Query => "query",
+            crate::config::server_config::XhttpPaddingPlacement::QueryInHeader => {
+                "queryInHeader"
+            }
+        };
+        let padding_method = match config.padding_method {
+            crate::config::server_config::XhttpPaddingMethod::RepeatX => "repeat-x",
+            crate::config::server_config::XhttpPaddingMethod::Tokenish => "tokenish",
+        };
+        let session_placement = match config.session_placement {
+            crate::config::server_config::XhttpPlacement::Path => "path",
+            crate::config::server_config::XhttpPlacement::Query => "query",
+            crate::config::server_config::XhttpPlacement::Header => "header",
+            crate::config::server_config::XhttpPlacement::Cookie => "cookie",
+        };
+        let seq_placement = match config.seq_placement {
+            crate::config::server_config::XhttpPlacement::Path => "path",
+            crate::config::server_config::XhttpPlacement::Query => "query",
+            crate::config::server_config::XhttpPlacement::Header => "header",
+            crate::config::server_config::XhttpPlacement::Cookie => "cookie",
+        };
+        let uplink_data_placement = match config.uplink_data_placement {
+            crate::config::server_config::XhttpDataPlacement::Auto => "auto",
+            crate::config::server_config::XhttpDataPlacement::Body => "body",
+            crate::config::server_config::XhttpDataPlacement::Header => "header",
+            crate::config::server_config::XhttpDataPlacement::Cookie => "cookie",
+        };
+
+        XhttpConfigPayload {
+            host: config.host.clone().unwrap_or_default(),
+            path: config.path.clone(),
+            mode: xhttp_mode.to_string(),
+            headers: std::collections::HashMap::new(),
+            x_padding_bytes: Some(range(config.min_padding, config.max_padding)),
+            no_grpc_header: config.no_grpc_header,
+            no_sse_header: config.no_sse_header,
+            sc_max_each_post_bytes: Some(XhttpRangePayload {
+                from: config
+                    .max_each_post_bytes
+                    .clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+                    as i32,
+                to: config
+                    .max_each_post_bytes
+                    .clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+                    as i32,
+            }),
+            sc_min_posts_interval_ms: Some(range(
+                config.min_posts_interval_ms.0,
+                config.min_posts_interval_ms.1,
+            )),
+            sc_max_buffered_posts: config.max_buffered_posts.min(i64::MAX as usize)
+                as i64,
+            sc_stream_up_server_secs: Some(range(
+                config.stream_up_server_secs.0,
+                config.stream_up_server_secs.1,
+            )),
+            xmux: None,
+            download_settings: None,
+            x_padding_obfs_mode: config.padding_obfs_mode,
+            x_padding_key: config.padding_key.clone(),
+            x_padding_header: config.padding_header.clone(),
+            x_padding_placement: padding_placement.to_string(),
+            x_padding_method: padding_method.to_string(),
+            uplink_http_method: config.uplink_http_method.clone(),
+            session_id_placement: session_placement.to_string(),
+            session_id_key: config.session_key.clone(),
+            seq_placement: seq_placement.to_string(),
+            seq_key: config.seq_key.clone(),
+            uplink_data_placement: uplink_data_placement.to_string(),
+            uplink_data_key: config.uplink_data_key.clone(),
+            uplink_chunk_size: None,
+            server_max_header_bytes: config
+                .server_max_header_bytes
+                .min(i32::MAX as usize) as i32,
+            session_id_table: String::new(),
+            session_id_length: None,
+        }
+    }
+
     fn encode_inbound_protocol_layers(
         &self,
         protocol: &ServerProxyConfig,
@@ -1403,6 +1814,7 @@ impl HandlerServiceImpl {
                         transport_settings: Vec::new(),
                         security_type: String::new(),
                         security_settings: Vec::new(),
+                        quic_params: None,
                     });
                 settings.protocol_name = "websocket".to_string();
                 settings.transport_settings.push(TransportConfigPayload {
@@ -1421,6 +1833,7 @@ impl HandlerServiceImpl {
                         transport_settings: Vec::new(),
                         security_type: String::new(),
                         security_settings: Vec::new(),
+                        quic_params: None,
                     });
                 settings.security_type = "tls".to_string();
                 settings.security_settings.push(Self::typed_message(
@@ -1457,6 +1870,7 @@ impl HandlerServiceImpl {
                         transport_settings: Vec::new(),
                         security_type: String::new(),
                         security_settings: Vec::new(),
+                        quic_params: None,
                     });
                 settings.security_type = "reality".to_string();
                 settings.security_settings.push(Self::typed_message(
@@ -1483,7 +1897,7 @@ impl HandlerServiceImpl {
                 ));
                 (stream_settings, proxy_settings)
             }
-            ServerProxyConfig::Xhttp { inner, .. } => {
+            ServerProxyConfig::Xhttp { config, inner } => {
                 let (mut stream_settings, proxy_settings) =
                     self.encode_inbound_protocol_layers(inner);
                 let settings =
@@ -1492,8 +1906,53 @@ impl HandlerServiceImpl {
                         transport_settings: Vec::new(),
                         security_type: String::new(),
                         security_settings: Vec::new(),
+                        quic_params: None,
                     });
                 settings.protocol_name = "xhttp".to_string();
+                settings.transport_settings.push(TransportConfigPayload {
+                    settings: Some(Self::typed_message(
+                        TYPE_TRANSPORT_XHTTP_CONFIG,
+                        Self::encode_xhttp_config(config),
+                    )),
+                    protocol_name: "xhttp".to_string(),
+                });
+                settings.quic_params = match (
+                    config.xray_max_idle_timeout_secs,
+                    config.xray_max_incoming_streams,
+                    config.xray_max_stream_receive_window,
+                    config.xray_max_connection_receive_window,
+                    config.xray_disable_path_mtu_discovery,
+                ) {
+                    (None, None, None, None, None) => None,
+                    _ => Some(QuicParamsPayload {
+                        congestion: String::new(),
+                        bbr_profile: String::new(),
+                        init_stream_receive_window: config
+                            .xray_init_stream_receive_window
+                            .unwrap_or_default(),
+                        max_stream_receive_window: config
+                            .xray_max_stream_receive_window
+                            .unwrap_or_default(),
+                        init_connection_receive_window: config
+                            .xray_init_connection_receive_window
+                            .unwrap_or_default(),
+                        max_connection_receive_window: config
+                            .xray_max_connection_receive_window
+                            .unwrap_or_default(),
+                        max_idle_timeout: config
+                            .xray_max_idle_timeout_secs
+                            .unwrap_or_default()
+                            as i64,
+                        keep_alive_period: 0,
+                        disable_path_mtu_discovery: config
+                            .xray_disable_path_mtu_discovery
+                            .unwrap_or(false),
+                        max_incoming_streams: config
+                            .xray_max_incoming_streams
+                            .unwrap_or_default()
+                            as i64,
+                    }),
+                };
                 (stream_settings, proxy_settings)
             }
             protocol => (None, self.encode_user_manager_protocol(protocol)),
@@ -3204,6 +3663,7 @@ mod tests {
                             .encode_to_vec(),
                         },
                     ],
+                    quic_params: None,
                 }),
             )),
             proxy_settings: Some(proto::xray::common::serial::TypedMessage {
@@ -3274,6 +3734,175 @@ mod tests {
             }
             other => panic!("unexpected protocol: {other:?}"),
         }
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn handler_parse_add_inbound_supports_xhttp_and_round_trips_settings() {
+        let service =
+            HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+        let user = proto::xray::common::protocol::User {
+            level: 0,
+            email: "xhttp-user@example.com".to_string(),
+            account: Some(HandlerServiceImpl::typed_message(
+                TYPE_PROXY_VLESS_ACCOUNT,
+                VlessAccountPayload {
+                    id: "5df5643d-4e28-4399-bb9e-22014a2d3246".to_string(),
+                    flow: String::new(),
+                },
+            )),
+        };
+        let inbound = proto::xray::core::InboundHandlerConfig {
+            tag: unique_tag("xhttp"),
+            receiver_settings: Some(build_receiver_settings(
+                2081,
+                Some(StreamConfigPayload {
+                    protocol_name: "xhttp".to_string(),
+                    transport_settings: vec![TransportConfigPayload {
+                        protocol_name: "xhttp".to_string(),
+                        settings: Some(HandlerServiceImpl::typed_message(
+                            TYPE_TRANSPORT_XHTTP_CONFIG,
+                            XhttpConfigPayload {
+                                path: "/api".to_string(),
+                                mode: "packet-up".to_string(),
+                                x_padding_bytes: Some(XhttpRangePayload {
+                                    from: 42,
+                                    to: 84,
+                                }),
+                                sc_max_buffered_posts: 9,
+                                uplink_http_method: "get".to_string(),
+                                ..XhttpConfigPayload::default()
+                            },
+                        )),
+                    }],
+                    security_type: String::new(),
+                    security_settings: Vec::new(),
+                    quic_params: Some(QuicParamsPayload {
+                        congestion: "bbr".to_string(),
+                        bbr_profile: String::new(),
+                        init_stream_receive_window: 32_768,
+                        max_stream_receive_window: 65_536,
+                        init_connection_receive_window: 32_768,
+                        max_connection_receive_window: 131_072,
+                        max_idle_timeout: 10,
+                        keep_alive_period: 5,
+                        disable_path_mtu_discovery: true,
+                        max_incoming_streams: 16,
+                    }),
+                }),
+            )),
+            proxy_settings: Some(HandlerServiceImpl::typed_message(
+                TYPE_PROXY_VLESS_INBOUND_CONFIG,
+                VlessInboundConfigPayload {
+                    clients: vec![user],
+                },
+            )),
+        };
+
+        let parsed = service
+            .parse_add_inbound(inbound)
+            .expect("xhttp inbound should parse");
+        assert_eq!(parsed.transport, Transport::Tcp);
+        let ServerProxyConfig::Xhttp { config, inner } = &parsed.protocol else {
+            panic!("expected xhttp protocol");
+        };
+        assert_eq!(config.path, "/api/");
+        assert_eq!(config.min_padding, 42);
+        assert_eq!(config.max_padding, 84);
+        assert_eq!(config.max_buffered_posts, 9);
+        assert_eq!(config.uplink_http_method, "GET");
+        assert_eq!(config.xray_max_idle_timeout_secs, Some(10));
+        assert_eq!(config.xray_max_incoming_streams, Some(16));
+        assert_eq!(config.xray_max_stream_receive_window, Some(65_536));
+        assert_eq!(config.xray_disable_path_mtu_discovery, Some(true));
+        assert!(
+            matches!(inner.as_ref(), ServerProxyConfig::Vless { users, .. } if users.len() == 1)
+        );
+
+        let encoded = service.encode_inbound_config(&parsed);
+        let receiver = ReceiverConfigPayload::decode(
+            encoded
+                .receiver_settings
+                .expect("receiver settings")
+                .value
+                .as_slice(),
+        )
+        .expect("receiver settings should decode");
+        let stream = receiver.stream_settings.expect("stream settings");
+        let transport = stream
+            .transport_settings
+            .iter()
+            .find(|item| item.protocol_name == "xhttp")
+            .and_then(|item| item.settings.as_ref())
+            .expect("xhttp transport settings should be echoed");
+        let echoed = XhttpConfigPayload::decode(transport.value.as_slice())
+            .expect("xhttp settings should decode");
+        assert_eq!(echoed.path, "/api/");
+        assert_eq!(echoed.mode, "packet-up");
+        assert_eq!(
+            stream.quic_params.expect("quic params").max_idle_timeout,
+            10
+        );
+    }
+
+    #[cfg(feature = "vless")]
+    #[tokio::test]
+    async fn handler_add_inbound_starts_xhttp_listener() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let service = HandlerServiceImpl::new(runtime.clone());
+        let tag = unique_tag("xhttp-runtime");
+        let user = proto::xray::common::protocol::User {
+            level: 0,
+            email: "xhttp-runtime-user@example.com".to_string(),
+            account: Some(HandlerServiceImpl::typed_message(
+                TYPE_PROXY_VLESS_ACCOUNT,
+                VlessAccountPayload {
+                    id: "9199ca5b-1850-4ae6-a4fa-fd6384073692".to_string(),
+                    flow: String::new(),
+                },
+            )),
+        };
+        let request = proto::xray::app::proxyman::command::AddInboundRequest {
+            inbound: Some(proto::xray::core::InboundHandlerConfig {
+                tag: tag.clone(),
+                receiver_settings: Some(build_receiver_settings(
+                    free_localhost_port(),
+                    Some(StreamConfigPayload {
+                        protocol_name: "xhttp".to_string(),
+                        transport_settings: vec![TransportConfigPayload {
+                            protocol_name: "xhttp".to_string(),
+                            settings: Some(HandlerServiceImpl::typed_message(
+                                TYPE_TRANSPORT_XHTTP_CONFIG,
+                                XhttpConfigPayload {
+                                    path: "/control".to_string(),
+                                    ..XhttpConfigPayload::default()
+                                },
+                            )),
+                        }],
+                        security_type: String::new(),
+                        security_settings: Vec::new(),
+                        quic_params: None,
+                    }),
+                )),
+                proxy_settings: Some(HandlerServiceImpl::typed_message(
+                    TYPE_PROXY_VLESS_INBOUND_CONFIG,
+                    VlessInboundConfigPayload {
+                        clients: vec![user],
+                    },
+                )),
+            }),
+        };
+
+        service
+            .add_inbound(Request::new(request))
+            .await
+            .expect("xhttp AddInbound should start");
+        let inbound = runtime
+            .inbound_by_tag(&tag)
+            .expect("xhttp inbound should be registered");
+        assert!(matches!(inbound.protocol, ServerProxyConfig::Xhttp { .. }));
+        assert!(runtime.stop_inbound_tasks(&tag).await);
+        assert!(runtime.remove_inbound(&tag).is_some());
     }
 
     #[cfg(feature = "vmess")]
@@ -3359,6 +3988,7 @@ mod tests {
                             .encode_to_vec(),
                         },
                     ],
+                    quic_params: None,
                 }),
             )),
             proxy_settings: Some(proto::xray::common::serial::TypedMessage {
