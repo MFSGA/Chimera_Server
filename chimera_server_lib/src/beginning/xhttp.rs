@@ -292,9 +292,9 @@ const XRAY_XHTTP_H3_INITIAL_MTU: u16 = 1280;
 #[cfg(feature = "tls")]
 const XRAY_XHTTP_H3_MAX_FIELD_SECTION_SIZE: u64 = 1 << 20;
 #[cfg(feature = "tls")]
-const XRAY_XHTTP_H3_MAX_STREAM_RECEIVE_WINDOW: u64 = 6 * 1024 * 1024;
+const XRAY_XHTTP_H3_INITIAL_STREAM_RECEIVE_WINDOW: u64 = 2 * 1024 * 1024;
 #[cfg(feature = "tls")]
-const XRAY_XHTTP_H3_MAX_CONNECTION_RECEIVE_WINDOW: u64 = 15 * 1024 * 1024;
+const XRAY_XHTTP_H3_INITIAL_CONNECTION_RECEIVE_WINDOW: u64 = 3 * 1024 * 1024;
 
 #[cfg(feature = "tls")]
 fn apply_xray_xhttp_h3_initial_mtu(transport: &mut quinn::TransportConfig) {
@@ -323,14 +323,17 @@ fn build_xhttp_h3_transport_config(
             })?;
         transport.max_concurrent_bidi_streams(max_incoming_streams);
     }
+    // Quinn exposes the receive credit advertised on the wire, but not quic-go's
+    // separate auto-tuning ceiling. Match Xray's initial flow-control windows here;
+    // using max*ReceiveWindow would advertise Xray's ceiling as the initial credit.
     let stream_receive_window = configured_xhttp_receive_window(
-        config.xray_max_stream_receive_window,
-        XRAY_XHTTP_H3_MAX_STREAM_RECEIVE_WINDOW,
+        config.xray_init_stream_receive_window,
+        XRAY_XHTTP_H3_INITIAL_STREAM_RECEIVE_WINDOW,
     )?;
     transport.stream_receive_window(stream_receive_window);
     let connection_receive_window = configured_xhttp_receive_window(
-        config.xray_max_connection_receive_window,
-        XRAY_XHTTP_H3_MAX_CONNECTION_RECEIVE_WINDOW,
+        config.xray_init_connection_receive_window,
+        XRAY_XHTTP_H3_INITIAL_CONNECTION_RECEIVE_WINDOW,
     )?;
     transport.receive_window(connection_receive_window);
     let platform_supports_path_mtu_discovery = cfg!(any(
@@ -2413,29 +2416,29 @@ mod tests {
 
     #[cfg(feature = "tls")]
     #[test]
-    fn h3_receive_window_uses_xray_max_value_and_defaults() {
+    fn h3_receive_window_uses_xray_initial_value_and_defaults() {
         assert_eq!(
             configured_xhttp_receive_window(
                 None,
-                XRAY_XHTTP_H3_MAX_STREAM_RECEIVE_WINDOW
+                XRAY_XHTTP_H3_INITIAL_STREAM_RECEIVE_WINDOW
             )
             .expect("unset receive window")
             .into_inner(),
-            XRAY_XHTTP_H3_MAX_STREAM_RECEIVE_WINDOW
+            XRAY_XHTTP_H3_INITIAL_STREAM_RECEIVE_WINDOW
         );
         assert_eq!(
             configured_xhttp_receive_window(
                 Some(0),
-                XRAY_XHTTP_H3_MAX_CONNECTION_RECEIVE_WINDOW
+                XRAY_XHTTP_H3_INITIAL_CONNECTION_RECEIVE_WINDOW
             )
             .expect("zero receive window")
             .into_inner(),
-            XRAY_XHTTP_H3_MAX_CONNECTION_RECEIVE_WINDOW
+            XRAY_XHTTP_H3_INITIAL_CONNECTION_RECEIVE_WINDOW
         );
         assert_eq!(
             configured_xhttp_receive_window(
                 Some(65_536),
-                XRAY_XHTTP_H3_MAX_STREAM_RECEIVE_WINDOW
+                XRAY_XHTTP_H3_INITIAL_STREAM_RECEIVE_WINDOW
             )
             .expect("explicit receive window")
             .into_inner(),
@@ -2444,7 +2447,7 @@ mod tests {
         assert!(
             configured_xhttp_receive_window(
                 Some(1_u64 << 62),
-                XRAY_XHTTP_H3_MAX_STREAM_RECEIVE_WINDOW
+                XRAY_XHTTP_H3_INITIAL_STREAM_RECEIVE_WINDOW
             )
             .is_err()
         );
