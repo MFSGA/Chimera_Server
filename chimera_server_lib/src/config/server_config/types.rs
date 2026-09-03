@@ -434,6 +434,8 @@ pub struct XhttpServerConfig {
     #[serde(default)]
     pub xray_congestion: Option<String>,
     #[serde(default)]
+    pub xray_brutal_up: Option<u64>,
+    #[serde(default)]
     pub xray_max_idle_timeout_secs: Option<u64>,
     #[serde(default)]
     pub xray_max_incoming_streams: Option<u64>,

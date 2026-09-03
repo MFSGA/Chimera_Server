@@ -1210,12 +1210,12 @@ impl TryFrom<InboudItem> for ServerConfig {
                         {
                             let congestion = quic_params.congestion.to_ascii_lowercase();
                             match congestion.as_str() {
-                                "" | "reno" | "bbr" => {
-                                    xhttp_config.xray_congestion = Some(congestion);
+                                "" | "reno" | "bbr" | "force-brutal" => {
+                                    xhttp_config.xray_congestion = Some(congestion.clone());
                                 }
-                                "brutal" | "force-brutal" => {
+                                "brutal" => {
                                     return Err(Error::InvalidConfig(format!(
-                                        "finalmask.quicParams.congestion={} is not supported for XHTTP yet",
+                                        "finalmask.quicParams.congestion={} is not supported for XHTTP",
                                         quic_params.congestion
                                     )));
                                 }
@@ -1226,6 +1226,20 @@ impl TryFrom<InboudItem> for ServerConfig {
                                     )));
                                 }
                             }
+                            let brutal_up =
+                                parse_xray_finalmask_bandwidth(&quic_params.brutal_up)?;
+                            if brutal_up > 0 && brutal_up < 65_536 {
+                                return Err(Error::InvalidConfig(
+                                    "finalmask.quicParams.brutalUp must be at least 65536 bytes per second"
+                                        .into(),
+                                ));
+                            }
+                            if congestion == "force-brutal" && brutal_up == 0 {
+                                return Err(Error::InvalidConfig(
+                                    "finalmask.quicParams.force-brutal requires brutalUp".into(),
+                                ));
+                            }
+                            xhttp_config.xray_brutal_up = (brutal_up != 0).then_some(brutal_up);
                             let max_idle_timeout = quic_params.max_idle_timeout;
                             if max_idle_timeout != 0 && !(4..=120).contains(&max_idle_timeout) {
                                 return Err(Error::InvalidConfig(format!(
@@ -2978,6 +2992,51 @@ mod tests {
         assert_eq!(config.xray_init_connection_receive_window, Some(131_072));
         assert_eq!(config.xray_max_connection_receive_window, Some(262_144));
         assert_eq!(config.xray_disable_path_mtu_discovery, Some(true));
+    }
+
+    #[cfg(all(feature = "tls", feature = "vless"))]
+    #[test]
+    fn vless_xhttp_accepts_xray_force_brutal_configuration() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "xhttp-force-brutal",
+            "settings": {
+                "clients": [{ "id": "3ac9b383-75a1-431c-8184-106c80eb2273" }],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "xhttp",
+                "security": "tls",
+                "tlsSettings": {
+                    "alpn": ["h3"],
+                    "certificates": [{
+                        "certificate": ["-----BEGIN CERTIFICATE-----","MIIB","-----END CERTIFICATE-----"],
+                        "key": ["-----BEGIN PRIVATE KEY-----","MIIB","-----END PRIVATE KEY-----"]
+                    }]
+                },
+                "xhttpSettings": { "path": "/xhttp" },
+                "finalmask": {
+                    "quicParams": {
+                        "congestion": "force-brutal",
+                        "brutalUp": "8 mbps"
+                    }
+                }
+            }
+        }))
+        .expect("valid inbound item");
+
+        let server = ServerConfig::try_from(inbound)
+            .expect("Xray force-brutal XHTTP/3 configuration should build");
+        let ServerProxyConfig::Tls(tls) = server.protocol else {
+            panic!("expected TLS-wrapped XHTTP protocol");
+        };
+        let ServerProxyConfig::Xhttp { config, .. } = *tls.inner else {
+            panic!("expected XHTTP inside TLS");
+        };
+        assert_eq!(config.xray_congestion.as_deref(), Some("force-brutal"));
+        assert_eq!(config.xray_brutal_up, Some(1024 * 1024));
     }
 
     #[cfg(feature = "vless")]

@@ -28,13 +28,13 @@ const DEBUG_ENV: &str = "HYSTERIA_BRUTAL_DEBUG";
 const DEBUG_PRINT_INTERVAL: u64 = 2;
 
 #[derive(Clone)]
-pub(super) struct BrutalConfig {
+pub(crate) struct BrutalConfig {
     tx_bps: Arc<AtomicU64>,
     bbr_config: Arc<BbrConfig>,
 }
 
 impl BrutalConfig {
-    pub(super) fn new(tx_bps: Arc<AtomicU64>) -> Self {
+    pub(crate) fn new(tx_bps: Arc<AtomicU64>) -> Self {
         Self {
             tx_bps,
             bbr_config: Arc::new(BbrConfig::default()),

@@ -15,7 +15,7 @@ use crate::{
     util::socket::new_socket2_udp_socket_with_buffer_size,
 };
 
-mod congestion;
+pub(crate) mod congestion;
 pub mod connection;
 
 const MAX_QUIC_ENDPOINTS: usize = 1;
