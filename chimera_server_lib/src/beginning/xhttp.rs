@@ -318,6 +318,8 @@ const XRAY_XHTTP_H3_INITIAL_MTU: u16 = 1280;
 #[cfg(feature = "tls")]
 const XRAY_XHTTP_H3_MAX_FIELD_SECTION_SIZE: u64 = 1 << 20;
 #[cfg(feature = "tls")]
+const XRAY_XHTTP_H3_BBR_INITIAL_WINDOW: u64 = 32 * XRAY_XHTTP_H3_INITIAL_MTU as u64;
+#[cfg(feature = "tls")]
 const XRAY_XHTTP_H3_INITIAL_STREAM_RECEIVE_WINDOW: u64 = 2 * 1024 * 1024;
 #[cfg(feature = "tls")]
 const XRAY_XHTTP_H3_INITIAL_CONNECTION_RECEIVE_WINDOW: u64 = 3 * 1024 * 1024;
@@ -362,9 +364,11 @@ fn build_xhttp_h3_transport_config(
             ));
         }
         XhttpH3CongestionMode::Bbr => {
-            transport.congestion_controller_factory(Arc::new(
-                quinn::congestion::BbrConfig::default(),
-            ));
+            let mut bbr = quinn::congestion::BbrConfig::default();
+            // Xray's BBR starts at 32 packets and XHTTP/3 uses quic-go's
+            // 1280-byte InitialPacketSize, for a 40,960-byte initial CWND.
+            bbr.initial_window(XRAY_XHTTP_H3_BBR_INITIAL_WINDOW);
+            transport.congestion_controller_factory(Arc::new(bbr));
         }
         XhttpH3CongestionMode::ForceBrutal => {
             let tx_bps = config
@@ -2539,6 +2543,15 @@ mod tests {
         apply_xray_xhttp_h3_initial_mtu(&mut transport);
         let debug = format!("{transport:?}");
         assert!(debug.contains("initial_mtu: 1280"), "{debug}");
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn h3_bbr_initial_window_matches_xray() {
+        let mut bbr = quinn::congestion::BbrConfig::default();
+        bbr.initial_window(XRAY_XHTTP_H3_BBR_INITIAL_WINDOW);
+        let debug = format!("{bbr:?}");
+        assert!(debug.contains("initial_window: 40960"), "{debug}");
     }
 
     #[cfg(feature = "tls")]
