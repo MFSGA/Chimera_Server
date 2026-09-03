@@ -6,7 +6,7 @@ use serde_json::json;
 use xhttp_support::{
     TEST_UUID, assert_socks5_echo, create_test_dir, deterministic_payload,
     free_localhost_port, serial_xray_guard, start_chimera, start_tcp_echo_server,
-    start_xray, wait_for_tcp, workspace_root, write_json,
+    start_xray, wait_for_tcp, workspace_root, write_json, xray_binary,
 };
 
 #[derive(Clone, Copy)]
@@ -26,8 +26,16 @@ struct XhttpCase {
 }
 
 fn run_xhttp_case(case: XhttpCase) {
-    let _serial = serial_xray_guard();
     let workspace = workspace_root();
+    let xray = xray_binary(&workspace);
+    if !xray.is_file() {
+        eprintln!(
+            "skipping XHTTP Xray interoperability test because {} is unavailable; set XRAY_BIN to enable it",
+            xray.display()
+        );
+        return;
+    }
+    let _serial = serial_xray_guard();
     let work_dir = create_test_dir(case.name);
     let echo_addr = start_tcp_echo_server();
     let chimera_port = free_localhost_port();
@@ -161,7 +169,6 @@ macro_rules! xhttp_case {
      $data:literal, $header_limit:expr, $obfs:expr, $padding_place:literal,
      $padding_method:literal, $no_grpc:expr, $no_sse:expr) => {
         #[test]
-        #[ignore = "starts Chimera and Xray for one XHTTP interoperability matrix case"]
         fn $test() {
             run_xhttp_case(XhttpCase {
                 name: stringify!($test),
