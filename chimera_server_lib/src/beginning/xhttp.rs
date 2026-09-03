@@ -307,6 +307,12 @@ fn build_xhttp_h3_transport_config(
     config: &XhttpServerConfig,
 ) -> std::io::Result<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
+    // Current Xray's XHTTP/3 listener switches accepted QUIC connections to
+    // its standard BBR profile when congestion is left unset. Quinn defaults
+    // to Cubic, so select its BBR controller explicitly for the same default.
+    transport.congestion_controller_factory(Arc::new(
+        quinn::congestion::BbrConfig::default(),
+    ));
     apply_xray_xhttp_h3_initial_mtu(&mut transport);
     if let Some(max_idle_timeout_secs) = config.xray_max_idle_timeout_secs {
         let idle_timeout = std::time::Duration::from_secs(max_idle_timeout_secs)
