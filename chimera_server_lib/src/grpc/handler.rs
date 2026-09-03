@@ -1281,17 +1281,26 @@ impl HandlerServiceImpl {
                 })?;
                 let certificate_path = certificate.certificate_path.trim();
                 let private_key_path = certificate.key_path.trim();
-                if certificate_path.is_empty() || private_key_path.is_empty() {
+                if certificate_path.is_empty() && certificate.certificate.is_empty()
+                {
                     return Err(Status::invalid_argument(
-                        "tls AddInbound currently requires certificate_path and key_path",
+                        "tls AddInbound requires certificate_path or inline certificate PEM",
+                    ));
+                }
+                if private_key_path.is_empty() && certificate.key.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "tls AddInbound requires key_path or inline private key PEM",
                     ));
                 }
                 Ok(ServerProxyConfig::Tls(TlsServerConfig {
                     certificates: vec![TlsCertificateConfig {
-                        certificate_path: Some(certificate_path.to_string()),
+                        certificate_path: (!certificate_path.is_empty())
+                            .then(|| certificate_path.to_string()),
                         certificate_pem: certificate.certificate.clone(),
-                        key_path: Some(private_key_path.to_string()),
-                        key_pem: Some(certificate.key.clone()),
+                        key_path: (!private_key_path.is_empty())
+                            .then(|| private_key_path.to_string()),
+                        key_pem: (!certificate.key.is_empty())
+                            .then(|| certificate.key.clone()),
                         usage: TlsCertificateUsage::Encipherment,
                     }],
                     alpn_protocols: tls.next_protocol,
@@ -3903,6 +3912,146 @@ mod tests {
         assert!(matches!(inbound.protocol, ServerProxyConfig::Xhttp { .. }));
         assert!(runtime.stop_inbound_tasks(&tag).await);
         assert!(runtime.remove_inbound(&tag).is_some());
+    }
+
+    #[cfg(all(feature = "vless", feature = "tls"))]
+    #[test]
+    fn handler_parse_add_inbound_supports_xhttp_tls_h3() {
+        let service =
+            HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+        let user = proto::xray::common::protocol::User {
+            level: 0,
+            email: "xhttp-tls-user@example.com".to_string(),
+            account: Some(HandlerServiceImpl::typed_message(
+                TYPE_PROXY_VLESS_ACCOUNT,
+                VlessAccountPayload {
+                    id: "9199ca5b-1850-4ae6-a4fa-fd6384073692".to_string(),
+                    flow: String::new(),
+                },
+            )),
+        };
+        let parsed = service
+            .parse_add_inbound(proto::xray::core::InboundHandlerConfig {
+                tag: unique_tag("xhttp-tls"),
+                receiver_settings: Some(build_receiver_settings(
+                    2443,
+                    Some(StreamConfigPayload {
+                        protocol_name: "xhttp".to_string(),
+                        transport_settings: vec![TransportConfigPayload {
+                            protocol_name: "xhttp".to_string(),
+                            settings: Some(HandlerServiceImpl::typed_message(
+                                TYPE_TRANSPORT_XHTTP_CONFIG,
+                                XhttpConfigPayload {
+                                    path: "/h3".to_string(),
+                                    ..XhttpConfigPayload::default()
+                                },
+                            )),
+                        }],
+                        security_type: "tls".to_string(),
+                        security_settings: vec![HandlerServiceImpl::typed_message(
+                            TYPE_TRANSPORT_TLS_CONFIG,
+                            TlsConfigPayload {
+                                certificate: vec![TlsCertificatePayload {
+                                    certificate: b"inline-certificate".to_vec(),
+                                    key: b"inline-private-key".to_vec(),
+                                    certificate_path: String::new(),
+                                    key_path: String::new(),
+                                }],
+                                next_protocol: vec!["h3".to_string()],
+                            },
+                        )],
+                        quic_params: None,
+                    }),
+                )),
+                proxy_settings: Some(HandlerServiceImpl::typed_message(
+                    TYPE_PROXY_VLESS_INBOUND_CONFIG,
+                    VlessInboundConfigPayload {
+                        clients: vec![user],
+                    },
+                )),
+            })
+            .expect("xhttp TLS inbound should parse");
+
+        let ServerProxyConfig::Tls(tls) = parsed.protocol else {
+            panic!("expected TLS outer layer");
+        };
+        assert_eq!(tls.alpn_protocols, vec!["h3"]);
+        assert!(matches!(
+            tls.inner.as_ref(),
+            ServerProxyConfig::Xhttp { config, inner }
+                if config.path == "/h3/"
+                    && matches!(inner.as_ref(), ServerProxyConfig::Vless { users, .. } if users.len() == 1)
+        ));
+    }
+
+    #[cfg(all(feature = "vless", feature = "reality"))]
+    #[test]
+    fn handler_parse_add_inbound_supports_xhttp_reality() {
+        let service =
+            HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+        let user = proto::xray::common::protocol::User {
+            level: 0,
+            email: "xhttp-reality-user@example.com".to_string(),
+            account: Some(HandlerServiceImpl::typed_message(
+                TYPE_PROXY_VLESS_ACCOUNT,
+                VlessAccountPayload {
+                    id: "9199ca5b-1850-4ae6-a4fa-fd6384073692".to_string(),
+                    flow: String::new(),
+                },
+            )),
+        };
+        let parsed = service
+            .parse_add_inbound(proto::xray::core::InboundHandlerConfig {
+                tag: unique_tag("xhttp-reality"),
+                receiver_settings: Some(build_receiver_settings(
+                    2443,
+                    Some(StreamConfigPayload {
+                        protocol_name: "xhttp".to_string(),
+                        transport_settings: vec![TransportConfigPayload {
+                            protocol_name: "xhttp".to_string(),
+                            settings: Some(HandlerServiceImpl::typed_message(
+                                TYPE_TRANSPORT_XHTTP_CONFIG,
+                                XhttpConfigPayload {
+                                    path: "/reality".to_string(),
+                                    ..XhttpConfigPayload::default()
+                                },
+                            )),
+                        }],
+                        security_type: "reality".to_string(),
+                        security_settings: vec![HandlerServiceImpl::typed_message(
+                            TYPE_TRANSPORT_REALITY_CONFIG,
+                            RealityConfigPayload {
+                                dest: "www.example.com:443".to_string(),
+                                server_names: vec!["www.example.com".to_string()],
+                                private_key: vec![7; 32],
+                                min_client_ver: Vec::new(),
+                                max_client_ver: Vec::new(),
+                                max_time_diff: 30,
+                                short_ids: vec![vec![1, 2, 3, 4, 5, 6, 7, 8]],
+                            },
+                        )],
+                        quic_params: None,
+                    }),
+                )),
+                proxy_settings: Some(HandlerServiceImpl::typed_message(
+                    TYPE_PROXY_VLESS_INBOUND_CONFIG,
+                    VlessInboundConfigPayload {
+                        clients: vec![user],
+                    },
+                )),
+            })
+            .expect("xhttp Reality inbound should parse");
+
+        let ServerProxyConfig::Reality(reality) = parsed.protocol else {
+            panic!("expected Reality outer layer");
+        };
+        assert_eq!(reality.dest.to_string(), "www.example.com:443");
+        assert!(matches!(
+            reality.inner.as_ref(),
+            ServerProxyConfig::Xhttp { config, inner }
+                if config.path == "/reality/"
+                    && matches!(inner.as_ref(), ServerProxyConfig::Vless { users, .. } if users.len() == 1)
+        ));
     }
 
     #[cfg(feature = "vmess")]
