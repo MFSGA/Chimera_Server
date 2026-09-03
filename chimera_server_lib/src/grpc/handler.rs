@@ -4055,6 +4055,93 @@ mod tests {
         ));
     }
 
+    #[cfg(all(feature = "vless", feature = "tls"))]
+    #[tokio::test]
+    async fn handler_add_inbound_starts_xhttp_h3_listener() {
+        let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider()
+            .install_default();
+        let generated =
+            rcgen::generate_simple_self_signed(["localhost".to_string()])
+                .expect("generate test certificate");
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let service = HandlerServiceImpl::new(runtime.clone());
+        let tag = unique_tag("xhttp-h3-runtime");
+        let request = proto::xray::app::proxyman::command::AddInboundRequest {
+            inbound: Some(proto::xray::core::InboundHandlerConfig {
+                tag: tag.clone(),
+                receiver_settings: Some(build_receiver_settings(
+                    free_localhost_port(),
+                    Some(StreamConfigPayload {
+                        protocol_name: "xhttp".to_string(),
+                        transport_settings: vec![TransportConfigPayload {
+                            protocol_name: "xhttp".to_string(),
+                            settings: Some(HandlerServiceImpl::typed_message(
+                                TYPE_TRANSPORT_XHTTP_CONFIG,
+                                XhttpConfigPayload {
+                                    path: "/h3".to_string(),
+                                    ..XhttpConfigPayload::default()
+                                },
+                            )),
+                        }],
+                        security_type: "tls".to_string(),
+                        security_settings: vec![HandlerServiceImpl::typed_message(
+                            TYPE_TRANSPORT_TLS_CONFIG,
+                            TlsConfigPayload {
+                                certificate: vec![TlsCertificatePayload {
+                                    certificate: generated.cert.pem().into_bytes(),
+                                    key: generated
+                                        .signing_key
+                                        .serialize_pem()
+                                        .into_bytes(),
+                                    certificate_path: String::new(),
+                                    key_path: String::new(),
+                                }],
+                                next_protocol: vec!["h3".to_string()],
+                            },
+                        )],
+                        quic_params: Some(QuicParamsPayload {
+                            congestion: String::new(),
+                            bbr_profile: String::new(),
+                            init_stream_receive_window: 2 * 1024 * 1024,
+                            max_stream_receive_window: 6 * 1024 * 1024,
+                            init_connection_receive_window: 3 * 1024 * 1024,
+                            max_connection_receive_window: 15 * 1024 * 1024,
+                            max_idle_timeout: 30,
+                            keep_alive_period: 5,
+                            disable_path_mtu_discovery: false,
+                            max_incoming_streams: 16,
+                        }),
+                    }),
+                )),
+                proxy_settings: Some(HandlerServiceImpl::typed_message(
+                    TYPE_PROXY_VLESS_INBOUND_CONFIG,
+                    VlessInboundConfigPayload {
+                        clients: vec![proto::xray::common::protocol::User {
+                            level: 0,
+                            email: "xhttp-h3-user@example.com".to_string(),
+                            account: Some(HandlerServiceImpl::typed_message(
+                                TYPE_PROXY_VLESS_ACCOUNT,
+                                VlessAccountPayload {
+                                    id: "9199ca5b-1850-4ae6-a4fa-fd6384073692"
+                                        .to_string(),
+                                    flow: String::new(),
+                                },
+                            )),
+                        }],
+                    },
+                )),
+            }),
+        };
+
+        service
+            .add_inbound(Request::new(request))
+            .await
+            .expect("xhttp H3 AddInbound should start");
+        assert!(runtime.inbound_by_tag(&tag).is_some());
+        assert!(runtime.stop_inbound_tasks(&tag).await);
+        assert!(runtime.remove_inbound(&tag).is_some());
+    }
+
     #[cfg(all(feature = "vless", feature = "reality"))]
     #[test]
     fn handler_parse_add_inbound_supports_xhttp_reality() {
