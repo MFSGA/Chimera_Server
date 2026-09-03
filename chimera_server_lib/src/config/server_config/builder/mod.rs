@@ -1226,6 +1226,24 @@ impl TryFrom<InboudItem> for ServerConfig {
                                     )));
                                 }
                             }
+                            let bbr_profile = quic_params.bbr_profile.to_ascii_lowercase();
+                            match bbr_profile.as_str() {
+                                "" | "standard" => {}
+                                "conservative" | "aggressive"
+                                    if matches!(congestion.as_str(), "reno" | "force-brutal") => {}
+                                "conservative" | "aggressive" => {
+                                    return Err(Error::InvalidConfig(
+                                        "finalmask.quicParams.bbrProfile conservative/aggressive is not supported when Xray may use BBR"
+                                            .into(),
+                                    ));
+                                }
+                                _ => {
+                                    return Err(Error::InvalidConfig(format!(
+                                        "finalmask.quicParams.bbrProfile must be one of conservative, standard, aggressive (got {})",
+                                        quic_params.bbr_profile
+                                    )));
+                                }
+                            }
                             let brutal_up =
                                 parse_xray_finalmask_bandwidth(&quic_params.brutal_up)?;
                             if brutal_up > 0 && brutal_up < 65_536 {
@@ -2994,6 +3012,27 @@ mod tests {
         assert_eq!(config.xray_disable_path_mtu_discovery, Some(true));
     }
 
+    #[cfg(feature = "vless")]
+    fn xhttp_inbound_with_quic_params(quic_params: serde_json::Value) -> InboudItem {
+        serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 443,
+            "protocol": "vless",
+            "tag": "xhttp-quic-params",
+            "settings": {
+                "clients": [{ "id": "3ac9b383-75a1-431c-8184-106c80eb2273" }],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "xhttp",
+                "security": "none",
+                "xhttpSettings": { "path": "/xhttp" },
+                "finalmask": { "quicParams": quic_params }
+            }
+        }))
+        .expect("valid XHTTP inbound")
+    }
+
     #[cfg(all(feature = "tls", feature = "vless"))]
     #[test]
     fn vless_xhttp_accepts_xray_force_brutal_configuration() {
@@ -3037,6 +3076,53 @@ mod tests {
         };
         assert_eq!(config.xray_congestion.as_deref(), Some("force-brutal"));
         assert_eq!(config.xray_brutal_up, Some(1024 * 1024));
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn vless_xhttp_validates_xray_bbr_profile_without_fake_parity() {
+        for (congestion, profile) in
+            [("reno", "aggressive"), ("force-brutal", "conservative")]
+        {
+            let mut quic_params = serde_json::json!({
+                "congestion": congestion,
+                "bbrProfile": profile,
+            });
+            if congestion == "force-brutal" {
+                quic_params["brutalUp"] = serde_json::json!("8 mbps");
+            }
+            let inbound = xhttp_inbound_with_quic_params(quic_params);
+            ServerConfig::try_from(inbound)
+                .expect("BBR profile is inert when Xray does not use BBR");
+        }
+
+        for profile in ["conservative", "aggressive"] {
+            let inbound = xhttp_inbound_with_quic_params(serde_json::json!({
+                "congestion": "bbr",
+                "bbrProfile": profile,
+            }));
+            let err = ServerConfig::try_from(inbound).expect_err(
+                "unsupported active Xray BBR profile must not be silently ignored",
+            );
+            assert!(
+                err.to_string().contains(
+                    "finalmask.quicParams.bbrProfile conservative/aggressive is not supported when Xray may use BBR"
+                ),
+                "unexpected error: {err}"
+            );
+        }
+
+        let inbound = xhttp_inbound_with_quic_params(serde_json::json!({
+            "bbrProfile": "turbo",
+        }));
+        let err = ServerConfig::try_from(inbound)
+            .expect_err("Xray-invalid BBR profile must fail");
+        assert!(
+            err.to_string().contains(
+                "finalmask.quicParams.bbrProfile must be one of conservative, standard, aggressive"
+            ),
+            "unexpected error: {err}"
+        );
     }
 
     #[cfg(feature = "vless")]
