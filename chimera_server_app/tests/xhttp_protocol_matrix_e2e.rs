@@ -121,7 +121,6 @@ fn request(
 }
 
 #[test]
-#[ignore = "starts Chimera and validates XHTTP OPTIONS/CORS semantics"]
 fn options_reflects_cors_and_returns_padding() {
     let _serial = serial_xray_guard();
     let (_server, addr) = start_server("options-cors", ServerOptions::default());
@@ -157,7 +156,6 @@ fn options_reflects_cors_and_returns_padding() {
 }
 
 #[test]
-#[ignore = "starts Chimera and validates XHTTP host rejection"]
 fn wrong_host_returns_404_before_padding_validation() {
     let _serial = serial_xray_guard();
     let options = ServerOptions {
@@ -173,7 +171,6 @@ fn wrong_host_returns_404_before_padding_validation() {
 }
 
 #[test]
-#[ignore = "starts Chimera and validates XHTTP path rejection"]
 fn wrong_path_returns_404_before_padding_validation() {
     let _serial = serial_xray_guard();
     let (_server, addr) = start_server("wrong-path", ServerOptions::default());
@@ -183,7 +180,6 @@ fn wrong_path_returns_404_before_padding_validation() {
 }
 
 #[test]
-#[ignore = "starts Chimera and validates required XHTTP padding"]
 fn missing_or_short_padding_returns_400() {
     let _serial = serial_xray_guard();
     let (_server, addr) = start_server("invalid-padding", ServerOptions::default());
@@ -198,7 +194,6 @@ fn missing_or_short_padding_returns_400() {
 }
 
 #[test]
-#[ignore = "starts Chimera and validates current Xray uplink method dispatch"]
 fn current_xray_packet_uplink_method_dispatch_returns_200() {
     let _serial = serial_xray_guard();
     let options = ServerOptions {
@@ -221,7 +216,6 @@ fn current_xray_packet_uplink_method_dispatch_returns_200() {
 }
 
 #[test]
-#[ignore = "starts Chimera and validates current Xray packet-up cache headers"]
 fn packet_up_without_body_disables_caching_like_current_xray() {
     let _serial = serial_xray_guard();
     let options = ServerOptions {
@@ -245,7 +239,6 @@ fn packet_up_without_body_disables_caching_like_current_xray() {
 }
 
 #[test]
-#[ignore = "starts Chimera and validates packet-up sequence parsing"]
 fn invalid_packet_sequence_returns_500() {
     let _serial = serial_xray_guard();
     let options = ServerOptions {
@@ -265,7 +258,6 @@ fn invalid_packet_sequence_returns_500() {
 }
 
 #[test]
-#[ignore = "starts Chimera and validates Content-Length limits"]
 fn oversized_content_length_returns_413() {
     let _serial = serial_xray_guard();
     let options = ServerOptions {
@@ -286,7 +278,6 @@ fn oversized_content_length_returns_413() {
 }
 
 #[test]
-#[ignore = "starts Chimera and validates chunked-body limits"]
 fn oversized_chunked_body_returns_413() {
     let _serial = serial_xray_guard();
     let options = ServerOptions {
@@ -303,7 +294,6 @@ fn oversized_chunked_body_returns_413() {
 }
 
 #[test]
-#[ignore = "starts Chimera and validates mode-specific request rejection"]
 fn stream_up_request_in_packet_mode_returns_400() {
     let _serial = serial_xray_guard();
     let options = ServerOptions {
@@ -320,7 +310,6 @@ fn stream_up_request_in_packet_mode_returns_400() {
 }
 
 #[test]
-#[ignore = "starts Chimera and validates duplicate stream-up rejection"]
 fn duplicate_stream_up_returns_409() {
     let _serial = serial_xray_guard();
     let options = ServerOptions {
@@ -349,7 +338,6 @@ fn duplicate_stream_up_returns_409() {
 }
 
 #[test]
-#[ignore = "starts Chimera and validates current Xray packet-to-stream upload transition"]
 fn packet_then_stream_up_is_allowed_like_current_xray() {
     let _serial = serial_xray_guard();
     let (_server, addr) =
@@ -397,7 +385,6 @@ fn packet_then_stream_up_is_allowed_like_current_xray() {
 }
 
 #[test]
-#[ignore = "starts Chimera and validates custom header padding"]
 fn custom_header_padding_roundtrips() {
     let _serial = serial_xray_guard();
     let options = ServerOptions {
@@ -418,7 +405,6 @@ fn custom_header_padding_roundtrips() {
 }
 
 #[test]
-#[ignore = "starts Chimera and validates cookie padding/CORS credentials"]
 fn cookie_padding_roundtrips_with_credentials() {
     let _serial = serial_xray_guard();
     let options = ServerOptions {
