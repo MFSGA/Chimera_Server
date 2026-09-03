@@ -432,6 +432,8 @@ pub struct XhttpServerConfig {
     pub uplink_data_placement: XhttpDataPlacement,
     pub uplink_data_key: String,
     #[serde(default)]
+    pub xray_congestion: Option<String>,
+    #[serde(default)]
     pub xray_max_idle_timeout_secs: Option<u64>,
     #[serde(default)]
     pub xray_max_incoming_streams: Option<u64>,

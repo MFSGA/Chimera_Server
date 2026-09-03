@@ -316,6 +316,7 @@ mod tests {
                     uplink_data_placement:
                         crate::config::server_config::XhttpDataPlacement::Auto,
                     uplink_data_key: "X-Data".into(),
+                    xray_congestion: None,
                     xray_max_idle_timeout_secs: None,
                     xray_max_incoming_streams: None,
                     xray_init_stream_receive_window: None,

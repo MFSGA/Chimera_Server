@@ -1208,6 +1208,24 @@ impl TryFrom<InboudItem> for ServerConfig {
                             .as_ref()
                             .and_then(|final_mask| final_mask.quic_params.as_ref())
                         {
+                            let congestion = quic_params.congestion.to_ascii_lowercase();
+                            match congestion.as_str() {
+                                "" | "reno" | "bbr" => {
+                                    xhttp_config.xray_congestion = Some(congestion);
+                                }
+                                "brutal" | "force-brutal" => {
+                                    return Err(Error::InvalidConfig(format!(
+                                        "finalmask.quicParams.congestion={} is not supported for XHTTP yet",
+                                        quic_params.congestion
+                                    )));
+                                }
+                                _ => {
+                                    return Err(Error::InvalidConfig(format!(
+                                        "finalmask.quicParams.congestion must be one of reno, bbr, brutal, force-brutal (got {})",
+                                        quic_params.congestion
+                                    )));
+                                }
+                            }
                             let max_idle_timeout = quic_params.max_idle_timeout;
                             if max_idle_timeout != 0 && !(4..=120).contains(&max_idle_timeout) {
                                 return Err(Error::InvalidConfig(format!(
@@ -2929,6 +2947,7 @@ mod tests {
                 },
                 "finalmask": {
                     "quicParams": {
+                        "congestion": "RENO",
                         "maxIdleTimeout": 45,
                         "maxIncomingStreams": 64,
                         "initStreamReceiveWindow": 32768,
@@ -2951,6 +2970,7 @@ mod tests {
         let ServerProxyConfig::Xhttp { config, .. } = *tls.inner else {
             panic!("expected XHTTP inside TLS");
         };
+        assert_eq!(config.xray_congestion.as_deref(), Some("reno"));
         assert_eq!(config.xray_max_idle_timeout_secs, Some(45));
         assert_eq!(config.xray_max_incoming_streams, Some(64));
         assert_eq!(config.xray_init_stream_receive_window, Some(32_768));
