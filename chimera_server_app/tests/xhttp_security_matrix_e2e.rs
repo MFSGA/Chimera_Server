@@ -277,36 +277,38 @@ fn xray_stream_settings(
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "starts Chimera and Xray for XHTTP without a security wrapper"]
-async fn xhttp_security_none() {
-    run_security_case(SecurityCase::None).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "starts Chimera and Xray for XHTTP over TLS"]
-async fn xhttp_security_tls() {
-    run_security_case(SecurityCase::Tls).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn xhttp_security_http3() {
+async fn run_xray_security_case(case: SecurityCase) {
     let workspace = workspace_root();
     let xray = xray_binary(&workspace);
     if !xray.is_file() {
         eprintln!(
-            "skipping XHTTP/3 Xray interoperability test because {} is unavailable; set XRAY_BIN to enable it",
+            "skipping XHTTP {} Xray interoperability test because {} is unavailable; set XRAY_BIN to enable it",
+            case.name(),
             xray.display()
         );
         return;
     }
-    run_security_case(SecurityCase::Http3).await;
+    run_security_case(case).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "starts Chimera and Xray for XHTTP over REALITY"]
+async fn xhttp_security_none() {
+    run_xray_security_case(SecurityCase::None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn xhttp_security_tls() {
+    run_xray_security_case(SecurityCase::Tls).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn xhttp_security_http3() {
+    run_xray_security_case(SecurityCase::Http3).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn xhttp_security_reality() {
-    run_security_case(SecurityCase::Reality).await;
+    run_xray_security_case(SecurityCase::Reality).await;
 }
 
 async fn start_tls13_dest(cert_path: &Path, key_path: &Path) -> SocketAddr {
