@@ -81,7 +81,7 @@ async fn run_security_case(case: SecurityCase) {
         "seqKey": "x_security_seq",
         "uplinkDataPlacement": "body"
     });
-    let xray_xhttp_settings = json!({
+    let mut xray_xhttp_settings = json!({
         "path": "/xhttp",
         "mode": case.mode(),
         "noGRPCHeader": true,
@@ -93,6 +93,11 @@ async fn run_security_case(case: SecurityCase) {
         "seqKey": "x_security_seq",
         "uplinkDataPlacement": "body"
     });
+    if matches!(case, SecurityCase::Http3) {
+        xray_xhttp_settings["headers"] = json!({
+            "X-H3-Large-Header": "a".repeat(16 * 1024)
+        });
+    }
 
     write_json(
         &chimera_config_path,
