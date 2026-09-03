@@ -3860,6 +3860,7 @@ mod tests {
         let runtime = RuntimeState::new(Vec::new(), Vec::new());
         let service = HandlerServiceImpl::new(runtime.clone());
         let tag = unique_tag("xhttp-runtime");
+        let port = free_localhost_port();
         let user = proto::xray::common::protocol::User {
             level: 0,
             email: "xhttp-runtime-user@example.com".to_string(),
@@ -3875,7 +3876,7 @@ mod tests {
             inbound: Some(proto::xray::core::InboundHandlerConfig {
                 tag: tag.clone(),
                 receiver_settings: Some(build_receiver_settings(
-                    free_localhost_port(),
+                    port,
                     Some(StreamConfigPayload {
                         protocol_name: "xhttp".to_string(),
                         transport_settings: vec![TransportConfigPayload {
@@ -3910,6 +3911,76 @@ mod tests {
             .inbound_by_tag(&tag)
             .expect("xhttp inbound should be registered");
         assert!(matches!(inbound.protocol, ServerProxyConfig::Xhttp { .. }));
+
+        let added_email = unique_tag("xhttp-added-user");
+        let add_operation = proto::xray::app::proxyman::command::AddUserOperation {
+            user: Some(proto::xray::common::protocol::User {
+                level: 0,
+                email: added_email.clone(),
+                account: Some(HandlerServiceImpl::typed_message(
+                    TYPE_PROXY_VLESS_ACCOUNT,
+                    VlessAccountPayload {
+                        id: "bcd643ce-d9c8-50bb-b026-89d256010162".to_string(),
+                        flow: String::new(),
+                    },
+                )),
+            }),
+        };
+        service
+            .alter_inbound(Request::new(
+                proto::xray::app::proxyman::command::AlterInboundRequest {
+                    tag: tag.clone(),
+                    operation: Some(HandlerServiceImpl::typed_message(
+                        TYPE_ADD_USER_OPERATION,
+                        add_operation,
+                    )),
+                },
+            ))
+            .await
+            .expect("xhttp add user should restart listener");
+        let users = service
+            .get_inbound_users(Request::new(
+                proto::xray::app::proxyman::command::GetInboundUserRequest {
+                    tag: tag.clone(),
+                    email: String::new(),
+                },
+            ))
+            .await
+            .expect("xhttp users should be available after add")
+            .into_inner()
+            .users;
+        assert_eq!(users.len(), 2);
+        assert!(users.iter().any(|user| user.email == added_email));
+
+        let remove_operation =
+            proto::xray::app::proxyman::command::RemoveUserOperation {
+                email: added_email.clone(),
+            };
+        service
+            .alter_inbound(Request::new(
+                proto::xray::app::proxyman::command::AlterInboundRequest {
+                    tag: tag.clone(),
+                    operation: Some(HandlerServiceImpl::typed_message(
+                        TYPE_REMOVE_USER_OPERATION,
+                        remove_operation,
+                    )),
+                },
+            ))
+            .await
+            .expect("xhttp remove user should restart listener");
+        let users = service
+            .get_inbound_users(Request::new(
+                proto::xray::app::proxyman::command::GetInboundUserRequest {
+                    tag: tag.clone(),
+                    email: String::new(),
+                },
+            ))
+            .await
+            .expect("xhttp users should be available after remove")
+            .into_inner()
+            .users;
+        assert_eq!(users.len(), 1);
+        assert!(!users.iter().any(|user| user.email == added_email));
         assert!(runtime.stop_inbound_tasks(&tag).await);
         assert!(runtime.remove_inbound(&tag).is_some());
     }
