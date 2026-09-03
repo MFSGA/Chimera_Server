@@ -27,11 +27,13 @@ use rand::RngExt;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex},
     sync::{mpsc, oneshot},
+    task::JoinSet,
     time::{Duration, sleep},
 };
 #[cfg(feature = "tls")]
 use tokio_rustls::TlsAcceptor;
 use tokio_util::io::ReaderStream;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
 use crate::{
@@ -69,6 +71,14 @@ type H3BidiRequestStream =
 type H3SendRequestStream =
     h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
 type H3RecvRequestStream = h3::server::RequestStream<h3_quinn::RecvStream, Bytes>;
+
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
 
 /// Adapts the receive half of an HTTP/3 request stream to the `http_body::Body`
 /// interface used by the transport-neutral XHTTP request dispatcher.
@@ -190,6 +200,7 @@ pub async fn start_xhttp_server(
         &mut rules_stack,
     )?);
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let shutdown = CancellationToken::new();
     #[cfg(feature = "tls")]
     let h3_transport_config =
         build_xhttp_h3_transport_config(&listener_config.xhttp_config)?;
@@ -198,6 +209,7 @@ pub async fn start_xhttp_server(
         server_handler,
         resolver,
         runtime,
+        shutdown.clone(),
     ));
     #[cfg(feature = "tls")]
     if let XhttpSecurityLayer::H3Tls(server_config) = listener_config.security {
@@ -214,56 +226,67 @@ pub async fn start_xhttp_server(
     let security = listener_config.security.clone();
 
     let handle = tokio::spawn(async move {
+        let _cancel_on_drop = CancelOnDrop(shutdown);
+        let mut connections = JoinSet::new();
         loop {
-            let (stream, peer_addr) = match listener.accept().await {
-                Ok(pair) => pair,
-                Err(err) => {
-                    error!("xhttp accept failed: {}", err);
-                    continue;
-                }
-            };
-            let _ = stream.set_nodelay(true);
-            let local_addr = match stream.local_addr() {
-                Ok(addr) => addr,
-                Err(err) => {
-                    error!("xhttp local address for {} failed: {}", peer_addr, err);
-                    continue;
-                }
-            };
-
-            let state = state.clone();
-            let security = security.clone();
-            tokio::spawn(async move {
-                let stream: Box<dyn AsyncStream> = Box::new(stream);
-                let wrapped_stream: std::io::Result<Box<dyn AsyncStream>> =
-                    match security {
-                        XhttpSecurityLayer::None => Ok(stream),
-                        #[cfg(feature = "tls")]
-                        XhttpSecurityLayer::Tls(acceptor) => {
-                            accept_xhttp_tls(acceptor, stream).await
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, peer_addr) = match accepted {
+                        Ok(pair) => pair,
+                        Err(err) => {
+                            error!("xhttp accept failed: {}", err);
+                            continue;
                         }
-                        #[cfg(feature = "tls")]
-                        XhttpSecurityLayer::H3Tls(_) => unreachable!(
-                            "HTTP/3 XHTTP listener is dispatched before TCP accept"
-                        ),
-                        #[cfg(feature = "reality")]
-                        XhttpSecurityLayer::Reality(config) => {
-                            accept_reality_stream(stream, &config).await.map(
-                                |stream| Box::new(stream) as Box<dyn AsyncStream>,
-                            )
+                    };
+                    let _ = stream.set_nodelay(true);
+                    let local_addr = match stream.local_addr() {
+                        Ok(addr) => addr,
+                        Err(err) => {
+                            error!("xhttp local address for {} failed: {}", peer_addr, err);
+                            continue;
                         }
                     };
 
-                match wrapped_stream {
-                    Ok(stream) => {
-                        serve_http_connection(stream, state, peer_addr, local_addr)
-                            .await
-                    }
-                    Err(err) => {
-                        error!("xhttp accept {} failed: {}", peer_addr, err);
+                    let state = state.clone();
+                    let security = security.clone();
+                    connections.spawn(async move {
+                        let stream: Box<dyn AsyncStream> = Box::new(stream);
+                        let wrapped_stream: std::io::Result<Box<dyn AsyncStream>> =
+                            match security {
+                                XhttpSecurityLayer::None => Ok(stream),
+                                #[cfg(feature = "tls")]
+                                XhttpSecurityLayer::Tls(acceptor) => {
+                                    accept_xhttp_tls(acceptor, stream).await
+                                }
+                                #[cfg(feature = "tls")]
+                                XhttpSecurityLayer::H3Tls(_) => unreachable!(
+                                    "HTTP/3 XHTTP listener is dispatched before TCP accept"
+                                ),
+                                #[cfg(feature = "reality")]
+                                XhttpSecurityLayer::Reality(config) => {
+                                    accept_reality_stream(stream, &config).await.map(
+                                        |stream| Box::new(stream) as Box<dyn AsyncStream>,
+                                    )
+                                }
+                            };
+
+                        match wrapped_stream {
+                            Ok(stream) => {
+                                serve_http_connection(stream, state, peer_addr, local_addr)
+                                    .await
+                            }
+                            Err(err) => {
+                                error!("xhttp accept {} failed: {}", peer_addr, err);
+                            }
+                        }
+                    });
+                }
+                result = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(err)) = result {
+                        error!("xhttp connection task failed: {}", err);
                     }
                 }
-            });
+            }
         }
     });
 
@@ -380,78 +403,102 @@ async fn start_xhttp_h3_server(
     let listener_addr = endpoint.local_addr()?;
 
     let handle = tokio::spawn(async move {
-        while let Some(incoming) = endpoint.accept().await {
-            let state = state.clone();
-            tokio::spawn(async move {
-                let local_addr = xhttp_h3_connection_local_addr(
-                    listener_addr,
-                    incoming.local_ip(),
-                );
-                let connection = match incoming.await {
-                    Ok(connection) => connection,
-                    Err(err) => {
-                        debug!("xhttp H3 QUIC handshake failed: {}", err);
-                        return;
-                    }
-                };
-                let peer_addr = connection.remote_address();
-                let h3_quinn_connection = h3_quinn::Connection::new(connection);
-                let mut h3_builder = h3::server::builder();
-                // Xray's quic-go HTTP/3 server uses Go's http.DefaultMaxHeaderBytes,
-                // advertises extended CONNECT, and doesn't emit HTTP/3 GREASE values.
-                h3_builder
-                    .max_field_section_size(XRAY_XHTTP_H3_MAX_FIELD_SECTION_SIZE)
-                    .enable_extended_connect(true)
-                    .send_grease(false);
-                let mut h3_connection =
-                    match h3_builder.build(h3_quinn_connection).await {
-                        Ok(connection) => connection,
-                        Err(err) => {
-                            debug!(
-                                "xhttp H3 connection setup from {} failed: {}",
-                                peer_addr, err
-                            );
-                            return;
-                        }
-                    };
-
-                loop {
-                    let resolver = match h3_connection.accept().await {
-                        Ok(Some(resolver)) => resolver,
-                        Ok(None) => break,
-                        Err(err) => {
-                            debug!(
-                                "xhttp H3 accept from {} failed: {}",
-                                peer_addr, err
-                            );
-                            break;
-                        }
-                    };
-                    let (request, stream) = match resolver.resolve_request().await {
-                        Ok(request) => request,
-                        Err(err) => {
-                            debug!(
-                                "xhttp H3 request from {} failed: {}",
-                                peer_addr, err
-                            );
-                            continue;
-                        }
+        let _cancel_on_drop = CancelOnDrop(state.shutdown.clone());
+        let mut connections = JoinSet::new();
+        loop {
+            tokio::select! {
+                incoming = endpoint.accept() => {
+                    let Some(incoming) = incoming else {
+                        break;
                     };
                     let state = state.clone();
-                    tokio::spawn(async move {
-                        if let Err(err) = handle_h3_request_stream(
-                            request, stream, state, peer_addr, local_addr,
-                        )
-                        .await
-                        {
-                            debug!(
-                                "xhttp H3 response to {} failed: {}",
-                                peer_addr, err
-                            );
+                    connections.spawn(async move {
+                        let local_addr = xhttp_h3_connection_local_addr(
+                            listener_addr,
+                            incoming.local_ip(),
+                        );
+                        let connection = match incoming.await {
+                            Ok(connection) => connection,
+                            Err(err) => {
+                                debug!("xhttp H3 QUIC handshake failed: {}", err);
+                                return;
+                            }
+                        };
+                        let peer_addr = connection.remote_address();
+                        let h3_quinn_connection = h3_quinn::Connection::new(connection);
+                        let mut h3_builder = h3::server::builder();
+                        // Xray's quic-go HTTP/3 server uses Go's http.DefaultMaxHeaderBytes,
+                        // advertises extended CONNECT, and doesn't emit HTTP/3 GREASE values.
+                        h3_builder
+                            .max_field_section_size(XRAY_XHTTP_H3_MAX_FIELD_SECTION_SIZE)
+                            .enable_extended_connect(true)
+                            .send_grease(false);
+                        let mut h3_connection =
+                            match h3_builder.build(h3_quinn_connection).await {
+                                Ok(connection) => connection,
+                                Err(err) => {
+                                    debug!(
+                                        "xhttp H3 connection setup from {} failed: {}",
+                                        peer_addr, err
+                                    );
+                                    return;
+                                }
+                            };
+                        let mut requests = JoinSet::new();
+
+                        loop {
+                            tokio::select! {
+                                resolved = h3_connection.accept() => {
+                                    let resolver = match resolved {
+                                        Ok(Some(resolver)) => resolver,
+                                        Ok(None) => break,
+                                        Err(err) => {
+                                            debug!(
+                                                "xhttp H3 accept from {} failed: {}",
+                                                peer_addr, err
+                                            );
+                                            break;
+                                        }
+                                    };
+                                    let (request, stream) = match resolver.resolve_request().await {
+                                        Ok(request) => request,
+                                        Err(err) => {
+                                            debug!(
+                                                "xhttp H3 request from {} failed: {}",
+                                                peer_addr, err
+                                            );
+                                            continue;
+                                        }
+                                    };
+                                    let state = state.clone();
+                                    requests.spawn(async move {
+                                        if let Err(err) = handle_h3_request_stream(
+                                            request, stream, state, peer_addr, local_addr,
+                                        )
+                                        .await
+                                        {
+                                            debug!(
+                                                "xhttp H3 response to {} failed: {}",
+                                                peer_addr, err
+                                            );
+                                        }
+                                    });
+                                }
+                                result = requests.join_next(), if !requests.is_empty() => {
+                                    if let Some(Err(err)) = result {
+                                        debug!("xhttp H3 request task failed: {}", err);
+                                    }
+                                }
+                            }
                         }
                     });
                 }
-            });
+                result = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(err)) = result {
+                        debug!("xhttp H3 connection task failed: {}", err);
+                    }
+                }
+            }
         }
     });
 
@@ -675,6 +722,7 @@ struct AppState {
     server_handler: Arc<Box<dyn TcpServerHandler>>,
     resolver: Arc<dyn Resolver>,
     runtime: RuntimeState,
+    shutdown: CancellationToken,
     sessions: SessionStore,
 }
 
@@ -684,6 +732,7 @@ impl AppState {
         server_handler: Arc<Box<dyn TcpServerHandler>>,
         resolver: Arc<dyn Resolver>,
         runtime: RuntimeState,
+        shutdown: CancellationToken,
     ) -> Self {
         Self {
             mode: config.mode,
@@ -715,9 +764,11 @@ impl AppState {
             server_handler,
             resolver,
             runtime,
+            shutdown: shutdown.clone(),
             sessions: SessionStore::new(
                 Duration::from_secs(config.session_ttl_secs),
                 config.max_buffered_posts,
+                shutdown,
             ),
         }
     }
@@ -991,18 +1042,24 @@ where
     spawn_handler_stream(logical_stream, state.clone(), peer_addr, local_addr);
 
     let mut upload_writer = client_upload;
+    let shutdown = state.shutdown.clone();
     tokio::spawn(async move {
-        while let Some(frame_result) = body.frame().await {
-            match frame_result {
-                Ok(frame) => {
-                    if let Some(chunk) = frame.data_ref()
-                        && upload_writer.write_all(chunk).await.is_err()
-                    {
-                        break;
+        tokio::select! {
+            _ = shutdown.cancelled() => {}
+            _ = async {
+                while let Some(frame_result) = body.frame().await {
+                    match frame_result {
+                        Ok(frame) => {
+                            if let Some(chunk) = frame.data_ref()
+                                && upload_writer.write_all(chunk).await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
                     }
                 }
-                Err(_) => break,
-            }
+            } => {}
         }
         let _ = upload_writer.shutdown().await;
     });
@@ -1223,22 +1280,27 @@ async fn stream_up_response(
 
     let min_padding = state.min_padding;
     let max_padding = state.max_padding;
+    let shutdown = state.shutdown.clone();
     let body_stream = futures::stream::unfold(
         (done_rx, Some(first_padding)),
-        move |(mut done_rx, first_padding)| async move {
-            if let Some(first_padding) = first_padding {
-                return Some((Ok(Frame::data(first_padding)), (done_rx, None)));
-            }
+        move |(mut done_rx, first_padding)| {
+            let shutdown = shutdown.clone();
+            async move {
+                if let Some(first_padding) = first_padding {
+                    return Some((Ok(Frame::data(first_padding)), (done_rx, None)));
+                }
 
-            let delay_secs = random_xray_range(min_secs, max_secs);
-            tokio::select! {
-                _ = &mut done_rx => None,
-                _ = sleep(Duration::from_secs(delay_secs as u64)) => {
-                    let padding_len = random_xray_range(min_padding, max_padding);
-                    Some((
-                        Ok(Frame::data(Bytes::from(vec![b'X'; padding_len]))),
-                        (done_rx, None),
-                    ))
+                let delay_secs = random_xray_range(min_secs, max_secs);
+                tokio::select! {
+                    _ = &mut done_rx => None,
+                    _ = shutdown.cancelled() => None,
+                    _ = sleep(Duration::from_secs(delay_secs as u64)) => {
+                        let padding_len = random_xray_range(min_padding, max_padding);
+                        Some((
+                            Ok(Frame::data(Bytes::from(vec![b'X'; padding_len]))),
+                            (done_rx, None),
+                        ))
+                    }
                 }
             }
         },
@@ -1253,18 +1315,22 @@ fn spawn_handler_stream(
     peer_addr: std::net::SocketAddr,
     local_addr: std::net::SocketAddr,
 ) {
+    let shutdown = state.shutdown.clone();
     tokio::spawn(async move {
-        if let Err(err) = process_stream_with_local_addr(
-            stream,
-            state.server_handler.clone(),
-            state.resolver.clone(),
-            peer_addr,
-            Some(local_addr),
-            state.runtime.clone(),
-        )
-        .await
-        {
-            error!("xhttp logical stream {} failed: {}", peer_addr, err);
+        tokio::select! {
+            _ = shutdown.cancelled() => {}
+            result = process_stream_with_local_addr(
+                stream,
+                state.server_handler.clone(),
+                state.resolver.clone(),
+                peer_addr,
+                Some(local_addr),
+                state.runtime.clone(),
+            ) => {
+                if let Err(err) = result {
+                    error!("xhttp logical stream {} failed: {}", peer_addr, err);
+                }
+            }
         }
     });
 }
@@ -1318,14 +1384,20 @@ struct SessionStore {
     inner: Arc<RwLock<HashMap<String, Arc<XhttpSession>>>>,
     ttl: Duration,
     max_buffered_posts: usize,
+    shutdown: CancellationToken,
 }
 
 impl SessionStore {
-    fn new(ttl: Duration, max_buffered_posts: usize) -> Self {
+    fn new(
+        ttl: Duration,
+        max_buffered_posts: usize,
+        shutdown: CancellationToken,
+    ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
             ttl,
             max_buffered_posts,
+            shutdown,
         }
     }
 
@@ -1352,8 +1424,16 @@ impl SessionStore {
     fn spawn_ttl_cleanup(&self, session_id: String, session: Arc<XhttpSession>) {
         let ttl = self.ttl;
         let store = self.clone();
+        let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
-            sleep(ttl).await;
+            tokio::select! {
+                _ = sleep(ttl) => {}
+                _ = shutdown.cancelled() => {
+                    store.remove(&session_id);
+                    session.close_upload_queue();
+                    return;
+                }
+            }
 
             let should_remove =
                 store.inner.read().unwrap().get(&session_id).is_some_and(
@@ -3724,7 +3804,11 @@ mod tests {
 
     #[tokio::test]
     async fn expired_session_closes_upload_queue_like_current_xray() {
-        let store = SessionStore::new(Duration::from_millis(20), 1);
+        let store = SessionStore::new(
+            Duration::from_millis(20),
+            1,
+            CancellationToken::new(),
+        );
         let session = store.get_or_create("session");
         session
             .upload_queue
@@ -3810,7 +3894,11 @@ mod tests {
 
     #[tokio::test]
     async fn expired_session_timer_does_not_reap_reused_session_id() {
-        let store = SessionStore::new(Duration::from_millis(60), 30);
+        let store = SessionStore::new(
+            Duration::from_millis(60),
+            30,
+            CancellationToken::new(),
+        );
         let old = store.get_or_create("session");
         old.fully_connected.store(true, Ordering::Release);
         store.remove("session");
@@ -3837,7 +3925,8 @@ mod tests {
 
     #[tokio::test]
     async fn stream_down_cleanup_guard_removes_connected_session() {
-        let store = SessionStore::new(Duration::from_secs(30), 30);
+        let store =
+            SessionStore::new(Duration::from_secs(30), 30, CancellationToken::new());
         let session = store.get_or_create("session");
         session.fully_connected.store(true, Ordering::Release);
         assert!(store.inner.read().unwrap().contains_key("session"));
