@@ -861,8 +861,8 @@ fn parse_xhttp_data_placement(
     mode: XhttpMode,
 ) -> Result<XhttpDataPlacement, Error> {
     let placement = match placement.unwrap_or("") {
-        "" | "body" => XhttpDataPlacement::Body,
-        "auto" => XhttpDataPlacement::Auto,
+        "" | "auto" => XhttpDataPlacement::Auto,
+        "body" => XhttpDataPlacement::Body,
         "header" => XhttpDataPlacement::Header,
         "cookie" => XhttpDataPlacement::Cookie,
         unsupported => {
@@ -1328,8 +1328,8 @@ mod tests {
         assert!(config.session_key.is_empty());
         assert_eq!(config.seq_placement, XhttpPlacement::Path);
         assert!(config.seq_key.is_empty());
-        assert_eq!(config.uplink_data_placement, XhttpDataPlacement::Body);
-        assert!(config.uplink_data_key.is_empty());
+        assert_eq!(config.uplink_data_placement, XhttpDataPlacement::Auto);
+        assert_eq!(config.uplink_data_key, "X-Data");
     }
 
     #[test]
