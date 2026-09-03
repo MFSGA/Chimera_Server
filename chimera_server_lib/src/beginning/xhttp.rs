@@ -563,6 +563,10 @@ fn xray_http2_header_list_limit(server_max_header_bytes: usize) -> u32 {
         .min(u32::MAX as usize) as u32
 }
 
+fn uses_http1_header_read_limit(version: hyper::Version) -> bool {
+    matches!(version, hyper::Version::HTTP_10 | hyper::Version::HTTP_11)
+}
+
 fn xray_valid_http_host(request: &str, config: &str) -> bool {
     let request = request.to_ascii_lowercase();
     let config = config.to_ascii_lowercase();
@@ -824,7 +828,7 @@ where
 
     let http1_header_limit =
         xray_http1_header_read_limit(state.server_max_header_bytes);
-    if request.version() != hyper::Version::HTTP_2
+    if uses_http1_header_read_limit(request.version())
         && request_head_bytes(&request) > http1_header_limit
     {
         debug!(
@@ -2563,6 +2567,10 @@ mod tests {
     fn http1_header_read_limit_includes_xray_bufio_slop() {
         assert_eq!(xray_http1_header_read_limit(8192), 12_288);
         assert_eq!(xray_http1_header_read_limit(16_384), 20_480);
+        assert!(uses_http1_header_read_limit(hyper::Version::HTTP_10));
+        assert!(uses_http1_header_read_limit(hyper::Version::HTTP_11));
+        assert!(!uses_http1_header_read_limit(hyper::Version::HTTP_2));
+        assert!(!uses_http1_header_read_limit(hyper::Version::HTTP_3));
 
         let request = Request::builder()
             .uri("/x/")
