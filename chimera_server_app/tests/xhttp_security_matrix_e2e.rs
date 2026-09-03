@@ -195,6 +195,7 @@ fn chimera_stream_settings(
             "finalmask": if matches!(case, SecurityCase::Http3) {
                 json!({
                     "quicParams": {
+                        "congestion": "reno",
                         "maxIdleTimeout": 45,
                         "maxIncomingStreams": 64,
                         "initStreamReceiveWindow": 32768,

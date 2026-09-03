@@ -326,16 +326,42 @@ fn apply_xray_xhttp_h3_initial_mtu(transport: &mut quinn::TransportConfig) {
 }
 
 #[cfg(feature = "tls")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XhttpH3CongestionMode {
+    Reno,
+    Bbr,
+}
+
+#[cfg(feature = "tls")]
+fn configured_xhttp_h3_congestion_mode(
+    congestion: Option<&str>,
+) -> XhttpH3CongestionMode {
+    match congestion {
+        Some("reno") => XhttpH3CongestionMode::Reno,
+        None | Some("") | Some("bbr") => XhttpH3CongestionMode::Bbr,
+        Some(_) => unreachable!("validated XHTTP congestion mode"),
+    }
+}
+
+#[cfg(feature = "tls")]
 fn build_xhttp_h3_transport_config(
     config: &XhttpServerConfig,
 ) -> std::io::Result<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
-    // Current Xray's XHTTP/3 listener switches accepted QUIC connections to
-    // its standard BBR profile when congestion is left unset. Quinn defaults
-    // to Cubic, so select its BBR controller explicitly for the same default.
-    transport.congestion_controller_factory(Arc::new(
-        quinn::congestion::BbrConfig::default(),
-    ));
+    // Xray leaves quic-go's Reno controller in place for explicit `reno`, and
+    // switches accepted XHTTP/3 connections to BBR for the default / `bbr`.
+    match configured_xhttp_h3_congestion_mode(config.xray_congestion.as_deref()) {
+        XhttpH3CongestionMode::Reno => {
+            transport.congestion_controller_factory(Arc::new(
+                quinn::congestion::NewRenoConfig::default(),
+            ));
+        }
+        XhttpH3CongestionMode::Bbr => {
+            transport.congestion_controller_factory(Arc::new(
+                quinn::congestion::BbrConfig::default(),
+            ));
+        }
+    }
     apply_xray_xhttp_h3_initial_mtu(&mut transport);
     if let Some(max_idle_timeout_secs) = config.xray_max_idle_timeout_secs {
         let idle_timeout = std::time::Duration::from_secs(max_idle_timeout_secs)
@@ -2502,6 +2528,27 @@ mod tests {
 
     #[cfg(feature = "tls")]
     #[test]
+    fn h3_congestion_mode_matches_xray_explicit_reno_and_bbr() {
+        assert_eq!(
+            configured_xhttp_h3_congestion_mode(None),
+            XhttpH3CongestionMode::Bbr
+        );
+        assert_eq!(
+            configured_xhttp_h3_congestion_mode(Some("")),
+            XhttpH3CongestionMode::Bbr
+        );
+        assert_eq!(
+            configured_xhttp_h3_congestion_mode(Some("bbr")),
+            XhttpH3CongestionMode::Bbr
+        );
+        assert_eq!(
+            configured_xhttp_h3_congestion_mode(Some("reno")),
+            XhttpH3CongestionMode::Reno
+        );
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
     fn h3_receive_window_uses_xray_initial_value_and_defaults() {
         assert_eq!(
             configured_xhttp_receive_window(
@@ -3075,6 +3122,7 @@ mod tests {
             seq_key: String::new(),
             uplink_data_placement: XhttpDataPlacement::Auto,
             uplink_data_key: "x_data".to_string(),
+            xray_congestion: None,
             xray_max_idle_timeout_secs: None,
             xray_max_incoming_streams: None,
             xray_init_stream_receive_window: None,
