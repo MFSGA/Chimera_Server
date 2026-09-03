@@ -36,6 +36,9 @@ use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
+#[cfg(feature = "tls")]
+use std::sync::atomic::AtomicU64;
+
 use crate::{
     address::BindLocation,
     async_stream::{AsyncPing, AsyncStream},
@@ -330,6 +333,7 @@ fn apply_xray_xhttp_h3_initial_mtu(transport: &mut quinn::TransportConfig) {
 enum XhttpH3CongestionMode {
     Reno,
     Bbr,
+    ForceBrutal,
 }
 
 #[cfg(feature = "tls")]
@@ -339,6 +343,7 @@ fn configured_xhttp_h3_congestion_mode(
     match congestion {
         Some("reno") => XhttpH3CongestionMode::Reno,
         None | Some("") | Some("bbr") => XhttpH3CongestionMode::Bbr,
+        Some("force-brutal") => XhttpH3CongestionMode::ForceBrutal,
         Some(_) => unreachable!("validated XHTTP congestion mode"),
     }
 }
@@ -359,6 +364,16 @@ fn build_xhttp_h3_transport_config(
         XhttpH3CongestionMode::Bbr => {
             transport.congestion_controller_factory(Arc::new(
                 quinn::congestion::BbrConfig::default(),
+            ));
+        }
+        XhttpH3CongestionMode::ForceBrutal => {
+            let tx_bps = config
+                .xray_brutal_up
+                .expect("validated XHTTP force-brutal bandwidth");
+            transport.congestion_controller_factory(Arc::new(
+                crate::handler::hysteria2::congestion::BrutalConfig::new(Arc::new(
+                    AtomicU64::new(tx_bps),
+                )),
             ));
         }
     }
@@ -2545,6 +2560,10 @@ mod tests {
             configured_xhttp_h3_congestion_mode(Some("reno")),
             XhttpH3CongestionMode::Reno
         );
+        assert_eq!(
+            configured_xhttp_h3_congestion_mode(Some("force-brutal")),
+            XhttpH3CongestionMode::ForceBrutal
+        );
     }
 
     #[cfg(feature = "tls")]
@@ -3123,6 +3142,7 @@ mod tests {
             uplink_data_placement: XhttpDataPlacement::Auto,
             uplink_data_key: "x_data".to_string(),
             xray_congestion: None,
+            xray_brutal_up: None,
             xray_max_idle_timeout_secs: None,
             xray_max_incoming_streams: None,
             xray_init_stream_receive_window: None,
