@@ -1,6 +1,6 @@
 #![cfg(feature = "vless")]
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use bytes::{Buf, BytesMut};
@@ -101,10 +101,21 @@ impl VlessTcpHandler {
         mut server_stream: Box<dyn AsyncStream>,
         server_name: &str,
         alpn: &str,
+        handshake_timeout: Option<Duration>,
     ) -> std::io::Result<TcpServerSetupResult> {
+        let handshake_deadline =
+            handshake_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
+
         if !self.fallbacks.is_empty() {
-            let (mut prefix, candidate) =
-                read_vless_auth_prefix(&mut server_stream).await;
+            let (mut prefix, candidate) = match handshake_deadline {
+                Some(deadline) => tokio::time::timeout_at(
+                    deadline,
+                    read_vless_auth_prefix(&mut server_stream),
+                )
+                .await
+                .map_err(|_| vless_handshake_timeout_error())?,
+                None => read_vless_auth_prefix(&mut server_stream).await,
+            };
             let authenticated = candidate.is_some_and(|candidate| {
                 self.users.iter().any(|(stored_user_id, _, _)| {
                     stored_user_id.len() == 16
@@ -139,12 +150,21 @@ impl VlessTcpHandler {
             server_stream = Box::new(PrefixedStream::new(prefix, server_stream));
         }
 
+        let header = match handshake_deadline {
+            Some(deadline) => tokio::time::timeout_at(
+                deadline,
+                read_request_header(&mut server_stream),
+            )
+            .await
+            .map_err(|_| vless_handshake_timeout_error())??,
+            None => read_request_header(&mut server_stream).await?,
+        };
         let ParsedVlessHeader {
             user_id,
             flow: request_flow,
             command,
             remote_location,
-        } = read_request_header(&mut server_stream).await?;
+        } = header;
         let matched_user = self.users.iter().find(|(stored_user_id, _, _)| {
             stored_user_id.len() == 16
                 && stored_user_id.as_ref() == user_id.as_slice()
@@ -212,11 +232,25 @@ impl VlessTcpHandler {
 
 #[async_trait]
 impl TcpServerHandler for VlessTcpHandler {
+    fn manages_handshake_timeout(&self) -> bool {
+        true
+    }
+
+    fn pre_transport_handshake_timeout(
+        &self,
+        context: &TcpServerConnectionContext,
+    ) -> Option<Duration> {
+        context
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.xray_handshake_timeout_for_level(0))
+    }
+
     async fn setup_server_stream(
         &self,
         server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
-        self.setup_server_stream_with_metadata(server_stream, "", "")
+        self.setup_server_stream_with_metadata(server_stream, "", "", None)
             .await
     }
 
@@ -225,13 +259,22 @@ impl TcpServerHandler for VlessTcpHandler {
         server_stream: Box<dyn AsyncStream>,
         context: TcpServerConnectionContext,
     ) -> std::io::Result<TcpServerSetupResult> {
+        let handshake_timeout = context
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.xray_handshake_timeout_for_level(0));
         self.setup_server_stream_with_metadata(
             server_stream,
             context.server_name.as_deref().unwrap_or(""),
             context.alpn_protocol.as_deref().unwrap_or(""),
+            handshake_timeout,
         )
         .await
     }
+}
+
+fn vless_handshake_timeout_error() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, "VLESS handshake timed out")
 }
 
 fn validate_request_flow(
@@ -413,9 +456,12 @@ mod tests {
         address::{Address, NetLocation},
         async_stream::{AsyncPing, AsyncStream},
         beginning::udp::{run_bidirectional_udp, run_session_based_udp},
-        config::server_config::{VlessFallback, VlessUser},
+        config::{
+            def::{PolicyConfig, PolicyLevelConfig},
+            server_config::{VlessFallback, VlessUser},
+        },
         handler::{
-            tcp::tcp_handler::TcpServerSetupResult,
+            tcp::tcp_handler::{TcpServerConnectionContext, TcpServerSetupResult},
             vless_handler::vision_unpad::{UnpadCommand, VisionUnpadder},
             xudp::frame::{
                 FrameMetadata, FrameOption, SessionStatus, TargetNetwork,
@@ -521,6 +567,40 @@ mod tests {
             request.extend_from_slice(&[127, 0, 0, 1]);
         }
         request
+    }
+
+    #[tokio::test]
+    async fn handshake_uses_xray_level_zero_policy() {
+        let user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
+        let handler = plain_vless_handler(user_id, "vless-policy-user");
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let mut policy = PolicyConfig::default();
+        policy.levels.insert(
+            0,
+            Some(PolicyLevelConfig {
+                handshake: Some(0),
+                ..PolicyLevelConfig::default()
+            }),
+        );
+        runtime.replace_policy(Some(&policy));
+        let context = TcpServerConnectionContext {
+            runtime: Some(runtime),
+            ..TcpServerConnectionContext::default()
+        };
+        assert_eq!(
+            handler.pre_transport_handshake_timeout(&context),
+            Some(Duration::ZERO)
+        );
+
+        let (_client, server) = duplex(1024);
+        let error = handler
+            .setup_server_stream_with_context(Box::new(TestStream(server)), context)
+            .await
+            .expect_err(
+                "level-zero handshake=0 must time out before VLESS bytes arrive",
+            );
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "VLESS handshake timed out");
     }
 
     #[tokio::test]
