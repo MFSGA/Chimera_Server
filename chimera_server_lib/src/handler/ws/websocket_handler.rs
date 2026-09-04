@@ -139,6 +139,44 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             }
         };
 
+        let (method, request_target, host_required) =
+            match parse_xray_websocket_request_line(&first_line) {
+                Ok(parsed) => parsed,
+                Err(WebsocketRequestLineError::Malformed) => {
+                    write_xray_bad_request_line(&mut server_stream).await?;
+                    return Err(std::io::Error::other(
+                        "malformed HTTP request line",
+                    ));
+                }
+                Err(WebsocketRequestLineError::UnsupportedVersion) => {
+                    write_xray_unsupported_http_version(&mut server_stream).await?;
+                    return Err(std::io::Error::other(
+                        "unsupported HTTP protocol version",
+                    ));
+                }
+            };
+        let raw_request_target = raw_xray_request_target(&first_line_raw)
+            .unwrap_or(request_target.as_bytes());
+        if xray_websocket_absolute_authority_has_non_ascii_userinfo(
+            raw_request_target,
+        ) {
+            write_xray_bad_request_line(&mut server_stream).await?;
+            return Err(std::io::Error::other("non-ASCII absolute URI userinfo"));
+        }
+        let raw_request_path = websocket_request_path_raw(request_target);
+        let xray_request_path = match xray_websocket_request_path_raw_bytes(
+            request_target,
+            raw_request_target,
+        ) {
+            Ok(path) => path,
+            Err(()) => {
+                write_xray_bad_request_line(&mut server_stream).await?;
+                return Err(std::io::Error::other(
+                    "malformed request target escape",
+                ));
+            }
+        };
+
         if !valid_xray_content_length(&request_headers) {
             write_xray_bad_request_line(&mut server_stream).await?;
             return Err(std::io::Error::other("invalid Content-Length header"));
@@ -169,30 +207,6 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             return Err(std::io::Error::other("malformed Host header"));
         }
 
-        let (method, request_target, host_required) =
-            match parse_xray_websocket_request_line(&first_line) {
-                Ok(parsed) => parsed,
-                Err(WebsocketRequestLineError::Malformed) => {
-                    write_xray_bad_request_line(&mut server_stream).await?;
-                    return Err(std::io::Error::other(
-                        "malformed HTTP request line",
-                    ));
-                }
-                Err(WebsocketRequestLineError::UnsupportedVersion) => {
-                    write_xray_unsupported_http_version(&mut server_stream).await?;
-                    return Err(std::io::Error::other(
-                        "unsupported HTTP protocol version",
-                    ));
-                }
-            };
-        let raw_request_target = raw_xray_request_target(&first_line_raw)
-            .unwrap_or(request_target.as_bytes());
-        if xray_websocket_absolute_authority_has_non_ascii_userinfo(
-            raw_request_target,
-        ) {
-            write_xray_bad_request_line(&mut server_stream).await?;
-            return Err(std::io::Error::other("non-ASCII absolute URI userinfo"));
-        }
         let request_host = request_headers
             .get("host")
             .and_then(|values| values.first())
@@ -203,19 +217,6 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
         }
         let absolute_host = xray_websocket_absolute_host(request_target);
         let effective_host = absolute_host.as_deref().or(request_host);
-        let raw_request_path = websocket_request_path_raw(request_target);
-        let xray_request_path = match xray_websocket_request_path_raw_bytes(
-            request_target,
-            raw_request_target,
-        ) {
-            Ok(path) => path,
-            Err(()) => {
-                write_xray_bad_request_line(&mut server_stream).await?;
-                return Err(std::io::Error::other(
-                    "malformed request target escape",
-                ));
-            }
-        };
         debug!(
             "request path is {}",
             String::from_utf8_lossy(&xray_request_path)
@@ -1724,6 +1725,40 @@ mod tests {
             let (result, response) = run_handshake(&request).await;
             assert!(result.is_err(), "{target}");
             assert!(response.is_empty(), "{target}: {response:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_xray_request_target_validation_precedes_header_semantics() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let cases = [
+            (
+                format!(
+                    "GET /ws HTTP/2.0\r\nHost: bad host\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                ),
+                "HTTP/1.1 505 HTTP Version Not Supported: unsupported protocol version\r\n",
+            ),
+            (
+                format!(
+                    "GET /ws%ZZ HTTP/1.1\r\nHost: bad host\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                ),
+                "HTTP/1.1 400 Bad Request\r\n",
+            ),
+            (
+                format!(
+                    "GET /ws%ZZ HTTP/1.1\r\nHost: example.com\r\nContent-Length: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                ),
+                "HTTP/1.1 400 Bad Request\r\n",
+            ),
+        ];
+
+        for (request, expected_prefix) in cases {
+            let (result, response) = run_handshake(&request).await;
+            assert!(result.is_err());
+            assert!(
+                response.starts_with(expected_prefix),
+                "expected {expected_prefix:?}, got {response:?}"
+            );
         }
     }
 
