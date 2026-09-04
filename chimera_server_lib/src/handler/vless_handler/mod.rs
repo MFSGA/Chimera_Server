@@ -593,12 +593,15 @@ mod tests {
         );
 
         let (_client, server) = duplex(1024);
-        let error = handler
+        let error = match handler
             .setup_server_stream_with_context(Box::new(TestStream(server)), context)
             .await
-            .expect_err(
-                "level-zero handshake=0 must time out before VLESS bytes arrive",
-            );
+        {
+            Ok(_) => panic!(
+                "level-zero handshake=0 must time out before VLESS bytes arrive"
+            ),
+            Err(error) => error,
+        };
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert_eq!(error.to_string(), "VLESS handshake timed out");
     }
