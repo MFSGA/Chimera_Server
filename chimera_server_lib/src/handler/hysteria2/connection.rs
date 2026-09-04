@@ -25,7 +25,7 @@ use rand::{
     distr::{Alphanumeric, SampleString},
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::UdpSocket,
 };
 use tracing::{debug, warn};
@@ -350,13 +350,16 @@ async fn handle_tcp_stream(
         auth_ctx.client.level,
         &runtime,
     );
-    let request = match read_tcp_request(&mut recv, tcp_request_timeout).await {
-        Ok(request) => request,
-        Err(err) => {
-            let _ = send.finish();
-            return Err(err);
-        }
-    };
+    let request =
+        match read_tcp_request(&mut recv, tcp_request_timeout, auth_ctx.xray_compat)
+            .await
+        {
+            Ok(request) => request,
+            Err(err) => {
+                let _ = send.finish();
+                return Err(err);
+            }
+        };
     send_tcp_response(&mut send, TCP_SUCCESS_STATUS, "", auth_ctx.xray_compat)
         .await?;
 
@@ -421,25 +424,34 @@ fn configured_tcp_request_timeout(
     xray_compat.then(|| runtime.xray_handshake_timeout_for_level(level))
 }
 
-async fn read_tcp_request(
-    stream: &mut quinn::RecvStream,
+async fn read_tcp_request<S>(
+    stream: &mut S,
     timeout: Option<Duration>,
-) -> std::io::Result<TcpRequest> {
+    xray_compat: bool,
+) -> std::io::Result<TcpRequest>
+where
+    S: AsyncRead + Unpin,
+{
     match timeout {
-        Some(timeout) => tokio::time::timeout(timeout, TcpRequest::read(stream))
-            .await
-            .map_err(|_| {
-                Error::new(
-                    ErrorKind::TimedOut,
-                    "hysteria2 TCP request header timed out",
-                )
-            })?,
-        None => TcpRequest::read(stream).await,
+        Some(timeout) => {
+            tokio::time::timeout(timeout, TcpRequest::read(stream, xray_compat))
+                .await
+                .map_err(|_| {
+                    Error::new(
+                        ErrorKind::TimedOut,
+                        "hysteria2 TCP request header timed out",
+                    )
+                })?
+        }
+        None => TcpRequest::read(stream, xray_compat).await,
     }
 }
 
 impl TcpRequest {
-    async fn read(stream: &mut quinn::RecvStream) -> std::io::Result<Self> {
+    async fn read<S>(stream: &mut S, xray_compat: bool) -> std::io::Result<Self>
+    where
+        S: AsyncRead + Unpin,
+    {
         let request_id = read_varint(stream).await?;
         if request_id != TCP_REQUEST_ID {
             return Err(Error::new(
@@ -461,14 +473,20 @@ impl TcpRequest {
             .read_exact(&mut address_bytes)
             .await
             .map_err(Error::other)?;
-        let address = String::from_utf8(address_bytes)
-            .map_err(|err| Error::new(ErrorKind::InvalidData, err))?;
-        let target = NetLocation::from_str(&address, None)?;
+        let target = if xray_compat {
+            None
+        } else {
+            Some(parse_tcp_request_target(address_bytes.as_slice())?)
+        };
 
         let padding_len =
             validate_tcp_request_padding_len(read_varint(stream).await?)?;
         skip_padding(stream, padding_len).await?;
 
+        let target = match target {
+            Some(target) => target,
+            None => parse_tcp_request_target(address_bytes.as_slice())?,
+        };
         Ok(Self { target })
     }
 }
@@ -2509,7 +2527,16 @@ where
     Error::other(err)
 }
 
-async fn read_varint(stream: &mut quinn::RecvStream) -> std::io::Result<u64> {
+fn parse_tcp_request_target(address_bytes: &[u8]) -> std::io::Result<NetLocation> {
+    let address = std::str::from_utf8(address_bytes)
+        .map_err(|err| Error::new(ErrorKind::InvalidData, err))?;
+    NetLocation::from_str(address, None)
+}
+
+async fn read_varint<S>(stream: &mut S) -> std::io::Result<u64>
+where
+    S: AsyncRead + Unpin,
+{
     let mut first = [0u8; 1];
     stream.read_exact(&mut first).await.map_err(Error::other)?;
     let prefix = first[0] >> 6;
@@ -2553,10 +2580,10 @@ fn validate_tcp_request_padding_len(padding_len: u64) -> std::io::Result<usize> 
         .map_err(|_| Error::new(ErrorKind::InvalidData, "padding length too large"))
 }
 
-async fn skip_padding(
-    stream: &mut quinn::RecvStream,
-    mut len: usize,
-) -> std::io::Result<()> {
+async fn skip_padding<S>(stream: &mut S, mut len: usize) -> std::io::Result<()>
+where
+    S: AsyncRead + Unpin,
+{
     if len == 0 {
         return Ok(());
     }
@@ -3493,6 +3520,51 @@ mod tests {
 
         assert_eq!(err.kind(), ErrorKind::TimedOut);
         assert!(started.elapsed() >= AUTH_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn tcp_request_target_parse_order_matches_xray_and_shoes() {
+        let mut frame = Vec::new();
+        push_varint(&mut frame, TCP_REQUEST_ID).unwrap();
+        push_varint(&mut frame, 3).unwrap();
+        frame.extend_from_slice(b"bad");
+        push_varint(&mut frame, 1).unwrap();
+
+        let (mut shoes_writer, mut shoes_reader) = tokio::io::duplex(64);
+        shoes_writer.write_all(&frame).await.unwrap();
+        let shoes_error = match tokio::time::timeout(
+            Duration::from_secs(1),
+            read_tcp_request(&mut shoes_reader, None, false),
+        )
+        .await
+        .expect("shoes mode must parse the target before waiting for padding")
+        {
+            Ok(_) => panic!("invalid shoes target unexpectedly parsed"),
+            Err(error) => error,
+        };
+        assert!(shoes_error.to_string().contains("No port"));
+
+        let (mut xray_writer, mut xray_reader) = tokio::io::duplex(64);
+        xray_writer.write_all(&frame).await.unwrap();
+        let xray_task = tokio::spawn(async move {
+            read_tcp_request(&mut xray_reader, None, true).await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !xray_task.is_finished(),
+            "Xray mode must consume declared padding before parsing the target"
+        );
+        xray_writer.write_all(b"x").await.unwrap();
+        let xray_error =
+            match tokio::time::timeout(Duration::from_secs(1), xray_task)
+                .await
+                .expect("Xray parser should finish after padding arrives")
+                .expect("Xray parser task should not panic")
+            {
+                Ok(_) => panic!("invalid Xray target unexpectedly parsed"),
+                Err(error) => error,
+            };
+        assert!(xray_error.to_string().contains("No port"));
     }
 
     #[test]
