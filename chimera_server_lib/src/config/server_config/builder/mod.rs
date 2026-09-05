@@ -75,6 +75,143 @@ fn parse_xray_finalmask_bandwidth(input: &str) -> Result<u64, Error> {
     Ok(bits_per_second as u64 / 8)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedFinalMaskQuicParams {
+    congestion: String,
+    bbr_profile: String,
+    brutal_up: u64,
+    brutal_down: Option<u64>,
+    max_idle_timeout: u64,
+    keep_alive_period: u64,
+    max_incoming_streams: u64,
+    receive_windows: (u64, u64, u64, u64),
+}
+
+fn validate_xray_finalmask_quic_params(
+    params: &crate::config::FinalMaskQuicParams,
+    validate_brutal_down: bool,
+) -> Result<ValidatedFinalMaskQuicParams, Error> {
+    let congestion = params.congestion.to_ascii_lowercase();
+    if !matches!(
+        congestion.as_str(),
+        "" | "brutal" | "reno" | "bbr" | "force-brutal"
+    ) {
+        return Err(Error::InvalidConfig(format!(
+            "finalmask.quicParams.congestion must be one of reno, bbr, brutal, force-brutal (got {})",
+            params.congestion
+        )));
+    }
+
+    let bbr_profile = match params.bbr_profile.to_ascii_lowercase() {
+        profile if profile.is_empty() => "standard".to_string(),
+        profile
+            if matches!(
+                profile.as_str(),
+                "conservative" | "standard" | "aggressive"
+            ) =>
+        {
+            profile
+        }
+        _ => {
+            return Err(Error::InvalidConfig(format!(
+                "finalmask.quicParams.bbrProfile must be one of conservative, standard, aggressive (got {})",
+                params.bbr_profile
+            )));
+        }
+    };
+    if matches!(bbr_profile.as_str(), "conservative" | "aggressive")
+        && !matches!(congestion.as_str(), "reno" | "force-brutal")
+    {
+        return Err(Error::InvalidConfig(
+            "finalmask.quicParams.bbrProfile conservative/aggressive is not supported when Xray may use BBR"
+                .into(),
+        ));
+    }
+
+    let brutal_up = parse_xray_finalmask_bandwidth(&params.brutal_up)?;
+    if brutal_up != 0 && brutal_up < 65_536 {
+        return Err(Error::InvalidConfig(
+            "finalmask.quicParams.brutalUp must be at least 65536 bytes per second"
+                .into(),
+        ));
+    }
+    let brutal_down = validate_brutal_down
+        .then(|| {
+            let value = parse_xray_finalmask_bandwidth(&params.brutal_down)?;
+            if value != 0 && value < 65_536 {
+                return Err(Error::InvalidConfig(
+                    "finalmask.quicParams.brutalDown must be at least 65536 bytes per second"
+                        .into(),
+                ));
+            }
+            Ok(value)
+        })
+        .transpose()?;
+    if congestion == "force-brutal" && brutal_up == 0 {
+        return Err(Error::InvalidConfig(
+            "finalmask.quicParams.force-brutal requires brutalUp".into(),
+        ));
+    }
+
+    let max_idle_timeout = params.max_idle_timeout;
+    if max_idle_timeout != 0 && !(4..=120).contains(&max_idle_timeout) {
+        return Err(Error::InvalidConfig(format!(
+            "finalmask.quicParams.maxIdleTimeout must be 0 or between 4 and 120 seconds (got {max_idle_timeout})"
+        )));
+    }
+    let keep_alive_period = params.keep_alive_period;
+    if keep_alive_period != 0 && !(2..=60).contains(&keep_alive_period) {
+        return Err(Error::InvalidConfig(format!(
+            "finalmask.quicParams.keepAlivePeriod must be 0 or between 2 and 60 seconds (got {keep_alive_period})"
+        )));
+    }
+    let max_incoming_streams = params.max_incoming_streams;
+    if max_incoming_streams != 0 && max_incoming_streams < 8 {
+        return Err(Error::InvalidConfig(format!(
+            "finalmask.quicParams.maxIncomingStreams must be 0 or at least 8 (got {max_incoming_streams})"
+        )));
+    }
+
+    for (field, value) in [
+        ("initStreamReceiveWindow", params.init_stream_receive_window),
+        ("maxStreamReceiveWindow", params.max_stream_receive_window),
+        (
+            "initConnectionReceiveWindow",
+            params.init_connection_receive_window,
+        ),
+        (
+            "maxConnectionReceiveWindow",
+            params.max_connection_receive_window,
+        ),
+    ] {
+        if value != 0 && value < 16_384 {
+            return Err(Error::InvalidConfig(format!(
+                "finalmask.quicParams.{field} must be 0 or at least 16384 (got {value})"
+            )));
+        }
+    }
+
+    Ok(ValidatedFinalMaskQuicParams {
+        congestion,
+        bbr_profile,
+        brutal_up,
+        brutal_down,
+        max_idle_timeout: max_idle_timeout as u64,
+        keep_alive_period: keep_alive_period as u64,
+        max_incoming_streams: if max_incoming_streams == 0 {
+            0
+        } else {
+            (max_incoming_streams as u64).min(1_u64 << 60)
+        },
+        receive_windows: (
+            params.init_stream_receive_window,
+            params.max_stream_receive_window,
+            params.init_connection_receive_window,
+            params.max_connection_receive_window,
+        ),
+    })
+}
+
 #[cfg(feature = "ws")]
 fn normalize_xray_websocket_path(path: Option<String>) -> String {
     let path = path.map(strip_xray_websocket_early_data_query);
@@ -1226,137 +1363,39 @@ impl TryFrom<InboudItem> for ServerConfig {
                             .into(),
                     ));
                 }
-                let xray_congestion = xray_quic_params
-                    .map(|quic_params| {
-                        let congestion = quic_params.congestion.to_ascii_lowercase();
-                        match congestion.as_str() {
-                            "" | "brutal" | "reno" | "bbr" | "force-brutal" => {
-                                Ok(congestion)
-                            }
-                            _ => Err(Error::InvalidConfig(format!(
-                                "finalmask.quicParams.congestion must be one of reno, bbr, brutal, force-brutal (got {})",
-                                quic_params.congestion
-                            ))),
-                        }
-                    })
+                let validated_xray_quic = xray_quic_params
+                    .map(|params| validate_xray_finalmask_quic_params(params, true))
                     .transpose()?;
-                let xray_bbr_profile = xray_quic_params
-                    .map(|quic_params| {
-                        let profile = quic_params.bbr_profile.to_ascii_lowercase();
-                        match profile.as_str() {
-                            "" => Ok("standard".to_string()),
-                            "conservative" | "standard" | "aggressive" => Ok(profile),
-                            _ => Err(Error::InvalidConfig(format!(
-                                "finalmask.quicParams.bbrProfile must be one of conservative, standard, aggressive (got {})",
-                                quic_params.bbr_profile
-                            ))),
-                        }
-                    })
-                    .transpose()?;
-                if matches!(
-                    xray_bbr_profile.as_deref(),
-                    Some("conservative" | "aggressive")
-                ) && !matches!(
-                    xray_congestion.as_deref(),
-                    Some("reno" | "force-brutal")
-                ) {
-                    return Err(Error::InvalidConfig(
-                        "finalmask.quicParams.bbrProfile conservative/aggressive is not supported when Xray may use BBR"
-                            .into(),
-                    ));
-                }
-                let xray_brutal_up = xray_quic_params
-                    .map(|quic_params| {
-                        let up = parse_xray_finalmask_bandwidth(&quic_params.brutal_up)?;
-                        if up != 0 && up < 65_536 {
-                            return Err(Error::InvalidConfig(
-                                "finalmask.quicParams.brutalUp must be at least 65536 bytes per second"
-                                    .into(),
-                            ));
-                        }
-                        Ok(up)
-                    })
-                    .transpose()?;
-                let xray_brutal_down = xray_quic_params
-                    .map(|quic_params| {
-                        let down = parse_xray_finalmask_bandwidth(&quic_params.brutal_down)?;
-                        if down != 0 && down < 65_536 {
-                            return Err(Error::InvalidConfig(
-                                "finalmask.quicParams.brutalDown must be at least 65536 bytes per second"
-                                    .into(),
-                            ));
-                        }
-                        Ok(down)
-                    })
-                    .transpose()?;
-                if xray_congestion.as_deref() == Some("force-brutal")
-                    && xray_brutal_up == Some(0)
-                {
-                    return Err(Error::InvalidConfig(
-                        "finalmask.quicParams.force-brutal requires brutalUp".into(),
-                    ));
-                }
-                let xray_max_idle_timeout_secs = xray_quic_params.map(|quic_params| {
-                        let timeout = quic_params.max_idle_timeout;
-                        if timeout != 0 && !(4..=120).contains(&timeout) {
-                            return Err(Error::InvalidConfig(format!(
-                                "finalmask.quicParams.maxIdleTimeout must be 0 or between 4 and 120 seconds (got {timeout})"
-                            )));
-                        }
-                        Ok(if timeout == 0 { 30 } else { timeout as u64 })
-                    })
-                    .transpose()?;
-                let xray_keep_alive_period_secs = xray_quic_params
-                    .map(|quic_params| {
-                        let keep_alive_period = quic_params.keep_alive_period;
-                        if keep_alive_period != 0 && !(2..=60).contains(&keep_alive_period) {
-                            return Err(Error::InvalidConfig(format!(
-                                "finalmask.quicParams.keepAlivePeriod must be 0 or between 2 and 60 seconds (got {keep_alive_period})"
-                            )));
-                        }
-                        Ok(keep_alive_period as u64)
-                    })
-                    .transpose()?;
-                let xray_max_incoming_streams = xray_quic_params
-                    .map(|quic_params| {
-                        let streams = quic_params.max_incoming_streams;
-                        if streams != 0 && streams < 8 {
-                            return Err(Error::InvalidConfig(format!(
-                                "finalmask.quicParams.maxIncomingStreams must be 0 or at least 8 (got {streams})"
-                            )));
-                        }
-                        let streams = if streams == 0 { 1024 } else { streams as u64 };
-                        Ok(streams.min(1_u64 << 60))
-                    })
-                    .transpose()?;
-                let xray_receive_windows = xray_quic_params
-                    .map(|quic_params| {
-                        for (field, value) in [
-                            ("initStreamReceiveWindow", quic_params.init_stream_receive_window),
-                            ("maxStreamReceiveWindow", quic_params.max_stream_receive_window),
-                            (
-                                "initConnectionReceiveWindow",
-                                quic_params.init_connection_receive_window,
-                            ),
-                            (
-                                "maxConnectionReceiveWindow",
-                                quic_params.max_connection_receive_window,
-                            ),
-                        ] {
-                            if value != 0 && value < 16_384 {
-                                return Err(Error::InvalidConfig(format!(
-                                    "finalmask.quicParams.{field} must be 0 or at least 16384 (got {value})"
-                                )));
-                            }
-                        }
-                        Ok((
-                            quic_params.init_stream_receive_window,
-                            quic_params.max_stream_receive_window,
-                            quic_params.init_connection_receive_window,
-                            quic_params.max_connection_receive_window,
-                        ))
-                    })
-                    .transpose()?;
+                let (
+                    xray_congestion,
+                    xray_bbr_profile,
+                    xray_brutal_up,
+                    xray_brutal_down,
+                    xray_max_idle_timeout_secs,
+                    xray_keep_alive_period_secs,
+                    xray_max_incoming_streams,
+                    xray_receive_windows,
+                ) = match validated_xray_quic {
+                    Some(validated) => (
+                        Some(validated.congestion),
+                        Some(validated.bbr_profile),
+                        Some(validated.brutal_up),
+                        validated.brutal_down,
+                        Some(if validated.max_idle_timeout == 0 {
+                            30
+                        } else {
+                            validated.max_idle_timeout
+                        }),
+                        Some(validated.keep_alive_period),
+                        Some(if validated.max_incoming_streams == 0 {
+                            1024
+                        } else {
+                            validated.max_incoming_streams
+                        }),
+                        Some(validated.receive_windows),
+                    ),
+                    None => (None, None, None, None, None, None, None, None),
+                };
                 let tls_settings =
                     stream_settings.tls_settings.ok_or_else(|| {
                         Error::InvalidConfig(
@@ -1566,106 +1605,35 @@ impl TryFrom<InboudItem> for ServerConfig {
                             .as_ref()
                             .and_then(|final_mask| final_mask.quic_params.as_ref())
                         {
-                            let congestion = quic_params.congestion.to_ascii_lowercase();
-                            match congestion.as_str() {
-                                "" | "reno" | "bbr" | "force-brutal" => {
-                                    xhttp_config.xray_congestion = Some(congestion.clone());
-                                }
-                                "brutal" => {
-                                    return Err(Error::InvalidConfig(format!(
-                                        "finalmask.quicParams.congestion={} is not supported for XHTTP",
-                                        quic_params.congestion
-                                    )));
-                                }
-                                _ => {
-                                    return Err(Error::InvalidConfig(format!(
-                                        "finalmask.quicParams.congestion must be one of reno, bbr, brutal, force-brutal (got {})",
-                                        quic_params.congestion
-                                    )));
-                                }
-                            }
-                            let bbr_profile = quic_params.bbr_profile.to_ascii_lowercase();
-                            match bbr_profile.as_str() {
-                                "" | "standard" => {}
-                                "conservative" | "aggressive"
-                                    if matches!(congestion.as_str(), "reno" | "force-brutal") => {}
-                                "conservative" | "aggressive" => {
-                                    return Err(Error::InvalidConfig(
-                                        "finalmask.quicParams.bbrProfile conservative/aggressive is not supported when Xray may use BBR"
-                                            .into(),
-                                    ));
-                                }
-                                _ => {
-                                    return Err(Error::InvalidConfig(format!(
-                                        "finalmask.quicParams.bbrProfile must be one of conservative, standard, aggressive (got {})",
-                                        quic_params.bbr_profile
-                                    )));
-                                }
-                            }
-                            let brutal_up =
-                                parse_xray_finalmask_bandwidth(&quic_params.brutal_up)?;
-                            if brutal_up > 0 && brutal_up < 65_536 {
-                                return Err(Error::InvalidConfig(
-                                    "finalmask.quicParams.brutalUp must be at least 65536 bytes per second"
-                                        .into(),
-                                ));
-                            }
-                            if congestion == "force-brutal" && brutal_up == 0 {
-                                return Err(Error::InvalidConfig(
-                                    "finalmask.quicParams.force-brutal requires brutalUp".into(),
-                                ));
-                            }
-                            xhttp_config.xray_brutal_up = (brutal_up != 0).then_some(brutal_up);
-                            let max_idle_timeout = quic_params.max_idle_timeout;
-                            if max_idle_timeout != 0 && !(4..=120).contains(&max_idle_timeout) {
+                            if quic_params.congestion.eq_ignore_ascii_case("brutal") {
                                 return Err(Error::InvalidConfig(format!(
-                                    "finalmask.quicParams.maxIdleTimeout must be 0 or between 4 and 120 seconds (got {max_idle_timeout})"
+                                    "finalmask.quicParams.congestion={} is not supported for XHTTP",
+                                    quic_params.congestion
                                 )));
                             }
-                            let keep_alive_period = quic_params.keep_alive_period;
-                            if keep_alive_period != 0 && !(2..=60).contains(&keep_alive_period) {
-                                return Err(Error::InvalidConfig(format!(
-                                    "finalmask.quicParams.keepAlivePeriod must be 0 or between 2 and 60 seconds (got {keep_alive_period})"
-                                )));
-                            }
-                            let max_incoming_streams = quic_params.max_incoming_streams;
-                            if max_incoming_streams != 0 && max_incoming_streams < 8 {
-                                return Err(Error::InvalidConfig(format!(
-                                    "finalmask.quicParams.maxIncomingStreams must be 0 or at least 8 (got {max_incoming_streams})"
-                                )));
-                            }
-                            for (field, value) in [
-                                ("initStreamReceiveWindow", quic_params.init_stream_receive_window),
-                                ("maxStreamReceiveWindow", quic_params.max_stream_receive_window),
-                                (
-                                    "initConnectionReceiveWindow",
-                                    quic_params.init_connection_receive_window,
-                                ),
-                                (
-                                    "maxConnectionReceiveWindow",
-                                    quic_params.max_connection_receive_window,
-                                ),
-                            ] {
-                                if value != 0 && value < 16_384 {
-                                    return Err(Error::InvalidConfig(format!(
-                                        "finalmask.quicParams.{field} must be 0 or at least 16384 (got {value})"
-                                    )));
-                                }
-                            }
+                            let validated =
+                                validate_xray_finalmask_quic_params(quic_params, false)?;
+                            xhttp_config.xray_congestion = Some(validated.congestion);
+                            xhttp_config.xray_brutal_up =
+                                (validated.brutal_up != 0).then_some(validated.brutal_up);
                             xhttp_config.xray_max_idle_timeout_secs =
-                                (max_idle_timeout != 0).then_some(max_idle_timeout as u64);
+                                (validated.max_idle_timeout != 0)
+                                    .then_some(validated.max_idle_timeout);
                             xhttp_config.xray_max_incoming_streams =
-                                (max_incoming_streams != 0).then_some(
-                                    (max_incoming_streams as u64).min(1_u64 << 60),
-                                );
-                            xhttp_config.xray_init_stream_receive_window =
-                                Some(quic_params.init_stream_receive_window);
-                            xhttp_config.xray_max_stream_receive_window =
-                                Some(quic_params.max_stream_receive_window);
+                                (validated.max_incoming_streams != 0)
+                                    .then_some(validated.max_incoming_streams);
+                            let (
+                                init_stream,
+                                max_stream,
+                                init_connection,
+                                max_connection,
+                            ) = validated.receive_windows;
+                            xhttp_config.xray_init_stream_receive_window = Some(init_stream);
+                            xhttp_config.xray_max_stream_receive_window = Some(max_stream);
                             xhttp_config.xray_init_connection_receive_window =
-                                Some(quic_params.init_connection_receive_window);
+                                Some(init_connection);
                             xhttp_config.xray_max_connection_receive_window =
-                                Some(quic_params.max_connection_receive_window);
+                                Some(max_connection);
                             xhttp_config.xray_disable_path_mtu_discovery =
                                 Some(quic_params.disable_path_mtu_discovery);
                         }
