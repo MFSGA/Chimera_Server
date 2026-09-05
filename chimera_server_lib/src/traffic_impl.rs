@@ -87,6 +87,45 @@ pub struct TrafficSnapshot {
     pub known_identities: HashSet<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrafficRecordPlan {
+    upload: u64,
+    download: u64,
+    protocol: String,
+    known_identity: Option<String>,
+    protocol_identity: Option<(String, String)>,
+    inbound_tag: Option<String>,
+    inbound_identity: Option<(String, String)>,
+    outbound_tag: Option<String>,
+}
+
+fn plan_traffic_record(
+    context: TrafficContext,
+    upload: u64,
+    download: u64,
+) -> TrafficRecordPlan {
+    let protocol = context.protocol.to_string();
+    let known_identity = context.identity;
+    let protocol_identity = known_identity
+        .as_ref()
+        .map(|identity| (protocol.clone(), identity.clone()));
+    let inbound_identity = match (&context.inbound_tag, &known_identity) {
+        (Some(tag), Some(identity)) => Some((tag.clone(), identity.clone())),
+        _ => None,
+    };
+
+    TrafficRecordPlan {
+        upload,
+        download,
+        protocol,
+        known_identity,
+        protocol_identity,
+        inbound_tag: context.inbound_tag,
+        inbound_identity,
+        outbound_tag: context.outbound_tag,
+    }
+}
+
 #[derive(Debug, Default)]
 struct StatsInner {
     total: TransferTotals,
@@ -99,43 +138,49 @@ struct StatsInner {
 }
 
 impl StatsInner {
-    fn record(&mut self, context: TrafficContext, upload: u64, download: u64) {
+    fn apply(&mut self, plan: TrafficRecordPlan) {
+        let TrafficRecordPlan {
+            upload,
+            download,
+            protocol,
+            known_identity,
+            protocol_identity,
+            inbound_tag,
+            inbound_identity,
+            outbound_tag,
+        } = plan;
+
         self.total.accumulate(upload, download);
-
-        let identity = context.identity.clone();
-        let inbound_tag = context.inbound_tag.clone();
-        let outbound_tag = context.outbound_tag.clone();
-
-        if let Some(identity) = identity.clone() {
+        if let Some(identity) = known_identity {
             self.known_identities.insert(identity);
         }
-
-        let protocol_entry = self
-            .per_protocol
-            .entry(context.protocol.to_string())
-            .or_default();
-        protocol_entry.accumulate(upload, download);
-
-        if let Some(identity) = identity.clone() {
-            let key = (context.protocol.to_string(), identity);
-            let entry = self.per_identity.entry(key).or_default();
-            entry.accumulate(upload, download);
+        self.per_protocol
+            .entry(protocol)
+            .or_default()
+            .accumulate(upload, download);
+        if let Some(key) = protocol_identity {
+            self.per_identity
+                .entry(key)
+                .or_default()
+                .accumulate(upload, download);
         }
-
         if let Some(tag) = inbound_tag {
-            let inbound_entry = self.per_inbound.entry(tag.clone()).or_default();
-            inbound_entry.accumulate(upload, download);
-
-            if let Some(identity) = identity {
-                let key = (tag, identity);
-                let entry = self.per_inbound_user.entry(key).or_default();
-                entry.accumulate(upload, download);
-            }
+            self.per_inbound
+                .entry(tag)
+                .or_default()
+                .accumulate(upload, download);
         }
-
+        if let Some(key) = inbound_identity {
+            self.per_inbound_user
+                .entry(key)
+                .or_default()
+                .accumulate(upload, download);
+        }
         if let Some(tag) = outbound_tag {
-            let outbound_entry = self.per_outbound.entry(tag).or_default();
-            outbound_entry.accumulate(upload, download);
+            self.per_outbound
+                .entry(tag)
+                .or_default()
+                .accumulate(upload, download);
         }
     }
 
@@ -164,8 +209,9 @@ impl TrafficRecorder {
     }
 
     fn record(&self, context: TrafficContext, upload: u64, download: u64) {
+        let plan = plan_traffic_record(context, upload, download);
         let mut guard = self.inner.write().expect("traffic stats poisoned");
-        guard.record(context, upload, download);
+        guard.apply(plan);
     }
 
     fn register_identity(&self, identity: impl Into<String>) {
@@ -300,4 +346,68 @@ pub fn active_connections() -> Vec<ActiveConnectionSnapshot> {
 
 pub fn active_connection_count() -> usize {
     ActiveConnections::global().count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn traffic_record_plan_derives_all_index_keys_before_mutation() {
+        let plan = plan_traffic_record(
+            TrafficContext::new("vless")
+                .with_identity("alice")
+                .with_inbound_tag("in")
+                .with_outbound_tag("out"),
+            7,
+            11,
+        );
+
+        assert_eq!(plan.upload, 7);
+        assert_eq!(plan.download, 11);
+        assert_eq!(plan.protocol, "vless");
+        assert_eq!(plan.known_identity.as_deref(), Some("alice"));
+        assert_eq!(
+            plan.protocol_identity,
+            Some(("vless".to_string(), "alice".to_string()))
+        );
+        assert_eq!(plan.inbound_tag.as_deref(), Some("in"));
+        assert_eq!(
+            plan.inbound_identity,
+            Some(("in".to_string(), "alice".to_string()))
+        );
+        assert_eq!(plan.outbound_tag.as_deref(), Some("out"));
+    }
+
+    #[test]
+    fn applying_traffic_record_plan_updates_every_index_consistently() {
+        let mut stats = StatsInner::default();
+        stats.apply(plan_traffic_record(
+            TrafficContext::new("vmess")
+                .with_identity("bob")
+                .with_inbound_tag("edge")
+                .with_outbound_tag("direct"),
+            13,
+            17,
+        ));
+        let snapshot = stats.snapshot();
+
+        assert_eq!(snapshot.total.connections, 1);
+        assert_eq!(snapshot.total.upload_bytes, 13);
+        assert_eq!(snapshot.total.download_bytes, 17);
+        assert_eq!(snapshot.per_protocol["vmess"].upload_bytes, 13);
+        assert_eq!(
+            snapshot.per_identity[&("vmess".to_string(), "bob".to_string())]
+                .download_bytes,
+            17
+        );
+        assert_eq!(snapshot.per_inbound["edge"].connections, 1);
+        assert_eq!(
+            snapshot.per_inbound_user[&("edge".to_string(), "bob".to_string())]
+                .connections,
+            1
+        );
+        assert_eq!(snapshot.per_outbound["direct"].connections, 1);
+        assert!(snapshot.known_identities.contains("bob"));
+    }
 }
