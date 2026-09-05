@@ -1,20 +1,24 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use quic::start_quic_server;
 #[cfg(target_os = "linux")]
 use socket2::SockRef;
-use tokio::{io::AsyncWriteExt, task::JoinHandle, time::timeout};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    task::JoinHandle,
+    time::timeout,
+};
 use udp::{
     run_bidirectional_udp, run_multi_directional_udp, run_session_based_udp,
     start_udp_server,
 };
 
 use crate::{
-    address::{BindLocation, NetLocation},
+    address::{Address, BindLocation, NetLocation},
     async_stream::AsyncStream,
     config::{
         Transport,
-        server_config::{ServerConfig, ServerProxyConfig},
+        server_config::{InboundSniffingConfig, ServerConfig, ServerProxyConfig},
     },
     handler::{
         http::relay_plain_http_response,
@@ -26,9 +30,10 @@ use crate::{
             tcp_handler_util::create_tcp_server_handler,
         },
     },
-    outbound::connect_tcp_outbound,
+    outbound::{InboundRoutingMetadata, connect_tcp_outbound_with_routing_metadata},
     resolver::{NativeResolver, Resolver, resolve_single_address},
     runtime::RuntimeState,
+    tls_client_hello::{ClientHelloInspection, inspect_client_hello},
     traffic::{
         MeteredStream, TrafficDirection, record_transfer, register_connection,
         register_identity,
@@ -37,6 +42,9 @@ use crate::{
 };
 
 use tracing::{error, info};
+
+const SNIFFING_MAX_BYTES: usize = 32_767;
+const SNIFFING_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[cfg(feature = "grpc_transport")]
 mod grpc_transport;
@@ -252,8 +260,8 @@ async fn start_tcp_server_with_runtime(
     let ServerConfig {
         tag,
         bind_location,
-
         protocol,
+        sniffing,
         ..
     } = config;
 
@@ -273,7 +281,9 @@ async fn start_tcp_server_with_runtime(
     };
 
     Ok(Some(tokio::spawn(async move {
-        if let Err(err) = run_tcp_server(listener, tcp_handler, runtime).await {
+        if let Err(err) =
+            run_tcp_server(listener, tcp_handler, runtime, sniffing).await
+        {
             error!("TCP server stopped with error: {}", err);
         }
     })))
@@ -283,6 +293,7 @@ async fn run_tcp_server(
     listener: tokio::net::TcpListener,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
     runtime: RuntimeState,
+    sniffing: Option<InboundSniffingConfig>,
 ) -> std::io::Result<()> {
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
     let listener_addr = listener.local_addr()?;
@@ -301,6 +312,7 @@ async fn run_tcp_server(
         let cloned_cache = resolver.clone();
         let cloned_handler = server_handler.clone();
         let runtime = runtime.clone();
+        let sniffing = sniffing.clone();
 
         tokio::spawn(async move {
             let connection_context = match tcp_server_connection_context(
@@ -330,6 +342,7 @@ async fn run_tcp_server(
                 addr,
                 runtime,
                 connection_context,
+                sniffing,
             )
             .await
             {
@@ -459,6 +472,247 @@ fn build_proxy_protocol_header(
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SniffedRoutingMetadata {
+    protocol: Option<String>,
+    domain: Option<String>,
+    attributes: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SniffInspection {
+    NeedMore,
+    Complete(SniffedRoutingMetadata),
+    NoClue,
+}
+
+const XRAY_HTTP_METHODS: &[&[u8]] = &[
+    b"get", b"post", b"head", b"put", b"delete", b"options", b"connect",
+];
+
+fn ascii_prefix_eq_ignore_case(input: &[u8], expected: &[u8]) -> bool {
+    input
+        .iter()
+        .zip(expected)
+        .all(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
+fn inspect_http_routing_metadata(input: &[u8]) -> SniffInspection {
+    let method_matches = XRAY_HTTP_METHODS.iter().any(|method| {
+        input.len() >= method.len()
+            && ascii_prefix_eq_ignore_case(&input[..method.len()], method)
+    });
+    if !method_matches {
+        let method_may_match = XRAY_HTTP_METHODS.iter().any(|method| {
+            input.len() < method.len()
+                && ascii_prefix_eq_ignore_case(input, &method[..input.len()])
+        });
+        return if method_may_match {
+            SniffInspection::NeedMore
+        } else {
+            SniffInspection::NoClue
+        };
+    }
+
+    let Some(header_end) = input.windows(4).position(|window| window == b"\r\n\r\n")
+    else {
+        return SniffInspection::NeedMore;
+    };
+    let header_block = &input[..header_end + 2];
+    let mut lines = header_block.split(|byte| *byte == b'\n');
+    let Some(request_line) = lines.next() else {
+        return SniffInspection::NoClue;
+    };
+    let request_line = request_line.strip_suffix(b"\r").unwrap_or(request_line);
+    let request_line = String::from_utf8_lossy(request_line);
+    let request_parts = request_line.split(' ').collect::<Vec<_>>();
+
+    let mut attributes = HashMap::new();
+    let mut domain = None;
+    for line in lines {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            break;
+        }
+        let Some(separator) = line.iter().position(|byte| *byte == b':') else {
+            continue;
+        };
+        let key = String::from_utf8_lossy(&line[..separator]).to_ascii_lowercase();
+        let value = String::from_utf8_lossy(&line[separator + 1..])
+            .trim()
+            .to_string();
+        if key == "host" && !value.is_empty() {
+            domain = sniffed_http_domain(&value);
+        }
+        attributes.insert(key, value);
+    }
+    if request_parts.len() == 3 {
+        attributes.insert(":method".into(), request_parts[0].to_string());
+        attributes.insert(":path".into(), request_parts[1].to_string());
+    }
+
+    SniffInspection::Complete(SniffedRoutingMetadata {
+        protocol: domain.as_ref().map(|_| "http1".to_string()),
+        domain,
+        attributes,
+    })
+}
+
+fn sniffed_http_domain(host: &str) -> Option<String> {
+    let host = host.trim().to_ascii_lowercase();
+    let host = if let Some(host) = host.strip_prefix('[') {
+        let (host, remainder) = host.split_once(']')?;
+        if !remainder.is_empty()
+            && !remainder
+                .strip_prefix(':')
+                .is_some_and(|port| port.parse::<u16>().is_ok())
+        {
+            return None;
+        }
+        host
+    } else if let Some((name, port)) = host.rsplit_once(':') {
+        if !name.contains(':') && port.parse::<u16>().is_ok() {
+            name
+        } else {
+            host.as_str()
+        }
+    } else {
+        host.as_str()
+    };
+    if host.is_empty() || host.parse::<std::net::IpAddr>().is_ok() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+fn inspect_sniffed_routing_metadata(input: &[u8]) -> SniffInspection {
+    let tls_inspection = inspect_client_hello(input);
+    match tls_inspection {
+        ClientHelloInspection::ServerName(server_name) => {
+            return SniffInspection::Complete(SniffedRoutingMetadata {
+                protocol: Some("tls".into()),
+                domain: Some(server_name.to_ascii_lowercase()),
+                attributes: HashMap::new(),
+            });
+        }
+        ClientHelloInspection::EncryptedClientHello
+        | ClientHelloInspection::NoServerName => {
+            return SniffInspection::Complete(SniffedRoutingMetadata {
+                protocol: Some("tls".into()),
+                domain: None,
+                attributes: HashMap::new(),
+            });
+        }
+        ClientHelloInspection::Incomplete
+        | ClientHelloInspection::NotTls
+        | ClientHelloInspection::Malformed => {}
+    }
+
+    match inspect_http_routing_metadata(input) {
+        SniffInspection::NoClue
+            if tls_inspection == ClientHelloInspection::Incomplete =>
+        {
+            SniffInspection::NeedMore
+        }
+        inspection => inspection,
+    }
+}
+
+fn sniffed_override_domain(
+    sniffing: Option<&InboundSniffingConfig>,
+    metadata: &SniffedRoutingMetadata,
+    remote_location: &NetLocation,
+) -> Option<String> {
+    let config = sniffing.filter(|config| config.enabled)?;
+    let protocol = metadata.protocol.as_deref()?;
+    if !config.overrides_protocol(protocol) {
+        return None;
+    }
+    let domain = metadata.domain.as_deref()?;
+    if config.excludes_domain(domain) {
+        return None;
+    }
+    let excluded_ip = match remote_location.address() {
+        Address::Ipv4(ip) => config.excludes_ip((*ip).into()),
+        Address::Ipv6(ip) => config.excludes_ip((*ip).into()),
+        Address::Hostname(_) => false,
+    };
+    (!excluded_ip).then(|| domain.to_string())
+}
+
+fn route_only_sniffed_domain(
+    sniffing: Option<&InboundSniffingConfig>,
+    metadata: &SniffedRoutingMetadata,
+    remote_location: &NetLocation,
+) -> Option<String> {
+    sniffing
+        .filter(|config| config.route_only)
+        .and_then(|config| {
+            sniffed_override_domain(Some(config), metadata, remote_location)
+        })
+}
+
+fn sniffed_outbound_target(
+    sniffing: Option<&InboundSniffingConfig>,
+    metadata: &SniffedRoutingMetadata,
+    remote_location: &NetLocation,
+) -> NetLocation {
+    if sniffing.is_some_and(|config| config.route_only) {
+        return remote_location.clone();
+    }
+    match sniffed_override_domain(sniffing, metadata, remote_location) {
+        Some(domain) => {
+            NetLocation::new(Address::Hostname(domain), remote_location.port())
+        }
+        None => remote_location.clone(),
+    }
+}
+
+async fn sniff_stream_protocol(
+    mut stream: Box<dyn AsyncStream>,
+    sniffing: Option<&InboundSniffingConfig>,
+) -> std::io::Result<(Box<dyn AsyncStream>, SniffedRoutingMetadata)> {
+    if !sniffing.is_some_and(|config| config.enabled) {
+        return Ok((stream, SniffedRoutingMetadata::default()));
+    }
+
+    let mut captured = Vec::new();
+    let sniffed = timeout(SNIFFING_TIMEOUT, async {
+        loop {
+            match inspect_sniffed_routing_metadata(&captured) {
+                SniffInspection::Complete(metadata) => {
+                    return Ok::<_, std::io::Error>(metadata);
+                }
+                SniffInspection::NoClue => {
+                    return Ok(SniffedRoutingMetadata::default());
+                }
+                SniffInspection::NeedMore => {}
+            }
+            if captured.len() >= SNIFFING_MAX_BYTES {
+                return Ok(SniffedRoutingMetadata::default());
+            }
+            let mut buffer = [0u8; 4096];
+            let read_limit = buffer
+                .len()
+                .min(SNIFFING_MAX_BYTES.saturating_sub(captured.len()));
+            let read = stream.read(&mut buffer[..read_limit]).await?;
+            if read == 0 {
+                return Ok(SniffedRoutingMetadata::default());
+            }
+            captured.extend_from_slice(&buffer[..read]);
+        }
+    })
+    .await
+    .unwrap_or(Ok(SniffedRoutingMetadata::default()))?;
+
+    if captured.is_empty() {
+        Ok((stream, sniffed))
+    } else {
+        Ok((Box::new(PrefixedStream::new(captured, stream)), sniffed))
+    }
+}
+
 pub(super) async fn process_stream<AS>(
     stream: AS,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
@@ -491,6 +745,30 @@ pub(super) async fn process_stream_with_local_addr<AS>(
 where
     AS: AsyncStream + 'static,
 {
+    process_stream_with_sniffing_and_local_addr(
+        stream,
+        server_handler,
+        resolver,
+        peer_addr,
+        local_addr,
+        runtime,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn process_stream_with_sniffing_and_local_addr<AS>(
+    stream: AS,
+    server_handler: Arc<Box<dyn TcpServerHandler>>,
+    resolver: Arc<dyn Resolver>,
+    peer_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
+    runtime: RuntimeState,
+    sniffing: Option<InboundSniffingConfig>,
+) -> std::io::Result<()>
+where
+    AS: AsyncStream + 'static,
+{
     let connection_context = stream_connection_context(&runtime, local_addr);
     process_stream_with_context(
         stream,
@@ -499,6 +777,7 @@ where
         peer_addr,
         runtime,
         connection_context,
+        sniffing,
     )
     .await
 }
@@ -521,6 +800,7 @@ async fn process_stream_with_context<AS>(
     mut peer_addr: SocketAddr,
     runtime: RuntimeState,
     connection_context: TcpServerConnectionContext,
+    sniffing: Option<InboundSniffingConfig>,
 ) -> std::io::Result<()>
 where
     AS: AsyncStream + 'static,
@@ -629,6 +909,10 @@ where
                 &inbound_tag,
                 &user,
                 peer_addr,
+                InboundRoutingMetadata {
+                    local_addr,
+                    ..InboundRoutingMetadata::default()
+                },
             ),
         )
         .await
@@ -731,6 +1015,19 @@ where
         } => {
             let mut traffic_context = traffic_context
                 .map(|context| context.with_client_ip(peer_addr.ip()));
+            let (sniffed_stream, sniffed_metadata) =
+                sniff_stream_protocol(server_stream, sniffing.as_ref()).await?;
+            server_stream = sniffed_stream;
+            let outbound_remote_location = sniffed_outbound_target(
+                sniffing.as_ref(),
+                &sniffed_metadata,
+                &remote_location,
+            );
+            let route_target_domain = route_only_sniffed_domain(
+                sniffing.as_ref(),
+                &sniffed_metadata,
+                &remote_location,
+            );
             let inbound_tag = traffic_context
                 .as_ref()
                 .and_then(|context| context.inbound_tag.as_deref())
@@ -746,11 +1043,18 @@ where
                 Duration::from_secs(60),
                 setup_routed_client_stream(
                     resolver,
-                    remote_location.clone(),
+                    outbound_remote_location.clone(),
                     &runtime,
                     &inbound_tag,
                     &user,
                     peer_addr,
+                    InboundRoutingMetadata {
+                        local_addr,
+                        vless_route: 0,
+                        sniffed_protocol: sniffed_metadata.protocol,
+                        route_target_domain,
+                        attributes: sniffed_metadata.attributes,
+                    },
                 ),
             );
 
@@ -767,7 +1071,7 @@ where
                             e.kind(),
                             format!(
                                 "failed to setup client stream to {}: {}",
-                                remote_location, e
+                                outbound_remote_location, e
                             ),
                         ));
                     }
@@ -777,7 +1081,7 @@ where
                             std::io::ErrorKind::TimedOut,
                             format!(
                                 "client setup to {} timed out: {}",
-                                remote_location, elapsed
+                                outbound_remote_location, elapsed
                             ),
                         ));
                     }
@@ -825,7 +1129,7 @@ where
                 bypassed_upload = copy_result.bypassed_left_to_right,
                 bypassed_download = copy_result.bypassed_right_to_left,
                 "tcp forward to {} completed: client->remote {} bytes, remote->client {} bytes",
-                remote_location,
+                outbound_remote_location,
                 copy_result.left_to_right,
                 copy_result.right_to_left,
             );
@@ -922,14 +1226,16 @@ async fn setup_routed_client_stream(
     inbound_tag: &str,
     user: &str,
     peer_addr: SocketAddr,
+    routing_metadata: InboundRoutingMetadata,
 ) -> std::io::Result<Option<(Box<dyn AsyncStream>, Option<String>)>> {
-    connect_tcp_outbound(
+    connect_tcp_outbound_with_routing_metadata(
         &resolver,
         &remote_location,
         runtime,
         inbound_tag,
         user,
         peer_addr,
+        routing_metadata,
     )
     .await
     .map(|connection| {
@@ -979,6 +1285,73 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn sniffed_http_metadata_drives_xray_override_and_exclusions() {
+        let SniffInspection::Complete(metadata) = inspect_sniffed_routing_metadata(
+            b"GET /private?q=1 HTTP/1.1\r\nHost: Api.Example.COM:443\r\nX-Test: ok\r\n\r\n",
+        ) else {
+            panic!("HTTP request should be sniffed");
+        };
+        assert_eq!(metadata.protocol.as_deref(), Some("http1"));
+        assert_eq!(metadata.domain.as_deref(), Some("api.example.com"));
+        assert_eq!(
+            metadata.attributes.get(":method").map(String::as_str),
+            Some("GET")
+        );
+        assert_eq!(
+            metadata.attributes.get(":path").map(String::as_str),
+            Some("/private?q=1")
+        );
+        assert_eq!(
+            metadata.attributes.get("x-test").map(String::as_str),
+            Some("ok")
+        );
+
+        let original =
+            NetLocation::new(Address::Ipv4("192.0.2.7".parse().unwrap()), 8443);
+        let replace = InboundSniffingConfig {
+            enabled: true,
+            dest_override_http: true,
+            ..InboundSniffingConfig::default()
+        };
+        assert_eq!(
+            sniffed_outbound_target(Some(&replace), &metadata, &original),
+            NetLocation::new(Address::Hostname("api.example.com".into()), 8443)
+        );
+
+        let route_only = InboundSniffingConfig {
+            route_only: true,
+            ..replace.clone()
+        };
+        assert_eq!(
+            sniffed_outbound_target(Some(&route_only), &metadata, &original),
+            original
+        );
+        assert_eq!(
+            route_only_sniffed_domain(Some(&route_only), &metadata, &original)
+                .as_deref(),
+            Some("api.example.com")
+        );
+
+        let exclusions = crate::routing_state::SniffExclusionMatcher::compile(
+            vec!["domain:example.com".into()],
+            vec!["192.0.2.0/24".into()],
+        )
+        .expect("sniff exclusions should compile");
+        let excluded = InboundSniffingConfig {
+            exclusions: Arc::new(exclusions),
+            ..replace
+        };
+        assert_eq!(
+            sniffed_outbound_target(Some(&excluded), &metadata, &original),
+            original
+        );
+        assert_eq!(
+            route_only_sniffed_domain(Some(&excluded), &metadata, &original),
+            None
+        );
+    }
 
     #[test]
     fn logical_stream_context_preserves_local_addr() {
