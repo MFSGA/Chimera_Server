@@ -34,6 +34,56 @@ pub struct RoutingState {
     observations: Arc<RwLock<HashMap<String, OutboundObservation>>>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SniffExclusionMatcher {
+    domains: Vec<DomainMatcher>,
+    ips: IpMatcher,
+}
+
+impl SniffExclusionMatcher {
+    pub(crate) fn compile(
+        domains: Vec<String>,
+        ips: Vec<String>,
+    ) -> Result<Self, String> {
+        let mut geodata = GeodataStore::default();
+        let rule = RuleConfig {
+            domain: domains,
+            ip: ips,
+            outbound_tag: Some("__sniff_exclusion__".into()),
+            ..RuleConfig::default()
+        };
+        if rule_uses_geoip(&rule) {
+            geodata.ensure_default_geoip()?;
+        }
+        if rule_uses_geosite(&rule) {
+            geodata.ensure_default_geosite()?;
+        }
+
+        let domains = expand_geosite_values(&geodata, rule.domain)?
+            .into_iter()
+            .map(|value| parse_domain_matcher(&value))
+            .collect::<Result<Vec<_>, _>>()?;
+        let ips =
+            IpMatcher::from_xray_values(expand_geoip_values(&geodata, rule.ip)?)?;
+        Ok(Self { domains, ips })
+    }
+
+    pub(crate) fn excludes_domain(&self, domain: &str) -> bool {
+        !self.domains.is_empty() && matches_domains(&self.domains, domain)
+    }
+
+    pub(crate) fn excludes_ip(&self, ip: IpAddr) -> bool {
+        if !self.ips.configured {
+            return false;
+        }
+        let encoded = match ip {
+            IpAddr::V4(ip) => ip.octets().to_vec(),
+            IpAddr::V6(ip) => ip.octets().to_vec(),
+        };
+        self.ips.matches(&[encoded])
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OutboundObservation {
     pub alive: bool,

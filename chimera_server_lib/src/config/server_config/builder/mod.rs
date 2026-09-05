@@ -310,7 +310,10 @@ fn apply_httpupgrade_layer(
 use super::quic::ServerQuicConfig;
 #[cfg(feature = "httpupgrade")]
 use super::types::HttpUpgradeServerConfig;
-use super::types::{ServerConfig, ServerProxyConfig, XhttpServerConfig};
+use super::types::{
+    InboundSniffingConfig, ServerConfig, ServerProxyConfig, XhttpServerConfig,
+};
+use crate::routing_state::SniffExclusionMatcher;
 
 pub(crate) fn collect_xhttp_settings_from_json(
     value: serde_json::Value,
@@ -751,6 +754,84 @@ fn planned_unsupported_protocol_error(protocol: &str) -> Error {
     ))
 }
 
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawSniffingConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    dest_override: Vec<String>,
+    #[serde(default)]
+    domains_excluded: Vec<String>,
+    #[serde(default)]
+    ips_excluded: Vec<String>,
+    #[serde(default)]
+    metadata_only: bool,
+    #[serde(default)]
+    route_only: bool,
+}
+
+fn collect_sniffing_config(
+    tag: &str,
+    value: Option<serde_json::Value>,
+) -> Result<Option<InboundSniffingConfig>, Error> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let raw =
+        serde_json::from_value::<RawSniffingConfig>(value).map_err(|error| {
+            Error::InvalidConfig(format!(
+                "invalid inbound {tag} sniffing settings: {error}"
+            ))
+        })?;
+    if raw.metadata_only {
+        return Err(Error::InvalidConfig(format!(
+            "inbound {tag} sniffing metadataOnly is not implemented yet"
+        )));
+    }
+
+    let mut dest_override_http = false;
+    let mut dest_override_tls = false;
+    for protocol in &raw.dest_override {
+        match protocol.trim().to_ascii_lowercase().as_str() {
+            "http" => dest_override_http = true,
+            "tls" | "https" | "ssl" => dest_override_tls = true,
+            "quic" | "fakedns" | "fakedns+others" => {
+                return Err(Error::InvalidConfig(format!(
+                    "inbound {tag} sniffing destOverride={protocol:?} is recognized by Xray but not implemented yet"
+                )));
+            }
+            _ => {
+                return Err(Error::InvalidConfig(format!(
+                    "inbound {tag} sniffing has unknown destOverride protocol {protocol:?}"
+                )));
+            }
+        }
+    }
+
+    let has_exclusions =
+        !raw.domains_excluded.is_empty() || !raw.ips_excluded.is_empty();
+    let exclusions =
+        SniffExclusionMatcher::compile(raw.domains_excluded, raw.ips_excluded)
+            .map_err(|error| {
+                Error::InvalidConfig(format!(
+                    "invalid inbound {tag} sniffing exclusions: {error}"
+                ))
+            })?;
+    let config = InboundSniffingConfig {
+        enabled: raw.enabled,
+        dest_override_http,
+        dest_override_tls,
+        route_only: raw.route_only,
+        exclusions: std::sync::Arc::new(exclusions),
+    };
+    Ok((raw.enabled
+        || raw.route_only
+        || !raw.dest_override.is_empty()
+        || has_exclusions)
+        .then_some(config))
+}
+
 impl TryFrom<InboudItem> for ServerConfig {
     type Error = Error;
 
@@ -764,8 +845,10 @@ impl TryFrom<InboudItem> for ServerConfig {
             settings,
             stream_settings,
             tag,
+            sniffing,
             ..
         } = value;
+        let sniffing = collect_sniffing_config(&tag, sniffing)?;
 
         let listen = listen.unwrap_or_else(|| "0.0.0.0".to_string());
         let address = Address::from(&listen).map_err(|err| {
@@ -846,6 +929,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                     protocol,
                     transport,
                     quic_settings: None,
+                    sniffing,
                 })
             }
             #[cfg(feature = "hysteria")]
@@ -1071,6 +1155,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                     protocol: ServerProxyConfig::Hysteria2 { config },
                     transport: Transport::Quic,
                     quic_settings,
+                    sniffing,
                 })
             }
             #[cfg(feature = "vless")]
@@ -1357,6 +1442,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                     protocol,
                     transport: Transport::Tcp,
                     quic_settings: None,
+                    sniffing,
                 })
             }
             #[cfg(feature = "vmess")]
@@ -1416,6 +1502,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                     protocol,
                     transport: Transport::Tcp,
                     quic_settings: None,
+                    sniffing,
                 })
             }
 
@@ -1458,6 +1545,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                     protocol,
                     transport: Transport::Tcp,
                     quic_settings: None,
+                    sniffing,
                 })
             }
 
@@ -1505,6 +1593,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                     protocol: ServerProxyConfig::TuicV5 { config },
                     transport: Transport::Quic,
                     quic_settings,
+                    sniffing,
                 })
             }
 
@@ -1561,6 +1650,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                     protocol,
                     transport: Transport::Tcp,
                     quic_settings: None,
+                    sniffing,
                 })
             }
             #[cfg(not(feature = "http"))]
@@ -1625,6 +1715,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                     protocol,
                     transport: Transport::Tcp,
                     quic_settings: None,
+                    sniffing,
                 })
             }
             #[cfg(not(feature = "mixed"))]
@@ -1683,6 +1774,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                     protocol,
                     transport,
                     quic_settings: None,
+                    sniffing,
                 })
             }
             #[cfg(not(feature = "shadowsocks"))]
@@ -1730,6 +1822,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                     protocol,
                     transport: Transport::Tcp,
                     quic_settings: None,
+                    sniffing,
                 })
             }
         }
@@ -2381,6 +2474,57 @@ mod tests {
         let config = ServerConfig::try_from(inbound)
             .expect("Shadowsocks TCP+UDP should build");
         assert_eq!(config.transport, Transport::TcpAndUdp);
+    }
+
+    #[test]
+    fn inbound_builder_compiles_xray_sniffing_and_exclusions() {
+        let inbound = serde_json::from_value::<InboudItem>(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "dokodemo-door",
+            "tag": "dokodemo-sniff",
+            "settings": {"address": "127.0.0.1", "port": 53},
+            "sniffing": {
+                "enabled": true,
+                "destOverride": ["http", "https", "ssl"],
+                "routeOnly": true,
+                "domainsExcluded": ["domain:example.com", "regexp:^private\\."],
+                "ipsExcluded": ["192.0.2.0/24"]
+            }
+        }))
+        .expect("literal sniffing inbound should parse");
+        let config = ServerConfig::try_from(inbound)
+            .expect("Xray sniffing config should compile");
+        let sniffing = config.sniffing.expect("compiled sniffing config");
+        assert!(sniffing.enabled);
+        assert!(sniffing.route_only);
+        assert!(sniffing.dest_override_http);
+        assert!(sniffing.dest_override_tls);
+        assert!(sniffing.excludes_domain("api.example.com"));
+        assert!(sniffing.excludes_domain("private.test"));
+        assert!(!sniffing.excludes_domain("public.test"));
+        assert!(sniffing.excludes_ip("192.0.2.7".parse().unwrap()));
+        assert!(!sniffing.excludes_ip("198.51.100.7".parse().unwrap()));
+
+        for sniffing in [
+            serde_json::json!({"enabled": true, "metadataOnly": true}),
+            serde_json::json!({"enabled": true, "destOverride": ["quic"]}),
+            serde_json::json!({"enabled": true, "domainsExcluded": ["regexp:(invalid"]}),
+            serde_json::json!({"enabled": true, "ipsExcluded": ["192.0.2.0/99"]}),
+        ] {
+            let inbound = serde_json::from_value::<InboudItem>(serde_json::json!({
+                "listen": "127.0.0.1",
+                "port": 10000,
+                "protocol": "dokodemo-door",
+                "tag": "dokodemo-sniff-invalid",
+                "settings": {"address": "127.0.0.1", "port": 53},
+                "sniffing": sniffing
+            }))
+            .expect("literal invalid sniffing inbound should parse");
+            let error = ServerConfig::try_from(inbound)
+                .expect_err("unsupported or malformed sniffing must fail closed");
+            assert!(error.to_string().contains("sniffing"));
+        }
     }
 
     #[test]
