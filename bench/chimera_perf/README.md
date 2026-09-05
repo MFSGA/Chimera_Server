@@ -253,6 +253,54 @@ strace -f -c \
 
 The io_uring implementation is intentionally benchmark-only. It must not be connected to the production relay until it beats ordinary splice in throughput and CPU/GiB with acceptable variance. The current measured candidate does not meet that gate.
 
+## TCP pacing probe
+
+`tcp_pacing_probe` is a Linux-only loopback sender/sink benchmark for TCP Brutal2 pacing design. It compares the same blocking TCP write workload under three pacing modes:
+
+- `unpaced`: no rate limiting;
+- `kernel`: set `SO_MAX_PACING_RATE` on the sending TCP socket;
+- `userspace`: sleep after each write chunk to follow the same target byte rate.
+
+Build and verify the socket option first:
+
+```bash
+cargo test --manifest-path bench/chimera_perf/Cargo.toml --bin tcp_pacing_probe
+cargo build --release --manifest-path bench/chimera_perf/Cargo.toml --bin tcp_pacing_probe
+```
+
+Compare all modes at the same target rate:
+
+```bash
+for mode in unpaced kernel userspace; do
+  taskset -c 0,1 \
+    bench/chimera_perf/target/release/tcp_pacing_probe \
+    --mode "$mode" \
+    --bytes 134217728 \
+    --chunk-size 65536 \
+    --rate-bytes-per-sec 52428800 \
+    --warmup 1 \
+    --runs 5
+done
+```
+
+The important output fields are `requested_rate_ratio`, `cpu_seconds_per_gib`, and total context switches. A successful `setsockopt` is not enough evidence that kernel pacing is effective: the observed/requested rate ratio should remain close to 1 on the target host and network path.
+
+Use `strace` to attribute userspace pacing wakeups:
+
+```bash
+strace -f -c \
+  -e trace=write,sendto,sendmsg,clock_nanosleep,nanosleep,futex,poll,ppoll,epoll_wait,setsockopt,getsockopt \
+  bench/chimera_perf/target/release/tcp_pacing_probe \
+  --mode kernel \
+  --bytes 33554432 \
+  --chunk-size 65536 \
+  --rate-bytes-per-sec 52428800 \
+  --warmup 0 \
+  --runs 1
+```
+
+Run the same command with `--mode userspace`. This probe is benchmark-only; production TCP Brutal2 should not adopt kernel pacing until the target rate lifecycle and fallback semantics are defined through the normal config/runtime/handler layering.
+
 ## Required experiment discipline
 
 - Build every compared binary in release mode using the same toolchain.
