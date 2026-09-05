@@ -262,3 +262,44 @@ The io_uring implementation is intentionally benchmark-only. It must not be conn
 - Do not accept a throughput result unless correctness runs pass first.
 - Record at least three warmups and ten measured runs.
 - Treat coefficient of variation above 3% as an unstable environment, not as proof of a performance change.
+
+## UDP syscall batching probe
+
+`udp_probe` is a Linux-only loopback UDP relay microbenchmark. It keeps the
+source and sink on batched `sendmmsg`/`recvmmsg` in both variants so the
+measured difference is concentrated in the relay itself. A shared in-process
+progress window keeps both legs below the UDP socket queue limit so the probe
+compares no-loss relay paths instead of buffer-overflow behavior:
+
+- `single`: one `recv` plus one `send` syscall per relayed datagram;
+- `mmsg`: `recvmmsg` plus `sendmmsg` with a configurable batch size.
+
+Build and run correctness first:
+
+```bash
+cargo build --release --manifest-path bench/chimera_perf/Cargo.toml --bin udp_probe
+bench/chimera_perf/target/release/udp_probe \
+  --backend mmsg --packets 10000 --datagram-size 1200 \
+  --batch-size 32 --inflight-window 64 --warmup 1 --runs 2 --verify
+```
+
+Then compare stable samples and syscall counts:
+
+```bash
+for backend in single mmsg; do
+  taskset -c 0,1,2 \
+    bench/chimera_perf/target/release/udp_probe \
+    --backend "$backend" --packets 200000 --datagram-size 1200 \
+    --batch-size 32 --inflight-window 64 --warmup 2 --runs 10
+
+done
+
+strace -f -c -e trace=recvfrom,sendto,recvmmsg,sendmmsg \
+  bench/chimera_perf/target/release/udp_probe \
+  --backend mmsg --packets 20000 --datagram-size 1200 \
+  --batch-size 32 --inflight-window 64 --warmup 0 --runs 1
+```
+
+This probe is benchmark-only. Production UDP paths should adopt batching only
+when packet-rate and CPU-per-million-packets measurements improve without
+changing protocol/session semantics.
