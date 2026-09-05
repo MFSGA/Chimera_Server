@@ -397,8 +397,7 @@ fn apply_probe_result(
     let now = unix_time_secs();
     let (observation, next_window) = if sampling_count == 0 {
         let previous_last_seen = runtime
-            .outbound_observations()
-            .get(&tag)
+            .outbound_observation(&tag)
             .map_or(0, |status| status.last_seen_time);
         let last_seen_time = if result.alive {
             now
