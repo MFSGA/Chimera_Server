@@ -9,6 +9,7 @@ use serde::Deserialize;
 use crate::{
     address::{BindLocation, NetLocation},
     config::Transport,
+    routing_state::SniffExclusionMatcher,
 };
 
 #[cfg(feature = "reality")]
@@ -30,6 +31,38 @@ pub struct ServerConfig {
     pub transport: Transport,
     #[serde(default)]
     pub quic_settings: Option<ServerQuicConfig>,
+    #[serde(default)]
+    pub sniffing: Option<InboundSniffingConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct InboundSniffingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub dest_override_http: bool,
+    #[serde(default)]
+    pub dest_override_tls: bool,
+    #[serde(default)]
+    pub route_only: bool,
+    #[serde(skip)]
+    pub(crate) exclusions: Arc<SniffExclusionMatcher>,
+}
+
+impl InboundSniffingConfig {
+    pub fn overrides_protocol(&self, protocol: &str) -> bool {
+        (self.dest_override_http && protocol.starts_with("http"))
+            || (self.dest_override_tls && protocol.starts_with("tls"))
+    }
+
+    pub(crate) fn excludes_domain(&self, domain: &str) -> bool {
+        self.exclusions.excludes_domain(domain)
+    }
+
+    pub(crate) fn excludes_ip(&self, ip: IpAddr) -> bool {
+        self.exclusions.excludes_ip(ip)
+    }
 }
 
 #[cfg(feature = "hysteria")]

@@ -610,6 +610,7 @@ mod tests {
             },
             transport: Transport::Tcp,
             quic_settings: None,
+            sniffing: None,
         }
     }
 

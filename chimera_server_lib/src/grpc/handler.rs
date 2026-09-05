@@ -655,6 +655,7 @@ impl HandlerServiceImpl {
             protocol,
             transport: Transport::Tcp,
             quic_settings: None,
+            sniffing: None,
         })
     }
 
@@ -2999,6 +3000,7 @@ mod tests {
             protocol,
             transport: Transport::Tcp,
             quic_settings: None,
+            sniffing: None,
         };
 
         let outbound = OutboundSummary {
@@ -3141,6 +3143,7 @@ mod tests {
             },
             transport: Transport::Tcp,
             quic_settings: None,
+            sniffing: None,
         };
         let runtime = RuntimeState::new(vec![inbound], Vec::new());
         let placeholder_task = tokio::spawn(std::future::pending::<()>());
@@ -3271,6 +3274,7 @@ mod tests {
             },
             transport: Transport::Tcp,
             quic_settings: None,
+            sniffing: None,
         };
         let runtime = RuntimeState::new(vec![inbound], Vec::new());
         let service = HandlerServiceImpl::new(runtime);
@@ -4362,6 +4366,7 @@ mod tests {
             },
             transport: Transport::Tcp,
             quic_settings: None,
+            sniffing: None,
         };
         let runtime = RuntimeState::new(vec![inbound], Vec::new());
         let service = HandlerServiceImpl::new(runtime);
@@ -4507,6 +4512,7 @@ mod tests {
             },
             transport: Transport::Tcp,
             quic_settings: None,
+            sniffing: None,
         };
         let runtime = RuntimeState::new(vec![inbound], Vec::new());
         let service = HandlerServiceImpl::new(runtime);
@@ -4702,6 +4708,7 @@ mod tests {
             },
             transport: Transport::Tcp,
             quic_settings: None,
+            sniffing: None,
         };
         let runtime = RuntimeState::new(vec![inbound.clone()], Vec::new());
         let handles = start_servers(inbound, runtime.clone())
@@ -4944,6 +4951,7 @@ mod tests {
             },
             transport: Transport::Tcp,
             quic_settings: None,
+            sniffing: None,
         };
         let runtime = RuntimeState::new(vec![inbound], Vec::new());
         let service = HandlerServiceImpl::new(runtime);
@@ -5300,6 +5308,7 @@ mod tests {
             },
             transport: Transport::Quic,
             quic_settings: None,
+            sniffing: None,
         };
         let runtime = RuntimeState::new(vec![inbound], Vec::new());
         let service = HandlerServiceImpl::new(runtime.clone());
