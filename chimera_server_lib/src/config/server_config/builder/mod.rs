@@ -861,6 +861,184 @@ fn plan_vless_core(
     })
 }
 
+#[cfg(feature = "vless")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VlessTransportKind {
+    Xhttp,
+    Standard,
+}
+
+#[cfg(feature = "vless")]
+struct VlessTransportPlan {
+    kind: VlessTransportKind,
+    security: String,
+}
+
+#[cfg(feature = "vless")]
+fn plan_vless_transport(
+    stream_settings: Option<&crate::config::StreamSettings>,
+    uses_vision: bool,
+) -> Result<VlessTransportPlan, Error> {
+    let uses_xhttp = stream_settings
+        .map(|settings| settings.network.eq_ignore_ascii_case("xhttp"))
+        .unwrap_or(false);
+    let security = stream_settings
+        .and_then(|settings| settings.security.as_deref())
+        .unwrap_or("none")
+        .to_ascii_lowercase();
+
+    if uses_vision {
+        if uses_xhttp {
+            return Err(Error::InvalidConfig(
+                "xtls-rprx-vision does not support xhttp transport".into(),
+            ));
+        }
+        if security != "tls" && security != "reality" {
+            return Err(Error::InvalidConfig(
+                "xtls-rprx-vision requires streamSettings.security=tls or reality"
+                    .into(),
+            ));
+        }
+        #[cfg(feature = "ws")]
+        if stream_settings.is_some_and(|settings| settings.ws_settings.is_some()) {
+            return Err(Error::InvalidConfig(
+                "xtls-rprx-vision does not support websocket transport".into(),
+            ));
+        }
+        if stream_settings.is_some_and(|settings| {
+            matches!(
+                settings.network.to_ascii_lowercase().as_str(),
+                "httpupgrade" | "grpc"
+            )
+        }) {
+            return Err(Error::InvalidConfig(
+                "xtls-rprx-vision does not support httpupgrade or grpc transport"
+                    .into(),
+            ));
+        }
+    }
+
+    Ok(VlessTransportPlan {
+        kind: if uses_xhttp {
+            VlessTransportKind::Xhttp
+        } else {
+            VlessTransportKind::Standard
+        },
+        security,
+    })
+}
+
+#[cfg(feature = "vless")]
+fn apply_vless_xhttp_transport(
+    protocol: ServerProxyConfig,
+    stream_settings: &crate::config::StreamSettings,
+    security: &str,
+) -> Result<ServerProxyConfig, Error> {
+    let xhttp_settings =
+        stream_settings.xhttp_settings.clone().ok_or_else(|| {
+            Error::InvalidConfig("xhttp inbound requires xhttpSettings".into())
+        })?;
+    let mut xhttp_config = collect_xhttp_settings(xhttp_settings)?;
+    xhttp_config.trusted_x_forwarded_for =
+        xray_trusted_x_forwarded_for(stream_settings);
+    if let Some(quic_params) = stream_settings
+        .final_mask
+        .as_ref()
+        .and_then(|final_mask| final_mask.quic_params.as_ref())
+    {
+        if quic_params.congestion.eq_ignore_ascii_case("brutal") {
+            return Err(Error::InvalidConfig(format!(
+                "finalmask.quicParams.congestion={} is not supported for XHTTP",
+                quic_params.congestion
+            )));
+        }
+        let validated = validate_xray_finalmask_quic_params(quic_params, false)?;
+        xhttp_config.xray_congestion = Some(validated.congestion);
+        xhttp_config.xray_brutal_up =
+            (validated.brutal_up != 0).then_some(validated.brutal_up);
+        xhttp_config.xray_max_idle_timeout_secs =
+            (validated.max_idle_timeout != 0).then_some(validated.max_idle_timeout);
+        xhttp_config.xray_max_incoming_streams = (validated.max_incoming_streams
+            != 0)
+            .then_some(validated.max_incoming_streams);
+        let (init_stream, max_stream, init_connection, max_connection) =
+            validated.receive_windows;
+        xhttp_config.xray_init_stream_receive_window = Some(init_stream);
+        xhttp_config.xray_max_stream_receive_window = Some(max_stream);
+        xhttp_config.xray_init_connection_receive_window = Some(init_connection);
+        xhttp_config.xray_max_connection_receive_window = Some(max_connection);
+        xhttp_config.xray_disable_path_mtu_discovery =
+            Some(quic_params.disable_path_mtu_discovery);
+    }
+    let protocol = ServerProxyConfig::Xhttp {
+        config: xhttp_config,
+        inner: Box::new(protocol),
+    };
+
+    match security {
+        "none" => Ok(protocol),
+        "tls" | "reality" => apply_security_layers(protocol, stream_settings),
+        unsupported => Err(Error::InvalidConfig(format!(
+            "xhttp inbound currently supports only security=none, tls, or reality, got {unsupported}"
+        ))),
+    }
+}
+
+#[cfg(feature = "vless")]
+fn apply_vless_transport_plan(
+    mut protocol: ServerProxyConfig,
+    stream_settings: Option<&crate::config::StreamSettings>,
+    plan: &VlessTransportPlan,
+) -> Result<ServerProxyConfig, Error> {
+    #[cfg(feature = "ws")]
+    if plan.kind == VlessTransportKind::Standard
+        && let Some(stream_settings) = stream_settings
+        && let Some(ws_settings) = stream_settings.ws_settings.clone()
+    {
+        tracing::info!("use websocket");
+        protocol = ServerProxyConfig::Websocket {
+            targets: Box::new(OneOrSome::One(websocket_server_config(
+                ws_settings,
+                stream_settings,
+                protocol,
+            ))),
+        };
+    }
+
+    let Some(stream_settings) = stream_settings else {
+        return Ok(protocol);
+    };
+    match plan.kind {
+        VlessTransportKind::Xhttp => {
+            apply_vless_xhttp_transport(protocol, stream_settings, &plan.security)
+        }
+        VlessTransportKind::Standard => {
+            let protocol = apply_httpupgrade_layer(protocol, stream_settings)?;
+            let protocol = apply_grpc_layer(protocol, stream_settings)?;
+            apply_security_layers(protocol, stream_settings)
+        }
+    }
+}
+
+#[cfg(feature = "vless")]
+fn build_vless_server(
+    context: InboundBuildContext,
+    settings: Option<crate::config::SettingObject>,
+) -> Result<ServerConfig, Error> {
+    let VlessCorePlan {
+        protocol,
+        uses_vision,
+    } = plan_vless_core(settings.as_ref())?;
+    let transport_plan =
+        plan_vless_transport(context.stream_settings(), uses_vision)?;
+    let protocol = apply_vless_transport_plan(
+        protocol,
+        context.stream_settings(),
+        &transport_plan,
+    )?;
+    Ok(context.finish_tcp(protocol))
+}
+
 #[cfg(feature = "shadowsocks")]
 fn collect_shadowsocks_users(
     settings: Option<crate::config::SettingObject>,
@@ -1589,162 +1767,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                 })
             }
             #[cfg(feature = "vless")]
-            Protocol::Vless => {
-                let InboundBuildContext {
-                    tag,
-                    bind_location,
-                    stream_settings,
-                    sniffing,
-                    ..
-                } = context;
-                let VlessCorePlan {
-                    mut protocol,
-                    uses_vision,
-                } = plan_vless_core(settings.as_ref())?;
-                let uses_xhttp = stream_settings
-                    .as_ref()
-                    .map(|settings| settings.network.eq_ignore_ascii_case("xhttp"))
-                    .unwrap_or(false);
-                let security = stream_settings
-                    .as_ref()
-                    .and_then(|settings| settings.security.as_deref())
-                    .unwrap_or("none")
-                    .to_ascii_lowercase();
-
-                if uses_vision {
-                    if uses_xhttp {
-                        return Err(Error::InvalidConfig(
-                            "xtls-rprx-vision does not support xhttp transport".into(),
-                        ));
-                    }
-                    if security != "tls" && security != "reality" {
-                        return Err(Error::InvalidConfig(
-                            "xtls-rprx-vision requires streamSettings.security=tls or reality"
-                                .into(),
-                        ));
-                    }
-                }
-
-                #[cfg(feature = "ws")]
-                if !uses_xhttp
-                    && let Some(stream_setting) = stream_settings.as_ref()
-                        && let Some(ws_setting) = stream_setting.ws_settings.clone() {
-                            if uses_vision {
-                                return Err(Error::InvalidConfig(
-                                    "xtls-rprx-vision does not support websocket transport"
-                                        .into(),
-                                ));
-                            }
-                            tracing::info!("use websocket");
-                            protocol = ServerProxyConfig::Websocket {
-                                targets: Box::new(OneOrSome::One(
-                                    websocket_server_config(
-                                    ws_setting,
-                                    stream_setting,
-                                    protocol,
-                                ),
-                                )),
-                            };
-                        }
-
-                if let Some(stream_setting) = stream_settings.as_ref() {
-                    if uses_xhttp {
-                        let xhttp_settings =
-                            stream_setting.xhttp_settings.clone().ok_or_else(|| {
-                                Error::InvalidConfig(
-                                    "xhttp inbound requires xhttpSettings".into(),
-                                )
-                            })?;
-
-                        let mut xhttp_config = collect_xhttp_settings(xhttp_settings)?;
-                        xhttp_config.trusted_x_forwarded_for =
-                            xray_trusted_x_forwarded_for(stream_setting);
-                        if let Some(quic_params) = stream_setting
-                            .final_mask
-                            .as_ref()
-                            .and_then(|final_mask| final_mask.quic_params.as_ref())
-                        {
-                            if quic_params.congestion.eq_ignore_ascii_case("brutal") {
-                                return Err(Error::InvalidConfig(format!(
-                                    "finalmask.quicParams.congestion={} is not supported for XHTTP",
-                                    quic_params.congestion
-                                )));
-                            }
-                            let validated =
-                                validate_xray_finalmask_quic_params(quic_params, false)?;
-                            xhttp_config.xray_congestion = Some(validated.congestion);
-                            xhttp_config.xray_brutal_up =
-                                (validated.brutal_up != 0).then_some(validated.brutal_up);
-                            xhttp_config.xray_max_idle_timeout_secs =
-                                (validated.max_idle_timeout != 0)
-                                    .then_some(validated.max_idle_timeout);
-                            xhttp_config.xray_max_incoming_streams =
-                                (validated.max_incoming_streams != 0)
-                                    .then_some(validated.max_incoming_streams);
-                            let (
-                                init_stream,
-                                max_stream,
-                                init_connection,
-                                max_connection,
-                            ) = validated.receive_windows;
-                            xhttp_config.xray_init_stream_receive_window = Some(init_stream);
-                            xhttp_config.xray_max_stream_receive_window = Some(max_stream);
-                            xhttp_config.xray_init_connection_receive_window =
-                                Some(init_connection);
-                            xhttp_config.xray_max_connection_receive_window =
-                                Some(max_connection);
-                            xhttp_config.xray_disable_path_mtu_discovery =
-                                Some(quic_params.disable_path_mtu_discovery);
-                        }
-                        protocol = ServerProxyConfig::Xhttp {
-                            config: xhttp_config,
-                            inner: Box::new(protocol),
-                        };
-
-                        match security.as_str() {
-                            "none" => {}
-                            "tls" => {
-                                protocol =
-                                    apply_security_layers(protocol, stream_setting)?;
-                            }
-                            "reality" => {
-                                protocol =
-                                    apply_security_layers(protocol, stream_setting)?;
-                            }
-                            unsupported => {
-                                return Err(Error::InvalidConfig(format!(
-                                    "xhttp inbound currently supports only security=none, tls, or reality, got {unsupported}"
-                                )));
-                            }
-                        }
-                    } else {
-                        if uses_vision
-                            && matches!(
-                                stream_setting.network.to_ascii_lowercase().as_str(),
-                                "httpupgrade" | "grpc"
-                            )
-                        {
-                            return Err(Error::InvalidConfig(
-                                "xtls-rprx-vision does not support httpupgrade or grpc transport"
-                                    .into(),
-                            ));
-                        }
-                        protocol =
-                            apply_httpupgrade_layer(protocol, stream_setting)?;
-                        protocol = apply_grpc_layer(protocol, stream_setting)?;
-                        protocol = apply_security_layers(protocol, stream_setting)?;
-                    }
-                }
-
-                Ok(ServerConfig {
-                    tag,
-                    bind_location,
-                    protocol,
-                    transport: Transport::Tcp,
-                    quic_settings: None,
-                    sniffing,
-                })
-            }
+            Protocol::Vless => build_vless_server(context, settings),
             #[cfg(feature = "vmess")]
             Protocol::Vmess => build_vmess_server(context, settings),
 
