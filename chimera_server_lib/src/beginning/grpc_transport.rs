@@ -1487,14 +1487,13 @@ fn skip_protobuf_field(
 fn encode_grpc_message(data: &[u8], _multi_mode: bool) -> Bytes {
     // Hunk and MultiHunk both encode their data using protobuf field 1. A single
     // field is a valid repeated-field encoding, so replies can use the same wire form.
-    let mut protobuf = Vec::with_capacity(data.len() + 6);
-    protobuf.push(0x0a);
-    encode_varint(data.len(), &mut protobuf);
-    protobuf.extend_from_slice(data);
-    let mut frame = Vec::with_capacity(protobuf.len() + 5);
-    frame.push(0);
-    frame.extend_from_slice(&(protobuf.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&protobuf);
+    let mut frame = Vec::with_capacity(data.len() + 11);
+    frame.extend_from_slice(&[0; 5]);
+    frame.push(0x0a);
+    encode_varint(data.len(), &mut frame);
+    frame.extend_from_slice(data);
+    let message_len = frame.len() - 5;
+    frame[1..5].copy_from_slice(&(message_len as u32).to_be_bytes());
     Bytes::from(frame)
 }
 
