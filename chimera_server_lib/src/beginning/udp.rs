@@ -195,6 +195,19 @@ struct SessionUdpWorker {
     task: Option<JoinHandle<()>>,
 }
 
+enum SessionUdpWorkerPlan {
+    Reuse(SessionUdpSender),
+    Replace,
+}
+
+struct SessionUdpWorkerStart {
+    key: TargetedUdpSessionKey,
+    response_sender: mpsc::Sender<SessionUdpEvent>,
+    traffic_context: Option<TrafficContext>,
+    global_id: Option<[u8; 8]>,
+    idle_timeout: Duration,
+}
+
 struct GlobalSessionUdpWorker {
     key: GlobalUdpWorkerKey,
     sender: mpsc::Sender<GlobalUdpPayload>,
@@ -536,57 +549,45 @@ pub(crate) async fn run_session_based_udp(
                             target_addr,
                             outbound_tag: tag,
                         };
-                        let sender = match sessions.get(&session_id) {
-                            Some(worker)
-                                if session_udp_worker_matches(
-                                    worker,
-                                    &key,
-                                    global_id,
-                                ) =>
-                            {
-                                worker.sender.clone()
-                            }
-                            _ => {
-                                terminate_session_udp_worker(&mut sessions, session_id).await;
-                                let generation = take_session_generation(
-                                    &mut next_generation,
-                                )?;
-                                let worker = start_session_udp_session(
+                        let sender = match plan_session_udp_worker(
+                            sessions.get(&session_id),
+                            &key,
+                            global_id,
+                        ) {
+                            SessionUdpWorkerPlan::Reuse(sender) => sender,
+                            SessionUdpWorkerPlan::Replace => {
+                                replace_session_udp_worker(
+                                    &mut sessions,
                                     session_id,
-                                    generation,
-                                    key.clone(),
-                                    response_sender.clone(),
-                                    packet_context.clone(),
-                                    global_id,
-                                    UDP_SESSION_IDLE_TIMEOUT,
+                                    &mut next_generation,
+                                    SessionUdpWorkerStart {
+                                        key: key.clone(),
+                                        response_sender: response_sender.clone(),
+                                        traffic_context: packet_context.clone(),
+                                        global_id,
+                                        idle_timeout: UDP_SESSION_IDLE_TIMEOUT,
+                                    },
                                 )
-                                .await?;
-                                let sender = worker.sender.clone();
-                                sessions.insert(session_id, worker);
-                                sender
+                                .await?
                             }
                         };
 
-                        if sender.send_to(payload, target_addr).await.is_err() {
-                            terminate_session_udp_worker(&mut sessions, session_id).await;
-                            let generation =
-                                take_session_generation(&mut next_generation)?;
-                            let worker = start_session_udp_session(
+                        if let Err(retry_payload) = sender.send_to(payload, target_addr).await {
+                            let retry_sender = replace_session_udp_worker(
+                                &mut sessions,
                                 session_id,
-                                generation,
-                                key,
-                                response_sender.clone(),
-                                packet_context,
-                                global_id,
-                                UDP_SESSION_IDLE_TIMEOUT,
+                                &mut next_generation,
+                                SessionUdpWorkerStart {
+                                    key,
+                                    response_sender: response_sender.clone(),
+                                    traffic_context: packet_context,
+                                    global_id,
+                                    idle_timeout: UDP_SESSION_IDLE_TIMEOUT,
+                                },
                             )
                             .await?;
-                            worker
-                                .sender
-                                .send_to(
-                                    client_buffer[..payload_length].to_vec(),
-                                    target_addr,
-                                )
+                            retry_sender
+                                .send_to(retry_payload, target_addr)
                                 .await
                                 .map_err(|_| {
                                     std::io::Error::new(
@@ -594,7 +595,6 @@ pub(crate) async fn run_session_based_udp(
                                         "session udp socket closed before payload was sent",
                                     )
                                 })?;
-                            sessions.insert(session_id, worker);
                         }
                     }
                 }
@@ -668,18 +668,52 @@ fn session_udp_worker_matches(
     key: &TargetedUdpSessionKey,
     global_id: Option<[u8; 8]>,
 ) -> bool {
-    if worker.global_id != global_id || worker.sender.is_closed() {
-        return false;
-    }
-    GlobalUdpWorkerKey::from(&worker.key) == GlobalUdpWorkerKey::from(key)
+    worker.global_id == global_id
+        && !worker.sender.is_closed()
+        && GlobalUdpWorkerKey::from(&worker.key) == GlobalUdpWorkerKey::from(key)
 }
 
-fn take_session_generation(next_generation: &mut u64) -> std::io::Result<u64> {
-    let generation = *next_generation;
-    *next_generation = next_generation.checked_add(1).ok_or_else(|| {
+fn plan_session_udp_worker(
+    worker: Option<&SessionUdpWorker>,
+    key: &TargetedUdpSessionKey,
+    global_id: Option<[u8; 8]>,
+) -> SessionUdpWorkerPlan {
+    worker
+        .filter(|worker| session_udp_worker_matches(worker, key, global_id))
+        .map(|worker| SessionUdpWorkerPlan::Reuse(worker.sender.clone()))
+        .unwrap_or(SessionUdpWorkerPlan::Replace)
+}
+
+fn plan_session_generation(next_generation: u64) -> std::io::Result<(u64, u64)> {
+    let following_generation = next_generation.checked_add(1).ok_or_else(|| {
         std::io::Error::other("session UDP generation counter exhausted")
     })?;
-    Ok(generation)
+    Ok((next_generation, following_generation))
+}
+
+async fn replace_session_udp_worker(
+    sessions: &mut HashMap<u16, SessionUdpWorker>,
+    session_id: u16,
+    next_generation: &mut u64,
+    start: SessionUdpWorkerStart,
+) -> std::io::Result<SessionUdpSender> {
+    terminate_session_udp_worker(sessions, session_id).await;
+    let (generation, following_generation) =
+        plan_session_generation(*next_generation)?;
+    *next_generation = following_generation;
+    let worker = start_session_udp_session(
+        session_id,
+        generation,
+        start.key,
+        start.response_sender,
+        start.traffic_context,
+        start.global_id,
+        start.idle_timeout,
+    )
+    .await?;
+    let sender = worker.sender.clone();
+    sessions.insert(session_id, worker);
+    Ok(sender)
 }
 
 async fn terminate_session_udp_worker(
@@ -2187,31 +2221,23 @@ mod tests {
 
     #[test]
     fn session_generation_exhaustion_is_reported_without_wrapping() {
-        let mut next_generation = u64::MAX;
-
-        let error = take_session_generation(&mut next_generation)
+        let error = plan_session_generation(u64::MAX)
             .expect_err("exhausted session generation counter must fail");
 
         assert_eq!(error.kind(), std::io::ErrorKind::Other);
         assert!(error.to_string().contains("generation counter exhausted"));
-        assert_eq!(next_generation, u64::MAX);
     }
 
     #[test]
-    fn session_generation_advances_monotonically() {
-        let mut next_generation = 41;
-
+    fn session_generation_plan_advances_monotonically() {
         assert_eq!(
-            take_session_generation(&mut next_generation)
-                .expect("take first session generation"),
-            41
+            plan_session_generation(41).expect("plan next session generation"),
+            (41, 42)
         );
         assert_eq!(
-            take_session_generation(&mut next_generation)
-                .expect("take second session generation"),
-            42
+            plan_session_generation(42).expect("plan following session generation"),
+            (42, 43)
         );
-        assert_eq!(next_generation, 43);
     }
 
     #[cfg(any(feature = "vless", feature = "vmess"))]
