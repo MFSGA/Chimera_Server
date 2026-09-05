@@ -43,8 +43,8 @@ use crate::{
     address::BindLocation,
     async_stream::{AsyncPing, AsyncStream},
     config::server_config::{
-        ServerConfig, ServerProxyConfig, XhttpDataPlacement, XhttpMode,
-        XhttpPaddingMethod, XhttpPaddingPlacement, XhttpPlacement,
+        InboundSniffingConfig, ServerConfig, ServerProxyConfig, XhttpDataPlacement,
+        XhttpMode, XhttpPaddingMethod, XhttpPaddingPlacement, XhttpPlacement,
         XhttpServerConfig,
     },
     handler::tcp::{
@@ -63,7 +63,7 @@ use crate::{
     config::server_config::TlsServerConfig, handler::tls::build_server_config,
 };
 
-use super::process_stream_with_local_addr;
+use super::process_stream_with_sniffing_and_local_addr;
 
 const XHTTP_PIPE_CAPACITY: usize = 64 * 1024;
 const XHTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(4);
@@ -187,6 +187,7 @@ pub async fn start_xhttp_server(
         tag,
         bind_location,
         protocol,
+        sniffing,
         ..
     } = config;
 
@@ -212,6 +213,7 @@ pub async fn start_xhttp_server(
         server_handler,
         resolver,
         runtime,
+        sniffing,
         shutdown.clone(),
     ));
     #[cfg(feature = "tls")]
@@ -767,6 +769,7 @@ struct AppState {
     server_handler: Arc<Box<dyn TcpServerHandler>>,
     resolver: Arc<dyn Resolver>,
     runtime: RuntimeState,
+    sniffing: Option<InboundSniffingConfig>,
     shutdown: CancellationToken,
     sessions: SessionStore,
 }
@@ -777,6 +780,7 @@ impl AppState {
         server_handler: Arc<Box<dyn TcpServerHandler>>,
         resolver: Arc<dyn Resolver>,
         runtime: RuntimeState,
+        sniffing: Option<InboundSniffingConfig>,
         shutdown: CancellationToken,
     ) -> Self {
         Self {
@@ -809,6 +813,7 @@ impl AppState {
             server_handler,
             resolver,
             runtime,
+            sniffing,
             shutdown: shutdown.clone(),
             sessions: SessionStore::new(
                 Duration::from_secs(config.session_ttl_secs),
@@ -1364,13 +1369,14 @@ fn spawn_handler_stream(
     tokio::spawn(async move {
         tokio::select! {
             _ = shutdown.cancelled() => {}
-            result = process_stream_with_local_addr(
+            result = process_stream_with_sniffing_and_local_addr(
                 stream,
                 state.server_handler.clone(),
                 state.resolver.clone(),
                 peer_addr,
                 Some(local_addr),
                 state.runtime.clone(),
+                state.sniffing.clone(),
             ) => {
                 if let Err(err) = result {
                     error!("xhttp logical stream {} failed: {}", peer_addr, err);
