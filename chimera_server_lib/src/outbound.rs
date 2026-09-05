@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -26,6 +27,15 @@ pub(crate) enum DirectOutboundAction {
 pub(crate) struct TcpOutboundConnection {
     pub stream: tokio::net::TcpStream,
     pub outbound_tag: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct InboundRoutingMetadata {
+    pub local_addr: Option<SocketAddr>,
+    pub vless_route: u32,
+    pub sniffed_protocol: Option<String>,
+    pub route_target_domain: Option<String>,
+    pub attributes: HashMap<String, String>,
 }
 
 pub(crate) async fn connect_tcp_outbound(
@@ -57,6 +67,30 @@ pub(crate) async fn connect_tcp_outbound_with_vless_route(
     source_addr: SocketAddr,
     vless_route: u32,
 ) -> std::io::Result<Option<TcpOutboundConnection>> {
+    connect_tcp_outbound_with_routing_metadata(
+        resolver,
+        remote_location,
+        runtime,
+        inbound_tag,
+        user,
+        source_addr,
+        InboundRoutingMetadata {
+            vless_route,
+            ..InboundRoutingMetadata::default()
+        },
+    )
+    .await
+}
+
+pub(crate) async fn connect_tcp_outbound_with_routing_metadata(
+    resolver: &Arc<dyn Resolver>,
+    remote_location: &NetLocation,
+    runtime: &RuntimeState,
+    inbound_tag: &str,
+    user: &str,
+    source_addr: SocketAddr,
+    routing_metadata: InboundRoutingMetadata,
+) -> std::io::Result<Option<TcpOutboundConnection>> {
     let target_addr = resolve_single_address(resolver, remote_location).await?;
     let mut route_input = connection_routing_input(
         inbound_tag,
@@ -66,7 +100,18 @@ pub(crate) async fn connect_tcp_outbound_with_vless_route(
         target_addr,
         remote_location,
     );
-    route_input.vless_route = vless_route;
+    route_input.vless_route = routing_metadata.vless_route;
+    if let Some(local_addr) = routing_metadata.local_addr {
+        route_input.local_ips = vec![encode_ip(local_addr.ip())];
+        route_input.local_port = local_addr.port() as u32;
+    }
+    if let Some(domain) = routing_metadata.route_target_domain {
+        route_input.target_domain = domain;
+    }
+    if let Some(protocol) = routing_metadata.sniffed_protocol {
+        route_input.protocol = protocol;
+    }
+    route_input.attributes = routing_metadata.attributes;
     if runtime.routing().requires_process_lookup() {
         enrich_routing_input(&mut route_input).await;
     }
