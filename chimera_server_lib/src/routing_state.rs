@@ -99,6 +99,28 @@ pub struct OutboundObservation {
     pub health_min_ms: i64,
 }
 
+fn merge_outbound_observation(
+    previous: Option<&OutboundObservation>,
+    mut observation: OutboundObservation,
+) -> OutboundObservation {
+    let Some(previous) = previous else {
+        return observation;
+    };
+
+    if observation.last_seen_time == 0 {
+        observation.last_seen_time = previous.last_seen_time;
+    }
+    if observation.health_all == 0 && previous.health_all > 0 {
+        observation.health_all = previous.health_all;
+        observation.health_fail = previous.health_fail;
+        observation.health_deviation_ms = previous.health_deviation_ms;
+        observation.health_average_ms = previous.health_average_ms;
+        observation.health_max_ms = previous.health_max_ms;
+        observation.health_min_ms = previous.health_min_ms;
+    }
+    observation
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum DomainStrategy {
     #[default]
@@ -644,23 +666,12 @@ impl RoutingState {
     pub(crate) fn record_observation(
         &self,
         tag: impl Into<String>,
-        mut observation: OutboundObservation,
+        observation: OutboundObservation,
     ) {
+        let tag = tag.into();
         if let Ok(mut observations) = self.observations.write() {
-            let tag = tag.into();
-            if let Some(previous) = observations.get(&tag) {
-                if observation.last_seen_time == 0 {
-                    observation.last_seen_time = previous.last_seen_time;
-                }
-                if observation.health_all == 0 && previous.health_all > 0 {
-                    observation.health_all = previous.health_all;
-                    observation.health_fail = previous.health_fail;
-                    observation.health_deviation_ms = previous.health_deviation_ms;
-                    observation.health_average_ms = previous.health_average_ms;
-                    observation.health_max_ms = previous.health_max_ms;
-                    observation.health_min_ms = previous.health_min_ms;
-                }
-            }
+            let observation =
+                merge_outbound_observation(observations.get(&tag), observation);
             observations.insert(tag, observation);
         }
     }
@@ -4223,6 +4234,63 @@ mod tests {
             vec![String::new()],
             "leastPing principle target must not apply fallbackTag"
         );
+    }
+
+    #[test]
+    fn observation_merge_preserves_only_missing_liveness_history() {
+        let previous = OutboundObservation {
+            alive: true,
+            delay_ms: 20,
+            last_seen_time: 100,
+            last_try_time: 100,
+            health_all: 10,
+            health_fail: 2,
+            health_deviation_ms: 4,
+            health_average_ms: 18,
+            health_max_ms: 30,
+            health_min_ms: 10,
+            ..OutboundObservation::default()
+        };
+        let incoming = OutboundObservation {
+            alive: false,
+            delay_ms: 50,
+            last_try_time: 101,
+            last_error_reason: "connection refused".into(),
+            ..OutboundObservation::default()
+        };
+
+        let merged = merge_outbound_observation(Some(&previous), incoming);
+        assert!(!merged.alive);
+        assert_eq!(merged.delay_ms, 50);
+        assert_eq!(merged.last_seen_time, 100);
+        assert_eq!(merged.last_try_time, 101);
+        assert_eq!(merged.health_all, 10);
+        assert_eq!(merged.health_fail, 2);
+        assert_eq!(merged.health_deviation_ms, 4);
+        assert_eq!(merged.health_average_ms, 18);
+        assert_eq!(merged.health_max_ms, 30);
+        assert_eq!(merged.health_min_ms, 10);
+        assert_eq!(merged.last_error_reason, "connection refused");
+    }
+
+    #[test]
+    fn observation_merge_keeps_explicit_new_health_window() {
+        let previous = OutboundObservation {
+            last_seen_time: 100,
+            health_all: 10,
+            health_fail: 2,
+            ..OutboundObservation::default()
+        };
+        let incoming = OutboundObservation {
+            last_seen_time: 200,
+            health_all: 3,
+            health_fail: 1,
+            health_average_ms: 9,
+            ..OutboundObservation::default()
+        };
+
+        let merged = merge_outbound_observation(Some(&previous), incoming.clone());
+        assert_eq!(merged, incoming);
     }
 
     #[test]
