@@ -59,6 +59,9 @@ use crate::{
 const GRPC_PIPE_CAPACITY: usize = 64 * 1024;
 const MAX_GRPC_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const GRPC_MAX_HEADER_LIST_BYTES: u32 = 16 * 1024 * 1024;
+// google.golang.org/protobuf v1.36.11, used by Xray, accepts field numbers
+// only in the protobuf wire-format range 1..=2^29-1.
+const PROTOBUF_MAX_FIELD_NUMBER: usize = (1 << 29) - 1;
 const GRPC_CONNECTION_SETUP_TIMEOUT: Duration = Duration::from_secs(120);
 const HTTP2_CLIENT_PREFACE_LEN: usize = 24;
 const HTTP2_FRAME_HEADER_LEN: usize = 9;
@@ -1342,10 +1345,10 @@ fn decode_data_fields(message: &[u8], multi_mode: bool) -> io::Result<Vec<Vec<u8
         offset += key_len;
         let field_number = key >> 3;
         let wire_type = key & 0x07;
-        if field_number == 0 {
+        if field_number == 0 || field_number > PROTOBUF_MAX_FIELD_NUMBER {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "protobuf field number cannot be zero",
+                "invalid protobuf field number",
             ));
         }
 
@@ -1427,10 +1430,12 @@ fn skip_protobuf_field(
             offset += key_len;
             let nested_field_number = key >> 3;
             let nested_wire_type = key & 0x07;
-            if nested_field_number == 0 {
+            if nested_field_number == 0
+                || nested_field_number > PROTOBUF_MAX_FIELD_NUMBER
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "protobuf field number cannot be zero",
+                    "invalid protobuf field number",
                 ));
             }
             if nested_wire_type == 4 {
@@ -1600,12 +1605,12 @@ mod tests {
 
     use super::{
         GrpcKeepalive, GrpcPeerContext, GrpcSetupTimeoutIo, GrpcStreamTaskGuard,
-        decode_grpc_message, encode_grpc_message, grpc_content_type,
-        grpc_content_type_is_valid, grpc_deadline_exceeded_response,
-        grpc_duplicate_host_error, grpc_duplicate_host_response,
-        grpc_encode_message, grpc_http2_builder, grpc_invalid_base64_offset,
-        grpc_invalid_content_type_response, grpc_logical_addrs,
-        grpc_logical_peer_addr, grpc_malformed_binary_metadata,
+        PROTOBUF_MAX_FIELD_NUMBER, decode_grpc_message, encode_grpc_message,
+        encode_varint, grpc_content_type, grpc_content_type_is_valid,
+        grpc_deadline_exceeded_response, grpc_duplicate_host_error,
+        grpc_duplicate_host_response, grpc_encode_message, grpc_http2_builder,
+        grpc_invalid_base64_offset, grpc_invalid_content_type_response,
+        grpc_logical_addrs, grpc_logical_peer_addr, grpc_malformed_binary_metadata,
         grpc_malformed_binary_metadata_response, grpc_malformed_timeout_response,
         grpc_method_not_allowed_response, grpc_service_paths, grpc_stream_response,
         grpc_timeout_duration, grpc_unimplemented_path_response,
@@ -2023,6 +2028,44 @@ mod tests {
         assert_eq!(grpc_encode_message("50% done"), "50%25 done");
         assert_eq!(grpc_encode_message("line\nbreak"), "line%0Abreak");
         assert_eq!(grpc_encode_message("é"), "%C3%A9");
+    }
+
+    #[test]
+    fn grpc_rejects_out_of_range_protobuf_field_numbers_like_xray_v26_2_6() {
+        let encode_key = |field_number: usize| {
+            let mut key = Vec::new();
+            encode_varint(field_number << 3, &mut key);
+            key
+        };
+
+        let mut max_field = encode_key(PROTOBUF_MAX_FIELD_NUMBER);
+        max_field.push(1);
+        max_field.extend_from_slice(&[0x0a, 0x02, b'o', b'k']);
+        let mut frame = vec![0];
+        frame.extend_from_slice(&(max_field.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&max_field);
+        let mut buffer = BytesMut::from(frame.as_slice());
+        assert_eq!(
+            decode_grpc_message(&mut buffer, false).unwrap(),
+            Some(vec![b"ok".to_vec()])
+        );
+
+        let mut too_large = encode_key(PROTOBUF_MAX_FIELD_NUMBER + 1);
+        too_large.push(1);
+        too_large.extend_from_slice(&[0x0a, 0x02, b'o', b'k']);
+        let mut frame = vec![0];
+        frame.extend_from_slice(&(too_large.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&too_large);
+        let mut buffer = BytesMut::from(frame.as_slice());
+        let error = decode_grpc_message(&mut buffer, false)
+            .expect_err("protobuf field numbers above 2^29 - 1 must be rejected");
+        let status = grpc_upload_status_from_error(&error)
+            .expect("invalid protobuf field number must map to a status");
+        assert_eq!(status.code, 13);
+        assert_eq!(
+            status.message,
+            "grpc: failed to unmarshal the received message: proto: cannot parse invalid wire-format data"
+        );
     }
 
     #[tokio::test]
