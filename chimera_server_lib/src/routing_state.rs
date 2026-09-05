@@ -718,10 +718,12 @@ impl RoutingState {
             return self.route_once(input, outbounds, balancer_overrides);
         }
 
-        let mut domain_only_input = input.clone();
-        domain_only_input.target_ips.clear();
-        let domain_match =
-            self.route_once(&domain_only_input, outbounds, balancer_overrides);
+        let domain_match = self.route_once_with_target_ips(
+            input,
+            &[],
+            outbounds,
+            balancer_overrides,
+        );
         if domain_match.is_some() || self.domain_strategy == DomainStrategy::AsIs {
             return domain_match;
         }
@@ -735,8 +737,23 @@ impl RoutingState {
         outbounds: &[OutboundSummary],
         balancer_overrides: &HashMap<String, String>,
     ) -> Option<RouteMatch> {
+        self.route_once_with_target_ips(
+            input,
+            &input.target_ips,
+            outbounds,
+            balancer_overrides,
+        )
+    }
+
+    fn route_once_with_target_ips(
+        &self,
+        input: &RoutingInput,
+        target_ips: &[Vec<u8>],
+        outbounds: &[OutboundSummary],
+        balancer_overrides: &HashMap<String, String>,
+    ) -> Option<RouteMatch> {
         for rule in &self.rules {
-            if !rule.matches(input) {
+            if !rule.matches_with_target_ips(input, target_ips) {
                 continue;
             }
             let (outbound_tag, outbound_group_tags) =
@@ -1264,10 +1281,18 @@ impl TryFrom<RuleConfig> for CompiledRule {
 
 impl CompiledRule {
     fn matches(&self, input: &RoutingInput) -> bool {
+        self.matches_with_target_ips(input, &input.target_ips)
+    }
+
+    fn matches_with_target_ips(
+        &self,
+        input: &RoutingInput,
+        target_ips: &[Vec<u8>],
+    ) -> bool {
         matches_string_list(&self.inbound_tags, &input.inbound_tag)
             && matches_networks(&self.networks, input.network)
             && self.source_ips.matches(&input.source_ips)
-            && self.target_ips.matches(&input.target_ips)
+            && self.target_ips.matches(target_ips)
             && self.local_ips.matches(&input.local_ips)
             && matches_ports(&self.source_ports, input.source_port)
             && matches_ports(&self.target_ports, input.target_port)
