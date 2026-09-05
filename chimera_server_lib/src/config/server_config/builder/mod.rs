@@ -1290,6 +1290,58 @@ fn build_socks_server(
     Ok(context.finish_tcp(protocol))
 }
 
+#[cfg(feature = "tuic")]
+fn build_tuic_server(
+    context: InboundBuildContext,
+    settings: Option<crate::config::SettingObject>,
+) -> Result<ServerConfig, Error> {
+    let InboundBuildContext {
+        tag,
+        bind_location,
+        stream_settings,
+        sniffing,
+        ..
+    } = context;
+    let stream_settings = stream_settings.ok_or_else(|| {
+        Error::InvalidConfig("tuic inbound missing streamSettings".into())
+    })?;
+    let tls_settings = stream_settings.tls_settings.ok_or_else(|| {
+        Error::InvalidConfig("tuic inbound requires tlsSettings".into())
+    })?;
+    let certificate = tls_settings
+        .certificates
+        .first()
+        .ok_or_else(|| {
+            Error::InvalidConfig(
+                "tuic inbound requires at least one certificate".into(),
+            )
+        })?
+        .clone();
+    let settings = settings.ok_or_else(|| {
+        Error::InvalidConfig("tuic inbound requires settings".into())
+    })?;
+    let config = collect_tuic_settings(settings)?;
+    let quic_settings = Some(ServerQuicConfig {
+        cert: certificate.certificate_file.ok_or_else(|| {
+            Error::InvalidConfig("tuic inbound requires certificateFile".into())
+        })?,
+        key: certificate.key_file.ok_or_else(|| {
+            Error::InvalidConfig("tuic inbound requires keyFile".into())
+        })?,
+        alpn_protocols: NoneOrSome::Some(tls_settings.alpn),
+        client_fingerprints: NoneOrSome::None,
+    });
+
+    Ok(ServerConfig {
+        tag,
+        bind_location,
+        protocol: ServerProxyConfig::TuicV5 { config },
+        transport: Transport::Quic,
+        quic_settings,
+        sniffing,
+    })
+}
+
 impl TryFrom<InboudItem> for ServerConfig {
     type Error = Error;
 
@@ -1693,59 +1745,7 @@ impl TryFrom<InboudItem> for ServerConfig {
             Protocol::Trojan => build_trojan_server(context, settings),
 
             #[cfg(feature = "tuic")]
-            Protocol::TuicV5 => {
-                let InboundBuildContext {
-                    tag,
-                    bind_location,
-                    stream_settings,
-                    sniffing,
-                    ..
-                } = context;
-                let stream_settings = stream_settings.ok_or_else(|| {
-                    Error::InvalidConfig(
-                        "tuic inbound missing streamSettings".into(),
-                    )
-                })?;
-                let tls_settings = stream_settings.tls_settings.ok_or_else(|| {
-                    Error::InvalidConfig("tuic inbound requires tlsSettings".into())
-                })?;
-                let certificate = tls_settings
-                    .certificates.first()
-                    .ok_or_else(|| {
-                        Error::InvalidConfig(
-                            "tuic inbound requires at least one certificate".into(),
-                        )
-                    })?
-                    .clone();
-
-                let settings = settings
-                    .ok_or_else(|| Error::InvalidConfig("tuic inbound requires settings".into()))?;
-                let config = collect_tuic_settings(settings)?;
-
-                let quic_settings = Some(ServerQuicConfig {
-                    cert: certificate.certificate_file.ok_or_else(|| {
-                        Error::InvalidConfig(
-                            "tuic inbound requires certificateFile".into(),
-                        )
-                    })?,
-                    key: certificate.key_file.ok_or_else(|| {
-                        Error::InvalidConfig(
-                            "tuic inbound requires keyFile".into(),
-                        )
-                    })?,
-                    alpn_protocols: NoneOrSome::Some(tls_settings.alpn),
-                    client_fingerprints: NoneOrSome::None,
-                });
-
-                Ok(ServerConfig {
-                    tag,
-                    bind_location,
-                    protocol: ServerProxyConfig::TuicV5 { config },
-                    transport: Transport::Quic,
-                    quic_settings,
-                    sniffing,
-                })
-            }
+            Protocol::TuicV5 => build_tuic_server(context, settings),
 
             Protocol::Xhttp => {
                 Err(Error::InvalidConfig(
