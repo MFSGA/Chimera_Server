@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::HashMap,
     net::IpAddr,
     str::FromStr,
@@ -177,6 +178,8 @@ pub(crate) struct RoutingEvent {
     pub input: RoutingInput,
     pub route: RouteMatch,
 }
+
+pub(crate) type BalancerTargetMap = HashMap<String, Arc<[String]>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RoutingRuleSummary {
@@ -712,10 +715,40 @@ impl RoutingState {
         outbounds: &[OutboundSummary],
         balancer_overrides: &HashMap<String, String>,
     ) -> Option<RouteMatch> {
+        self.route_with_target_map(input, outbounds, balancer_overrides, None)
+    }
+
+    pub(crate) fn route_with_balancer_targets(
+        &self,
+        input: &RoutingInput,
+        outbounds: &[OutboundSummary],
+        balancer_overrides: &HashMap<String, String>,
+        balancer_targets: &BalancerTargetMap,
+    ) -> Option<RouteMatch> {
+        self.route_with_target_map(
+            input,
+            outbounds,
+            balancer_overrides,
+            Some(balancer_targets),
+        )
+    }
+
+    fn route_with_target_map(
+        &self,
+        input: &RoutingInput,
+        outbounds: &[OutboundSummary],
+        balancer_overrides: &HashMap<String, String>,
+        balancer_targets: Option<&BalancerTargetMap>,
+    ) -> Option<RouteMatch> {
         if input.target_domain.is_empty()
             || self.domain_strategy == DomainStrategy::IpOnDemand
         {
-            return self.route_once(input, outbounds, balancer_overrides);
+            return self.route_once(
+                input,
+                outbounds,
+                balancer_overrides,
+                balancer_targets,
+            );
         }
 
         let domain_match = self.route_once_with_target_ips(
@@ -723,12 +756,13 @@ impl RoutingState {
             &[],
             outbounds,
             balancer_overrides,
+            balancer_targets,
         );
         if domain_match.is_some() || self.domain_strategy == DomainStrategy::AsIs {
             return domain_match;
         }
 
-        self.route_once(input, outbounds, balancer_overrides)
+        self.route_once(input, outbounds, balancer_overrides, balancer_targets)
     }
 
     fn route_once(
@@ -736,12 +770,14 @@ impl RoutingState {
         input: &RoutingInput,
         outbounds: &[OutboundSummary],
         balancer_overrides: &HashMap<String, String>,
+        balancer_targets: Option<&BalancerTargetMap>,
     ) -> Option<RouteMatch> {
         self.route_once_with_target_ips(
             input,
             &input.target_ips,
             outbounds,
             balancer_overrides,
+            balancer_targets,
         )
     }
 
@@ -751,13 +787,18 @@ impl RoutingState {
         target_ips: &[Vec<u8>],
         outbounds: &[OutboundSummary],
         balancer_overrides: &HashMap<String, String>,
+        balancer_targets: Option<&BalancerTargetMap>,
     ) -> Option<RouteMatch> {
         for rule in &self.rules {
             if !rule.matches_with_target_ips(input, target_ips) {
                 continue;
             }
-            let (outbound_tag, outbound_group_tags) =
-                self.resolve_target(&rule.target, outbounds, balancer_overrides);
+            let (outbound_tag, outbound_group_tags) = self.resolve_target(
+                &rule.target,
+                outbounds,
+                balancer_overrides,
+                balancer_targets,
+            );
             if let (Some(webhook), Some(outbound_tag)) =
                 (&rule.webhook, outbound_tag.as_deref())
             {
@@ -814,6 +855,21 @@ impl RoutingState {
         targets
     }
 
+    pub(crate) fn compile_balancer_targets(
+        &self,
+        outbounds: &[OutboundSummary],
+    ) -> BalancerTargetMap {
+        self.balancers
+            .keys()
+            .map(|tag| {
+                (
+                    tag.clone(),
+                    Arc::<[String]>::from(self.balancer_targets(tag, outbounds)),
+                )
+            })
+            .collect()
+    }
+
     pub(crate) fn balancer_principle_targets(
         &self,
         balancer_tag: &str,
@@ -836,6 +892,7 @@ impl RoutingState {
         target: &RuleTarget,
         outbounds: &[OutboundSummary],
         balancer_overrides: &HashMap<String, String>,
+        balancer_targets: Option<&BalancerTargetMap>,
     ) -> (Option<String>, Vec<String>) {
         match target {
             RuleTarget::Outbound(tag) => (Some(tag.clone()), Vec::new()),
@@ -843,14 +900,21 @@ impl RoutingState {
                 if let Some(target) = balancer_overrides.get(balancer_tag) {
                     return (Some(target.clone()), vec![balancer_tag.clone()]);
                 }
-                let targets = self.balancer_targets(balancer_tag, outbounds);
+                let targets = match balancer_targets
+                    .and_then(|targets| targets.get(balancer_tag))
+                {
+                    Some(targets) => Cow::Borrowed(targets.as_ref()),
+                    None => {
+                        Cow::Owned(self.balancer_targets(balancer_tag, outbounds))
+                    }
+                };
                 let observations = self
                     .observations
                     .read()
                     .map(|observations| observations.clone())
                     .unwrap_or_default();
                 let target = self.balancers.get(balancer_tag).and_then(|balancer| {
-                    balancer.pick(&targets, outbounds, &observations)
+                    balancer.pick(targets.as_ref(), outbounds, &observations)
                 });
                 (target, vec![balancer_tag.clone()])
             }
