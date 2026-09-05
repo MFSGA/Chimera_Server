@@ -9,7 +9,8 @@ use tokio::{sync::broadcast, task::JoinHandle};
 use crate::{
     config::{def::PolicyConfig, server_config::ServerConfig},
     routing_state::{
-        OutboundObservation, RouteMatch, RoutingEvent, RoutingInput, RoutingState,
+        BalancerTargetMap, OutboundObservation, RouteMatch, RoutingEvent,
+        RoutingInput, RoutingState,
     },
     user_domain::{
         UserDomainAccessFailure, UserDomainAccessRevision, UserDomainAccessStatus,
@@ -25,12 +26,32 @@ pub struct OutboundSummary {
     pub proxy_settings_value: Option<Vec<u8>>,
 }
 
+#[derive(Debug)]
+struct RoutingPublication {
+    routing: Arc<RoutingState>,
+    outbounds: Arc<Vec<OutboundSummary>>,
+    balancer_targets: BalancerTargetMap,
+}
+
+impl RoutingPublication {
+    fn new(
+        routing: Arc<RoutingState>,
+        outbounds: Arc<Vec<OutboundSummary>>,
+    ) -> Self {
+        let balancer_targets = routing.compile_balancer_targets(&outbounds);
+        Self {
+            routing,
+            outbounds,
+            balancer_targets,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeState {
     inbounds: Arc<RwLock<Vec<ServerConfig>>>,
-    outbounds: Arc<RwLock<Arc<Vec<OutboundSummary>>>>,
+    routing_publication: Arc<RwLock<Arc<RoutingPublication>>>,
     inbound_tasks: Arc<RwLock<HashMap<String, Vec<JoinHandle<()>>>>>,
-    routing: Arc<RwLock<Arc<RoutingState>>>,
     routing_updates: Arc<Mutex<()>>,
     policy: Arc<RwLock<PolicyConfig>>,
     user_domain_access: UserDomainAccessStore,
@@ -44,11 +65,14 @@ impl RuntimeState {
         outbounds: Vec<OutboundSummary>,
     ) -> Self {
         let (routing_events, _) = broadcast::channel(256);
+        let routing = Arc::new(RoutingState::default());
+        let outbounds = Arc::new(outbounds);
         Self {
             inbounds: Arc::new(RwLock::new(inbounds)),
-            outbounds: Arc::new(RwLock::new(Arc::new(outbounds))),
+            routing_publication: Arc::new(RwLock::new(Arc::new(
+                RoutingPublication::new(routing, outbounds),
+            ))),
             inbound_tasks: Arc::new(RwLock::new(HashMap::new())),
-            routing: Arc::new(RwLock::new(Arc::new(RoutingState::default()))),
             routing_updates: Arc::new(Mutex::new(())),
             policy: Arc::new(RwLock::new(PolicyConfig::default())),
             user_domain_access: UserDomainAccessStore::default(),
@@ -175,13 +199,17 @@ impl RuntimeState {
         self.outbound_snapshot().as_ref().clone()
     }
 
-    fn outbound_snapshot(&self) -> Arc<Vec<OutboundSummary>> {
+    fn routing_publication(&self) -> Arc<RoutingPublication> {
         Arc::clone(
             &self
-                .outbounds
+                .routing_publication
                 .read()
-                .expect("runtime outbounds lock poisoned"),
+                .expect("runtime routing publication lock poisoned"),
         )
+    }
+
+    fn outbound_snapshot(&self) -> Arc<Vec<OutboundSummary>> {
+        Arc::clone(&self.routing_publication().outbounds)
     }
 
     pub fn select_outbound(&self, input: &RoutingInput) -> Option<OutboundSummary> {
@@ -192,12 +220,15 @@ impl RuntimeState {
         &self,
         input: &RoutingInput,
     ) -> Result<Option<OutboundSummary>, String> {
-        let outbounds = self.outbound_snapshot();
+        let publication = self.routing_publication();
+        let outbounds = &publication.outbounds;
         let overrides = self.balancer_override_snapshot();
-        let Some(route) =
-            self.routing()
-                .route(input, outbounds.as_ref(), overrides.as_ref())
-        else {
+        let Some(route) = publication.routing.route_with_balancer_targets(
+            input,
+            outbounds.as_ref(),
+            overrides.as_ref(),
+            &publication.balancer_targets,
+        ) else {
             let selected = outbounds.first().cloned();
             if let Some(outbound) = selected.as_ref() {
                 self.publish_routing_event(RoutingEvent {
@@ -284,33 +315,41 @@ impl RuntimeState {
     }
 
     pub fn remove_outbound(&self, tag: &str) -> Option<OutboundSummary> {
-        let mut current = self
-            .outbounds
-            .write()
-            .expect("runtime outbounds lock poisoned");
-        let mut next = current.as_ref().clone();
-        let index = next.iter().position(|cfg| cfg.tag == tag)?;
-        let removed = next.remove(index);
-        *current = Arc::new(next);
+        let _update = self
+            .routing_updates
+            .lock()
+            .expect("runtime routing update lock poisoned");
+        let current = self.routing_publication();
+        let mut outbounds = current.outbounds.as_ref().clone();
+        let index = outbounds.iter().position(|cfg| cfg.tag == tag)?;
+        let removed = outbounds.remove(index);
+        self.publish_routing_publication(RoutingPublication::new(
+            Arc::clone(&current.routing),
+            Arc::new(outbounds),
+        ));
         Some(removed)
     }
 
     pub fn add_outbound(&self, outbound: OutboundSummary) -> Result<(), String> {
-        let mut current = self
-            .outbounds
-            .write()
-            .expect("runtime outbounds lock poisoned");
-        if current.iter().any(|cfg| cfg.tag == outbound.tag) {
+        let _update = self
+            .routing_updates
+            .lock()
+            .expect("runtime routing update lock poisoned");
+        let current = self.routing_publication();
+        if current.outbounds.iter().any(|cfg| cfg.tag == outbound.tag) {
             return Err(format!("outbound {} already exists", outbound.tag));
         }
-        let mut next = current.as_ref().clone();
-        next.push(outbound);
-        *current = Arc::new(next);
+        let mut outbounds = current.outbounds.as_ref().clone();
+        outbounds.push(outbound);
+        self.publish_routing_publication(RoutingPublication::new(
+            Arc::clone(&current.routing),
+            Arc::new(outbounds),
+        ));
         Ok(())
     }
 
     pub fn routing(&self) -> Arc<RoutingState> {
-        Arc::clone(&self.routing.read().expect("runtime routing lock poisoned"))
+        Arc::clone(&self.routing_publication().routing)
     }
 
     pub fn replace_routing(&self, routing: RoutingState) {
@@ -318,14 +357,28 @@ impl RuntimeState {
             .routing_updates
             .lock()
             .expect("runtime routing update lock poisoned");
-        self.publish_routing(routing);
+        let current = self.routing_publication();
+        self.publish_routing_against(&current, routing);
     }
 
-    fn publish_routing(&self, mut routing: RoutingState) {
-        let mut current =
-            self.routing.write().expect("runtime routing lock poisoned");
-        routing.inherit_observations_from(&current);
-        *current = Arc::new(routing);
+    fn publish_routing_against(
+        &self,
+        current: &RoutingPublication,
+        mut routing: RoutingState,
+    ) {
+        routing.inherit_observations_from(&current.routing);
+        self.publish_routing_publication(RoutingPublication::new(
+            Arc::new(routing),
+            Arc::clone(&current.outbounds),
+        ));
+    }
+
+    fn publish_routing_publication(&self, publication: RoutingPublication) {
+        *self
+            .routing_publication
+            .write()
+            .expect("runtime routing publication lock poisoned") =
+            Arc::new(publication);
     }
 
     pub(crate) fn record_outbound_observation(
@@ -350,10 +403,10 @@ impl RuntimeState {
             .routing_updates
             .lock()
             .expect("runtime routing update lock poisoned");
-        let current = self.routing();
-        let mut next = (*current).clone();
+        let current = self.routing_publication();
+        let mut next = (*current.routing).clone();
         let result = mutator(&mut next);
-        self.publish_routing(next);
+        self.publish_routing_against(&current, next);
         result
     }
 
@@ -389,7 +442,10 @@ impl RuntimeState {
 mod tests {
     use super::RuntimeState;
     use crate::{
-        config::def::{PolicyConfig, PolicyLevelConfig},
+        config::{
+            def::{PolicyConfig, PolicyLevelConfig},
+            rule::BalancerConfig,
+        },
         routing_state::RoutingState,
     };
     use std::{
@@ -535,6 +591,54 @@ mod tests {
             replaced_overrides.get("auto").map(String::as_str),
             Some("backup")
         );
+    }
+
+    #[test]
+    fn routing_publication_recompiles_balancer_targets_on_control_updates() {
+        fn outbound(tag: &str) -> super::OutboundSummary {
+            super::OutboundSummary {
+                tag: tag.into(),
+                protocol: "freedom".into(),
+                proxy_settings_type: None,
+                proxy_settings_value: None,
+            }
+        }
+
+        let runtime = RuntimeState::new(
+            Vec::new(),
+            vec![outbound("direct-a"), outbound("backup")],
+        );
+        runtime.replace_routing(
+            RoutingState::from_parts(
+                Vec::new(),
+                vec![BalancerConfig {
+                    tag: "auto".into(),
+                    outbound_selector: vec!["direct".into()],
+                    ..BalancerConfig::default()
+                }],
+            )
+            .expect("compile routing balancer"),
+        );
+
+        let first = runtime.routing_publication();
+        assert_eq!(first.balancer_targets["auto"].as_ref(), ["direct-a"]);
+
+        runtime
+            .add_outbound(outbound("direct-b"))
+            .expect("add matching outbound");
+        let added = runtime.routing_publication();
+        assert!(!Arc::ptr_eq(&first, &added));
+        assert_eq!(first.balancer_targets["auto"].as_ref(), ["direct-a"]);
+        assert_eq!(
+            added.balancer_targets["auto"].as_ref(),
+            ["direct-a", "direct-b"]
+        );
+
+        runtime
+            .remove_outbound("direct-a")
+            .expect("remove matching outbound");
+        let removed = runtime.routing_publication();
+        assert_eq!(removed.balancer_targets["auto"].as_ref(), ["direct-b"]);
     }
 
     #[test]
