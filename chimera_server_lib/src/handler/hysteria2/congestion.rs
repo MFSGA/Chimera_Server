@@ -189,6 +189,9 @@ struct BrutalState {
     last_rtt: Duration,
     ack_rate: f64,
     slots: [PacketInfo; PACKET_INFO_SLOT_COUNT as usize],
+    rolling_ack_count: u64,
+    rolling_loss_count: u64,
+    rolling_timestamp: Option<u64>,
     debug: bool,
     last_debug_timestamp: u64,
 }
@@ -205,6 +208,9 @@ impl BrutalState {
             last_rtt: Duration::from_millis(0),
             ack_rate: 1.0,
             slots: [PacketInfo::default(); PACKET_INFO_SLOT_COUNT as usize],
+            rolling_ack_count: 0,
+            rolling_loss_count: 0,
+            rolling_timestamp: None,
             debug,
             last_debug_timestamp: 0,
         }
@@ -214,6 +220,9 @@ impl BrutalState {
         self.start = now;
         self.ack_rate = 1.0;
         self.slots = [PacketInfo::default(); PACKET_INFO_SLOT_COUNT as usize];
+        self.rolling_ack_count = 0;
+        self.rolling_loss_count = 0;
+        self.rolling_timestamp = None;
         self.last_debug_timestamp = 0;
     }
 
@@ -269,20 +278,28 @@ impl BrutalState {
                 loss_count,
             };
         }
+        if self.rolling_timestamp == Some(timestamp) {
+            self.rolling_ack_count += ack_count;
+            self.rolling_loss_count += loss_count;
+        } else {
+            let min_timestamp = timestamp.saturating_sub(PACKET_INFO_SLOT_COUNT);
+            self.rolling_ack_count = 0;
+            self.rolling_loss_count = 0;
+            for info in &self.slots {
+                if info.timestamp < min_timestamp {
+                    continue;
+                }
+                self.rolling_ack_count += info.ack_count;
+                self.rolling_loss_count += info.loss_count;
+            }
+            self.rolling_timestamp = Some(timestamp);
+        }
         self.update_ack_rate(timestamp);
     }
 
     fn update_ack_rate(&mut self, timestamp: u64) {
-        let min_timestamp = timestamp.saturating_sub(PACKET_INFO_SLOT_COUNT);
-        let mut ack_count = 0u64;
-        let mut loss_count = 0u64;
-        for info in &self.slots {
-            if info.timestamp < min_timestamp {
-                continue;
-            }
-            ack_count += info.ack_count;
-            loss_count += info.loss_count;
-        }
+        let ack_count = self.rolling_ack_count;
+        let loss_count = self.rolling_loss_count;
 
         if ack_count + loss_count < MIN_SAMPLE_COUNT {
             self.ack_rate = 1.0;
@@ -420,5 +437,36 @@ mod tests {
         state.last_rtt = Duration::from_millis(100);
 
         assert_eq!(state.window(1_000_000), 80_000);
+    }
+
+    #[test]
+    fn brutal_rolling_sample_totals_match_slot_scan_across_time_gaps() {
+        let start = Instant::now();
+        let mut state = BrutalState::new(start, 1200);
+        let events = [
+            (0, 10, 0),
+            (0, 5, 2),
+            (1, 20, 1),
+            (4, 8, 3),
+            (7, 30, 4),
+            (7, 2, 1),
+            (13, 50, 5),
+        ];
+
+        for (second, ack_count, loss_count) in events {
+            state.record(start + Duration::from_secs(second), ack_count, loss_count);
+
+            let min_timestamp = second.saturating_sub(PACKET_INFO_SLOT_COUNT);
+            let (expected_ack, expected_loss) = state
+                .slots
+                .iter()
+                .filter(|info| info.timestamp >= min_timestamp)
+                .fold((0, 0), |(acks, losses), info| {
+                    (acks + info.ack_count, losses + info.loss_count)
+                });
+            assert_eq!(state.rolling_ack_count, expected_ack);
+            assert_eq!(state.rolling_loss_count, expected_loss);
+            assert_eq!(state.rolling_timestamp, Some(second));
+        }
     }
 }
