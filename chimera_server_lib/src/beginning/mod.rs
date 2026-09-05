@@ -35,8 +35,8 @@ use crate::{
     runtime::RuntimeState,
     tls_client_hello::{ClientHelloInspection, inspect_client_hello},
     traffic::{
-        MeteredStream, TrafficDirection, record_transfer, register_connection,
-        register_identity,
+        MeteredStream, TrafficContext, TrafficDirection, record_transfer,
+        register_connection, register_identity,
     },
     util::{prefixed_stream::PrefixedStream, socket::new_tcp_socket},
 };
@@ -669,6 +669,33 @@ fn sniffed_outbound_target(
     }
 }
 
+struct SniffedRoutePlan {
+    outbound_target: NetLocation,
+    routing_metadata: InboundRoutingMetadata,
+}
+
+fn build_sniffed_route_plan(
+    sniffing: Option<&InboundSniffingConfig>,
+    sniffed: SniffedRoutingMetadata,
+    remote_location: &NetLocation,
+    local_addr: Option<SocketAddr>,
+) -> SniffedRoutePlan {
+    let outbound_target =
+        sniffed_outbound_target(sniffing, &sniffed, remote_location);
+    let route_target_domain =
+        route_only_sniffed_domain(sniffing, &sniffed, remote_location);
+    SniffedRoutePlan {
+        outbound_target,
+        routing_metadata: InboundRoutingMetadata {
+            local_addr,
+            vless_route: 0,
+            sniffed_protocol: sniffed.protocol,
+            route_target_domain,
+            attributes: sniffed.attributes,
+        },
+    }
+}
+
 async fn sniff_stream_protocol(
     mut stream: Box<dyn AsyncStream>,
     sniffing: Option<&InboundSniffingConfig>,
@@ -793,11 +820,79 @@ fn stream_connection_context(
     }
 }
 
+fn peel_peer_addr_overrides(
+    mut setup_result: TcpServerSetupResult,
+    mut peer_addr: SocketAddr,
+) -> (SocketAddr, TcpServerSetupResult) {
+    loop {
+        match setup_result {
+            TcpServerSetupResult::PeerAddrOverride {
+                peer_addr: overridden,
+                inner,
+            } => {
+                peer_addr = overridden;
+                setup_result = *inner;
+            }
+            result => return (peer_addr, result),
+        }
+    }
+}
+
+fn normalize_tcp_fallback(
+    setup_result: TcpServerSetupResult,
+    peer_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
+) -> std::io::Result<TcpServerSetupResult> {
+    match setup_result {
+        TcpServerSetupResult::TcpFallback {
+            remote_location,
+            stream,
+            proxy_protocol_version,
+            traffic_context,
+        } => {
+            let prefix = build_proxy_protocol_header(
+                proxy_protocol_version,
+                peer_addr,
+                local_addr,
+            )?;
+            Ok(TcpServerSetupResult::TcpForward {
+                remote_location,
+                stream: Box::new(PrefixedStream::new(prefix, stream)),
+                need_initial_flush: false,
+                connection_success_response: None,
+                traffic_context,
+            })
+        }
+        result => Ok(result),
+    }
+}
+
+fn normalize_setup_result(
+    setup_result: TcpServerSetupResult,
+    peer_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
+) -> std::io::Result<(SocketAddr, TcpServerSetupResult)> {
+    let (peer_addr, setup_result) =
+        peel_peer_addr_overrides(setup_result, peer_addr);
+    normalize_tcp_fallback(setup_result, peer_addr, local_addr)
+        .map(|setup_result| (peer_addr, setup_result))
+}
+
+fn routing_identity(traffic_context: Option<&TrafficContext>) -> (&str, &str) {
+    let inbound_tag = traffic_context
+        .and_then(|context| context.inbound_tag.as_deref())
+        .unwrap_or_default();
+    let user = traffic_context
+        .and_then(|context| context.identity.as_deref())
+        .unwrap_or_default();
+    (inbound_tag, user)
+}
+
 async fn process_stream_with_context<AS>(
     stream: AS,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
     resolver: Arc<dyn Resolver>,
-    mut peer_addr: SocketAddr,
+    peer_addr: SocketAddr,
     runtime: RuntimeState,
     connection_context: TcpServerConnectionContext,
     sniffing: Option<InboundSniffingConfig>,
@@ -809,7 +904,7 @@ where
     let handler_manages_handshake_timeout =
         server_handler.manages_handshake_timeout();
     tracing::info!("prepare to setup server stream");
-    let mut setup_result = if handler_manages_handshake_timeout {
+    let setup_result = if handler_manages_handshake_timeout {
         setup_server_stream(stream, server_handler, connection_context.clone())
             .await
             .map_err(|e| {
@@ -840,40 +935,8 @@ where
             }
         }
     };
-    let setup_result = loop {
-        match setup_result {
-            TcpServerSetupResult::PeerAddrOverride {
-                peer_addr: overridden,
-                inner,
-            } => {
-                peer_addr = overridden;
-                setup_result = *inner;
-            }
-            other => break other,
-        }
-    };
-    let mut setup_result = match setup_result {
-        TcpServerSetupResult::TcpFallback {
-            remote_location,
-            stream,
-            proxy_protocol_version,
-            traffic_context,
-        } => {
-            let prefix = build_proxy_protocol_header(
-                proxy_protocol_version,
-                peer_addr,
-                local_addr,
-            )?;
-            TcpServerSetupResult::TcpForward {
-                remote_location,
-                stream: Box::new(PrefixedStream::new(prefix, stream)),
-                need_initial_flush: false,
-                connection_success_response: None,
-                traffic_context,
-            }
-        }
-        other => other,
-    };
+    let (peer_addr, mut setup_result) =
+        normalize_setup_result(setup_result, peer_addr, local_addr)?;
 
     while matches!(&setup_result, TcpServerSetupResult::HttpPlainForward { .. }) {
         let TcpServerSetupResult::HttpPlainForward {
@@ -890,24 +953,15 @@ where
         };
         let mut traffic_context =
             traffic_context.map(|context| context.with_client_ip(peer_addr.ip()));
-        let inbound_tag = traffic_context
-            .as_ref()
-            .and_then(|context| context.inbound_tag.as_deref())
-            .unwrap_or_default()
-            .to_string();
-        let user = traffic_context
-            .as_ref()
-            .and_then(|context| context.identity.as_deref())
-            .unwrap_or_default()
-            .to_string();
+        let (inbound_tag, user) = routing_identity(traffic_context.as_ref());
         let (client_stream, outbound_tag) = match timeout(
             Duration::from_secs(60),
             setup_routed_client_stream(
                 resolver.clone(),
                 remote_location.clone(),
                 &runtime,
-                &inbound_tag,
-                &user,
+                inbound_tag,
+                user,
                 peer_addr,
                 InboundRoutingMetadata {
                     local_addr,
@@ -1018,26 +1072,16 @@ where
             let (sniffed_stream, sniffed_metadata) =
                 sniff_stream_protocol(server_stream, sniffing.as_ref()).await?;
             server_stream = sniffed_stream;
-            let outbound_remote_location = sniffed_outbound_target(
+            let SniffedRoutePlan {
+                outbound_target: outbound_remote_location,
+                routing_metadata,
+            } = build_sniffed_route_plan(
                 sniffing.as_ref(),
-                &sniffed_metadata,
+                sniffed_metadata,
                 &remote_location,
+                local_addr,
             );
-            let route_target_domain = route_only_sniffed_domain(
-                sniffing.as_ref(),
-                &sniffed_metadata,
-                &remote_location,
-            );
-            let inbound_tag = traffic_context
-                .as_ref()
-                .and_then(|context| context.inbound_tag.as_deref())
-                .unwrap_or_default()
-                .to_string();
-            let user = traffic_context
-                .as_ref()
-                .and_then(|context| context.identity.as_deref())
-                .unwrap_or_default()
-                .to_string();
+            let (inbound_tag, user) = routing_identity(traffic_context.as_ref());
 
             let setup_client_stream_future = timeout(
                 Duration::from_secs(60),
@@ -1045,16 +1089,10 @@ where
                     resolver,
                     outbound_remote_location.clone(),
                     &runtime,
-                    &inbound_tag,
-                    &user,
+                    inbound_tag,
+                    user,
                     peer_addr,
-                    InboundRoutingMetadata {
-                        local_addr,
-                        vless_route: 0,
-                        sniffed_protocol: sniffed_metadata.protocol,
-                        route_target_domain,
-                        attributes: sniffed_metadata.attributes,
-                    },
+                    routing_metadata,
                 ),
             );
 
@@ -1335,6 +1373,23 @@ mod tests {
                 .as_deref(),
             Some("api.example.com")
         );
+        let local_addr: SocketAddr = "127.0.0.1:8443".parse().unwrap();
+        let plan = build_sniffed_route_plan(
+            Some(&route_only),
+            metadata.clone(),
+            &original,
+            Some(local_addr),
+        );
+        assert_eq!(plan.outbound_target, original);
+        assert_eq!(plan.routing_metadata.local_addr, Some(local_addr));
+        assert_eq!(
+            plan.routing_metadata.sniffed_protocol.as_deref(),
+            Some("http1")
+        );
+        assert_eq!(
+            plan.routing_metadata.route_target_domain.as_deref(),
+            Some("api.example.com")
+        );
 
         let exclusions = crate::routing_state::SniffExclusionMatcher::compile(
             vec!["domain:example.com".into()],
@@ -1392,6 +1447,35 @@ mod tests {
 
         assert_eq!(context.local_addr, Some(local_addr));
         assert!(context.runtime.is_some());
+    }
+
+    #[test]
+    fn routing_identity_projects_only_routing_fields() {
+        assert_eq!(routing_identity(None), ("", ""));
+
+        let context = TrafficContext::new("test")
+            .with_inbound_tag("inbound-a")
+            .with_identity("user-a");
+        assert_eq!(routing_identity(Some(&context)), ("inbound-a", "user-a"));
+    }
+
+    #[test]
+    fn setup_result_normalization_uses_innermost_peer_override() {
+        let original: SocketAddr = "192.0.2.1:1000".parse().unwrap();
+        let outer: SocketAddr = "192.0.2.2:2000".parse().unwrap();
+        let inner: SocketAddr = "192.0.2.3:3000".parse().unwrap();
+        let result = TcpServerSetupResult::PeerAddrOverride {
+            peer_addr: outer,
+            inner: Box::new(TcpServerSetupResult::PeerAddrOverride {
+                peer_addr: inner,
+                inner: Box::new(TcpServerSetupResult::AlreadyHandled),
+            }),
+        };
+
+        let (peer_addr, normalized) =
+            normalize_setup_result(result, original, None).unwrap();
+        assert_eq!(peer_addr, inner);
+        assert!(matches!(normalized, TcpServerSetupResult::AlreadyHandled));
     }
 
     #[test]
