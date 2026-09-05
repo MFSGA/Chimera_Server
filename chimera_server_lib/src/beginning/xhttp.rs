@@ -1433,6 +1433,33 @@ fn simple_response(status: StatusCode) -> Response<ResponseBody> {
         .unwrap()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionTtlSnapshot {
+    is_current: bool,
+    fully_connected: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionTtlPlan {
+    Keep,
+    RemoveAndClose,
+}
+
+fn same_xhttp_session(
+    current: Option<&Arc<XhttpSession>>,
+    candidate: &Arc<XhttpSession>,
+) -> bool {
+    current.is_some_and(|current| Arc::ptr_eq(current, candidate))
+}
+
+fn plan_session_ttl(snapshot: SessionTtlSnapshot) -> SessionTtlPlan {
+    if snapshot.is_current && !snapshot.fully_connected {
+        SessionTtlPlan::RemoveAndClose
+    } else {
+        SessionTtlPlan::Keep
+    }
+}
+
 #[derive(Clone)]
 struct SessionStore {
     inner: Arc<RwLock<HashMap<String, Arc<XhttpSession>>>>,
@@ -1477,10 +1504,7 @@ impl SessionStore {
 
     fn remove_if_current(&self, session_id: &str, session: &Arc<XhttpSession>) {
         let mut sessions = self.inner.write().unwrap();
-        if sessions
-            .get(session_id)
-            .is_some_and(|current| Arc::ptr_eq(current, session))
-        {
+        if same_xhttp_session(sessions.get(session_id), session) {
             sessions.remove(session_id);
         }
     }
@@ -1499,14 +1523,17 @@ impl SessionStore {
                 }
             }
 
-            let should_remove =
-                store.inner.read().unwrap().get(&session_id).is_some_and(
-                    |current| {
-                        Arc::ptr_eq(current, &session)
-                            && !session.fully_connected.load(Ordering::Acquire)
-                    },
-                );
-            if should_remove {
+            let snapshot = {
+                let sessions = store.inner.read().unwrap();
+                SessionTtlSnapshot {
+                    is_current: same_xhttp_session(
+                        sessions.get(&session_id),
+                        &session,
+                    ),
+                    fully_connected: session.fully_connected.load(Ordering::Acquire),
+                }
+            };
+            if plan_session_ttl(snapshot) == SessionTtlPlan::RemoveAndClose {
                 store.remove_if_current(&session_id, &session);
                 session.close_upload_queue();
             }
@@ -3899,6 +3926,31 @@ mod tests {
             .expect("missing packet completes reorder sequence");
 
         assert_eq!(read.await.expect("ordered read task"), *b"012");
+    }
+
+    #[test]
+    fn session_ttl_plan_only_reaps_current_unconnected_generation() {
+        assert_eq!(
+            plan_session_ttl(SessionTtlSnapshot {
+                is_current: true,
+                fully_connected: false,
+            }),
+            SessionTtlPlan::RemoveAndClose
+        );
+        assert_eq!(
+            plan_session_ttl(SessionTtlSnapshot {
+                is_current: true,
+                fully_connected: true,
+            }),
+            SessionTtlPlan::Keep
+        );
+        assert_eq!(
+            plan_session_ttl(SessionTtlSnapshot {
+                is_current: false,
+                fully_connected: false,
+            }),
+            SessionTtlPlan::Keep
+        );
     }
 
     #[tokio::test]
