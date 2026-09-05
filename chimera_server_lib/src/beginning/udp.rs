@@ -3,7 +3,7 @@ use std::{
     future::poll_fn,
     net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, Weak},
     time::Duration,
 };
 
@@ -283,6 +283,7 @@ fn snapshot_global_udp_worker(
 struct GlobalXudpWorkers {
     registry: XudpGlobalRegistry,
     workers: HashMap<[u8; 8], GlobalSessionUdpWorker>,
+    gates: HashMap<[u8; 8], Weak<Mutex<()>>>,
 }
 
 static GLOBAL_XUDP_WORKERS: OnceLock<Arc<Mutex<GlobalXudpWorkers>>> =
@@ -292,6 +293,19 @@ fn global_xudp_workers() -> Arc<Mutex<GlobalXudpWorkers>> {
     GLOBAL_XUDP_WORKERS
         .get_or_init(|| Arc::new(Mutex::new(GlobalXudpWorkers::default())))
         .clone()
+}
+
+async fn global_xudp_gate(global_id: [u8; 8]) -> Arc<Mutex<()>> {
+    let globals = global_xudp_workers();
+    let mut guard = globals.lock().await;
+    guard.gates.retain(|_, gate| gate.strong_count() > 0);
+    if let Some(gate) = guard.gates.get(&global_id).and_then(Weak::upgrade) {
+        return gate;
+    }
+
+    let gate = Arc::new(Mutex::new(()));
+    guard.gates.insert(global_id, Arc::downgrade(&gate));
+    gate
 }
 
 #[derive(Debug)]
@@ -992,60 +1006,86 @@ async fn attach_global_session_udp_session(
     traffic_context: Option<TrafficContext>,
     idle_timeout: Duration,
 ) -> std::io::Result<SessionUdpWorker> {
+    let gate = global_xudp_gate(global_id).await;
+    let _gate_guard = gate.lock().await;
     let globals = global_xudp_workers();
     let now = Instant::now();
-    let mut guard = globals.lock().await;
-    purge_expired_global_udp_workers(&mut guard, now);
-
-    let transition = guard
-        .registry
-        .attach(global_id, session_id, generation, now)?;
-    let attachment = GlobalUdpAttachment {
-        token: transition.current.token,
-        session_id,
-        generation,
-        response_sender,
-        traffic_context,
-    };
     let worker_key = GlobalUdpWorkerKey::from(&key);
 
-    let worker_plan = plan_global_udp_worker(snapshot_global_udp_worker(
-        guard.workers.get(&global_id),
-        &worker_key,
-    ));
-    if worker_plan == GlobalUdpWorkerPlan::Replace {
-        if let Some(worker) = guard.workers.remove(&global_id) {
+    let (transition, attachment, worker_plan) = {
+        let mut guard = globals.lock().await;
+        purge_expired_global_udp_workers(&mut guard, now);
+
+        let transition = guard
+            .registry
+            .attach(global_id, session_id, generation, now)?;
+        let attachment = GlobalUdpAttachment {
+            token: transition.current.token,
+            session_id,
+            generation,
+            response_sender,
+            traffic_context,
+        };
+        let worker_plan = plan_global_udp_worker(snapshot_global_udp_worker(
+            guard.workers.get(&global_id),
+            &worker_key,
+        ));
+        if worker_plan == GlobalUdpWorkerPlan::Replace
+            && let Some(worker) = guard.workers.remove(&global_id)
+        {
             worker.task.abort();
         }
+        (transition, attachment, worker_plan)
+    };
+
+    if worker_plan == GlobalUdpWorkerPlan::Replace {
         let worker =
             match start_global_session_udp_worker(worker_key.clone(), idle_timeout)
                 .await
             {
                 Ok(worker) => worker,
                 Err(error) => {
+                    let mut guard = globals.lock().await;
                     guard
                         .registry
                         .remove_current(global_id, transition.current.token);
                     return Err(error);
                 }
             };
-        guard.workers.insert(global_id, worker);
+
+        let mut guard = globals.lock().await;
+        if guard.registry.current(global_id, Instant::now())
+            != Some(transition.current)
+        {
+            worker.task.abort();
+            return Err(std::io::Error::other(
+                "global XUDP attachment changed during worker startup",
+            ));
+        }
+        if let Some(previous_worker) = guard.workers.insert(global_id, worker) {
+            previous_worker.task.abort();
+        }
     }
 
-    let Some(worker) = guard.workers.get(&global_id) else {
-        guard
-            .registry
-            .remove_current(global_id, transition.current.token);
-        return Err(std::io::Error::other(
-            "global XUDP worker missing after attachment planning",
-        ));
+    let (sender, attachment_state, attachment_notify) = {
+        let mut guard = globals.lock().await;
+        let Some(worker) = guard.workers.get(&global_id) else {
+            guard
+                .registry
+                .remove_current(global_id, transition.current.token);
+            return Err(std::io::Error::other(
+                "global XUDP worker missing after attachment planning",
+            ));
+        };
+        (
+            worker.sender.clone(),
+            worker.attachment.clone(),
+            worker.attachment_notify.clone(),
+        )
     };
-    let sender = worker.sender.clone();
-    let attachment_state = worker.attachment.clone();
-    let attachment_notify = worker.attachment_notify.clone();
+
     let previous = attachment_state.write().await.replace(attachment.clone());
     attachment_notify.notify_one();
-    drop(guard);
 
     if let Some(previous) = previous
         && previous.token != attachment.token
@@ -1314,24 +1354,31 @@ fn purge_expired_global_udp_workers(globals: &mut GlobalXudpWorkers, now: Instan
 }
 
 async fn detach_global_udp_worker(global_id: [u8; 8], attachment_token: u64) {
+    let gate = global_xudp_gate(global_id).await;
+    let _gate_guard = gate.lock().await;
     let globals = global_xudp_workers();
-    let mut guard = globals.lock().await;
-    if !guard
-        .registry
-        .detach(global_id, attachment_token, Instant::now())
-    {
-        return;
-    }
-    if let Some(worker) = guard.workers.get(&global_id) {
-        let mut attachment = worker.attachment.write().await;
+    let worker_state = {
+        let mut guard = globals.lock().await;
+        if !guard
+            .registry
+            .detach(global_id, attachment_token, Instant::now())
+        {
+            return;
+        }
+        guard.workers.get(&global_id).map(|worker| {
+            (worker.attachment.clone(), worker.attachment_notify.clone())
+        })
+    };
+
+    if let Some((attachment_state, attachment_notify)) = worker_state {
+        let mut attachment = attachment_state.write().await;
         if attachment.as_ref().map(|attachment| attachment.token)
             == Some(attachment_token)
         {
             *attachment = None;
-            worker.attachment_notify.notify_one();
+            attachment_notify.notify_one();
         }
     }
-    drop(guard);
 
     tokio::spawn(async move {
         sleep(XUDP_GLOBAL_REATTACH_TTL).await;
@@ -1342,6 +1389,8 @@ async fn detach_global_udp_worker(global_id: [u8; 8], attachment_token: u64) {
 }
 
 async fn terminate_global_udp_worker(global_id: [u8; 8], attachment_token: u64) {
+    let gate = global_xudp_gate(global_id).await;
+    let _gate_guard = gate.lock().await;
     let globals = global_xudp_workers();
     let mut guard = globals.lock().await;
     if guard.registry.remove_current(global_id, attachment_token)
@@ -2363,6 +2412,39 @@ mod tests {
                 GlobalUdpWorkerPlan::Replace,
             );
         }
+    }
+
+    #[tokio::test]
+    async fn global_xudp_gates_serialize_same_id_without_blocking_other_ids() {
+        let first_id = [201, 202, 203, 204, 205, 206, 207, 208];
+        let second_id = [209, 210, 211, 212, 213, 214, 215, 216];
+        let first_gate = global_xudp_gate(first_id).await;
+        let held = first_gate.lock().await;
+        let same_gate = global_xudp_gate(first_id).await;
+        let second_gate = global_xudp_gate(second_id).await;
+
+        assert!(Arc::ptr_eq(&first_gate, &same_gate));
+        assert!(!Arc::ptr_eq(&first_gate, &second_gate));
+        assert!(
+            timeout(Duration::from_millis(50), second_gate.lock())
+                .await
+                .is_ok(),
+            "a held GlobalID gate must not block a different GlobalID",
+        );
+        assert!(
+            timeout(Duration::from_millis(20), same_gate.lock())
+                .await
+                .is_err(),
+            "the same GlobalID must remain serialized",
+        );
+
+        drop(held);
+        assert!(
+            timeout(Duration::from_millis(50), same_gate.lock())
+                .await
+                .is_ok(),
+            "the next same-ID operation should proceed after release",
+        );
     }
 
     #[test]
