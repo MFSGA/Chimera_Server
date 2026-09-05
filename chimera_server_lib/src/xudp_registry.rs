@@ -24,6 +24,59 @@ struct XudpGlobalSessionState {
     expires_at: Option<Instant>,
 }
 
+fn session_is_expired(state: XudpGlobalSessionState, now: Instant) -> bool {
+    state.attachment.is_none()
+        && state.expires_at.is_some_and(|expires_at| expires_at <= now)
+}
+
+fn live_session_state(
+    state: Option<XudpGlobalSessionState>,
+    now: Instant,
+) -> Option<XudpGlobalSessionState> {
+    state.filter(|state| !session_is_expired(*state, now))
+}
+
+fn plan_attach(
+    previous: Option<XudpGlobalSessionState>,
+    current: XudpAttachment,
+    now: Instant,
+) -> (XudpGlobalSessionState, XudpAttachTransition) {
+    let previous = live_session_state(previous, now);
+    let resumed_detached_session =
+        previous.is_some_and(|state| state.attachment.is_none());
+    let replaced = previous.and_then(|state| state.attachment);
+    (
+        XudpGlobalSessionState {
+            attachment: Some(current),
+            expires_at: None,
+        },
+        XudpAttachTransition {
+            current,
+            replaced,
+            resumed_detached_session,
+        },
+    )
+}
+
+fn plan_detach(
+    state: XudpGlobalSessionState,
+    attachment_token: u64,
+    now: Instant,
+) -> Option<XudpGlobalSessionState> {
+    (state.attachment.map(|attachment| attachment.token) == Some(attachment_token))
+        .then_some(XudpGlobalSessionState {
+            attachment: None,
+            expires_at: Some(now + XUDP_GLOBAL_REATTACH_TTL),
+        })
+}
+
+fn current_attachment(
+    state: Option<XudpGlobalSessionState>,
+    now: Instant,
+) -> Option<XudpAttachment> {
+    live_session_state(state, now).and_then(|state| state.attachment)
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct XudpGlobalRegistry {
     sessions: HashMap<[u8; 8], XudpGlobalSessionState>,
@@ -49,28 +102,17 @@ impl XudpGlobalRegistry {
         let token = self.next_attachment_token.checked_add(1).ok_or_else(|| {
             std::io::Error::other("XUDP attachment token counter exhausted")
         })?;
-        self.next_attachment_token = token;
         let current = XudpAttachment {
             token,
             session_id,
             generation,
         };
+        let (next_state, transition) =
+            plan_attach(self.sessions.get(&global_id).copied(), current, now);
 
-        let previous = self.sessions.insert(
-            global_id,
-            XudpGlobalSessionState {
-                attachment: Some(current),
-                expires_at: None,
-            },
-        );
-        Ok(XudpAttachTransition {
-            current,
-            replaced: previous.and_then(|state| state.attachment),
-            resumed_detached_session: previous.is_some_and(|state| {
-                state.attachment.is_none()
-                    && state.expires_at.is_some_and(|expires_at| expires_at > now)
-            }),
-        })
+        self.next_attachment_token = token;
+        self.sessions.insert(global_id, next_state);
+        Ok(transition)
     }
 
     pub(crate) fn detach(
@@ -79,17 +121,14 @@ impl XudpGlobalRegistry {
         attachment_token: u64,
         now: Instant,
     ) -> bool {
-        let Some(state) = self.sessions.get_mut(&global_id) else {
+        let Some(state) = self.sessions.get(&global_id).copied() else {
             return false;
         };
-        if state.attachment.map(|attachment| attachment.token)
-            != Some(attachment_token)
-        {
+        let Some(next_state) = plan_detach(state, attachment_token, now) else {
             return false;
-        }
+        };
 
-        state.attachment = None;
-        state.expires_at = Some(now + XUDP_GLOBAL_REATTACH_TTL);
+        self.sessions.insert(global_id, next_state);
         true
     }
 
@@ -114,10 +153,12 @@ impl XudpGlobalRegistry {
         global_id: [u8; 8],
         now: Instant,
     ) -> Option<XudpAttachment> {
-        self.remove_expired_id(global_id, now);
-        self.sessions
-            .get(&global_id)
-            .and_then(|state| state.attachment)
+        let state = self.sessions.get(&global_id).copied();
+        let current = current_attachment(state, now);
+        if state.is_some_and(|state| session_is_expired(state, now)) {
+            self.sessions.remove(&global_id);
+        }
+        current
     }
 
     pub(crate) fn take_expired(&mut self, now: Instant) -> Vec<[u8; 8]> {
@@ -125,9 +166,7 @@ impl XudpGlobalRegistry {
             .sessions
             .iter()
             .filter_map(|(global_id, state)| {
-                (state.attachment.is_none()
-                    && state.expires_at.is_some_and(|expires_at| expires_at <= now))
-                .then_some(*global_id)
+                session_is_expired(*state, now).then_some(*global_id)
             })
             .collect::<Vec<_>>();
         for global_id in &expired {
@@ -137,10 +176,11 @@ impl XudpGlobalRegistry {
     }
 
     fn remove_expired_id(&mut self, global_id: [u8; 8], now: Instant) {
-        let expired = self.sessions.get(&global_id).is_some_and(|state| {
-            state.attachment.is_none()
-                && state.expires_at.is_some_and(|expires_at| expires_at <= now)
-        });
+        let expired = self
+            .sessions
+            .get(&global_id)
+            .copied()
+            .is_some_and(|state| session_is_expired(state, now));
         if expired {
             self.sessions.remove(&global_id);
         }
