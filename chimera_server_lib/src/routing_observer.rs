@@ -288,48 +288,27 @@ async fn connectivity_is_unavailable(
         .is_err()
 }
 
-fn apply_probe_result(
-    runtime: &RuntimeState,
-    windows: &mut HashMap<String, ProbeWindow>,
-    tag: String,
-    result: ProbeResult,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ProbeHealthSummary {
+    all: i64,
+    fail: i64,
+    deviation_ms: i64,
+    average_ms: i64,
+    max_ms: i64,
+    min_ms: i64,
+}
+
+fn advance_probe_window(
+    mut window: ProbeWindow,
+    result: &ProbeResult,
+    now: i64,
+    recorded_at: Instant,
     sampling_count: usize,
     validity: Duration,
-) {
-    let now = unix_time_secs();
-    if sampling_count == 0 {
-        let last_seen_time = if result.alive {
-            now
-        } else {
-            runtime
-                .outbound_observations()
-                .get(&tag)
-                .map_or(0, |status| status.last_seen_time)
-        };
-        runtime.record_outbound_observation(
-            tag.clone(),
-            OutboundObservation {
-                alive: result.alive,
-                delay_ms: result.delay_ms,
-                last_error_reason: result.error,
-                last_seen_time,
-                last_try_time: now,
-                ..OutboundObservation::default()
-            },
-        );
-        debug!(
-            outbound = %tag,
-            alive = result.alive,
-            delay_ms = result.delay_ms,
-            "routing observatory probe completed"
-        );
-        return;
-    }
-    let window = windows.entry(tag.clone()).or_default();
+) -> ProbeWindow {
     if result.alive {
         window.last_seen_time = now;
     }
-    let recorded_at = Instant::now();
     window.samples.push_back(ProbeSample {
         recorded_at,
         alive: result.alive,
@@ -343,6 +322,10 @@ fn apply_probe_result(
     }) {
         window.samples.pop_front();
     }
+    window
+}
+
+fn summarize_probe_window(window: &ProbeWindow) -> ProbeHealthSummary {
     let all = window.samples.len() as i64;
     let fail = window.samples.iter().filter(|sample| !sample.alive).count() as i64;
     let successful = window
@@ -351,48 +334,112 @@ fn apply_probe_result(
         .filter(|sample| sample.alive)
         .map(|sample| sample.delay_ms)
         .collect::<Vec<_>>();
-    let average = if successful.is_empty() {
+    let average_ms = if successful.is_empty() {
         0
     } else {
         successful.iter().sum::<i64>() / successful.len() as i64
     };
-    let deviation = if successful.is_empty() {
-        0
-    } else if successful.len() == 1 {
-        average / 2
-    } else {
-        let variance = successful
-            .iter()
-            .map(|delay| {
-                let delta = *delay as f64 - average as f64;
-                delta * delta
-            })
-            .sum::<f64>()
-            / successful.len() as f64;
-        variance.sqrt().round() as i64
+    let deviation_ms = match successful.len() {
+        0 => 0,
+        1 => average_ms / 2,
+        count => {
+            let variance = successful
+                .iter()
+                .map(|delay| {
+                    let delta = *delay as f64 - average_ms as f64;
+                    delta * delta
+                })
+                .sum::<f64>()
+                / count as f64;
+            variance.sqrt().round() as i64
+        }
     };
-    let maximum = successful.iter().copied().max().unwrap_or_default();
-    let minimum = successful.iter().copied().min().unwrap_or_default();
-    runtime.record_outbound_observation(
-        tag.clone(),
-        OutboundObservation {
-            alive: result.alive,
-            delay_ms: result.delay_ms,
-            last_error_reason: result.error,
-            last_seen_time: window.last_seen_time,
-            last_try_time: now,
-            health_all: all,
-            health_fail: fail,
-            health_deviation_ms: deviation,
-            health_average_ms: average,
-            health_max_ms: maximum,
-            health_min_ms: minimum,
-        },
-    );
+
+    ProbeHealthSummary {
+        all,
+        fail,
+        deviation_ms,
+        average_ms,
+        max_ms: successful.iter().copied().max().unwrap_or_default(),
+        min_ms: successful.iter().copied().min().unwrap_or_default(),
+    }
+}
+
+fn build_probe_observation(
+    result: ProbeResult,
+    now: i64,
+    last_seen_time: i64,
+    health: ProbeHealthSummary,
+) -> OutboundObservation {
+    OutboundObservation {
+        alive: result.alive,
+        delay_ms: result.delay_ms,
+        last_error_reason: result.error,
+        last_seen_time,
+        last_try_time: now,
+        health_all: health.all,
+        health_fail: health.fail,
+        health_deviation_ms: health.deviation_ms,
+        health_average_ms: health.average_ms,
+        health_max_ms: health.max_ms,
+        health_min_ms: health.min_ms,
+    }
+}
+
+fn apply_probe_result(
+    runtime: &RuntimeState,
+    windows: &mut HashMap<String, ProbeWindow>,
+    tag: String,
+    result: ProbeResult,
+    sampling_count: usize,
+    validity: Duration,
+) {
+    let now = unix_time_secs();
+    let (observation, next_window) = if sampling_count == 0 {
+        let previous_last_seen = runtime
+            .outbound_observations()
+            .get(&tag)
+            .map_or(0, |status| status.last_seen_time);
+        let last_seen_time = if result.alive {
+            now
+        } else {
+            previous_last_seen
+        };
+        (
+            build_probe_observation(
+                result,
+                now,
+                last_seen_time,
+                ProbeHealthSummary::default(),
+            ),
+            None,
+        )
+    } else {
+        let window = windows.remove(&tag).unwrap_or_default();
+        let window = advance_probe_window(
+            window,
+            &result,
+            now,
+            Instant::now(),
+            sampling_count,
+            validity,
+        );
+        let health = summarize_probe_window(&window);
+        let observation =
+            build_probe_observation(result, now, window.last_seen_time, health);
+        (observation, Some(window))
+    };
+
+    if let Some(window) = next_window {
+        windows.insert(tag.clone(), window);
+    }
+    let alive = observation.alive;
+    let delay_ms = observation.delay_ms;
+    runtime.record_outbound_observation(tag.clone(), observation);
     debug!(
         outbound = %tag,
-        alive = result.alive,
-        delay_ms = result.delay_ms,
+        alive,
+        delay_ms,
         "routing observatory probe completed"
     );
 }
