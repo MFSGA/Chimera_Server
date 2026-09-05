@@ -768,6 +768,13 @@ where
     A: AsyncStream + ?Sized,
     B: AsyncStream + ?Sized,
 {
+    if raw_relay_ready(left, right) {
+        return Ok(PreludeOutcome::RawReady {
+            left_to_right: 0,
+            right_to_left: 0,
+        });
+    }
+
     let mut left_to_right = CopyDirection::new(buffer_size);
     let mut right_to_left = CopyDirection::new(buffer_size);
 
@@ -1217,6 +1224,61 @@ mod tests {
         }
     }
 
+    struct ReadyPanicStream;
+
+    impl AsyncRead for ReadyPanicStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            panic!("ready raw stream must not be polled during handoff prelude")
+        }
+    }
+
+    impl AsyncWrite for ReadyPanicStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            panic!("ready raw stream must not be polled during handoff prelude")
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            panic!("ready raw stream must not be flushed during handoff prelude")
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            panic!("ready raw stream must not be shut down during handoff prelude")
+        }
+    }
+
+    impl AsyncPing for ReadyPanicStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for ReadyPanicStream {
+        fn raw_tcp_relay_state(&self) -> RawTcpRelayState {
+            RawTcpRelayState::Ready
+        }
+    }
+
     #[derive(Default)]
     struct FlushGateWriter {
         pending: Vec<u8>,
@@ -1415,6 +1477,24 @@ mod tests {
         assert_eq!(limited.configured_backend(), "auto");
         assert_eq!(limited.effective_path(), "userspace-copy");
         assert_eq!(limited.fallback_reason(), Some("auto-connection-limit"),);
+    }
+
+    #[tokio::test]
+    async fn prelude_short_circuits_when_both_raw_streams_are_ready() {
+        let mut left = ReadyPanicStream;
+        let mut right = ReadyPanicStream;
+
+        let outcome = copy_until_raw_ready(&mut left, &mut right, 32 * 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            PreludeOutcome::RawReady {
+                left_to_right: 0,
+                right_to_left: 0,
+            }
+        );
     }
 
     #[tokio::test]
