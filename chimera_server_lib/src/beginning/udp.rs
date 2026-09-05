@@ -133,6 +133,32 @@ struct PendingGlobalUdpResponse {
     payload: Vec<u8>,
 }
 
+struct GlobalUdpResponseDelivery {
+    attachment_token: u64,
+    response_sender: mpsc::Sender<SessionUdpEvent>,
+    response: SessionUdpResponse,
+}
+
+fn plan_global_udp_response_delivery(
+    attachment: Option<GlobalUdpAttachment>,
+    pending: PendingGlobalUdpResponse,
+) -> Result<GlobalUdpResponseDelivery, PendingGlobalUdpResponse> {
+    let Some(attachment) = attachment else {
+        return Err(pending);
+    };
+    Ok(GlobalUdpResponseDelivery {
+        attachment_token: attachment.token,
+        response_sender: attachment.response_sender,
+        response: SessionUdpResponse {
+            session_id: attachment.session_id,
+            generation: attachment.generation,
+            source: pending.source,
+            payload: pending.payload,
+            traffic_context: attachment.traffic_context,
+        },
+    })
+}
+
 #[derive(Clone)]
 enum SessionUdpSender {
     Local(mpsc::Sender<LocalUdpPayload>),
@@ -1062,28 +1088,30 @@ async fn forward_global_udp_response(
     attachment: &Arc<RwLock<Option<GlobalUdpAttachment>>>,
     pending: PendingGlobalUdpResponse,
 ) -> Result<(), (PendingGlobalUdpResponse, Option<u64>)> {
-    let Some(current) = attachment.read().await.clone() else {
-        return Err((pending, None));
+    let delivery = match plan_global_udp_response_delivery(
+        attachment.read().await.clone(),
+        pending,
+    ) {
+        Ok(delivery) => delivery,
+        Err(pending) => return Err((pending, None)),
     };
-    let event = SessionUdpEvent::Data(SessionUdpResponse {
-        session_id: current.session_id,
-        generation: current.generation,
-        source: pending.source,
-        payload: pending.payload,
-        traffic_context: current.traffic_context,
-    });
-    match current.response_sender.send(event).await {
+    let attachment_token = delivery.attachment_token;
+    match delivery
+        .response_sender
+        .send(SessionUdpEvent::Data(delivery.response))
+        .await
+    {
         Ok(()) => Ok(()),
         Err(error) => {
             let SessionUdpEvent::Data(response) = error.0 else {
-                unreachable!("global UDP response sender returned a non-data event")
+                unreachable!("global UDP response delivery only sends data events")
             };
             Err((
                 PendingGlobalUdpResponse {
                     source: response.source,
                     payload: response.payload,
                 },
-                Some(current.token),
+                Some(attachment_token),
             ))
         }
     }
@@ -2257,6 +2285,49 @@ mod tests {
             proxy_settings_type: None,
             proxy_settings_value: None,
         }
+    }
+
+    #[test]
+    fn global_udp_response_delivery_routes_to_current_attachment() {
+        let (response_sender, _response_receiver) = mpsc::channel(1);
+        let pending = PendingGlobalUdpResponse {
+            source: SocketAddr::from((Ipv4Addr::LOCALHOST, 53)),
+            payload: b"response".to_vec(),
+        };
+        let delivery = match plan_global_udp_response_delivery(
+            Some(GlobalUdpAttachment {
+                token: 9,
+                session_id: 17,
+                generation: 23,
+                response_sender,
+                traffic_context: None,
+            }),
+            pending,
+        ) {
+            Ok(delivery) => delivery,
+            Err(_) => panic!("attached GlobalID should produce a delivery plan"),
+        };
+
+        assert_eq!(delivery.attachment_token, 9);
+        assert_eq!(delivery.response.session_id, 17);
+        assert_eq!(delivery.response.generation, 23);
+        assert_eq!(delivery.response.source.port(), 53);
+        assert_eq!(delivery.response.payload, b"response");
+    }
+
+    #[test]
+    fn global_udp_response_delivery_preserves_payload_while_detached() {
+        let pending = PendingGlobalUdpResponse {
+            source: SocketAddr::from((Ipv4Addr::LOCALHOST, 53)),
+            payload: b"pending".to_vec(),
+        };
+        let pending = match plan_global_udp_response_delivery(None, pending) {
+            Ok(_) => panic!("detached GlobalID must keep the response pending"),
+            Err(pending) => pending,
+        };
+
+        assert_eq!(pending.source.port(), 53);
+        assert_eq!(pending.payload, b"pending");
     }
 
     #[test]
