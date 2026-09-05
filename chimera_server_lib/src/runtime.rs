@@ -389,6 +389,13 @@ impl RuntimeState {
         self.routing().record_observation(tag, observation);
     }
 
+    pub(crate) fn outbound_observation(
+        &self,
+        tag: &str,
+    ) -> Option<OutboundObservation> {
+        self.routing().observation(tag)
+    }
+
     pub(crate) fn outbound_observations(
         &self,
     ) -> HashMap<String, OutboundObservation> {

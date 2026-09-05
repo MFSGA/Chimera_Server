@@ -1,5 +1,4 @@
 use std::{
-    borrow::Cow,
     collections::HashMap,
     net::IpAddr,
     str::FromStr,
@@ -25,6 +24,7 @@ use crate::{
 const INTERNAL_NEVER_IP_RULE: &str = "\0chimera:never-ip";
 const INTERNAL_NEVER_DOMAIN_RULE: &str = "\0chimera:never-domain";
 const LEAST_PING_MAX_DELAY_MS: i64 = 99_999_999;
+const OBSERVATION_SHARD_COUNT: usize = 16;
 
 #[derive(Debug, Clone, Default)]
 pub struct RoutingState {
@@ -32,7 +32,7 @@ pub struct RoutingState {
     rules: Vec<CompiledRule>,
     domain_strategy: DomainStrategy,
     geodata: GeodataStore,
-    observations: Arc<RwLock<HashMap<String, OutboundObservation>>>,
+    observations: Arc<ObservationStore>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -179,7 +179,108 @@ pub(crate) struct RoutingEvent {
     pub route: RouteMatch,
 }
 
-pub(crate) type BalancerTargetMap = HashMap<String, Arc<[String]>>;
+type ObservationSnapshot = Vec<Option<Arc<OutboundObservation>>>;
+
+#[derive(Debug)]
+struct ObservationStore {
+    shards:
+        [RwLock<HashMap<String, Arc<OutboundObservation>>>; OBSERVATION_SHARD_COUNT],
+}
+
+impl Default for ObservationStore {
+    fn default() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| RwLock::new(HashMap::new())),
+        }
+    }
+}
+
+impl ObservationStore {
+    fn record(&self, tag: String, observation: OutboundObservation) {
+        let shard = observation_shard_index(&tag);
+        if let Ok(mut observations) = self.shards[shard].write() {
+            let observation = merge_outbound_observation(
+                observations.get(&tag).map(AsRef::as_ref),
+                observation,
+            );
+            observations.insert(tag, Arc::new(observation));
+        }
+    }
+
+    fn get(&self, tag: &str) -> Option<Arc<OutboundObservation>> {
+        self.shards[observation_shard_index(tag)]
+            .read()
+            .ok()?
+            .get(tag)
+            .cloned()
+    }
+
+    fn snapshot_all(&self) -> HashMap<String, OutboundObservation> {
+        let mut snapshot = HashMap::new();
+        for shard in &self.shards {
+            let Ok(observations) = shard.read() else {
+                continue;
+            };
+            snapshot.extend(observations.iter().map(|(tag, observation)| {
+                (tag.clone(), observation.as_ref().clone())
+            }));
+        }
+        snapshot
+    }
+
+    fn snapshot_for(&self, targets: &BalancerTargetSet) -> ObservationSnapshot {
+        let mut snapshot = vec![None; targets.tags.len()];
+        for (shard_index, indices) in targets.indices_by_shard.iter().enumerate() {
+            if indices.is_empty() {
+                continue;
+            }
+            let Ok(observations) = self.shards[shard_index].read() else {
+                continue;
+            };
+            for &index in indices {
+                snapshot[index] = observations.get(&targets.tags[index]).cloned();
+            }
+        }
+        snapshot
+    }
+}
+
+fn observation_shard_index(tag: &str) -> usize {
+    let hash = tag
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
+    hash as usize % OBSERVATION_SHARD_COUNT
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BalancerTargetSet {
+    tags: Arc<[String]>,
+    indices_by_shard: Arc<[Vec<usize>]>,
+}
+
+impl AsRef<[String]> for BalancerTargetSet {
+    fn as_ref(&self) -> &[String] {
+        self.tags.as_ref()
+    }
+}
+
+impl BalancerTargetSet {
+    fn new(tags: Vec<String>) -> Self {
+        let mut indices_by_shard = vec![Vec::new(); OBSERVATION_SHARD_COUNT];
+        for (index, tag) in tags.iter().enumerate() {
+            indices_by_shard[observation_shard_index(tag)].push(index);
+        }
+        Self {
+            tags: Arc::from(tags),
+            indices_by_shard: Arc::from(indices_by_shard),
+        }
+    }
+}
+
+pub(crate) type BalancerTargetMap = HashMap<String, BalancerTargetSet>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RoutingRuleSummary {
@@ -671,19 +772,17 @@ impl RoutingState {
         tag: impl Into<String>,
         observation: OutboundObservation,
     ) {
-        let tag = tag.into();
-        if let Ok(mut observations) = self.observations.write() {
-            let observation =
-                merge_outbound_observation(observations.get(&tag), observation);
-            observations.insert(tag, observation);
-        }
+        self.observations.record(tag.into(), observation);
+    }
+
+    pub(crate) fn observation(&self, tag: &str) -> Option<OutboundObservation> {
+        self.observations
+            .get(tag)
+            .map(|observation| observation.as_ref().clone())
     }
 
     pub(crate) fn observations(&self) -> HashMap<String, OutboundObservation> {
-        self.observations
-            .read()
-            .map(|observations| observations.clone())
-            .unwrap_or_default()
+        self.observations.snapshot_all()
     }
 
     pub(crate) fn requires_process_lookup(&self) -> bool {
@@ -864,7 +963,7 @@ impl RoutingState {
             .map(|tag| {
                 (
                     tag.clone(),
-                    Arc::<[String]>::from(self.balancer_targets(tag, outbounds)),
+                    BalancerTargetSet::new(self.balancer_targets(tag, outbounds)),
                 )
             })
             .collect()
@@ -875,16 +974,19 @@ impl RoutingState {
         balancer_tag: &str,
         outbounds: &[OutboundSummary],
     ) -> Vec<String> {
-        let targets = self.balancer_targets(balancer_tag, outbounds);
+        let targets =
+            BalancerTargetSet::new(self.balancer_targets(balancer_tag, outbounds));
         let Some(balancer) = self.balancers.get(balancer_tag) else {
-            return targets;
+            return targets.tags.as_ref().to_vec();
         };
-        let observations = self
-            .observations
-            .read()
-            .map(|observations| observations.clone())
-            .unwrap_or_default();
-        balancer.principle_targets(&targets, outbounds, &observations)
+        let observations = balancer
+            .needs_observations()
+            .then(|| self.observations.snapshot_for(&targets));
+        balancer.principle_targets(
+            targets.tags.as_ref(),
+            outbounds,
+            observations.as_deref(),
+        )
     }
 
     fn resolve_target(
@@ -900,21 +1002,27 @@ impl RoutingState {
                 if let Some(target) = balancer_overrides.get(balancer_tag) {
                     return (Some(target.clone()), vec![balancer_tag.clone()]);
                 }
+                let owned_targets;
                 let targets = match balancer_targets
                     .and_then(|targets| targets.get(balancer_tag))
                 {
-                    Some(targets) => Cow::Borrowed(targets.as_ref()),
+                    Some(targets) => targets,
                     None => {
-                        Cow::Owned(self.balancer_targets(balancer_tag, outbounds))
+                        owned_targets = BalancerTargetSet::new(
+                            self.balancer_targets(balancer_tag, outbounds),
+                        );
+                        &owned_targets
                     }
                 };
-                let observations = self
-                    .observations
-                    .read()
-                    .map(|observations| observations.clone())
-                    .unwrap_or_default();
                 let target = self.balancers.get(balancer_tag).and_then(|balancer| {
-                    balancer.pick(targets.as_ref(), outbounds, &observations)
+                    let observations = balancer
+                        .needs_observations()
+                        .then(|| self.observations.snapshot_for(targets));
+                    balancer.pick(
+                        targets.tags.as_ref(),
+                        outbounds,
+                        observations.as_deref(),
+                    )
                 });
                 (target, vec![balancer_tag.clone()])
             }
@@ -964,19 +1072,28 @@ impl TryFrom<BalancerConfig> for CompiledBalancer {
 }
 
 impl CompiledBalancer {
+    fn needs_observations(&self) -> bool {
+        self.fallback_tag.is_some()
+            || matches!(
+                self.strategy,
+                BalancerStrategy::LeastPing | BalancerStrategy::LeastLoad(_)
+            )
+    }
+
     fn pick(
         &self,
         targets: &[String],
         outbounds: &[OutboundSummary],
-        observations: &HashMap<String, OutboundObservation>,
+        observations: Option<&[Option<Arc<OutboundObservation>>]>,
     ) -> Option<String> {
         let candidates = if self.fallback_tag.is_some() {
             targets
                 .iter()
-                .filter(|tag| {
-                    observations.get(*tag).is_none_or(|status| status.alive)
+                .zip(observations.unwrap_or_default())
+                .filter(|(_, status)| {
+                    status.as_deref().is_none_or(|status| status.alive)
                 })
-                .cloned()
+                .map(|(tag, _)| tag.clone())
                 .collect::<Vec<_>>()
         } else {
             targets.to_vec()
@@ -994,11 +1111,13 @@ impl CompiledBalancer {
                     .cloned()
             }
             BalancerStrategy::LeastPing => {
-                let target = least_ping_target(targets, observations);
+                let target =
+                    least_ping_target(targets, observations.unwrap_or_default());
                 (!target.is_empty()).then_some(target)
             }
             BalancerStrategy::LeastLoad(settings) => {
-                let selected = settings.select(targets, observations);
+                let selected =
+                    settings.select(targets, observations.unwrap_or_default());
                 (!selected.is_empty()).then(|| {
                     selected[rand::rng().random_range(0..selected.len())].clone()
                 })
@@ -1019,14 +1138,14 @@ impl CompiledBalancer {
         &self,
         targets: &[String],
         _outbounds: &[OutboundSummary],
-        observations: &HashMap<String, OutboundObservation>,
+        observations: Option<&[Option<Arc<OutboundObservation>>]>,
     ) -> Vec<String> {
         match &self.strategy {
             BalancerStrategy::LeastPing => {
-                vec![least_ping_target(targets, observations)]
+                vec![least_ping_target(targets, observations.unwrap_or_default())]
             }
             BalancerStrategy::LeastLoad(settings) => {
-                settings.select(targets, observations)
+                settings.select(targets, observations.unwrap_or_default())
             }
             _ => targets.to_vec(),
         }
@@ -1035,13 +1154,14 @@ impl CompiledBalancer {
 
 fn least_ping_target(
     targets: &[String],
-    observations: &HashMap<String, OutboundObservation>,
+    observations: &[Option<Arc<OutboundObservation>>],
 ) -> String {
     targets
         .iter()
-        .filter_map(|tag| {
-            observations
-                .get(tag)
+        .zip(observations)
+        .filter_map(|(tag, status)| {
+            status
+                .as_deref()
                 .filter(|status| {
                     status.alive && status.delay_ms < LEAST_PING_MAX_DELAY_MS
                 })
@@ -1108,12 +1228,13 @@ impl LeastLoadConfig {
     fn select(
         &self,
         targets: &[String],
-        observations: &HashMap<String, OutboundObservation>,
+        observations: &[Option<Arc<OutboundObservation>>],
     ) -> Vec<String> {
         let mut nodes = targets
             .iter()
-            .filter_map(|tag| {
-                let status = observations.get(tag)?;
+            .zip(observations)
+            .filter_map(|(tag, status)| {
+                let status = status.as_deref()?;
                 if !status.alive {
                     return None;
                 }
@@ -4323,6 +4444,68 @@ mod tests {
             vec![String::new()],
             "leastPing principle target must not apply fallbackTag"
         );
+    }
+
+    #[test]
+    fn observation_store_shards_writes_and_reconstructs_full_snapshot() {
+        let store = Arc::new(ObservationStore::default());
+        let writers = (0..8)
+            .map(|writer| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    for index in 0..32 {
+                        store.record(
+                            format!("node-{writer}-{index}"),
+                            OutboundObservation {
+                                alive: true,
+                                delay_ms: i64::from(writer * 32 + index),
+                                ..OutboundObservation::default()
+                            },
+                        );
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for writer in writers {
+            writer.join().expect("observation writer should finish");
+        }
+
+        let snapshot = store.snapshot_all();
+        assert_eq!(snapshot.len(), 256);
+        assert_eq!(snapshot["node-3-7"].delay_ms, 103);
+    }
+
+    #[test]
+    fn observation_target_snapshot_reuses_arc_values() {
+        let store = ObservationStore::default();
+        store.record(
+            "direct".into(),
+            OutboundObservation {
+                alive: true,
+                delay_ms: 12,
+                ..OutboundObservation::default()
+            },
+        );
+        store.record(
+            "unrelated".into(),
+            OutboundObservation {
+                alive: true,
+                delay_ms: 99,
+                ..OutboundObservation::default()
+            },
+        );
+        let direct = store.get("direct").expect("direct observation");
+        let targets =
+            BalancerTargetSet::new(vec!["direct".into(), "missing".into()]);
+
+        let snapshot = store.snapshot_for(&targets);
+
+        assert_eq!(snapshot.len(), 2);
+        assert!(Arc::ptr_eq(
+            &direct,
+            snapshot[0].as_ref().expect("direct target snapshot")
+        ));
+        assert!(snapshot[1].is_none());
     }
 
     #[test]
