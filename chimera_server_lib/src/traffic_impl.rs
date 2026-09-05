@@ -3,7 +3,7 @@ use std::{
     net::IpAddr,
     sync::{
         OnceLock, RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::SystemTime,
 };
@@ -73,6 +73,13 @@ impl TransferTotals {
         self.connections = self.connections.saturating_add(1);
         self.upload_bytes = self.upload_bytes.saturating_add(upload);
         self.download_bytes = self.download_bytes.saturating_add(download);
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.connections = self.connections.saturating_add(other.connections);
+        self.upload_bytes = self.upload_bytes.saturating_add(other.upload_bytes);
+        self.download_bytes =
+            self.download_bytes.saturating_add(other.download_bytes);
     }
 }
 
@@ -197,9 +204,44 @@ impl StatsInner {
     }
 }
 
-#[derive(Debug, Default)]
+const TRAFFIC_SHARD_COUNT: usize = 32;
+
+fn merge_totals_map<K>(
+    target: &mut HashMap<K, TransferTotals>,
+    source: &HashMap<K, TransferTotals>,
+) where
+    K: Clone + Eq + std::hash::Hash,
+{
+    for (key, totals) in source {
+        target.entry(key.clone()).or_default().merge(totals);
+    }
+}
+
+fn merge_stats_into_snapshot(snapshot: &mut TrafficSnapshot, stats: &StatsInner) {
+    snapshot.total.merge(&stats.total);
+    merge_totals_map(&mut snapshot.per_protocol, &stats.per_protocol);
+    merge_totals_map(&mut snapshot.per_identity, &stats.per_identity);
+    merge_totals_map(&mut snapshot.per_inbound, &stats.per_inbound);
+    merge_totals_map(&mut snapshot.per_outbound, &stats.per_outbound);
+    merge_totals_map(&mut snapshot.per_inbound_user, &stats.per_inbound_user);
+    snapshot
+        .known_identities
+        .extend(stats.known_identities.iter().cloned());
+}
+
+#[derive(Debug)]
 struct TrafficRecorder {
-    inner: RwLock<StatsInner>,
+    shards: [RwLock<StatsInner>; TRAFFIC_SHARD_COUNT],
+    next_shard: AtomicUsize,
+}
+
+impl Default for TrafficRecorder {
+    fn default() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| RwLock::new(StatsInner::default())),
+            next_shard: AtomicUsize::new(0),
+        }
+    }
 }
 
 impl TrafficRecorder {
@@ -208,9 +250,18 @@ impl TrafficRecorder {
         INSTANCE.get_or_init(TrafficRecorder::default)
     }
 
+    fn next_shard(&self) -> &RwLock<StatsInner> {
+        let index =
+            self.next_shard.fetch_add(1, Ordering::Relaxed) % TRAFFIC_SHARD_COUNT;
+        &self.shards[index]
+    }
+
     fn record(&self, context: TrafficContext, upload: u64, download: u64) {
         let plan = plan_traffic_record(context, upload, download);
-        let mut guard = self.inner.write().expect("traffic stats poisoned");
+        let mut guard = self
+            .next_shard()
+            .write()
+            .expect("traffic stats shard poisoned");
         guard.apply(plan);
     }
 
@@ -219,16 +270,20 @@ impl TrafficRecorder {
         if identity.is_empty() {
             return;
         }
-        self.inner
+        self.next_shard()
             .write()
-            .expect("traffic stats poisoned")
+            .expect("traffic stats shard poisoned")
             .known_identities
             .insert(identity);
     }
 
     fn snapshot(&self) -> TrafficSnapshot {
-        let guard = self.inner.read().expect("traffic stats poisoned");
-        guard.snapshot()
+        let mut snapshot = TrafficSnapshot::default();
+        for shard in &self.shards {
+            let guard = shard.read().expect("traffic stats shard poisoned");
+            merge_stats_into_snapshot(&mut snapshot, &guard);
+        }
+        snapshot
     }
 }
 
@@ -424,6 +479,58 @@ mod tests {
         assert_eq!(snapshot.per_outbound["direct"].connections, 1);
         assert!(snapshot.known_identities.contains("bob"));
     }
+    #[test]
+    fn sharded_recorder_aggregates_concurrent_updates_exactly() {
+        const WRITERS: usize = 8;
+        const RECORDS_PER_WRITER: usize = 256;
+
+        let recorder = std::sync::Arc::new(TrafficRecorder::default());
+        let writers = (0..WRITERS)
+            .map(|_| {
+                let recorder = std::sync::Arc::clone(&recorder);
+                std::thread::spawn(move || {
+                    for _ in 0..RECORDS_PER_WRITER {
+                        recorder.record(
+                            TrafficContext::new("vless")
+                                .with_identity("alice")
+                                .with_inbound_tag("edge")
+                                .with_outbound_tag("direct"),
+                            7,
+                            11,
+                        );
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for writer in writers {
+            writer.join().expect("traffic writer thread");
+        }
+
+        let expected_records = (WRITERS * RECORDS_PER_WRITER) as u64;
+        let snapshot = recorder.snapshot();
+        assert_eq!(snapshot.total.connections, expected_records);
+        assert_eq!(snapshot.total.upload_bytes, expected_records * 7);
+        assert_eq!(snapshot.total.download_bytes, expected_records * 11);
+        assert_eq!(snapshot.per_protocol["vless"].connections, expected_records);
+        assert_eq!(snapshot.per_inbound["edge"].connections, expected_records);
+        assert_eq!(
+            snapshot.per_outbound["direct"].connections,
+            expected_records
+        );
+        assert_eq!(
+            snapshot.per_identity[&("vless".to_string(), "alice".to_string())]
+                .connections,
+            expected_records
+        );
+        assert_eq!(
+            snapshot.per_inbound_user[&("edge".to_string(), "alice".to_string())]
+                .connections,
+            expected_records
+        );
+        assert!(snapshot.known_identities.contains("alice"));
+    }
+
     #[test]
     fn active_connection_plan_and_snapshot_conversion_are_pure() {
         let started_at = SystemTime::UNIX_EPOCH;
