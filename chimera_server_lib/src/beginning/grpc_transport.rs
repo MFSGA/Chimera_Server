@@ -3,6 +3,7 @@ use std::{
     future::Future,
     io,
     net::SocketAddr,
+    ops::Range,
     pin::Pin,
     sync::{
         Arc,
@@ -1113,11 +1114,11 @@ async fn decode_request_body(
         })?;
         if let Some(data) = frame.data_ref() {
             buffered.extend_from_slice(data);
-            while let Some(payloads) =
-                decode_grpc_message(&mut buffered, multi_mode)?
+            while let Some(message) =
+                decode_grpc_message_view(&mut buffered, multi_mode)?
             {
-                for payload in payloads {
-                    writer.write_all(&payload).await?;
+                for range in message.payloads {
+                    writer.write_all(&message.data[range]).await?;
                 }
             }
         }
@@ -1295,10 +1296,15 @@ fn grpc_status_response(status: u8, message: &str) -> Response<ResponseBody> {
         .unwrap()
 }
 
-fn decode_grpc_message(
+struct DecodedGrpcMessage {
+    data: Bytes,
+    payloads: Vec<Range<usize>>,
+}
+
+fn decode_grpc_message_view(
     buffer: &mut BytesMut,
     multi_mode: bool,
-) -> io::Result<Option<Vec<Vec<u8>>>> {
+) -> io::Result<Option<DecodedGrpcMessage>> {
     if buffer.len() < 5 {
         return Ok(None);
     }
@@ -1331,13 +1337,36 @@ fn decode_grpc_message(
         return Ok(None);
     }
     buffer.advance(5);
-    let message = buffer.split_to(message_len);
-    decode_data_fields(&message, multi_mode)
-        .map(Some)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, GrpcInvalidProtobuf))
+    let message = buffer.split_to(message_len).freeze();
+    let payloads = decode_data_field_ranges(&message, multi_mode).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, GrpcInvalidProtobuf)
+    })?;
+    Ok(Some(DecodedGrpcMessage {
+        data: message,
+        payloads,
+    }))
 }
 
-fn decode_data_fields(message: &[u8], multi_mode: bool) -> io::Result<Vec<Vec<u8>>> {
+#[cfg(test)]
+fn decode_grpc_message(
+    buffer: &mut BytesMut,
+    multi_mode: bool,
+) -> io::Result<Option<Vec<Vec<u8>>>> {
+    decode_grpc_message_view(buffer, multi_mode).map(|message| {
+        message.map(|message| {
+            message
+                .payloads
+                .into_iter()
+                .map(|range| message.data[range].to_vec())
+                .collect()
+        })
+    })
+}
+
+fn decode_data_field_ranges(
+    message: &[u8],
+    multi_mode: bool,
+) -> io::Result<Vec<Range<usize>>> {
     let mut offset = 0;
     let mut payloads = Vec::new();
     while offset < message.len() {
@@ -1367,7 +1396,7 @@ fn decode_data_fields(message: &[u8], multi_mode: bool) -> io::Result<Vec<Vec<u8
                     "truncated gRPC protobuf payload",
                 ));
             }
-            let payload = message[offset..end].to_vec();
+            let payload = offset..end;
             offset = end;
             if multi_mode {
                 payloads.push(payload);
@@ -1385,7 +1414,7 @@ fn decode_data_fields(message: &[u8], multi_mode: bool) -> io::Result<Vec<Vec<u8
     }
 
     if payloads.is_empty() {
-        payloads.push(Vec::new());
+        payloads.push(0..0);
     }
     Ok(payloads)
 }
@@ -1604,12 +1633,13 @@ mod tests {
 
     use super::{
         GrpcKeepalive, GrpcPeerContext, GrpcSetupTimeoutIo, GrpcStreamTaskGuard,
-        PROTOBUF_MAX_FIELD_NUMBER, decode_grpc_message, encode_grpc_message,
-        encode_varint, grpc_content_type, grpc_content_type_is_valid,
-        grpc_deadline_exceeded_response, grpc_duplicate_host_error,
-        grpc_duplicate_host_response, grpc_encode_message, grpc_http2_builder,
-        grpc_invalid_base64_offset, grpc_invalid_content_type_response,
-        grpc_logical_addrs, grpc_logical_peer_addr, grpc_malformed_binary_metadata,
+        PROTOBUF_MAX_FIELD_NUMBER, decode_grpc_message, decode_grpc_message_view,
+        encode_grpc_message, encode_varint, grpc_content_type,
+        grpc_content_type_is_valid, grpc_deadline_exceeded_response,
+        grpc_duplicate_host_error, grpc_duplicate_host_response,
+        grpc_encode_message, grpc_http2_builder, grpc_invalid_base64_offset,
+        grpc_invalid_content_type_response, grpc_logical_addrs,
+        grpc_logical_peer_addr, grpc_malformed_binary_metadata,
         grpc_malformed_binary_metadata_response, grpc_malformed_timeout_response,
         grpc_method_not_allowed_response, grpc_service_paths, grpc_stream_response,
         grpc_timeout_duration, grpc_unimplemented_path_response,
@@ -2524,6 +2554,25 @@ mod tests {
             .expect("decode Hunk")
             .expect("complete Hunk");
         assert_eq!(decoded, vec![payload]);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn grpc_message_view_reuses_frame_backing_memory() {
+        let protobuf = [0x0a, 0x05, b'h', b'e', b'l', b'l', b'o'];
+        let mut frame = vec![0];
+        frame.extend_from_slice(&(protobuf.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&protobuf);
+        let mut buffer = BytesMut::from(frame.as_slice());
+        let message_ptr = buffer[5..].as_ptr();
+
+        let decoded = decode_grpc_message_view(&mut buffer, false)
+            .expect("decode Hunk view")
+            .expect("complete Hunk view");
+
+        assert_eq!(decoded.data.as_ptr(), message_ptr);
+        assert_eq!(decoded.payloads, vec![2..7]);
+        assert_eq!(&decoded.data[decoded.payloads[0].clone()], b"hello");
         assert!(buffer.is_empty());
     }
 
