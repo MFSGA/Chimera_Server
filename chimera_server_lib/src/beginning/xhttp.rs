@@ -26,7 +26,7 @@ use hyper_util::{
 use rand::RngExt;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex},
-    sync::{mpsc, oneshot},
+    sync::mpsc,
     task::JoinSet,
     time::{Duration, sleep},
 };
@@ -1142,8 +1142,7 @@ where
     let response_can_flush_while_uploading =
         stream_up_can_flush_while_uploading(request_version);
     let session = state.sessions.get_or_create(&session_id);
-    let (done_tx, done_rx) = oneshot::channel();
-    let reader = IncomingBodyReader::new(body, done_tx);
+    let reader = IncomingBodyReader::new(body);
     if session
         .upload_queue
         .push_reader(Box::pin(reader))
@@ -1154,7 +1153,7 @@ where
     }
 
     stream_up_response(
-        done_rx,
+        session.closed.clone(),
         &state,
         padding_enabled && response_can_flush_while_uploading,
     )
@@ -1176,6 +1175,7 @@ async fn handle_stream_down(
     let cleanup = SessionCleanupGuard {
         sessions: state.sessions.clone(),
         session_id,
+        session,
     };
     let body_stream = futures::stream::unfold(
         (ReaderStream::new(reader), cleanup),
@@ -1291,30 +1291,30 @@ fn packet_up_success_response(
 }
 
 async fn wait_for_stream_up_response_start(
-    done_rx: oneshot::Receiver<()>,
+    session_closed: CancellationToken,
     padding_enabled: bool,
     min_padding: usize,
     max_padding: usize,
-) -> Option<(oneshot::Receiver<()>, Bytes)> {
+) -> Option<(CancellationToken, Bytes)> {
     if padding_enabled {
         let padding_len = random_xray_range(min_padding, max_padding);
-        return Some((done_rx, Bytes::from(vec![b'X'; padding_len])));
+        return Some((session_closed, Bytes::from(vec![b'X'; padding_len])));
     }
 
-    let _ = done_rx.await;
+    session_closed.cancelled().await;
     None
 }
 
 async fn stream_up_response(
-    done_rx: oneshot::Receiver<()>,
+    session_closed: CancellationToken,
     state: &AppState,
     padding_enabled: bool,
 ) -> Response<ResponseBody> {
     let (min_secs, max_secs) = state.stream_up_server_secs;
     let padding_enabled = padding_enabled && max_secs > 0;
 
-    let Some((done_rx, first_padding)) = wait_for_stream_up_response_start(
-        done_rx,
+    let Some((session_closed, first_padding)) = wait_for_stream_up_response_start(
+        session_closed,
         padding_enabled,
         state.min_padding,
         state.max_padding,
@@ -1332,23 +1332,26 @@ async fn stream_up_response(
     let max_padding = state.max_padding;
     let shutdown = state.shutdown.clone();
     let body_stream = futures::stream::unfold(
-        (done_rx, Some(first_padding)),
-        move |(mut done_rx, first_padding)| {
+        (session_closed, Some(first_padding)),
+        move |(session_closed, first_padding)| {
             let shutdown = shutdown.clone();
             async move {
                 if let Some(first_padding) = first_padding {
-                    return Some((Ok(Frame::data(first_padding)), (done_rx, None)));
+                    return Some((
+                        Ok(Frame::data(first_padding)),
+                        (session_closed, None),
+                    ));
                 }
 
                 let delay_secs = random_xray_range(min_secs, max_secs);
                 tokio::select! {
-                    _ = &mut done_rx => None,
+                    _ = session_closed.cancelled() => None,
                     _ = shutdown.cancelled() => None,
                     _ = sleep(Duration::from_secs(delay_secs as u64)) => {
                         let padding_len = random_xray_range(min_padding, max_padding);
                         Some((
                             Ok(Frame::data(Bytes::from(vec![b'X'; padding_len]))),
-                            (done_rx, None),
+                            (session_closed, None),
                         ))
                     }
                 }
@@ -1472,6 +1475,16 @@ impl SessionStore {
         self.inner.write().unwrap().remove(session_id);
     }
 
+    fn remove_if_current(&self, session_id: &str, session: &Arc<XhttpSession>) {
+        let mut sessions = self.inner.write().unwrap();
+        if sessions
+            .get(session_id)
+            .is_some_and(|current| Arc::ptr_eq(current, session))
+        {
+            sessions.remove(session_id);
+        }
+    }
+
     fn spawn_ttl_cleanup(&self, session_id: String, session: Arc<XhttpSession>) {
         let ttl = self.ttl;
         let store = self.clone();
@@ -1480,7 +1493,7 @@ impl SessionStore {
             tokio::select! {
                 _ = sleep(ttl) => {}
                 _ = shutdown.cancelled() => {
-                    store.remove(&session_id);
+                    store.remove_if_current(&session_id, &session);
                     session.close_upload_queue();
                     return;
                 }
@@ -1494,7 +1507,7 @@ impl SessionStore {
                     },
                 );
             if should_remove {
-                store.remove(&session_id);
+                store.remove_if_current(&session_id, &session);
                 session.close_upload_queue();
             }
         });
@@ -1504,32 +1517,27 @@ impl SessionStore {
 struct SessionCleanupGuard {
     sessions: SessionStore,
     session_id: String,
+    session: Arc<XhttpSession>,
 }
 
 impl Drop for SessionCleanupGuard {
     fn drop(&mut self) {
-        self.sessions.remove(&self.session_id);
+        self.sessions
+            .remove_if_current(&self.session_id, &self.session);
+        self.session.close_upload_queue();
     }
 }
 
 struct IncomingBodyReader<B> {
     body: B,
     current: Bytes,
-    done_tx: Option<oneshot::Sender<()>>,
 }
 
 impl<B> IncomingBodyReader<B> {
-    fn new(body: B, done_tx: oneshot::Sender<()>) -> Self {
+    fn new(body: B) -> Self {
         Self {
             body,
             current: Bytes::new(),
-            done_tx: Some(done_tx),
-        }
-    }
-
-    fn finish(&mut self) {
-        if let Some(done_tx) = self.done_tx.take() {
-            let _ = done_tx.send(());
         }
     }
 }
@@ -1558,13 +1566,9 @@ where
                     }
                 }
                 Poll::Ready(Some(Err(error))) => {
-                    self.finish();
                     return Poll::Ready(Err(std::io::Error::other(error)));
                 }
-                Poll::Ready(None) => {
-                    self.finish();
-                    return Poll::Ready(Ok(()));
-                }
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -1767,6 +1771,7 @@ struct XhttpSession {
     upload_queue: UploadQueueSender,
     upload_reader: Arc<StdMutex<XhttpUploadReader>>,
     fully_connected: AtomicBool,
+    closed: CancellationToken,
 }
 
 impl XhttpSession {
@@ -1778,6 +1783,7 @@ impl XhttpSession {
             upload_queue,
             upload_reader: Arc::new(StdMutex::new(upload_reader)),
             fully_connected: AtomicBool::new(false),
+            closed: CancellationToken::new(),
         }
     }
 
@@ -1795,6 +1801,7 @@ impl XhttpSession {
     }
 
     fn close_upload_queue(&self) {
+        self.closed.cancel();
         let mut reader = self
             .upload_reader
             .lock()
@@ -3593,31 +3600,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_up_response_waits_for_body_without_padding_like_xray_v26_2_6() {
-        let (done_tx, done_rx) = oneshot::channel();
-        let mut wait =
-            Box::pin(wait_for_stream_up_response_start(done_rx, false, 100, 100));
+    async fn stream_up_response_waits_for_session_close_without_padding_like_current_xray()
+     {
+        let session_closed = CancellationToken::new();
+        let mut wait = Box::pin(wait_for_stream_up_response_start(
+            session_closed.clone(),
+            false,
+            100,
+            100,
+        ));
 
         assert!(
             tokio::time::timeout(Duration::from_millis(20), &mut wait)
                 .await
                 .is_err(),
-            "stream-up response must stay pending while the request body is still open"
+            "stream-up response must stay pending while the logical session is open"
         );
 
-        done_tx.send(()).expect("finish stream-up body");
+        session_closed.cancel();
         assert!(
             wait.await.is_none(),
-            "completed stream-up without padding should return headers only after body EOF"
+            "stream-up without padding should finish when the logical session closes"
         );
     }
 
     #[tokio::test]
     async fn stream_up_padding_starts_immediately_like_current_xray() {
-        let (_done_tx, done_rx) = oneshot::channel();
+        let session_closed = CancellationToken::new();
         let started = tokio::time::timeout(
             Duration::from_millis(20),
-            wait_for_stream_up_response_start(done_rx, true, 7, 7),
+            wait_for_stream_up_response_start(session_closed, true, 7, 7),
         )
         .await
         .expect("current Xray writes the first stream-up padding chunk immediately")
@@ -4021,8 +4033,11 @@ mod tests {
         drop(SessionCleanupGuard {
             sessions: store.clone(),
             session_id: "session".to_string(),
+            session: session.clone(),
         });
 
         assert!(!store.inner.read().unwrap().contains_key("session"));
+        assert!(session.closed.is_cancelled());
+        assert!(session.upload_queue.closed.load(Ordering::Acquire));
     }
 }
