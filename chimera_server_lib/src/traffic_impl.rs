@@ -256,12 +256,35 @@ pub struct ActiveConnectionSnapshot {
     pub started_at: SystemTime,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveConnection {
     inbound_tag: Option<String>,
     identity: Option<String>,
     client_ip: Option<IpAddr>,
     started_at: SystemTime,
+}
+
+fn plan_active_connection(
+    context: &TrafficContext,
+    started_at: SystemTime,
+) -> ActiveConnection {
+    ActiveConnection {
+        inbound_tag: context.inbound_tag.clone(),
+        identity: context.identity.clone(),
+        client_ip: context.client_ip,
+        started_at,
+    }
+}
+
+impl From<ActiveConnection> for ActiveConnectionSnapshot {
+    fn from(entry: ActiveConnection) -> Self {
+        Self {
+            inbound_tag: entry.inbound_tag,
+            identity: entry.identity,
+            client_ip: entry.client_ip,
+            started_at: entry.started_at,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -289,16 +312,13 @@ impl ActiveConnections {
     }
 
     fn snapshot(&self) -> Vec<ActiveConnectionSnapshot> {
-        let guard = self.inner.read().expect("active connections poisoned");
-        guard
-            .values()
-            .cloned()
-            .map(|entry| ActiveConnectionSnapshot {
-                inbound_tag: entry.inbound_tag,
-                identity: entry.identity,
-                client_ip: entry.client_ip,
-                started_at: entry.started_at,
-            })
+        let entries = {
+            let guard = self.inner.read().expect("active connections poisoned");
+            guard.values().cloned().collect::<Vec<_>>()
+        };
+        entries
+            .into_iter()
+            .map(ActiveConnectionSnapshot::from)
             .collect()
     }
 
@@ -329,13 +349,7 @@ pub fn register_connection(context: Option<&TrafficContext>) -> ConnectionGuard 
         }
     };
 
-    let entry = ActiveConnection {
-        inbound_tag: context.inbound_tag.clone(),
-        identity: context.identity.clone(),
-        client_ip: context.client_ip,
-        started_at: SystemTime::now(),
-    };
-
+    let entry = plan_active_connection(context, SystemTime::now());
     let id = ActiveConnections::global().insert(entry);
     ConnectionGuard { id: Some(id) }
 }
@@ -409,5 +423,25 @@ mod tests {
         );
         assert_eq!(snapshot.per_outbound["direct"].connections, 1);
         assert!(snapshot.known_identities.contains("bob"));
+    }
+    #[test]
+    fn active_connection_plan_and_snapshot_conversion_are_pure() {
+        let started_at = SystemTime::UNIX_EPOCH;
+        let context = TrafficContext::new("vless")
+            .with_identity("alice")
+            .with_inbound_tag("edge")
+            .with_client_ip("127.0.0.1".parse().expect("loopback ip"));
+        let entry = plan_active_connection(&context, started_at);
+
+        assert_eq!(entry.inbound_tag.as_deref(), Some("edge"));
+        assert_eq!(entry.identity.as_deref(), Some("alice"));
+        assert_eq!(entry.client_ip, Some("127.0.0.1".parse().unwrap()));
+        assert_eq!(entry.started_at, started_at);
+
+        let snapshot = ActiveConnectionSnapshot::from(entry);
+        assert_eq!(snapshot.inbound_tag.as_deref(), Some("edge"));
+        assert_eq!(snapshot.identity.as_deref(), Some("alice"));
+        assert_eq!(snapshot.client_ip, Some("127.0.0.1".parse().unwrap()));
+        assert_eq!(snapshot.started_at, started_at);
     }
 }
