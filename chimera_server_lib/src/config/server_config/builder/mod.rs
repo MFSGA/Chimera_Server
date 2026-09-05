@@ -1541,6 +1541,151 @@ fn build_socks_server(
     Ok(context.finish_tcp(protocol))
 }
 
+#[cfg(feature = "hysteria")]
+#[derive(Default)]
+struct Hysteria2XrayQuicPlan {
+    enabled: bool,
+    congestion: Option<String>,
+    bbr_profile: Option<String>,
+    brutal_up: Option<u64>,
+    brutal_down: Option<u64>,
+    max_idle_timeout_secs: Option<u64>,
+    keep_alive_period_secs: Option<u64>,
+    max_incoming_streams: Option<u64>,
+    receive_windows: Option<(u64, u64, u64, u64)>,
+    disable_path_mtu_discovery: Option<bool>,
+}
+
+#[cfg(feature = "hysteria")]
+fn plan_hysteria2_xray_quic(
+    final_mask: Option<&crate::config::FinalMaskSettings>,
+) -> Result<Hysteria2XrayQuicPlan, Error> {
+    let Some(final_mask) = final_mask else {
+        return Ok(Hysteria2XrayQuicPlan::default());
+    };
+    if !final_mask.tcp.is_empty() || !final_mask.udp.is_empty() {
+        return Err(Error::InvalidConfig(
+            "hysteria2 finalmask.tcp/udp mask chains are not supported".into(),
+        ));
+    }
+
+    let Some(quic_params) = final_mask.quic_params.as_ref() else {
+        return Ok(Hysteria2XrayQuicPlan::default());
+    };
+    if quic_params
+        .udp_hop
+        .as_ref()
+        .is_some_and(|udp_hop| !finalmask_udp_hop_is_inert(udp_hop))
+    {
+        return Err(Error::InvalidConfig(
+            "finalmask.quicParams.udpHop is not supported unless it is empty/inert"
+                .into(),
+        ));
+    }
+
+    let validated = validate_xray_finalmask_quic_params(quic_params, true)?;
+    Ok(Hysteria2XrayQuicPlan {
+        enabled: true,
+        congestion: Some(validated.congestion),
+        bbr_profile: Some(validated.bbr_profile),
+        brutal_up: Some(validated.brutal_up),
+        brutal_down: validated.brutal_down,
+        max_idle_timeout_secs: Some(if validated.max_idle_timeout == 0 {
+            30
+        } else {
+            validated.max_idle_timeout
+        }),
+        keep_alive_period_secs: Some(validated.keep_alive_period),
+        max_incoming_streams: Some(if validated.max_incoming_streams == 0 {
+            1024
+        } else {
+            validated.max_incoming_streams
+        }),
+        receive_windows: Some(validated.receive_windows),
+        disable_path_mtu_discovery: Some(quic_params.disable_path_mtu_discovery),
+    })
+}
+
+#[cfg(feature = "hysteria")]
+fn apply_hysteria2_xray_quic_plan(
+    mut config: crate::config::server_config::Hysteria2ServerConfig,
+    plan: Hysteria2XrayQuicPlan,
+) -> crate::config::server_config::Hysteria2ServerConfig {
+    config.xray_compat |= plan.enabled;
+    config.xray_congestion = plan.congestion;
+    config.xray_bbr_profile = plan.bbr_profile;
+    config.xray_brutal_up = plan.brutal_up;
+    config.xray_brutal_down = plan.brutal_down;
+    config.xray_max_idle_timeout_secs = plan.max_idle_timeout_secs;
+    config.xray_keep_alive_period_secs = plan.keep_alive_period_secs;
+    config.xray_max_incoming_streams = plan.max_incoming_streams;
+    config.xray_disable_path_mtu_discovery = plan.disable_path_mtu_discovery;
+    if let Some((init_stream, max_stream, init_connection, max_connection)) =
+        plan.receive_windows
+    {
+        config.xray_init_stream_receive_window = Some(init_stream);
+        config.xray_max_stream_receive_window = Some(max_stream);
+        config.xray_init_connection_receive_window = Some(init_connection);
+        config.xray_max_connection_receive_window = Some(max_connection);
+    }
+    config
+}
+
+#[cfg(feature = "hysteria")]
+fn plan_hysteria2_quic_settings(
+    stream_settings: &crate::config::StreamSettings,
+) -> Result<ServerQuicConfig, Error> {
+    let tls_settings = stream_settings.tls_settings.as_ref().ok_or_else(|| {
+        Error::InvalidConfig("hysteria2 inbound requires tlsSettings".into())
+    })?;
+    let item = tls_settings.certificates[0].clone();
+    let cert = item.certificate_file.ok_or_else(|| {
+        Error::InvalidConfig(
+            "hysteria2 inbound currently requires certificateFile".into(),
+        )
+    })?;
+    let key = item.key_file.ok_or_else(|| {
+        Error::InvalidConfig("hysteria2 inbound currently requires keyFile".into())
+    })?;
+    Ok(ServerQuicConfig {
+        cert,
+        key,
+        alpn_protocols: NoneOrSome::Some(tls_settings.alpn.clone()),
+        client_fingerprints: NoneOrSome::None,
+    })
+}
+
+#[cfg(feature = "hysteria")]
+fn build_hysteria2_server(
+    context: InboundBuildContext,
+    settings: Option<crate::config::SettingObject>,
+) -> Result<ServerConfig, Error> {
+    let stream_settings = context.stream_settings().ok_or_else(|| {
+        Error::InvalidConfig("hysteria2 inbound missing streamSettings".into())
+    })?;
+    let xray_quic_plan =
+        plan_hysteria2_xray_quic(stream_settings.final_mask.as_ref())?;
+    let quic_settings = plan_hysteria2_quic_settings(stream_settings)?;
+    let settings = settings.ok_or_else(|| {
+        Error::InvalidConfig("hysteria2 inbound requires clients".into())
+    })?;
+    let config = collect_hysteria2_settings(
+        settings,
+        stream_settings.hysteria_settings.as_ref(),
+    )?;
+    let config = apply_hysteria2_xray_quic_plan(config, xray_quic_plan);
+    if config.clients.is_empty() {
+        return Err(Error::InvalidConfig(
+            "hysteria2 inbound requires at least one client".into(),
+        ));
+    }
+    Ok(context.finish(
+        ServerProxyConfig::Hysteria2 { config },
+        Transport::Quic,
+        Some(quic_settings),
+    ))
+}
+
 #[cfg(feature = "tuic")]
 fn build_tuic_server(
     context: InboundBuildContext,
@@ -1632,140 +1777,7 @@ impl TryFrom<InboudItem> for ServerConfig {
                 build_dokodemo_server(context, settings)
             }
             #[cfg(feature = "hysteria")]
-            Protocol::Hysteria2 => {
-                let InboundBuildContext {
-                    tag,
-                    bind_location,
-                    stream_settings,
-                    sniffing,
-                    ..
-                } = context;
-                let stream_settings = stream_settings.ok_or_else(|| {
-                    Error::InvalidConfig(
-                        "hysteria2 inbound missing streamSettings".into(),
-                    )
-                })?;
-                let hysteria_settings = stream_settings.hysteria_settings.as_ref();
-                let final_mask = stream_settings.final_mask.as_ref();
-                if let Some(final_mask) = final_mask
-                    && (!final_mask.tcp.is_empty() || !final_mask.udp.is_empty())
-                {
-                    return Err(Error::InvalidConfig(
-                        "hysteria2 finalmask.tcp/udp mask chains are not supported"
-                            .into(),
-                    ));
-                }
-                let xray_quic_params =
-                    final_mask.and_then(|final_mask| final_mask.quic_params.as_ref());
-                if let Some(udp_hop) =
-                    xray_quic_params.and_then(|quic_params| quic_params.udp_hop.as_ref())
-                    && !finalmask_udp_hop_is_inert(udp_hop)
-                {
-                    return Err(Error::InvalidConfig(
-                        "finalmask.quicParams.udpHop is not supported unless it is empty/inert"
-                            .into(),
-                    ));
-                }
-                let validated_xray_quic = xray_quic_params
-                    .map(|params| validate_xray_finalmask_quic_params(params, true))
-                    .transpose()?;
-                let (
-                    xray_congestion,
-                    xray_bbr_profile,
-                    xray_brutal_up,
-                    xray_brutal_down,
-                    xray_max_idle_timeout_secs,
-                    xray_keep_alive_period_secs,
-                    xray_max_incoming_streams,
-                    xray_receive_windows,
-                ) = match validated_xray_quic {
-                    Some(validated) => (
-                        Some(validated.congestion),
-                        Some(validated.bbr_profile),
-                        Some(validated.brutal_up),
-                        validated.brutal_down,
-                        Some(if validated.max_idle_timeout == 0 {
-                            30
-                        } else {
-                            validated.max_idle_timeout
-                        }),
-                        Some(validated.keep_alive_period),
-                        Some(if validated.max_incoming_streams == 0 {
-                            1024
-                        } else {
-                            validated.max_incoming_streams
-                        }),
-                        Some(validated.receive_windows),
-                    ),
-                    None => (None, None, None, None, None, None, None, None),
-                };
-                let tls_settings =
-                    stream_settings.tls_settings.ok_or_else(|| {
-                        Error::InvalidConfig(
-                            "hysteria2 inbound requires tlsSettings".into(),
-                        )
-                    })?;
-                let item = tls_settings.certificates[0].clone();
-                let cert = item.certificate_file.ok_or_else(|| {
-                    Error::InvalidConfig(
-                        "hysteria2 inbound currently requires certificateFile"
-                            .into(),
-                    )
-                })?;
-                let key = item.key_file.ok_or_else(|| {
-                    Error::InvalidConfig(
-                        "hysteria2 inbound currently requires keyFile".into(),
-                    )
-                })?;
-
-                let settings = settings.ok_or_else(|| {
-                    Error::InvalidConfig("hysteria2 inbound requires clients".into())
-                })?;
-                let mut config =
-                    collect_hysteria2_settings(settings, hysteria_settings)?;
-                config.xray_compat |= xray_quic_params.is_some();
-                config.xray_congestion = xray_congestion;
-                config.xray_bbr_profile = xray_bbr_profile;
-                config.xray_brutal_up = xray_brutal_up;
-                config.xray_brutal_down = xray_brutal_down;
-                config.xray_max_idle_timeout_secs = xray_max_idle_timeout_secs;
-                config.xray_keep_alive_period_secs = xray_keep_alive_period_secs;
-                config.xray_max_incoming_streams = xray_max_incoming_streams;
-                config.xray_disable_path_mtu_discovery =
-                    xray_quic_params.map(|params| params.disable_path_mtu_discovery);
-                if let Some((
-                    init_stream,
-                    max_stream,
-                    init_connection,
-                    max_connection,
-                )) = xray_receive_windows
-                {
-                    config.xray_init_stream_receive_window = Some(init_stream);
-                    config.xray_max_stream_receive_window = Some(max_stream);
-                    config.xray_init_connection_receive_window = Some(init_connection);
-                    config.xray_max_connection_receive_window = Some(max_connection);
-                }
-                if config.clients.is_empty() {
-                    return Err(Error::InvalidConfig(
-                        "hysteria2 inbound requires at least one client".into(),
-                    ));
-                }
-
-                let quic_settings = Some(ServerQuicConfig {
-                    cert,
-                    key,
-                    alpn_protocols: NoneOrSome::Some(tls_settings.alpn),
-                    client_fingerprints: NoneOrSome::None,
-                });
-                Ok(ServerConfig {
-                    tag,
-                    bind_location,
-                    protocol: ServerProxyConfig::Hysteria2 { config },
-                    transport: Transport::Quic,
-                    quic_settings,
-                    sniffing,
-                })
-            }
+            Protocol::Hysteria2 => build_hysteria2_server(context, settings),
             #[cfg(feature = "vless")]
             Protocol::Vless => build_vless_server(context, settings),
             #[cfg(feature = "vmess")]
