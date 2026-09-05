@@ -2,7 +2,7 @@ use std::{
     io,
     pin::Pin,
     sync::{
-        OnceLock,
+        Arc, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
     task::{Context, Poll},
@@ -957,15 +957,17 @@ impl SpliceRelay {
         right_fd: RawFd,
         requested_pipe_size: usize,
     ) -> io::Result<Self> {
+        let left = Arc::new(AsyncFd::new(duplicate_fd(left_fd)?)?);
+        let right = Arc::new(AsyncFd::new(duplicate_fd(right_fd)?)?);
         Ok(Self {
-            left_to_right: SpliceDirection::new(
-                left_fd,
-                right_fd,
+            left_to_right: SpliceDirection::with_endpoints(
+                Arc::clone(&left),
+                Arc::clone(&right),
                 requested_pipe_size,
             )?,
-            right_to_left: SpliceDirection::new(
-                right_fd,
-                left_fd,
+            right_to_left: SpliceDirection::with_endpoints(
+                right,
+                left,
                 requested_pipe_size,
             )?,
         })
@@ -982,8 +984,8 @@ impl SpliceRelay {
 
 #[cfg(target_os = "linux")]
 struct SpliceDirection {
-    source: AsyncFd<OwnedFd>,
-    destination: AsyncFd<OwnedFd>,
+    source: Arc<AsyncFd<OwnedFd>>,
+    destination: Arc<AsyncFd<OwnedFd>>,
     pipe_read: OwnedFd,
     pipe_write: OwnedFd,
     pipe_capacity: usize,
@@ -996,8 +998,18 @@ impl SpliceDirection {
         destination_fd: RawFd,
         requested_pipe_size: usize,
     ) -> io::Result<Self> {
-        let source = AsyncFd::new(duplicate_fd(source_fd)?)?;
-        let destination = AsyncFd::new(duplicate_fd(destination_fd)?)?;
+        Self::with_endpoints(
+            Arc::new(AsyncFd::new(duplicate_fd(source_fd)?)?),
+            Arc::new(AsyncFd::new(duplicate_fd(destination_fd)?)?),
+            requested_pipe_size,
+        )
+    }
+
+    fn with_endpoints(
+        source: Arc<AsyncFd<OwnedFd>>,
+        destination: Arc<AsyncFd<OwnedFd>>,
+        requested_pipe_size: usize,
+    ) -> io::Result<Self> {
         let (pipe_read, pipe_write, pipe_capacity) =
             nonblocking_pipe(requested_pipe_size)?;
         Ok(Self {
@@ -1588,6 +1600,36 @@ mod tests {
         assert_eq!(&right_request, b"left-before");
         assert_eq!(left_tail, b"right-after");
         assert_eq!(right_tail, b"left-after");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn full_splice_shares_endpoint_readiness_registrations() {
+        let (_left_peer, left_relay) = tcp_pair().await.unwrap();
+        let (_right_peer, right_relay) = tcp_pair().await.unwrap();
+        let splice = SpliceRelay::new(
+            left_relay.as_raw_fd(),
+            right_relay.as_raw_fd(),
+            DEFAULT_SPLICE_PIPE_SIZE,
+        )
+        .unwrap();
+
+        assert!(Arc::ptr_eq(
+            &splice.left_to_right.source,
+            &splice.right_to_left.destination,
+        ));
+        assert!(Arc::ptr_eq(
+            &splice.left_to_right.destination,
+            &splice.right_to_left.source,
+        ));
+        assert_ne!(
+            splice.left_to_right.pipe_read.as_raw_fd(),
+            splice.right_to_left.pipe_read.as_raw_fd(),
+        );
+        assert_ne!(
+            splice.left_to_right.pipe_write.as_raw_fd(),
+            splice.right_to_left.pipe_write.as_raw_fd(),
+        );
     }
 
     #[cfg(target_os = "linux")]
