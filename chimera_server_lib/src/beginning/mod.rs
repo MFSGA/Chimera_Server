@@ -1152,6 +1152,7 @@ where
             stream,
             udp_socket,
             expected_client,
+            user_level,
             traffic_context,
         } => {
             let traffic_context = traffic_context
@@ -1163,6 +1164,7 @@ where
                 resolver,
                 runtime,
                 Some(expected_client),
+                user_level,
                 traffic_context,
             )
             .await

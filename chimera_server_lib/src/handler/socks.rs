@@ -6,7 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
 
@@ -226,7 +226,7 @@ impl SocksTcpServerHandler {
                         local_addr.map(|addr| addr.ip()),
                         listener_addr,
                         self.udp_response_ip.clone(),
-                        self.accounts.clone(),
+                        self.user_level,
                     )
                     .await
                 }
@@ -541,7 +541,7 @@ async fn handle_udp_associate(
     response_default_ip: Option<std::net::IpAddr>,
     _listener_addr: Option<SocketAddr>,
     udp_response_ip: Option<String>,
-    _accounts: SocksUserStore,
+    user_level: u32,
 ) -> std::io::Result<TcpServerSetupResult> {
     let client_hint = read_socks_address(&mut server_stream).await?;
     let (hint_address, hint_port) = client_hint.components();
@@ -585,6 +585,7 @@ async fn handle_udp_associate(
         stream: server_stream,
         udp_socket,
         expected_client,
+        user_level,
         traffic_context,
     })
 }
@@ -667,6 +668,7 @@ fn start_udp_client_session(
     initial_target_addr: SocketAddr,
     client_endpoint: SocketAddr,
     client_socket: Arc<tokio::net::UdpSocket>,
+    association_activity: Option<Arc<Notify>>,
 ) -> std::io::Result<SocksUdpClientSession> {
     let target_socket = create_udp_socket_for_target(&initial_target_addr)?;
     let (sender, mut receiver) =
@@ -705,6 +707,9 @@ fn start_udp_client_session(
                             // downstream packet is read, before the SOCKS
                             // response callback writes it to the client.
                             activity.record_downstream();
+                            if let Some(activity) = association_activity.as_ref() {
+                                activity.notify_one();
+                            }
                             let socks5_response =
                                 build_udp_response_packet(resp_addr, &response_buf[..resp_len]);
                             let forwarded_payload_len = if socks5_response.is_empty() {
@@ -748,6 +753,7 @@ async fn send_udp_target_payload(
     target_addr: SocketAddr,
     client_endpoint: SocketAddr,
     client_socket: Arc<tokio::net::UdpSocket>,
+    association_activity: Option<&Arc<Notify>>,
     payload: Vec<u8>,
     traffic_context: Option<TrafficContext>,
 ) -> std::io::Result<()> {
@@ -761,6 +767,7 @@ async fn send_udp_target_payload(
                 target_addr,
                 client_endpoint,
                 client_socket.clone(),
+                association_activity.cloned(),
             )?);
         }
 
@@ -883,6 +890,7 @@ pub(crate) async fn run_shared_udp_relay(
             target_addr,
             client_addr,
             udp_socket.clone(),
+            None,
             payload.to_vec(),
             datagram_context,
         )
@@ -910,6 +918,7 @@ pub(crate) async fn run_udp_relay(
         resolver,
         runtime,
         expected_client,
+        0,
         traffic_context,
     )
     .await
@@ -921,10 +930,17 @@ pub(crate) async fn run_udp_relay_with_expected_client(
     resolver: Arc<dyn Resolver>,
     runtime: RuntimeState,
     mut expected_client: Option<SocketAddr>,
+    user_level: u32,
     traffic_context: Option<TrafficContext>,
 ) -> std::io::Result<()> {
     let udp_socket_clone = udp_socket.clone();
     let _connection_guard = register_connection(traffic_context.as_ref());
+    let association_idle_timeout =
+        runtime.xray_connection_idle_timeout_for_level(user_level);
+    if association_idle_timeout.is_zero() {
+        tracing::debug!("SOCKS5 UDP relay: zero Xray connIdle, terminating");
+        return Ok(());
+    }
 
     let mut tcp_monitor = tokio::spawn(async move {
         let mut buf = [0u8; 1024];
@@ -944,10 +960,30 @@ pub(crate) async fn run_udp_relay_with_expected_client(
     // first IPv4 target cannot make a later IPv6 target unusable (or vice versa).
     let mut client_sessions =
         HashMap::<(SocketAddr, bool), SocksUdpClientSession>::new();
+    let association_activity = Arc::new(Notify::new());
+    let association_idle = tokio::time::sleep(association_idle_timeout);
+    tokio::pin!(association_idle);
+    let mut association_active = true;
     loop {
         let (len, client_addr) = tokio::select! {
             _ = &mut tcp_monitor => {
                 tracing::debug!("SOCKS5 UDP relay: TCP connection closed, terminating");
+                return Ok(());
+            }
+            _ = association_activity.notified() => {
+                association_active = true;
+                continue;
+            }
+            _ = &mut association_idle => {
+                if association_active {
+                    association_active = false;
+                    association_idle
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + association_idle_timeout);
+                    continue;
+                }
+                tracing::debug!("SOCKS5 UDP relay: association idle timeout, terminating");
+                tcp_monitor.abort();
                 return Ok(());
             }
             result = udp_socket_clone.recv_from(&mut recv_buf) => {
@@ -970,6 +1006,7 @@ pub(crate) async fn run_udp_relay_with_expected_client(
                 expected_client = Some(client_addr);
             }
         }
+        association_active = true;
         let response_endpoint = client_addr;
         // Apply Xray's packet limit explicitly so Windows and Unix truncate
         // oversized datagrams identically.
@@ -1051,6 +1088,7 @@ pub(crate) async fn run_udp_relay_with_expected_client(
             target_addr,
             response_endpoint,
             udp_socket_clone.clone(),
+            Some(&association_activity),
             payload.to_vec(),
             datagram_context,
         )
@@ -2295,7 +2333,8 @@ mod tests {
             "socks-local",
             true,
             None,
-        );
+        )
+        .with_user_level(7);
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let listener_addr = listener.local_addr().unwrap();
         let mut client = TcpStream::connect(listener_addr).await.unwrap();
@@ -2329,7 +2368,10 @@ mod tests {
             )
             .await
             .expect("SOCKS UDP ASSOCIATE should succeed");
-        assert!(matches!(result, TcpServerSetupResult::UdpAssociate { .. }));
+        let TcpServerSetupResult::UdpAssociate { user_level, .. } = result else {
+            panic!("expected UDP associate result");
+        };
+        assert_eq!(user_level, 7);
         let mut response = [0u8; 12];
         client.read_exact(&mut response).await.unwrap();
         assert_eq!(&response[..2], &[SOCKS_VERSION, METHOD_NO_AUTH]);
@@ -2348,17 +2390,10 @@ mod tests {
             .await
             .unwrap();
 
-        let result = handle_udp_associate(
-            Box::new(server),
-            None,
-            None,
-            None,
-            None,
-            None,
-            SocksUserStore::with_auth_required(Vec::new(), false),
-        )
-        .await
-        .unwrap();
+        let result =
+            handle_udp_associate(Box::new(server), None, None, None, None, None, 0)
+                .await
+                .unwrap();
         let TcpServerSetupResult::UdpAssociate {
             expected_client, ..
         } = result
@@ -2387,7 +2422,7 @@ mod tests {
             None,
             None,
             None,
-            SocksUserStore::with_auth_required(Vec::new(), true),
+            0,
         )
         .await
         .unwrap();
@@ -2421,7 +2456,7 @@ mod tests {
             Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             None,
             Some(advertised_ip.to_string()),
-            SocksUserStore::with_auth_required(Vec::new(), false),
+            0,
         )
         .await
         .unwrap();
@@ -2479,7 +2514,7 @@ mod tests {
             Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             Some(listener_addr),
             Some("localhost".to_string()),
-            SocksUserStore::with_auth_required(Vec::new(), false),
+            0,
         )
         .await
         .unwrap();
@@ -2977,6 +3012,7 @@ mod tests {
             origin_addr,
             client_endpoint,
             client_socket,
+            None,
             b"after-idle".to_vec(),
             None,
         )
@@ -2990,6 +3026,64 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(&buf[..len], b"after-idle");
+    }
+
+    #[cfg(feature = "traffic")]
+    #[tokio::test]
+    async fn udp_relay_connection_idle_uses_xray_user_level_policy() {
+        use crate::config::def::{PolicyConfig, PolicyLevelConfig};
+
+        let relay_socket =
+            Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let relay_addr = relay_socket.local_addr().unwrap();
+        let control_listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let control_addr = control_listener.local_addr().unwrap();
+        let client_control = TcpStream::connect(control_addr).await.unwrap();
+        let (server_control, _) = control_listener.accept().await.unwrap();
+
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        runtime.replace_policy(Some(&PolicyConfig {
+            levels: HashMap::from([(
+                7,
+                Some(PolicyLevelConfig {
+                    connection_idle: Some(1),
+                    ..PolicyLevelConfig::default()
+                }),
+            )]),
+            ..PolicyConfig::default()
+        }));
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let mut relay_task = tokio::spawn(run_udp_relay_with_expected_client(
+            relay_socket,
+            Box::new(server_control),
+            resolver,
+            runtime,
+            None,
+            7,
+            None,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(
+            !relay_task.is_finished(),
+            "Xray's initial activity token keeps the association through the first idle check"
+        );
+
+        let client_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        client_socket.send_to(&[0], relay_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(
+            !relay_task.is_finished(),
+            "valid-source UDP activity should keep the next Xray idle check alive"
+        );
+
+        timeout(Duration::from_millis(1_200), &mut relay_task)
+            .await
+            .expect("association should close on the following inactive check")
+            .unwrap()
+            .unwrap();
+        drop(client_control);
     }
 
     #[cfg(feature = "traffic")]

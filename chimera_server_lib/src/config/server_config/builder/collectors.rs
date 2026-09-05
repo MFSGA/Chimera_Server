@@ -564,19 +564,12 @@ pub(super) fn collect_socks_settings(
             udp_response_ip,
             user_level,
         )),
-        "password" => {
-            if accounts.is_empty() {
-                return Err(Error::InvalidConfig(
-                    "socks inbound with password auth requires accounts".into(),
-                ));
-            }
-            Ok((
-                SocksUserStore::with_auth_required(accounts, true),
-                udp_enabled,
-                udp_response_ip,
-                user_level,
-            ))
-        }
+        "password" => Ok((
+            SocksUserStore::with_auth_required(accounts, true),
+            udp_enabled,
+            udp_response_ip,
+            user_level,
+        )),
         _ => Ok((
             SocksUserStore::with_auth_required(accounts, false),
             udp_enabled,
@@ -1167,6 +1160,24 @@ mod tests {
         assert_eq!(users.snapshot()[0].username, "alice");
         assert!(udp_enabled);
         assert_eq!(udp_response_ip.as_deref(), Some("127.0.0.1"));
+    }
+
+    #[test]
+    fn collect_socks_password_auth_accepts_empty_accounts_like_xray() {
+        let settings = SettingObject(serde_json::json!({
+            "auth": "password",
+            "accounts": []
+        }));
+
+        let (users, udp_enabled, udp_response_ip, user_level) =
+            collect_socks_settings(settings).expect(
+                "Xray accepts password auth before any accounts are configured",
+            );
+        assert!(users.auth_required());
+        assert!(users.snapshot().is_empty());
+        assert!(!udp_enabled);
+        assert!(udp_response_ip.is_none());
+        assert_eq!(user_level, 0);
     }
 
     #[test]
