@@ -55,7 +55,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for MeteredStream<S> {
                     TrafficDirection::Upload => (bytes, 0),
                     TrafficDirection::Download => (0, bytes),
                 };
-                record_transfer(self.context.clone(), upload, download);
+                record_transfer_ref(self.context.as_ref(), upload, download);
             }
         }
         result
@@ -209,6 +209,12 @@ mod traffic_noop {
         );
     }
 
+    pub fn record_transfer_ref(_: Option<&TrafficContext>, _: u64, _: u64) {
+        tracing::warn!(
+            "Traffic recording is disabled because the 'traffic' feature is not enabled."
+        );
+    }
+
     pub fn register_identity(_: impl Into<String>) {}
 
     pub fn snapshot() -> TrafficSnapshot {
@@ -232,7 +238,7 @@ mod traffic_noop {
 pub use traffic_noop::{
     ActiveConnectionSnapshot, ConnectionGuard, TrafficContext, TrafficSnapshot,
     TransferTotals, active_connection_count, active_connections, record_transfer,
-    register_connection, register_identity, snapshot,
+    record_transfer_ref, register_connection, register_identity, snapshot,
 };
 
 #[cfg(all(test, feature = "traffic"))]
