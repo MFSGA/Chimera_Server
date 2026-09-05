@@ -788,6 +788,79 @@ fn has_vless_vision_flow(users: &[crate::config::server_config::VlessUser]) -> b
     users.iter().any(|user| user.flow == "xtls-rprx-vision")
 }
 
+#[cfg(feature = "vless")]
+struct VlessCorePlan {
+    protocol: ServerProxyConfig,
+    uses_vision: bool,
+}
+
+#[cfg(feature = "vless")]
+fn plan_vless_core(
+    settings: Option<&crate::config::SettingObject>,
+) -> Result<VlessCorePlan, Error> {
+    let vless_settings = settings
+        .map(|value| value.deserialize::<VlessInboundSettings>())
+        .transpose()
+        .map_err(|err| {
+            Error::InvalidConfig(format!("invalid vless settings: {err}"))
+        })?
+        .unwrap_or_default();
+    let decryption = vless_settings
+        .decryption
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            Error::InvalidConfig(
+                "vless settings.decryption must be explicitly set to none".into(),
+            )
+        })?
+        .to_ascii_lowercase();
+    if decryption != "none" {
+        return Err(Error::InvalidConfig(format!(
+            "vless settings.decryption must be none, got {decryption}"
+        )));
+    }
+
+    let settings_flow = vless_settings.flow.as_deref().map(str::trim).unwrap_or("");
+    validate_vless_flow(settings_flow)?;
+    let users = settings
+        .and_then(crate::config::SettingObject::clients)
+        .map(|clients| {
+            clients
+                .into_iter()
+                .map(|client| {
+                    let flow = if client.flow.trim().is_empty() {
+                        settings_flow.to_string()
+                    } else {
+                        client.flow
+                    };
+                    validate_vless_flow(&flow)?;
+                    Ok(crate::config::server_config::VlessUser {
+                        user_id: client.id.clone(),
+                        user_label: if client.email.is_empty() {
+                            client.id
+                        } else {
+                            client.email
+                        },
+                        flow,
+                    })
+                })
+                .collect::<Result<Vec<_>, Error>>()
+        })
+        .transpose()?
+        .ok_or_else(|| {
+            Error::InvalidConfig("vless inbound requires at least one client".into())
+        })?;
+    let uses_vision = has_vless_vision_flow(&users);
+    let fallbacks = collect_vless_fallbacks(vless_settings.fallbacks)?;
+
+    Ok(VlessCorePlan {
+        protocol: ServerProxyConfig::Vless { users, fallbacks },
+        uses_vision,
+    })
+}
+
 #[cfg(feature = "shadowsocks")]
 fn collect_shadowsocks_users(
     settings: Option<crate::config::SettingObject>,
@@ -1524,76 +1597,10 @@ impl TryFrom<InboudItem> for ServerConfig {
                     sniffing,
                     ..
                 } = context;
-                let vless_settings = settings
-                    .as_ref()
-                    .map(|value| value.deserialize::<VlessInboundSettings>())
-                    .transpose()
-                    .map_err(|err| {
-                        Error::InvalidConfig(format!("invalid vless settings: {err}"))
-                    })?
-                    .unwrap_or_default();
-                let decryption = vless_settings
-                    .decryption
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| {
-                        Error::InvalidConfig(
-                            "vless settings.decryption must be explicitly set to none".into(),
-                        )
-                    })?
-                    .to_ascii_lowercase();
-                if decryption != "none" {
-                    return Err(Error::InvalidConfig(format!(
-                        "vless settings.decryption must be none, got {decryption}"
-                    )));
-                }
-                let fallbacks =
-                    collect_vless_fallbacks(vless_settings.fallbacks)?;
-                let settings_flow = vless_settings
-                    .flow
-                    .as_deref()
-                    .map(str::trim)
-                    .unwrap_or("");
-                validate_vless_flow(settings_flow)?;
-
-                let users = settings
-                    .as_ref()
-                    .and_then(|setting| setting.clients())
-                    .map(|clients| {
-                        clients
-                            .into_iter()
-                            .map(|client| {
-                                let flow = if client.flow.trim().is_empty() {
-                                    settings_flow.to_string()
-                                } else {
-                                    client.flow
-                                };
-                                validate_vless_flow(&flow)?;
-                                Ok(crate::config::server_config::VlessUser {
-                                    user_id: client.id.clone(),
-                                    user_label: if client.email.is_empty() {
-                                        client.id
-                                    } else {
-                                        client.email
-                                    },
-                                    flow,
-                                })
-                            })
-                            .collect::<Result<Vec<_>, Error>>()
-                    })
-                    .transpose()?
-                    .ok_or_else(|| {
-                        Error::InvalidConfig(
-                            "vless inbound requires at least one client".into(),
-                        )
-                    })?;
-                let uses_vision = has_vless_vision_flow(&users);
-
-                let mut protocol = ServerProxyConfig::Vless {
-                    users,
-                    fallbacks,
-                };
+                let VlessCorePlan {
+                    mut protocol,
+                    uses_vision,
+                } = plan_vless_core(settings.as_ref())?;
                 let uses_xhttp = stream_settings
                     .as_ref()
                     .map(|settings| settings.network.eq_ignore_ascii_case("xhttp"))
