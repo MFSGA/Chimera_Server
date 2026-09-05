@@ -306,6 +306,65 @@ fn apply_httpupgrade_layer(
     Ok(protocol)
 }
 
+#[cfg(feature = "ws")]
+fn apply_websocket_layer(
+    protocol: ServerProxyConfig,
+    stream_settings: &crate::config::StreamSettings,
+) -> ServerProxyConfig {
+    match stream_settings.ws_settings.clone() {
+        Some(ws_setting) => ServerProxyConfig::Websocket {
+            targets: Box::new(OneOrSome::One(websocket_server_config(
+                ws_setting,
+                stream_settings,
+                protocol,
+            ))),
+        },
+        None => protocol,
+    }
+}
+
+#[cfg(not(feature = "ws"))]
+fn apply_websocket_layer(
+    protocol: ServerProxyConfig,
+    _stream_settings: &crate::config::StreamSettings,
+) -> ServerProxyConfig {
+    protocol
+}
+
+fn apply_standard_stream_layers(
+    protocol: ServerProxyConfig,
+    stream_settings: Option<&crate::config::StreamSettings>,
+) -> Result<ServerProxyConfig, Error> {
+    let Some(stream_settings) = stream_settings else {
+        return Ok(protocol);
+    };
+
+    let protocol = apply_websocket_layer(protocol, stream_settings);
+    let protocol = apply_httpupgrade_layer(protocol, stream_settings)?;
+    let protocol = apply_grpc_layer(protocol, stream_settings)?;
+    apply_security_layers(protocol, stream_settings)
+}
+
+fn validate_standard_tcp_network(
+    stream_settings: Option<&crate::config::StreamSettings>,
+    inbound_protocol: &str,
+) -> Result<(), Error> {
+    let Some(stream_settings) = stream_settings else {
+        return Ok(());
+    };
+    let network = stream_settings.network.trim().to_ascii_lowercase();
+    if matches!(
+        network.as_str(),
+        "" | "tcp" | "ws" | "websocket" | "httpupgrade" | "grpc"
+    ) {
+        Ok(())
+    } else {
+        Err(Error::InvalidConfig(format!(
+            "{inbound_protocol} inbound streamSettings.network={network} is not supported"
+        )))
+    }
+}
+
 #[cfg(any(feature = "hysteria", feature = "tuic"))]
 use super::quic::ServerQuicConfig;
 #[cfg(feature = "httpupgrade")]
@@ -1473,28 +1532,16 @@ impl TryFrom<InboudItem> for ServerConfig {
                         })
                     })
                     .collect::<Result<Vec<_>, Error>>()?;
-                let mut protocol = ServerProxyConfig::Vmess { users };
-
+                let protocol = ServerProxyConfig::Vmess { users };
                 #[cfg(feature = "ws")]
-                if let Some(stream_setting) = stream_settings.as_ref()
-                    && let Some(ws_setting) = stream_setting.ws_settings.clone() {
-                        tracing::info!("use websocket");
-                        protocol = ServerProxyConfig::Websocket {
-                            targets: Box::new(OneOrSome::One(
-                                websocket_server_config(
-                                    ws_setting,
-                                    stream_setting,
-                                    protocol,
-                                ),
-                            )),
-                        };
-                    }
-
-                if let Some(stream_setting) = stream_settings.as_ref() {
-                    protocol = apply_httpupgrade_layer(protocol, stream_setting)?;
-                    protocol = apply_grpc_layer(protocol, stream_setting)?;
-                    protocol = apply_security_layers(protocol, stream_setting)?;
+                if stream_settings
+                    .as_ref()
+                    .is_some_and(|settings| settings.ws_settings.is_some())
+                {
+                    tracing::info!("use websocket");
                 }
+                let protocol =
+                    apply_standard_stream_layers(protocol, stream_settings.as_ref())?;
 
                 Ok(ServerConfig {
                     tag,
@@ -1513,31 +1560,19 @@ impl TryFrom<InboudItem> for ServerConfig {
                 })?;
                 let trojan_fallbacks = collect_trojan_fallbacks(&settings)?;
                 let trojan_users = collect_trojan_clients(settings)?;
-                let mut protocol = ServerProxyConfig::Trojan {
+                let protocol = ServerProxyConfig::Trojan {
                     users: trojan_users,
                     fallbacks: trojan_fallbacks,
                 };
-
                 #[cfg(feature = "ws")]
-                if let Some(stream_setting) = stream_settings.as_ref()
-                    && let Some(ws_setting) = stream_setting.ws_settings.clone() {
-                        tracing::info!("use websocket");
-                        protocol = ServerProxyConfig::Websocket {
-                            targets: Box::new(OneOrSome::One(
-                                websocket_server_config(
-                                    ws_setting,
-                                    stream_setting,
-                                    protocol,
-                                ),
-                            )),
-                        };
-                    }
-
-                if let Some(stream_setting) = stream_settings.as_ref() {
-                    protocol = apply_httpupgrade_layer(protocol, stream_setting)?;
-                    protocol = apply_grpc_layer(protocol, stream_setting)?;
-                    protocol = apply_security_layers(protocol, stream_setting)?;
+                if stream_settings
+                    .as_ref()
+                    .is_some_and(|settings| settings.ws_settings.is_some())
+                {
+                    tracing::info!("use websocket");
                 }
+                let protocol =
+                    apply_standard_stream_layers(protocol, stream_settings.as_ref())?;
 
                 Ok(ServerConfig {
                     tag,
@@ -1608,41 +1643,15 @@ impl TryFrom<InboudItem> for ServerConfig {
             Protocol::Http => {
                 let (accounts, allow_transparent, user_level) =
                     collect_http_settings(settings)?;
-                let mut protocol = ServerProxyConfig::Http {
-                    accounts,
-                    allow_transparent,
-                    user_level,
-                };
-
-                #[cfg(feature = "ws")]
-                if let Some(stream_setting) = stream_settings.as_ref()
-                    && let Some(ws_setting) = stream_setting.ws_settings.clone()
-                {
-                    protocol = ServerProxyConfig::Websocket {
-                        targets: Box::new(OneOrSome::One(
-                            websocket_server_config(
-                                    ws_setting,
-                                    stream_setting,
-                                    protocol,
-                                ),
-                        )),
-                    };
-                }
-
-                if let Some(stream_setting) = stream_settings.as_ref() {
-                    let network = stream_setting.network.trim().to_ascii_lowercase();
-                    if !matches!(
-                        network.as_str(),
-                        "" | "tcp" | "ws" | "websocket" | "httpupgrade" | "grpc"
-                    ) {
-                        return Err(Error::InvalidConfig(format!(
-                            "http inbound streamSettings.network={network} is not supported"
-                        )));
-                    }
-                    protocol = apply_httpupgrade_layer(protocol, stream_setting)?;
-                    protocol = apply_grpc_layer(protocol, stream_setting)?;
-                    protocol = apply_security_layers(protocol, stream_setting)?;
-                }
+                validate_standard_tcp_network(stream_settings.as_ref(), "http")?;
+                let protocol = apply_standard_stream_layers(
+                    ServerProxyConfig::Http {
+                        accounts,
+                        allow_transparent,
+                        user_level,
+                    },
+                    stream_settings.as_ref(),
+                )?;
 
                 Ok(ServerConfig {
                     tag,
@@ -1674,40 +1683,14 @@ impl TryFrom<InboudItem> for ServerConfig {
                         "mixed settings.userLevel is not supported".into(),
                     ));
                 }
-                let mut protocol = ServerProxyConfig::Mixed {
-                    accounts,
-                    udp_enabled,
-                };
-
-                #[cfg(feature = "ws")]
-                if let Some(stream_setting) = stream_settings.as_ref()
-                    && let Some(ws_setting) = stream_setting.ws_settings.clone()
-                {
-                    protocol = ServerProxyConfig::Websocket {
-                        targets: Box::new(OneOrSome::One(
-                            websocket_server_config(
-                                    ws_setting,
-                                    stream_setting,
-                                    protocol,
-                                ),
-                        )),
-                    };
-                }
-
-                if let Some(stream_setting) = stream_settings.as_ref() {
-                    let network = stream_setting.network.trim().to_ascii_lowercase();
-                    if !matches!(
-                        network.as_str(),
-                        "" | "tcp" | "ws" | "websocket" | "httpupgrade" | "grpc"
-                    ) {
-                        return Err(Error::InvalidConfig(format!(
-                            "mixed inbound streamSettings.network={network} is not supported"
-                        )));
-                    }
-                    protocol = apply_httpupgrade_layer(protocol, stream_setting)?;
-                    protocol = apply_grpc_layer(protocol, stream_setting)?;
-                    protocol = apply_security_layers(protocol, stream_setting)?;
-                }
+                validate_standard_tcp_network(stream_settings.as_ref(), "mixed")?;
+                let protocol = apply_standard_stream_layers(
+                    ServerProxyConfig::Mixed {
+                        accounts,
+                        udp_enabled,
+                    },
+                    stream_settings.as_ref(),
+                )?;
 
                 Ok(ServerConfig {
                     tag,
@@ -1726,9 +1709,6 @@ impl TryFrom<InboudItem> for ServerConfig {
             Protocol::Shadowsocks => {
                 let (users, identity, transport) =
                     collect_shadowsocks_users(settings)?;
-                let mut protocol =
-                    ServerProxyConfig::Shadowsocks { users, identity };
-
                 if !matches!(transport, Transport::Tcp)
                     && stream_settings.is_some()
                 {
@@ -1737,36 +1717,11 @@ impl TryFrom<InboudItem> for ServerConfig {
                             .into(),
                     ));
                 }
-
-                #[cfg(feature = "ws")]
-                if let Some(stream_setting) = stream_settings.as_ref()
-                    && let Some(ws_setting) = stream_setting.ws_settings.clone()
-                {
-                    protocol = ServerProxyConfig::Websocket {
-                        targets: Box::new(OneOrSome::One(
-                            websocket_server_config(
-                                    ws_setting,
-                                    stream_setting,
-                                    protocol,
-                                ),
-                        )),
-                    };
-                }
-
-                if let Some(stream_setting) = stream_settings.as_ref() {
-                    let network = stream_setting.network.trim().to_ascii_lowercase();
-                    if !matches!(
-                        network.as_str(),
-                        "" | "tcp" | "ws" | "websocket" | "httpupgrade" | "grpc"
-                    ) {
-                        return Err(Error::InvalidConfig(format!(
-                            "shadowsocks inbound streamSettings.network={network} is not supported"
-                        )));
-                    }
-                    protocol = apply_httpupgrade_layer(protocol, stream_setting)?;
-                    protocol = apply_grpc_layer(protocol, stream_setting)?;
-                    protocol = apply_security_layers(protocol, stream_setting)?;
-                }
+                validate_standard_tcp_network(stream_settings.as_ref(), "shadowsocks")?;
+                let protocol = apply_standard_stream_layers(
+                    ServerProxyConfig::Shadowsocks { users, identity },
+                    stream_settings.as_ref(),
+                )?;
 
                 Ok(ServerConfig {
                     tag,
@@ -1788,33 +1743,21 @@ impl TryFrom<InboudItem> for ServerConfig {
                 })?;
                 let (accounts, udp_enabled, udp_response_ip, user_level) =
                     collect_socks_settings(settings)?;
-                let mut protocol = ServerProxyConfig::Socks {
+                let protocol = ServerProxyConfig::Socks {
                     accounts,
                     udp_enabled,
                     udp_response_ip,
                     user_level,
                 };
-
                 #[cfg(feature = "ws")]
-                if let Some(stream_setting) = stream_settings.as_ref()
-                    && let Some(ws_setting) = stream_setting.ws_settings.clone() {
-                        tracing::info!("use websocket");
-                        protocol = ServerProxyConfig::Websocket {
-                            targets: Box::new(OneOrSome::One(
-                                websocket_server_config(
-                                    ws_setting,
-                                    stream_setting,
-                                    protocol,
-                                ),
-                            )),
-                        };
-                    }
-
-                if let Some(stream_setting) = stream_settings.as_ref() {
-                    protocol = apply_httpupgrade_layer(protocol, stream_setting)?;
-                    protocol = apply_grpc_layer(protocol, stream_setting)?;
-                    protocol = apply_security_layers(protocol, stream_setting)?;
+                if stream_settings
+                    .as_ref()
+                    .is_some_and(|settings| settings.ws_settings.is_some())
+                {
+                    tracing::info!("use websocket");
                 }
+                let protocol =
+                    apply_standard_stream_layers(protocol, stream_settings.as_ref())?;
 
                 Ok(ServerConfig {
                     tag,
