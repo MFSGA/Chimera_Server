@@ -30,7 +30,7 @@ pub struct RuntimeState {
     inbounds: Arc<RwLock<Vec<ServerConfig>>>,
     outbounds: Arc<RwLock<Vec<OutboundSummary>>>,
     inbound_tasks: Arc<RwLock<HashMap<String, Vec<JoinHandle<()>>>>>,
-    routing: Arc<RwLock<RoutingState>>,
+    routing: Arc<RwLock<Arc<RoutingState>>>,
     routing_updates: Arc<Mutex<()>>,
     policy: Arc<RwLock<PolicyConfig>>,
     user_domain_access: UserDomainAccessStore,
@@ -48,7 +48,7 @@ impl RuntimeState {
             inbounds: Arc::new(RwLock::new(inbounds)),
             outbounds: Arc::new(RwLock::new(outbounds)),
             inbound_tasks: Arc::new(RwLock::new(HashMap::new())),
-            routing: Arc::new(RwLock::new(RoutingState::default())),
+            routing: Arc::new(RwLock::new(Arc::new(RoutingState::default()))),
             routing_updates: Arc::new(Mutex::new(())),
             policy: Arc::new(RwLock::new(PolicyConfig::default())),
             user_domain_access: UserDomainAccessStore::default(),
@@ -285,11 +285,8 @@ impl RuntimeState {
         Ok(())
     }
 
-    pub fn routing(&self) -> RoutingState {
-        self.routing
-            .read()
-            .expect("runtime routing lock poisoned")
-            .clone()
+    pub fn routing(&self) -> Arc<RoutingState> {
+        Arc::clone(&self.routing.read().expect("runtime routing lock poisoned"))
     }
 
     pub fn replace_routing(&self, routing: RoutingState) {
@@ -304,7 +301,7 @@ impl RuntimeState {
         let mut current =
             self.routing.write().expect("runtime routing lock poisoned");
         routing.inherit_observations_from(&current);
-        *current = routing;
+        *current = Arc::new(routing);
     }
 
     pub(crate) fn record_outbound_observation(
@@ -329,7 +326,8 @@ impl RuntimeState {
             .routing_updates
             .lock()
             .expect("runtime routing update lock poisoned");
-        let mut next = self.routing();
+        let current = self.routing();
+        let mut next = (*current).clone();
         let result = mutator(&mut next);
         self.publish_routing(next);
         result
@@ -366,7 +364,10 @@ impl RuntimeState {
 #[cfg(test)]
 mod tests {
     use super::RuntimeState;
-    use crate::config::def::{PolicyConfig, PolicyLevelConfig};
+    use crate::{
+        config::def::{PolicyConfig, PolicyLevelConfig},
+        routing_state::RoutingState,
+    };
     use std::{
         collections::HashMap,
         sync::{Arc, mpsc},
@@ -473,6 +474,18 @@ mod tests {
             Duration::from_secs(300)
         );
     }
+    #[test]
+    fn routing_reads_share_immutable_snapshots_until_publish() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let first = runtime.routing();
+        let second = runtime.routing();
+        assert!(Arc::ptr_eq(&first, &second));
+
+        runtime.replace_routing(RoutingState::default());
+        let replaced = runtime.routing();
+        assert!(!Arc::ptr_eq(&first, &replaced));
+    }
+
     #[test]
     fn routing_update_compilation_does_not_hold_data_plane_write_lock() {
         let runtime = Arc::new(RuntimeState::new(Vec::new(), Vec::new()));
