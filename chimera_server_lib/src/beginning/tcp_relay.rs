@@ -1091,16 +1091,22 @@ fn nonblocking_pipe(
     let pipe_write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
 
     let current_capacity = pipe_capacity(pipe_write.as_raw_fd())?;
-    if requested_capacity > current_capacity {
-        let _ = unsafe {
+    let actual_capacity = if requested_capacity > current_capacity {
+        let resized = unsafe {
             libc::fcntl(
                 pipe_write.as_raw_fd(),
                 libc::F_SETPIPE_SZ,
                 requested_capacity as libc::c_int,
             )
         };
-    }
-    let actual_capacity = pipe_capacity(pipe_write.as_raw_fd())?;
+        if resized > 0 {
+            resized as usize
+        } else {
+            current_capacity
+        }
+    } else {
+        current_capacity
+    };
     Ok((pipe_read, pipe_write, actual_capacity))
 }
 
