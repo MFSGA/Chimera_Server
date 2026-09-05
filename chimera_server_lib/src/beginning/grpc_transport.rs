@@ -37,7 +37,9 @@ use tracing::{debug, error, info};
 use crate::{
     address::BindLocation,
     async_stream::{AsyncPing, AsyncStream},
-    config::server_config::{GrpcServerConfig, ServerConfig, ServerProxyConfig},
+    config::server_config::{
+        GrpcServerConfig, InboundSniffingConfig, ServerConfig, ServerProxyConfig,
+    },
     handler::tcp::{
         tcp_handler::TcpServerHandler, tcp_handler_util::create_tcp_server_handler,
     },
@@ -138,6 +140,7 @@ struct GrpcConnectionContext {
     local_addr: SocketAddr,
     setup_deadline: Instant,
     trusted_x_forwarded_for: Arc<Vec<String>>,
+    sniffing: Option<InboundSniffingConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +148,7 @@ struct GrpcPeerContext {
     peer_addr: SocketAddr,
     local_addr: SocketAddr,
     trusted_x_forwarded_for: Arc<Vec<String>>,
+    sniffing: Option<InboundSniffingConfig>,
 }
 
 #[derive(Debug)]
@@ -290,6 +294,7 @@ pub(super) async fn start_grpc_server(
         tag,
         bind_location,
         protocol,
+        sniffing,
         ..
     } = config;
     let (grpc_config, inner_protocol, security) = parse_listener_protocol(protocol)?;
@@ -338,6 +343,7 @@ pub(super) async fn start_grpc_server(
             let server_handler = server_handler.clone();
             let resolver = resolver.clone();
             let runtime = runtime.clone();
+            let sniffing = sniffing.clone();
             match &security {
                 GrpcSecurity::Plain => {
                     tokio::spawn(serve_grpc_connection(
@@ -348,6 +354,7 @@ pub(super) async fn start_grpc_server(
                             setup_deadline: Instant::now()
                                 + GRPC_CONNECTION_SETUP_TIMEOUT,
                             trusted_x_forwarded_for,
+                            sniffing,
                         },
                         (tun_service_path, tun_multi_service_path),
                         keepalive,
@@ -376,6 +383,7 @@ pub(super) async fn start_grpc_server(
                                         local_addr,
                                         setup_deadline,
                                         trusted_x_forwarded_for,
+                                        sniffing,
                                     },
                                     (tun_service_path, tun_multi_service_path),
                                     keepalive,
@@ -413,6 +421,7 @@ pub(super) async fn start_grpc_server(
                                         setup_deadline: Instant::now()
                                             + GRPC_CONNECTION_SETUP_TIMEOUT,
                                         trusted_x_forwarded_for,
+                                        sniffing,
                                     },
                                     (tun_service_path, tun_multi_service_path),
                                     keepalive,
@@ -598,6 +607,7 @@ async fn serve_grpc_connection<IO>(
         local_addr,
         setup_deadline,
         trusted_x_forwarded_for,
+        sniffing,
     } = connection;
     let (tun_service_path, tun_multi_service_path) = service_paths;
     let service = service_fn(move |request| {
@@ -612,6 +622,7 @@ async fn serve_grpc_connection<IO>(
                 peer_addr,
                 local_addr,
                 trusted_x_forwarded_for: trusted_x_forwarded_for.clone(),
+                sniffing: sniffing.clone(),
             },
         )
     });
@@ -632,6 +643,7 @@ async fn handle_request(
 ) -> Result<Response<ResponseBody>, Infallible> {
     let (logical_peer_addr, logical_local_addr) =
         grpc_logical_addrs(request.headers(), &peer_context);
+    let sniffing = peer_context.sniffing.clone();
     if let Some(message) =
         grpc_duplicate_host_error(request.headers(), request.uri())
     {
@@ -680,13 +692,14 @@ async fn handle_request(
     let (transport_read, mut transport_write) = tokio::io::split(transport_stream);
     let timed_out = Arc::new(AtomicBool::new(false));
     let stream_task = tokio::spawn(async move {
-        if let Err(error) = super::process_stream_with_local_addr(
+        if let Err(error) = super::process_stream_with_sniffing_and_local_addr(
             GrpcLogicalStream(handler_stream),
             server_handler,
             resolver,
             logical_peer_addr,
             Some(logical_local_addr),
             runtime,
+            sniffing,
         )
         .await
         {
@@ -2450,6 +2463,7 @@ mod tests {
             peer_addr,
             local_addr,
             trusted_x_forwarded_for: Arc::new(vec!["X-Trusted-CDN".to_string()]),
+            sniffing: None,
         };
 
         let (logical_peer_addr, logical_local_addr) =

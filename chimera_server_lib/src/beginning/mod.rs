@@ -1353,6 +1353,35 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn sniff_stream_replays_consumed_bytes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().unwrap();
+        let connect = tokio::net::TcpStream::connect(addr);
+        let accept = listener.accept();
+        let (client, accepted) = tokio::join!(connect, accept);
+        let mut client = client.expect("connect loopback client");
+        let (server, _) = accepted.expect("accept loopback client");
+
+        let payload = b"GET / HTTP/1.1\r\nHost: replay.example\r\n\r\nbody";
+        client.write_all(payload).await.unwrap();
+        let config = InboundSniffingConfig {
+            enabled: true,
+            dest_override_http: true,
+            ..InboundSniffingConfig::default()
+        };
+        let (mut stream, metadata) =
+            sniff_stream_protocol(Box::new(server), Some(&config))
+                .await
+                .expect("sniff stream");
+        assert_eq!(metadata.domain.as_deref(), Some("replay.example"));
+        let mut replayed = vec![0; payload.len()];
+        stream.read_exact(&mut replayed).await.unwrap();
+        assert_eq!(replayed, payload);
+    }
+
     #[test]
     fn logical_stream_context_preserves_local_addr() {
         let runtime = RuntimeState::new(Vec::new(), Vec::new());
