@@ -139,6 +139,35 @@ struct GlobalUdpResponseDelivery {
     response: SessionUdpResponse,
 }
 
+enum GlobalUdpPayloadPlan {
+    Send(GlobalUdpAttachment),
+    RejectDetached,
+    RejectStale { current_token: u64 },
+}
+
+fn plan_global_udp_payload(
+    attachment: Option<GlobalUdpAttachment>,
+    request_token: u64,
+) -> GlobalUdpPayloadPlan {
+    match attachment {
+        None => GlobalUdpPayloadPlan::RejectDetached,
+        Some(attachment) if attachment.token != request_token => {
+            GlobalUdpPayloadPlan::RejectStale {
+                current_token: attachment.token,
+            }
+        }
+        Some(attachment) => GlobalUdpPayloadPlan::Send(attachment),
+    }
+}
+
+fn should_pause_global_udp_receive(
+    attachment_present: bool,
+    pending_responses: usize,
+    capacity: usize,
+) -> bool {
+    !attachment_present && pending_responses >= capacity
+}
+
 fn plan_global_udp_response_delivery(
     attachment: Option<GlobalUdpAttachment>,
     pending: PendingGlobalUdpResponse,
@@ -1214,8 +1243,11 @@ async fn start_global_session_udp_worker(
             }
 
             let attachment_present = task_attachment.read().await.is_some();
-            let pause_socket = !attachment_present
-                && pending_responses.len() >= UDP_SESSION_CHANNEL_CAPACITY;
+            let pause_socket = should_pause_global_udp_receive(
+                attachment_present,
+                pending_responses.len(),
+                UDP_SESSION_CHANNEL_CAPACITY,
+            );
             tokio::select! {
                 _ = idle.as_mut() => break false,
                 _ = task_attachment_notify.notified() => continue,
@@ -1223,29 +1255,34 @@ async fn start_global_session_udp_worker(
                     let Some(request) = request else {
                         return;
                     };
-                    let current = task_attachment.read().await.clone();
-                    let Some(current) = current else {
-                        let _ = request.completion.send(Err(
-                            std::io::Error::new(
-                                std::io::ErrorKind::BrokenPipe,
-                                "XUDP GlobalID attachment is detached",
-                            ),
-                        ));
-                        continue;
+                    let current = match plan_global_udp_payload(
+                        task_attachment.read().await.clone(),
+                        request.attachment_token,
+                    ) {
+                        GlobalUdpPayloadPlan::Send(current) => current,
+                        GlobalUdpPayloadPlan::RejectDetached => {
+                            let _ = request.completion.send(Err(
+                                std::io::Error::new(
+                                    std::io::ErrorKind::BrokenPipe,
+                                    "XUDP GlobalID attachment is detached",
+                                ),
+                            ));
+                            continue;
+                        }
+                        GlobalUdpPayloadPlan::RejectStale { current_token } => {
+                            debug!(
+                                "dropping stale XUDP GlobalID payload token {} (current {})",
+                                request.attachment_token, current_token,
+                            );
+                            let _ = request.completion.send(Err(
+                                std::io::Error::new(
+                                    std::io::ErrorKind::BrokenPipe,
+                                    "XUDP GlobalID attachment token is stale",
+                                ),
+                            ));
+                            continue;
+                        }
                     };
-                    if current.token != request.attachment_token {
-                        debug!(
-                            "dropping stale XUDP GlobalID payload token {}",
-                            request.attachment_token
-                        );
-                        let _ = request.completion.send(Err(
-                            std::io::Error::new(
-                                std::io::ErrorKind::BrokenPipe,
-                                "XUDP GlobalID attachment token is stale",
-                            ),
-                        ));
-                        continue;
-                    }
                     match socket
                         .send_to(&request.payload, request.target_addr)
                         .await
@@ -2377,6 +2414,43 @@ mod tests {
 
         assert_eq!(pending.source.port(), 53);
         assert_eq!(pending.payload, b"pending");
+    }
+
+    #[test]
+    fn global_udp_payload_plan_distinguishes_detached_stale_and_current() {
+        let (response_sender, _response_receiver) = mpsc::channel(1);
+        let attachment = GlobalUdpAttachment {
+            token: 17,
+            session_id: 3,
+            generation: 5,
+            response_sender,
+            traffic_context: None,
+        };
+
+        assert!(matches!(
+            plan_global_udp_payload(None, 17),
+            GlobalUdpPayloadPlan::RejectDetached,
+        ));
+        assert!(matches!(
+            plan_global_udp_payload(Some(attachment.clone()), 16),
+            GlobalUdpPayloadPlan::RejectStale { current_token: 17 },
+        ));
+        match plan_global_udp_payload(Some(attachment), 17) {
+            GlobalUdpPayloadPlan::Send(current) => {
+                assert_eq!(current.token, 17);
+                assert_eq!(current.session_id, 3);
+                assert_eq!(current.generation, 5);
+            }
+            _ => panic!("current attachment token should be accepted"),
+        }
+    }
+
+    #[test]
+    fn global_udp_receive_pauses_only_for_full_detached_buffer() {
+        assert!(!should_pause_global_udp_receive(true, 64, 64));
+        assert!(!should_pause_global_udp_receive(false, 63, 64));
+        assert!(should_pause_global_udp_receive(false, 64, 64));
+        assert!(should_pause_global_udp_receive(false, 65, 64));
     }
 
     #[test]
