@@ -38,6 +38,31 @@ pub(crate) struct InboundRoutingMetadata {
     pub attributes: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TcpRoutePlan {
+    target_addr: SocketAddr,
+    outbound_tag: Option<String>,
+}
+
+fn apply_routing_metadata(
+    mut input: RoutingInput,
+    metadata: InboundRoutingMetadata,
+) -> RoutingInput {
+    input.vless_route = metadata.vless_route;
+    if let Some(local_addr) = metadata.local_addr {
+        input.local_ips = vec![encode_ip(local_addr.ip())];
+        input.local_port = local_addr.port() as u32;
+    }
+    if let Some(domain) = metadata.route_target_domain {
+        input.target_domain = domain;
+    }
+    if let Some(protocol) = metadata.sniffed_protocol {
+        input.protocol = protocol;
+    }
+    input.attributes = metadata.attributes;
+    input
+}
+
 pub(crate) async fn connect_tcp_outbound(
     resolver: &Arc<dyn Resolver>,
     remote_location: &NetLocation,
@@ -91,70 +116,103 @@ pub(crate) async fn connect_tcp_outbound_with_routing_metadata(
     source_addr: SocketAddr,
     routing_metadata: InboundRoutingMetadata,
 ) -> std::io::Result<Option<TcpOutboundConnection>> {
-    let target_addr = resolve_single_address(resolver, remote_location).await?;
-    let mut route_input = connection_routing_input(
+    let Some(plan) = plan_tcp_route(
+        resolver,
+        remote_location,
+        runtime,
         inbound_tag,
         user,
-        2,
         source_addr,
-        target_addr,
-        remote_location,
-    );
-    route_input.vless_route = routing_metadata.vless_route;
-    if let Some(local_addr) = routing_metadata.local_addr {
-        route_input.local_ips = vec![encode_ip(local_addr.ip())];
-        route_input.local_port = local_addr.port() as u32;
-    }
-    if let Some(domain) = routing_metadata.route_target_domain {
-        route_input.target_domain = domain;
-    }
-    if let Some(protocol) = routing_metadata.sniffed_protocol {
-        route_input.protocol = protocol;
-    }
-    route_input.attributes = routing_metadata.attributes;
-    if runtime.routing().requires_process_lookup() {
-        enrich_routing_input(&mut route_input).await;
-    }
-
-    let outbound_tag = match select_direct_outbound(runtime, &route_input, "tcp")? {
-        DirectOutboundAction::Freedom { tag } => tag,
-        DirectOutboundAction::Blackhole { .. } => return Ok(None),
+        routing_metadata,
+    )
+    .await?
+    else {
+        return Ok(None);
     };
 
+    connect_planned_tcp_outbound(runtime, plan).await.map(Some)
+}
+
+async fn plan_tcp_route(
+    resolver: &Arc<dyn Resolver>,
+    remote_location: &NetLocation,
+    runtime: &RuntimeState,
+    inbound_tag: &str,
+    user: &str,
+    source_addr: SocketAddr,
+    routing_metadata: InboundRoutingMetadata,
+) -> std::io::Result<Option<TcpRoutePlan>> {
+    let target_addr = resolve_single_address(resolver, remote_location).await?;
+    let route_input = apply_routing_metadata(
+        connection_routing_input(
+            inbound_tag,
+            user,
+            2,
+            source_addr,
+            target_addr,
+            remote_location,
+        ),
+        routing_metadata,
+    );
+    let route_input = enrich_route_input_if_needed(runtime, route_input).await;
+
+    Ok(
+        match select_direct_outbound(runtime, &route_input, "tcp")? {
+            DirectOutboundAction::Freedom { tag } => Some(TcpRoutePlan {
+                target_addr,
+                outbound_tag: tag,
+            }),
+            DirectOutboundAction::Blackhole { .. } => None,
+        },
+    )
+}
+
+async fn enrich_route_input_if_needed(
+    runtime: &RuntimeState,
+    mut input: RoutingInput,
+) -> RoutingInput {
+    if runtime.routing().requires_process_lookup() {
+        enrich_routing_input(&mut input).await;
+    }
+    input
+}
+
+async fn connect_planned_tcp_outbound(
+    runtime: &RuntimeState,
+    plan: TcpRoutePlan,
+) -> std::io::Result<TcpOutboundConnection> {
+    let TcpRoutePlan {
+        target_addr,
+        outbound_tag,
+    } = plan;
     let tcp_socket = new_tcp_socket(None, target_addr.is_ipv6())?;
     let started = Instant::now();
     let attempted_at = unix_time_secs();
     let stream = match tcp_socket.connect(target_addr).await {
         Ok(stream) => {
-            if let Some(tag) = outbound_tag.as_deref() {
-                runtime.record_outbound_observation(
-                    tag,
-                    OutboundObservation {
-                        alive: true,
-                        delay_ms: started.elapsed().as_millis().min(i64::MAX as u128)
-                            as i64,
-                        last_seen_time: attempted_at,
-                        last_try_time: attempted_at,
-                        ..OutboundObservation::default()
-                    },
-                );
-            }
+            record_tcp_connect_observation(
+                runtime,
+                outbound_tag.as_deref(),
+                tcp_connect_observation(
+                    true,
+                    elapsed_millis(started),
+                    attempted_at,
+                    String::new(),
+                ),
+            );
             stream
         }
         Err(error) => {
-            if let Some(tag) = outbound_tag.as_deref() {
-                runtime.record_outbound_observation(
-                    tag,
-                    OutboundObservation {
-                        alive: false,
-                        delay_ms: started.elapsed().as_millis().min(i64::MAX as u128)
-                            as i64,
-                        last_error_reason: error.to_string(),
-                        last_try_time: attempted_at,
-                        ..OutboundObservation::default()
-                    },
-                );
-            }
+            record_tcp_connect_observation(
+                runtime,
+                outbound_tag.as_deref(),
+                tcp_connect_observation(
+                    false,
+                    elapsed_millis(started),
+                    attempted_at,
+                    error.to_string(),
+                ),
+            );
             return Err(error);
         }
     };
@@ -162,10 +220,40 @@ pub(crate) async fn connect_tcp_outbound_with_routing_metadata(
         warn!("Failed to set TCP no-delay on client socket: {}", err);
     }
 
-    Ok(Some(TcpOutboundConnection {
+    Ok(TcpOutboundConnection {
         stream,
         outbound_tag,
-    }))
+    })
+}
+
+fn elapsed_millis(started: Instant) -> i64 {
+    started.elapsed().as_millis().min(i64::MAX as u128) as i64
+}
+
+fn tcp_connect_observation(
+    alive: bool,
+    delay_ms: i64,
+    attempted_at: i64,
+    last_error_reason: String,
+) -> OutboundObservation {
+    OutboundObservation {
+        alive,
+        delay_ms,
+        last_error_reason,
+        last_seen_time: if alive { attempted_at } else { 0 },
+        last_try_time: attempted_at,
+        ..OutboundObservation::default()
+    }
+}
+
+fn record_tcp_connect_observation(
+    runtime: &RuntimeState,
+    outbound_tag: Option<&str>,
+    observation: OutboundObservation,
+) {
+    if let Some(tag) = outbound_tag {
+        runtime.record_outbound_observation(tag, observation);
+    }
 }
 
 pub(crate) fn connection_routing_input(
@@ -258,6 +346,62 @@ mod tests {
             proxy_settings_type: None,
             proxy_settings_value: None,
         }
+    }
+
+    #[test]
+    fn routing_metadata_is_applied_as_value_transformation() {
+        let source_addr: SocketAddr = "192.0.2.10:12345".parse().unwrap();
+        let target_addr: SocketAddr = "198.51.100.20:443".parse().unwrap();
+        let target = NetLocation::from_str("origin.example:443", None).unwrap();
+        let base = connection_routing_input(
+            "inbound",
+            "alice",
+            2,
+            source_addr,
+            target_addr,
+            &target,
+        );
+        let transformed = apply_routing_metadata(
+            base,
+            InboundRoutingMetadata {
+                local_addr: Some("203.0.113.7:8443".parse().unwrap()),
+                vless_route: 42,
+                sniffed_protocol: Some("tls".into()),
+                route_target_domain: Some("sniffed.example".into()),
+                attributes: HashMap::from([("x-test".into(), "ok".into())]),
+            },
+        );
+
+        assert_eq!(transformed.inbound_tag, "inbound");
+        assert_eq!(transformed.user, "alice");
+        assert_eq!(transformed.source_port, 12345);
+        assert_eq!(transformed.target_port, 443);
+        assert_eq!(transformed.local_port, 8443);
+        assert_eq!(transformed.local_ips, vec![vec![203, 0, 113, 7]]);
+        assert_eq!(transformed.vless_route, 42);
+        assert_eq!(transformed.protocol, "tls");
+        assert_eq!(transformed.target_domain, "sniffed.example");
+        assert_eq!(
+            transformed.attributes.get("x-test").map(String::as_str),
+            Some("ok")
+        );
+    }
+
+    #[test]
+    fn tcp_connect_observation_is_a_pure_result_projection() {
+        let success = tcp_connect_observation(true, 12, 100, String::new());
+        assert!(success.alive);
+        assert_eq!(success.delay_ms, 12);
+        assert_eq!(success.last_seen_time, 100);
+        assert_eq!(success.last_try_time, 100);
+        assert!(success.last_error_reason.is_empty());
+
+        let failure = tcp_connect_observation(false, 34, 200, "refused".into());
+        assert!(!failure.alive);
+        assert_eq!(failure.delay_ms, 34);
+        assert_eq!(failure.last_seen_time, 0);
+        assert_eq!(failure.last_try_time, 200);
+        assert_eq!(failure.last_error_reason, "refused");
     }
 
     #[test]
