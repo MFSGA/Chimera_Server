@@ -48,9 +48,12 @@ impl ControllerFactory for BrutalConfig {
         now: Instant,
         current_mtu: u16,
     ) -> Box<dyn Controller> {
+        let brutal = BrutalState::new(now, current_mtu);
         Box::new(BrutalController {
             tx_bps: self.tx_bps.clone(),
-            brutal: BrutalState::new(now, current_mtu),
+            cached_brutal_window: brutal.initial_window(),
+            brutal_tx_bps: 0,
+            brutal,
             bbr: Some(Bbr::new(self.bbr_config.clone(), current_mtu)),
             brutal_active: false,
         })
@@ -63,6 +66,8 @@ struct BrutalController {
     brutal: BrutalState,
     bbr: Option<Bbr>,
     brutal_active: bool,
+    brutal_tx_bps: u64,
+    cached_brutal_window: u64,
 }
 
 impl BrutalController {
@@ -75,17 +80,32 @@ impl BrutalController {
     }
 
     fn activate_brutal_if_configured(&mut self, now: Instant) {
-        if self.brutal_active || !self.brutal_requested() {
+        if self.brutal_active {
+            return;
+        }
+        let tx_bps = self.tx_bps.load(Ordering::Relaxed);
+        if tx_bps == 0 {
             return;
         }
 
         // Xray replaces BBR with a fresh Brutal sender after authentication.
         // Clear handshake-era ACK/loss samples at the same boundary, but keep
         // the RTT already learned by QUIC so the first Brutal window does not
-        // fall back to an uninitialized estimate.
+        // fall back to an uninitialized estimate. The connection publishes the
+        // target rate once at this transition, so cache the derived window and
+        // refresh it only when Brutal state changes instead of recomputing it on
+        // every Quinn `window()` query.
         self.brutal.reset_samples(now);
         self.bbr = None;
         self.brutal_active = true;
+        self.brutal_tx_bps = tx_bps;
+        self.refresh_brutal_window();
+    }
+
+    fn refresh_brutal_window(&mut self) {
+        if self.brutal_active {
+            self.cached_brutal_window = self.brutal.window(self.brutal_tx_bps);
+        }
     }
 }
 
@@ -110,6 +130,7 @@ impl Controller for BrutalController {
             bbr.on_ack(now, sent, bytes, app_limited, rtt);
         }
         self.brutal.on_ack(now, rtt);
+        self.refresh_brutal_window();
     }
 
     fn on_end_acks(
@@ -137,6 +158,9 @@ impl Controller for BrutalController {
             bbr.on_congestion_event(now, sent, is_persistent_congestion, lost_bytes);
         }
         self.brutal.on_congestion_event(now, lost_bytes);
+        if lost_bytes > 0 {
+            self.refresh_brutal_window();
+        }
     }
 
     fn on_mtu_update(&mut self, new_mtu: u16) {
@@ -144,15 +168,21 @@ impl Controller for BrutalController {
             bbr.on_mtu_update(new_mtu);
         }
         self.brutal.on_mtu_update(new_mtu);
+        self.refresh_brutal_window();
     }
 
     fn window(&self) -> u64 {
-        if self.use_brutal() {
-            self.brutal.window(self.tx_bps.load(Ordering::Relaxed))
-        } else if let Some(bbr) = self.bbr.as_ref() {
-            bbr.window()
+        if self.brutal_active {
+            self.cached_brutal_window
         } else {
-            self.brutal.initial_window()
+            let tx_bps = self.tx_bps.load(Ordering::Relaxed);
+            if tx_bps > 0 {
+                self.brutal.window(tx_bps)
+            } else if let Some(bbr) = self.bbr.as_ref() {
+                bbr.window()
+            } else {
+                self.brutal.initial_window()
+            }
         }
     }
 
@@ -360,9 +390,12 @@ mod tests {
     use super::*;
 
     fn controller(tx_bps: Arc<AtomicU64>, now: Instant) -> BrutalController {
+        let brutal = BrutalState::new(now, 1200);
         BrutalController {
             tx_bps,
-            brutal: BrutalState::new(now, 1200),
+            cached_brutal_window: brutal.initial_window(),
+            brutal_tx_bps: 0,
+            brutal,
             bbr: Some(Bbr::new(Arc::new(BbrConfig::default()), 1200)),
             brutal_active: false,
         }
@@ -402,6 +435,36 @@ mod tests {
         controller
             .activate_brutal_if_configured(activated_at + Duration::from_secs(1));
         assert_eq!(controller.brutal.start, activated_at);
+    }
+
+    #[test]
+    fn activated_brutal_window_cache_tracks_state_changes() {
+        let tx_bps = Arc::new(AtomicU64::new(1_000_000));
+        let now = Instant::now();
+        let mut controller = controller(tx_bps, now);
+        controller.brutal.last_rtt = Duration::from_millis(80);
+        controller.activate_brutal_if_configured(now);
+
+        assert_eq!(
+            controller.cached_brutal_window,
+            controller.brutal.window(controller.brutal_tx_bps)
+        );
+        assert_eq!(controller.window(), controller.cached_brutal_window);
+
+        controller.brutal.last_rtt = Duration::from_millis(120);
+        controller.brutal.ack_rate = MIN_ACK_RATE;
+        controller.refresh_brutal_window();
+        assert_eq!(
+            controller.cached_brutal_window,
+            controller.brutal.window(controller.brutal_tx_bps)
+        );
+
+        controller.brutal.on_mtu_update(9000);
+        controller.refresh_brutal_window();
+        assert_eq!(
+            controller.cached_brutal_window,
+            controller.brutal.window(controller.brutal_tx_bps)
+        );
     }
 
     #[test]
