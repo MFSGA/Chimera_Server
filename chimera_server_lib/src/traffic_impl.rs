@@ -107,12 +107,12 @@ struct TrafficRecordPlan {
 }
 
 fn plan_traffic_record(
-    context: TrafficContext,
+    context: &TrafficContext,
     upload: u64,
     download: u64,
 ) -> TrafficRecordPlan {
     let protocol = context.protocol.to_string();
-    let known_identity = context.identity;
+    let known_identity = context.identity.clone();
     let protocol_identity = known_identity
         .as_ref()
         .map(|identity| (protocol.clone(), identity.clone()));
@@ -127,9 +127,9 @@ fn plan_traffic_record(
         protocol,
         known_identity,
         protocol_identity,
-        inbound_tag: context.inbound_tag,
+        inbound_tag: context.inbound_tag.clone(),
         inbound_identity,
-        outbound_tag: context.outbound_tag,
+        outbound_tag: context.outbound_tag.clone(),
     }
 }
 
@@ -256,7 +256,7 @@ impl TrafficRecorder {
         &self.shards[index]
     }
 
-    fn record(&self, context: TrafficContext, upload: u64, download: u64) {
+    fn record(&self, context: &TrafficContext, upload: u64, download: u64) {
         let plan = plan_traffic_record(context, upload, download);
         let mut guard = self
             .next_shard()
@@ -288,8 +288,29 @@ impl TrafficRecorder {
 }
 
 pub fn record_transfer(context: Option<TrafficContext>, upload: u64, download: u64) {
-    let context = context.unwrap_or_default();
-    TrafficRecorder::global().record(context, upload, download);
+    match context.as_ref() {
+        Some(context) => TrafficRecorder::global().record(context, upload, download),
+        None => TrafficRecorder::global().record(
+            &TrafficContext::default(),
+            upload,
+            download,
+        ),
+    }
+}
+
+pub fn record_transfer_ref(
+    context: Option<&TrafficContext>,
+    upload: u64,
+    download: u64,
+) {
+    match context {
+        Some(context) => TrafficRecorder::global().record(context, upload, download),
+        None => TrafficRecorder::global().record(
+            &TrafficContext::default(),
+            upload,
+            download,
+        ),
+    }
 }
 
 /// Register identities known from configuration before they generate traffic.
@@ -424,7 +445,7 @@ mod tests {
     #[test]
     fn traffic_record_plan_derives_all_index_keys_before_mutation() {
         let plan = plan_traffic_record(
-            TrafficContext::new("vless")
+            &TrafficContext::new("vless")
                 .with_identity("alice")
                 .with_inbound_tag("in")
                 .with_outbound_tag("out"),
@@ -452,7 +473,7 @@ mod tests {
     fn applying_traffic_record_plan_updates_every_index_consistently() {
         let mut stats = StatsInner::default();
         stats.apply(plan_traffic_record(
-            TrafficContext::new("vmess")
+            &TrafficContext::new("vmess")
                 .with_identity("bob")
                 .with_inbound_tag("edge")
                 .with_outbound_tag("direct"),
@@ -491,7 +512,7 @@ mod tests {
                 std::thread::spawn(move || {
                     for _ in 0..RECORDS_PER_WRITER {
                         recorder.record(
-                            TrafficContext::new("vless")
+                            &TrafficContext::new("vless")
                                 .with_identity("alice")
                                 .with_inbound_tag("edge")
                                 .with_outbound_tag("direct"),
