@@ -76,6 +76,22 @@ impl RuntimeState {
         Duration::from_secs(seconds)
     }
 
+    pub fn xray_connection_idle_timeout_for_level(&self, level: u32) -> Duration {
+        const DEFAULT_CONNECTION_IDLE_TIMEOUT_SECS: u64 = 300;
+
+        let seconds = self
+            .policy
+            .read()
+            .expect("runtime policy lock poisoned")
+            .levels
+            .get(&level)
+            .and_then(Option::as_ref)
+            .and_then(|policy| policy.connection_idle)
+            .map(u64::from)
+            .unwrap_or(DEFAULT_CONNECTION_IDLE_TIMEOUT_SECS);
+        Duration::from_secs(seconds)
+    }
+
     pub fn inbounds(&self) -> Vec<ServerConfig> {
         self.inbounds
             .read()
@@ -383,6 +399,58 @@ mod tests {
         assert_eq!(
             runtime.xray_handshake_timeout_for_level(11),
             Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn xray_connection_idle_policy_uses_level_override_and_default() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        assert_eq!(
+            runtime.xray_connection_idle_timeout_for_level(7),
+            Duration::from_secs(300)
+        );
+
+        let mut levels = HashMap::new();
+        levels.insert(
+            7,
+            Some(PolicyLevelConfig {
+                connection_idle: Some(5),
+                ..PolicyLevelConfig::default()
+            }),
+        );
+        levels.insert(
+            8,
+            Some(PolicyLevelConfig {
+                connection_idle: Some(0),
+                ..PolicyLevelConfig::default()
+            }),
+        );
+        levels.insert(9, Some(PolicyLevelConfig::default()));
+        levels.insert(10, None);
+        runtime.replace_policy(Some(&PolicyConfig {
+            levels,
+            ..PolicyConfig::default()
+        }));
+
+        assert_eq!(
+            runtime.xray_connection_idle_timeout_for_level(7),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            runtime.xray_connection_idle_timeout_for_level(8),
+            Duration::ZERO
+        );
+        assert_eq!(
+            runtime.xray_connection_idle_timeout_for_level(9),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            runtime.xray_connection_idle_timeout_for_level(10),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            runtime.xray_connection_idle_timeout_for_level(11),
+            Duration::from_secs(300)
         );
     }
 }
