@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 
@@ -31,6 +31,7 @@ pub struct RuntimeState {
     outbounds: Arc<RwLock<Vec<OutboundSummary>>>,
     inbound_tasks: Arc<RwLock<HashMap<String, Vec<JoinHandle<()>>>>>,
     routing: Arc<RwLock<RoutingState>>,
+    routing_updates: Arc<Mutex<()>>,
     policy: Arc<RwLock<PolicyConfig>>,
     user_domain_access: UserDomainAccessStore,
     balancer_overrides: Arc<RwLock<HashMap<String, String>>>,
@@ -48,6 +49,7 @@ impl RuntimeState {
             outbounds: Arc::new(RwLock::new(outbounds)),
             inbound_tasks: Arc::new(RwLock::new(HashMap::new())),
             routing: Arc::new(RwLock::new(RoutingState::default())),
+            routing_updates: Arc::new(Mutex::new(())),
             policy: Arc::new(RwLock::new(PolicyConfig::default())),
             user_domain_access: UserDomainAccessStore::default(),
             balancer_overrides: Arc::new(RwLock::new(HashMap::new())),
@@ -290,7 +292,15 @@ impl RuntimeState {
             .clone()
     }
 
-    pub fn replace_routing(&self, mut routing: RoutingState) {
+    pub fn replace_routing(&self, routing: RoutingState) {
+        let _update = self
+            .routing_updates
+            .lock()
+            .expect("runtime routing update lock poisoned");
+        self.publish_routing(routing);
+    }
+
+    fn publish_routing(&self, mut routing: RoutingState) {
         let mut current =
             self.routing.write().expect("runtime routing lock poisoned");
         routing.inherit_observations_from(&current);
@@ -315,8 +325,14 @@ impl RuntimeState {
     where
         F: FnOnce(&mut RoutingState) -> R,
     {
-        let mut guard = self.routing.write().expect("runtime routing lock poisoned");
-        mutator(&mut guard)
+        let _update = self
+            .routing_updates
+            .lock()
+            .expect("runtime routing update lock poisoned");
+        let mut next = self.routing();
+        let result = mutator(&mut next);
+        self.publish_routing(next);
+        result
     }
 
     pub(crate) fn apply_user_domain_policy(
@@ -351,7 +367,11 @@ impl RuntimeState {
 mod tests {
     use super::RuntimeState;
     use crate::config::def::{PolicyConfig, PolicyLevelConfig};
-    use std::{collections::HashMap, time::Duration};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, mpsc},
+        time::Duration,
+    };
 
     #[test]
     fn xray_handshake_policy_uses_level_override_and_default() {
@@ -451,6 +471,39 @@ mod tests {
         assert_eq!(
             runtime.xray_connection_idle_timeout_for_level(11),
             Duration::from_secs(300)
+        );
+    }
+    #[test]
+    fn routing_update_compilation_does_not_hold_data_plane_write_lock() {
+        let runtime = Arc::new(RuntimeState::new(Vec::new(), Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let update_runtime = Arc::clone(&runtime);
+        let update = std::thread::spawn(move || {
+            update_runtime.with_routing_mut(|_| {
+                started_tx.send(()).expect("signal update start");
+                release_rx.recv().expect("release routing update");
+            });
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("routing update should start");
+
+        let (read_tx, read_rx) = mpsc::channel();
+        let read_runtime = Arc::clone(&runtime);
+        let reader = std::thread::spawn(move || {
+            let _ = read_runtime.routing();
+            read_tx.send(()).expect("signal routing read");
+        });
+        let read_result = read_rx.recv_timeout(Duration::from_millis(200));
+
+        release_tx.send(()).expect("release routing update");
+        update.join().expect("routing update thread");
+        reader.join().expect("routing reader thread");
+        assert!(
+            read_result.is_ok(),
+            "data-plane routing reads must remain available while a control-plane update is prepared"
         );
     }
 }
