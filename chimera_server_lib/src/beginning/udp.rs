@@ -216,6 +216,43 @@ struct GlobalSessionUdpWorker {
     task: JoinHandle<()>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GlobalUdpWorkerSnapshot {
+    key_matches: bool,
+    task_finished: bool,
+    sender_closed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlobalUdpWorkerPlan {
+    Reuse,
+    Replace,
+}
+
+fn plan_global_udp_worker(
+    snapshot: Option<GlobalUdpWorkerSnapshot>,
+) -> GlobalUdpWorkerPlan {
+    match snapshot {
+        Some(GlobalUdpWorkerSnapshot {
+            key_matches: true,
+            task_finished: false,
+            sender_closed: false,
+        }) => GlobalUdpWorkerPlan::Reuse,
+        _ => GlobalUdpWorkerPlan::Replace,
+    }
+}
+
+fn snapshot_global_udp_worker(
+    worker: Option<&GlobalSessionUdpWorker>,
+    desired_key: &GlobalUdpWorkerKey,
+) -> Option<GlobalUdpWorkerSnapshot> {
+    worker.map(|worker| GlobalUdpWorkerSnapshot {
+        key_matches: worker.key == *desired_key,
+        task_finished: worker.task.is_finished(),
+        sender_closed: worker.sender.is_closed(),
+    })
+}
+
 #[derive(Default)]
 struct GlobalXudpWorkers {
     registry: XudpGlobalRegistry,
@@ -946,12 +983,11 @@ async fn attach_global_session_udp_session(
     };
     let worker_key = GlobalUdpWorkerKey::from(&key);
 
-    let existing_is_usable = guard.workers.get(&global_id).is_some_and(|worker| {
-        worker.key == worker_key
-            && !worker.task.is_finished()
-            && !worker.sender.is_closed()
-    });
-    if !existing_is_usable {
+    let worker_plan = plan_global_udp_worker(snapshot_global_udp_worker(
+        guard.workers.get(&global_id),
+        &worker_key,
+    ));
+    if worker_plan == GlobalUdpWorkerPlan::Replace {
         if let Some(worker) = guard.workers.remove(&global_id) {
             worker.task.abort();
         }
@@ -970,10 +1006,14 @@ async fn attach_global_session_udp_session(
         guard.workers.insert(global_id, worker);
     }
 
-    let worker = guard
-        .workers
-        .get(&global_id)
-        .expect("global XUDP worker inserted before attachment");
+    let Some(worker) = guard.workers.get(&global_id) else {
+        guard
+            .registry
+            .remove_current(global_id, transition.current.token);
+        return Err(std::io::Error::other(
+            "global XUDP worker missing after attachment planning",
+        ));
+    };
     let sender = worker.sender.clone();
     let attachment_state = worker.attachment.clone();
     let attachment_notify = worker.attachment_notify.clone();
@@ -2216,6 +2256,41 @@ mod tests {
             protocol: protocol.into(),
             proxy_settings_type: None,
             proxy_settings_value: None,
+        }
+    }
+
+    #[test]
+    fn global_udp_worker_plan_reuses_only_matching_live_open_worker() {
+        assert_eq!(plan_global_udp_worker(None), GlobalUdpWorkerPlan::Replace);
+        assert_eq!(
+            plan_global_udp_worker(Some(GlobalUdpWorkerSnapshot {
+                key_matches: true,
+                task_finished: false,
+                sender_closed: false,
+            })),
+            GlobalUdpWorkerPlan::Reuse,
+        );
+        for snapshot in [
+            GlobalUdpWorkerSnapshot {
+                key_matches: false,
+                task_finished: false,
+                sender_closed: false,
+            },
+            GlobalUdpWorkerSnapshot {
+                key_matches: true,
+                task_finished: true,
+                sender_closed: false,
+            },
+            GlobalUdpWorkerSnapshot {
+                key_matches: true,
+                task_finished: false,
+                sender_closed: true,
+            },
+        ] {
+            assert_eq!(
+                plan_global_udp_worker(Some(snapshot)),
+                GlobalUdpWorkerPlan::Replace,
+            );
         }
     }
 
