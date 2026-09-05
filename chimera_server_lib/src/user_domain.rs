@@ -160,10 +160,29 @@ enum DecisionReason {
     DenylistMiss,
 }
 
+#[derive(Debug, Clone)]
+struct ActiveUserDomainAccessPublication {
+    publication: Arc<UserDomainAccessPublication>,
+    activation: Arc<()>,
+}
+
+impl ActiveUserDomainAccessPublication {
+    fn new(publication: Arc<UserDomainAccessPublication>) -> Self {
+        Self {
+            publication,
+            activation: Arc::new(()),
+        }
+    }
+
+    fn same_activation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.activation, &other.activation)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct UserDomainAccessInner {
-    active: Option<UserDomainAccessPublication>,
-    revisions: BTreeMap<u64, UserDomainAccessPublication>,
+    active: Option<ActiveUserDomainAccessPublication>,
+    revisions: BTreeMap<u64, Arc<UserDomainAccessPublication>>,
     highest_version: u64,
     stats: UserDomainAccessDecisionStats,
 }
@@ -179,6 +198,7 @@ impl UserDomainAccessStore {
         publication: UserDomainAccessPublication,
     ) -> Result<UserDomainAccessRevision, UserDomainAccessFailure> {
         let revision = revision_of(&publication);
+        let publication = Arc::new(publication);
         let mut inner = self
             .inner
             .write()
@@ -198,8 +218,8 @@ impl UserDomainAccessStore {
         inner.highest_version = publication.version;
         inner
             .revisions
-            .insert(publication.version, publication.clone());
-        inner.active = Some(publication);
+            .insert(publication.version, Arc::clone(&publication));
+        inner.active = Some(ActiveUserDomainAccessPublication::new(publication));
         inner.stats = UserDomainAccessDecisionStats::default();
         Ok(revision)
     }
@@ -219,7 +239,7 @@ impl UserDomainAccessStore {
             ))
             })?;
         let revision = revision_of(&publication);
-        inner.active = Some(publication);
+        inner.active = Some(ActiveUserDomainAccessPublication::new(publication));
         inner.stats = UserDomainAccessDecisionStats::default();
         Ok(revision)
     }
@@ -227,7 +247,10 @@ impl UserDomainAccessStore {
     pub(crate) fn status(&self) -> UserDomainAccessStatus {
         let inner = self.inner.read().expect("user-domain access lock poisoned");
         UserDomainAccessStatus {
-            revision: inner.active.as_ref().map(revision_of),
+            revision: inner
+                .active
+                .as_ref()
+                .map(|active| revision_of(&active.publication)),
             stats: inner.stats.clone(),
         }
     }
@@ -237,36 +260,40 @@ impl UserDomainAccessStore {
     /// an IP-only or otherwise unknown target and follows the configured
     /// unknown-target action.
     pub(crate) fn allows(&self, identity: &str, target_domain: &str) -> bool {
+        let active = {
+            let inner = self.inner.read().expect("user-domain access lock poisoned");
+            let Some(active) = inner.active.clone() else {
+                return true;
+            };
+            if active.publication.enforcement_mode
+                == UserDomainEnforcementMode::Disabled
+            {
+                return true;
+            }
+            active
+        };
+
+        let enforcement_mode = active.publication.enforcement_mode;
+        let (allowed, reason) =
+            evaluate_publication(&active.publication, identity, target_domain);
+
         let mut inner = self
             .inner
             .write()
             .expect("user-domain access lock poisoned");
-        let Some(publication) = inner.active.as_ref() else {
-            return true;
-        };
-        if publication.enforcement_mode == UserDomainEnforcementMode::Disabled {
-            return true;
+        if inner
+            .active
+            .as_ref()
+            .is_some_and(|current| current.same_activation(&active))
+        {
+            record_decision_stats(&mut inner.stats, allowed, reason);
         }
-        let enforcement_mode = publication.enforcement_mode;
+        drop(inner);
 
-        let (allowed, reason) =
-            evaluate_publication(publication, identity, target_domain);
-        bump(&mut inner.stats.evaluations);
-        match reason {
-            DecisionReason::NoUserPolicy => bump(&mut inner.stats.no_user_policy),
-            DecisionReason::UnknownTarget => bump(&mut inner.stats.unknown_target),
-            DecisionReason::MatchedRule => bump(&mut inner.stats.matched_rule),
-            DecisionReason::AllowAllDefault => {
-                bump(&mut inner.stats.allow_all_default)
-            }
-            DecisionReason::AllowlistMiss => bump(&mut inner.stats.allowlist_miss),
-            DecisionReason::DenylistMiss => bump(&mut inner.stats.denylist_miss),
-        };
-        let decision_allowed = record_decision(&mut inner.stats, allowed);
         if enforcement_mode == UserDomainEnforcementMode::Shadow {
             true
         } else {
-            decision_allowed
+            allowed
         }
     }
 }
@@ -605,16 +632,25 @@ fn bump(value: &mut u64) {
     *value = value.saturating_add(1);
 }
 
-fn record_decision(
+fn record_decision_stats(
     stats: &mut UserDomainAccessDecisionStats,
     allowed: bool,
-) -> bool {
+    reason: DecisionReason,
+) {
+    bump(&mut stats.evaluations);
+    match reason {
+        DecisionReason::NoUserPolicy => bump(&mut stats.no_user_policy),
+        DecisionReason::UnknownTarget => bump(&mut stats.unknown_target),
+        DecisionReason::MatchedRule => bump(&mut stats.matched_rule),
+        DecisionReason::AllowAllDefault => bump(&mut stats.allow_all_default),
+        DecisionReason::AllowlistMiss => bump(&mut stats.allowlist_miss),
+        DecisionReason::DenylistMiss => bump(&mut stats.denylist_miss),
+    }
     if allowed {
         bump(&mut stats.allowed);
     } else {
         bump(&mut stats.rejected);
     }
-    allowed
 }
 
 #[cfg(test)]
@@ -760,6 +796,69 @@ mod tests {
 
         assert!(disabled.allows("vless-1", "api.example.com"));
         assert_eq!(disabled.status().stats.evaluations, 0);
+    }
+
+    #[test]
+    fn stale_policy_decision_does_not_update_new_activation_stats() {
+        let store = UserDomainAccessStore::default();
+        store
+            .apply(parse_publication(&signed_publication(1)).unwrap())
+            .unwrap();
+
+        let stale = store
+            .inner
+            .read()
+            .expect("user-domain access lock poisoned")
+            .active
+            .clone()
+            .expect("active policy");
+        let (allowed, reason) =
+            evaluate_publication(&stale.publication, "vless-1", "api.example.com");
+
+        store
+            .apply(parse_publication(&signed_publication(2)).unwrap())
+            .unwrap();
+        let mut inner = store
+            .inner
+            .write()
+            .expect("user-domain access lock poisoned");
+        if inner
+            .active
+            .as_ref()
+            .is_some_and(|current| current.same_activation(&stale))
+        {
+            record_decision_stats(&mut inner.stats, allowed, reason);
+        }
+        assert_eq!(inner.stats.evaluations, 0);
+    }
+
+    #[test]
+    fn rollback_creates_a_fresh_policy_activation() {
+        let store = UserDomainAccessStore::default();
+        store
+            .apply(parse_publication(&signed_publication(1)).unwrap())
+            .unwrap();
+        let original = store
+            .inner
+            .read()
+            .expect("user-domain access lock poisoned")
+            .active
+            .clone()
+            .expect("active policy");
+        store
+            .apply(parse_publication(&signed_publication(2)).unwrap())
+            .unwrap();
+        store.rollback(1).unwrap();
+        let rolled_back = store
+            .inner
+            .read()
+            .expect("user-domain access lock poisoned")
+            .active
+            .clone()
+            .expect("rolled back policy");
+
+        assert!(Arc::ptr_eq(&original.publication, &rolled_back.publication));
+        assert!(!original.same_activation(&rolled_back));
     }
 
     #[test]
