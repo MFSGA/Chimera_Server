@@ -1654,6 +1654,50 @@ impl UploadQueueSender {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UploadReassemblySnapshot {
+    has_current_payload: bool,
+    has_next_buffered_payload: bool,
+    buffered_packets: usize,
+    max_buffered_posts: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadReassemblyPlan {
+    ConsumeCurrent,
+    PromoteBuffered,
+    RejectTooLarge,
+    PollReceiver,
+}
+
+fn plan_upload_reassembly(
+    snapshot: UploadReassemblySnapshot,
+) -> UploadReassemblyPlan {
+    if snapshot.has_current_payload {
+        UploadReassemblyPlan::ConsumeCurrent
+    } else if snapshot.has_next_buffered_payload {
+        UploadReassemblyPlan::PromoteBuffered
+    } else if snapshot.buffered_packets > snapshot.max_buffered_posts + 1 {
+        UploadReassemblyPlan::RejectTooLarge
+    } else {
+        UploadReassemblyPlan::PollReceiver
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadPayloadPlan {
+    Buffer,
+    DropStale,
+}
+
+fn plan_upload_payload(next_seq: u64, incoming_seq: u64) -> UploadPayloadPlan {
+    if incoming_seq >= next_seq {
+        UploadPayloadPlan::Buffer
+    } else {
+        UploadPayloadPlan::DropStale
+    }
+}
+
 struct XhttpUploadReader {
     receiver: mpsc::Receiver<UploadPacket>,
     reader: Arc<StdMutex<Option<BoxedUploadReader>>>,
@@ -1715,62 +1759,79 @@ impl AsyncRead for XhttpUploadReader {
                 return Poll::Ready(Ok(()));
             }
 
-            if let Some(mut payload) = self.current_payload.take() {
-                if payload.is_empty() {
-                    // Xray advances past an empty packet with (0, nil). Tokio
-                    // interprets a successful zero-byte AsyncRead as EOF, so
-                    // consume the empty sequence internally instead of exposing
-                    // a false end-of-stream to the logical connection.
-                    self.next_seq += 1;
-                    continue;
-                }
+            let plan = plan_upload_reassembly(UploadReassemblySnapshot {
+                has_current_payload: self.current_payload.is_some(),
+                has_next_buffered_payload: self
+                    .buffered
+                    .contains_key(&self.next_seq),
+                buffered_packets: self.buffered_packets,
+                max_buffered_posts: self.max_buffered_posts,
+            });
 
-                let len = payload.len().min(buf.remaining());
-                buf.put_slice(&payload.split_to(len));
-                if payload.is_empty() {
-                    self.next_seq += 1;
-                } else {
+            match plan {
+                UploadReassemblyPlan::ConsumeCurrent => {
+                    let Some(mut payload) = self.current_payload.take() else {
+                        continue;
+                    };
+                    if payload.is_empty() {
+                        // Xray advances past an empty packet with (0, nil). Tokio
+                        // interprets a successful zero-byte AsyncRead as EOF, so
+                        // consume the empty sequence internally instead of exposing
+                        // a false end-of-stream to the logical connection.
+                        self.next_seq += 1;
+                        continue;
+                    }
+
+                    let len = payload.len().min(buf.remaining());
+                    buf.put_slice(&payload.split_to(len));
+                    if payload.is_empty() {
+                        self.next_seq += 1;
+                    } else {
+                        self.current_payload = Some(payload);
+                    }
+                    return Poll::Ready(Ok(()));
+                }
+                UploadReassemblyPlan::PromoteBuffered => {
+                    let next_seq = self.next_seq;
+                    let mut remove_entry = false;
+                    let Some(payload) =
+                        self.buffered.get_mut(&next_seq).and_then(|payloads| {
+                            let payload = payloads.pop_front();
+                            remove_entry = payloads.is_empty();
+                            payload
+                        })
+                    else {
+                        continue;
+                    };
+                    self.buffered_packets -= 1;
+                    if remove_entry {
+                        self.buffered.remove(&next_seq);
+                    }
                     self.current_payload = Some(payload);
                 }
-                return Poll::Ready(Ok(()));
-            }
-
-            let next_seq = self.next_seq;
-            let mut remove_entry = false;
-            let next_payload =
-                self.buffered.get_mut(&next_seq).and_then(|payloads| {
-                    let payload = payloads.pop_front();
-                    remove_entry = payloads.is_empty();
-                    payload
-                });
-            if let Some(payload) = next_payload {
-                self.buffered_packets -= 1;
-                if remove_entry {
-                    self.buffered.remove(&next_seq);
+                UploadReassemblyPlan::RejectTooLarge => {
+                    return Poll::Ready(Err(std::io::Error::other(
+                        "packet queue is too large",
+                    )));
                 }
-                self.current_payload = Some(payload);
-                continue;
-            }
-
-            // Current Xray's upload heap retains duplicate future sequence
-            // packets, so every queued packet counts toward the reassembly
-            // limit even when its sequence number is already buffered.
-            if self.buffered_packets > self.max_buffered_posts + 1 {
-                return Poll::Ready(Err(std::io::Error::other(
-                    "packet queue is too large",
-                )));
-            }
-
-            match Pin::new(&mut self.receiver).poll_recv(cx) {
-                Poll::Ready(Some(UploadPacket::ReaderClaim)) => continue,
-                Poll::Ready(Some(UploadPacket::Payload { seq, data })) => {
-                    if seq >= self.next_seq {
-                        self.buffered.entry(seq).or_default().push_back(data);
-                        self.buffered_packets += 1;
+                UploadReassemblyPlan::PollReceiver => {
+                    match Pin::new(&mut self.receiver).poll_recv(cx) {
+                        Poll::Ready(Some(UploadPacket::ReaderClaim)) => continue,
+                        Poll::Ready(Some(UploadPacket::Payload { seq, data })) => {
+                            if plan_upload_payload(self.next_seq, seq)
+                                == UploadPayloadPlan::Buffer
+                            {
+                                self.buffered
+                                    .entry(seq)
+                                    .or_default()
+                                    .push_back(data);
+                                self.buffered_packets += 1;
+                            }
+                        }
+                        Poll::Ready(None) => return Poll::Ready(Ok(())),
+                        Poll::Pending => return Poll::Pending,
                     }
                 }
-                Poll::Ready(None) => return Poll::Ready(Ok(())),
-                Poll::Pending => return Poll::Pending,
             }
         }
     }
@@ -3571,6 +3632,43 @@ mod tests {
             &headers,
             7,
         ));
+    }
+
+    #[test]
+    fn upload_reassembly_plan_preserves_xray_priority_order() {
+        let snapshot =
+            |has_current_payload, has_next_buffered_payload, buffered_packets| {
+                UploadReassemblySnapshot {
+                    has_current_payload,
+                    has_next_buffered_payload,
+                    buffered_packets,
+                    max_buffered_posts: 2,
+                }
+            };
+
+        assert_eq!(
+            plan_upload_reassembly(snapshot(true, true, 4)),
+            UploadReassemblyPlan::ConsumeCurrent,
+        );
+        assert_eq!(
+            plan_upload_reassembly(snapshot(false, true, 4)),
+            UploadReassemblyPlan::PromoteBuffered,
+        );
+        assert_eq!(
+            plan_upload_reassembly(snapshot(false, false, 4)),
+            UploadReassemblyPlan::RejectTooLarge,
+        );
+        assert_eq!(
+            plan_upload_reassembly(snapshot(false, false, 3)),
+            UploadReassemblyPlan::PollReceiver,
+        );
+    }
+
+    #[test]
+    fn upload_payload_plan_only_drops_stale_sequences() {
+        assert_eq!(plan_upload_payload(7, 6), UploadPayloadPlan::DropStale);
+        assert_eq!(plan_upload_payload(7, 7), UploadPayloadPlan::Buffer);
+        assert_eq!(plan_upload_payload(7, 8), UploadPayloadPlan::Buffer);
     }
 
     #[tokio::test]
