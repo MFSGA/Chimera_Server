@@ -365,6 +365,40 @@ fn validate_standard_tcp_network(
     }
 }
 
+struct InboundBuildContext {
+    tag: String,
+    port: u16,
+    bind_location: BindLocation,
+    stream_settings: Option<crate::config::StreamSettings>,
+    sniffing: Option<InboundSniffingConfig>,
+}
+
+impl InboundBuildContext {
+    fn stream_settings(&self) -> Option<&crate::config::StreamSettings> {
+        self.stream_settings.as_ref()
+    }
+
+    fn finish(
+        self,
+        protocol: ServerProxyConfig,
+        transport: Transport,
+        quic_settings: Option<super::quic::ServerQuicConfig>,
+    ) -> ServerConfig {
+        ServerConfig {
+            tag: self.tag,
+            bind_location: self.bind_location,
+            protocol,
+            transport,
+            quic_settings,
+            sniffing: self.sniffing,
+        }
+    }
+
+    fn finish_tcp(self, protocol: ServerProxyConfig) -> ServerConfig {
+        self.finish(protocol, Transport::Tcp, None)
+    }
+}
+
 #[cfg(any(feature = "hysteria", feature = "tuic"))]
 use super::quic::ServerQuicConfig;
 #[cfg(feature = "httpupgrade")]
@@ -891,6 +925,234 @@ fn collect_sniffing_config(
         .then_some(config))
 }
 
+fn build_dokodemo_server(
+    context: InboundBuildContext,
+    settings: Option<crate::config::SettingObject>,
+) -> Result<ServerConfig, Error> {
+    let settings = settings
+        .map(|value| value.deserialize::<DokodemoDoorSettings>())
+        .transpose()
+        .map_err(|err| {
+            Error::InvalidConfig(format!("invalid dokodemo-door settings: {err}"))
+        })?
+        .unwrap_or_default();
+
+    let address = match settings.address.as_deref() {
+        Some(value) => Address::from(value)?,
+        None => match &context.bind_location {
+            BindLocation::Address(addr) => addr.address().clone(),
+        },
+    };
+    let remote_location =
+        NetLocation::new(address, settings.port.unwrap_or(context.port));
+    let protocol = ServerProxyConfig::DokodemoDoor {
+        config: super::types::DokodemoDoorConfig {
+            target: remote_location,
+            follow_redirect: settings.follow_redirect,
+        },
+    };
+
+    let (protocol, transport) = match context.stream_settings() {
+        Some(stream_settings)
+            if stream_settings.network.trim().eq_ignore_ascii_case("udp") =>
+        {
+            if stream_settings.security.as_deref().unwrap_or("none") != "none" {
+                return Err(Error::InvalidConfig(
+                    "dokodemo-door udp transport does not support streamSettings.security"
+                        .into(),
+                ));
+            }
+            (protocol, Transport::Udp)
+        }
+        Some(stream_settings)
+            if matches!(
+                stream_settings.network.trim().to_ascii_lowercase().as_str(),
+                "" | "tcp" | "httpupgrade" | "grpc"
+            ) =>
+        {
+            let protocol = apply_httpupgrade_layer(protocol, stream_settings)?;
+            let protocol = apply_grpc_layer(protocol, stream_settings)?;
+            (
+                apply_security_layers(protocol, stream_settings)?,
+                Transport::Tcp,
+            )
+        }
+        Some(stream_settings) => {
+            let network = stream_settings.network.trim().to_ascii_lowercase();
+            return Err(Error::InvalidConfig(format!(
+                "dokodemo-door streamSettings.network={network} is not supported"
+            )));
+        }
+        None => (protocol, Transport::Tcp),
+    };
+
+    Ok(context.finish(protocol, transport, None))
+}
+
+#[cfg(feature = "vmess")]
+fn build_vmess_server(
+    context: InboundBuildContext,
+    settings: Option<crate::config::SettingObject>,
+) -> Result<ServerConfig, Error> {
+    let settings = settings.ok_or_else(|| {
+        Error::InvalidConfig("vmess inbound requires clients".into())
+    })?;
+    let clients = settings.clients().ok_or_else(|| {
+        Error::InvalidConfig("vmess inbound settings.clients is required".into())
+    })?;
+    let users = clients
+        .into_iter()
+        .map(|client| {
+            let user_id = super::normalize_vmess_user_id(&client.id)
+                .map_err(Error::InvalidConfig)?;
+            let user_label = if client.email.is_empty() {
+                user_id.clone()
+            } else {
+                client.email
+            };
+            Ok(crate::config::server_config::VmessUser {
+                user_id,
+                user_label,
+                cipher: client
+                    .security
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "auto".to_string()),
+            })
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    #[cfg(feature = "ws")]
+    if context
+        .stream_settings()
+        .is_some_and(|settings| settings.ws_settings.is_some())
+    {
+        tracing::info!("use websocket");
+    }
+    let protocol = apply_standard_stream_layers(
+        ServerProxyConfig::Vmess { users },
+        context.stream_settings(),
+    )?;
+    Ok(context.finish_tcp(protocol))
+}
+
+#[cfg(feature = "trojan")]
+fn build_trojan_server(
+    context: InboundBuildContext,
+    settings: Option<crate::config::SettingObject>,
+) -> Result<ServerConfig, Error> {
+    let settings = settings.ok_or_else(|| {
+        Error::InvalidConfig("trojan inbound requires clients".into())
+    })?;
+    let fallbacks = collect_trojan_fallbacks(&settings)?;
+    let users = collect_trojan_clients(settings)?;
+    #[cfg(feature = "ws")]
+    if context
+        .stream_settings()
+        .is_some_and(|settings| settings.ws_settings.is_some())
+    {
+        tracing::info!("use websocket");
+    }
+    let protocol = apply_standard_stream_layers(
+        ServerProxyConfig::Trojan { users, fallbacks },
+        context.stream_settings(),
+    )?;
+    Ok(context.finish_tcp(protocol))
+}
+
+#[cfg(feature = "http")]
+fn build_http_server(
+    context: InboundBuildContext,
+    settings: Option<crate::config::SettingObject>,
+) -> Result<ServerConfig, Error> {
+    let (accounts, allow_transparent, user_level) = collect_http_settings(settings)?;
+    validate_standard_tcp_network(context.stream_settings(), "http")?;
+    let protocol = apply_standard_stream_layers(
+        ServerProxyConfig::Http {
+            accounts,
+            allow_transparent,
+            user_level,
+        },
+        context.stream_settings(),
+    )?;
+    Ok(context.finish_tcp(protocol))
+}
+
+#[cfg(feature = "mixed")]
+fn build_mixed_server(
+    context: InboundBuildContext,
+    settings: Option<crate::config::SettingObject>,
+) -> Result<ServerConfig, Error> {
+    let settings = settings
+        .unwrap_or_else(|| crate::config::SettingObject(serde_json::json!({})));
+    let (accounts, udp_enabled, udp_response_ip, user_level) =
+        collect_socks_settings(settings)?;
+    if udp_response_ip.is_some() {
+        return Err(Error::InvalidConfig(
+            "mixed settings.ip is not supported".into(),
+        ));
+    }
+    if user_level != 0 {
+        return Err(Error::InvalidConfig(
+            "mixed settings.userLevel is not supported".into(),
+        ));
+    }
+    validate_standard_tcp_network(context.stream_settings(), "mixed")?;
+    let protocol = apply_standard_stream_layers(
+        ServerProxyConfig::Mixed {
+            accounts,
+            udp_enabled,
+        },
+        context.stream_settings(),
+    )?;
+    Ok(context.finish_tcp(protocol))
+}
+
+#[cfg(feature = "shadowsocks")]
+fn build_shadowsocks_server(
+    context: InboundBuildContext,
+    settings: Option<crate::config::SettingObject>,
+) -> Result<ServerConfig, Error> {
+    let (users, identity, transport) = collect_shadowsocks_users(settings)?;
+    if !matches!(transport, Transport::Tcp) && context.stream_settings.is_some() {
+        return Err(Error::InvalidConfig(
+            "shadowsocks UDP listeners do not support streamSettings".into(),
+        ));
+    }
+    validate_standard_tcp_network(context.stream_settings(), "shadowsocks")?;
+    let protocol = apply_standard_stream_layers(
+        ServerProxyConfig::Shadowsocks { users, identity },
+        context.stream_settings(),
+    )?;
+    Ok(context.finish(protocol, transport, None))
+}
+
+fn build_socks_server(
+    context: InboundBuildContext,
+    settings: Option<crate::config::SettingObject>,
+) -> Result<ServerConfig, Error> {
+    let settings = settings.ok_or_else(|| {
+        Error::InvalidConfig("socks inbound requires settings".into())
+    })?;
+    let (accounts, udp_enabled, udp_response_ip, user_level) =
+        collect_socks_settings(settings)?;
+    #[cfg(feature = "ws")]
+    if context
+        .stream_settings()
+        .is_some_and(|settings| settings.ws_settings.is_some())
+    {
+        tracing::info!("use websocket");
+    }
+    let protocol = apply_standard_stream_layers(
+        ServerProxyConfig::Socks {
+            accounts,
+            udp_enabled,
+            udp_response_ip,
+            user_level,
+        },
+        context.stream_settings(),
+    )?;
+    Ok(context.finish_tcp(protocol))
+}
+
 impl TryFrom<InboudItem> for ServerConfig {
     type Error = Error;
 
@@ -917,82 +1179,27 @@ impl TryFrom<InboudItem> for ServerConfig {
             ))
         })?;
         let bind_location = BindLocation::Address(NetLocation::new(address, port));
+        let context = InboundBuildContext {
+            tag,
+            port,
+            bind_location,
+            stream_settings,
+            sniffing,
+        };
 
         match protocol {
             Protocol::DokodemoDoor | Protocol::Tunnel => {
-                let settings = settings
-                    .map(|value| value.deserialize::<DokodemoDoorSettings>())
-                    .transpose()
-                    .map_err(|err| {
-                        Error::InvalidConfig(format!(
-                            "invalid dokodemo-door settings: {err}"
-                        ))
-                    })?
-                    .unwrap_or_default();
-
-                let address = match settings.address.as_deref() {
-                    Some(value) => Address::from(value)?,
-                    None => match &bind_location {
-                        BindLocation::Address(addr) => addr.address().clone(),
-                    },
-                };
-                let remote_location =
-                    NetLocation::new(address, settings.port.unwrap_or(port));
-
-                let mut protocol = ServerProxyConfig::DokodemoDoor {
-                    config: super::types::DokodemoDoorConfig {
-                        target: remote_location,
-                        follow_redirect: settings.follow_redirect,
-                    },
-                };
-
-                let transport = match stream_settings.as_ref().map(|settings| {
-                    settings.network.trim().to_ascii_lowercase()
-                }) {
-                    Some(network) if network == "udp" => {
-                        if let Some(stream_setting) = stream_settings.as_ref()
-                            && stream_setting.security.as_deref().unwrap_or("none") != "none"
-                        {
-                            return Err(Error::InvalidConfig(
-                                "dokodemo-door udp transport does not support streamSettings.security"
-                                    .into(),
-                            ));
-                        }
-                        Transport::Udp
-                    }
-                    Some(network)
-                        if network.is_empty()
-                            || network == "tcp"
-                            || network == "httpupgrade"
-                            || network == "grpc" =>
-                    {
-                        if let Some(stream_setting) = stream_settings.as_ref() {
-                            protocol =
-                                apply_httpupgrade_layer(protocol, stream_setting)?;
-                            protocol = apply_grpc_layer(protocol, stream_setting)?;
-                            protocol = apply_security_layers(protocol, stream_setting)?;
-                        }
-                        Transport::Tcp
-                    }
-                    Some(network) => {
-                        return Err(Error::InvalidConfig(format!(
-                            "dokodemo-door streamSettings.network={network} is not supported"
-                        )));
-                    }
-                    None => Transport::Tcp,
-                };
-
-                Ok(ServerConfig {
-                    tag,
-                    bind_location,
-                    protocol,
-                    transport,
-                    quic_settings: None,
-                    sniffing,
-                })
+                build_dokodemo_server(context, settings)
             }
             #[cfg(feature = "hysteria")]
             Protocol::Hysteria2 => {
+                let InboundBuildContext {
+                    tag,
+                    bind_location,
+                    stream_settings,
+                    sniffing,
+                    ..
+                } = context;
                 let stream_settings = stream_settings.ok_or_else(|| {
                     Error::InvalidConfig(
                         "hysteria2 inbound missing streamSettings".into(),
@@ -1219,6 +1426,13 @@ impl TryFrom<InboudItem> for ServerConfig {
             }
             #[cfg(feature = "vless")]
             Protocol::Vless => {
+                let InboundBuildContext {
+                    tag,
+                    bind_location,
+                    stream_settings,
+                    sniffing,
+                    ..
+                } = context;
                 let vless_settings = settings
                     .as_ref()
                     .map(|value| value.deserialize::<VlessInboundSettings>())
@@ -1505,87 +1719,20 @@ impl TryFrom<InboudItem> for ServerConfig {
                 })
             }
             #[cfg(feature = "vmess")]
-            Protocol::Vmess => {
-                let settings = settings.ok_or_else(|| {
-                    Error::InvalidConfig("vmess inbound requires clients".into())
-                })?;
-                let clients = settings.clients().ok_or_else(|| {
-                    Error::InvalidConfig("vmess inbound settings.clients is required".into())
-                })?;
-                let users: Vec<crate::config::server_config::VmessUser> = clients
-                    .into_iter()
-                    .map(|client| {
-                        let user_id = super::normalize_vmess_user_id(&client.id)
-                            .map_err(Error::InvalidConfig)?;
-                        let user_label = if client.email.is_empty() {
-                            user_id.clone()
-                        } else {
-                            client.email
-                        };
-                        Ok(crate::config::server_config::VmessUser {
-                            user_id,
-                            user_label,
-                            cipher: client
-                                .security
-                                .filter(|value| !value.trim().is_empty())
-                                .unwrap_or_else(|| "auto".to_string()),
-                        })
-                    })
-                    .collect::<Result<Vec<_>, Error>>()?;
-                let protocol = ServerProxyConfig::Vmess { users };
-                #[cfg(feature = "ws")]
-                if stream_settings
-                    .as_ref()
-                    .is_some_and(|settings| settings.ws_settings.is_some())
-                {
-                    tracing::info!("use websocket");
-                }
-                let protocol =
-                    apply_standard_stream_layers(protocol, stream_settings.as_ref())?;
-
-                Ok(ServerConfig {
-                    tag,
-                    bind_location,
-                    protocol,
-                    transport: Transport::Tcp,
-                    quic_settings: None,
-                    sniffing,
-                })
-            }
+            Protocol::Vmess => build_vmess_server(context, settings),
 
             #[cfg(feature = "trojan")]
-            Protocol::Trojan => {
-                let settings = settings.ok_or_else(|| {
-                    Error::InvalidConfig("trojan inbound requires clients".into())
-                })?;
-                let trojan_fallbacks = collect_trojan_fallbacks(&settings)?;
-                let trojan_users = collect_trojan_clients(settings)?;
-                let protocol = ServerProxyConfig::Trojan {
-                    users: trojan_users,
-                    fallbacks: trojan_fallbacks,
-                };
-                #[cfg(feature = "ws")]
-                if stream_settings
-                    .as_ref()
-                    .is_some_and(|settings| settings.ws_settings.is_some())
-                {
-                    tracing::info!("use websocket");
-                }
-                let protocol =
-                    apply_standard_stream_layers(protocol, stream_settings.as_ref())?;
-
-                Ok(ServerConfig {
-                    tag,
-                    bind_location,
-                    protocol,
-                    transport: Transport::Tcp,
-                    quic_settings: None,
-                    sniffing,
-                })
-            }
+            Protocol::Trojan => build_trojan_server(context, settings),
 
             #[cfg(feature = "tuic")]
             Protocol::TuicV5 => {
+                let InboundBuildContext {
+                    tag,
+                    bind_location,
+                    stream_settings,
+                    sniffing,
+                    ..
+                } = context;
                 let stream_settings = stream_settings.ok_or_else(|| {
                     Error::InvalidConfig(
                         "tuic inbound missing streamSettings".into(),
@@ -1640,134 +1787,25 @@ impl TryFrom<InboudItem> for ServerConfig {
             }
 
             #[cfg(feature = "http")]
-            Protocol::Http => {
-                let (accounts, allow_transparent, user_level) =
-                    collect_http_settings(settings)?;
-                validate_standard_tcp_network(stream_settings.as_ref(), "http")?;
-                let protocol = apply_standard_stream_layers(
-                    ServerProxyConfig::Http {
-                        accounts,
-                        allow_transparent,
-                        user_level,
-                    },
-                    stream_settings.as_ref(),
-                )?;
-
-                Ok(ServerConfig {
-                    tag,
-                    bind_location,
-                    protocol,
-                    transport: Transport::Tcp,
-                    quic_settings: None,
-                    sniffing,
-                })
-            }
+            Protocol::Http => build_http_server(context, settings),
             #[cfg(not(feature = "http"))]
             Protocol::Http => Err(Error::InvalidConfig(
                 "http inbound requires the http feature".into(),
             )),
             #[cfg(feature = "mixed")]
-            Protocol::Mixed => {
-                let settings = settings.unwrap_or_else(|| {
-                    crate::config::SettingObject(serde_json::json!({}))
-                });
-                let (accounts, udp_enabled, udp_response_ip, user_level) =
-                    collect_socks_settings(settings)?;
-                if udp_response_ip.is_some() {
-                    return Err(Error::InvalidConfig(
-                        "mixed settings.ip is not supported".into(),
-                    ));
-                }
-                if user_level != 0 {
-                    return Err(Error::InvalidConfig(
-                        "mixed settings.userLevel is not supported".into(),
-                    ));
-                }
-                validate_standard_tcp_network(stream_settings.as_ref(), "mixed")?;
-                let protocol = apply_standard_stream_layers(
-                    ServerProxyConfig::Mixed {
-                        accounts,
-                        udp_enabled,
-                    },
-                    stream_settings.as_ref(),
-                )?;
-
-                Ok(ServerConfig {
-                    tag,
-                    bind_location,
-                    protocol,
-                    transport: Transport::Tcp,
-                    quic_settings: None,
-                    sniffing,
-                })
-            }
+            Protocol::Mixed => build_mixed_server(context, settings),
             #[cfg(not(feature = "mixed"))]
             Protocol::Mixed => Err(Error::InvalidConfig(
                 "mixed inbound requires the mixed feature".into(),
             )),
             #[cfg(feature = "shadowsocks")]
-            Protocol::Shadowsocks => {
-                let (users, identity, transport) =
-                    collect_shadowsocks_users(settings)?;
-                if !matches!(transport, Transport::Tcp)
-                    && stream_settings.is_some()
-                {
-                    return Err(Error::InvalidConfig(
-                        "shadowsocks UDP listeners do not support streamSettings"
-                            .into(),
-                    ));
-                }
-                validate_standard_tcp_network(stream_settings.as_ref(), "shadowsocks")?;
-                let protocol = apply_standard_stream_layers(
-                    ServerProxyConfig::Shadowsocks { users, identity },
-                    stream_settings.as_ref(),
-                )?;
-
-                Ok(ServerConfig {
-                    tag,
-                    bind_location,
-                    protocol,
-                    transport,
-                    quic_settings: None,
-                    sniffing,
-                })
-            }
+            Protocol::Shadowsocks => build_shadowsocks_server(context, settings),
             #[cfg(not(feature = "shadowsocks"))]
             Protocol::Shadowsocks => Err(Error::InvalidConfig(
                 "shadowsocks inbound requires the shadowsocks feature".into(),
             )),
 
-            Protocol::Socks => {
-                let settings = settings.ok_or_else(|| {
-                    Error::InvalidConfig("socks inbound requires settings".into())
-                })?;
-                let (accounts, udp_enabled, udp_response_ip, user_level) =
-                    collect_socks_settings(settings)?;
-                let protocol = ServerProxyConfig::Socks {
-                    accounts,
-                    udp_enabled,
-                    udp_response_ip,
-                    user_level,
-                };
-                #[cfg(feature = "ws")]
-                if stream_settings
-                    .as_ref()
-                    .is_some_and(|settings| settings.ws_settings.is_some())
-                {
-                    tracing::info!("use websocket");
-                }
-                let protocol =
-                    apply_standard_stream_layers(protocol, stream_settings.as_ref())?;
-
-                Ok(ServerConfig {
-                    tag,
-                    bind_location,
-                    protocol,
-                    transport: Transport::Tcp,
-                    quic_settings: None,
-                    sniffing,
-                })
-            }
+            Protocol::Socks => build_socks_server(context, settings),
         }
     }
 }
