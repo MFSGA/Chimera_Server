@@ -29,7 +29,12 @@ const MIN_COPY_BUFFER_SIZE: usize = 4 * 1024;
 const MAX_COPY_BUFFER_SIZE: usize = 1024 * 1024;
 const MAX_STEPS_PER_POLL: usize = 16;
 #[cfg(target_os = "linux")]
-const DEFAULT_SPLICE_PIPE_SIZE: usize = 64 * 1024;
+// 128 KiB halves the steady-state splice syscall rate for bulk loopback
+// transfers compared with Linux's common 64 KiB pipe capacity, while keeping
+// the worst-case two-direction pipe footprint bounded to 256 KiB per relay.
+// Higher-throughput deployments can still override this with
+// CHIMERA_TCP_SPLICE_PIPE_SIZE.
+const DEFAULT_SPLICE_PIPE_SIZE: usize = 128 * 1024;
 #[cfg(target_os = "linux")]
 const MIN_SPLICE_PIPE_SIZE: usize = 4 * 1024;
 #[cfg(target_os = "linux")]
