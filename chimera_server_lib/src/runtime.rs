@@ -28,13 +28,13 @@ pub struct OutboundSummary {
 #[derive(Debug, Clone)]
 pub struct RuntimeState {
     inbounds: Arc<RwLock<Vec<ServerConfig>>>,
-    outbounds: Arc<RwLock<Vec<OutboundSummary>>>,
+    outbounds: Arc<RwLock<Arc<Vec<OutboundSummary>>>>,
     inbound_tasks: Arc<RwLock<HashMap<String, Vec<JoinHandle<()>>>>>,
     routing: Arc<RwLock<Arc<RoutingState>>>,
     routing_updates: Arc<Mutex<()>>,
     policy: Arc<RwLock<PolicyConfig>>,
     user_domain_access: UserDomainAccessStore,
-    balancer_overrides: Arc<RwLock<HashMap<String, String>>>,
+    balancer_overrides: Arc<RwLock<Arc<HashMap<String, String>>>>,
     routing_events: broadcast::Sender<RoutingEvent>,
 }
 
@@ -46,13 +46,13 @@ impl RuntimeState {
         let (routing_events, _) = broadcast::channel(256);
         Self {
             inbounds: Arc::new(RwLock::new(inbounds)),
-            outbounds: Arc::new(RwLock::new(outbounds)),
+            outbounds: Arc::new(RwLock::new(Arc::new(outbounds))),
             inbound_tasks: Arc::new(RwLock::new(HashMap::new())),
             routing: Arc::new(RwLock::new(Arc::new(RoutingState::default()))),
             routing_updates: Arc::new(Mutex::new(())),
             policy: Arc::new(RwLock::new(PolicyConfig::default())),
             user_domain_access: UserDomainAccessStore::default(),
-            balancer_overrides: Arc::new(RwLock::new(HashMap::new())),
+            balancer_overrides: Arc::new(RwLock::new(Arc::new(HashMap::new()))),
             routing_events,
         }
     }
@@ -172,10 +172,16 @@ impl RuntimeState {
     }
 
     pub fn outbounds(&self) -> Vec<OutboundSummary> {
-        self.outbounds
-            .read()
-            .expect("runtime outbounds lock poisoned")
-            .clone()
+        self.outbound_snapshot().as_ref().clone()
+    }
+
+    fn outbound_snapshot(&self) -> Arc<Vec<OutboundSummary>> {
+        Arc::clone(
+            &self
+                .outbounds
+                .read()
+                .expect("runtime outbounds lock poisoned"),
+        )
     }
 
     pub fn select_outbound(&self, input: &RoutingInput) -> Option<OutboundSummary> {
@@ -186,9 +192,12 @@ impl RuntimeState {
         &self,
         input: &RoutingInput,
     ) -> Result<Option<OutboundSummary>, String> {
-        let outbounds = self.outbounds();
-        let overrides = self.balancer_overrides();
-        let Some(route) = self.routing().route(input, &outbounds, &overrides) else {
+        let outbounds = self.outbound_snapshot();
+        let overrides = self.balancer_override_snapshot();
+        let Some(route) =
+            self.routing()
+                .route(input, outbounds.as_ref(), overrides.as_ref())
+        else {
             let selected = outbounds.first().cloned();
             if let Some(outbound) = selected.as_ref() {
                 self.publish_routing_event(RoutingEvent {
@@ -231,18 +240,20 @@ impl RuntimeState {
     }
 
     pub(crate) fn balancer_overrides(&self) -> HashMap<String, String> {
-        self.balancer_overrides
-            .read()
-            .expect("runtime balancer overrides lock poisoned")
-            .clone()
+        self.balancer_override_snapshot().as_ref().clone()
+    }
+
+    fn balancer_override_snapshot(&self) -> Arc<HashMap<String, String>> {
+        Arc::clone(
+            &self
+                .balancer_overrides
+                .read()
+                .expect("runtime balancer overrides lock poisoned"),
+        )
     }
 
     pub(crate) fn balancer_override(&self, tag: &str) -> Option<String> {
-        self.balancer_overrides
-            .read()
-            .expect("runtime balancer overrides lock poisoned")
-            .get(tag)
-            .cloned()
+        self.balancer_override_snapshot().get(tag).cloned()
     }
 
     pub(crate) fn set_balancer_override(
@@ -250,38 +261,51 @@ impl RuntimeState {
         balancer_tag: impl Into<String>,
         outbound_tag: impl Into<String>,
     ) {
-        self.balancer_overrides
+        let mut current = self
+            .balancer_overrides
             .write()
-            .expect("runtime balancer overrides lock poisoned")
-            .insert(balancer_tag.into(), outbound_tag.into());
+            .expect("runtime balancer overrides lock poisoned");
+        let mut next = current.as_ref().clone();
+        next.insert(balancer_tag.into(), outbound_tag.into());
+        *current = Arc::new(next);
     }
 
     pub(crate) fn remove_balancer_override(&self, tag: &str) -> bool {
-        self.balancer_overrides
+        let mut current = self
+            .balancer_overrides
             .write()
-            .expect("runtime balancer overrides lock poisoned")
-            .remove(tag)
-            .is_some()
+            .expect("runtime balancer overrides lock poisoned");
+        let mut next = current.as_ref().clone();
+        let removed = next.remove(tag).is_some();
+        if removed {
+            *current = Arc::new(next);
+        }
+        removed
     }
 
     pub fn remove_outbound(&self, tag: &str) -> Option<OutboundSummary> {
-        let mut guard = self
+        let mut current = self
             .outbounds
             .write()
             .expect("runtime outbounds lock poisoned");
-        let index = guard.iter().position(|cfg| cfg.tag == tag)?;
-        Some(guard.remove(index))
+        let mut next = current.as_ref().clone();
+        let index = next.iter().position(|cfg| cfg.tag == tag)?;
+        let removed = next.remove(index);
+        *current = Arc::new(next);
+        Some(removed)
     }
 
     pub fn add_outbound(&self, outbound: OutboundSummary) -> Result<(), String> {
-        let mut guard = self
+        let mut current = self
             .outbounds
             .write()
             .expect("runtime outbounds lock poisoned");
-        if guard.iter().any(|cfg| cfg.tag == outbound.tag) {
+        if current.iter().any(|cfg| cfg.tag == outbound.tag) {
             return Err(format!("outbound {} already exists", outbound.tag));
         }
-        guard.push(outbound);
+        let mut next = current.as_ref().clone();
+        next.push(outbound);
+        *current = Arc::new(next);
         Ok(())
     }
 
@@ -474,6 +498,45 @@ mod tests {
             Duration::from_secs(300)
         );
     }
+    #[test]
+    fn outbound_and_override_snapshots_are_copy_on_write() {
+        let runtime = RuntimeState::new(
+            Vec::new(),
+            vec![super::OutboundSummary {
+                tag: "direct".into(),
+                protocol: "freedom".into(),
+                proxy_settings_type: None,
+                proxy_settings_value: None,
+            }],
+        );
+        let first_outbounds = runtime.outbound_snapshot();
+        let second_outbounds = runtime.outbound_snapshot();
+        assert!(Arc::ptr_eq(&first_outbounds, &second_outbounds));
+
+        runtime
+            .add_outbound(super::OutboundSummary {
+                tag: "backup".into(),
+                protocol: "freedom".into(),
+                proxy_settings_type: None,
+                proxy_settings_value: None,
+            })
+            .expect("add outbound");
+        let replaced_outbounds = runtime.outbound_snapshot();
+        assert!(!Arc::ptr_eq(&first_outbounds, &replaced_outbounds));
+        assert_eq!(first_outbounds.len(), 1);
+        assert_eq!(replaced_outbounds.len(), 2);
+
+        let first_overrides = runtime.balancer_override_snapshot();
+        runtime.set_balancer_override("auto", "backup");
+        let replaced_overrides = runtime.balancer_override_snapshot();
+        assert!(!Arc::ptr_eq(&first_overrides, &replaced_overrides));
+        assert!(first_overrides.is_empty());
+        assert_eq!(
+            replaced_overrides.get("auto").map(String::as_str),
+            Some("backup")
+        );
+    }
+
     #[test]
     fn routing_reads_share_immutable_snapshots_until_publish() {
         let runtime = RuntimeState::new(Vec::new(), Vec::new());
