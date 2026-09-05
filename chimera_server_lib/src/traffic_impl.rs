@@ -94,124 +94,131 @@ pub struct TrafficSnapshot {
     pub known_identities: HashSet<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TrafficRecordPlan {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrafficRecordPlan<'a> {
     upload: u64,
     download: u64,
-    protocol: String,
-    known_identity: Option<String>,
-    protocol_identity: Option<(String, String)>,
-    inbound_tag: Option<String>,
-    inbound_identity: Option<(String, String)>,
-    outbound_tag: Option<String>,
+    protocol: &'static str,
+    identity: Option<&'a str>,
+    inbound_tag: Option<&'a str>,
+    outbound_tag: Option<&'a str>,
 }
 
-fn plan_traffic_record(
-    context: &TrafficContext,
+fn plan_traffic_record<'a>(
+    context: &'a TrafficContext,
     upload: u64,
     download: u64,
-) -> TrafficRecordPlan {
-    let protocol = context.protocol.to_string();
-    let known_identity = context.identity.clone();
-    let protocol_identity = known_identity
-        .as_ref()
-        .map(|identity| (protocol.clone(), identity.clone()));
-    let inbound_identity = match (&context.inbound_tag, &known_identity) {
-        (Some(tag), Some(identity)) => Some((tag.clone(), identity.clone())),
-        _ => None,
-    };
-
+) -> TrafficRecordPlan<'a> {
     TrafficRecordPlan {
         upload,
         download,
-        protocol,
-        known_identity,
-        protocol_identity,
-        inbound_tag: context.inbound_tag.clone(),
-        inbound_identity,
-        outbound_tag: context.outbound_tag.clone(),
+        protocol: context.protocol,
+        identity: context.identity.as_deref(),
+        inbound_tag: context.inbound_tag.as_deref(),
+        outbound_tag: context.outbound_tag.as_deref(),
     }
 }
 
 #[derive(Debug, Default)]
 struct StatsInner {
     total: TransferTotals,
-    per_protocol: HashMap<String, TransferTotals>,
-    per_identity: HashMap<(String, String), TransferTotals>,
+    per_protocol: HashMap<&'static str, TransferTotals>,
+    per_identity: HashMap<&'static str, HashMap<String, TransferTotals>>,
     per_inbound: HashMap<String, TransferTotals>,
     per_outbound: HashMap<String, TransferTotals>,
-    per_inbound_user: HashMap<(String, String), TransferTotals>,
+    per_inbound_user: HashMap<String, HashMap<String, TransferTotals>>,
     known_identities: HashSet<String>,
 }
 
+fn accumulate_string_key(
+    totals: &mut HashMap<String, TransferTotals>,
+    key: &str,
+    upload: u64,
+    download: u64,
+) {
+    if let Some(existing) = totals.get_mut(key) {
+        existing.accumulate(upload, download);
+        return;
+    }
+    let mut value = TransferTotals::default();
+    value.accumulate(upload, download);
+    totals.insert(key.to_owned(), value);
+}
+
+fn accumulate_nested_string_key(
+    totals: &mut HashMap<String, HashMap<String, TransferTotals>>,
+    outer: &str,
+    inner: &str,
+    upload: u64,
+    download: u64,
+) {
+    if let Some(inner_totals) = totals.get_mut(outer) {
+        accumulate_string_key(inner_totals, inner, upload, download);
+        return;
+    }
+    let mut inner_totals = HashMap::new();
+    accumulate_string_key(&mut inner_totals, inner, upload, download);
+    totals.insert(outer.to_owned(), inner_totals);
+}
+
 impl StatsInner {
-    fn apply(&mut self, plan: TrafficRecordPlan) {
+    fn apply(&mut self, plan: TrafficRecordPlan<'_>) {
         let TrafficRecordPlan {
             upload,
             download,
             protocol,
-            known_identity,
-            protocol_identity,
+            identity,
             inbound_tag,
-            inbound_identity,
             outbound_tag,
         } = plan;
 
         self.total.accumulate(upload, download);
-        if let Some(identity) = known_identity {
-            self.known_identities.insert(identity);
-        }
         self.per_protocol
             .entry(protocol)
             .or_default()
             .accumulate(upload, download);
-        if let Some(key) = protocol_identity {
-            self.per_identity
-                .entry(key)
-                .or_default()
-                .accumulate(upload, download);
+
+        if let Some(identity) = identity {
+            if !self.known_identities.contains(identity) {
+                self.known_identities.insert(identity.to_owned());
+            }
+            accumulate_string_key(
+                self.per_identity.entry(protocol).or_default(),
+                identity,
+                upload,
+                download,
+            );
+            if let Some(inbound_tag) = inbound_tag {
+                accumulate_nested_string_key(
+                    &mut self.per_inbound_user,
+                    inbound_tag,
+                    identity,
+                    upload,
+                    download,
+                );
+            }
         }
         if let Some(tag) = inbound_tag {
-            self.per_inbound
-                .entry(tag)
-                .or_default()
-                .accumulate(upload, download);
-        }
-        if let Some(key) = inbound_identity {
-            self.per_inbound_user
-                .entry(key)
-                .or_default()
-                .accumulate(upload, download);
+            accumulate_string_key(&mut self.per_inbound, tag, upload, download);
         }
         if let Some(tag) = outbound_tag {
-            self.per_outbound
-                .entry(tag)
-                .or_default()
-                .accumulate(upload, download);
+            accumulate_string_key(&mut self.per_outbound, tag, upload, download);
         }
     }
 
     fn snapshot(&self) -> TrafficSnapshot {
-        TrafficSnapshot {
-            total: self.total.clone(),
-            per_protocol: self.per_protocol.clone(),
-            per_identity: self.per_identity.clone(),
-            per_inbound: self.per_inbound.clone(),
-            per_outbound: self.per_outbound.clone(),
-            per_inbound_user: self.per_inbound_user.clone(),
-            known_identities: self.known_identities.clone(),
-        }
+        let mut snapshot = TrafficSnapshot::default();
+        merge_stats_into_snapshot(&mut snapshot, self);
+        snapshot
     }
 }
 
 const TRAFFIC_SHARD_COUNT: usize = 32;
 
-fn merge_totals_map<K>(
-    target: &mut HashMap<K, TransferTotals>,
-    source: &HashMap<K, TransferTotals>,
-) where
-    K: Clone + Eq + std::hash::Hash,
-{
+fn merge_string_totals_map(
+    target: &mut HashMap<String, TransferTotals>,
+    source: &HashMap<String, TransferTotals>,
+) {
     for (key, totals) in source {
         target.entry(key.clone()).or_default().merge(totals);
     }
@@ -219,11 +226,33 @@ fn merge_totals_map<K>(
 
 fn merge_stats_into_snapshot(snapshot: &mut TrafficSnapshot, stats: &StatsInner) {
     snapshot.total.merge(&stats.total);
-    merge_totals_map(&mut snapshot.per_protocol, &stats.per_protocol);
-    merge_totals_map(&mut snapshot.per_identity, &stats.per_identity);
-    merge_totals_map(&mut snapshot.per_inbound, &stats.per_inbound);
-    merge_totals_map(&mut snapshot.per_outbound, &stats.per_outbound);
-    merge_totals_map(&mut snapshot.per_inbound_user, &stats.per_inbound_user);
+    for (protocol, totals) in &stats.per_protocol {
+        snapshot
+            .per_protocol
+            .entry((*protocol).to_owned())
+            .or_default()
+            .merge(totals);
+    }
+    for (protocol, identities) in &stats.per_identity {
+        for (identity, totals) in identities {
+            snapshot
+                .per_identity
+                .entry(((*protocol).to_owned(), identity.clone()))
+                .or_default()
+                .merge(totals);
+        }
+    }
+    merge_string_totals_map(&mut snapshot.per_inbound, &stats.per_inbound);
+    merge_string_totals_map(&mut snapshot.per_outbound, &stats.per_outbound);
+    for (inbound, identities) in &stats.per_inbound_user {
+        for (identity, totals) in identities {
+            snapshot
+                .per_inbound_user
+                .entry((inbound.clone(), identity.clone()))
+                .or_default()
+                .merge(totals);
+        }
+    }
     snapshot
         .known_identities
         .extend(stats.known_identities.iter().cloned());
@@ -444,29 +473,18 @@ mod tests {
 
     #[test]
     fn traffic_record_plan_derives_all_index_keys_before_mutation() {
-        let plan = plan_traffic_record(
-            &TrafficContext::new("vless")
-                .with_identity("alice")
-                .with_inbound_tag("in")
-                .with_outbound_tag("out"),
-            7,
-            11,
-        );
+        let context = TrafficContext::new("vless")
+            .with_identity("alice")
+            .with_inbound_tag("in")
+            .with_outbound_tag("out");
+        let plan = plan_traffic_record(&context, 7, 11);
 
         assert_eq!(plan.upload, 7);
         assert_eq!(plan.download, 11);
         assert_eq!(plan.protocol, "vless");
-        assert_eq!(plan.known_identity.as_deref(), Some("alice"));
-        assert_eq!(
-            plan.protocol_identity,
-            Some(("vless".to_string(), "alice".to_string()))
-        );
-        assert_eq!(plan.inbound_tag.as_deref(), Some("in"));
-        assert_eq!(
-            plan.inbound_identity,
-            Some(("in".to_string(), "alice".to_string()))
-        );
-        assert_eq!(plan.outbound_tag.as_deref(), Some("out"));
+        assert_eq!(plan.identity, Some("alice"));
+        assert_eq!(plan.inbound_tag, Some("in"));
+        assert_eq!(plan.outbound_tag, Some("out"));
     }
 
     #[test]
