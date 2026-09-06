@@ -255,7 +255,7 @@ The io_uring implementation is intentionally benchmark-only. It must not be conn
 
 ## TCP pacing probe
 
-`tcp_pacing_probe` is a Linux-only loopback sender/sink benchmark for TCP Brutal2 pacing design. It compares the same blocking TCP write workload under three pacing modes:
+`tcp_pacing_probe` is a Linux-only loopback sender/sink benchmark for TCP Brutal2 pacing design. It compares the same payload under two send backends (`send` and `splice`) and three pacing modes:
 
 - `unpaced`: no rate limiting;
 - `kernel`: set `SO_MAX_PACING_RATE` on the sending TCP socket;
@@ -268,22 +268,40 @@ cargo test --manifest-path bench/chimera_perf/Cargo.toml --bin tcp_pacing_probe
 cargo build --release --manifest-path bench/chimera_perf/Cargo.toml --bin tcp_pacing_probe
 ```
 
-Compare all modes at the same target rate:
+Compare both backends and all modes at the same target rate:
 
 ```bash
-for mode in unpaced kernel userspace; do
-  taskset -c 0,1 \
-    bench/chimera_perf/target/release/tcp_pacing_probe \
-    --mode "$mode" \
+for backend in send splice; do
+  for mode in unpaced kernel userspace; do
+    taskset -c 0,1 \
+      bench/chimera_perf/target/release/tcp_pacing_probe \
+      --backend "$backend" \
+      --mode "$mode" \
     --bytes 134217728 \
     --chunk-size 65536 \
     --rate-bytes-per-sec 52428800 \
-    --warmup 1 \
-    --runs 5
+      --warmup 1 \
+      --runs 5
+  done
 done
 ```
 
-The important output fields are `requested_rate_ratio`, `cpu_seconds_per_gib`, and total context switches. A successful `setsockopt` is not enough evidence that kernel pacing is effective: the observed/requested rate ratio should remain close to 1 on the target host and network path.
+The important output fields are `requested_rate_ratio`, `cpu_seconds_per_gib`, and total context switches. A successful `setsockopt` is not enough evidence that kernel pacing is effective: the observed/requested rate ratio should remain close to 1 on the target host and network path. The `splice` backend feeds a memfd through a pipe into the paced TCP socket so the paced output operation uses the same pipe-to-socket splice shape as the production relay.
+
+To probe a dynamic rate publication, set `--second-rate-bytes-per-sec`; the probe switches once after half the bytes have been submitted and computes the expected aggregate rate from the two equal-byte phases:
+
+```bash
+bench/chimera_perf/target/release/tcp_pacing_probe \
+  --backend splice \
+  --mode kernel \
+  --bytes 67108864 \
+  --rate-bytes-per-sec 104857600 \
+  --second-rate-bytes-per-sec 26214400 \
+  --warmup 1 \
+  --runs 5
+```
+
+Dynamic results also report `pacing_updates`. Treat them as a queue-response probe rather than a guarantee that an already-buffered TCP send queue changes rate instantaneously.
 
 Use `strace` to attribute userspace pacing wakeups:
 
@@ -291,6 +309,7 @@ Use `strace` to attribute userspace pacing wakeups:
 strace -f -c \
   -e trace=write,sendto,sendmsg,clock_nanosleep,nanosleep,futex,poll,ppoll,epoll_wait,setsockopt,getsockopt \
   bench/chimera_perf/target/release/tcp_pacing_probe \
+  --backend splice \
   --mode kernel \
   --bytes 33554432 \
   --chunk-size 65536 \
