@@ -353,6 +353,8 @@ cargo run --release --manifest-path bench/chimera_perf/Cargo.toml \
 
 The benchmark intentionally includes a rejected optimization: skipping ACK-rate division while the rolling loss count is zero helps a pristine window but regresses the path once a loss remains in the five-second window. The `cached-second-record` comparison instead caches the active second and slot, avoiding repeated duration-to-seconds conversion and modulo work for events in the same second while preserving the slow path for rollovers and reordered timestamps. Use the latter comparison when evaluating changes to `BrutalState::record`.
 
+The final section models Quinn's ACK callback batching contract: each acknowledged packet reaches `Controller::on_ack`, followed by one `Controller::on_end_acks` for the batch. `per-packet-record` recomputes Brutal accounting and the derived congestion window after every acknowledged packet, while `batched-record` pays a per-packet pending-counter update and publishes the same final ACK rate and window once per ACK batch. Sweep batch sizes when evaluating whether moving work to `on_end_acks` is worthwhile; batch size 1 is the regression guard for paths that receive mostly singleton ACKs.
+
 ## Required experiment discipline
 
 - Build every compared binary in release mode using the same toolchain.
