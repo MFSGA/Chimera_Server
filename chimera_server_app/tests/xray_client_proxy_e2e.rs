@@ -1849,6 +1849,160 @@ async fn xray_hysteria2_brutal_ack_batch_trace() {
     println!("{last_trace}");
 }
 
+#[cfg(feature = "brutal-pacing-trace")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "profiles real Brutal pacing publication policies through a lossy Xray Hysteria2 path"]
+async fn xray_hysteria2_brutal_pacing_publication_trace() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("hysteria2-brutal-pacing-trace");
+    let echo_addr = start_tcp_echo_server();
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let (cert_path, key_path) = generate_test_certificate(&work_dir);
+    let pinned_peer_cert_sha256 = first_cert_sha256_hex(&cert_path);
+    let proxy =
+        start_lossy_udp_proxy(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)))
+            .await;
+
+    let chimera_config_path = work_dir.join("chimera-hysteria2-pacing-trace.json");
+    let xray_config_path = work_dir.join("xray-hysteria2-pacing-trace-client.json");
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "hysteria",
+                "tag": "chimera-hysteria2-pacing-trace",
+                "settings": {
+                    "version": 2,
+                    "clients": [{
+                        "auth": HYSTERIA_AUTH,
+                        "email": "hy-pacing-trace@example.test"
+                    }]
+                },
+                "streamSettings": {
+                    "network": "quic",
+                    "security": "tls",
+                    "hysteriaSettings": {"version": 2},
+                    "finalmask": {
+                        "quicParams": {
+                            "congestion": "force-brutal",
+                            "brutalUp": "100 mbps"
+                        }
+                    },
+                    "tlsSettings": {
+                        "alpn": ["h3"],
+                        "certificates": [{
+                            "certificateFile": cert_path,
+                            "keyFile": key_path
+                        }]
+                    }
+                }
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth"}
+            }],
+            "outbounds": [{
+                "protocol": "hysteria",
+                "settings": {
+                    "version": 2,
+                    "address": "127.0.0.1",
+                    "port": proxy.addr.port()
+                },
+                "streamSettings": {
+                    "network": "hysteria",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "pinnedPeerCertSha256": pinned_peer_cert_sha256,
+                        "alpn": ["h3"]
+                    },
+                    "hysteriaSettings": {
+                        "version": 2,
+                        "auth": HYSTERIA_AUTH
+                    }
+                }
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera_with_env(
+        &workspace,
+        &work_dir,
+        &chimera_config_path,
+        &[
+            ("HYSTERIA_BRUTAL_DEBUG", "true"),
+            (
+                "RUST_LOG",
+                "chimera_server_lib::handler::hysteria2::congestion=debug",
+            ),
+        ],
+    );
+    chimera.assert_running();
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+
+    assert_socks5_echo_async_with_timeout(
+        socks_addr,
+        echo_addr,
+        &deterministic_payload(64 * 1024),
+        Duration::from_secs(20),
+    )
+    .await;
+
+    proxy.set_drop_every(10);
+    assert_socks5_echo_async_with_timeout(
+        socks_addr,
+        echo_addr,
+        &deterministic_payload(512 * 1024),
+        Duration::from_secs(20),
+    )
+    .await;
+
+    proxy.set_drop_every(0);
+    assert_socks5_echo_async_with_timeout(
+        socks_addr,
+        echo_addr,
+        &deterministic_payload(768 * 1024),
+        Duration::from_secs(20),
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let stderr = read_lossy(&chimera.stderr_path);
+    let last_trace = stderr
+        .lines()
+        .rev()
+        .find(|line| line.contains("brutal pacing publication trace"))
+        .unwrap_or_else(|| {
+            panic!("missing Brutal pacing publication trace; stderr={stderr}")
+        });
+    assert!(
+        proxy.dropped_server_packets() > 0,
+        "loss phase did not drop server packets"
+    );
+    println!(
+        "lossy proxy server_packets={} dropped_server_packets={} {last_trace}",
+        proxy.server_packets(),
+        proxy.dropped_server_packets(),
+    );
+}
+
 #[test]
 #[ignore = "starts Chimera and ./xray to validate Xray Hysteria2 empty user auth"]
 fn xray_hysteria2_empty_user_auth_can_proxy_tcp() {
@@ -2487,6 +2641,77 @@ async fn start_udp_echo_server() -> SocketAddr {
         }
     });
     addr
+}
+
+#[cfg(feature = "brutal-pacing-trace")]
+struct LossyUdpProxy {
+    addr: SocketAddr,
+    drop_every: Arc<AtomicUsize>,
+    server_packets: Arc<AtomicUsize>,
+    dropped_server_packets: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "brutal-pacing-trace")]
+impl LossyUdpProxy {
+    fn set_drop_every(&self, every: usize) {
+        self.drop_every.store(every, Ordering::Relaxed);
+    }
+
+    fn server_packets(&self) -> usize {
+        self.server_packets.load(Ordering::Relaxed)
+    }
+
+    fn dropped_server_packets(&self) -> usize {
+        self.dropped_server_packets.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(feature = "brutal-pacing-trace")]
+async fn start_lossy_udp_proxy(server_addr: SocketAddr) -> LossyUdpProxy {
+    let socket = TokioUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind lossy Hysteria UDP proxy");
+    let addr = socket.local_addr().expect("lossy Hysteria UDP proxy addr");
+    let drop_every = Arc::new(AtomicUsize::new(0));
+    let server_packets = Arc::new(AtomicUsize::new(0));
+    let dropped_server_packets = Arc::new(AtomicUsize::new(0));
+    let task_drop_every = drop_every.clone();
+    let task_server_packets = server_packets.clone();
+    let task_dropped_server_packets = dropped_server_packets.clone();
+
+    tokio::spawn(async move {
+        let mut client_addr = None;
+        let mut buf = [0u8; 65_535];
+        while let Ok((len, peer)) = socket.recv_from(&mut buf).await {
+            if peer == server_addr {
+                let Some(client_addr) = client_addr else {
+                    continue;
+                };
+                let packet_index =
+                    task_server_packets.fetch_add(1, Ordering::Relaxed) + 1;
+                let every = task_drop_every.load(Ordering::Relaxed);
+                if every > 0 && packet_index.is_multiple_of(every) {
+                    task_dropped_server_packets.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                if socket.send_to(&buf[..len], client_addr).await.is_err() {
+                    break;
+                }
+            } else {
+                client_addr = Some(peer);
+                if socket.send_to(&buf[..len], server_addr).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    LossyUdpProxy {
+        addr,
+        drop_every,
+        server_packets,
+        dropped_server_packets,
+    }
 }
 
 async fn assert_tls_handshake_to_localhost(_workspace: &Path, addr: SocketAddr) {

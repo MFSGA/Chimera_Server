@@ -83,6 +83,7 @@ rcgen = { workspace = true }
 
 [features]
 brutal-ack-batch-trace = []
+brutal-pacing-trace = []
 hysteria = ["uuid", "lru", "flate2"]
 http = []
 mixed = ["http"]

@@ -28,6 +28,8 @@ const DEBUG_ENV: &str = "HYSTERIA_BRUTAL_DEBUG";
 const DEBUG_PRINT_INTERVAL: u64 = 2;
 #[cfg(feature = "brutal-ack-batch-trace")]
 const ACK_BATCH_TRACE_REPORT_INTERVAL: u64 = 64;
+#[cfg(feature = "brutal-pacing-trace")]
+const PACING_TRACE_REPORT_INTERVAL: u64 = 128;
 
 #[derive(Clone)]
 pub(crate) struct BrutalConfig {
@@ -57,6 +59,8 @@ impl ControllerFactory for BrutalConfig {
             brutal_tx_bps: 0,
             #[cfg(feature = "brutal-ack-batch-trace")]
             pending_ack_trace: 0,
+            #[cfg(feature = "brutal-pacing-trace")]
+            pacing_trace: None,
             brutal,
             bbr: Some(Bbr::new(self.bbr_config.clone(), current_mtu)),
             brutal_active: false,
@@ -73,7 +77,192 @@ struct BrutalController {
     brutal_tx_bps: u64,
     #[cfg(feature = "brutal-ack-batch-trace")]
     pending_ack_trace: u64,
+    #[cfg(feature = "brutal-pacing-trace")]
+    pacing_trace: Option<PacingPublicationTrace>,
     cached_brutal_window: u64,
+}
+
+#[cfg(feature = "brutal-pacing-trace")]
+#[derive(Clone, Copy)]
+struct PacingTracePolicy {
+    min_update: Duration,
+    delta_fraction: f64,
+    emergency_delta_fraction: Option<f64>,
+}
+
+#[cfg(feature = "brutal-pacing-trace")]
+#[derive(Clone)]
+struct PacingPolicyTrace {
+    policy: PacingTracePolicy,
+    published_rate: u64,
+    last_publish_at: Instant,
+    publications: u64,
+    observations: u64,
+    error_sum: f64,
+    peak_error: f64,
+}
+
+#[cfg(feature = "brutal-pacing-trace")]
+impl PacingPolicyTrace {
+    fn new(policy: PacingTracePolicy, now: Instant, target_rate: u64) -> Self {
+        Self {
+            policy,
+            published_rate: target_rate,
+            last_publish_at: now,
+            publications: 1,
+            observations: 1,
+            error_sum: 0.0,
+            peak_error: 0.0,
+        }
+    }
+
+    fn observe(&mut self, now: Instant, target_rate: u64) {
+        let delta = self.published_rate.abs_diff(target_rate) as f64;
+        let relative_delta = delta / self.published_rate.max(1) as f64;
+        let emergency = self
+            .policy
+            .emergency_delta_fraction
+            .is_some_and(|threshold| relative_delta >= threshold);
+        let interval_ready = now.saturating_duration_since(self.last_publish_at)
+            >= self.policy.min_update;
+
+        if emergency
+            || (interval_ready && relative_delta >= self.policy.delta_fraction)
+        {
+            self.published_rate = target_rate;
+            self.last_publish_at = now;
+            self.publications = self.publications.saturating_add(1);
+        }
+
+        let error = self.published_rate.abs_diff(target_rate) as f64
+            / target_rate.max(1) as f64;
+        self.observations = self.observations.saturating_add(1);
+        self.error_sum += error;
+        self.peak_error = self.peak_error.max(error);
+    }
+
+    fn mean_error_percent(&self) -> f64 {
+        self.error_sum / self.observations.max(1) as f64 * 100.0
+    }
+
+    fn peak_error_percent(&self) -> f64 {
+        self.peak_error * 100.0
+    }
+
+    fn publications_per_second(&self, elapsed: Duration) -> f64 {
+        self.publications as f64 / elapsed.as_secs_f64().max(f64::EPSILON)
+    }
+}
+
+#[cfg(feature = "brutal-pacing-trace")]
+#[derive(Clone)]
+struct PacingPublicationTrace {
+    started_at: Instant,
+    samples: u64,
+    target_rate_min: u64,
+    target_rate_max: u64,
+    ack_rate_min: f64,
+    ack_rate_max: f64,
+    delta_1: PacingPolicyTrace,
+    delta_5: PacingPolicyTrace,
+    delta_5_10ms: PacingPolicyTrace,
+    delta_10: PacingPolicyTrace,
+}
+
+#[cfg(feature = "brutal-pacing-trace")]
+impl PacingPublicationTrace {
+    fn new(now: Instant, target_rate: u64, ack_rate: f64) -> Self {
+        let no_interval = Duration::ZERO;
+        Self {
+            started_at: now,
+            samples: 1,
+            target_rate_min: target_rate,
+            target_rate_max: target_rate,
+            ack_rate_min: ack_rate,
+            ack_rate_max: ack_rate,
+            delta_1: PacingPolicyTrace::new(
+                PacingTracePolicy {
+                    min_update: no_interval,
+                    delta_fraction: 0.01,
+                    emergency_delta_fraction: None,
+                },
+                now,
+                target_rate,
+            ),
+            delta_5: PacingPolicyTrace::new(
+                PacingTracePolicy {
+                    min_update: no_interval,
+                    delta_fraction: 0.05,
+                    emergency_delta_fraction: None,
+                },
+                now,
+                target_rate,
+            ),
+            delta_5_10ms: PacingPolicyTrace::new(
+                PacingTracePolicy {
+                    min_update: Duration::from_millis(10),
+                    delta_fraction: 0.05,
+                    emergency_delta_fraction: Some(0.25),
+                },
+                now,
+                target_rate,
+            ),
+            delta_10: PacingPolicyTrace::new(
+                PacingTracePolicy {
+                    min_update: no_interval,
+                    delta_fraction: 0.10,
+                    emergency_delta_fraction: None,
+                },
+                now,
+                target_rate,
+            ),
+        }
+    }
+
+    fn observe(&mut self, now: Instant, target_rate: u64, ack_rate: f64) {
+        self.samples = self.samples.saturating_add(1);
+        self.target_rate_min = self.target_rate_min.min(target_rate);
+        self.target_rate_max = self.target_rate_max.max(target_rate);
+        self.ack_rate_min = self.ack_rate_min.min(ack_rate);
+        self.ack_rate_max = self.ack_rate_max.max(ack_rate);
+        self.delta_1.observe(now, target_rate);
+        self.delta_5.observe(now, target_rate);
+        self.delta_5_10ms.observe(now, target_rate);
+        self.delta_10.observe(now, target_rate);
+
+        if self.samples.is_multiple_of(PACING_TRACE_REPORT_INTERVAL) {
+            self.report(now);
+        }
+    }
+
+    fn report(&self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.started_at);
+        debug!(
+            samples = self.samples,
+            elapsed_ms = elapsed.as_millis(),
+            target_rate_min = self.target_rate_min,
+            target_rate_max = self.target_rate_max,
+            ack_rate_min = self.ack_rate_min,
+            ack_rate_max = self.ack_rate_max,
+            delta_1_publications = self.delta_1.publications,
+            delta_1_pps = self.delta_1.publications_per_second(elapsed),
+            delta_1_mean_error_percent = self.delta_1.mean_error_percent(),
+            delta_1_peak_error_percent = self.delta_1.peak_error_percent(),
+            delta_5_publications = self.delta_5.publications,
+            delta_5_pps = self.delta_5.publications_per_second(elapsed),
+            delta_5_mean_error_percent = self.delta_5.mean_error_percent(),
+            delta_5_peak_error_percent = self.delta_5.peak_error_percent(),
+            delta_5_10ms_publications = self.delta_5_10ms.publications,
+            delta_5_10ms_pps = self.delta_5_10ms.publications_per_second(elapsed),
+            delta_5_10ms_mean_error_percent = self.delta_5_10ms.mean_error_percent(),
+            delta_5_10ms_peak_error_percent = self.delta_5_10ms.peak_error_percent(),
+            delta_10_publications = self.delta_10.publications,
+            delta_10_pps = self.delta_10.publications_per_second(elapsed),
+            delta_10_mean_error_percent = self.delta_10.mean_error_percent(),
+            delta_10_peak_error_percent = self.delta_10.peak_error_percent(),
+            "brutal pacing publication trace"
+        );
+    }
 }
 
 impl BrutalController {
@@ -110,6 +299,8 @@ impl BrutalController {
         self.brutal_active = true;
         self.brutal_tx_bps = tx_bps;
         self.refresh_brutal_window();
+        #[cfg(feature = "brutal-pacing-trace")]
+        self.initialize_pacing_trace(now);
     }
 
     #[cfg(feature = "brutal-ack-batch-trace")]
@@ -129,6 +320,33 @@ impl BrutalController {
         if self.brutal_active {
             self.cached_brutal_window = self.brutal.window(self.brutal_tx_bps);
         }
+    }
+
+    #[cfg(feature = "brutal-pacing-trace")]
+    fn initialize_pacing_trace(&mut self, now: Instant) {
+        if !self.brutal.debug {
+            return;
+        }
+        let target_rate = self.pacing_target_rate();
+        self.pacing_trace = Some(PacingPublicationTrace::new(
+            now,
+            target_rate,
+            self.brutal.ack_rate,
+        ));
+    }
+
+    #[cfg(feature = "brutal-pacing-trace")]
+    fn trace_pacing_rate(&mut self, now: Instant) {
+        let target_rate = self.pacing_target_rate();
+        let ack_rate = self.brutal.ack_rate;
+        if let Some(trace) = self.pacing_trace.as_mut() {
+            trace.observe(now, target_rate, ack_rate);
+        }
+    }
+
+    #[cfg(feature = "brutal-pacing-trace")]
+    fn pacing_target_rate(&self) -> u64 {
+        ((self.brutal_tx_bps as f64) / self.brutal.ack_rate) as u64
     }
 }
 
@@ -154,6 +372,8 @@ impl Controller for BrutalController {
         }
         self.brutal.on_ack(now, rtt);
         self.refresh_brutal_window();
+        #[cfg(feature = "brutal-pacing-trace")]
+        self.trace_pacing_rate(now);
         #[cfg(feature = "brutal-ack-batch-trace")]
         self.queue_ack_trace();
     }
@@ -187,6 +407,8 @@ impl Controller for BrutalController {
         self.brutal.on_congestion_event(now, lost_bytes);
         if lost_bytes > 0 {
             self.refresh_brutal_window();
+            #[cfg(feature = "brutal-pacing-trace")]
+            self.trace_pacing_rate(now);
         }
     }
 
@@ -519,6 +741,8 @@ mod tests {
             brutal_tx_bps: 0,
             #[cfg(feature = "brutal-ack-batch-trace")]
             pending_ack_trace: 0,
+            #[cfg(feature = "brutal-pacing-trace")]
+            pacing_trace: None,
             brutal,
             bbr: Some(Bbr::new(Arc::new(BbrConfig::default()), 1200)),
             brutal_active: false,
@@ -604,6 +828,52 @@ mod tests {
         assert_eq!(state.ack_batch_trace.batches, 12);
         assert_eq!(state.ack_batch_trace.packets, 194);
         assert_eq!(state.ack_batch_trace.buckets, [1, 1, 2, 2, 2, 2, 2]);
+    }
+
+    #[cfg(feature = "brutal-pacing-trace")]
+    #[test]
+    fn pacing_trace_delta_gate_accumulates_against_last_publication() {
+        let now = Instant::now();
+        let mut trace = PacingPolicyTrace::new(
+            PacingTracePolicy {
+                min_update: Duration::ZERO,
+                delta_fraction: 0.05,
+                emergency_delta_fraction: None,
+            },
+            now,
+            100,
+        );
+
+        trace.observe(now + Duration::from_millis(1), 104);
+        assert_eq!(trace.publications, 1);
+        assert_eq!(trace.published_rate, 100);
+
+        trace.observe(now + Duration::from_millis(2), 105);
+        assert_eq!(trace.publications, 2);
+        assert_eq!(trace.published_rate, 105);
+    }
+
+    #[cfg(feature = "brutal-pacing-trace")]
+    #[test]
+    fn pacing_trace_emergency_delta_bypasses_minimum_interval() {
+        let now = Instant::now();
+        let mut trace = PacingPolicyTrace::new(
+            PacingTracePolicy {
+                min_update: Duration::from_millis(20),
+                delta_fraction: 0.05,
+                emergency_delta_fraction: Some(0.25),
+            },
+            now,
+            100,
+        );
+
+        trace.observe(now + Duration::from_millis(1), 110);
+        assert_eq!(trace.publications, 1);
+        assert_eq!(trace.published_rate, 100);
+
+        trace.observe(now + Duration::from_millis(2), 130);
+        assert_eq!(trace.publications, 2);
+        assert_eq!(trace.published_rate, 130);
     }
 
     #[test]

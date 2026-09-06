@@ -372,6 +372,17 @@ The important fields are `publications_per_second`, mean/p95/peak absolute track
 
 To test the publication rule against the current Brutal loss-compensation behavior instead of arbitrary estimator noise, rerun with `--trace brutal-loss`. That mode deliberately keeps the configured base rate fixed and varies deterministic packet loss in phases; the resulting target changes only as the same 5-second ACK/loss accounting used by the production Brutal controller evolves. It is still a deterministic model rather than a captured production trace, but it is suitable for checking whether timer debounce or rate-delta hysteresis actually matters for the current algorithm before wiring a TCP Brutal2 publisher into the data path.
 
+For a live estimator trace, enable the benchmark-only `brutal-pacing-trace` feature and run the ignored Xray Hysteria2 probe. The test inserts an unprivileged userspace UDP proxy between Xray and Chimera, keeps the handshake/warmup lossless, drops every tenth server-to-client datagram during the loss phase, then disables loss again so the five-second Brutal window can recover:
+
+```bash
+cargo test -p chimera_server_app --features brutal-pacing-trace \
+  --test xray_client_proxy_e2e \
+  xray_hysteria2_brutal_pacing_publication_trace \
+  -- --ignored --nocapture
+```
+
+The trace is compiled out unless the feature is enabled and is runtime-gated by `HYSTERIA_BRUTAL_DEBUG`, so normal data-plane builds pay no trace-state cost. It evaluates the real `tx_bps / ack_rate` sequence against 1%, 5%, and 10% delta gates plus the previous 5% + 10 ms minimum interval + 25% emergency candidate. In three September 2026 loopback runs, each final report contained 1024 estimator samples over 12.3-13.0 seconds with the measured ACK rate falling to roughly 0.90-0.91. The 5% gate published 3-5 times (0.24-0.38/s) with about 1.93-2.85% mean and 4.55-5.26% peak tracking error. Adding the 10 ms interval and emergency bypass produced exactly the same publication count and error in all three runs. A 1% gate published 13-16 times (1.04-1.30/s) for roughly 1% peak error, while 10% published only 1-2 times but allowed about 8.97-11.04% peak stale-rate error. These are controlled loopback traces rather than Internet-wide tuning data, but they support using delta hysteresis as the primary publication gate and do not show a benefit from adding a periodic pacing timer.
+
 ### Brutal ACK accounting microbenchmark
 
 `brutal_ack_rate_bench` isolates the current per-ACK loss-window accounting. It reports both the floating-point ACK-rate calculation alone and a full 10 kHz `record()` model that includes timestamp-to-second conversion, slot lookup, rolling totals, and ACK-rate refresh:
