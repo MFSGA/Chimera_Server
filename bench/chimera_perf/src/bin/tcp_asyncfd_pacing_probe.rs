@@ -105,6 +105,7 @@ mod linux {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
     enum DestinationDrainMode {
         Single,
+        TwoSplices,
         UntilWouldBlock,
     }
 
@@ -112,7 +113,16 @@ mod linux {
         fn as_str(self) -> &'static str {
             match self {
                 Self::Single => "single",
+                Self::TwoSplices => "two-splices",
                 Self::UntilWouldBlock => "until-would-block",
+            }
+        }
+
+        fn max_splice_attempts(self) -> Option<usize> {
+            match self {
+                Self::Single => Some(1),
+                Self::TwoSplices => Some(2),
+                Self::UntilWouldBlock => None,
             }
         }
     }
@@ -1142,9 +1152,10 @@ mod linux {
                 let mut writable = destination.writable().await?;
                 destination_ready_acquisitions =
                     destination_ready_acquisitions.saturating_add(1);
-                if options.destination_drain_mode
-                    == DestinationDrainMode::UntilWouldBlock
-                {
+                if options.destination_drain_mode != DestinationDrainMode::Single {
+                    let max_splice_attempts =
+                        options.destination_drain_mode.max_splice_attempts();
+                    let mut splice_attempts = 0_usize;
                     loop {
                         match writable.try_io(|destination| {
                             splice_once(
@@ -1158,7 +1169,12 @@ mod linux {
                                 pending -= written;
                                 transferred =
                                     transferred.saturating_add(written as u64);
-                                if pending == 0 {
+                                splice_attempts += 1;
+                                if pending == 0
+                                    || max_splice_attempts.is_some_and(|maximum| {
+                                        splice_attempts >= maximum
+                                    })
+                                {
                                     break;
                                 }
                             }
@@ -1621,6 +1637,8 @@ mod linux {
         #[test]
         fn destination_drain_until_would_block_rejects_dynamic_pacing() {
             let mut args = base_args();
+            args.destination_drain_mode = DestinationDrainMode::TwoSplices;
+            assert!(validate_args(&args).is_ok());
             args.destination_drain_mode = DestinationDrainMode::UntilWouldBlock;
             assert!(validate_args(&args).is_ok());
 
