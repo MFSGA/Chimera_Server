@@ -376,7 +376,13 @@ impl Controller for BrutalController {
         if let Some(bbr) = self.bbr.as_mut() {
             bbr.on_ack(now, sent, bytes, app_limited, rtt);
         }
+        #[cfg(feature = "brutal-ack-batch-trace")]
+        let previous_window_inputs = (self.brutal.last_rtt, self.brutal.ack_rate);
         self.brutal.on_ack(now, rtt);
+        #[cfg(feature = "brutal-ack-batch-trace")]
+        self.brutal.record_ack_window_input_trace(
+            previous_window_inputs == (self.brutal.last_rtt, self.brutal.ack_rate),
+        );
         self.refresh_brutal_window();
         #[cfg(feature = "brutal-pacing-trace")]
         self.trace_pacing_rate(now);
@@ -473,6 +479,8 @@ struct AckBatchTrace {
     batches: u64,
     packets: u64,
     buckets: [u64; 7],
+    ack_input_samples: u64,
+    unchanged_window_inputs: u64,
 }
 
 #[derive(Clone)]
@@ -537,6 +545,18 @@ impl BrutalState {
     }
 
     #[cfg(feature = "brutal-ack-batch-trace")]
+    fn record_ack_window_input_trace(&mut self, unchanged: bool) {
+        if !self.debug {
+            return;
+        }
+        let trace = &mut self.ack_batch_trace;
+        trace.ack_input_samples = trace.ack_input_samples.saturating_add(1);
+        trace.unchanged_window_inputs = trace
+            .unchanged_window_inputs
+            .saturating_add(u64::from(unchanged));
+    }
+
+    #[cfg(feature = "brutal-ack-batch-trace")]
     fn record_ack_batch_trace(&mut self, ack_count: u64) {
         if !self.debug {
             return;
@@ -571,6 +591,14 @@ impl BrutalState {
                 size_9_16 = trace.buckets[4],
                 size_17_32 = trace.buckets[5],
                 size_33_plus = trace.buckets[6],
+                ack_input_samples = trace.ack_input_samples,
+                unchanged_window_inputs = trace.unchanged_window_inputs,
+                unchanged_window_input_fraction = if trace.ack_input_samples == 0 {
+                    0.0
+                } else {
+                    trace.unchanged_window_inputs as f64
+                        / trace.ack_input_samples as f64
+                },
                 "brutal ack batch trace"
             );
         }
