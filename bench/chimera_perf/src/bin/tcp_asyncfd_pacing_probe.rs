@@ -53,6 +53,9 @@ mod linux {
         #[arg(long)]
         second_rate_bytes_per_sec: Option<u64>,
 
+        #[arg(long, value_delimiter = ',')]
+        rate_updates_bytes_per_sec: Vec<u64>,
+
         #[arg(long)]
         notsent_lowat_bytes: Option<u32>,
 
@@ -64,6 +67,9 @@ mod linux {
 
         #[arg(long)]
         notsent_lowat_max_bytes: Option<u32>,
+
+        #[arg(long, default_value_t = 0.0)]
+        notsent_lowat_update_threshold_percent: f64,
 
         #[arg(long)]
         adaptive_notsent_lowat_bytes: Option<u32>,
@@ -99,11 +105,18 @@ mod linux {
     }
 
     #[derive(Debug, Clone, Copy)]
+    struct RateUpdate {
+        after_bytes: u64,
+        rate: u64,
+        notsent_lowat: Option<u32>,
+    }
+
+    #[derive(Debug, Clone)]
     struct RelayOptions {
-        expected_bytes: u64,
         requested_pipe_size: usize,
-        second_rate: Option<u64>,
-        second_notsent_lowat_update: Option<u32>,
+        initial_notsent_lowat: Option<u32>,
+        rate_updates: Arc<[RateUpdate]>,
+        notsent_lowat_update_threshold_percent: f64,
         adaptive_notsent_lowat: Option<u32>,
         sample_tcp_info: bool,
     }
@@ -118,6 +131,8 @@ mod linux {
         notsent_bytes_at_lowat_restore: Option<u32>,
         adaptive_lowat_applied: bool,
         adaptive_lowat_restores: u64,
+        pacing_updates: u64,
+        notsent_lowat_updates: u64,
     }
 
     #[derive(Debug, Serialize)]
@@ -134,10 +149,12 @@ mod linux {
         pipe_size: usize,
         requested_rate_bytes_per_sec: u64,
         second_rate_bytes_per_sec: Option<u64>,
+        rate_updates_bytes_per_sec: Vec<u64>,
         requested_notsent_lowat_bytes: Option<u32>,
         requested_notsent_lowat_ms: Option<u32>,
         requested_notsent_lowat_min_bytes: Option<u32>,
         requested_notsent_lowat_max_bytes: Option<u32>,
+        notsent_lowat_update_threshold_percent: f64,
         effective_initial_notsent_lowat_bytes: Option<u32>,
         effective_second_notsent_lowat_bytes: Option<u32>,
         adaptive_notsent_lowat_bytes: Option<u32>,
@@ -152,6 +169,8 @@ mod linux {
         notsent_bytes_at_lowat_restore_median: Option<f64>,
         adaptive_lowat_applied_total: u64,
         adaptive_lowat_restores_total: u64,
+        pacing_updates_total: u64,
+        notsent_lowat_updates_total: u64,
         elapsed_seconds: f64,
         aggregate_throughput_gbps: f64,
         per_connection_rate_ratio: f64,
@@ -174,10 +193,12 @@ mod linux {
         pipe_size: usize,
         requested_rate_bytes_per_sec: u64,
         second_rate_bytes_per_sec: Option<u64>,
+        rate_updates_bytes_per_sec: Vec<u64>,
         requested_notsent_lowat_bytes: Option<u32>,
         requested_notsent_lowat_ms: Option<u32>,
         requested_notsent_lowat_min_bytes: Option<u32>,
         requested_notsent_lowat_max_bytes: Option<u32>,
+        notsent_lowat_update_threshold_percent: f64,
         effective_initial_notsent_lowat_bytes: Option<u32>,
         effective_second_notsent_lowat_bytes: Option<u32>,
         adaptive_notsent_lowat_bytes: Option<u32>,
@@ -195,6 +216,8 @@ mod linux {
         notsent_bytes_at_lowat_restore_median: Option<f64>,
         adaptive_lowat_applied_per_connection_median: f64,
         adaptive_lowat_restores_per_connection_median: f64,
+        pacing_updates_per_connection_median: f64,
+        notsent_lowat_updates_per_connection_median: f64,
     }
 
     pub(super) fn run() -> Result<()> {
@@ -224,6 +247,8 @@ mod linux {
         let mut restore_notsent = Vec::new();
         let mut adaptive_applied = Vec::with_capacity(args.runs);
         let mut adaptive_restores = Vec::with_capacity(args.runs);
+        let mut pacing_updates = Vec::with_capacity(args.runs);
+        let mut notsent_lowat_updates = Vec::with_capacity(args.runs);
         for run_index in 0..args.runs {
             let record = runtime.block_on(run_once(&args, run_index, false))?;
             throughput.push(record.aggregate_throughput_gbps);
@@ -256,6 +281,11 @@ mod linux {
                 record.adaptive_lowat_restores_total as f64
                     / args.connections as f64,
             );
+            pacing_updates
+                .push(record.pacing_updates_total as f64 / args.connections as f64);
+            notsent_lowat_updates.push(
+                record.notsent_lowat_updates_total as f64 / args.connections as f64,
+            );
             println!("{}", serde_json::to_string(&record)?);
         }
 
@@ -273,10 +303,13 @@ mod linux {
                 pipe_size: args.pipe_size,
                 requested_rate_bytes_per_sec: args.rate_bytes_per_sec,
                 second_rate_bytes_per_sec: args.second_rate_bytes_per_sec,
+                rate_updates_bytes_per_sec: args.rate_updates_bytes_per_sec.clone(),
                 requested_notsent_lowat_bytes: args.notsent_lowat_bytes,
                 requested_notsent_lowat_ms: args.notsent_lowat_ms,
                 requested_notsent_lowat_min_bytes: args.notsent_lowat_min_bytes,
                 requested_notsent_lowat_max_bytes: args.notsent_lowat_max_bytes,
+                notsent_lowat_update_threshold_percent: args
+                    .notsent_lowat_update_threshold_percent,
                 effective_initial_notsent_lowat_bytes: initial_notsent_lowat,
                 effective_second_notsent_lowat_bytes: second_notsent_lowat,
                 adaptive_notsent_lowat_bytes: args.adaptive_notsent_lowat_bytes,
@@ -305,6 +338,12 @@ mod linux {
                 adaptive_lowat_restores_per_connection_median: round(median(
                     &adaptive_restores,
                 )),
+                pacing_updates_per_connection_median: round(
+                    median(&pacing_updates,)
+                ),
+                notsent_lowat_updates_per_connection_median: round(median(
+                    &notsent_lowat_updates,
+                )),
             })?
         );
         Ok(())
@@ -326,9 +365,21 @@ mod linux {
         if args.pipe_size == 0 || args.pipe_size > i32::MAX as usize {
             bail!("--pipe-size must be between 1 and i32::MAX");
         }
-        if args.rate_bytes_per_sec == 0 || args.second_rate_bytes_per_sec == Some(0)
+        if args.rate_bytes_per_sec == 0
+            || args.second_rate_bytes_per_sec == Some(0)
+            || args.rate_updates_bytes_per_sec.contains(&0)
         {
             bail!("pacing rates must be greater than zero");
+        }
+        if args.second_rate_bytes_per_sec.is_some()
+            && !args.rate_updates_bytes_per_sec.is_empty()
+        {
+            bail!(
+                "--second-rate-bytes-per-sec and --rate-updates-bytes-per-sec are mutually exclusive"
+            );
+        }
+        if args.rate_updates_bytes_per_sec.len() > 64 {
+            bail!("--rate-updates-bytes-per-sec supports at most 64 updates");
         }
         let lowat_modes = usize::from(args.notsent_lowat_bytes.is_some())
             + usize::from(args.notsent_lowat_ms.is_some())
@@ -340,6 +391,20 @@ mod linux {
         }
         if args.notsent_lowat_ms == Some(0) {
             bail!("--notsent-lowat-ms must be greater than zero");
+        }
+        if !args.notsent_lowat_update_threshold_percent.is_finite()
+            || !(0.0..=100.0).contains(&args.notsent_lowat_update_threshold_percent)
+        {
+            bail!(
+                "--notsent-lowat-update-threshold-percent must be between 0 and 100"
+            );
+        }
+        if args.notsent_lowat_update_threshold_percent > 0.0
+            && args.notsent_lowat_ms.is_none()
+        {
+            bail!(
+                "--notsent-lowat-update-threshold-percent requires --notsent-lowat-ms"
+            );
         }
         if (args.notsent_lowat_min_bytes.is_some()
             || args.notsent_lowat_max_bytes.is_some())
@@ -354,15 +419,21 @@ mod linux {
         {
             bail!("bounded TCP_NOTSENT_LOWAT values must be greater than zero");
         }
-        if let (Some(minimum), Some(maximum)) = (
-            args.notsent_lowat_min_bytes,
-            args.notsent_lowat_max_bytes,
-        ) && minimum > maximum
+        if let (Some(minimum), Some(maximum)) =
+            (args.notsent_lowat_min_bytes, args.notsent_lowat_max_bytes)
+            && minimum > maximum
         {
-            bail!("--notsent-lowat-min-bytes cannot exceed --notsent-lowat-max-bytes");
+            bail!(
+                "--notsent-lowat-min-bytes cannot exceed --notsent-lowat-max-bytes"
+            );
         }
         let _ = resolved_static_lowats(args)?;
         if args.adaptive_notsent_lowat_bytes.is_some() {
+            if !args.rate_updates_bytes_per_sec.is_empty() {
+                bail!(
+                    "--adaptive-notsent-lowat-bytes does not support --rate-updates-bytes-per-sec"
+                );
+            }
             let Some(second_rate) = args.second_rate_bytes_per_sec else {
                 bail!(
                     "--adaptive-notsent-lowat-bytes requires --second-rate-bytes-per-sec"
@@ -382,10 +453,7 @@ mod linux {
 
     fn resolved_static_lowats(args: &Args) -> Result<(Option<u32>, Option<u32>)> {
         if let Some(bytes) = args.notsent_lowat_bytes {
-            return Ok((
-                Some(bytes),
-                args.second_rate_bytes_per_sec.map(|_| bytes),
-            ));
+            return Ok((Some(bytes), args.second_rate_bytes_per_sec.map(|_| bytes)));
         }
         let Some(milliseconds) = args.notsent_lowat_ms else {
             return Ok((None, None));
@@ -416,8 +484,9 @@ mod linux {
         minimum: Option<u32>,
         maximum: Option<u32>,
     ) -> Result<u32> {
-        let mut bytes =
-            (u128::from(rate_bytes_per_sec) * u128::from(milliseconds) / 1_000).max(1);
+        let mut bytes = (u128::from(rate_bytes_per_sec) * u128::from(milliseconds)
+            / 1_000)
+            .max(1);
         if let Some(minimum) = minimum {
             bytes = bytes.max(u128::from(minimum));
         }
@@ -431,6 +500,54 @@ mod linux {
         })
     }
 
+    fn requested_rate_updates(args: &Args) -> Vec<u64> {
+        if let Some(second) = args.second_rate_bytes_per_sec {
+            vec![second]
+        } else {
+            args.rate_updates_bytes_per_sec.clone()
+        }
+    }
+
+    fn build_rate_updates(args: &Args) -> Result<Vec<RateUpdate>> {
+        let rates = requested_rate_updates(args);
+        if rates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let phases = rates.len() as u64 + 1;
+        let mut updates = Vec::with_capacity(rates.len());
+        for (index, rate) in rates.into_iter().enumerate() {
+            let after_bytes =
+                args.bytes_per_connection.saturating_mul(index as u64 + 1) / phases;
+            let notsent_lowat = match args.notsent_lowat_ms {
+                Some(milliseconds) => Some(queue_time_lowat_bytes(
+                    rate,
+                    milliseconds,
+                    args.notsent_lowat_min_bytes,
+                    args.notsent_lowat_max_bytes,
+                )?),
+                None => None,
+            };
+            updates.push(RateUpdate {
+                after_bytes,
+                rate,
+                notsent_lowat,
+            });
+        }
+        Ok(updates)
+    }
+
+    fn should_publish_lowat(
+        last_published: u32,
+        candidate: u32,
+        threshold_percent: f64,
+    ) -> bool {
+        if candidate == last_published {
+            return false;
+        }
+        let delta = last_published.abs_diff(candidate) as f64;
+        delta * 100.0 / last_published as f64 >= threshold_percent
+    }
+
     async fn run_once(
         args: &Args,
         run_index: usize,
@@ -438,6 +555,7 @@ mod linux {
     ) -> Result<RunRecord> {
         let (initial_notsent_lowat, second_notsent_lowat) =
             resolved_static_lowats(args)?;
+        let rate_updates: Arc<[RateUpdate]> = build_rate_updates(args)?.into();
         let barrier = Arc::new(Barrier::new(args.connections * 3 + 1));
         let mut writers = Vec::with_capacity(args.connections);
         let mut relays = Vec::with_capacity(args.connections);
@@ -475,10 +593,11 @@ mod linux {
             let chunk_size = args.chunk_size;
             let verify = args.verify;
             let relay_options = RelayOptions {
-                expected_bytes: bytes,
                 requested_pipe_size: args.pipe_size,
-                second_rate: args.second_rate_bytes_per_sec,
-                second_notsent_lowat_update: args.notsent_lowat_ms.and(second_notsent_lowat),
+                initial_notsent_lowat,
+                rate_updates: Arc::clone(&rate_updates),
+                notsent_lowat_update_threshold_percent: args
+                    .notsent_lowat_update_threshold_percent,
                 adaptive_notsent_lowat: args.adaptive_notsent_lowat_bytes,
                 sample_tcp_info: args.sample_tcp_info,
             };
@@ -577,6 +696,14 @@ mod linux {
             .iter()
             .map(|stats| stats.adaptive_lowat_restores)
             .sum::<u64>();
+        let pacing_updates_total = relay_stats
+            .iter()
+            .map(|stats| stats.pacing_updates)
+            .sum::<u64>();
+        let notsent_lowat_updates_total = relay_stats
+            .iter()
+            .map(|stats| stats.notsent_lowat_updates)
+            .sum::<u64>();
         let expected_rate = effective_requested_rate(args);
         let per_connection_observed_rate =
             args.bytes_per_connection as f64 / elapsed;
@@ -595,10 +722,13 @@ mod linux {
             pipe_size: args.pipe_size,
             requested_rate_bytes_per_sec: args.rate_bytes_per_sec,
             second_rate_bytes_per_sec: args.second_rate_bytes_per_sec,
+            rate_updates_bytes_per_sec: args.rate_updates_bytes_per_sec.clone(),
             requested_notsent_lowat_bytes: args.notsent_lowat_bytes,
             requested_notsent_lowat_ms: args.notsent_lowat_ms,
             requested_notsent_lowat_min_bytes: args.notsent_lowat_min_bytes,
             requested_notsent_lowat_max_bytes: args.notsent_lowat_max_bytes,
+            notsent_lowat_update_threshold_percent: args
+                .notsent_lowat_update_threshold_percent,
             effective_initial_notsent_lowat_bytes: initial_notsent_lowat,
             effective_second_notsent_lowat_bytes: second_notsent_lowat,
             adaptive_notsent_lowat_bytes: args.adaptive_notsent_lowat_bytes,
@@ -620,6 +750,8 @@ mod linux {
                 .then(|| round(median(&restore_notsent))),
             adaptive_lowat_applied_total,
             adaptive_lowat_restores_total,
+            pacing_updates_total,
+            notsent_lowat_updates_total,
             elapsed_seconds: round(elapsed),
             aggregate_throughput_gbps: round(
                 total_bytes as f64 * 8.0 / elapsed / 1e9,
@@ -706,8 +838,10 @@ mod linux {
         let mut adaptive_lowat_active = false;
         let mut adaptive_lowat_observed_block = false;
         let mut adaptive_lowat_restores = 0_u64;
-        let switch_after = options.expected_bytes / 2;
-        let mut pacing_updated = false;
+        let mut pacing_updates = 0_u64;
+        let mut notsent_lowat_updates = 0_u64;
+        let mut next_rate_update = 0_usize;
+        let mut last_published_lowat = options.initial_notsent_lowat;
         barrier.wait().await;
 
         loop {
@@ -734,29 +868,55 @@ mod linux {
                     Ok(Ok(written)) => {
                         pending -= written;
                         transferred += written as u64;
-                        if !pacing_updated
-                            && transferred >= switch_after
-                            && let Some(rate) = options.second_rate
+                        while let Some(update) = options
+                            .rate_updates
+                            .get(next_rate_update)
+                            .copied()
+                            .filter(|update| transferred >= update.after_bytes)
                         {
                             let destination_fd = destination.get_ref().as_raw_fd();
-                            let queued = get_notsent_bytes(destination_fd)?;
-                            notsent_bytes_at_rate_update = Some(queued);
-                            if options.sample_tcp_info {
-                                tcp_info_at_rate_update =
-                                    Some(get_tcp_info(destination_fd)?);
+                            let need_queued = notsent_bytes_at_rate_update.is_none()
+                                || options.adaptive_notsent_lowat.is_some();
+                            let queued = need_queued
+                                .then(|| get_notsent_bytes(destination_fd))
+                                .transpose()?;
+                            if notsent_bytes_at_rate_update.is_none() {
+                                notsent_bytes_at_rate_update = queued;
+                                if options.sample_tcp_info {
+                                    tcp_info_at_rate_update =
+                                        Some(get_tcp_info(destination_fd)?);
+                                }
                             }
-                            if let Some(lowat) = options.second_notsent_lowat_update {
-                                set_tcp_notsent_lowat(destination_fd, lowat)?;
+                            if let Some(candidate) = update.notsent_lowat {
+                                let publish = match last_published_lowat {
+                                    Some(last) => should_publish_lowat(
+                                        last,
+                                        candidate,
+                                        options
+                                            .notsent_lowat_update_threshold_percent,
+                                    ),
+                                    None => true,
+                                };
+                                if publish {
+                                    set_tcp_notsent_lowat(
+                                        destination_fd,
+                                        candidate,
+                                    )?;
+                                    last_published_lowat = Some(candidate);
+                                    notsent_lowat_updates =
+                                        notsent_lowat_updates.saturating_add(1);
+                                }
                             }
-                            set_max_pacing_rate(destination_fd, rate)?;
+                            set_max_pacing_rate(destination_fd, update.rate)?;
+                            pacing_updates = pacing_updates.saturating_add(1);
                             if let Some(lowat) = options.adaptive_notsent_lowat
-                                && queued > lowat
+                                && queued.is_some_and(|queued| queued > lowat)
                             {
                                 set_tcp_notsent_lowat(destination_fd, lowat)?;
                                 adaptive_lowat_applied = true;
                                 adaptive_lowat_active = true;
                             }
-                            pacing_updated = true;
+                            next_rate_update += 1;
                         }
                     }
                     Ok(Err(error)) => return Err(error),
@@ -791,6 +951,8 @@ mod linux {
                         notsent_bytes_at_lowat_restore,
                         adaptive_lowat_applied,
                         adaptive_lowat_restores,
+                        pacing_updates,
+                        notsent_lowat_updates,
                     });
                 }
                 Ok(Ok(read)) => pending = read,
@@ -970,12 +1132,11 @@ mod linux {
     }
 
     fn effective_requested_rate(args: &Args) -> f64 {
-        match args.second_rate_bytes_per_sec {
-            Some(second) => {
-                2.0 / (1.0 / args.rate_bytes_per_sec as f64 + 1.0 / second as f64)
-            }
-            None => args.rate_bytes_per_sec as f64,
-        }
+        let updates = requested_rate_updates(args);
+        let phase_count = updates.len() as f64 + 1.0;
+        let reciprocal_sum = 1.0 / args.rate_bytes_per_sec as f64
+            + updates.iter().map(|rate| 1.0 / *rate as f64).sum::<f64>();
+        phase_count / reciprocal_sum
     }
 
     fn usage() -> io::Result<Usage> {
@@ -1014,10 +1175,12 @@ mod linux {
                 chunk_size: 1,
                 rate_bytes_per_sec: 100,
                 second_rate_bytes_per_sec: None,
+                rate_updates_bytes_per_sec: Vec::new(),
                 notsent_lowat_bytes: None,
                 notsent_lowat_ms: None,
                 notsent_lowat_min_bytes: None,
                 notsent_lowat_max_bytes: None,
+                notsent_lowat_update_threshold_percent: 0.0,
                 adaptive_notsent_lowat_bytes: None,
                 pipe_size: 4096,
                 warmup: 0,
@@ -1046,6 +1209,37 @@ mod linux {
             let mut args = base_args();
             args.second_rate_bytes_per_sec = Some(25);
             assert_eq!(effective_requested_rate(&args), 40.0);
+
+            args.second_rate_bytes_per_sec = None;
+            args.rate_updates_bytes_per_sec = vec![50, 25];
+            assert!((effective_requested_rate(&args) - 300.0 / 7.0).abs() < 1e-12);
+        }
+
+        #[test]
+        fn rate_updates_split_transfer_into_equal_byte_phases() {
+            let mut args = base_args();
+            args.bytes_per_connection = 400;
+            args.rate_updates_bytes_per_sec = vec![95, 105, 90];
+            let updates = build_rate_updates(&args).unwrap();
+            assert_eq!(
+                updates
+                    .iter()
+                    .map(|update| update.after_bytes)
+                    .collect::<Vec<_>>(),
+                vec![100, 200, 300]
+            );
+            assert_eq!(
+                updates.iter().map(|update| update.rate).collect::<Vec<_>>(),
+                vec![95, 105, 90]
+            );
+        }
+
+        #[test]
+        fn lowat_publication_gate_accumulates_against_last_publication() {
+            assert!(!should_publish_lowat(1_000, 1_090, 12.5));
+            assert!(should_publish_lowat(1_000, 1_125, 12.5));
+            assert!(should_publish_lowat(1_000, 870, 12.5));
+            assert!(!should_publish_lowat(1_000, 1_000, 0.0));
         }
 
         #[test]
@@ -1105,6 +1299,21 @@ mod linux {
         }
 
         #[test]
+        fn publication_sequence_and_lowat_gate_validate_together() {
+            let mut args = base_args();
+            args.second_rate_bytes_per_sec = Some(90);
+            args.rate_updates_bytes_per_sec = vec![95, 105];
+            assert!(validate_args(&args).is_err());
+
+            args.second_rate_bytes_per_sec = None;
+            args.notsent_lowat_update_threshold_percent = 12.5;
+            assert!(validate_args(&args).is_err());
+
+            args.notsent_lowat_ms = Some(32);
+            assert!(validate_args(&args).is_ok());
+        }
+
+        #[test]
         fn adaptive_lowat_requires_a_rate_decrease() {
             let mut args = base_args();
             args.second_rate_bytes_per_sec = Some(100);
@@ -1125,6 +1334,26 @@ mod linux {
             args.notsent_lowat_bytes = None;
             args.adaptive_notsent_lowat_bytes = Some(512 * 1024);
             assert!(validate_args(&args).is_err());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn multi_stage_rate_updates_preserve_payload_and_gate_lowat() {
+            let mut args = base_args();
+            args.worker_threads = 2;
+            args.bytes_per_connection = 512 * 1024;
+            args.chunk_size = 16 * 1024;
+            args.rate_bytes_per_sec = 64 * 1024 * 1024;
+            args.rate_updates_bytes_per_sec =
+                vec![56 * 1024 * 1024, 64 * 1024 * 1024];
+            args.notsent_lowat_ms = Some(32);
+            args.notsent_lowat_update_threshold_percent = 10.0;
+            args.pipe_size = 128 * 1024;
+            args.verify = true;
+
+            let record = run_once(&args, 0, false).await.unwrap();
+            assert_eq!(record.total_bytes, args.bytes_per_connection);
+            assert_eq!(record.pacing_updates_total, 2);
+            assert_eq!(record.notsent_lowat_updates_total, 2);
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
