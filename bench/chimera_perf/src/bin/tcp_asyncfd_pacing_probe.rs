@@ -212,6 +212,7 @@ mod linux {
         pipe_size: usize,
         actual_pipe_capacity_min: usize,
         actual_pipe_capacity_max: usize,
+        pipe_capacity_shortfall_connections: u64,
         unpaced: bool,
         destination_drain_mode: &'static str,
         requested_rate_bytes_per_sec: Option<u64>,
@@ -271,6 +272,7 @@ mod linux {
         pipe_size: usize,
         actual_pipe_capacity_min: usize,
         actual_pipe_capacity_max: usize,
+        pipe_capacity_shortfall_connections_median: f64,
         unpaced: bool,
         destination_drain_mode: &'static str,
         requested_rate_bytes_per_sec: Option<u64>,
@@ -331,6 +333,7 @@ mod linux {
         let mut ratios = Vec::with_capacity(args.runs);
         let mut actual_pipe_capacity_min = Vec::with_capacity(args.runs);
         let mut actual_pipe_capacity_max = Vec::with_capacity(args.runs);
+        let mut pipe_capacity_shortfalls = Vec::with_capacity(args.runs);
         let mut cpu_per_gib = Vec::with_capacity(args.runs);
         let mut context_switches = Vec::with_capacity(args.runs);
         let mut destination_ready_acquisitions = Vec::with_capacity(args.runs);
@@ -359,6 +362,9 @@ mod linux {
             }
             actual_pipe_capacity_min.push(record.actual_pipe_capacity_min);
             actual_pipe_capacity_max.push(record.actual_pipe_capacity_max);
+            pipe_capacity_shortfalls.push(
+                record.pipe_capacity_shortfall_connections as f64,
+            );
             cpu_per_gib.push(record.cpu_seconds_per_gib);
             context_switches.push(
                 (record.voluntary_context_switches
@@ -445,6 +451,9 @@ mod linux {
                     .iter()
                     .max()
                     .expect("at least one measured run"),
+                pipe_capacity_shortfall_connections_median: round(median(
+                    &pipe_capacity_shortfalls,
+                )),
                 unpaced: args.unpaced,
                 destination_drain_mode: args.destination_drain_mode.as_str(),
                 requested_rate_bytes_per_sec: (!args.unpaced)
@@ -882,6 +891,10 @@ mod linux {
             .map(|stats| stats.pipe_capacity)
             .max()
             .expect("at least one relay");
+        let pipe_capacity_shortfall_connections = relay_stats
+            .iter()
+            .filter(|stats| stats.pipe_capacity < args.pipe_size)
+            .count() as u64;
         let destination_ready_acquisitions_total = relay_stats
             .iter()
             .map(|stats| stats.destination_ready_acquisitions)
@@ -990,6 +1003,7 @@ mod linux {
             pipe_size: args.pipe_size,
             actual_pipe_capacity_min,
             actual_pipe_capacity_max,
+            pipe_capacity_shortfall_connections,
             unpaced: args.unpaced,
             destination_drain_mode: args.destination_drain_mode.as_str(),
             requested_rate_bytes_per_sec: (!args.unpaced)
@@ -1879,6 +1893,7 @@ mod linux {
                 record.actual_pipe_capacity_max
             );
             assert!(record.actual_pipe_capacity_min > 0);
+            assert_eq!(record.pipe_capacity_shortfall_connections, 0);
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
