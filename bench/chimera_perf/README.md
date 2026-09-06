@@ -129,7 +129,7 @@ The target and generator support `--worker-threads` so each process can be pinne
 
 `CHIMERA_TCP_COPY_BUFFER_SIZE` accepts 4096 through 1048576 bytes. The measured production default is 32768 bytes: it preserved the 64 KiB candidate's 64-connection throughput while reducing peak RSS, and it was dramatically faster than 8 KiB for a single long flow. On Linux `auto`, when this environment variable is unset, the successful `splice-downlink` path uses a measured 64 KiB buffer only for its remaining userspace uplink direction. Prelude, fallback, and all-userspace relays keep the 32 KiB default, and any explicit `CHIMERA_TCP_COPY_BUFFER_SIZE` value is preserved unchanged.
 
-`CHIMERA_TCP_SPLICE_PIPE_SIZE` accepts 4096 through 1048576 bytes. The current measured default is 131072 bytes; the larger pipe reduces steady-state splice syscall frequency while bounding the two-direction pipe footprint to 256 KiB per full-splice relay.
+`CHIMERA_TCP_SPLICE_PIPE_SIZE` accepts 4096 through 1048576 bytes. The current measured default is 131072 bytes; the larger pipe reduces steady-state splice syscall frequency while bounding the two-direction pipe capacity to 256 KiB per full-splice relay. A September 2026 concurrency recheck below still favors 128 KiB over either 64 KiB or 256 KiB, so the default remains unchanged.
 
 Completed TCP-forward logs include three structured relay-attribution fields:
 
@@ -261,6 +261,32 @@ Linux `auto` fast path, also test eight simultaneous `tokio-copy` probes because
 the default auto splice threshold is eight connections; the single-direction
 uplink buffer is intentionally tuned independently from the all-userspace
 32 KiB default.
+
+For splice-pipe experiments, add `--splice-pipe-size N` with `--backend splice`.
+When that flag is absent, `relay_probe` preserves its historical pipe behavior;
+when present, it mirrors production by requesting `F_SETPIPE_SZ`, reporting the
+actual kernel capacity, and using that capacity as the source-to-pipe splice
+length. On the September 2026 host, 64/128/256 KiB were all granted exactly.
+A 32 MiB `strace -f -c -e splice,pipe2,fcntl` run measured 1025, 643, and 533
+`splice` calls respectively: moving 64→128 KiB removed about 37% of calls, while
+128→256 KiB removed only another 17%, showing clear diminishing syscall returns.
+
+The same candidate was then tested as concurrent batches of independent
+single-direction probes pinned to CPUs 0-7. With c16 and 512 MiB/flow, aggregate
+throughput medians were 75.05, 80.91, and 79.72 Gbit/s for 64/128/256 KiB; CVs
+were 1.54%, 1.16%, and 1.91%, while CPU cost was 0.638, 0.603, and 0.612
+seconds/GiB. Thus 128 KiB beat 64 KiB by about 7.8% throughput and 5.5% CPU/GiB,
+and beat 256 KiB by about 1.5% throughput and 1.4% CPU/GiB. With c64 and
+256 MiB/flow, medians were 70.17, 70.78, and 68.74 Gbit/s with 0.45%, 0.58%,
+and 2.03% CV; CPU/GiB was 0.680, 0.687, and 0.692 seconds. At that concurrency
+128 KiB retained a small throughput gain over 64 KiB and was about 3.0% faster
+than 256 KiB with slightly lower CPU cost. Service-level cgroup `memory.current`
+peak deltas were not monotonic across pipe sizes and are treated as noise rather
+than pipe-memory evidence. The deterministic capacity bound still matters:
+raising a full-splice relay from 128 to 256 KiB adds up to 256 KiB of two-direction
+pipe capacity per connection, or 16 MiB across c64. These results support keeping
+the 128 KiB production default rather than trading more capacity for the smaller
+remaining syscall reduction.
 
 `tcp_copy_finish_bench` isolates the EOF completion path used by the
 single-direction userspace relay. Tokio `copy_buf` already polls `flush` after
