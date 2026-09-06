@@ -363,6 +363,29 @@ A five-run c64 32→25 MiB/s workload is closer to the 20-25% rate reductions se
 
 `--adaptive-notsent-lowat-bytes N` models a rejected event-driven alternative: on a pacing decrease, it sets `TCP_NOTSENT_LOWAT` only if the already-queued bytes exceed `N`, waits until the low-water has caused a destination `WouldBlock`, then restores the socket override to zero at the next writable notification. This avoids a timer and, in `strace`, costs exactly two additional `setsockopt` calls per connection plus one restore-time `SIOCOUTQNSD` sample. It does **not** solve the queue problem because the stale bytes were already admitted before the rate decrease. In the c64 32→25 MiB/s workload, 512 KiB adaptive mode restored at a median 261,932 queued bytes but improved tracking only from 0.880580x to 0.892072x, far behind either static low-water. The probe keeps this negative result so future work does not repeat the same post-update strategy.
 
+Use `--sample-tcp-info` when the experiment needs the destination socket's measured RTT and congestion-window state at the midpoint update. The flag adds one `getsockopt(TCP_INFO)` per dynamic flow and is off by default so existing syscall baselines remain unchanged. The report includes `tcp_rtt_us_at_rate_update_median`, approximate unacked bytes, and approximate sender-cwnd bytes. An isolated user/network namespace can add real kernel delay without modifying the host qdisc:
+
+```bash
+unshare -Urn sh -c '
+  ip link set lo up
+  tc qdisc add dev lo root netem delay 15ms limit 100000
+  bench/chimera_perf/target/release/tcp_asyncfd_pacing_probe \
+    --connections 16 \
+    --worker-threads 4 \
+    --bytes-per-connection 16777216 \
+    --rate-bytes-per-sec 33554432 \
+    --second-rate-bytes-per-sec 26214400 \
+    --notsent-lowat-bytes 1048576 \
+    --sample-tcp-info \
+    --warmup 1 \
+    --runs 3
+'
+```
+
+A September 2026 c16 32→25 MiB/s RTT sweep showed that the static 1 MiB candidate is useful only while unsent queue depth is a material part of the transition. With no netem, measured RTT was about 1.5 ms: 1 MiB reduced midpoint `SIOCOUTQNSD` from 2.39 MiB to 0.80 MiB and improved the aggregate rate ratio from 0.967x to 0.995x. With 5 ms one-way netem (about 11.6 ms measured RTT), it reduced 2.75 MiB to 0.80 MiB and improved 0.895x to 0.922x. With 15 ms one-way netem (about 31.5 ms RTT), it reduced 2.52 MiB to 0.99 MiB and improved 0.726x to 0.752x; a focused c16 `strace` increased tracked calls from 5045 to 5298 (+5.0%), mainly additional failed `splice` attempts. At roughly 31 ms RTT, 512 KiB gained only another ~0.5 percentage point of rate tracking while nearly doubling destination `WouldBlock` events relative to 1 MiB.
+
+The high-RTT boundary is a negative result. At about 82 ms measured RTT, a longer c4/64 MiB-per-flow run reported about 2.68 MiB unacked and a 5.6 MiB sender cwnd at the update, while unsent backlog was only around 0.6-1.0 MiB. Default, 1 MiB, 2 MiB, and 4 MiB low-water variants all tracked only about 0.76-0.78x, with no repeatable low-water gain. The new 25 MiB/s target has roughly a 2 MiB one-RTT BDP at that RTT, so even choosing a low-water near one BDP does not rescue the transition once RTT/cwnd rather than unsent queue is dominant. Do not infer a universal fixed or BDP-scaled `TCP_NOTSENT_LOWAT` rule from the low-RTT data; any future Brutal2-specific policy needs an applicability gate and representative Internet-path validation.
+
 Use `strace` to attribute userspace pacing wakeups:
 
 ```bash

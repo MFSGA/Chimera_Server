@@ -69,6 +69,9 @@ mod linux {
         runs: usize,
 
         #[arg(long)]
+        sample_tcp_info: bool,
+
+        #[arg(long)]
         verify: bool,
     }
 
@@ -79,12 +82,29 @@ mod linux {
         involuntary_context_switches: i64,
     }
 
+    #[derive(Debug, Clone, Copy)]
+    struct TcpInfoSample {
+        rtt_us: u32,
+        unacked_bytes: u64,
+        snd_cwnd_bytes: u64,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct RelayOptions {
+        expected_bytes: u64,
+        requested_pipe_size: usize,
+        second_rate: Option<u64>,
+        adaptive_notsent_lowat: Option<u32>,
+        sample_tcp_info: bool,
+    }
+
     #[derive(Debug)]
     struct RelayStats {
         bytes: u64,
         destination_would_blocks: u64,
         source_would_blocks: u64,
         notsent_bytes_at_rate_update: Option<u32>,
+        tcp_info_at_rate_update: Option<TcpInfoSample>,
         notsent_bytes_at_lowat_restore: Option<u32>,
         adaptive_lowat_applied: bool,
         adaptive_lowat_restores: u64,
@@ -106,10 +126,14 @@ mod linux {
         second_rate_bytes_per_sec: Option<u64>,
         requested_notsent_lowat_bytes: Option<u32>,
         adaptive_notsent_lowat_bytes: Option<u32>,
+        sample_tcp_info: bool,
         destination_would_blocks_total: u64,
         destination_would_blocks_per_connection: f64,
         source_would_blocks_total: u64,
         notsent_bytes_at_rate_update_median: Option<f64>,
+        tcp_rtt_us_at_rate_update_median: Option<f64>,
+        tcp_unacked_bytes_at_rate_update_median: Option<f64>,
+        tcp_snd_cwnd_bytes_at_rate_update_median: Option<f64>,
         notsent_bytes_at_lowat_restore_median: Option<f64>,
         adaptive_lowat_applied_total: u64,
         adaptive_lowat_restores_total: u64,
@@ -137,6 +161,7 @@ mod linux {
         second_rate_bytes_per_sec: Option<u64>,
         requested_notsent_lowat_bytes: Option<u32>,
         adaptive_notsent_lowat_bytes: Option<u32>,
+        sample_tcp_info: bool,
         aggregate_throughput_median_gbps: f64,
         throughput_cv: f64,
         per_connection_rate_ratio_median: f64,
@@ -144,6 +169,9 @@ mod linux {
         context_switches_median: f64,
         destination_would_blocks_per_connection_median: f64,
         notsent_bytes_at_rate_update_median: Option<f64>,
+        tcp_rtt_us_at_rate_update_median: Option<f64>,
+        tcp_unacked_bytes_at_rate_update_median: Option<f64>,
+        tcp_snd_cwnd_bytes_at_rate_update_median: Option<f64>,
         notsent_bytes_at_lowat_restore_median: Option<f64>,
         adaptive_lowat_applied_per_connection_median: f64,
         adaptive_lowat_restores_per_connection_median: f64,
@@ -168,6 +196,9 @@ mod linux {
         let mut context_switches = Vec::with_capacity(args.runs);
         let mut destination_blocks = Vec::with_capacity(args.runs);
         let mut notsent = Vec::new();
+        let mut tcp_rtt = Vec::new();
+        let mut tcp_unacked = Vec::new();
+        let mut tcp_cwnd = Vec::new();
         let mut restore_notsent = Vec::new();
         let mut adaptive_applied = Vec::with_capacity(args.runs);
         let mut adaptive_restores = Vec::with_capacity(args.runs);
@@ -183,6 +214,15 @@ mod linux {
             destination_blocks.push(record.destination_would_blocks_per_connection);
             if let Some(bytes) = record.notsent_bytes_at_rate_update_median {
                 notsent.push(bytes);
+            }
+            if let Some(rtt_us) = record.tcp_rtt_us_at_rate_update_median {
+                tcp_rtt.push(rtt_us);
+            }
+            if let Some(bytes) = record.tcp_unacked_bytes_at_rate_update_median {
+                tcp_unacked.push(bytes);
+            }
+            if let Some(bytes) = record.tcp_snd_cwnd_bytes_at_rate_update_median {
+                tcp_cwnd.push(bytes);
             }
             if let Some(bytes) = record.notsent_bytes_at_lowat_restore_median {
                 restore_notsent.push(bytes);
@@ -213,6 +253,7 @@ mod linux {
                 second_rate_bytes_per_sec: args.second_rate_bytes_per_sec,
                 requested_notsent_lowat_bytes: args.notsent_lowat_bytes,
                 adaptive_notsent_lowat_bytes: args.adaptive_notsent_lowat_bytes,
+                sample_tcp_info: args.sample_tcp_info,
                 aggregate_throughput_median_gbps: round(median(&throughput)),
                 throughput_cv: round(coefficient_of_variation(&throughput)),
                 per_connection_rate_ratio_median: round(median(&ratios)),
@@ -223,6 +264,12 @@ mod linux {
                 )),
                 notsent_bytes_at_rate_update_median: (!notsent.is_empty())
                     .then(|| round(median(&notsent))),
+                tcp_rtt_us_at_rate_update_median: (!tcp_rtt.is_empty())
+                    .then(|| round(median(&tcp_rtt))),
+                tcp_unacked_bytes_at_rate_update_median: (!tcp_unacked.is_empty())
+                    .then(|| round(median(&tcp_unacked))),
+                tcp_snd_cwnd_bytes_at_rate_update_median: (!tcp_cwnd.is_empty())
+                    .then(|| round(median(&tcp_cwnd))),
                 notsent_bytes_at_lowat_restore_median: (!restore_notsent.is_empty())
                     .then(|| round(median(&restore_notsent))),
                 adaptive_lowat_applied_per_connection_median: round(median(
@@ -322,9 +369,13 @@ mod linux {
             let bytes = args.bytes_per_connection;
             let chunk_size = args.chunk_size;
             let verify = args.verify;
-            let pipe_size = args.pipe_size;
-            let second_rate = args.second_rate_bytes_per_sec;
-            let adaptive_notsent_lowat = args.adaptive_notsent_lowat_bytes;
+            let relay_options = RelayOptions {
+                expected_bytes: bytes,
+                requested_pipe_size: args.pipe_size,
+                second_rate: args.second_rate_bytes_per_sec,
+                adaptive_notsent_lowat: args.adaptive_notsent_lowat_bytes,
+                sample_tcp_info: args.sample_tcp_info,
+            };
 
             writers.push(tokio::spawn(async move {
                 write_payload(writer, writer_barrier, bytes, chunk_size).await
@@ -333,16 +384,7 @@ mod linux {
                 read_payload(sink, sink_barrier, bytes, chunk_size, verify).await
             }));
             relays.push(tokio::spawn(async move {
-                splice_relay(
-                    source,
-                    destination,
-                    relay_barrier,
-                    bytes,
-                    pipe_size,
-                    second_rate,
-                    adaptive_notsent_lowat,
-                )
-                .await
+                splice_relay(source, destination, relay_barrier, relay_options).await
             }));
         }
 
@@ -395,6 +437,28 @@ mod linux {
             .iter()
             .filter_map(|stats| stats.notsent_bytes_at_rate_update.map(f64::from))
             .collect::<Vec<_>>();
+        let tcp_rtt = relay_stats
+            .iter()
+            .filter_map(|stats| {
+                stats.tcp_info_at_rate_update.map(|info| info.rtt_us as f64)
+            })
+            .collect::<Vec<_>>();
+        let tcp_unacked = relay_stats
+            .iter()
+            .filter_map(|stats| {
+                stats
+                    .tcp_info_at_rate_update
+                    .map(|info| info.unacked_bytes as f64)
+            })
+            .collect::<Vec<_>>();
+        let tcp_cwnd = relay_stats
+            .iter()
+            .filter_map(|stats| {
+                stats
+                    .tcp_info_at_rate_update
+                    .map(|info| info.snd_cwnd_bytes as f64)
+            })
+            .collect::<Vec<_>>();
         let restore_notsent = relay_stats
             .iter()
             .filter_map(|stats| stats.notsent_bytes_at_lowat_restore.map(f64::from))
@@ -427,6 +491,7 @@ mod linux {
             second_rate_bytes_per_sec: args.second_rate_bytes_per_sec,
             requested_notsent_lowat_bytes: args.notsent_lowat_bytes,
             adaptive_notsent_lowat_bytes: args.adaptive_notsent_lowat_bytes,
+            sample_tcp_info: args.sample_tcp_info,
             destination_would_blocks_total,
             destination_would_blocks_per_connection: round(
                 destination_would_blocks_total as f64 / args.connections as f64,
@@ -434,6 +499,12 @@ mod linux {
             source_would_blocks_total,
             notsent_bytes_at_rate_update_median: (!notsent.is_empty())
                 .then(|| round(median(&notsent))),
+            tcp_rtt_us_at_rate_update_median: (!tcp_rtt.is_empty())
+                .then(|| round(median(&tcp_rtt))),
+            tcp_unacked_bytes_at_rate_update_median: (!tcp_unacked.is_empty())
+                .then(|| round(median(&tcp_unacked))),
+            tcp_snd_cwnd_bytes_at_rate_update_median: (!tcp_cwnd.is_empty())
+                .then(|| round(median(&tcp_cwnd))),
             notsent_bytes_at_lowat_restore_median: (!restore_notsent.is_empty())
                 .then(|| round(median(&restore_notsent))),
             adaptive_lowat_applied_total,
@@ -509,24 +580,22 @@ mod linux {
         source: Arc<AsyncFd<OwnedFd>>,
         destination: Arc<AsyncFd<OwnedFd>>,
         barrier: Arc<Barrier>,
-        expected_bytes: u64,
-        requested_pipe_size: usize,
-        second_rate: Option<u64>,
-        adaptive_notsent_lowat: Option<u32>,
+        options: RelayOptions,
     ) -> io::Result<RelayStats> {
         let (pipe_read, pipe_write, pipe_capacity) =
-            nonblocking_pipe(requested_pipe_size)?;
+            nonblocking_pipe(options.requested_pipe_size)?;
         let mut pending = 0_usize;
         let mut transferred = 0_u64;
         let mut destination_would_blocks = 0_u64;
         let mut source_would_blocks = 0_u64;
         let mut notsent_bytes_at_rate_update = None;
+        let mut tcp_info_at_rate_update = None;
         let mut notsent_bytes_at_lowat_restore = None;
         let mut adaptive_lowat_applied = false;
         let mut adaptive_lowat_active = false;
         let mut adaptive_lowat_observed_block = false;
         let mut adaptive_lowat_restores = 0_u64;
-        let switch_after = expected_bytes / 2;
+        let switch_after = options.expected_bytes / 2;
         let mut pacing_updated = false;
         barrier.wait().await;
 
@@ -556,13 +625,17 @@ mod linux {
                         transferred += written as u64;
                         if !pacing_updated
                             && transferred >= switch_after
-                            && let Some(rate) = second_rate
+                            && let Some(rate) = options.second_rate
                         {
                             let destination_fd = destination.get_ref().as_raw_fd();
                             let queued = get_notsent_bytes(destination_fd)?;
                             notsent_bytes_at_rate_update = Some(queued);
+                            if options.sample_tcp_info {
+                                tcp_info_at_rate_update =
+                                    Some(get_tcp_info(destination_fd)?);
+                            }
                             set_max_pacing_rate(destination_fd, rate)?;
-                            if let Some(lowat) = adaptive_notsent_lowat
+                            if let Some(lowat) = options.adaptive_notsent_lowat
                                 && queued > lowat
                             {
                                 set_tcp_notsent_lowat(destination_fd, lowat)?;
@@ -600,6 +673,7 @@ mod linux {
                         destination_would_blocks,
                         source_would_blocks,
                         notsent_bytes_at_rate_update,
+                        tcp_info_at_rate_update,
                         notsent_bytes_at_lowat_restore,
                         adaptive_lowat_applied,
                         adaptive_lowat_restores,
@@ -756,6 +830,31 @@ mod linux {
         }
     }
 
+    fn get_tcp_info(fd: RawFd) -> io::Result<TcpInfoSample> {
+        let mut info = std::mem::MaybeUninit::<libc::tcp_info>::zeroed();
+        let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_INFO,
+                info.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let info = unsafe { info.assume_init() };
+        Ok(TcpInfoSample {
+            rtt_us: info.tcpi_rtt,
+            unacked_bytes: u64::from(info.tcpi_unacked)
+                * u64::from(info.tcpi_snd_mss),
+            snd_cwnd_bytes: u64::from(info.tcpi_snd_cwnd)
+                * u64::from(info.tcpi_snd_mss),
+        })
+    }
+
     fn effective_requested_rate(args: &Args) -> f64 {
         match args.second_rate_bytes_per_sec {
             Some(second) => {
@@ -807,9 +906,17 @@ mod linux {
                 pipe_size: 4096,
                 warmup: 0,
                 runs: 1,
+                sample_tcp_info: false,
                 verify: false,
             };
             assert!(validate_args(&args).is_err());
+        }
+
+        #[test]
+        fn tcp_info_reports_sender_window() {
+            let (client, _server) = tcp_pair().unwrap();
+            let info = get_tcp_info(client.as_raw_fd()).unwrap();
+            assert!(info.snd_cwnd_bytes > 0);
         }
 
         #[test]
@@ -826,6 +933,7 @@ mod linux {
                 pipe_size: 4096,
                 warmup: 0,
                 runs: 1,
+                sample_tcp_info: false,
                 verify: false,
             };
             assert_eq!(effective_requested_rate(&args), 40.0);
@@ -845,6 +953,7 @@ mod linux {
                 pipe_size: 4096,
                 warmup: 0,
                 runs: 1,
+                sample_tcp_info: false,
                 verify: false,
             };
             assert!(validate_args(&args).is_err());
@@ -866,6 +975,7 @@ mod linux {
                 pipe_size: 4096,
                 warmup: 0,
                 runs: 1,
+                sample_tcp_info: false,
                 verify: false,
             };
             assert!(validate_args(&args).is_err());
@@ -885,6 +995,7 @@ mod linux {
                 pipe_size: 128 * 1024,
                 warmup: 0,
                 runs: 1,
+                sample_tcp_info: true,
                 verify: true,
             };
 
