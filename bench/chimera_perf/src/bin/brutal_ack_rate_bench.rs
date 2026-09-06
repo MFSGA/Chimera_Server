@@ -141,6 +141,25 @@ impl RecordState {
         ack_count: u64,
         loss_count: u64,
     ) {
+        self.cached_second_record_inner(now, ack_count, loss_count, false);
+    }
+
+    fn cached_second_record_skip_pristine_rate(
+        &mut self,
+        now: Instant,
+        ack_count: u64,
+        loss_count: u64,
+    ) {
+        self.cached_second_record_inner(now, ack_count, loss_count, true);
+    }
+
+    fn cached_second_record_inner(
+        &mut self,
+        now: Instant,
+        ack_count: u64,
+        loss_count: u64,
+        skip_pristine_rate: bool,
+    ) {
         if self.rolling_timestamp.is_some()
             && now >= self.current_second_start
             && now < self.next_rollover
@@ -150,7 +169,9 @@ impl RecordState {
             info.loss_count += loss_count;
             self.rolling_ack_count += ack_count;
             self.rolling_loss_count += loss_count;
-            self.update_rate();
+            if !(skip_pristine_rate && self.rolling_loss_count == 0) {
+                self.update_rate();
+            }
             return;
         }
 
@@ -174,11 +195,15 @@ impl RecordState {
         self.current_slot = slot;
         self.current_second_start = self.start + Duration::from_secs(timestamp);
         self.next_rollover = self.start + Duration::from_secs(timestamp + 1);
-        self.update_rate();
+        if skip_pristine_rate && self.rolling_loss_count == 0 {
+            self.ack_rate = 1.0;
+        } else {
+            self.update_rate();
+        }
     }
 }
 
-fn run_record_bench(name: &str, cached: bool, loss_every: Option<u64>) {
+fn run_record_bench(name: &str, mode: u8, loss_every: Option<u64>) {
     let origin = Instant::now();
     let mut state = RecordState::new(origin);
     let started = Instant::now();
@@ -186,10 +211,11 @@ fn run_record_bench(name: &str, cached: bool, loss_every: Option<u64>) {
         let now = origin + Duration::from_micros(event * 100);
         let loss =
             u64::from(loss_every.is_some_and(|period| (event + 1) % period == 0));
-        if cached {
-            state.cached_second_record(black_box(now), 1, loss);
-        } else {
-            state.baseline_record(black_box(now), 1, loss);
+        match mode {
+            0 => state.baseline_record(black_box(now), 1, loss),
+            1 => state.cached_second_record(black_box(now), 1, loss),
+            2 => state.cached_second_record_skip_pristine_rate(black_box(now), 1, loss),
+            _ => unreachable!(),
         }
     }
     let elapsed = started.elapsed();
@@ -248,8 +274,9 @@ fn main() {
     }
     println!("full record path at 10 kHz:");
     for loss_every in [None, Some(10_000), Some(1_000), Some(100)] {
-        run_record_bench("baseline-record", false, loss_every);
-        run_record_bench("cached-second-record", true, loss_every);
+        run_record_bench("baseline-record", 0, loss_every);
+        run_record_bench("cached-second-record", 1, loss_every);
+        run_record_bench("skip-pristine-rate-record", 2, loss_every);
     }
     println!("ACK-frame batching over cached-second record path:");
     for batch_size in [1, 2, 4, 8, 16, 32] {
@@ -296,6 +323,29 @@ mod tests {
             }
             baseline_update(&mut baseline);
             no_loss_fast_path_update(&mut optimized);
+            assert_eq!(baseline.ack_rate, optimized.ack_rate);
+        }
+    }
+
+    #[test]
+    fn pristine_record_fast_path_matches_cached_second_across_loss_lifecycle() {
+        let origin = Instant::now();
+        let mut baseline = RecordState::new(origin);
+        let mut optimized = RecordState::new(origin);
+        let events = [
+            (Duration::from_millis(100), 60, 0),
+            (Duration::from_millis(200), 0, 10),
+            (Duration::from_secs(1), 40, 0),
+            (Duration::from_secs(7), 80, 0),
+            (Duration::from_secs(7) + Duration::from_millis(100), 20, 0),
+        ];
+
+        for (elapsed, acks, losses) in events {
+            let now = origin + elapsed;
+            baseline.cached_second_record(now, acks, losses);
+            optimized.cached_second_record_skip_pristine_rate(now, acks, losses);
+            assert_eq!(baseline.rolling_ack_count, optimized.rolling_ack_count);
+            assert_eq!(baseline.rolling_loss_count, optimized.rolling_loss_count);
             assert_eq!(baseline.ack_rate, optimized.ack_rate);
         }
     }

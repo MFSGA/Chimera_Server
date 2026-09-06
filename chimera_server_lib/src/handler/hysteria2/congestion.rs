@@ -397,7 +397,7 @@ impl BrutalState {
             info.loss_count += loss_count;
             self.rolling_ack_count += ack_count;
             self.rolling_loss_count += loss_count;
-            self.update_ack_rate(timestamp);
+            self.refresh_ack_rate(timestamp);
             return;
         }
 
@@ -434,6 +434,18 @@ impl BrutalState {
             .start
             .checked_add(Duration::from_secs(timestamp.saturating_add(1)))
             .unwrap_or(now);
+        self.refresh_ack_rate(timestamp);
+    }
+
+    fn refresh_ack_rate(&mut self, timestamp: u64) {
+        // A pristine rolling window always has an ACK rate of exactly 1.0.
+        // Avoid repeating the floating-point division on every ACK. Keep the
+        // debug path unchanged so HYSTERIA_BRUTAL_DEBUG still emits its normal
+        // periodic accounting lines.
+        if self.rolling_loss_count == 0 && !self.debug {
+            self.ack_rate = 1.0;
+            return;
+        }
         self.update_ack_rate(timestamp);
     }
 
@@ -627,6 +639,24 @@ mod tests {
         state.last_rtt = Duration::from_millis(100);
 
         assert_eq!(state.window(1_000_000), 80_000);
+    }
+
+    #[test]
+    fn brutal_pristine_window_keeps_exact_ack_rate_and_recovers_after_loss_expires()
+    {
+        let start = Instant::now();
+        let mut state = BrutalState::new(start, 1200);
+        state.debug = false;
+
+        state.record(start + Duration::from_millis(100), 60, 0);
+        assert_eq!(state.ack_rate, 1.0);
+
+        state.record(start + Duration::from_millis(200), 0, 10);
+        assert!((state.ack_rate - (60.0 / 70.0)).abs() < f64::EPSILON);
+
+        state.record(start + Duration::from_secs(7), 60, 0);
+        assert_eq!(state.rolling_loss_count, 0);
+        assert_eq!(state.ack_rate, 1.0);
     }
 
     #[test]
