@@ -25,6 +25,7 @@ tonic-prost = { workspace = true }
 [features]
 default = ["full"]
 brutal-ack-batch-trace = ["chimera_server_lib/brutal-ack-batch-trace"]
+brutal-pacing-trace = ["chimera_server_lib/brutal-pacing-trace"]
 full = ["chimera_server_lib/full"]
 minimal-vless = ["chimera_server_lib/vless"]
 minimal-vless-tls = ["chimera_server_lib/vless", "chimera_server_lib/tls"]
