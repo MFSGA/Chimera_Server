@@ -29,6 +29,9 @@ struct Args {
 
     #[arg(long, default_value_t = 50)]
     cpu_repetitions: usize,
+
+    #[arg(long)]
+    emit_publication_rates: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -107,6 +110,7 @@ struct PolicyRecord {
     target_rate_min: u64,
     target_rate_max: u64,
     publications: usize,
+    publication_rates_bytes_per_sec: Option<Vec<u64>>,
     publications_per_second: f64,
     mean_absolute_error_percent: f64,
     p95_absolute_error_percent: f64,
@@ -171,8 +175,9 @@ fn benchmark_policy(
     trace: &[u64],
     policy: PublicationPolicy,
 ) -> PolicyRecord {
-    let (publications, mut errors) =
+    let (publication_rates, mut errors) =
         evaluate_trace(trace, args.sample_interval_us, policy);
+    let publications = publication_rates.len();
     let target_rate_min = *trace.iter().min().expect("non-empty trace");
     let target_rate_max = *trace.iter().max().expect("non-empty trace");
     errors.sort_unstable_by(|left, right| left.total_cmp(right));
@@ -216,6 +221,9 @@ fn benchmark_policy(
         target_rate_min,
         target_rate_max,
         publications,
+        publication_rates_bytes_per_sec: args
+            .emit_publication_rates
+            .then_some(publication_rates),
         publications_per_second: round(publications as f64 / simulated_seconds),
         mean_absolute_error_percent: round(mean_error * 100.0),
         p95_absolute_error_percent: round(p95_error * 100.0),
@@ -228,16 +236,18 @@ fn evaluate_trace(
     trace: &[u64],
     sample_interval_us: u64,
     policy: PublicationPolicy,
-) -> (usize, Vec<f64>) {
+) -> (Vec<u64>, Vec<f64>) {
     let mut publisher = Publisher::new(policy);
-    let mut publications = 0;
+    let mut publication_rates = Vec::new();
     let mut errors = Vec::with_capacity(trace.len());
     for (index, &rate) in trace.iter().enumerate() {
         let now_us = index as u64 * sample_interval_us;
-        publications += usize::from(publisher.observe(now_us, rate));
+        if publisher.observe(now_us, rate) {
+            publication_rates.push(publisher.published_rate);
+        }
         errors.push(relative_error(publisher.published_rate, rate));
     }
-    (publications, errors)
+    (publication_rates, errors)
 }
 
 fn build_rate_trace(samples: usize) -> Vec<u64> {
@@ -418,5 +428,23 @@ mod tests {
         assert_eq!(*trace.iter().min().unwrap(), TARGET);
         assert!(*trace.iter().max().unwrap() > TARGET * 11 / 10);
         assert!(*trace.iter().max().unwrap() <= TARGET * 5 / 4);
+    }
+
+    #[test]
+    fn brutal_loss_publication_rates_can_drive_socket_replay() {
+        let trace = build_brutal_loss_trace(200_000, 100);
+        let policy = PublicationPolicy {
+            min_update_us: 0,
+            delta_fraction: 0.05,
+            emergency_delta_fraction: None,
+        };
+        let (rates, errors) = evaluate_trace(&trace, 100, policy);
+
+        assert_eq!(
+            rates,
+            vec![52_428_800, 55_177_973, 57_936_973, 61_559_364, 64_637_792]
+        );
+        assert_eq!(errors.len(), trace.len());
+        assert!(rates.windows(2).all(|pair| pair[0] != pair[1]));
     }
 }
