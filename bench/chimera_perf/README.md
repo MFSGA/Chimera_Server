@@ -127,9 +127,9 @@ The target and generator support `--worker-threads` so each process can be pinne
 - `splice`: experimental full bidirectional splice. It is retained for diagnostics and must not be selected as a production default without new data.
 - `copy`: legacy direct Tokio bidirectional copy, retained only as a control. It does not provide the handoff flush barrier required by REALITY Vision.
 
-`CHIMERA_TCP_COPY_BUFFER_SIZE` accepts 4096 through 1048576 bytes. The measured production default is 32768 bytes: it preserved the 64 KiB candidate's 64-connection throughput while reducing peak RSS, and it was dramatically faster than 8 KiB for a single long flow.
+`CHIMERA_TCP_COPY_BUFFER_SIZE` accepts 4096 through 1048576 bytes. The measured production default is 32768 bytes: it preserved the 64 KiB candidate's 64-connection throughput while reducing peak RSS, and it was dramatically faster than 8 KiB for a single long flow. On Linux `auto`, when this environment variable is unset, the successful `splice-downlink` path uses a measured 64 KiB buffer only for its remaining userspace uplink direction. Prelude, fallback, and all-userspace relays keep the 32 KiB default, and any explicit `CHIMERA_TCP_COPY_BUFFER_SIZE` value is preserved unchanged.
 
-`CHIMERA_TCP_SPLICE_PIPE_SIZE` accepts 4096 through 1048576 bytes. The current measured default is 65536 bytes. Increasing it to 262144 bytes reduced throughput in the recorded high-concurrency experiment.
+`CHIMERA_TCP_SPLICE_PIPE_SIZE` accepts 4096 through 1048576 bytes. The current measured default is 131072 bytes; the larger pipe reduces steady-state splice syscall frequency while bounding the two-direction pipe footprint to 256 KiB per full-splice relay.
 
 Completed TCP-forward logs include three structured relay-attribution fields:
 
@@ -256,7 +256,11 @@ strace -f -c \
 For copy-buffer experiments, sweep `--chunk-size` with `--backend tokio-copy`
 and confirm the result with `strace -f -c` before changing
 `CHIMERA_TCP_COPY_BUFFER_SIZE` defaults. A single-flow win is not sufficient to
-override the recorded high-concurrency RSS/throughput tradeoff above.
+override the recorded high-concurrency RSS/throughput tradeoff above. For the
+Linux `auto` fast path, also test eight simultaneous `tokio-copy` probes because
+the default auto splice threshold is eight connections; the single-direction
+uplink buffer is intentionally tuned independently from the all-userspace
+32 KiB default.
 
 The io_uring implementation is intentionally benchmark-only. It must not be connected to the production relay until it beats ordinary splice in throughput and CPU/GiB with acceptable variance. The current measured candidate does not meet that gate.
 

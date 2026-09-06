@@ -29,6 +29,12 @@ const MIN_COPY_BUFFER_SIZE: usize = 4 * 1024;
 const MAX_COPY_BUFFER_SIZE: usize = 1024 * 1024;
 const MAX_STEPS_PER_POLL: usize = 16;
 #[cfg(target_os = "linux")]
+// The auto backend is limited to a small number of splice relays. For its one
+// remaining userspace direction, 64 KiB cuts send syscalls roughly in half vs
+// the 32 KiB general-purpose default without paying that footprint on fallback
+// or high-concurrency all-userspace relays.
+const DEFAULT_AUTO_UPLINK_COPY_BUFFER_SIZE: usize = 64 * 1024;
+#[cfg(target_os = "linux")]
 // 128 KiB halves the steady-state splice syscall rate for bulk loopback
 // transfers compared with Linux's common 64 KiB pipe capacity, while keeping
 // the worst-case two-direction pipe footprint bounded to 256 KiB per relay.
@@ -44,7 +50,13 @@ const DEFAULT_AUTO_MAX_CONNECTIONS: usize = 8;
 #[cfg(target_os = "linux")]
 const AUTO_MAX_CONNECTIONS_LIMIT: usize = 4096;
 
-static COPY_BUFFER_SIZE: OnceLock<usize> = OnceLock::new();
+#[derive(Debug, Clone, Copy)]
+struct CopyBufferConfig {
+    size: usize,
+    explicit: bool,
+}
+
+static COPY_BUFFER_CONFIG: OnceLock<CopyBufferConfig> = OnceLock::new();
 static RELAY_BACKEND: OnceLock<RelayBackend> = OnceLock::new();
 #[cfg(target_os = "linux")]
 static SPLICE_PIPE_SIZE: OnceLock<usize> = OnceLock::new();
@@ -228,7 +240,8 @@ where
     A: AsyncStream + ?Sized,
     B: AsyncStream + ?Sized,
 {
-    let size = configured_copy_buffer_size();
+    let copy_buffer = configured_copy_buffer();
+    let size = copy_buffer.size;
     let backend = configured_relay_backend();
     #[cfg(target_os = "linux")]
     let _auto_guard =
@@ -257,6 +270,7 @@ where
                 left,
                 right,
                 size,
+                size,
                 RelayBackend::SpliceDownlink,
                 None,
             )
@@ -268,6 +282,7 @@ where
                 left,
                 right,
                 size,
+                auto_uplink_copy_buffer_size(copy_buffer),
                 RelayBackend::Auto,
                 Some(configured_auto_max_connections()),
             )
@@ -411,6 +426,7 @@ async fn relay_after_handoff_with_downlink_splice<A, B>(
     left: &mut A,
     right: &mut B,
     buffer_size: usize,
+    uplink_buffer_size: usize,
     configured_backend: RelayBackend,
     auto_connection_limit: Option<usize>,
 ) -> io::Result<TcpRelayResult>
@@ -487,7 +503,7 @@ where
             };
 
             let (remaining_left_to_right, bypassed_right_to_left) = tokio::try_join!(
-                copy_one_direction(left, right, buffer_size),
+                copy_one_direction(left, right, uplink_buffer_size),
                 downlink.run(),
             )?;
             Ok(TcpRelayResult::with_bypassed(
@@ -547,8 +563,8 @@ where
     ))
 }
 
-pub(crate) fn configured_copy_buffer_size() -> usize {
-    *COPY_BUFFER_SIZE.get_or_init(|| {
+fn configured_copy_buffer() -> CopyBufferConfig {
+    *COPY_BUFFER_CONFIG.get_or_init(|| {
         let configured = std::env::var(ENV_COPY_BUFFER_SIZE).ok();
         match parse_copy_buffer_size(configured.as_deref()) {
             Ok(size) => {
@@ -561,7 +577,10 @@ pub(crate) fn configured_copy_buffer_size() -> usize {
                     },
                     "configured TCP userspace relay buffer"
                 );
-                size
+                CopyBufferConfig {
+                    size,
+                    explicit: configured.is_some(),
+                }
             }
             Err(error) => {
                 warn!(
@@ -570,10 +589,22 @@ pub(crate) fn configured_copy_buffer_size() -> usize {
                     %error,
                     "invalid TCP userspace relay buffer; using default"
                 );
-                DEFAULT_COPY_BUFFER_SIZE
+                CopyBufferConfig {
+                    size: DEFAULT_COPY_BUFFER_SIZE,
+                    explicit: false,
+                }
             }
         }
     })
+}
+
+#[cfg(target_os = "linux")]
+fn auto_uplink_copy_buffer_size(config: CopyBufferConfig) -> usize {
+    if config.explicit {
+        config.size
+    } else {
+        DEFAULT_AUTO_UPLINK_COPY_BUFFER_SIZE
+    }
 }
 
 fn configured_relay_backend() -> RelayBackend {
@@ -1340,6 +1371,32 @@ mod tests {
     #[test]
     fn default_uses_measured_thirty_two_kibibyte_buffer() {
         assert_eq!(parse_copy_buffer_size(None).unwrap(), 32 * 1024);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn auto_uplink_uses_measured_sixty_four_kibibyte_default() {
+        assert_eq!(
+            auto_uplink_copy_buffer_size(CopyBufferConfig {
+                size: DEFAULT_COPY_BUFFER_SIZE,
+                explicit: false,
+            }),
+            DEFAULT_AUTO_UPLINK_COPY_BUFFER_SIZE,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn auto_uplink_preserves_explicit_copy_buffer_size() {
+        for size in [32 * 1024, 64 * 1024, 128 * 1024] {
+            assert_eq!(
+                auto_uplink_copy_buffer_size(CopyBufferConfig {
+                    size,
+                    explicit: true,
+                }),
+                size,
+            );
+        }
     }
 
     #[test]
