@@ -57,6 +57,9 @@ mod linux {
         notsent_lowat_bytes: Option<u32>,
 
         #[arg(long)]
+        notsent_lowat_ms: Option<u32>,
+
+        #[arg(long)]
         adaptive_notsent_lowat_bytes: Option<u32>,
 
         #[arg(long, default_value_t = 128 * 1024)]
@@ -94,6 +97,7 @@ mod linux {
         expected_bytes: u64,
         requested_pipe_size: usize,
         second_rate: Option<u64>,
+        second_notsent_lowat_update: Option<u32>,
         adaptive_notsent_lowat: Option<u32>,
         sample_tcp_info: bool,
     }
@@ -125,6 +129,9 @@ mod linux {
         requested_rate_bytes_per_sec: u64,
         second_rate_bytes_per_sec: Option<u64>,
         requested_notsent_lowat_bytes: Option<u32>,
+        requested_notsent_lowat_ms: Option<u32>,
+        effective_initial_notsent_lowat_bytes: Option<u32>,
+        effective_second_notsent_lowat_bytes: Option<u32>,
         adaptive_notsent_lowat_bytes: Option<u32>,
         sample_tcp_info: bool,
         destination_would_blocks_total: u64,
@@ -160,6 +167,9 @@ mod linux {
         requested_rate_bytes_per_sec: u64,
         second_rate_bytes_per_sec: Option<u64>,
         requested_notsent_lowat_bytes: Option<u32>,
+        requested_notsent_lowat_ms: Option<u32>,
+        effective_initial_notsent_lowat_bytes: Option<u32>,
+        effective_second_notsent_lowat_bytes: Option<u32>,
         adaptive_notsent_lowat_bytes: Option<u32>,
         sample_tcp_info: bool,
         aggregate_throughput_median_gbps: f64,
@@ -180,6 +190,8 @@ mod linux {
     pub(super) fn run() -> Result<()> {
         let args = Args::parse();
         validate_args(&args)?;
+        let (initial_notsent_lowat, second_notsent_lowat) =
+            resolved_static_lowats(&args)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(args.worker_threads)
             .enable_io()
@@ -252,6 +264,9 @@ mod linux {
                 requested_rate_bytes_per_sec: args.rate_bytes_per_sec,
                 second_rate_bytes_per_sec: args.second_rate_bytes_per_sec,
                 requested_notsent_lowat_bytes: args.notsent_lowat_bytes,
+                requested_notsent_lowat_ms: args.notsent_lowat_ms,
+                effective_initial_notsent_lowat_bytes: initial_notsent_lowat,
+                effective_second_notsent_lowat_bytes: second_notsent_lowat,
                 adaptive_notsent_lowat_bytes: args.adaptive_notsent_lowat_bytes,
                 sample_tcp_info: args.sample_tcp_info,
                 aggregate_throughput_median_gbps: round(median(&throughput)),
@@ -303,13 +318,18 @@ mod linux {
         {
             bail!("pacing rates must be greater than zero");
         }
-        if args.notsent_lowat_bytes.is_some()
-            && args.adaptive_notsent_lowat_bytes.is_some()
-        {
+        let lowat_modes = usize::from(args.notsent_lowat_bytes.is_some())
+            + usize::from(args.notsent_lowat_ms.is_some())
+            + usize::from(args.adaptive_notsent_lowat_bytes.is_some());
+        if lowat_modes > 1 {
             bail!(
-                "--notsent-lowat-bytes and --adaptive-notsent-lowat-bytes are mutually exclusive"
+                "--notsent-lowat-bytes, --notsent-lowat-ms, and --adaptive-notsent-lowat-bytes are mutually exclusive"
             );
         }
+        if args.notsent_lowat_ms == Some(0) {
+            bail!("--notsent-lowat-ms must be greater than zero");
+        }
+        let _ = resolved_static_lowats(args)?;
         if args.adaptive_notsent_lowat_bytes.is_some() {
             let Some(second_rate) = args.second_rate_bytes_per_sec else {
                 bail!(
@@ -328,11 +348,41 @@ mod linux {
         Ok(())
     }
 
+    fn resolved_static_lowats(args: &Args) -> Result<(Option<u32>, Option<u32>)> {
+        if let Some(bytes) = args.notsent_lowat_bytes {
+            return Ok((
+                Some(bytes),
+                args.second_rate_bytes_per_sec.map(|_| bytes),
+            ));
+        }
+        let Some(milliseconds) = args.notsent_lowat_ms else {
+            return Ok((None, None));
+        };
+        let initial = queue_time_lowat_bytes(args.rate_bytes_per_sec, milliseconds)?;
+        let second = args
+            .second_rate_bytes_per_sec
+            .map(|rate| queue_time_lowat_bytes(rate, milliseconds))
+            .transpose()?;
+        Ok((Some(initial), second))
+    }
+
+    fn queue_time_lowat_bytes(rate_bytes_per_sec: u64, milliseconds: u32) -> Result<u32> {
+        let bytes = u128::from(rate_bytes_per_sec) * u128::from(milliseconds) / 1_000;
+        let bytes = bytes.max(1);
+        u32::try_from(bytes).map_err(|_| {
+            anyhow::anyhow!(
+                "rate {rate_bytes_per_sec} B/s with {milliseconds} ms queue time exceeds TCP_NOTSENT_LOWAT u32 range"
+            )
+        })
+    }
+
     async fn run_once(
         args: &Args,
         run_index: usize,
         warmup: bool,
     ) -> Result<RunRecord> {
+        let (initial_notsent_lowat, second_notsent_lowat) =
+            resolved_static_lowats(args)?;
         let barrier = Arc::new(Barrier::new(args.connections * 3 + 1));
         let mut writers = Vec::with_capacity(args.connections);
         let mut relays = Vec::with_capacity(args.connections);
@@ -355,7 +405,7 @@ mod linux {
                 destination.get_ref().as_raw_fd(),
                 args.rate_bytes_per_sec,
             )?;
-            if let Some(lowat) = args.notsent_lowat_bytes {
+            if let Some(lowat) = initial_notsent_lowat {
                 set_tcp_notsent_lowat(destination.get_ref().as_raw_fd(), lowat)?;
             }
             drop(relay_source);
@@ -373,6 +423,7 @@ mod linux {
                 expected_bytes: bytes,
                 requested_pipe_size: args.pipe_size,
                 second_rate: args.second_rate_bytes_per_sec,
+                second_notsent_lowat_update: args.notsent_lowat_ms.and(second_notsent_lowat),
                 adaptive_notsent_lowat: args.adaptive_notsent_lowat_bytes,
                 sample_tcp_info: args.sample_tcp_info,
             };
@@ -490,6 +541,9 @@ mod linux {
             requested_rate_bytes_per_sec: args.rate_bytes_per_sec,
             second_rate_bytes_per_sec: args.second_rate_bytes_per_sec,
             requested_notsent_lowat_bytes: args.notsent_lowat_bytes,
+            requested_notsent_lowat_ms: args.notsent_lowat_ms,
+            effective_initial_notsent_lowat_bytes: initial_notsent_lowat,
+            effective_second_notsent_lowat_bytes: second_notsent_lowat,
             adaptive_notsent_lowat_bytes: args.adaptive_notsent_lowat_bytes,
             sample_tcp_info: args.sample_tcp_info,
             destination_would_blocks_total,
@@ -633,6 +687,9 @@ mod linux {
                             if options.sample_tcp_info {
                                 tcp_info_at_rate_update =
                                     Some(get_tcp_info(destination_fd)?);
+                            }
+                            if let Some(lowat) = options.second_notsent_lowat_update {
+                                set_tcp_notsent_lowat(destination_fd, lowat)?;
                             }
                             set_max_pacing_rate(destination_fd, rate)?;
                             if let Some(lowat) = options.adaptive_notsent_lowat
@@ -892,23 +949,29 @@ mod linux {
     mod tests {
         use super::*;
 
-        #[test]
-        fn rejects_zero_connections() {
-            let args = Args {
-                connections: 0,
+        fn base_args() -> Args {
+            Args {
+                connections: 1,
                 worker_threads: 1,
                 bytes_per_connection: 1,
                 chunk_size: 1,
-                rate_bytes_per_sec: 1,
+                rate_bytes_per_sec: 100,
                 second_rate_bytes_per_sec: None,
                 notsent_lowat_bytes: None,
+                notsent_lowat_ms: None,
                 adaptive_notsent_lowat_bytes: None,
                 pipe_size: 4096,
                 warmup: 0,
                 runs: 1,
                 sample_tcp_info: false,
                 verify: false,
-            };
+            }
+        }
+
+        #[test]
+        fn rejects_zero_connections() {
+            let mut args = base_args();
+            args.connections = 0;
             assert!(validate_args(&args).is_err());
         }
 
@@ -921,83 +984,68 @@ mod linux {
 
         #[test]
         fn effective_rate_uses_equal_byte_harmonic_mean() {
-            let args = Args {
-                connections: 1,
-                worker_threads: 1,
-                bytes_per_connection: 1,
-                chunk_size: 1,
-                rate_bytes_per_sec: 100,
-                second_rate_bytes_per_sec: Some(25),
-                notsent_lowat_bytes: None,
-                adaptive_notsent_lowat_bytes: None,
-                pipe_size: 4096,
-                warmup: 0,
-                runs: 1,
-                sample_tcp_info: false,
-                verify: false,
-            };
+            let mut args = base_args();
+            args.second_rate_bytes_per_sec = Some(25);
             assert_eq!(effective_requested_rate(&args), 40.0);
         }
 
         #[test]
+        fn queue_time_lowat_tracks_active_rate() {
+            let mut args = base_args();
+            args.rate_bytes_per_sec = 32 * 1024 * 1024;
+            args.second_rate_bytes_per_sec = Some(25 * 1024 * 1024);
+            args.notsent_lowat_ms = Some(32);
+
+            let (initial, second) = resolved_static_lowats(&args).unwrap();
+            assert_eq!(initial, Some(1_073_741));
+            assert_eq!(second, Some(838_860));
+        }
+
+        #[test]
+        fn queue_time_lowat_rejects_zero_or_unrepresentable_values() {
+            let mut args = base_args();
+            args.notsent_lowat_ms = Some(0);
+            assert!(validate_args(&args).is_err());
+
+            args.notsent_lowat_ms = Some(1);
+            args.rate_bytes_per_sec = u64::MAX;
+            assert!(validate_args(&args).is_err());
+        }
+
+        #[test]
         fn adaptive_lowat_requires_a_rate_decrease() {
-            let mut args = Args {
-                connections: 1,
-                worker_threads: 1,
-                bytes_per_connection: 1,
-                chunk_size: 1,
-                rate_bytes_per_sec: 100,
-                second_rate_bytes_per_sec: Some(100),
-                notsent_lowat_bytes: None,
-                adaptive_notsent_lowat_bytes: Some(512 * 1024),
-                pipe_size: 4096,
-                warmup: 0,
-                runs: 1,
-                sample_tcp_info: false,
-                verify: false,
-            };
+            let mut args = base_args();
+            args.second_rate_bytes_per_sec = Some(100);
+            args.adaptive_notsent_lowat_bytes = Some(512 * 1024);
             assert!(validate_args(&args).is_err());
             args.second_rate_bytes_per_sec = Some(25);
             assert!(validate_args(&args).is_ok());
         }
 
         #[test]
-        fn static_and_adaptive_lowat_are_mutually_exclusive() {
-            let args = Args {
-                connections: 1,
-                worker_threads: 1,
-                bytes_per_connection: 1,
-                chunk_size: 1,
-                rate_bytes_per_sec: 100,
-                second_rate_bytes_per_sec: Some(25),
-                notsent_lowat_bytes: Some(512 * 1024),
-                adaptive_notsent_lowat_bytes: Some(512 * 1024),
-                pipe_size: 4096,
-                warmup: 0,
-                runs: 1,
-                sample_tcp_info: false,
-                verify: false,
-            };
+        fn lowat_modes_are_mutually_exclusive() {
+            let mut args = base_args();
+            args.second_rate_bytes_per_sec = Some(25);
+            args.notsent_lowat_bytes = Some(512 * 1024);
+            args.notsent_lowat_ms = Some(32);
+            assert!(validate_args(&args).is_err());
+
+            args.notsent_lowat_bytes = None;
+            args.adaptive_notsent_lowat_bytes = Some(512 * 1024);
             assert!(validate_args(&args).is_err());
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn asyncfd_splice_roundtrip_preserves_payload() {
-            let args = Args {
-                connections: 1,
-                worker_threads: 2,
-                bytes_per_connection: 256 * 1024,
-                chunk_size: 16 * 1024,
-                rate_bytes_per_sec: 64 * 1024 * 1024,
-                second_rate_bytes_per_sec: None,
-                notsent_lowat_bytes: Some(512 * 1024),
-                adaptive_notsent_lowat_bytes: None,
-                pipe_size: 128 * 1024,
-                warmup: 0,
-                runs: 1,
-                sample_tcp_info: true,
-                verify: true,
-            };
+            let mut args = base_args();
+            args.worker_threads = 2;
+            args.bytes_per_connection = 256 * 1024;
+            args.chunk_size = 16 * 1024;
+            args.rate_bytes_per_sec = 64 * 1024 * 1024;
+            args.notsent_lowat_bytes = Some(512 * 1024);
+            args.pipe_size = 128 * 1024;
+            args.sample_tcp_info = true;
+            args.verify = true;
 
             let record = run_once(&args, 0, false).await.unwrap();
             assert_eq!(record.total_bytes, args.bytes_per_connection);
