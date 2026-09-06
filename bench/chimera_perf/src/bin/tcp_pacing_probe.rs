@@ -14,7 +14,7 @@ mod linux {
     use std::{
         io::{self, Read, Write},
         net::{Shutdown, TcpListener, TcpStream},
-        os::fd::AsRawFd,
+        os::fd::{AsRawFd, FromRawFd, OwnedFd},
         sync::{Arc, Barrier},
         thread,
         time::{Duration, Instant},
@@ -36,11 +36,21 @@ mod linux {
         Userspace,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+    #[serde(rename_all = "kebab-case")]
+    enum Backend {
+        Send,
+        Splice,
+    }
+
     #[derive(Debug, Parser)]
     #[command(about = "Loopback TCP pacing probe for Brutal2 design work")]
     struct Args {
         #[arg(long, value_enum)]
         mode: PacingMode,
+
+        #[arg(long, value_enum, default_value_t = Backend::Send)]
+        backend: Backend,
 
         #[arg(long, default_value_t = 256 * 1024 * 1024_u64)]
         bytes: u64,
@@ -51,6 +61,9 @@ mod linux {
         #[arg(long, default_value_t = 100 * 1024 * 1024_u64)]
         rate_bytes_per_sec: u64,
 
+        #[arg(long)]
+        second_rate_bytes_per_sec: Option<u64>,
+
         #[arg(long, default_value_t = 1)]
         warmup: usize,
 
@@ -59,6 +72,12 @@ mod linux {
 
         #[arg(long)]
         verify: bool,
+    }
+
+    struct SpliceSource {
+        file: OwnedFd,
+        pipe_read: OwnedFd,
+        pipe_write: OwnedFd,
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -73,12 +92,15 @@ mod linux {
         schema_version: u32,
         record_type: &'static str,
         mode: PacingMode,
+        backend: Backend,
         run_index: usize,
         warmup: bool,
         bytes: u64,
         chunk_size: usize,
         requested_rate_bytes_per_sec: u64,
+        second_rate_bytes_per_sec: Option<u64>,
         kernel_pacing_rate_bytes_per_sec: Option<u64>,
+        pacing_updates: usize,
         elapsed_seconds: f64,
         throughput_gbps: f64,
         observed_rate_bytes_per_sec: f64,
@@ -94,11 +116,13 @@ mod linux {
         schema_version: u32,
         record_type: &'static str,
         mode: PacingMode,
+        backend: Backend,
         runs: usize,
         warmup_runs: usize,
         bytes: u64,
         chunk_size: usize,
         requested_rate_bytes_per_sec: u64,
+        second_rate_bytes_per_sec: Option<u64>,
         throughput_median_gbps: f64,
         throughput_cv: f64,
         observed_rate_bytes_per_sec_median: f64,
@@ -140,11 +164,13 @@ mod linux {
             schema_version: 1,
             record_type: "summary",
             mode: args.mode,
+            backend: args.backend,
             runs: args.runs,
             warmup_runs: args.warmup,
             bytes: args.bytes,
             chunk_size: args.chunk_size,
             requested_rate_bytes_per_sec: args.rate_bytes_per_sec,
+            second_rate_bytes_per_sec: args.second_rate_bytes_per_sec,
             throughput_median_gbps: round(median(&throughput)),
             throughput_cv: round(coefficient_of_variation(&throughput)),
             observed_rate_bytes_per_sec_median: round(median(&observed_rates)),
@@ -165,6 +191,14 @@ mod linux {
         }
         if args.rate_bytes_per_sec == 0 {
             bail!("--rate-bytes-per-sec must be greater than zero");
+        }
+        if args.second_rate_bytes_per_sec == Some(0) {
+            bail!("--second-rate-bytes-per-sec must be greater than zero");
+        }
+        if args.second_rate_bytes_per_sec.is_some()
+            && args.mode != PacingMode::Kernel
+        {
+            bail!("--second-rate-bytes-per-sec currently requires --mode kernel");
         }
         if args.runs == 0 {
             bail!("--runs must be greater than zero");
@@ -213,18 +247,77 @@ mod linux {
         };
 
         let buffer = vec![PATTERN_BYTE; args.chunk_size];
+        let splice_source = if args.backend == Backend::Splice {
+            Some(build_splice_source(args.bytes, args.chunk_size, &buffer)?)
+        } else {
+            None
+        };
         barrier.wait();
         let usage_before = usage()?;
         let started = Instant::now();
         let mut sent = 0_u64;
-        while sent < args.bytes {
-            let count =
-                usize::try_from((args.bytes - sent).min(args.chunk_size as u64))
+        let switch_after = args.bytes / 2;
+        let mut pacing_updates = 0_usize;
+        match args.backend {
+            Backend::Send => {
+                while sent < args.bytes {
+                    let count = usize::try_from(
+                        (args.bytes - sent).min(args.chunk_size as u64),
+                    )
                     .expect("chunk size fits usize");
-            sender.write_all(&buffer[..count])?;
-            sent += count as u64;
-            if args.mode == PacingMode::Userspace {
-                pace_userspace(started, sent, args.rate_bytes_per_sec);
+                    sender.write_all(&buffer[..count])?;
+                    sent += count as u64;
+                    maybe_update_kernel_pacing(
+                        &sender,
+                        sent,
+                        switch_after,
+                        args.second_rate_bytes_per_sec,
+                        &mut pacing_updates,
+                    )?;
+                    if args.mode == PacingMode::Userspace {
+                        pace_userspace(started, sent, args.rate_bytes_per_sec);
+                    }
+                }
+            }
+            Backend::Splice => {
+                let source = splice_source.expect("splice source created");
+                while sent < args.bytes {
+                    let count = usize::try_from(
+                        (args.bytes - sent).min(args.chunk_size as u64),
+                    )
+                    .expect("chunk size fits usize");
+                    let filled = splice_exact(
+                        source.file.as_raw_fd(),
+                        source.pipe_write.as_raw_fd(),
+                        count,
+                    )?;
+                    if filled == 0 {
+                        bail!("splice source reached EOF after {sent} bytes");
+                    }
+                    let mut drained = 0;
+                    while drained < filled {
+                        let moved = splice_exact(
+                            source.pipe_read.as_raw_fd(),
+                            sender.as_raw_fd(),
+                            filled - drained,
+                        )?;
+                        if moved == 0 {
+                            bail!("splice pipe drained zero bytes");
+                        }
+                        drained += moved;
+                    }
+                    sent += filled as u64;
+                    maybe_update_kernel_pacing(
+                        &sender,
+                        sent,
+                        switch_after,
+                        args.second_rate_bytes_per_sec,
+                        &mut pacing_updates,
+                    )?;
+                    if args.mode == PacingMode::Userspace {
+                        pace_userspace(started, sent, args.rate_bytes_per_sec);
+                    }
+                }
             }
         }
         sender.shutdown(Shutdown::Write)?;
@@ -242,27 +335,128 @@ mod linux {
         let involuntary_context_switches = usage_after.involuntary_context_switches
             - usage_before.involuntary_context_switches;
         let observed_rate = args.bytes as f64 / elapsed.max(f64::MIN_POSITIVE);
+        let effective_requested_rate = effective_requested_rate(args);
         Ok(RunRecord {
             schema_version: 1,
             record_type: "run",
             mode: args.mode,
+            backend: args.backend,
             run_index,
             warmup,
             bytes: args.bytes,
             chunk_size: args.chunk_size,
             requested_rate_bytes_per_sec: args.rate_bytes_per_sec,
+            second_rate_bytes_per_sec: args.second_rate_bytes_per_sec,
             kernel_pacing_rate_bytes_per_sec: kernel_pacing_rate,
+            pacing_updates,
             elapsed_seconds: round(elapsed),
             throughput_gbps: round(observed_rate * 8.0 / 1e9),
             observed_rate_bytes_per_sec: round(observed_rate),
-            requested_rate_ratio: round(
-                observed_rate / args.rate_bytes_per_sec as f64,
-            ),
+            requested_rate_ratio: round(observed_rate / effective_requested_rate),
             cpu_seconds: round(cpu_seconds),
             cpu_seconds_per_gib: round(cpu_seconds / (args.bytes as f64 / GIB)),
             voluntary_context_switches,
             involuntary_context_switches,
         })
+    }
+
+    fn build_splice_source(
+        bytes: u64,
+        chunk_size: usize,
+        pattern: &[u8],
+    ) -> io::Result<SpliceSource> {
+        let name = c"chimera-tcp-pacing";
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut written = 0_u64;
+        while written < bytes {
+            let count = usize::try_from((bytes - written).min(chunk_size as u64))
+                .expect("chunk size fits usize");
+            let mut offset = 0;
+            while offset < count {
+                let result = unsafe {
+                    libc::write(
+                        fd.as_raw_fd(),
+                        pattern[offset..count].as_ptr().cast(),
+                        count - offset,
+                    )
+                };
+                if result < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                offset += result as usize;
+            }
+            written += count as u64;
+        }
+        if unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_SET) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut pipe_fds = [0_i32; 2];
+        if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let pipe_read = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+        let pipe_write = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+        Ok(SpliceSource {
+            file: fd,
+            pipe_read,
+            pipe_write,
+        })
+    }
+
+    fn splice_exact(
+        source: i32,
+        destination: i32,
+        count: usize,
+    ) -> io::Result<usize> {
+        loop {
+            let moved = unsafe {
+                libc::splice(
+                    source,
+                    std::ptr::null_mut(),
+                    destination,
+                    std::ptr::null_mut(),
+                    count,
+                    libc::SPLICE_F_MOVE | libc::SPLICE_F_MORE,
+                )
+            };
+            if moved >= 0 {
+                return Ok(moved as usize);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    fn effective_requested_rate(args: &Args) -> f64 {
+        match args.second_rate_bytes_per_sec {
+            Some(second) => {
+                2.0 / (1.0 / args.rate_bytes_per_sec as f64 + 1.0 / second as f64)
+            }
+            None => args.rate_bytes_per_sec as f64,
+        }
+    }
+
+    fn maybe_update_kernel_pacing(
+        sender: &TcpStream,
+        sent: u64,
+        switch_after: u64,
+        second_rate: Option<u64>,
+        pacing_updates: &mut usize,
+    ) -> io::Result<()> {
+        if *pacing_updates == 0
+            && sent >= switch_after
+            && let Some(rate) = second_rate
+        {
+            set_max_pacing_rate(sender, rate)?;
+            *pacing_updates = 1;
+        }
+        Ok(())
     }
 
     fn pace_userspace(started: Instant, sent: u64, rate_bytes_per_sec: u64) {
@@ -336,6 +530,29 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn splice_source_preserves_payload_bytes() {
+            let pattern = vec![PATTERN_BYTE; 4096];
+            let source = build_splice_source(4096, 4096, &pattern).unwrap();
+            let filled = splice_exact(
+                source.file.as_raw_fd(),
+                source.pipe_write.as_raw_fd(),
+                4096,
+            )
+            .unwrap();
+            assert_eq!(filled, 4096);
+            let mut output = vec![0_u8; 4096];
+            let read = unsafe {
+                libc::read(
+                    source.pipe_read.as_raw_fd(),
+                    output.as_mut_ptr().cast(),
+                    output.len(),
+                )
+            };
+            assert_eq!(read, 4096);
+            assert_eq!(output, pattern);
+        }
 
         #[test]
         fn kernel_pacing_rate_round_trips_on_tcp_socket() {
