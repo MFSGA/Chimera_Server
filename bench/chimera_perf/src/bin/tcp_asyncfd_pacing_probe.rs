@@ -21,7 +21,7 @@ mod linux {
 
     use anyhow::{Result, bail};
     use chimera_perf::stats::{coefficient_of_variation, median};
-    use clap::Parser;
+    use clap::{Parser, ValueEnum};
     use serde::Serialize;
     use tokio::{
         io::unix::AsyncFd,
@@ -83,6 +83,9 @@ mod linux {
         #[arg(long, default_value_t = 128 * 1024)]
         pipe_size: usize,
 
+        #[arg(long, value_enum, default_value_t = DestinationDrainMode::Single)]
+        destination_drain_mode: DestinationDrainMode,
+
         #[arg(long, default_value_t = 1)]
         warmup: usize,
 
@@ -97,6 +100,21 @@ mod linux {
 
         #[arg(long)]
         verify: bool,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+    enum DestinationDrainMode {
+        Single,
+        UntilWouldBlock,
+    }
+
+    impl DestinationDrainMode {
+        fn as_str(self) -> &'static str {
+            match self {
+                Self::Single => "single",
+                Self::UntilWouldBlock => "until-would-block",
+            }
+        }
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -123,6 +141,7 @@ mod linux {
     #[derive(Debug, Clone)]
     struct RelayOptions {
         requested_pipe_size: usize,
+        destination_drain_mode: DestinationDrainMode,
         initial_rate: u64,
         initial_notsent_lowat: Option<u32>,
         rate_updates: Arc<[RateUpdate]>,
@@ -155,6 +174,7 @@ mod linux {
     struct RelayStats {
         bytes: u64,
         pipe_capacity: usize,
+        destination_ready_acquisitions: u64,
         destination_would_blocks: u64,
         source_would_blocks: u64,
         notsent_bytes_at_rate_update: Option<u32>,
@@ -183,6 +203,7 @@ mod linux {
         actual_pipe_capacity_min: usize,
         actual_pipe_capacity_max: usize,
         unpaced: bool,
+        destination_drain_mode: &'static str,
         requested_rate_bytes_per_sec: Option<u64>,
         second_rate_bytes_per_sec: Option<u64>,
         rate_updates_bytes_per_sec: Vec<u64>,
@@ -197,6 +218,8 @@ mod linux {
         adaptive_notsent_lowat_bytes: Option<u32>,
         sample_tcp_info: bool,
         sample_rate_decrease_recovery: bool,
+        destination_ready_acquisitions_total: u64,
+        destination_ready_acquisitions_per_connection: f64,
         destination_would_blocks_total: u64,
         destination_would_blocks_per_connection: f64,
         source_would_blocks_total: u64,
@@ -239,6 +262,7 @@ mod linux {
         actual_pipe_capacity_min: usize,
         actual_pipe_capacity_max: usize,
         unpaced: bool,
+        destination_drain_mode: &'static str,
         requested_rate_bytes_per_sec: Option<u64>,
         second_rate_bytes_per_sec: Option<u64>,
         rate_updates_bytes_per_sec: Vec<u64>,
@@ -258,6 +282,7 @@ mod linux {
         per_connection_rate_ratio_median: Option<f64>,
         cpu_seconds_per_gib_median: f64,
         context_switches_median: f64,
+        destination_ready_acquisitions_per_connection_median: f64,
         destination_would_blocks_per_connection_median: f64,
         notsent_bytes_at_rate_update_median: Option<f64>,
         tcp_rtt_us_at_rate_update_median: Option<f64>,
@@ -298,6 +323,7 @@ mod linux {
         let mut actual_pipe_capacity_max = Vec::with_capacity(args.runs);
         let mut cpu_per_gib = Vec::with_capacity(args.runs);
         let mut context_switches = Vec::with_capacity(args.runs);
+        let mut destination_ready_acquisitions = Vec::with_capacity(args.runs);
         let mut destination_blocks = Vec::with_capacity(args.runs);
         let mut notsent = Vec::new();
         let mut tcp_rtt = Vec::new();
@@ -328,6 +354,8 @@ mod linux {
                 (record.voluntary_context_switches
                     + record.involuntary_context_switches) as f64,
             );
+            destination_ready_acquisitions
+                .push(record.destination_ready_acquisitions_per_connection);
             destination_blocks.push(record.destination_would_blocks_per_connection);
             if let Some(bytes) = record.notsent_bytes_at_rate_update_median {
                 notsent.push(bytes);
@@ -408,6 +436,7 @@ mod linux {
                     .max()
                     .expect("at least one measured run"),
                 unpaced: args.unpaced,
+                destination_drain_mode: args.destination_drain_mode.as_str(),
                 requested_rate_bytes_per_sec: (!args.unpaced)
                     .then_some(args.rate_bytes_per_sec),
                 second_rate_bytes_per_sec: args.second_rate_bytes_per_sec,
@@ -431,6 +460,9 @@ mod linux {
                     .then(|| round(median(&ratios))),
                 cpu_seconds_per_gib_median: round(median(&cpu_per_gib)),
                 context_switches_median: round(median(&context_switches)),
+                destination_ready_acquisitions_per_connection_median: round(median(
+                    &destination_ready_acquisitions,
+                )),
                 destination_would_blocks_per_connection_median: round(median(
                     &destination_blocks
                 )),
@@ -503,6 +535,23 @@ mod linux {
             || args.rate_updates_bytes_per_sec.contains(&0)
         {
             bail!("pacing rates must be greater than zero");
+        }
+        if args.destination_drain_mode != DestinationDrainMode::Single
+            && (args.second_rate_bytes_per_sec.is_some()
+                || !args.rate_updates_bytes_per_sec.is_empty()
+                || args.notsent_lowat_bytes.is_some()
+                || args.notsent_lowat_ms.is_some()
+                || args.notsent_lowat_min_bytes.is_some()
+                || args.notsent_lowat_max_bytes.is_some()
+                || args.notsent_lowat_update_threshold_percent != 0.0
+                || args.notsent_lowat_gate_decreases_only
+                || args.adaptive_notsent_lowat_bytes.is_some()
+                || args.sample_tcp_info
+                || args.sample_rate_decrease_recovery)
+        {
+            bail!(
+                "--destination-drain-mode until-would-block supports only steady pacing or --unpaced"
+            );
         }
         if args.unpaced
             && (args.second_rate_bytes_per_sec.is_some()
@@ -752,6 +801,7 @@ mod linux {
             let verify = args.verify;
             let relay_options = RelayOptions {
                 requested_pipe_size: args.pipe_size,
+                destination_drain_mode: args.destination_drain_mode,
                 initial_rate: args.rate_bytes_per_sec,
                 initial_notsent_lowat,
                 rate_updates: Arc::clone(&rate_updates),
@@ -822,6 +872,10 @@ mod linux {
             .map(|stats| stats.pipe_capacity)
             .max()
             .expect("at least one relay");
+        let destination_ready_acquisitions_total = relay_stats
+            .iter()
+            .map(|stats| stats.destination_ready_acquisitions)
+            .sum::<u64>();
         let destination_would_blocks_total = relay_stats
             .iter()
             .map(|stats| stats.destination_would_blocks)
@@ -927,6 +981,7 @@ mod linux {
             actual_pipe_capacity_min,
             actual_pipe_capacity_max,
             unpaced: args.unpaced,
+            destination_drain_mode: args.destination_drain_mode.as_str(),
             requested_rate_bytes_per_sec: (!args.unpaced)
                 .then_some(args.rate_bytes_per_sec),
             second_rate_bytes_per_sec: args.second_rate_bytes_per_sec,
@@ -944,6 +999,10 @@ mod linux {
             adaptive_notsent_lowat_bytes: args.adaptive_notsent_lowat_bytes,
             sample_tcp_info: args.sample_tcp_info,
             sample_rate_decrease_recovery: args.sample_rate_decrease_recovery,
+            destination_ready_acquisitions_total,
+            destination_ready_acquisitions_per_connection: round(
+                destination_ready_acquisitions_total as f64 / args.connections as f64,
+            ),
             destination_would_blocks_total,
             destination_would_blocks_per_connection: round(
                 destination_would_blocks_total as f64 / args.connections as f64,
@@ -1056,6 +1115,7 @@ mod linux {
             nonblocking_pipe(options.requested_pipe_size)?;
         let mut pending = 0_usize;
         let mut transferred = 0_u64;
+        let mut destination_ready_acquisitions = 0_u64;
         let mut destination_would_blocks = 0_u64;
         let mut source_would_blocks = 0_u64;
         let mut notsent_bytes_at_rate_update = None;
@@ -1080,6 +1140,38 @@ mod linux {
             if pending > 0 {
                 let pipe_read_fd = pipe_read.as_raw_fd();
                 let mut writable = destination.writable().await?;
+                destination_ready_acquisitions =
+                    destination_ready_acquisitions.saturating_add(1);
+                if options.destination_drain_mode
+                    == DestinationDrainMode::UntilWouldBlock
+                {
+                    loop {
+                        match writable.try_io(|destination| {
+                            splice_once(
+                                pipe_read_fd,
+                                destination.get_ref().as_raw_fd(),
+                                pending,
+                            )
+                        }) {
+                            Ok(Ok(0)) => return Err(io::ErrorKind::WriteZero.into()),
+                            Ok(Ok(written)) => {
+                                pending -= written;
+                                transferred =
+                                    transferred.saturating_add(written as u64);
+                                if pending == 0 {
+                                    break;
+                                }
+                            }
+                            Ok(Err(error)) => return Err(error),
+                            Err(_would_block) => {
+                                destination_would_blocks =
+                                    destination_would_blocks.saturating_add(1);
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if active_rate_decrease_recovery
                     .as_ref()
                     .is_some_and(|recovery| recovery.would_blocks > 0)
@@ -1248,6 +1340,7 @@ mod linux {
                     return Ok(RelayStats {
                         bytes: transferred,
                         pipe_capacity,
+                        destination_ready_acquisitions,
                         destination_would_blocks,
                         source_would_blocks,
                         notsent_bytes_at_rate_update,
@@ -1491,6 +1584,7 @@ mod linux {
                 notsent_lowat_gate_decreases_only: false,
                 adaptive_notsent_lowat_bytes: None,
                 pipe_size: 4096,
+                destination_drain_mode: DestinationDrainMode::Single,
                 warmup: 0,
                 runs: 1,
                 sample_tcp_info: false,
@@ -1522,6 +1616,20 @@ mod linux {
 
             args.sample_tcp_info = true;
             assert!(validate_args(&args).is_err());
+        }
+
+        #[test]
+        fn destination_drain_until_would_block_rejects_dynamic_pacing() {
+            let mut args = base_args();
+            args.destination_drain_mode = DestinationDrainMode::UntilWouldBlock;
+            assert!(validate_args(&args).is_ok());
+
+            args.second_rate_bytes_per_sec = Some(50);
+            assert!(validate_args(&args).is_err());
+            args.second_rate_bytes_per_sec = None;
+
+            args.unpaced = true;
+            assert!(validate_args(&args).is_ok());
         }
 
         #[test]
@@ -1734,6 +1842,7 @@ mod linux {
         async fn unpaced_asyncfd_splice_roundtrip_reports_no_rate_ratio() {
             let mut args = base_args();
             args.unpaced = true;
+            args.destination_drain_mode = DestinationDrainMode::UntilWouldBlock;
             args.worker_threads = 2;
             args.bytes_per_connection = 256 * 1024;
             args.chunk_size = 16 * 1024;
@@ -1745,6 +1854,7 @@ mod linux {
             assert_eq!(record.requested_rate_bytes_per_sec, None);
             assert_eq!(record.per_connection_rate_ratio, None);
             assert_eq!(record.pacing_updates_total, 0);
+            assert_eq!(record.destination_drain_mode, "until-would-block");
             assert_eq!(
                 record.actual_pipe_capacity_min,
                 record.actual_pipe_capacity_max
