@@ -7,6 +7,7 @@ const EVENTS: u64 = 20_000_000;
 const RECORD_EVENTS: u64 = 10_000_000;
 const BATCHED_ACK_PACKETS: u64 = 8_000_000;
 const WINDOW_EVENTS: u64 = 40_000_000;
+const ON_ACK_EVENTS: u64 = 10_000_000;
 const SLOT_COUNT: u64 = 5;
 
 #[derive(Clone, Copy)]
@@ -281,6 +282,47 @@ fn run_window_bench(name: &str, optimized: bool, ack_rate: f64) {
     );
 }
 
+fn run_on_ack_component_bench(
+    name: &str,
+    include_record: bool,
+    include_window: bool,
+    cached_tx_f64: bool,
+) {
+    let origin = Instant::now();
+    let mut state = RecordState::new(origin);
+    let tx_bps = 50_000_000_u64;
+    let tx_bps_f64 = tx_bps as f64;
+    let mut window = modeled_window(state.ack_rate);
+    let started = Instant::now();
+    for event in 0..ON_ACK_EVENTS {
+        let now = origin + Duration::from_micros(event * 100);
+        // Live Quinn traces move the RTT input on almost every ACK. Model a small,
+        // deterministic estimator movement instead of benchmarking a constant RTT.
+        let last_rtt = Duration::from_nanos(79_500_000 + event % 1_000_001);
+        black_box(last_rtt);
+        if include_record {
+            state.cached_second_record_skip_pristine_rate(black_box(now), 1, 0);
+        }
+        if include_window {
+            let rtt_secs = black_box(last_rtt).as_secs_f64();
+            let tx = if cached_tx_f64 {
+                black_box(tx_bps_f64)
+            } else {
+                black_box(tx_bps) as f64
+            };
+            window = ((tx * rtt_secs * 0.8) / black_box(state.ack_rate)) as u64;
+            black_box(window);
+        }
+    }
+    let elapsed = started.elapsed();
+    println!(
+        "{name}: record={include_record} window={include_window} cached_tx_f64={cached_tx_f64} ns_per_ack={:.3} final_ack_rate={:.6} final_window={}",
+        elapsed.as_nanos() as f64 / ON_ACK_EVENTS as f64,
+        black_box(state.ack_rate),
+        black_box(window),
+    );
+}
+
 fn run_ack_batch_bench(name: &str, batched: bool, batch_size: u64) {
     let origin = Instant::now();
     let mut state = RecordState::new(origin);
@@ -334,6 +376,13 @@ fn main() {
         run_window_bench("baseline-window", false, ack_rate);
         run_window_bench("pristine-fast-window", true, ack_rate);
     }
+    println!("modeled on_ack component attribution with moving RTT:");
+    run_on_ack_component_bench("rtt-input-only", false, false, false);
+    run_on_ack_component_bench("record-only", true, false, false);
+    run_on_ack_component_bench("window-only", false, true, false);
+    run_on_ack_component_bench("window-cached-tx", false, true, true);
+    run_on_ack_component_bench("record-plus-window", true, true, false);
+    run_on_ack_component_bench("record-plus-window-cached-tx", true, true, true);
     println!("ACK-frame batching over cached-second record path:");
     for batch_size in [1, 2, 4, 8, 16, 32] {
         run_ack_batch_bench("per-packet-record", false, batch_size);
