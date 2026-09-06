@@ -50,6 +50,13 @@ mod linux {
         Duplicate,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+    #[serde(rename_all = "kebab-case")]
+    enum SpliceWaitMode {
+        Blocking,
+        Poll,
+    }
+
     #[derive(Debug, Parser)]
     #[command(about = "Loopback TCP pacing probe for Brutal2 design work")]
     struct Args {
@@ -65,6 +72,9 @@ mod linux {
         #[arg(long, value_enum, default_value_t = FdPlacement::Original)]
         splice_destination_fd: FdPlacement,
 
+        #[arg(long, value_enum, default_value_t = SpliceWaitMode::Blocking)]
+        splice_wait_mode: SpliceWaitMode,
+
         #[arg(long, default_value_t = 256 * 1024 * 1024_u64)]
         bytes: u64,
 
@@ -76,6 +86,9 @@ mod linux {
 
         #[arg(long)]
         second_rate_bytes_per_sec: Option<u64>,
+
+        #[arg(long)]
+        notsent_lowat_bytes: Option<u32>,
 
         #[arg(long, default_value_t = 1)]
         warmup: usize,
@@ -108,6 +121,7 @@ mod linux {
         backend: Backend,
         pacing_fd: FdPlacement,
         splice_destination_fd: FdPlacement,
+        splice_wait_mode: SpliceWaitMode,
         run_index: usize,
         warmup: bool,
         bytes: u64,
@@ -115,7 +129,11 @@ mod linux {
         requested_rate_bytes_per_sec: u64,
         second_rate_bytes_per_sec: Option<u64>,
         kernel_pacing_rate_bytes_per_sec: Option<u64>,
+        requested_notsent_lowat_bytes: Option<u32>,
+        socket_notsent_lowat_bytes: u32,
         pacing_updates: usize,
+        notsent_bytes_at_rate_update: Option<u32>,
+        writable_waits: u64,
         elapsed_seconds: f64,
         throughput_gbps: f64,
         observed_rate_bytes_per_sec: f64,
@@ -134,12 +152,18 @@ mod linux {
         backend: Backend,
         pacing_fd: FdPlacement,
         splice_destination_fd: FdPlacement,
+        splice_wait_mode: SpliceWaitMode,
         runs: usize,
         warmup_runs: usize,
         bytes: u64,
         chunk_size: usize,
         requested_rate_bytes_per_sec: u64,
         second_rate_bytes_per_sec: Option<u64>,
+        requested_notsent_lowat_bytes: Option<u32>,
+        socket_notsent_lowat_bytes: u32,
+        system_notsent_lowat_bytes: Option<u32>,
+        notsent_bytes_at_rate_update_median: Option<f64>,
+        writable_waits_median: f64,
         throughput_median_gbps: f64,
         throughput_cv: f64,
         observed_rate_bytes_per_sec_median: f64,
@@ -164,6 +188,9 @@ mod linux {
         let mut requested_ratios = Vec::with_capacity(args.runs);
         let mut cpu_per_gib = Vec::with_capacity(args.runs);
         let mut context_switches = Vec::with_capacity(args.runs);
+        let mut notsent_at_update = Vec::with_capacity(args.runs);
+        let mut writable_waits = Vec::with_capacity(args.runs);
+        let mut socket_notsent_lowat = None;
         for run_index in 0..args.runs {
             let record = run_once(&args, run_index, false)?;
             throughput.push(record.throughput_gbps);
@@ -174,6 +201,11 @@ mod linux {
                 (record.voluntary_context_switches
                     + record.involuntary_context_switches) as f64,
             );
+            if let Some(notsent) = record.notsent_bytes_at_rate_update {
+                notsent_at_update.push(notsent as f64);
+            }
+            writable_waits.push(record.writable_waits as f64);
+            socket_notsent_lowat = Some(record.socket_notsent_lowat_bytes);
             println!("{}", serde_json::to_string(&record)?);
         }
 
@@ -184,12 +216,20 @@ mod linux {
             backend: args.backend,
             pacing_fd: args.pacing_fd,
             splice_destination_fd: args.splice_destination_fd,
+            splice_wait_mode: args.splice_wait_mode,
             runs: args.runs,
             warmup_runs: args.warmup,
             bytes: args.bytes,
             chunk_size: args.chunk_size,
             requested_rate_bytes_per_sec: args.rate_bytes_per_sec,
             second_rate_bytes_per_sec: args.second_rate_bytes_per_sec,
+            requested_notsent_lowat_bytes: args.notsent_lowat_bytes,
+            socket_notsent_lowat_bytes: socket_notsent_lowat
+                .expect("at least one measured run"),
+            system_notsent_lowat_bytes: system_notsent_lowat(),
+            notsent_bytes_at_rate_update_median: (!notsent_at_update.is_empty())
+                .then(|| round(median(&notsent_at_update))),
+            writable_waits_median: round(median(&writable_waits)),
             throughput_median_gbps: round(median(&throughput)),
             throughput_cv: round(coefficient_of_variation(&throughput)),
             observed_rate_bytes_per_sec_median: round(median(&observed_rates)),
@@ -223,6 +263,11 @@ mod linux {
             && args.splice_destination_fd != FdPlacement::Original
         {
             bail!("--splice-destination-fd duplicate requires --backend splice");
+        }
+        if args.backend != Backend::Splice
+            && args.splice_wait_mode != SpliceWaitMode::Blocking
+        {
+            bail!("--splice-wait-mode poll requires --backend splice");
         }
         if args.mode != PacingMode::Kernel && args.pacing_fd != FdPlacement::Original
         {
@@ -286,6 +331,13 @@ mod linux {
         } else {
             None
         };
+        if let Some(lowat) = args.notsent_lowat_bytes {
+            set_tcp_notsent_lowat(pacing_fd, lowat)?;
+        }
+        let socket_notsent_lowat = get_tcp_notsent_lowat(sender.as_raw_fd())?;
+        if args.splice_wait_mode == SpliceWaitMode::Poll {
+            set_nonblocking(splice_destination_fd)?;
+        }
 
         let buffer = vec![PATTERN_BYTE; args.chunk_size];
         let splice_source = if args.backend == Backend::Splice {
@@ -299,6 +351,8 @@ mod linux {
         let mut sent = 0_u64;
         let switch_after = args.bytes / 2;
         let mut pacing_updates = 0_usize;
+        let mut notsent_bytes_at_rate_update = None;
+        let mut writable_waits = 0_u64;
         match args.backend {
             Backend::Send => {
                 while sent < args.bytes {
@@ -314,6 +368,7 @@ mod linux {
                         switch_after,
                         args.second_rate_bytes_per_sec,
                         &mut pacing_updates,
+                        &mut notsent_bytes_at_rate_update,
                     )?;
                     if args.mode == PacingMode::Userspace {
                         pace_userspace(started, sent, args.rate_bytes_per_sec);
@@ -337,10 +392,12 @@ mod linux {
                     }
                     let mut drained = 0;
                     while drained < filled {
-                        let moved = splice_exact(
+                        let moved = splice_to_socket(
                             source.pipe_read.as_raw_fd(),
                             splice_destination_fd,
                             filled - drained,
+                            args.splice_wait_mode,
+                            &mut writable_waits,
                         )?;
                         if moved == 0 {
                             bail!("splice pipe drained zero bytes");
@@ -354,6 +411,7 @@ mod linux {
                         switch_after,
                         args.second_rate_bytes_per_sec,
                         &mut pacing_updates,
+                        &mut notsent_bytes_at_rate_update,
                     )?;
                     if args.mode == PacingMode::Userspace {
                         pace_userspace(started, sent, args.rate_bytes_per_sec);
@@ -384,6 +442,7 @@ mod linux {
             backend: args.backend,
             pacing_fd: args.pacing_fd,
             splice_destination_fd: args.splice_destination_fd,
+            splice_wait_mode: args.splice_wait_mode,
             run_index,
             warmup,
             bytes: args.bytes,
@@ -391,7 +450,11 @@ mod linux {
             requested_rate_bytes_per_sec: args.rate_bytes_per_sec,
             second_rate_bytes_per_sec: args.second_rate_bytes_per_sec,
             kernel_pacing_rate_bytes_per_sec: kernel_pacing_rate,
+            requested_notsent_lowat_bytes: args.notsent_lowat_bytes,
+            socket_notsent_lowat_bytes: socket_notsent_lowat,
             pacing_updates,
+            notsent_bytes_at_rate_update,
+            writable_waits,
             elapsed_seconds: round(elapsed),
             throughput_gbps: round(observed_rate * 8.0 / 1e9),
             observed_rate_bytes_per_sec: round(observed_rate),
@@ -476,6 +539,48 @@ mod linux {
         }
     }
 
+    fn splice_to_socket(
+        source: RawFd,
+        destination: RawFd,
+        count: usize,
+        wait_mode: SpliceWaitMode,
+        writable_waits: &mut u64,
+    ) -> io::Result<usize> {
+        loop {
+            match splice_exact(source, destination, count) {
+                Err(error)
+                    if wait_mode == SpliceWaitMode::Poll
+                        && error.kind() == io::ErrorKind::WouldBlock =>
+                {
+                    wait_writable(destination)?;
+                    *writable_waits = writable_waits.saturating_add(1);
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn wait_writable(fd: RawFd) -> io::Result<()> {
+        let mut poll_fd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        loop {
+            let result = unsafe { libc::poll(&mut poll_fd, 1, -1) };
+            if result > 0 {
+                return Ok(());
+            }
+            if result == 0 {
+                continue;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
     fn effective_requested_rate(args: &Args) -> f64 {
         match args.second_rate_bytes_per_sec {
             Some(second) => {
@@ -491,11 +596,13 @@ mod linux {
         switch_after: u64,
         second_rate: Option<u64>,
         pacing_updates: &mut usize,
+        notsent_bytes_at_rate_update: &mut Option<u32>,
     ) -> io::Result<()> {
         if *pacing_updates == 0
             && sent >= switch_after
             && let Some(rate) = second_rate
         {
+            *notsent_bytes_at_rate_update = Some(get_notsent_bytes(pacing_fd)?);
             set_max_pacing_rate(pacing_fd, rate)?;
             *pacing_updates = 1;
         }
@@ -536,6 +643,17 @@ mod linux {
         Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
     }
 
+    fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     fn set_max_pacing_rate(fd: RawFd, rate: u64) -> io::Result<()> {
         let result = unsafe {
             libc::setsockopt(
@@ -567,6 +685,62 @@ mod linux {
         };
         if result == 0 {
             Ok(rate)
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    fn set_tcp_notsent_lowat(fd: RawFd, bytes: u32) -> io::Result<()> {
+        let result = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_NOTSENT_LOWAT,
+                (&bytes as *const u32).cast(),
+                std::mem::size_of::<u32>() as libc::socklen_t,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    fn get_tcp_notsent_lowat(fd: RawFd) -> io::Result<u32> {
+        let mut bytes = 0_u32;
+        let mut len = std::mem::size_of::<u32>() as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_NOTSENT_LOWAT,
+                (&mut bytes as *mut u32).cast(),
+                &mut len,
+            )
+        };
+        if result == 0 {
+            Ok(bytes)
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    fn system_notsent_lowat() -> Option<u32> {
+        std::fs::read_to_string("/proc/sys/net/ipv4/tcp_notsent_lowat")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+    }
+
+    fn get_notsent_bytes(fd: RawFd) -> io::Result<u32> {
+        let mut bytes = 0_i32;
+        let result = unsafe { libc::ioctl(fd, libc::SIOCOUTQNSD, &mut bytes) };
+        if result == 0 {
+            u32::try_from(bytes).map_err(|_| {
+                io::Error::other(format!(
+                    "SIOCOUTQNSD returned negative bytes: {bytes}"
+                ))
+            })
         } else {
             Err(io::Error::last_os_error())
         }
@@ -651,6 +825,29 @@ mod linux {
             assert_eq!(
                 get_max_pacing_rate(duplicate.as_raw_fd()).unwrap(),
                 34_567_890
+            );
+            drop(peer);
+        }
+
+        #[test]
+        fn duplicated_tcp_fd_shares_notsent_lowat_state() {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let accept = thread::spawn(move || listener.accept().unwrap().0);
+            let stream = TcpStream::connect(address).unwrap();
+            let peer = accept.join().unwrap();
+            let duplicate = duplicate_fd(stream.as_raw_fd()).unwrap();
+
+            set_tcp_notsent_lowat(duplicate.as_raw_fd(), 32 * 1024).unwrap();
+            assert_eq!(
+                get_tcp_notsent_lowat(stream.as_raw_fd()).unwrap(),
+                32 * 1024
+            );
+
+            set_tcp_notsent_lowat(stream.as_raw_fd(), 64 * 1024).unwrap();
+            assert_eq!(
+                get_tcp_notsent_lowat(duplicate.as_raw_fd()).unwrap(),
+                64 * 1024
             );
             drop(peer);
         }
