@@ -335,7 +335,6 @@ mod linux {
                     tokio::io::BufReader::with_capacity(chunk_size, &mut source);
                 let copied =
                     tokio::io::copy_buf(&mut buffered, &mut destination).await?;
-                tokio::io::AsyncWriteExt::flush(&mut destination).await?;
                 Ok(copied)
             })
     }
