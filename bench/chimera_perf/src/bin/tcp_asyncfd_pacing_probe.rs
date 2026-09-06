@@ -51,6 +51,9 @@ mod linux {
         rate_bytes_per_sec: u64,
 
         #[arg(long)]
+        unpaced: bool,
+
+        #[arg(long)]
         second_rate_bytes_per_sec: Option<u64>,
 
         #[arg(long, value_delimiter = ',')]
@@ -151,6 +154,7 @@ mod linux {
     #[derive(Debug)]
     struct RelayStats {
         bytes: u64,
+        pipe_capacity: usize,
         destination_would_blocks: u64,
         source_would_blocks: u64,
         notsent_bytes_at_rate_update: Option<u32>,
@@ -176,7 +180,10 @@ mod linux {
         total_bytes: u64,
         chunk_size: usize,
         pipe_size: usize,
-        requested_rate_bytes_per_sec: u64,
+        actual_pipe_capacity_min: usize,
+        actual_pipe_capacity_max: usize,
+        unpaced: bool,
+        requested_rate_bytes_per_sec: Option<u64>,
         second_rate_bytes_per_sec: Option<u64>,
         rate_updates_bytes_per_sec: Vec<u64>,
         requested_notsent_lowat_bytes: Option<u32>,
@@ -211,7 +218,7 @@ mod linux {
         rate_decrease_recovery_target_notsent_bytes_median: Option<f64>,
         elapsed_seconds: f64,
         aggregate_throughput_gbps: f64,
-        per_connection_rate_ratio: f64,
+        per_connection_rate_ratio: Option<f64>,
         cpu_seconds: f64,
         cpu_seconds_per_gib: f64,
         voluntary_context_switches: i64,
@@ -229,7 +236,10 @@ mod linux {
         bytes_per_connection: u64,
         chunk_size: usize,
         pipe_size: usize,
-        requested_rate_bytes_per_sec: u64,
+        actual_pipe_capacity_min: usize,
+        actual_pipe_capacity_max: usize,
+        unpaced: bool,
+        requested_rate_bytes_per_sec: Option<u64>,
         second_rate_bytes_per_sec: Option<u64>,
         rate_updates_bytes_per_sec: Vec<u64>,
         requested_notsent_lowat_bytes: Option<u32>,
@@ -245,7 +255,7 @@ mod linux {
         sample_rate_decrease_recovery: bool,
         aggregate_throughput_median_gbps: f64,
         throughput_cv: f64,
-        per_connection_rate_ratio_median: f64,
+        per_connection_rate_ratio_median: Option<f64>,
         cpu_seconds_per_gib_median: f64,
         context_switches_median: f64,
         destination_would_blocks_per_connection_median: f64,
@@ -284,6 +294,8 @@ mod linux {
 
         let mut throughput = Vec::with_capacity(args.runs);
         let mut ratios = Vec::with_capacity(args.runs);
+        let mut actual_pipe_capacity_min = Vec::with_capacity(args.runs);
+        let mut actual_pipe_capacity_max = Vec::with_capacity(args.runs);
         let mut cpu_per_gib = Vec::with_capacity(args.runs);
         let mut context_switches = Vec::with_capacity(args.runs);
         let mut destination_blocks = Vec::with_capacity(args.runs);
@@ -306,7 +318,11 @@ mod linux {
         for run_index in 0..args.runs {
             let record = runtime.block_on(run_once(&args, run_index, false))?;
             throughput.push(record.aggregate_throughput_gbps);
-            ratios.push(record.per_connection_rate_ratio);
+            if let Some(ratio) = record.per_connection_rate_ratio {
+                ratios.push(ratio);
+            }
+            actual_pipe_capacity_min.push(record.actual_pipe_capacity_min);
+            actual_pipe_capacity_max.push(record.actual_pipe_capacity_max);
             cpu_per_gib.push(record.cpu_seconds_per_gib);
             context_switches.push(
                 (record.voluntary_context_switches
@@ -383,7 +399,17 @@ mod linux {
                 bytes_per_connection: args.bytes_per_connection,
                 chunk_size: args.chunk_size,
                 pipe_size: args.pipe_size,
-                requested_rate_bytes_per_sec: args.rate_bytes_per_sec,
+                actual_pipe_capacity_min: *actual_pipe_capacity_min
+                    .iter()
+                    .min()
+                    .expect("at least one measured run"),
+                actual_pipe_capacity_max: *actual_pipe_capacity_max
+                    .iter()
+                    .max()
+                    .expect("at least one measured run"),
+                unpaced: args.unpaced,
+                requested_rate_bytes_per_sec: (!args.unpaced)
+                    .then_some(args.rate_bytes_per_sec),
                 second_rate_bytes_per_sec: args.second_rate_bytes_per_sec,
                 rate_updates_bytes_per_sec: args.rate_updates_bytes_per_sec.clone(),
                 requested_notsent_lowat_bytes: args.notsent_lowat_bytes,
@@ -401,7 +427,8 @@ mod linux {
                 sample_rate_decrease_recovery: args.sample_rate_decrease_recovery,
                 aggregate_throughput_median_gbps: round(median(&throughput)),
                 throughput_cv: round(coefficient_of_variation(&throughput)),
-                per_connection_rate_ratio_median: round(median(&ratios)),
+                per_connection_rate_ratio_median: (!ratios.is_empty())
+                    .then(|| round(median(&ratios))),
                 cpu_seconds_per_gib_median: round(median(&cpu_per_gib)),
                 context_switches_median: round(median(&context_switches)),
                 destination_would_blocks_per_connection_median: round(median(
@@ -476,6 +503,23 @@ mod linux {
             || args.rate_updates_bytes_per_sec.contains(&0)
         {
             bail!("pacing rates must be greater than zero");
+        }
+        if args.unpaced
+            && (args.second_rate_bytes_per_sec.is_some()
+                || !args.rate_updates_bytes_per_sec.is_empty()
+                || args.notsent_lowat_bytes.is_some()
+                || args.notsent_lowat_ms.is_some()
+                || args.notsent_lowat_min_bytes.is_some()
+                || args.notsent_lowat_max_bytes.is_some()
+                || args.notsent_lowat_update_threshold_percent != 0.0
+                || args.notsent_lowat_gate_decreases_only
+                || args.adaptive_notsent_lowat_bytes.is_some()
+                || args.sample_tcp_info
+                || args.sample_rate_decrease_recovery)
+        {
+            bail!(
+                "--unpaced cannot be combined with pacing, low-water, or rate-update options"
+            );
         }
         if args.second_rate_bytes_per_sec.is_some()
             && !args.rate_updates_bytes_per_sec.is_empty()
@@ -686,10 +730,12 @@ mod linux {
             let destination = Arc::new(AsyncFd::new(duplicate_fd(
                 relay_destination.as_raw_fd(),
             )?)?);
-            set_max_pacing_rate(
-                destination.get_ref().as_raw_fd(),
-                args.rate_bytes_per_sec,
-            )?;
+            if !args.unpaced {
+                set_max_pacing_rate(
+                    destination.get_ref().as_raw_fd(),
+                    args.rate_bytes_per_sec,
+                )?;
+            }
             if let Some(lowat) = initial_notsent_lowat {
                 set_tcp_notsent_lowat(destination.get_ref().as_raw_fd(), lowat)?;
             }
@@ -766,6 +812,16 @@ mod linux {
         {
             bail!("one or more relays transferred an unexpected byte count");
         }
+        let actual_pipe_capacity_min = relay_stats
+            .iter()
+            .map(|stats| stats.pipe_capacity)
+            .min()
+            .expect("at least one relay");
+        let actual_pipe_capacity_max = relay_stats
+            .iter()
+            .map(|stats| stats.pipe_capacity)
+            .max()
+            .expect("at least one relay");
         let destination_would_blocks_total = relay_stats
             .iter()
             .map(|stats| stats.destination_would_blocks)
@@ -852,7 +908,7 @@ mod linux {
             .iter()
             .map(|sample| sample.target_notsent_bytes as f64)
             .collect::<Vec<_>>();
-        let expected_rate = effective_requested_rate(args);
+        let expected_rate = (!args.unpaced).then(|| effective_requested_rate(args));
         let per_connection_observed_rate =
             args.bytes_per_connection as f64 / elapsed;
         let cpu_seconds = usage_after.cpu_seconds - usage_before.cpu_seconds;
@@ -868,7 +924,11 @@ mod linux {
             total_bytes,
             chunk_size: args.chunk_size,
             pipe_size: args.pipe_size,
-            requested_rate_bytes_per_sec: args.rate_bytes_per_sec,
+            actual_pipe_capacity_min,
+            actual_pipe_capacity_max,
+            unpaced: args.unpaced,
+            requested_rate_bytes_per_sec: (!args.unpaced)
+                .then_some(args.rate_bytes_per_sec),
             second_rate_bytes_per_sec: args.second_rate_bytes_per_sec,
             rate_updates_bytes_per_sec: args.rate_updates_bytes_per_sec.clone(),
             requested_notsent_lowat_bytes: args.notsent_lowat_bytes,
@@ -924,9 +984,8 @@ mod linux {
             aggregate_throughput_gbps: round(
                 total_bytes as f64 * 8.0 / elapsed / 1e9,
             ),
-            per_connection_rate_ratio: round(
-                per_connection_observed_rate / expected_rate,
-            ),
+            per_connection_rate_ratio: expected_rate
+                .map(|expected| round(per_connection_observed_rate / expected)),
             cpu_seconds: round(cpu_seconds),
             cpu_seconds_per_gib: round(cpu_seconds / (total_bytes as f64 / GIB)),
             voluntary_context_switches: usage_after.voluntary_context_switches
@@ -1188,6 +1247,7 @@ mod linux {
                     }
                     return Ok(RelayStats {
                         bytes: transferred,
+                        pipe_capacity,
                         destination_would_blocks,
                         source_would_blocks,
                         notsent_bytes_at_rate_update,
@@ -1420,6 +1480,7 @@ mod linux {
                 bytes_per_connection: 1,
                 chunk_size: 1,
                 rate_bytes_per_sec: 100,
+                unpaced: false,
                 second_rate_bytes_per_sec: None,
                 rate_updates_bytes_per_sec: Vec::new(),
                 notsent_lowat_bytes: None,
@@ -1442,6 +1503,24 @@ mod linux {
         fn rejects_zero_connections() {
             let mut args = base_args();
             args.connections = 0;
+            assert!(validate_args(&args).is_err());
+        }
+
+        #[test]
+        fn unpaced_rejects_pacing_specific_options() {
+            let mut args = base_args();
+            args.unpaced = true;
+            assert!(validate_args(&args).is_ok());
+
+            args.second_rate_bytes_per_sec = Some(50);
+            assert!(validate_args(&args).is_err());
+            args.second_rate_bytes_per_sec = None;
+
+            args.notsent_lowat_bytes = Some(64 * 1024);
+            assert!(validate_args(&args).is_err());
+            args.notsent_lowat_bytes = None;
+
+            args.sample_tcp_info = true;
             assert!(validate_args(&args).is_err());
         }
 
@@ -1644,8 +1723,33 @@ mod linux {
             assert!(record.rate_decrease_recovery_elapsed_us_median.is_some());
             assert_eq!(
                 record.rate_decrease_recovery_target_notsent_bytes_median,
-                Some(queue_time_lowat_bytes(25 * 1024 * 1024, 32, None, None).unwrap() as f64)
+                Some(
+                    queue_time_lowat_bytes(25 * 1024 * 1024, 32, None, None).unwrap()
+                        as f64
+                )
             );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn unpaced_asyncfd_splice_roundtrip_reports_no_rate_ratio() {
+            let mut args = base_args();
+            args.unpaced = true;
+            args.worker_threads = 2;
+            args.bytes_per_connection = 256 * 1024;
+            args.chunk_size = 16 * 1024;
+            args.pipe_size = 128 * 1024;
+            args.verify = true;
+
+            let record = run_once(&args, 0, false).await.unwrap();
+            assert_eq!(record.total_bytes, args.bytes_per_connection);
+            assert_eq!(record.requested_rate_bytes_per_sec, None);
+            assert_eq!(record.per_connection_rate_ratio, None);
+            assert_eq!(record.pacing_updates_total, 0);
+            assert_eq!(
+                record.actual_pipe_capacity_min,
+                record.actual_pipe_capacity_max
+            );
+            assert!(record.actual_pipe_capacity_min > 0);
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
