@@ -320,6 +320,25 @@ strace -f -c \
 
 Run the same command with `--mode userspace`. This probe is benchmark-only; production TCP Brutal2 should not adopt kernel pacing until the target rate lifecycle and fallback semantics are defined through the normal config/runtime/handler layering.
 
+### Pacing-rate publication policy
+
+`tcp_pacing_policy_bench` isolates the userspace policy that decides when a high-frequency Brutal2 rate estimate should be published to `SO_MAX_PACING_RATE`. The deterministic synthetic trace contains 10 kHz estimator samples, small jitter/ramp noise, and large bandwidth steps. Sweep minimum update intervals and normal rate-delta hysteresis without involving TCP queue behavior:
+
+```bash
+cargo build --release --manifest-path bench/chimera_perf/Cargo.toml \
+  --bin tcp_pacing_policy_bench
+
+bench/chimera_perf/target/release/tcp_pacing_policy_bench \
+  --sample-interval-us 100 \
+  --samples 400000 \
+  --min-update-ms 5,10,20 \
+  --delta-percent 1,5 \
+  --emergency-delta-percent 25 \
+  --cpu-repetitions 100
+```
+
+The important fields are `publications_per_second`, mean/p95/peak absolute tracking error, and `cpu_nanoseconds_per_sample`. A minimum update interval by itself can leave a stale pacing rate in place across a sharp bandwidth step. `--emergency-delta-percent` models an immediate publication path for large relative changes so normal jitter can remain rate-limited without delaying a major correction. The synthetic trace is a policy microbenchmark, not a substitute for replaying real Brutal2 estimator traces; use it to reject obviously bad publication rules before wiring any policy into the production data path.
+
 ## Required experiment discipline
 
 - Build every compared binary in release mode using the same toolchain.
