@@ -53,6 +53,7 @@ impl ControllerFactory for BrutalConfig {
             tx_bps: self.tx_bps.clone(),
             cached_brutal_window: brutal.initial_window(),
             brutal_tx_bps: 0,
+            pending_brutal_acks: 0,
             brutal,
             bbr: Some(Bbr::new(self.bbr_config.clone(), current_mtu)),
             brutal_active: false,
@@ -67,6 +68,7 @@ struct BrutalController {
     bbr: Option<Bbr>,
     brutal_active: bool,
     brutal_tx_bps: u64,
+    pending_brutal_acks: u64,
     cached_brutal_window: u64,
 }
 
@@ -95,10 +97,25 @@ impl BrutalController {
         // target rate once at this transition, so cache the derived window and
         // refresh it only when Brutal state changes instead of recomputing it on
         // every Quinn `window()` query.
+        self.pending_brutal_acks = 0;
         self.brutal.reset_samples(now);
         self.bbr = None;
         self.brutal_active = true;
         self.brutal_tx_bps = tx_bps;
+        self.refresh_brutal_window();
+    }
+
+    fn queue_brutal_ack(&mut self, rtt: Duration) {
+        self.brutal.last_rtt = rtt;
+        self.pending_brutal_acks += 1;
+    }
+
+    fn flush_brutal_acks(&mut self, now: Instant) {
+        let ack_count = std::mem::take(&mut self.pending_brutal_acks);
+        if ack_count == 0 {
+            return;
+        }
+        self.brutal.record(now, ack_count, 0);
         self.refresh_brutal_window();
     }
 
@@ -129,8 +146,10 @@ impl Controller for BrutalController {
         if let Some(bbr) = self.bbr.as_mut() {
             bbr.on_ack(now, sent, bytes, app_limited, rtt);
         }
-        self.brutal.on_ack(now, rtt);
-        self.refresh_brutal_window();
+        // Quinn delivers every packet in an ACK batch through `on_ack`, then
+        // calls `on_end_acks` once with the same `now`. Brutal only exposes its
+        // window after the batch, so defer rate/window recomputation until then.
+        self.queue_brutal_ack(rtt.get());
     }
 
     fn on_end_acks(
@@ -144,6 +163,7 @@ impl Controller for BrutalController {
         if let Some(bbr) = self.bbr.as_mut() {
             bbr.on_end_acks(now, in_flight, app_limited, largest_packet_num_acked);
         }
+        self.flush_brutal_acks(now);
     }
 
     fn on_congestion_event(
@@ -263,11 +283,6 @@ impl BrutalState {
         self.rolling_second_start = now;
         self.next_rolling_second = now;
         self.last_debug_timestamp = 0;
-    }
-
-    fn on_ack(&mut self, now: Instant, rtt: &RttEstimator) {
-        self.last_rtt = rtt.get();
-        self.record(now, 1, 0);
     }
 
     fn on_congestion_event(&mut self, now: Instant, lost_bytes: u64) {
@@ -422,6 +437,7 @@ mod tests {
             tx_bps,
             cached_brutal_window: brutal.initial_window(),
             brutal_tx_bps: 0,
+            pending_brutal_acks: 0,
             brutal,
             bbr: Some(Bbr::new(Arc::new(BbrConfig::default()), 1200)),
             brutal_active: false,
@@ -440,6 +456,7 @@ mod tests {
             ack_count: 40,
             loss_count: 10,
         };
+        controller.queue_brutal_ack(Duration::from_millis(80));
 
         tx_bps.store(1_000_000, Ordering::Relaxed);
         let activated_at = now + Duration::from_secs(2);
@@ -450,6 +467,7 @@ mod tests {
         assert_eq!(controller.brutal.start, activated_at);
         assert_eq!(controller.brutal.last_rtt, Duration::from_millis(80));
         assert_eq!(controller.brutal.ack_rate, 1.0);
+        assert_eq!(controller.pending_brutal_acks, 0);
         assert!(
             controller
                 .brutal
@@ -492,6 +510,54 @@ mod tests {
             controller.cached_brutal_window,
             controller.brutal.window(controller.brutal_tx_bps)
         );
+    }
+
+    #[test]
+    fn brutal_ack_batch_flush_matches_per_packet_accounting() {
+        let tx_bps = Arc::new(AtomicU64::new(1_000_000));
+        let start = Instant::now();
+        let mut controller = controller(tx_bps, start);
+        controller.brutal.last_rtt = Duration::from_millis(80);
+        controller.activate_brutal_if_configured(start);
+        let mut per_packet = controller.brutal.clone();
+
+        for (elapsed, batch_size, rtt) in [
+            (Duration::from_millis(100), 1, Duration::from_millis(80)),
+            (Duration::from_millis(900), 4, Duration::from_millis(90)),
+            (Duration::from_millis(1_100), 8, Duration::from_millis(70)),
+            (Duration::from_millis(4_500), 16, Duration::from_millis(120)),
+            (Duration::from_millis(7_050), 7, Duration::from_millis(60)),
+        ] {
+            let now = start + elapsed;
+            for _ in 0..batch_size {
+                per_packet.last_rtt = rtt;
+                per_packet.record(now, 1, 0);
+                controller.queue_brutal_ack(rtt);
+            }
+
+            assert_eq!(controller.pending_brutal_acks, batch_size);
+            controller.flush_brutal_acks(now);
+
+            assert_eq!(controller.pending_brutal_acks, 0);
+            assert_eq!(
+                controller.brutal.rolling_ack_count,
+                per_packet.rolling_ack_count
+            );
+            assert_eq!(
+                controller.brutal.rolling_loss_count,
+                per_packet.rolling_loss_count
+            );
+            assert_eq!(
+                controller.brutal.rolling_timestamp,
+                per_packet.rolling_timestamp
+            );
+            assert_eq!(controller.brutal.ack_rate, per_packet.ack_rate);
+            assert_eq!(controller.brutal.last_rtt, per_packet.last_rtt);
+            assert_eq!(
+                controller.cached_brutal_window,
+                per_packet.window(controller.brutal_tx_bps)
+            );
+        }
     }
 
     #[test]

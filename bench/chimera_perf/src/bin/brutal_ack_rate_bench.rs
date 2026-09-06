@@ -5,6 +5,7 @@ const MIN_SAMPLE_COUNT: u64 = 50;
 const MIN_ACK_RATE: f64 = 0.8;
 const EVENTS: u64 = 20_000_000;
 const RECORD_EVENTS: u64 = 10_000_000;
+const BATCHED_ACK_PACKETS: u64 = 8_000_000;
 const SLOT_COUNT: u64 = 5;
 
 #[derive(Clone, Copy)]
@@ -200,6 +201,45 @@ fn run_record_bench(name: &str, cached: bool, loss_every: Option<u64>) {
     );
 }
 
+fn modeled_window(ack_rate: f64) -> u64 {
+    ((50_000_000_f64 * 0.080 * 0.8) / ack_rate) as u64
+}
+
+fn run_ack_batch_bench(name: &str, batched: bool, batch_size: u64) {
+    let origin = Instant::now();
+    let mut state = RecordState::new(origin);
+    let mut window = modeled_window(state.ack_rate);
+    let batches = BATCHED_ACK_PACKETS / batch_size;
+    let started = Instant::now();
+    for batch in 0..batches {
+        let now = origin + Duration::from_micros(batch * batch_size * 100);
+        if batched {
+            let mut pending_acks = 0_u64;
+            for _ in 0..batch_size {
+                pending_acks = pending_acks.wrapping_add(black_box(1));
+            }
+            state.cached_second_record(black_box(now), black_box(pending_acks), 0);
+            window = modeled_window(black_box(state.ack_rate));
+        } else {
+            for _ in 0..batch_size {
+                state.cached_second_record(black_box(now), 1, 0);
+                window = modeled_window(black_box(state.ack_rate));
+            }
+        }
+        if (batch + 1) % 100 == 0 {
+            state.cached_second_record(black_box(now), 0, 1);
+            window = modeled_window(black_box(state.ack_rate));
+        }
+    }
+    let elapsed = started.elapsed();
+    println!(
+        "{name}: batch_size={batch_size} ns_per_acked_packet={:.3} final_ack_rate={:.6} final_window={}",
+        elapsed.as_nanos() as f64 / BATCHED_ACK_PACKETS as f64,
+        black_box(state.ack_rate),
+        black_box(window),
+    );
+}
+
 fn main() {
     println!("ack-rate arithmetic only:");
     for loss_every in [None, Some(10_000), Some(1_000), Some(100)] {
@@ -210,6 +250,11 @@ fn main() {
     for loss_every in [None, Some(10_000), Some(1_000), Some(100)] {
         run_record_bench("baseline-record", false, loss_every);
         run_record_bench("cached-second-record", true, loss_every);
+    }
+    println!("ACK-frame batching over cached-second record path:");
+    for batch_size in [1, 2, 4, 8, 16, 32] {
+        run_ack_batch_bench("per-packet-record", false, batch_size);
+        run_ack_batch_bench("batched-record", true, batch_size);
     }
 }
 
@@ -252,6 +297,32 @@ mod tests {
             baseline_update(&mut baseline);
             no_loss_fast_path_update(&mut optimized);
             assert_eq!(baseline.ack_rate, optimized.ack_rate);
+        }
+    }
+
+    #[test]
+    fn batched_ack_updates_match_per_packet_at_batch_boundaries() {
+        let origin = Instant::now();
+        let mut per_packet = RecordState::new(origin);
+        let mut batched = RecordState::new(origin);
+
+        for batch in 0..20_000_u64 {
+            let batch_size = 1 + (batch % 17);
+            let now = origin + Duration::from_micros(batch * 700);
+            for _ in 0..batch_size {
+                per_packet.cached_second_record(now, 1, 0);
+            }
+            batched.cached_second_record(now, batch_size, 0);
+
+            if batch % 137 == 0 {
+                per_packet.cached_second_record(now, 0, 1);
+                batched.cached_second_record(now, 0, 1);
+            }
+
+            assert_eq!(per_packet.rolling_ack_count, batched.rolling_ack_count);
+            assert_eq!(per_packet.rolling_loss_count, batched.rolling_loss_count);
+            assert_eq!(per_packet.rolling_timestamp, batched.rolling_timestamp);
+            assert_eq!(per_packet.ack_rate, batched.ack_rate);
         }
     }
 }
