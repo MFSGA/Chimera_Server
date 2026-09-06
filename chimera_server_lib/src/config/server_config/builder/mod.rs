@@ -1277,7 +1277,12 @@ fn collect_sniffing_config(
         match protocol.trim().to_ascii_lowercase().as_str() {
             "http" => dest_override_http = true,
             "tls" | "https" | "ssl" => dest_override_tls = true,
-            "quic" | "fakedns" | "fakedns+others" => {
+            // Xray accepts QUIC as a sniffing destination override, but this
+            // server does not implement QUIC destination replacement. Keep
+            // the option as a compatibility no-op so existing Xray-shaped
+            // configs remain loadable while HTTP/TLS overrides still work.
+            "quic" => {}
+            "fakedns" | "fakedns+others" => {
                 return Err(Error::InvalidConfig(format!(
                     "inbound {tag} sniffing destOverride={protocol:?} is recognized by Xray but not implemented yet"
                 )));
@@ -2497,9 +2502,26 @@ mod tests {
         assert!(sniffing.excludes_ip("192.0.2.7".parse().unwrap()));
         assert!(!sniffing.excludes_ip("198.51.100.7".parse().unwrap()));
 
+        let quic_only = serde_json::from_value::<InboudItem>(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "dokodemo-door",
+            "tag": "dokodemo-sniff-quic",
+            "settings": {"address": "127.0.0.1", "port": 53},
+            "sniffing": {"enabled": true, "destOverride": ["quic"]}
+        }))
+        .expect("literal QUIC compatibility sniffing inbound should parse");
+        let quic_config = ServerConfig::try_from(quic_only)
+            .expect("Xray QUIC destOverride should be accepted as a no-op");
+        let quic_sniffing =
+            quic_config.sniffing.expect("compiled QUIC sniffing config");
+        assert!(quic_sniffing.enabled);
+        assert!(!quic_sniffing.dest_override_http);
+        assert!(!quic_sniffing.dest_override_tls);
+
         for sniffing in [
             serde_json::json!({"enabled": true, "metadataOnly": true}),
-            serde_json::json!({"enabled": true, "destOverride": ["quic"]}),
+            serde_json::json!({"enabled": true, "destOverride": ["fakedns"]}),
             serde_json::json!({"enabled": true, "domainsExcluded": ["regexp:(invalid"]}),
             serde_json::json!({"enabled": true, "ipsExcluded": ["192.0.2.0/99"]}),
         ] {
