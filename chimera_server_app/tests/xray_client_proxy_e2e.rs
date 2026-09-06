@@ -1965,23 +1965,21 @@ async fn xray_hysteria2_brutal_pacing_publication_trace() {
     )
     .await;
 
-    proxy.set_drop_every(10);
-    assert_socks5_echo_async_with_timeout(
-        socks_addr,
-        echo_addr,
-        &deterministic_payload(512 * 1024),
-        Duration::from_secs(20),
-    )
-    .await;
-
-    proxy.set_drop_every(0);
-    assert_socks5_echo_async_with_timeout(
-        socks_addr,
-        echo_addr,
-        &deterministic_payload(768 * 1024),
-        Duration::from_secs(20),
-    )
-    .await;
+    for (drop_every, payload_bytes) in [
+        (20, 384 * 1024),
+        (10, 512 * 1024),
+        (6, 640 * 1024),
+        (0, 1024 * 1024),
+    ] {
+        proxy.set_drop_every(drop_every);
+        assert_socks5_echo_async_with_timeout(
+            socks_addr,
+            echo_addr,
+            &deterministic_payload(payload_bytes),
+            Duration::from_secs(30),
+        )
+        .await;
+    }
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     let stderr = read_lossy(&chimera.stderr_path);
