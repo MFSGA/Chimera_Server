@@ -210,10 +210,12 @@ cargo build --manifest-path bench/chimera_perf/Cargo.toml \
   --release --bin relay_probe
 ```
 
-Compare the three candidates:
+Compare the relay candidates. `tokio-copy` mirrors Chimera's single-direction
+userspace fast path by using Tokio `BufReader + copy_buf`, so use it when
+measuring copy-buffer size and syscall-granularity changes:
 
 ```bash
-for backend in copy splice uring-splice; do
+for backend in copy tokio-copy splice uring-splice; do
   taskset -c 0,2,4 \
     bench/chimera_perf/target/release/relay_probe \
     --backend "$backend" \
@@ -250,6 +252,11 @@ strace -f -c \
   --warmup 0 \
   --runs 1
 ```
+
+For copy-buffer experiments, sweep `--chunk-size` with `--backend tokio-copy`
+and confirm the result with `strace -f -c` before changing
+`CHIMERA_TCP_COPY_BUFFER_SIZE` defaults. A single-flow win is not sufficient to
+override the recorded high-concurrency RSS/throughput tradeoff above.
 
 The io_uring implementation is intentionally benchmark-only. It must not be connected to the production relay until it beats ordinary splice in throughput and CPU/GiB with acceptable variance. The current measured candidate does not meet that gate.
 
