@@ -90,6 +90,9 @@ mod linux {
         sample_tcp_info: bool,
 
         #[arg(long)]
+        sample_rate_decrease_recovery: bool,
+
+        #[arg(long)]
         verify: bool,
     }
 
@@ -117,12 +120,32 @@ mod linux {
     #[derive(Debug, Clone)]
     struct RelayOptions {
         requested_pipe_size: usize,
+        initial_rate: u64,
         initial_notsent_lowat: Option<u32>,
         rate_updates: Arc<[RateUpdate]>,
         notsent_lowat_update_threshold_percent: f64,
         notsent_lowat_gate_decreases_only: bool,
         adaptive_notsent_lowat: Option<u32>,
         sample_tcp_info: bool,
+        sample_rate_decrease_recovery: bool,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct RateDecreaseRecovery {
+        elapsed_us: f64,
+        forwarded_bytes: u64,
+        would_blocks: u64,
+        start_notsent_bytes: u32,
+        target_notsent_bytes: u32,
+    }
+
+    #[derive(Debug)]
+    struct PendingRateDecreaseRecovery {
+        started: Instant,
+        transferred_at_start: u64,
+        would_blocks: u64,
+        start_notsent_bytes: u32,
+        target_notsent_bytes: u32,
     }
 
     #[derive(Debug)]
@@ -137,6 +160,8 @@ mod linux {
         adaptive_lowat_restores: u64,
         pacing_updates: u64,
         notsent_lowat_updates: u64,
+        rate_decrease_recoveries: Vec<RateDecreaseRecovery>,
+        incomplete_rate_decrease_recoveries: u64,
     }
 
     #[derive(Debug, Serialize)]
@@ -164,6 +189,7 @@ mod linux {
         effective_second_notsent_lowat_bytes: Option<u32>,
         adaptive_notsent_lowat_bytes: Option<u32>,
         sample_tcp_info: bool,
+        sample_rate_decrease_recovery: bool,
         destination_would_blocks_total: u64,
         destination_would_blocks_per_connection: f64,
         source_would_blocks_total: u64,
@@ -176,6 +202,13 @@ mod linux {
         adaptive_lowat_restores_total: u64,
         pacing_updates_total: u64,
         notsent_lowat_updates_total: u64,
+        rate_decrease_recoveries_total: u64,
+        incomplete_rate_decrease_recoveries_total: u64,
+        rate_decrease_recovery_elapsed_us_median: Option<f64>,
+        rate_decrease_recovery_forwarded_bytes_median: Option<f64>,
+        rate_decrease_recovery_would_blocks_median: Option<f64>,
+        rate_decrease_recovery_start_notsent_bytes_median: Option<f64>,
+        rate_decrease_recovery_target_notsent_bytes_median: Option<f64>,
         elapsed_seconds: f64,
         aggregate_throughput_gbps: f64,
         per_connection_rate_ratio: f64,
@@ -209,6 +242,7 @@ mod linux {
         effective_second_notsent_lowat_bytes: Option<u32>,
         adaptive_notsent_lowat_bytes: Option<u32>,
         sample_tcp_info: bool,
+        sample_rate_decrease_recovery: bool,
         aggregate_throughput_median_gbps: f64,
         throughput_cv: f64,
         per_connection_rate_ratio_median: f64,
@@ -224,6 +258,13 @@ mod linux {
         adaptive_lowat_restores_per_connection_median: f64,
         pacing_updates_per_connection_median: f64,
         notsent_lowat_updates_per_connection_median: f64,
+        rate_decrease_recoveries_per_connection_median: f64,
+        incomplete_rate_decrease_recoveries_per_connection_median: f64,
+        rate_decrease_recovery_elapsed_us_median: Option<f64>,
+        rate_decrease_recovery_forwarded_bytes_median: Option<f64>,
+        rate_decrease_recovery_would_blocks_median: Option<f64>,
+        rate_decrease_recovery_start_notsent_bytes_median: Option<f64>,
+        rate_decrease_recovery_target_notsent_bytes_median: Option<f64>,
     }
 
     pub(super) fn run() -> Result<()> {
@@ -255,6 +296,13 @@ mod linux {
         let mut adaptive_restores = Vec::with_capacity(args.runs);
         let mut pacing_updates = Vec::with_capacity(args.runs);
         let mut notsent_lowat_updates = Vec::with_capacity(args.runs);
+        let mut rate_decrease_recoveries = Vec::with_capacity(args.runs);
+        let mut incomplete_rate_decrease_recoveries = Vec::with_capacity(args.runs);
+        let mut recovery_elapsed_us = Vec::new();
+        let mut recovery_forwarded_bytes = Vec::new();
+        let mut recovery_would_blocks = Vec::new();
+        let mut recovery_start_notsent = Vec::new();
+        let mut recovery_target_notsent = Vec::new();
         for run_index in 0..args.runs {
             let record = runtime.block_on(run_once(&args, run_index, false))?;
             throughput.push(record.aggregate_throughput_gbps);
@@ -292,6 +340,34 @@ mod linux {
             notsent_lowat_updates.push(
                 record.notsent_lowat_updates_total as f64 / args.connections as f64,
             );
+            rate_decrease_recoveries.push(
+                record.rate_decrease_recoveries_total as f64
+                    / args.connections as f64,
+            );
+            incomplete_rate_decrease_recoveries.push(
+                record.incomplete_rate_decrease_recoveries_total as f64
+                    / args.connections as f64,
+            );
+            if let Some(value) = record.rate_decrease_recovery_elapsed_us_median {
+                recovery_elapsed_us.push(value);
+            }
+            if let Some(value) = record.rate_decrease_recovery_forwarded_bytes_median
+            {
+                recovery_forwarded_bytes.push(value);
+            }
+            if let Some(value) = record.rate_decrease_recovery_would_blocks_median {
+                recovery_would_blocks.push(value);
+            }
+            if let Some(value) =
+                record.rate_decrease_recovery_start_notsent_bytes_median
+            {
+                recovery_start_notsent.push(value);
+            }
+            if let Some(value) =
+                record.rate_decrease_recovery_target_notsent_bytes_median
+            {
+                recovery_target_notsent.push(value);
+            }
             println!("{}", serde_json::to_string(&record)?);
         }
 
@@ -316,11 +392,13 @@ mod linux {
                 requested_notsent_lowat_max_bytes: args.notsent_lowat_max_bytes,
                 notsent_lowat_update_threshold_percent: args
                     .notsent_lowat_update_threshold_percent,
-                notsent_lowat_gate_decreases_only: args.notsent_lowat_gate_decreases_only,
+                notsent_lowat_gate_decreases_only: args
+                    .notsent_lowat_gate_decreases_only,
                 effective_initial_notsent_lowat_bytes: initial_notsent_lowat,
                 effective_second_notsent_lowat_bytes: second_notsent_lowat,
                 adaptive_notsent_lowat_bytes: args.adaptive_notsent_lowat_bytes,
                 sample_tcp_info: args.sample_tcp_info,
+                sample_rate_decrease_recovery: args.sample_rate_decrease_recovery,
                 aggregate_throughput_median_gbps: round(median(&throughput)),
                 throughput_cv: round(coefficient_of_variation(&throughput)),
                 per_connection_rate_ratio_median: round(median(&ratios)),
@@ -351,6 +429,27 @@ mod linux {
                 notsent_lowat_updates_per_connection_median: round(median(
                     &notsent_lowat_updates,
                 )),
+                rate_decrease_recoveries_per_connection_median: round(median(
+                    &rate_decrease_recoveries,
+                )),
+                incomplete_rate_decrease_recoveries_per_connection_median: round(
+                    median(&incomplete_rate_decrease_recoveries,)
+                ),
+                rate_decrease_recovery_elapsed_us_median: (!recovery_elapsed_us
+                    .is_empty())
+                .then(|| round(median(&recovery_elapsed_us))),
+                rate_decrease_recovery_forwarded_bytes_median:
+                    (!recovery_forwarded_bytes.is_empty())
+                        .then(|| round(median(&recovery_forwarded_bytes))),
+                rate_decrease_recovery_would_blocks_median: (!recovery_would_blocks
+                    .is_empty())
+                .then(|| round(median(&recovery_would_blocks))),
+                rate_decrease_recovery_start_notsent_bytes_median:
+                    (!recovery_start_notsent.is_empty())
+                        .then(|| round(median(&recovery_start_notsent))),
+                rate_decrease_recovery_target_notsent_bytes_median:
+                    (!recovery_target_notsent.is_empty())
+                        .then(|| round(median(&recovery_target_notsent))),
             })?
         );
         Ok(())
@@ -410,9 +509,7 @@ mod linux {
             || args.notsent_lowat_gate_decreases_only)
             && args.notsent_lowat_ms.is_none()
         {
-            bail!(
-                "low-water publication gating requires --notsent-lowat-ms"
-            );
+            bail!("low-water publication gating requires --notsent-lowat-ms");
         }
         if (args.notsent_lowat_min_bytes.is_some()
             || args.notsent_lowat_max_bytes.is_some())
@@ -421,6 +518,9 @@ mod linux {
             bail!(
                 "--notsent-lowat-min-bytes and --notsent-lowat-max-bytes require --notsent-lowat-ms"
             );
+        }
+        if args.sample_rate_decrease_recovery && args.notsent_lowat_ms.is_none() {
+            bail!("--sample-rate-decrease-recovery requires --notsent-lowat-ms");
         }
         if args.notsent_lowat_min_bytes == Some(0)
             || args.notsent_lowat_max_bytes == Some(0)
@@ -606,13 +706,16 @@ mod linux {
             let verify = args.verify;
             let relay_options = RelayOptions {
                 requested_pipe_size: args.pipe_size,
+                initial_rate: args.rate_bytes_per_sec,
                 initial_notsent_lowat,
                 rate_updates: Arc::clone(&rate_updates),
                 notsent_lowat_update_threshold_percent: args
                     .notsent_lowat_update_threshold_percent,
-                notsent_lowat_gate_decreases_only: args.notsent_lowat_gate_decreases_only,
+                notsent_lowat_gate_decreases_only: args
+                    .notsent_lowat_gate_decreases_only,
                 adaptive_notsent_lowat: args.adaptive_notsent_lowat_bytes,
                 sample_tcp_info: args.sample_tcp_info,
+                sample_rate_decrease_recovery: args.sample_rate_decrease_recovery,
             };
 
             writers.push(tokio::spawn(async move {
@@ -717,6 +820,38 @@ mod linux {
             .iter()
             .map(|stats| stats.notsent_lowat_updates)
             .sum::<u64>();
+        let rate_decrease_recoveries_total = relay_stats
+            .iter()
+            .map(|stats| stats.rate_decrease_recoveries.len() as u64)
+            .sum::<u64>();
+        let incomplete_rate_decrease_recoveries_total = relay_stats
+            .iter()
+            .map(|stats| stats.incomplete_rate_decrease_recoveries)
+            .sum::<u64>();
+        let rate_decrease_recoveries = relay_stats
+            .iter()
+            .flat_map(|stats| stats.rate_decrease_recoveries.iter().copied())
+            .collect::<Vec<_>>();
+        let recovery_elapsed_us = rate_decrease_recoveries
+            .iter()
+            .map(|sample| sample.elapsed_us)
+            .collect::<Vec<_>>();
+        let recovery_forwarded_bytes = rate_decrease_recoveries
+            .iter()
+            .map(|sample| sample.forwarded_bytes as f64)
+            .collect::<Vec<_>>();
+        let recovery_would_blocks = rate_decrease_recoveries
+            .iter()
+            .map(|sample| sample.would_blocks as f64)
+            .collect::<Vec<_>>();
+        let recovery_start_notsent = rate_decrease_recoveries
+            .iter()
+            .map(|sample| sample.start_notsent_bytes as f64)
+            .collect::<Vec<_>>();
+        let recovery_target_notsent = rate_decrease_recoveries
+            .iter()
+            .map(|sample| sample.target_notsent_bytes as f64)
+            .collect::<Vec<_>>();
         let expected_rate = effective_requested_rate(args);
         let per_connection_observed_rate =
             args.bytes_per_connection as f64 / elapsed;
@@ -742,11 +877,13 @@ mod linux {
             requested_notsent_lowat_max_bytes: args.notsent_lowat_max_bytes,
             notsent_lowat_update_threshold_percent: args
                 .notsent_lowat_update_threshold_percent,
-            notsent_lowat_gate_decreases_only: args.notsent_lowat_gate_decreases_only,
+            notsent_lowat_gate_decreases_only: args
+                .notsent_lowat_gate_decreases_only,
             effective_initial_notsent_lowat_bytes: initial_notsent_lowat,
             effective_second_notsent_lowat_bytes: second_notsent_lowat,
             adaptive_notsent_lowat_bytes: args.adaptive_notsent_lowat_bytes,
             sample_tcp_info: args.sample_tcp_info,
+            sample_rate_decrease_recovery: args.sample_rate_decrease_recovery,
             destination_would_blocks_total,
             destination_would_blocks_per_connection: round(
                 destination_would_blocks_total as f64 / args.connections as f64,
@@ -766,6 +903,23 @@ mod linux {
             adaptive_lowat_restores_total,
             pacing_updates_total,
             notsent_lowat_updates_total,
+            rate_decrease_recoveries_total,
+            incomplete_rate_decrease_recoveries_total,
+            rate_decrease_recovery_elapsed_us_median: (!recovery_elapsed_us
+                .is_empty())
+            .then(|| round(median(&recovery_elapsed_us))),
+            rate_decrease_recovery_forwarded_bytes_median:
+                (!recovery_forwarded_bytes.is_empty())
+                    .then(|| round(median(&recovery_forwarded_bytes))),
+            rate_decrease_recovery_would_blocks_median: (!recovery_would_blocks
+                .is_empty())
+            .then(|| round(median(&recovery_would_blocks))),
+            rate_decrease_recovery_start_notsent_bytes_median:
+                (!recovery_start_notsent.is_empty())
+                    .then(|| round(median(&recovery_start_notsent))),
+            rate_decrease_recovery_target_notsent_bytes_median:
+                (!recovery_target_notsent.is_empty())
+                    .then(|| round(median(&recovery_target_notsent))),
             elapsed_seconds: round(elapsed),
             aggregate_throughput_gbps: round(
                 total_bytes as f64 * 8.0 / elapsed / 1e9,
@@ -855,13 +1009,41 @@ mod linux {
         let mut pacing_updates = 0_u64;
         let mut notsent_lowat_updates = 0_u64;
         let mut next_rate_update = 0_usize;
+        let mut current_rate = options.initial_rate;
         let mut last_published_lowat = options.initial_notsent_lowat;
+        let mut active_rate_decrease_recovery: Option<PendingRateDecreaseRecovery> =
+            None;
+        let mut rate_decrease_recoveries = Vec::new();
+        let mut incomplete_rate_decrease_recoveries = 0_u64;
         barrier.wait().await;
 
         loop {
             if pending > 0 {
                 let pipe_read_fd = pipe_read.as_raw_fd();
                 let mut writable = destination.writable().await?;
+                if active_rate_decrease_recovery
+                    .as_ref()
+                    .is_some_and(|recovery| recovery.would_blocks > 0)
+                {
+                    let destination_fd = destination.get_ref().as_raw_fd();
+                    let queued = get_notsent_bytes(destination_fd)?;
+                    if active_rate_decrease_recovery.as_ref().is_some_and(
+                        |recovery| queued <= recovery.target_notsent_bytes,
+                    ) {
+                        let recovery = active_rate_decrease_recovery
+                            .take()
+                            .expect("rate decrease recovery is active");
+                        rate_decrease_recoveries.push(RateDecreaseRecovery {
+                            elapsed_us: recovery.started.elapsed().as_secs_f64()
+                                * 1e6,
+                            forwarded_bytes: transferred
+                                .saturating_sub(recovery.transferred_at_start),
+                            would_blocks: recovery.would_blocks,
+                            start_notsent_bytes: recovery.start_notsent_bytes,
+                            target_notsent_bytes: recovery.target_notsent_bytes,
+                        });
+                    }
+                }
                 if adaptive_lowat_active && adaptive_lowat_observed_block {
                     let destination_fd = destination.get_ref().as_raw_fd();
                     notsent_bytes_at_lowat_restore =
@@ -889,8 +1071,11 @@ mod linux {
                             .filter(|update| transferred >= update.after_bytes)
                         {
                             let destination_fd = destination.get_ref().as_raw_fd();
+                            let rate_decreased = update.rate < current_rate;
                             let need_queued = notsent_bytes_at_rate_update.is_none()
-                                || options.adaptive_notsent_lowat.is_some();
+                                || options.adaptive_notsent_lowat.is_some()
+                                || (options.sample_rate_decrease_recovery
+                                    && rate_decreased);
                             let queued = need_queued
                                 .then(|| get_notsent_bytes(destination_fd))
                                 .transpose()?;
@@ -924,6 +1109,42 @@ mod linux {
                             }
                             set_max_pacing_rate(destination_fd, update.rate)?;
                             pacing_updates = pacing_updates.saturating_add(1);
+                            if options.sample_rate_decrease_recovery
+                                && rate_decreased
+                            {
+                                if active_rate_decrease_recovery.take().is_some() {
+                                    incomplete_rate_decrease_recoveries =
+                                        incomplete_rate_decrease_recoveries
+                                            .saturating_add(1);
+                                }
+                                let target_notsent_bytes = update.notsent_lowat.expect(
+                                    "rate-decrease recovery sampling requires queue-time low-water",
+                                );
+                                let start_notsent_bytes = queued.expect(
+                                    "rate-decrease recovery sampling requires queue depth",
+                                );
+                                if start_notsent_bytes <= target_notsent_bytes {
+                                    rate_decrease_recoveries.push(
+                                        RateDecreaseRecovery {
+                                            elapsed_us: 0.0,
+                                            forwarded_bytes: 0,
+                                            would_blocks: 0,
+                                            start_notsent_bytes,
+                                            target_notsent_bytes,
+                                        },
+                                    );
+                                } else {
+                                    active_rate_decrease_recovery =
+                                        Some(PendingRateDecreaseRecovery {
+                                            started: Instant::now(),
+                                            transferred_at_start: transferred,
+                                            would_blocks: 0,
+                                            start_notsent_bytes,
+                                            target_notsent_bytes,
+                                        });
+                                }
+                            }
+                            current_rate = update.rate;
                             if let Some(lowat) = options.adaptive_notsent_lowat
                                 && queued.is_some_and(|queued| queued > lowat)
                             {
@@ -938,6 +1159,10 @@ mod linux {
                     Err(_would_block) => {
                         destination_would_blocks =
                             destination_would_blocks.saturating_add(1);
+                        if let Some(recovery) = &mut active_rate_decrease_recovery {
+                            recovery.would_blocks =
+                                recovery.would_blocks.saturating_add(1);
+                        }
                         if adaptive_lowat_active {
                             adaptive_lowat_observed_block = true;
                         }
@@ -957,6 +1182,10 @@ mod linux {
             }) {
                 Ok(Ok(0)) => {
                     shutdown_write(destination.get_ref().as_raw_fd())?;
+                    if active_rate_decrease_recovery.is_some() {
+                        incomplete_rate_decrease_recoveries =
+                            incomplete_rate_decrease_recoveries.saturating_add(1);
+                    }
                     return Ok(RelayStats {
                         bytes: transferred,
                         destination_would_blocks,
@@ -968,6 +1197,8 @@ mod linux {
                         adaptive_lowat_restores,
                         pacing_updates,
                         notsent_lowat_updates,
+                        rate_decrease_recoveries,
+                        incomplete_rate_decrease_recoveries,
                     });
                 }
                 Ok(Ok(read)) => pending = read,
@@ -1202,6 +1433,7 @@ mod linux {
                 warmup: 0,
                 runs: 1,
                 sample_tcp_info: false,
+                sample_rate_decrease_recovery: false,
                 verify: false,
             }
         }
@@ -1211,6 +1443,16 @@ mod linux {
             let mut args = base_args();
             args.connections = 0;
             assert!(validate_args(&args).is_err());
+        }
+
+        #[test]
+        fn rate_decrease_recovery_sampling_requires_queue_time_lowat() {
+            let mut args = base_args();
+            args.sample_rate_decrease_recovery = true;
+            assert!(validate_args(&args).is_err());
+
+            args.notsent_lowat_ms = Some(32);
+            assert!(validate_args(&args).is_ok());
         }
 
         #[test]
@@ -1381,6 +1623,29 @@ mod linux {
             assert_eq!(record.total_bytes, args.bytes_per_connection);
             assert_eq!(record.pacing_updates_total, 2);
             assert_eq!(record.notsent_lowat_updates_total, 2);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn rate_decrease_recovery_sampling_completes() {
+            let mut args = base_args();
+            args.worker_threads = 2;
+            args.bytes_per_connection = 4 * 1024 * 1024;
+            args.chunk_size = 16 * 1024;
+            args.rate_bytes_per_sec = 32 * 1024 * 1024;
+            args.second_rate_bytes_per_sec = Some(25 * 1024 * 1024);
+            args.notsent_lowat_ms = Some(32);
+            args.sample_rate_decrease_recovery = true;
+            args.pipe_size = 128 * 1024;
+            args.verify = true;
+
+            let record = run_once(&args, 0, false).await.unwrap();
+            assert_eq!(record.rate_decrease_recoveries_total, 1);
+            assert_eq!(record.incomplete_rate_decrease_recoveries_total, 0);
+            assert!(record.rate_decrease_recovery_elapsed_us_median.is_some());
+            assert_eq!(
+                record.rate_decrease_recovery_target_notsent_bytes_median,
+                Some(queue_time_lowat_bytes(25 * 1024 * 1024, 32, None, None).unwrap() as f64)
+            );
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
