@@ -35,6 +35,7 @@ mod linux {
     enum Backend {
         Copy,
         PrefixSplice,
+        SpliceDownlink,
         Splice,
     }
 
@@ -350,6 +351,20 @@ mod linux {
                     }
                     Ok(())
                 }
+                Backend::SpliceDownlink => {
+                    let splice = SpliceDirection::new(
+                        flow.relay_source.as_raw_fd(),
+                        flow.relay_destination.as_raw_fd(),
+                        splice_pipe_size,
+                    )?;
+                    let transferred = splice.run().await?;
+                    if transferred != expected as u64 {
+                        return Err(io::Error::other(format!(
+                            "downlink splice relay count {transferred}, expected {expected}"
+                        )));
+                    }
+                    Ok(())
+                }
                 Backend::Splice => {
                     let splice = SpliceRelay::new(
                         flow.relay_source.as_raw_fd(),
@@ -482,6 +497,18 @@ mod linux {
     }
 
     impl SpliceDirection {
+        fn new(
+            source_fd: RawFd,
+            destination_fd: RawFd,
+            requested_pipe_size: usize,
+        ) -> io::Result<Self> {
+            Self::with_endpoints(
+                Arc::new(AsyncFd::new(duplicate_fd(source_fd)?)?),
+                Arc::new(AsyncFd::new(duplicate_fd(destination_fd)?)?),
+                requested_pipe_size,
+            )
+        }
+
         fn with_endpoints(
             source: Arc<AsyncFd<OwnedFd>>,
             destination: Arc<AsyncFd<OwnedFd>>,
