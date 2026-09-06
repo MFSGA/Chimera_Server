@@ -257,7 +257,11 @@ mod linux {
                 None,
             ),
             Backend::TokioCopy => (
-                tokio_copy_relay(&relay_source, &relay_destination, args.chunk_size)?,
+                tokio_copy_relay(
+                    &relay_source,
+                    &relay_destination,
+                    args.chunk_size,
+                )?,
                 None,
             ),
             Backend::Splice => {
@@ -379,7 +383,9 @@ mod linux {
     ) -> io::Result<(u64, usize)> {
         let (pipe_read, pipe_write, pipe_capacity) =
             pipe_with_capacity(requested_pipe_size)?;
-        let splice_len = requested_pipe_size.map(|_| pipe_capacity).unwrap_or(chunk_size);
+        let splice_len = requested_pipe_size
+            .map(|_| pipe_capacity)
+            .unwrap_or(chunk_size);
         let mut total = 0_u64;
         loop {
             let input = retry_splice(source, pipe_write.as_raw_fd(), splice_len)?;
