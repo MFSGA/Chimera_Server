@@ -60,6 +60,12 @@ mod linux {
         notsent_lowat_ms: Option<u32>,
 
         #[arg(long)]
+        notsent_lowat_min_bytes: Option<u32>,
+
+        #[arg(long)]
+        notsent_lowat_max_bytes: Option<u32>,
+
+        #[arg(long)]
         adaptive_notsent_lowat_bytes: Option<u32>,
 
         #[arg(long, default_value_t = 128 * 1024)]
@@ -130,6 +136,8 @@ mod linux {
         second_rate_bytes_per_sec: Option<u64>,
         requested_notsent_lowat_bytes: Option<u32>,
         requested_notsent_lowat_ms: Option<u32>,
+        requested_notsent_lowat_min_bytes: Option<u32>,
+        requested_notsent_lowat_max_bytes: Option<u32>,
         effective_initial_notsent_lowat_bytes: Option<u32>,
         effective_second_notsent_lowat_bytes: Option<u32>,
         adaptive_notsent_lowat_bytes: Option<u32>,
@@ -168,6 +176,8 @@ mod linux {
         second_rate_bytes_per_sec: Option<u64>,
         requested_notsent_lowat_bytes: Option<u32>,
         requested_notsent_lowat_ms: Option<u32>,
+        requested_notsent_lowat_min_bytes: Option<u32>,
+        requested_notsent_lowat_max_bytes: Option<u32>,
         effective_initial_notsent_lowat_bytes: Option<u32>,
         effective_second_notsent_lowat_bytes: Option<u32>,
         adaptive_notsent_lowat_bytes: Option<u32>,
@@ -265,6 +275,8 @@ mod linux {
                 second_rate_bytes_per_sec: args.second_rate_bytes_per_sec,
                 requested_notsent_lowat_bytes: args.notsent_lowat_bytes,
                 requested_notsent_lowat_ms: args.notsent_lowat_ms,
+                requested_notsent_lowat_min_bytes: args.notsent_lowat_min_bytes,
+                requested_notsent_lowat_max_bytes: args.notsent_lowat_max_bytes,
                 effective_initial_notsent_lowat_bytes: initial_notsent_lowat,
                 effective_second_notsent_lowat_bytes: second_notsent_lowat,
                 adaptive_notsent_lowat_bytes: args.adaptive_notsent_lowat_bytes,
@@ -329,6 +341,26 @@ mod linux {
         if args.notsent_lowat_ms == Some(0) {
             bail!("--notsent-lowat-ms must be greater than zero");
         }
+        if (args.notsent_lowat_min_bytes.is_some()
+            || args.notsent_lowat_max_bytes.is_some())
+            && args.notsent_lowat_ms.is_none()
+        {
+            bail!(
+                "--notsent-lowat-min-bytes and --notsent-lowat-max-bytes require --notsent-lowat-ms"
+            );
+        }
+        if args.notsent_lowat_min_bytes == Some(0)
+            || args.notsent_lowat_max_bytes == Some(0)
+        {
+            bail!("bounded TCP_NOTSENT_LOWAT values must be greater than zero");
+        }
+        if let (Some(minimum), Some(maximum)) = (
+            args.notsent_lowat_min_bytes,
+            args.notsent_lowat_max_bytes,
+        ) && minimum > maximum
+        {
+            bail!("--notsent-lowat-min-bytes cannot exceed --notsent-lowat-max-bytes");
+        }
         let _ = resolved_static_lowats(args)?;
         if args.adaptive_notsent_lowat_bytes.is_some() {
             let Some(second_rate) = args.second_rate_bytes_per_sec else {
@@ -358,22 +390,46 @@ mod linux {
         let Some(milliseconds) = args.notsent_lowat_ms else {
             return Ok((None, None));
         };
-        let initial = queue_time_lowat_bytes(args.rate_bytes_per_sec, milliseconds)?;
+        let initial = queue_time_lowat_bytes(
+            args.rate_bytes_per_sec,
+            milliseconds,
+            args.notsent_lowat_min_bytes,
+            args.notsent_lowat_max_bytes,
+        )?;
         let second = args
             .second_rate_bytes_per_sec
-            .map(|rate| queue_time_lowat_bytes(rate, milliseconds))
+            .map(|rate| {
+                queue_time_lowat_bytes(
+                    rate,
+                    milliseconds,
+                    args.notsent_lowat_min_bytes,
+                    args.notsent_lowat_max_bytes,
+                )
+            })
             .transpose()?;
         Ok((Some(initial), second))
     }
 
-    fn queue_time_lowat_bytes(rate_bytes_per_sec: u64, milliseconds: u32) -> Result<u32> {
+    fn queue_time_lowat_bytes(
+        rate_bytes_per_sec: u64,
+        milliseconds: u32,
+        minimum: Option<u32>,
+        maximum: Option<u32>,
+    ) -> Result<u32> {
         let bytes = u128::from(rate_bytes_per_sec) * u128::from(milliseconds) / 1_000;
         let bytes = bytes.max(1);
-        u32::try_from(bytes).map_err(|_| {
+        let mut bytes = u32::try_from(bytes).map_err(|_| {
             anyhow::anyhow!(
                 "rate {rate_bytes_per_sec} B/s with {milliseconds} ms queue time exceeds TCP_NOTSENT_LOWAT u32 range"
             )
-        })
+        })?;
+        if let Some(minimum) = minimum {
+            bytes = bytes.max(minimum);
+        }
+        if let Some(maximum) = maximum {
+            bytes = bytes.min(maximum);
+        }
+        Ok(bytes)
     }
 
     async fn run_once(
@@ -542,6 +598,8 @@ mod linux {
             second_rate_bytes_per_sec: args.second_rate_bytes_per_sec,
             requested_notsent_lowat_bytes: args.notsent_lowat_bytes,
             requested_notsent_lowat_ms: args.notsent_lowat_ms,
+            requested_notsent_lowat_min_bytes: args.notsent_lowat_min_bytes,
+            requested_notsent_lowat_max_bytes: args.notsent_lowat_max_bytes,
             effective_initial_notsent_lowat_bytes: initial_notsent_lowat,
             effective_second_notsent_lowat_bytes: second_notsent_lowat,
             adaptive_notsent_lowat_bytes: args.adaptive_notsent_lowat_bytes,
@@ -959,6 +1017,8 @@ mod linux {
                 second_rate_bytes_per_sec: None,
                 notsent_lowat_bytes: None,
                 notsent_lowat_ms: None,
+                notsent_lowat_min_bytes: None,
+                notsent_lowat_max_bytes: None,
                 adaptive_notsent_lowat_bytes: None,
                 pipe_size: 4096,
                 warmup: 0,
@@ -1009,6 +1069,35 @@ mod linux {
 
             args.notsent_lowat_ms = Some(1);
             args.rate_bytes_per_sec = u64::MAX;
+            assert!(validate_args(&args).is_err());
+        }
+
+        #[test]
+        fn bounded_queue_time_lowat_clamps_each_active_rate() {
+            let mut args = base_args();
+            args.rate_bytes_per_sec = 64 * 1024 * 1024;
+            args.second_rate_bytes_per_sec = Some(25 * 1024 * 1024);
+            args.notsent_lowat_ms = Some(32);
+            args.notsent_lowat_min_bytes = Some(512 * 1024);
+            args.notsent_lowat_max_bytes = Some(1024 * 1024);
+
+            let (initial, second) = resolved_static_lowats(&args).unwrap();
+            assert_eq!(initial, Some(1024 * 1024));
+            assert_eq!(second, Some(838_860));
+        }
+
+        #[test]
+        fn bounded_queue_time_lowat_requires_valid_bounds() {
+            let mut args = base_args();
+            args.notsent_lowat_min_bytes = Some(512 * 1024);
+            assert!(validate_args(&args).is_err());
+
+            args.notsent_lowat_ms = Some(32);
+            args.notsent_lowat_max_bytes = Some(256 * 1024);
+            assert!(validate_args(&args).is_err());
+
+            args.notsent_lowat_min_bytes = Some(0);
+            args.notsent_lowat_max_bytes = Some(1024 * 1024);
             assert!(validate_args(&args).is_err());
         }
 
