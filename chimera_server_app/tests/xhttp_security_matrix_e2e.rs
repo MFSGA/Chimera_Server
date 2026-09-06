@@ -17,8 +17,9 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use xhttp_support::{
     TEST_UUID, assert_socks5_echo, create_test_dir, deterministic_payload,
-    free_localhost_port, serial_xray_guard, start_chimera, start_tcp_echo_server,
-    start_xray, wait_for_tcp, workspace_root, write_json, xray_binary,
+    free_localhost_port, serial_xray_guard, start_chimera, start_chimera_with_env,
+    start_tcp_echo_server, start_xray, wait_for_tcp, workspace_root, write_json,
+    xray_binary,
 };
 
 const REALITY_PRIVATE_KEY: &str = "dnprBfWdJgo5yaGClSaZ12TZW-SiD988YmjDKOhXLKI";
@@ -54,7 +55,7 @@ impl SecurityCase {
     }
 }
 
-async fn run_security_case(case: SecurityCase) {
+async fn run_security_case(case: SecurityCase, payload_len: usize, ack_trace: bool) {
     let workspace = workspace_root();
     let work_dir = create_test_dir(&format!("security-{}", case.name()));
     let (cert_path, key_path) = generate_test_certificate(&work_dir);
@@ -155,7 +156,22 @@ async fn run_security_case(case: SecurityCase) {
         }),
     );
 
-    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    let mut chimera = if ack_trace {
+        start_chimera_with_env(
+            &workspace,
+            &work_dir,
+            &chimera_config_path,
+            &[
+                ("HYSTERIA_BRUTAL_DEBUG", "true"),
+                (
+                    "RUST_LOG",
+                    "chimera_server_lib::handler::hysteria2::congestion=debug",
+                ),
+            ],
+        )
+    } else {
+        start_chimera(&workspace, &work_dir, &chimera_config_path)
+    };
     if matches!(case, SecurityCase::Http3) {
         std::thread::sleep(Duration::from_millis(250));
     } else {
@@ -172,7 +188,20 @@ async fn run_security_case(case: SecurityCase) {
         echo_addr,
         format!("XHTTP {} security", case.name()).as_bytes(),
     );
-    assert_socks5_echo(socks_addr, echo_addr, &deterministic_payload(64 * 1024));
+    assert_socks5_echo(socks_addr, echo_addr, &deterministic_payload(payload_len));
+
+    if ack_trace {
+        std::thread::sleep(Duration::from_millis(100));
+        let stderr = chimera.stderr_log();
+        let last_trace = stderr
+            .lines()
+            .rev()
+            .find(|line| line.contains("brutal ack batch trace"))
+            .unwrap_or_else(|| {
+                panic!("missing Brutal ACK batch trace; stderr={stderr}")
+            });
+        println!("{last_trace}");
+    }
 }
 
 fn chimera_stream_settings(
@@ -288,7 +317,7 @@ async fn run_xray_security_case(case: SecurityCase) {
         );
         return;
     }
-    run_security_case(case).await;
+    run_security_case(case, 64 * 1024, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -309,6 +338,22 @@ async fn xhttp_security_http3() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn xhttp_security_reality() {
     run_xray_security_case(SecurityCase::Reality).await;
+}
+
+#[cfg(feature = "brutal-ack-batch-trace")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "benchmarks real Xray XHTTP/3 ACK batch sizes through Chimera Brutal"]
+async fn xhttp_http3_brutal_ack_batch_trace() {
+    let workspace = workspace_root();
+    let xray = xray_binary(&workspace);
+    if !xray.is_file() {
+        eprintln!(
+            "skipping XHTTP/3 Brutal ACK batch trace because {} is unavailable; set XRAY_BIN to enable it",
+            xray.display()
+        );
+        return;
+    }
+    run_security_case(SecurityCase::Http3, 1024 * 1024, true).await;
 }
 
 async fn start_tls13_dest(cert_path: &Path, key_path: &Path) -> SocketAddr {

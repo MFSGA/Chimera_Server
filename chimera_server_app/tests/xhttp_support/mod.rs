@@ -34,10 +34,21 @@ impl ChildGuard {
         args: &[&str],
         work_dir: &Path,
     ) -> io::Result<Self> {
+        Self::spawn_with_env(name, command, args, work_dir, &[])
+    }
+
+    fn spawn_with_env(
+        name: &'static str,
+        command: &Path,
+        args: &[&str],
+        work_dir: &Path,
+        envs: &[(&str, &str)],
+    ) -> io::Result<Self> {
         let stdout_path = work_dir.join(format!("{name}.stdout.log"));
         let stderr_path = work_dir.join(format!("{name}.stderr.log"));
         let child = Command::new(command)
             .args(args)
+            .envs(envs.iter().copied())
             .stdout(Stdio::from(File::create(&stdout_path)?))
             .stderr(Stdio::from(File::create(&stderr_path)?))
             .spawn()?;
@@ -60,6 +71,10 @@ impl ChildGuard {
             Ok(None) => {}
             Err(error) => panic!("failed to poll {}: {error}", self.name),
         }
+    }
+
+    pub fn stderr_log(&self) -> String {
+        read_lossy(&self.stderr_path)
     }
 }
 
@@ -111,8 +126,17 @@ pub fn start_chimera(
     work_dir: &Path,
     config: &Path,
 ) -> ChildGuard {
+    start_chimera_with_env(workspace, work_dir, config, &[])
+}
+
+pub fn start_chimera_with_env(
+    workspace: &Path,
+    work_dir: &Path,
+    config: &Path,
+    envs: &[(&str, &str)],
+) -> ChildGuard {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_chimera_server_app"));
-    ChildGuard::spawn(
+    ChildGuard::spawn_with_env(
         "chimera",
         &binary,
         &[
@@ -122,6 +146,7 @@ pub fn start_chimera(
             "json",
         ],
         work_dir,
+        envs,
     )
     .unwrap_or_else(|error| {
         panic!(

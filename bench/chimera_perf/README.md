@@ -353,7 +353,21 @@ cargo run --release --manifest-path bench/chimera_perf/Cargo.toml \
 
 The benchmark intentionally includes a rejected optimization: skipping ACK-rate division while the rolling loss count is zero helps a pristine window but regresses the path once a loss remains in the five-second window. The `cached-second-record` comparison instead caches the active second and slot, avoiding repeated duration-to-seconds conversion and modulo work for events in the same second while preserving the slow path for rollovers and reordered timestamps. Use the latter comparison when evaluating changes to `BrutalState::record`.
 
-The final section models Quinn's ACK callback batching contract: each acknowledged packet reaches `Controller::on_ack`, followed by one `Controller::on_end_acks` for the batch. `per-packet-record` recomputes Brutal accounting and the derived congestion window after every acknowledged packet, while `batched-record` pays a per-packet pending-counter update and publishes the same final ACK rate and window once per ACK batch. Sweep batch sizes when evaluating whether moving work to `on_end_acks` is worthwhile; batch size 1 is the regression guard for paths that receive mostly singleton ACKs.
+The final section models Quinn's ACK callback batching contract: each acknowledged packet reaches `Controller::on_ack`, followed by one `Controller::on_end_acks` for the batch. `per-packet-record` recomputes Brutal accounting and the derived congestion window after every acknowledged packet, while `batched-record` pays a per-packet pending-counter update and publishes the same final ACK rate and window once per ACK batch. This is currently a rejected production optimization: batch size 1 is slower in the microbenchmark, and real loopback Xray interoperability traces are overwhelmingly singleton ACK batches.
+
+To re-measure that distribution on the actual Hysteria2 and XHTTP/3 server paths, build the application with the benchmark-only `brutal-ack-batch-trace` feature and run the ignored probes:
+
+```bash
+cargo test -p chimera_server_app --features brutal-ack-batch-trace \
+  --test xray_client_proxy_e2e xray_hysteria2_brutal_ack_batch_trace \
+  -- --ignored --nocapture
+
+cargo test -p chimera_server_app --features brutal-ack-batch-trace \
+  --test xhttp_security_matrix_e2e xhttp_http3_brutal_ack_batch_trace \
+  -- --ignored --nocapture
+```
+
+The trace feature is not part of the default `full` feature and adds no ACK-batch counters to normal builds. The probes enable the existing Brutal debug switch only in the spawned Chimera process and report cumulative buckets for sizes `1`, `2`, `3-4`, `5-8`, `9-16`, `17-32`, and `33+`. On the September 2026 loopback probe used to reject batching, Hysteria2 reported 124 singleton batches out of 128 (96.9%, four size-2 batches), while XHTTP/3 reported 832 singleton batches out of 832. These are loopback/debug-build workload observations, not a claim about Internet RTT distributions; rerun the probes under representative network conditions before reconsidering ACK-batch deferral.
 
 ## Required experiment discipline
 

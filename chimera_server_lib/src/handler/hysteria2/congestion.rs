@@ -26,6 +26,8 @@ const DEFAULT_CONGESTION_WINDOW: u64 = 10_240;
 const MIN_CONGESTION_WINDOW_DATAGRAMS: u64 = 2;
 const DEBUG_ENV: &str = "HYSTERIA_BRUTAL_DEBUG";
 const DEBUG_PRINT_INTERVAL: u64 = 2;
+#[cfg(feature = "brutal-ack-batch-trace")]
+const ACK_BATCH_TRACE_REPORT_INTERVAL: u64 = 64;
 
 #[derive(Clone)]
 pub(crate) struct BrutalConfig {
@@ -53,7 +55,8 @@ impl ControllerFactory for BrutalConfig {
             tx_bps: self.tx_bps.clone(),
             cached_brutal_window: brutal.initial_window(),
             brutal_tx_bps: 0,
-            pending_brutal_acks: 0,
+            #[cfg(feature = "brutal-ack-batch-trace")]
+            pending_ack_trace: 0,
             brutal,
             bbr: Some(Bbr::new(self.bbr_config.clone(), current_mtu)),
             brutal_active: false,
@@ -68,7 +71,8 @@ struct BrutalController {
     bbr: Option<Bbr>,
     brutal_active: bool,
     brutal_tx_bps: u64,
-    pending_brutal_acks: u64,
+    #[cfg(feature = "brutal-ack-batch-trace")]
+    pending_ack_trace: u64,
     cached_brutal_window: u64,
 }
 
@@ -97,7 +101,10 @@ impl BrutalController {
         // target rate once at this transition, so cache the derived window and
         // refresh it only when Brutal state changes instead of recomputing it on
         // every Quinn `window()` query.
-        self.pending_brutal_acks = 0;
+        #[cfg(feature = "brutal-ack-batch-trace")]
+        {
+            self.pending_ack_trace = 0;
+        }
         self.brutal.reset_samples(now);
         self.bbr = None;
         self.brutal_active = true;
@@ -105,18 +112,17 @@ impl BrutalController {
         self.refresh_brutal_window();
     }
 
-    fn queue_brutal_ack(&mut self, rtt: Duration) {
-        self.brutal.last_rtt = rtt;
-        self.pending_brutal_acks += 1;
+    #[cfg(feature = "brutal-ack-batch-trace")]
+    fn queue_ack_trace(&mut self) {
+        self.pending_ack_trace = self.pending_ack_trace.saturating_add(1);
     }
 
-    fn flush_brutal_acks(&mut self, now: Instant) {
-        let ack_count = std::mem::take(&mut self.pending_brutal_acks);
-        if ack_count == 0 {
-            return;
+    #[cfg(feature = "brutal-ack-batch-trace")]
+    fn flush_ack_trace(&mut self) {
+        let ack_count = std::mem::take(&mut self.pending_ack_trace);
+        if ack_count > 0 {
+            self.brutal.record_ack_batch_trace(ack_count);
         }
-        self.brutal.record(now, ack_count, 0);
-        self.refresh_brutal_window();
     }
 
     fn refresh_brutal_window(&mut self) {
@@ -146,10 +152,10 @@ impl Controller for BrutalController {
         if let Some(bbr) = self.bbr.as_mut() {
             bbr.on_ack(now, sent, bytes, app_limited, rtt);
         }
-        // Quinn delivers every packet in an ACK batch through `on_ack`, then
-        // calls `on_end_acks` once with the same `now`. Brutal only exposes its
-        // window after the batch, so defer rate/window recomputation until then.
-        self.queue_brutal_ack(rtt.get());
+        self.brutal.on_ack(now, rtt);
+        self.refresh_brutal_window();
+        #[cfg(feature = "brutal-ack-batch-trace")]
+        self.queue_ack_trace();
     }
 
     fn on_end_acks(
@@ -163,7 +169,8 @@ impl Controller for BrutalController {
         if let Some(bbr) = self.bbr.as_mut() {
             bbr.on_end_acks(now, in_flight, app_limited, largest_packet_num_acked);
         }
-        self.flush_brutal_acks(now);
+        #[cfg(feature = "brutal-ack-batch-trace")]
+        self.flush_ack_trace();
     }
 
     fn on_congestion_event(
@@ -232,6 +239,14 @@ struct PacketInfo {
     loss_count: u64,
 }
 
+#[cfg(feature = "brutal-ack-batch-trace")]
+#[derive(Clone, Default)]
+struct AckBatchTrace {
+    batches: u64,
+    packets: u64,
+    buckets: [u64; 7],
+}
+
 #[derive(Clone)]
 struct BrutalState {
     start: Instant,
@@ -247,6 +262,8 @@ struct BrutalState {
     next_rolling_second: Instant,
     debug: bool,
     last_debug_timestamp: u64,
+    #[cfg(feature = "brutal-ack-batch-trace")]
+    ack_batch_trace: AckBatchTrace,
 }
 
 impl BrutalState {
@@ -269,6 +286,8 @@ impl BrutalState {
             next_rolling_second: now,
             debug,
             last_debug_timestamp: 0,
+            #[cfg(feature = "brutal-ack-batch-trace")]
+            ack_batch_trace: AckBatchTrace::default(),
         }
     }
 
@@ -283,6 +302,55 @@ impl BrutalState {
         self.rolling_second_start = now;
         self.next_rolling_second = now;
         self.last_debug_timestamp = 0;
+        #[cfg(feature = "brutal-ack-batch-trace")]
+        {
+            self.ack_batch_trace = AckBatchTrace::default();
+        }
+    }
+
+    #[cfg(feature = "brutal-ack-batch-trace")]
+    fn record_ack_batch_trace(&mut self, ack_count: u64) {
+        if !self.debug {
+            return;
+        }
+
+        let bucket = match ack_count {
+            1 => 0,
+            2 => 1,
+            3..=4 => 2,
+            5..=8 => 3,
+            9..=16 => 4,
+            17..=32 => 5,
+            _ => 6,
+        };
+        let trace = &mut self.ack_batch_trace;
+        trace.batches = trace.batches.saturating_add(1);
+        trace.packets = trace.packets.saturating_add(ack_count);
+        trace.buckets[bucket] = trace.buckets[bucket].saturating_add(1);
+
+        if trace
+            .batches
+            .is_multiple_of(ACK_BATCH_TRACE_REPORT_INTERVAL)
+        {
+            debug!(
+                batches = trace.batches,
+                packets = trace.packets,
+                mean_batch = trace.packets as f64 / trace.batches as f64,
+                size_1 = trace.buckets[0],
+                size_2 = trace.buckets[1],
+                size_3_4 = trace.buckets[2],
+                size_5_8 = trace.buckets[3],
+                size_9_16 = trace.buckets[4],
+                size_17_32 = trace.buckets[5],
+                size_33_plus = trace.buckets[6],
+                "brutal ack batch trace"
+            );
+        }
+    }
+
+    fn on_ack(&mut self, now: Instant, rtt: &RttEstimator) {
+        self.last_rtt = rtt.get();
+        self.record(now, 1, 0);
     }
 
     fn on_congestion_event(&mut self, now: Instant, lost_bytes: u64) {
@@ -437,7 +505,8 @@ mod tests {
             tx_bps,
             cached_brutal_window: brutal.initial_window(),
             brutal_tx_bps: 0,
-            pending_brutal_acks: 0,
+            #[cfg(feature = "brutal-ack-batch-trace")]
+            pending_ack_trace: 0,
             brutal,
             bbr: Some(Bbr::new(Arc::new(BbrConfig::default()), 1200)),
             brutal_active: false,
@@ -456,7 +525,6 @@ mod tests {
             ack_count: 40,
             loss_count: 10,
         };
-        controller.queue_brutal_ack(Duration::from_millis(80));
 
         tx_bps.store(1_000_000, Ordering::Relaxed);
         let activated_at = now + Duration::from_secs(2);
@@ -467,7 +535,6 @@ mod tests {
         assert_eq!(controller.brutal.start, activated_at);
         assert_eq!(controller.brutal.last_rtt, Duration::from_millis(80));
         assert_eq!(controller.brutal.ack_rate, 1.0);
-        assert_eq!(controller.pending_brutal_acks, 0);
         assert!(
             controller
                 .brutal
@@ -512,52 +579,19 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "brutal-ack-batch-trace")]
     #[test]
-    fn brutal_ack_batch_flush_matches_per_packet_accounting() {
-        let tx_bps = Arc::new(AtomicU64::new(1_000_000));
-        let start = Instant::now();
-        let mut controller = controller(tx_bps, start);
-        controller.brutal.last_rtt = Duration::from_millis(80);
-        controller.activate_brutal_if_configured(start);
-        let mut per_packet = controller.brutal.clone();
+    fn brutal_ack_batch_trace_buckets_cover_benchmark_ranges() {
+        let mut state = BrutalState::new(Instant::now(), 1200);
+        state.debug = true;
 
-        for (elapsed, batch_size, rtt) in [
-            (Duration::from_millis(100), 1, Duration::from_millis(80)),
-            (Duration::from_millis(900), 4, Duration::from_millis(90)),
-            (Duration::from_millis(1_100), 8, Duration::from_millis(70)),
-            (Duration::from_millis(4_500), 16, Duration::from_millis(120)),
-            (Duration::from_millis(7_050), 7, Duration::from_millis(60)),
-        ] {
-            let now = start + elapsed;
-            for _ in 0..batch_size {
-                per_packet.last_rtt = rtt;
-                per_packet.record(now, 1, 0);
-                controller.queue_brutal_ack(rtt);
-            }
-
-            assert_eq!(controller.pending_brutal_acks, batch_size);
-            controller.flush_brutal_acks(now);
-
-            assert_eq!(controller.pending_brutal_acks, 0);
-            assert_eq!(
-                controller.brutal.rolling_ack_count,
-                per_packet.rolling_ack_count
-            );
-            assert_eq!(
-                controller.brutal.rolling_loss_count,
-                per_packet.rolling_loss_count
-            );
-            assert_eq!(
-                controller.brutal.rolling_timestamp,
-                per_packet.rolling_timestamp
-            );
-            assert_eq!(controller.brutal.ack_rate, per_packet.ack_rate);
-            assert_eq!(controller.brutal.last_rtt, per_packet.last_rtt);
-            assert_eq!(
-                controller.cached_brutal_window,
-                per_packet.window(controller.brutal_tx_bps)
-            );
+        for ack_count in [1, 2, 3, 4, 5, 8, 9, 16, 17, 32, 33, 64] {
+            state.record_ack_batch_trace(ack_count);
         }
+
+        assert_eq!(state.ack_batch_trace.batches, 12);
+        assert_eq!(state.ack_batch_trace.packets, 194);
+        assert_eq!(state.ack_batch_trace.buckets, [1, 1, 2, 2, 2, 2, 2]);
     }
 
     #[test]

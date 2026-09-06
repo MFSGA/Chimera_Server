@@ -101,10 +101,21 @@ impl ChildGuard {
         args: &[&str],
         work_dir: &Path,
     ) -> io::Result<Self> {
+        Self::spawn_with_env(name, command, args, work_dir, &[])
+    }
+
+    fn spawn_with_env(
+        name: &'static str,
+        command: &Path,
+        args: &[&str],
+        work_dir: &Path,
+        envs: &[(&str, &str)],
+    ) -> io::Result<Self> {
         let stdout_path = work_dir.join(format!("{name}.stdout.log"));
         let stderr_path = work_dir.join(format!("{name}.stderr.log"));
         let child = Command::new(command)
             .args(args)
+            .envs(envs.iter().copied())
             .stdout(Stdio::from(File::create(&stdout_path)?))
             .stderr(Stdio::from(File::create(&stderr_path)?))
             .spawn()?;
@@ -1713,6 +1724,131 @@ async fn xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2_with_xray_d
     .await;
 }
 
+#[cfg(feature = "brutal-ack-batch-trace")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "benchmarks real Xray Hysteria2 ACK batch sizes through Chimera Brutal"]
+async fn xray_hysteria2_brutal_ack_batch_trace() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("hysteria2-brutal-ack-batch-trace");
+    let echo_addr = start_tcp_echo_server();
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let (cert_path, key_path) = generate_test_certificate(&work_dir);
+    let pinned_peer_cert_sha256 = first_cert_sha256_hex(&cert_path);
+
+    let chimera_config_path = work_dir.join("chimera-hysteria2-ack-trace.json");
+    let xray_config_path = work_dir.join("xray-hysteria2-ack-trace-client.json");
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "hysteria",
+                "tag": "chimera-hysteria2-ack-trace",
+                "settings": {
+                    "version": 2,
+                    "clients": [{
+                        "auth": HYSTERIA_AUTH,
+                        "email": "hy-trace@example.test"
+                    }]
+                },
+                "streamSettings": {
+                    "network": "quic",
+                    "security": "tls",
+                    "hysteriaSettings": {"version": 2},
+                    "finalmask": {
+                        "quicParams": {
+                            "congestion": "force-brutal",
+                            "brutalUp": "100 mbps"
+                        }
+                    },
+                    "tlsSettings": {
+                        "alpn": ["h3"],
+                        "certificates": [{
+                            "certificateFile": cert_path,
+                            "keyFile": key_path
+                        }]
+                    }
+                }
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth"}
+            }],
+            "outbounds": [{
+                "protocol": "hysteria",
+                "settings": {
+                    "version": 2,
+                    "address": "127.0.0.1",
+                    "port": chimera_port
+                },
+                "streamSettings": {
+                    "network": "hysteria",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "pinnedPeerCertSha256": pinned_peer_cert_sha256,
+                        "alpn": ["h3"]
+                    },
+                    "hysteriaSettings": {
+                        "version": 2,
+                        "auth": HYSTERIA_AUTH
+                    }
+                }
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera_with_env(
+        &workspace,
+        &work_dir,
+        &chimera_config_path,
+        &[
+            ("HYSTERIA_BRUTAL_DEBUG", "true"),
+            (
+                "RUST_LOG",
+                "chimera_server_lib::handler::hysteria2::congestion=debug",
+            ),
+        ],
+    );
+    chimera.assert_running();
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+
+    assert_socks5_echo_async_with_timeout(
+        socks_addr,
+        echo_addr,
+        &deterministic_payload(256 * 1024),
+        Duration::from_secs(20),
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let stderr = read_lossy(&chimera.stderr_path);
+    let last_trace = stderr
+        .lines()
+        .rev()
+        .find(|line| line.contains("brutal ack batch trace"))
+        .unwrap_or_else(|| {
+            panic!("missing Brutal ACK batch trace; stderr={stderr}")
+        });
+    println!("{last_trace}");
+}
+
 #[test]
 #[ignore = "starts Chimera and ./xray to validate Xray Hysteria2 empty user auth"]
 fn xray_hysteria2_empty_user_auth_can_proxy_tcp() {
@@ -2096,8 +2232,17 @@ fn install_rustls_provider() {
 }
 
 fn start_chimera(workspace: &Path, work_dir: &Path, config: &Path) -> ChildGuard {
+    start_chimera_with_env(workspace, work_dir, config, &[])
+}
+
+fn start_chimera_with_env(
+    workspace: &Path,
+    work_dir: &Path,
+    config: &Path,
+    envs: &[(&str, &str)],
+) -> ChildGuard {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_chimera_server_app"));
-    ChildGuard::spawn(
+    ChildGuard::spawn_with_env(
         "chimera",
         &binary,
         &[
@@ -2107,6 +2252,7 @@ fn start_chimera(workspace: &Path, work_dir: &Path, config: &Path) -> ChildGuard
             "json",
         ],
         work_dir,
+        envs,
     )
     .unwrap_or_else(|err| {
         panic!(
@@ -2457,6 +2603,21 @@ async fn assert_socks5_echo_async(
     target_addr: SocketAddr,
     payload: &[u8],
 ) {
+    assert_socks5_echo_async_with_timeout(
+        socks_addr,
+        target_addr,
+        payload,
+        IO_TIMEOUT,
+    )
+    .await;
+}
+
+async fn assert_socks5_echo_async_with_timeout(
+    socks_addr: SocketAddr,
+    target_addr: SocketAddr,
+    payload: &[u8],
+    timeout: Duration,
+) {
     let mut stream = connect_socks5_tcp(socks_addr, target_addr).await;
     stream
         .write_all(payload)
@@ -2464,7 +2625,7 @@ async fn assert_socks5_echo_async(
         .expect("write async tunneled payload");
     stream.flush().await.expect("flush async tunneled payload");
     let mut echoed = vec![0u8; payload.len()];
-    tokio::time::timeout(IO_TIMEOUT, stream.read_exact(&mut echoed))
+    tokio::time::timeout(timeout, stream.read_exact(&mut echoed))
         .await
         .expect("async tunneled echo timeout")
         .expect("read async tunneled echo response");

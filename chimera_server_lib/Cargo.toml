@@ -82,6 +82,7 @@ protoc-bin-vendored = { workspace = true }
 rcgen = { workspace = true }
 
 [features]
+brutal-ack-batch-trace = []
 hysteria = ["uuid", "lru", "flate2"]
 http = []
 mixed = ["http"]
