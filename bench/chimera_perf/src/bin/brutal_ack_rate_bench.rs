@@ -6,6 +6,7 @@ const MIN_ACK_RATE: f64 = 0.8;
 const EVENTS: u64 = 20_000_000;
 const RECORD_EVENTS: u64 = 10_000_000;
 const BATCHED_ACK_PACKETS: u64 = 8_000_000;
+const WINDOW_EVENTS: u64 = 40_000_000;
 const SLOT_COUNT: u64 = 5;
 
 #[derive(Clone, Copy)]
@@ -141,7 +142,16 @@ impl RecordState {
         ack_count: u64,
         loss_count: u64,
     ) {
-        self.cached_second_record_inner(now, ack_count, loss_count, false);
+        self.cached_second_record_inner(now, ack_count, loss_count, 0);
+    }
+
+    fn cached_second_record_pristine_assign(
+        &mut self,
+        now: Instant,
+        ack_count: u64,
+        loss_count: u64,
+    ) {
+        self.cached_second_record_inner(now, ack_count, loss_count, 1);
     }
 
     fn cached_second_record_skip_pristine_rate(
@@ -150,7 +160,7 @@ impl RecordState {
         ack_count: u64,
         loss_count: u64,
     ) {
-        self.cached_second_record_inner(now, ack_count, loss_count, true);
+        self.cached_second_record_inner(now, ack_count, loss_count, 2);
     }
 
     fn cached_second_record_inner(
@@ -158,7 +168,7 @@ impl RecordState {
         now: Instant,
         ack_count: u64,
         loss_count: u64,
-        skip_pristine_rate: bool,
+        pristine_mode: u8,
     ) {
         if self.rolling_timestamp.is_some()
             && now >= self.current_second_start
@@ -169,7 +179,13 @@ impl RecordState {
             info.loss_count += loss_count;
             self.rolling_ack_count += ack_count;
             self.rolling_loss_count += loss_count;
-            if !(skip_pristine_rate && self.rolling_loss_count == 0) {
+            if self.rolling_loss_count == 0 {
+                if pristine_mode == 1 {
+                    self.ack_rate = 1.0;
+                } else if pristine_mode == 0 {
+                    self.update_rate();
+                }
+            } else {
                 self.update_rate();
             }
             return;
@@ -195,7 +211,7 @@ impl RecordState {
         self.current_slot = slot;
         self.current_second_start = self.start + Duration::from_secs(timestamp);
         self.next_rollover = self.start + Duration::from_secs(timestamp + 1);
-        if skip_pristine_rate && self.rolling_loss_count == 0 {
+        if pristine_mode > 0 && self.rolling_loss_count == 0 {
             self.ack_rate = 1.0;
         } else {
             self.update_rate();
@@ -214,7 +230,12 @@ fn run_record_bench(name: &str, mode: u8, loss_every: Option<u64>) {
         match mode {
             0 => state.baseline_record(black_box(now), 1, loss),
             1 => state.cached_second_record(black_box(now), 1, loss),
-            2 => state.cached_second_record_skip_pristine_rate(black_box(now), 1, loss),
+            2 => state.cached_second_record_pristine_assign(black_box(now), 1, loss),
+            3 => state.cached_second_record_skip_pristine_rate(
+                black_box(now),
+                1,
+                loss,
+            ),
             _ => unreachable!(),
         }
     }
@@ -229,6 +250,35 @@ fn run_record_bench(name: &str, mode: u8, loss_every: Option<u64>) {
 
 fn modeled_window(ack_rate: f64) -> u64 {
     ((50_000_000_f64 * 0.080 * 0.8) / ack_rate) as u64
+}
+
+fn modeled_window_pristine_fast_path(ack_rate: f64) -> u64 {
+    let cwnd = 50_000_000_f64 * 0.080 * 0.8;
+    if ack_rate == 1.0 {
+        cwnd as u64
+    } else {
+        (cwnd / ack_rate) as u64
+    }
+}
+
+fn run_window_bench(name: &str, optimized: bool, ack_rate: f64) {
+    let started = Instant::now();
+    let mut window = 0_u64;
+    for _ in 0..WINDOW_EVENTS {
+        let rate = black_box(ack_rate);
+        window = if optimized {
+            modeled_window_pristine_fast_path(rate)
+        } else {
+            modeled_window(rate)
+        };
+        black_box(window);
+    }
+    let elapsed = started.elapsed();
+    println!(
+        "{name}: ack_rate={ack_rate:.6} ns_per_window={:.3} final_window={}",
+        elapsed.as_nanos() as f64 / WINDOW_EVENTS as f64,
+        black_box(window),
+    );
 }
 
 fn run_ack_batch_bench(name: &str, batched: bool, batch_size: u64) {
@@ -276,7 +326,13 @@ fn main() {
     for loss_every in [None, Some(10_000), Some(1_000), Some(100)] {
         run_record_bench("baseline-record", 0, loss_every);
         run_record_bench("cached-second-record", 1, loss_every);
-        run_record_bench("skip-pristine-rate-record", 2, loss_every);
+        run_record_bench("pristine-assign-record", 2, loss_every);
+        run_record_bench("skip-pristine-rate-record", 3, loss_every);
+    }
+    println!("window arithmetic:");
+    for ack_rate in [1.0, 0.9999, 0.99, 0.9, 0.8] {
+        run_window_bench("baseline-window", false, ack_rate);
+        run_window_bench("pristine-fast-window", true, ack_rate);
     }
     println!("ACK-frame batching over cached-second record path:");
     for batch_size in [1, 2, 4, 8, 16, 32] {
@@ -331,6 +387,7 @@ mod tests {
     fn pristine_record_fast_path_matches_cached_second_across_loss_lifecycle() {
         let origin = Instant::now();
         let mut baseline = RecordState::new(origin);
+        let mut production = RecordState::new(origin);
         let mut optimized = RecordState::new(origin);
         let events = [
             (Duration::from_millis(100), 60, 0),
@@ -343,10 +400,24 @@ mod tests {
         for (elapsed, acks, losses) in events {
             let now = origin + elapsed;
             baseline.cached_second_record(now, acks, losses);
+            production.cached_second_record_pristine_assign(now, acks, losses);
             optimized.cached_second_record_skip_pristine_rate(now, acks, losses);
+            assert_eq!(baseline.rolling_ack_count, production.rolling_ack_count);
+            assert_eq!(baseline.rolling_loss_count, production.rolling_loss_count);
+            assert_eq!(baseline.ack_rate, production.ack_rate);
             assert_eq!(baseline.rolling_ack_count, optimized.rolling_ack_count);
             assert_eq!(baseline.rolling_loss_count, optimized.rolling_loss_count);
             assert_eq!(baseline.ack_rate, optimized.ack_rate);
+        }
+    }
+
+    #[test]
+    fn pristine_window_fast_path_matches_baseline() {
+        for ack_rate in [1.0, 0.9999, 0.99, 0.9, 0.8] {
+            assert_eq!(
+                modeled_window(ack_rate),
+                modeled_window_pristine_fast_path(ack_rate)
+            );
         }
     }
 
