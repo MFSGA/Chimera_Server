@@ -1011,7 +1011,8 @@ mod linux {
             sample_rate_decrease_recovery: args.sample_rate_decrease_recovery,
             destination_ready_acquisitions_total,
             destination_ready_acquisitions_per_connection: round(
-                destination_ready_acquisitions_total as f64 / args.connections as f64,
+                destination_ready_acquisitions_total as f64
+                    / args.connections as f64,
             ),
             destination_would_blocks_total,
             destination_would_blocks_per_connection: round(
