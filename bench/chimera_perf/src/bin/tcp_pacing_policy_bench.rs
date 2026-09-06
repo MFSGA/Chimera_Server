@@ -1,7 +1,7 @@
 use std::{hint::black_box, time::Instant};
 
 use anyhow::{Result, bail};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
@@ -9,6 +9,9 @@ use serde::Serialize;
     about = "CPU/accuracy benchmark for TCP Brutal2 pacing-rate publication policies"
 )]
 struct Args {
+    #[arg(long, value_enum, default_value_t = TraceKind::Synthetic)]
+    trace: TraceKind,
+
     #[arg(long, default_value_t = 100)]
     sample_interval_us: u64,
 
@@ -26,6 +29,12 @@ struct Args {
 
     #[arg(long, default_value_t = 50)]
     cpu_repetitions: usize,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum TraceKind {
+    Synthetic,
+    BrutalLoss,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -89,11 +98,14 @@ impl Publisher {
 struct PolicyRecord {
     schema_version: u32,
     record_type: &'static str,
+    trace: &'static str,
     sample_interval_us: u64,
     samples: usize,
     min_update_ms: u64,
     delta_percent: f64,
     emergency_delta_percent: Option<f64>,
+    target_rate_min: u64,
+    target_rate_max: u64,
     publications: usize,
     publications_per_second: f64,
     mean_absolute_error_percent: f64,
@@ -105,7 +117,12 @@ struct PolicyRecord {
 fn main() -> Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
-    let trace = build_rate_trace(args.samples);
+    let trace = match args.trace {
+        TraceKind::Synthetic => build_rate_trace(args.samples),
+        TraceKind::BrutalLoss => {
+            build_brutal_loss_trace(args.samples, args.sample_interval_us)
+        }
+    };
 
     for &min_update_ms in &args.min_update_ms {
         for &delta_percent in &args.delta_percent {
@@ -156,6 +173,8 @@ fn benchmark_policy(
 ) -> PolicyRecord {
     let (publications, mut errors) =
         evaluate_trace(trace, args.sample_interval_us, policy);
+    let target_rate_min = *trace.iter().min().expect("non-empty trace");
+    let target_rate_max = *trace.iter().max().expect("non-empty trace");
     errors.sort_unstable_by(|left, right| left.total_cmp(right));
     let mean_error = errors.iter().sum::<f64>() / errors.len() as f64;
     let p95_index = ((errors.len() - 1) as f64 * 0.95).round() as usize;
@@ -183,6 +202,10 @@ fn benchmark_policy(
     PolicyRecord {
         schema_version: 1,
         record_type: "pacing-policy",
+        trace: match args.trace {
+            TraceKind::Synthetic => "synthetic",
+            TraceKind::BrutalLoss => "brutal-loss",
+        },
         sample_interval_us: args.sample_interval_us,
         samples: trace.len(),
         min_update_ms: policy.min_update_us / 1000,
@@ -190,6 +213,8 @@ fn benchmark_policy(
         emergency_delta_percent: policy
             .emergency_delta_fraction
             .map(|fraction| round(fraction * 100.0)),
+        target_rate_min,
+        target_rate_max,
         publications,
         publications_per_second: round(publications as f64 / simulated_seconds),
         mean_absolute_error_percent: round(mean_error * 100.0),
@@ -238,6 +263,82 @@ fn build_rate_trace(samples: usize) -> Vec<u64> {
 
         trace.push((base as i64 + jitter + ramp).max(1) as u64);
     }
+    trace
+}
+
+fn build_brutal_loss_trace(samples: usize, sample_interval_us: u64) -> Vec<u64> {
+    const MIB: u64 = 1024 * 1024;
+    const TARGET_BPS: u64 = 50 * MIB;
+    const SLOT_COUNT: u64 = 5;
+    const MIN_SAMPLE_COUNT: u64 = 50;
+    const MIN_ACK_RATE: f64 = 0.8;
+    const PHASE_LOSS_BASIS_POINTS: [u64; 8] =
+        [0, 200, 500, 1_000, 2_000, 500, 3_000, 0];
+    const PHASE_US: u64 = 2_500_000;
+
+    #[derive(Clone, Copy, Default)]
+    struct Slot {
+        timestamp: u64,
+        ack_count: u64,
+        loss_count: u64,
+    }
+
+    let mut state = 0x243f_6a88_85a3_08d3_u64;
+    let mut slots = [Slot::default(); SLOT_COUNT as usize];
+    let mut rolling_ack_count = 0_u64;
+    let mut rolling_loss_count = 0_u64;
+    let mut rolling_timestamp = None;
+    let mut trace = Vec::with_capacity(samples);
+
+    for index in 0..samples {
+        let now_us = index as u64 * sample_interval_us;
+        let timestamp = now_us / 1_000_000;
+        let phase = ((now_us / PHASE_US) as usize) % PHASE_LOSS_BASIS_POINTS.len();
+        let loss_basis_points = PHASE_LOSS_BASIS_POINTS[phase];
+
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let lost = state % 10_000 < loss_basis_points;
+        let (ack_count, loss_count) = if lost { (0, 1) } else { (1, 0) };
+
+        let slot_index = (timestamp % SLOT_COUNT) as usize;
+        if slots[slot_index].timestamp == timestamp {
+            slots[slot_index].ack_count += ack_count;
+            slots[slot_index].loss_count += loss_count;
+        } else {
+            slots[slot_index] = Slot {
+                timestamp,
+                ack_count,
+                loss_count,
+            };
+        }
+
+        if rolling_timestamp == Some(timestamp) {
+            rolling_ack_count += ack_count;
+            rolling_loss_count += loss_count;
+        } else {
+            let min_timestamp = timestamp.saturating_sub(SLOT_COUNT);
+            rolling_ack_count = 0;
+            rolling_loss_count = 0;
+            for slot in &slots {
+                if slot.timestamp >= min_timestamp {
+                    rolling_ack_count += slot.ack_count;
+                    rolling_loss_count += slot.loss_count;
+                }
+            }
+            rolling_timestamp = Some(timestamp);
+        }
+
+        let total = rolling_ack_count + rolling_loss_count;
+        let ack_rate = if total < MIN_SAMPLE_COUNT {
+            1.0
+        } else {
+            (rolling_ack_count as f64 / total as f64).max(MIN_ACK_RATE)
+        };
+        trace.push(((TARGET_BPS as f64) / ack_rate) as u64);
+    }
+
     trace
 }
 
@@ -306,5 +407,16 @@ mod tests {
         let first = trace[..2_500].iter().copied().sum::<u64>() / 2_500;
         let second = trace[2_500..5_000].iter().copied().sum::<u64>() / 2_500;
         assert!(second > first * 2);
+    }
+
+    #[test]
+    fn brutal_loss_trace_matches_ack_rate_compensation_bounds() {
+        const TARGET: u64 = 50 * 1024 * 1024;
+        let trace = build_brutal_loss_trace(200_000, 100);
+        assert_eq!(trace.len(), 200_000);
+        assert_eq!(trace[0], TARGET);
+        assert_eq!(*trace.iter().min().unwrap(), TARGET);
+        assert!(*trace.iter().max().unwrap() > TARGET * 11 / 10);
+        assert!(*trace.iter().max().unwrap() <= TARGET * 5 / 4);
     }
 }
