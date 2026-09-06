@@ -56,6 +56,9 @@ mod linux {
         #[arg(long)]
         notsent_lowat_bytes: Option<u32>,
 
+        #[arg(long)]
+        adaptive_notsent_lowat_bytes: Option<u32>,
+
         #[arg(long, default_value_t = 128 * 1024)]
         pipe_size: usize,
 
@@ -82,6 +85,9 @@ mod linux {
         destination_would_blocks: u64,
         source_would_blocks: u64,
         notsent_bytes_at_rate_update: Option<u32>,
+        notsent_bytes_at_lowat_restore: Option<u32>,
+        adaptive_lowat_applied: bool,
+        adaptive_lowat_restores: u64,
     }
 
     #[derive(Debug, Serialize)]
@@ -99,10 +105,14 @@ mod linux {
         requested_rate_bytes_per_sec: u64,
         second_rate_bytes_per_sec: Option<u64>,
         requested_notsent_lowat_bytes: Option<u32>,
+        adaptive_notsent_lowat_bytes: Option<u32>,
         destination_would_blocks_total: u64,
         destination_would_blocks_per_connection: f64,
         source_would_blocks_total: u64,
         notsent_bytes_at_rate_update_median: Option<f64>,
+        notsent_bytes_at_lowat_restore_median: Option<f64>,
+        adaptive_lowat_applied_total: u64,
+        adaptive_lowat_restores_total: u64,
         elapsed_seconds: f64,
         aggregate_throughput_gbps: f64,
         per_connection_rate_ratio: f64,
@@ -126,6 +136,7 @@ mod linux {
         requested_rate_bytes_per_sec: u64,
         second_rate_bytes_per_sec: Option<u64>,
         requested_notsent_lowat_bytes: Option<u32>,
+        adaptive_notsent_lowat_bytes: Option<u32>,
         aggregate_throughput_median_gbps: f64,
         throughput_cv: f64,
         per_connection_rate_ratio_median: f64,
@@ -133,6 +144,9 @@ mod linux {
         context_switches_median: f64,
         destination_would_blocks_per_connection_median: f64,
         notsent_bytes_at_rate_update_median: Option<f64>,
+        notsent_bytes_at_lowat_restore_median: Option<f64>,
+        adaptive_lowat_applied_per_connection_median: f64,
+        adaptive_lowat_restores_per_connection_median: f64,
     }
 
     pub(super) fn run() -> Result<()> {
@@ -154,6 +168,9 @@ mod linux {
         let mut context_switches = Vec::with_capacity(args.runs);
         let mut destination_blocks = Vec::with_capacity(args.runs);
         let mut notsent = Vec::new();
+        let mut restore_notsent = Vec::new();
+        let mut adaptive_applied = Vec::with_capacity(args.runs);
+        let mut adaptive_restores = Vec::with_capacity(args.runs);
         for run_index in 0..args.runs {
             let record = runtime.block_on(run_once(&args, run_index, false))?;
             throughput.push(record.aggregate_throughput_gbps);
@@ -167,6 +184,16 @@ mod linux {
             if let Some(bytes) = record.notsent_bytes_at_rate_update_median {
                 notsent.push(bytes);
             }
+            if let Some(bytes) = record.notsent_bytes_at_lowat_restore_median {
+                restore_notsent.push(bytes);
+            }
+            adaptive_applied.push(
+                record.adaptive_lowat_applied_total as f64 / args.connections as f64,
+            );
+            adaptive_restores.push(
+                record.adaptive_lowat_restores_total as f64
+                    / args.connections as f64,
+            );
             println!("{}", serde_json::to_string(&record)?);
         }
 
@@ -185,6 +212,7 @@ mod linux {
                 requested_rate_bytes_per_sec: args.rate_bytes_per_sec,
                 second_rate_bytes_per_sec: args.second_rate_bytes_per_sec,
                 requested_notsent_lowat_bytes: args.notsent_lowat_bytes,
+                adaptive_notsent_lowat_bytes: args.adaptive_notsent_lowat_bytes,
                 aggregate_throughput_median_gbps: round(median(&throughput)),
                 throughput_cv: round(coefficient_of_variation(&throughput)),
                 per_connection_rate_ratio_median: round(median(&ratios)),
@@ -195,6 +223,14 @@ mod linux {
                 )),
                 notsent_bytes_at_rate_update_median: (!notsent.is_empty())
                     .then(|| round(median(&notsent))),
+                notsent_bytes_at_lowat_restore_median: (!restore_notsent.is_empty())
+                    .then(|| round(median(&restore_notsent))),
+                adaptive_lowat_applied_per_connection_median: round(median(
+                    &adaptive_applied,
+                )),
+                adaptive_lowat_restores_per_connection_median: round(median(
+                    &adaptive_restores,
+                )),
             })?
         );
         Ok(())
@@ -219,6 +255,25 @@ mod linux {
         if args.rate_bytes_per_sec == 0 || args.second_rate_bytes_per_sec == Some(0)
         {
             bail!("pacing rates must be greater than zero");
+        }
+        if args.notsent_lowat_bytes.is_some()
+            && args.adaptive_notsent_lowat_bytes.is_some()
+        {
+            bail!(
+                "--notsent-lowat-bytes and --adaptive-notsent-lowat-bytes are mutually exclusive"
+            );
+        }
+        if args.adaptive_notsent_lowat_bytes.is_some() {
+            let Some(second_rate) = args.second_rate_bytes_per_sec else {
+                bail!(
+                    "--adaptive-notsent-lowat-bytes requires --second-rate-bytes-per-sec"
+                );
+            };
+            if second_rate >= args.rate_bytes_per_sec {
+                bail!(
+                    "--adaptive-notsent-lowat-bytes requires the second pacing rate to be lower"
+                );
+            }
         }
         if args.runs == 0 {
             bail!("--runs must be greater than zero");
@@ -269,6 +324,7 @@ mod linux {
             let verify = args.verify;
             let pipe_size = args.pipe_size;
             let second_rate = args.second_rate_bytes_per_sec;
+            let adaptive_notsent_lowat = args.adaptive_notsent_lowat_bytes;
 
             writers.push(tokio::spawn(async move {
                 write_payload(writer, writer_barrier, bytes, chunk_size).await
@@ -284,6 +340,7 @@ mod linux {
                     bytes,
                     pipe_size,
                     second_rate,
+                    adaptive_notsent_lowat,
                 )
                 .await
             }));
@@ -338,6 +395,18 @@ mod linux {
             .iter()
             .filter_map(|stats| stats.notsent_bytes_at_rate_update.map(f64::from))
             .collect::<Vec<_>>();
+        let restore_notsent = relay_stats
+            .iter()
+            .filter_map(|stats| stats.notsent_bytes_at_lowat_restore.map(f64::from))
+            .collect::<Vec<_>>();
+        let adaptive_lowat_applied_total = relay_stats
+            .iter()
+            .filter(|stats| stats.adaptive_lowat_applied)
+            .count() as u64;
+        let adaptive_lowat_restores_total = relay_stats
+            .iter()
+            .map(|stats| stats.adaptive_lowat_restores)
+            .sum::<u64>();
         let expected_rate = effective_requested_rate(args);
         let per_connection_observed_rate =
             args.bytes_per_connection as f64 / elapsed;
@@ -357,6 +426,7 @@ mod linux {
             requested_rate_bytes_per_sec: args.rate_bytes_per_sec,
             second_rate_bytes_per_sec: args.second_rate_bytes_per_sec,
             requested_notsent_lowat_bytes: args.notsent_lowat_bytes,
+            adaptive_notsent_lowat_bytes: args.adaptive_notsent_lowat_bytes,
             destination_would_blocks_total,
             destination_would_blocks_per_connection: round(
                 destination_would_blocks_total as f64 / args.connections as f64,
@@ -364,6 +434,10 @@ mod linux {
             source_would_blocks_total,
             notsent_bytes_at_rate_update_median: (!notsent.is_empty())
                 .then(|| round(median(&notsent))),
+            notsent_bytes_at_lowat_restore_median: (!restore_notsent.is_empty())
+                .then(|| round(median(&restore_notsent))),
+            adaptive_lowat_applied_total,
+            adaptive_lowat_restores_total,
             elapsed_seconds: round(elapsed),
             aggregate_throughput_gbps: round(
                 total_bytes as f64 * 8.0 / elapsed / 1e9,
@@ -438,6 +512,7 @@ mod linux {
         expected_bytes: u64,
         requested_pipe_size: usize,
         second_rate: Option<u64>,
+        adaptive_notsent_lowat: Option<u32>,
     ) -> io::Result<RelayStats> {
         let (pipe_read, pipe_write, pipe_capacity) =
             nonblocking_pipe(requested_pipe_size)?;
@@ -446,6 +521,11 @@ mod linux {
         let mut destination_would_blocks = 0_u64;
         let mut source_would_blocks = 0_u64;
         let mut notsent_bytes_at_rate_update = None;
+        let mut notsent_bytes_at_lowat_restore = None;
+        let mut adaptive_lowat_applied = false;
+        let mut adaptive_lowat_active = false;
+        let mut adaptive_lowat_observed_block = false;
+        let mut adaptive_lowat_restores = 0_u64;
         let switch_after = expected_bytes / 2;
         let mut pacing_updated = false;
         barrier.wait().await;
@@ -454,6 +534,15 @@ mod linux {
             if pending > 0 {
                 let pipe_read_fd = pipe_read.as_raw_fd();
                 let mut writable = destination.writable().await?;
+                if adaptive_lowat_active && adaptive_lowat_observed_block {
+                    let destination_fd = destination.get_ref().as_raw_fd();
+                    notsent_bytes_at_lowat_restore =
+                        Some(get_notsent_bytes(destination_fd)?);
+                    set_tcp_notsent_lowat(destination_fd, 0)?;
+                    adaptive_lowat_active = false;
+                    adaptive_lowat_restores =
+                        adaptive_lowat_restores.saturating_add(1);
+                }
                 match writable.try_io(|destination| {
                     splice_once(
                         pipe_read_fd,
@@ -469,13 +558,17 @@ mod linux {
                             && transferred >= switch_after
                             && let Some(rate) = second_rate
                         {
-                            notsent_bytes_at_rate_update = Some(get_notsent_bytes(
-                                destination.get_ref().as_raw_fd(),
-                            )?);
-                            set_max_pacing_rate(
-                                destination.get_ref().as_raw_fd(),
-                                rate,
-                            )?;
+                            let destination_fd = destination.get_ref().as_raw_fd();
+                            let queued = get_notsent_bytes(destination_fd)?;
+                            notsent_bytes_at_rate_update = Some(queued);
+                            set_max_pacing_rate(destination_fd, rate)?;
+                            if let Some(lowat) = adaptive_notsent_lowat
+                                && queued > lowat
+                            {
+                                set_tcp_notsent_lowat(destination_fd, lowat)?;
+                                adaptive_lowat_applied = true;
+                                adaptive_lowat_active = true;
+                            }
                             pacing_updated = true;
                         }
                     }
@@ -483,6 +576,9 @@ mod linux {
                     Err(_would_block) => {
                         destination_would_blocks =
                             destination_would_blocks.saturating_add(1);
+                        if adaptive_lowat_active {
+                            adaptive_lowat_observed_block = true;
+                        }
                     }
                 }
                 continue;
@@ -504,6 +600,9 @@ mod linux {
                         destination_would_blocks,
                         source_would_blocks,
                         notsent_bytes_at_rate_update,
+                        notsent_bytes_at_lowat_restore,
+                        adaptive_lowat_applied,
+                        adaptive_lowat_restores,
                     });
                 }
                 Ok(Ok(read)) => pending = read,
@@ -704,6 +803,7 @@ mod linux {
                 rate_bytes_per_sec: 1,
                 second_rate_bytes_per_sec: None,
                 notsent_lowat_bytes: None,
+                adaptive_notsent_lowat_bytes: None,
                 pipe_size: 4096,
                 warmup: 0,
                 runs: 1,
@@ -722,12 +822,53 @@ mod linux {
                 rate_bytes_per_sec: 100,
                 second_rate_bytes_per_sec: Some(25),
                 notsent_lowat_bytes: None,
+                adaptive_notsent_lowat_bytes: None,
                 pipe_size: 4096,
                 warmup: 0,
                 runs: 1,
                 verify: false,
             };
             assert_eq!(effective_requested_rate(&args), 40.0);
+        }
+
+        #[test]
+        fn adaptive_lowat_requires_a_rate_decrease() {
+            let mut args = Args {
+                connections: 1,
+                worker_threads: 1,
+                bytes_per_connection: 1,
+                chunk_size: 1,
+                rate_bytes_per_sec: 100,
+                second_rate_bytes_per_sec: Some(100),
+                notsent_lowat_bytes: None,
+                adaptive_notsent_lowat_bytes: Some(512 * 1024),
+                pipe_size: 4096,
+                warmup: 0,
+                runs: 1,
+                verify: false,
+            };
+            assert!(validate_args(&args).is_err());
+            args.second_rate_bytes_per_sec = Some(25);
+            assert!(validate_args(&args).is_ok());
+        }
+
+        #[test]
+        fn static_and_adaptive_lowat_are_mutually_exclusive() {
+            let args = Args {
+                connections: 1,
+                worker_threads: 1,
+                bytes_per_connection: 1,
+                chunk_size: 1,
+                rate_bytes_per_sec: 100,
+                second_rate_bytes_per_sec: Some(25),
+                notsent_lowat_bytes: Some(512 * 1024),
+                adaptive_notsent_lowat_bytes: Some(512 * 1024),
+                pipe_size: 4096,
+                warmup: 0,
+                runs: 1,
+                verify: false,
+            };
+            assert!(validate_args(&args).is_err());
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -740,6 +881,7 @@ mod linux {
                 rate_bytes_per_sec: 64 * 1024 * 1024,
                 second_rate_bytes_per_sec: None,
                 notsent_lowat_bytes: Some(512 * 1024),
+                adaptive_notsent_lowat_bytes: None,
                 pipe_size: 128 * 1024,
                 warmup: 0,
                 runs: 1,
