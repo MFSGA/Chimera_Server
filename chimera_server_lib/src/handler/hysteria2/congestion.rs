@@ -97,6 +97,7 @@ struct PacingPolicyTrace {
     published_rate: u64,
     last_publish_at: Instant,
     publications: u64,
+    publication_rates: Vec<u64>,
     observations: u64,
     error_sum: f64,
     peak_error: f64,
@@ -110,6 +111,7 @@ impl PacingPolicyTrace {
             published_rate: target_rate,
             last_publish_at: now,
             publications: 1,
+            publication_rates: vec![target_rate],
             observations: 1,
             error_sum: 0.0,
             peak_error: 0.0,
@@ -132,6 +134,9 @@ impl PacingPolicyTrace {
             self.published_rate = target_rate;
             self.last_publish_at = now;
             self.publications = self.publications.saturating_add(1);
+            if self.publication_rates.len() < 64 {
+                self.publication_rates.push(target_rate);
+            }
         }
 
         let error = self.published_rate.abs_diff(target_rate) as f64
@@ -249,6 +254,7 @@ impl PacingPublicationTrace {
             delta_1_mean_error_percent = self.delta_1.mean_error_percent(),
             delta_1_peak_error_percent = self.delta_1.peak_error_percent(),
             delta_5_publications = self.delta_5.publications,
+            delta_5_rates = ?self.delta_5.publication_rates,
             delta_5_pps = self.delta_5.publications_per_second(elapsed),
             delta_5_mean_error_percent = self.delta_5.mean_error_percent(),
             delta_5_peak_error_percent = self.delta_5.peak_error_percent(),
@@ -851,6 +857,7 @@ mod tests {
         trace.observe(now + Duration::from_millis(2), 105);
         assert_eq!(trace.publications, 2);
         assert_eq!(trace.published_rate, 105);
+        assert_eq!(trace.publication_rates, vec![100, 105]);
     }
 
     #[cfg(feature = "brutal-pacing-trace")]
@@ -874,6 +881,7 @@ mod tests {
         trace.observe(now + Duration::from_millis(2), 130);
         assert_eq!(trace.publications, 2);
         assert_eq!(trace.published_rate, 130);
+        assert_eq!(trace.publication_rates, vec![100, 130]);
     }
 
     #[test]
