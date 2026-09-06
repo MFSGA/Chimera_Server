@@ -339,6 +339,26 @@ Dynamic results also report `pacing_updates`. Treat them as a queue-response pro
 
 On the September 2026 loopback host (`tcp_notsent_lowat=4294967295` globally), production-like duplicate/duplicate nonblocking splice with a 100→25 MiB/s midpoint change had a median 2.40 MB of unsent data at the update and tracked 0.961697x of the ideal aggregate rate. A 512 KiB socket low-water reduced the update backlog to 336,613 bytes and improved tracking to 0.996108x, while writable waits rose from 67 to 203 per 64 MiB, context switches from 1113 to 1233, and CPU/GiB from 0.826 to 0.837 seconds. Smaller 64/128 KiB values reduced the backlog to roughly 90 KiB but raised writable waits to 511 and CPU/GiB to about 0.92 seconds. In steady 50 MiB/s traffic, 512 KiB still raised writable waits from 71 to 203, context switches from 1107 to 1236, and CPU/GiB from 0.882 to 0.920 seconds. A focused 32 MiB `strace` likewise increased tracked `splice + poll + socket-option/fcntl` calls from 1130 at the default to 1335 at 512 KiB; 128 KiB reached 1791. The low-water knob therefore materially reduces stale queued data after a pacing decrease, but it buys that response with persistent readiness/syscall churn. The current data does not support enabling it globally in the generic TCP relay; keep it benchmark-only until a TCP Brutal2-specific socket lifecycle and workload justify the trade-off.
 
+`tcp_asyncfd_pacing_probe` removes the remaining wait-model mismatch by reproducing the production one-direction relay shape with Tokio `AsyncFd<OwnedFd>`, duplicated nonblocking TCP endpoints, a 128 KiB nonblocking splice pipe, and concurrent writer/sink tasks on one multi-thread runtime. It also supports `--connections N`, so the same `TCP_NOTSENT_LOWAT` choice can be measured under reactor contention instead of only as a single blocking or `poll(2)` flow:
+
+```bash
+cargo build --release --manifest-path bench/chimera_perf/Cargo.toml \
+  --bin tcp_asyncfd_pacing_probe
+
+bench/chimera_perf/target/release/tcp_asyncfd_pacing_probe \
+  --connections 64 \
+  --worker-threads 4 \
+  --bytes-per-connection 8388608 \
+  --rate-bytes-per-sec 33554432 \
+  --second-rate-bytes-per-sec 8388608 \
+  --notsent-lowat-bytes 524288 \
+  --pipe-size 131072 \
+  --warmup 1 \
+  --runs 3
+```
+
+On the same host, the c64 dynamic 32→8 MiB/s-per-flow workload reduced median update backlog from 1,942,016 bytes with the default socket behavior to 586,930 bytes at 512 KiB, and improved the per-flow rate ratio from 0.672233x to 0.907811x. CPU/GiB moved from 0.582588 to 0.589456 seconds, context switches from 7530 to 8053, and destination `try_io` `WouldBlock` events from 6.02 to 23.98 per connection. In the matching steady 16 MiB/s workload, 512 KiB changed CPU/GiB from 0.536948 to 0.595306 seconds, context switches from 8063 to 9033, and `WouldBlock` events from 6.06 to 24.05 per connection. A c16 steady `strace -f -c` changed `splice` from 1150 calls / 46 errors to 1426 / 176 and total tracked calls from 2797 to 3065. A c64 dynamic sweep places 256 KiB at 0.939513x rate ratio with 40.73 `WouldBlock` events/connection and 0.614820 CPU seconds/GiB, while 1 MiB falls to 0.862457x with 12.95 events and 0.545576 seconds/GiB. The data still identifies roughly 512 KiB as a useful response/CPU compromise, but its steady-state scheduler cost remains too large to justify a generic relay default without an explicit TCP Brutal2 socket policy.
+
 Use `strace` to attribute userspace pacing wakeups:
 
 ```bash

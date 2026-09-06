@@ -1,0 +1,753 @@
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("tcp_asyncfd_pacing_probe requires Linux");
+    std::process::exit(2);
+}
+
+#[cfg(target_os = "linux")]
+fn main() -> anyhow::Result<()> {
+    linux::run()
+}
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::{
+        io,
+        net::{TcpListener, TcpStream},
+        os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+        sync::Arc,
+        time::Instant,
+    };
+
+    use anyhow::{Result, bail};
+    use chimera_perf::stats::{coefficient_of_variation, median};
+    use clap::Parser;
+    use serde::Serialize;
+    use tokio::{
+        io::unix::AsyncFd,
+        io::{AsyncReadExt, AsyncWriteExt},
+        sync::Barrier,
+    };
+
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const PATTERN_BYTE: u8 = 0x5a;
+
+    #[derive(Debug, Parser)]
+    #[command(about = "Concurrent AsyncFd TCP pacing probe for Brutal2 design work")]
+    struct Args {
+        #[arg(long, default_value_t = 1)]
+        connections: usize,
+
+        #[arg(long, default_value_t = 4)]
+        worker_threads: usize,
+
+        #[arg(long, default_value_t = 16 * 1024 * 1024_u64)]
+        bytes_per_connection: u64,
+
+        #[arg(long, default_value_t = 64 * 1024)]
+        chunk_size: usize,
+
+        #[arg(long, default_value_t = 32 * 1024 * 1024_u64)]
+        rate_bytes_per_sec: u64,
+
+        #[arg(long)]
+        second_rate_bytes_per_sec: Option<u64>,
+
+        #[arg(long)]
+        notsent_lowat_bytes: Option<u32>,
+
+        #[arg(long, default_value_t = 128 * 1024)]
+        pipe_size: usize,
+
+        #[arg(long, default_value_t = 1)]
+        warmup: usize,
+
+        #[arg(long, default_value_t = 5)]
+        runs: usize,
+
+        #[arg(long)]
+        verify: bool,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct Usage {
+        cpu_seconds: f64,
+        voluntary_context_switches: i64,
+        involuntary_context_switches: i64,
+    }
+
+    #[derive(Debug)]
+    struct RelayStats {
+        bytes: u64,
+        destination_would_blocks: u64,
+        source_would_blocks: u64,
+        notsent_bytes_at_rate_update: Option<u32>,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct RunRecord {
+        schema_version: u32,
+        record_type: &'static str,
+        run_index: usize,
+        warmup: bool,
+        connections: usize,
+        worker_threads: usize,
+        bytes_per_connection: u64,
+        total_bytes: u64,
+        chunk_size: usize,
+        pipe_size: usize,
+        requested_rate_bytes_per_sec: u64,
+        second_rate_bytes_per_sec: Option<u64>,
+        requested_notsent_lowat_bytes: Option<u32>,
+        destination_would_blocks_total: u64,
+        destination_would_blocks_per_connection: f64,
+        source_would_blocks_total: u64,
+        notsent_bytes_at_rate_update_median: Option<f64>,
+        elapsed_seconds: f64,
+        aggregate_throughput_gbps: f64,
+        per_connection_rate_ratio: f64,
+        cpu_seconds: f64,
+        cpu_seconds_per_gib: f64,
+        voluntary_context_switches: i64,
+        involuntary_context_switches: i64,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct Summary {
+        schema_version: u32,
+        record_type: &'static str,
+        connections: usize,
+        worker_threads: usize,
+        runs: usize,
+        warmup_runs: usize,
+        bytes_per_connection: u64,
+        chunk_size: usize,
+        pipe_size: usize,
+        requested_rate_bytes_per_sec: u64,
+        second_rate_bytes_per_sec: Option<u64>,
+        requested_notsent_lowat_bytes: Option<u32>,
+        aggregate_throughput_median_gbps: f64,
+        throughput_cv: f64,
+        per_connection_rate_ratio_median: f64,
+        cpu_seconds_per_gib_median: f64,
+        context_switches_median: f64,
+        destination_would_blocks_per_connection_median: f64,
+        notsent_bytes_at_rate_update_median: Option<f64>,
+    }
+
+    pub(super) fn run() -> Result<()> {
+        let args = Args::parse();
+        validate_args(&args)?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(args.worker_threads)
+            .enable_io()
+            .build()?;
+
+        for run_index in 0..args.warmup {
+            let record = runtime.block_on(run_once(&args, run_index, true))?;
+            println!("{}", serde_json::to_string(&record)?);
+        }
+
+        let mut throughput = Vec::with_capacity(args.runs);
+        let mut ratios = Vec::with_capacity(args.runs);
+        let mut cpu_per_gib = Vec::with_capacity(args.runs);
+        let mut context_switches = Vec::with_capacity(args.runs);
+        let mut destination_blocks = Vec::with_capacity(args.runs);
+        let mut notsent = Vec::new();
+        for run_index in 0..args.runs {
+            let record = runtime.block_on(run_once(&args, run_index, false))?;
+            throughput.push(record.aggregate_throughput_gbps);
+            ratios.push(record.per_connection_rate_ratio);
+            cpu_per_gib.push(record.cpu_seconds_per_gib);
+            context_switches.push(
+                (record.voluntary_context_switches
+                    + record.involuntary_context_switches) as f64,
+            );
+            destination_blocks.push(record.destination_would_blocks_per_connection);
+            if let Some(bytes) = record.notsent_bytes_at_rate_update_median {
+                notsent.push(bytes);
+            }
+            println!("{}", serde_json::to_string(&record)?);
+        }
+
+        println!(
+            "{}",
+            serde_json::to_string(&Summary {
+                schema_version: 1,
+                record_type: "summary",
+                connections: args.connections,
+                worker_threads: args.worker_threads,
+                runs: args.runs,
+                warmup_runs: args.warmup,
+                bytes_per_connection: args.bytes_per_connection,
+                chunk_size: args.chunk_size,
+                pipe_size: args.pipe_size,
+                requested_rate_bytes_per_sec: args.rate_bytes_per_sec,
+                second_rate_bytes_per_sec: args.second_rate_bytes_per_sec,
+                requested_notsent_lowat_bytes: args.notsent_lowat_bytes,
+                aggregate_throughput_median_gbps: round(median(&throughput)),
+                throughput_cv: round(coefficient_of_variation(&throughput)),
+                per_connection_rate_ratio_median: round(median(&ratios)),
+                cpu_seconds_per_gib_median: round(median(&cpu_per_gib)),
+                context_switches_median: round(median(&context_switches)),
+                destination_would_blocks_per_connection_median: round(median(
+                    &destination_blocks
+                )),
+                notsent_bytes_at_rate_update_median: (!notsent.is_empty())
+                    .then(|| round(median(&notsent))),
+            })?
+        );
+        Ok(())
+    }
+
+    fn validate_args(args: &Args) -> Result<()> {
+        if args.connections == 0 {
+            bail!("--connections must be greater than zero");
+        }
+        if args.worker_threads == 0 {
+            bail!("--worker-threads must be greater than zero");
+        }
+        if args.bytes_per_connection == 0 {
+            bail!("--bytes-per-connection must be greater than zero");
+        }
+        if args.chunk_size == 0 {
+            bail!("--chunk-size must be greater than zero");
+        }
+        if args.pipe_size == 0 || args.pipe_size > i32::MAX as usize {
+            bail!("--pipe-size must be between 1 and i32::MAX");
+        }
+        if args.rate_bytes_per_sec == 0 || args.second_rate_bytes_per_sec == Some(0)
+        {
+            bail!("pacing rates must be greater than zero");
+        }
+        if args.runs == 0 {
+            bail!("--runs must be greater than zero");
+        }
+        Ok(())
+    }
+
+    async fn run_once(
+        args: &Args,
+        run_index: usize,
+        warmup: bool,
+    ) -> Result<RunRecord> {
+        let barrier = Arc::new(Barrier::new(args.connections * 3 + 1));
+        let mut writers = Vec::with_capacity(args.connections);
+        let mut relays = Vec::with_capacity(args.connections);
+        let mut sinks = Vec::with_capacity(args.connections);
+
+        for _ in 0..args.connections {
+            let (writer, relay_source) = tcp_pair()?;
+            let (relay_destination, sink) = tcp_pair()?;
+            for stream in [&writer, &relay_source, &relay_destination, &sink] {
+                stream.set_nodelay(true)?;
+                stream.set_nonblocking(true)?;
+            }
+
+            let source =
+                Arc::new(AsyncFd::new(duplicate_fd(relay_source.as_raw_fd())?)?);
+            let destination = Arc::new(AsyncFd::new(duplicate_fd(
+                relay_destination.as_raw_fd(),
+            )?)?);
+            set_max_pacing_rate(
+                destination.get_ref().as_raw_fd(),
+                args.rate_bytes_per_sec,
+            )?;
+            if let Some(lowat) = args.notsent_lowat_bytes {
+                set_tcp_notsent_lowat(destination.get_ref().as_raw_fd(), lowat)?;
+            }
+            drop(relay_source);
+            drop(relay_destination);
+
+            let writer = tokio::net::TcpStream::from_std(writer)?;
+            let sink = tokio::net::TcpStream::from_std(sink)?;
+            let writer_barrier = Arc::clone(&barrier);
+            let sink_barrier = Arc::clone(&barrier);
+            let relay_barrier = Arc::clone(&barrier);
+            let bytes = args.bytes_per_connection;
+            let chunk_size = args.chunk_size;
+            let verify = args.verify;
+            let pipe_size = args.pipe_size;
+            let second_rate = args.second_rate_bytes_per_sec;
+
+            writers.push(tokio::spawn(async move {
+                write_payload(writer, writer_barrier, bytes, chunk_size).await
+            }));
+            sinks.push(tokio::spawn(async move {
+                read_payload(sink, sink_barrier, bytes, chunk_size, verify).await
+            }));
+            relays.push(tokio::spawn(async move {
+                splice_relay(
+                    source,
+                    destination,
+                    relay_barrier,
+                    bytes,
+                    pipe_size,
+                    second_rate,
+                )
+                .await
+            }));
+        }
+
+        let usage_before = usage()?;
+        let started = Instant::now();
+        barrier.wait().await;
+
+        for writer in writers {
+            writer
+                .await
+                .map_err(|_| anyhow::anyhow!("writer task panicked"))??;
+        }
+
+        let mut relay_stats = Vec::with_capacity(args.connections);
+        for relay in relays {
+            relay_stats.push(
+                relay
+                    .await
+                    .map_err(|_| anyhow::anyhow!("relay task panicked"))??,
+            );
+        }
+        for sink in sinks {
+            sink.await
+                .map_err(|_| anyhow::anyhow!("sink task panicked"))??;
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        let usage_after = usage()?;
+
+        let total_bytes = args
+            .bytes_per_connection
+            .checked_mul(args.connections as u64)
+            .ok_or_else(|| {
+                anyhow::anyhow!("total benchmark bytes overflowed u64")
+            })?;
+        if relay_stats
+            .iter()
+            .any(|stats| stats.bytes != args.bytes_per_connection)
+        {
+            bail!("one or more relays transferred an unexpected byte count");
+        }
+        let destination_would_blocks_total = relay_stats
+            .iter()
+            .map(|stats| stats.destination_would_blocks)
+            .sum::<u64>();
+        let source_would_blocks_total = relay_stats
+            .iter()
+            .map(|stats| stats.source_would_blocks)
+            .sum::<u64>();
+        let notsent = relay_stats
+            .iter()
+            .filter_map(|stats| stats.notsent_bytes_at_rate_update.map(f64::from))
+            .collect::<Vec<_>>();
+        let expected_rate = effective_requested_rate(args);
+        let per_connection_observed_rate =
+            args.bytes_per_connection as f64 / elapsed;
+        let cpu_seconds = usage_after.cpu_seconds - usage_before.cpu_seconds;
+
+        Ok(RunRecord {
+            schema_version: 1,
+            record_type: "run",
+            run_index,
+            warmup,
+            connections: args.connections,
+            worker_threads: args.worker_threads,
+            bytes_per_connection: args.bytes_per_connection,
+            total_bytes,
+            chunk_size: args.chunk_size,
+            pipe_size: args.pipe_size,
+            requested_rate_bytes_per_sec: args.rate_bytes_per_sec,
+            second_rate_bytes_per_sec: args.second_rate_bytes_per_sec,
+            requested_notsent_lowat_bytes: args.notsent_lowat_bytes,
+            destination_would_blocks_total,
+            destination_would_blocks_per_connection: round(
+                destination_would_blocks_total as f64 / args.connections as f64,
+            ),
+            source_would_blocks_total,
+            notsent_bytes_at_rate_update_median: (!notsent.is_empty())
+                .then(|| round(median(&notsent))),
+            elapsed_seconds: round(elapsed),
+            aggregate_throughput_gbps: round(
+                total_bytes as f64 * 8.0 / elapsed / 1e9,
+            ),
+            per_connection_rate_ratio: round(
+                per_connection_observed_rate / expected_rate,
+            ),
+            cpu_seconds: round(cpu_seconds),
+            cpu_seconds_per_gib: round(cpu_seconds / (total_bytes as f64 / GIB)),
+            voluntary_context_switches: usage_after.voluntary_context_switches
+                - usage_before.voluntary_context_switches,
+            involuntary_context_switches: usage_after.involuntary_context_switches
+                - usage_before.involuntary_context_switches,
+        })
+    }
+
+    async fn write_payload(
+        mut stream: tokio::net::TcpStream,
+        barrier: Arc<Barrier>,
+        bytes: u64,
+        chunk_size: usize,
+    ) -> io::Result<()> {
+        let buffer = vec![PATTERN_BYTE; chunk_size];
+        barrier.wait().await;
+        let mut written = 0_u64;
+        while written < bytes {
+            let count = usize::try_from((bytes - written).min(chunk_size as u64))
+                .expect("chunk size fits usize");
+            stream.write_all(&buffer[..count]).await?;
+            written += count as u64;
+        }
+        stream.shutdown().await
+    }
+
+    async fn read_payload(
+        mut stream: tokio::net::TcpStream,
+        barrier: Arc<Barrier>,
+        expected_bytes: u64,
+        chunk_size: usize,
+        verify: bool,
+    ) -> io::Result<()> {
+        let mut buffer = vec![0_u8; chunk_size];
+        barrier.wait().await;
+        let mut received = 0_u64;
+        while received < expected_bytes {
+            let count = stream.read(&mut buffer).await?;
+            if count == 0 {
+                break;
+            }
+            if verify && buffer[..count].iter().any(|byte| *byte != PATTERN_BYTE) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "asyncfd pacing payload verification failed",
+                ));
+            }
+            received += count as u64;
+        }
+        if received == expected_bytes {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("sink received {received} bytes, expected {expected_bytes}"),
+            ))
+        }
+    }
+
+    async fn splice_relay(
+        source: Arc<AsyncFd<OwnedFd>>,
+        destination: Arc<AsyncFd<OwnedFd>>,
+        barrier: Arc<Barrier>,
+        expected_bytes: u64,
+        requested_pipe_size: usize,
+        second_rate: Option<u64>,
+    ) -> io::Result<RelayStats> {
+        let (pipe_read, pipe_write, pipe_capacity) =
+            nonblocking_pipe(requested_pipe_size)?;
+        let mut pending = 0_usize;
+        let mut transferred = 0_u64;
+        let mut destination_would_blocks = 0_u64;
+        let mut source_would_blocks = 0_u64;
+        let mut notsent_bytes_at_rate_update = None;
+        let switch_after = expected_bytes / 2;
+        let mut pacing_updated = false;
+        barrier.wait().await;
+
+        loop {
+            if pending > 0 {
+                let pipe_read_fd = pipe_read.as_raw_fd();
+                let mut writable = destination.writable().await?;
+                match writable.try_io(|destination| {
+                    splice_once(
+                        pipe_read_fd,
+                        destination.get_ref().as_raw_fd(),
+                        pending,
+                    )
+                }) {
+                    Ok(Ok(0)) => return Err(io::ErrorKind::WriteZero.into()),
+                    Ok(Ok(written)) => {
+                        pending -= written;
+                        transferred += written as u64;
+                        if !pacing_updated
+                            && transferred >= switch_after
+                            && let Some(rate) = second_rate
+                        {
+                            notsent_bytes_at_rate_update = Some(get_notsent_bytes(
+                                destination.get_ref().as_raw_fd(),
+                            )?);
+                            set_max_pacing_rate(
+                                destination.get_ref().as_raw_fd(),
+                                rate,
+                            )?;
+                            pacing_updated = true;
+                        }
+                    }
+                    Ok(Err(error)) => return Err(error),
+                    Err(_would_block) => {
+                        destination_would_blocks =
+                            destination_would_blocks.saturating_add(1);
+                    }
+                }
+                continue;
+            }
+
+            let pipe_write_fd = pipe_write.as_raw_fd();
+            let mut readable = source.readable().await?;
+            match readable.try_io(|source| {
+                splice_once(
+                    source.get_ref().as_raw_fd(),
+                    pipe_write_fd,
+                    pipe_capacity,
+                )
+            }) {
+                Ok(Ok(0)) => {
+                    shutdown_write(destination.get_ref().as_raw_fd())?;
+                    return Ok(RelayStats {
+                        bytes: transferred,
+                        destination_would_blocks,
+                        source_would_blocks,
+                        notsent_bytes_at_rate_update,
+                    });
+                }
+                Ok(Ok(read)) => pending = read,
+                Ok(Err(error)) => return Err(error),
+                Err(_would_block) => {
+                    source_would_blocks = source_would_blocks.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    fn tcp_pair() -> io::Result<(TcpStream, TcpStream)> {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        let client = TcpStream::connect(listener.local_addr()?)?;
+        let (server, _) = listener.accept()?;
+        Ok((client, server))
+    }
+
+    fn duplicate_fd(fd: RawFd) -> io::Result<OwnedFd> {
+        let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if duplicated < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
+    }
+
+    fn nonblocking_pipe(
+        requested_capacity: usize,
+    ) -> io::Result<(OwnedFd, OwnedFd, usize)> {
+        let mut fds = [-1; 2];
+        let result = unsafe {
+            libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK)
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let pipe_read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let pipe_write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let current = pipe_capacity(pipe_write.as_raw_fd())?;
+        let actual = if requested_capacity > current {
+            let resized = unsafe {
+                libc::fcntl(
+                    pipe_write.as_raw_fd(),
+                    libc::F_SETPIPE_SZ,
+                    requested_capacity as libc::c_int,
+                )
+            };
+            if resized > 0 {
+                resized as usize
+            } else {
+                current
+            }
+        } else {
+            current
+        };
+        Ok((pipe_read, pipe_write, actual))
+    }
+
+    fn pipe_capacity(fd: RawFd) -> io::Result<usize> {
+        let capacity = unsafe { libc::fcntl(fd, libc::F_GETPIPE_SZ) };
+        if capacity < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(capacity as usize)
+    }
+
+    fn splice_once(
+        source: RawFd,
+        destination: RawFd,
+        len: usize,
+    ) -> io::Result<usize> {
+        loop {
+            let result = unsafe {
+                libc::splice(
+                    source,
+                    std::ptr::null_mut(),
+                    destination,
+                    std::ptr::null_mut(),
+                    len,
+                    libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK,
+                )
+            };
+            if result >= 0 {
+                return Ok(result as usize);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+    }
+
+    fn shutdown_write(fd: RawFd) -> io::Result<()> {
+        let result = unsafe { libc::shutdown(fd, libc::SHUT_WR) };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::ENOTCONN | libc::EPIPE)) {
+            return Ok(());
+        }
+        Err(error)
+    }
+
+    fn set_max_pacing_rate(fd: RawFd, rate: u64) -> io::Result<()> {
+        let result = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_MAX_PACING_RATE,
+                (&rate as *const u64).cast(),
+                std::mem::size_of::<u64>() as libc::socklen_t,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    fn set_tcp_notsent_lowat(fd: RawFd, bytes: u32) -> io::Result<()> {
+        let result = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_NOTSENT_LOWAT,
+                (&bytes as *const u32).cast(),
+                std::mem::size_of::<u32>() as libc::socklen_t,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    fn get_notsent_bytes(fd: RawFd) -> io::Result<u32> {
+        let mut bytes = 0_i32;
+        let result = unsafe { libc::ioctl(fd, libc::SIOCOUTQNSD, &mut bytes) };
+        if result == 0 {
+            u32::try_from(bytes).map_err(|_| {
+                io::Error::other(format!(
+                    "SIOCOUTQNSD returned negative bytes: {bytes}"
+                ))
+            })
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    fn effective_requested_rate(args: &Args) -> f64 {
+        match args.second_rate_bytes_per_sec {
+            Some(second) => {
+                2.0 / (1.0 / args.rate_bytes_per_sec as f64 + 1.0 / second as f64)
+            }
+            None => args.rate_bytes_per_sec as f64,
+        }
+    }
+
+    fn usage() -> io::Result<Usage> {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        let result =
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let usage = unsafe { usage.assume_init() };
+        Ok(Usage {
+            cpu_seconds: timeval_seconds(usage.ru_utime)
+                + timeval_seconds(usage.ru_stime),
+            voluntary_context_switches: usage.ru_nvcsw,
+            involuntary_context_switches: usage.ru_nivcsw,
+        })
+    }
+
+    fn timeval_seconds(value: libc::timeval) -> f64 {
+        value.tv_sec as f64 + value.tv_usec as f64 / 1_000_000.0
+    }
+
+    fn round(value: f64) -> f64 {
+        (value * 1_000_000.0).round() / 1_000_000.0
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn rejects_zero_connections() {
+            let args = Args {
+                connections: 0,
+                worker_threads: 1,
+                bytes_per_connection: 1,
+                chunk_size: 1,
+                rate_bytes_per_sec: 1,
+                second_rate_bytes_per_sec: None,
+                notsent_lowat_bytes: None,
+                pipe_size: 4096,
+                warmup: 0,
+                runs: 1,
+                verify: false,
+            };
+            assert!(validate_args(&args).is_err());
+        }
+
+        #[test]
+        fn effective_rate_uses_equal_byte_harmonic_mean() {
+            let args = Args {
+                connections: 1,
+                worker_threads: 1,
+                bytes_per_connection: 1,
+                chunk_size: 1,
+                rate_bytes_per_sec: 100,
+                second_rate_bytes_per_sec: Some(25),
+                notsent_lowat_bytes: None,
+                pipe_size: 4096,
+                warmup: 0,
+                runs: 1,
+                verify: false,
+            };
+            assert_eq!(effective_requested_rate(&args), 40.0);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn asyncfd_splice_roundtrip_preserves_payload() {
+            let args = Args {
+                connections: 1,
+                worker_threads: 2,
+                bytes_per_connection: 256 * 1024,
+                chunk_size: 16 * 1024,
+                rate_bytes_per_sec: 64 * 1024 * 1024,
+                second_rate_bytes_per_sec: None,
+                notsent_lowat_bytes: Some(512 * 1024),
+                pipe_size: 128 * 1024,
+                warmup: 0,
+                runs: 1,
+                verify: true,
+            };
+
+            let record = run_once(&args, 0, false).await.unwrap();
+            assert_eq!(record.total_bytes, args.bytes_per_connection);
+        }
+    }
+}
