@@ -34,6 +34,7 @@ mod linux {
     #[serde(rename_all = "kebab-case")]
     enum Backend {
         Copy,
+        TokioCopy,
         Splice,
         UringSplice,
     }
@@ -233,6 +234,9 @@ mod linux {
                 &mut relay_destination,
                 args.chunk_size,
             )?,
+            Backend::TokioCopy => {
+                tokio_copy_relay(&relay_source, &relay_destination, args.chunk_size)?
+            }
             Backend::Splice => splice_relay(
                 relay_source.as_raw_fd(),
                 relay_destination.as_raw_fd(),
@@ -309,6 +313,31 @@ mod linux {
             destination.write_all(&buffer[..count])?;
             total = total.saturating_add(count as u64);
         }
+    }
+
+    fn tokio_copy_relay(
+        source: &TcpStream,
+        destination: &TcpStream,
+        chunk_size: usize,
+    ) -> io::Result<u64> {
+        let source = source.try_clone()?;
+        let destination = destination.try_clone()?;
+        source.set_nonblocking(true)?;
+        destination.set_nonblocking(true)?;
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()?
+            .block_on(async move {
+                let mut source = tokio::net::TcpStream::from_std(source)?;
+                let mut destination = tokio::net::TcpStream::from_std(destination)?;
+                let mut buffered =
+                    tokio::io::BufReader::with_capacity(chunk_size, &mut source);
+                let copied =
+                    tokio::io::copy_buf(&mut buffered, &mut destination).await?;
+                tokio::io::AsyncWriteExt::flush(&mut destination).await?;
+                Ok(copied)
+            })
     }
 
     fn splice_relay(
