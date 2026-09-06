@@ -72,6 +72,9 @@ mod linux {
         notsent_lowat_update_threshold_percent: f64,
 
         #[arg(long)]
+        notsent_lowat_gate_decreases_only: bool,
+
+        #[arg(long)]
         adaptive_notsent_lowat_bytes: Option<u32>,
 
         #[arg(long, default_value_t = 128 * 1024)]
@@ -117,6 +120,7 @@ mod linux {
         initial_notsent_lowat: Option<u32>,
         rate_updates: Arc<[RateUpdate]>,
         notsent_lowat_update_threshold_percent: f64,
+        notsent_lowat_gate_decreases_only: bool,
         adaptive_notsent_lowat: Option<u32>,
         sample_tcp_info: bool,
     }
@@ -155,6 +159,7 @@ mod linux {
         requested_notsent_lowat_min_bytes: Option<u32>,
         requested_notsent_lowat_max_bytes: Option<u32>,
         notsent_lowat_update_threshold_percent: f64,
+        notsent_lowat_gate_decreases_only: bool,
         effective_initial_notsent_lowat_bytes: Option<u32>,
         effective_second_notsent_lowat_bytes: Option<u32>,
         adaptive_notsent_lowat_bytes: Option<u32>,
@@ -199,6 +204,7 @@ mod linux {
         requested_notsent_lowat_min_bytes: Option<u32>,
         requested_notsent_lowat_max_bytes: Option<u32>,
         notsent_lowat_update_threshold_percent: f64,
+        notsent_lowat_gate_decreases_only: bool,
         effective_initial_notsent_lowat_bytes: Option<u32>,
         effective_second_notsent_lowat_bytes: Option<u32>,
         adaptive_notsent_lowat_bytes: Option<u32>,
@@ -310,6 +316,7 @@ mod linux {
                 requested_notsent_lowat_max_bytes: args.notsent_lowat_max_bytes,
                 notsent_lowat_update_threshold_percent: args
                     .notsent_lowat_update_threshold_percent,
+                notsent_lowat_gate_decreases_only: args.notsent_lowat_gate_decreases_only,
                 effective_initial_notsent_lowat_bytes: initial_notsent_lowat,
                 effective_second_notsent_lowat_bytes: second_notsent_lowat,
                 adaptive_notsent_lowat_bytes: args.adaptive_notsent_lowat_bytes,
@@ -399,11 +406,12 @@ mod linux {
                 "--notsent-lowat-update-threshold-percent must be between 0 and 100"
             );
         }
-        if args.notsent_lowat_update_threshold_percent > 0.0
+        if (args.notsent_lowat_update_threshold_percent > 0.0
+            || args.notsent_lowat_gate_decreases_only)
             && args.notsent_lowat_ms.is_none()
         {
             bail!(
-                "--notsent-lowat-update-threshold-percent requires --notsent-lowat-ms"
+                "low-water publication gating requires --notsent-lowat-ms"
             );
         }
         if (args.notsent_lowat_min_bytes.is_some()
@@ -540,9 +548,13 @@ mod linux {
         last_published: u32,
         candidate: u32,
         threshold_percent: f64,
+        gate_decreases_only: bool,
     ) -> bool {
         if candidate == last_published {
             return false;
+        }
+        if gate_decreases_only && candidate > last_published {
+            return true;
         }
         let delta = last_published.abs_diff(candidate) as f64;
         delta * 100.0 / last_published as f64 >= threshold_percent
@@ -598,6 +610,7 @@ mod linux {
                 rate_updates: Arc::clone(&rate_updates),
                 notsent_lowat_update_threshold_percent: args
                     .notsent_lowat_update_threshold_percent,
+                notsent_lowat_gate_decreases_only: args.notsent_lowat_gate_decreases_only,
                 adaptive_notsent_lowat: args.adaptive_notsent_lowat_bytes,
                 sample_tcp_info: args.sample_tcp_info,
             };
@@ -729,6 +742,7 @@ mod linux {
             requested_notsent_lowat_max_bytes: args.notsent_lowat_max_bytes,
             notsent_lowat_update_threshold_percent: args
                 .notsent_lowat_update_threshold_percent,
+            notsent_lowat_gate_decreases_only: args.notsent_lowat_gate_decreases_only,
             effective_initial_notsent_lowat_bytes: initial_notsent_lowat,
             effective_second_notsent_lowat_bytes: second_notsent_lowat,
             adaptive_notsent_lowat_bytes: args.adaptive_notsent_lowat_bytes,
@@ -894,6 +908,7 @@ mod linux {
                                         candidate,
                                         options
                                             .notsent_lowat_update_threshold_percent,
+                                        options.notsent_lowat_gate_decreases_only,
                                     ),
                                     None => true,
                                 };
@@ -1181,6 +1196,7 @@ mod linux {
                 notsent_lowat_min_bytes: None,
                 notsent_lowat_max_bytes: None,
                 notsent_lowat_update_threshold_percent: 0.0,
+                notsent_lowat_gate_decreases_only: false,
                 adaptive_notsent_lowat_bytes: None,
                 pipe_size: 4096,
                 warmup: 0,
@@ -1236,10 +1252,17 @@ mod linux {
 
         #[test]
         fn lowat_publication_gate_accumulates_against_last_publication() {
-            assert!(!should_publish_lowat(1_000, 1_090, 12.5));
-            assert!(should_publish_lowat(1_000, 1_125, 12.5));
-            assert!(should_publish_lowat(1_000, 870, 12.5));
-            assert!(!should_publish_lowat(1_000, 1_000, 0.0));
+            assert!(!should_publish_lowat(1_000, 1_090, 12.5, false));
+            assert!(should_publish_lowat(1_000, 1_125, 12.5, false));
+            assert!(should_publish_lowat(1_000, 870, 12.5, false));
+            assert!(!should_publish_lowat(1_000, 1_000, 0.0, false));
+        }
+
+        #[test]
+        fn decrease_only_gate_publishes_lowat_increases_immediately() {
+            assert!(should_publish_lowat(1_000, 1_010, 12.5, true));
+            assert!(!should_publish_lowat(1_000, 900, 12.5, true));
+            assert!(should_publish_lowat(1_000, 875, 12.5, true));
         }
 
         #[test]
@@ -1307,6 +1330,10 @@ mod linux {
 
             args.second_rate_bytes_per_sec = None;
             args.notsent_lowat_update_threshold_percent = 12.5;
+            assert!(validate_args(&args).is_err());
+
+            args.notsent_lowat_update_threshold_percent = 0.0;
+            args.notsent_lowat_gate_decreases_only = true;
             assert!(validate_args(&args).is_err());
 
             args.notsent_lowat_ms = Some(32);
