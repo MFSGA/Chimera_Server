@@ -318,6 +318,10 @@ done
 
 The important output fields are `requested_rate_ratio`, `cpu_seconds_per_gib`, and total context switches. A successful `setsockopt` is not enough evidence that kernel pacing is effective: the observed/requested rate ratio should remain close to 1 on the target host and network path. The `splice` backend feeds a memfd through a pipe into the paced TCP socket so the paced output operation uses the same pipe-to-socket splice shape as the production relay.
 
+Production splice does not write through the original Tokio `TcpStream` fd: it duplicates each raw TCP endpoint with `F_DUPFD_CLOEXEC` before registering the duplicate with `AsyncFd`. Use `--pacing-fd duplicate --splice-destination-fd duplicate` to mirror that ownership shape. The probe reuses one duplicate for both roles, and the unit test verifies that `SO_MAX_PACING_RATE` set through either fd is immediately visible through the other because both descriptors reference the same TCP socket. On the September 2026 loopback host, 128 MiB at 50 MiB/s produced essentially identical rate control across the placement matrix: original/original was 1.002645x requested rate, original/duplicate was 1.002802x, and duplicate/duplicate was 1.002654x. A 100→25 MiB/s midpoint update also matched closely (0.959763x original/original vs 0.961140x duplicate/duplicate), confirming that later publications through the duplicate affect an active splice sender.
+
+`strace -f -c -e trace=fcntl,setsockopt,getsockopt,splice` shows one extra `fcntl(F_DUPFD_CLOEXEC)` in the duplicate/duplicate benchmark setup and no per-transfer fd-management calls. Production splice already pays that duplication to build `SpliceDirection`, so a future pacing publisher can target the existing destination duplicate without adding another fd duplication syscall. This still does not define the TCP Brutal2 rate lifecycle or configuration semantics; it only proves the low-level socket placement is viable.
+
 To probe a dynamic rate publication, set `--second-rate-bytes-per-sec`; the probe switches once after half the bytes have been submitted and computes the expected aggregate rate from the two equal-byte phases:
 
 ```bash
