@@ -530,7 +530,8 @@ where
     let mut buffered_reader =
         tokio::io::BufReader::with_capacity(buffer_size, reader);
     let copied = tokio::io::copy_buf(&mut buffered_reader, &mut *writer).await?;
-    writer.flush().await?;
+    // `copy_buf` flushes the writer after observing EOF. Avoid polling the
+    // entire wrapper chain a second time before the required half-close.
     writer.shutdown().await?;
     Ok(copied)
 }
@@ -1368,6 +1369,48 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FinishCountingWriter {
+        pending: Vec<u8>,
+        visible: Vec<u8>,
+        flushes: usize,
+        shutdowns: usize,
+    }
+
+    impl AsyncWrite for FinishCountingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.pending.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            let pending = std::mem::take(&mut self.pending);
+            self.visible.extend_from_slice(&pending);
+            self.flushes += 1;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            if !self.pending.is_empty() {
+                return Poll::Ready(Err(io::Error::other(
+                    "shutdown observed bytes that copy_buf did not flush",
+                )));
+            }
+            self.shutdowns += 1;
+            Poll::Ready(Ok(()))
+        }
+    }
+
     #[test]
     fn default_uses_measured_thirty_two_kibibyte_buffer() {
         assert_eq!(parse_copy_buffer_size(None).unwrap(), 32 * 1024);
@@ -1611,6 +1654,23 @@ mod tests {
         assert_eq!(visible.lock().unwrap().as_slice(), b"server-hello");
         assert_eq!(flushes.load(Ordering::Relaxed), 1);
         assert!(!state.flush_pending);
+    }
+
+    #[tokio::test]
+    async fn one_direction_copy_flushes_once_before_shutdown() {
+        let payload = b"copy-buf-flush-contract";
+        let mut reader = &payload[..];
+        let mut writer = FinishCountingWriter::default();
+
+        let copied = copy_one_direction(&mut reader, &mut writer, 5)
+            .await
+            .unwrap();
+
+        assert_eq!(copied, payload.len() as u64);
+        assert_eq!(writer.visible, payload);
+        assert_eq!(writer.flushes, 1);
+        assert_eq!(writer.shutdowns, 1);
+        assert!(writer.pending.is_empty());
     }
 
     #[tokio::test]

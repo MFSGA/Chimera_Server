@@ -262,6 +262,25 @@ the default auto splice threshold is eight connections; the single-direction
 uplink buffer is intentionally tuned independently from the all-userspace
 32 KiB default.
 
+`tcp_copy_finish_bench` isolates the EOF completion path used by the
+single-direction userspace relay. Tokio `copy_buf` already polls `flush` after
+observing EOF, so polling `flush` again before `shutdown` only traverses the
+writer wrapper chain a second time. Compare the old and single-flush shapes with:
+
+```bash
+cargo build --release --manifest-path bench/chimera_perf/Cargo.toml \
+  --bin tcp_copy_finish_bench
+for mode in redundant-flush copy-buf-flush; do
+  bench/chimera_perf/target/release/tcp_copy_finish_bench \
+    --mode "$mode" --iterations 20000000 --warmup 2 --runs 7
+done
+```
+
+This is a completion-path microbenchmark, not a bulk-throughput benchmark. Its
+flush counters are the semantic guard: `redundant-flush` must report two flush
+polls per transfer and `copy-buf-flush` one, while both still perform one write
+and one shutdown.
+
 The io_uring implementation is intentionally benchmark-only. It must not be connected to the production relay until it beats ordinary splice in throughput and CPU/GiB with acceptable variance. The current measured candidate does not meet that gate.
 
 ## TCP pacing probe
