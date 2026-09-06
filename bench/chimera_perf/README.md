@@ -342,6 +342,17 @@ The important fields are `publications_per_second`, mean/p95/peak absolute track
 
 To test the publication rule against the current Brutal loss-compensation behavior instead of arbitrary estimator noise, rerun with `--trace brutal-loss`. That mode deliberately keeps the configured base rate fixed and varies deterministic packet loss in phases; the resulting target changes only as the same 5-second ACK/loss accounting used by the production Brutal controller evolves. It is still a deterministic model rather than a captured production trace, but it is suitable for checking whether timer debounce or rate-delta hysteresis actually matters for the current algorithm before wiring a TCP Brutal2 publisher into the data path.
 
+### Brutal ACK accounting microbenchmark
+
+`brutal_ack_rate_bench` isolates the current per-ACK loss-window accounting. It reports both the floating-point ACK-rate calculation alone and a full 10 kHz `record()` model that includes timestamp-to-second conversion, slot lookup, rolling totals, and ACK-rate refresh:
+
+```bash
+cargo run --release --manifest-path bench/chimera_perf/Cargo.toml \
+  --bin brutal_ack_rate_bench
+```
+
+The benchmark intentionally includes a rejected optimization: skipping ACK-rate division while the rolling loss count is zero helps a pristine window but regresses the path once a loss remains in the five-second window. The `cached-second-record` comparison instead caches the active second and slot, avoiding repeated duration-to-seconds conversion and modulo work for events in the same second while preserving the slow path for rollovers and reordered timestamps. Use the latter comparison when evaluating changes to `BrutalState::record`.
+
 ## Required experiment discipline
 
 - Build every compared binary in release mode using the same toolchain.
