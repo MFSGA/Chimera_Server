@@ -51,6 +51,9 @@ mod linux {
         #[arg(long, default_value_t = 64 * 1024)]
         chunk_size: usize,
 
+        #[arg(long)]
+        splice_pipe_size: Option<usize>,
+
         #[arg(long, default_value_t = 16)]
         uring_batch_depth: usize,
 
@@ -80,6 +83,8 @@ mod linux {
         warmup: bool,
         bytes: u64,
         chunk_size: usize,
+        splice_pipe_size: Option<usize>,
+        actual_splice_pipe_capacity: Option<usize>,
         uring_batch_depth: usize,
         verify: bool,
         elapsed_seconds: f64,
@@ -99,6 +104,8 @@ mod linux {
         warmup_runs: usize,
         bytes: u64,
         chunk_size: usize,
+        splice_pipe_size: Option<usize>,
+        actual_splice_pipe_capacity: Option<usize>,
         uring_batch_depth: usize,
         verify: bool,
         throughput_median_gbps: f64,
@@ -125,9 +132,11 @@ mod linux {
         let mut cpu_seconds = Vec::with_capacity(args.runs);
         let mut cpu_per_gib = Vec::with_capacity(args.runs);
         let mut context_switches = Vec::with_capacity(args.runs);
+        let mut actual_splice_pipe_capacity = None;
 
         for run_index in 0..args.runs {
             let record = run_once(&args, run_index, false)?;
+            actual_splice_pipe_capacity = record.actual_splice_pipe_capacity;
             throughput.push(record.throughput_gbps);
             cpu_seconds.push(record.cpu_seconds);
             cpu_per_gib.push(record.cpu_seconds_per_gib);
@@ -146,6 +155,8 @@ mod linux {
             warmup_runs: args.warmup,
             bytes: args.bytes,
             chunk_size: args.chunk_size,
+            splice_pipe_size: args.splice_pipe_size,
+            actual_splice_pipe_capacity,
             uring_batch_depth: args.uring_batch_depth,
             verify: args.verify,
             throughput_median_gbps: round(median(&throughput)),
@@ -164,6 +175,14 @@ mod linux {
         }
         if args.chunk_size == 0 || args.chunk_size > u32::MAX as usize {
             bail!("--chunk-size must be between 1 and u32::MAX");
+        }
+        if let Some(size) = args.splice_pipe_size {
+            if args.backend != Backend::Splice {
+                bail!("--splice-pipe-size requires --backend splice");
+            }
+            if !(4 * 1024..=1024 * 1024).contains(&size) {
+                bail!("--splice-pipe-size must be between 4096 and 1048576 bytes");
+            }
         }
         if args.uring_batch_depth == 0 || args.uring_batch_depth > 128 {
             bail!("--uring-batch-depth must be between 1 and 128");
@@ -228,27 +247,38 @@ mod linux {
         let usage_before = usage()?;
         let started = Instant::now();
         start_barrier.wait();
-        let relayed = match args.backend {
-            Backend::Copy => copy_relay(
-                &mut relay_source,
-                &mut relay_destination,
-                args.chunk_size,
-            )?,
-            Backend::TokioCopy => {
-                tokio_copy_relay(&relay_source, &relay_destination, args.chunk_size)?
+        let (relayed, actual_splice_pipe_capacity) = match args.backend {
+            Backend::Copy => (
+                copy_relay(
+                    &mut relay_source,
+                    &mut relay_destination,
+                    args.chunk_size,
+                )?,
+                None,
+            ),
+            Backend::TokioCopy => (
+                tokio_copy_relay(&relay_source, &relay_destination, args.chunk_size)?,
+                None,
+            ),
+            Backend::Splice => {
+                let (relayed, capacity) = splice_relay(
+                    relay_source.as_raw_fd(),
+                    relay_destination.as_raw_fd(),
+                    args.chunk_size,
+                    args.splice_pipe_size,
+                )?;
+                (relayed, Some(capacity))
             }
-            Backend::Splice => splice_relay(
-                relay_source.as_raw_fd(),
-                relay_destination.as_raw_fd(),
-                args.chunk_size,
-            )?,
-            Backend::UringSplice => uring_splice_relay(
-                relay_source.as_raw_fd(),
-                relay_destination.as_raw_fd(),
-                args.chunk_size,
-                args.bytes,
-                args.uring_batch_depth,
-            )?,
+            Backend::UringSplice => (
+                uring_splice_relay(
+                    relay_source.as_raw_fd(),
+                    relay_destination.as_raw_fd(),
+                    args.chunk_size,
+                    args.bytes,
+                    args.uring_batch_depth,
+                )?,
+                None,
+            ),
         };
         relay_destination.shutdown(Shutdown::Write)?;
         let elapsed = started.elapsed().as_secs_f64();
@@ -276,6 +306,8 @@ mod linux {
             warmup,
             bytes: args.bytes,
             chunk_size: args.chunk_size,
+            splice_pipe_size: args.splice_pipe_size,
+            actual_splice_pipe_capacity,
             uring_batch_depth: args.uring_batch_depth,
             verify: args.verify,
             elapsed_seconds: round(elapsed),
@@ -343,13 +375,16 @@ mod linux {
         source: RawFd,
         destination: RawFd,
         chunk_size: usize,
-    ) -> io::Result<u64> {
-        let (pipe_read, pipe_write) = pipe()?;
+        requested_pipe_size: Option<usize>,
+    ) -> io::Result<(u64, usize)> {
+        let (pipe_read, pipe_write, pipe_capacity) =
+            pipe_with_capacity(requested_pipe_size)?;
+        let splice_len = requested_pipe_size.map(|_| pipe_capacity).unwrap_or(chunk_size);
         let mut total = 0_u64;
         loop {
-            let input = retry_splice(source, pipe_write.as_raw_fd(), chunk_size)?;
+            let input = retry_splice(source, pipe_write.as_raw_fd(), splice_len)?;
             if input == 0 {
-                return Ok(total);
+                return Ok((total, pipe_capacity));
             }
             drain_pipe(pipe_read.as_raw_fd(), destination, input)?;
             total = total.saturating_add(input as u64);
@@ -601,14 +636,46 @@ mod linux {
     }
 
     fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+        pipe_with_capacity(None).map(|(read, write, _capacity)| (read, write))
+    }
+
+    fn pipe_with_capacity(
+        requested_capacity: Option<usize>,
+    ) -> io::Result<(OwnedFd, OwnedFd, usize)> {
         let mut fds = [-1; 2];
         let result = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
         if result != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok((unsafe { OwnedFd::from_raw_fd(fds[0]) }, unsafe {
-            OwnedFd::from_raw_fd(fds[1])
-        }))
+        let pipe_read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let pipe_write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let current = pipe_capacity(pipe_write.as_raw_fd())?;
+        let actual = match requested_capacity {
+            Some(requested) if requested > current => {
+                let resized = unsafe {
+                    libc::fcntl(
+                        pipe_write.as_raw_fd(),
+                        libc::F_SETPIPE_SZ,
+                        requested as libc::c_int,
+                    )
+                };
+                if resized > 0 {
+                    resized as usize
+                } else {
+                    current
+                }
+            }
+            _ => current,
+        };
+        Ok((pipe_read, pipe_write, actual))
+    }
+
+    fn pipe_capacity(fd: RawFd) -> io::Result<usize> {
+        let capacity = unsafe { libc::fcntl(fd, libc::F_GETPIPE_SZ) };
+        if capacity < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(capacity as usize)
     }
 
     fn usage() -> io::Result<Usage> {
@@ -644,6 +711,7 @@ mod linux {
                 backend,
                 bytes: 4 * 1024 * 1024,
                 chunk_size: 64 * 1024,
+                splice_pipe_size: None,
                 uring_batch_depth: 16,
                 warmup: 0,
                 runs: 1,
@@ -672,6 +740,29 @@ mod linux {
                 assert!(record.throughput_gbps > 0.0);
                 assert!(record.cpu_seconds >= 0.0);
             }
+        }
+
+        #[test]
+        fn explicit_splice_pipe_size_reports_kernel_capacity() {
+            let mut args = args(Backend::Splice);
+            args.splice_pipe_size = Some(128 * 1024);
+            assert!(validate_args(&args).is_ok());
+            let record = run_once(&args, 0, false).unwrap();
+            assert_eq!(record.splice_pipe_size, Some(128 * 1024));
+            assert!(record.actual_splice_pipe_capacity.unwrap() >= 4 * 1024);
+        }
+
+        #[test]
+        fn splice_pipe_size_is_rejected_for_other_backends_and_out_of_range() {
+            let mut args = args(Backend::Copy);
+            args.splice_pipe_size = Some(128 * 1024);
+            assert!(validate_args(&args).is_err());
+
+            args.backend = Backend::Splice;
+            args.splice_pipe_size = Some(1024);
+            assert!(validate_args(&args).is_err());
+            args.splice_pipe_size = Some(2 * 1024 * 1024);
+            assert!(validate_args(&args).is_err());
         }
 
         #[test]
