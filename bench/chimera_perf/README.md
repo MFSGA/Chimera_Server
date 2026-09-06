@@ -563,35 +563,60 @@ measured difference is concentrated in the relay itself. A shared in-process
 progress window keeps both legs below the UDP socket queue limit so the probe
 compares no-loss relay paths instead of buffer-overflow behavior:
 
-- `single`: one `recv` plus one `send` syscall per relayed datagram;
-- `mmsg`: `recvmmsg` plus `sendmmsg` with a configurable batch size.
+- `single`: one receive plus one send per relayed datagram;
+- `mmsg`: `recvmmsg` plus `sendmmsg` with a configurable relay batch size;
+- `--relay-model blocking`: original blocking-thread model;
+- `--relay-model tokio`: nonblocking `tokio::net::UdpSocket` using
+  `readable`/`writable` plus `try_io` and `MSG_DONTWAIT`, which mirrors the
+  readiness contract a production Linux batching helper would need.
+
+`--harness-batch-size` decouples the source/sink generator capacity from the
+relay batch size. The Tokio model also uses a `Notify` wakeup when the bounded
+inflight window fills instead of repeatedly `yield_now`-polling sink progress;
+this matters because the busy-yield model could perform tens of millions of
+scheduler yields in a 200k-packet run and dominate the relay being measured.
+Reports include actual packets per receive/send syscall, bounded-window wait
+events, whole-process CPU per million packets, and the CPU charged to the
+thread calling `Runtime::block_on`. The latter deliberately excludes CPU spent
+on Tokio worker/reactor threads, so whole-process CPU remains the end-to-end
+cost metric.
 
 Build and run correctness first:
 
 ```bash
 cargo build --release --manifest-path bench/chimera_perf/Cargo.toml --bin udp_probe
 bench/chimera_perf/target/release/udp_probe \
-  --backend mmsg --packets 10000 --datagram-size 1200 \
-  --batch-size 32 --inflight-window 64 --warmup 1 --runs 2 --verify
+  --backend mmsg --relay-model tokio --worker-threads 8 \
+  --packets 20000 --datagram-size 1200 \
+  --batch-size 16 --harness-batch-size 64 --inflight-window 64 \
+  --warmup 1 --runs 2 --verify
 ```
 
-Then compare stable samples and syscall counts:
+A September 2026 eight-worker comparison pinned to CPUs 0-7 used 300k
+1200-byte datagrams/run, relay batch 16, harness batch 64, and the 64-packet
+no-loss inflight window. Five measured runs were stable for both variants:
+`single` delivered about **149.7k packets/s** with **14.92 CPU seconds per
+million packets** (throughput CV 2.42%, CPU CV 2.39%), while `mmsg` delivered
+about **167.1k packets/s** with **12.39 CPU seconds per million packets**
+(throughput CV 1.19%, CPU CV 0.97%). That is roughly **+11.7% packet rate** and
+**-16.9% whole-process CPU/Mpkt**. The batched relay carried about **15.4
+packets per `recvmmsg`/`sendmmsg` call**. On a one-worker runtime, batching
+showed a larger median gain, but the eight-worker result is the more useful
+production-side bound because runtime/reactor CPU reduces the relative win.
 
-```bash
-for backend in single mmsg; do
-  taskset -c 0,1,2 \
-    bench/chimera_perf/target/release/udp_probe \
-    --backend "$backend" --packets 200000 --datagram-size 1200 \
-    --batch-size 32 --inflight-window 64 --warmup 2 --runs 10
+A focused eight-worker 50k-packet `strace -f -c` with the same relay/harness
+batch sizes counted about **282,146** tracked
+`recvfrom/sendto/recvmmsg/sendmmsg/epoll_wait/epoll_ctl` calls for `single`
+versus **40,161** for `mmsg` (about **-85.8%**). `epoll_wait` fell from about
+82.3k to 16.5k calls. This confirms that the Tokio-ready batching model turns
+its reduced datagram syscalls into materially fewer reactor waits rather than
+merely moving work into userspace.
 
-done
-
-strace -f -c -e trace=recvfrom,sendto,recvmmsg,sendmmsg \
-  bench/chimera_perf/target/release/udp_probe \
-  --backend mmsg --packets 20000 --datagram-size 1200 \
-  --batch-size 32 --inflight-window 64 --warmup 0 --runs 1
-```
-
-This probe is benchmark-only. Production UDP paths should adopt batching only
-when packet-rate and CPU-per-million-packets measurements improve without
-changing protocol/session semantics.
+This remains benchmark-only. The current production UDP freedom/session paths
+also include `mpsc`, idle timers, routing/traffic accounting, and bidirectional
+`select!` fairness; batch fill and fairness have not yet been measured through
+that full state machine. Do not wire `recvmmsg`/`sendmmsg` into production from
+this socket-only result alone. The next production-facing experiment should
+mirror one real session loop and prove that bounded batching preserves message
+ordering, idle-timeout behavior, response fairness, and Xray/shoes-compatible
+session semantics.
