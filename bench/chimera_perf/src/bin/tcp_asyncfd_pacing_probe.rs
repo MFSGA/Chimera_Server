@@ -183,6 +183,7 @@ mod linux {
     #[derive(Debug)]
     struct RelayStats {
         bytes: u64,
+        elapsed_us: f64,
         pipe_capacity: usize,
         destination_ready_acquisitions: u64,
         destination_would_blocks: u64,
@@ -231,6 +232,9 @@ mod linux {
         sample_rate_decrease_recovery: bool,
         destination_ready_acquisitions_total: u64,
         destination_ready_acquisitions_per_connection: f64,
+        relay_elapsed_us_median: f64,
+        relay_elapsed_us_max: f64,
+        relay_elapsed_max_to_median_ratio: f64,
         destination_would_blocks_total: u64,
         destination_would_blocks_per_connection: f64,
         source_would_blocks_total: u64,
@@ -296,6 +300,9 @@ mod linux {
         context_switches_median: f64,
         destination_ready_acquisitions_per_connection_median: f64,
         destination_would_blocks_per_connection_median: f64,
+        relay_elapsed_us_median: f64,
+        relay_elapsed_us_max_median: f64,
+        relay_elapsed_max_to_median_ratio_median: f64,
         notsent_bytes_at_rate_update_median: Option<f64>,
         tcp_rtt_us_at_rate_update_median: Option<f64>,
         tcp_unacked_bytes_at_rate_update_median: Option<f64>,
@@ -338,6 +345,9 @@ mod linux {
         let mut context_switches = Vec::with_capacity(args.runs);
         let mut destination_ready_acquisitions = Vec::with_capacity(args.runs);
         let mut destination_blocks = Vec::with_capacity(args.runs);
+        let mut relay_elapsed_us = Vec::with_capacity(args.runs);
+        let mut relay_elapsed_us_max = Vec::with_capacity(args.runs);
+        let mut relay_elapsed_ratios = Vec::with_capacity(args.runs);
         let mut notsent = Vec::new();
         let mut tcp_rtt = Vec::new();
         let mut tcp_unacked = Vec::new();
@@ -373,6 +383,9 @@ mod linux {
             destination_ready_acquisitions
                 .push(record.destination_ready_acquisitions_per_connection);
             destination_blocks.push(record.destination_would_blocks_per_connection);
+            relay_elapsed_us.push(record.relay_elapsed_us_median);
+            relay_elapsed_us_max.push(record.relay_elapsed_us_max);
+            relay_elapsed_ratios.push(record.relay_elapsed_max_to_median_ratio);
             if let Some(bytes) = record.notsent_bytes_at_rate_update_median {
                 notsent.push(bytes);
             }
@@ -484,6 +497,11 @@ mod linux {
                 )),
                 destination_would_blocks_per_connection_median: round(median(
                     &destination_blocks
+                )),
+                relay_elapsed_us_median: round(median(&relay_elapsed_us)),
+                relay_elapsed_us_max_median: round(median(&relay_elapsed_us_max)),
+                relay_elapsed_max_to_median_ratio_median: round(median(
+                    &relay_elapsed_ratios,
                 )),
                 notsent_bytes_at_rate_update_median: (!notsent.is_empty())
                     .then(|| round(median(&notsent))),
@@ -903,6 +921,15 @@ mod linux {
             .iter()
             .map(|stats| stats.destination_would_blocks)
             .sum::<u64>();
+        let relay_elapsed_us = relay_stats
+            .iter()
+            .map(|stats| stats.elapsed_us)
+            .collect::<Vec<_>>();
+        let relay_elapsed_us_median = median(&relay_elapsed_us);
+        let relay_elapsed_us_max = relay_elapsed_us
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
         let source_would_blocks_total = relay_stats
             .iter()
             .map(|stats| stats.source_would_blocks)
@@ -1032,6 +1059,11 @@ mod linux {
             destination_would_blocks_per_connection: round(
                 destination_would_blocks_total as f64 / args.connections as f64,
             ),
+            relay_elapsed_us_median: round(relay_elapsed_us_median),
+            relay_elapsed_us_max: round(relay_elapsed_us_max),
+            relay_elapsed_max_to_median_ratio: round(
+                relay_elapsed_us_max / relay_elapsed_us_median,
+            ),
             source_would_blocks_total,
             notsent_bytes_at_rate_update_median: (!notsent.is_empty())
                 .then(|| round(median(&notsent))),
@@ -1160,6 +1192,7 @@ mod linux {
         let mut rate_decrease_recoveries = Vec::new();
         let mut incomplete_rate_decrease_recoveries = 0_u64;
         barrier.wait().await;
+        let relay_started = Instant::now();
 
         loop {
             if pending > 0 {
@@ -1370,6 +1403,7 @@ mod linux {
                     }
                     return Ok(RelayStats {
                         bytes: transferred,
+                        elapsed_us: relay_started.elapsed().as_secs_f64() * 1e6,
                         pipe_capacity,
                         destination_ready_acquisitions,
                         destination_would_blocks,
@@ -1894,6 +1928,9 @@ mod linux {
             );
             assert!(record.actual_pipe_capacity_min > 0);
             assert_eq!(record.pipe_capacity_shortfall_connections, 0);
+            assert!(record.relay_elapsed_us_median > 0.0);
+            assert!(record.relay_elapsed_us_max >= record.relay_elapsed_us_median);
+            assert!(record.relay_elapsed_max_to_median_ratio >= 1.0);
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
