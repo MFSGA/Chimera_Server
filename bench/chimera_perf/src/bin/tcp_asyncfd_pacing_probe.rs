@@ -238,6 +238,12 @@ mod linux {
         destination_would_blocks_total: u64,
         destination_would_blocks_per_connection: f64,
         source_would_blocks_total: u64,
+        writer_elapsed_us_median: f64,
+        writer_elapsed_us_max: f64,
+        writer_elapsed_max_to_median_ratio: f64,
+        sink_elapsed_us_median: f64,
+        sink_elapsed_us_max: f64,
+        sink_elapsed_max_to_median_ratio: f64,
         notsent_bytes_at_rate_update_median: Option<f64>,
         tcp_rtt_us_at_rate_update_median: Option<f64>,
         tcp_unacked_bytes_at_rate_update_median: Option<f64>,
@@ -303,6 +309,12 @@ mod linux {
         relay_elapsed_us_median: f64,
         relay_elapsed_us_max_median: f64,
         relay_elapsed_max_to_median_ratio_median: f64,
+        writer_elapsed_us_median: f64,
+        writer_elapsed_us_max_median: f64,
+        writer_elapsed_max_to_median_ratio_median: f64,
+        sink_elapsed_us_median: f64,
+        sink_elapsed_us_max_median: f64,
+        sink_elapsed_max_to_median_ratio_median: f64,
         notsent_bytes_at_rate_update_median: Option<f64>,
         tcp_rtt_us_at_rate_update_median: Option<f64>,
         tcp_unacked_bytes_at_rate_update_median: Option<f64>,
@@ -348,6 +360,12 @@ mod linux {
         let mut relay_elapsed_us = Vec::with_capacity(args.runs);
         let mut relay_elapsed_us_max = Vec::with_capacity(args.runs);
         let mut relay_elapsed_ratios = Vec::with_capacity(args.runs);
+        let mut writer_elapsed_us = Vec::with_capacity(args.runs);
+        let mut writer_elapsed_us_max = Vec::with_capacity(args.runs);
+        let mut writer_elapsed_ratios = Vec::with_capacity(args.runs);
+        let mut sink_elapsed_us = Vec::with_capacity(args.runs);
+        let mut sink_elapsed_us_max = Vec::with_capacity(args.runs);
+        let mut sink_elapsed_ratios = Vec::with_capacity(args.runs);
         let mut notsent = Vec::new();
         let mut tcp_rtt = Vec::new();
         let mut tcp_unacked = Vec::new();
@@ -386,6 +404,12 @@ mod linux {
             relay_elapsed_us.push(record.relay_elapsed_us_median);
             relay_elapsed_us_max.push(record.relay_elapsed_us_max);
             relay_elapsed_ratios.push(record.relay_elapsed_max_to_median_ratio);
+            writer_elapsed_us.push(record.writer_elapsed_us_median);
+            writer_elapsed_us_max.push(record.writer_elapsed_us_max);
+            writer_elapsed_ratios.push(record.writer_elapsed_max_to_median_ratio);
+            sink_elapsed_us.push(record.sink_elapsed_us_median);
+            sink_elapsed_us_max.push(record.sink_elapsed_us_max);
+            sink_elapsed_ratios.push(record.sink_elapsed_max_to_median_ratio);
             if let Some(bytes) = record.notsent_bytes_at_rate_update_median {
                 notsent.push(bytes);
             }
@@ -502,6 +526,16 @@ mod linux {
                 relay_elapsed_us_max_median: round(median(&relay_elapsed_us_max)),
                 relay_elapsed_max_to_median_ratio_median: round(median(
                     &relay_elapsed_ratios,
+                )),
+                writer_elapsed_us_median: round(median(&writer_elapsed_us)),
+                writer_elapsed_us_max_median: round(median(&writer_elapsed_us_max)),
+                writer_elapsed_max_to_median_ratio_median: round(median(
+                    &writer_elapsed_ratios,
+                )),
+                sink_elapsed_us_median: round(median(&sink_elapsed_us)),
+                sink_elapsed_us_max_median: round(median(&sink_elapsed_us_max)),
+                sink_elapsed_max_to_median_ratio_median: round(median(
+                    &sink_elapsed_ratios,
                 )),
                 notsent_bytes_at_rate_update_median: (!notsent.is_empty())
                     .then(|| round(median(&notsent))),
@@ -866,10 +900,13 @@ mod linux {
         let started = Instant::now();
         barrier.wait().await;
 
+        let mut writer_elapsed_us = Vec::with_capacity(args.connections);
         for writer in writers {
-            writer
-                .await
-                .map_err(|_| anyhow::anyhow!("writer task panicked"))??;
+            writer_elapsed_us.push(
+                writer
+                    .await
+                    .map_err(|_| anyhow::anyhow!("writer task panicked"))??,
+            );
         }
 
         let mut relay_stats = Vec::with_capacity(args.connections);
@@ -880,9 +917,12 @@ mod linux {
                     .map_err(|_| anyhow::anyhow!("relay task panicked"))??,
             );
         }
+        let mut sink_elapsed_us = Vec::with_capacity(args.connections);
         for sink in sinks {
-            sink.await
-                .map_err(|_| anyhow::anyhow!("sink task panicked"))??;
+            sink_elapsed_us.push(
+                sink.await
+                    .map_err(|_| anyhow::anyhow!("sink task panicked"))??,
+            );
         }
         let elapsed = started.elapsed().as_secs_f64();
         let usage_after = usage()?;
@@ -927,6 +967,16 @@ mod linux {
             .collect::<Vec<_>>();
         let relay_elapsed_us_median = median(&relay_elapsed_us);
         let relay_elapsed_us_max = relay_elapsed_us
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let writer_elapsed_us_median = median(&writer_elapsed_us);
+        let writer_elapsed_us_max = writer_elapsed_us
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let sink_elapsed_us_median = median(&sink_elapsed_us);
+        let sink_elapsed_us_max = sink_elapsed_us
             .iter()
             .copied()
             .fold(f64::NEG_INFINITY, f64::max);
@@ -1065,6 +1115,16 @@ mod linux {
                 relay_elapsed_us_max / relay_elapsed_us_median,
             ),
             source_would_blocks_total,
+            writer_elapsed_us_median: round(writer_elapsed_us_median),
+            writer_elapsed_us_max: round(writer_elapsed_us_max),
+            writer_elapsed_max_to_median_ratio: round(
+                writer_elapsed_us_max / writer_elapsed_us_median,
+            ),
+            sink_elapsed_us_median: round(sink_elapsed_us_median),
+            sink_elapsed_us_max: round(sink_elapsed_us_max),
+            sink_elapsed_max_to_median_ratio: round(
+                sink_elapsed_us_max / sink_elapsed_us_median,
+            ),
             notsent_bytes_at_rate_update_median: (!notsent.is_empty())
                 .then(|| round(median(&notsent))),
             tcp_rtt_us_at_rate_update_median: (!tcp_rtt.is_empty())
@@ -1116,9 +1176,10 @@ mod linux {
         barrier: Arc<Barrier>,
         bytes: u64,
         chunk_size: usize,
-    ) -> io::Result<()> {
+    ) -> io::Result<f64> {
         let buffer = vec![PATTERN_BYTE; chunk_size];
         barrier.wait().await;
+        let started = Instant::now();
         let mut written = 0_u64;
         while written < bytes {
             let count = usize::try_from((bytes - written).min(chunk_size as u64))
@@ -1126,7 +1187,8 @@ mod linux {
             stream.write_all(&buffer[..count]).await?;
             written += count as u64;
         }
-        stream.shutdown().await
+        stream.shutdown().await?;
+        Ok(started.elapsed().as_secs_f64() * 1e6)
     }
 
     async fn read_payload(
@@ -1135,9 +1197,10 @@ mod linux {
         expected_bytes: u64,
         chunk_size: usize,
         verify: bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<f64> {
         let mut buffer = vec![0_u8; chunk_size];
         barrier.wait().await;
+        let started = Instant::now();
         let mut received = 0_u64;
         while received < expected_bytes {
             let count = stream.read(&mut buffer).await?;
@@ -1153,7 +1216,7 @@ mod linux {
             received += count as u64;
         }
         if received == expected_bytes {
-            Ok(())
+            Ok(started.elapsed().as_secs_f64() * 1e6)
         } else {
             Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -1931,6 +1994,12 @@ mod linux {
             assert!(record.relay_elapsed_us_median > 0.0);
             assert!(record.relay_elapsed_us_max >= record.relay_elapsed_us_median);
             assert!(record.relay_elapsed_max_to_median_ratio >= 1.0);
+            assert!(record.writer_elapsed_us_median > 0.0);
+            assert!(record.writer_elapsed_us_max >= record.writer_elapsed_us_median);
+            assert!(record.writer_elapsed_max_to_median_ratio >= 1.0);
+            assert!(record.sink_elapsed_us_median > 0.0);
+            assert!(record.sink_elapsed_us_max >= record.sink_elapsed_us_median);
+            assert!(record.sink_elapsed_max_to_median_ratio >= 1.0);
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
