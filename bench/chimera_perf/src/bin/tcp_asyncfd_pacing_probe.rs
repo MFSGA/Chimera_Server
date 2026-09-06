@@ -416,20 +416,19 @@ mod linux {
         minimum: Option<u32>,
         maximum: Option<u32>,
     ) -> Result<u32> {
-        let bytes = u128::from(rate_bytes_per_sec) * u128::from(milliseconds) / 1_000;
-        let bytes = bytes.max(1);
-        let mut bytes = u32::try_from(bytes).map_err(|_| {
+        let mut bytes =
+            (u128::from(rate_bytes_per_sec) * u128::from(milliseconds) / 1_000).max(1);
+        if let Some(minimum) = minimum {
+            bytes = bytes.max(u128::from(minimum));
+        }
+        if let Some(maximum) = maximum {
+            bytes = bytes.min(u128::from(maximum));
+        }
+        u32::try_from(bytes).map_err(|_| {
             anyhow::anyhow!(
                 "rate {rate_bytes_per_sec} B/s with {milliseconds} ms queue time exceeds TCP_NOTSENT_LOWAT u32 range"
             )
-        })?;
-        if let Some(minimum) = minimum {
-            bytes = bytes.max(minimum);
-        }
-        if let Some(maximum) = maximum {
-            bytes = bytes.min(maximum);
-        }
-        Ok(bytes)
+        })
     }
 
     async fn run_once(
@@ -1070,6 +1069,10 @@ mod linux {
             args.notsent_lowat_ms = Some(1);
             args.rate_bytes_per_sec = u64::MAX;
             assert!(validate_args(&args).is_err());
+
+            args.notsent_lowat_max_bytes = Some(1024 * 1024);
+            assert!(validate_args(&args).is_ok());
+            assert_eq!(resolved_static_lowats(&args).unwrap().0, Some(1024 * 1024));
         }
 
         #[test]
