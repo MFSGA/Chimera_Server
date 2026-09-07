@@ -720,7 +720,108 @@ validation, and sends responses through a server socket shared by multiple
 sessions; this probe's response socket remains single-session and connected.
 The decomposition now shows that the large syscall win requires coordinated
 uplink and downlink batching, so a supposedly "small" production patch would
-not retain most of the measured benefit. Before introducing a Linux helper,
-the next useful experiment is multi-session contention on one shared response
-socket using the more conservative 8-uplink/16-downlink candidate, including
-per-session fairness and partial/error semantics.
+not retain most of the measured benefit.
+
+## UDP shared response socket probe
+
+`udp_shared_socket_probe` closes the largest remaining topology gap. It creates
+multiple freedom-like session tasks, each with its own **unconnected** outbound
+UDP socket and bounded request channel, while every session sends responses via
+one shared **unconnected** server socket. All sessions use the same echo target
+but distinct 127/8 client addresses, so the shared response socket exercises a
+real destination address on every `sendto`/`sendmmsg`. The sink binds one
+wildcard socket and decodes a session id plus per-session sequence number from
+each payload. This makes response-address validation, per-session ordering,
+completion spread, cross-session queue composition, and shared-socket write
+readiness observable without modifying production.
+
+The benchmark intentionally keeps cross-session send batching disabled: each
+session may batch only its own responses. That matches the current production
+task ownership model. A central worker would require transferring owned
+response buffers between session tasks and would be a separate architecture,
+not a drop-in syscall replacement. The probe reports this explicitly as
+`shared_send_cross_session_batching=false`.
+
+Build and verify the production-shaped paths with a conservative aggregate
+window first:
+
+```bash
+cargo build --release --manifest-path bench/chimera_perf/Cargo.toml \
+  --bin udp_shared_socket_probe
+for backend in single mmsg; do
+  taskset -c 0-7 bench/chimera_perf/target/release/udp_shared_socket_probe \
+    --backend "$backend" --worker-threads 8 \
+    --sessions 16 --packets-per-session 4096 --datagram-size 1200 \
+    --inflight-window 16 --uplink-batch-size 8 --downlink-batch-size 16 \
+    --warmup 2 --runs 5 --verify
+done
+```
+
+The fixed-total 65,536-packet c1/c16/c64 sweep shows that the single-session
+result does **not** survive realistic session concurrency. With one session,
+8/16 batching still averaged about **7.13 uplink packets**, **8.81 downlink
+packets**, and **8.81 shared-send packets per socket call**. The session data
+path therefore fell from 196,608 measured socket attempts to about **24,070**
+(roughly **-87.8%**). The corresponding CPU median fell from about **33.46** to
+**28.03 CPU seconds/Mpkt**, but the batched CPU CV was **3.10%** and packet-rate
+CV **4.41%**, just outside the repository stability gate, so that wall-time
+improvement remains directional rather than accepted production evidence.
+
+At 16 sessions the batching opportunity collapses. `single` measured about
+65,536 uplink attempts, 69,212 response receive attempts (including EAGAIN
+retries), and 65,536 shared sends: **200,284** session data-path socket
+attempts. The 8/16 path measured about 57,579 / 60,605 / 56,287 respectively:
+**174,471**, only about **-12.9%**. Average useful fill was just **1.14 uplink**,
+**1.08 response receive**, and **1.16 shared-send packets per call**. CPU was
+stable enough to reject the candidate on cost: **25.70 -> 27.69 CPU
+seconds/Mpkt** (about **+7.7%**, batched CPU CV **1.91%**). Packet-rate CV for
+the batched sample was **3.76%**, so no throughput claim is accepted.
+
+At 64 sessions the result is the same. `single` used about **200,721** measured
+session socket attempts versus **169,614** for 8/16 (about **-15.5%**), while
+useful fill remained only **1.18 uplink**, **1.11 response receive**, and
+**1.20 shared-send packets per call**. CPU rose from **25.46** to **27.08 CPU
+seconds/Mpkt** (about **+6.3%**); both CPU CVs were below 3%. Packet-rate medians
+were essentially equal, but their CVs were above 3%, so the stable conclusion
+is increased CPU cost for a modest syscall reduction, not a throughput win.
+
+The shared socket itself did not show write-readiness pressure in these runs:
+`shared_send_would_block` stayed at **zero** for c1, c16, and c64. The lost
+batching therefore comes primarily from per-session scheduling and independent
+outbound receive queues, not from the shared server socket becoming
+non-writable. Fairness counters also showed no obvious starvation under the
+16-packet per-session harness window: c16/c64 both kept the longest observed
+single-session run at 16 packets, and completion spread remained a small
+fraction of total run time. These are loopback mechanism checks, not WAN
+latency/fairness proof.
+
+Cross-session queue composition argues against immediately adding a central
+send worker. In focused c16/c64 samples, the wildcard sink received only about
+**1.48-1.52 packets per `recvmmsg` batch** and roughly **1.46 distinct sessions
+per batch** on average, despite occasional maxima of 12-17 sessions. In other
+words, the kernel queue usually exposes only about one and a half packets at a
+time. A central worker could not approach a 16-packet batch without deliberately
+waiting to coalesce traffic, which would introduce a new latency/fairness
+policy that current Xray-compatible semantics do not have.
+
+A traced c16/c64 run did show substantially fewer total network/reactor calls
+under mmsg, but `strace` slowed scheduling enough to inflate observed batch fill
+from roughly 1.1 untraced to around 4 packets/call. Treat those traced totals as
+syscall attribution only, not as representative batching efficiency or
+throughput evidence. The probe's own nonblocking attempt counters are the
+preferred untraced mechanism metric.
+
+Correctness coverage includes both backends over multiple concurrent sessions,
+per-session payload/sequence verification through the shared wildcard sink,
+distinct loopback client destinations, response-source validation, a real
+multi-destination `sendmmsg` roundtrip, and a deterministic partial-send offset
+test proving that a short batch send resumes at the first unsent datagram and
+rejects zero/overrun progress.
+
+**Production decision:** keep `run_freedom_udp_session` unchanged. Per-session
+8/16 mmsg loses most of its batching at c16/c64 and costs about 6-8% more CPU in
+the stable samples. A central cross-session worker is also not justified by the
+observed queue depth without adding deliberate coalescing delay. Any future UDP
+work should first find a workload where naturally available multi-session
+queue depth is materially larger, or move to a different measured hotspot,
+rather than introducing batching policy into the Xray-compatible data path.
