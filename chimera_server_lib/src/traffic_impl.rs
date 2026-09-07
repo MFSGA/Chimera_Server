@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     net::IpAddr,
     sync::{
@@ -215,6 +216,10 @@ impl StatsInner {
 
 const TRAFFIC_SHARD_COUNT: usize = 32;
 
+thread_local! {
+    static TRAFFIC_SHARD_INDEX: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
 fn merge_string_totals_map(
     target: &mut HashMap<String, TransferTotals>,
     source: &HashMap<String, TransferTotals>,
@@ -261,14 +266,14 @@ fn merge_stats_into_snapshot(snapshot: &mut TrafficSnapshot, stats: &StatsInner)
 #[derive(Debug)]
 struct TrafficRecorder {
     shards: [RwLock<StatsInner>; TRAFFIC_SHARD_COUNT],
-    next_shard: AtomicUsize,
+    next_thread_shard: AtomicUsize,
 }
 
 impl Default for TrafficRecorder {
     fn default() -> Self {
         Self {
             shards: std::array::from_fn(|_| RwLock::new(StatsInner::default())),
-            next_shard: AtomicUsize::new(0),
+            next_thread_shard: AtomicUsize::new(0),
         }
     }
 }
@@ -279,16 +284,26 @@ impl TrafficRecorder {
         INSTANCE.get_or_init(TrafficRecorder::default)
     }
 
-    fn next_shard(&self) -> &RwLock<StatsInner> {
-        let index =
-            self.next_shard.fetch_add(1, Ordering::Relaxed) % TRAFFIC_SHARD_COUNT;
-        &self.shards[index]
+    fn current_thread_shard_index(&self) -> usize {
+        TRAFFIC_SHARD_INDEX.with(|slot| {
+            if let Some(index) = slot.get() {
+                return index;
+            }
+            let index = self.next_thread_shard.fetch_add(1, Ordering::Relaxed)
+                % TRAFFIC_SHARD_COUNT;
+            slot.set(Some(index));
+            index
+        })
+    }
+
+    fn current_thread_shard(&self) -> &RwLock<StatsInner> {
+        &self.shards[self.current_thread_shard_index()]
     }
 
     fn record(&self, context: &TrafficContext, upload: u64, download: u64) {
         let plan = plan_traffic_record(context, upload, download);
         let mut guard = self
-            .next_shard()
+            .current_thread_shard()
             .write()
             .expect("traffic stats shard poisoned");
         guard.apply(plan);
@@ -299,7 +314,7 @@ impl TrafficRecorder {
         if identity.is_empty() {
             return;
         }
-        self.next_shard()
+        self.current_thread_shard()
             .write()
             .expect("traffic stats shard poisoned")
             .known_identities
@@ -568,6 +583,32 @@ mod tests {
             expected_records
         );
         assert!(snapshot.known_identities.contains("alice"));
+    }
+
+    #[test]
+    fn sharded_recorder_assigns_stable_shards_per_thread() {
+        const WRITERS: usize = 8;
+
+        let recorder = std::sync::Arc::new(TrafficRecorder::default());
+        let writers = (0..WRITERS)
+            .map(|_| {
+                let recorder = std::sync::Arc::clone(&recorder);
+                std::thread::spawn(move || {
+                    let first = recorder.current_thread_shard_index();
+                    let second = recorder.current_thread_shard_index();
+                    assert_eq!(first, second);
+                    first
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut indices = writers
+            .into_iter()
+            .map(|writer| writer.join().expect("traffic writer thread"))
+            .collect::<Vec<_>>();
+        indices.sort_unstable();
+        indices.dedup();
+
+        assert_eq!(indices.len(), WRITERS);
     }
 
     #[test]

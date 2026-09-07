@@ -622,6 +622,66 @@ This remains benchmark-only. The socket-only result motivated the separate
 production-shaped session probe below; do not wire `recvmmsg`/`sendmmsg` into
 production from this result alone.
 
+## Traffic recorder shard probe
+
+`chimera_server_lib/tests/traffic_record_probe.rs` is an ignored release-mode
+probe for the production `traffic` recorder. It compares the existing owned
+`record_transfer(Some(context.clone()), ...)` call shape with the borrowed
+`record_transfer_ref(Some(&context), ...)` shape while preserving the exact
+snapshot delta for both `connections` and bytes. Writer threads live for the
+whole warmup/measurement schedule and alternate clone/ref order by pair, which
+mirrors long-lived Tokio worker threads more closely than spawning a new OS
+thread for every sample.
+
+Run it explicitly with the real main-workspace dependency graph:
+
+```bash
+CHIMERA_TRAFFIC_PROBE_WRITERS=4 \
+CHIMERA_TRAFFIC_PROBE_TOTAL_RECORDS=10000000 \
+CHIMERA_TRAFFIC_PROBE_WARMUP=3 \
+CHIMERA_TRAFFIC_PROBE_RUNS=10 \
+CHIMERA_TRAFFIC_PROBE_SHAPE=inbound-outbound \
+taskset -c 0-7 cargo test -p chimera_server_lib --features traffic \
+  --test traffic_record_probe --release \
+  compare_owned_clone_and_borrowed_ref_recording -- \
+  --ignored --exact --nocapture
+```
+
+The probe exposed a larger recorder-level contention source before the context
+clone itself. The previous recorder performed a shared `AtomicUsize::fetch_add`
+on **every traffic record** and then round-robined each record across all 32
+`RwLock<StatsInner>` shards. With long-lived writers this makes every worker
+bounce through the same atomic cache line and all shard lock/cache lines. The
+production change assigns a shard once on first traffic activity in each OS
+thread and reuses that shard thereafter. Tokio tasks may still migrate between
+workers, but each synchronous record is written to the shard local to the
+worker executing it; snapshots already merge every shard, so public totals are
+unchanged.
+
+A strict same-probe A/B was run by temporarily compiling the committed legacy
+round-robin implementation and then restoring the thread-local implementation.
+The realistic dokodemo context had an inbound and outbound tag and 1,200 bytes
+per record. Legacy clone-mode CPU cost was **0.158566 / 0.195667 / 0.227842 CPU
+seconds per million records** at 2/4/8 writers. Legacy CPU CVs were **0.86% /
+0.70% / 2.64%**. With stable per-thread shards, clone-mode cost was **0.097692 /
+0.114417 / about 0.120234** at 2/4/8 writers: roughly **-38.4% / -41.5% /
+-47.2% CPU**. Corresponding record rates improved about **+62.9% / +57.3% /
++68.1%**. The new 2/4-writer CPU CVs were **1.70% / 2.62%**, within the 3%
+acceptance threshold; the saturated 8-writer rerun remained noisy at about
+5-6% CV, so the c8 magnitude is directional only. Single-writer measurements
+before and after remained around 0.085-0.086 CPU seconds/Mrecord, with no
+material regression visible.
+
+The same probe also explains why removing `TrafficContext::clone` should be a
+**separate** follow-up rather than bundled into this change. Under the legacy
+round-robin recorder, borrowed recording helped at 2/4 writers but became about
+6% more CPU-expensive at 8 writers because faster callers simply hit the shared
+recorder bottleneck sooner. After per-thread sharding, borrowed recording was
+again faster at every tested writer count (for example about **-21% CPU** at 4
+writers in the stable sample). Keep the freedom UDP clone-to-ref change for a
+separate production iteration so its end-to-end effect can be attributed after
+this recorder bottleneck is removed.
+
 ## UDP freedom session batching probe
 
 `udp_session_probe` is a Linux-only follow-up that mirrors the hot structure of
