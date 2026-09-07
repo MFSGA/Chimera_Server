@@ -621,6 +621,15 @@ impl BrutalState {
         self.max_datagram_size = new_mtu as u64;
     }
 
+    #[inline]
+    fn rtt_seconds(rtt: Duration) -> f64 {
+        if rtt.as_secs() == 0 {
+            f64::from(rtt.subsec_nanos()) / 1_000_000_000.0
+        } else {
+            rtt.as_secs_f64()
+        }
+    }
+
     fn window(&self, tx_bps: u64) -> u64 {
         if tx_bps == 0 {
             return self.initial_window();
@@ -631,7 +640,7 @@ impl BrutalState {
         }
 
         let cwnd =
-            (tx_bps as f64) * rtt.as_secs_f64() * CONGESTION_WINDOW_MULTIPLIER
+            (tx_bps as f64) * Self::rtt_seconds(rtt) * CONGESTION_WINDOW_MULTIPLIER
                 / self.ack_rate;
         (cwnd as u64).max(
             self.max_datagram_size
@@ -936,6 +945,26 @@ mod tests {
 
         state.on_mtu_update(1450);
         assert_eq!(state.window(65_536), 2900);
+    }
+
+    #[test]
+    fn brutal_rtt_seconds_fast_path_preserves_duration_conversion() {
+        for nanos in [
+            1_u64,
+            999,
+            1_000,
+            999_999,
+            1_000_000,
+            79_500_000,
+            80_000_001,
+            999_999_999,
+            1_000_000_000,
+            1_000_000_001,
+            5_123_456_789,
+        ] {
+            let rtt = Duration::from_nanos(nanos);
+            assert_eq!(BrutalState::rtt_seconds(rtt), rtt.as_secs_f64());
+        }
     }
 
     #[test]

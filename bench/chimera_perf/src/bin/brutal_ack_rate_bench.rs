@@ -8,6 +8,7 @@ const RECORD_EVENTS: u64 = 10_000_000;
 const BATCHED_ACK_PACKETS: u64 = 8_000_000;
 const WINDOW_EVENTS: u64 = 40_000_000;
 const ON_ACK_EVENTS: u64 = 10_000_000;
+const RTT_CONVERSION_EVENTS: u64 = 40_000_000;
 const SLOT_COUNT: u64 = 5;
 
 #[derive(Clone, Copy)]
@@ -282,11 +283,44 @@ fn run_window_bench(name: &str, optimized: bool, ack_rate: f64) {
     );
 }
 
+#[inline(always)]
+fn rtt_secs_subsecond_fast_path(rtt: Duration) -> f64 {
+    if rtt.as_secs() == 0 {
+        f64::from(rtt.subsec_nanos()) / 1_000_000_000.0
+    } else {
+        rtt.as_secs_f64()
+    }
+}
+
+fn run_rtt_conversion_bench(
+    name: &str,
+    subsecond_fast_path: bool,
+    base_rtt_nanos: u64,
+) {
+    let started = Instant::now();
+    let mut seconds = 0.0;
+    for event in 0..RTT_CONVERSION_EVENTS {
+        let rtt = Duration::from_nanos(base_rtt_nanos + event % 1_000_001);
+        seconds = if subsecond_fast_path {
+            rtt_secs_subsecond_fast_path(black_box(rtt))
+        } else {
+            black_box(rtt).as_secs_f64()
+        };
+        black_box(seconds);
+    }
+    let elapsed = started.elapsed();
+    println!(
+        "{name}: subsecond_fast_path={subsecond_fast_path} base_rtt_nanos={base_rtt_nanos} ns_per_conversion={:.3} final_seconds={seconds:.9}",
+        elapsed.as_nanos() as f64 / RTT_CONVERSION_EVENTS as f64,
+    );
+}
+
 fn run_on_ack_component_bench(
     name: &str,
     include_record: bool,
     include_window: bool,
     cached_tx_f64: bool,
+    subsecond_rtt_fast_path: bool,
 ) {
     let origin = Instant::now();
     let mut state = RecordState::new(origin);
@@ -304,7 +338,11 @@ fn run_on_ack_component_bench(
             state.cached_second_record_skip_pristine_rate(black_box(now), 1, 0);
         }
         if include_window {
-            let rtt_secs = black_box(last_rtt).as_secs_f64();
+            let rtt_secs = if subsecond_rtt_fast_path {
+                rtt_secs_subsecond_fast_path(black_box(last_rtt))
+            } else {
+                black_box(last_rtt).as_secs_f64()
+            };
             let tx = if cached_tx_f64 {
                 black_box(tx_bps_f64)
             } else {
@@ -316,7 +354,7 @@ fn run_on_ack_component_bench(
     }
     let elapsed = started.elapsed();
     println!(
-        "{name}: record={include_record} window={include_window} cached_tx_f64={cached_tx_f64} ns_per_ack={:.3} final_ack_rate={:.6} final_window={}",
+        "{name}: record={include_record} window={include_window} cached_tx_f64={cached_tx_f64} subsecond_rtt_fast_path={subsecond_rtt_fast_path} ns_per_ack={:.3} final_ack_rate={:.6} final_window={}",
         elapsed.as_nanos() as f64 / ON_ACK_EVENTS as f64,
         black_box(state.ack_rate),
         black_box(window),
@@ -376,13 +414,45 @@ fn main() {
         run_window_bench("baseline-window", false, ack_rate);
         run_window_bench("pristine-fast-window", true, ack_rate);
     }
+    println!("RTT seconds conversion:");
+    for base_rtt_nanos in [79_500_000, 500_000_000, 998_999_999, 1_500_000_000] {
+        run_rtt_conversion_bench("baseline-rtt-seconds", false, base_rtt_nanos);
+        run_rtt_conversion_bench(
+            "subsecond-fast-rtt-seconds",
+            true,
+            base_rtt_nanos,
+        );
+    }
     println!("modeled on_ack component attribution with moving RTT:");
-    run_on_ack_component_bench("rtt-input-only", false, false, false);
-    run_on_ack_component_bench("record-only", true, false, false);
-    run_on_ack_component_bench("window-only", false, true, false);
-    run_on_ack_component_bench("window-cached-tx", false, true, true);
-    run_on_ack_component_bench("record-plus-window", true, true, false);
-    run_on_ack_component_bench("record-plus-window-cached-tx", true, true, true);
+    run_on_ack_component_bench("rtt-input-only", false, false, false, false);
+    run_on_ack_component_bench("record-only", true, false, false, false);
+    run_on_ack_component_bench("window-only", false, true, false, false);
+    run_on_ack_component_bench("window-subsecond-rtt", false, true, false, true);
+    run_on_ack_component_bench("window-cached-tx", false, true, true, false);
+    run_on_ack_component_bench("record-plus-window", true, true, false, false);
+    run_on_ack_component_bench(
+        "record-plus-window-subsecond-rtt",
+        true,
+        true,
+        false,
+        true,
+    );
+    run_on_ack_component_bench("record-plus-window-cached-tx", true, true, true, false);
+    println!("window RTT conversion order-sensitivity check:");
+    run_on_ack_component_bench(
+        "record-plus-window-subsecond-rtt-first",
+        true,
+        true,
+        false,
+        true,
+    );
+    run_on_ack_component_bench(
+        "record-plus-window-baseline-second",
+        true,
+        true,
+        false,
+        false,
+    );
     println!("ACK-frame batching over cached-second record path:");
     for batch_size in [1, 2, 4, 8, 16, 32] {
         run_ack_batch_bench("per-packet-record", false, batch_size);
@@ -467,6 +537,37 @@ mod tests {
                 modeled_window(ack_rate),
                 modeled_window_pristine_fast_path(ack_rate)
             );
+        }
+    }
+
+    #[test]
+    fn subsecond_rtt_fast_path_matches_duration_seconds_and_window() {
+        for nanos in [
+            1_u64,
+            999,
+            1_000,
+            999_999,
+            1_000_000,
+            79_500_000,
+            80_000_001,
+            999_999_999,
+            1_000_000_000,
+            1_000_000_001,
+            5_123_456_789,
+        ] {
+            let rtt = Duration::from_nanos(nanos);
+            assert_eq!(rtt_secs_subsecond_fast_path(rtt), rtt.as_secs_f64());
+            for ack_rate in [1.0, 0.9999, 0.99, 0.9, 0.8] {
+                let baseline = ((50_000_000_f64
+                    * rtt.as_secs_f64()
+                    * 0.8)
+                    / ack_rate) as u64;
+                let candidate = ((50_000_000_f64
+                    * rtt_secs_subsecond_fast_path(rtt)
+                    * 0.8)
+                    / ack_rate) as u64;
+                assert_eq!(candidate, baseline);
+            }
         }
     }
 
