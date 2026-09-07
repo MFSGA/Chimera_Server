@@ -685,7 +685,19 @@ production change therefore replaces only the two per-datagram owned clones in
 `run_freedom_udp_session` with `record_transfer_ref(Some(&traffic_context),
 ...)`. It preserves one recorder call per successful uplink/downlink datagram,
 all byte and `connections` accounting, idle-reset timing, socket ordering, and
-error behavior; other UDP paths remain unchanged for independent attribution.
+error behavior.
+
+The remaining owned-clone hot call was the Shadowsocks UDP freedom uplink,
+where the same context must survive for the later downlink record. The probe now
+has a `shadowsocks` shape with protocol, identity, inbound tag, outbound tag,
+and client IP. At 10 million records/sample with 3 warmup + 10 measured pairs,
+2 writers changed from **0.174991 -> 0.150815 CPU seconds/Mrecord (-13.8%)**
+and 4 writers from **0.192497 -> 0.167367 (-13.1%)**; both clone/ref CPU CVs
+were below 3% in those accepted samples. The 8-writer direction was also
+favorable (about -18% CPU) but remained noisy. Production therefore borrows the
+context for only the successful Shadowsocks uplink record and still moves the
+original context into the downlink record, preserving exactly one record per
+successful direction and all existing socket/error ordering.
 
 ## UDP freedom session batching probe
 
