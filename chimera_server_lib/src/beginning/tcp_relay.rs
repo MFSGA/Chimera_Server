@@ -46,7 +46,11 @@ const MIN_SPLICE_PIPE_SIZE: usize = 4 * 1024;
 #[cfg(target_os = "linux")]
 const MAX_SPLICE_PIPE_SIZE: usize = 1024 * 1024;
 #[cfg(target_os = "linux")]
-const DEFAULT_AUTO_MAX_CONNECTIONS: usize = 8;
+// Controlled raw-ready contention shows that 32 concurrent downlink-splice
+// relays materially reduce CPU for 192-256 KiB flows versus eight, while
+// 64-128 KiB flows remain effectively neutral. Keep the cap configurable for
+// hosts where pipe memory or scheduler pressure makes a lower value preferable.
+const DEFAULT_AUTO_MAX_CONNECTIONS: usize = 32;
 #[cfg(target_os = "linux")]
 const AUTO_MAX_CONNECTIONS_LIMIT: usize = 4096;
 
