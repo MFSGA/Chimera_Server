@@ -747,6 +747,24 @@ gets materially worse once multiple worker threads are active, keep the shard
 `RwLock`; after thread-local shard assignment, replacing the lock primitive is
 not a useful traffic-recording optimization on this host.
 
+A component-attribution follow-up extends `CHIMERA_TRAFFIC_PROBE_SHAPE` with
+`protocol-only`, `identity-only`, `identity-inbound`, and `identity-outbound` so
+steady-state string-key indexing can be separated without changing production
+code. On the same host at four writers, five million records/sample, two warmup
+and six measured pairs, borrowed-ref CPU medians were **0.0632 s/Mrecord** for
+protocol-only, **0.0777** for inbound-only, **0.0882** for inbound+outbound,
+**0.0919** for identity-only, **0.0935** for identity+outbound, **0.1270** for
+identity+inbound, and **0.1563** for the full Shadowsocks shape. The striking
+interaction is identity+inbound: adding inbound indexing to identity-only costs
+about **35 ns CPU/record**, versus about **15 ns** when inbound is added without
+an identity. That extra work is the `per_inbound_user` nested string HashMap
+lookup/update, not the simple `per_inbound` map. Adding outbound to an identity
+is comparatively small in this run. The full Shadowsocks cost is still larger
+than any one component, so this is attribution rather than evidence for a key
+representation rewrite; future traffic-recorder work should isolate
+`per_inbound_user` hashing/key structure first and require a same-probe A/B
+before changing production semantics.
+
 ## UDP freedom session batching probe
 
 `udp_session_probe` is a Linux-only follow-up that mirrors the hot structure of
