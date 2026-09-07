@@ -423,6 +423,45 @@ fn run_on_ack_component_bench(
     );
 }
 
+fn run_on_ack_dispatch_bench(name: &str, active_fast_path: bool) {
+    let origin = Instant::now();
+    let mut state = RecordState::new(origin);
+    let tx_bps = 50_000_000_u64;
+    let mut window = modeled_window(state.ack_rate);
+    let brutal_active = true;
+    let bbr_present = false;
+    let started = Instant::now();
+    for event in 0..ON_ACK_EVENTS {
+        let now = origin + Duration::from_micros(event * 100);
+        let last_rtt = Duration::from_nanos(79_500_000 + event % 1_000_001);
+        // Both production shapes must test whether Brutal is active. The current
+        // path then checks the BBR option even though activation has cleared it;
+        // the candidate returns directly to Brutal after the active test.
+        if !black_box(brutal_active) {
+            black_box(tx_bps);
+        }
+        if !active_fast_path && black_box(bbr_present) {
+            black_box((now, last_rtt));
+        }
+        state.cached_second_record_ack_only(black_box(now));
+        let rtt_secs = if black_box(last_rtt).is_zero() {
+            0.0
+        } else {
+            rtt_secs_subsecond_fast_path(black_box(last_rtt))
+        };
+        window = ((black_box(tx_bps) as f64 * rtt_secs * 0.8)
+            / black_box(state.ack_rate)) as u64;
+        black_box(window);
+    }
+    let elapsed = started.elapsed();
+    println!(
+        "{name}: active_fast_path={active_fast_path} ns_per_ack={:.3} final_ack_rate={:.6} final_window={}",
+        elapsed.as_nanos() as f64 / ON_ACK_EVENTS as f64,
+        black_box(state.ack_rate),
+        black_box(window),
+    );
+}
+
 fn run_on_ack_record_shape_bench(name: &str, split_ack_record: bool) {
     let origin = Instant::now();
     let mut state = RecordState::new(origin);
@@ -491,6 +530,14 @@ fn run_ack_batch_bench(name: &str, batched: bool, batch_size: u64) {
 }
 
 fn main() {
+    if let Ok(mode) = std::env::var("BRUTAL_DISPATCH_BENCH_MODE") {
+        match mode.as_str() {
+            "baseline" => run_on_ack_dispatch_bench("baseline-active-dispatch", false),
+            "active-fast" => run_on_ack_dispatch_bench("active-fast-dispatch", true),
+            _ => panic!("BRUTAL_DISPATCH_BENCH_MODE must be baseline or active-fast"),
+        }
+        return;
+    }
     if let Ok(mode) = std::env::var("BRUTAL_ON_ACK_BENCH_MODE") {
         match mode.as_str() {
             "rollover-only" => {
@@ -616,6 +663,9 @@ fn main() {
         false,
         false,
     );
+    println!("post-activation controller dispatch attribution:");
+    run_on_ack_dispatch_bench("baseline-active-dispatch", false);
+    run_on_ack_dispatch_bench("active-fast-dispatch", true);
     println!("production-shaped on_ack record attribution:");
     run_on_ack_record_shape_bench("rollover-only-on-ack", false);
     run_on_ack_record_shape_bench("split-ack-on-ack", true);
