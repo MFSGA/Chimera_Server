@@ -635,7 +635,7 @@ impl BrutalState {
             return self.initial_window();
         }
         let rtt = self.last_rtt;
-        if rtt.as_nanos() == 0 {
+        if rtt.is_zero() {
             return self.initial_window();
         }
 
