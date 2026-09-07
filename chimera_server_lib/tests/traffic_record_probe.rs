@@ -31,6 +31,7 @@ impl RecordMode {
 enum ContextShape {
     InboundOnly,
     InboundOutbound,
+    Shadowsocks,
 }
 
 impl ContextShape {
@@ -41,8 +42,9 @@ impl ContextShape {
         {
             "inbound-only" => Self::InboundOnly,
             "inbound-outbound" => Self::InboundOutbound,
+            "shadowsocks" => Self::Shadowsocks,
             other => panic!(
-                "CHIMERA_TRAFFIC_PROBE_SHAPE must be inbound-only or inbound-outbound, got {other}"
+                "CHIMERA_TRAFFIC_PROBE_SHAPE must be inbound-only, inbound-outbound, or shadowsocks, got {other}"
             ),
         }
     }
@@ -51,6 +53,7 @@ impl ContextShape {
         match self {
             Self::InboundOnly => "inbound-only",
             Self::InboundOutbound => "inbound-outbound",
+            Self::Shadowsocks => "shadowsocks",
         }
     }
 }
@@ -143,12 +146,18 @@ fn pair_order(pair: usize) -> [RecordMode; 2] {
 }
 
 fn make_context(shape: ContextShape) -> TrafficContext {
-    let context = TrafficContext::new("dokodemo-door")
-        .with_inbound_tag("udp-in")
-        .with_client_ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let context = TrafficContext::new(match shape {
+        ContextShape::Shadowsocks => "shadowsocks",
+        ContextShape::InboundOnly | ContextShape::InboundOutbound => "dokodemo-door",
+    })
+    .with_inbound_tag("udp-in")
+    .with_client_ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
     match shape {
         ContextShape::InboundOnly => context,
         ContextShape::InboundOutbound => context.with_outbound_tag("direct"),
+        ContextShape::Shadowsocks => {
+            context.with_identity("alice").with_outbound_tag("direct")
+        }
     }
 }
 

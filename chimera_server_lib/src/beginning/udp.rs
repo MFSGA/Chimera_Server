@@ -1903,7 +1903,7 @@ async fn relay_shadowsocks_udp_packet(
             };
             let outbound = UdpSocket::bind(bind_addr).await?;
             let sent = outbound.send_to(&request.payload, target_addr).await?;
-            record_transfer(Some(traffic_context.clone()), sent as u64, 0);
+            record_transfer_ref(Some(&traffic_context), sent as u64, 0);
 
             let mut response = vec![0u8; UDP_BUFFER_SIZE];
             let (response_len, response_addr) =
