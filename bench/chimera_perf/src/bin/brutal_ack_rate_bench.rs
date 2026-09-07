@@ -183,6 +183,22 @@ impl RecordState {
         self.cached_second_record_inner(now, ack_count, loss_count, 2, true, true);
     }
 
+    fn cached_second_record_ack_only(&mut self, now: Instant) {
+        if now < self.next_rollover {
+            let info = &mut self.slots[self.current_slot];
+            info.ack_count += 1;
+            self.rolling_ack_count += 1;
+            if self.rolling_loss_count != 0 {
+                self.update_rate();
+            } else {
+                self.ack_rate = 1.0;
+            }
+            return;
+        }
+
+        self.cached_second_record_rollover_only(now, 1, 0);
+    }
+
     fn cached_second_record_inner(
         &mut self,
         now: Instant,
@@ -266,6 +282,16 @@ fn run_record_bench(name: &str, mode: u8, loss_every: Option<u64>) {
             ),
             4 => state.cached_second_record_monotonic_fast(black_box(now), 1, loss),
             5 => state.cached_second_record_rollover_only(black_box(now), 1, loss),
+            6 => {
+                if loss != 0 {
+                    state.cached_second_record_rollover_only(
+                        black_box(now),
+                        0,
+                        loss,
+                    );
+                }
+                state.cached_second_record_ack_only(black_box(now));
+            }
             _ => unreachable!(),
         }
     }
@@ -397,6 +423,38 @@ fn run_on_ack_component_bench(
     );
 }
 
+fn run_on_ack_record_shape_bench(name: &str, split_ack_record: bool) {
+    let origin = Instant::now();
+    let mut state = RecordState::new(origin);
+    let tx_bps = 50_000_000_u64;
+    let mut window = modeled_window(state.ack_rate);
+    let started = Instant::now();
+    for event in 0..ON_ACK_EVENTS {
+        let now = origin + Duration::from_micros(event * 100);
+        let last_rtt = Duration::from_nanos(79_500_000 + event % 1_000_001);
+        if split_ack_record {
+            state.cached_second_record_ack_only(black_box(now));
+        } else {
+            state.cached_second_record_rollover_only(black_box(now), 1, 0);
+        }
+        let rtt_secs = if black_box(last_rtt).is_zero() {
+            0.0
+        } else {
+            rtt_secs_subsecond_fast_path(black_box(last_rtt))
+        };
+        window = ((black_box(tx_bps) as f64 * rtt_secs * 0.8)
+            / black_box(state.ack_rate)) as u64;
+        black_box(window);
+    }
+    let elapsed = started.elapsed();
+    println!(
+        "{name}: split_ack_record={split_ack_record} ns_per_ack={:.3} final_ack_rate={:.6} final_window={}",
+        elapsed.as_nanos() as f64 / ON_ACK_EVENTS as f64,
+        black_box(state.ack_rate),
+        black_box(window),
+    );
+}
+
 fn run_ack_batch_bench(name: &str, batched: bool, batch_size: u64) {
     let origin = Instant::now();
     let mut state = RecordState::new(origin);
@@ -433,13 +491,26 @@ fn run_ack_batch_bench(name: &str, batched: bool, batch_size: u64) {
 }
 
 fn main() {
+    if let Ok(mode) = std::env::var("BRUTAL_ON_ACK_BENCH_MODE") {
+        match mode.as_str() {
+            "rollover-only" => {
+                run_on_ack_record_shape_bench("rollover-only-on-ack", false)
+            }
+            "split-ack" => run_on_ack_record_shape_bench("split-ack-on-ack", true),
+            _ => {
+                panic!("BRUTAL_ON_ACK_BENCH_MODE must be rollover-only or split-ack")
+            }
+        }
+        return;
+    }
     if let Ok(mode) = std::env::var("BRUTAL_RECORD_BENCH_MODE") {
         match mode.as_str() {
             "cached" => run_record_bench("skip-pristine-rate-record", 3, None),
             "monotonic" => run_record_bench("monotonic-fast-record", 4, None),
             "rollover-only" => run_record_bench("rollover-only-record", 5, None),
+            "split-ack" => run_record_bench("split-ack-record", 6, None),
             _ => panic!(
-                "BRUTAL_RECORD_BENCH_MODE must be cached, monotonic, or rollover-only"
+                "BRUTAL_RECORD_BENCH_MODE must be cached, monotonic, rollover-only, or split-ack"
             ),
         }
         return;
@@ -458,6 +529,7 @@ fn main() {
         run_record_bench("skip-pristine-rate-record", 3, loss_every);
         run_record_bench("monotonic-fast-record", 4, loss_every);
         run_record_bench("rollover-only-record", 5, loss_every);
+        run_record_bench("split-ack-record", 6, loss_every);
     }
     println!("record fast-path order-sensitivity check:");
     for loss_every in [None, Some(1_000), Some(100)] {
@@ -544,6 +616,9 @@ fn main() {
         false,
         false,
     );
+    println!("production-shaped on_ack record attribution:");
+    run_on_ack_record_shape_bench("rollover-only-on-ack", false);
+    run_on_ack_record_shape_bench("split-ack-on-ack", true);
     println!("ACK-frame batching over cached-second record path:");
     for batch_size in [1, 2, 4, 8, 16, 32] {
         run_ack_batch_bench("per-packet-record", false, batch_size);
@@ -582,6 +657,27 @@ mod tests {
             let loss = u64::from((event + 1).is_multiple_of(997));
             baseline.cached_second_record_monotonic_fast(now, 1, loss);
             optimized.cached_second_record_rollover_only(now, 1, loss);
+            assert_eq!(baseline.rolling_ack_count, optimized.rolling_ack_count);
+            assert_eq!(baseline.rolling_loss_count, optimized.rolling_loss_count);
+            assert_eq!(baseline.rolling_timestamp, optimized.rolling_timestamp);
+            assert_eq!(baseline.ack_rate, optimized.ack_rate);
+        }
+        assert_eq!(baseline.slots, optimized.slots);
+    }
+
+    #[test]
+    fn split_ack_record_matches_rollover_only_for_monotonic_callbacks() {
+        let origin = Instant::now();
+        let mut baseline = RecordState::new(origin);
+        let mut optimized = RecordState::new(origin);
+        for event in 0..50_000_u64 {
+            let now = origin + Duration::from_micros(event * 100);
+            let loss = u64::from((event + 1).is_multiple_of(997));
+            baseline.cached_second_record_rollover_only(now, 1, loss);
+            if loss != 0 {
+                optimized.cached_second_record_rollover_only(now, 0, loss);
+            }
+            optimized.cached_second_record_ack_only(now);
             assert_eq!(baseline.rolling_ack_count, optimized.rolling_ack_count);
             assert_eq!(baseline.rolling_loss_count, optimized.rolling_loss_count);
             assert_eq!(baseline.rolling_timestamp, optimized.rolling_timestamp);

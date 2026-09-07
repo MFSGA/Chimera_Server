@@ -603,7 +603,7 @@ impl BrutalState {
 
     fn on_ack(&mut self, now: Instant, rtt: &RttEstimator) {
         self.last_rtt = rtt.get();
-        self.record(now, 1, 0);
+        self.record_ack(now);
     }
 
     fn on_congestion_event(&mut self, now: Instant, lost_bytes: u64) {
@@ -647,6 +647,18 @@ impl BrutalState {
 
     fn initial_window(&self) -> u64 {
         DEFAULT_CONGESTION_WINDOW.max(self.max_datagram_size)
+    }
+
+    fn record_ack(&mut self, now: Instant) {
+        if now < self.next_rolling_second {
+            let info = &mut self.slots[self.rolling_slot];
+            info.ack_count += 1;
+            self.rolling_ack_count += 1;
+            self.refresh_ack_rate(self.rolling_timestamp);
+            return;
+        }
+
+        self.record(now, 1, 0);
     }
 
     fn record(&mut self, now: Instant, ack_count: u64, loss_count: u64) {
@@ -1014,6 +1026,39 @@ mod tests {
             assert_eq!(state.rolling_ack_count, expected_ack);
             assert_eq!(state.rolling_loss_count, expected_loss);
             assert_eq!(state.rolling_timestamp, timestamp);
+        }
+    }
+
+    #[test]
+    fn brutal_ack_specialization_matches_generic_record_across_loss_lifecycle() {
+        let start = Instant::now();
+        let mut generic = BrutalState::new(start, 1200);
+        let mut specialized = BrutalState::new(start, 1200);
+        generic.debug = false;
+        specialized.debug = false;
+
+        for event in 0..50_000_u64 {
+            let now = start + Duration::from_micros(event * 100);
+            if (event + 1).is_multiple_of(997) {
+                generic.record(now, 0, 1);
+                specialized.record(now, 0, 1);
+            }
+            generic.record(now, 1, 0);
+            specialized.record_ack(now);
+
+            assert_eq!(generic.rolling_ack_count, specialized.rolling_ack_count);
+            assert_eq!(generic.rolling_loss_count, specialized.rolling_loss_count);
+            assert_eq!(generic.rolling_timestamp, specialized.rolling_timestamp);
+            assert_eq!(generic.rolling_slot, specialized.rolling_slot);
+            assert_eq!(generic.ack_rate, specialized.ack_rate);
+        }
+
+        for (generic, specialized) in
+            generic.slots.iter().zip(specialized.slots.iter())
+        {
+            assert_eq!(generic.timestamp, specialized.timestamp);
+            assert_eq!(generic.ack_count, specialized.ack_count);
+            assert_eq!(generic.loss_count, specialized.loss_count);
         }
     }
 
