@@ -492,7 +492,7 @@ struct BrutalState {
     slots: [PacketInfo; PACKET_INFO_SLOT_COUNT as usize],
     rolling_ack_count: u64,
     rolling_loss_count: u64,
-    rolling_timestamp: Option<u64>,
+    rolling_timestamp: u64,
     rolling_slot: usize,
     next_rolling_second: Instant,
     debug: bool,
@@ -515,7 +515,7 @@ impl BrutalState {
             slots: [PacketInfo::default(); PACKET_INFO_SLOT_COUNT as usize],
             rolling_ack_count: 0,
             rolling_loss_count: 0,
-            rolling_timestamp: None,
+            rolling_timestamp: 0,
             rolling_slot: 0,
             next_rolling_second: now,
             debug,
@@ -531,7 +531,7 @@ impl BrutalState {
         self.slots = [PacketInfo::default(); PACKET_INFO_SLOT_COUNT as usize];
         self.rolling_ack_count = 0;
         self.rolling_loss_count = 0;
-        self.rolling_timestamp = None;
+        self.rolling_timestamp = 0;
         self.rolling_slot = 0;
         self.next_rolling_second = now;
         self.last_debug_timestamp = 0;
@@ -652,15 +652,13 @@ impl BrutalState {
     fn record(&mut self, now: Instant, ack_count: u64, loss_count: u64) {
         // quinn-proto requires Connection input events to have monotonically increasing time,
         // so once a rolling second is active, `now` cannot move back before that second.
-        if let Some(timestamp) = self.rolling_timestamp
-            && now < self.next_rolling_second
-        {
+        if now < self.next_rolling_second {
             let info = &mut self.slots[self.rolling_slot];
             info.ack_count += ack_count;
             info.loss_count += loss_count;
             self.rolling_ack_count += ack_count;
             self.rolling_loss_count += loss_count;
-            self.refresh_ack_rate(timestamp);
+            self.refresh_ack_rate(self.rolling_timestamp);
             return;
         }
 
@@ -687,7 +685,7 @@ impl BrutalState {
             self.rolling_ack_count += info.ack_count;
             self.rolling_loss_count += info.loss_count;
         }
-        self.rolling_timestamp = Some(timestamp);
+        self.rolling_timestamp = timestamp;
         self.rolling_slot = slot;
         self.next_rolling_second = self
             .start
@@ -1015,7 +1013,7 @@ mod tests {
                 });
             assert_eq!(state.rolling_ack_count, expected_ack);
             assert_eq!(state.rolling_loss_count, expected_loss);
-            assert_eq!(state.rolling_timestamp, Some(timestamp));
+            assert_eq!(state.rolling_timestamp, timestamp);
         }
     }
 
@@ -1046,7 +1044,7 @@ mod tests {
                 });
             assert_eq!(state.rolling_ack_count, expected_ack);
             assert_eq!(state.rolling_loss_count, expected_loss);
-            assert_eq!(state.rolling_timestamp, Some(second));
+            assert_eq!(state.rolling_timestamp, second);
         }
     }
 }
