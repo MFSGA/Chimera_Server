@@ -494,7 +494,6 @@ struct BrutalState {
     rolling_loss_count: u64,
     rolling_timestamp: Option<u64>,
     rolling_slot: usize,
-    rolling_second_start: Instant,
     next_rolling_second: Instant,
     debug: bool,
     last_debug_timestamp: u64,
@@ -518,7 +517,6 @@ impl BrutalState {
             rolling_loss_count: 0,
             rolling_timestamp: None,
             rolling_slot: 0,
-            rolling_second_start: now,
             next_rolling_second: now,
             debug,
             last_debug_timestamp: 0,
@@ -535,7 +533,6 @@ impl BrutalState {
         self.rolling_loss_count = 0;
         self.rolling_timestamp = None;
         self.rolling_slot = 0;
-        self.rolling_second_start = now;
         self.next_rolling_second = now;
         self.last_debug_timestamp = 0;
         #[cfg(feature = "brutal-ack-batch-trace")]
@@ -653,8 +650,9 @@ impl BrutalState {
     }
 
     fn record(&mut self, now: Instant, ack_count: u64, loss_count: u64) {
+        // quinn-proto requires Connection input events to have monotonically increasing time,
+        // so once a rolling second is active, `now` cannot move back before that second.
         if let Some(timestamp) = self.rolling_timestamp
-            && now >= self.rolling_second_start
             && now < self.next_rolling_second
         {
             let info = &mut self.slots[self.rolling_slot];
@@ -691,10 +689,6 @@ impl BrutalState {
         }
         self.rolling_timestamp = Some(timestamp);
         self.rolling_slot = slot;
-        self.rolling_second_start = self
-            .start
-            .checked_add(Duration::from_secs(timestamp))
-            .unwrap_or(now);
         self.next_rolling_second = self
             .start
             .checked_add(Duration::from_secs(timestamp.saturating_add(1)))
