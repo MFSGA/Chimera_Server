@@ -732,6 +732,21 @@ only as a no-regression check. A pre-registered identity spanning multiple
 protocol maps is covered by a unit test so the public `known_identities` set,
 per-identity totals, bytes, and record counts remain unchanged.
 
+A follow-up tested whether the now mostly thread-local recorder shards should
+switch from `std::sync::RwLock` to `std::sync::Mutex`. The hypothesis was that
+normal records only need an exclusive lock while snapshots are rare, so a mutex
+might have a cheaper uncontended writer path. A strict same-host A/B used the
+existing full Shadowsocks context, 10 million records/sample, 3 warmup + 10
+measured pairs, and the borrowed-ref result as the steady-state production
+shape. At one writer the two locks were effectively tied at **0.126647 vs
+0.126614 CPU seconds/Mrecord**. At two writers, however, `Mutex` regressed from
+**0.134688 to 0.145865 (+8.3%)**, and at four writers from **0.148240 to
+0.155666 (+5.0%)**. The owned-clone control moved in the same direction at two
+and four writers. Because the candidate does not produce a stable CPU win and
+gets materially worse once multiple worker threads are active, keep the shard
+`RwLock`; after thread-local shard assignment, replacing the lock primitive is
+not a useful traffic-recording optimization on this host.
+
 ## UDP freedom session batching probe
 
 `udp_session_probe` is a Linux-only follow-up that mirrors the hot structure of
