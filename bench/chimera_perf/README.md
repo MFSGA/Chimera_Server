@@ -701,6 +701,25 @@ context for only the successful Shadowsocks uplink record and still moves the
 original context into the downlink record, preserving exactly one record per
 successful direction and all existing socket/error ordering.
 
+After the owned context clones were removed, the same full Shadowsocks shape
+was used to attribute the remaining steady-state identity indexing cost. The
+legacy `StatsInner::apply` checked `known_identities.contains(identity)` on
+every record before performing the per-protocol identity-map lookup, so a hot
+identity paid one redundant string hash even though an existing
+`per_identity[protocol][identity]` entry already proves that identity was seen
+on that shard. The optimized path makes `accumulate_string_key` report whether
+it inserted the per-protocol identity and only checks/inserts
+`known_identities` on that first insertion. A strict same-host A/B with 10
+million records/sample and 3 warmup + 10 measured pairs reduced borrowed-ref
+CPU cost from **0.149605 -> 0.134064 CPU seconds/Mrecord (-10.4%)** at 2 writers
+and **0.166674 -> 0.146966 (-11.8%)** at 4 writers. Candidate CPU CVs were
+**1.75% / 0.91%**; both legacy baselines were also below 3%. An identity-free
+inbound+outbound c4 control showed no regression (**0.075768 -> 0.073670 CPU
+seconds/Mrecord**), with both CVs below 3%; that small difference is treated
+only as a no-regression check. A pre-registered identity spanning multiple
+protocol maps is covered by a unit test so the public `known_identities` set,
+per-identity totals, bytes, and record counts remain unchanged.
+
 ## UDP freedom session batching probe
 
 `udp_session_probe` is a Linux-only follow-up that mirrors the hot structure of

@@ -136,14 +136,15 @@ fn accumulate_string_key(
     key: &str,
     upload: u64,
     download: u64,
-) {
+) -> bool {
     if let Some(existing) = totals.get_mut(key) {
         existing.accumulate(upload, download);
-        return;
+        return false;
     }
     let mut value = TransferTotals::default();
     value.accumulate(upload, download);
     totals.insert(key.to_owned(), value);
+    true
 }
 
 fn accumulate_nested_string_key(
@@ -180,15 +181,15 @@ impl StatsInner {
             .accumulate(upload, download);
 
         if let Some(identity) = identity {
-            if !self.known_identities.contains(identity) {
-                self.known_identities.insert(identity.to_owned());
-            }
-            accumulate_string_key(
+            let identity_inserted = accumulate_string_key(
                 self.per_identity.entry(protocol).or_default(),
                 identity,
                 upload,
                 download,
             );
+            if identity_inserted && !self.known_identities.contains(identity) {
+                self.known_identities.insert(identity.to_owned());
+            }
             if let Some(inbound_tag) = inbound_tag {
                 accumulate_nested_string_key(
                     &mut self.per_inbound_user,
@@ -533,6 +534,34 @@ mod tests {
         assert_eq!(snapshot.per_outbound["direct"].connections, 1);
         assert!(snapshot.known_identities.contains("bob"));
     }
+    #[test]
+    fn known_identity_remains_deduplicated_across_protocol_maps() {
+        let mut stats = StatsInner::default();
+        stats.known_identities.insert("alice".to_owned());
+
+        for protocol in ["vless", "shadowsocks"] {
+            stats.apply(plan_traffic_record(
+                &TrafficContext::new(protocol).with_identity("alice"),
+                7,
+                11,
+            ));
+        }
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.known_identities.len(), 1);
+        assert!(snapshot.known_identities.contains("alice"));
+        assert_eq!(
+            snapshot.per_identity[&("vless".to_string(), "alice".to_string())]
+                .connections,
+            1
+        );
+        assert_eq!(
+            snapshot.per_identity[&("shadowsocks".to_string(), "alice".to_string())]
+                .connections,
+            1
+        );
+    }
+
     #[test]
     fn sharded_recorder_aggregates_concurrent_updates_exactly() {
         const WRITERS: usize = 8;
