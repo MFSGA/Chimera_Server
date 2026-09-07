@@ -98,6 +98,9 @@ mod linux {
         #[arg(long)]
         sample_rate_decrease_recovery: bool,
 
+        #[arg(long, default_value_t = 0)]
+        sample_partial_notsent_every: u64,
+
         #[arg(long)]
         verify: bool,
     }
@@ -160,6 +163,7 @@ mod linux {
         adaptive_notsent_lowat: Option<u32>,
         sample_tcp_info: bool,
         sample_rate_decrease_recovery: bool,
+        sample_partial_notsent_every: u64,
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -194,6 +198,10 @@ mod linux {
         destination_splice_successes: u64,
         destination_splice_bytes: u64,
         destination_partial_splices: u64,
+        destination_partial_notsent_samples: u64,
+        destination_partial_notsent_bytes: u64,
+        destination_partial_notsent_min: Option<u32>,
+        destination_partial_notsent_max: Option<u32>,
         notsent_bytes_at_rate_update: Option<u32>,
         tcp_info_at_rate_update: Option<TcpInfoSample>,
         notsent_bytes_at_lowat_restore: Option<u32>,
@@ -236,6 +244,7 @@ mod linux {
         adaptive_notsent_lowat_bytes: Option<u32>,
         sample_tcp_info: bool,
         sample_rate_decrease_recovery: bool,
+        sample_partial_notsent_every: u64,
         destination_ready_acquisitions_total: u64,
         destination_ready_acquisitions_per_connection: f64,
         relay_elapsed_us_median: f64,
@@ -250,6 +259,10 @@ mod linux {
         destination_splice_successes_total: u64,
         destination_splice_bytes_per_success: f64,
         destination_partial_splices_total: u64,
+        destination_partial_notsent_samples_total: u64,
+        destination_partial_notsent_bytes_mean: Option<f64>,
+        destination_partial_notsent_min: Option<u32>,
+        destination_partial_notsent_max: Option<u32>,
         writer_elapsed_us_median: f64,
         writer_elapsed_us_max: f64,
         writer_elapsed_max_to_median_ratio: f64,
@@ -311,6 +324,7 @@ mod linux {
         adaptive_notsent_lowat_bytes: Option<u32>,
         sample_tcp_info: bool,
         sample_rate_decrease_recovery: bool,
+        sample_partial_notsent_every: u64,
         aggregate_throughput_median_gbps: f64,
         throughput_cv: f64,
         per_connection_rate_ratio_median: Option<f64>,
@@ -522,6 +536,7 @@ mod linux {
                 adaptive_notsent_lowat_bytes: args.adaptive_notsent_lowat_bytes,
                 sample_tcp_info: args.sample_tcp_info,
                 sample_rate_decrease_recovery: args.sample_rate_decrease_recovery,
+                sample_partial_notsent_every: args.sample_partial_notsent_every,
                 aggregate_throughput_median_gbps: round(median(&throughput)),
                 throughput_cv: round(coefficient_of_variation(&throughput)),
                 per_connection_rate_ratio_median: (!ratios.is_empty())
@@ -693,6 +708,16 @@ mod linux {
         }
         if args.sample_rate_decrease_recovery && args.notsent_lowat_ms.is_none() {
             bail!("--sample-rate-decrease-recovery requires --notsent-lowat-ms");
+        }
+        if args.sample_partial_notsent_every > 0
+            && (args.unpaced
+                || args.destination_drain_mode != DestinationDrainMode::Single
+                || (args.notsent_lowat_bytes.is_none()
+                    && args.notsent_lowat_ms.is_none()))
+        {
+            bail!(
+                "--sample-partial-notsent-every requires paced single-drain mode with static TCP_NOTSENT_LOWAT"
+            );
         }
         if args.notsent_lowat_min_bytes == Some(0)
             || args.notsent_lowat_max_bytes == Some(0)
@@ -891,6 +916,7 @@ mod linux {
                 adaptive_notsent_lowat: args.adaptive_notsent_lowat_bytes,
                 sample_tcp_info: args.sample_tcp_info,
                 sample_rate_decrease_recovery: args.sample_rate_decrease_recovery,
+                sample_partial_notsent_every: args.sample_partial_notsent_every,
             };
 
             writers.push(tokio::spawn(async move {
@@ -1016,6 +1042,22 @@ mod linux {
             .iter()
             .map(|stats| stats.destination_partial_splices)
             .sum::<u64>();
+        let destination_partial_notsent_samples_total = relay_stats
+            .iter()
+            .map(|stats| stats.destination_partial_notsent_samples)
+            .sum::<u64>();
+        let destination_partial_notsent_bytes_total = relay_stats
+            .iter()
+            .map(|stats| stats.destination_partial_notsent_bytes)
+            .sum::<u64>();
+        let destination_partial_notsent_min = relay_stats
+            .iter()
+            .filter_map(|stats| stats.destination_partial_notsent_min)
+            .min();
+        let destination_partial_notsent_max = relay_stats
+            .iter()
+            .filter_map(|stats| stats.destination_partial_notsent_max)
+            .max();
         let notsent = relay_stats
             .iter()
             .filter_map(|stats| stats.notsent_bytes_at_rate_update.map(f64::from))
@@ -1132,6 +1174,7 @@ mod linux {
             adaptive_notsent_lowat_bytes: args.adaptive_notsent_lowat_bytes,
             sample_tcp_info: args.sample_tcp_info,
             sample_rate_decrease_recovery: args.sample_rate_decrease_recovery,
+            sample_partial_notsent_every: args.sample_partial_notsent_every,
             destination_ready_acquisitions_total,
             destination_ready_acquisitions_per_connection: round(
                 destination_ready_acquisitions_total as f64
@@ -1159,6 +1202,16 @@ mod linux {
                     / destination_splice_successes_total as f64,
             ),
             destination_partial_splices_total,
+            destination_partial_notsent_samples_total,
+            destination_partial_notsent_bytes_mean:
+                (destination_partial_notsent_samples_total > 0).then(|| {
+                    round(
+                        destination_partial_notsent_bytes_total as f64
+                            / destination_partial_notsent_samples_total as f64,
+                    )
+                }),
+            destination_partial_notsent_min,
+            destination_partial_notsent_max,
             writer_elapsed_us_median: round(writer_elapsed_us_median),
             writer_elapsed_us_max: round(writer_elapsed_us_max),
             writer_elapsed_max_to_median_ratio: round(
@@ -1288,6 +1341,10 @@ mod linux {
         let mut destination_splice_successes = 0_u64;
         let mut destination_splice_bytes = 0_u64;
         let mut destination_partial_splices = 0_u64;
+        let mut destination_partial_notsent_samples = 0_u64;
+        let mut destination_partial_notsent_bytes = 0_u64;
+        let mut destination_partial_notsent_min = None;
+        let mut destination_partial_notsent_max = None;
         let mut notsent_bytes_at_rate_update = None;
         let mut tcp_info_at_rate_update = None;
         let mut notsent_bytes_at_lowat_restore = None;
@@ -1406,6 +1463,33 @@ mod linux {
                         if written < pending {
                             destination_partial_splices =
                                 destination_partial_splices.saturating_add(1);
+                            if options.sample_partial_notsent_every > 0
+                                && destination_partial_splices.is_multiple_of(
+                                    options.sample_partial_notsent_every,
+                                )
+                            {
+                                let queued = get_notsent_bytes(
+                                    destination.get_ref().as_raw_fd(),
+                                )?;
+                                destination_partial_notsent_samples =
+                                    destination_partial_notsent_samples
+                                        .saturating_add(1);
+                                destination_partial_notsent_bytes =
+                                    destination_partial_notsent_bytes
+                                        .saturating_add(u64::from(queued));
+                                destination_partial_notsent_min = Some(
+                                    destination_partial_notsent_min
+                                        .map_or(queued, |value: u32| {
+                                            value.min(queued)
+                                        }),
+                                );
+                                destination_partial_notsent_max = Some(
+                                    destination_partial_notsent_max
+                                        .map_or(queued, |value: u32| {
+                                            value.max(queued)
+                                        }),
+                                );
+                            }
                         }
                         pending -= written;
                         transferred += written as u64;
@@ -1544,6 +1628,10 @@ mod linux {
                         destination_splice_successes,
                         destination_splice_bytes,
                         destination_partial_splices,
+                        destination_partial_notsent_samples,
+                        destination_partial_notsent_bytes,
+                        destination_partial_notsent_min,
+                        destination_partial_notsent_max,
                         notsent_bytes_at_rate_update,
                         tcp_info_at_rate_update,
                         notsent_bytes_at_lowat_restore,
@@ -1800,8 +1888,22 @@ mod linux {
                 runs: 1,
                 sample_tcp_info: false,
                 sample_rate_decrease_recovery: false,
+                sample_partial_notsent_every: 0,
                 verify: false,
             }
+        }
+
+        #[test]
+        fn partial_notsent_sampling_requires_static_lowat() {
+            let mut args = base_args();
+            args.sample_partial_notsent_every = 8;
+            assert!(validate_args(&args).is_err());
+
+            args.notsent_lowat_bytes = Some(32 * 1024);
+            assert!(validate_args(&args).is_ok());
+
+            args.destination_drain_mode = DestinationDrainMode::TwoSplices;
+            assert!(validate_args(&args).is_err());
         }
 
         #[test]
