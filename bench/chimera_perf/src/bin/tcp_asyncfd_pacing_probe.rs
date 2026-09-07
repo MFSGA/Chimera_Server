@@ -25,7 +25,7 @@ mod linux {
     use serde::Serialize;
     use tokio::{
         io::unix::AsyncFd,
-        io::{AsyncReadExt, AsyncWriteExt},
+        io::{AsyncReadExt, AsyncWriteExt, Interest},
         sync::Barrier,
     };
 
@@ -86,6 +86,9 @@ mod linux {
         #[arg(long, value_enum, default_value_t = DestinationDrainMode::Single)]
         destination_drain_mode: DestinationDrainMode,
 
+        #[arg(long, value_enum, default_value_t = SourceReadinessMode::Guarded)]
+        source_readiness_mode: SourceReadinessMode,
+
         #[arg(long, default_value_t = 1)]
         warmup: usize,
 
@@ -110,6 +113,21 @@ mod linux {
         Single,
         TwoSplices,
         UntilWouldBlock,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+    enum SourceReadinessMode {
+        Guarded,
+        TryFirst,
+    }
+
+    impl SourceReadinessMode {
+        fn as_str(self) -> &'static str {
+            match self {
+                Self::Guarded => "guarded",
+                Self::TryFirst => "try-first",
+            }
+        }
     }
 
     impl DestinationDrainMode {
@@ -155,6 +173,7 @@ mod linux {
     struct RelayOptions {
         requested_pipe_size: usize,
         destination_drain_mode: DestinationDrainMode,
+        source_readiness_mode: SourceReadinessMode,
         initial_rate: u64,
         initial_notsent_lowat: Option<u32>,
         rate_updates: Arc<[RateUpdate]>,
@@ -191,6 +210,8 @@ mod linux {
         pipe_capacity: usize,
         destination_ready_acquisitions: u64,
         destination_would_blocks: u64,
+        source_ready_acquisitions: u64,
+        source_try_first_successes: u64,
         source_would_blocks: u64,
         source_splice_successes: u64,
         source_splice_bytes: u64,
@@ -230,6 +251,7 @@ mod linux {
         pipe_capacity_shortfall_connections: u64,
         unpaced: bool,
         destination_drain_mode: &'static str,
+        source_readiness_mode: &'static str,
         requested_rate_bytes_per_sec: Option<u64>,
         second_rate_bytes_per_sec: Option<u64>,
         rate_updates_bytes_per_sec: Vec<u64>,
@@ -252,6 +274,10 @@ mod linux {
         relay_elapsed_max_to_median_ratio: f64,
         destination_would_blocks_total: u64,
         destination_would_blocks_per_connection: f64,
+        source_ready_acquisitions_total: u64,
+        source_ready_acquisitions_per_connection: f64,
+        source_try_first_successes_total: u64,
+        source_try_first_successes_per_connection: f64,
         source_would_blocks_total: u64,
         source_splice_successes_total: u64,
         source_splice_bytes_per_success: f64,
@@ -310,6 +336,7 @@ mod linux {
         pipe_capacity_shortfall_connections_median: f64,
         unpaced: bool,
         destination_drain_mode: &'static str,
+        source_readiness_mode: &'static str,
         requested_rate_bytes_per_sec: Option<u64>,
         second_rate_bytes_per_sec: Option<u64>,
         rate_updates_bytes_per_sec: Vec<u64>,
@@ -332,6 +359,8 @@ mod linux {
         context_switches_median: f64,
         destination_ready_acquisitions_per_connection_median: f64,
         destination_would_blocks_per_connection_median: f64,
+        source_ready_acquisitions_per_connection_median: f64,
+        source_try_first_successes_per_connection_median: f64,
         relay_elapsed_us_median: f64,
         relay_elapsed_us_max_median: f64,
         relay_elapsed_max_to_median_ratio_median: f64,
@@ -383,6 +412,8 @@ mod linux {
         let mut context_switches = Vec::with_capacity(args.runs);
         let mut destination_ready_acquisitions = Vec::with_capacity(args.runs);
         let mut destination_blocks = Vec::with_capacity(args.runs);
+        let mut source_ready_acquisitions = Vec::with_capacity(args.runs);
+        let mut source_try_first_successes = Vec::with_capacity(args.runs);
         let mut relay_elapsed_us = Vec::with_capacity(args.runs);
         let mut relay_elapsed_us_max = Vec::with_capacity(args.runs);
         let mut relay_elapsed_ratios = Vec::with_capacity(args.runs);
@@ -427,6 +458,10 @@ mod linux {
             destination_ready_acquisitions
                 .push(record.destination_ready_acquisitions_per_connection);
             destination_blocks.push(record.destination_would_blocks_per_connection);
+            source_ready_acquisitions
+                .push(record.source_ready_acquisitions_per_connection);
+            source_try_first_successes
+                .push(record.source_try_first_successes_per_connection);
             relay_elapsed_us.push(record.relay_elapsed_us_median);
             relay_elapsed_us_max.push(record.relay_elapsed_us_max);
             relay_elapsed_ratios.push(record.relay_elapsed_max_to_median_ratio);
@@ -519,6 +554,7 @@ mod linux {
                 )),
                 unpaced: args.unpaced,
                 destination_drain_mode: args.destination_drain_mode.as_str(),
+                source_readiness_mode: args.source_readiness_mode.as_str(),
                 requested_rate_bytes_per_sec: (!args.unpaced)
                     .then_some(args.rate_bytes_per_sec),
                 second_rate_bytes_per_sec: args.second_rate_bytes_per_sec,
@@ -548,6 +584,12 @@ mod linux {
                 )),
                 destination_would_blocks_per_connection_median: round(median(
                     &destination_blocks
+                )),
+                source_ready_acquisitions_per_connection_median: round(median(
+                    &source_ready_acquisitions,
+                )),
+                source_try_first_successes_per_connection_median: round(median(
+                    &source_try_first_successes,
                 )),
                 relay_elapsed_us_median: round(median(&relay_elapsed_us)),
                 relay_elapsed_us_max_median: round(median(&relay_elapsed_us_max)),
@@ -906,6 +948,7 @@ mod linux {
             let relay_options = RelayOptions {
                 requested_pipe_size: args.pipe_size,
                 destination_drain_mode: args.destination_drain_mode,
+                source_readiness_mode: args.source_readiness_mode,
                 initial_rate: args.rate_bytes_per_sec,
                 initial_notsent_lowat,
                 rate_updates: Arc::clone(&rate_updates),
@@ -994,6 +1037,14 @@ mod linux {
         let destination_would_blocks_total = relay_stats
             .iter()
             .map(|stats| stats.destination_would_blocks)
+            .sum::<u64>();
+        let source_ready_acquisitions_total = relay_stats
+            .iter()
+            .map(|stats| stats.source_ready_acquisitions)
+            .sum::<u64>();
+        let source_try_first_successes_total = relay_stats
+            .iter()
+            .map(|stats| stats.source_try_first_successes)
             .sum::<u64>();
         let relay_elapsed_us = relay_stats
             .iter()
@@ -1157,6 +1208,7 @@ mod linux {
             pipe_capacity_shortfall_connections,
             unpaced: args.unpaced,
             destination_drain_mode: args.destination_drain_mode.as_str(),
+            source_readiness_mode: args.source_readiness_mode.as_str(),
             requested_rate_bytes_per_sec: (!args.unpaced)
                 .then_some(args.rate_bytes_per_sec),
             second_rate_bytes_per_sec: args.second_rate_bytes_per_sec,
@@ -1183,6 +1235,14 @@ mod linux {
             destination_would_blocks_total,
             destination_would_blocks_per_connection: round(
                 destination_would_blocks_total as f64 / args.connections as f64,
+            ),
+            source_ready_acquisitions_total,
+            source_ready_acquisitions_per_connection: round(
+                source_ready_acquisitions_total as f64 / args.connections as f64,
+            ),
+            source_try_first_successes_total,
+            source_try_first_successes_per_connection: round(
+                source_try_first_successes_total as f64 / args.connections as f64,
             ),
             relay_elapsed_us_median: round(relay_elapsed_us_median),
             relay_elapsed_us_max: round(relay_elapsed_us_max),
@@ -1334,6 +1394,8 @@ mod linux {
         let mut transferred = 0_u64;
         let mut destination_ready_acquisitions = 0_u64;
         let mut destination_would_blocks = 0_u64;
+        let mut source_ready_acquisitions = 0_u64;
+        let mut source_try_first_successes = 0_u64;
         let mut source_would_blocks = 0_u64;
         let mut source_splice_successes = 0_u64;
         let mut source_splice_bytes = 0_u64;
@@ -1601,15 +1663,42 @@ mod linux {
             }
 
             let pipe_write_fd = pipe_write.as_raw_fd();
-            let mut readable = source.readable().await?;
-            match readable.try_io(|source| {
-                splice_once(
-                    source.get_ref().as_raw_fd(),
-                    pipe_write_fd,
-                    pipe_capacity,
-                )
-            }) {
-                Ok(Ok(0)) => {
+            let source_read = if options.source_readiness_mode
+                == SourceReadinessMode::TryFirst
+            {
+                match source.try_io(Interest::READABLE, |source| {
+                    splice_once(source.as_raw_fd(), pipe_write_fd, pipe_capacity)
+                }) {
+                    Ok(read) => {
+                        source_try_first_successes =
+                            source_try_first_successes.saturating_add(1);
+                        Some(read)
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
+            let source_read = if let Some(read) = source_read {
+                Some(read)
+            } else {
+                source_ready_acquisitions = source_ready_acquisitions.saturating_add(1);
+                let mut readable = source.readable().await?;
+                match readable.try_io(|source| {
+                    splice_once(
+                        source.get_ref().as_raw_fd(),
+                        pipe_write_fd,
+                        pipe_capacity,
+                    )
+                }) {
+                    Ok(Ok(read)) => Some(read),
+                    Ok(Err(error)) => return Err(error),
+                    Err(_would_block) => None,
+                }
+            };
+            match source_read {
+                Some(0) => {
                     shutdown_write(destination.get_ref().as_raw_fd())?;
                     if active_rate_decrease_recovery.is_some() {
                         incomplete_rate_decrease_recoveries =
@@ -1621,6 +1710,8 @@ mod linux {
                         pipe_capacity,
                         destination_ready_acquisitions,
                         destination_would_blocks,
+                        source_ready_acquisitions,
+                        source_try_first_successes,
                         source_would_blocks,
                         source_splice_successes,
                         source_splice_bytes,
@@ -1643,7 +1734,7 @@ mod linux {
                         incomplete_rate_decrease_recoveries,
                     });
                 }
-                Ok(Ok(read)) => {
+                Some(read) => {
                     source_splice_successes =
                         source_splice_successes.saturating_add(1);
                     source_splice_bytes =
@@ -1654,8 +1745,7 @@ mod linux {
                     }
                     pending = read;
                 }
-                Ok(Err(error)) => return Err(error),
-                Err(_would_block) => {
+                None => {
                     source_would_blocks = source_would_blocks.saturating_add(1);
                 }
             }
@@ -1884,6 +1974,7 @@ mod linux {
                 adaptive_notsent_lowat_bytes: None,
                 pipe_size: 4096,
                 destination_drain_mode: DestinationDrainMode::Single,
+                source_readiness_mode: SourceReadinessMode::Guarded,
                 warmup: 0,
                 runs: 1,
                 sample_tcp_info: false,
@@ -2203,6 +2294,27 @@ mod linux {
 
             let record = run_once(&args, 0, false).await.unwrap();
             assert_eq!(record.total_bytes, args.bytes_per_connection);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn try_first_source_readiness_preserves_payload_and_hits_cached_ready() {
+            let mut args = base_args();
+            args.worker_threads = 2;
+            args.bytes_per_connection = 512 * 1024;
+            args.chunk_size = 16 * 1024;
+            args.rate_bytes_per_sec = 64 * 1024 * 1024;
+            args.notsent_lowat_bytes = Some(512 * 1024);
+            args.pipe_size = 128 * 1024;
+            args.source_readiness_mode = SourceReadinessMode::TryFirst;
+            args.verify = true;
+
+            let record = run_once(&args, 0, false).await.unwrap();
+            assert_eq!(record.total_bytes, args.bytes_per_connection);
+            assert!(record.source_try_first_successes_total > 0);
+            assert!(
+                record.source_ready_acquisitions_total
+                    < record.source_splice_successes_total
+            );
         }
     }
 }
