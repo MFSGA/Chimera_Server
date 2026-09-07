@@ -29,8 +29,12 @@ impl RecordMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextShape {
+    ProtocolOnly,
     InboundOnly,
     InboundOutbound,
+    IdentityOnly,
+    IdentityInbound,
+    IdentityOutbound,
     Shadowsocks,
 }
 
@@ -40,19 +44,27 @@ impl ContextShape {
             .unwrap_or_else(|_| "inbound-outbound".to_string())
             .as_str()
         {
+            "protocol-only" => Self::ProtocolOnly,
             "inbound-only" => Self::InboundOnly,
             "inbound-outbound" => Self::InboundOutbound,
+            "identity-only" => Self::IdentityOnly,
+            "identity-inbound" => Self::IdentityInbound,
+            "identity-outbound" => Self::IdentityOutbound,
             "shadowsocks" => Self::Shadowsocks,
             other => panic!(
-                "CHIMERA_TRAFFIC_PROBE_SHAPE must be inbound-only, inbound-outbound, or shadowsocks, got {other}"
+                "CHIMERA_TRAFFIC_PROBE_SHAPE must be protocol-only, inbound-only, inbound-outbound, identity-only, identity-inbound, identity-outbound, or shadowsocks, got {other}"
             ),
         }
     }
 
     const fn as_str(self) -> &'static str {
         match self {
+            Self::ProtocolOnly => "protocol-only",
             Self::InboundOnly => "inbound-only",
             Self::InboundOutbound => "inbound-outbound",
+            Self::IdentityOnly => "identity-only",
+            Self::IdentityInbound => "identity-inbound",
+            Self::IdentityOutbound => "identity-outbound",
             Self::Shadowsocks => "shadowsocks",
         }
     }
@@ -146,18 +158,34 @@ fn pair_order(pair: usize) -> [RecordMode; 2] {
 }
 
 fn make_context(shape: ContextShape) -> TrafficContext {
-    let context = TrafficContext::new(match shape {
-        ContextShape::Shadowsocks => "shadowsocks",
-        ContextShape::InboundOnly | ContextShape::InboundOutbound => "dokodemo-door",
-    })
-    .with_inbound_tag("udp-in")
-    .with_client_ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let protocol = match shape {
+        ContextShape::Shadowsocks
+        | ContextShape::IdentityOnly
+        | ContextShape::IdentityInbound
+        | ContextShape::IdentityOutbound => "shadowsocks",
+        ContextShape::ProtocolOnly
+        | ContextShape::InboundOnly
+        | ContextShape::InboundOutbound => "dokodemo-door",
+    };
+    let context = TrafficContext::new(protocol)
+        .with_client_ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
     match shape {
-        ContextShape::InboundOnly => context,
-        ContextShape::InboundOutbound => context.with_outbound_tag("direct"),
-        ContextShape::Shadowsocks => {
+        ContextShape::ProtocolOnly => context,
+        ContextShape::InboundOnly => context.with_inbound_tag("udp-in"),
+        ContextShape::InboundOutbound => context
+            .with_inbound_tag("udp-in")
+            .with_outbound_tag("direct"),
+        ContextShape::IdentityOnly => context.with_identity("alice"),
+        ContextShape::IdentityInbound => {
+            context.with_identity("alice").with_inbound_tag("udp-in")
+        }
+        ContextShape::IdentityOutbound => {
             context.with_identity("alice").with_outbound_tag("direct")
         }
+        ContextShape::Shadowsocks => context
+            .with_identity("alice")
+            .with_inbound_tag("udp-in")
+            .with_outbound_tag("direct"),
     }
 }
 
