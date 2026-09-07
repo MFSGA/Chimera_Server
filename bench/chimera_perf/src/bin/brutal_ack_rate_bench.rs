@@ -144,7 +144,7 @@ impl RecordState {
         ack_count: u64,
         loss_count: u64,
     ) {
-        self.cached_second_record_inner(now, ack_count, loss_count, 0, false);
+        self.cached_second_record_inner(now, ack_count, loss_count, 0, false, false);
     }
 
     fn cached_second_record_pristine_assign(
@@ -153,7 +153,7 @@ impl RecordState {
         ack_count: u64,
         loss_count: u64,
     ) {
-        self.cached_second_record_inner(now, ack_count, loss_count, 1, false);
+        self.cached_second_record_inner(now, ack_count, loss_count, 1, false, false);
     }
 
     fn cached_second_record_skip_pristine_rate(
@@ -162,7 +162,7 @@ impl RecordState {
         ack_count: u64,
         loss_count: u64,
     ) {
-        self.cached_second_record_inner(now, ack_count, loss_count, 2, false);
+        self.cached_second_record_inner(now, ack_count, loss_count, 2, false, false);
     }
 
     fn cached_second_record_monotonic_fast(
@@ -171,7 +171,16 @@ impl RecordState {
         ack_count: u64,
         loss_count: u64,
     ) {
-        self.cached_second_record_inner(now, ack_count, loss_count, 2, true);
+        self.cached_second_record_inner(now, ack_count, loss_count, 2, true, false);
+    }
+
+    fn cached_second_record_rollover_only(
+        &mut self,
+        now: Instant,
+        ack_count: u64,
+        loss_count: u64,
+    ) {
+        self.cached_second_record_inner(now, ack_count, loss_count, 2, true, true);
     }
 
     fn cached_second_record_inner(
@@ -181,8 +190,11 @@ impl RecordState {
         loss_count: u64,
         pristine_mode: u8,
         monotonic_fast: bool,
+        rollover_only: bool,
     ) {
-        let in_cached_second = if monotonic_fast {
+        let in_cached_second = if rollover_only {
+            now < self.next_rollover
+        } else if monotonic_fast {
             self.rolling_timestamp.is_some() && now < self.next_rollover
         } else {
             self.rolling_timestamp.is_some()
@@ -253,6 +265,7 @@ fn run_record_bench(name: &str, mode: u8, loss_every: Option<u64>) {
                 loss,
             ),
             4 => state.cached_second_record_monotonic_fast(black_box(now), 1, loss),
+            5 => state.cached_second_record_rollover_only(black_box(now), 1, loss),
             _ => unreachable!(),
         }
     }
@@ -424,7 +437,10 @@ fn main() {
         match mode.as_str() {
             "cached" => run_record_bench("skip-pristine-rate-record", 3, None),
             "monotonic" => run_record_bench("monotonic-fast-record", 4, None),
-            _ => panic!("BRUTAL_RECORD_BENCH_MODE must be cached or monotonic"),
+            "rollover-only" => run_record_bench("rollover-only-record", 5, None),
+            _ => panic!(
+                "BRUTAL_RECORD_BENCH_MODE must be cached, monotonic, or rollover-only"
+            ),
         }
         return;
     }
@@ -441,6 +457,7 @@ fn main() {
         run_record_bench("pristine-assign-record", 2, loss_every);
         run_record_bench("skip-pristine-rate-record", 3, loss_every);
         run_record_bench("monotonic-fast-record", 4, loss_every);
+        run_record_bench("rollover-only-record", 5, loss_every);
     }
     println!("record fast-path order-sensitivity check:");
     for loss_every in [None, Some(1_000), Some(100)] {
@@ -553,6 +570,34 @@ mod tests {
             assert_eq!(baseline.ack_rate, optimized.ack_rate);
         }
         assert_eq!(baseline.slots, optimized.slots);
+    }
+
+    #[test]
+    fn rollover_only_record_matches_monotonic_guard_for_monotonic_callbacks() {
+        let origin = Instant::now();
+        let mut baseline = RecordState::new(origin);
+        let mut optimized = RecordState::new(origin);
+        for event in 0..50_000_u64 {
+            let now = origin + Duration::from_micros(event * 100);
+            let loss = u64::from((event + 1).is_multiple_of(997));
+            baseline.cached_second_record_monotonic_fast(now, 1, loss);
+            optimized.cached_second_record_rollover_only(now, 1, loss);
+            assert_eq!(baseline.rolling_ack_count, optimized.rolling_ack_count);
+            assert_eq!(baseline.rolling_loss_count, optimized.rolling_loss_count);
+            assert_eq!(baseline.rolling_timestamp, optimized.rolling_timestamp);
+            assert_eq!(baseline.ack_rate, optimized.ack_rate);
+        }
+        assert_eq!(baseline.slots, optimized.slots);
+    }
+
+    #[test]
+    fn rollover_only_guard_does_not_treat_initial_timestamp_as_cached() {
+        let origin = Instant::now();
+        let mut state = RecordState::new(origin);
+        state.cached_second_record_rollover_only(origin, 1, 0);
+        assert_eq!(state.rolling_timestamp, Some(0));
+        assert_eq!(state.rolling_ack_count, 1);
+        assert_eq!(state.slots[0].ack_count, 1);
     }
 
     #[test]
