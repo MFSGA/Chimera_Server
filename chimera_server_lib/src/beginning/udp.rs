@@ -40,7 +40,9 @@ use crate::{
     routing_process::enrich_routing_input,
     routing_state::RoutingInput,
     runtime::RuntimeState,
-    traffic::{TrafficContext, record_transfer, register_connection},
+    traffic::{
+        TrafficContext, record_transfer, record_transfer_ref, register_connection,
+    },
     xudp_registry::{XUDP_GLOBAL_REATTACH_TTL, XudpGlobalRegistry},
 };
 
@@ -2129,7 +2131,7 @@ async fn run_freedom_udp_session(
                 };
                 match outbound_socket.send_to(&payload, key.target_addr).await {
                     Ok(sent) => {
-                        record_transfer(Some(traffic_context.clone()), sent as u64, 0);
+                        record_transfer_ref(Some(&traffic_context), sent as u64, 0);
                         idle.as_mut().reset(Instant::now() + UDP_SESSION_IDLE_TIMEOUT);
                     }
                     Err(err) => {
@@ -2170,7 +2172,7 @@ async fn run_freedom_udp_session(
                 let response = &response_buf[..response_len];
                 match relay_state.server_socket.send_to(response, key.client_addr).await {
                     Ok(sent) => {
-                        record_transfer(Some(traffic_context.clone()), 0, sent as u64);
+                        record_transfer_ref(Some(&traffic_context), 0, sent as u64);
                         idle.as_mut().reset(Instant::now() + UDP_SESSION_IDLE_TIMEOUT);
                         debug!(
                             "dokodemo-door udp relay {} <- {} via {} forwarded {} bytes",

@@ -672,15 +672,20 @@ acceptance threshold; the saturated 8-writer rerun remained noisy at about
 before and after remained around 0.085-0.086 CPU seconds/Mrecord, with no
 material regression visible.
 
-The same probe also explains why removing `TrafficContext::clone` should be a
-**separate** follow-up rather than bundled into this change. Under the legacy
-round-robin recorder, borrowed recording helped at 2/4 writers but became about
-6% more CPU-expensive at 8 writers because faster callers simply hit the shared
-recorder bottleneck sooner. After per-thread sharding, borrowed recording was
-again faster at every tested writer count (for example about **-21% CPU** at 4
-writers in the stable sample). Keep the freedom UDP clone-to-ref change for a
-separate production iteration so its end-to-end effect can be attributed after
-this recorder bottleneck is removed.
+The same probe also explains why removing `TrafficContext::clone` needed to be
+a **separate** follow-up rather than bundled into the shard change. Under the
+legacy round-robin recorder, borrowed recording helped at 2/4 writers but became
+about 6% more CPU-expensive at 8 writers because faster callers simply hit the
+shared recorder bottleneck sooner. After per-thread sharding, the stable
+2/4-writer samples changed from **0.097692 -> 0.081434** and **0.114417 ->
+0.090054 CPU seconds/Mrecord**, about **-16.6% / -21.3%**, with both clone and
+borrowed CPU CVs below 3%. The 8-writer direction was also favorable (about
+-18% CPU) but remained too noisy for an accepted magnitude. The follow-up
+production change therefore replaces only the two per-datagram owned clones in
+`run_freedom_udp_session` with `record_transfer_ref(Some(&traffic_context),
+...)`. It preserves one recorder call per successful uplink/downlink datagram,
+all byte and `connections` accounting, idle-reset timing, socket ordering, and
+error behavior; other UDP paths remain unchanged for independent attribution.
 
 ## UDP freedom session batching probe
 
