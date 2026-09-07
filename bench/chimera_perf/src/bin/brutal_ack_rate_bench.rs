@@ -63,7 +63,7 @@ fn run(name: &str, update: fn(&mut State), loss_every: Option<u64>) {
     );
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct PacketInfo {
     timestamp: u64,
     ack_count: u64,
@@ -144,7 +144,7 @@ impl RecordState {
         ack_count: u64,
         loss_count: u64,
     ) {
-        self.cached_second_record_inner(now, ack_count, loss_count, 0);
+        self.cached_second_record_inner(now, ack_count, loss_count, 0, false);
     }
 
     fn cached_second_record_pristine_assign(
@@ -153,7 +153,7 @@ impl RecordState {
         ack_count: u64,
         loss_count: u64,
     ) {
-        self.cached_second_record_inner(now, ack_count, loss_count, 1);
+        self.cached_second_record_inner(now, ack_count, loss_count, 1, false);
     }
 
     fn cached_second_record_skip_pristine_rate(
@@ -162,7 +162,16 @@ impl RecordState {
         ack_count: u64,
         loss_count: u64,
     ) {
-        self.cached_second_record_inner(now, ack_count, loss_count, 2);
+        self.cached_second_record_inner(now, ack_count, loss_count, 2, false);
+    }
+
+    fn cached_second_record_monotonic_fast(
+        &mut self,
+        now: Instant,
+        ack_count: u64,
+        loss_count: u64,
+    ) {
+        self.cached_second_record_inner(now, ack_count, loss_count, 2, true);
     }
 
     fn cached_second_record_inner(
@@ -171,11 +180,16 @@ impl RecordState {
         ack_count: u64,
         loss_count: u64,
         pristine_mode: u8,
+        monotonic_fast: bool,
     ) {
-        if self.rolling_timestamp.is_some()
-            && now >= self.current_second_start
-            && now < self.next_rollover
-        {
+        let in_cached_second = if monotonic_fast {
+            self.rolling_timestamp.is_some() && now < self.next_rollover
+        } else {
+            self.rolling_timestamp.is_some()
+                && now >= self.current_second_start
+                && now < self.next_rollover
+        };
+        if in_cached_second {
             let info = &mut self.slots[self.current_slot];
             info.ack_count += ack_count;
             info.loss_count += loss_count;
@@ -238,6 +252,7 @@ fn run_record_bench(name: &str, mode: u8, loss_every: Option<u64>) {
                 1,
                 loss,
             ),
+            4 => state.cached_second_record_monotonic_fast(black_box(now), 1, loss),
             _ => unreachable!(),
         }
     }
@@ -405,6 +420,15 @@ fn run_ack_batch_bench(name: &str, batched: bool, batch_size: u64) {
 }
 
 fn main() {
+    if let Ok(mode) = std::env::var("BRUTAL_RECORD_BENCH_MODE") {
+        match mode.as_str() {
+            "cached" => run_record_bench("skip-pristine-rate-record", 3, None),
+            "monotonic" => run_record_bench("monotonic-fast-record", 4, None),
+            _ => panic!("BRUTAL_RECORD_BENCH_MODE must be cached or monotonic"),
+        }
+        return;
+    }
+
     println!("ack-rate arithmetic only:");
     for loss_every in [None, Some(10_000), Some(1_000), Some(100)] {
         run("baseline", baseline_update, loss_every);
@@ -416,6 +440,12 @@ fn main() {
         run_record_bench("cached-second-record", 1, loss_every);
         run_record_bench("pristine-assign-record", 2, loss_every);
         run_record_bench("skip-pristine-rate-record", 3, loss_every);
+        run_record_bench("monotonic-fast-record", 4, loss_every);
+    }
+    println!("record fast-path order-sensitivity check:");
+    for loss_every in [None, Some(1_000), Some(100)] {
+        run_record_bench("monotonic-fast-record-first", 4, loss_every);
+        run_record_bench("skip-pristine-rate-record-second", 3, loss_every);
     }
     println!("window arithmetic:");
     for ack_rate in [1.0, 0.9999, 0.99, 0.9, 0.8] {
@@ -507,6 +537,48 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monotonic_fast_record_matches_cached_path_for_monotonic_callbacks() {
+        let origin = Instant::now();
+        let mut baseline = RecordState::new(origin);
+        let mut optimized = RecordState::new(origin);
+        for event in 0..50_000_u64 {
+            let now = origin + Duration::from_micros(event * 100);
+            let loss = u64::from((event + 1).is_multiple_of(997));
+            baseline.cached_second_record_skip_pristine_rate(now, 1, loss);
+            optimized.cached_second_record_monotonic_fast(now, 1, loss);
+            assert_eq!(baseline.rolling_ack_count, optimized.rolling_ack_count);
+            assert_eq!(baseline.rolling_loss_count, optimized.rolling_loss_count);
+            assert_eq!(baseline.ack_rate, optimized.ack_rate);
+        }
+        assert_eq!(baseline.slots, optimized.slots);
+    }
+
+    #[test]
+    fn monotonic_fast_record_is_not_equivalent_for_backdated_callbacks() {
+        let origin = Instant::now();
+        let mut baseline = RecordState::new(origin);
+        let mut optimized = RecordState::new(origin);
+        for state in [&mut baseline, &mut optimized] {
+            state.cached_second_record_skip_pristine_rate(
+                origin + Duration::from_millis(2_100),
+                1,
+                0,
+            );
+        }
+        baseline.cached_second_record_skip_pristine_rate(
+            origin + Duration::from_millis(1_900),
+            1,
+            0,
+        );
+        optimized.cached_second_record_monotonic_fast(
+            origin + Duration::from_millis(1_900),
+            1,
+            0,
+        );
+        assert_ne!(baseline.slots, optimized.slots);
+    }
 
     #[test]
     fn no_loss_fast_path_matches_baseline() {
