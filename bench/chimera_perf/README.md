@@ -765,6 +765,25 @@ representation rewrite; future traffic-recorder work should isolate
 `per_inbound_user` hashing/key structure first and require a same-probe A/B
 before changing production semantics.
 
+A production-shaped follow-up then tested whether the two inbound-index maps
+could share their outer lookup without changing the public snapshot. Previously
+an identity+inbound record updated `per_inbound_user[inbound][identity]` and
+then separately updated `per_inbound[inbound]`, hashing and looking up the same
+inbound string twice. The optimized internal representation stores inbound
+totals and its per-user map in one `InboundStats` entry, so steady-state records
+perform one inbound lookup and still emit the same `TrafficSnapshot::per_inbound`
+and `per_inbound_user` maps. On CPU 0-3 with four writers, five million
+records/sample, one warmup pair and four measured pairs per process, six
+independent release runs before and after the change reduced the median of the
+borrowed-ref CPU medians from **0.124371 -> 0.115540 s/Mrecord (-7.1%)** for
+`identity-inbound` and from **0.145384 -> 0.135183 (-7.0%)** for full
+Shadowsocks. All six same-position before/after process pairs moved in the
+favorable direction for both shapes. A focused unit test covers two identities
+plus an identity-free record sharing one inbound and verifies that public
+inbound totals and per-inbound-user cardinality remain unchanged. This keeps the
+optimization limited to the internal write-side layout: no interning, unsafe,
+extra lock, or steady-state allocation is introduced.
+
 ## UDP freedom session batching probe
 
 `udp_session_probe` is a Linux-only follow-up that mirrors the hot structure of

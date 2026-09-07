@@ -121,13 +121,18 @@ fn plan_traffic_record<'a>(
 }
 
 #[derive(Debug, Default)]
+struct InboundStats {
+    totals: TransferTotals,
+    per_user: HashMap<String, TransferTotals>,
+}
+
+#[derive(Debug, Default)]
 struct StatsInner {
     total: TransferTotals,
     per_protocol: HashMap<&'static str, TransferTotals>,
     per_identity: HashMap<&'static str, HashMap<String, TransferTotals>>,
-    per_inbound: HashMap<String, TransferTotals>,
+    per_inbound: HashMap<String, InboundStats>,
     per_outbound: HashMap<String, TransferTotals>,
-    per_inbound_user: HashMap<String, HashMap<String, TransferTotals>>,
     known_identities: HashSet<String>,
 }
 
@@ -147,20 +152,27 @@ fn accumulate_string_key(
     true
 }
 
-fn accumulate_nested_string_key(
-    totals: &mut HashMap<String, HashMap<String, TransferTotals>>,
-    outer: &str,
-    inner: &str,
+fn accumulate_inbound(
+    totals: &mut HashMap<String, InboundStats>,
+    inbound: &str,
+    identity: Option<&str>,
     upload: u64,
     download: u64,
 ) {
-    if let Some(inner_totals) = totals.get_mut(outer) {
-        accumulate_string_key(inner_totals, inner, upload, download);
+    if let Some(stats) = totals.get_mut(inbound) {
+        stats.totals.accumulate(upload, download);
+        if let Some(identity) = identity {
+            accumulate_string_key(&mut stats.per_user, identity, upload, download);
+        }
         return;
     }
-    let mut inner_totals = HashMap::new();
-    accumulate_string_key(&mut inner_totals, inner, upload, download);
-    totals.insert(outer.to_owned(), inner_totals);
+
+    let mut stats = InboundStats::default();
+    stats.totals.accumulate(upload, download);
+    if let Some(identity) = identity {
+        accumulate_string_key(&mut stats.per_user, identity, upload, download);
+    }
+    totals.insert(inbound.to_owned(), stats);
 }
 
 impl StatsInner {
@@ -190,18 +202,15 @@ impl StatsInner {
             if identity_inserted && !self.known_identities.contains(identity) {
                 self.known_identities.insert(identity.to_owned());
             }
-            if let Some(inbound_tag) = inbound_tag {
-                accumulate_nested_string_key(
-                    &mut self.per_inbound_user,
-                    inbound_tag,
-                    identity,
-                    upload,
-                    download,
-                );
-            }
         }
         if let Some(tag) = inbound_tag {
-            accumulate_string_key(&mut self.per_inbound, tag, upload, download);
+            accumulate_inbound(
+                &mut self.per_inbound,
+                tag,
+                identity,
+                upload,
+                download,
+            );
         }
         if let Some(tag) = outbound_tag {
             accumulate_string_key(&mut self.per_outbound, tag, upload, download);
@@ -248,10 +257,13 @@ fn merge_stats_into_snapshot(snapshot: &mut TrafficSnapshot, stats: &StatsInner)
                 .merge(totals);
         }
     }
-    merge_string_totals_map(&mut snapshot.per_inbound, &stats.per_inbound);
-    merge_string_totals_map(&mut snapshot.per_outbound, &stats.per_outbound);
-    for (inbound, identities) in &stats.per_inbound_user {
-        for (identity, totals) in identities {
+    for (inbound, inbound_stats) in &stats.per_inbound {
+        snapshot
+            .per_inbound
+            .entry(inbound.clone())
+            .or_default()
+            .merge(&inbound_stats.totals);
+        for (identity, totals) in &inbound_stats.per_user {
             snapshot
                 .per_inbound_user
                 .entry((inbound.clone(), identity.clone()))
@@ -259,6 +271,7 @@ fn merge_stats_into_snapshot(snapshot: &mut TrafficSnapshot, stats: &StatsInner)
                 .merge(totals);
         }
     }
+    merge_string_totals_map(&mut snapshot.per_outbound, &stats.per_outbound);
     snapshot
         .known_identities
         .extend(stats.known_identities.iter().cloned());
@@ -534,6 +547,38 @@ mod tests {
         assert_eq!(snapshot.per_outbound["direct"].connections, 1);
         assert!(snapshot.known_identities.contains("bob"));
     }
+    #[test]
+    fn inbound_totals_and_users_share_internal_entry_without_changing_snapshot() {
+        let mut stats = StatsInner::default();
+        for context in [
+            TrafficContext::new("vless")
+                .with_identity("alice")
+                .with_inbound_tag("edge"),
+            TrafficContext::new("vless")
+                .with_identity("bob")
+                .with_inbound_tag("edge"),
+            TrafficContext::new("dokodemo-door").with_inbound_tag("edge"),
+        ] {
+            stats.apply(plan_traffic_record(&context, 5, 7));
+        }
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.per_inbound["edge"].connections, 3);
+        assert_eq!(snapshot.per_inbound["edge"].upload_bytes, 15);
+        assert_eq!(snapshot.per_inbound["edge"].download_bytes, 21);
+        assert_eq!(
+            snapshot.per_inbound_user[&("edge".to_string(), "alice".to_string())]
+                .connections,
+            1
+        );
+        assert_eq!(
+            snapshot.per_inbound_user[&("edge".to_string(), "bob".to_string())]
+                .connections,
+            1
+        );
+        assert_eq!(snapshot.per_inbound_user.len(), 2);
+    }
+
     #[test]
     fn known_identity_remains_deduplicated_across_protocol_maps() {
         let mut stats = StatsInner::default();
