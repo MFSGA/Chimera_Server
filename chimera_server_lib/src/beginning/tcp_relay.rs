@@ -243,9 +243,6 @@ where
     let copy_buffer = configured_copy_buffer();
     let size = copy_buffer.size;
     let backend = configured_relay_backend();
-    #[cfg(target_os = "linux")]
-    let _auto_guard =
-        matches!(backend, RelayBackend::Auto).then(AutoRelayGuard::acquire);
     match backend {
         RelayBackend::Copy => {
             let (left_to_right, right_to_left) =
@@ -448,24 +445,28 @@ where
             left_to_right,
             right_to_left,
         } => {
-            if auto_connection_limit.is_some_and(|limit| {
-                limit == 0 || ACTIVE_AUTO_RELAYS.load(Ordering::Acquire) > limit
-            }) {
-                return continue_userspace_copy(
-                    left,
-                    right,
-                    buffer_size,
-                    configured_backend,
-                    RelayFallbackReason::AutoConnectionLimit,
-                    left_to_right,
-                    right_to_left,
-                )
-                .await;
-            }
+            let auto_guard = if let Some(limit) = auto_connection_limit {
+                let Some(guard) = AutoRelayGuard::try_acquire(limit) else {
+                    return continue_userspace_copy(
+                        left,
+                        right,
+                        buffer_size,
+                        configured_backend,
+                        RelayFallbackReason::AutoConnectionLimit,
+                        left_to_right,
+                        right_to_left,
+                    )
+                    .await;
+                };
+                Some(guard)
+            } else {
+                None
+            };
 
             let (Some(left_fd), Some(right_fd)) =
                 (left.raw_tcp_fd(), right.raw_tcp_fd())
             else {
+                drop(auto_guard);
                 warn!(
                     "raw relay became ready without both TCP fds; falling back to copy"
                 );
@@ -488,6 +489,7 @@ where
             ) {
                 Ok(direction) => direction,
                 Err(error) => {
+                    drop(auto_guard);
                     warn!(%error, "failed to initialize downlink splice; falling back to copy");
                     return continue_userspace_copy(
                         left,
@@ -662,9 +664,18 @@ struct AutoRelayGuard;
 
 #[cfg(target_os = "linux")]
 impl AutoRelayGuard {
-    fn acquire() -> Self {
-        ACTIVE_AUTO_RELAYS.fetch_add(1, Ordering::AcqRel);
-        Self
+    fn try_acquire(limit: usize) -> Option<Self> {
+        if limit == 0 {
+            return None;
+        }
+
+        let previous = ACTIVE_AUTO_RELAYS.fetch_add(1, Ordering::AcqRel);
+        if previous >= limit {
+            ACTIVE_AUTO_RELAYS.fetch_sub(1, Ordering::AcqRel);
+            None
+        } else {
+            Some(Self)
+        }
     }
 }
 
@@ -1487,12 +1498,18 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn adaptive_relay_guard_tracks_and_releases_active_connections() {
+    fn adaptive_relay_guard_reserves_only_available_slots() {
         assert_eq!(ACTIVE_AUTO_RELAYS.load(Ordering::Acquire), 0);
-        let first = AutoRelayGuard::acquire();
+        assert!(AutoRelayGuard::try_acquire(0).is_none());
+        assert_eq!(ACTIVE_AUTO_RELAYS.load(Ordering::Acquire), 0);
+
+        let first = AutoRelayGuard::try_acquire(2).expect("first slot available");
         assert_eq!(ACTIVE_AUTO_RELAYS.load(Ordering::Acquire), 1);
-        let second = AutoRelayGuard::acquire();
+        let second = AutoRelayGuard::try_acquire(2).expect("second slot available");
         assert_eq!(ACTIVE_AUTO_RELAYS.load(Ordering::Acquire), 2);
+        assert!(AutoRelayGuard::try_acquire(2).is_none());
+        assert_eq!(ACTIVE_AUTO_RELAYS.load(Ordering::Acquire), 2);
+
         drop(first);
         assert_eq!(ACTIVE_AUTO_RELAYS.load(Ordering::Acquire), 1);
         drop(second);

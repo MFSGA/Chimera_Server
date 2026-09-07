@@ -122,7 +122,7 @@ The target and generator support `--worker-threads` so each process can be pinne
 `CHIMERA_TCP_RELAY_BACKEND` accepts:
 
 - `handoff`: safe general-purpose path. It uses the handoff barrier, then continues with userspace copy.
-- `auto`: Linux low-concurrency optimization. It uses downlink splice only while the number of active auto-relay connections is at or below `CHIMERA_TCP_AUTO_MAX_CONNECTIONS`; otherwise it falls back to handoff.
+- `auto`: Linux low-concurrency optimization. It uses downlink splice only while the number of active raw-TCP splice-downlink relays is below `CHIMERA_TCP_AUTO_MAX_CONNECTIONS`; otherwise it falls back to handoff. Connections still in the handoff prelude do not consume a splice slot.
 - `splice-downlink`: always splice target-to-client traffic while keeping client-to-target traffic in userspace. This mirrors the currently enabled direction in Xray.
 - `splice`: experimental full bidirectional splice. It is retained for diagnostics and must not be selected as a production default without new data.
 - `copy`: legacy direct Tokio bidirectional copy, retained only as a control. It does not provide the handoff flush barrier required by REALITY Vision.
@@ -145,6 +145,10 @@ Current fallback values are:
 - `splice-initialization`: pipe or splice-direction initialization failed and the connection safely continued with userspace copy.
 
 These fields make `auto` suitable for controlled production observation: operators can aggregate actual splice hit rate and fallback causes instead of assuming the configured backend was used.
+
+A September 2026 slot-scope review found that the original `auto` guard was acquired before `copy_until_raw_ready`, so protocol-wrapped connections that were still in the handoff prelude consumed the same global limit as relays already holding a splice pipe. Under the default limit of eight, eight slow prelude sessions could therefore force a ninth raw-ready long flow onto userspace copy even though none of the first eight used splice resources. The production guard now reserves a slot only after both streams report raw TCP readiness, before preserving the existing fd/fallback classification order; the reservation itself is atomic, so an over-limit contender immediately releases its increment instead of relying on a separate load. A focused unit test covers zero-limit, exact-limit, over-limit, and release behavior.
+
+The change is supported by the existing production-shaped short-flow relay probe rather than by atomic microbenchmarks. Ten CPU-0-7-pinned c64 independent-process pairs at 256 KiB/flow alternated `copy` and `splice-downlink`. Splice-downlink used less CPU in **10/10** pairs; the paired CPU/flow ratio had a **0.792x median** (range **0.736x-0.927x**), with medians of about **289.5 us/flow** versus **363.3 us/flow** for copy. Wall-time/throughput remained scheduler-noisy and is not used for the decision. The optimization therefore targets a policy misclassification that can discard an already-measured CPU-efficient relay path once a flow is in the splice benefit range; it does not claim that the slot counter itself is a data-plane CPU hotspot.
 
 External-process E2E suites should be run with one test thread:
 
