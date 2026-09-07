@@ -610,10 +610,6 @@ mod linux {
         if args.destination_drain_mode != DestinationDrainMode::Single
             && (args.second_rate_bytes_per_sec.is_some()
                 || !args.rate_updates_bytes_per_sec.is_empty()
-                || args.notsent_lowat_bytes.is_some()
-                || args.notsent_lowat_ms.is_some()
-                || args.notsent_lowat_min_bytes.is_some()
-                || args.notsent_lowat_max_bytes.is_some()
                 || args.notsent_lowat_update_threshold_percent != 0.0
                 || args.notsent_lowat_gate_decreases_only
                 || args.adaptive_notsent_lowat_bytes.is_some()
@@ -621,7 +617,7 @@ mod linux {
                 || args.sample_rate_decrease_recovery)
         {
             bail!(
-                "--destination-drain-mode until-would-block supports only steady pacing or --unpaced"
+                "non-single --destination-drain-mode supports only steady pacing with optional static TCP_NOTSENT_LOWAT, or --unpaced"
             );
         }
         if args.unpaced
@@ -1747,9 +1743,10 @@ mod linux {
         }
 
         #[test]
-        fn destination_drain_until_would_block_rejects_dynamic_pacing() {
+        fn destination_drain_modes_allow_static_lowat_but_reject_dynamic_pacing() {
             let mut args = base_args();
             args.destination_drain_mode = DestinationDrainMode::TwoSplices;
+            args.notsent_lowat_ms = Some(32);
             assert!(validate_args(&args).is_ok());
             args.destination_drain_mode = DestinationDrainMode::UntilWouldBlock;
             assert!(validate_args(&args).is_ok());
@@ -1758,6 +1755,7 @@ mod linux {
             assert!(validate_args(&args).is_err());
             args.second_rate_bytes_per_sec = None;
 
+            args.notsent_lowat_ms = None;
             args.unpaced = true;
             assert!(validate_args(&args).is_ok());
         }
