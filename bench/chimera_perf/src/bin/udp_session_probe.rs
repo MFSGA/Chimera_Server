@@ -46,11 +46,53 @@ mod linux {
         Mmsg,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+    #[serde(rename_all = "kebab-case")]
+    enum BatchPath {
+        UplinkOnly,
+        DownlinkRecvOnly,
+        DownlinkSendOnly,
+        DownlinkFull,
+        Full,
+    }
+
+    impl BatchPath {
+        fn uplink_batched(self) -> bool {
+            matches!(self, Self::UplinkOnly | Self::Full)
+        }
+
+        fn downlink_receive_batched(self) -> bool {
+            matches!(
+                self,
+                Self::DownlinkRecvOnly | Self::DownlinkFull | Self::Full
+            )
+        }
+
+        fn downlink_send_batched(self) -> bool {
+            matches!(
+                self,
+                Self::DownlinkSendOnly | Self::DownlinkFull | Self::Full
+            )
+        }
+
+        fn downlink_collects_batch(self) -> bool {
+            matches!(
+                self,
+                Self::DownlinkRecvOnly
+                    | Self::DownlinkSendOnly
+                    | Self::DownlinkFull
+                    | Self::Full
+            )
+        }
+    }
+
     #[derive(Debug, Parser)]
     #[command(about = "Production-shaped Tokio freedom UDP session batching probe")]
     struct Args {
         #[arg(long, value_enum)]
         backend: Backend,
+        #[arg(long, value_enum)]
+        batch_path: Option<BatchPath>,
         #[arg(long, default_value_t = 8)]
         worker_threads: usize,
         #[arg(long, default_value_t = 300_000)]
@@ -59,6 +101,10 @@ mod linux {
         datagram_size: usize,
         #[arg(long, default_value_t = 16)]
         batch_size: usize,
+        #[arg(long)]
+        uplink_batch_size: Option<usize>,
+        #[arg(long)]
+        downlink_batch_size: Option<usize>,
         #[arg(long, default_value_t = DEFAULT_CHANNEL_CAPACITY)]
         channel_capacity: usize,
         #[arg(long, default_value_t = DEFAULT_CHANNEL_CAPACITY)]
@@ -222,12 +268,15 @@ mod linux {
                 "schema_version": 1,
                 "record_type": "summary",
                 "backend": args.backend,
+                "batch_path": effective_batch_path(&args),
                 "worker_threads": args.worker_threads,
                 "runs": args.runs,
                 "warmup_runs": args.warmup,
                 "packets": args.packets,
                 "datagram_size": args.datagram_size,
                 "batch_size": args.batch_size,
+                "uplink_batch_size": effective_uplink_batch_size(&args),
+                "downlink_batch_size": effective_downlink_batch_size(&args),
                 "channel_capacity": args.channel_capacity,
                 "inflight_window": args.inflight_window,
                 "idle_timeout_ms": args.idle_timeout_ms,
@@ -274,7 +323,29 @@ mod linux {
         Ok(())
     }
 
+    fn effective_batch_path(args: &Args) -> Option<BatchPath> {
+        match args.backend {
+            Backend::Single => None,
+            Backend::Mmsg => Some(args.batch_path.unwrap_or(BatchPath::Full)),
+        }
+    }
+
+    fn effective_uplink_batch_size(args: &Args) -> usize {
+        args.uplink_batch_size.unwrap_or(args.batch_size)
+    }
+
+    fn effective_downlink_batch_size(args: &Args) -> usize {
+        args.downlink_batch_size.unwrap_or(args.batch_size)
+    }
+
     fn validate_args(args: &Args) -> Result<()> {
+        if args.backend == Backend::Single
+            && (args.batch_path.is_some()
+                || args.uplink_batch_size.is_some()
+                || args.downlink_batch_size.is_some())
+        {
+            bail!("batch controls require --backend mmsg");
+        }
         if args.worker_threads == 0 {
             bail!("--worker-threads must be greater than zero");
         }
@@ -286,6 +357,18 @@ mod linux {
         }
         if args.batch_size == 0 || args.batch_size > MAX_BATCH_SIZE {
             bail!("--batch-size must be between 1 and {MAX_BATCH_SIZE}");
+        }
+        if args
+            .uplink_batch_size
+            .is_some_and(|size| size == 0 || size > MAX_BATCH_SIZE)
+        {
+            bail!("--uplink-batch-size must be between 1 and {MAX_BATCH_SIZE}");
+        }
+        if args
+            .downlink_batch_size
+            .is_some_and(|size| size == 0 || size > MAX_BATCH_SIZE)
+        {
+            bail!("--downlink-batch-size must be between 1 and {MAX_BATCH_SIZE}");
         }
         if args.channel_capacity == 0 {
             bail!("--channel-capacity must be greater than zero");
@@ -373,7 +456,7 @@ mod linux {
         let cpu_before = cpu_seconds()?;
         let started = Instant::now();
         let stats = run_session(
-            args.backend,
+            effective_batch_path(args),
             &outbound_socket,
             &server_socket,
             receiver,
@@ -461,7 +544,7 @@ mod linux {
     }
 
     async fn run_session(
-        backend: Backend,
+        batch_path: Option<BatchPath>,
         outbound_socket: &UdpSocket,
         server_socket: &UdpSocket,
         mut receiver: mpsc::Receiver<Vec<u8>>,
@@ -470,8 +553,11 @@ mod linux {
         let idle_timeout = Duration::from_millis(args.idle_timeout_ms);
         let mut idle = Box::pin(sleep(idle_timeout));
         let mut stats = SessionStats::default();
-        let mut response_batch = MmsgBatch::new(args.batch_size, args.datagram_size);
-        let mut channel_batch = Vec::with_capacity(args.batch_size);
+        let uplink_batch_size = effective_uplink_batch_size(args);
+        let downlink_batch_size = effective_downlink_batch_size(args);
+        let mut response_batch =
+            MmsgBatch::new(downlink_batch_size, args.datagram_size);
+        let mut channel_batch = Vec::with_capacity(uplink_batch_size);
 
         while stats.downlink_packets < args.packets as u64 {
             tokio::select! {
@@ -486,47 +572,49 @@ mod linux {
                     let Some(payload) = maybe_payload else {
                         bail!("session channel closed before all packets were sent");
                     };
-                    match backend {
-                        Backend::Single => {
-                            if outbound_socket
-                                .send(&payload)
-                                .await
-                                .context("single session uplink send failed")?
-                                != payload.len()
-                            {
-                                bail!("short UDP uplink send");
+                    if batch_path.is_some_and(BatchPath::uplink_batched) {
+                        channel_batch.clear();
+                        channel_batch.push(payload);
+                        while channel_batch.len() < uplink_batch_size {
+                            match receiver.try_recv() {
+                                Ok(payload) => channel_batch.push(payload),
+                                Err(mpsc::error::TryRecvError::Empty) => break,
+                                Err(mpsc::error::TryRecvError::Disconnected) => break,
                             }
-                            stats.record_uplink(1, 1);
                         }
-                        Backend::Mmsg => {
-                            channel_batch.clear();
-                            channel_batch.push(payload);
-                            while channel_batch.len() < args.batch_size {
-                                match receiver.try_recv() {
-                                    Ok(payload) => channel_batch.push(payload),
-                                    Err(mpsc::error::TryRecvError::Empty) => break,
-                                    Err(mpsc::error::TryRecvError::Disconnected) => break,
-                                }
-                            }
-                            let calls = send_vec_batch(outbound_socket, &channel_batch).await?;
-                            stats.record_uplink(channel_batch.len(), calls);
+                        let calls = send_vec_batch(outbound_socket, &channel_batch).await?;
+                        stats.record_uplink(channel_batch.len(), calls);
+                    } else {
+                        if outbound_socket
+                            .send(&payload)
+                            .await
+                            .context("single session uplink send failed")?
+                            != payload.len()
+                        {
+                            bail!("short UDP uplink send");
                         }
+                        stats.record_uplink(1, 1);
                     }
                     reset_idle(&mut idle, idle_timeout);
                 }
                 response = receive_responses(
-                    backend,
+                    batch_path,
                     outbound_socket,
                     &mut response_batch,
-                    args.batch_size,
+                    downlink_batch_size,
                 ) => {
                     let (received, receive_calls) = response?;
                     if received == 0 {
                         bail!("UDP response receive returned zero datagrams");
                     }
-                    let send_calls = match backend {
-                        Backend::Single => {
-                            let payload = response_batch.buffer(0);
+                    let send_calls = if batch_path
+                        .is_some_and(BatchPath::downlink_send_batched)
+                    {
+                        send_buffer_batch(server_socket, &mut response_batch, received).await?
+                    } else {
+                        let mut calls = 0usize;
+                        for index in 0..received {
+                            let payload = response_batch.buffer(index);
                             if server_socket
                                 .send(payload)
                                 .await
@@ -535,11 +623,9 @@ mod linux {
                             {
                                 bail!("short UDP downlink send");
                             }
-                            1
+                            calls = calls.saturating_add(1);
                         }
-                        Backend::Mmsg => {
-                            send_buffer_batch(server_socket, &mut response_batch, received).await?
-                        }
+                        calls
                     };
                     stats.record_downlink(received, receive_calls, send_calls);
                     reset_idle(&mut idle, idle_timeout);
@@ -554,37 +640,76 @@ mod linux {
     }
 
     async fn receive_responses(
-        backend: Backend,
+        batch_path: Option<BatchPath>,
         socket: &UdpSocket,
         batch: &mut MmsgBatch,
         batch_size: usize,
     ) -> Result<(usize, usize)> {
-        match backend {
-            Backend::Single => {
-                let received = socket
-                    .recv(batch.buffer_mut(0))
-                    .await
-                    .context("single session response receive failed")?;
-                batch.set_len(0, received);
-                Ok((1, 1))
-            }
-            Backend::Mmsg => {
-                let mut calls = 0usize;
-                loop {
-                    socket.readable().await?;
-                    let result = socket.try_io(Interest::READABLE, || {
-                        batch.recv_nonblocking(socket.as_raw_fd(), batch_size)
-                    });
-                    calls = calls.saturating_add(1);
-                    match result {
-                        Ok(received) => return Ok((received, calls)),
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            continue;
-                        }
-                        Err(error) => return Err(error.into()),
+        if batch_path.is_some_and(BatchPath::downlink_receive_batched) {
+            let mut calls = 0usize;
+            loop {
+                socket.readable().await?;
+                let result = socket.try_io(Interest::READABLE, || {
+                    batch.recv_nonblocking(socket.as_raw_fd(), batch_size)
+                });
+                calls = calls.saturating_add(1);
+                match result {
+                    Ok(received) => return Ok((received, calls)),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        continue;
                     }
+                    Err(error) => return Err(error.into()),
                 }
             }
+        }
+
+        let received = socket
+            .recv(batch.buffer_mut(0))
+            .await
+            .context("single session response receive failed")?;
+        batch.set_len(0, received);
+        let mut count = 1usize;
+        let mut calls = 1usize;
+
+        if batch_path.is_some_and(BatchPath::downlink_collects_batch) {
+            while count < batch_size {
+                match recv_one_nonblocking(
+                    socket.as_raw_fd(),
+                    batch.buffer_mut(count),
+                ) {
+                    Ok(received) => {
+                        batch.set_len(count, received);
+                        count += 1;
+                        calls += 1;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        calls += 1;
+                        break;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+
+        Ok((count, calls))
+    }
+
+    fn recv_one_nonblocking(
+        fd: libc::c_int,
+        buffer: &mut [u8],
+    ) -> io::Result<usize> {
+        let result = unsafe {
+            libc::recv(
+                fd,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if result >= 0 {
+            Ok(result as usize)
+        } else {
+            Err(io::Error::last_os_error())
         }
     }
 
@@ -1050,10 +1175,13 @@ mod linux {
         fn args(backend: Backend) -> Args {
             Args {
                 backend,
+                batch_path: None,
                 worker_threads: 2,
                 packets: 1024,
                 datagram_size: 256,
                 batch_size: 16,
+                uplink_batch_size: None,
+                downlink_batch_size: None,
                 channel_capacity: DEFAULT_CHANNEL_CAPACITY,
                 inflight_window: DEFAULT_CHANNEL_CAPACITY,
                 idle_timeout_ms: 1000,
@@ -1076,6 +1204,51 @@ mod linux {
             value.channel_capacity = DEFAULT_CHANNEL_CAPACITY;
             value.inflight_window = 0;
             assert!(validate_args(&value).is_err());
+            value.inflight_window = DEFAULT_CHANNEL_CAPACITY;
+            value.uplink_batch_size = Some(0);
+            assert!(validate_args(&value).is_err());
+            value.uplink_batch_size = Some(8);
+            value.downlink_batch_size = Some(MAX_BATCH_SIZE + 1);
+            assert!(validate_args(&value).is_err());
+
+            let mut single = args(Backend::Single);
+            single.batch_path = Some(BatchPath::UplinkOnly);
+            assert!(validate_args(&single).is_err());
+        }
+
+        #[test]
+        fn split_batch_sizes_override_legacy_batch_size() {
+            let mut value = args(Backend::Mmsg);
+            assert_eq!(effective_uplink_batch_size(&value), value.batch_size);
+            assert_eq!(effective_downlink_batch_size(&value), value.batch_size);
+            value.uplink_batch_size = Some(8);
+            value.downlink_batch_size = Some(32);
+            assert_eq!(effective_uplink_batch_size(&value), 8);
+            assert_eq!(effective_downlink_batch_size(&value), 32);
+        }
+
+        #[test]
+        fn batch_paths_enable_only_the_requested_components() {
+            assert!(BatchPath::UplinkOnly.uplink_batched());
+            assert!(!BatchPath::UplinkOnly.downlink_receive_batched());
+            assert!(!BatchPath::UplinkOnly.downlink_send_batched());
+
+            assert!(!BatchPath::DownlinkRecvOnly.uplink_batched());
+            assert!(BatchPath::DownlinkRecvOnly.downlink_receive_batched());
+            assert!(!BatchPath::DownlinkRecvOnly.downlink_send_batched());
+
+            assert!(!BatchPath::DownlinkSendOnly.uplink_batched());
+            assert!(!BatchPath::DownlinkSendOnly.downlink_receive_batched());
+            assert!(BatchPath::DownlinkSendOnly.downlink_send_batched());
+            assert!(BatchPath::DownlinkSendOnly.downlink_collects_batch());
+
+            assert!(!BatchPath::DownlinkFull.uplink_batched());
+            assert!(BatchPath::DownlinkFull.downlink_receive_batched());
+            assert!(BatchPath::DownlinkFull.downlink_send_batched());
+
+            assert!(BatchPath::Full.uplink_batched());
+            assert!(BatchPath::Full.downlink_receive_batched());
+            assert!(BatchPath::Full.downlink_send_batched());
         }
 
         #[test]
@@ -1110,8 +1283,14 @@ mod linux {
                 let server =
                     UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
                 let (_sender, receiver) = mpsc::channel(value.channel_capacity);
-                run_session(value.backend, &outbound, &server, receiver, &value)
-                    .await
+                run_session(
+                    effective_batch_path(&value),
+                    &outbound,
+                    &server,
+                    receiver,
+                    &value,
+                )
+                .await
             });
             assert!(result.unwrap_err().to_string().contains("session expired"));
         }
@@ -1132,6 +1311,35 @@ mod linux {
             assert!(sample.max_uplink_batch_packets <= value.batch_size as u64);
             assert!(sample.max_downlink_batch_packets <= value.batch_size as u64);
             assert!(sample.max_consecutive_uplink_packets <= value.packets as u64);
+        }
+
+        #[test]
+        fn sliced_batch_paths_preserve_unbatched_sides() {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_io()
+                .enable_time()
+                .build()
+                .unwrap();
+
+            let mut uplink = args(Backend::Mmsg);
+            uplink.batch_path = Some(BatchPath::UplinkOnly);
+            let sample = runtime.block_on(run_once(&uplink)).unwrap();
+            assert_eq!(sample.max_downlink_batch_packets, 1);
+            assert_eq!(sample.downlink_receive_calls, uplink.packets as u64);
+            assert_eq!(sample.downlink_send_calls, uplink.packets as u64);
+
+            let mut recv_only = args(Backend::Mmsg);
+            recv_only.batch_path = Some(BatchPath::DownlinkRecvOnly);
+            let sample = runtime.block_on(run_once(&recv_only)).unwrap();
+            assert_eq!(sample.max_uplink_batch_packets, 1);
+            assert_eq!(sample.downlink_send_calls, recv_only.packets as u64);
+
+            let mut send_only = args(Backend::Mmsg);
+            send_only.batch_path = Some(BatchPath::DownlinkSendOnly);
+            let sample = runtime.block_on(run_once(&send_only)).unwrap();
+            assert_eq!(sample.max_uplink_batch_packets, 1);
+            assert!(sample.downlink_send_calls <= send_only.packets as u64);
         }
     }
 }

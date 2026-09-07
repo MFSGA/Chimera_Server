@@ -626,11 +626,15 @@ production from this result alone.
 `run_freedom_udp_session`: a bounded Tokio `mpsc` request channel, an idle
 timer, an unbiased bidirectional `tokio::select!`, a connected outbound UDP
 socket, and a second UDP send for responses. `single` keeps one datagram per
-channel/socket operation. `mmsg` drains at most `--batch-size` channel entries,
-uses nonblocking `sendmmsg` for the uplink, `recvmmsg` for target responses,
-and `sendmmsg` for the response socket. The batch size is bounded and reported
-explicitly; correctness tests verify request/response payload boundaries and
-the quiet-session idle timeout.
+channel/socket operation. `mmsg` defaults to the original full-batching model,
+but `--batch-path` can now isolate `uplink-only`, `downlink-recv-only`,
+`downlink-send-only`, `downlink-full`, or `full`. `--uplink-batch-size` and
+`--downlink-batch-size` override the legacy shared `--batch-size` while leaving
+its old behavior unchanged when omitted. This makes it possible to attribute
+channel draining, target `recvmmsg`, and response `sendmmsg` independently.
+Batch sizes are bounded and reported explicitly; correctness tests verify
+request/response payload boundaries, component isolation, split-size
+validation, and the quiet-session idle timeout.
 
 The external echo target and sink use batched blocking syscalls so they do not
 intentionally become the measured hot path. A separate `--inflight-window`
@@ -683,12 +687,40 @@ versus **64,433** for `mmsg-16` (about **-84.8%**). `epoll_wait` fell from
 still removes real network/reactor calls after adding the production-shaped
 `mpsc`/timer/`select!` state machine.
 
-Keep this benchmark-only for now. The real freedom session also performs
+The component follow-up shows that the full result is strongly **synergistic**
+rather than the sum of three independent wins. In a same-binary 50k-packet
+`strace -f -c` attribution, `single` made about **425,843** tracked network and
+reactor calls. `uplink-only` made **384,095** (-9.8%), `downlink-recv-only`
+**361,079** (-15.2%), `downlink-send-only` **330,146** (-22.5%), and
+`downlink-full` **291,027** (-31.7%). Only coordinated `full` batching reached
+about **66,123** calls (-84.5%). The corresponding 100k randomized component
+matrix was too noisy for throughput claims (most absolute CPU/packet-rate CVs
+were above 3%), but the mechanism counters were stable: uplink-only averaged
+only about **1.62 packets/sendmmsg**, either isolated downlink component about
+**2.8 packets/batched call**, and `downlink-full` still only about **2.77**.
+`full` instead sustained roughly **12.7 uplink** and **15.8 downlink packets per
+socket call**. Uplink bursting therefore creates the response burst that makes
+the downlink batching efficient; there is no current evidence that one narrow
+component can be enabled independently and retain most of the full benefit.
+
+A split batch-size sweep narrows that coordination requirement. With downlink
+fixed at 16, uplink batches of 2/4/8/16 produced roughly **5.0/8.9/14.0/15.75**
+downlink packets per batched call. Focused 50k `strace` runs counted about
+**172,020 / 104,806 / 74,209 / 66,596** tracked calls respectively. Relative
+to the same `single` baseline, uplink=8/downlink=16 therefore captures roughly
+**98% of the syscall reduction** achieved by 16/16, while bounding each uplink
+channel drain at eight packets. This is a useful future fairness/semantics
+candidate, not accepted throughput evidence: a formal 3-warmup/10-run 8/16
+sample still had **5.6% packet-rate CV** and **3.85% CPU CV**, above the
+repository threshold.
+
+Keep all of this benchmark-only for now. The real freedom session also performs
 traffic accounting, uses an unconnected outbound socket with response-address
-validation, and sends responses through a server socket shared by sessions.
-A full `mmsg` production patch would change uplink channel draining, target
-receive behavior, and shared-socket response sending at once, making failure
-and concurrency semantics difficult to isolate. The next useful experiment is
-to split the probe into uplink-only and downlink-only batching and identify the
-smallest slice that retains most of the syscall/CPU benefit before considering
-a Linux production helper.
+validation, and sends responses through a server socket shared by multiple
+sessions; this probe's response socket remains single-session and connected.
+The decomposition now shows that the large syscall win requires coordinated
+uplink and downlink batching, so a supposedly "small" production patch would
+not retain most of the measured benefit. Before introducing a Linux helper,
+the next useful experiment is multi-session contention on one shared response
+socket using the more conservative 8-uplink/16-downlink candidate, including
+per-session fairness and partial/error semantics.
