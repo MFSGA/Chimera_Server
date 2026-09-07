@@ -614,11 +614,79 @@ versus **40,161** for `mmsg` (about **-85.8%**). `epoll_wait` fell from about
 its reduced datagram syscalls into materially fewer reactor waits rather than
 merely moving work into userspace.
 
-This remains benchmark-only. The current production UDP freedom/session paths
-also include `mpsc`, idle timers, routing/traffic accounting, and bidirectional
-`select!` fairness; batch fill and fairness have not yet been measured through
-that full state machine. Do not wire `recvmmsg`/`sendmmsg` into production from
-this socket-only result alone. The next production-facing experiment should
-mirror one real session loop and prove that bounded batching preserves message
-ordering, idle-timeout behavior, response fairness, and Xray/shoes-compatible
-session semantics.
+This remains benchmark-only. The socket-only result motivated the separate
+production-shaped session probe below; do not wire `recvmmsg`/`sendmmsg` into
+production from this result alone.
+
+## UDP freedom session batching probe
+
+`udp_session_probe` is a Linux-only follow-up that mirrors the hot structure of
+`run_freedom_udp_session`: a bounded Tokio `mpsc` request channel, an idle
+timer, an unbiased bidirectional `tokio::select!`, a connected outbound UDP
+socket, and a second UDP send for responses. `single` keeps one datagram per
+channel/socket operation. `mmsg` drains at most `--batch-size` channel entries,
+uses nonblocking `sendmmsg` for the uplink, `recvmmsg` for target responses,
+and `sendmmsg` for the response socket. The batch size is bounded and reported
+explicitly; correctness tests verify request/response payload boundaries and
+the quiet-session idle timeout.
+
+The external echo target and sink use batched blocking syscalls so they do not
+intentionally become the measured hot path. A separate `--inflight-window`
+(default 64, matching the production session channel capacity) throttles only
+the source harness using sink progress. This is required for a no-loss
+loopback comparison: without the harness window a 20k-packet single-session
+smoke run could enqueue all 20k uplink packets but forward only about 13.4k
+responses before the default UDP receive queue overflowed and the idle timer
+expired. The window is therefore measurement scaffolding, not a proposed
+production flow-control rule.
+
+Build and verify both paths first:
+
+```bash
+cargo build --release --manifest-path bench/chimera_perf/Cargo.toml \
+  --bin udp_session_probe
+for backend in single mmsg; do
+  taskset -c 0-7 bench/chimera_perf/target/release/udp_session_probe \
+    --backend "$backend" --worker-threads 8 \
+    --packets 100000 --datagram-size 1200 --batch-size 16 \
+    --channel-capacity 64 --inflight-window 64 \
+    --warmup 3 --runs 10 --verify
+done
+```
+
+On the September 2026 host, the formal 3-warmup/10-run sample gave `single`
+**78.4k packets/s** (CV **2.98%**) and **29.00 CPU seconds/Mpkt** (CV
+**1.93%**). `mmsg-16` gave **86.0k packets/s** (about +9.6%) and **23.50 CPU
+seconds/Mpkt** (about -19.0%), with average observed batch fill around **12.7
+uplink packets** and **15.7 downlink packets** per socket call. However, the
+batched run's packet-rate CV was **3.54%** and CPU CV **3.12%**, both just over
+the repository's 3% acceptance threshold. A second ten-pair interleaved run
+remained noisy for both backends (roughly 4.7% single and 6.0% mmsg packet-rate
+CV), so the median speedup is not accepted as stable production evidence.
+
+The fairness counters also reject one early concern but do not prove Internet
+fairness: under the 64-packet no-loss harness both `single` and `mmsg-16`
+reached a maximum steady outstanding count of 64 and a maximum steady
+consecutive-uplink count of 64. In other words, the existing always-ready
+channel plus unbiased `select!` can already fill the window one packet at a
+time; batching did not worsen these particular extrema. More representative
+latency/fairness testing would still be required before changing the real
+session loop.
+
+Syscall evidence is much stronger than wall-time evidence. A focused
+50k-packet `strace -f -c` counted **424,418** tracked
+`recvfrom/sendto/recvmmsg/sendmmsg/epoll_wait/epoll_ctl` calls for `single`
+versus **64,433** for `mmsg-16` (about **-84.8%**). `epoll_wait` fell from
+**135,711** to **31,278** calls (about **-77.0%**). This confirms that batching
+still removes real network/reactor calls after adding the production-shaped
+`mpsc`/timer/`select!` state machine.
+
+Keep this benchmark-only for now. The real freedom session also performs
+traffic accounting, uses an unconnected outbound socket with response-address
+validation, and sends responses through a server socket shared by sessions.
+A full `mmsg` production patch would change uplink channel draining, target
+receive behavior, and shared-socket response sending at once, making failure
+and concurrency semantics difficult to isolate. The next useful experiment is
+to split the probe into uplink-only and downlink-only batching and identify the
+smallest slice that retains most of the syscall/CPU benefit before considering
+a Linux production helper.
