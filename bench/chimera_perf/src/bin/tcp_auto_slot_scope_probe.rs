@@ -29,6 +29,7 @@ mod linux {
     use tokio::{
         io::unix::AsyncFd,
         io::{AsyncReadExt, AsyncWriteExt},
+        sync::Barrier,
     };
 
     const PATTERN_BYTE: u8 = 0x5a;
@@ -77,6 +78,9 @@ mod linux {
         #[arg(long, default_value_t = 20)]
         slow_prelude_ms: u64,
 
+        #[arg(long)]
+        synchronize_ready: bool,
+
         #[arg(long, default_value_t = 1)]
         warmup: usize,
 
@@ -106,6 +110,7 @@ mod linux {
         copy_buffer_size: usize,
         splice_pipe_size: usize,
         prefix_bytes: usize,
+        synchronize_ready: bool,
         verify: bool,
         elapsed_seconds: f64,
         elapsed_us_per_connection: f64,
@@ -128,6 +133,7 @@ mod linux {
         copy_buffer_size: usize,
         splice_pipe_size: usize,
         prefix_bytes: usize,
+        synchronize_ready: bool,
         runs: usize,
         warmup_runs: usize,
         elapsed_us_per_connection_median: f64,
@@ -190,6 +196,7 @@ mod linux {
                 copy_buffer_size: args.copy_buffer_size,
                 splice_pipe_size: args.splice_pipe_size,
                 prefix_bytes: args.prefix_bytes,
+                synchronize_ready: args.synchronize_ready,
                 runs: args.runs,
                 warmup_runs: args.warmup,
                 elapsed_us_per_connection_median: round(median(&elapsed)),
@@ -249,6 +256,9 @@ mod linux {
         let started = Instant::now();
         let mut tasks = Vec::with_capacity(args.connections);
         let active_slots = Arc::new(AtomicUsize::new(0));
+        let ready_barrier = args
+            .synchronize_ready
+            .then(|| Arc::new(Barrier::new(args.connections)));
         if args.backend == Backend::AutoBeforePrelude {
             active_slots.store(
                 args.slow_prelude_connections.min(args.auto_slot_limit),
@@ -268,8 +278,9 @@ mod linux {
                 slow_prelude_ms: args.slow_prelude_ms,
             };
             let active_slots = Arc::clone(&active_slots);
+            let ready_barrier = ready_barrier.clone();
             tasks.push(tokio::spawn(async move {
-                run_flow(flow, flow_index, config, active_slots).await
+                run_flow(flow, flow_index, config, active_slots, ready_barrier).await
             }));
         }
         let mut splice_hits = 0usize;
@@ -300,6 +311,7 @@ mod linux {
             copy_buffer_size: args.copy_buffer_size,
             splice_pipe_size: args.splice_pipe_size,
             prefix_bytes: args.prefix_bytes,
+            synchronize_ready: args.synchronize_ready,
             verify: args.verify,
             elapsed_seconds: round(elapsed),
             elapsed_us_per_connection: round(
@@ -390,6 +402,7 @@ mod linux {
         flow_index: usize,
         config: FlowRunConfig,
         active_slots: Arc<AtomicUsize>,
+        ready_barrier: Option<Arc<Barrier>>,
     ) -> io::Result<EffectivePath> {
         let FlowRunConfig {
             backend,
@@ -486,6 +499,9 @@ mod linux {
                         tokio::time::sleep(Duration::from_millis(slow_prelude_ms))
                             .await;
                     }
+                    if let Some(barrier) = ready_barrier.as_ref() {
+                        barrier.wait().await;
+                    }
                     let slot = if pre_reserved {
                         Some(SlotGuard {
                             active: Arc::clone(&active_slots),
@@ -493,6 +509,9 @@ mod linux {
                     } else {
                         try_reserve_slot(&active_slots, auto_slot_limit)
                     };
+                    if let Some(barrier) = ready_barrier.as_ref() {
+                        barrier.wait().await;
+                    }
                     if let Some(_slot) = slot {
                         let splice = SpliceDirection::new(
                             flow.relay_source.as_raw_fd(),
