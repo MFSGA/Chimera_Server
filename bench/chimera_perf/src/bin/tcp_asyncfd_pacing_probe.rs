@@ -188,6 +188,12 @@ mod linux {
         destination_ready_acquisitions: u64,
         destination_would_blocks: u64,
         source_would_blocks: u64,
+        source_splice_successes: u64,
+        source_splice_bytes: u64,
+        source_partial_splices: u64,
+        destination_splice_successes: u64,
+        destination_splice_bytes: u64,
+        destination_partial_splices: u64,
         notsent_bytes_at_rate_update: Option<u32>,
         tcp_info_at_rate_update: Option<TcpInfoSample>,
         notsent_bytes_at_lowat_restore: Option<u32>,
@@ -238,6 +244,12 @@ mod linux {
         destination_would_blocks_total: u64,
         destination_would_blocks_per_connection: f64,
         source_would_blocks_total: u64,
+        source_splice_successes_total: u64,
+        source_splice_bytes_per_success: f64,
+        source_partial_splices_total: u64,
+        destination_splice_successes_total: u64,
+        destination_splice_bytes_per_success: f64,
+        destination_partial_splices_total: u64,
         writer_elapsed_us_median: f64,
         writer_elapsed_us_max: f64,
         writer_elapsed_max_to_median_ratio: f64,
@@ -980,6 +992,30 @@ mod linux {
             .iter()
             .map(|stats| stats.source_would_blocks)
             .sum::<u64>();
+        let source_splice_successes_total = relay_stats
+            .iter()
+            .map(|stats| stats.source_splice_successes)
+            .sum::<u64>();
+        let source_splice_bytes_total = relay_stats
+            .iter()
+            .map(|stats| stats.source_splice_bytes)
+            .sum::<u64>();
+        let source_partial_splices_total = relay_stats
+            .iter()
+            .map(|stats| stats.source_partial_splices)
+            .sum::<u64>();
+        let destination_splice_successes_total = relay_stats
+            .iter()
+            .map(|stats| stats.destination_splice_successes)
+            .sum::<u64>();
+        let destination_splice_bytes_total = relay_stats
+            .iter()
+            .map(|stats| stats.destination_splice_bytes)
+            .sum::<u64>();
+        let destination_partial_splices_total = relay_stats
+            .iter()
+            .map(|stats| stats.destination_partial_splices)
+            .sum::<u64>();
         let notsent = relay_stats
             .iter()
             .filter_map(|stats| stats.notsent_bytes_at_rate_update.map(f64::from))
@@ -1111,6 +1147,18 @@ mod linux {
                 relay_elapsed_us_max / relay_elapsed_us_median,
             ),
             source_would_blocks_total,
+            source_splice_successes_total,
+            source_splice_bytes_per_success: round(
+                source_splice_bytes_total as f64
+                    / source_splice_successes_total as f64,
+            ),
+            source_partial_splices_total,
+            destination_splice_successes_total,
+            destination_splice_bytes_per_success: round(
+                destination_splice_bytes_total as f64
+                    / destination_splice_successes_total as f64,
+            ),
+            destination_partial_splices_total,
             writer_elapsed_us_median: round(writer_elapsed_us_median),
             writer_elapsed_us_max: round(writer_elapsed_us_max),
             writer_elapsed_max_to_median_ratio: round(
@@ -1234,6 +1282,12 @@ mod linux {
         let mut destination_ready_acquisitions = 0_u64;
         let mut destination_would_blocks = 0_u64;
         let mut source_would_blocks = 0_u64;
+        let mut source_splice_successes = 0_u64;
+        let mut source_splice_bytes = 0_u64;
+        let mut source_partial_splices = 0_u64;
+        let mut destination_splice_successes = 0_u64;
+        let mut destination_splice_bytes = 0_u64;
+        let mut destination_partial_splices = 0_u64;
         let mut notsent_bytes_at_rate_update = None;
         let mut tcp_info_at_rate_update = None;
         let mut notsent_bytes_at_lowat_restore = None;
@@ -1273,6 +1327,15 @@ mod linux {
                         }) {
                             Ok(Ok(0)) => return Err(io::ErrorKind::WriteZero.into()),
                             Ok(Ok(written)) => {
+                                destination_splice_successes =
+                                    destination_splice_successes.saturating_add(1);
+                                destination_splice_bytes = destination_splice_bytes
+                                    .saturating_add(written as u64);
+                                if written < pending {
+                                    destination_partial_splices =
+                                        destination_partial_splices
+                                            .saturating_add(1);
+                                }
                                 pending -= written;
                                 transferred =
                                     transferred.saturating_add(written as u64);
@@ -1336,6 +1399,14 @@ mod linux {
                 }) {
                     Ok(Ok(0)) => return Err(io::ErrorKind::WriteZero.into()),
                     Ok(Ok(written)) => {
+                        destination_splice_successes =
+                            destination_splice_successes.saturating_add(1);
+                        destination_splice_bytes =
+                            destination_splice_bytes.saturating_add(written as u64);
+                        if written < pending {
+                            destination_partial_splices =
+                                destination_partial_splices.saturating_add(1);
+                        }
                         pending -= written;
                         transferred += written as u64;
                         while let Some(update) = options
@@ -1467,6 +1538,12 @@ mod linux {
                         destination_ready_acquisitions,
                         destination_would_blocks,
                         source_would_blocks,
+                        source_splice_successes,
+                        source_splice_bytes,
+                        source_partial_splices,
+                        destination_splice_successes,
+                        destination_splice_bytes,
+                        destination_partial_splices,
                         notsent_bytes_at_rate_update,
                         tcp_info_at_rate_update,
                         notsent_bytes_at_lowat_restore,
@@ -1478,7 +1555,17 @@ mod linux {
                         incomplete_rate_decrease_recoveries,
                     });
                 }
-                Ok(Ok(read)) => pending = read,
+                Ok(Ok(read)) => {
+                    source_splice_successes =
+                        source_splice_successes.saturating_add(1);
+                    source_splice_bytes =
+                        source_splice_bytes.saturating_add(read as u64);
+                    if read < pipe_capacity {
+                        source_partial_splices =
+                            source_partial_splices.saturating_add(1);
+                    }
+                    pending = read;
+                }
                 Ok(Err(error)) => return Err(error),
                 Err(_would_block) => {
                     source_would_blocks = source_would_blocks.saturating_add(1);
