@@ -337,14 +337,14 @@ impl BrutalController {
         self.pacing_trace = Some(PacingPublicationTrace::new(
             now,
             target_rate,
-            self.brutal.ack_rate,
+            self.brutal.ack_rate(),
         ));
     }
 
     #[cfg(feature = "brutal-pacing-trace")]
     fn trace_pacing_rate(&mut self, now: Instant) {
         let target_rate = self.pacing_target_rate();
-        let ack_rate = self.brutal.ack_rate;
+        let ack_rate = self.brutal.ack_rate();
         if let Some(trace) = self.pacing_trace.as_mut() {
             trace.observe(now, target_rate, ack_rate);
         }
@@ -352,7 +352,7 @@ impl BrutalController {
 
     #[cfg(feature = "brutal-pacing-trace")]
     fn pacing_target_rate(&self) -> u64 {
-        ((self.brutal_tx_bps as f64) / self.brutal.ack_rate) as u64
+        ((self.brutal_tx_bps as f64) * self.brutal.reciprocal_ack_rate) as u64
     }
 }
 
@@ -377,11 +377,13 @@ impl Controller for BrutalController {
             bbr.on_ack(now, sent, bytes, app_limited, rtt);
         }
         #[cfg(feature = "brutal-ack-batch-trace")]
-        let previous_window_inputs = (self.brutal.last_rtt, self.brutal.ack_rate);
+        let previous_window_inputs =
+            (self.brutal.last_rtt, self.brutal.reciprocal_ack_rate);
         self.brutal.on_ack(now, rtt);
         #[cfg(feature = "brutal-ack-batch-trace")]
         self.brutal.record_ack_window_input_trace(
-            previous_window_inputs == (self.brutal.last_rtt, self.brutal.ack_rate),
+            previous_window_inputs
+                == (self.brutal.last_rtt, self.brutal.reciprocal_ack_rate),
         );
         self.refresh_brutal_window();
         #[cfg(feature = "brutal-pacing-trace")]
@@ -488,7 +490,9 @@ struct BrutalState {
     start: Instant,
     max_datagram_size: u64,
     last_rtt: Duration,
-    ack_rate: f64,
+    // Store the reciprocal because the data-plane window needs `1 / ack_rate` on every ACK.
+    // This keeps loss accounting at one floating-point division per ACK instead of two.
+    reciprocal_ack_rate: f64,
     slots: [PacketInfo; PACKET_INFO_SLOT_COUNT as usize],
     rolling_ack_count: u64,
     rolling_loss_count: u64,
@@ -511,7 +515,7 @@ impl BrutalState {
             start: now,
             max_datagram_size: current_mtu as u64,
             last_rtt: Duration::from_millis(0),
-            ack_rate: 1.0,
+            reciprocal_ack_rate: 1.0,
             slots: [PacketInfo::default(); PACKET_INFO_SLOT_COUNT as usize],
             rolling_ack_count: 0,
             rolling_loss_count: 0,
@@ -527,7 +531,7 @@ impl BrutalState {
 
     fn reset_samples(&mut self, now: Instant) {
         self.start = now;
-        self.ack_rate = 1.0;
+        self.reciprocal_ack_rate = 1.0;
         self.slots = [PacketInfo::default(); PACKET_INFO_SLOT_COUNT as usize];
         self.rolling_ack_count = 0;
         self.rolling_loss_count = 0;
@@ -636,9 +640,10 @@ impl BrutalState {
             return self.initial_window();
         }
 
-        let cwnd =
-            (tx_bps as f64) * Self::rtt_seconds(rtt) * CONGESTION_WINDOW_MULTIPLIER
-                / self.ack_rate;
+        let cwnd = (tx_bps as f64)
+            * Self::rtt_seconds(rtt)
+            * CONGESTION_WINDOW_MULTIPLIER
+            * self.reciprocal_ack_rate;
         (cwnd as u64).max(
             self.max_datagram_size
                 .saturating_mul(MIN_CONGESTION_WINDOW_DATAGRAMS),
@@ -706,13 +711,18 @@ impl BrutalState {
         self.refresh_ack_rate(timestamp);
     }
 
+    #[inline]
+    fn ack_rate(&self) -> f64 {
+        1.0 / self.reciprocal_ack_rate
+    }
+
     fn refresh_ack_rate(&mut self, timestamp: u64) {
         // A pristine rolling window always has an ACK rate of exactly 1.0.
         // Avoid repeating the floating-point division on every ACK. Keep the
         // debug path unchanged so HYSTERIA_BRUTAL_DEBUG still emits its normal
         // periodic accounting lines.
         if self.rolling_loss_count == 0 && !self.debug {
-            self.ack_rate = 1.0;
+            self.reciprocal_ack_rate = 1.0;
             return;
         }
         self.update_ack_rate(timestamp);
@@ -723,7 +733,7 @@ impl BrutalState {
         let loss_count = self.rolling_loss_count;
 
         if ack_count + loss_count < MIN_SAMPLE_COUNT {
-            self.ack_rate = 1.0;
+            self.reciprocal_ack_rate = 1.0;
             if self.can_print_ack_rate(timestamp) {
                 self.last_debug_timestamp = timestamp;
                 debug!(
@@ -737,14 +747,15 @@ impl BrutalState {
             return;
         }
 
-        let rate = ack_count as f64 / (ack_count + loss_count) as f64;
-        if rate < MIN_ACK_RATE {
-            self.ack_rate = MIN_ACK_RATE;
+        let reciprocal_rate = (ack_count + loss_count) as f64 / ack_count as f64;
+        let max_reciprocal_rate = 1.0 / MIN_ACK_RATE;
+        if reciprocal_rate > max_reciprocal_rate {
+            self.reciprocal_ack_rate = max_reciprocal_rate;
             if self.can_print_ack_rate(timestamp) {
                 self.last_debug_timestamp = timestamp;
                 debug!(
                     "brutal ack rate: clamped {:.2} -> {:.2} (total={}, ack={}, loss={}, rtt_ms={})",
-                    rate,
+                    1.0 / reciprocal_rate,
                     MIN_ACK_RATE,
                     ack_count + loss_count,
                     ack_count,
@@ -755,12 +766,12 @@ impl BrutalState {
             return;
         }
 
-        self.ack_rate = rate;
+        self.reciprocal_ack_rate = reciprocal_rate;
         if self.can_print_ack_rate(timestamp) {
             self.last_debug_timestamp = timestamp;
             debug!(
                 "brutal ack rate: {:.2} (total={}, ack={}, loss={}, rtt_ms={})",
-                rate,
+                1.0 / reciprocal_rate,
                 ack_count + loss_count,
                 ack_count,
                 loss_count,
@@ -802,7 +813,7 @@ mod tests {
         let now = Instant::now();
         let mut controller = controller(tx_bps.clone(), now);
         controller.brutal.last_rtt = Duration::from_millis(80);
-        controller.brutal.ack_rate = MIN_ACK_RATE;
+        controller.brutal.reciprocal_ack_rate = 1.0 / MIN_ACK_RATE;
         controller.brutal.slots[0] = PacketInfo {
             timestamp: 1,
             ack_count: 40,
@@ -817,7 +828,7 @@ mod tests {
         assert!(controller.bbr.is_none());
         assert_eq!(controller.brutal.start, activated_at);
         assert_eq!(controller.brutal.last_rtt, Duration::from_millis(80));
-        assert_eq!(controller.brutal.ack_rate, 1.0);
+        assert_eq!(controller.brutal.ack_rate(), 1.0);
         assert!(
             controller
                 .brutal
@@ -847,7 +858,7 @@ mod tests {
         assert_eq!(controller.window(), controller.cached_brutal_window);
 
         controller.brutal.last_rtt = Duration::from_millis(120);
-        controller.brutal.ack_rate = MIN_ACK_RATE;
+        controller.brutal.reciprocal_ack_rate = 1.0 / MIN_ACK_RATE;
         controller.refresh_brutal_window();
         assert_eq!(
             controller.cached_brutal_window,
@@ -988,14 +999,14 @@ mod tests {
         state.debug = false;
 
         state.record(start + Duration::from_millis(100), 60, 0);
-        assert_eq!(state.ack_rate, 1.0);
+        assert_eq!(state.ack_rate(), 1.0);
 
         state.record(start + Duration::from_millis(200), 0, 10);
-        assert!((state.ack_rate - (60.0 / 70.0)).abs() < f64::EPSILON);
+        assert!((state.ack_rate() - (60.0 / 70.0)).abs() < f64::EPSILON);
 
         state.record(start + Duration::from_secs(7), 60, 0);
         assert_eq!(state.rolling_loss_count, 0);
-        assert_eq!(state.ack_rate, 1.0);
+        assert_eq!(state.ack_rate(), 1.0);
     }
 
     #[test]
@@ -1050,7 +1061,7 @@ mod tests {
             assert_eq!(generic.rolling_loss_count, specialized.rolling_loss_count);
             assert_eq!(generic.rolling_timestamp, specialized.rolling_timestamp);
             assert_eq!(generic.rolling_slot, specialized.rolling_slot);
-            assert_eq!(generic.ack_rate, specialized.ack_rate);
+            assert_eq!(generic.reciprocal_ack_rate, specialized.reciprocal_ack_rate);
         }
 
         for (generic, specialized) in
