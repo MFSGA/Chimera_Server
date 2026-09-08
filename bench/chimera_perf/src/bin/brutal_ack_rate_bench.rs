@@ -10,6 +10,7 @@ const WINDOW_EVENTS: u64 = 40_000_000;
 const ON_ACK_EVENTS: u64 = 10_000_000;
 const RTT_CONVERSION_EVENTS: u64 = 40_000_000;
 const CLAMP_EVENTS: u64 = 100_000_000;
+const PRISTINE_STORE_EVENTS: u64 = 100_000_000;
 const SLOT_COUNT: u64 = 5;
 
 #[derive(Clone, Copy)]
@@ -602,6 +603,52 @@ fn run_on_ack_dispatch_bench(name: &str, active_fast_path: bool) {
     );
 }
 
+fn run_pristine_ack_store_bench(name: &str, skip_redundant_store: bool) {
+    let tx_bps_f64 = 50_000_000_f64;
+    let reciprocal_ack_rate = 1.0_f64;
+    let mut stored_reciprocal_ack_rate = reciprocal_ack_rate;
+    let mut rolling_ack_count = 0_u64;
+    let mut slot_ack_count = 0_u64;
+    let mut window = 0_u64;
+    let started = Instant::now();
+    for event in 0..PRISTINE_STORE_EVENTS {
+        slot_ack_count = slot_ack_count.wrapping_add(black_box(1));
+        rolling_ack_count = rolling_ack_count.wrapping_add(black_box(1));
+        let rolling_loss_count = black_box(0_u64);
+        let debug = black_box(false);
+        if skip_redundant_store {
+            if rolling_loss_count != 0 || debug {
+                stored_reciprocal_ack_rate = black_box(
+                    (rolling_ack_count + rolling_loss_count) as f64
+                        / rolling_ack_count.max(1) as f64,
+                );
+            }
+        } else if rolling_loss_count == 0 && !debug {
+            stored_reciprocal_ack_rate = black_box(1.0);
+        } else {
+            stored_reciprocal_ack_rate = black_box(
+                (rolling_ack_count + rolling_loss_count) as f64
+                    / rolling_ack_count.max(1) as f64,
+            );
+        }
+        let last_rtt = Duration::from_nanos(79_500_000 + event % 1_000_001);
+        window = (black_box(tx_bps_f64)
+            * rtt_secs_subsecond_fast_path(black_box(last_rtt))
+            * 0.8
+            * black_box(stored_reciprocal_ack_rate)) as u64;
+        black_box(window);
+    }
+    let elapsed = started.elapsed();
+    println!(
+        "{name}: skip_redundant_store={skip_redundant_store} ns_per_ack={:.3} rolling_ack_count={} slot_ack_count={} final_reciprocal_ack_rate={:.6} final_window={}",
+        elapsed.as_nanos() as f64 / PRISTINE_STORE_EVENTS as f64,
+        black_box(rolling_ack_count),
+        black_box(slot_ack_count),
+        black_box(stored_reciprocal_ack_rate),
+        black_box(window),
+    );
+}
+
 fn run_on_ack_record_shape_bench(name: &str, split_ack_record: bool) {
     let origin = Instant::now();
     let mut state = RecordState::new(origin);
@@ -670,6 +717,16 @@ fn run_ack_batch_bench(name: &str, batched: bool, batch_size: u64) {
 }
 
 fn main() {
+    if let Ok(mode) = std::env::var("BRUTAL_PRISTINE_STORE_BENCH_MODE") {
+        match mode.as_str() {
+            "baseline" => {
+                run_pristine_ack_store_bench("baseline-pristine-store", false)
+            }
+            "skip" => run_pristine_ack_store_bench("skip-pristine-store", true),
+            _ => panic!("BRUTAL_PRISTINE_STORE_BENCH_MODE must be baseline or skip"),
+        }
+        return;
+    }
     if let Ok(mode) = std::env::var("BRUTAL_RECIP_BENCH_MODE") {
         match mode.as_str() {
             "baseline" => run_loss_window_bench("baseline-loss-window", false),

@@ -667,7 +667,13 @@ impl BrutalState {
             let info = &mut self.slots[self.rolling_slot];
             info.ack_count += 1;
             self.rolling_ack_count += 1;
-            self.refresh_ack_rate(self.rolling_timestamp);
+            // On a pristine non-debug window, every legal state transition that
+            // reaches this cached-second path has already established an exact
+            // reciprocal ACK rate of 1.0. Avoid rewriting that unchanged f64 on
+            // every ACK; loss-active and debug accounting still refresh normally.
+            if self.rolling_loss_count != 0 || self.debug {
+                self.update_ack_rate(self.rolling_timestamp);
+            }
             return;
         }
 
