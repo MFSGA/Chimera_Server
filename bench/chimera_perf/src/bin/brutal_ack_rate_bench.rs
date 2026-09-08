@@ -11,6 +11,7 @@ const ON_ACK_EVENTS: u64 = 10_000_000;
 const RTT_CONVERSION_EVENTS: u64 = 40_000_000;
 const CLAMP_EVENTS: u64 = 100_000_000;
 const PRISTINE_STORE_EVENTS: u64 = 100_000_000;
+const SENT_DISPATCH_EVENTS: u64 = 200_000_000;
 const SLOT_COUNT: u64 = 5;
 
 #[derive(Clone, Copy)]
@@ -603,6 +604,33 @@ fn run_on_ack_dispatch_bench(name: &str, active_fast_path: bool) {
     );
 }
 
+fn run_on_sent_dispatch_bench(name: &str, active_fast_path: bool) {
+    let mut checksum = 0_u64;
+    let started = Instant::now();
+    for event in 0..SENT_DISPATCH_EVENTS {
+        let brutal_active = black_box(true);
+        let bbr_present = black_box(false);
+        if active_fast_path {
+            if brutal_active {
+                checksum = checksum.wrapping_add(black_box(event));
+                continue;
+            }
+        } else if !brutal_active {
+            black_box(event);
+        }
+        if bbr_present {
+            black_box(event);
+        }
+        checksum = checksum.wrapping_add(black_box(event));
+    }
+    let elapsed = started.elapsed();
+    println!(
+        "{name}: active_fast_path={active_fast_path} ns_per_sent={:.3} checksum={}",
+        elapsed.as_nanos() as f64 / SENT_DISPATCH_EVENTS as f64,
+        black_box(checksum),
+    );
+}
+
 fn run_pristine_ack_store_bench(name: &str, skip_redundant_store: bool) {
     let tx_bps_f64 = 50_000_000_f64;
     let reciprocal_ack_rate = 1.0_f64;
@@ -717,6 +745,20 @@ fn run_ack_batch_bench(name: &str, batched: bool, batch_size: u64) {
 }
 
 fn main() {
+    if let Ok(mode) = std::env::var("BRUTAL_SENT_DISPATCH_BENCH_MODE") {
+        match mode.as_str() {
+            "baseline" => {
+                run_on_sent_dispatch_bench("baseline-sent-dispatch", false)
+            }
+            "active-fast" => {
+                run_on_sent_dispatch_bench("active-fast-sent-dispatch", true)
+            }
+            _ => panic!(
+                "BRUTAL_SENT_DISPATCH_BENCH_MODE must be baseline or active-fast"
+            ),
+        }
+        return;
+    }
     if let Ok(mode) = std::env::var("BRUTAL_PRISTINE_STORE_BENCH_MODE") {
         match mode.as_str() {
             "baseline" => {
