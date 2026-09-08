@@ -529,12 +529,14 @@ fn decode_frame_with_control_count(
         }
 
         let global_id = normalize_global_id(metadata.global_id);
-        let existing_session = sessions.get(&metadata.session_id).cloned();
-        let session_known = existing_session.is_some();
+        let existing_global_id = sessions
+            .get(&metadata.session_id)
+            .map(|session| session.global_id);
+        let session_known = existing_global_id.is_some();
         match metadata.status {
             SessionStatus::New => {
-                if let Some(existing) = &existing_session
-                    && (global_id.is_none() || existing.global_id != global_id)
+                if let Some(existing_global_id) = existing_global_id
+                    && (global_id.is_none() || existing_global_id != global_id)
                 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -584,24 +586,23 @@ fn decode_frame_with_control_count(
                     reply: true,
                 }));
             } else {
-                let session = sessions.get(&metadata.session_id).cloned();
+                let session = sessions.get(&metadata.session_id);
                 let target = metadata
                     .target
-                    .or_else(|| {
-                        session.as_ref().map(|session| session.target.clone())
-                    })
+                    .or_else(|| session.map(|session| session.target.clone()))
                     .ok_or_else(|| {
                         std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             format!("unknown XUDP session: {}", metadata.session_id),
                         )
                     })?;
+                let global_id = session.and_then(|session| session.global_id);
                 *consecutive_control_frames = 0;
                 return Ok(Some(DecodedFrame::Data {
                     session_id: metadata.session_id,
                     payload,
                     target,
-                    global_id: session.and_then(|session| session.global_id),
+                    global_id,
                     is_new: metadata.status == SessionStatus::New,
                 }));
             }
@@ -803,6 +804,45 @@ mod tests {
         assert!(!is_new);
         assert_eq!(sessions.get(&39).unwrap().target, target);
         assert!(input.is_empty());
+    }
+
+    #[test]
+    fn keep_reuses_hostname_target_and_global_id_without_inline_metadata() {
+        let target = NetLocation::from_str("benchmark.example.invalid:5353", None)
+            .expect("valid hostname target");
+        let global_id = [1, 3, 5, 7, 9, 11, 13, 15];
+        let mut sessions = HashMap::new();
+        let mut first = encode_data_frame_with_global_id(
+            SessionStatus::New,
+            44,
+            Some(target.clone()),
+            b"first",
+            Some(global_id),
+        );
+        decode_frame(&mut first, &mut sessions)
+            .expect("decode initial XUDP New")
+            .expect("initial XUDP New data");
+
+        let mut keep = encode_data_frame(SessionStatus::Keep, 44, None, b"next");
+        let DecodedFrame::Data {
+            payload,
+            target: decoded_target,
+            global_id: decoded_global_id,
+            is_new,
+            ..
+        } = decode_frame(&mut keep, &mut sessions)
+            .expect("decode XUDP Keep")
+            .expect("XUDP Keep data")
+        else {
+            panic!("XUDP Keep decoded as End");
+        };
+
+        assert_eq!(payload.as_ref(), b"next");
+        assert_eq!(decoded_target, target);
+        assert_eq!(decoded_global_id, Some(global_id));
+        assert!(!is_new);
+        assert_eq!(sessions.get(&44).unwrap().target, target);
+        assert_eq!(sessions.get(&44).unwrap().global_id, Some(global_id));
     }
 
     #[test]
