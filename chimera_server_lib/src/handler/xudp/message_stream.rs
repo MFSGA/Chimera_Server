@@ -35,7 +35,7 @@ type IncomingResult = std::io::Result<IncomingMessage>;
 enum IncomingMessage {
     Data {
         session_id: u16,
-        payload: Vec<u8>,
+        payload: BytesMut,
         target: SocketAddr,
         global_id: Option<[u8; 8]>,
         is_new: bool,
@@ -446,7 +446,7 @@ struct XudpSessionState {
 enum DecodedFrame {
     Data {
         session_id: u16,
-        payload: Vec<u8>,
+        payload: BytesMut,
         target: NetLocation,
         global_id: Option<[u8; 8]>,
         is_new: bool,
@@ -574,7 +574,7 @@ fn decode_frame_with_control_count(
             *consecutive_control_frames += 1;
         } else {
             let payload_length = complete.get_u16() as usize;
-            let payload = complete.split_to(payload_length).to_vec();
+            let payload = complete.split_to(payload_length);
             if payload.is_empty() {
                 *consecutive_control_frames += 1;
             } else if metadata.status == SessionStatus::Keep && !session_known {
@@ -797,7 +797,7 @@ mod tests {
         };
 
         assert_eq!(session_id, 39);
-        assert_eq!(payload, b"payload");
+        assert_eq!(payload.as_ref(), b"payload");
         assert_eq!(decoded_target, target);
         assert_eq!(global_id, None);
         assert!(!is_new);
@@ -924,7 +924,7 @@ mod tests {
         };
 
         assert_eq!(session_id, 43);
-        assert_eq!(payload, b"reattach");
+        assert_eq!(payload.as_ref(), b"reattach");
         assert_eq!(target, second_target);
         assert_eq!(decoded_global_id, Some(global_id));
         assert!(is_new);
@@ -971,7 +971,7 @@ mod tests {
             panic!("frame after XUDP peer error decoded as End");
         };
         assert_eq!(session_id, 42);
-        assert_eq!(payload, b"next");
+        assert_eq!(payload.as_ref(), b"next");
         assert_eq!(target.port(), 53);
         assert!(input.is_empty());
     }
@@ -1014,7 +1014,7 @@ mod tests {
             panic!("frame after unknown XUDP Keep decoded as End");
         };
         assert_eq!(session_id, 52);
-        assert_eq!(payload, b"next");
+        assert_eq!(payload.as_ref(), b"next");
         assert!(input.is_empty());
     }
 
@@ -1046,7 +1046,7 @@ mod tests {
             panic!("data after XUDP KeepAlive decoded as End");
         };
         assert_eq!(session_id, 62);
-        assert_eq!(payload, b"next");
+        assert_eq!(payload.as_ref(), b"next");
         assert!(input.is_empty());
     }
 
@@ -1148,7 +1148,7 @@ mod tests {
         };
 
         assert_eq!(session_id, 91);
-        assert_eq!(payload, b"payload");
+        assert_eq!(payload.as_ref(), b"payload");
         assert_eq!(target.port(), 53);
         assert!(input.is_empty());
     }
