@@ -443,7 +443,8 @@ fn run_loss_window_bench(name: &str, reciprocal_window: bool) {
             ack_rate = 1.0;
             reciprocal_ack_rate = 1.0;
         } else if reciprocal_window {
-            reciprocal_ack_rate = ((total as f64) / (ack as f64)).min(1.0 / MIN_ACK_RATE);
+            reciprocal_ack_rate =
+                ((total as f64) / (ack as f64)).min(1.0 / MIN_ACK_RATE);
         } else {
             ack_rate = ((ack as f64) / (total as f64)).max(MIN_ACK_RATE);
         }
@@ -451,10 +452,13 @@ fn run_loss_window_bench(name: &str, reciprocal_window: bool) {
             79_500_000 + event % 1_000_001,
         ));
         if reciprocal_window {
-            window = (black_box(tx_bps) * rtt_secs * 0.8 * black_box(reciprocal_ack_rate))
-                as u64;
+            window = (black_box(tx_bps)
+                * rtt_secs
+                * 0.8
+                * black_box(reciprocal_ack_rate)) as u64;
         } else {
-            window = ((black_box(tx_bps) * rtt_secs * 0.8) / black_box(ack_rate)) as u64;
+            window =
+                ((black_box(tx_bps) * rtt_secs * 0.8) / black_box(ack_rate)) as u64;
         }
         black_box(window);
     }
@@ -474,6 +478,47 @@ fn run_loss_window_bench(name: &str, reciprocal_window: bool) {
 
 fn integer_min_ack_rate_clamp_applies(ack_count: u64, loss_count: u64) -> bool {
     ack_count < loss_count.saturating_mul(4)
+}
+
+fn run_cached_tx_window_bench(name: &str, cached_tx_f64: bool) {
+    let tx_bps = 50_000_000_u64;
+    let tx_bps_f64 = tx_bps as f64;
+    let mut ack_count = 0_u64;
+    let mut loss_count = 0_u64;
+    let mut reciprocal_ack_rate = 1.0_f64;
+    let mut window = modeled_window(1.0);
+    let started = Instant::now();
+    for event in 0..ON_ACK_EVENTS {
+        ack_count = ack_count.wrapping_add(1);
+        if event % 10 == 0 {
+            loss_count = loss_count.wrapping_add(1);
+        }
+        let total = black_box(ack_count + loss_count);
+        let ack = black_box(ack_count);
+        if total < MIN_SAMPLE_COUNT {
+            reciprocal_ack_rate = 1.0;
+        } else {
+            reciprocal_ack_rate =
+                ((total as f64) / (ack as f64)).min(1.0 / MIN_ACK_RATE);
+        }
+        let rtt_secs = rtt_secs_subsecond_fast_path(Duration::from_nanos(
+            79_500_000 + event % 1_000_001,
+        ));
+        let tx = if cached_tx_f64 {
+            black_box(tx_bps_f64)
+        } else {
+            black_box(tx_bps) as f64
+        };
+        window = (tx * rtt_secs * 0.8 * black_box(reciprocal_ack_rate)) as u64;
+        black_box(window);
+    }
+    let elapsed = started.elapsed();
+    println!(
+        "{name}: cached_tx_f64={cached_tx_f64} ns_per_ack={:.3} final_ack_rate={:.6} final_window={}",
+        elapsed.as_nanos() as f64 / ON_ACK_EVENTS as f64,
+        black_box(1.0 / reciprocal_ack_rate),
+        black_box(window),
+    );
 }
 
 fn run_clamped_loss_window_bench(name: &str, integer_clamp: bool) {
@@ -633,6 +678,14 @@ fn main() {
         }
         return;
     }
+    if let Ok(mode) = std::env::var("BRUTAL_TX_CAST_BENCH_MODE") {
+        match mode.as_str() {
+            "baseline" => run_cached_tx_window_bench("baseline-tx-cast", false),
+            "cached" => run_cached_tx_window_bench("cached-tx-f64", true),
+            _ => panic!("BRUTAL_TX_CAST_BENCH_MODE must be baseline or cached"),
+        }
+        return;
+    }
     if let Ok(mode) = std::env::var("BRUTAL_CLAMP_BENCH_MODE") {
         match mode.as_str() {
             "baseline" => {
@@ -647,9 +700,13 @@ fn main() {
     }
     if let Ok(mode) = std::env::var("BRUTAL_DISPATCH_BENCH_MODE") {
         match mode.as_str() {
-            "baseline" => run_on_ack_dispatch_bench("baseline-active-dispatch", false),
+            "baseline" => {
+                run_on_ack_dispatch_bench("baseline-active-dispatch", false)
+            }
             "active-fast" => run_on_ack_dispatch_bench("active-fast-dispatch", true),
-            _ => panic!("BRUTAL_DISPATCH_BENCH_MODE must be baseline or active-fast"),
+            _ => {
+                panic!("BRUTAL_DISPATCH_BENCH_MODE must be baseline or active-fast")
+            }
         }
         return;
     }
@@ -884,6 +941,29 @@ mod tests {
             0,
         );
         assert_ne!(baseline.slots, optimized.slots);
+    }
+
+    #[test]
+    fn cached_tx_conversion_preserves_window_result() {
+        for tx_bps in [65_536_u64, 1_000_000, 50_000_000, u32::MAX as u64] {
+            for nanos in [1_u64, 79_500_000, 999_999_999, 1_500_000_000] {
+                let rtt = Duration::from_nanos(nanos);
+                for reciprocal_ack_rate in [1.0_f64, 1.001, 1.1, 1.25] {
+                    let baseline = (tx_bps as f64
+                        * rtt_secs_subsecond_fast_path(rtt)
+                        * 0.8
+                        * reciprocal_ack_rate)
+                        as u64;
+                    let cached_tx = tx_bps as f64;
+                    let candidate = (cached_tx
+                        * rtt_secs_subsecond_fast_path(rtt)
+                        * 0.8
+                        * reciprocal_ack_rate)
+                        as u64;
+                    assert_eq!(baseline, candidate);
+                }
+            }
+        }
     }
 
     #[test]
