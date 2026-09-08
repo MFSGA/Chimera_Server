@@ -423,6 +423,54 @@ fn run_on_ack_component_bench(
     );
 }
 
+fn run_loss_window_bench(name: &str, reciprocal_window: bool) {
+    let tx_bps = 50_000_000_f64;
+    let mut ack_count = 0_u64;
+    let mut loss_count = 0_u64;
+    let mut ack_rate = 1.0_f64;
+    let mut reciprocal_ack_rate = 1.0_f64;
+    let mut window = modeled_window(ack_rate);
+    let started = Instant::now();
+    for event in 0..ON_ACK_EVENTS {
+        ack_count = ack_count.wrapping_add(1);
+        if event % 10 == 0 {
+            loss_count = loss_count.wrapping_add(1);
+        }
+        let total = black_box(ack_count + loss_count);
+        let ack = black_box(ack_count);
+        if total < MIN_SAMPLE_COUNT {
+            ack_rate = 1.0;
+            reciprocal_ack_rate = 1.0;
+        } else if reciprocal_window {
+            reciprocal_ack_rate = ((total as f64) / (ack as f64)).min(1.0 / MIN_ACK_RATE);
+        } else {
+            ack_rate = ((ack as f64) / (total as f64)).max(MIN_ACK_RATE);
+        }
+        let rtt_secs = rtt_secs_subsecond_fast_path(Duration::from_nanos(
+            79_500_000 + event % 1_000_001,
+        ));
+        if reciprocal_window {
+            window = (black_box(tx_bps) * rtt_secs * 0.8 * black_box(reciprocal_ack_rate))
+                as u64;
+        } else {
+            window = ((black_box(tx_bps) * rtt_secs * 0.8) / black_box(ack_rate)) as u64;
+        }
+        black_box(window);
+    }
+    let elapsed = started.elapsed();
+    let final_ack_rate = if reciprocal_window {
+        1.0 / reciprocal_ack_rate
+    } else {
+        ack_rate
+    };
+    println!(
+        "{name}: reciprocal_window={reciprocal_window} ns_per_ack={:.3} final_ack_rate={:.6} final_window={}",
+        elapsed.as_nanos() as f64 / ON_ACK_EVENTS as f64,
+        black_box(final_ack_rate),
+        black_box(window),
+    );
+}
+
 fn run_on_ack_dispatch_bench(name: &str, active_fast_path: bool) {
     let origin = Instant::now();
     let mut state = RecordState::new(origin);
@@ -530,6 +578,14 @@ fn run_ack_batch_bench(name: &str, batched: bool, batch_size: u64) {
 }
 
 fn main() {
+    if let Ok(mode) = std::env::var("BRUTAL_RECIP_BENCH_MODE") {
+        match mode.as_str() {
+            "baseline" => run_loss_window_bench("baseline-loss-window", false),
+            "reciprocal" => run_loss_window_bench("reciprocal-loss-window", true),
+            _ => panic!("BRUTAL_RECIP_BENCH_MODE must be baseline or reciprocal"),
+        }
+        return;
+    }
     if let Ok(mode) = std::env::var("BRUTAL_DISPATCH_BENCH_MODE") {
         match mode.as_str() {
             "baseline" => run_on_ack_dispatch_bench("baseline-active-dispatch", false),
