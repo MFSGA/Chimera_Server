@@ -101,6 +101,9 @@ mod linux {
         #[arg(long)]
         sample_rate_decrease_recovery: bool,
 
+        #[arg(long)]
+        sample_rate_decrease_flight: bool,
+
         #[arg(long, default_value_t = 0)]
         sample_partial_notsent_every: u64,
 
@@ -185,6 +188,7 @@ mod linux {
         adaptive_notsent_lowat: Option<u32>,
         sample_tcp_info: bool,
         sample_rate_decrease_recovery: bool,
+        sample_rate_decrease_flight: bool,
         sample_partial_notsent_every: u64,
         sample_writable_wake_every: u64,
     }
@@ -196,6 +200,14 @@ mod linux {
         would_blocks: u64,
         start_notsent_bytes: u32,
         target_notsent_bytes: u32,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct RateDecreaseFlightSample {
+        unsent_bytes: u32,
+        unacked_bytes: u64,
+        snd_cwnd_bytes: u64,
+        new_rate_bdp_bytes: u64,
     }
 
     #[derive(Debug)]
@@ -240,6 +252,7 @@ mod linux {
         pacing_updates: u64,
         notsent_lowat_updates: u64,
         rate_decrease_recoveries: Vec<RateDecreaseRecovery>,
+        rate_decrease_flight_samples: Vec<RateDecreaseFlightSample>,
         incomplete_rate_decrease_recoveries: u64,
     }
 
@@ -275,6 +288,7 @@ mod linux {
         adaptive_notsent_lowat_bytes: Option<u32>,
         sample_tcp_info: bool,
         sample_rate_decrease_recovery: bool,
+        sample_rate_decrease_flight: bool,
         sample_partial_notsent_every: u64,
         sample_writable_wake_every: u64,
         destination_ready_acquisitions_total: u64,
@@ -320,6 +334,13 @@ mod linux {
         pacing_updates_total: u64,
         notsent_lowat_updates_total: u64,
         rate_decrease_recoveries_total: u64,
+        rate_decrease_flight_samples_total: u64,
+        rate_decrease_flight_unsent_bytes_median: Option<f64>,
+        rate_decrease_flight_unacked_bytes_median: Option<f64>,
+        rate_decrease_flight_cwnd_bytes_median: Option<f64>,
+        rate_decrease_flight_bdp_bytes_median: Option<f64>,
+        rate_decrease_flight_admitted_to_bdp_ratio_median: Option<f64>,
+        rate_decrease_flight_unacked_to_bdp_ratio_median: Option<f64>,
         incomplete_rate_decrease_recoveries_total: u64,
         rate_decrease_recovery_elapsed_us_median: Option<f64>,
         rate_decrease_recovery_forwarded_bytes_median: Option<f64>,
@@ -366,6 +387,7 @@ mod linux {
         adaptive_notsent_lowat_bytes: Option<u32>,
         sample_tcp_info: bool,
         sample_rate_decrease_recovery: bool,
+        sample_rate_decrease_flight: bool,
         sample_partial_notsent_every: u64,
         sample_writable_wake_every: u64,
         aggregate_throughput_median_gbps: f64,
@@ -396,6 +418,13 @@ mod linux {
         pacing_updates_per_connection_median: f64,
         notsent_lowat_updates_per_connection_median: f64,
         rate_decrease_recoveries_per_connection_median: f64,
+        rate_decrease_flight_samples_per_connection_median: f64,
+        rate_decrease_flight_unsent_bytes_median: Option<f64>,
+        rate_decrease_flight_unacked_bytes_median: Option<f64>,
+        rate_decrease_flight_cwnd_bytes_median: Option<f64>,
+        rate_decrease_flight_bdp_bytes_median: Option<f64>,
+        rate_decrease_flight_admitted_to_bdp_ratio_median: Option<f64>,
+        rate_decrease_flight_unacked_to_bdp_ratio_median: Option<f64>,
         incomplete_rate_decrease_recoveries_per_connection_median: f64,
         rate_decrease_recovery_elapsed_us_median: Option<f64>,
         rate_decrease_recovery_forwarded_bytes_median: Option<f64>,
@@ -449,6 +478,13 @@ mod linux {
         let mut pacing_updates = Vec::with_capacity(args.runs);
         let mut notsent_lowat_updates = Vec::with_capacity(args.runs);
         let mut rate_decrease_recoveries = Vec::with_capacity(args.runs);
+        let mut rate_decrease_flight_samples = Vec::with_capacity(args.runs);
+        let mut rate_decrease_flight_unsent = Vec::new();
+        let mut rate_decrease_flight_unacked = Vec::new();
+        let mut rate_decrease_flight_cwnd = Vec::new();
+        let mut rate_decrease_flight_bdp = Vec::new();
+        let mut rate_decrease_flight_admitted_ratio = Vec::new();
+        let mut rate_decrease_flight_unacked_ratio = Vec::new();
         let mut incomplete_rate_decrease_recoveries = Vec::with_capacity(args.runs);
         let mut recovery_elapsed_us = Vec::new();
         let mut recovery_forwarded_bytes = Vec::new();
@@ -463,9 +499,8 @@ mod linux {
             }
             actual_pipe_capacity_min.push(record.actual_pipe_capacity_min);
             actual_pipe_capacity_max.push(record.actual_pipe_capacity_max);
-            pipe_capacity_shortfalls.push(
-                record.pipe_capacity_shortfall_connections as f64,
-            );
+            pipe_capacity_shortfalls
+                .push(record.pipe_capacity_shortfall_connections as f64);
             cpu_per_gib.push(record.cpu_seconds_per_gib);
             context_switches.push(
                 (record.voluntary_context_switches
@@ -518,6 +553,32 @@ mod linux {
                 record.rate_decrease_recoveries_total as f64
                     / args.connections as f64,
             );
+            rate_decrease_flight_samples.push(
+                record.rate_decrease_flight_samples_total as f64
+                    / args.connections as f64,
+            );
+            if let Some(value) = record.rate_decrease_flight_unsent_bytes_median {
+                rate_decrease_flight_unsent.push(value);
+            }
+            if let Some(value) = record.rate_decrease_flight_unacked_bytes_median {
+                rate_decrease_flight_unacked.push(value);
+            }
+            if let Some(value) = record.rate_decrease_flight_cwnd_bytes_median {
+                rate_decrease_flight_cwnd.push(value);
+            }
+            if let Some(value) = record.rate_decrease_flight_bdp_bytes_median {
+                rate_decrease_flight_bdp.push(value);
+            }
+            if let Some(value) =
+                record.rate_decrease_flight_admitted_to_bdp_ratio_median
+            {
+                rate_decrease_flight_admitted_ratio.push(value);
+            }
+            if let Some(value) =
+                record.rate_decrease_flight_unacked_to_bdp_ratio_median
+            {
+                rate_decrease_flight_unacked_ratio.push(value);
+            }
             incomplete_rate_decrease_recoveries.push(
                 record.incomplete_rate_decrease_recoveries_total as f64
                     / args.connections as f64,
@@ -588,6 +649,7 @@ mod linux {
                 adaptive_notsent_lowat_bytes: args.adaptive_notsent_lowat_bytes,
                 sample_tcp_info: args.sample_tcp_info,
                 sample_rate_decrease_recovery: args.sample_rate_decrease_recovery,
+                sample_rate_decrease_flight: args.sample_rate_decrease_flight,
                 sample_partial_notsent_every: args.sample_partial_notsent_every,
                 sample_writable_wake_every: args.sample_writable_wake_every,
                 aggregate_throughput_median_gbps: round(median(&throughput)),
@@ -648,6 +710,27 @@ mod linux {
                 rate_decrease_recoveries_per_connection_median: round(median(
                     &rate_decrease_recoveries,
                 )),
+                rate_decrease_flight_samples_per_connection_median: round(median(
+                    &rate_decrease_flight_samples,
+                )),
+                rate_decrease_flight_unsent_bytes_median:
+                    (!rate_decrease_flight_unsent.is_empty())
+                        .then(|| round(median(&rate_decrease_flight_unsent))),
+                rate_decrease_flight_unacked_bytes_median:
+                    (!rate_decrease_flight_unacked.is_empty())
+                        .then(|| round(median(&rate_decrease_flight_unacked))),
+                rate_decrease_flight_cwnd_bytes_median: (!rate_decrease_flight_cwnd
+                    .is_empty())
+                .then(|| round(median(&rate_decrease_flight_cwnd))),
+                rate_decrease_flight_bdp_bytes_median: (!rate_decrease_flight_bdp
+                    .is_empty())
+                .then(|| round(median(&rate_decrease_flight_bdp))),
+                rate_decrease_flight_admitted_to_bdp_ratio_median:
+                    (!rate_decrease_flight_admitted_ratio.is_empty())
+                        .then(|| round(median(&rate_decrease_flight_admitted_ratio))),
+                rate_decrease_flight_unacked_to_bdp_ratio_median:
+                    (!rate_decrease_flight_unacked_ratio.is_empty())
+                        .then(|| round(median(&rate_decrease_flight_unacked_ratio))),
                 incomplete_rate_decrease_recoveries_per_connection_median: round(
                     median(&incomplete_rate_decrease_recoveries,)
                 ),
@@ -700,7 +783,8 @@ mod linux {
                 || args.notsent_lowat_gate_decreases_only
                 || args.adaptive_notsent_lowat_bytes.is_some()
                 || args.sample_tcp_info
-                || args.sample_rate_decrease_recovery)
+                || args.sample_rate_decrease_recovery
+                || args.sample_rate_decrease_flight)
         {
             bail!(
                 "non-single --destination-drain-mode supports only steady pacing with optional static TCP_NOTSENT_LOWAT, or --unpaced"
@@ -717,7 +801,8 @@ mod linux {
                 || args.notsent_lowat_gate_decreases_only
                 || args.adaptive_notsent_lowat_bytes.is_some()
                 || args.sample_tcp_info
-                || args.sample_rate_decrease_recovery)
+                || args.sample_rate_decrease_recovery
+                || args.sample_rate_decrease_flight)
         {
             bail!(
                 "--unpaced cannot be combined with pacing, low-water, or rate-update options"
@@ -767,6 +852,20 @@ mod linux {
         }
         if args.sample_rate_decrease_recovery && args.notsent_lowat_ms.is_none() {
             bail!("--sample-rate-decrease-recovery requires --notsent-lowat-ms");
+        }
+        if args.sample_rate_decrease_flight {
+            let mut previous = args.rate_bytes_per_sec;
+            let has_decrease =
+                requested_rate_updates(args).into_iter().any(|rate| {
+                    let decreased = rate < previous;
+                    previous = rate;
+                    decreased
+                });
+            if !has_decrease {
+                bail!(
+                    "--sample-rate-decrease-flight requires at least one pacing-rate decrease"
+                );
+            }
         }
         if args.sample_partial_notsent_every > 0
             && (args.unpaced
@@ -986,6 +1085,7 @@ mod linux {
                 adaptive_notsent_lowat: args.adaptive_notsent_lowat_bytes,
                 sample_tcp_info: args.sample_tcp_info,
                 sample_rate_decrease_recovery: args.sample_rate_decrease_recovery,
+                sample_rate_decrease_flight: args.sample_rate_decrease_flight,
                 sample_partial_notsent_every: args.sample_partial_notsent_every,
                 sample_writable_wake_every: args.sample_writable_wake_every,
             };
@@ -1215,6 +1315,39 @@ mod linux {
             .iter()
             .flat_map(|stats| stats.rate_decrease_recoveries.iter().copied())
             .collect::<Vec<_>>();
+        let rate_decrease_flight_samples = relay_stats
+            .iter()
+            .flat_map(|stats| stats.rate_decrease_flight_samples.iter().copied())
+            .collect::<Vec<_>>();
+        let flight_unsent = rate_decrease_flight_samples
+            .iter()
+            .map(|sample| f64::from(sample.unsent_bytes))
+            .collect::<Vec<_>>();
+        let flight_unacked = rate_decrease_flight_samples
+            .iter()
+            .map(|sample| sample.unacked_bytes as f64)
+            .collect::<Vec<_>>();
+        let flight_cwnd = rate_decrease_flight_samples
+            .iter()
+            .map(|sample| sample.snd_cwnd_bytes as f64)
+            .collect::<Vec<_>>();
+        let flight_bdp = rate_decrease_flight_samples
+            .iter()
+            .map(|sample| sample.new_rate_bdp_bytes as f64)
+            .collect::<Vec<_>>();
+        let flight_admitted_ratio = rate_decrease_flight_samples
+            .iter()
+            .map(|sample| {
+                (u64::from(sample.unsent_bytes) + sample.unacked_bytes) as f64
+                    / sample.new_rate_bdp_bytes as f64
+            })
+            .collect::<Vec<_>>();
+        let flight_unacked_ratio = rate_decrease_flight_samples
+            .iter()
+            .map(|sample| {
+                sample.unacked_bytes as f64 / sample.new_rate_bdp_bytes as f64
+            })
+            .collect::<Vec<_>>();
         let recovery_elapsed_us = rate_decrease_recoveries
             .iter()
             .map(|sample| sample.elapsed_us)
@@ -1274,6 +1407,7 @@ mod linux {
             adaptive_notsent_lowat_bytes: args.adaptive_notsent_lowat_bytes,
             sample_tcp_info: args.sample_tcp_info,
             sample_rate_decrease_recovery: args.sample_rate_decrease_recovery,
+            sample_rate_decrease_flight: args.sample_rate_decrease_flight,
             sample_partial_notsent_every: args.sample_partial_notsent_every,
             sample_writable_wake_every: args.sample_writable_wake_every,
             destination_ready_acquisitions_total,
@@ -1376,6 +1510,22 @@ mod linux {
             pacing_updates_total,
             notsent_lowat_updates_total,
             rate_decrease_recoveries_total,
+            rate_decrease_flight_samples_total: rate_decrease_flight_samples.len()
+                as u64,
+            rate_decrease_flight_unsent_bytes_median: (!flight_unsent.is_empty())
+                .then(|| round(median(&flight_unsent))),
+            rate_decrease_flight_unacked_bytes_median: (!flight_unacked.is_empty())
+                .then(|| round(median(&flight_unacked))),
+            rate_decrease_flight_cwnd_bytes_median: (!flight_cwnd.is_empty())
+                .then(|| round(median(&flight_cwnd))),
+            rate_decrease_flight_bdp_bytes_median: (!flight_bdp.is_empty())
+                .then(|| round(median(&flight_bdp))),
+            rate_decrease_flight_admitted_to_bdp_ratio_median:
+                (!flight_admitted_ratio.is_empty())
+                    .then(|| round(median(&flight_admitted_ratio))),
+            rate_decrease_flight_unacked_to_bdp_ratio_median:
+                (!flight_unacked_ratio.is_empty())
+                    .then(|| round(median(&flight_unacked_ratio))),
             incomplete_rate_decrease_recoveries_total,
             rate_decrease_recovery_elapsed_us_median: (!recovery_elapsed_us
                 .is_empty())
@@ -1508,6 +1658,7 @@ mod linux {
         let mut active_rate_decrease_recovery: Option<PendingRateDecreaseRecovery> =
             None;
         let mut rate_decrease_recoveries = Vec::new();
+        let mut rate_decrease_flight_samples = Vec::new();
         let mut incomplete_rate_decrease_recoveries = 0_u64;
         barrier.wait().await;
         let relay_started = Instant::now();
@@ -1677,7 +1828,8 @@ mod linux {
                             let rate_decreased = update.rate < current_rate;
                             let need_queued = notsent_bytes_at_rate_update.is_none()
                                 || options.adaptive_notsent_lowat.is_some()
-                                || (options.sample_rate_decrease_recovery
+                                || ((options.sample_rate_decrease_recovery
+                                    || options.sample_rate_decrease_flight)
                                     && rate_decreased);
                             let queued = need_queued
                                 .then(|| get_notsent_bytes(destination_fd))
@@ -1688,6 +1840,26 @@ mod linux {
                                     tcp_info_at_rate_update =
                                         Some(get_tcp_info(destination_fd)?);
                                 }
+                            }
+                            if options.sample_rate_decrease_flight && rate_decreased
+                            {
+                                let queued = queued.expect(
+                                    "rate-decrease flight sampling requires queue depth",
+                                );
+                                let tcp_info = get_tcp_info(destination_fd)?;
+                                let bdp = (u128::from(update.rate)
+                                    * u128::from(tcp_info.rtt_us)
+                                    / 1_000_000)
+                                    .max(1);
+                                rate_decrease_flight_samples.push(
+                                    RateDecreaseFlightSample {
+                                        unsent_bytes: queued,
+                                        unacked_bytes: tcp_info.unacked_bytes,
+                                        snd_cwnd_bytes: tcp_info.snd_cwnd_bytes,
+                                        new_rate_bdp_bytes: u64::try_from(bdp)
+                                            .unwrap_or(u64::MAX),
+                                    },
+                                );
                             }
                             if let Some(candidate) = update.notsent_lowat {
                                 let publish = match last_published_lowat {
@@ -1850,6 +2022,7 @@ mod linux {
                         pacing_updates,
                         notsent_lowat_updates,
                         rate_decrease_recoveries,
+                        rate_decrease_flight_samples,
                         incomplete_rate_decrease_recoveries,
                     });
                 }
@@ -2098,6 +2271,7 @@ mod linux {
                 runs: 1,
                 sample_tcp_info: false,
                 sample_rate_decrease_recovery: false,
+                sample_rate_decrease_flight: false,
                 sample_partial_notsent_every: 0,
                 sample_writable_wake_every: 0,
                 verify: false,
@@ -2181,6 +2355,19 @@ mod linux {
 
             args.notsent_lowat_ms = Some(32);
             assert!(validate_args(&args).is_ok());
+        }
+
+        #[test]
+        fn rate_decrease_flight_sampling_requires_a_decrease() {
+            let mut args = base_args();
+            args.sample_rate_decrease_flight = true;
+            assert!(validate_args(&args).is_err());
+
+            args.rate_updates_bytes_per_sec = vec![110, 90];
+            assert!(validate_args(&args).is_ok());
+
+            args.rate_updates_bytes_per_sec = vec![110, 120];
+            assert!(validate_args(&args).is_err());
         }
 
         #[test]
@@ -2376,6 +2563,36 @@ mod linux {
                     queue_time_lowat_bytes(25 * 1024 * 1024, 32, None, None).unwrap()
                         as f64
                 )
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn rate_decrease_flight_sampling_records_bdp_ratios() {
+            let mut args = base_args();
+            args.worker_threads = 2;
+            args.bytes_per_connection = 4 * 1024 * 1024;
+            args.chunk_size = 16 * 1024;
+            args.rate_bytes_per_sec = 32 * 1024 * 1024;
+            args.second_rate_bytes_per_sec = Some(25 * 1024 * 1024);
+            args.notsent_lowat_ms = Some(32);
+            args.sample_rate_decrease_flight = true;
+            args.pipe_size = 128 * 1024;
+            args.verify = true;
+
+            let record = run_once(&args, 0, false).await.unwrap();
+            assert_eq!(record.rate_decrease_flight_samples_total, 1);
+            assert!(record.rate_decrease_flight_bdp_bytes_median.unwrap() > 0.0);
+            assert!(
+                record
+                    .rate_decrease_flight_admitted_to_bdp_ratio_median
+                    .unwrap()
+                    > 0.0
+            );
+            assert!(
+                record
+                    .rate_decrease_flight_unacked_to_bdp_ratio_median
+                    .unwrap()
+                    >= 0.0
             );
         }
 
