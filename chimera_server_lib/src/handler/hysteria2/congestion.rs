@@ -57,6 +57,7 @@ impl ControllerFactory for BrutalConfig {
             tx_bps: self.tx_bps.clone(),
             cached_brutal_window: brutal.initial_window(),
             brutal_tx_bps: 0,
+            brutal_tx_bps_f64: 0.0,
             #[cfg(feature = "brutal-ack-batch-trace")]
             pending_ack_trace: 0,
             #[cfg(feature = "brutal-pacing-trace")]
@@ -75,6 +76,7 @@ struct BrutalController {
     bbr: Option<Bbr>,
     brutal_active: bool,
     brutal_tx_bps: u64,
+    brutal_tx_bps_f64: f64,
     #[cfg(feature = "brutal-ack-batch-trace")]
     pending_ack_trace: u64,
     #[cfg(feature = "brutal-pacing-trace")]
@@ -304,6 +306,7 @@ impl BrutalController {
         self.bbr = None;
         self.brutal_active = true;
         self.brutal_tx_bps = tx_bps;
+        self.brutal_tx_bps_f64 = tx_bps as f64;
         self.refresh_brutal_window();
         #[cfg(feature = "brutal-pacing-trace")]
         self.initialize_pacing_trace(now);
@@ -324,7 +327,8 @@ impl BrutalController {
 
     fn refresh_brutal_window(&mut self) {
         if self.brutal_active {
-            self.cached_brutal_window = self.brutal.window(self.brutal_tx_bps);
+            self.cached_brutal_window =
+                self.brutal.window_f64(self.brutal_tx_bps_f64);
         }
     }
 
@@ -632,7 +636,11 @@ impl BrutalState {
     }
 
     fn window(&self, tx_bps: u64) -> u64 {
-        if tx_bps == 0 {
+        self.window_f64(tx_bps as f64)
+    }
+
+    fn window_f64(&self, tx_bps: f64) -> u64 {
+        if tx_bps == 0.0 {
             return self.initial_window();
         }
         let rtt = self.last_rtt;
@@ -640,7 +648,7 @@ impl BrutalState {
             return self.initial_window();
         }
 
-        let cwnd = (tx_bps as f64)
+        let cwnd = tx_bps
             * Self::rtt_seconds(rtt)
             * CONGESTION_WINDOW_MULTIPLIER
             * self.reciprocal_ack_rate;
@@ -797,6 +805,7 @@ mod tests {
             tx_bps,
             cached_brutal_window: brutal.initial_window(),
             brutal_tx_bps: 0,
+            brutal_tx_bps_f64: 0.0,
             #[cfg(feature = "brutal-ack-batch-trace")]
             pending_ack_trace: 0,
             #[cfg(feature = "brutal-pacing-trace")]
@@ -827,6 +836,8 @@ mod tests {
         assert!(controller.brutal_active);
         assert!(controller.bbr.is_none());
         assert_eq!(controller.brutal.start, activated_at);
+        assert_eq!(controller.brutal_tx_bps, 1_000_000);
+        assert_eq!(controller.brutal_tx_bps_f64, 1_000_000.0);
         assert_eq!(controller.brutal.last_rtt, Duration::from_millis(80));
         assert_eq!(controller.brutal.ack_rate(), 1.0);
         assert!(
