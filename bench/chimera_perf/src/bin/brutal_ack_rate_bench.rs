@@ -9,6 +9,7 @@ const BATCHED_ACK_PACKETS: u64 = 8_000_000;
 const WINDOW_EVENTS: u64 = 40_000_000;
 const ON_ACK_EVENTS: u64 = 10_000_000;
 const RTT_CONVERSION_EVENTS: u64 = 40_000_000;
+const CLAMP_EVENTS: u64 = 100_000_000;
 const SLOT_COUNT: u64 = 5;
 
 #[derive(Clone, Copy)]
@@ -471,6 +472,52 @@ fn run_loss_window_bench(name: &str, reciprocal_window: bool) {
     );
 }
 
+fn integer_min_ack_rate_clamp_applies(ack_count: u64, loss_count: u64) -> bool {
+    ack_count < loss_count.saturating_mul(4)
+}
+
+fn run_clamped_loss_window_bench(name: &str, integer_clamp: bool) {
+    let tx_bps = 50_000_000_f64;
+    let mut ack_count = 0_u64;
+    let mut loss_count = 0_u64;
+    let mut reciprocal_ack_rate = 1.0_f64;
+    let mut window = modeled_window(1.0);
+    let started = Instant::now();
+    for event in 0..CLAMP_EVENTS {
+        ack_count = ack_count.wrapping_add(1);
+        // One modeled loss per three ACKs keeps the rolling ACK rate near 75%,
+        // so the production 80% minimum remains active after warmup.
+        if event % 3 == 0 {
+            loss_count = loss_count.wrapping_add(1);
+        }
+        let total = black_box(ack_count + loss_count);
+        let ack = black_box(ack_count);
+        let loss = black_box(loss_count);
+        if total < MIN_SAMPLE_COUNT {
+            reciprocal_ack_rate = 1.0;
+        } else if integer_clamp && integer_min_ack_rate_clamp_applies(ack, loss) {
+            reciprocal_ack_rate = 1.0 / MIN_ACK_RATE;
+        } else {
+            reciprocal_ack_rate =
+                ((total as f64) / (ack as f64)).min(1.0 / MIN_ACK_RATE);
+        }
+        let rtt_secs = rtt_secs_subsecond_fast_path(Duration::from_nanos(
+            79_500_000 + event % 1_000_001,
+        ));
+        window =
+            (black_box(tx_bps) * rtt_secs * 0.8 * black_box(reciprocal_ack_rate))
+                as u64;
+        black_box(window);
+    }
+    let elapsed = started.elapsed();
+    println!(
+        "{name}: integer_clamp={integer_clamp} ns_per_ack={:.3} final_ack_rate={:.6} final_window={}",
+        elapsed.as_nanos() as f64 / CLAMP_EVENTS as f64,
+        black_box(1.0 / reciprocal_ack_rate),
+        black_box(window),
+    );
+}
+
 fn run_on_ack_dispatch_bench(name: &str, active_fast_path: bool) {
     let origin = Instant::now();
     let mut state = RecordState::new(origin);
@@ -583,6 +630,18 @@ fn main() {
             "baseline" => run_loss_window_bench("baseline-loss-window", false),
             "reciprocal" => run_loss_window_bench("reciprocal-loss-window", true),
             _ => panic!("BRUTAL_RECIP_BENCH_MODE must be baseline or reciprocal"),
+        }
+        return;
+    }
+    if let Ok(mode) = std::env::var("BRUTAL_CLAMP_BENCH_MODE") {
+        match mode.as_str() {
+            "baseline" => {
+                run_clamped_loss_window_bench("baseline-clamped-loss-window", false)
+            }
+            "integer" => {
+                run_clamped_loss_window_bench("integer-clamped-loss-window", true)
+            }
+            _ => panic!("BRUTAL_CLAMP_BENCH_MODE must be baseline or integer"),
         }
         return;
     }
@@ -825,6 +884,27 @@ mod tests {
             0,
         );
         assert_ne!(baseline.slots, optimized.slots);
+    }
+
+    #[test]
+    fn integer_min_ack_rate_threshold_matches_float_clamp_around_boundary() {
+        for loss_count in 0..=10_000_u64 {
+            let boundary_ack = loss_count.saturating_mul(4);
+            for ack_count in
+                boundary_ack.saturating_sub(2)..=boundary_ack.saturating_add(2)
+            {
+                if ack_count == 0 {
+                    continue;
+                }
+                let total = ack_count + loss_count;
+                let reciprocal = total as f64 / ack_count as f64;
+                assert_eq!(
+                    integer_min_ack_rate_clamp_applies(ack_count, loss_count),
+                    reciprocal > 1.0 / MIN_ACK_RATE,
+                    "ack_count={ack_count} loss_count={loss_count}"
+                );
+            }
+        }
     }
 
     #[test]
