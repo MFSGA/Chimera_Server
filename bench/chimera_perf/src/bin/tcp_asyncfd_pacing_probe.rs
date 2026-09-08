@@ -104,6 +104,9 @@ mod linux {
         #[arg(long, default_value_t = 0)]
         sample_partial_notsent_every: u64,
 
+        #[arg(long, default_value_t = 0)]
+        sample_writable_wake_every: u64,
+
         #[arg(long)]
         verify: bool,
     }
@@ -183,6 +186,7 @@ mod linux {
         sample_tcp_info: bool,
         sample_rate_decrease_recovery: bool,
         sample_partial_notsent_every: u64,
+        sample_writable_wake_every: u64,
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -223,6 +227,11 @@ mod linux {
         destination_partial_notsent_bytes: u64,
         destination_partial_notsent_min: Option<u32>,
         destination_partial_notsent_max: Option<u32>,
+        writable_wake_samples: u64,
+        writable_wake_at_or_below_lowat: u64,
+        writable_wake_notsent_bytes: u64,
+        writable_wake_unacked_bytes: u64,
+        writable_wake_cwnd_bytes: u64,
         notsent_bytes_at_rate_update: Option<u32>,
         tcp_info_at_rate_update: Option<TcpInfoSample>,
         notsent_bytes_at_lowat_restore: Option<u32>,
@@ -267,6 +276,7 @@ mod linux {
         sample_tcp_info: bool,
         sample_rate_decrease_recovery: bool,
         sample_partial_notsent_every: u64,
+        sample_writable_wake_every: u64,
         destination_ready_acquisitions_total: u64,
         destination_ready_acquisitions_per_connection: f64,
         relay_elapsed_us_median: f64,
@@ -289,6 +299,11 @@ mod linux {
         destination_partial_notsent_bytes_mean: Option<f64>,
         destination_partial_notsent_min: Option<u32>,
         destination_partial_notsent_max: Option<u32>,
+        writable_wake_samples_total: u64,
+        writable_wake_at_or_below_lowat_ratio: Option<f64>,
+        writable_wake_notsent_bytes_mean: Option<f64>,
+        writable_wake_unacked_bytes_mean: Option<f64>,
+        writable_wake_cwnd_bytes_mean: Option<f64>,
         writer_elapsed_us_median: f64,
         writer_elapsed_us_max: f64,
         writer_elapsed_max_to_median_ratio: f64,
@@ -352,6 +367,7 @@ mod linux {
         sample_tcp_info: bool,
         sample_rate_decrease_recovery: bool,
         sample_partial_notsent_every: u64,
+        sample_writable_wake_every: u64,
         aggregate_throughput_median_gbps: f64,
         throughput_cv: f64,
         per_connection_rate_ratio_median: Option<f64>,
@@ -573,6 +589,7 @@ mod linux {
                 sample_tcp_info: args.sample_tcp_info,
                 sample_rate_decrease_recovery: args.sample_rate_decrease_recovery,
                 sample_partial_notsent_every: args.sample_partial_notsent_every,
+                sample_writable_wake_every: args.sample_writable_wake_every,
                 aggregate_throughput_median_gbps: round(median(&throughput)),
                 throughput_cv: round(coefficient_of_variation(&throughput)),
                 per_connection_rate_ratio_median: (!ratios.is_empty())
@@ -759,6 +776,16 @@ mod linux {
         {
             bail!(
                 "--sample-partial-notsent-every requires paced single-drain mode with static TCP_NOTSENT_LOWAT"
+            );
+        }
+        if args.sample_writable_wake_every > 0
+            && (args.unpaced
+                || args.destination_drain_mode != DestinationDrainMode::Single
+                || (args.notsent_lowat_bytes.is_none()
+                    && args.notsent_lowat_ms.is_none()))
+        {
+            bail!(
+                "--sample-writable-wake-every requires paced single-drain mode with static TCP_NOTSENT_LOWAT"
             );
         }
         if args.notsent_lowat_min_bytes == Some(0)
@@ -960,6 +987,7 @@ mod linux {
                 sample_tcp_info: args.sample_tcp_info,
                 sample_rate_decrease_recovery: args.sample_rate_decrease_recovery,
                 sample_partial_notsent_every: args.sample_partial_notsent_every,
+                sample_writable_wake_every: args.sample_writable_wake_every,
             };
 
             writers.push(tokio::spawn(async move {
@@ -1109,6 +1137,26 @@ mod linux {
             .iter()
             .filter_map(|stats| stats.destination_partial_notsent_max)
             .max();
+        let writable_wake_samples_total = relay_stats
+            .iter()
+            .map(|stats| stats.writable_wake_samples)
+            .sum::<u64>();
+        let writable_wake_at_or_below_lowat_total = relay_stats
+            .iter()
+            .map(|stats| stats.writable_wake_at_or_below_lowat)
+            .sum::<u64>();
+        let writable_wake_notsent_bytes_total = relay_stats
+            .iter()
+            .map(|stats| stats.writable_wake_notsent_bytes)
+            .sum::<u64>();
+        let writable_wake_unacked_bytes_total = relay_stats
+            .iter()
+            .map(|stats| stats.writable_wake_unacked_bytes)
+            .sum::<u64>();
+        let writable_wake_cwnd_bytes_total = relay_stats
+            .iter()
+            .map(|stats| stats.writable_wake_cwnd_bytes)
+            .sum::<u64>();
         let notsent = relay_stats
             .iter()
             .filter_map(|stats| stats.notsent_bytes_at_rate_update.map(f64::from))
@@ -1227,6 +1275,7 @@ mod linux {
             sample_tcp_info: args.sample_tcp_info,
             sample_rate_decrease_recovery: args.sample_rate_decrease_recovery,
             sample_partial_notsent_every: args.sample_partial_notsent_every,
+            sample_writable_wake_every: args.sample_writable_wake_every,
             destination_ready_acquisitions_total,
             destination_ready_acquisitions_per_connection: round(
                 destination_ready_acquisitions_total as f64
@@ -1272,6 +1321,36 @@ mod linux {
                 }),
             destination_partial_notsent_min,
             destination_partial_notsent_max,
+            writable_wake_samples_total,
+            writable_wake_at_or_below_lowat_ratio: (writable_wake_samples_total > 0)
+                .then(|| {
+                    round(
+                        writable_wake_at_or_below_lowat_total as f64
+                            / writable_wake_samples_total as f64,
+                    )
+                }),
+            writable_wake_notsent_bytes_mean: (writable_wake_samples_total > 0)
+                .then(|| {
+                    round(
+                        writable_wake_notsent_bytes_total as f64
+                            / writable_wake_samples_total as f64,
+                    )
+                }),
+            writable_wake_unacked_bytes_mean: (writable_wake_samples_total > 0)
+                .then(|| {
+                    round(
+                        writable_wake_unacked_bytes_total as f64
+                            / writable_wake_samples_total as f64,
+                    )
+                }),
+            writable_wake_cwnd_bytes_mean: (writable_wake_samples_total > 0).then(
+                || {
+                    round(
+                        writable_wake_cwnd_bytes_total as f64
+                            / writable_wake_samples_total as f64,
+                    )
+                },
+            ),
             writer_elapsed_us_median: round(writer_elapsed_us_median),
             writer_elapsed_us_max: round(writer_elapsed_us_max),
             writer_elapsed_max_to_median_ratio: round(
@@ -1407,6 +1486,13 @@ mod linux {
         let mut destination_partial_notsent_bytes = 0_u64;
         let mut destination_partial_notsent_min = None;
         let mut destination_partial_notsent_max = None;
+        let mut writable_wake_samples = 0_u64;
+        let mut writable_wake_at_or_below_lowat = 0_u64;
+        let mut writable_wake_notsent_bytes = 0_u64;
+        let mut writable_wake_unacked_bytes = 0_u64;
+        let mut writable_wake_cwnd_bytes = 0_u64;
+        let mut writable_wakes_after_block = 0_u64;
+        let mut sample_next_writable_wake = false;
         let mut notsent_bytes_at_rate_update = None;
         let mut tcp_info_at_rate_update = None;
         let mut notsent_bytes_at_lowat_restore = None;
@@ -1432,6 +1518,32 @@ mod linux {
                 let mut writable = destination.writable().await?;
                 destination_ready_acquisitions =
                     destination_ready_acquisitions.saturating_add(1);
+                if sample_next_writable_wake {
+                    writable_wakes_after_block =
+                        writable_wakes_after_block.saturating_add(1);
+                    if options.sample_writable_wake_every > 0
+                        && writable_wakes_after_block
+                            .is_multiple_of(options.sample_writable_wake_every)
+                    {
+                        let destination_fd = destination.get_ref().as_raw_fd();
+                        let queued = get_notsent_bytes(destination_fd)?;
+                        let tcp_info = get_tcp_info(destination_fd)?;
+                        writable_wake_samples =
+                            writable_wake_samples.saturating_add(1);
+                        writable_wake_notsent_bytes = writable_wake_notsent_bytes
+                            .saturating_add(u64::from(queued));
+                        writable_wake_unacked_bytes = writable_wake_unacked_bytes
+                            .saturating_add(tcp_info.unacked_bytes);
+                        writable_wake_cwnd_bytes = writable_wake_cwnd_bytes
+                            .saturating_add(tcp_info.snd_cwnd_bytes);
+                        if last_published_lowat.is_some_and(|lowat| queued <= lowat)
+                        {
+                            writable_wake_at_or_below_lowat =
+                                writable_wake_at_or_below_lowat.saturating_add(1);
+                        }
+                    }
+                    sample_next_writable_wake = false;
+                }
                 if options.destination_drain_mode != DestinationDrainMode::Single {
                     let max_splice_attempts =
                         options.destination_drain_mode.max_splice_attempts();
@@ -1650,6 +1762,7 @@ mod linux {
                     Err(_would_block) => {
                         destination_would_blocks =
                             destination_would_blocks.saturating_add(1);
+                        sample_next_writable_wake = true;
                         if let Some(recovery) = &mut active_rate_decrease_recovery {
                             recovery.would_blocks =
                                 recovery.would_blocks.saturating_add(1);
@@ -1683,7 +1796,8 @@ mod linux {
             let source_read = if let Some(read) = source_read {
                 Some(read)
             } else {
-                source_ready_acquisitions = source_ready_acquisitions.saturating_add(1);
+                source_ready_acquisitions =
+                    source_ready_acquisitions.saturating_add(1);
                 let mut readable = source.readable().await?;
                 match readable.try_io(|source| {
                     splice_once(
@@ -1723,6 +1837,11 @@ mod linux {
                         destination_partial_notsent_bytes,
                         destination_partial_notsent_min,
                         destination_partial_notsent_max,
+                        writable_wake_samples,
+                        writable_wake_at_or_below_lowat,
+                        writable_wake_notsent_bytes,
+                        writable_wake_unacked_bytes,
+                        writable_wake_cwnd_bytes,
                         notsent_bytes_at_rate_update,
                         tcp_info_at_rate_update,
                         notsent_bytes_at_lowat_restore,
@@ -1980,8 +2099,22 @@ mod linux {
                 sample_tcp_info: false,
                 sample_rate_decrease_recovery: false,
                 sample_partial_notsent_every: 0,
+                sample_writable_wake_every: 0,
                 verify: false,
             }
+        }
+
+        #[test]
+        fn writable_wake_sampling_requires_static_lowat() {
+            let mut args = base_args();
+            args.sample_writable_wake_every = 8;
+            assert!(validate_args(&args).is_err());
+
+            args.notsent_lowat_ms = Some(32);
+            assert!(validate_args(&args).is_ok());
+
+            args.destination_drain_mode = DestinationDrainMode::TwoSplices;
+            assert!(validate_args(&args).is_err());
         }
 
         #[test]
@@ -2297,7 +2430,8 @@ mod linux {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn try_first_source_readiness_preserves_payload_and_hits_cached_ready() {
+        async fn try_first_source_readiness_preserves_payload_and_hits_cached_ready()
+        {
             let mut args = base_args();
             args.worker_threads = 2;
             args.bytes_per_connection = 512 * 1024;
