@@ -579,6 +579,10 @@ A follow-up attribution splits the overwhelmingly common ACK callback from the g
 
 `BRUTAL_DISPATCH_BENCH_MODE=baseline|active-fast` isolates the remaining post-activation controller dispatch around that optimized ACK body. Both shapes keep the required `brutal_active` test; `baseline` also models the current `if let Some(bbr)` check after activation has permanently cleared BBR, while `active-fast` returns directly to the Brutal body. Ten CPU-0-pinned independent-process pairs with alternating order measured baseline mostly around **7.78-7.92 ns/ACK** and active-fast around **7.62-7.87 ns/ACK** (one baseline outlier at 8.93 ns and one candidate outlier at 8.10 ns). The medians differ by only about **1.7%**, with one of ten pairs reversing direction. That is too small to justify duplicating or restructuring `Controller::on_ack` production control flow solely to remove a highly predictable empty-BBR branch. Keep this as a regression probe and prioritize larger data-plane costs instead.
 
+### XUDP stable-target update benchmark
+
+`xudp_session_target_update_bench` isolates the established-session path where a Keep frame repeats the same hostname target. The previous decoder cloned the hostname into session state even when unchanged. Ten alternating-order CPU-0-pinned release pairs (5M frames/process, after three warmup pairs) all favored comparing before cloning: baseline samples were about **15.7-26.4 ns/frame**, while the candidate was about **8.9-14.1 ns/frame**, with identical checksums. Production now clones only when the target actually changes; changed-target semantics remain covered by the existing decoder regression test. See `XUDP_STABLE_TARGET_CLONE.md`.
+
 ## Required experiment discipline
 
 - Build every compared binary in release mode using the same toolchain.

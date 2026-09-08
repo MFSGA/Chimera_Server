@@ -554,10 +554,11 @@ fn decode_frame_with_control_count(
                 }
             }
             SessionStatus::Keep if session_known => {
-                if let Some(target) = metadata.target.clone()
+                if let Some(target) = metadata.target.as_ref()
                     && let Some(session) = sessions.get_mut(&metadata.session_id)
+                    && session.target != *target
                 {
-                    session.target = target;
+                    session.target = target.clone();
                 }
             }
             SessionStatus::Keep | SessionStatus::End | SessionStatus::KeepAlive => {}
