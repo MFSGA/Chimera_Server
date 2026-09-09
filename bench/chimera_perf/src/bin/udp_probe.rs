@@ -119,9 +119,8 @@ mod linux {
             packet_rates.push(sample.packets_per_second);
             throughput.push(sample.throughput_gbps);
             cpu.push(sample.cpu_seconds_per_million_packets);
-            relay_calling_thread_cpu.push(
-                sample.relay_calling_thread_cpu_seconds_per_million_packets,
-            );
+            relay_calling_thread_cpu
+                .push(sample.relay_calling_thread_cpu_seconds_per_million_packets);
             relay_receive_calls.push(sample.relay_receive_calls as f64);
             relay_send_calls.push(sample.relay_send_calls as f64);
             relay_window_wait_events.push(sample.relay_window_wait_events as f64);
