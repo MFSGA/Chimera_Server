@@ -956,6 +956,7 @@ pub(crate) async fn run_session_based_udp(
                                             resolver: trojan_resolver.clone(),
                                             runtime: runtime.clone(),
                                             outbound: outbound.clone(),
+                                            global_id: None,
                                             idle_timeout: UDP_SESSION_IDLE_TIMEOUT,
                                         },
                                     )
@@ -975,6 +976,7 @@ pub(crate) async fn run_session_based_udp(
                                         resolver: trojan_resolver.clone(),
                                         runtime: runtime.clone(),
                                         outbound,
+                                        global_id: None,
                                         idle_timeout: UDP_SESSION_IDLE_TIMEOUT,
                                     },
                                 )
@@ -1230,6 +1232,7 @@ async fn start_session_udp_session(
                 response_sender,
                 traffic_context,
                 idle_timeout,
+                GlobalUdpBackendStart::Direct,
             )
             .await
         }
@@ -1656,12 +1659,25 @@ async fn clear_global_attachment_if_current(
 
 async fn start_global_session_udp_worker(
     key: GlobalUdpWorkerKey,
+    target_addr: SocketAddr,
     idle_timeout: Duration,
+    backend_start: GlobalUdpBackendStart,
 ) -> std::io::Result<GlobalSessionUdpWorker> {
-    let bind_addr = if key.target_is_ipv6 {
-        SocketAddr::from(([0u16; 8], 0))
-    } else {
-        SocketAddr::from(([0, 0, 0, 0], 0))
+    let bind_addr = match backend_start {
+        GlobalUdpBackendStart::Direct => {
+            if target_addr.is_ipv6() {
+                SocketAddr::from(([0u16; 8], 0))
+            } else {
+                SocketAddr::from(([0, 0, 0, 0], 0))
+            }
+        }
+        #[cfg(feature = "trojan")]
+        GlobalUdpBackendStart::Trojan { .. } => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Trojan outbound for GlobalID XUDP is not implemented yet",
+            ));
+        }
     };
     let socket = UdpSocket::bind(bind_addr).await?;
     let (sender, mut receiver) =
@@ -4254,7 +4270,7 @@ mod tests {
         globals.workers.insert(
             global_id,
             GlobalSessionUdpWorker {
-                key: GlobalUdpWorkerKey {
+                key: GlobalUdpWorkerKey::Direct {
                     target_is_ipv6: false,
                     outbound_tag: None,
                 },
