@@ -1,162 +1,265 @@
 # AGENTS
 
-This AGENTS document explains the expectations for automatic contributors running inside Chimera_Server.
-It captures the current project priorities, key architecture references, and the commands/style guidance you should follow before touching core logic.
-Treat it as the first read for any new change: you do not need to repeat its recommendations unless you diverge.
-Use the references here when you feel direction is missing rather than guessing defaults.
+These instructions apply to contributions in Chimera_Server. Read them before changing code,
+then inspect the affected modules and any more specific `AGENTS.md` files. Follow the user's
+current task instructions when they conflict with this document. Keep changes focused and
+report any necessary deviation from the project conventions.
 
-## Compass
-- Chimera_Server is a Rust networking core whose behavior should stay aligned with xray-core and shoes when it comes to inbound parsing and protocols.
-- Maintain an inbound-first focus while the outbound/routing/policy surface is still materializing.
-- Keep the data path lean: configuration → runtime state → handler chain → outbound session.
-- Data plane logic must stay non-blocking; push heavy work into the control plane or dedicated threads.
-- Observability should reuse the `traffic` / gRPC / MCP channels and not invent new telemetry surfaces without coordination.
-- Contributors join the code path at the config layer, pass through handler/transport, and surface in runtime/traffic metrics.
+## Project Goal, Scope and References
 
-## Architecture Reference
-- Follow clash-rs for the layered thought process: parse config, build runtime state, isolate handler chain, then expose control-plane APIs.
-- Keep the handoff between inbound listener, handler pipeline, and outbound connection explicit in code and documentation.
-- Controller services (gRPC, MCP, stats) must stay decoupled from the forwarding data path to avoid blocking.
-- As features grow, prefer the existing async task mesh instead of adding custom threads unless mutex-protected state justifies it.
+- The ultimate goal is full xray-core compatibility **as a server**, with inbound compatibility
+  as the current primary objective. Existing Xray-compatible clients should connect without
+  client changes, and supported Xray server configurations should retain equivalent behavior.
+- Inbound scope includes protocols, transports, TLS/REALITY, authentication, fallback, listeners,
+  socket options, sniffing, user policy, and the management/statistics APIs needed to operate
+  those inbounds. Track platform-specific behavior explicitly.
+- Defer broad outbound protocol and routing feature expansion until the inbound objective is
+  complete, unless the user changes priorities. Preserve existing outbound behavior. Implement
+  the destination connection, DNS resolution, TCP/UDP forwarding, timeout and routing/policy
+  integration necessary to validate an inbound end to end; those dependencies remain in scope.
+- Use `ref/xray-core/` as the canonical reference for server configuration **and observable
+  protocol/runtime behavior**, including defaults, validation and failure handling.
+  Use `ref/shoes/` as an implementation aid and `ref/clash-rs/` for architectural layering.
+  When shoes differs from Xray, follow Xray for the compatibility contract and document the choice.
+- Record the actual Xray reference commit/tag and client binary version for compatibility work.
+  Prefer checked-out sources over assumptions about upstream. Do not call a local snapshot
+  "latest" without verification, and do not silently change the baseline during a task.
+- Improve internal safety, lifecycle management, resource use and maintainability while retaining
+  external compatibility. Establish a concrete failure or measured cost before calling an Xray
+  design deficient; a Rust rewrite alone does not demonstrate an improvement.
+- Keep the data flow explicit: configuration → validated runtime state → listener/transport
+  → protocol handler → outbound session. Control-plane services must stay decoupled from forwarding.
+- Preserve Chimera naming and existing extensions, but do not let Chimera-only features displace
+  the inbound compatibility goal. Do not modify `ref/` unless reference updates are in scope.
 
-## Implementation Reference
-- Protocol behavior is best modeled after https://github.com/cfal/shoes; when in doubt, compare handshake flows, defaults, and error handling.
-- New outbound or inbound protocols must update config parsing, the `ServerConfig` conversions, and the handler layer.
-- Keep compatibility with xray-core semantics; treat xray as the canonical snapshot for inbound configuration structures and defaults.
-- When adding new options, sync them through `config` → `ServerConfig` → `handler` to ensure end-to-end coverage.
+## Compatibility Contract and Evidence
+
+- Compatibility covers configuration acceptance/defaults, wire behavior, authentication and
+  replay handling, fallback selection, TCP/UDP semantics, timeouts, EOF/half-close, user policy,
+  dynamic management and statistics where applicable. Successful parsing or a single successful
+  handshake does not establish full compatibility.
+- Implement options through every applicable layer: literal config → validation/defaults →
+  `ServerConfig` or owning runtime state → behavior → focused tests and configuration docs.
+  Route file configuration and management API input through shared validation/building logic
+  where practical; equivalent inputs must not acquire different defaults through separate paths.
+- Never silently accept a recognized, behavior-changing option as a no-op and count it as
+  supported. Until implemented, provide an explicit unsupported-field error or a clearly
+  documented compatibility diagnostic. Security-critical unsupported behavior must fail closed.
+- Match Xray's treatment of omitted, explicit, unknown and server-inapplicable fields deliberately.
+  Do not apply blanket unknown-field rejection without checking its compatibility impact.
+  Any intentional stricter behavior must be documented as a deviation, not full parity.
+- Maintain the inbound support matrix in `examples/xray-compatible/README.md` and adjacent
+  configuration docs. Distinguish missing, parse/build only, runtime implemented, and verified
+  interoperability, with partial support and limitations stated explicitly. Verify code and tests
+  before reusing a documentation claim; keep changing gap inventories out of this instruction file.
+- Define coverage by protocol × transport × security × TCP/UDP, plus relevant user, policy,
+  fallback and platform variants. Enumerate supported combinations rather than implying that
+  separate support for two features proves their combination works.
+- For an affected compatibility claim, run a real versioned Xray-compatible client against Chimera
+  and, where behavior is ambiguous, run the same case against the reference Xray server.
+  Cover valid traffic and relevant invalid authentication, replay, malformed/truncated frames,
+  cancellation and connection teardown. Use deterministic local fixtures when possible.
+- Record exact test commands, versions, outcomes and prerequisites. Ignored tests do not run under
+  ordinary `cargo test`; execute the relevant ones explicitly before declaring interoperability
+  verified. If prerequisites are unavailable, report the unverified scope instead of claiming parity.
+- Full compatibility claims require a defined baseline and coverage matrix with no unresolved gaps
+  in the claimed scope. Do not invent a compatibility percentage from code size or protocol counts.
+
+## Improvement Priorities and Design Guardrails
+
+- Prioritize evidenced credential exposure, silent configuration misbehavior, protocol correctness
+  and lifecycle/resource failures before adding breadth or optimizing throughput.
+- Complete one bounded inbound behavior at a time. Prefer closing gaps in deployed protocol and
+  transport combinations, then extend coverage toward the full server contract. A broad request
+  to improve the project is not a reason to mix unrelated protocol goals in one change.
+- Never log full configurations, authentication payloads, passwords, private keys or tokens.
+  Keep diagnostics useful through safe fields such as inbound tag, protocol and config field path;
+  parsing errors must not echo the original secret-bearing configuration.
+- Give listeners, connections and background tasks explicit owners and shutdown behavior.
+  Account for startup rollback, stop-accepting, draining, cancellation and bounded cleanup;
+  dropping a task handle is not task cancellation. Test these paths when changing lifecycle code.
+- Bound handshake concurrency, buffering, queues and session state where appropriate. Preserve
+  backpressure and isolate control-plane work from forwarding. Introduce limits with documented
+  defaults and overload behavior, and check that legitimate reference-client traffic still works.
+- Keep wire-level compatibility separate from internal implementation choices. Do not reproduce
+  an unsafe implementation detail merely because the reference uses it; document any externally
+  visible security hardening, especially if it changes probe/fallback or error behavior.
+- Justify performance changes using comparable workloads and equivalent security/transport
+  semantics. Record client/server versions, hardware, network conditions and measurement method;
+  evaluate CPU, memory, latency, throughput and loss recovery as relevant. Performance gains do
+  not excuse broken authentication, fallback, accounting or shutdown behavior.
+- Keep improvements incremental and reviewable; use concrete regression tests or measurements
+  to justify architectural changes rather than undertaking an unbounded rewrite.
 
 ## Code Map
-- Entry application: `chimera_server_app/src/main.rs` contains the CLI harness for the workspace.
-- Core library bootstrap: `chimera_server_lib/src/lib.rs` orchestrates config parsing, runtime creation, and server startup.
-- Configuration parsing: `chimera_server_lib/src/config` houses literal config definitions, validation, and serde maps.
-- Inbound services: `chimera_server_lib/src/beginning` handles socket acceptance and transport wrappers.
-- Handler stack: `chimera_server_lib/src/handler` organizes the protocol-specific layers that sit between transport and outbound.
-- gRPC control plane: `chimera_server_lib/src/grpc` exposes APIs for runtime introspection, management, and stats.
-- MCP push service: `chimera_server_lib/src/mcp` implements the MCP data stream.
-- Runtime and traffic state: `chimera_server_lib/src/runtime` and `chimera_server_lib/src/traffic` manage statistics and service registry.
-- TLS and REALITY helpers: `chimera_server_lib/src/reality` contains TLS setup, certificate wiring, and crypto utilities.
-- Build-time protos: `chimera_server_lib/build.rs` generates gRPC bindings used by the control plane.
-- CLI helpers: `chimera_cli` hosts utilities for interacting with the server while the main app remains lean.
 
-## Development Conventions
-- Keep `tokio` runtimes explicit: choose between multi-thread and current-thread builders near `start` and never mix runtime types inside a single server task.
-- Derive `ServerConfig` via `TryFrom`/`TryInto`; each inbound entry must validate addresses, tags, and optional API bindings.
-- Use `tracing` for logs, `anyhow`/`thiserror` for error aggregation, and ensure each module owns a helper to map string configs to enums.
-- When adding observability, follow the existing channels: `traffic` for metrics, `tracing` for logs, `mcp` for control-plane pushes.
-- Respect the config layering: literal JSON5 → `config::def` structures → `ServerConfig` → handler builder; do not bypass this chain.
-- Avoid blocking in the data path; if you need `std::fs` or complex parsing, spawn a blocking task or precompute during start-up.
-- Document new config options in the literal schema and describe them in adjacent README fragments (add to the `config` folder docs if necessary).
-- Coordinate new features by updating documentation or AGENTS when extra setup steps become necessary.
-- Prefer `#[cfg(test)]` modules for helpers so test scaffolding is gated away from production builds.
+Paths below are relative to the repository root.
 
-## Build / Lint / Test Commands
-- `cargo build --all-features` builds `chimera_server_app`, `chimera_server_lib`, and `chimera_cli` with default features.
-- `cargo run --package chimera_server_app -- --config config.json5` boots the main app using the local config file.
-- `./start.sh` or `start_server.ps1` (Windows) perform scripted hot-reload sequences; inspect them for environment assumptions before running.
-- `cargo fmt --all` ensures every crate follows rustfmt; run this before opening PRs.
-- `cargo clippy --all-targets --all-features -- -D warnings` enforces lint gates; fix new warnings locally before pushing.
-- `cargo test` runs the full test suite across the workspace; it includes integration and unit tests defined under `chimera_server_lib` and `chimera_server_app`.
-- `cargo test -p chimera_server_lib --lib` focuses on the core library, while `cargo test --package chimera_server_app` targets the application.
-- `cargo test --locked` pins dependencies; locally run it while updating `Cargo.lock`.
-- `cargo test --workspace -- --ignored` executes slow tests that are currently gated; run these when iterating on related features.
+| Path | Responsibility |
+| --- | --- |
+| `chimera_server_app/src/main.rs` | Main CLI, config source selection, validation and startup |
+| `chimera_server_lib/src/lib.rs` | Library entry points, runtime preparation and server lifecycle |
+| `chimera_server_lib/src/config_loader.rs` | Local and external configuration loading |
+| `chimera_server_lib/src/config/def.rs` | Literal configuration structures |
+| `chimera_server_lib/src/config/server_config/` | Server configuration types and builders |
+| `chimera_server_lib/src/config/rule/` | Routing configuration |
+| `chimera_server_lib/src/beginning/` | Listeners and transport entry points |
+| `chimera_server_lib/src/handler/` | Protocol and transport handler layers |
+| `chimera_server_lib/src/outbound.rs` | Outbound connection behavior |
+| `chimera_server_lib/src/runtime.rs` | Shared runtime state and management |
+| `chimera_server_lib/src/routing_*.rs` | Routing state, observation, process lookup and webhooks |
+| `chimera_server_lib/src/traffic.rs`, `traffic_impl.rs` | Traffic interface and implementation (both under `src/`) |
+| `chimera_server_lib/src/grpc/`, `chimera_server_lib/src/mcp.rs` | Control-plane APIs and streams |
+| `chimera_server_lib/src/reality/` | REALITY handshake and cryptographic helpers |
+| `chimera_server_lib/proto/`, `chimera_server_lib/build.rs` | Protobuf sources and binding generation |
+| `chimera_cli/` | CLI utilities |
+| `chimera_tcp_reality_server/` | Dedicated TCP REALITY server crate |
+| `chimera_server_lib/tests/`, `chimera_server_app/tests/` | Integration tests |
+| `chimera_server_lib/src/config/README.md`, `examples/xray-compatible/` | Configuration documentation and examples |
+| `bench/chimera_perf/` | Performance probes in a separate Cargo workspace |
+| `vendor/quinn-proto/` | Locally patched dependency selected by the root Cargo manifest |
+| `.github/workflows/` | CI, release and performance workflows |
 
-## Single-Test Workflow
-- To run one test function: `cargo test <testname> -p chimera_server_lib -- --exact`; the name can be module-qualified, e.g., `cargo test config::server::parse_basic -- --exact`.
-- When a test name is ambiguous, combine module path and function, such as `cargo test handler::tcp::inbound_parse_settings -- --exact`.
-- For doc tests in a module, add the crate flag `cargo test --doc <module>` or run `cargo test -p chimera_server_lib doc_tests::api` if they are grouped.
-- If a test requires runtime service mocks, prefer helpers under `chimera_server_lib/tests` and run `cargo test --test helper_name` to exercise them.
+## Working Procedure
 
-## Style Guidelines
-### Imports
-- Group `use` statements by crate group: `std`, workspace, external dependencies, then local modules; keep each group sorted alphabetically.
-- Avoid glob imports unless a module exposes a carefully curated prelude; prefer explicit names so the compiler and reviewers know what is imported.
-- In nested modules, prefer relative imports (`crate::`, `super::`, `self::`) over absolute paths to keep the structure digestible.
+1. Run `git status --short` before editing. Inspect relevant diffs and preserve unrelated work.
+2. Trace the affected configuration and runtime path, and read the relevant reference code
+   before changing compatibility behavior.
+3. Choose a small, reviewable change with a clear observable result. Avoid unrelated cleanup,
+   dependency upgrades, or broad formatting churn.
+4. Add or update tests for changed behavior, including invalid input and boundary cases when
+   applicable. Update configuration docs and examples when user-visible semantics change.
+5. Run the checks appropriate to the change. Report what passed, what failed, and what could
+   not be run; distinguish pre-existing failures from regressions introduced by the change.
+6. Summarize the result, compatibility differences and remaining limitations. Update this
+   document only when durable workflow, architecture or setup guidance changes.
 
-### Formatting
-- Run `cargo fmt` with the workspace settings for every change; do not hand-tune spacing unless rustfmt is misguided (explain the exemption in a comment).
-- Keep line lengths around 100 characters; break expressions across lines with trailing commas to keep diffs readable.
-- Use trailing commas in multi-line arrays, maps, enums, and match arms to reduce churn when items move.
+## Rust and Runtime Conventions
 
-### Types & Config
-- Prefer small, focused structs (e.g., `ServerConfig`, `ApiConfig`, `McpConfig`) and keep serde derives close to literal config types.
-- Align config defaults with xray-core; if new defaults differ, add comments referencing the reason and spike with tests for both nil and explicit values.
-- When exposing public constructors, use `impl Default` or builder helpers so callers do not replicate configuration plumbing.
-- Wrap configuration validation logic in helper methods inside config modules; keep verification close to parsing so invalid states are rejected early.
+- Follow surrounding module style and workspace rustfmt settings. Use explicit imports,
+  conventional Rust names, and small modules with clear responsibilities.
+- Keep literal parsing and validation in the config layer; reuse `TryFrom`/`TryInto` conversions
+  where established. Validate addresses, tags and API bindings before starting listeners.
+- Preserve the distinction between omitted and explicit config values when the reference does.
+  Document intentional default differences and cover them with tests.
+- Use existing error types, including `Error::InvalidConfig` for configuration validation.
+  Prefer typed errors in the library and `anyhow` at application boundaries. Add context without
+  exposing credentials. Avoid production `unwrap`/`expect` unless an invariant is established.
+- Keep runtime creation at the application/library startup boundary. Do not create nested
+  runtimes or call blocking runtime entry points from async request handlers.
+- Keep forwarding non-blocking. Precompute expensive work at startup or use `spawn_blocking`
+  for blocking I/O and CPU work where needed. A mutex alone is not a reason to add a thread.
+- Do not hold blocking mutex guards across `.await`. Keep critical sections short and preserve
+  backpressure, cancellation, EOF, half-close and error propagation in relay changes.
+- Futures may be awaited, spawned, selected or combined as the design requires. Apply `Send`
+  and lifetime bounds where the executor or API requires them; do not require `Sync` universally.
+- Preserve server task supervision and shutdown behavior. Inspect the existing lifecycle before
+  adding tasks; handle termination and errors instead of silently detaching essential services.
+- Reuse `tracing` for logs, `traffic` for metrics, and gRPC/MCP for control-plane exposure.
+  Use structured tags and addresses where useful; avoid noisy per-packet logs in normal operation.
+  Preserve public statistics and serialization compatibility.
+- Keep optional behavior consistent with Cargo feature gates and runtime configuration. Test
+  affected reduced-feature builds when changing gates or shared imports.
+- Document new or changed public APIs and non-obvious protocol choices. Prefer reference file
+  paths or symbols in comments. Keep TODOs concrete and remove them when resolved.
+- Treat changes to `vendor/quinn-proto/` as dependency patches: explain their purpose and test
+  the affected transport behavior. Do not hand-edit generated protobuf bindings.
 
-### Naming
-- Use `snake_case` for functions, variables, and modules, `CamelCase` for structs/enums, and `SCREAMING_SNAKE` for constants.
-- Keep tag names short but descriptive; follow xray semantics when deriving tags from inbound entries.
-- Use verbs for functions (e.g., `start_server`), nouns for structs (`InboundConfig`), and `maybe_`/`try_` prefixes for fallible helpers.
-- When a function returns `Option`, name it to match the `None` semantic (e.g., `next_handler`, `api_listen_addr`).
+## Validation Commands
 
-### Error Handling
-- Prefer `Result<T, Error>` with `thiserror` to derive error enums; include context in `#[error("...")]` strings.
-- Use `anyhow` at application boundaries only when you need to bubble multiple error kinds to the CLI layer; internal logic should use explicit error enums.
-- Map parsing errors (e.g., invalid addresses) to `Error::InvalidConfig` before they escape to the runtime.
-- Log recoverable errors at `tracing::warn`, fatal errors at `tracing::error`, and only `panic!` when invariants cannot be recovered.
-- Avoid `unwrap`/`expect` in production code unless invariants are proven; prefer `?` or `match` to surface failures.
+Run commands from the repository root unless stated otherwise. The root workspace contains
+`chimera_server_app`, `chimera_server_lib`, `chimera_cli`, and `chimera_tcp_reality_server`.
+`--all-features` enables all features of selected packages; it is not the default feature set.
 
-### Async & Runtime
-- Use `tokio::spawn`/`tokio::task::spawn_blocking` from `start_async` and prefer `async move` when capturing owned state.
-- Keep `async fn` bodies small; split complex flows into helpers for readability and easier test coverage.
-- Always call `.await` directly on futures you create; avoid storing raw futures in struct fields unless they implement `Send` and `Sync` properly.
-- When running multiple servers, gather `JoinHandles` and `select_all` on them just like `start_async` does, so any finished server triggers shutdown.
+For Rust changes, run formatting, Clippy, and the smallest meaningful tests:
 
-### Observability
-- Instrument critical transitions with `tracing::info` and `tracing::warn`; capture tags and addresses to tether logs to inbound entries.
-- Add structured fields when logging `join_handles`, listen addresses, or config tags to make debugging easier.
-- When exposing stats over `runtime` or `traffic`, keep the serialization format stable; add versioned fields only after ensuring backward compatibility.
+```sh
+cargo fmt --all
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test -p chimera_server_lib --lib
+```
 
-### Testing Practices
-- Place unit tests inline with modules for small helpers and use `#[cfg(test)] mod tests` to keep them close to the code they verify.
-- For integration tests, drop them under `tests/` or use `#[tokio::test]` in `chimera_server_lib` when async context is needed.
-- Run slow or environment-dependent tests manually and annotate them with `#[ignore]`; make it easy to find them via `cargo test -- --ignored`.
-- When mocking sockets or control-plane services, reuse helpers in `chimera_server_lib/tests/common` to keep behavior consistent.
+Inspect formatting diffs so unrelated changes are not swept into the task. Select the affected
+package or integration target instead of library tests when appropriate. For documentation-only
+changes, verify paths, commands and the diff; Rust builds and tests are unnecessary unless the
+edit also changes executable examples or build behavior.
 
-### Module Layout
-- Keep each module focused on a single responsibility and limit file size to maintain readability.
-- Organize handler chain layers so that transport, parsing, and outbound flow remain obvious to readers.
-- Avoid circular references by pulling shared helpers into `util` or dedicated submodules.
+Useful targeted commands (replace angle-bracket placeholders before running):
 
-### Feature Flags & Conditional Code
-- Prefer Cargo features for optional transports or protocols and keep feature flags well-documented in Cargo.toml.
-- Combine feature flags with runtime configuration so feature-intensive code paths are easy to toggle during tests.
-- When using `#[cfg(feature = "x")]`, document the runtime impact in the same module to help future maintainers understand why the gate exists.
+```sh
+cargo test -p chimera_server_lib --lib -- --list
+cargo test -p chimera_server_lib --lib <fully_qualified_test_name> -- --exact
+cargo test -p chimera_server_lib --test <integration_target>
+cargo test -p chimera_server_app
+cargo test -p chimera_server_lib --doc
+cargo check -p chimera_server_app --no-default-features --features minimal-vless
+cargo check -p chimera_server_app --no-default-features --features minimal-vless-tls
+```
 
-### Documentation & Comments
-- Document every exported function, struct, and enum with doc comments explaining its role in the pipeline; focus on why it exists rather than how it works.
-- When a comment is needed, explain the non-obvious decision or cross-reference the xray/shoes equivalent behavior.
-- Keep TODOs actionable (who, what, why) and remove them once the change is implemented.
+- `--exact` matches the full test name. Confirm that the intended test actually ran;
+  a successful run with zero matching tests is not validation.
+- Keep unit tests in `#[cfg(test)]` modules and integration tests in the owning crate's `tests/`.
+  Reuse existing helpers when available; do not assume a `tests/common` module exists.
+- Read prerequisites before running ignored or environment-dependent tests. Select related
+  tests with `cargo test -p <package> <filter> -- --ignored`; do not run every network or
+  performance probe by default.
+- `cargo test --locked` requires the existing lockfile to remain unchanged; it does not update
+  or pin dependencies itself. After an intentional lockfile update, use it to verify the result.
+- Root workspace commands do not cover `bench/chimera_perf/`. For probe changes, use
+  `--manifest-path bench/chimera_perf/Cargo.toml` with the relevant Cargo command and read its README.
+- `build.rs` uses `protoc-bin-vendored`; inspect build errors before requiring a system `protoc`.
+  Consult the current workflows for platform-specific build requirements.
 
-## Diagnostics & Debugging
-- Prefer bringing up a full-featured trace (via `tracing` subscribers) when a runtime path is ambiguous.
-- Capture configuration tags and listen addresses in logs before and after each server start to correlate later with metrics.
-- Use `cargo test -- --nocapture` sparingly to troubleshoot tests that fail silently under the default harness.
-- Validate generated config structures (`ServerConfig`, API wrappers) during startup by invoking the same helpers used in production.
-- When investigating threading issues, lean on `tokio-console` when enabled or add temporary `tracing::debug!` statements gated by verbose settings.
-- Before filing a bug, reproduce it with the config that triggered it and describe which module's handler chain is responsible.
+Validate a configuration or start the app using an existing configuration file:
+
+```sh
+cargo run -p chimera_server_app -- --config <config_path> --check
+cargo run -p chimera_server_app -- --config <config_path>
+```
+
+Inspect `start.sh` before using it: it requires `cargo-watch` and references a particular local
+configuration. Do not assume launcher scripts or example configs fit the current environment.
 
 ## Release Discipline
-- After `v0.7.5`, advance only one primary protocol goal per release. Do not mix unrelated protocol behavior into the same release cycle.
-- A release goal must be vertically complete before it is considered releasable: user-facing config (when applicable) → validation/defaults → `ServerConfig` → runtime/handler behavior → focused tests.
-- Parsing, validation, or field-preservation work that is not yet consumed by runtime behavior is development groundwork, not a completed protocol goal; keep it out of a stable release unless the release goal is explicitly configuration/schema alignment.
-- Prepare the workspace package version before release. The release workflow must not silently bump source versions or push `master` on behalf of the release.
-- Publish the completed goal directly as `vX.Y.Z`, then deploy and validate that released version before beginning the next primary protocol goal.
-- Every release must pass `cargo fmt --all -- --check`, `cargo build --all-features`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`, and `cargo test --locked` before a tag is created.
-- Start the next primary protocol goal only after the current released version has been validated; if validation fails, fix that same goal and publish a new patch version before moving on.
 
-## Git & Collaboration
-- Always run `git status` before editing to understand unrelated changes; do not revert files modified by other contributors unless explicitly asked.
-- Keep commits focused; describe why the change exists rather than how it was implemented, mirroring this AGENTS file's style.
-- Never amend commits unless you created the HEAD commit in this conversation and no hook rejected the original commit.
-- Do not run destructive git commands like `reset --hard` or `checkout --` without explicit instruction.
-- Coordinate with other agents by referencing this AGENTS document when introducing new commands, features, or conventions that will affect workflow.
+- After `v0.7.5`, advance only one primary protocol goal per release. Do not mix unrelated
+  protocol behavior into the same release cycle.
+- A release goal must be vertically complete: user-facing config (when applicable) →
+  validation/defaults → `ServerConfig` or owning runtime state → runtime/handler behavior →
+  focused tests. Protocol compatibility releases also require the relevant real-client
+  interoperability checks and an updated support matrix for the recorded Xray baseline.
+- Parsing, validation or field preservation not consumed by runtime behavior is development
+  groundwork, not a completed protocol goal. Keep it out of a stable release unless the release
+  goal is explicitly configuration/schema alignment.
+- Prepare the workspace package version before release. The release workflow must not silently
+  bump source versions or push `master` on behalf of the release.
+- Every release must pass all of the following before a tag is created:
 
-## Cursor / Copilot Rules
-- Cursor rules: there are no `.cursor/rules/` directories or `.cursorrules` files in this workspace as of Jan 2026.
-- Copilot rules: the repo does not contain `.github/copilot-instructions.md`; rely on this AGENTS file for guidance.
+```sh
+cargo fmt --all -- --check
+cargo build --all-features
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+cargo test --locked
+```
 
-## Next Steps for Agents
-- Always run `cargo fmt` and `cargo clippy` locally after editing layout or logic, then select the smallest meaningful scope for `cargo test`.
-- When adding features, update this AGENTS document as needed to capture any new setup steps or conventions you introduced.
-- If you encounter conflicting guidance, prefer what the humans last committed to `AGENTS.md` unless a TODO describes a future change.
+- Also check the current CI matrix for applicable platform and feature coverage. CI coverage
+  does not replace the required release checks above.
+- Publish the completed goal directly as `vX.Y.Z`, then deploy and validate that released
+  version before beginning the next primary protocol goal.
+- If deployed validation fails, fix that same goal and publish a new patch version before
+  moving on. Record validation evidence and unresolved limitations.
+- Apply this sequence when a release is in scope; an ordinary code or documentation task does
+  not itself request tagging, publishing or deployment.
+
+## Git and Collaboration
+
+- Preserve other contributors' modified and untracked files. Do not revert unrelated changes
+  or include them in a commit. Keep commits focused on the requested behavior.
+- Never amend a commit unless you created HEAD in this conversation and no hook rejected it.
+- Do not run destructive commands such as `git reset --hard` or `git checkout --` without
+  explicit instruction.
+- Check for applicable editor or contributor instructions when needed rather than relying on
+  dated claims that particular rule files do not exist.
+- A TODO describes unfinished work; it does not override current instructions or authorize
+  expanding the task. Resolve routine implementation choices using the task and existing code.
