@@ -1630,6 +1630,129 @@ fn build_socks_server(
 }
 
 #[cfg(feature = "hysteria")]
+fn parse_hysteria2_finalmask_packet_size(
+    value: &serde_json::Value,
+) -> Result<(i32, i32), Error> {
+    let (left, right) = if let Some(value) = value.as_i64() {
+        let value = i32::try_from(value).map_err(|_| {
+            Error::InvalidConfig(
+                "hysteria2 finalmask packetSize is out of int32 range".into(),
+            )
+        })?;
+        (value, value)
+    } else if let Some(value) = value.as_str() {
+        if value.is_empty() {
+            (0, 0)
+        } else if let Ok(value) = value.parse::<i32>() {
+            (value, value)
+        } else {
+            let split_index = if let Some(value) = value.strip_prefix('-') {
+                value.find('-').map(|index| index + 1)
+            } else {
+                value.find('-')
+            }
+            .ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "invalid hysteria2 finalmask packetSize range {value:?}"
+                ))
+            })?;
+            let (left, right) = value.split_at(split_index);
+            let right = &right[1..];
+            (
+                left.parse::<i32>().map_err(|_| {
+                    Error::InvalidConfig(format!(
+                        "invalid hysteria2 finalmask packetSize range {value:?}"
+                    ))
+                })?,
+                right.parse::<i32>().map_err(|_| {
+                    Error::InvalidConfig(format!(
+                        "invalid hysteria2 finalmask packetSize range {value:?}"
+                    ))
+                })?,
+            )
+        }
+    } else {
+        return Err(Error::InvalidConfig(
+            "hysteria2 finalmask packetSize must be an integer or range string"
+                .into(),
+        ));
+    };
+    Ok(if left <= right {
+        (left, right)
+    } else {
+        (right, left)
+    })
+}
+
+#[cfg(feature = "hysteria")]
+fn collect_hysteria2_udp_finalmask(
+    masks: &[serde_json::Value],
+) -> Result<Option<crate::config::server_config::Hysteria2UdpFinalMask>, Error> {
+    use crate::config::server_config::Hysteria2UdpFinalMask;
+
+    if masks.is_empty() {
+        return Ok(None);
+    }
+    if masks.len() != 1 {
+        return Err(Error::InvalidConfig(
+            "hysteria2 finalmask.udp currently supports exactly one salamander mask"
+                .into(),
+        ));
+    }
+
+    let mask = masks[0].as_object().ok_or_else(|| {
+        Error::InvalidConfig("hysteria2 finalmask.udp mask must be an object".into())
+    })?;
+    let mask_type = mask
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            Error::InvalidConfig(
+                "hysteria2 finalmask.udp mask requires a string type".into(),
+            )
+        })?;
+    if !mask_type.eq_ignore_ascii_case("salamander") {
+        return Err(Error::InvalidConfig(format!(
+            "hysteria2 finalmask.udp mask type {mask_type:?} is not implemented yet"
+        )));
+    }
+
+    let settings = mask.get("settings").and_then(serde_json::Value::as_object);
+    let packet_size = settings
+        .and_then(|settings| settings.get("packetSize"))
+        .map(parse_hysteria2_finalmask_packet_size)
+        .transpose()?;
+    let password = settings
+        .and_then(|settings| settings.get("password"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if password.len() < 4 {
+        return Err(Error::InvalidConfig(
+            "hysteria2 finalmask.udp salamander password must be at least 4 bytes"
+                .into(),
+        ));
+    }
+
+    if let Some((min_packet_size, max_packet_size)) = packet_size
+        && max_packet_size > 0
+    {
+        if min_packet_size <= 0 || max_packet_size > 2048 {
+            return Err(Error::InvalidConfig(
+                "gecko: invalid min/max packet size".into(),
+            ));
+        }
+        return Ok(Some(Hysteria2UdpFinalMask::Gecko {
+            password,
+            min_packet_size: min_packet_size as usize,
+            max_packet_size: max_packet_size as usize,
+        }));
+    }
+
+    Ok(Some(Hysteria2UdpFinalMask::Salamander { password }))
+}
+
+#[cfg(feature = "hysteria")]
 #[derive(Default)]
 struct Hysteria2XrayQuicPlan {
     enabled: bool,
@@ -1642,6 +1765,7 @@ struct Hysteria2XrayQuicPlan {
     max_incoming_streams: Option<u64>,
     receive_windows: Option<(u64, u64, u64, u64)>,
     disable_path_mtu_discovery: Option<bool>,
+    udp_finalmask: Option<crate::config::server_config::Hysteria2UdpFinalMask>,
 }
 
 #[cfg(feature = "hysteria")]
@@ -1651,14 +1775,19 @@ fn plan_hysteria2_xray_quic(
     let Some(final_mask) = final_mask else {
         return Ok(Hysteria2XrayQuicPlan::default());
     };
-    if !final_mask.tcp.is_empty() || !final_mask.udp.is_empty() {
+    if !final_mask.tcp.is_empty() {
         return Err(Error::InvalidConfig(
-            "hysteria2 finalmask.tcp/udp mask chains are not supported".into(),
+            "hysteria2 finalmask.tcp mask chains are not supported".into(),
         ));
     }
+    let udp_finalmask = collect_hysteria2_udp_finalmask(&final_mask.udp)?;
 
     let Some(quic_params) = final_mask.quic_params.as_ref() else {
-        return Ok(Hysteria2XrayQuicPlan::default());
+        return Ok(Hysteria2XrayQuicPlan {
+            enabled: udp_finalmask.is_some(),
+            udp_finalmask,
+            ..Hysteria2XrayQuicPlan::default()
+        });
     };
     if quic_params
         .udp_hop
@@ -1691,6 +1820,7 @@ fn plan_hysteria2_xray_quic(
         }),
         receive_windows: Some(validated.receive_windows),
         disable_path_mtu_discovery: Some(quic_params.disable_path_mtu_discovery),
+        udp_finalmask,
     })
 }
 
@@ -1708,6 +1838,7 @@ fn apply_hysteria2_xray_quic_plan(
     config.xray_keep_alive_period_secs = plan.keep_alive_period_secs;
     config.xray_max_incoming_streams = plan.max_incoming_streams;
     config.xray_disable_path_mtu_discovery = plan.disable_path_mtu_discovery;
+    config.udp_finalmask = plan.udp_finalmask;
     if let Some((init_stream, max_stream, init_connection, max_connection)) =
         plan.receive_windows
     {
@@ -2221,18 +2352,64 @@ mod tests {
             .expect("empty/inert Xray UDP hop should remain compatible");
         }
 
-        for field in ["tcp", "udp"] {
-            let mut final_mask = serde_json::Map::new();
-            final_mask.insert(
-                field.to_string(),
-                serde_json::json!([{"type": "unsupported-mask"}]),
-            );
-            let err =
-                ServerConfig::try_from(hysteria2_inbound_with_finalmask_settings(
-                    serde_json::Value::Object(final_mask),
-                ))
-                .expect_err("configured finalmask chain must fail explicitly");
-            assert!(err.to_string().contains("finalmask.tcp/udp"), "{err}");
+        let err = ServerConfig::try_from(hysteria2_inbound_with_finalmask_settings(
+            serde_json::json!({"tcp": [{"type": "unsupported-mask"}]}),
+        ))
+        .expect_err("configured TCP finalmask chain must fail explicitly");
+        assert!(err.to_string().contains("finalmask.tcp"), "{err}");
+
+        let err = ServerConfig::try_from(hysteria2_inbound_with_finalmask_settings(
+            serde_json::json!({"udp": [{"type": "unsupported-mask"}]}),
+        ))
+        .expect_err("unknown UDP finalmask type must fail explicitly");
+        assert!(err.to_string().contains("not implemented"), "{err}");
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[test]
+    fn hysteria2_finalmask_accepts_salamander_and_gecko_udp_masks() {
+        use crate::config::server_config::Hysteria2UdpFinalMask;
+
+        let config = ServerConfig::try_from(
+            hysteria2_inbound_with_finalmask_settings(serde_json::json!({
+                "udp": [{
+                    "type": "salamander",
+                    "settings": {"password": "secret"}
+                }]
+            })),
+        )
+        .expect("single Xray Salamander UDP mask should build");
+        match config.protocol {
+            ServerProxyConfig::Hysteria2 { config } => assert!(matches!(
+                config.udp_finalmask,
+                Some(Hysteria2UdpFinalMask::Salamander { ref password })
+                    if password == "secret"
+            )),
+            other => panic!("expected hysteria2 protocol, got {other:?}"),
+        }
+
+        let config = ServerConfig::try_from(
+            hysteria2_inbound_with_finalmask_settings(serde_json::json!({
+                "udp": [{
+                    "type": "salamander",
+                    "settings": {
+                        "password": "secret",
+                        "packetSize": "600-1200"
+                    }
+                }]
+            })),
+        )
+        .expect("Xray packetSize enables Gecko framing over Salamander");
+        match config.protocol {
+            ServerProxyConfig::Hysteria2 { config } => assert!(matches!(
+                config.udp_finalmask,
+                Some(Hysteria2UdpFinalMask::Gecko {
+                    ref password,
+                    min_packet_size: 600,
+                    max_packet_size: 1200,
+                }) if password == "secret"
+            )),
+            other => panic!("expected hysteria2 protocol, got {other:?}"),
         }
     }
 

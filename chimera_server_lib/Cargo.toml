@@ -65,6 +65,7 @@ sha2 = { workspace = true }
 reqwest = { workspace = true }
 flate2 = { workspace = true, optional = true }
 md-5 = { workspace = true, optional = true }
+blake2 = { workspace = true, optional = true }
 blake3 = { workspace = true, optional = true }
 aes = { workspace = true, optional = true }
 chacha20poly1305 = { workspace = true, optional = true }
@@ -85,7 +86,7 @@ rcgen = { workspace = true }
 [features]
 brutal-ack-batch-trace = []
 brutal-pacing-trace = []
-hysteria = ["uuid", "lru", "flate2"]
+hysteria = ["uuid", "lru", "flate2", "blake2"]
 http = []
 mixed = ["http"]
 httpupgrade = []

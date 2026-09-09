@@ -20,7 +20,7 @@ pub use types::GrpcServerConfig;
 pub use types::{
     Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2MasqueradeFileConfig,
     Hysteria2MasqueradeProxyConfig, Hysteria2MasqueradeStringConfig,
-    Hysteria2ServerConfig,
+    Hysteria2ServerConfig, Hysteria2UdpFinalMask,
 };
 #[allow(unused_imports)]
 pub use types::{

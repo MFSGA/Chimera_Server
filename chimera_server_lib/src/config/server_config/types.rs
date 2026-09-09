@@ -143,6 +143,20 @@ pub struct Hysteria2MasqueradeProxyConfig {
 #[cfg(feature = "hysteria")]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum Hysteria2UdpFinalMask {
+    Salamander {
+        password: String,
+    },
+    Gecko {
+        password: String,
+        min_packet_size: usize,
+        max_packet_size: usize,
+    },
+}
+
+#[cfg(feature = "hysteria")]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Hysteria2ServerConfig {
     pub clients: Vec<Hysteria2Client>,
     #[serde(default)]
@@ -188,6 +202,8 @@ pub struct Hysteria2ServerConfig {
     pub xray_max_connection_receive_window: Option<u64>,
     #[serde(default)]
     pub xray_disable_path_mtu_discovery: Option<bool>,
+    #[serde(default)]
+    pub udp_finalmask: Option<Hysteria2UdpFinalMask>,
 }
 
 #[cfg(feature = "tuic")]
