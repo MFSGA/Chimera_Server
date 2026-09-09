@@ -125,9 +125,7 @@ enum GlobalUdpBackendStart {
     Direct,
     #[cfg(feature = "trojan")]
     Trojan {
-        resolver: Arc<dyn Resolver>,
-        runtime: RuntimeState,
-        outbound: OutboundSummary,
+        outbound: Box<OutboundSummary>,
     },
 }
 
@@ -136,8 +134,8 @@ impl GlobalUdpBackendStart {
         match self {
             Self::Direct => GlobalUdpWorkerKey::from(key),
             #[cfg(feature = "trojan")]
-            Self::Trojan { outbound, .. } => GlobalUdpWorkerKey::Trojan {
-                outbound: outbound.clone(),
+            Self::Trojan { outbound } => GlobalUdpWorkerKey::Trojan {
+                outbound: outbound.as_ref().clone(),
             },
         }
     }
@@ -147,6 +145,17 @@ struct TargetedUdpResponse {
     source: SocketAddr,
     payload: Vec<u8>,
     traffic_context: Option<TrafficContext>,
+}
+
+struct GlobalSessionUdpAttachStart {
+    global_id: [u8; 8],
+    session_id: u16,
+    generation: u64,
+    key: TargetedUdpSessionKey,
+    response_sender: mpsc::Sender<SessionUdpEvent>,
+    traffic_context: Option<TrafficContext>,
+    idle_timeout: Duration,
+    backend_start: GlobalUdpBackendStart,
 }
 
 struct SessionUdpResponse {
@@ -173,6 +182,13 @@ struct GlobalUdpAttachment {
     generation: u64,
     response_sender: mpsc::Sender<SessionUdpEvent>,
     traffic_context: Option<TrafficContext>,
+}
+
+struct DokodemoUdpDatagram {
+    client_addr: SocketAddr,
+    target_addr: SocketAddr,
+    target_location: NetLocation,
+    payload: Vec<u8>,
 }
 
 struct LocalUdpPayload {
@@ -1229,7 +1245,7 @@ async fn start_session_udp_session(
 ) -> std::io::Result<SessionUdpWorker> {
     match global_id {
         Some(global_id) => {
-            attach_global_session_udp_session(
+            attach_global_session_udp_session(GlobalSessionUdpAttachStart {
                 global_id,
                 session_id,
                 generation,
@@ -1237,8 +1253,8 @@ async fn start_session_udp_session(
                 response_sender,
                 traffic_context,
                 idle_timeout,
-                GlobalUdpBackendStart::Direct,
-            )
+                backend_start: GlobalUdpBackendStart::Direct,
+            })
             .await
         }
         None => {
@@ -1364,20 +1380,18 @@ async fn start_trojan_session_udp_session(
     start: TrojanSessionUdpWorkerStart,
 ) -> std::io::Result<SessionUdpWorker> {
     if let Some(global_id) = start.global_id {
-        return attach_global_session_udp_session(
+        return attach_global_session_udp_session(GlobalSessionUdpAttachStart {
             global_id,
             session_id,
             generation,
-            start.key,
-            start.response_sender,
-            start.traffic_context,
-            start.idle_timeout,
-            GlobalUdpBackendStart::Trojan {
-                resolver: start.resolver,
-                runtime: start.runtime,
-                outbound: start.outbound,
+            key: start.key,
+            response_sender: start.response_sender,
+            traffic_context: start.traffic_context,
+            idle_timeout: start.idle_timeout,
+            backend_start: GlobalUdpBackendStart::Trojan {
+                outbound: Box::new(start.outbound),
             },
-        )
+        })
         .await;
     }
 
@@ -1487,15 +1501,18 @@ async fn start_trojan_session_udp_session(
 }
 
 async fn attach_global_session_udp_session(
-    global_id: [u8; 8],
-    session_id: u16,
-    generation: u64,
-    key: TargetedUdpSessionKey,
-    response_sender: mpsc::Sender<SessionUdpEvent>,
-    traffic_context: Option<TrafficContext>,
-    idle_timeout: Duration,
-    backend_start: GlobalUdpBackendStart,
+    start: GlobalSessionUdpAttachStart,
 ) -> std::io::Result<SessionUdpWorker> {
+    let GlobalSessionUdpAttachStart {
+        global_id,
+        session_id,
+        generation,
+        key,
+        response_sender,
+        traffic_context,
+        idle_timeout,
+        backend_start,
+    } = start;
     let gate = global_xudp_gate(global_id).await;
     let _gate_guard = gate.lock().await;
     let globals = global_xudp_workers();
@@ -2700,13 +2717,15 @@ async fn run_dokodemo_udp_server(
         tokio::spawn(async move {
             if let Err(err) = relay_dokodemo_udp_datagram(
                 relay_state,
-                client_addr,
-                datagram_target,
-                target_location,
                 inbound_tag,
                 config.user_level,
                 runtime,
-                payload,
+                DokodemoUdpDatagram {
+                    client_addr,
+                    target_addr: datagram_target,
+                    target_location,
+                    payload,
+                },
             )
             .await
             {
@@ -2721,14 +2740,17 @@ async fn run_dokodemo_udp_server(
 
 async fn relay_dokodemo_udp_datagram(
     relay_state: Arc<UdpRelayState>,
-    client_addr: SocketAddr,
-    target_addr: SocketAddr,
-    target_location: NetLocation,
     inbound_tag: String,
     user_level: u32,
     runtime: RuntimeState,
-    payload: Vec<u8>,
+    datagram: DokodemoUdpDatagram,
 ) -> std::io::Result<()> {
+    let DokodemoUdpDatagram {
+        client_addr,
+        target_addr,
+        target_location,
+        payload,
+    } = datagram;
     let outbound_action = select_udp_outbound(
         &runtime,
         &inbound_tag,
