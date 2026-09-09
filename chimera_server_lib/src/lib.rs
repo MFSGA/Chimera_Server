@@ -409,13 +409,9 @@ async fn start_async(
     let outbounds = config
         .outbounds
         .iter()
-        .map(|item| OutboundSummary {
-            tag: item.tag.clone(),
-            protocol: item.protocol.clone(),
-            proxy_settings_type: None,
-            proxy_settings_value: None,
-        })
-        .collect::<Vec<_>>();
+        .map(outbound::compile_static_outbound)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Error::InvalidConfig)?;
 
     let all_inbounds = config
         .inbounds
@@ -612,6 +608,7 @@ mod tests {
             transport: Transport::Tcp,
             quic_settings: None,
             sniffing: None,
+            tcp_socket_policy: None,
         }
     }
 

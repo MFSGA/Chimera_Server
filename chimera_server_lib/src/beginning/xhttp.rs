@@ -188,6 +188,7 @@ pub async fn start_xhttp_server(
         bind_location,
         protocol,
         sniffing,
+        tcp_socket_policy,
         ..
     } = config;
 
@@ -218,6 +219,12 @@ pub async fn start_xhttp_server(
     ));
     #[cfg(feature = "tls")]
     if let XhttpSecurityLayer::H3Tls(server_config) = listener_config.security {
+        if tcp_socket_policy.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "streamSettings.sockopt.tcpCongestion is not applicable to XHTTP HTTP/3",
+            ));
+        }
         return start_xhttp_h3_server(
             bind_addr,
             server_config,
@@ -244,6 +251,17 @@ pub async fn start_xhttp_server(
                         }
                     };
                     let _ = stream.set_nodelay(true);
+                    if let Some(policy) = tcp_socket_policy.as_ref()
+                        && let Err(err) = super::apply_tcp_socket_policy(
+                            &stream,
+                            bind_addr,
+                            peer_addr,
+                            policy,
+                        )
+                    {
+                        error!("xhttp TCP socket policy for {} failed: {}", peer_addr, err);
+                        continue;
+                    }
                     let local_addr = match stream.local_addr() {
                         Ok(addr) => addr,
                         Err(err) => {

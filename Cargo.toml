@@ -48,6 +48,7 @@ protoc-bin-vendored = "3"
 
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"
+rustls-native-certs = "0.8"
 
 
 
@@ -74,6 +75,7 @@ reqwest = { version = "0.13.4", default-features = false, features = [
     "blocking",
     "http2",
     "rustls",
+    "socks",
 ] }
 flate2 = "1.1.9"
 axum = { version = "0.8.9", features = [

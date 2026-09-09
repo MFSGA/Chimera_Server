@@ -120,6 +120,8 @@ async fn start_test_connection() -> (
             protocol: "freedom".into(),
             proxy_settings_type: None,
             proxy_settings_value: None,
+            sender_settings_type: None,
+            sender_settings_value: None,
         }],
     );
     let server_task = tokio::spawn(run_tuic_server(

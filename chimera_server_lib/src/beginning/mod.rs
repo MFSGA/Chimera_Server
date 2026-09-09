@@ -3,6 +3,8 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use quic::start_quic_server;
 #[cfg(target_os = "linux")]
 use socket2::SockRef;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     task::JoinHandle,
@@ -18,7 +20,9 @@ use crate::{
     async_stream::AsyncStream,
     config::{
         Transport,
-        server_config::{InboundSniffingConfig, ServerConfig, ServerProxyConfig},
+        server_config::{
+            InboundSniffingConfig, ServerConfig, ServerProxyConfig, TcpSocketPolicy,
+        },
     },
     handler::{
         http::relay_plain_http_response,
@@ -47,7 +51,7 @@ const SNIFFING_MAX_BYTES: usize = 32_767;
 const SNIFFING_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[cfg(feature = "grpc_transport")]
-mod grpc_transport;
+pub(crate) mod grpc_transport;
 mod quic;
 mod tcp_relay;
 pub(crate) mod udp;
@@ -262,6 +266,7 @@ async fn start_tcp_server_with_runtime(
         bind_location,
         protocol,
         sniffing,
+        tcp_socket_policy,
         ..
     } = config;
 
@@ -281,8 +286,14 @@ async fn start_tcp_server_with_runtime(
     };
 
     Ok(Some(tokio::spawn(async move {
-        if let Err(err) =
-            run_tcp_server(listener, tcp_handler, runtime, sniffing).await
+        if let Err(err) = run_tcp_server(
+            listener,
+            tcp_handler,
+            runtime,
+            sniffing,
+            tcp_socket_policy,
+        )
+        .await
         {
             error!("TCP server stopped with error: {}", err);
         }
@@ -294,6 +305,7 @@ async fn run_tcp_server(
     server_handler: Arc<Box<dyn TcpServerHandler>>,
     runtime: RuntimeState,
     sniffing: Option<InboundSniffingConfig>,
+    tcp_socket_policy: Option<TcpSocketPolicy>,
 ) -> std::io::Result<()> {
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
     let listener_addr = listener.local_addr()?;
@@ -308,6 +320,19 @@ async fn run_tcp_server(
         };
         if let Err(e) = stream.set_nodelay(true) {
             error!("Failed to set TCP nodelay: {}", e);
+        }
+        if let Some(policy) = tcp_socket_policy.as_ref()
+            && let Err(error) =
+                apply_tcp_socket_policy(&stream, listener_addr, addr, policy)
+        {
+            error!(
+                peer = %addr,
+                listener = %listener_addr,
+                congestion = %policy.congestion,
+                %error,
+                "failed to apply inbound TCP socket policy"
+            );
+            continue;
         }
         let cloned_cache = resolver.clone();
         let cloned_handler = server_handler.clone();
@@ -356,6 +381,52 @@ async fn run_tcp_server(
             }
         });
     }
+}
+
+#[cfg(target_os = "linux")]
+fn apply_tcp_socket_policy(
+    stream: &tokio::net::TcpStream,
+    listener_addr: SocketAddr,
+    peer_addr: SocketAddr,
+    policy: &TcpSocketPolicy,
+) -> std::io::Result<()> {
+    let fd = stream.as_raw_fd();
+    crate::util::socket::set_tcp_congestion(fd, &policy.congestion)?;
+    if let Some(brutal) = policy.brutal.as_ref() {
+        let group_id =
+            crate::util::socket::tcp_brutal_group_id(listener_addr, peer_addr);
+        crate::util::socket::set_tcp_brutal_params(
+            fd,
+            brutal.rate_bytes_per_sec,
+            brutal.cwnd_gain,
+            group_id,
+        )?;
+        tracing::debug!(
+            peer = %peer_addr,
+            listener = %listener_addr,
+            rate_bytes_per_sec = brutal.rate_bytes_per_sec,
+            cwnd_gain = brutal.cwnd_gain,
+            group_id,
+            "configured TCP Brutal v2 inbound socket"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_tcp_socket_policy(
+    _stream: &tokio::net::TcpStream,
+    _listener_addr: SocketAddr,
+    _peer_addr: SocketAddr,
+    policy: &TcpSocketPolicy,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!(
+            "sockopt.tcpCongestion={} is supported only on Linux",
+            policy.congestion
+        ),
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -1218,6 +1289,7 @@ where
                 resolver,
                 runtime,
                 peer_addr,
+                local_addr,
                 traffic_context,
             )
             .await
@@ -1231,6 +1303,7 @@ where
                 resolver,
                 runtime,
                 peer_addr,
+                local_addr,
                 traffic_context,
             )
             .await
@@ -1239,7 +1312,14 @@ where
             stream,
             traffic_context,
         } => {
-            run_session_based_udp(stream, runtime, peer_addr, traffic_context).await
+            run_session_based_udp(
+                stream,
+                runtime,
+                peer_addr,
+                local_addr,
+                traffic_context,
+            )
+            .await
         }
         TcpServerSetupResult::AlreadyHandled => Ok(()),
     }

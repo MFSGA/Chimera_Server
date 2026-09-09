@@ -5,7 +5,10 @@ use std::{
 };
 
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf, WriteHalf, split},
+    io::{
+        AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, WriteHalf,
+        split,
+    },
     sync::mpsc,
     task::JoinHandle,
 };
@@ -65,6 +68,43 @@ impl TrojanUdpStream {
             pending_write: Vec::new(),
             pending_write_offset: 0,
             reader_task,
+        }
+    }
+
+    pub(crate) async fn send_to(
+        &mut self,
+        target: &NetLocation,
+        payload: &[u8],
+    ) -> std::io::Result<()> {
+        let packet = encode_location_packet(target, payload)?;
+        self.writer.write_all(&packet).await?;
+        self.writer.flush().await
+    }
+
+    pub(crate) async fn recv_from(
+        &mut self,
+        buffer: &mut [u8],
+    ) -> std::io::Result<(NetLocation, usize)> {
+        match self.receiver.recv().await {
+            Some(Ok((source, payload))) => {
+                if payload.len() > buffer.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "trojan udp payload exceeds receive buffer: {} > {}",
+                            payload.len(),
+                            buffer.len()
+                        ),
+                    ));
+                }
+                buffer[..payload.len()].copy_from_slice(&payload);
+                Ok((source, payload.len()))
+            }
+            Some(Err(error)) => Err(error),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "trojan udp stream closed",
+            )),
         }
     }
 }
@@ -248,7 +288,10 @@ where
     Ok(NetLocation::new(address, port))
 }
 
-fn encode_packet(source: &SocketAddr, payload: &[u8]) -> std::io::Result<Vec<u8>> {
+pub(crate) fn encode_location_packet(
+    target: &NetLocation,
+    payload: &[u8],
+) -> std::io::Result<Vec<u8>> {
     if payload.len() > MAX_PACKET_LENGTH {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -257,21 +300,40 @@ fn encode_packet(source: &SocketAddr, payload: &[u8]) -> std::io::Result<Vec<u8>
     }
 
     let mut packet = Vec::with_capacity(1 + 16 + 2 + 2 + 2 + payload.len());
-    match source.ip() {
-        std::net::IpAddr::V4(address) => {
+    match target.address() {
+        Address::Ipv4(address) => {
             packet.push(ADDR_TYPE_IPV4);
             packet.extend_from_slice(&address.octets());
         }
-        std::net::IpAddr::V6(address) => {
+        Address::Ipv6(address) => {
             packet.push(ADDR_TYPE_IPV6);
             packet.extend_from_slice(&address.octets());
         }
+        Address::Hostname(domain) => {
+            let bytes = domain.as_bytes();
+            if bytes.is_empty() || bytes.len() > u8::MAX as usize {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "trojan udp target domain must contain 1..=255 bytes",
+                ));
+            }
+            packet.push(ADDR_TYPE_DOMAIN_NAME);
+            packet.push(bytes.len() as u8);
+            packet.extend_from_slice(bytes);
+        }
     }
-    packet.extend_from_slice(&source.port().to_be_bytes());
+    packet.extend_from_slice(&target.port().to_be_bytes());
     packet.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     packet.extend_from_slice(&CRLF);
     packet.extend_from_slice(payload);
     Ok(packet)
+}
+
+fn encode_packet(source: &SocketAddr, payload: &[u8]) -> std::io::Result<Vec<u8>> {
+    encode_location_packet(
+        &NetLocation::from_ip_addr(source.ip(), source.port()),
+        payload,
+    )
 }
 
 #[cfg(test)]

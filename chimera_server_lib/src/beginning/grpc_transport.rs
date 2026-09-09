@@ -299,6 +299,7 @@ pub(super) async fn start_grpc_server(
         bind_location,
         protocol,
         sniffing,
+        tcp_socket_policy,
         ..
     } = config;
     let (grpc_config, inner_protocol, security) = parse_listener_protocol(protocol)?;
@@ -329,6 +330,19 @@ pub(super) async fn start_grpc_server(
                     continue;
                 }
             };
+            if let Some(policy) = tcp_socket_policy.as_ref()
+                && let Err(error) = super::apply_tcp_socket_policy(
+                    &stream,
+                    listen_addr,
+                    peer_addr,
+                    policy,
+                )
+            {
+                error!(
+                    "gRPC transport TCP socket policy for {peer_addr} failed: {error}"
+                );
+                continue;
+            }
             let local_addr = match stream.local_addr() {
                 Ok(value) => value,
                 Err(error) => {
@@ -507,7 +521,7 @@ fn parse_listener_protocol(
     }
 }
 
-fn grpc_service_paths(service_name: &str) -> (String, String) {
+pub(crate) fn grpc_service_paths(service_name: &str) -> (String, String) {
     let (service, tun, tun_multi) = grpc_service_parts(service_name);
     (
         format!("/{service}/{tun}"),
@@ -1347,17 +1361,31 @@ fn decode_grpc_message_view(
     }))
 }
 
-#[cfg(test)]
-fn decode_grpc_message(
+pub(crate) fn decode_grpc_message_payloads(
     buffer: &mut BytesMut,
     multi_mode: bool,
-) -> io::Result<Option<Vec<Vec<u8>>>> {
+) -> io::Result<Option<Vec<Bytes>>> {
     decode_grpc_message_view(buffer, multi_mode).map(|message| {
         message.map(|message| {
             message
                 .payloads
                 .into_iter()
-                .map(|range| message.data[range].to_vec())
+                .map(|range| message.data.slice(range))
+                .collect()
+        })
+    })
+}
+
+#[cfg(test)]
+fn decode_grpc_message(
+    buffer: &mut BytesMut,
+    multi_mode: bool,
+) -> io::Result<Option<Vec<Vec<u8>>>> {
+    decode_grpc_message_payloads(buffer, multi_mode).map(|message| {
+        message.map(|payloads| {
+            payloads
+                .into_iter()
+                .map(|payload| payload.to_vec())
                 .collect()
         })
     })
@@ -1513,7 +1541,7 @@ fn skip_protobuf_field(
     Ok(offset)
 }
 
-fn encode_grpc_message(data: &[u8], _multi_mode: bool) -> Bytes {
+pub(crate) fn encode_grpc_message(data: &[u8], _multi_mode: bool) -> Bytes {
     // Hunk and MultiHunk both encode their data using protobuf field 1. A single
     // field is a valid repeated-field encoding, so replies can use the same wire form.
     let mut frame = Vec::with_capacity(data.len() + 11);

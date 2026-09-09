@@ -87,6 +87,12 @@ pub struct SocketSettings {
     accept_proxy_protocol: bool,
     #[serde(default)]
     trusted_x_forwarded_for: Vec<String>,
+    #[serde(default)]
+    tcp_congestion: Option<String>,
+    #[serde(default)]
+    tcp_brutal_rate: Option<BandwidthValue>,
+    #[serde(default)]
+    tcp_brutal_cwnd_gain: Option<u32>,
 }
 
 #[cfg(feature = "grpc_transport")]

@@ -32,7 +32,11 @@ pub struct RoutingState {
     rules: Vec<CompiledRule>,
     domain_strategy: DomainStrategy,
     geodata: GeodataStore,
+    // Active Observatory results are authoritative for balancers. Passive
+    // connect results are retained separately and are only used as a fallback
+    // when no active sample exists for a tag.
     observations: Arc<ObservationStore>,
+    passive_observations: Arc<ObservationStore>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -213,6 +217,14 @@ impl ObservationStore {
             .ok()?
             .get(tag)
             .cloned()
+    }
+
+    fn remove(&self, tag: &str) -> Option<OutboundObservation> {
+        self.shards[observation_shard_index(tag)]
+            .write()
+            .ok()?
+            .remove(tag)
+            .map(|observation| observation.as_ref().clone())
     }
 
     fn snapshot_all(&self) -> HashMap<String, OutboundObservation> {
@@ -671,6 +683,7 @@ impl RoutingState {
             Self {
                 geodata: self.geodata.clone(),
                 observations: Arc::clone(&self.observations),
+                passive_observations: Arc::clone(&self.passive_observations),
                 ..Self::default()
             }
         };
@@ -765,6 +778,7 @@ impl RoutingState {
 
     pub(crate) fn inherit_observations_from(&mut self, other: &RoutingState) {
         self.observations = Arc::clone(&other.observations);
+        self.passive_observations = Arc::clone(&other.passive_observations);
     }
 
     pub(crate) fn record_observation(
@@ -775,18 +789,95 @@ impl RoutingState {
         self.observations.record(tag.into(), observation);
     }
 
+    pub(crate) fn record_passive_observation(
+        &self,
+        tag: impl Into<String>,
+        observation: OutboundObservation,
+    ) {
+        self.passive_observations.record(tag.into(), observation);
+    }
+
     pub(crate) fn observation(&self, tag: &str) -> Option<OutboundObservation> {
         self.observations
             .get(tag)
+            .or_else(|| self.passive_observations.get(tag))
             .map(|observation| observation.as_ref().clone())
     }
 
+    pub(crate) fn remove_observation(
+        &self,
+        tag: &str,
+    ) -> Option<OutboundObservation> {
+        let active = self.observations.remove(tag);
+        let passive = self.passive_observations.remove(tag);
+        active.or(passive)
+    }
+
     pub(crate) fn observations(&self) -> HashMap<String, OutboundObservation> {
-        self.observations.snapshot_all()
+        let mut observations = self.passive_observations.snapshot_all();
+        observations.extend(self.observations.snapshot_all());
+        observations
+    }
+
+    fn observation_snapshot_for(
+        &self,
+        targets: &BalancerTargetSet,
+    ) -> ObservationSnapshot {
+        let active = self.observations.snapshot_for(targets);
+        let passive = self.passive_observations.snapshot_for(targets);
+        active
+            .into_iter()
+            .zip(passive)
+            .map(|(active, passive)| active.or(passive))
+            .collect()
     }
 
     pub(crate) fn requires_process_lookup(&self) -> bool {
         self.rules.iter().any(|rule| rule.processes.configured)
+    }
+
+    pub(crate) fn domain_strategy(&self) -> DomainStrategy {
+        self.domain_strategy
+    }
+
+    pub(crate) fn needs_target_ip_resolution(&self, input: &RoutingInput) -> bool {
+        if self.domain_strategy != DomainStrategy::IpOnDemand
+            || input.target_domain.is_empty()
+            || !input.target_ips.is_empty()
+        {
+            return false;
+        }
+        for rule in &self.rules {
+            if !rule.matches_before_target_ip(input) {
+                continue;
+            }
+            if rule.target_ips.configured {
+                return true;
+            }
+            if rule.matches_with_target_ips(input, &[]) {
+                return false;
+            }
+        }
+        false
+    }
+
+    pub(crate) fn needs_process_lookup(&self, input: &RoutingInput) -> bool {
+        if input.process_id != 0
+            || !input.process_name.is_empty()
+            || !input.process_path.is_empty()
+        {
+            return false;
+        }
+        for rule in &self.rules {
+            if !rule.matches_before_process(input) {
+                continue;
+            }
+            if rule.processes.configured {
+                return true;
+            }
+            return false;
+        }
+        false
     }
 
     pub(crate) fn list_rules(&self) -> Vec<RoutingRuleSummary> {
@@ -981,7 +1072,7 @@ impl RoutingState {
         };
         let observations = balancer
             .needs_observations()
-            .then(|| self.observations.snapshot_for(&targets));
+            .then(|| self.observation_snapshot_for(&targets));
         balancer.principle_targets(
             targets.tags.as_ref(),
             outbounds,
@@ -1017,7 +1108,7 @@ impl RoutingState {
                 let target = self.balancers.get(balancer_tag).and_then(|balancer| {
                     let observations = balancer
                         .needs_observations()
-                        .then(|| self.observations.snapshot_for(targets));
+                        .then(|| self.observation_snapshot_for(targets));
                     balancer.pick(
                         targets.tags.as_ref(),
                         outbounds,
@@ -1414,19 +1505,17 @@ impl TryFrom<RuleConfig> for CompiledRule {
             return Err("routing rule has no effective fields".into());
         }
 
-        let target = match (rule.outbound_tag, rule.balancer_tag) {
-            (Some(outbound_tag), None) if !outbound_tag.trim().is_empty() => {
-                RuleTarget::Outbound(outbound_tag)
-            }
-            (None, Some(balancer_tag)) if !balancer_tag.trim().is_empty() => {
-                RuleTarget::Balancer(balancer_tag)
-            }
-            _ => {
-                return Err(
-                    "neither outboundTag nor balancerTag is specified in routing rule"
-                        .into(),
-                );
-            }
+        let outbound_tag = rule.outbound_tag.filter(|tag| !tag.trim().is_empty());
+        let balancer_tag = rule.balancer_tag.filter(|tag| !tag.trim().is_empty());
+        let target = if let Some(outbound_tag) = outbound_tag {
+            RuleTarget::Outbound(outbound_tag)
+        } else if let Some(balancer_tag) = balancer_tag {
+            RuleTarget::Balancer(balancer_tag)
+        } else {
+            return Err(
+                "neither outboundTag nor balancerTag is specified in routing rule"
+                    .into(),
+            );
         };
 
         let mut target_domains = Vec::new();
@@ -1469,6 +1558,26 @@ impl CompiledRule {
         self.matches_with_target_ips(input, &input.target_ips)
     }
 
+    fn matches_before_target_ip(&self, input: &RoutingInput) -> bool {
+        matches_string_list(&self.inbound_tags, &input.inbound_tag)
+            && matches_networks(&self.networks, input.network)
+            && self.protocols.matches(&input.protocol)
+            && matches_ports(&self.target_ports, input.target_port)
+            && matches_ports(&self.source_ports, input.source_port)
+            && matches_ports(&self.local_ports, input.local_port)
+            && matches_ports(&self.vless_routes, input.vless_route)
+            && self.users.matches(&input.user)
+            && self.attrs.matches(&input.attributes)
+    }
+
+    fn matches_before_process(&self, input: &RoutingInput) -> bool {
+        self.matches_before_target_ip(input)
+            && self.target_ips.matches(&input.target_ips)
+            && self.source_ips.matches(&input.source_ips)
+            && self.local_ips.matches(&input.local_ips)
+            && matches_domains(&self.target_domains, &input.target_domain)
+    }
+
     fn matches_with_target_ips(
         &self,
         input: &RoutingInput,
@@ -1476,18 +1585,18 @@ impl CompiledRule {
     ) -> bool {
         matches_string_list(&self.inbound_tags, &input.inbound_tag)
             && matches_networks(&self.networks, input.network)
-            && self.source_ips.matches(&input.source_ips)
-            && self.target_ips.matches(target_ips)
-            && self.local_ips.matches(&input.local_ips)
-            && matches_ports(&self.source_ports, input.source_port)
+            && self.protocols.matches(&input.protocol)
             && matches_ports(&self.target_ports, input.target_port)
+            && matches_ports(&self.source_ports, input.source_port)
             && matches_ports(&self.local_ports, input.local_port)
             && matches_ports(&self.vless_routes, input.vless_route)
-            && matches_domains(&self.target_domains, &input.target_domain)
-            && self.processes.matches(input)
-            && self.protocols.matches(&input.protocol)
             && self.users.matches(&input.user)
             && self.attrs.matches(&input.attributes)
+            && self.target_ips.matches(target_ips)
+            && self.source_ips.matches(&input.source_ips)
+            && self.local_ips.matches(&input.local_ips)
+            && matches_domains(&self.target_domains, &input.target_domain)
+            && self.processes.matches(input)
     }
 }
 
@@ -1856,6 +1965,8 @@ mod tests {
             protocol: "freedom".to_string(),
             proxy_settings_type: None,
             proxy_settings_value: None,
+            sender_settings_type: None,
+            sender_settings_value: None,
         }
     }
 
@@ -4908,5 +5019,37 @@ mod tests {
             .expect("balancer rule should match");
         assert_eq!(matched.outbound_tag, "backup");
         assert_eq!(matched.outbound_group_tags, vec!["auto".to_string()]);
+    }
+
+    #[test]
+    fn outbound_tag_takes_priority_when_balancer_tag_is_also_present() {
+        let state = RoutingState::from_parts(
+            vec![RuleConfig {
+                inbound_tag: vec!["test".into()],
+                outbound_tag: Some("direct".into()),
+                balancer_tag: Some("auto".into()),
+                ..RuleConfig::default()
+            }],
+            vec![BalancerConfig {
+                tag: "auto".into(),
+                outbound_selector: vec!["backup".into()],
+                strategy: Default::default(),
+                fallback_tag: None,
+            }],
+        )
+        .expect("Xray gives outboundTag priority over balancerTag");
+
+        let matched = state
+            .route(
+                &RoutingInput {
+                    inbound_tag: "test".into(),
+                    ..RoutingInput::default()
+                },
+                &[outbound("direct"), outbound("backup")],
+                &HashMap::new(),
+            )
+            .expect("routing rule should match");
+        assert_eq!(matched.outbound_tag, "direct");
+        assert!(matched.outbound_group_tags.is_empty());
     }
 }

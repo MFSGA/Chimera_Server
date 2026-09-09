@@ -173,6 +173,19 @@ fn parse_port_range(value: &str) -> Result<PortRangeConfig, String> {
     if value.is_empty() {
         return Err("port value cannot be empty".into());
     }
+    if let Some(name) = value.strip_prefix("env:") {
+        if name.is_empty() {
+            return Err(
+                "routing port environment variable name cannot be empty".into()
+            );
+        }
+        let resolved = std::env::var(name).map_err(|error| {
+            format!(
+                "routing port environment variable {name} is unavailable: {error}"
+            )
+        })?;
+        return parse_port_range(&resolved);
+    }
     let Some((from, to)) = value.split_once('-') else {
         let port = value
             .parse::<u16>()
@@ -249,5 +262,33 @@ mod tests {
             Some(serde_json::json!({"ignored": true}))
         );
         assert_eq!(balancer.fallback_tag.as_deref(), Some("direct"));
+    }
+
+    #[test]
+    fn xray_env_port_rule_is_deserialized() {
+        const NAME: &str = "CHIMERA_ROUTING_PORT_TEST_8F2A";
+        // Safety: this test uses a unique process-local variable name and no
+        // production thread depends on it.
+        unsafe {
+            std::env::set_var(NAME, "8443-8445");
+        }
+        let config: RoutingConfig = serde_json::from_value(serde_json::json!({
+            "rules": [{
+                "port": format!("env:{NAME}"),
+                "outboundTag": "direct"
+            }]
+        }))
+        .expect("Xray env port should deserialize");
+        unsafe {
+            std::env::remove_var(NAME);
+        }
+
+        assert_eq!(
+            config.rules[0].port.0,
+            vec![PortRangeConfig {
+                from: 8443,
+                to: 8445,
+            }]
+        );
     }
 }

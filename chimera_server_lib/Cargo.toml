@@ -35,6 +35,7 @@ tokio-rustls = { workspace = true }
 
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+rustls-native-certs = { workspace = true }
 
 axum = { workspace = true }
 http-body-util = { workspace = true }

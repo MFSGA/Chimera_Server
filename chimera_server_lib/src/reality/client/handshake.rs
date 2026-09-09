@@ -14,6 +14,8 @@ use crate::reality::reality_tls13_messages::{
     DEFAULT_ALPN_PROTOCOLS, construct_client_hello, write_record_header,
 };
 
+const XRAY_COMPAT_CLIENT_VERSION: [u8; 3] = [26, 7, 28];
+
 pub(super) fn generate_client_hello(
     conn: &mut RealityClientConnection,
 ) -> io::Result<()> {
@@ -55,9 +57,7 @@ pub(super) fn generate_client_hello(
         .as_secs();
 
     let mut session_id_plaintext = [0u8; 16];
-    session_id_plaintext[0] = 1; // Protocol version major
-    session_id_plaintext[1] = 8; // Protocol version minor
-    session_id_plaintext[2] = 0; // Protocol version patch
+    session_id_plaintext[0..3].copy_from_slice(&XRAY_COMPAT_CLIENT_VERSION);
     session_id_plaintext[3] = 0; // Padding byte
     // Timestamp (4 bytes as uint32, in seconds)
     session_id_plaintext[4..8].copy_from_slice(&(timestamp as u32).to_be_bytes());

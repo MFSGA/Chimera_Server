@@ -33,6 +33,21 @@ pub struct ServerConfig {
     pub quic_settings: Option<ServerQuicConfig>,
     #[serde(default)]
     pub sniffing: Option<InboundSniffingConfig>,
+    #[serde(default)]
+    pub tcp_socket_policy: Option<TcpSocketPolicy>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TcpSocketPolicy {
+    pub congestion: String,
+    #[serde(default)]
+    pub brutal: Option<TcpBrutalConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TcpBrutalConfig {
+    pub rate_bytes_per_sec: u64,
+    pub cwnd_gain: u32,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

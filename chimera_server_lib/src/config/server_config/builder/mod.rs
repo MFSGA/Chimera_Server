@@ -7,6 +7,7 @@ use crate::{
     Error,
     address::{Address, BindLocation, NetLocation},
     config::{Protocol, Transport, def::InboudItem},
+    util::bandwidth::parse_bandwidth,
 };
 
 #[cfg(any(feature = "hysteria", feature = "tuic"))]
@@ -502,12 +503,92 @@ fn validate_standard_tcp_network(
     }
 }
 
+const TCP_BRUTAL_MIN_RATE_BYTES_PER_SEC: u64 = 62_500;
+const TCP_BRUTAL_MAX_RATE_BYTES_PER_SEC: u64 = 125_000_000_000;
+const TCP_BRUTAL_DEFAULT_CWND_GAIN: u32 = 20;
+const TCP_BRUTAL_MIN_CWND_GAIN: u32 = 5;
+const TCP_BRUTAL_MAX_CWND_GAIN: u32 = 80;
+
+fn collect_tcp_socket_policy(
+    stream_settings: Option<&crate::config::StreamSettings>,
+) -> Result<Option<TcpSocketPolicy>, Error> {
+    let Some(sockopt) =
+        stream_settings.and_then(|settings| settings.sockopt.as_ref())
+    else {
+        return Ok(None);
+    };
+    let congestion = sockopt
+        .tcp_congestion
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let brutal_rate = sockopt
+        .tcp_brutal_rate
+        .clone()
+        .map(parse_bandwidth)
+        .transpose()
+        .map_err(|error| {
+            Error::InvalidConfig(format!("invalid sockopt.tcpBrutalRate: {error}"))
+        })?;
+    let brutal_cwnd_gain = sockopt.tcp_brutal_cwnd_gain;
+
+    let Some(congestion) = congestion else {
+        if brutal_rate.is_some() || brutal_cwnd_gain.is_some() {
+            return Err(Error::InvalidConfig(
+                "sockopt.tcpBrutalRate/tcpBrutalCwndGain require tcpCongestion=brutal".into(),
+            ));
+        }
+        return Ok(None);
+    };
+
+    if !congestion.eq_ignore_ascii_case("brutal") {
+        if brutal_rate.is_some() || brutal_cwnd_gain.is_some() {
+            return Err(Error::InvalidConfig(format!(
+                "sockopt.tcpBrutalRate/tcpBrutalCwndGain require tcpCongestion=brutal, got {congestion}"
+            )));
+        }
+        return Ok(Some(TcpSocketPolicy {
+            congestion,
+            brutal: None,
+        }));
+    }
+
+    let rate_bytes_per_sec = brutal_rate.ok_or_else(|| {
+        Error::InvalidConfig(
+            "sockopt.tcpCongestion=brutal requires tcpBrutalRate; TCP Brutal defaults to 1 Mbps without an explicit rate".into(),
+        )
+    })?;
+    if !(TCP_BRUTAL_MIN_RATE_BYTES_PER_SEC..=TCP_BRUTAL_MAX_RATE_BYTES_PER_SEC)
+        .contains(&rate_bytes_per_sec)
+    {
+        return Err(Error::InvalidConfig(format!(
+            "sockopt.tcpBrutalRate must be between 500kbps and 1tbps (got {rate_bytes_per_sec} bytes/s)"
+        )));
+    }
+    let cwnd_gain = brutal_cwnd_gain.unwrap_or(TCP_BRUTAL_DEFAULT_CWND_GAIN);
+    if !(TCP_BRUTAL_MIN_CWND_GAIN..=TCP_BRUTAL_MAX_CWND_GAIN).contains(&cwnd_gain) {
+        return Err(Error::InvalidConfig(format!(
+            "sockopt.tcpBrutalCwndGain must be between {TCP_BRUTAL_MIN_CWND_GAIN} and {TCP_BRUTAL_MAX_CWND_GAIN} (got {cwnd_gain})"
+        )));
+    }
+
+    Ok(Some(TcpSocketPolicy {
+        congestion: "brutal".to_string(),
+        brutal: Some(TcpBrutalConfig {
+            rate_bytes_per_sec,
+            cwnd_gain,
+        }),
+    }))
+}
+
 struct InboundBuildContext {
     tag: String,
     port: u16,
     bind_location: BindLocation,
     stream_settings: Option<crate::config::StreamSettings>,
     sniffing: Option<InboundSniffingConfig>,
+    tcp_socket_policy: Option<TcpSocketPolicy>,
 }
 
 impl InboundBuildContext {
@@ -528,6 +609,7 @@ impl InboundBuildContext {
             transport,
             quic_settings,
             sniffing: self.sniffing,
+            tcp_socket_policy: self.tcp_socket_policy,
         }
     }
 
@@ -541,7 +623,8 @@ use super::quic::ServerQuicConfig;
 #[cfg(feature = "httpupgrade")]
 use super::types::HttpUpgradeServerConfig;
 use super::types::{
-    InboundSniffingConfig, ServerConfig, ServerProxyConfig, XhttpServerConfig,
+    InboundSniffingConfig, ServerConfig, ServerProxyConfig, TcpBrutalConfig,
+    TcpSocketPolicy, XhttpServerConfig,
 };
 use crate::routing_state::SniffExclusionMatcher;
 
@@ -1740,6 +1823,7 @@ fn build_tuic_server(
         transport: Transport::Quic,
         quic_settings,
         sniffing,
+        tcp_socket_policy: None,
     })
 }
 
@@ -1760,6 +1844,7 @@ impl TryFrom<InboudItem> for ServerConfig {
             ..
         } = value;
         let sniffing = collect_sniffing_config(&tag, sniffing)?;
+        let tcp_socket_policy = collect_tcp_socket_policy(stream_settings.as_ref())?;
 
         let listen = listen.unwrap_or_else(|| "0.0.0.0".to_string());
         let address = Address::from(&listen).map_err(|err| {
@@ -1775,6 +1860,7 @@ impl TryFrom<InboudItem> for ServerConfig {
             bind_location,
             stream_settings,
             sniffing,
+            tcp_socket_policy,
         };
 
         match protocol {
@@ -1837,6 +1923,83 @@ mod tests {
             "tag": format!("{protocol}-planned")
         }))
         .expect("valid inbound item")
+    }
+
+    #[test]
+    fn tcp_sockopt_preserves_xray_congestion_and_validates_brutal_v2() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "socks",
+            "tag": "socks-brutal",
+            "settings": {},
+            "streamSettings": {
+                "network": "tcp",
+                "sockopt": {
+                    "tcpCongestion": "brutal",
+                    "tcpBrutalRate": "150mbps",
+                    "tcpBrutalCwndGain": 20
+                }
+            }
+        }))
+        .expect("valid TCP Brutal inbound");
+        let config = ServerConfig::try_from(inbound)
+            .expect("TCP Brutal socket policy should build");
+        let policy = config
+            .tcp_socket_policy
+            .expect("TCP socket policy should be retained");
+        assert_eq!(policy.congestion, "brutal");
+        let brutal = policy.brutal.expect("Brutal settings should be retained");
+        assert_eq!(brutal.rate_bytes_per_sec, 18_750_000);
+        assert_eq!(brutal.cwnd_gain, 20);
+
+        let bbr: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10001,
+            "protocol": "socks",
+            "tag": "socks-bbr",
+            "settings": {},
+            "streamSettings": {
+                "network": "tcp",
+                "sockopt": { "tcpCongestion": "bbr" }
+            }
+        }))
+        .expect("valid BBR inbound");
+        let bbr =
+            ServerConfig::try_from(bbr).expect("Xray tcpCongestion should build");
+        let policy = bbr
+            .tcp_socket_policy
+            .expect("BBR policy should be retained");
+        assert_eq!(policy.congestion, "bbr");
+        assert!(policy.brutal.is_none());
+    }
+
+    #[test]
+    fn tcp_brutal_sockopt_rejects_missing_or_mismatched_rate() {
+        for sockopt in [
+            serde_json::json!({ "tcpCongestion": "brutal" }),
+            serde_json::json!({
+                "tcpCongestion": "bbr",
+                "tcpBrutalRate": "150mbps"
+            }),
+            serde_json::json!({ "tcpBrutalRate": "150mbps" }),
+        ] {
+            let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+                "listen": "127.0.0.1",
+                "port": 10000,
+                "protocol": "socks",
+                "tag": "socks-invalid-brutal",
+                "settings": {},
+                "streamSettings": {
+                    "network": "tcp",
+                    "sockopt": sockopt
+                }
+            }))
+            .expect("socket policy should deserialize before validation");
+            let error = ServerConfig::try_from(inbound)
+                .expect_err("invalid TCP Brutal socket policy must be rejected");
+            assert!(error.to_string().contains("tcpBrutal"), "{error}");
+        }
     }
 
     #[cfg(feature = "grpc_transport")]

@@ -898,6 +898,7 @@ mod tests {
             Arc::new(NativeResolver::new()),
             RuntimeState::new(Vec::new(), Vec::new()),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 43123)),
+            None,
             traffic_context,
         ));
 
@@ -1075,6 +1076,7 @@ mod tests {
             stream,
             RuntimeState::new(Vec::new(), Vec::new()),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 43141)),
+            None,
             traffic_context,
         ));
 

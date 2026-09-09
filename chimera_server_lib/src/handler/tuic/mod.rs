@@ -1301,6 +1301,17 @@ async fn forward_udp_payload(
             traffic_context = traffic_context.with_outbound_tag(tag);
         }
         DirectOutboundAction::Freedom { tag: None } => {}
+        DirectOutboundAction::Socks { outbound }
+        | DirectOutboundAction::Vless { outbound }
+        | DirectOutboundAction::Trojan { outbound } => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "TCP proxy outbound {} cannot be used for UDP",
+                    outbound.tag
+                ),
+            ));
+        }
     }
 
     session
@@ -1587,6 +1598,8 @@ mod tests {
                 protocol: "freedom".into(),
                 proxy_settings_type: None,
                 proxy_settings_value: None,
+                sender_settings_type: None,
+                sender_settings_value: None,
             }],
         );
         let context = TuicFlowContext {
