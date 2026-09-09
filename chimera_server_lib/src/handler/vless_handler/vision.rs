@@ -1,11 +1,12 @@
 use async_trait::async_trait;
 use tracing::warn;
 
+#[cfg(feature = "reality")]
+use crate::reality::{RealityServerConnection, RealityTlsStream};
 use crate::{
     async_stream::AsyncStream,
     config::server_config::{VlessFallback, VlessUser},
     handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
-    reality::{RealityServerConnection, RealityTlsStream},
     traffic::TrafficContext,
 };
 
@@ -17,6 +18,7 @@ use super::protocol::{
     COMMAND_TCP, ParsedVlessHeader, XTLS_VISION_FLOW, read_request_header,
     read_request_header_after_auth,
 };
+#[cfg(any(feature = "tls", feature = "reality"))]
 use super::reality_vision_stream::RealityVisionServerStream;
 #[cfg(feature = "tls")]
 use super::tls_vision::{RustlsVisionSession, VisionRecordIo};
@@ -40,6 +42,7 @@ impl VisionVlessTcpHandler {
     }
 }
 
+#[cfg(feature = "reality")]
 pub async fn setup_reality_mixed_vless_server_stream(
     mut tls_stream: RealityTlsStream<Box<dyn AsyncStream>, RealityServerConnection>,
     users: &[VlessUser],
@@ -259,6 +262,7 @@ pub async fn setup_tls_vision_server_stream(
     })
 }
 
+#[cfg(feature = "reality")]
 pub async fn setup_reality_vision_server_stream(
     mut tls_stream: RealityTlsStream<Box<dyn AsyncStream>, RealityServerConnection>,
     users: &[ParsedVisionUser],

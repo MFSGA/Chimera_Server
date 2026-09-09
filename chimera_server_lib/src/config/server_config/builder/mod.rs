@@ -293,7 +293,6 @@ fn decode_xray_websocket_query_component(value: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
-#[cfg(any(feature = "ws", feature = "httpupgrade", feature = "grpc_transport"))]
 fn xray_trusted_x_forwarded_for(
     stream_settings: &crate::config::StreamSettings,
 ) -> Vec<String> {
