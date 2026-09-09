@@ -14,7 +14,7 @@ use crate::handler::hysteria2::connection::HysteriaUserStore;
 #[cfg(feature = "shadowsocks")]
 use crate::handler::shadowsocks::ShadowsocksUserStore;
 use crate::{
-    beginning::start_servers,
+    beginning::start_bound_servers,
     config::server_config::{ServerConfig, ServerProxyConfig},
     runtime::RuntimeState,
 };
@@ -1218,9 +1218,10 @@ impl InboundManager {
             PendingAddGuard::new(Arc::clone(self), tag.clone(), generation);
 
         let pending = PendingTasks::new(
-            start_servers(config.clone(), runtime)
+            start_bound_servers(config.clone(), runtime)
                 .await
-                .map_err(AddInboundError::Start)?,
+                .map_err(AddInboundError::Start)?
+                .into_handles(),
         );
         let mut state = self.state.write().expect("inbound manager lock poisoned");
         if state.configs.iter().any(|entry| entry.config.tag == tag) {
@@ -1309,8 +1310,8 @@ impl InboundManager {
                 tag.clone(),
                 generation,
             );
-            let handles = match start_servers(config, runtime.clone()).await {
-                Ok(handles) => handles,
+            let handles = match start_bound_servers(config, runtime.clone()).await {
+                Ok(bound) => bound.into_handles(),
                 Err(error) => {
                     drop(starting);
                     rollback.rollback().await;
@@ -1633,8 +1634,9 @@ impl InboundManager {
             ));
         }
 
-        match start_servers(updated.clone(), runtime.clone()).await {
-            Ok(handles) => {
+        match start_bound_servers(updated.clone(), runtime.clone()).await {
+            Ok(bound) => {
+                let handles = bound.into_handles();
                 let pending = PendingTasks::new(handles);
                 self.replace_running_generation(
                     tag,
@@ -1653,8 +1655,9 @@ impl InboundManager {
                     InboundLifecycleState::Recovering,
                 );
                 tokio::task::yield_now().await;
-                match start_servers(original.clone(), runtime).await {
-                    Ok(handles) => {
+                match start_bound_servers(original.clone(), runtime).await {
+                    Ok(bound) => {
+                        let handles = bound.into_handles();
                         let pending = PendingTasks::new(handles);
                         self.replace_running_generation(
                             tag,
@@ -1714,8 +1717,9 @@ impl InboundManager {
             return;
         }
 
-        match start_servers(original.clone(), runtime).await {
-            Ok(handles) => {
+        match start_bound_servers(original.clone(), runtime).await {
+            Ok(bound) => {
+                let handles = bound.into_handles();
                 let pending = PendingTasks::new(handles);
                 if let Err(error) = self.replace_running_generation(
                     &tag,

@@ -90,7 +90,53 @@ impl Drop for StartingTasks {
     }
 }
 
+/// Listener tasks produced only after every required socket bind/listen step
+/// for one inbound has succeeded. Dropping the value before adoption aborts
+/// the listeners, so lifecycle code cannot accidentally detach a ready-but-
+/// unpublished instance.
+pub(crate) struct BoundInboundTasks {
+    handles: Option<Vec<JoinHandle<()>>>,
+}
+
+impl BoundInboundTasks {
+    fn new(handles: Vec<JoinHandle<()>>) -> Self {
+        Self {
+            handles: Some(handles),
+        }
+    }
+
+    pub(crate) fn into_handles(mut self) -> Vec<JoinHandle<()>> {
+        self.handles.take().unwrap_or_default()
+    }
+}
+
+impl Drop for BoundInboundTasks {
+    fn drop(&mut self) {
+        if let Some(handles) = self.handles.take() {
+            for handle in handles {
+                handle.abort();
+            }
+        }
+    }
+}
+
+pub(crate) async fn start_bound_servers(
+    config: ServerConfig,
+    runtime: RuntimeState,
+) -> std::io::Result<BoundInboundTasks> {
+    start_server_tasks(config, runtime)
+        .await
+        .map(BoundInboundTasks::new)
+}
+
 pub async fn start_servers(
+    config: ServerConfig,
+    runtime: RuntimeState,
+) -> std::io::Result<Vec<JoinHandle<()>>> {
+    Ok(start_bound_servers(config, runtime).await?.into_handles())
+}
+
+async fn start_server_tasks(
     config: ServerConfig,
     runtime: RuntimeState,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
@@ -1575,6 +1621,53 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn bound_inbound_tasks_drop_releases_ready_listener() {
+        let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("bind ephemeral port");
+        let address = probe.local_addr().expect("read ephemeral address");
+        drop(probe);
+
+        let config = ServerConfig {
+            tag: "bound-ready".to_string(),
+            bind_location: BindLocation::Address(NetLocation::from_ip_addr(
+                address.ip(),
+                address.port(),
+            )),
+            protocol: ServerProxyConfig::Socks {
+                accounts: crate::config::server_config::SocksUserStore::new(
+                    Vec::new(),
+                ),
+                udp_enabled: false,
+                udp_response_ip: None,
+                user_level: 0,
+            },
+            transport: Transport::Tcp,
+            quic_settings: None,
+            sniffing: None,
+            tcp_socket_policy: None,
+        };
+        let runtime = RuntimeState::new(vec![config.clone()], Vec::new());
+        let bound = start_bound_servers(config, runtime)
+            .await
+            .expect("bind inbound before returning readiness token");
+
+        assert!(
+            tokio::net::TcpListener::bind(address).await.is_err(),
+            "bound result must represent an already-owned listener"
+        );
+        drop(bound);
+
+        for _ in 0..50 {
+            if let Ok(listener) = tokio::net::TcpListener::bind(address).await {
+                drop(listener);
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("dropping an unadopted bound result must release its listener");
+    }
 
     #[test]
     fn configured_identity_registration_respects_user_stats_policy() {
