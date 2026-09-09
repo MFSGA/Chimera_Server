@@ -5994,6 +5994,7 @@ mod tests {
                 xray_init_connection_receive_window: None,
                 xray_max_connection_receive_window: None,
                 xray_disable_path_mtu_discovery: None,
+                udp_finalmask: None,
             },
         };
         let user = |email: &str, auth: &str| proto::xray::common::protocol::User {
@@ -6139,6 +6140,7 @@ mod tests {
                     xray_init_connection_receive_window: None,
                     xray_max_connection_receive_window: None,
                     xray_disable_path_mtu_discovery: None,
+                    udp_finalmask: None,
                 },
             },
             transport: Transport::Quic,

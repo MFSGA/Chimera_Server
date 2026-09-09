@@ -6,10 +6,11 @@ use std::{
 
 use congestion::BrutalConfig;
 use connection::{build_xray_proxy_transport, process_hysteria2_connection};
+use finalmask::{GeckoUdpSocket, SalamanderUdpSocket};
 use quinn::congestion::{BbrConfig, NewRenoConfig};
 
 use crate::{
-    config::server_config::Hysteria2ServerConfig,
+    config::server_config::{Hysteria2ServerConfig, Hysteria2UdpFinalMask},
     resolver::{NativeResolver, Resolver},
     runtime::RuntimeState,
     util::socket::new_socket2_udp_socket_with_buffer_size,
@@ -17,6 +18,7 @@ use crate::{
 
 pub(crate) mod congestion;
 pub mod connection;
+mod finalmask;
 
 const MAX_QUIC_ENDPOINTS: usize = 1;
 const SHOES_MAX_INCOMING_UNI_STREAMS: u32 = 1024;
@@ -76,12 +78,34 @@ pub async fn run_hysteria2_server(
             false,
             configured_udp_socket_buffer_size(config.xray_compat),
         )?;
+        let quinn_runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
+        let raw_socket = quinn_runtime.wrap_udp_socket(socket2_socket.into())?;
+        let socket: Arc<dyn quinn::AsyncUdpSocket> = match &config.udp_finalmask {
+            Some(Hysteria2UdpFinalMask::Salamander { password }) => Arc::new(
+                SalamanderUdpSocket::new(raw_socket, password.as_bytes().to_vec())
+                    .map_err(std::io::Error::other)?,
+            ),
+            Some(Hysteria2UdpFinalMask::Gecko {
+                password,
+                min_packet_size,
+                max_packet_size,
+            }) => Arc::new(
+                GeckoUdpSocket::new(
+                    raw_socket,
+                    password.as_bytes().to_vec(),
+                    *min_packet_size,
+                    *max_packet_size,
+                )
+                .map_err(std::io::Error::other)?,
+            ),
+            None => raw_socket,
+        };
 
-        let endpoint = quinn::Endpoint::new(
+        let endpoint = quinn::Endpoint::new_with_abstract_socket(
             quinn::EndpointConfig::default(),
             Some(base_server_config.clone()),
-            socket2_socket.into(),
-            Arc::new(quinn::TokioRuntime),
+            socket,
+            quinn_runtime,
         )?;
 
         let join_handle = tokio::spawn(async move {
