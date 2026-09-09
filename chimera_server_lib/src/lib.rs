@@ -1,7 +1,6 @@
 // TODO: remove this once WIP modules stabilize and dead code is pruned
 #![allow(dead_code)]
 
-use beginning::start_servers;
 pub use beginning::start_tcp_server;
 use config::{def::ApiConfig, rule::RoutingConfig};
 pub use config::{
@@ -480,21 +479,17 @@ async fn start_async(
     // Bind every configured data-plane listener before advertising the control
     // plane. rnode uses GetSysStats as its readiness probe, so starting gRPC
     // first would allow a process with a failed inbound bind to look healthy.
-    for config in all_inbounds {
-        // Skip the API inbound if it's configured to avoid port conflicts
-        if skip_inbound_tag.as_deref() == Some(config.tag.as_str()) {
-            tracing::info!(
-                "skip api inbound {} to avoid grpc port conflict",
-                config.tag
-            );
-            continue;
-        }
-        // Runtime state lets UDP listeners evaluate routing and outbound policy.
-        let inbound_tag = config.tag.clone();
-        let handles = start_servers(config, runtime_state.clone()).await?;
-        runtime_state.register_inbound_tasks(&inbound_tag, handles);
-        has_started_server = true;
+    if let Some(tag) = skip_inbound_tag.as_deref() {
+        tracing::info!("skip api inbound {} to avoid grpc port conflict", tag);
     }
+    let started_inbounds = runtime_state
+        .inbound_manager()
+        .start_configured_inbounds(
+            runtime_state.clone(),
+            skip_inbound_tag.as_deref(),
+        )
+        .await?;
+    has_started_server |= started_inbounds > 0;
 
     if let Some(observer) = routing_observer::start_observer(
         runtime_state.clone(),

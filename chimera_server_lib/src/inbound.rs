@@ -597,6 +597,55 @@ impl Drop for PendingTasks {
     }
 }
 
+struct ConfiguredStartGuard {
+    manager: Arc<InboundManager>,
+    started: Vec<(String, u64)>,
+}
+
+impl ConfiguredStartGuard {
+    fn new(manager: Arc<InboundManager>) -> Self {
+        Self {
+            manager,
+            started: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, tag: String, generation: u64) {
+        self.started.push((tag, generation));
+    }
+
+    async fn rollback(&mut self) {
+        while let Some((tag, generation)) = self.started.last().cloned() {
+            self.manager
+                .stop_tasks_for_generation(&tag, generation)
+                .await;
+            self.started.pop();
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.started.clear();
+    }
+}
+
+impl Drop for ConfiguredStartGuard {
+    fn drop(&mut self) {
+        if self.started.is_empty() {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let manager = Arc::clone(&self.manager);
+        let started = std::mem::take(&mut self.started);
+        handle.spawn(async move {
+            for (tag, generation) in started.into_iter().rev() {
+                manager.stop_tasks_for_generation(&tag, generation).await;
+            }
+        });
+    }
+}
+
 struct AlterRecoveryGuard {
     manager: Arc<InboundManager>,
     runtime: RuntimeState,
@@ -942,6 +991,75 @@ impl InboundManager {
             abort_tasks(&previous.handles);
         }
         Ok(())
+    }
+
+    pub(crate) async fn start_configured_inbounds(
+        &self,
+        runtime: RuntimeState,
+        skip_tag: Option<&str>,
+    ) -> io::Result<usize> {
+        let manager = runtime.inbound_manager();
+        let tags = self
+            .configs()
+            .into_iter()
+            .map(|config| config.tag)
+            .collect::<Vec<_>>();
+        let mut rollback = ConfiguredStartGuard::new(manager);
+        let mut started = 0usize;
+
+        for tag in tags {
+            if skip_tag == Some(tag.as_str()) {
+                continue;
+            }
+            let _operation_guard = self.operation_lock(&tag).lock().await;
+            let prepared = {
+                let state =
+                    self.state.read().expect("inbound manager lock poisoned");
+                match state.configs.iter().find(|entry| entry.config.tag == tag) {
+                    None => Err(io::Error::other(format!(
+                        "configured inbound {tag} disappeared during startup"
+                    ))),
+                    Some(_) if state.tasks.contains_key(&tag) => {
+                        Err(io::Error::other(format!(
+                            "configured inbound {tag} is already running"
+                        )))
+                    }
+                    Some(entry) => Ok((entry.generation, entry.config_view())),
+                }
+            };
+            let (generation, config) = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    rollback.rollback().await;
+                    return Err(error);
+                }
+            };
+
+            let handles = match start_servers(config, runtime.clone()).await {
+                Ok(handles) => handles,
+                Err(error) => {
+                    rollback.rollback().await;
+                    return Err(error);
+                }
+            };
+            let pending = PendingTasks::new(handles);
+            let published = self.register_tasks_for_generation(
+                &tag,
+                generation,
+                pending.commit(),
+            );
+            if !published {
+                rollback.rollback().await;
+                return Err(io::Error::other(format!(
+                    "configured inbound {tag} changed during startup"
+                )));
+            }
+            rollback.record(tag, generation);
+            started += 1;
+        }
+
+        rollback.disarm();
+        Ok(started)
     }
 
     pub(crate) async fn remove_started(
@@ -1368,7 +1486,9 @@ async fn stop_task_set(task_set: InboundTaskSet) {
 
 #[cfg(test)]
 mod tests {
-    use super::{AlterRecoveryGuard, InboundManager, stop_task_set};
+    use super::{
+        AlterRecoveryGuard, ConfiguredStartGuard, InboundManager, stop_task_set,
+    };
     use crate::{
         address::{BindLocation, NetLocation},
         beginning::start_servers,
@@ -1541,6 +1661,57 @@ mod tests {
             "cancelling alter must restore the original listener"
         );
         assert!(manager.stop_tasks("primary").await);
+    }
+
+    #[tokio::test]
+    async fn configured_start_rolls_back_prior_listener_on_later_bind_failure() {
+        let first_port = free_localhost_port();
+        let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("bind occupied second port");
+        let second_port = occupied.local_addr().unwrap().port();
+        let runtime = RuntimeState::new(
+            vec![inbound("first", first_port), inbound("second", second_port)],
+            Vec::new(),
+        );
+        let manager = runtime.inbound_manager();
+
+        manager
+            .start_configured_inbounds(runtime.clone(), None)
+            .await
+            .expect_err("second inbound bind must fail");
+
+        assert!(
+            TcpListener::bind((Ipv4Addr::LOCALHOST, first_port)).is_ok(),
+            "failed initial startup must release previously started listeners"
+        );
+        assert!(manager.config_by_tag("first").is_some());
+        assert!(manager.config_by_tag("second").is_some());
+        assert!(!manager.stop_tasks("first").await);
+    }
+
+    #[tokio::test]
+    async fn cancelled_configured_start_guard_cleans_recorded_generation() {
+        let manager = Arc::new(InboundManager::new(vec![inbound("primary", 10001)]));
+        let generation = manager.generation("primary").unwrap();
+        let task = tokio::spawn(std::future::pending());
+        let abort_handle = task.abort_handle();
+        assert!(manager.register_tasks_for_generation(
+            "primary",
+            generation,
+            vec![task]
+        ));
+
+        let mut guard = ConfiguredStartGuard::new(Arc::clone(&manager));
+        guard.record("primary".to_string(), generation);
+        drop(guard);
+        for _ in 0..20 {
+            if abort_handle.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(abort_handle.is_finished());
+        assert!(!manager.stop_tasks("primary").await);
     }
 
     #[tokio::test]
