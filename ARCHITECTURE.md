@@ -1,121 +1,364 @@
-# Chimera Server 架构（按代码执行时序）
+# Chimera Server 架构设计与演进规范
 
-本文档按“代码真实执行顺序”梳理 Chimera_Server 的架构与运行流程，覆盖构建期、启动期、控制面与数据面、连接生命周期及观测链路。
+- 文档版本：1.1
+- 更新日期：2026-09-09
+- 定位：后续架构设计与渐进迁移的首要参考；不是已实现功能清单。
+- 实施状态：目标设计已形成，本文不表示代码迁移已经完成。
+- 适用范围：Chimera_Server 服务端，当前以 inbound 为主。
 
-## 0. 项目组成
+## 1. 目标与使用方式
 
-- Workspace：`chimera_server_app`（入口应用） + `chimera_server_lib`（核心库）。
-- `chimera_server_app` 只负责 CLI、配置文件定位与启动库。
-- `chimera_server_lib` 负责配置解析、协议处理、控制面服务与数据面代理。
+Chimera 的最终目标是完整兼容 xray-core 的服务端行为，使现有客户端无需改变协议配置即可使用 Chimera，并使支持范围内的 Xray 服务端配置保留等价语义。在实现这一目标的同时，改善模块职责、状态所有权、生命周期、资源控制和可维护性。
 
-## 1. 构建期（Build-Time）
+后续贡献者应先阅读 [AGENTS.md](AGENTS.md) 和本文，再检查任务涉及的实际代码与参考实现。架构相关改动应说明所属模块、状态所有者、影响的兼容行为和验证方式。本文中的类型与目录名称是设计名称，迁移完成前不得假设它们已经存在。
 
-1. `chimera_server_lib/build.rs` 在构建阶段执行：
-   - 设置 `PROTOC` 为 vendored protoc。
-   - 使用 `tonic_build` 编译 `proto/` 下的 xray 相关 proto。
-2. 生成的 gRPC 代码通过 `chimera_server_lib/src/grpc/proto.rs` 的
-   `tonic::include_proto!` 被引入到运行时模块。
+用户当前明确指令优先；AGENTS 规定贡献流程；本文规定内部设计方向；固定版本的 Xray 源码与互通结果规定外部兼容行为。遇到分歧应明确记录：代码现状不自动推翻目标设计，目标设计也不允许未经验证改变 Xray 行为。例行局部实现不需要反复请求架构确认；重大边界调整应先更新设计理由。
 
-## 2. 进程启动（App Entry）
+### 1.1 当前范围
 
-1. `chimera_server_app/src/main.rs` 解析 CLI：
-   - 组装配置文件路径（目录 + 文件名）。
-   - 校验配置文件存在性。
-2. 调用 `chimera::start`（`chimera_server_lib/src/lib.rs`）：
-   - 安装 rustls crypto provider。
-   - 创建 Tokio runtime（多线程或单线程）。
-   - 进入 `start_async` 异步初始化流程。
+- Inbound 协议、传输、安全握手、认证、回落、监听、socket 选项、sniffing。
+- 与 inbound 直接相关的用户策略、动态管理、统计和任务生命周期。
+- Inbound 正常工作所必需的目标连接、DNS、TCP/UDP 转发及现有路由衔接。
+- 保护现有 outbound、Chimera 扩展和部署行为。
 
-## 3. 配置解析与运行态准备（start_async）
+### 1.2 后置事项与非目标
 
-1. 配置解析：
-   - `Config::try_parse` -> `LiteralConfig`（支持 JSON/JSON5）。
-2. Inbound 转换：
-   - `ServerConfig::try_from(InboudItem)` 把 Inbound 转为运行态配置。
-   - 应用协议层（VLESS/Trojan/Socks/Hysteria2/XHTTP）。
-   - 应用安全层（TLS/REALITY）、WS 包装。
-3. RuntimeState 组装：
-   - `RuntimeState::new` 保存入站与出站摘要。
-4. API 监听地址解析：
-   - 优先使用 `api.listen`，否则尝试用 `api.tag` 对应 inbound 的地址。
-   - 若 api 使用了 inbound 的端口，会记录 `skip_inbound_tag` 以避免冲突。
-5. 日志初始化：
-   - `log::init` 目前在 `start_async` 中被注释掉（实际不执行）。
+- 完整 outbound 协议生态和大规模路由功能扩展后置。
+- 当前不引入微服务、通用插件平台、分布式控制协议或全局依赖注入容器。
+- 不以重构名义改变协议字节、认证规则、默认超时、回落表现或统计口径。
+- 不把 Rust、更多 trait、更多 crate 或更短文件视为架构质量的直接证明。
+- 不承诺未验证的性能优势；不把参考项目的全部设计视为最优解。
 
-## 4. 控制面服务启动（Control Plane）
+## 2. 参考体系与适用边界
 
-1. gRPC 服务（`grpc::start_grpc_server`）：
-   - 监听 `api.listen` 地址。
-   - 依据配置注册服务：Stats / Logger / Handler / Routing / Observatory。
-   - 服务内部读取 `RuntimeState` 与 `traffic` 统计。
-2. MCP 服务（`mcp::start_mcp_server`）：
-   - Axum WebSocket 服务，默认路径 `/mcp`。
-   - 周期推送 `chimera://status/connection_count` 的更新通知。
+| 参考 | 采用的思路 | 不直接继承的内容 |
+| --- | --- | --- |
+| xray-core | 配置、线上协议、失败处理和管理 API 的兼容契约 | 具体语言机制和未经分析的内部耦合 |
+| clash-rs | 外部配置到内部模型、InboundManager、会话分发的分工 | Clash 配置及默认值 |
+| sing-box | inbound 管理与分阶段生命周期 | Go 服务注册机制和整套功能范围 |
+| Envoy | listener 就绪/排空、连接与请求作用域、传输和过滤职责 | xDS 全套体系、固定 worker 模型和复杂插件机制 |
+| shadowsocks-rust | 协议核心、服务实现与程序入口分离 | 将单一协议抽象直接套用到所有 Xray 组合 |
+| Pingora / Leaf | 公共网络能力、协议与传输接口的局部设计 | 用 HTTP 模型统一所有会话，或替换 Xray 行为标准 |
 
-## 5. 数据面服务启动（Inbound Servers）
+本次设计核对的本地基线：
 
-1. 逐个 inbound 启动（跳过 `skip_inbound_tag`）：
-   - `beginning::start_servers` 选择传输层：
-     - TCP：`start_tcp_server`
-     - QUIC：`start_quic_server`（当前仅 Hysteria2）
-     - XHTTP：`start_xhttp_server`
-     - UDP：未支持（panic）
-2. 所有服务任务进入 `join_handles`：
-   - `select_all` 等待任意任务退出。
-   - 任意服务退出即视为错误并触发退出。
+- `ref/xray-core`：`5ca6f4b7d4dc20a881d4330e498892697627ec0c`。
+- `ref/clash-rs`：`c6f25ab847a15bf7628d34108eab6a171325dadb`。
 
-## 6. TCP 入站连接生命周期（核心数据面）
+后续兼容工作须重新记录实际参考提交和客户端二进制版本。这些基线不是“永远最新”的声明；外部链接可能随分支更新，具体移植前必须固定所用版本。
 
-1. Listener 接受连接，设置 `TCP_NODELAY`。
-2. `process_stream`：
-   - 在 60s 超时内调用 `setup_server_stream` 完成协议握手。
-   - 解析目标 `NetLocation`，生成 `TrafficContext`。
-   - 在 60s 超时内解析 DNS 并连接目标地址。
-   - 必要时回写“连接成功响应”（如 VLESS/Socks）。
-   - `copy_bidirectional` 双向转发数据。
-   - 记录流量统计与活动连接。
-3. Handler 链路构建：
-   - `create_tcp_server_handler` 构建协议处理器。
-   - 可能叠加 WebSocket / TLS / REALITY 的包装层。
+### 2.1 独立设计原则
 
-## 7. TCP 协议处理顺序（握手阶段）
+参考项目是证据与备选方案，不是 Chimera 内部架构的强制模板。允许并鼓励基于本项目约束提出原创方案；内部结构不必与任何参考项目一一对应。Xray 的外部兼容契约仍然有效。
 
-- VLESS：读取版本与用户 ID -> 解析目标地址 -> 返回响应头。
-- Trojan：校验密码哈希 -> 解析目标地址 -> 校验 CRLF。
-- SOCKS5：协商鉴权 -> 可选用户名密码 -> CONNECT 解析 -> 返回成功响应。
-- TLS：先完成 TLS 握手，再交给内层 handler。
-- REALITY：解析 ClientHello -> SNI 校验 -> 自定义握手 -> 交给内层 handler。
-- WebSocket：解析 HTTP Upgrade -> 路由匹配 -> 回写 101 -> 使用 WebsocketStream。
+设计决策从问题出发：先说明状态归属、必须保持的不变量和真实维护成本，再决定模块、接口与并发机制。比较保留现状、借鉴参考和本地简化方案；根据问题规模记录必要的取舍，不为每个小修复增加形式化负担。
 
-## 8. QUIC / Hysteria2 生命周期
+优先评估：改变一个行为需要触及多少责任中心、失败后能否恢复一致状态、接口是否暴露过多能力、方案能否独立测试，以及迁移和运行成本。新增抽象应对应真实变化点或不变量；不为了模仿成熟项目或追求原创而增加复杂度。
 
-1. `start_quic_server`：
-   - 读取证书与私钥，构建 rustls QUIC 配置。
-   - 启动 quinn Endpoint 并等待连接。
-2. 每条 QUIC 连接：
-   - 先进行 HTTP/3 `/auth` 认证（`Hysteria-Auth`）。
-   - 成功后并行处理：
-     - TCP 流：读取目标地址 -> 连接目标 -> QUIC <-> TCP 转发。
-     - UDP 数据报：维护会话、分片与转发。
-3. 连接层记录流量与在线统计。
+本设计的独立判断包括：以四种作用域分析状态，同时允许跨连接会话脱离严格父子树；使用实例代次隔离同 tag 重建；数据面获取窄能力而非全局管理状态；先稳定核心库内边界再考虑拆 crate。这些方向应由代码和测试持续检验，不因写入本文而成为不可修订的结论。
 
-## 9. XHTTP 生命周期
+## 3. 代码现状与设计动机
 
-1. Axum HTTP 服务提供 `GET`/`POST`：
-   - `up_handler`：按 seq 排序写入上游 TCP。
-   - `down_handler`：将上游读取流回传给客户端（event-stream）。
-2. SessionStore 维护会话与上游连接，支持 padding 与 host/path 校验。
+以下是文档编写时可观察到的结构，不是运行故障或性能回归的完整证明。
 
-## 10. 观测与统计链路
+| 当前结构 | 维护风险 | 目标边界 |
+| --- | --- | --- |
+| `lib.rs` 的 validate 与启动、gRPC 的配置转换分别组织校验 | 默认值和支持范围可能分叉 | 共用配置编译入口 |
+| `ServerProxyConfig` 部分分支持有 `SocksUserStore` 共享可变状态 | 配置克隆与运行状态共享的语义不同 | 计划与用户运行状态分离 |
+| `RuntimeState` 同时持有配置、任务、路由、策略和事件 | 连接层能依赖过多管理能力 | 管理能力与数据侧查询能力分离 |
+| gRPC handler 直接登记、启动、回滚和停止 inbound | 生命周期规则绑定在 API 实现中 | InboundManager 统一编排 |
+| `beginning` 同时负责监听、sniffing、分发与转发 | 修改一个流程需要理解多个层次 | 按职责渐进提取 |
+| handler 可以返回 `AlreadyHandled` 表示内部自行执行任务 | 外层难以统一跟踪完成和取消 | 有所有者的任务移交 |
+| 协议与安全/传输层共用递归枚举 | 多处递归匹配容易重复规则 | 明确组合计划及能力边界 |
 
-- `traffic` 记录总量、按协议/入站/用户聚合的流量。
-- 活动连接通过 `register_connection` 维护，供 Stats/MCP 读取。
-- gRPC StatsService 映射为 xray 风格命名键值。
-- MCP 提供实时连接数订阅。
+代码入口： [lib.rs](chimera_server_lib/src/lib.rs)、[runtime.rs](chimera_server_lib/src/runtime.rs)、[配置类型](chimera_server_lib/src/config/server_config/types.rs)、[gRPC Handler](chimera_server_lib/src/grpc/handler.rs)、[连接处理结果](chimera_server_lib/src/handler/tcp/tcp_handler.rs)。
 
-## 11. 当前限制与代码现状（便于理解执行分支）
+现有 handler、TCP/UDP 消息流区分、路由快照和真实客户端测试是迁移基础。本文不要求推翻这些实现。协议覆盖应查阅并核验 [兼容矩阵](examples/xray-compatible/README.md)，不在此维护易过时的“未实现协议”列表。
 
-- UDP 传输层未支持（`beginning` 中直接 panic）。
-- VMess inbound 尚未实现。
-- WebSocket 流、YAML/TOML 配置解析等存在 `todo!()`。
-- 日志初始化在启动流程中被注释，需显式开启才能生效。
+## 4. 总体结构与依赖方向
+
+```mermaid
+flowchart TD
+    Input[文件配置 / 管理 API 输入] --> Adapt[格式适配]
+    Adapt --> Compile[配置编译与兼容诊断]
+    Compile --> Plan[InboundPlan]
+    Plan --> Manager[Server / InboundManager]
+    Manager --> Instance[InboundInstance]
+    Instance --> Transport[监听与传输安全组合]
+    Transport --> Protocol[协议认证与解析]
+    Protocol --> Session[会话分发与执行]
+    Session --> Connector[既有目标连接与转发]
+    Identity[用户与策略发布] -.查询.-> Protocol
+    Identity -.查询.-> Session
+    Session -.计量.-> Traffic[Traffic]
+    Control[gRPC / MCP] --> Manager
+    Control --> Identity
+    Control --> Traffic
+```
+
+图表示职责调用关系，不规定所有网络包都经过相同线性链路。QUIC、XHTTP、REALITY/Vision 的组合必须单独表达。
+
+### 4.1 模块契约
+
+| 逻辑模块 | 输入与输出 | 拥有的内容 | 禁止承担的职责 |
+| --- | --- | --- | --- |
+| config | 外部配置 → 已验证计划或诊断 | 字段规则、默认值、组合校验 | listener、连接任务、动态授权状态 |
+| server | 启动计划 → ServerHandle | 组件装配、整体就绪、进程级关闭 | 协议帧解析 |
+| inbound | 计划与管理命令 → 实例/操作结果 | 实例注册、启停、资源准备协调 | protobuf 解码、业务路由匹配 |
+| transport | 网络接入 → 流/消息与传输上下文 | listener、传输状态、安全握手资源 | 代理协议业务目标决策 |
+| protocol | 流/消息与凭据查询 → 会话请求/回落结果 | 认证和协议编解码 | 全局服务增删 |
+| session | 会话请求 → 转发与完成结果 | 会话任务、超时、取消、半关闭 | JSON/protobuf 格式 |
+| identity / policy | 管理更新 → 可查询版本 | 用户、授权规则、策略发布 | socket 启停 |
+| control | API 请求 ↔ 内部命令与响应 | API 适配与错误映射 | 独立实现启动事务 |
+| traffic | 计量记录 → 聚合/查询 | 统计状态 | 决定认证和连接结束 |
+| outbound | 目标请求 → 既有连接能力 | 已有出站实现 | 本轮扩展新协议体系 |
+
+配置编译可依赖纯协议选项校验；运行模块不反向依赖外部配置格式。控制面可调用管理能力，但协议/会话层不依赖 gRPC/MCP。跨模块公共类型只提取稳定的小型值对象，不建立容纳所有状态的 `common` 大模块。
+
+## 5. 配置、计划与运行实体
+
+### 5.1 三阶段模型
+
+| 对象（设计名） | 作用 | 不变量 |
+| --- | --- | --- |
+| XrayInboundConfig | 表达原始输入，包括别名与省略值 | 不把未指定值过早变成默认值 |
+| InboundPlan | 表达编译完成的监听、传输、协议和初始用户设置 | 不持有活跃 socket、任务或可变授权集合 |
+| InboundInstance | 表达实际运行的 inbound | 资源、动态状态和清理责任明确 |
+
+计划不等于可公开打印的数据：它仍可能包含凭据，必须采用安全摘要或脱敏 Debug。不要持久保存无必要的原始配置副本。
+
+### 5.2 单一语义入口
+
+文件和 gRPC 各自解码，再汇入共用的内部描述及编译逻辑。两种格式不必具有相同字段，但相同含义必须得到相同默认值与组合检查。API 侧需保留 protobuf presence 等输入语义，不能无条件绕经 JSON 导致信息丢失。
+
+检查分三个阶段：
+
+1. 配置编译：字段、默认值、feature 支持及协议组合。
+2. 资源准备：证书、密钥、必要文件和平台能力；昂贵或阻塞工作离开转发路径。
+3. 启动：实际绑定端点、启动任务、确认就绪。
+
+`--check` 的检查深度应在迁移时记录并用测试固定；它不等同于端口可绑定。共享编译过程不应启动后台任务或安装日志订阅器。
+
+### 5.3 兼容诊断
+
+- 区分已支持、部分支持、仅格式保留、服务端不适用和未支持。
+- 已识别但未执行的行为不能无声成为“支持”；安全关键选项未实现时应拒绝。
+- 未知字段的处理对照 Xray，不通过全局严格模式随意改变接受范围。
+- 诊断包含安全的字段路径和错误类别，不回显配置原文、私钥、密码或认证帧。
+- 偏离 Xray 的安全强化应声明影响，尤其关注认证失败响应和回落行为。
+
+## 6. 四个生命周期作用域
+
+| 作用域 | 典型所有者 | 资源与状态 | 结束条件 |
+| --- | --- | --- | --- |
+| 服务器 | ServerHandle | 组件管理器、控制服务、根取消信号 | 组件完成关闭或达到明确清理期限 |
+| Inbound 实例 | InboundManager / InboundInstance | 监听、用户存储、实例任务组 | 停止接入并完成规定的清理 |
+| 物理连接 | ConnectionHandle | TCP/QUIC 连接、握手状态、传输子任务 | 传输关闭且所属任务收尾 |
+| 逻辑会话 | SessionHandle 或会话注册表 | 目标连接、消息通道、策略引用、计量 | 协议规定的关闭、超时或取消 |
+
+这些作用域不是严格的四层树：HTTP/2 和 QUIC 一条连接可承载多会话；XHTTP 会话可能关联多条 HTTP 请求；XUDP 的跨连接重关联可能要求会话状态由 inbound 级注册表持有。明确谁拥有持久会话、谁仅持有引用，禁止在连接退出时误删可重关联状态。
+
+### 6.1 Inbound 状态机与实例身份
+
+```mermaid
+stateDiagram-v2
+    [*] --> Preparing
+    Preparing --> Starting
+    Preparing --> Failed: 校验或准备失败
+    Starting --> Running: 就绪确认
+    Starting --> Failed: 启动失败并清理
+    Running --> Stopping: 删除、关闭或致命错误
+    Stopping --> Stopped: 完成清理
+    Failed --> [*]
+    Stopped --> [*]
+```
+
+- tag 是外部寻址属性，不是唯一内部身份。内部实例 ID/代次应能区分同 tag 的删除重建；无 tag 和重复 tag 的合法性遵循 Xray。
+- 管理器统一维护实例及状态，避免配置表与任务表由不同调用者分别更新。
+- 同一目标的变更须串行化或做版本检查；不持有全局阻塞锁执行异步启动。
+- 旧实例任务回调只能影响自己的代次，不能删除新实例。
+- 对外 API 何时返回成功、是否暴露准备状态，按 Xray 合同确定；内部就绪状态不自动新增外部 API。
+
+### 6.2 关闭与任务所有权
+
+任务生成必须有 owner；任务移交要带登记与完成通知。Drop 不能完成异步排空，丢弃 JoinHandle 也不是取消。设计应提供显式关闭流程，并处理调用方取消管理操作时的资源清理。
+
+区分停止接受新连接、结束逻辑会话、关闭底层传输。是否排空既有连接及其期限按协议/API 兼容行为确定，不能默认所有删除都立即 abort，也不能默认永远保留旧连接。清理超时后仍应记录未完成项并处理资源，不把取消信号已发送当作关闭成功。
+
+## 7. 传输、安全与协议边界
+
+监听端点与代理协议分开建模；计划明确合法的安全/传输组合，构建阶段选取实现。避免每个管理操作都重复递归匹配整个协议枚举。
+
+但不强制固定的“TCP → TLS → HTTP → 协议”顺序：QUIC 自带安全握手；REALITY 具有回落职责；Vision 依赖安全状态与底层转发能力。传输上下文通过明确能力提供 SNI、ALPN、来源地址及必要状态，不把完整 RuntimeState 交给协议。
+
+原始 TCP 转发等优化仅在能力与安全前提满足时启用。快速路径必须保持计量、取消、半关闭及协议边界；缺少能力时使用已验证的常规路径。
+
+协议返回结果应表达 TCP、固定目标 UDP、多目标 UDP、会话型 UDP、回落或可跟踪的协议自主管理任务。保留现有不同消息流抽象，不用单一字节流隐藏消息边界，也不建立覆盖所有协议细节的巨大 trait。
+
+## 8. 身份、策略、分发与统计
+
+- 初始用户属于计划；可变用户与授权状态属于运行存储。存储可共享实现，但协议特定凭据和认证流程保留在对应模块。
+- 认证身份由协议产生，再用于策略、目标选择与统计；不能依靠统计上下文充当认证的唯一事实来源。
+- 数据面仅持有查询/执行能力，管理面持有发布/变更能力。优先使用具体窄接口，确有替换或测试需求时再引入 trait。
+- 路由与关联数据应作为一致版本发布；现有 RoutingPublication 可逐步复用。
+- 每项用户/策略变更注明影响新握手、新请求、新消息还是既有会话。不可统一假定整条连接只读取一次，也不可按字节获取全局锁。
+- 流量在定义明确的位置计量，传输层和会话层避免重复计数；失败、回落、取消和快速路径同样验证 Xray 对应口径。
+- 继续复用 traffic、tracing、gRPC/MCP，不另设观测体系。
+
+## 9. 关键流程
+
+### 9.1 初始启动
+
+解码与编译 → 准备必需资源 → 创建组件与 inbound 实例 → 绑定并等待就绪 → 按既有部署契约暴露服务就绪。
+
+阶段失败由 server 统一执行已创建资源的反向清理；清理责任不能依赖 CLI 进程恰好退出。部分启动是否允许必须明确，默认不能把关键 inbound 失败报告为整体健康。
+
+### 9.2 动态增加与删除 inbound
+
+控制适配 → 共用配置编译 → 管理器预留实例身份 → 准备与启动 → 发布运行状态 → 映射 API 结果。失败撤销预留并清理资源；相同 tag 的并发变更不能绕过一致性规则。
+
+删除按实例身份进入停止流程，API 状态和返回时机保持兼容。不得直接由 gRPC 分别删除配置、abort listener、修改统计来拼凑操作。
+
+### 9.3 连接与会话
+
+接入 → 传输/安全处理 → 协议认证与目标解析 → sniffing/策略/分发 → 目标连接 → 会话转发 → 计量及资源收尾。
+
+该流程表达逻辑责任，不改变协议规定的成功响应时机、认证顺序和回落原始字节重放。握手、目标连接、空闲以及单向关闭分别拥有超时语义。
+
+### 9.4 动态用户更新
+
+输入适配 → 协议用户校验 → 发布更新版本 → 按指定边界读取新版本。失败不发布半成品；跨字段更新应原子可见。既有连接是否继续有效按参考行为测试。
+
+## 10. 资源与错误模型
+
+资源预算按适当作用域分配，重点覆盖未认证握手、连接、UDP 会话、XHTTP 待配对数据、队列和缓存。限额同时定义释放条件、过载行为和配置默认值。新增限额不得隐式破坏合法客户端流量。
+
+控制更新和慢速统计消费者不阻塞转发。明确背压或丢弃策略：允许丢弃的观测事件不能被误用于认证、流量结算或生命周期事实。重放缓存也不能因普通缓存淘汰策略失去安全保证。
+
+内部错误至少在责任上区分配置、资源准备、协议、连接和生命周期失败；沿用已有错误类型渐进演化，不要求一次重写全部错误枚举。控制面映射 Status，CLI 映射退出与诊断；内部模块不直接决定外部 API 错误格式。
+
+## 11. 目录演进与工程边界
+
+第一阶段保留现有四个 workspace crate：主应用、核心库、CLI 工具、专用 TCP REALITY 服务。先在核心库内部建立边界，稳定后再依据独立依赖、复用或编译需求决定是否拆 crate。
+
+| 当前位置 | 目标职责归属（不是立即移动指令） |
+| --- | --- |
+| lib.rs 的装配与启动 | server |
+| config 与各入口重复转换 | config 的适配、编译、计划 |
+| beginning 的 listener 创建 | inbound / transport |
+| beginning 的 sniffing、分发、转发 | session |
+| handler 的代理协议 | protocol |
+| handler 的 WS、gRPC、TLS 等包装 | transport 及安全子模块 |
+| RuntimeState 的实例与任务表 | inbound 管理组件 |
+| 配置内动态用户状态 | identity / inbound 实例 |
+| gRPC 的启停事务 | inbound 管理组件 |
+| gRPC/MCP 的格式适配 | control |
+
+专用服务入口和公共 library API 是需要保护的使用方，不因为主 CLI 通过就视为迁移完成。优先提取职责和收窄可见性，再移动文件；不做大规模纯重命名。
+
+### 11.1 功能隔离：模块、Cargo feature 与运行时配置
+
+目标是让能力可隔离、可验证，并帮助缩小线上故障范围。模块和类型负责职责与依赖；Cargo feature 负责构建时裁剪可选能力；运行时配置负责选择已编译能力的启用方式。不能通过增加 feature 数量代替职责拆分，也不要求每个模块对应一个 feature。
+
+| 能力类别 | 划分建议 | 约束 |
+| --- | --- | --- |
+| 入站协议 | 按独立协议提供可选 feature | 启用时包含必需认证与协议校验 |
+| 可选传输 | WS、HTTPUpgrade、gRPC transport、XHTTP 等按需要隔离 | 声明组合要求，不暗示所有协议均能使用 |
+| 安全能力 | TLS、REALITY 等显式表达依赖 | 未编译时拒绝相关配置，不降级为明文 |
+| 控制面 | Xray gRPC API、MCP 可独立裁剪 | 区分管理 API 与 gRPC 传输，数据面不依赖管理服务 |
+| 可选优化 | 编译选择配合必要的运行时路径选择 | 常规路径须保持等价协议、安全和计量语义 |
+| 诊断能力 | 昂贵跟踪与实验探针单独控制 | 不自动进入普通生产构建，不泄露凭据 |
+| 核心保障 | 生命周期、取消、必要校验与错误处理保持必需 | 不能作为关闭后“更快”或“更容易排障”的选项 |
+
+上表是目标分类，不是现有 feature 清单。当前 manifest 已包含协议/传输 feature、`full`、`minimal-vless`、`minimal-vless-tls` 等组合；XHTTP、MCP 是否独立裁剪等事项仍需审计。先验证既有边界是否真实有效，再决定新增或调整 feature；本文件不授权立即重命名或修改默认构建。
+
+### 11.2 依赖与能力记录
+
+- Feature 以增加能力为原则，避免表示“关闭某行为”的负向 feature，以及隐含优先级的互斥组合。确需选择不同实现时，优先在合法构建中通过明确配置选择。
+- 默认依赖及其他使用方可能使依赖 feature 被合并启用。最小构建必须明确 package、target 和 feature 集合，检查最终依赖图，不能根据 `--no-default-features` 或组合名称推断隔离成功。
+- 应用 crate 向库转发 feature 时保持语义一致；共享辅助实现不应因为某个协议关闭而意外消失，也不应为复用辅助函数而启用无关服务器。
+- 对影响行为的已识别能力，区分“未编译”“已编译但未启用”和“不支持该组合”。配置应给出明确诊断，不能通过条件编译移除字段后静默忽略用户意图。
+- 保留现有发布构建和默认值；变更默认 feature 是部署兼容变更，需要单独说明。
+
+为涉及的能力在对应 Cargo.toml 注释、配置说明或兼容矩阵记录：责任模块、所属 package、编译 feature、必需/共享依赖、运行时入口、平台限制、未编译时行为、验证命令和已验证版本。不要求在多处重复维护同一清单；通过链接关联构建能力与协议兼容矩阵。
+
+### 11.3 构建与行为验证矩阵
+
+不穷举所有 feature 排列，但每项公开支持的构建组合应有可追溯验证。覆盖至少包含：
+
+| 构建范围 | 验证目的 |
+| --- | --- |
+| 指定 package 的最小支持组合 | 发现对默认/full 隐含依赖，验证该组合实际可用 |
+| 常用生产组合 | 验证真实部署配置和所需控制面能力 |
+| 默认与 full 组合 | 防止对现有发行方式的回归 |
+| all-features | 检查全部已声明特性的共存，不等同生产推荐构建 |
+| 本次影响的重要交互组合 | 协议 × 传输 × 安全，以及控制面或优化路径交互 |
+| 禁用相关能力的组合 | 已识别配置明确失败，无静默安全降级 |
+
+有意义的验证包含编译、针对性行为测试与必要互通，不只检查 feature 名称存在。测试依赖与 feature 合并可能掩盖生产二进制缺少依赖的问题，需同时检查实际部署目标。降低 feature 后问题消失，只能证明与构建差异相关，不能直接认定某模块有 bug。
+
+以下命令对应当前应用 manifest，仅展示如何查看和检查最小 VLESS 构建，不表示本次文档更新已执行或认证这些组合：
+
+```sh
+cargo tree -p chimera_server_app --no-default-features --features minimal-vless -e features
+cargo check -p chimera_server_app --no-default-features --features minimal-vless
+cargo check -p chimera_server_app --no-default-features --features minimal-vless-tls
+```
+
+针对部署补充相同 target 与实际构建参数；追踪某依赖是谁启用时可进一步使用反向依赖查询。确认相关测试真正执行，不能把零测试、被忽略测试或全特性下通过当成最小组合验证。
+
+### 11.4 线上问题的两级缩减流程
+
+1. 保存原始证据：源码提交、二进制标识、工具链、lockfile 状态、package/target、启用 feature、构建参数、安全配置摘要、客户端版本与请求、负载和故障现象。不要记录凭据原文。
+2. 在复现或灰度环境优先使用同一二进制，减少无关 inbound、停用不影响复现的可选服务，或切换已有的等语义常规转发路径。每次只改变一个维度，并确认请求仍经过原故障路径。
+3. 必要时制作最小 feature 构建：保留故障协议、传输、安全能力及其依赖，检查实际启用图；保持其余构建和运行条件可比。
+4. 恢复被移除能力并重复观察，检查是否为功能交互或时序变化；对并发性问题重复运行，记录频率与负载。减少并发后不复现不等于问题修复。
+5. 定位后增加对应组合的回归验证，并在原始部署组合复验。保留可回退版本，生产切换遵循现有部署授权与流程。
+
+禁止以关闭认证、重放保护、必要校验或资源安全保障的方式取得“通过”结果。该排障流程不是任意停用生产服务的授权。使用现有日志与构建记录，不为此默认增加遥测服务或公开诊断 API。
+
+## 12. 渐进迁移路线与验收
+
+本文建立路线，不自动授权执行所有阶段。后续任务按当前用户范围选择一个切片；迁移与新增协议分别验收。
+
+| 阶段 | 交付 | 最小验收 |
+| --- | --- | --- |
+| M0 | 固定现有行为与入口测试、记录依赖边界 | 基线和未验证范围可追溯 |
+| M1 | 一个现有 inbound 的共用编译与计划边界 | 文件/检查/API 等价输入规则一致，准备不启动任务 |
+| M2 | 管理器接管该 inbound 的初始启动和动态增删 | 绑定失败回滚、重复操作、取消、同 tag 重建 |
+| M3 | 配置计划与动态用户状态分离 | 克隆隔离、原子更新、认证及删除用户语义 |
+| M4 | 连接/会话任务归属明确 | EOF、半关闭、超时、重关联、取消和计量收尾 |
+| M5 | 提取传输/协议组合边界 | 所涉及的 TLS/REALITY/传输组合互通不变 |
+| M6 | 收窄 RuntimeState 与依赖，扩展到其余 inbound | 无控制面格式进入数据面，公共调用方保持可用 |
+
+每轮优先控制在 500 行增删以内；以本轮改动相对开始时的基线计数，不把已有工作区改动计入本轮。超过时拆小，不能以删除测试或省略验证满足行数。
+
+协议兼容验收使用版本固定的真实客户端，必要时同案对照 Xray 服务端。覆盖正向请求和相关异常行为，记录准确命令；`#[ignore]` 测试必须显式执行才算验证。性能变更另做等语义基准。编译、Clippy、单元测试通过不等于全协议兼容。
+
+执行 [AGENTS.md](AGENTS.md) 规定的格式、lint、测试和发布门禁。不能以架构迁移跳过“单一主要协议目标、发布后部署验证”的节奏。
+
+## 13. 决策记录与待验证事项
+
+已选定的方向：单核心库内渐进分层；共用配置语义入口；计划与运行实体分离；管理器拥有生命周期；数据面仅接收必要能力；复用既有观测面。
+
+实施前需按切片验证，而非臆定：
+
+- Xray 增删 inbound 的成功时机、错误映射和已有连接处理。
+- 用户与策略更新对既有连接/会话的生效边界。
+- XHTTP/XUDP 跨请求、跨连接状态的真正所有者与回收条件。
+- 各入口已有的 `--check`、资源加载和 readiness 约定。
+- 共享锁是否形成实际瓶颈；采用分片或无锁发布前先测量。
+
+重大调整在本文追加决策：问题、证据、备选方案、选择理由、兼容影响、迁移与验证方式。完成阶段时更新实施状态和代码映射；普通局部修复不要求重写整份设计。
+
+## 14. 参考资料
+
+- [Xray inbound 管理源码（本地）](ref/xray-core/app/proxyman/inbound/inbound.go)：外部管理行为的核对入口。
+- [clash-rs 配置入口（本地）](ref/clash-rs/clash-lib/src/lib.rs)、[InboundManager（本地）](ref/clash-rs/clash-lib/src/app/inbound/manager.rs)：内部模型与管理分工。
+- [sing-box Inbound Manager](https://raw.githubusercontent.com/SagerNet/sing-box/testing/adapter/inbound/manager.go)、[Lifecycle](https://raw.githubusercontent.com/SagerNet/sing-box/testing/adapter/lifecycle.go)：组件管理和分阶段生命周期。
+- [Envoy: Life of a Request](https://www.envoyproxy.io/docs/envoy/latest/intro/life_of_a_request.html)：listener 状态、连接和请求作用域。
+- [shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust)：协议库、服务库和可执行入口划分。
+- [Pingora](https://github.com/cloudflare/pingora)：基础网络能力与代理逻辑的职责边界。
+- [Leaf 协议接口](https://raw.githubusercontent.com/eycorsican/leaf/master/leaf/src/proxy/mod.rs)：流、消息与 handler 抽象的补充参考。
+
+这些资料提供设计依据，不构成对其全部实现的质量背书，也不替代 Xray 兼容测试。

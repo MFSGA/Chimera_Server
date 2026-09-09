@@ -5,6 +5,30 @@ then inspect the affected modules and any more specific `AGENTS.md` files. Follo
 current task instructions when they conflict with this document. Keep changes focused and
 report any necessary deviation from the project conventions.
 
+## Required Architecture Reference
+
+- Read [ARCHITECTURE.md](ARCHITECTURE.md) at the start of each new task, before planning or
+  editing code; then inspect the relevant implementation and more specific instructions.
+  It records the user's intended server architecture and is the primary internal design reference.
+- Follow its boundaries for configuration compilation, inbound lifecycle, transport/protocol
+  separation, connection/session ownership, and control/data-plane capabilities.
+- The document describes a target architecture, not completed implementation. Check its migration
+  status and actual code; do not assume proposed types or modules already exist.
+- Current user instructions take precedence. AGENTS governs workflow, ARCHITECTURE governs internal
+  design, and the recorded Xray baseline governs external compatibility. Do not copy another
+  project's behavior where it conflicts with Xray; document justified design deviations.
+- Exercise independent architectural judgment. Reference projects provide evidence and alternatives,
+  not mandatory internal templates. Prefer designs justified by Chimera's server compatibility,
+  ownership, maintenance and operational needs, even when no reference uses the same structure.
+  Evaluate the current design, a reference-derived option and a simpler local option when useful;
+  explain tradeoffs and validation. Neither resemblance to upstream nor novelty proves quality.
+- For architecture work, identify the affected boundary and ownership, choose one reviewable
+  migration slice, and state the compatibility checks. The roadmap does not authorize an entire
+  rewrite or unrelated feature work. Routine fixes need only the relevant portions of the design.
+- When a major design decision changes or a migration stage is completed, update ARCHITECTURE.md
+  with the rationale, implementation status and verification evidence so later agents inherit
+  the decision. Keep support claims synchronized with the compatibility matrix.
+
 ## Project Goal, Scope and References
 
 - The ultimate goal is full xray-core compatibility **as a server**, with inbound compatibility
@@ -164,6 +188,28 @@ Paths below are relative to the repository root.
   paths or symbols in comments. Keep TODOs concrete and remove them when resolved.
 - Treat changes to `vendor/quinn-proto/` as dependency patches: explain their purpose and test
   the affected transport behavior. Do not hand-edit generated protobuf bindings.
+
+## Feature Isolation and Diagnostics
+
+- Follow ARCHITECTURE.md section 11: modules define responsibility, Cargo features select compiled
+  capabilities, and runtime configuration selects enabled behavior. Do not add a feature per module.
+- Audit existing gates before adding more. Keep protocol, transport, security, control-plane,
+  optimization and diagnostic capabilities explicit; preserve mandatory correctness and lifecycle
+  guarantees. Distinguish gRPC transport from the Xray gRPC management API.
+- Features should be additive. Preserve release/default feature behavior unless changing it is in
+  scope. Document required/shared dependencies, app-to-library forwarding, platform constraints,
+  runtime activation and missing-capability errors in the owning manifest/docs or support matrix.
+- An uncompiled recognized capability must produce an explicit configuration error, not silently
+  ignored fields or a security downgrade. Never disable authentication or replay protection for diagnosis.
+- Verify the actual dependency feature graph for the selected package and target; feature unification
+  can invalidate an assumed minimal build. Test affected minimal, deployed, default/full and important
+  interaction combinations as appropriate, plus existing all-feature gates. Record commands and results;
+  all-feature success does not establish reduced-feature correctness.
+- For fault isolation, first reproduce with the same binary and change one runtime variable at a time;
+  then use minimal feature builds if needed. Keep versions, target, build settings and workload comparable.
+  A disappearing fault is evidence of a changed condition, not proof of the responsible module.
+- Recheck the original deployment combination after a fix. Use existing safe diagnostics and respect
+  deployment authorization; this workflow does not authorize disabling live services.
 
 ## Validation Commands
 
