@@ -509,7 +509,7 @@ const TCP_BRUTAL_DEFAULT_CWND_GAIN: u32 = 20;
 const TCP_BRUTAL_MIN_CWND_GAIN: u32 = 5;
 const TCP_BRUTAL_MAX_CWND_GAIN: u32 = 80;
 
-fn collect_tcp_socket_policy(
+fn collect_tcp_congestion_policy(
     stream_settings: Option<&crate::config::StreamSettings>,
 ) -> Result<Option<TcpSocketPolicy>, Error> {
     let Some(sockopt) =
@@ -551,6 +551,7 @@ fn collect_tcp_socket_policy(
         return Ok(Some(TcpSocketPolicy {
             congestion,
             brutal: None,
+            ..TcpSocketPolicy::default()
         }));
     }
 
@@ -579,7 +580,143 @@ fn collect_tcp_socket_policy(
             rate_bytes_per_sec,
             cwnd_gain,
         }),
+        ..TcpSocketPolicy::default()
     }))
+}
+
+fn collect_tcp_socket_policy(
+    stream_settings: Option<&crate::config::StreamSettings>,
+) -> Result<Option<TcpSocketPolicy>, Error> {
+    use super::types::CustomSocketOption;
+    use crate::config::TcpFastOpenValue;
+
+    let Some(stream_settings) = stream_settings else {
+        return Ok(None);
+    };
+    let Some(sockopt) = stream_settings.sockopt.as_ref() else {
+        return Ok(None);
+    };
+
+    let mut policy =
+        collect_tcp_congestion_policy(Some(stream_settings))?.unwrap_or_default();
+
+    policy.fast_open = match sockopt.tcp_fast_open.as_ref() {
+        None => None,
+        Some(TcpFastOpenValue::Bool(true)) => Some(256),
+        Some(TcpFastOpenValue::Bool(false)) => Some(0),
+        Some(TcpFastOpenValue::Number(value)) => {
+            if !value.is_finite() {
+                return Err(Error::InvalidConfig(
+                    "tcpFastOpen must be a finite number".into(),
+                ));
+            }
+            let value = value.min(i32::MAX as f64) as i32;
+            match value.cmp(&0) {
+                std::cmp::Ordering::Equal => None,
+                std::cmp::Ordering::Less => Some(0),
+                std::cmp::Ordering::Greater => Some(value),
+            }
+        }
+    };
+    policy.keep_alive_idle = sockopt.tcp_keep_alive_idle;
+    policy.keep_alive_interval = sockopt.tcp_keep_alive_interval;
+    policy.user_timeout_ms =
+        (sockopt.tcp_user_timeout > 0).then_some(sockopt.tcp_user_timeout);
+    policy.window_clamp =
+        (sockopt.tcp_window_clamp > 0).then_some(sockopt.tcp_window_clamp);
+    policy.max_seg = (sockopt.tcp_max_seg > 0).then_some(sockopt.tcp_max_seg);
+    policy.multipath = sockopt.tcp_mptcp;
+    policy.ipv6_only = sockopt.v6only;
+    policy.bind_interface =
+        (!sockopt.interface.is_empty()).then(|| sockopt.interface.clone());
+    policy.mark = (sockopt.mark != 0).then_some(sockopt.mark);
+    policy.transparent = matches!(
+        sockopt.tproxy.to_ascii_lowercase().as_str(),
+        "tproxy" | "redirect"
+    );
+    policy.receive_original_destination = sockopt.receive_original_dest_address;
+    policy.custom_sockopt = sockopt
+        .custom_sockopt
+        .iter()
+        .cloned()
+        .map(|option| CustomSocketOption {
+            system: option.system,
+            network: option.network,
+            level: option.level,
+            opt: option.opt,
+            value: option.value,
+            value_type: option.value_type,
+        })
+        .collect();
+
+    if policy
+        .bind_interface
+        .as_deref()
+        .is_some_and(|value| value.contains('\0'))
+    {
+        return Err(Error::InvalidConfig(
+            "sockopt.interface must not contain NUL bytes".into(),
+        ));
+    }
+
+    let configured = !policy.congestion.is_empty()
+        || policy.brutal.is_some()
+        || policy.fast_open.is_some()
+        || policy.keep_alive_idle != 0
+        || policy.keep_alive_interval != 0
+        || policy.user_timeout_ms.is_some()
+        || policy.window_clamp.is_some()
+        || policy.max_seg.is_some()
+        || policy.multipath
+        || policy.ipv6_only
+        || policy.bind_interface.is_some()
+        || policy.mark.is_some()
+        || policy.transparent
+        || policy.receive_original_destination
+        || !policy.custom_sockopt.is_empty();
+    if !configured {
+        return Ok(None);
+    }
+
+    let network = stream_settings.network.trim().to_ascii_lowercase();
+    if policy.receive_original_destination
+        && !matches!(network.as_str(), "udp" | "quic" | "hysteria2")
+    {
+        return Err(Error::InvalidConfig(
+            "receiveOriginalDestAddress is supported only for UDP/QUIC listeners"
+                .into(),
+        ));
+    }
+    if !matches!(
+        network.as_str(),
+        "" | "raw"
+            | "tcp"
+            | "ws"
+            | "websocket"
+            | "httpupgrade"
+            | "grpc"
+            | "xhttp"
+            | "splithttp"
+    ) {
+        let has_tcp_only = !policy.congestion.is_empty()
+            || policy.brutal.is_some()
+            || policy.fast_open.is_some()
+            || policy.keep_alive_idle != 0
+            || policy.keep_alive_interval != 0
+            || policy.user_timeout_ms.is_some()
+            || policy.window_clamp.is_some()
+            || policy.max_seg.is_some()
+            || policy.multipath;
+        if has_tcp_only {
+            return Err(Error::InvalidConfig(format!(
+                "TCP socket options are not supported for {network} transport"
+            )));
+        }
+        // Listener-generic options are retained for UDP/QUIC listeners by the
+        // same runtime policy and are ignored by TCP-only connection setup.
+    }
+
+    Ok(Some(policy))
 }
 
 struct InboundBuildContext {
@@ -2106,6 +2243,78 @@ mod tests {
     }
 
     #[test]
+    fn tcp_sockopt_preserves_xray_listener_and_connection_options() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "::1",
+            "port": 10002,
+            "protocol": "socks",
+            "tag": "socks-sockopt",
+            "settings": {},
+            "streamSettings": {
+                "network": "tcp",
+                "sockopt": {
+                    "tcpFastOpen": true,
+                    "tcpKeepAliveIdle": 11,
+                    "tcpKeepAliveInterval": 7,
+                    "tcpUserTimeout": 12345,
+                    "tcpWindowClamp": 32768,
+                    "tcpMaxSeg": 1200,
+                    "tcpMptcp": true,
+                    "v6only": true,
+                    "interface": "lo",
+                    "mark": 17,
+                    "tproxy": "redirect",
+                    "customSockopt": [{
+                        "system": "linux",
+                        "network": "tcp",
+                        "level": "1",
+                        "opt": "2",
+                        "value": "1",
+                        "type": "int"
+                    }]
+                }
+            }
+        }))
+        .expect("Xray TCP socket options should deserialize");
+        let config = ServerConfig::try_from(inbound)
+            .expect("Xray TCP socket options should build");
+        let policy = config
+            .tcp_socket_policy
+            .expect("TCP socket policy should be retained");
+        assert_eq!(policy.fast_open, Some(256));
+        assert_eq!(policy.keep_alive_idle, 11);
+        assert_eq!(policy.keep_alive_interval, 7);
+        assert_eq!(policy.user_timeout_ms, Some(12345));
+        assert_eq!(policy.window_clamp, Some(32768));
+        assert_eq!(policy.max_seg, Some(1200));
+        assert!(policy.multipath);
+        assert!(policy.ipv6_only);
+        assert_eq!(policy.bind_interface.as_deref(), Some("lo"));
+        assert_eq!(policy.mark, Some(17));
+        assert!(policy.transparent);
+        assert_eq!(policy.custom_sockopt.len(), 1);
+    }
+
+    #[test]
+    fn receive_original_destination_rejects_tcp_transport() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10003,
+            "protocol": "socks",
+            "tag": "socks-origdst-invalid",
+            "settings": {},
+            "streamSettings": {
+                "network": "tcp",
+                "sockopt": {"receiveOriginalDestAddress": true}
+            }
+        }))
+        .expect("receiveOriginalDestAddress should deserialize before validation");
+        let error = ServerConfig::try_from(inbound)
+            .expect_err("receiveOriginalDestAddress must not become a TCP no-op");
+        assert!(error.to_string().contains("receiveOriginalDestAddress"));
+    }
+
+    #[test]
     fn tcp_brutal_sockopt_rejects_missing_or_mismatched_rate() {
         for sockopt in [
             serde_json::json!({ "tcpCongestion": "brutal" }),
@@ -2909,6 +3118,62 @@ mod tests {
     }
 
     #[test]
+    fn dokodemo_udp_preserves_generic_listener_sockopts() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10004,
+            "protocol": "dokodemo-door",
+            "tag": "dokodemo-udp-sockopt",
+            "settings": {"address": "127.0.0.1", "port": 5353},
+            "streamSettings": {
+                "network": "udp",
+                "sockopt": {
+                    "interface": "lo",
+                    "mark": 17,
+                    "tproxy": "redirect",
+                    "receiveOriginalDestAddress": true,
+                    "customSockopt": [{
+                        "system": "linux",
+                        "network": "udp4",
+                        "level": "1",
+                        "opt": "2",
+                        "value": "1",
+                        "type": "int"
+                    }]
+                }
+            }
+        }))
+        .expect("UDP listener sockopts should deserialize");
+        let config = ServerConfig::try_from(inbound)
+            .expect("generic UDP listener sockopts should build");
+        let policy = config
+            .tcp_socket_policy
+            .expect("UDP listener policy should be retained");
+        assert_eq!(policy.bind_interface.as_deref(), Some("lo"));
+        assert_eq!(policy.mark, Some(17));
+        assert!(policy.transparent);
+        assert!(policy.receive_original_destination);
+        assert_eq!(policy.custom_sockopt.len(), 1);
+        assert!(!policy.has_tcp_only_options());
+
+        let invalid: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10005,
+            "protocol": "dokodemo-door",
+            "tag": "dokodemo-udp-tcp-only-sockopt",
+            "settings": {"address": "127.0.0.1", "port": 5353},
+            "streamSettings": {
+                "network": "udp",
+                "sockopt": {"tcpFastOpen": true}
+            }
+        }))
+        .expect("TCP-only UDP sockopt should deserialize before validation");
+        let error = ServerConfig::try_from(invalid)
+            .expect_err("TCP-only UDP listener option must fail closed");
+        assert!(error.to_string().contains("TCP socket options"));
+    }
+
+    #[test]
     fn dokodemo_door_rejects_udp_security_layers() {
         let inbound: InboudItem = serde_json::from_value(serde_json::json!({
             "listen": "127.0.0.1",
@@ -3474,6 +3739,20 @@ mod tests {
                 "xhttpSettings": {
                     "path": "/xhttp"
                 },
+                "sockopt": {
+                    "v6only": true,
+                    "interface": "lo",
+                    "mark": 17,
+                    "tproxy": "redirect",
+                    "customSockopt": [{
+                        "system": "linux",
+                        "network": "udp4",
+                        "level": "1",
+                        "opt": "2",
+                        "value": "1",
+                        "type": "int"
+                    }]
+                },
                 "finalmask": {
                     "quicParams": {
                         "congestion": "RENO",
@@ -3492,6 +3771,16 @@ mod tests {
 
         let server = ServerConfig::try_from(inbound)
             .expect("XHTTP/3 TLS configuration should build");
+        let policy = server
+            .tcp_socket_policy
+            .as_ref()
+            .expect("XHTTP/3 generic listener sockopts should be retained");
+        assert!(policy.ipv6_only);
+        assert_eq!(policy.bind_interface.as_deref(), Some("lo"));
+        assert_eq!(policy.mark, Some(17));
+        assert!(policy.transparent);
+        assert_eq!(policy.custom_sockopt.len(), 1);
+        assert!(!policy.has_tcp_only_options());
         let ServerProxyConfig::Tls(tls) = server.protocol else {
             panic!("expected TLS-wrapped XHTTP protocol");
         };

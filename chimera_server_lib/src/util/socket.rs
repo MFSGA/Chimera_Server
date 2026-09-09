@@ -5,7 +5,7 @@ use std::{
     io,
     mem::{self, MaybeUninit},
     net::{Ipv4Addr, Ipv6Addr},
-    os::fd::{AsRawFd, RawFd},
+    os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
     ptr,
 };
 
@@ -16,26 +16,78 @@ pub fn new_tcp_socket(
     bind_interface: Option<String>,
     is_ipv6: bool,
 ) -> std::io::Result<tokio::net::TcpSocket> {
-    let tcp_socket = if is_ipv6 {
+    new_tcp_socket_with_mptcp(bind_interface, is_ipv6, false)
+}
+
+#[inline]
+pub fn new_xray_tcp_listener_socket(
+    bind_interface: Option<String>,
+    is_ipv6: bool,
+    multipath: bool,
+) -> std::io::Result<tokio::net::TcpSocket> {
+    let socket = new_tcp_socket_with_mptcp(bind_interface, is_ipv6, multipath)?;
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos"
+    ))]
+    socket2::SockRef::from(&socket).set_reuse_port(true)?;
+    Ok(socket)
+}
+
+#[inline]
+pub fn new_tcp_socket_with_mptcp(
+    bind_interface: Option<String>,
+    is_ipv6: bool,
+    multipath: bool,
+) -> std::io::Result<tokio::net::TcpSocket> {
+    let tcp_socket = if multipath {
+        #[cfg(target_os = "linux")]
+        {
+            let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
+            let socket = Socket::new(
+                domain,
+                Type::STREAM,
+                Some(Protocol::from(libc::IPPROTO_MPTCP)),
+            )?;
+            socket.set_nonblocking(true)?;
+            let fd = socket.into_raw_fd();
+            // SAFETY: ownership of a valid nonblocking TCP-compatible socket is
+            // transferred exactly once into Tokio's TcpSocket wrapper.
+            unsafe { tokio::net::TcpSocket::from_raw_fd(fd) }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "tcpMptcp is currently supported only on Linux",
+            ));
+        }
+    } else if is_ipv6 {
         tokio::net::TcpSocket::new_v6()?
     } else {
         tokio::net::TcpSocket::new_v4()?
     };
 
-    if let Some(_b) = bind_interface {
+    if let Some(interface) = bind_interface {
         #[cfg(any(
             target_os = "android",
             target_os = "fuchsia",
             target_os = "linux"
         ))]
-        tcp_socket.bind_device(Some(_b.as_bytes()))?;
+        tcp_socket.bind_device(Some(interface.as_bytes()))?;
 
         #[cfg(not(any(
             target_os = "android",
             target_os = "fuchsia",
             target_os = "linux"
         )))]
-        panic!("Could not find to device, unsupported platform.")
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "binding a TCP socket to an interface is not supported on this platform",
+        ));
     }
 
     Ok(tcp_socket)
@@ -262,6 +314,185 @@ fn original_destination_from_message(
         io::ErrorKind::AddrNotAvailable,
         "UDP original destination is unavailable",
     ))
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub fn configure_tcp_keepalive(
+    fd: std::os::fd::RawFd,
+    idle_secs: i32,
+    interval_secs: i32,
+) -> std::io::Result<()> {
+    let enabled = i32::from(idle_secs > 0 || interval_secs > 0);
+    set_socket_option_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, enabled)?;
+    if enabled == 0 {
+        return Ok(());
+    }
+    if idle_secs > 0 {
+        set_socket_option_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, idle_secs)?;
+    }
+    if interval_secs > 0 {
+        set_socket_option_int(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPINTVL,
+            interval_secs,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn configure_tcp_user_timeout(
+    fd: std::os::fd::RawFd,
+    timeout_ms: i32,
+) -> std::io::Result<()> {
+    set_socket_option_int(fd, libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, timeout_ms)
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub fn configure_tcp_window_clamp(
+    fd: std::os::fd::RawFd,
+    value: i32,
+) -> std::io::Result<()> {
+    set_socket_option_int(fd, libc::IPPROTO_TCP, libc::TCP_WINDOW_CLAMP, value)
+}
+
+#[cfg(target_os = "linux")]
+pub fn configure_socket_mark(
+    fd: std::os::fd::RawFd,
+    value: i32,
+) -> std::io::Result<()> {
+    set_socket_option_int(fd, libc::SOL_SOCKET, libc::SO_MARK, value)
+}
+
+#[cfg(target_os = "linux")]
+pub fn configure_ip_transparent(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    set_socket_option_int(fd, libc::SOL_IP, libc::IP_TRANSPARENT, 1)
+}
+
+#[cfg(target_os = "linux")]
+pub fn configure_custom_sockopt(
+    fd: std::os::fd::RawFd,
+    network: &str,
+    options: &[crate::config::server_config::CustomSocketOption],
+) -> std::io::Result<()> {
+    for option in options {
+        if !option.system.is_empty() && option.system != "linux" {
+            continue;
+        }
+        if !network.starts_with(&option.network) {
+            continue;
+        }
+        if option.opt.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "customSockopt.opt must not be empty",
+            ));
+        }
+        let level = if option.level.is_empty() {
+            libc::IPPROTO_TCP
+        } else {
+            option.level.parse::<libc::c_int>().map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid customSockopt.level: {error}"),
+                )
+            })?
+        };
+        let opt = option.opt.parse::<libc::c_int>().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid customSockopt.opt: {error}"),
+            )
+        })?;
+        match option.value_type.as_str() {
+            "int" => {
+                let value =
+                    option.value.parse::<libc::c_int>().map_err(|error| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("invalid customSockopt integer value: {error}"),
+                        )
+                    })?;
+                set_socket_option_int(fd, level, opt, value)?;
+            }
+            "str" => {
+                let value =
+                    std::ffi::CString::new(option.value.as_str()).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "customSockopt string value must not contain NUL bytes",
+                        )
+                    })?;
+                // SAFETY: `fd` is borrowed for this call and `value` remains
+                // alive for the full setsockopt invocation.
+                let result = unsafe {
+                    libc::setsockopt(
+                        fd,
+                        level,
+                        opt,
+                        value.as_ptr().cast(),
+                        value.as_bytes_with_nul().len() as libc::socklen_t,
+                    )
+                };
+                if result == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unknown customSockopt type: {other}"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub fn configure_tcp_fast_open(
+    fd: std::os::fd::RawFd,
+    value: i32,
+) -> std::io::Result<()> {
+    set_socket_option_int(fd, libc::SOL_TCP, libc::TCP_FASTOPEN, value)
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub fn configure_ipv6_only(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    set_socket_option_int(fd, libc::SOL_IPV6, libc::IPV6_V6ONLY, 1)
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub fn configure_tcp_max_seg(
+    fd: std::os::fd::RawFd,
+    value: i32,
+) -> std::io::Result<()> {
+    set_socket_option_int(fd, libc::IPPROTO_TCP, libc::TCP_MAXSEG, value)
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn set_socket_option_int(
+    fd: std::os::fd::RawFd,
+    level: libc::c_int,
+    option: libc::c_int,
+    value: libc::c_int,
+) -> std::io::Result<()> {
+    // SAFETY: `fd` is borrowed and `value` is a valid integer socket option
+    // payload for the duration of this call.
+    let result = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            option,
+            std::ptr::from_ref(&value).cast(),
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

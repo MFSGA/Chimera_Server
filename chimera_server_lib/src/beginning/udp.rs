@@ -7,6 +7,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+
 #[cfg(feature = "shadowsocks")]
 use tokio::time::timeout;
 use tokio::{
@@ -20,10 +23,10 @@ use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "shadowsocks")]
 use crate::handler::shadowsocks::ShadowsocksUdpCodec;
+use crate::util::socket::new_socket2_udp_socket;
 #[cfg(target_os = "linux")]
 use crate::util::socket::{
-    enable_udp_original_destination, new_socket2_udp_socket,
-    recv_udp_with_original_destination,
+    enable_udp_original_destination, recv_udp_with_original_destination,
 };
 
 #[cfg(feature = "trojan")]
@@ -37,7 +40,9 @@ use crate::{
         AsyncMessageStream, AsyncSessionMessageStream, AsyncTargetedMessageStream,
         SessionMessage,
     },
-    config::server_config::{DokodemoDoorConfig, ServerConfig, ServerProxyConfig},
+    config::server_config::{
+        DokodemoDoorConfig, ServerConfig, ServerProxyConfig, TcpSocketPolicy,
+    },
     outbound::{
         DirectOutboundAction, InboundRoutingMetadata, OutboundRoutingContext,
         apply_routing_metadata, connection_routing_input, select_direct_outbound,
@@ -2297,6 +2302,7 @@ pub async fn start_udp_server(
         tag,
         bind_location,
         protocol,
+        tcp_socket_policy,
         ..
     } = config;
 
@@ -2308,6 +2314,7 @@ pub async fn start_udp_server(
                 tag,
                 users,
                 identity,
+                tcp_socket_policy,
                 runtime,
             )
             .await;
@@ -2351,24 +2358,11 @@ pub async fn start_udp_server(
         );
     }
 
-    let socket = if dokodemo_config.follow_redirect {
-        #[cfg(target_os = "linux")]
-        {
-            let socket = new_socket2_udp_socket(
-                bind_addr.is_ipv6(),
-                None,
-                Some(bind_addr),
-                false,
-            )?;
-            enable_udp_original_destination(&socket, bind_addr.is_ipv6())?;
-            let socket: std::net::UdpSocket = socket.into();
-            Arc::new(UdpSocket::from_std(socket)?)
-        }
-        #[cfg(not(target_os = "linux"))]
-        unreachable!("non-Linux followRedirect returned before socket setup")
-    } else {
-        Arc::new(UdpSocket::bind(bind_addr).await?)
-    };
+    let socket = create_udp_listener(
+        bind_addr,
+        tcp_socket_policy.as_ref(),
+        dokodemo_config.follow_redirect,
+    )?;
     Ok(Some(tokio::spawn(async move {
         if let Err(err) = run_dokodemo_udp_server(
             socket,
@@ -2392,16 +2386,81 @@ fn bind_location_to_socket_addr(
     }
 }
 
+fn create_udp_listener(
+    bind_addr: SocketAddr,
+    policy: Option<&TcpSocketPolicy>,
+    force_original_destination: bool,
+) -> std::io::Result<Arc<UdpSocket>> {
+    let bind_interface = policy.and_then(|policy| policy.bind_interface.clone());
+    let socket =
+        new_socket2_udp_socket(bind_addr.is_ipv6(), bind_interface, None, true)?;
+
+    if policy.is_some_and(|policy| policy.ipv6_only) {
+        if !bind_addr.is_ipv6() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "sockopt.v6only requires an IPv6 UDP listener",
+            ));
+        }
+        socket.set_only_v6(true)?;
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(policy) = policy {
+        let fd = socket.as_raw_fd();
+        if let Some(mark) = policy.mark {
+            crate::util::socket::configure_socket_mark(fd, mark)?;
+        }
+        if policy.transparent {
+            crate::util::socket::configure_ip_transparent(fd)?;
+        }
+        crate::util::socket::configure_custom_sockopt(
+            fd,
+            if bind_addr.is_ipv6() { "udp6" } else { "udp4" },
+            &policy.custom_sockopt,
+        )?;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    if policy.is_some_and(|policy| {
+        policy.mark.is_some()
+            || policy.transparent
+            || !policy.custom_sockopt.is_empty()
+    }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "configured inbound UDP listener socket options are unsupported on this platform",
+        ));
+    }
+
+    let receive_original_destination = force_original_destination
+        || policy.is_some_and(|policy| policy.receive_original_destination);
+    if receive_original_destination {
+        #[cfg(target_os = "linux")]
+        enable_udp_original_destination(&socket, bind_addr.is_ipv6())?;
+        #[cfg(not(target_os = "linux"))]
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "UDP original destination is supported only on Linux",
+        ));
+    }
+
+    socket.bind(&socket2::SockAddr::from(bind_addr))?;
+    let socket: std::net::UdpSocket = socket.into();
+    Ok(Arc::new(UdpSocket::from_std(socket)?))
+}
+
 #[cfg(feature = "shadowsocks")]
 async fn start_shadowsocks_udp_server(
     bind_location: BindLocation,
     inbound_tag: String,
     users: Vec<crate::config::server_config::ShadowsocksUser>,
     identity: Option<crate::config::server_config::ShadowsocksServerIdentity>,
+    socket_policy: Option<TcpSocketPolicy>,
     runtime: RuntimeState,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let bind_addr = bind_location_to_socket_addr(&bind_location)?;
-    let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
+    let socket = create_udp_listener(bind_addr, socket_policy.as_ref(), false)?;
     let codec = Arc::new(ShadowsocksUdpCodec::new(users, identity)?);
     info!("Starting Shadowsocks UDP server at {}", bind_location);
 
@@ -3099,6 +3158,8 @@ fn target_domain(target_location: &NetLocation) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use std::os::fd::AsRawFd;
     use std::{net::Ipv4Addr, sync::Arc};
 
     #[cfg(any(feature = "trojan", feature = "vless", feature = "vmess"))]
@@ -3146,6 +3207,89 @@ mod tests {
     };
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn udp_listener_applies_reuse_port() {
+        let socket = create_udp_listener(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            None,
+            false,
+        )
+        .expect("create UDP listener");
+        let mut value = 0;
+        let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+        // SAFETY: `value` and `length` are valid writable getsockopt buffers.
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                std::ptr::from_mut(&mut value).cast(),
+                &mut length,
+            )
+        };
+        assert_eq!(result, 0);
+        assert_eq!(value, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn udp_listener_applies_original_destination_option() {
+        let policy = TcpSocketPolicy {
+            receive_original_destination: true,
+            ..TcpSocketPolicy::default()
+        };
+        let socket = create_udp_listener(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            Some(&policy),
+            false,
+        )
+        .expect("create original-destination UDP listener");
+        let mut value = 0;
+        let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+        // SAFETY: `value` and `length` are valid writable getsockopt buffers.
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_IP,
+                libc::IP_RECVORIGDSTADDR,
+                std::ptr::from_mut(&mut value).cast(),
+                &mut length,
+            )
+        };
+        assert_eq!(result, 0);
+        assert_eq!(value, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn udp_listener_applies_ipv6_only() {
+        let policy = TcpSocketPolicy {
+            ipv6_only: true,
+            ..TcpSocketPolicy::default()
+        };
+        let socket = create_udp_listener(
+            SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)),
+            Some(&policy),
+            false,
+        )
+        .expect("create IPv6-only UDP listener");
+        let mut value = 0;
+        let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+        // SAFETY: `value` and `length` are valid writable getsockopt buffers.
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_IPV6,
+                libc::IPV6_V6ONLY,
+                std::ptr::from_mut(&mut value).cast(),
+                &mut length,
+            )
+        };
+        assert_eq!(result, 0);
+        assert_eq!(value, 1);
+    }
 
     #[cfg(any(feature = "trojan", feature = "vless", feature = "vmess"))]
     struct TestStream(DuplexStream);
