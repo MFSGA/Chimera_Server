@@ -169,6 +169,7 @@ impl SocksTcpServerHandler {
                     server_stream,
                     self.requires_auth(),
                     &self.inbound_tag,
+                    self.user_level,
                 )
                 .await;
             }
@@ -194,9 +195,11 @@ impl SocksTcpServerHandler {
             let traffic_context = Some(match identity {
                 Some(id) => TrafficContext::new("socks")
                     .with_identity(id)
-                    .with_inbound_tag(self.inbound_tag.clone()),
+                    .with_inbound_tag(self.inbound_tag.clone())
+                    .with_user_level(self.user_level),
                 None => TrafficContext::new("socks")
-                    .with_inbound_tag(self.inbound_tag.clone()),
+                    .with_inbound_tag(self.inbound_tag.clone())
+                    .with_user_level(self.user_level),
             });
 
             match command {
@@ -310,6 +313,7 @@ async fn setup_socks4_stream(
     mut stream: Box<dyn AsyncStream>,
     auth_required: bool,
     inbound_tag: &str,
+    user_level: u32,
 ) -> std::io::Result<TcpServerSetupResult> {
     let command = stream.read_u8().await?;
     if auth_required {
@@ -357,7 +361,9 @@ async fn setup_socks4_stream(
         need_initial_flush: false,
         connection_success_response: None,
         traffic_context: Some(
-            TrafficContext::new("socks").with_inbound_tag(inbound_tag.to_string()),
+            TrafficContext::new("socks")
+                .with_inbound_tag(inbound_tag.to_string())
+                .with_user_level(user_level),
         ),
     })
 }

@@ -603,6 +603,7 @@ mod tests {
                         port,
                     ),
                     follow_redirect: false,
+                    user_level: 0,
                 },
             },
             transport: Transport::Tcp,

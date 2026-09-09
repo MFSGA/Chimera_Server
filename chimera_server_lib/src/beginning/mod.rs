@@ -52,6 +52,7 @@ const SNIFFING_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[cfg(feature = "grpc_transport")]
 pub(crate) mod grpc_transport;
+mod policy_stream;
 mod quic;
 mod tcp_relay;
 pub(crate) mod udp;
@@ -1277,6 +1278,9 @@ where
                 traffic_context =
                     traffic_context.map(|context| context.with_outbound_tag(tag));
             }
+            let user_level = traffic_context
+                .as_ref()
+                .map_or(0, |context| context.user_level);
             let _connection_guard = register_connection(traffic_context.as_ref());
             let relay_traffic_context = traffic_context.clone();
             let mut server_stream = MeteredStream::new(
@@ -1294,11 +1298,18 @@ where
                 server_stream.write_all(&data).await?;
             }
 
-            let copy_result = tcp_relay::copy_bidirectional(
-                &mut server_stream,
-                &mut client_stream,
-            )
-            .await;
+            let relay_timeouts = runtime.policy_relay_timeouts(user_level);
+            let copy_result = if relay_timeouts.is_empty() {
+                tcp_relay::copy_bidirectional(&mut server_stream, &mut client_stream)
+                    .await
+            } else {
+                policy_stream::copy_bidirectional_with_timeouts(
+                    &mut server_stream,
+                    &mut client_stream,
+                    relay_timeouts,
+                )
+                .await
+            };
 
             let (_, _) =
                 futures::join!(server_stream.shutdown(), client_stream.shutdown());
@@ -1697,6 +1708,7 @@ mod tests {
             DokodemoDoorConfig {
                 target: NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 1),
                 follow_redirect: true,
+                user_level: 0,
             },
             "dokodemo-original-destination",
         );

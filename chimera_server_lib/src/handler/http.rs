@@ -254,10 +254,12 @@ impl HttpTcpServerHandler {
                     TrafficContext::new("http")
                         .with_identity(identity)
                         .with_inbound_tag(self.inbound_tag.clone())
+                        .with_user_level(self.user_level)
                 })
                 .unwrap_or_else(|| {
                     TrafficContext::new("http")
                         .with_inbound_tag(self.inbound_tag.clone())
+                        .with_user_level(self.user_level)
                 }),
         );
 

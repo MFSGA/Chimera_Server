@@ -18,6 +18,23 @@ use crate::{
     },
 };
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PolicyRelayTimeouts {
+    pub connection_idle: Option<Duration>,
+    pub uplink_only: Option<Duration>,
+    pub downlink_only: Option<Duration>,
+    pub buffer_size: Option<usize>,
+}
+
+impl PolicyRelayTimeouts {
+    pub const fn is_empty(self) -> bool {
+        self.connection_idle.is_none()
+            && self.uplink_only.is_none()
+            && self.downlink_only.is_none()
+            && self.buffer_size.is_none()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundSummary {
     pub tag: String,
@@ -118,6 +135,46 @@ impl RuntimeState {
             .map(u64::from)
             .unwrap_or(DEFAULT_CONNECTION_IDLE_TIMEOUT_SECS);
         Duration::from_secs(seconds)
+    }
+
+    pub(crate) fn policy_relay_timeouts(&self, level: u32) -> PolicyRelayTimeouts {
+        const DEFAULT_CONNECTION_IDLE_TIMEOUT_SECS: u64 = 300;
+        const DEFAULT_UPLINK_ONLY_TIMEOUT_SECS: u64 = 1;
+        const DEFAULT_DOWNLINK_ONLY_TIMEOUT_SECS: u64 = 1;
+
+        let policy = self.policy.read().expect("runtime policy lock poisoned");
+        let level_policy = policy.levels.get(&level).and_then(Option::as_ref);
+        let buffer_size = level_policy
+            .and_then(|policy| policy.buffer_size)
+            .filter(|size| *size >= 0)
+            .map(|kibibytes| {
+                usize::try_from(kibibytes)
+                    .unwrap_or(usize::MAX)
+                    .saturating_mul(1024)
+                    .max(1)
+            });
+
+        PolicyRelayTimeouts {
+            connection_idle: Some(Duration::from_secs(
+                level_policy
+                    .and_then(|policy| policy.connection_idle)
+                    .map(u64::from)
+                    .unwrap_or(DEFAULT_CONNECTION_IDLE_TIMEOUT_SECS),
+            )),
+            uplink_only: Some(Duration::from_secs(
+                level_policy
+                    .and_then(|policy| policy.uplink_only)
+                    .map(u64::from)
+                    .unwrap_or(DEFAULT_UPLINK_ONLY_TIMEOUT_SECS),
+            )),
+            downlink_only: Some(Duration::from_secs(
+                level_policy
+                    .and_then(|policy| policy.downlink_only)
+                    .map(u64::from)
+                    .unwrap_or(DEFAULT_DOWNLINK_ONLY_TIMEOUT_SECS),
+            )),
+            buffer_size,
+        }
     }
 
     pub fn inbounds(&self) -> Vec<ServerConfig> {
@@ -590,6 +647,55 @@ mod tests {
             Duration::from_secs(300)
         );
     }
+
+    #[test]
+    fn xray_relay_policy_preserves_default_and_per_level_timeouts() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let defaults = runtime.policy_relay_timeouts(7);
+        assert_eq!(defaults.connection_idle, Some(Duration::from_secs(300)));
+        assert_eq!(defaults.uplink_only, Some(Duration::from_secs(1)));
+        assert_eq!(defaults.downlink_only, Some(Duration::from_secs(1)));
+        assert_eq!(defaults.buffer_size, None);
+
+        let mut levels = HashMap::new();
+        levels.insert(
+            7,
+            Some(PolicyLevelConfig {
+                connection_idle: Some(5),
+                uplink_only: Some(6),
+                downlink_only: Some(7),
+                buffer_size: Some(64),
+                ..PolicyLevelConfig::default()
+            }),
+        );
+        levels.insert(
+            8,
+            Some(PolicyLevelConfig {
+                connection_idle: Some(0),
+                uplink_only: Some(0),
+                downlink_only: Some(0),
+                buffer_size: Some(-1),
+                ..PolicyLevelConfig::default()
+            }),
+        );
+        runtime.replace_policy(Some(&PolicyConfig {
+            levels,
+            ..PolicyConfig::default()
+        }));
+
+        let configured = runtime.policy_relay_timeouts(7);
+        assert_eq!(configured.connection_idle, Some(Duration::from_secs(5)));
+        assert_eq!(configured.uplink_only, Some(Duration::from_secs(6)));
+        assert_eq!(configured.downlink_only, Some(Duration::from_secs(7)));
+        assert_eq!(configured.buffer_size, Some(64 * 1024));
+
+        let zeroed = runtime.policy_relay_timeouts(8);
+        assert_eq!(zeroed.connection_idle, Some(Duration::ZERO));
+        assert_eq!(zeroed.uplink_only, Some(Duration::ZERO));
+        assert_eq!(zeroed.downlink_only, Some(Duration::ZERO));
+        assert_eq!(zeroed.buffer_size, None);
+    }
+
     #[test]
     fn outbound_and_override_snapshots_are_copy_on_write() {
         let runtime = RuntimeState::new(

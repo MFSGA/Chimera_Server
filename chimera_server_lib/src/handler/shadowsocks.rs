@@ -194,6 +194,7 @@ fn parse_identity_key(
         method: identity.method,
         password: identity.password,
         email: String::new(),
+        user_level: 0,
     };
     let (cipher, key) = parse_user_key(&user)?;
     let ShadowsocksKeyMaterial::Aead2022(psk) = key else {
@@ -303,6 +304,7 @@ pub(crate) struct ShadowsocksUdpRequest {
     pub target_location: NetLocation,
     pub payload: Vec<u8>,
     pub identity: String,
+    pub user_level: u32,
     user_index: usize,
     client_session_id: Option<[u8; 8]>,
 }
@@ -312,6 +314,7 @@ struct ShadowsocksUdpUserCodec {
     cipher: ShadowsocksCipher,
     mode: ShadowsocksUdpMode,
     identity: String,
+    user_level: u32,
 }
 
 impl ShadowsocksUdpUserCodec {
@@ -364,6 +367,7 @@ impl ShadowsocksUdpUserCodec {
             cipher,
             mode,
             identity: user.email,
+            user_level: user.user_level,
         })
     }
 
@@ -505,6 +509,7 @@ impl ShadowsocksUdpUserCodec {
             target_location,
             payload: plaintext[offset..].to_vec(),
             identity: String::new(),
+            user_level: 0,
             user_index: 0,
             client_session_id: None,
         })
@@ -633,6 +638,7 @@ impl ShadowsocksUdpUserCodec {
             target_location,
             payload: body[payload_offset..].to_vec(),
             identity: String::new(),
+            user_level: 0,
             user_index: 0,
             client_session_id: Some(client_session_id),
         })
@@ -748,6 +754,7 @@ impl ShadowsocksUdpUserCodec {
             target_location,
             payload: body[payload_offset..].to_vec(),
             identity: String::new(),
+            user_level: 0,
             user_index: 0,
             client_session_id: Some(client_session_id),
         })
@@ -843,6 +850,7 @@ impl ShadowsocksUdpCodec {
                 Ok(mut request) => {
                     request.user_index = user_index;
                     request.identity = user.identity.clone();
+                    request.user_level = user.user_level;
                     return Ok(request);
                 }
                 Err(error) => last_error = Some(error),
@@ -901,6 +909,7 @@ impl ShadowsocksUdpCodec {
         let mut request = user.decrypt_packet(&rewritten)?;
         request.user_index = user_index;
         request.identity = user.identity.clone();
+        request.user_level = user.user_level;
         Ok(request)
     }
 
@@ -920,6 +929,7 @@ impl ShadowsocksUdpCodec {
             target_location: target.clone(),
             payload: Vec::new(),
             identity: String::new(),
+            user_level: 0,
             user_index: 0,
             client_session_id: None,
         };
@@ -948,6 +958,7 @@ struct ShadowsocksServerUser {
     key: ShadowsocksKeyMaterial,
     salt_checker: Arc<Mutex<TimedSaltChecker>>,
     identity: String,
+    user_level: u32,
 }
 
 impl ShadowsocksServerUser {
@@ -987,6 +998,7 @@ impl ShadowsocksTcpServerHandler {
                     key,
                     salt_checker: Arc::new(Mutex::new(TimedSaltChecker::default())),
                     identity: user.email,
+                    user_level: user.user_level,
                 })
             })
             .collect::<io::Result<Vec<_>>>()?;
@@ -1112,10 +1124,12 @@ impl TcpServerHandler for ShadowsocksTcpServerHandler {
         let traffic_context = Some(if user.identity.is_empty() {
             TrafficContext::new("shadowsocks")
                 .with_inbound_tag(self.inbound_tag.clone())
+                .with_user_level(user.user_level)
         } else {
             TrafficContext::new("shadowsocks")
                 .with_identity(user.identity.clone())
                 .with_inbound_tag(self.inbound_tag.clone())
+                .with_user_level(user.user_level)
         });
         Ok(TcpServerSetupResult::TcpForward {
             remote_location,
@@ -2265,6 +2279,7 @@ mod tests {
             method: "xchacha20-poly1305".to_string(),
             password: "password".to_string(),
             email: "xchacha@example.com".to_string(),
+            user_level: 0,
         })
         .expect("create XChaCha UDP codec");
         let source = NetLocation::new(Address::from("example.com").unwrap(), 443);
@@ -2273,6 +2288,7 @@ mod tests {
             target_location: source.clone(),
             payload: Vec::new(),
             identity: String::new(),
+            user_level: 0,
             user_index: 0,
             client_session_id: None,
         };

@@ -852,6 +852,8 @@ struct DokodemoDoorSettings {
     port: Option<u16>,
     #[serde(default)]
     follow_redirect: bool,
+    #[serde(default)]
+    user_level: u32,
 }
 
 #[cfg(feature = "vless")]
@@ -1063,6 +1065,7 @@ fn plan_vless_core(
                         } else {
                             client.email
                         },
+                        user_level: client.level,
                         flow,
                     })
                 })
@@ -1310,17 +1313,13 @@ fn collect_shadowsocks_users(
                     method: identity.method.clone(),
                     password: identity.password.clone(),
                     email: String::new(),
+                    user_level: raw.level,
                 },
             )
             .map_err(|error| Error::InvalidConfig(error.to_string()))?;
             let users = accounts
                 .into_iter()
                 .map(|user| {
-                    if user.level != 0 {
-                        return Err(Error::InvalidConfig(
-                            "shadowsocks user level is not supported yet".into(),
-                        ));
-                    }
                     if !user.method.trim().is_empty() {
                         return Err(Error::InvalidConfig(
                             "Shadowsocks 2022 EIH users must omit method".into(),
@@ -1330,6 +1329,7 @@ fn collect_shadowsocks_users(
                         method: raw.method.clone(),
                         password: user.password,
                         email: user.email,
+                        user_level: user.level,
                     })
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
@@ -1338,31 +1338,23 @@ fn collect_shadowsocks_users(
             let users = accounts
                 .into_iter()
                 .map(|user| {
-                    if user.level != 0 {
-                        return Err(Error::InvalidConfig(
-                            "shadowsocks user level is not supported yet".into(),
-                        ));
-                    }
                     Ok(crate::config::server_config::ShadowsocksUser {
                         method: user.method,
                         password: user.password,
                         email: user.email,
+                        user_level: user.level,
                     })
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
             (users, None)
         }
     } else {
-        if raw.level != 0 {
-            return Err(Error::InvalidConfig(
-                "shadowsocks settings.level is not supported yet".into(),
-            ));
-        }
         (
             vec![crate::config::server_config::ShadowsocksUser {
                 method: raw.method,
                 password: raw.password,
                 email: raw.email,
+                user_level: raw.level,
             }],
             None,
         )
@@ -1562,6 +1554,7 @@ fn build_dokodemo_server(
         config: super::types::DokodemoDoorConfig {
             target: remote_location,
             follow_redirect: settings.follow_redirect,
+            user_level: settings.user_level,
         },
     };
 
@@ -1626,6 +1619,7 @@ fn build_vmess_server(
             Ok(crate::config::server_config::VmessUser {
                 user_id,
                 user_label,
+                user_level: client.level,
                 cipher: client
                     .security
                     .filter(|value| !value.trim().is_empty())

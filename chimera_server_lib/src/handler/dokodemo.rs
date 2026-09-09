@@ -35,7 +35,8 @@ impl DokodemoDoorTcpHandler {
             connection_success_response: None,
             traffic_context: Some(
                 TrafficContext::new("dokodemo-door")
-                    .with_inbound_tag(self.inbound_tag.clone()),
+                    .with_inbound_tag(self.inbound_tag.clone())
+                    .with_user_level(self.config.user_level),
             ),
         }
     }
@@ -154,6 +155,7 @@ mod tests {
             DokodemoDoorConfig {
                 target: NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 80),
                 follow_redirect,
+                user_level: 0,
             },
             "dokodemo",
         )

@@ -122,6 +122,7 @@ mod traffic_noop {
         pub inbound_tag: Option<String>,
         pub outbound_tag: Option<String>,
         pub client_ip: Option<IpAddr>,
+        pub user_level: u32,
     }
 
     impl TrafficContext {
@@ -132,6 +133,7 @@ mod traffic_noop {
                 inbound_tag: None,
                 outbound_tag: None,
                 client_ip: None,
+                user_level: 0,
             }
         }
 
@@ -154,6 +156,11 @@ mod traffic_noop {
             self.client_ip = Some(ip);
             self
         }
+
+        pub fn with_user_level(mut self, level: u32) -> Self {
+            self.user_level = level;
+            self
+        }
     }
 
     impl Default for TrafficContext {
@@ -164,6 +171,7 @@ mod traffic_noop {
                 inbound_tag: None,
                 outbound_tag: None,
                 client_ip: None,
+                user_level: 0,
             }
         }
     }

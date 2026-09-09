@@ -480,6 +480,8 @@ pub struct ClientSetting {
     flow: String,
     id: String,
     #[serde(default)]
+    level: u32,
+    #[serde(default)]
     security: Option<String>,
 }
 
@@ -489,6 +491,8 @@ pub struct TrojanClientSetting {
     #[serde(default)]
     email: Option<String>,
     password: String,
+    #[serde(default)]
+    level: u32,
 }
 
 #[derive(Deserialize, Debug, Clone, Serialize)]
