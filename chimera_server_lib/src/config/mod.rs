@@ -80,6 +80,30 @@ pub struct StreamSettings {
     sockopt: Option<SocketSettings>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub(super) enum TcpFastOpenValue {
+    Bool(bool),
+    Number(f64),
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CustomSockoptConfig {
+    #[serde(default)]
+    pub(crate) system: String,
+    #[serde(default)]
+    pub(crate) network: String,
+    #[serde(default)]
+    pub(crate) level: String,
+    #[serde(default)]
+    pub(crate) opt: String,
+    #[serde(default)]
+    pub(crate) value: String,
+    #[serde(default, rename = "type")]
+    pub(crate) value_type: String,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SocketSettings {
@@ -88,11 +112,37 @@ pub struct SocketSettings {
     #[serde(default)]
     trusted_x_forwarded_for: Vec<String>,
     #[serde(default)]
+    tcp_fast_open: Option<TcpFastOpenValue>,
+    #[serde(default)]
+    tproxy: String,
+    #[serde(default)]
+    receive_original_dest_address: bool,
+    #[serde(default)]
+    tcp_keep_alive_interval: i32,
+    #[serde(default)]
+    tcp_keep_alive_idle: i32,
+    #[serde(default)]
+    tcp_user_timeout: i32,
+    #[serde(default)]
     tcp_congestion: Option<String>,
     #[serde(default)]
     tcp_brutal_rate: Option<BandwidthValue>,
     #[serde(default)]
     tcp_brutal_cwnd_gain: Option<u32>,
+    #[serde(default)]
+    tcp_window_clamp: i32,
+    #[serde(default)]
+    tcp_max_seg: i32,
+    #[serde(default)]
+    tcp_mptcp: bool,
+    #[serde(default)]
+    v6only: bool,
+    #[serde(default)]
+    interface: String,
+    #[serde(default)]
+    mark: i32,
+    #[serde(default)]
+    custom_sockopt: Vec<CustomSockoptConfig>,
 }
 
 #[cfg(feature = "grpc_transport")]

@@ -4,13 +4,18 @@ use std::{
     time::Duration,
 };
 
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+
 use congestion::BrutalConfig;
 use connection::{build_xray_proxy_transport, process_hysteria2_connection};
 use finalmask::{GeckoUdpSocket, SalamanderUdpSocket};
 use quinn::congestion::{BbrConfig, NewRenoConfig};
 
 use crate::{
-    config::server_config::{Hysteria2ServerConfig, Hysteria2UdpFinalMask},
+    config::server_config::{
+        Hysteria2ServerConfig, Hysteria2UdpFinalMask, TcpSocketPolicy,
+    },
     resolver::{NativeResolver, Resolver},
     runtime::RuntimeState,
     util::socket::new_socket2_udp_socket_with_buffer_size,
@@ -33,10 +38,85 @@ const XRAY_ASSUME_PEER_MAX_DATAGRAM_FRAME_SIZE: u32 = 1200;
 const DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 8 * 1024 * 1024;
 const DEFAULT_CONNECTION_RECEIVE_WINDOW: u64 = 20 * 1024 * 1024;
 
+fn create_hysteria2_listener_socket(
+    bind_address: SocketAddr,
+    policy: Option<&TcpSocketPolicy>,
+    xray_compat: bool,
+) -> std::io::Result<socket2::Socket> {
+    if policy.is_some_and(TcpSocketPolicy::has_tcp_only_options) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TCP-only sockopt fields are not applicable to Hysteria2 QUIC",
+        ));
+    }
+
+    let bind_interface = policy.and_then(|policy| policy.bind_interface.clone());
+    let socket = new_socket2_udp_socket_with_buffer_size(
+        bind_address.is_ipv6(),
+        bind_interface,
+        None,
+        true,
+        configured_udp_socket_buffer_size(xray_compat),
+    )?;
+
+    if policy.is_some_and(|policy| policy.ipv6_only) {
+        if !bind_address.is_ipv6() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "sockopt.v6only requires an IPv6 Hysteria2 listener",
+            ));
+        }
+        socket.set_only_v6(true)?;
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(policy) = policy {
+        let fd = socket.as_raw_fd();
+        if let Some(mark) = policy.mark {
+            crate::util::socket::configure_socket_mark(fd, mark)?;
+        }
+        if policy.transparent {
+            crate::util::socket::configure_ip_transparent(fd)?;
+        }
+        if policy.receive_original_destination {
+            crate::util::socket::enable_udp_original_destination(
+                &socket,
+                bind_address.is_ipv6(),
+            )?;
+        }
+        crate::util::socket::configure_custom_sockopt(
+            fd,
+            if bind_address.is_ipv6() {
+                "udp6"
+            } else {
+                "udp4"
+            },
+            &policy.custom_sockopt,
+        )?;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    if policy.is_some_and(|policy| {
+        policy.mark.is_some()
+            || policy.transparent
+            || policy.receive_original_destination
+            || !policy.custom_sockopt.is_empty()
+    }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "configured Hysteria2 listener socket options are unsupported on this platform",
+        ));
+    }
+
+    socket.bind(&socket2::SockAddr::from(bind_address))?;
+    Ok(socket)
+}
+
 pub async fn run_hysteria2_server(
     bind_address: SocketAddr,
     server_config: Arc<rustls::ServerConfig>,
     config: Hysteria2ServerConfig,
+    socket_policy: Option<TcpSocketPolicy>,
     inbound_tag: String,
     runtime: RuntimeState,
 ) -> std::io::Result<()> {
@@ -71,12 +151,10 @@ pub async fn run_hysteria2_server(
             .migration(configured_server_migration(config.xray_compat));
         base_server_config.transport_config(Arc::new(base_transport));
 
-        let socket2_socket = new_socket2_udp_socket_with_buffer_size(
-            bind_address.is_ipv6(),
-            None,
-            Some(bind_address),
-            false,
-            configured_udp_socket_buffer_size(config.xray_compat),
+        let socket2_socket = create_hysteria2_listener_socket(
+            bind_address,
+            socket_policy.as_ref(),
+            config.xray_compat,
         )?;
         let quinn_runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
         let raw_socket = quinn_runtime.wrap_udp_socket(socket2_socket.into())?;
@@ -378,6 +456,15 @@ mod tests {
         configured_max_incoming_uni_streams, configured_mtu_discovery,
         configured_receive_window, configured_send_window,
         configured_server_migration, configured_udp_socket_buffer_size,
+        create_hysteria2_listener_socket,
+    };
+
+    #[cfg(target_os = "linux")]
+    use crate::config::server_config::TcpSocketPolicy;
+    #[cfg(target_os = "linux")]
+    use std::{
+        net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+        os::fd::AsRawFd,
     };
 
     #[test]
@@ -485,6 +572,64 @@ mod tests {
             configured_congestion_mode(true, Some("force-brutal")),
             CongestionMode::Brutal
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hysteria2_listener_applies_original_destination_option() {
+        let policy = TcpSocketPolicy {
+            receive_original_destination: true,
+            ..TcpSocketPolicy::default()
+        };
+        let socket = create_hysteria2_listener_socket(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            Some(&policy),
+            true,
+        )
+        .expect("create original-destination Hysteria2 listener");
+        let mut value = 0;
+        let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+        // SAFETY: `value` and `length` are valid writable getsockopt buffers.
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_IP,
+                libc::IP_RECVORIGDSTADDR,
+                std::ptr::from_mut(&mut value).cast(),
+                &mut length,
+            )
+        };
+        assert_eq!(result, 0);
+        assert_eq!(value, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hysteria2_listener_applies_ipv6_only() {
+        let policy = TcpSocketPolicy {
+            ipv6_only: true,
+            ..TcpSocketPolicy::default()
+        };
+        let socket = create_hysteria2_listener_socket(
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+            Some(&policy),
+            true,
+        )
+        .expect("create IPv6-only Hysteria2 listener");
+        let mut value = 0;
+        let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+        // SAFETY: `value` and `length` are valid writable getsockopt buffers.
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_IPV6,
+                libc::IPV6_V6ONLY,
+                std::ptr::from_mut(&mut value).cast(),
+                &mut length,
+            )
+        };
+        assert_eq!(result, 0);
+        assert_eq!(value, 1);
     }
 
     #[test]

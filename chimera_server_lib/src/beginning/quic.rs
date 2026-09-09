@@ -34,6 +34,7 @@ pub async fn start_quic_server(
             bind_location,
             quic_settings,
             protocol,
+            tcp_socket_policy,
             ..
         } = config;
 
@@ -72,6 +73,7 @@ pub async fn start_quic_server(
                         bind_address,
                         server_config,
                         config,
+                        tcp_socket_policy,
                         tag,
                         runtime,
                     )
@@ -86,6 +88,12 @@ pub async fn start_quic_server(
             }
             #[cfg(feature = "tuic")]
             ServerProxyConfig::TuicV5 { config } => {
+                if tcp_socket_policy.is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "streamSettings.sockopt is not implemented for TUIC QUIC listeners",
+                    ));
+                }
                 Ok(Some(tokio::spawn(async move {
                     if let Err(err) = run_tuic_server(
                         bind_address,

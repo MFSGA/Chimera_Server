@@ -37,11 +37,65 @@ pub struct ServerConfig {
     pub tcp_socket_policy: Option<TcpSocketPolicy>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct TcpSocketPolicy {
     pub congestion: String,
     #[serde(default)]
     pub brutal: Option<TcpBrutalConfig>,
+    #[serde(default)]
+    pub fast_open: Option<i32>,
+    #[serde(default)]
+    pub keep_alive_idle: i32,
+    #[serde(default)]
+    pub keep_alive_interval: i32,
+    #[serde(default)]
+    pub user_timeout_ms: Option<i32>,
+    #[serde(default)]
+    pub window_clamp: Option<i32>,
+    #[serde(default)]
+    pub max_seg: Option<i32>,
+    #[serde(default)]
+    pub multipath: bool,
+    #[serde(default)]
+    pub ipv6_only: bool,
+    #[serde(default)]
+    pub bind_interface: Option<String>,
+    #[serde(default)]
+    pub mark: Option<i32>,
+    #[serde(default)]
+    pub transparent: bool,
+    #[serde(default)]
+    pub receive_original_destination: bool,
+    #[serde(default)]
+    pub custom_sockopt: Vec<CustomSocketOption>,
+}
+
+impl TcpSocketPolicy {
+    pub(crate) fn has_connection_options(&self) -> bool {
+        !self.congestion.is_empty()
+            || self.brutal.is_some()
+            || self.keep_alive_idle != 0
+            || self.keep_alive_interval != 0
+            || self.user_timeout_ms.is_some()
+            || self.window_clamp.is_some()
+    }
+
+    pub(crate) fn has_tcp_only_options(&self) -> bool {
+        self.has_connection_options()
+            || self.fast_open.is_some()
+            || self.max_seg.is_some()
+            || self.multipath
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CustomSocketOption {
+    pub system: String,
+    pub network: String,
+    pub level: String,
+    pub opt: String,
+    pub value: String,
+    pub value_type: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

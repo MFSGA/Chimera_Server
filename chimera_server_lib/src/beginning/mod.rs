@@ -281,7 +281,7 @@ async fn start_tcp_server_with_runtime(
     let listener = match bind_location {
         BindLocation::Address(a) => {
             let socket_addr = a.to_socket_addr()?;
-            tokio::net::TcpListener::bind(socket_addr).await?
+            create_tcp_listener(socket_addr, tcp_socket_policy.as_ref()).await?
         }
     };
 
@@ -383,6 +383,68 @@ async fn run_tcp_server(
     }
 }
 
+async fn create_tcp_listener(
+    bind_addr: SocketAddr,
+    policy: Option<&TcpSocketPolicy>,
+) -> std::io::Result<tokio::net::TcpListener> {
+    let bind_interface = policy.and_then(|policy| policy.bind_interface.clone());
+    let multipath = policy.is_some_and(|policy| policy.multipath);
+    let socket = crate::util::socket::new_xray_tcp_listener_socket(
+        bind_interface,
+        bind_addr.is_ipv6(),
+        multipath,
+    )?;
+
+    #[cfg(target_os = "linux")]
+    if let Some(policy) = policy {
+        let fd = socket.as_raw_fd();
+        if policy.ipv6_only {
+            if !bind_addr.is_ipv6() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "sockopt.v6only requires an IPv6 listener",
+                ));
+            }
+            crate::util::socket::configure_ipv6_only(fd)?;
+        }
+        if let Some(mark) = policy.mark {
+            crate::util::socket::configure_socket_mark(fd, mark)?;
+        }
+        if policy.transparent {
+            crate::util::socket::configure_ip_transparent(fd)?;
+        }
+        if let Some(value) = policy.fast_open {
+            crate::util::socket::configure_tcp_fast_open(fd, value)?;
+        }
+        if let Some(value) = policy.max_seg {
+            crate::util::socket::configure_tcp_max_seg(fd, value)?;
+        }
+        crate::util::socket::configure_custom_sockopt(
+            fd,
+            if bind_addr.is_ipv6() { "tcp6" } else { "tcp4" },
+            &policy.custom_sockopt,
+        )?;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    if policy.is_some_and(|policy| {
+        policy.ipv6_only
+            || policy.mark.is_some()
+            || policy.transparent
+            || policy.fast_open.is_some()
+            || policy.max_seg.is_some()
+            || !policy.custom_sockopt.is_empty()
+    }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "configured inbound TCP listener socket options are unsupported on this platform",
+        ));
+    }
+
+    socket.bind(bind_addr)?;
+    socket.listen(1024)
+}
+
 #[cfg(target_os = "linux")]
 fn apply_tcp_socket_policy(
     stream: &tokio::net::TcpStream,
@@ -391,7 +453,22 @@ fn apply_tcp_socket_policy(
     policy: &TcpSocketPolicy,
 ) -> std::io::Result<()> {
     let fd = stream.as_raw_fd();
-    crate::util::socket::set_tcp_congestion(fd, &policy.congestion)?;
+    if !policy.congestion.is_empty() {
+        crate::util::socket::set_tcp_congestion(fd, &policy.congestion)?;
+    }
+    if policy.keep_alive_idle != 0 || policy.keep_alive_interval != 0 {
+        crate::util::socket::configure_tcp_keepalive(
+            fd,
+            policy.keep_alive_idle,
+            policy.keep_alive_interval,
+        )?;
+    }
+    if let Some(timeout_ms) = policy.user_timeout_ms {
+        crate::util::socket::configure_tcp_user_timeout(fd, timeout_ms)?;
+    }
+    if let Some(value) = policy.window_clamp {
+        crate::util::socket::configure_tcp_window_clamp(fd, value)?;
+    }
     if let Some(brutal) = policy.brutal.as_ref() {
         let group_id =
             crate::util::socket::tcp_brutal_group_id(listener_addr, peer_addr);
@@ -420,13 +497,14 @@ fn apply_tcp_socket_policy(
     _peer_addr: SocketAddr,
     policy: &TcpSocketPolicy,
 ) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        format!(
-            "sockopt.tcpCongestion={} is supported only on Linux",
-            policy.congestion
-        ),
-    ))
+    if policy.has_connection_options() {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "configured inbound TCP connection socket options are unsupported on this platform",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "linux")]

@@ -15,18 +15,19 @@ pub use types::{VlessFallback, VlessUser};
 
 #[cfg(feature = "grpc_transport")]
 pub use types::GrpcServerConfig;
+#[allow(unused_imports)]
+pub use types::{
+    CustomSocketOption, InboundSniffingConfig, ServerConfig, ServerProxyConfig,
+    SocksUser, SocksUserStore, TcpBrutalConfig, TcpSocketPolicy, XhttpDataPlacement,
+    XhttpMode, XhttpPaddingMethod, XhttpPaddingPlacement, XhttpPlacement,
+    XhttpServerConfig,
+};
 #[cfg(feature = "hysteria")]
 #[allow(unused_imports)]
 pub use types::{
     Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2MasqueradeFileConfig,
     Hysteria2MasqueradeProxyConfig, Hysteria2MasqueradeStringConfig,
     Hysteria2ServerConfig, Hysteria2UdpFinalMask,
-};
-#[allow(unused_imports)]
-pub use types::{
-    InboundSniffingConfig, ServerConfig, ServerProxyConfig, SocksUser,
-    SocksUserStore, TcpBrutalConfig, TcpSocketPolicy, XhttpDataPlacement, XhttpMode,
-    XhttpPaddingMethod, XhttpPaddingPlacement, XhttpPlacement, XhttpServerConfig,
 };
 
 #[cfg(feature = "reality")]

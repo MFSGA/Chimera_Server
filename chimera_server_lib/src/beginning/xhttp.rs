@@ -36,6 +36,8 @@ use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
+#[cfg(all(feature = "tls", target_os = "linux"))]
+use std::os::fd::AsRawFd;
 #[cfg(feature = "tls")]
 use std::sync::atomic::AtomicU64;
 
@@ -43,9 +45,9 @@ use crate::{
     address::BindLocation,
     async_stream::{AsyncPing, AsyncStream},
     config::server_config::{
-        InboundSniffingConfig, ServerConfig, ServerProxyConfig, XhttpDataPlacement,
-        XhttpMode, XhttpPaddingMethod, XhttpPaddingPlacement, XhttpPlacement,
-        XhttpServerConfig,
+        InboundSniffingConfig, ServerConfig, ServerProxyConfig, TcpSocketPolicy,
+        XhttpDataPlacement, XhttpMode, XhttpPaddingMethod, XhttpPaddingPlacement,
+        XhttpPlacement, XhttpServerConfig,
     },
     handler::tcp::{
         tcp_handler::TcpServerHandler, tcp_handler_util::create_tcp_server_handler,
@@ -219,10 +221,13 @@ pub async fn start_xhttp_server(
     ));
     #[cfg(feature = "tls")]
     if let XhttpSecurityLayer::H3Tls(server_config) = listener_config.security {
-        if tcp_socket_policy.is_some() {
+        if tcp_socket_policy
+            .as_ref()
+            .is_some_and(TcpSocketPolicy::has_tcp_only_options)
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                "streamSettings.sockopt.tcpCongestion is not applicable to XHTTP HTTP/3",
+                "TCP-only sockopt fields are not applicable to XHTTP HTTP/3",
             ));
         }
         return start_xhttp_h3_server(
@@ -230,11 +235,13 @@ pub async fn start_xhttp_server(
             server_config,
             h3_transport_config,
             state,
+            tcp_socket_policy,
         )
         .await;
     }
 
-    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    let listener =
+        super::create_tcp_listener(bind_addr, tcp_socket_policy.as_ref()).await?;
     let security = listener_config.security.clone();
 
     let handle = tokio::spawn(async move {
@@ -459,12 +466,77 @@ async fn start_xhttp_h3_server(
     tls_config: Arc<rustls::ServerConfig>,
     transport_config: quinn::TransportConfig,
     state: Arc<AppState>,
+    socket_policy: Option<TcpSocketPolicy>,
 ) -> std::io::Result<Vec<tokio::task::JoinHandle<()>>> {
     let quic_crypto: quinn::crypto::rustls::QuicServerConfig =
         tls_config.try_into().map_err(std::io::Error::other)?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
     server_config.transport_config(Arc::new(transport_config));
-    let endpoint = quinn::Endpoint::server(server_config, bind_addr)?;
+
+    if socket_policy
+        .as_ref()
+        .is_some_and(|policy| policy.receive_original_destination)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "receiveOriginalDestAddress is not applicable to XHTTP HTTP/3",
+        ));
+    }
+    let bind_interface = socket_policy
+        .as_ref()
+        .and_then(|policy| policy.bind_interface.clone());
+    let socket = crate::util::socket::new_socket2_udp_socket_with_buffer_size(
+        bind_addr.is_ipv6(),
+        bind_interface,
+        None,
+        true,
+        Some(8_625_000),
+    )?;
+    if socket_policy
+        .as_ref()
+        .is_some_and(|policy| policy.ipv6_only)
+    {
+        if !bind_addr.is_ipv6() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "sockopt.v6only requires an IPv6 XHTTP HTTP/3 listener",
+            ));
+        }
+        socket.set_only_v6(true)?;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(policy) = socket_policy.as_ref() {
+        let fd = socket.as_raw_fd();
+        if let Some(mark) = policy.mark {
+            crate::util::socket::configure_socket_mark(fd, mark)?;
+        }
+        if policy.transparent {
+            crate::util::socket::configure_ip_transparent(fd)?;
+        }
+        crate::util::socket::configure_custom_sockopt(
+            fd,
+            if bind_addr.is_ipv6() { "udp6" } else { "udp4" },
+            &policy.custom_sockopt,
+        )?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    if socket_policy.as_ref().is_some_and(|policy| {
+        policy.mark.is_some()
+            || policy.transparent
+            || !policy.custom_sockopt.is_empty()
+    }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "configured XHTTP HTTP/3 listener socket options are unsupported on this platform",
+        ));
+    }
+    socket.bind(&socket2::SockAddr::from(bind_addr))?;
+    let endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        socket.into(),
+        Arc::new(quinn::TokioRuntime),
+    )?;
     let listener_addr = endpoint.local_addr()?;
 
     let handle = tokio::spawn(async move {

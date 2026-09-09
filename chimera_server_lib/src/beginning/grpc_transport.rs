@@ -311,7 +311,8 @@ pub(super) async fn start_grpc_server(
     let listen_addr = match bind_location {
         BindLocation::Address(location) => location.to_socket_addr()?,
     };
-    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+    let listener =
+        super::create_tcp_listener(listen_addr, tcp_socket_policy.as_ref()).await?;
     info!(
         service = %grpc_config.service_name,
         multi_mode = grpc_config.multi_mode,
