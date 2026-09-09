@@ -45,9 +45,19 @@ struct InboundState {
     next_generation: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboundLifecycleState {
+    Prepared,
+    Starting,
+    Running,
+    Stopping,
+    Recovering,
+}
+
 #[derive(Debug)]
 struct VersionedConfig {
     generation: u64,
+    lifecycle: InboundLifecycleState,
     config: ServerConfig,
     #[cfg(feature = "vless")]
     vless_users: Option<VlessUserStore>,
@@ -115,8 +125,14 @@ impl VersionedConfig {
                 })
                 .map(Arc::new),
             generation,
+            lifecycle: InboundLifecycleState::Prepared,
             config,
         }
+    }
+
+    fn running(mut self) -> Self {
+        self.lifecycle = InboundLifecycleState::Running;
+        self
     }
 
     fn config_view(&self) -> ServerConfig {
@@ -646,6 +662,37 @@ impl Drop for ConfiguredStartGuard {
     }
 }
 
+struct ConfiguredStartingGuard {
+    manager: Arc<InboundManager>,
+    tag: String,
+    generation: u64,
+    armed: bool,
+}
+
+impl ConfiguredStartingGuard {
+    fn new(manager: Arc<InboundManager>, tag: String, generation: u64) -> Self {
+        Self {
+            manager,
+            tag,
+            generation,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ConfiguredStartingGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.manager
+                .restore_prepared_state(&self.tag, self.generation);
+        }
+    }
+}
+
 struct AlterRecoveryGuard {
     manager: Arc<InboundManager>,
     runtime: RuntimeState,
@@ -723,6 +770,46 @@ impl InboundManager {
         let mut hasher = DefaultHasher::new();
         tag.hash(&mut hasher);
         &self.operation_locks[(hasher.finish() as usize) % OPERATION_LOCK_SHARDS]
+    }
+
+    fn set_lifecycle_for_generation(
+        &self,
+        tag: &str,
+        generation: u64,
+        lifecycle: InboundLifecycleState,
+    ) -> bool {
+        let mut state = self.state.write().expect("inbound manager lock poisoned");
+        let Some(entry) = state
+            .configs
+            .iter_mut()
+            .find(|entry| entry.config.tag == tag && entry.generation == generation)
+        else {
+            return false;
+        };
+        entry.lifecycle = lifecycle;
+        true
+    }
+
+    fn restore_prepared_state(&self, tag: &str, generation: u64) {
+        let mut state = self.state.write().expect("inbound manager lock poisoned");
+        if let Some(entry) = state.configs.iter_mut().find(|entry| {
+            entry.config.tag == tag
+                && entry.generation == generation
+                && entry.lifecycle == InboundLifecycleState::Starting
+        }) {
+            entry.lifecycle = InboundLifecycleState::Prepared;
+        }
+    }
+
+    #[cfg(test)]
+    fn lifecycle_state(&self, tag: &str) -> Option<InboundLifecycleState> {
+        self.state
+            .read()
+            .expect("inbound manager lock poisoned")
+            .configs
+            .iter()
+            .find(|entry| entry.config.tag == tag)
+            .map(|entry| entry.lifecycle)
     }
 
     pub(crate) fn configs(&self) -> Vec<ServerConfig> {
@@ -881,6 +968,13 @@ impl InboundManager {
                 }
             },
         };
+        if let Some(entry) = state
+            .configs
+            .iter_mut()
+            .find(|entry| entry.config.tag == tag && entry.generation == generation)
+        {
+            entry.lifecycle = InboundLifecycleState::Running;
+        }
         if let Some(previous) = state.tasks.insert(
             tag.to_string(),
             InboundTaskSet {
@@ -899,14 +993,15 @@ impl InboundManager {
         handles: Vec<JoinHandle<()>>,
     ) -> bool {
         let mut state = self.state.write().expect("inbound manager lock poisoned");
-        let is_current = state
+        let Some(entry) = state
             .configs
-            .iter()
-            .any(|entry| entry.config.tag == tag && entry.generation == generation);
-        if !is_current {
+            .iter_mut()
+            .find(|entry| entry.config.tag == tag && entry.generation == generation)
+        else {
             abort_tasks(&handles);
             return false;
-        }
+        };
+        entry.lifecycle = InboundLifecycleState::Running;
         if let Some(previous) = state.tasks.insert(
             tag.to_string(),
             InboundTaskSet {
@@ -920,16 +1015,30 @@ impl InboundManager {
     }
 
     pub(crate) async fn stop_tasks(&self, tag: &str) -> bool {
-        let task_set = self
-            .state
-            .write()
-            .expect("inbound manager lock poisoned")
-            .tasks
-            .remove(tag);
+        let task_set = {
+            let mut state =
+                self.state.write().expect("inbound manager lock poisoned");
+            let task_set = state.tasks.remove(tag);
+            if let Some(task_set) = task_set.as_ref()
+                && let Some(entry) = state.configs.iter_mut().find(|entry| {
+                    entry.config.tag == tag
+                        && entry.generation == task_set.generation
+                })
+            {
+                entry.lifecycle = InboundLifecycleState::Stopping;
+            }
+            task_set
+        };
         let Some(task_set) = task_set else {
             return false;
         };
+        let generation = task_set.generation;
         stop_task_set(task_set).await;
+        self.set_lifecycle_for_generation(
+            tag,
+            generation,
+            InboundLifecycleState::Prepared,
+        );
         true
     }
 
@@ -945,12 +1054,23 @@ impl InboundManager {
             {
                 return false;
             }
-            state.tasks.remove(tag)
+            let task_set = state.tasks.remove(tag);
+            if let Some(entry) = state.configs.iter_mut().find(|entry| {
+                entry.config.tag == tag && entry.generation == generation
+            }) {
+                entry.lifecycle = InboundLifecycleState::Stopping;
+            }
+            task_set
         };
         let Some(task_set) = task_set else {
             return false;
         };
         stop_task_set(task_set).await;
+        self.set_lifecycle_for_generation(
+            tag,
+            generation,
+            InboundLifecycleState::Prepared,
+        );
         true
     }
 
@@ -980,7 +1100,9 @@ impl InboundManager {
         }
         let generation =
             allocate_generation(&mut state).map_err(AddInboundError::State)?;
-        state.configs.push(VersionedConfig::new(generation, config));
+        state
+            .configs
+            .push(VersionedConfig::new(generation, config).running());
         if let Some(previous) = state.tasks.insert(
             tag,
             InboundTaskSet {
@@ -1004,7 +1126,7 @@ impl InboundManager {
             .into_iter()
             .map(|config| config.tag)
             .collect::<Vec<_>>();
-        let mut rollback = ConfiguredStartGuard::new(manager);
+        let mut rollback = ConfiguredStartGuard::new(Arc::clone(&manager));
         let mut started = 0usize;
 
         for tag in tags {
@@ -1013,18 +1135,33 @@ impl InboundManager {
             }
             let _operation_guard = self.operation_lock(&tag).lock().await;
             let prepared = {
-                let state =
-                    self.state.read().expect("inbound manager lock poisoned");
-                match state.configs.iter().find(|entry| entry.config.tag == tag) {
+                let mut state =
+                    self.state.write().expect("inbound manager lock poisoned");
+                match state
+                    .configs
+                    .iter()
+                    .position(|entry| entry.config.tag == tag)
+                {
                     None => Err(io::Error::other(format!(
                         "configured inbound {tag} disappeared during startup"
                     ))),
-                    Some(_) if state.tasks.contains_key(&tag) => {
+                    Some(index)
+                        if state.tasks.contains_key(&tag)
+                            || state.configs[index].lifecycle
+                                != InboundLifecycleState::Prepared =>
+                    {
                         Err(io::Error::other(format!(
-                            "configured inbound {tag} is already running"
+                            "configured inbound {tag} is not prepared for startup"
                         )))
                     }
-                    Some(entry) => Ok((entry.generation, entry.config_view())),
+                    Some(index) => {
+                        state.configs[index].lifecycle =
+                            InboundLifecycleState::Starting;
+                        Ok((
+                            state.configs[index].generation,
+                            state.configs[index].config_view(),
+                        ))
+                    }
                 }
             };
             let (generation, config) = match prepared {
@@ -1035,9 +1172,15 @@ impl InboundManager {
                 }
             };
 
+            let mut starting = ConfiguredStartingGuard::new(
+                Arc::clone(&manager),
+                tag.clone(),
+                generation,
+            );
             let handles = match start_servers(config, runtime.clone()).await {
                 Ok(handles) => handles,
                 Err(error) => {
+                    drop(starting);
                     rollback.rollback().await;
                     return Err(error);
                 }
@@ -1049,11 +1192,13 @@ impl InboundManager {
                 pending.commit(),
             );
             if !published {
+                drop(starting);
                 rollback.rollback().await;
                 return Err(io::Error::other(format!(
                     "configured inbound {tag} changed during startup"
                 )));
             }
+            starting.disarm();
             rollback.record(tag, generation);
             started += 1;
         }
@@ -1300,13 +1445,23 @@ impl InboundManager {
         let task_set = {
             let mut state =
                 self.state.write().expect("inbound manager lock poisoned");
+            let Some(index) = state.configs.iter().position(|entry| {
+                entry.config.tag == tag && entry.generation == generation
+            }) else {
+                return Err(AlterInboundError::State(
+                    "inbound generation changed during alter",
+                ));
+            };
             match state.tasks.get(tag) {
                 Some(tasks) if tasks.generation != generation => {
                     return Err(AlterInboundError::State(
                         "inbound task generation mismatch",
                     ));
                 }
-                Some(_) => state.tasks.remove(tag),
+                Some(_) => {
+                    state.configs[index].lifecycle = InboundLifecycleState::Stopping;
+                    state.tasks.remove(tag)
+                }
                 None => None,
             }
         };
@@ -1325,10 +1480,18 @@ impl InboundManager {
             original.clone(),
         );
         stop_task_set(task_set).await;
+        if !self.set_lifecycle_for_generation(
+            tag,
+            generation,
+            InboundLifecycleState::Starting,
+        ) {
+            return Err(AlterInboundError::State(
+                "inbound generation changed before restart",
+            ));
+        }
 
         match start_servers(updated.clone(), runtime.clone()).await {
             Ok(handles) => {
-                recovery.disarm();
                 let pending = PendingTasks::new(handles);
                 self.replace_running_generation(
                     tag,
@@ -1337,13 +1500,17 @@ impl InboundManager {
                     pending.commit(),
                 )
                 .map_err(AlterInboundError::State)?;
+                recovery.disarm();
                 Ok(())
             }
             Err(start_error) => {
+                self.set_lifecycle_for_generation(
+                    tag,
+                    generation,
+                    InboundLifecycleState::Recovering,
+                );
                 tokio::task::yield_now().await;
-                let rollback = start_servers(original.clone(), runtime).await;
-                recovery.disarm();
-                match rollback {
+                match start_servers(original.clone(), runtime).await {
                     Ok(handles) => {
                         let pending = PendingTasks::new(handles);
                         self.replace_running_generation(
@@ -1353,15 +1520,24 @@ impl InboundManager {
                             pending.commit(),
                         )
                         .map_err(AlterInboundError::State)?;
+                        recovery.disarm();
                         Err(AlterInboundError::Restart {
                             start_error,
                             rollback_error: None,
                         })
                     }
-                    Err(rollback_error) => Err(AlterInboundError::Restart {
-                        start_error,
-                        rollback_error: Some(rollback_error),
-                    }),
+                    Err(rollback_error) => {
+                        self.set_lifecycle_for_generation(
+                            tag,
+                            generation,
+                            InboundLifecycleState::Prepared,
+                        );
+                        recovery.disarm();
+                        Err(AlterInboundError::Restart {
+                            start_error,
+                            rollback_error: Some(rollback_error),
+                        })
+                    }
                 }
             }
         }
@@ -1376,10 +1552,18 @@ impl InboundManager {
     ) {
         let _operation_guard = self.operation_lock(&tag).lock().await;
         let should_recover = {
-            let state = self.state.read().expect("inbound manager lock poisoned");
-            state.configs.iter().any(|entry| {
+            let mut state =
+                self.state.write().expect("inbound manager lock poisoned");
+            if state.tasks.contains_key(&tag) {
+                false
+            } else if let Some(entry) = state.configs.iter_mut().find(|entry| {
                 entry.config.tag == tag && entry.generation == generation
-            }) && !state.tasks.contains_key(&tag)
+            }) {
+                entry.lifecycle = InboundLifecycleState::Recovering;
+                true
+            } else {
+                false
+            }
         };
         if !should_recover {
             return;
@@ -1402,6 +1586,11 @@ impl InboundManager {
                 }
             }
             Err(error) => {
+                self.set_lifecycle_for_generation(
+                    &tag,
+                    generation,
+                    InboundLifecycleState::Prepared,
+                );
                 tracing::warn!(
                     inbound_tag = %tag,
                     error = %error,
@@ -1449,7 +1638,7 @@ impl InboundManager {
                 return Err(error);
             }
         };
-        state.configs[index] = VersionedConfig::new(generation, config);
+        state.configs[index] = VersionedConfig::new(generation, config).running();
         if let Some(previous) = state.tasks.insert(
             tag.to_string(),
             InboundTaskSet {
@@ -1487,7 +1676,8 @@ async fn stop_task_set(task_set: InboundTaskSet) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AlterRecoveryGuard, ConfiguredStartGuard, InboundManager, stop_task_set,
+        AlterRecoveryGuard, ConfiguredStartGuard, ConfiguredStartingGuard,
+        InboundLifecycleState, InboundManager, stop_task_set,
     };
     use crate::{
         address::{BindLocation, NetLocation},
@@ -1558,12 +1748,47 @@ mod tests {
     #[tokio::test]
     async fn stopping_tasks_does_not_remove_config() {
         let manager = InboundManager::new(vec![inbound("primary", 10001)]);
+        assert_eq!(
+            manager.lifecycle_state("primary"),
+            Some(InboundLifecycleState::Prepared)
+        );
         let task = tokio::spawn(std::future::pending());
         manager.register_tasks("primary", vec![task]);
+        assert_eq!(
+            manager.lifecycle_state("primary"),
+            Some(InboundLifecycleState::Running)
+        );
 
         assert!(manager.stop_tasks("primary").await);
+        assert_eq!(
+            manager.lifecycle_state("primary"),
+            Some(InboundLifecycleState::Prepared)
+        );
         assert!(manager.config_by_tag("primary").is_some());
         assert!(!manager.stop_tasks("primary").await);
+    }
+
+    #[test]
+    fn cancelled_configured_start_restores_prepared_state() {
+        let manager = Arc::new(InboundManager::new(vec![inbound("primary", 10001)]));
+        let generation = manager.generation("primary").unwrap();
+        assert!(manager.set_lifecycle_for_generation(
+            "primary",
+            generation,
+            InboundLifecycleState::Starting,
+        ));
+        let guard = ConfiguredStartingGuard::new(
+            Arc::clone(&manager),
+            "primary".to_string(),
+            generation,
+        );
+
+        drop(guard);
+
+        assert_eq!(
+            manager.lifecycle_state("primary"),
+            Some(InboundLifecycleState::Prepared)
+        );
     }
 
     #[tokio::test]
@@ -1660,6 +1885,10 @@ mod tests {
             wait_for_tcp_listener(port).await,
             "cancelling alter must restore the original listener"
         );
+        assert_eq!(
+            manager.lifecycle_state("primary"),
+            Some(InboundLifecycleState::Running)
+        );
         assert!(manager.stop_tasks("primary").await);
     }
 
@@ -1686,6 +1915,14 @@ mod tests {
         );
         assert!(manager.config_by_tag("first").is_some());
         assert!(manager.config_by_tag("second").is_some());
+        assert_eq!(
+            manager.lifecycle_state("first"),
+            Some(InboundLifecycleState::Prepared)
+        );
+        assert_eq!(
+            manager.lifecycle_state("second"),
+            Some(InboundLifecycleState::Prepared)
+        );
         assert!(!manager.stop_tasks("first").await);
     }
 
