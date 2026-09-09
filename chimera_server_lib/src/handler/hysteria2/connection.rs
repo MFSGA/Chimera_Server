@@ -80,6 +80,25 @@ struct AuthInfo {
     vless_route: u32,
 }
 
+fn hysteria2_traffic_context(
+    client: &Hysteria2Client,
+    inbound_tag: &str,
+    peer_addr: SocketAddr,
+    runtime: &RuntimeState,
+) -> TrafficContext {
+    let identity = client
+        .email
+        .clone()
+        .unwrap_or_else(|| client.password.clone());
+    let mut context = TrafficContext::new("hysteria2")
+        .with_identity(identity)
+        .with_inbound_tag(inbound_tag.to_string())
+        .with_client_ip(peer_addr.ip())
+        .with_user_level(client.level);
+    runtime.apply_traffic_stats_policy(&mut context);
+    context
+}
+
 pub async fn process_hysteria2_connection(
     resolver: Arc<dyn Resolver>,
     config: Arc<Hysteria2ServerConfig>,
@@ -401,11 +420,12 @@ async fn handle_tcp_stream(
         }
     };
 
-    let mut context = TrafficContext::new("hysteria2")
-        .with_identity(context_identity)
-        .with_inbound_tag((*inbound_tag).clone())
-        .with_client_ip(peer_addr.ip())
-        .with_user_level(auth_ctx.client.level);
+    let mut context = hysteria2_traffic_context(
+        &auth_ctx.client,
+        inbound_tag.as_str(),
+        peer_addr,
+        &runtime,
+    );
     if let Some(tag) = connection.outbound_tag {
         context = context.with_outbound_tag(tag);
     }
@@ -2662,11 +2682,12 @@ async fn drive_udp_datagrams(
         .email
         .clone()
         .unwrap_or(auth_ctx.client.password.clone());
-    let base_context = TrafficContext::new("hysteria2")
-        .with_identity(identity.clone())
-        .with_inbound_tag((*inbound_tag).clone())
-        .with_client_ip(peer_addr.ip())
-        .with_user_level(auth_ctx.client.level);
+    let base_context = hysteria2_traffic_context(
+        &auth_ctx.client,
+        inbound_tag.as_str(),
+        peer_addr,
+        &runtime,
+    );
 
     loop {
         let data_result = loop {
@@ -3511,6 +3532,52 @@ mod tests {
             .header(AUTH_HEADER, auth)
             .body(())
             .expect("valid Hysteria2 auth request")
+    }
+
+    #[test]
+    fn traffic_context_applies_client_level_and_stats_policy() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let mut levels = std::collections::HashMap::new();
+        levels.insert(
+            7,
+            Some(crate::config::def::PolicyLevelConfig {
+                stats_user_uplink: false,
+                stats_user_downlink: true,
+                stats_user_online: false,
+                ..crate::config::def::PolicyLevelConfig::default()
+            }),
+        );
+        runtime.replace_policy(Some(&crate::config::def::PolicyConfig {
+            levels,
+            system: Some(crate::config::def::SystemPolicyConfig {
+                stats_inbound_uplink: true,
+                stats_inbound_downlink: false,
+                stats_outbound_uplink: false,
+                stats_outbound_downlink: true,
+            }),
+        }));
+        let client: Hysteria2Client = serde_json::from_value(serde_json::json!({
+            "password": "policy-secret",
+            "email": "policy@example.com",
+            "level": 7
+        }))
+        .expect("valid Hysteria2 policy client");
+        let context = hysteria2_traffic_context(
+            &client,
+            "hysteria-policy",
+            "127.0.0.1:12345".parse().unwrap(),
+            &runtime,
+        );
+
+        assert_eq!(context.user_level, 7);
+        assert_eq!(context.identity.as_deref(), Some("policy@example.com"));
+        assert_eq!(context.stats_user_uplink, Some(false));
+        assert_eq!(context.stats_user_downlink, Some(true));
+        assert_eq!(context.stats_user_online, Some(false));
+        assert_eq!(context.stats_inbound_uplink, Some(true));
+        assert_eq!(context.stats_inbound_downlink, Some(false));
+        assert_eq!(context.stats_outbound_uplink, Some(false));
+        assert_eq!(context.stats_outbound_downlink, Some(true));
     }
 
     #[test]

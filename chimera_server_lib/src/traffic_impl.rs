@@ -17,6 +17,13 @@ pub struct TrafficContext {
     pub outbound_tag: Option<String>,
     pub client_ip: Option<IpAddr>,
     pub user_level: u32,
+    pub stats_user_uplink: Option<bool>,
+    pub stats_user_downlink: Option<bool>,
+    pub stats_user_online: Option<bool>,
+    pub stats_inbound_uplink: Option<bool>,
+    pub stats_inbound_downlink: Option<bool>,
+    pub stats_outbound_uplink: Option<bool>,
+    pub stats_outbound_downlink: Option<bool>,
 }
 
 impl TrafficContext {
@@ -28,6 +35,13 @@ impl TrafficContext {
             outbound_tag: None,
             client_ip: None,
             user_level: 0,
+            stats_user_uplink: None,
+            stats_user_downlink: None,
+            stats_user_online: None,
+            stats_inbound_uplink: None,
+            stats_inbound_downlink: None,
+            stats_outbound_uplink: None,
+            stats_outbound_downlink: None,
         }
     }
 
@@ -55,6 +69,30 @@ impl TrafficContext {
         self.user_level = level;
         self
     }
+
+    pub fn set_user_stats_policy(
+        &mut self,
+        uplink: bool,
+        downlink: bool,
+        online: bool,
+    ) {
+        self.stats_user_uplink = Some(uplink);
+        self.stats_user_downlink = Some(downlink);
+        self.stats_user_online = Some(online);
+    }
+
+    pub fn set_system_stats_policy(
+        &mut self,
+        inbound_uplink: bool,
+        inbound_downlink: bool,
+        outbound_uplink: bool,
+        outbound_downlink: bool,
+    ) {
+        self.stats_inbound_uplink = Some(inbound_uplink);
+        self.stats_inbound_downlink = Some(inbound_downlink);
+        self.stats_outbound_uplink = Some(outbound_uplink);
+        self.stats_outbound_downlink = Some(outbound_downlink);
+    }
 }
 
 impl Default for TrafficContext {
@@ -66,6 +104,13 @@ impl Default for TrafficContext {
             outbound_tag: None,
             client_ip: None,
             user_level: 0,
+            stats_user_uplink: None,
+            stats_user_downlink: None,
+            stats_user_online: None,
+            stats_inbound_uplink: None,
+            stats_inbound_downlink: None,
+            stats_outbound_uplink: None,
+            stats_outbound_downlink: None,
         }
     }
 }
@@ -111,6 +156,15 @@ struct TrafficRecordPlan<'a> {
     identity: Option<&'a str>,
     inbound_tag: Option<&'a str>,
     outbound_tag: Option<&'a str>,
+    record_user: bool,
+    user_upload: u64,
+    user_download: u64,
+    record_inbound: bool,
+    inbound_upload: u64,
+    inbound_download: u64,
+    record_outbound: bool,
+    outbound_upload: u64,
+    outbound_download: u64,
 }
 
 fn plan_traffic_record<'a>(
@@ -118,6 +172,13 @@ fn plan_traffic_record<'a>(
     upload: u64,
     download: u64,
 ) -> TrafficRecordPlan<'a> {
+    let record_user_uplink = context.stats_user_uplink.unwrap_or(true);
+    let record_user_downlink = context.stats_user_downlink.unwrap_or(true);
+    let record_inbound_uplink = context.stats_inbound_uplink.unwrap_or(true);
+    let record_inbound_downlink = context.stats_inbound_downlink.unwrap_or(true);
+    let record_outbound_uplink = context.stats_outbound_uplink.unwrap_or(true);
+    let record_outbound_downlink = context.stats_outbound_downlink.unwrap_or(true);
+
     TrafficRecordPlan {
         upload,
         download,
@@ -125,6 +186,19 @@ fn plan_traffic_record<'a>(
         identity: context.identity.as_deref(),
         inbound_tag: context.inbound_tag.as_deref(),
         outbound_tag: context.outbound_tag.as_deref(),
+        record_user: record_user_uplink || record_user_downlink,
+        user_upload: if record_user_uplink { upload } else { 0 },
+        user_download: if record_user_downlink { download } else { 0 },
+        record_inbound: record_inbound_uplink || record_inbound_downlink,
+        inbound_upload: if record_inbound_uplink { upload } else { 0 },
+        inbound_download: if record_inbound_downlink { download } else { 0 },
+        record_outbound: record_outbound_uplink || record_outbound_downlink,
+        outbound_upload: if record_outbound_uplink { upload } else { 0 },
+        outbound_download: if record_outbound_downlink {
+            download
+        } else {
+            0
+        },
     }
 }
 
@@ -170,23 +244,20 @@ fn accumulate_inbound(
     totals: &mut HashMap<String, InboundStats>,
     inbound: &str,
     identity: Option<&str>,
-    upload: u64,
-    download: u64,
+    inbound_totals: Option<(u64, u64)>,
+    user_totals: Option<(u64, u64)>,
 ) {
-    if let Some(stats) = totals.get_mut(inbound) {
-        stats.totals.accumulate(upload, download);
-        if let Some(identity) = identity {
-            accumulate_string_key(&mut stats.per_user, identity, upload, download);
-        }
+    if inbound_totals.is_none() && (identity.is_none() || user_totals.is_none()) {
         return;
     }
 
-    let mut stats = InboundStats::default();
-    stats.totals.accumulate(upload, download);
-    if let Some(identity) = identity {
+    let stats = totals.entry(inbound.to_owned()).or_default();
+    if let Some((upload, download)) = inbound_totals {
+        stats.totals.accumulate(upload, download);
+    }
+    if let (Some(identity), Some((upload, download))) = (identity, user_totals) {
         accumulate_string_key(&mut stats.per_user, identity, upload, download);
     }
-    totals.insert(inbound.to_owned(), stats);
 }
 
 impl StatsInner {
@@ -198,20 +269,31 @@ impl StatsInner {
             identity,
             inbound_tag,
             outbound_tag,
+            record_user,
+            user_upload,
+            user_download,
+            record_inbound,
+            inbound_upload,
+            inbound_download,
+            record_outbound,
+            outbound_upload,
+            outbound_download,
         } = plan;
 
         self.total.accumulate(upload, download);
         if let Some(identity) = identity {
             let protocol_stats = self.per_identity.entry(protocol).or_default();
             protocol_stats.totals.accumulate(upload, download);
-            let identity_inserted = accumulate_string_key(
-                &mut protocol_stats.per_identity,
-                identity,
-                upload,
-                download,
-            );
-            if identity_inserted && !self.known_identities.contains(identity) {
-                self.known_identities.insert(identity.to_owned());
+            if record_user {
+                let identity_inserted = accumulate_string_key(
+                    &mut protocol_stats.per_identity,
+                    identity,
+                    user_upload,
+                    user_download,
+                );
+                if identity_inserted && !self.known_identities.contains(identity) {
+                    self.known_identities.insert(identity.to_owned());
+                }
             }
         } else {
             self.per_protocol
@@ -224,12 +306,17 @@ impl StatsInner {
                 &mut self.per_inbound,
                 tag,
                 identity,
-                upload,
-                download,
+                record_inbound.then_some((inbound_upload, inbound_download)),
+                record_user.then_some((user_upload, user_download)),
             );
         }
-        if let Some(tag) = outbound_tag {
-            accumulate_string_key(&mut self.per_outbound, tag, upload, download);
+        if record_outbound && let Some(tag) = outbound_tag {
+            accumulate_string_key(
+                &mut self.per_outbound,
+                tag,
+                outbound_upload,
+                outbound_download,
+            );
         }
     }
 
@@ -279,11 +366,13 @@ fn merge_stats_into_snapshot(snapshot: &mut TrafficSnapshot, stats: &StatsInner)
         }
     }
     for (inbound, inbound_stats) in &stats.per_inbound {
-        snapshot
-            .per_inbound
-            .entry(inbound.clone())
-            .or_default()
-            .merge(&inbound_stats.totals);
+        if inbound_stats.totals.connections != 0 {
+            snapshot
+                .per_inbound
+                .entry(inbound.clone())
+                .or_default()
+                .merge(&inbound_stats.totals);
+        }
         for (identity, totals) in &inbound_stats.per_user {
             snapshot
                 .per_inbound_user
@@ -425,7 +514,11 @@ fn plan_active_connection(
 ) -> ActiveConnection {
     ActiveConnection {
         inbound_tag: context.inbound_tag.clone(),
-        identity: context.identity.clone(),
+        identity: if context.stats_user_online.unwrap_or(true) {
+            context.identity.clone()
+        } else {
+            None
+        },
         client_ip: context.client_ip,
         started_at,
     }
@@ -655,6 +748,87 @@ mod tests {
                 .connections,
             1
         );
+    }
+
+    #[test]
+    fn stats_policy_filters_user_and_system_dimensions_independently() {
+        let mut stats = StatsInner::default();
+        let mut context = TrafficContext::new("vless")
+            .with_identity("alice")
+            .with_inbound_tag("edge")
+            .with_outbound_tag("direct");
+        context.set_user_stats_policy(true, false, true);
+        context.set_system_stats_policy(false, true, true, false);
+
+        stats.apply(plan_traffic_record(&context, 100, 200));
+        let snapshot = stats.snapshot();
+
+        assert_eq!(snapshot.total.upload_bytes, 100);
+        assert_eq!(snapshot.total.download_bytes, 200);
+        assert_eq!(snapshot.per_protocol["vless"].upload_bytes, 100);
+        assert_eq!(snapshot.per_protocol["vless"].download_bytes, 200);
+
+        let user =
+            &snapshot.per_identity[&("vless".to_string(), "alice".to_string())];
+        assert_eq!(user.upload_bytes, 100);
+        assert_eq!(user.download_bytes, 0);
+
+        let inbound = &snapshot.per_inbound["edge"];
+        assert_eq!(inbound.upload_bytes, 0);
+        assert_eq!(inbound.download_bytes, 200);
+        let inbound_user =
+            &snapshot.per_inbound_user[&("edge".to_string(), "alice".to_string())];
+        assert_eq!(inbound_user.upload_bytes, 100);
+        assert_eq!(inbound_user.download_bytes, 0);
+
+        let outbound = &snapshot.per_outbound["direct"];
+        assert_eq!(outbound.upload_bytes, 100);
+        assert_eq!(outbound.download_bytes, 0);
+    }
+
+    #[test]
+    fn disabled_system_stats_do_not_create_zero_valued_dimension_entries() {
+        let mut stats = StatsInner::default();
+        let mut context = TrafficContext::new("trojan")
+            .with_identity("alice")
+            .with_inbound_tag("edge")
+            .with_outbound_tag("direct");
+        context.set_user_stats_policy(true, true, false);
+        context.set_system_stats_policy(false, false, false, false);
+
+        stats.apply(plan_traffic_record(&context, 7, 11));
+        let snapshot = stats.snapshot();
+
+        assert!(!snapshot.per_inbound.contains_key("edge"));
+        assert!(!snapshot.per_outbound.contains_key("direct"));
+        assert!(
+            snapshot
+                .per_inbound_user
+                .contains_key(&("edge".to_string(), "alice".to_string()))
+        );
+    }
+
+    #[test]
+    fn online_stats_policy_hides_identity_but_keeps_connection_metadata() {
+        let started_at = SystemTime::UNIX_EPOCH;
+        let mut context = TrafficContext::new("vless")
+            .with_identity("alice")
+            .with_inbound_tag("edge")
+            .with_client_ip("192.0.2.1".parse().expect("test ip"));
+        context.set_user_stats_policy(true, true, false);
+
+        let hidden = plan_active_connection(&context, started_at);
+        assert_eq!(hidden.inbound_tag.as_deref(), Some("edge"));
+        assert_eq!(hidden.identity, None);
+        assert_eq!(
+            hidden.client_ip,
+            Some("192.0.2.1".parse().expect("test ip"))
+        );
+        assert_eq!(hidden.started_at, started_at);
+
+        context.set_user_stats_policy(true, true, true);
+        let visible = plan_active_connection(&context, started_at);
+        assert_eq!(visible.identity.as_deref(), Some("alice"));
     }
 
     #[test]

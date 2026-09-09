@@ -79,10 +79,14 @@ struct TuicFlowContext {
 
 impl TuicFlowContext {
     fn traffic_context(&self) -> TrafficContext {
-        TrafficContext::new("tuic")
+        let mut context = TrafficContext::new("tuic")
             .with_identity((*self.connection.identity).clone())
             .with_inbound_tag((*self.connection.inbound_tag).clone())
-            .with_client_ip(self.peer_addr.ip())
+            .with_client_ip(self.peer_addr.ip());
+        self.connection
+            .runtime
+            .apply_traffic_stats_policy(&mut context);
+        context
     }
 }
 
@@ -1568,6 +1572,48 @@ mod tests {
     };
 
     #[test]
+    fn traffic_context_applies_level_zero_and_system_stats_policy() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let mut levels = std::collections::HashMap::new();
+        levels.insert(
+            0,
+            Some(crate::config::def::PolicyLevelConfig {
+                stats_user_uplink: false,
+                stats_user_downlink: true,
+                stats_user_online: false,
+                ..crate::config::def::PolicyLevelConfig::default()
+            }),
+        );
+        runtime.replace_policy(Some(&crate::config::def::PolicyConfig {
+            levels,
+            system: Some(crate::config::def::SystemPolicyConfig {
+                stats_inbound_uplink: true,
+                stats_inbound_downlink: false,
+                stats_outbound_uplink: false,
+                stats_outbound_downlink: true,
+            }),
+        }));
+        let context = TuicFlowContext {
+            connection: TuicConnectionContext {
+                identity: Arc::new("tuic-policy-user".into()),
+                inbound_tag: Arc::new("tuic-policy-in".into()),
+                runtime,
+            },
+            peer_addr: "127.0.0.1:12345".parse().unwrap(),
+        }
+        .traffic_context();
+
+        assert_eq!(context.user_level, 0);
+        assert_eq!(context.stats_user_uplink, Some(false));
+        assert_eq!(context.stats_user_downlink, Some(true));
+        assert_eq!(context.stats_user_online, Some(false));
+        assert_eq!(context.stats_inbound_uplink, Some(true));
+        assert_eq!(context.stats_inbound_downlink, Some(false));
+        assert_eq!(context.stats_outbound_uplink, Some(false));
+        assert_eq!(context.stats_outbound_downlink, Some(true));
+    }
+
+    #[test]
     fn serialize_address_hostname() {
         let location = NetLocation::new(Address::from("example.com").unwrap(), 443);
         let bytes = serialize_address(&location);
@@ -1602,6 +1648,23 @@ mod tests {
                 sender_settings_value: None,
             }],
         );
+        runtime.replace_policy(Some(&crate::config::def::PolicyConfig {
+            levels: std::collections::HashMap::from([(
+                0,
+                Some(crate::config::def::PolicyLevelConfig {
+                    stats_user_uplink: true,
+                    stats_user_downlink: true,
+                    stats_user_online: true,
+                    ..crate::config::def::PolicyLevelConfig::default()
+                }),
+            )]),
+            system: Some(crate::config::def::SystemPolicyConfig {
+                stats_inbound_uplink: true,
+                stats_inbound_downlink: true,
+                stats_outbound_uplink: true,
+                stats_outbound_downlink: true,
+            }),
+        }));
         let context = TuicFlowContext {
             connection: TuicConnectionContext {
                 identity: Arc::new("tuic-test-user".into()),

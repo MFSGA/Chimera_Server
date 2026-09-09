@@ -123,6 +123,13 @@ mod traffic_noop {
         pub outbound_tag: Option<String>,
         pub client_ip: Option<IpAddr>,
         pub user_level: u32,
+        pub stats_user_uplink: Option<bool>,
+        pub stats_user_downlink: Option<bool>,
+        pub stats_user_online: Option<bool>,
+        pub stats_inbound_uplink: Option<bool>,
+        pub stats_inbound_downlink: Option<bool>,
+        pub stats_outbound_uplink: Option<bool>,
+        pub stats_outbound_downlink: Option<bool>,
     }
 
     impl TrafficContext {
@@ -134,6 +141,13 @@ mod traffic_noop {
                 outbound_tag: None,
                 client_ip: None,
                 user_level: 0,
+                stats_user_uplink: None,
+                stats_user_downlink: None,
+                stats_user_online: None,
+                stats_inbound_uplink: None,
+                stats_inbound_downlink: None,
+                stats_outbound_uplink: None,
+                stats_outbound_downlink: None,
             }
         }
 
@@ -161,6 +175,30 @@ mod traffic_noop {
             self.user_level = level;
             self
         }
+
+        pub fn set_user_stats_policy(
+            &mut self,
+            uplink: bool,
+            downlink: bool,
+            online: bool,
+        ) {
+            self.stats_user_uplink = Some(uplink);
+            self.stats_user_downlink = Some(downlink);
+            self.stats_user_online = Some(online);
+        }
+
+        pub fn set_system_stats_policy(
+            &mut self,
+            inbound_uplink: bool,
+            inbound_downlink: bool,
+            outbound_uplink: bool,
+            outbound_downlink: bool,
+        ) {
+            self.stats_inbound_uplink = Some(inbound_uplink);
+            self.stats_inbound_downlink = Some(inbound_downlink);
+            self.stats_outbound_uplink = Some(outbound_uplink);
+            self.stats_outbound_downlink = Some(outbound_downlink);
+        }
     }
 
     impl Default for TrafficContext {
@@ -172,6 +210,13 @@ mod traffic_noop {
                 outbound_tag: None,
                 client_ip: None,
                 user_level: 0,
+                stats_user_uplink: None,
+                stats_user_downlink: None,
+                stats_user_online: None,
+                stats_inbound_uplink: None,
+                stats_inbound_downlink: None,
+                stats_outbound_uplink: None,
+                stats_outbound_downlink: None,
             }
         }
     }
