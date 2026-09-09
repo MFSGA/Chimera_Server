@@ -2,8 +2,6 @@ use tonic::{Request, Response, Status};
 
 #[cfg(test)]
 use crate::beginning::start_servers;
-#[cfg(feature = "hysteria")]
-use crate::config::server_config::Hysteria2Client;
 #[cfg(feature = "reality")]
 use crate::config::server_config::RealityTransportConfig;
 #[cfg(feature = "tls")]
@@ -29,6 +27,11 @@ use crate::{
     },
     runtime::{OutboundSummary, RuntimeState},
     traffic::register_identity,
+};
+#[cfg(feature = "hysteria")]
+use crate::{
+    config::server_config::Hysteria2Client,
+    handler::hysteria2::connection::HysteriaUserStore,
 };
 #[cfg(feature = "trojan")]
 use crate::{
@@ -2486,6 +2489,32 @@ impl HandlerServiceImpl {
     }
 
     #[cfg(feature = "hysteria")]
+    fn apply_hysteria_runtime_operation(
+        &self,
+        store: &HysteriaUserStore,
+        operation: AlterInboundOperation,
+    ) -> Result<(), Status> {
+        match operation {
+            AlterInboundOperation::Noop => Ok(()),
+            AlterInboundOperation::AddUser(operation) => {
+                let user = operation.user.as_ref().ok_or_else(|| {
+                    Status::invalid_argument("AddUserOperation.user is required")
+                })?;
+                store.add_user(self.parse_hysteria_client(user)?);
+                let stats = self.runtime.policy_user_stats(user.level);
+                if stats.uplink || stats.downlink {
+                    register_identity(user.email.clone());
+                }
+                Ok(())
+            }
+            AlterInboundOperation::RemoveUser(operation) => {
+                store.remove_user_by_email(&operation.email);
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(feature = "hysteria")]
     fn parse_hysteria_client(
         &self,
         user: &proto::xray::common::protocol::User,
@@ -3170,6 +3199,29 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
         let request = request.into_inner();
         let operation = self.parse_alter_inbound_operation(request.operation)?;
         if matches!(&operation, AlterInboundOperation::Noop) {
+            return Ok(Response::new(
+                proto::xray::app::proxyman::command::AlterInboundResponse {},
+            ));
+        }
+
+        #[cfg(feature = "hysteria")]
+        if self.runtime.hysteria_user_store(&request.tag).is_some() {
+            let config_operation = operation.clone();
+            self.runtime
+                .alter_hysteria_users(
+                    &request.tag,
+                    |current| {
+                        let mut updated = Self::detached_inbound(current);
+                        self.apply_alter_inbound_operation(
+                            &mut updated,
+                            config_operation,
+                        )?;
+                        Ok::<ServerConfig, Status>(updated)
+                    },
+                    |store| self.apply_hysteria_runtime_operation(store, operation),
+                )
+                .await
+                .map_err(Self::map_alter_inbound_error)?;
             return Ok(Response::new(
                 proto::xray::app::proxyman::command::AlterInboundResponse {},
             ));
@@ -6568,6 +6620,99 @@ mod tests {
                 .expect("missing Hysteria user removal should remain idempotent"),
             "Xray treats a Hysteria remove miss as a handled no-op"
         );
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[tokio::test]
+    async fn handler_alter_hysteria_users_does_not_restart_listener() {
+        let occupied = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind occupied Hysteria UDP port");
+        let port = occupied.local_addr().unwrap().port();
+        let inbound_tag = unique_tag("hysteria-no-restart-inbound");
+        let runtime = RuntimeState::new(
+            vec![ServerConfig {
+                tag: inbound_tag.clone(),
+                bind_location: BindLocation::Address(NetLocation::new(
+                    Address::Ipv4(Ipv4Addr::LOCALHOST),
+                    port,
+                )),
+                protocol: ServerProxyConfig::Hysteria2 {
+                    config: Hysteria2ServerConfig {
+                        clients: Vec::new(),
+                        bandwidth: Hysteria2BandwidthConfig::default(),
+                        ignore_client_bandwidth: false,
+                        udp_enabled: true,
+                        xray_compat: true,
+                        xray_masquerade_string: None,
+                        xray_masquerade_file: None,
+                        xray_masquerade_proxy: None,
+                        xray_congestion: None,
+                        xray_bbr_profile: None,
+                        xray_brutal_up: None,
+                        xray_brutal_down: None,
+                        xray_max_idle_timeout_secs: None,
+                        xray_keep_alive_period_secs: None,
+                        xray_udp_idle_timeout_secs: None,
+                        xray_max_incoming_streams: None,
+                        xray_init_stream_receive_window: None,
+                        xray_max_stream_receive_window: None,
+                        xray_init_connection_receive_window: None,
+                        xray_max_connection_receive_window: None,
+                        xray_disable_path_mtu_discovery: None,
+                        udp_finalmask: None,
+                    },
+                },
+                transport: Transport::Quic,
+                quic_settings: None,
+                sniffing: None,
+                tcp_socket_policy: None,
+            }],
+            Vec::new(),
+        );
+        let placeholder_task = tokio::spawn(std::future::pending::<()>());
+        let abort_handle = placeholder_task.abort_handle();
+        runtime.register_inbound_tasks(&inbound_tag, vec![placeholder_task]);
+        let service = HandlerServiceImpl::new(runtime.clone());
+        let email = unique_tag("hysteria-dynamic-user");
+        let auth = "00112233-4455-6677-8899-aabbccddeeff";
+        let add_operation = proto::xray::app::proxyman::command::AddUserOperation {
+            user: Some(proto::xray::common::protocol::User {
+                level: 9,
+                email: email.clone(),
+                account: Some(proto::xray::common::serial::TypedMessage {
+                    r#type: TYPE_PROXY_HYSTERIA_ACCOUNT.to_string(),
+                    value: HysteriaAccountPayload {
+                        auth: auth.to_string(),
+                    }
+                    .encode_to_vec(),
+                }),
+            }),
+        };
+
+        service
+            .alter_inbound(Request::new(
+                proto::xray::app::proxyman::command::AlterInboundRequest {
+                    tag: inbound_tag.clone(),
+                    operation: Some(proto::xray::common::serial::TypedMessage {
+                        r#type: TYPE_ADD_USER_OPERATION.to_string(),
+                        value: add_operation.encode_to_vec(),
+                    }),
+                },
+            ))
+            .await
+            .expect("Hysteria user update must not rebind the occupied UDP port");
+
+        assert!(!abort_handle.is_finished());
+        let updated = runtime.inbound_by_tag(&inbound_tag).unwrap();
+        let ServerProxyConfig::Hysteria2 { config } = updated.protocol else {
+            panic!("expected hysteria2 inbound");
+        };
+        assert_eq!(config.clients.len(), 1);
+        assert_eq!(config.clients[0].email.as_deref(), Some(email.as_str()));
+        assert_eq!(config.clients[0].password, auth);
+        assert_eq!(config.clients[0].level, 9);
+        assert!(runtime.stop_inbound_tasks(&inbound_tag).await);
     }
 
     #[cfg(feature = "hysteria")]

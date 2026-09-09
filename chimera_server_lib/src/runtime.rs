@@ -355,6 +355,28 @@ impl RuntimeState {
             .await
     }
 
+    #[cfg(feature = "hysteria")]
+    pub(crate) async fn alter_hysteria_users<E, F, U>(
+        &self,
+        tag: &str,
+        update_config: F,
+        update_hysteria_users: U,
+    ) -> Result<(), crate::inbound::AlterInboundError<E>>
+    where
+        E: Send,
+        F: FnOnce(&ServerConfig) -> Result<ServerConfig, E> + Send,
+        U: FnOnce(&HysteriaUserStore) -> Result<(), E> + Send,
+    {
+        self.inbound_manager
+            .alter_hysteria_users(
+                self.clone(),
+                tag,
+                update_config,
+                update_hysteria_users,
+            )
+            .await
+    }
+
     pub fn outbounds(&self) -> Vec<OutboundSummary> {
         self.outbound_snapshot().as_ref().clone()
     }

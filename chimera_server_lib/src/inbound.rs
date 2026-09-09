@@ -905,6 +905,39 @@ impl InboundManager {
         self.alter_started_locked(runtime, tag, update_config).await
     }
 
+    #[cfg(feature = "hysteria")]
+    pub(crate) async fn alter_hysteria_users<E, F, U>(
+        &self,
+        runtime: RuntimeState,
+        tag: &str,
+        update_config: F,
+        update_hysteria_users: U,
+    ) -> Result<(), AlterInboundError<E>>
+    where
+        E: Send,
+        F: FnOnce(&ServerConfig) -> Result<ServerConfig, E> + Send,
+        U: FnOnce(&HysteriaUserStore) -> Result<(), E> + Send,
+    {
+        let _operation_guard = self.operation_lock(tag).lock().await;
+        let hysteria_store = {
+            let state = self.state.read().expect("inbound manager lock poisoned");
+            let Some(entry) =
+                state.configs.iter().find(|entry| entry.config.tag == tag)
+            else {
+                return Err(AlterInboundError::NotFound);
+            };
+            entry.hysteria_users.clone()
+        };
+
+        if let Some(store) = hysteria_store {
+            update_hysteria_users(store.as_ref())
+                .map_err(AlterInboundError::Update)?;
+            return Ok(());
+        }
+
+        self.alter_started_locked(runtime, tag, update_config).await
+    }
+
     async fn alter_started_locked<E, F>(
         &self,
         runtime: RuntimeState,
