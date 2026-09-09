@@ -432,6 +432,12 @@ fn build_config(grpc_port: u16, socks_port: u16) -> String {
   }},
   "routing": {{
     "domainStrategy": "AsIs",
+    "balancers": [
+      {{
+        "tag": "balancer-a",
+        "selector": ["{DIRECT_TAG}", "{BACKUP_TAG}"]
+      }}
+    ],
     "rules": [
       {{
         "inboundTag": ["{SOCKS_TAG}"],
@@ -1549,16 +1555,20 @@ fn routing_add_rule_rejects_missing_config() {
 }
 
 #[test]
-fn routing_remove_rule_rejects_invalid_tag() {
-    trace_step("==== test routing_remove_rule_rejects_invalid_tag start ====");
-    let harness = Harness::start().expect("failed to start test harness");
-    let result: Result<RemoveRuleResponse, Status> = harness.unary(
-        PATH_ROUTING_REMOVE_RULE,
-        RemoveRuleRequest {
-            rule_tag: "nonexistent-rule".to_string(),
-        },
+fn routing_remove_missing_rule_is_idempotent_like_xray() {
+    trace_step(
+        "==== test routing_remove_missing_rule_is_idempotent_like_xray start ====",
     );
-    harness.assert_status_code(result, Code::NotFound, "RoutingService/RemoveRule");
+    let harness = Harness::start().expect("failed to start test harness");
+    let _: RemoveRuleResponse = harness.expect_ok(
+        harness.unary(
+            PATH_ROUTING_REMOVE_RULE,
+            RemoveRuleRequest {
+                rule_tag: "nonexistent-rule".to_string(),
+            },
+        ),
+        "RoutingService/RemoveRule(missing rule)",
+    );
 }
 
 #[test]
