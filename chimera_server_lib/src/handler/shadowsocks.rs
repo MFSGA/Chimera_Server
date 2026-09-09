@@ -3,7 +3,7 @@ use std::{
     io,
     pin::Pin,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     task::{Context, Poll},
@@ -38,7 +38,9 @@ use crate::{
     address::{Address, NetLocation},
     async_stream::{AsyncPing, AsyncStream},
     config::server_config::{ShadowsocksServerIdentity, ShadowsocksUser},
-    handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
+    handler::tcp::tcp_handler::{
+        TcpServerConnectionContext, TcpServerHandler, TcpServerSetupResult,
+    },
     traffic::TrafficContext,
     util::prefixed_stream::PrefixedStream,
 };
@@ -170,6 +172,135 @@ fn parse_user_key(
 
 pub(crate) fn validate_user(user: &ShadowsocksUser) -> io::Result<()> {
     parse_user_key(user).map(|_| ())
+}
+
+#[derive(Debug)]
+struct ShadowsocksRuntimeUser {
+    config: ShadowsocksUser,
+    tcp: Arc<ShadowsocksServerUser>,
+    udp: Arc<ShadowsocksUdpUserCodec>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ShadowsocksUserStore {
+    users: RwLock<Vec<Arc<ShadowsocksRuntimeUser>>>,
+    identity: Option<ShadowsocksIdentityKey>,
+}
+
+#[derive(Debug)]
+pub(crate) enum ShadowsocksUserStoreError {
+    EmptyEmail,
+    DuplicateEmail(String),
+    NotFound(String),
+    InvalidUser(io::Error),
+}
+
+impl ShadowsocksUserStore {
+    pub(crate) fn new(
+        users: Vec<ShadowsocksUser>,
+        identity: Option<ShadowsocksServerIdentity>,
+    ) -> io::Result<Self> {
+        let identity = identity.map(parse_identity_key).transpose()?;
+        let users = users
+            .into_iter()
+            .map(ShadowsocksRuntimeUser::new)
+            .map(|result| result.map(Arc::new))
+            .collect::<io::Result<Vec<_>>>()?;
+        validate_runtime_users(&users, identity.as_ref())?;
+        Ok(Self {
+            users: RwLock::new(users),
+            identity,
+        })
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<ShadowsocksUser> {
+        self.users
+            .read()
+            .expect("Shadowsocks user store lock poisoned")
+            .iter()
+            .map(|user| user.config.clone())
+            .collect()
+    }
+
+    fn tcp_users(&self) -> Vec<Arc<ShadowsocksServerUser>> {
+        self.users
+            .read()
+            .expect("Shadowsocks user store lock poisoned")
+            .iter()
+            .map(|user| user.tcp.clone())
+            .collect()
+    }
+
+    fn udp_users(&self) -> Vec<Arc<ShadowsocksUdpUserCodec>> {
+        self.users
+            .read()
+            .expect("Shadowsocks user store lock poisoned")
+            .iter()
+            .map(|user| user.udp.clone())
+            .collect()
+    }
+
+    pub(crate) fn udp_codec(
+        &self,
+        base: &ShadowsocksUdpCodec,
+    ) -> ShadowsocksUdpCodec {
+        base.with_runtime_users(self.udp_users())
+    }
+
+    pub(crate) fn is_2022(&self) -> bool {
+        self.identity.is_some()
+    }
+
+    pub(crate) fn add_user(
+        &self,
+        user: ShadowsocksUser,
+    ) -> Result<(), ShadowsocksUserStoreError> {
+        let compiled = Arc::new(
+            ShadowsocksRuntimeUser::new(user)
+                .map_err(ShadowsocksUserStoreError::InvalidUser)?,
+        );
+        let mut users = self
+            .users
+            .write()
+            .expect("Shadowsocks user store lock poisoned");
+        if self.identity.is_some()
+            && !compiled.config.email.is_empty()
+            && users
+                .iter()
+                .any(|current| current.config.email == compiled.config.email)
+        {
+            return Err(ShadowsocksUserStoreError::DuplicateEmail(
+                compiled.config.email.clone(),
+            ));
+        }
+        let mut updated = users.clone();
+        updated.push(compiled);
+        validate_runtime_users(&updated, self.identity.as_ref())
+            .map_err(ShadowsocksUserStoreError::InvalidUser)?;
+        *users = updated;
+        Ok(())
+    }
+
+    pub(crate) fn remove_user_by_email(
+        &self,
+        email: &str,
+    ) -> Result<(), ShadowsocksUserStoreError> {
+        if email.is_empty() {
+            return Err(ShadowsocksUserStoreError::EmptyEmail);
+        }
+        let mut users = self
+            .users
+            .write()
+            .expect("Shadowsocks user store lock poisoned");
+        let Some(index) = users
+            .iter()
+            .position(|user| user.config.email.eq_ignore_ascii_case(email))
+        else {
+            return Err(ShadowsocksUserStoreError::NotFound(email.to_string()));
+        };
+        users.swap_remove(index);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -803,7 +934,7 @@ impl ShadowsocksUdpUserCodec {
 
 #[derive(Debug)]
 pub(crate) struct ShadowsocksUdpCodec {
-    users: Vec<ShadowsocksUdpUserCodec>,
+    users: Vec<Arc<ShadowsocksUdpUserCodec>>,
     identity: Option<ShadowsocksIdentityKey>,
 }
 
@@ -821,6 +952,7 @@ impl ShadowsocksUdpCodec {
         let users = users
             .into_iter()
             .map(ShadowsocksUdpUserCodec::new)
+            .map(|result| result.map(Arc::new))
             .collect::<io::Result<Vec<_>>>()?;
         let identity = identity.map(parse_identity_key).transpose()?;
         if let Some(identity) = &identity
@@ -835,6 +967,13 @@ impl ShadowsocksUdpCodec {
             ));
         }
         Ok(Self { users, identity })
+    }
+
+    fn with_runtime_users(&self, users: Vec<Arc<ShadowsocksUdpUserCodec>>) -> Self {
+        Self {
+            users,
+            identity: self.identity.clone(),
+        }
     }
 
     pub(crate) fn decrypt_packet(
@@ -962,6 +1101,17 @@ struct ShadowsocksServerUser {
 }
 
 impl ShadowsocksServerUser {
+    fn new(user: &ShadowsocksUser) -> io::Result<Self> {
+        let (cipher, key) = parse_user_key(user)?;
+        Ok(Self {
+            cipher,
+            key,
+            salt_checker: Arc::new(Mutex::new(TimedSaltChecker::default())),
+            identity: user.email.clone(),
+            user_level: user.user_level,
+        })
+    }
+
     fn aead2022_psk(&self) -> Option<&[u8]> {
         match &self.key {
             ShadowsocksKeyMaterial::Aead2022(psk) => Some(psk),
@@ -970,11 +1120,44 @@ impl ShadowsocksServerUser {
     }
 }
 
+impl ShadowsocksRuntimeUser {
+    fn new(config: ShadowsocksUser) -> io::Result<Self> {
+        let tcp = Arc::new(ShadowsocksServerUser::new(&config)?);
+        let udp = Arc::new(ShadowsocksUdpUserCodec::new(config.clone())?);
+        Ok(Self { config, tcp, udp })
+    }
+}
+
+fn validate_runtime_users(
+    users: &[Arc<ShadowsocksRuntimeUser>],
+    identity: Option<&ShadowsocksIdentityKey>,
+) -> io::Result<()> {
+    if let Some(identity) = identity {
+        if users.iter().any(|user| {
+            user.tcp.cipher.name != identity.cipher.name
+                || user.tcp.aead2022_psk().is_none()
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Shadowsocks EIH users must use the identity AES method",
+            ));
+        }
+    } else if users.len() > 1 && users.iter().any(|user| user.tcp.key.is_aead2022())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Shadowsocks 2022 multi-user requires EIH identity",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct ShadowsocksTcpServerHandler {
-    users: Vec<ShadowsocksServerUser>,
+    users: Vec<Arc<ShadowsocksServerUser>>,
     identity: Option<ShadowsocksIdentityKey>,
     inbound_tag: String,
+    runtime_users: OnceLock<Arc<ShadowsocksUserStore>>,
 }
 
 impl ShadowsocksTcpServerHandler {
@@ -990,17 +1173,9 @@ impl ShadowsocksTcpServerHandler {
             ));
         }
         let users = users
-            .into_iter()
-            .map(|user| {
-                let (cipher, key) = parse_user_key(&user)?;
-                Ok(ShadowsocksServerUser {
-                    cipher,
-                    key,
-                    salt_checker: Arc::new(Mutex::new(TimedSaltChecker::default())),
-                    identity: user.email,
-                    user_level: user.user_level,
-                })
-            })
+            .iter()
+            .map(ShadowsocksServerUser::new)
+            .map(|result| result.map(Arc::new))
             .collect::<io::Result<Vec<_>>>()?;
         let identity = identity.map(parse_identity_key).transpose()?;
         if let Some(identity) = &identity {
@@ -1024,6 +1199,7 @@ impl ShadowsocksTcpServerHandler {
             users,
             identity,
             inbound_tag: inbound_tag.to_string(),
+            runtime_users: OnceLock::new(),
         })
     }
 }
@@ -1034,6 +1210,8 @@ impl TcpServerHandler for ShadowsocksTcpServerHandler {
         &self,
         mut server_stream: Box<dyn AsyncStream>,
     ) -> io::Result<TcpServerSetupResult> {
+        let runtime_users = self.runtime_users.get().map(|store| store.tcp_users());
+        let users = runtime_users.as_deref().unwrap_or(&self.users);
         let user_index = if let Some(identity) = &self.identity {
             let prefix_len = identity.cipher.salt_len + 16;
             let mut prefix = vec![0u8; prefix_len];
@@ -1048,8 +1226,7 @@ impl TcpServerHandler for ShadowsocksTcpServerHandler {
                 .try_into()
                 .expect("EIH identity header length checked");
             aes_decrypt_block(&identity_subkey, &mut user_hash)?;
-            let user_index = self
-                .users
+            let user_index = users
                 .iter()
                 .position(|user| {
                     user.aead2022_psk()
@@ -1064,19 +1241,17 @@ impl TcpServerHandler for ShadowsocksTcpServerHandler {
             server_stream =
                 Box::new(PrefixedStream::new(salt.to_vec(), server_stream));
             user_index
-        } else if self.users.len() == 1 {
+        } else if users.len() == 1 {
             0
         } else {
-            let probe_len = self
-                .users
+            let probe_len = users
                 .iter()
                 .map(|user| user.cipher.salt_len + 2 + TAG_LEN)
                 .max()
                 .unwrap_or(0);
             let mut prefix = vec![0u8; probe_len];
             server_stream.read_exact(&mut prefix).await?;
-            let user_index = self
-                .users
+            let user_index = users
                 .iter()
                 .position(|user| legacy_tcp_probe_matches(user, &prefix))
                 .ok_or_else(|| {
@@ -1088,7 +1263,7 @@ impl TcpServerHandler for ShadowsocksTcpServerHandler {
             server_stream = Box::new(PrefixedStream::new(prefix, server_stream));
             user_index
         };
-        let user = &self.users[user_index];
+        let user = &users[user_index];
         let aead2022 = user.key.is_aead2022();
         let mut plaintext = if aead2022 {
             spawn_aead2022_codec(
@@ -1138,6 +1313,21 @@ impl TcpServerHandler for ShadowsocksTcpServerHandler {
             connection_success_response: None,
             traffic_context,
         })
+    }
+
+    async fn setup_server_stream_with_context(
+        &self,
+        server_stream: Box<dyn AsyncStream>,
+        context: TcpServerConnectionContext,
+    ) -> io::Result<TcpServerSetupResult> {
+        if let Some(store) = context
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.shadowsocks_user_store(&self.inbound_tag))
+        {
+            let _ = self.runtime_users.set(store);
+        }
+        self.setup_server_stream(server_stream).await
     }
 }
 
@@ -2181,7 +2371,10 @@ impl AsyncStream for TaskBackedStream {}
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        net::Ipv4Addr,
+        sync::{Arc, Mutex},
+    };
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
@@ -2191,10 +2384,89 @@ mod tests {
     };
 
     use super::{
-        ShadowsocksCipher, ShadowsocksUdpRequest, ShadowsocksUdpUserCodec,
+        ShadowsocksCipher, ShadowsocksTcpServerHandler, ShadowsocksUdpCodec,
+        ShadowsocksUdpRequest, ShadowsocksUdpUserCodec, ShadowsocksUserStore,
         TimedSaltChecker, decrypt_stream, derive_aead2022_session_key,
         derive_master_key, encrypt_stream,
     };
+
+    #[test]
+    fn runtime_user_store_preserves_state_and_updates_udp_auth() {
+        let initial = ShadowsocksUser {
+            method: "aes-128-gcm".to_string(),
+            password: "initial-secret".to_string(),
+            email: "initial@example.com".to_string(),
+            user_level: 1,
+        };
+        let added = ShadowsocksUser {
+            method: "chacha20-ietf-poly1305".to_string(),
+            password: "added-secret".to_string(),
+            email: "added@example.com".to_string(),
+            user_level: 7,
+        };
+        let store = ShadowsocksUserStore::new(vec![initial.clone()], None)
+            .expect("valid runtime user store");
+        let tcp_before = store.tcp_users()[0].clone();
+        let udp_before = store.udp_users()[0].clone();
+
+        store.add_user(added.clone()).expect("add runtime user");
+        assert!(Arc::ptr_eq(&tcp_before, &store.tcp_users()[0]));
+        assert!(Arc::ptr_eq(&udp_before, &store.udp_users()[0]));
+
+        let base = ShadowsocksUdpCodec::new(vec![initial], None)
+            .expect("valid base UDP codec");
+        let client = ShadowsocksUdpCodec::new(vec![added], None)
+            .expect("valid added-user UDP codec");
+        let target = NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 53);
+        let packet = client
+            .encrypt_test_request(&target, b"runtime-user")
+            .expect("encrypt added-user request");
+        let request = store
+            .udp_codec(&base)
+            .decrypt_packet(&packet)
+            .expect("runtime codec should accept added user");
+        assert_eq!(request.identity, "added@example.com");
+        assert_eq!(request.user_level, 7);
+
+        store
+            .remove_user_by_email("ADDED@example.com")
+            .expect("case-insensitive runtime remove");
+        assert!(Arc::ptr_eq(&tcp_before, &store.tcp_users()[0]));
+        assert!(Arc::ptr_eq(&udp_before, &store.udp_users()[0]));
+    }
+
+    #[test]
+    fn tcp_handler_runtime_store_tracks_updates_without_rebuild() {
+        let initial = ShadowsocksUser {
+            method: "aes-128-gcm".to_string(),
+            password: "initial-secret".to_string(),
+            email: "initial@example.com".to_string(),
+            user_level: 1,
+        };
+        let added = ShadowsocksUser {
+            method: "aes-256-gcm".to_string(),
+            password: "added-secret".to_string(),
+            email: "added@example.com".to_string(),
+            user_level: 9,
+        };
+        let store = Arc::new(
+            ShadowsocksUserStore::new(vec![initial.clone()], None)
+                .expect("valid runtime user store"),
+        );
+        let handler =
+            ShadowsocksTcpServerHandler::new(vec![initial], None, "ss-test")
+                .expect("valid TCP handler");
+        handler
+            .runtime_users
+            .set(store.clone())
+            .expect("bind runtime store");
+
+        store.add_user(added).expect("add runtime user");
+        let users = handler.runtime_users.get().unwrap().tcp_users();
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[1].identity, "added@example.com");
+        assert_eq!(users[1].user_level, 9);
+    }
 
     #[test]
     fn derives_xray_compatible_aes_128_master_key() {

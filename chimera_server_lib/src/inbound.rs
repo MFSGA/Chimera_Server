@@ -11,6 +11,8 @@ use tokio::{sync::Mutex, task::JoinHandle};
 use crate::config::server_config::VlessUser;
 #[cfg(feature = "hysteria")]
 use crate::handler::hysteria2::connection::HysteriaUserStore;
+#[cfg(feature = "shadowsocks")]
+use crate::handler::shadowsocks::ShadowsocksUserStore;
 use crate::{
     beginning::start_servers,
     config::server_config::{ServerConfig, ServerProxyConfig},
@@ -55,6 +57,8 @@ struct VersionedConfig {
     trojan_users: Option<Arc<TrojanUserStore>>,
     #[cfg(feature = "hysteria")]
     hysteria_users: Option<Arc<HysteriaUserStore>>,
+    #[cfg(feature = "shadowsocks")]
+    shadowsocks_users: Option<Arc<ShadowsocksUserStore>>,
 }
 
 #[cfg(feature = "vless")]
@@ -104,6 +108,12 @@ impl VersionedConfig {
                 }
                 _ => None,
             },
+            #[cfg(feature = "shadowsocks")]
+            shadowsocks_users: single_shadowsocks_users(&config.protocol)
+                .and_then(|(users, identity)| {
+                    ShadowsocksUserStore::new(users, identity).ok()
+                })
+                .map(Arc::new),
             generation,
             config,
         }
@@ -132,6 +142,11 @@ impl VersionedConfig {
                 &mut config.protocol
         {
             hysteria.clients = store.snapshot();
+        }
+        #[cfg(feature = "shadowsocks")]
+        if let Some(store) = &self.shadowsocks_users {
+            let users = store.snapshot();
+            let _ = replace_single_shadowsocks_users(&mut config.protocol, &users);
         }
         config
     }
@@ -422,6 +437,113 @@ fn replace_single_trojan_users(
     }
 }
 
+#[cfg(feature = "shadowsocks")]
+fn single_shadowsocks_users(
+    protocol: &ServerProxyConfig,
+) -> Option<(
+    Vec<crate::config::server_config::ShadowsocksUser>,
+    Option<crate::config::server_config::ShadowsocksServerIdentity>,
+)> {
+    let mut matches = Vec::new();
+    collect_shadowsocks_users(protocol, &mut matches);
+    (matches.len() == 1).then(|| matches.remove(0))
+}
+
+#[cfg(feature = "shadowsocks")]
+fn collect_shadowsocks_users(
+    protocol: &ServerProxyConfig,
+    matches: &mut Vec<(
+        Vec<crate::config::server_config::ShadowsocksUser>,
+        Option<crate::config::server_config::ShadowsocksServerIdentity>,
+    )>,
+) {
+    match protocol {
+        ServerProxyConfig::Shadowsocks { users, identity } => {
+            matches.push((users.clone(), identity.clone()));
+        }
+        #[cfg(feature = "ws")]
+        ServerProxyConfig::Websocket { targets } => match targets.as_ref() {
+            crate::util::option::OneOrSome::One(target) => {
+                collect_shadowsocks_users(&target.protocol, matches);
+            }
+            crate::util::option::OneOrSome::Some(targets) => {
+                for target in targets {
+                    collect_shadowsocks_users(&target.protocol, matches);
+                }
+            }
+        },
+        #[cfg(feature = "tls")]
+        ServerProxyConfig::Tls(config) => {
+            collect_shadowsocks_users(&config.inner, matches);
+        }
+        #[cfg(feature = "reality")]
+        ServerProxyConfig::Reality(config) => {
+            collect_shadowsocks_users(&config.inner, matches);
+        }
+        ServerProxyConfig::Xhttp { inner, .. } => {
+            collect_shadowsocks_users(inner, matches);
+        }
+        #[cfg(feature = "httpupgrade")]
+        ServerProxyConfig::HttpUpgrade(config) => {
+            collect_shadowsocks_users(&config.inner, matches);
+        }
+        #[cfg(feature = "grpc_transport")]
+        ServerProxyConfig::Grpc(config) => {
+            collect_shadowsocks_users(&config.inner, matches);
+        }
+        _ => {}
+    }
+}
+
+#[cfg(feature = "shadowsocks")]
+fn replace_single_shadowsocks_users(
+    protocol: &mut ServerProxyConfig,
+    users: &[crate::config::server_config::ShadowsocksUser],
+) -> bool {
+    match protocol {
+        ServerProxyConfig::Shadowsocks { users: current, .. } => {
+            *current = users.to_vec();
+            true
+        }
+        #[cfg(feature = "ws")]
+        ServerProxyConfig::Websocket { targets } => match targets.as_mut() {
+            crate::util::option::OneOrSome::One(target) => {
+                replace_single_shadowsocks_users(&mut target.protocol, users)
+            }
+            crate::util::option::OneOrSome::Some(targets) => {
+                let mut replaced = false;
+                for target in targets {
+                    replaced |= replace_single_shadowsocks_users(
+                        &mut target.protocol,
+                        users,
+                    );
+                }
+                replaced
+            }
+        },
+        #[cfg(feature = "tls")]
+        ServerProxyConfig::Tls(config) => {
+            replace_single_shadowsocks_users(&mut config.inner, users)
+        }
+        #[cfg(feature = "reality")]
+        ServerProxyConfig::Reality(config) => {
+            replace_single_shadowsocks_users(&mut config.inner, users)
+        }
+        ServerProxyConfig::Xhttp { inner, .. } => {
+            replace_single_shadowsocks_users(inner, users)
+        }
+        #[cfg(feature = "httpupgrade")]
+        ServerProxyConfig::HttpUpgrade(config) => {
+            replace_single_shadowsocks_users(&mut config.inner, users)
+        }
+        #[cfg(feature = "grpc_transport")]
+        ServerProxyConfig::Grpc(config) => {
+            replace_single_shadowsocks_users(&mut config.inner, users)
+        }
+        _ => false,
+    }
+}
+
 #[derive(Debug)]
 struct InboundTaskSet {
     generation: u64,
@@ -585,6 +707,21 @@ impl InboundManager {
             .iter()
             .find(|entry| entry.config.tag == tag)
             .and_then(|entry| entry.hysteria_users.as_ref())
+            .cloned()
+    }
+
+    #[cfg(feature = "shadowsocks")]
+    pub(crate) fn shadowsocks_user_store(
+        &self,
+        tag: &str,
+    ) -> Option<Arc<ShadowsocksUserStore>> {
+        self.state
+            .read()
+            .expect("inbound manager lock poisoned")
+            .configs
+            .iter()
+            .find(|entry| entry.config.tag == tag)
+            .and_then(|entry| entry.shadowsocks_users.as_ref())
             .cloned()
     }
 

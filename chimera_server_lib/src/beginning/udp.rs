@@ -2479,6 +2479,7 @@ async fn start_shadowsocks_udp_server(
     let bind_addr = bind_location_to_socket_addr(&bind_location)?;
     let socket = create_udp_listener(bind_addr, socket_policy.as_ref(), false)?;
     let codec = Arc::new(ShadowsocksUdpCodec::new(users, identity)?);
+    let runtime_users = runtime.shadowsocks_user_store(&inbound_tag);
     info!("Starting Shadowsocks UDP server at {}", bind_location);
 
     Ok(Some(tokio::spawn(async move {
@@ -2494,7 +2495,10 @@ async fn start_shadowsocks_udp_server(
             };
             let packet = buffer[..len].to_vec();
             let socket = socket.clone();
-            let codec = codec.clone();
+            let codec = runtime_users
+                .as_ref()
+                .map(|store| Arc::new(store.udp_codec(codec.as_ref())))
+                .unwrap_or_else(|| codec.clone());
             let runtime = runtime.clone();
             let resolver = resolver.clone();
             let inbound_tag = inbound_tag.clone();
