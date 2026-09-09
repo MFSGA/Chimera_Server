@@ -6,8 +6,11 @@ use std::{
 
 use tokio::{sync::broadcast, task::JoinHandle};
 
+#[cfg(feature = "vless")]
+use crate::config::server_config::VlessUser;
 use crate::{
     config::{def::PolicyConfig, server_config::ServerConfig},
+    inbound::InboundManager,
     routing_state::{
         BalancerTargetMap, OutboundObservation, RouteMatch, RoutingEvent,
         RoutingInput, RoutingState,
@@ -84,9 +87,8 @@ impl RoutingPublication {
 
 #[derive(Debug, Clone)]
 pub struct RuntimeState {
-    inbounds: Arc<RwLock<Vec<ServerConfig>>>,
+    inbound_manager: Arc<InboundManager>,
     routing_publication: Arc<RwLock<Arc<RoutingPublication>>>,
-    inbound_tasks: Arc<RwLock<HashMap<String, Vec<JoinHandle<()>>>>>,
     routing_updates: Arc<Mutex<()>>,
     policy: Arc<RwLock<PolicyConfig>>,
     user_domain_access: UserDomainAccessStore,
@@ -103,11 +105,10 @@ impl RuntimeState {
         let routing = Arc::new(RoutingState::default());
         let outbounds = Arc::new(outbounds);
         Self {
-            inbounds: Arc::new(RwLock::new(inbounds)),
+            inbound_manager: Arc::new(InboundManager::new(inbounds)),
             routing_publication: Arc::new(RwLock::new(Arc::new(
                 RoutingPublication::new(routing, outbounds),
             ))),
-            inbound_tasks: Arc::new(RwLock::new(HashMap::new())),
             routing_updates: Arc::new(Mutex::new(())),
             policy: Arc::new(RwLock::new(PolicyConfig::default())),
             user_domain_access: UserDomainAccessStore::default(),
@@ -229,81 +230,61 @@ impl RuntimeState {
         }
     }
 
+    pub(crate) fn inbound_manager(&self) -> Arc<InboundManager> {
+        Arc::clone(&self.inbound_manager)
+    }
+
     pub fn inbounds(&self) -> Vec<ServerConfig> {
-        self.inbounds
-            .read()
-            .expect("runtime inbounds lock poisoned")
-            .clone()
+        self.inbound_manager.configs()
     }
 
     pub fn inbound_by_tag(&self, tag: &str) -> Option<ServerConfig> {
-        self.inbounds
-            .read()
-            .expect("runtime inbounds lock poisoned")
-            .iter()
-            .find(|cfg| cfg.tag == tag)
-            .cloned()
+        self.inbound_manager.config_by_tag(tag)
     }
 
     pub fn with_inbound_mut<R, F>(&self, tag: &str, mutator: F) -> Option<R>
     where
         F: FnOnce(&mut ServerConfig) -> R,
     {
-        let mut guard = self
-            .inbounds
-            .write()
-            .expect("runtime inbounds lock poisoned");
-        let inbound = guard.iter_mut().find(|cfg| cfg.tag == tag)?;
-        Some(mutator(inbound))
+        self.inbound_manager.with_config_mut(tag, mutator)
     }
 
     pub fn remove_inbound(&self, tag: &str) -> Option<ServerConfig> {
-        let mut guard = self
-            .inbounds
-            .write()
-            .expect("runtime inbounds lock poisoned");
-        let index = guard.iter().position(|cfg| cfg.tag == tag)?;
-        Some(guard.remove(index))
+        self.inbound_manager.remove_config(tag)
     }
 
     pub fn add_inbound(&self, inbound: ServerConfig) -> Result<(), String> {
-        let mut guard = self
-            .inbounds
-            .write()
-            .expect("runtime inbounds lock poisoned");
-        if guard.iter().any(|cfg| cfg.tag == inbound.tag) {
-            return Err(format!("inbound {} already exists", inbound.tag));
-        }
-        guard.push(inbound);
-        Ok(())
+        self.inbound_manager.add_config(inbound)
     }
 
     pub fn register_inbound_tasks(&self, tag: &str, handles: Vec<JoinHandle<()>>) {
-        self.inbound_tasks
-            .write()
-            .expect("runtime inbound tasks lock poisoned")
-            .insert(tag.to_string(), handles);
+        self.inbound_manager.register_tasks(tag, handles);
     }
 
     pub async fn stop_inbound_tasks(&self, tag: &str) -> bool {
-        let Some(handles) = self
-            .inbound_tasks
-            .write()
-            .expect("runtime inbound tasks lock poisoned")
-            .remove(tag)
-        else {
-            return false;
-        };
+        self.inbound_manager.stop_tasks(tag).await
+    }
 
-        for handle in &handles {
-            handle.abort();
-        }
+    #[cfg(feature = "vless")]
+    pub(crate) fn vless_users_snapshot(&self, tag: &str) -> Option<Vec<VlessUser>> {
+        self.inbound_manager.vless_users_snapshot(tag)
+    }
 
-        for handle in handles {
-            let _ = handle.await;
-        }
-
-        true
+    #[cfg(feature = "vless")]
+    pub(crate) async fn alter_inbound_users<E, F, U>(
+        &self,
+        tag: &str,
+        update_config: F,
+        update_vless_users: U,
+    ) -> Result<(), crate::inbound::AlterInboundError<E>>
+    where
+        E: Send,
+        F: FnOnce(&ServerConfig) -> Result<ServerConfig, E> + Send,
+        U: FnOnce(&mut Vec<VlessUser>) -> Result<bool, E> + Send,
+    {
+        self.inbound_manager
+            .alter_users(self.clone(), tag, update_config, update_vless_users)
+            .await
     }
 
     pub fn outbounds(&self) -> Vec<OutboundSummary> {

@@ -43,6 +43,8 @@ mod log;
 
 mod handler;
 
+mod inbound;
+
 mod resolver;
 
 mod routing_observer;

@@ -1,5 +1,7 @@
 use tonic::{Request, Response, Status};
 
+#[cfg(test)]
+use crate::beginning::start_servers;
 #[cfg(feature = "hysteria")]
 use crate::config::server_config::Hysteria2Client;
 #[cfg(feature = "reality")]
@@ -20,10 +22,12 @@ use crate::config::server_config::{VmessUser, normalize_vmess_user_id};
 use crate::util::option::OneOrSome;
 use crate::{
     address::{Address, BindLocation, NetLocation},
-    beginning::start_servers,
     config::{
         Transport,
         server_config::{ServerConfig, ServerProxyConfig, SocksUser},
+    },
+    inbound::{
+        AddInboundError, AlterInboundError, InboundManager, RemoveInboundError,
     },
     runtime::{OutboundSummary, RuntimeState},
     traffic::register_identity,
@@ -609,9 +613,11 @@ struct RealityConfigPayload {
 #[derive(Clone)]
 pub(super) struct HandlerServiceImpl {
     runtime: RuntimeState,
-    mutation_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    inbound_manager: std::sync::Arc<InboundManager>,
+    outbound_mutation_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
+#[derive(Clone)]
 enum AlterInboundOperation {
     Noop,
     AddUser(proto::xray::app::proxyman::command::AddUserOperation),
@@ -620,9 +626,11 @@ enum AlterInboundOperation {
 
 impl HandlerServiceImpl {
     fn new(runtime: RuntimeState) -> Self {
+        let inbound_manager = runtime.inbound_manager();
         Self {
             runtime,
-            mutation_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            inbound_manager,
+            outbound_mutation_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -916,6 +924,74 @@ impl HandlerServiceImpl {
             user_level: user.level,
             flow: account.flow,
         })
+    }
+
+    #[cfg(feature = "vless")]
+    fn add_vless_user(
+        &self,
+        users: &mut Vec<VlessUser>,
+        user: &proto::xray::common::protocol::User,
+    ) -> Result<(), Status> {
+        let user = self.parse_vless_user(user)?;
+        if users
+            .iter()
+            .any(|existing| existing.user_label == user.user_label)
+        {
+            return Err(Status::already_exists(format!(
+                "VLESS user {} already exists",
+                user.user_label
+            )));
+        }
+        users.push(user);
+        Ok(())
+    }
+
+    #[cfg(feature = "vless")]
+    fn remove_vless_user(
+        &self,
+        users: &mut Vec<VlessUser>,
+        email: &str,
+    ) -> Result<(), Status> {
+        let before = users.len();
+        users.retain(|user| user.user_label != email);
+        if before == users.len() {
+            return Err(Status::not_found(format!("VLESS user {email} not found")));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "vless")]
+    fn apply_vless_runtime_operation(
+        &self,
+        users: &mut Vec<VlessUser>,
+        operation: AlterInboundOperation,
+    ) -> Result<bool, Status> {
+        let required_vision_before =
+            crate::handler::vless_handler::users_require_vision(users);
+        match operation {
+            AlterInboundOperation::Noop => return Ok(true),
+            AlterInboundOperation::AddUser(operation) => {
+                let user = operation.user.as_ref().ok_or_else(|| {
+                    Status::invalid_argument("AddUserOperation.user is required")
+                })?;
+                self.add_vless_user(users, user)?;
+                let stats = self.runtime.policy_user_stats(user.level);
+                if stats.uplink || stats.downlink {
+                    register_identity(user.email.clone());
+                }
+            }
+            AlterInboundOperation::RemoveUser(operation) => {
+                let email = operation.email.trim();
+                if email.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "RemoveUserOperation.email is required",
+                    ));
+                }
+                self.remove_vless_user(users, email)?;
+            }
+        }
+        Ok(required_vision_before
+            == crate::handler::vless_handler::users_require_vision(users))
     }
 
     #[cfg(feature = "vmess")]
@@ -2339,17 +2415,7 @@ impl HandlerServiceImpl {
         match protocol {
             #[cfg(feature = "vless")]
             ServerProxyConfig::Vless { users, .. } => {
-                let user = self.parse_vless_user(user)?;
-                if users
-                    .iter()
-                    .any(|existing| existing.user_label == user.user_label)
-                {
-                    return Err(Status::already_exists(format!(
-                        "VLESS user {} already exists",
-                        user.user_label
-                    )));
-                }
-                users.push(user);
+                self.add_vless_user(users, user)?;
                 Ok(true)
             }
             #[cfg(feature = "vmess")]
@@ -2500,14 +2566,8 @@ impl HandlerServiceImpl {
         match protocol {
             #[cfg(feature = "vless")]
             ServerProxyConfig::Vless { users, .. } => {
-                let before = users.len();
-                users.retain(|user| user.user_label != email);
-                if before == users.len() {
-                    return Err(Status::not_found(format!(
-                        "VLESS user {email} not found"
-                    )));
-                }
-                Ok(before != users.len())
+                self.remove_vless_user(users, email)?;
+                Ok(true)
             }
             #[cfg(feature = "vmess")]
             ServerProxyConfig::Vmess { users } => {
@@ -2937,27 +2997,23 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
         Response<proto::xray::app::proxyman::command::AddInboundResponse>,
         Status,
     > {
-        let _mutation_guard = self.mutation_lock.lock().await;
         let request = request.into_inner();
         let inbound = request
             .inbound
             .ok_or_else(|| Status::invalid_argument("inbound is required"))?;
         let inbound = self.parse_add_inbound(inbound)?;
-        let inbound_tag = inbound.tag.clone();
-        self.runtime.add_inbound(inbound.clone()).map_err(|error| {
-            Status::already_exists(format!("existing tag: {error}"))
-        })?;
-
-        let handles = match start_servers(inbound, self.runtime.clone()).await {
-            Ok(handles) => handles,
-            Err(err) => {
-                self.runtime.remove_inbound(&inbound_tag);
-                return Err(Status::unknown(format!(
-                    "failed to start inbound handler: {err}"
-                )));
-            }
-        };
-        self.runtime.register_inbound_tasks(&inbound_tag, handles);
+        self.inbound_manager
+            .add_started(self.runtime.clone(), inbound)
+            .await
+            .map_err(|error| match error {
+                AddInboundError::AlreadyExists(error) => {
+                    Status::already_exists(format!("existing tag: {error}"))
+                }
+                AddInboundError::Start(error) => Status::unknown(format!(
+                    "failed to start inbound handler: {error}"
+                )),
+                AddInboundError::State(error) => Status::internal(error),
+            })?;
 
         Ok(Response::new(
             proto::xray::app::proxyman::command::AddInboundResponse {},
@@ -2971,12 +3027,15 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
         Response<proto::xray::app::proxyman::command::RemoveInboundResponse>,
         Status,
     > {
-        let _mutation_guard = self.mutation_lock.lock().await;
         let request = request.into_inner();
-        let Some(_) = self.runtime.remove_inbound(&request.tag) else {
-            return Err(Status::not_found("inbound not found"));
-        };
-        self.runtime.stop_inbound_tasks(&request.tag).await;
+        self.inbound_manager
+            .remove_started(&request.tag)
+            .await
+            .map_err(|error| match error {
+                RemoveInboundError::NotFound => {
+                    Status::not_found("inbound not found")
+                }
+            })?;
         Ok(Response::new(
             proto::xray::app::proxyman::command::RemoveInboundResponse {},
         ))
@@ -2989,7 +3048,6 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
         Response<proto::xray::app::proxyman::command::AlterInboundResponse>,
         Status,
     > {
-        let _mutation_guard = self.mutation_lock.lock().await;
         let request = request.into_inner();
         let operation = self.parse_alter_inbound_operation(request.operation)?;
         if matches!(&operation, AlterInboundOperation::Noop) {
@@ -2998,45 +3056,51 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
             ));
         }
 
-        let Some(current) = self.runtime.inbound_by_tag(&request.tag) else {
-            return Err(Status::not_found("inbound not found"));
+        #[cfg(feature = "vless")]
+        let alter_result = {
+            let config_operation = operation.clone();
+            self.runtime
+                .alter_inbound_users(
+                    &request.tag,
+                    |current| {
+                        let mut updated = Self::detached_inbound(current);
+                        self.apply_alter_inbound_operation(
+                            &mut updated,
+                            config_operation,
+                        )?;
+                        Ok::<ServerConfig, Status>(updated)
+                    },
+                    |users| self.apply_vless_runtime_operation(users, operation),
+                )
+                .await
         };
-        let original = Self::detached_inbound(&current);
-        let mut updated = Self::detached_inbound(&current);
-        self.apply_alter_inbound_operation(&mut updated, operation)?;
-        self.runtime
-            .with_inbound_mut(&request.tag, |inbound| *inbound = updated.clone())
-            .ok_or_else(|| Status::not_found("inbound not found"))?;
+        #[cfg(not(feature = "vless"))]
+        let alter_result = self
+            .inbound_manager
+            .alter_started(self.runtime.clone(), &request.tag, |current| {
+                let mut updated = Self::detached_inbound(current);
+                self.apply_alter_inbound_operation(&mut updated, operation)?;
+                Ok::<ServerConfig, Status>(updated)
+            })
+            .await;
 
-        if self.runtime.stop_inbound_tasks(&request.tag).await {
-            match start_servers(updated, self.runtime.clone()).await {
-                Ok(handles) => {
-                    self.runtime.register_inbound_tasks(&request.tag, handles);
-                }
-                Err(start_error) => {
-                    self.runtime
-                        .with_inbound_mut(&request.tag, |inbound| {
-                            *inbound = original.clone()
-                        })
-                        .ok_or_else(|| Status::not_found("inbound not found"))?;
-                    tokio::task::yield_now().await;
-                    let rollback =
-                        start_servers(original, self.runtime.clone()).await;
-                    return match rollback {
-                        Ok(handles) => {
-                            self.runtime
-                                .register_inbound_tasks(&request.tag, handles);
-                            Err(Status::unknown(format!(
-                                "failed to restart inbound handler: {start_error}; previous inbound restored"
-                            )))
-                        }
-                        Err(rollback_error) => Err(Status::unknown(format!(
-                            "failed to restart inbound handler: {start_error}; rollback failed: {rollback_error}"
-                        ))),
-                    };
-                }
-            }
-        }
+        alter_result.map_err(|error| match error {
+                AlterInboundError::NotFound => Status::not_found("inbound not found"),
+                AlterInboundError::Update(error) => error,
+                AlterInboundError::State(error) => Status::internal(error),
+                AlterInboundError::Restart {
+                    start_error,
+                    rollback_error: None,
+                } => Status::unknown(format!(
+                    "failed to restart inbound handler: {start_error}; previous inbound restored"
+                )),
+                AlterInboundError::Restart {
+                    start_error,
+                    rollback_error: Some(rollback_error),
+                } => Status::unknown(format!(
+                    "failed to restart inbound handler: {start_error}; rollback failed: {rollback_error}"
+                )),
+            })?;
 
         Ok(Response::new(
             proto::xray::app::proxyman::command::AlterInboundResponse {},
@@ -3118,7 +3182,7 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
         Response<proto::xray::app::proxyman::command::AddOutboundResponse>,
         Status,
     > {
-        let _mutation_guard = self.mutation_lock.lock().await;
+        let _mutation_guard = self.outbound_mutation_lock.lock().await;
         let request = request.into_inner();
         let outbound = request
             .outbound
@@ -3139,7 +3203,7 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
         Response<proto::xray::app::proxyman::command::RemoveOutboundResponse>,
         Status,
     > {
-        let _mutation_guard = self.mutation_lock.lock().await;
+        let _mutation_guard = self.outbound_mutation_lock.lock().await;
         let request = request.into_inner();
         let Some(_) = self.runtime.remove_outbound(&request.tag) else {
             return Err(Status::not_found("outbound not found"));
@@ -3954,12 +4018,12 @@ mod tests {
 
     #[cfg(feature = "vless")]
     #[tokio::test]
-    async fn handler_alter_inbound_rolls_back_config_when_restart_fails() {
+    async fn handler_alter_vless_users_does_not_restart_listener() {
         let occupied = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
         let port = occupied.local_addr().unwrap().port();
-        let inbound_tag = unique_tag("rollback-inbound");
+        let inbound_tag = unique_tag("no-restart-inbound");
         let inbound = ServerConfig {
             tag: inbound_tag.clone(),
             bind_location: BindLocation::Address(NetLocation::new(
@@ -3977,18 +4041,88 @@ mod tests {
         };
         let runtime = RuntimeState::new(vec![inbound], Vec::new());
         let placeholder_task = tokio::spawn(std::future::pending::<()>());
+        let abort_handle = placeholder_task.abort_handle();
         runtime.register_inbound_tasks(&inbound_tag, vec![placeholder_task]);
         let service = HandlerServiceImpl::new(runtime.clone());
-        let added_email = unique_tag("failed-user");
+        let added_email = unique_tag("dynamic-user");
         let operation = proto::xray::app::proxyman::command::AddUserOperation {
             user: Some(proto::xray::common::protocol::User {
                 level: 0,
-                email: added_email,
+                email: added_email.clone(),
                 account: Some(proto::xray::common::serial::TypedMessage {
                     r#type: TYPE_PROXY_VLESS_ACCOUNT.to_string(),
                     value: VlessAccountPayload {
                         id: "9199ca5b-1850-4ae6-a4fa-fd6384073692".to_string(),
                         flow: String::new(),
+                    }
+                    .encode_to_vec(),
+                }),
+            }),
+        };
+
+        service
+            .alter_inbound(Request::new(
+                proto::xray::app::proxyman::command::AlterInboundRequest {
+                    tag: inbound_tag.clone(),
+                    operation: Some(proto::xray::common::serial::TypedMessage {
+                        r#type: TYPE_ADD_USER_OPERATION.to_string(),
+                        value: operation.encode_to_vec(),
+                    }),
+                },
+            ))
+            .await
+            .expect("VLESS user update must not rebind the occupied listener");
+
+        assert!(!abort_handle.is_finished());
+        let updated = runtime.inbound_by_tag(&inbound_tag).unwrap();
+        let ServerProxyConfig::Vless { users, .. } = updated.protocol else {
+            panic!("expected vless inbound");
+        };
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].user_label, added_email);
+        assert!(runtime.stop_inbound_tasks(&inbound_tag).await);
+    }
+
+    #[cfg(feature = "vless")]
+    #[tokio::test]
+    async fn handler_vless_vision_mode_change_keeps_restart_fallback() {
+        let occupied = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let inbound_tag = unique_tag("vision-restart-inbound");
+        let runtime = RuntimeState::new(
+            vec![ServerConfig {
+                tag: inbound_tag.clone(),
+                bind_location: BindLocation::Address(NetLocation::new(
+                    Address::Ipv4(Ipv4Addr::LOCALHOST),
+                    port,
+                )),
+                protocol: ServerProxyConfig::Vless {
+                    users: Vec::new(),
+                    fallbacks: Vec::new(),
+                },
+                transport: Transport::Tcp,
+                quic_settings: None,
+                sniffing: None,
+                tcp_socket_policy: None,
+            }],
+            Vec::new(),
+        );
+        runtime.register_inbound_tasks(
+            &inbound_tag,
+            vec![tokio::spawn(std::future::pending::<()>())],
+        );
+        let service = HandlerServiceImpl::new(runtime.clone());
+        let operation = proto::xray::app::proxyman::command::AddUserOperation {
+            user: Some(proto::xray::common::protocol::User {
+                level: 0,
+                email: unique_tag("vision-user"),
+                account: Some(proto::xray::common::serial::TypedMessage {
+                    r#type: TYPE_PROXY_VLESS_ACCOUNT.to_string(),
+                    value: VlessAccountPayload {
+                        id: "9199ca5b-1850-4ae6-a4fa-fd6384073692".to_string(),
+                        flow: "xtls-rprx-vision".to_string(),
                     }
                     .encode_to_vec(),
                 }),
@@ -4006,13 +4140,13 @@ mod tests {
                 },
             ))
             .await
-            .expect_err("occupied listener should fail both restart attempts");
+            .expect_err("Vision mode transition must retain restart fallback");
 
         assert_eq!(error.code(), Code::Unknown);
         assert!(error.message().contains("rollback failed"));
-        let restored = runtime.inbound_by_tag(&inbound_tag).unwrap();
-        let ServerProxyConfig::Vless { users, .. } = restored.protocol else {
-            panic!("expected vless inbound");
+        let current = runtime.inbound_by_tag(&inbound_tag).unwrap();
+        let ServerProxyConfig::Vless { users, .. } = current.protocol else {
+            panic!("expected VLESS inbound");
         };
         assert!(users.is_empty());
     }

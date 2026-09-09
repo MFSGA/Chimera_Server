@@ -227,6 +227,12 @@ impl TcpServerHandler for TlsServerHandler {
                 fallbacks,
                 inbound_tag,
             } => {
+                let dynamic_users = context
+                    .runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.vless_users_snapshot(inbound_tag))
+                    .map(|users| parse_vision_users(&users));
+                let users = dynamic_users.as_deref().unwrap_or(users);
                 let tls_stream = self
                     .acceptor
                     .accept(VisionRecordIo::new(server_stream))

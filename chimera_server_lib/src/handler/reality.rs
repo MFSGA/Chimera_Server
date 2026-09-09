@@ -748,6 +748,27 @@ impl TcpServerHandler for RealityVisionVlessServerHandler {
         )
         .await
     }
+
+    async fn setup_server_stream_with_context(
+        &self,
+        server_stream: Box<dyn AsyncStream>,
+        context: TcpServerConnectionContext,
+    ) -> io::Result<TcpServerSetupResult> {
+        let dynamic_users = context
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.vless_users_snapshot(&self.inbound_tag));
+        let users = dynamic_users.as_deref().unwrap_or(&self.users);
+        let tls_stream =
+            accept_reality_stream(server_stream, &self.transport_config).await?;
+        setup_reality_mixed_vless_server_stream(
+            tls_stream,
+            users,
+            &self.fallbacks,
+            &self.inbound_tag,
+        )
+        .await
+    }
 }
 
 #[cfg(test)]

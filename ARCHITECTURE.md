@@ -331,6 +331,8 @@ cargo check -p chimera_server_app --no-default-features --features minimal-vless
 | M5 | 提取传输/协议组合边界 | 所涉及的 TLS/REALITY/传输组合互通不变 |
 | M6 | 收窄 RuntimeState 与依赖，扩展到其余 inbound | 无控制面格式进入数据面，公共调用方保持可用 |
 
+实施状态（2026-09-09）：M2/M6 已完成第二层生命周期迁移，M3 已完成单一 VLESS UserManager 的第一批运行时分离，但均尚未完成整个阶段。`InboundManager` 统一持有运行时 inbound 配置与 listener task 注册表，并已接管 gRPC Add/Remove/Alter 的启动、停止和失败回滚事务；同 tag 操作通过有界 hash-lock 分片串行化，运行实例使用 generation 区分同 tag 重建，旧 generation 的 task 注册或停止不能影响新实例。Add 仅在 listener 启动成功后发布配置与 task，Remove 在摘除实例后 abort/await task，非原地 Alter 重启失败时按既有行为尝试恢复旧实例。对只有一个 VLESS UserManager 的 inbound，初始用户仍来自配置计划，但可变用户集合现由实例级运行时存储持有；管理查询把该快照投影回配置视图，VLESS/TLS/REALITY/Vision 数据面在新握手时读取最新用户快照，因此不改变 handler 类型的 AddUser/RemoveUser 已可按固定基线 Xray 语义原地生效且不重启 listener。若用户变化会切换是否需要 Vision handler，或一个 Chimera 扩展 inbound 含多个 VLESS user-manager target，则暂时保留既有 restart 路径以避免把不同认证作用域错误合并；VMess、Trojan、Hysteria2 等协议的动态用户状态也仍待后续切片迁移。初始启动仍由 `lib.rs` 编排，显式 Preparing/Starting/Stopping 状态、管理调用取消后的自动恢复，以及完整实例就绪模型仍待后续切片完成，因此不宣称 M2/M3 已完成。
+
 每轮优先控制在 500 行增删以内；以本轮改动相对开始时的基线计数，不把已有工作区改动计入本轮。超过时拆小，不能以删除测试或省略验证满足行数。
 
 协议兼容验收使用版本固定的真实客户端，必要时同案对照 Xray 服务端。覆盖正向请求和相关异常行为，记录准确命令；`#[ignore]` 测试必须显式执行才算验证。性能变更另做等语义基准。编译、Clippy、单元测试通过不等于全协议兼容。

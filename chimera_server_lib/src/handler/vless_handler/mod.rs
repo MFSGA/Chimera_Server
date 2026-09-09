@@ -62,9 +62,11 @@ pub(crate) use vision::{
 
 const SERVER_RESPONSE_HEADER: &[u8] = &[0u8, 0u8];
 
+type ParsedVlessUser = (Box<[u8]>, String, String, u32);
+
 #[derive(Debug)]
 pub struct VlessTcpHandler {
-    users: Vec<(Box<[u8]>, String, String, u32)>,
+    users: Vec<ParsedVlessUser>,
     fallbacks: Vec<VlessFallback>,
     inbound_tag: String,
 }
@@ -80,21 +82,25 @@ impl VlessTcpHandler {
         inbound_tag: &str,
     ) -> Self {
         Self {
-            users: users
-                .iter()
-                .map(|user| {
-                    (
-                        parse_hex(&user.user_id),
-                        user.user_label.clone(),
-                        user.flow.clone(),
-                        user.user_level,
-                    )
-                })
-                .collect(),
+            users: parse_vless_users(users),
             fallbacks: fallbacks.to_vec(),
             inbound_tag: inbound_tag.to_string(),
         }
     }
+}
+
+fn parse_vless_users(users: &[VlessUser]) -> Vec<ParsedVlessUser> {
+    users
+        .iter()
+        .map(|user| {
+            (
+                parse_hex(&user.user_id),
+                user.user_label.clone(),
+                user.flow.clone(),
+                user.user_level,
+            )
+        })
+        .collect()
 }
 
 pub fn users_require_vision(users: &[VlessUser]) -> bool {
@@ -104,6 +110,7 @@ pub fn users_require_vision(users: &[VlessUser]) -> bool {
 impl VlessTcpHandler {
     async fn setup_server_stream_with_metadata(
         &self,
+        users: &[ParsedVlessUser],
         mut server_stream: Box<dyn AsyncStream>,
         server_name: &str,
         alpn: &str,
@@ -123,7 +130,7 @@ impl VlessTcpHandler {
                 None => read_vless_auth_prefix(&mut server_stream).await,
             };
             let authenticated = candidate.is_some_and(|candidate| {
-                self.users.iter().any(|(stored_user_id, _, _, _)| {
+                users.iter().any(|(stored_user_id, _, _, _)| {
                     stored_user_id.len() == 16
                         && stored_user_id.as_ref() == candidate.as_slice()
                 })
@@ -171,14 +178,13 @@ impl VlessTcpHandler {
             command,
             remote_location,
         } = header;
-        let matched_user = self.users.iter().find(|(stored_user_id, _, _, _)| {
+        let matched_user = users.iter().find(|(stored_user_id, _, _, _)| {
             stored_user_id.len() == 16
                 && stored_user_id.as_ref() == user_id.as_slice()
         });
 
         let Some((_, user_label, configured_flow, user_level)) = matched_user else {
-            let expected = self
-                .users
+            let expected = users
                 .iter()
                 .map(|(user_id, _, _, _)| encode_hex(user_id.as_ref()))
                 .collect::<Vec<_>>()
@@ -257,8 +263,14 @@ impl TcpServerHandler for VlessTcpHandler {
         &self,
         server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
-        self.setup_server_stream_with_metadata(server_stream, "", "", None)
-            .await
+        self.setup_server_stream_with_metadata(
+            &self.users,
+            server_stream,
+            "",
+            "",
+            None,
+        )
+        .await
     }
 
     async fn setup_server_stream_with_context(
@@ -270,7 +282,14 @@ impl TcpServerHandler for VlessTcpHandler {
             .runtime
             .as_ref()
             .map(|runtime| runtime.xray_handshake_timeout_for_level(0));
+        let dynamic_users = context
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.vless_users_snapshot(&self.inbound_tag))
+            .map(|users| parse_vless_users(&users));
+        let users = dynamic_users.as_deref().unwrap_or(&self.users);
         self.setup_server_stream_with_metadata(
+            users,
             server_stream,
             context.server_name.as_deref().unwrap_or(""),
             context.alpn_protocol.as_deref().unwrap_or(""),
@@ -460,12 +479,15 @@ mod tests {
     };
 
     use crate::{
-        address::{Address, NetLocation},
+        address::{Address, BindLocation, NetLocation},
         async_stream::{AsyncPing, AsyncStream},
         beginning::udp::{run_bidirectional_udp, run_session_based_udp},
         config::{
+            Transport,
             def::{PolicyConfig, PolicyLevelConfig},
-            server_config::{VlessFallback, VlessUser},
+            server_config::{
+                ServerConfig, ServerProxyConfig, VlessFallback, VlessUser,
+            },
         },
         handler::{
             tcp::tcp_handler::{TcpServerConnectionContext, TcpServerSetupResult},
@@ -608,6 +630,115 @@ mod tests {
         };
         let context = traffic_context.expect("VLESS traffic context");
         assert_eq!(context.user_level, 7);
+    }
+
+    #[tokio::test]
+    async fn runtime_vless_user_update_changes_authentication_without_rebuilding_handler()
+     {
+        let original_user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
+        let added_user_id = "e041e73e-a0a0-49f5-9754-6401aa621fb7";
+        let handler = plain_vless_handler(original_user_id, "original-user");
+        let runtime = RuntimeState::new(
+            vec![ServerConfig {
+                tag: "vless-test".into(),
+                bind_location: BindLocation::Address(NetLocation::new(
+                    Address::Ipv4(Ipv4Addr::LOCALHOST),
+                    0,
+                )),
+                protocol: ServerProxyConfig::Vless {
+                    users: vec![VlessUser {
+                        user_id: original_user_id.into(),
+                        user_label: "original-user".into(),
+                        user_level: 0,
+                        flow: String::new(),
+                    }],
+                    fallbacks: Vec::new(),
+                },
+                transport: Transport::Tcp,
+                quic_settings: None,
+                sniffing: None,
+                tcp_socket_policy: None,
+            }],
+            Vec::new(),
+        );
+
+        runtime
+            .alter_inbound_users(
+                "vless-test",
+                |_| -> Result<ServerConfig, ()> {
+                    panic!("managed VLESS update must not rebuild the config")
+                },
+                |users| {
+                    users.push(VlessUser {
+                        user_id: added_user_id.into(),
+                        user_label: "added-user".into(),
+                        user_level: 7,
+                        flow: String::new(),
+                    });
+                    Ok(true)
+                },
+            )
+            .await
+            .expect("update managed VLESS users");
+
+        let (mut client, server) = duplex(1024);
+        client
+            .write_all(&build_plain_vless_request(added_user_id, COMMAND_TCP))
+            .await
+            .expect("write dynamically added VLESS request");
+        let result = handler
+            .setup_server_stream_with_context(
+                Box::new(TestStream(server)),
+                TcpServerConnectionContext {
+                    runtime: Some(runtime.clone()),
+                    ..TcpServerConnectionContext::default()
+                },
+            )
+            .await
+            .expect("dynamically added user must authenticate");
+        let TcpServerSetupResult::TcpForward {
+            traffic_context, ..
+        } = result
+        else {
+            panic!("VLESS TCP request should produce a TCP forward");
+        };
+        let context = traffic_context.expect("VLESS traffic context");
+        assert_eq!(context.identity.as_deref(), Some("added-user"));
+        assert_eq!(context.user_level, 7);
+
+        runtime
+            .alter_inbound_users(
+                "vless-test",
+                |_| -> Result<ServerConfig, ()> {
+                    panic!("managed VLESS update must not rebuild the config")
+                },
+                |users| {
+                    users.retain(|user| user.user_id != original_user_id);
+                    Ok(true)
+                },
+            )
+            .await
+            .expect("remove original managed VLESS user");
+
+        let (mut client, server) = duplex(1024);
+        client
+            .write_all(&build_plain_vless_request(original_user_id, COMMAND_TCP))
+            .await
+            .expect("write removed-user VLESS request");
+        let error = match handler
+            .setup_server_stream_with_context(
+                Box::new(TestStream(server)),
+                TcpServerConnectionContext {
+                    runtime: Some(runtime),
+                    ..TcpServerConnectionContext::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => panic!("removed VLESS user must stop authenticating"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[tokio::test]

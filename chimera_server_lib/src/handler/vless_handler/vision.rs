@@ -336,10 +336,10 @@ pub async fn setup_reality_vision_server_stream(
     })
 }
 
-#[async_trait]
-impl TcpServerHandler for VisionVlessTcpHandler {
-    async fn setup_server_stream(
+impl VisionVlessTcpHandler {
+    async fn setup_server_stream_with_users(
         &self,
+        users: &[ParsedVisionUser],
         mut server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
         let ParsedVlessHeader {
@@ -350,7 +350,7 @@ impl TcpServerHandler for VisionVlessTcpHandler {
         } = read_request_header(&mut server_stream).await?;
 
         let (user_label, user_level) =
-            find_matching_user_label(&self.users, &user_id, &self.inbound_tag)?;
+            find_matching_user_label(users, &user_id, &self.inbound_tag)?;
 
         validate_vision_request_flow(&request_flow, command)?;
 
@@ -366,6 +366,32 @@ impl TcpServerHandler for VisionVlessTcpHandler {
                     .with_user_level(user_level),
             ),
         })
+    }
+}
+
+#[async_trait]
+impl TcpServerHandler for VisionVlessTcpHandler {
+    async fn setup_server_stream(
+        &self,
+        server_stream: Box<dyn AsyncStream>,
+    ) -> std::io::Result<TcpServerSetupResult> {
+        self.setup_server_stream_with_users(&self.users, server_stream)
+            .await
+    }
+
+    async fn setup_server_stream_with_context(
+        &self,
+        server_stream: Box<dyn AsyncStream>,
+        context: crate::handler::tcp::tcp_handler::TcpServerConnectionContext,
+    ) -> std::io::Result<TcpServerSetupResult> {
+        let dynamic_users = context
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.vless_users_snapshot(&self.inbound_tag))
+            .map(|users| parse_vision_users(&users));
+        let users = dynamic_users.as_deref().unwrap_or(&self.users);
+        self.setup_server_stream_with_users(users, server_stream)
+            .await
     }
 }
 
