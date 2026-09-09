@@ -247,8 +247,15 @@ impl ShadowsocksUserStore {
         base.with_runtime_users(self.udp_users())
     }
 
-    pub(crate) fn is_2022(&self) -> bool {
-        self.identity.is_some()
+    pub(crate) fn identity_method(&self) -> Option<&'static str> {
+        self.identity
+            .as_ref()
+            .map(|identity| match identity.cipher.name {
+                "aes-128-gcm" => "2022-blake3-aes-128-gcm",
+                "aes-256-gcm" => "2022-blake3-aes-256-gcm",
+                "chacha20-ietf-poly1305" => "2022-blake3-chacha20-poly1305",
+                _ => unreachable!("validated Shadowsocks 2022 identity cipher"),
+            })
     }
 
     pub(crate) fn add_user(

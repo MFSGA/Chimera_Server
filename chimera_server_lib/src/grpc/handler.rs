@@ -33,6 +33,11 @@ use crate::{
     config::server_config::Hysteria2Client,
     handler::hysteria2::connection::HysteriaUserStore,
 };
+#[cfg(feature = "shadowsocks")]
+use crate::{
+    config::server_config::ShadowsocksUser,
+    handler::shadowsocks::{ShadowsocksUserStore, ShadowsocksUserStoreError},
+};
 #[cfg(feature = "trojan")]
 use crate::{
     config::server_config::TrojanUser,
@@ -1129,56 +1134,10 @@ impl HandlerServiceImpl {
         &self,
         protocol: &ServerProxyConfig,
         user: &proto::xray::common::protocol::User,
-    ) -> Result<crate::config::server_config::ShadowsocksUser, Status> {
-        let account = user.account.as_ref().ok_or_else(|| {
-            Status::invalid_argument(
-                "AddUserOperation.user.account is required for shadowsocks",
-            )
-        })?;
-        let account_type = Self::parse_typed_message_type(account);
-        let (method, password) = match protocol {
-            ServerProxyConfig::Shadowsocks { users, identity } => {
-                if let Some(identity) = identity {
-                    if account_type != TYPE_PROXY_SHADOWSOCKS_2022_ACCOUNT {
-                        return Err(Status::invalid_argument(
-                            "shadowsocks 2022 inbound requires a shadowsocks_2022 account",
-                        ));
-                    }
-                    let payload = Shadowsocks2022AccountPayload::decode(
-                        account.value.as_slice(),
-                    )
-                    .map_err(|err| {
-                        Status::invalid_argument(format!(
-                            "invalid shadowsocks 2022 account payload: {err}"
-                        ))
-                    })?;
-                    (identity.method.clone(), payload.key)
-                } else {
-                    if account_type != TYPE_PROXY_SHADOWSOCKS_ACCOUNT
-                        && account_type != TYPE_PROXY_SHADOWSOCKS_ACCOUNT_V2RAY
-                    {
-                        return Err(Status::invalid_argument(
-                            "legacy shadowsocks inbound requires a shadowsocks account",
-                        ));
-                    }
-                    let payload =
-                        ShadowsocksAccountPayload::decode(account.value.as_slice())
-                            .map_err(|err| {
-                                Status::invalid_argument(format!(
-                                    "invalid shadowsocks account payload: {err}"
-                                ))
-                            })?;
-                    let method = users
-                        .first()
-                        .map(|user| user.method.clone())
-                        .filter(|method| !method.is_empty())
-                        .ok_or_else(|| {
-                            Status::failed_precondition(
-                                "legacy shadowsocks inbound has no cipher method",
-                            )
-                        })?;
-                    (method, payload.password)
-                }
+    ) -> Result<ShadowsocksUser, Status> {
+        let identity_method = match protocol {
+            ServerProxyConfig::Shadowsocks { identity, .. } => {
+                identity.as_ref().map(|identity| identity.method.as_str())
             }
             _ => {
                 return Err(Status::invalid_argument(
@@ -1186,8 +1145,58 @@ impl HandlerServiceImpl {
                 ));
             }
         };
+        self.parse_shadowsocks_user_with_identity_method(identity_method, user)
+    }
 
-        let parsed = crate::config::server_config::ShadowsocksUser {
+    #[cfg(feature = "shadowsocks")]
+    fn parse_shadowsocks_user_with_identity_method(
+        &self,
+        identity_method: Option<&str>,
+        user: &proto::xray::common::protocol::User,
+    ) -> Result<ShadowsocksUser, Status> {
+        let account = user.account.as_ref().ok_or_else(|| {
+            Status::invalid_argument(
+                "AddUserOperation.user.account is required for shadowsocks",
+            )
+        })?;
+        let account_type = Self::parse_typed_message_type(account);
+        let (method, password) = if let Some(identity_method) = identity_method {
+            if account_type != TYPE_PROXY_SHADOWSOCKS_2022_ACCOUNT {
+                return Err(Status::invalid_argument(
+                    "shadowsocks 2022 inbound requires a shadowsocks_2022 account",
+                ));
+            }
+            let payload =
+                Shadowsocks2022AccountPayload::decode(account.value.as_slice())
+                    .map_err(|err| {
+                        Status::invalid_argument(format!(
+                            "invalid shadowsocks 2022 account payload: {err}"
+                        ))
+                    })?;
+            (identity_method.to_string(), payload.key)
+        } else {
+            if account_type != TYPE_PROXY_SHADOWSOCKS_ACCOUNT
+                && account_type != TYPE_PROXY_SHADOWSOCKS_ACCOUNT_V2RAY
+            {
+                return Err(Status::invalid_argument(
+                    "legacy shadowsocks inbound requires a shadowsocks account",
+                ));
+            }
+            let payload =
+                ShadowsocksAccountPayload::decode(account.value.as_slice())
+                    .map_err(|err| {
+                        Status::invalid_argument(format!(
+                            "invalid shadowsocks account payload: {err}"
+                        ))
+                    })?;
+            (
+                Self::shadowsocks_method_for_cipher_type(payload.cipher_type)?
+                    .to_string(),
+                payload.password,
+            )
+        };
+
+        let parsed = ShadowsocksUser {
             method,
             password,
             email: user.email.clone(),
@@ -1200,6 +1209,21 @@ impl HandlerServiceImpl {
     }
 
     #[cfg(feature = "shadowsocks")]
+    fn shadowsocks_method_for_cipher_type(
+        cipher_type: i32,
+    ) -> Result<&'static str, Status> {
+        match cipher_type {
+            5 => Ok("aes-128-gcm"),
+            6 => Ok("aes-256-gcm"),
+            7 => Ok("chacha20-ietf-poly1305"),
+            8 => Ok("xchacha20-ietf-poly1305"),
+            other => Err(Status::invalid_argument(format!(
+                "unsupported legacy shadowsocks cipher type {other}"
+            ))),
+        }
+    }
+
+    #[cfg(feature = "shadowsocks")]
     fn shadowsocks_cipher_type(method: &str) -> Result<i32, Status> {
         match method {
             "aes-128-gcm" => Ok(5),
@@ -1209,6 +1233,67 @@ impl HandlerServiceImpl {
             other => Err(Status::failed_precondition(format!(
                 "unsupported legacy shadowsocks cipher {other}"
             ))),
+        }
+    }
+
+    #[cfg(feature = "shadowsocks")]
+    fn map_shadowsocks_store_error(error: ShadowsocksUserStoreError) -> Status {
+        match error {
+            ShadowsocksUserStoreError::EmptyEmail => {
+                Status::invalid_argument("RemoveUserOperation.email is required")
+            }
+            ShadowsocksUserStoreError::DuplicateEmail(email) => {
+                Status::already_exists(format!(
+                    "Shadowsocks user {email} already exists"
+                ))
+            }
+            ShadowsocksUserStoreError::NotFound(email) => {
+                Status::not_found(format!("Shadowsocks user {email} not found"))
+            }
+            ShadowsocksUserStoreError::InvalidUser(error) => {
+                Status::invalid_argument(format!(
+                    "invalid shadowsocks user: {error}"
+                ))
+            }
+        }
+    }
+
+    #[cfg(feature = "shadowsocks")]
+    fn apply_shadowsocks_runtime_operation(
+        &self,
+        store: &ShadowsocksUserStore,
+        operation: AlterInboundOperation,
+    ) -> Result<(), Status> {
+        match operation {
+            AlterInboundOperation::Noop => Ok(()),
+            AlterInboundOperation::AddUser(operation) => {
+                let user = operation.user.as_ref().ok_or_else(|| {
+                    Status::invalid_argument("AddUserOperation.user is required")
+                })?;
+                let parsed = self.parse_shadowsocks_user_with_identity_method(
+                    store.identity_method(),
+                    user,
+                )?;
+                store
+                    .add_user(parsed)
+                    .map_err(Self::map_shadowsocks_store_error)?;
+                let stats = self.runtime.policy_user_stats(user.level);
+                if stats.uplink || stats.downlink {
+                    register_identity(user.email.clone());
+                }
+                Ok(())
+            }
+            AlterInboundOperation::RemoveUser(operation) => {
+                let email = operation.email.trim();
+                if email.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "RemoveUserOperation.email is required",
+                    ));
+                }
+                store
+                    .remove_user_by_email(email)
+                    .map_err(Self::map_shadowsocks_store_error)
+            }
         }
     }
 
@@ -2607,15 +2692,14 @@ impl HandlerServiceImpl {
                     identity: identity.clone(),
                 };
                 let parsed = self.parse_shadowsocks_user(&current, user)?;
-                if identity.is_some() {
-                    if users.iter().any(|existing| existing.email == parsed.email) {
-                        return Err(Status::already_exists(format!(
-                            "Shadowsocks user {} already exists",
-                            parsed.email
-                        )));
-                    }
-                } else {
-                    users.retain(|existing| existing.email != parsed.email);
+                if identity.is_some()
+                    && !parsed.email.is_empty()
+                    && users.iter().any(|existing| existing.email == parsed.email)
+                {
+                    return Err(Status::already_exists(format!(
+                        "Shadowsocks user {} already exists",
+                        parsed.email
+                    )));
                 }
                 users.push(parsed);
                 Ok(true)
@@ -2726,13 +2810,15 @@ impl HandlerServiceImpl {
             }
             #[cfg(feature = "shadowsocks")]
             ServerProxyConfig::Shadowsocks { users, .. } => {
-                let before = users.len();
-                users.retain(|user| user.email != email);
-                if before == users.len() {
+                let Some(index) = users
+                    .iter()
+                    .position(|user| user.email.eq_ignore_ascii_case(email))
+                else {
                     return Err(Status::not_found(format!(
                         "Shadowsocks user {email} not found"
                     )));
-                }
+                };
+                users.swap_remove(index);
                 Ok(true)
             }
             #[cfg(feature = "ws")]
@@ -2927,16 +3013,59 @@ impl HandlerServiceImpl {
         }
     }
 
+    fn shadowsocks_user_manager(protocol: &ServerProxyConfig) -> bool {
+        match protocol {
+            #[cfg(feature = "shadowsocks")]
+            ServerProxyConfig::Shadowsocks { .. } => true,
+            #[cfg(feature = "ws")]
+            ServerProxyConfig::Websocket { targets } => match targets.as_ref() {
+                crate::util::option::OneOrSome::One(target) => {
+                    Self::shadowsocks_user_manager(&target.protocol)
+                }
+                crate::util::option::OneOrSome::Some(targets) => targets
+                    .iter()
+                    .any(|target| Self::shadowsocks_user_manager(&target.protocol)),
+            },
+            #[cfg(feature = "tls")]
+            ServerProxyConfig::Tls(config) => {
+                Self::shadowsocks_user_manager(&config.inner)
+            }
+            #[cfg(feature = "reality")]
+            ServerProxyConfig::Reality(config) => {
+                Self::shadowsocks_user_manager(&config.inner)
+            }
+            ServerProxyConfig::Xhttp { inner, .. } => {
+                Self::shadowsocks_user_manager(inner)
+            }
+            #[cfg(feature = "httpupgrade")]
+            ServerProxyConfig::HttpUpgrade(config) => {
+                Self::shadowsocks_user_manager(&config.inner)
+            }
+            #[cfg(feature = "grpc_transport")]
+            ServerProxyConfig::Grpc(config) => {
+                Self::shadowsocks_user_manager(&config.inner)
+            }
+            _ => false,
+        }
+    }
+
     fn select_user_manager_users(
         users: Vec<proto::xray::common::protocol::User>,
         email: &str,
+        case_insensitive: bool,
     ) -> Vec<proto::xray::common::protocol::User> {
         if email.is_empty() {
             users
         } else {
             users
                 .into_iter()
-                .find(|user| user.email == email)
+                .find(|user| {
+                    if case_insensitive {
+                        user.email.eq_ignore_ascii_case(email)
+                    } else {
+                        user.email == email
+                    }
+                })
                 .into_iter()
                 .collect()
         }
@@ -3114,7 +3243,7 @@ impl HandlerServiceImpl {
                             )
                         };
                         proto::xray::common::protocol::User {
-                            level: 0,
+                            level: user.user_level,
                             email: user.email.clone(),
                             account: Some(account),
                         }
@@ -3199,6 +3328,31 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
         let request = request.into_inner();
         let operation = self.parse_alter_inbound_operation(request.operation)?;
         if matches!(&operation, AlterInboundOperation::Noop) {
+            return Ok(Response::new(
+                proto::xray::app::proxyman::command::AlterInboundResponse {},
+            ));
+        }
+
+        #[cfg(feature = "shadowsocks")]
+        if self.runtime.shadowsocks_user_store(&request.tag).is_some() {
+            let config_operation = operation.clone();
+            self.runtime
+                .alter_shadowsocks_users(
+                    &request.tag,
+                    |current| {
+                        let mut updated = Self::detached_inbound(current);
+                        self.apply_alter_inbound_operation(
+                            &mut updated,
+                            config_operation,
+                        )?;
+                        Ok::<ServerConfig, Status>(updated)
+                    },
+                    |store| {
+                        self.apply_shadowsocks_runtime_operation(store, operation)
+                    },
+                )
+                .await
+                .map_err(Self::map_alter_inbound_error)?;
             return Ok(Response::new(
                 proto::xray::app::proxyman::command::AlterInboundResponse {},
             ));
@@ -3346,7 +3500,9 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
         let users = self
             .get_user_manager_users(&inbound.protocol)
             .ok_or_else(|| Status::unknown(ERR_PROXY_NOT_USER_MANAGER))?;
-        let users = Self::select_user_manager_users(users, &request.email);
+        let case_insensitive = Self::shadowsocks_user_manager(&inbound.protocol);
+        let users =
+            Self::select_user_manager_users(users, &request.email, case_insensitive);
 
         Ok(Response::new(
             proto::xray::app::proxyman::command::GetInboundUserResponse { users },
@@ -3457,6 +3613,8 @@ pub(super) fn build_service(
 mod tests {
     use super::proto::xray::app::proxyman::command::handler_service_server::HandlerService;
     use super::*;
+    #[cfg(feature = "shadowsocks")]
+    use crate::config::server_config::ShadowsocksServerIdentity;
     #[cfg(feature = "trojan")]
     use crate::config::server_config::TrojanUser;
     #[cfg(feature = "vless")]
@@ -6405,6 +6563,161 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "shadowsocks")]
+    #[test]
+    fn shadowsocks_user_mutations_match_xray_legacy_and_2022_semantics() {
+        let service =
+            HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+        let legacy_user =
+            |email: &str, level: u32, cipher_type: i32, password: &str| {
+                proto::xray::common::protocol::User {
+                    level,
+                    email: email.to_string(),
+                    account: Some(proto::xray::common::serial::TypedMessage {
+                        r#type: TYPE_PROXY_SHADOWSOCKS_ACCOUNT.to_string(),
+                        value: ShadowsocksAccountPayload {
+                            password: password.to_string(),
+                            cipher_type,
+                            iv_check: false,
+                        }
+                        .encode_to_vec(),
+                    }),
+                }
+            };
+        let mut legacy = ServerProxyConfig::Shadowsocks {
+            users: vec![ShadowsocksUser {
+                method: "aes-128-gcm".to_string(),
+                password: "first-pass".to_string(),
+                email: "shared@example.com".to_string(),
+                user_level: 1,
+            }],
+            identity: None,
+        };
+        service
+            .apply_add_user_to_protocol(
+                &mut legacy,
+                &legacy_user("shared@example.com", 7, 6, "second-pass"),
+            )
+            .expect("legacy Xray validator appends duplicate-email AEAD users");
+        let ServerProxyConfig::Shadowsocks { users, .. } = &legacy else {
+            unreachable!()
+        };
+        assert_eq!(users[1].method, "aes-256-gcm");
+        let exposed = service.get_user_manager_users(&legacy).unwrap();
+        assert_eq!(exposed[1].level, 7);
+        service
+            .apply_remove_user_from_protocol(&mut legacy, "SHARED@EXAMPLE.COM")
+            .expect("legacy remove is case-insensitive");
+        let key = "AAECAwQFBgcICQoLDA0ODw==";
+        let mut modern = ServerProxyConfig::Shadowsocks {
+            users: vec![ShadowsocksUser {
+                method: "2022-blake3-aes-128-gcm".to_string(),
+                password: key.to_string(),
+                email: "Case@example.com".to_string(),
+                user_level: 2,
+            }],
+            identity: Some(ShadowsocksServerIdentity {
+                method: "2022-blake3-aes-128-gcm".to_string(),
+                password: key.to_string(),
+            }),
+        };
+        let modern_user = |email: &str| proto::xray::common::protocol::User {
+            level: 3,
+            email: email.to_string(),
+            account: Some(proto::xray::common::serial::TypedMessage {
+                r#type: TYPE_PROXY_SHADOWSOCKS_2022_ACCOUNT.to_string(),
+                value: Shadowsocks2022AccountPayload {
+                    key: key.to_string(),
+                }
+                .encode_to_vec(),
+            }),
+        };
+        let error = service
+            .apply_add_user_to_protocol(
+                &mut modern,
+                &modern_user("Case@example.com"),
+            )
+            .expect_err("2022 rejects exact non-empty duplicate email");
+        assert_eq!(error.code(), Code::AlreadyExists);
+        service
+            .apply_add_user_to_protocol(
+                &mut modern,
+                &modern_user("case@example.com"),
+            )
+            .expect("2022 duplicate check is case-sensitive");
+        service
+            .apply_add_user_to_protocol(&mut modern, &modern_user(""))
+            .expect("2022 allows empty email");
+        service
+            .apply_add_user_to_protocol(&mut modern, &modern_user(""))
+            .expect("2022 allows repeated empty email");
+    }
+
+    #[cfg(feature = "shadowsocks")]
+    #[tokio::test]
+    async fn handler_alter_shadowsocks_users_does_not_restart_listener() {
+        let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("bind occupied Shadowsocks TCP port");
+        let port = occupied.local_addr().unwrap().port();
+        let inbound_tag = unique_tag("shadowsocks-no-restart-inbound");
+        let runtime = RuntimeState::new(
+            vec![ServerConfig {
+                tag: inbound_tag.clone(),
+                bind_location: BindLocation::Address(NetLocation::new(
+                    Address::Ipv4(Ipv4Addr::LOCALHOST),
+                    port,
+                )),
+                protocol: ServerProxyConfig::Shadowsocks {
+                    users: vec![ShadowsocksUser {
+                        method: "aes-128-gcm".to_string(),
+                        password: "initial-pass".to_string(),
+                        email: "initial@example.com".to_string(),
+                        user_level: 1,
+                    }],
+                    identity: None,
+                },
+                transport: Transport::Tcp,
+                quic_settings: None,
+                sniffing: None,
+                tcp_socket_policy: None,
+            }],
+            Vec::new(),
+        );
+        let placeholder_task = tokio::spawn(std::future::pending::<()>());
+        let abort_handle = placeholder_task.abort_handle();
+        runtime.register_inbound_tasks(&inbound_tag, vec![placeholder_task]);
+        let service = HandlerServiceImpl::new(runtime.clone());
+        let add_operation = proto::xray::app::proxyman::command::AddUserOperation {
+            user: Some(proto::xray::common::protocol::User {
+                level: 9,
+                email: "dynamic@example.com".to_string(),
+                account: Some(proto::xray::common::serial::TypedMessage {
+                    r#type: TYPE_PROXY_SHADOWSOCKS_ACCOUNT.to_string(),
+                    value: ShadowsocksAccountPayload {
+                        password: "dynamic-pass".to_string(),
+                        cipher_type: 6,
+                        iv_check: false,
+                    }
+                    .encode_to_vec(),
+                }),
+            }),
+        };
+        service
+            .alter_inbound(Request::new(
+                proto::xray::app::proxyman::command::AlterInboundRequest {
+                    tag: inbound_tag.clone(),
+                    operation: Some(proto::xray::common::serial::TypedMessage {
+                        r#type: TYPE_ADD_USER_OPERATION.to_string(),
+                        value: add_operation.encode_to_vec(),
+                    }),
+                },
+            ))
+            .await
+            .expect("Shadowsocks user update must not rebind occupied TCP port");
+        assert!(!abort_handle.is_finished());
+        assert!(runtime.stop_inbound_tasks(&inbound_tag).await);
+    }
+
     #[cfg(feature = "hysteria")]
     #[test]
     fn hysteria_user_reads_include_empty_email_and_select_one_duplicate() {
@@ -6455,6 +6768,7 @@ mod tests {
         let selected = HandlerServiceImpl::select_user_manager_users(
             users,
             "shared@example.com",
+            false,
         );
         assert_eq!(
             selected.len(),

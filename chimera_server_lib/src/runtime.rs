@@ -387,6 +387,28 @@ impl RuntimeState {
             .await
     }
 
+    #[cfg(feature = "shadowsocks")]
+    pub(crate) async fn alter_shadowsocks_users<E, F, U>(
+        &self,
+        tag: &str,
+        update_config: F,
+        update_shadowsocks_users: U,
+    ) -> Result<(), crate::inbound::AlterInboundError<E>>
+    where
+        E: Send,
+        F: FnOnce(&ServerConfig) -> Result<ServerConfig, E> + Send,
+        U: FnOnce(&ShadowsocksUserStore) -> Result<(), E> + Send,
+    {
+        self.inbound_manager
+            .alter_shadowsocks_users(
+                self.clone(),
+                tag,
+                update_config,
+                update_shadowsocks_users,
+            )
+            .await
+    }
+
     pub fn outbounds(&self) -> Vec<OutboundSummary> {
         self.outbound_snapshot().as_ref().clone()
     }
