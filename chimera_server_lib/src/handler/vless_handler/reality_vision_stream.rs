@@ -8,14 +8,14 @@ use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::debug;
 
-use crate::{
-    async_stream::{AsyncPing, AsyncStream, RawTcpRelayState},
-    reality::{RealityIoState, RealitySession, SyncReadAdapter, SyncWriteAdapter},
-};
+use crate::async_stream::{AsyncPing, AsyncStream, RawTcpRelayState};
 
 use super::{
     append_plaintext_to_read_buf, bounded_write_chunk, drain_pending_read,
     queue_padded_packet, take_vless_response_header, unpad_into_pending_read,
+    vision_session::{
+        SyncReadAdapter, SyncWriteAdapter, VisionIoState, VisionSession,
+    },
     vision_tls::{VisionTlsState, is_complete_tls_application_data},
     vision_unpad::{UnpadCommand, VisionUnpadder},
 };
@@ -70,7 +70,7 @@ impl<IO, S> std::fmt::Debug for RealityVisionServerStream<IO, S> {
 impl<IO, S> RealityVisionServerStream<IO, S>
 where
     IO: AsyncStream,
-    S: RealitySession + Unpin + Send,
+    S: VisionSession + Unpin + Send,
 {
     pub fn new(
         tcp: IO,
@@ -107,7 +107,7 @@ where
 
     fn process_new_packets(
         &mut self,
-        io_state: RealityIoState,
+        io_state: VisionIoState,
     ) -> io::Result<Vec<u8>> {
         Self::drain_plaintext_from_session_with_capacity(
             &mut self.session,
@@ -333,7 +333,7 @@ where
 impl<IO, S> AsyncRead for RealityVisionServerStream<IO, S>
 where
     IO: AsyncStream,
-    S: RealitySession + Unpin + Send,
+    S: VisionSession + Unpin + Send,
 {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -394,7 +394,7 @@ where
 impl<IO, S> AsyncWrite for RealityVisionServerStream<IO, S>
 where
     IO: AsyncStream,
-    S: RealitySession + Unpin + Send,
+    S: VisionSession + Unpin + Send,
 {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -505,7 +505,7 @@ where
 impl<IO, S> AsyncPing for RealityVisionServerStream<IO, S>
 where
     IO: AsyncStream,
-    S: RealitySession + Unpin + Send,
+    S: VisionSession + Unpin + Send,
 {
     fn supports_ping(&self) -> bool {
         self.tcp.supports_ping()
@@ -522,7 +522,7 @@ where
 impl<IO, S> AsyncStream for RealityVisionServerStream<IO, S>
 where
     IO: AsyncStream,
-    S: RealitySession + Unpin + Send,
+    S: VisionSession + Unpin + Send,
 {
     fn raw_tcp_relay_state(&self) -> RawTcpRelayState {
         match self.tcp.raw_tcp_relay_state() {

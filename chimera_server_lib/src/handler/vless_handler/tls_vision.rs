@@ -12,8 +12,9 @@ use tokio_rustls::rustls::{Reader, ServerConnection, Writer};
 use crate::{
     async_stream::{AsyncPing, AsyncStream},
     handler::tls_deframer::{TLS_MAX_RECORD_SIZE, TlsDeframer},
-    reality::{RealityIoState, RealitySession},
 };
+
+use super::vision_session::{VisionIoState, VisionSession};
 
 const READ_SCRATCH_SIZE: usize = TLS_MAX_RECORD_SIZE * 2;
 
@@ -242,7 +243,7 @@ impl std::fmt::Debug for RustlsVisionSession {
     }
 }
 
-impl RealitySession for RustlsVisionSession {
+impl VisionSession for RustlsVisionSession {
     type Reader<'a> = Reader<'a>;
     type Writer<'a> = Writer<'a>;
 
@@ -250,12 +251,12 @@ impl RealitySession for RustlsVisionSession {
         self.connection.read_tls(rd)
     }
 
-    fn process_new_packets(&mut self) -> io::Result<RealityIoState> {
+    fn process_new_packets(&mut self) -> io::Result<VisionIoState> {
         let state = self
             .connection
             .process_new_packets()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        Ok(RealityIoState::new(state.plaintext_bytes_to_read()))
+        Ok(VisionIoState::new(state.plaintext_bytes_to_read()))
     }
 
     fn reader(&mut self) -> Self::Reader<'_> {

@@ -17,12 +17,15 @@ use crate::{
 
 mod fallback;
 pub(crate) mod protocol;
+#[cfg(any(feature = "tls", feature = "reality"))]
 mod reality_vision_stream;
 #[cfg(feature = "tls")]
 mod tls_vision;
 mod udp_stream;
 mod vision;
 mod vision_pad;
+#[cfg(any(feature = "tls", feature = "reality"))]
+mod vision_session;
 mod vision_stream;
 mod vision_tls;
 mod vision_unpad;
@@ -49,11 +52,13 @@ use vision_unpad::{UnpadCommand, VisionUnpadder};
 
 #[cfg(feature = "tls")]
 pub(crate) use tls_vision::VisionRecordIo;
+pub use vision::VisionVlessTcpHandler;
+#[cfg(feature = "reality")]
+pub use vision::setup_reality_mixed_vless_server_stream;
 #[cfg(feature = "tls")]
 pub(crate) use vision::{
     ParsedVisionUser, parse_vision_users, setup_tls_vision_server_stream,
 };
-pub use vision::{VisionVlessTcpHandler, setup_reality_mixed_vless_server_stream};
 
 const SERVER_RESPONSE_HEADER: &[u8] = &[0u8, 0u8];
 

@@ -38,7 +38,7 @@ use tracing::{debug, error};
 
 #[cfg(all(feature = "tls", target_os = "linux"))]
 use std::os::fd::AsRawFd;
-#[cfg(feature = "tls")]
+#[cfg(all(feature = "tls", feature = "hysteria"))]
 use std::sync::atomic::AtomicU64;
 
 use crate::{
@@ -398,14 +398,24 @@ fn build_xhttp_h3_transport_config(
             transport.congestion_controller_factory(Arc::new(bbr));
         }
         XhttpH3CongestionMode::ForceBrutal => {
-            let tx_bps = config
-                .xray_brutal_up
-                .expect("validated XHTTP force-brutal bandwidth");
-            transport.congestion_controller_factory(Arc::new(
-                crate::handler::hysteria2::congestion::BrutalConfig::new(Arc::new(
-                    AtomicU64::new(tx_bps),
-                )),
-            ));
+            #[cfg(feature = "hysteria")]
+            {
+                let tx_bps = config
+                    .xray_brutal_up
+                    .expect("validated XHTTP force-brutal bandwidth");
+                transport.congestion_controller_factory(Arc::new(
+                    crate::handler::hysteria2::congestion::BrutalConfig::new(
+                        Arc::new(AtomicU64::new(tx_bps)),
+                    ),
+                ));
+            }
+            #[cfg(not(feature = "hysteria"))]
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "XHTTP force-brutal requires the hysteria feature",
+                ));
+            }
         }
     }
     apply_xray_xhttp_h3_initial_mtu(&mut transport);
