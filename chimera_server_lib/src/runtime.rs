@@ -690,9 +690,12 @@ impl RuntimeState {
 mod tests {
     use super::RuntimeState;
     use crate::{
+        address::{BindLocation, NetLocation},
         config::{
+            Transport,
             def::{PolicyConfig, PolicyLevelConfig, SystemPolicyConfig},
             rule::BalancerConfig,
+            server_config::{ServerConfig, ServerProxyConfig, SocksUserStore},
         },
         routing_state::{OutboundObservation, RoutingState},
     };
@@ -712,7 +715,26 @@ mod tests {
         let task = tokio::spawn(async move {
             let _ = listener.accept().await;
         });
-        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let runtime = RuntimeState::new(
+            vec![ServerConfig {
+                tag: "listener-release".to_string(),
+                bind_location: BindLocation::Address(NetLocation::from_ip_addr(
+                    address.ip(),
+                    address.port(),
+                )),
+                protocol: ServerProxyConfig::Socks {
+                    accounts: SocksUserStore::new(Vec::new()),
+                    udp_enabled: false,
+                    udp_response_ip: None,
+                    user_level: 0,
+                },
+                transport: Transport::Tcp,
+                quic_settings: None,
+                sniffing: None,
+                tcp_socket_policy: None,
+            }],
+            Vec::new(),
+        );
         runtime.register_inbound_tasks("listener-release", vec![task]);
 
         assert!(runtime.stop_inbound_tasks("listener-release").await);

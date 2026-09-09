@@ -40,8 +40,7 @@ pub(crate) struct InboundManager {
 
 #[derive(Debug)]
 struct InboundState {
-    configs: Vec<VersionedConfig>,
-    tasks: HashMap<String, InboundTaskSet>,
+    configs: Vec<InboundInstance>,
     pending: HashMap<String, PendingInboundLifecycle>,
     next_generation: u64,
 }
@@ -62,9 +61,10 @@ struct PendingInboundLifecycle {
 }
 
 #[derive(Debug)]
-struct VersionedConfig {
+struct InboundInstance {
     generation: u64,
     lifecycle: InboundLifecycleState,
+    tasks: Option<Vec<JoinHandle<()>>>,
     config: ServerConfig,
     #[cfg(feature = "vless")]
     vless_users: Option<VlessUserStore>,
@@ -104,7 +104,7 @@ impl VlessUserStore {
     }
 }
 
-impl VersionedConfig {
+impl InboundInstance {
     fn new(generation: u64, config: ServerConfig) -> Self {
         Self {
             #[cfg(feature = "vless")]
@@ -133,12 +133,14 @@ impl VersionedConfig {
                 .map(Arc::new),
             generation,
             lifecycle: InboundLifecycleState::Prepared,
+            tasks: None,
             config,
         }
     }
 
-    fn running(mut self) -> Self {
+    fn running_with_tasks(mut self, handles: Vec<JoinHandle<()>>) -> Self {
         self.lifecycle = InboundLifecycleState::Running;
+        self.tasks = Some(handles);
         self
     }
 
@@ -861,7 +863,7 @@ impl InboundManager {
             .into_iter()
             .enumerate()
             .map(|(index, config)| {
-                VersionedConfig::new(
+                InboundInstance::new(
                     u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1),
                     config,
                 )
@@ -870,7 +872,6 @@ impl InboundManager {
         Self {
             state: RwLock::new(InboundState {
                 configs,
-                tasks: HashMap::new(),
                 pending: HashMap::new(),
                 next_generation,
             }),
@@ -949,7 +950,7 @@ impl InboundManager {
             .expect("inbound manager lock poisoned")
             .configs
             .iter()
-            .map(VersionedConfig::config_view)
+            .map(InboundInstance::config_view)
             .collect()
     }
 
@@ -960,7 +961,7 @@ impl InboundManager {
             .configs
             .iter()
             .find(|entry| entry.config.tag == tag)
-            .map(VersionedConfig::config_view)
+            .map(InboundInstance::config_view)
     }
 
     pub(crate) fn generation(&self, tag: &str) -> Option<u64> {
@@ -1060,7 +1061,11 @@ impl InboundManager {
             .configs
             .iter()
             .position(|entry| entry.config.tag == tag)?;
-        Some(state.configs.remove(index).config)
+        let removed = state.configs.remove(index);
+        if let Some(handles) = removed.tasks {
+            abort_tasks(&handles);
+        }
+        Some(removed.config)
     }
 
     pub(crate) fn add_config(&self, config: ServerConfig) -> Result<(), String> {
@@ -1075,46 +1080,23 @@ impl InboundManager {
         }
         let generation =
             allocate_generation(&mut state).map_err(ToString::to_string)?;
-        if let Some(stale) = state.tasks.remove(&config.tag) {
-            abort_tasks(&stale.handles);
-        }
-        state.configs.push(VersionedConfig::new(generation, config));
+        state.configs.push(InboundInstance::new(generation, config));
         Ok(())
     }
 
     pub(crate) fn register_tasks(&self, tag: &str, handles: Vec<JoinHandle<()>>) {
         let mut state = self.state.write().expect("inbound manager lock poisoned");
-        let generation = state
-            .configs
-            .iter()
-            .find(|entry| entry.config.tag == tag)
-            .map(|entry| entry.generation)
-            .or_else(|| state.tasks.get(tag).map(|tasks| tasks.generation));
-        let generation = match generation {
-            Some(generation) => generation,
-            None => match allocate_generation(&mut state) {
-                Ok(generation) => generation,
-                Err(_) => {
-                    abort_tasks(&handles);
-                    return;
-                }
-            },
-        };
-        if let Some(entry) = state
+        let Some(entry) = state
             .configs
             .iter_mut()
-            .find(|entry| entry.config.tag == tag && entry.generation == generation)
-        {
-            entry.lifecycle = InboundLifecycleState::Running;
-        }
-        if let Some(previous) = state.tasks.insert(
-            tag.to_string(),
-            InboundTaskSet {
-                generation,
-                handles,
-            },
-        ) {
-            abort_tasks(&previous.handles);
+            .find(|entry| entry.config.tag == tag)
+        else {
+            abort_tasks(&handles);
+            return;
+        };
+        entry.lifecycle = InboundLifecycleState::Running;
+        if let Some(previous) = entry.tasks.replace(handles) {
+            abort_tasks(&previous);
         }
     }
 
@@ -1134,14 +1116,8 @@ impl InboundManager {
             return false;
         };
         entry.lifecycle = InboundLifecycleState::Running;
-        if let Some(previous) = state.tasks.insert(
-            tag.to_string(),
-            InboundTaskSet {
-                generation,
-                handles,
-            },
-        ) {
-            abort_tasks(&previous.handles);
+        if let Some(previous) = entry.tasks.replace(handles) {
+            abort_tasks(&previous);
         }
         true
     }
@@ -1150,16 +1126,21 @@ impl InboundManager {
         let task_set = {
             let mut state =
                 self.state.write().expect("inbound manager lock poisoned");
-            let task_set = state.tasks.remove(tag);
-            if let Some(task_set) = task_set.as_ref()
-                && let Some(entry) = state.configs.iter_mut().find(|entry| {
-                    entry.config.tag == tag
-                        && entry.generation == task_set.generation
-                })
-            {
-                entry.lifecycle = InboundLifecycleState::Stopping;
-            }
-            task_set
+            let Some(entry) = state
+                .configs
+                .iter_mut()
+                .find(|entry| entry.config.tag == tag)
+            else {
+                return false;
+            };
+            let Some(handles) = entry.tasks.take() else {
+                return false;
+            };
+            entry.lifecycle = InboundLifecycleState::Stopping;
+            Some(InboundTaskSet {
+                generation: entry.generation,
+                handles,
+            })
         };
         let Some(task_set) = task_set else {
             return false;
@@ -1182,20 +1163,19 @@ impl InboundManager {
         let task_set = {
             let mut state =
                 self.state.write().expect("inbound manager lock poisoned");
-            if state.tasks.get(tag).map(|tasks| tasks.generation) != Some(generation)
-            {
-                return false;
-            }
-            let task_set = state.tasks.remove(tag);
-            if let Some(entry) = state.configs.iter_mut().find(|entry| {
+            let Some(entry) = state.configs.iter_mut().find(|entry| {
                 entry.config.tag == tag && entry.generation == generation
-            }) {
-                entry.lifecycle = InboundLifecycleState::Stopping;
+            }) else {
+                return false;
+            };
+            let Some(handles) = entry.tasks.take() else {
+                return false;
+            };
+            entry.lifecycle = InboundLifecycleState::Stopping;
+            InboundTaskSet {
+                generation,
+                handles,
             }
-            task_set
-        };
-        let Some(task_set) = task_set else {
-            return false;
         };
         stop_task_set(task_set).await;
         self.set_lifecycle_for_generation(
@@ -1259,18 +1239,10 @@ impl InboundManager {
             ));
         }
         state.pending.remove(&tag);
-        state
-            .configs
-            .push(VersionedConfig::new(generation, config).running());
-        if let Some(previous) = state.tasks.insert(
-            tag,
-            InboundTaskSet {
-                generation,
-                handles: pending.commit(),
-            },
-        ) {
-            abort_tasks(&previous.handles);
-        }
+        state.configs.push(
+            InboundInstance::new(generation, config)
+                .running_with_tasks(pending.commit()),
+        );
         add_guard.disarm();
         Ok(())
     }
@@ -1306,7 +1278,7 @@ impl InboundManager {
                         "configured inbound {tag} disappeared during startup"
                     ))),
                     Some(index)
-                        if state.tasks.contains_key(&tag)
+                        if state.configs[index].tasks.is_some()
                             || state.configs[index].lifecycle
                                 != InboundLifecycleState::Prepared =>
                     {
@@ -1382,8 +1354,12 @@ impl InboundManager {
             else {
                 return Err(RemoveInboundError::NotFound);
             };
-            let removed = state.configs.remove(index);
+            let mut removed = state.configs.remove(index);
             let generation = removed.generation;
+            let task_set = removed.tasks.take().map(|handles| InboundTaskSet {
+                generation,
+                handles,
+            });
             state.pending.insert(
                 tag.to_string(),
                 PendingInboundLifecycle {
@@ -1391,7 +1367,7 @@ impl InboundManager {
                     lifecycle: InboundLifecycleState::Stopping,
                 },
             );
-            (generation, state.tasks.remove(tag))
+            (generation, task_set)
         };
         let mut cleanup = RemoveCleanupGuard::new(
             Arc::clone(self),
@@ -1617,25 +1593,20 @@ impl InboundManager {
         let task_set = {
             let mut state =
                 self.state.write().expect("inbound manager lock poisoned");
-            let Some(index) = state.configs.iter().position(|entry| {
+            let Some(entry) = state.configs.iter_mut().find(|entry| {
                 entry.config.tag == tag && entry.generation == generation
             }) else {
                 return Err(AlterInboundError::State(
                     "inbound generation changed during alter",
                 ));
             };
-            match state.tasks.get(tag) {
-                Some(tasks) if tasks.generation != generation => {
-                    return Err(AlterInboundError::State(
-                        "inbound task generation mismatch",
-                    ));
+            entry.tasks.take().map(|handles| {
+                entry.lifecycle = InboundLifecycleState::Stopping;
+                InboundTaskSet {
+                    generation,
+                    handles,
                 }
-                Some(_) => {
-                    state.configs[index].lifecycle = InboundLifecycleState::Stopping;
-                    state.tasks.remove(tag)
-                }
-                None => None,
-            }
+            })
         };
 
         let Some(task_set) = task_set else {
@@ -1726,13 +1697,15 @@ impl InboundManager {
         let should_recover = {
             let mut state =
                 self.state.write().expect("inbound manager lock poisoned");
-            if state.tasks.contains_key(&tag) {
-                false
-            } else if let Some(entry) = state.configs.iter_mut().find(|entry| {
+            if let Some(entry) = state.configs.iter_mut().find(|entry| {
                 entry.config.tag == tag && entry.generation == generation
             }) {
-                entry.lifecycle = InboundLifecycleState::Recovering;
-                true
+                if entry.tasks.is_some() {
+                    false
+                } else {
+                    entry.lifecycle = InboundLifecycleState::Recovering;
+                    true
+                }
             } else {
                 false
             }
@@ -1785,7 +1758,7 @@ impl InboundManager {
             return Err("inbound generation changed during update");
         };
         let generation = allocate_generation(&mut state)?;
-        state.configs[index] = VersionedConfig::new(generation, config);
+        state.configs[index] = InboundInstance::new(generation, config);
         Ok(())
     }
 
@@ -1810,16 +1783,8 @@ impl InboundManager {
                 return Err(error);
             }
         };
-        state.configs[index] = VersionedConfig::new(generation, config).running();
-        if let Some(previous) = state.tasks.insert(
-            tag.to_string(),
-            InboundTaskSet {
-                generation,
-                handles,
-            },
-        ) {
-            abort_tasks(&previous.handles);
-        }
+        state.configs[index] =
+            InboundInstance::new(generation, config).running_with_tasks(handles);
         Ok(())
     }
 }
@@ -1849,7 +1814,7 @@ async fn stop_task_set(task_set: InboundTaskSet) {
 mod tests {
     use super::{
         AlterRecoveryGuard, ConfiguredStartGuard, ConfiguredStartingGuard,
-        InboundLifecycleState, InboundManager, stop_task_set,
+        InboundLifecycleState, InboundManager, InboundTaskSet, stop_task_set,
     };
     use crate::{
         address::{BindLocation, NetLocation},
@@ -1938,6 +1903,19 @@ mod tests {
         );
         assert!(manager.config_by_tag("primary").is_some());
         assert!(!manager.stop_tasks("primary").await);
+    }
+
+    #[tokio::test]
+    async fn registering_tasks_for_missing_instance_aborts_them() {
+        let manager = InboundManager::new(Vec::new());
+        let task = tokio::spawn(std::future::pending());
+        let abort_handle = task.abort_handle();
+
+        manager.register_tasks("missing", vec![task]);
+        tokio::task::yield_now().await;
+
+        assert!(abort_handle.is_finished());
+        assert_eq!(manager.lifecycle_state("missing"), None);
     }
 
     #[test]
@@ -2030,13 +2008,24 @@ mod tests {
         let transition = tokio::spawn(async move {
             let _operation_guard =
                 transition_manager.operation_lock("primary").lock().await;
-            let task_set = transition_manager
-                .state
-                .write()
-                .expect("inbound manager lock poisoned")
-                .tasks
-                .remove("primary")
-                .expect("original listener tasks registered");
+            let task_set = {
+                let mut state = transition_manager
+                    .state
+                    .write()
+                    .expect("inbound manager lock poisoned");
+                let entry = state
+                    .configs
+                    .iter_mut()
+                    .find(|entry| entry.config.tag == "primary")
+                    .expect("original inbound registered");
+                InboundTaskSet {
+                    generation: entry.generation,
+                    handles: entry
+                        .tasks
+                        .take()
+                        .expect("original listener tasks registered"),
+                }
+            };
             let _recovery = AlterRecoveryGuard::new(
                 Arc::clone(&transition_manager),
                 transition_runtime,
