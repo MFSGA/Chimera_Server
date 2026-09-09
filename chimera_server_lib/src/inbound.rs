@@ -42,6 +42,7 @@ pub(crate) struct InboundManager {
 struct InboundState {
     configs: Vec<VersionedConfig>,
     tasks: HashMap<String, InboundTaskSet>,
+    pending: HashMap<String, PendingInboundLifecycle>,
     next_generation: u64,
 }
 
@@ -52,6 +53,12 @@ enum InboundLifecycleState {
     Running,
     Stopping,
     Recovering,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingInboundLifecycle {
+    generation: u64,
+    lifecycle: InboundLifecycleState,
 }
 
 #[derive(Debug)]
@@ -662,6 +669,110 @@ impl Drop for ConfiguredStartGuard {
     }
 }
 
+struct PendingAddGuard {
+    manager: Arc<InboundManager>,
+    tag: String,
+    generation: u64,
+    armed: bool,
+}
+
+impl PendingAddGuard {
+    fn new(manager: Arc<InboundManager>, tag: String, generation: u64) -> Self {
+        Self {
+            manager,
+            tag,
+            generation,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingAddGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.manager.clear_pending_lifecycle(
+                &self.tag,
+                self.generation,
+                InboundLifecycleState::Starting,
+            );
+        }
+    }
+}
+
+struct RemoveCleanupGuard {
+    manager: Arc<InboundManager>,
+    tag: String,
+    generation: u64,
+    handles: Vec<JoinHandle<()>>,
+    armed: bool,
+}
+
+impl RemoveCleanupGuard {
+    fn new(
+        manager: Arc<InboundManager>,
+        tag: String,
+        generation: u64,
+        task_set: Option<InboundTaskSet>,
+    ) -> Self {
+        let handles = task_set.map(|tasks| tasks.handles).unwrap_or_default();
+        abort_tasks(&handles);
+        Self {
+            manager,
+            tag,
+            generation,
+            handles,
+            armed: true,
+        }
+    }
+
+    async fn finish(&mut self) {
+        while let Some(handle) = self.handles.last_mut() {
+            let _ = handle.await;
+            self.handles.pop();
+        }
+        self.manager.clear_pending_lifecycle(
+            &self.tag,
+            self.generation,
+            InboundLifecycleState::Stopping,
+        );
+        self.armed = false;
+    }
+}
+
+impl Drop for RemoveCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let handles = std::mem::take(&mut self.handles);
+        let manager = Arc::clone(&self.manager);
+        let tag = self.tag.clone();
+        let generation = self.generation;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                for handle in handles {
+                    let _ = handle.await;
+                }
+                manager.clear_pending_lifecycle(
+                    &tag,
+                    generation,
+                    InboundLifecycleState::Stopping,
+                );
+            });
+        } else {
+            manager.clear_pending_lifecycle(
+                &tag,
+                generation,
+                InboundLifecycleState::Stopping,
+            );
+        }
+    }
+}
+
 struct ConfiguredStartingGuard {
     manager: Arc<InboundManager>,
     tag: String,
@@ -760,6 +871,7 @@ impl InboundManager {
             state: RwLock::new(InboundState {
                 configs,
                 tasks: HashMap::new(),
+                pending: HashMap::new(),
                 next_generation,
             }),
             operation_locks: std::array::from_fn(|_| Mutex::new(())),
@@ -801,15 +913,34 @@ impl InboundManager {
         }
     }
 
+    fn clear_pending_lifecycle(
+        &self,
+        tag: &str,
+        generation: u64,
+        lifecycle: InboundLifecycleState,
+    ) -> bool {
+        let mut state = self.state.write().expect("inbound manager lock poisoned");
+        if state.pending.get(tag).copied()
+            != Some(PendingInboundLifecycle {
+                generation,
+                lifecycle,
+            })
+        {
+            return false;
+        }
+        state.pending.remove(tag);
+        true
+    }
+
     #[cfg(test)]
     fn lifecycle_state(&self, tag: &str) -> Option<InboundLifecycleState> {
-        self.state
-            .read()
-            .expect("inbound manager lock poisoned")
+        let state = self.state.read().expect("inbound manager lock poisoned");
+        state
             .configs
             .iter()
             .find(|entry| entry.config.tag == tag)
             .map(|entry| entry.lifecycle)
+            .or_else(|| state.pending.get(tag).map(|entry| entry.lifecycle))
     }
 
     pub(crate) fn configs(&self) -> Vec<ServerConfig> {
@@ -938,6 +1069,7 @@ impl InboundManager {
             .configs
             .iter()
             .any(|current| current.config.tag == config.tag)
+            || state.pending.contains_key(&config.tag)
         {
             return Err(format!("inbound {} already exists", config.tag));
         }
@@ -1075,17 +1207,35 @@ impl InboundManager {
     }
 
     pub(crate) async fn add_started(
-        &self,
+        self: &Arc<Self>,
         runtime: RuntimeState,
         config: ServerConfig,
     ) -> Result<(), AddInboundError> {
         let tag = config.tag.clone();
         let _operation_guard = self.operation_lock(&tag).lock().await;
-        if self.config_by_tag(&tag).is_some() {
-            return Err(AddInboundError::AlreadyExists(format!(
-                "inbound {tag} already exists"
-            )));
-        }
+        let generation = {
+            let mut state =
+                self.state.write().expect("inbound manager lock poisoned");
+            if state.configs.iter().any(|entry| entry.config.tag == tag)
+                || state.pending.contains_key(&tag)
+            {
+                return Err(AddInboundError::AlreadyExists(format!(
+                    "inbound {tag} already exists"
+                )));
+            }
+            let generation =
+                allocate_generation(&mut state).map_err(AddInboundError::State)?;
+            state.pending.insert(
+                tag.clone(),
+                PendingInboundLifecycle {
+                    generation,
+                    lifecycle: InboundLifecycleState::Starting,
+                },
+            );
+            generation
+        };
+        let mut add_guard =
+            PendingAddGuard::new(Arc::clone(self), tag.clone(), generation);
 
         let pending = PendingTasks::new(
             start_servers(config.clone(), runtime)
@@ -1098,8 +1248,17 @@ impl InboundManager {
                 "inbound {tag} already exists"
             )));
         }
-        let generation =
-            allocate_generation(&mut state).map_err(AddInboundError::State)?;
+        if state.pending.get(&tag).copied()
+            != Some(PendingInboundLifecycle {
+                generation,
+                lifecycle: InboundLifecycleState::Starting,
+            })
+        {
+            return Err(AddInboundError::State(
+                "inbound starting reservation changed before publish",
+            ));
+        }
+        state.pending.remove(&tag);
         state
             .configs
             .push(VersionedConfig::new(generation, config).running());
@@ -1112,6 +1271,7 @@ impl InboundManager {
         ) {
             abort_tasks(&previous.handles);
         }
+        add_guard.disarm();
         Ok(())
     }
 
@@ -1208,11 +1368,11 @@ impl InboundManager {
     }
 
     pub(crate) async fn remove_started(
-        &self,
+        self: &Arc<Self>,
         tag: &str,
     ) -> Result<(), RemoveInboundError> {
         let _operation_guard = self.operation_lock(tag).lock().await;
-        let task_set = {
+        let (generation, task_set) = {
             let mut state =
                 self.state.write().expect("inbound manager lock poisoned");
             let Some(index) = state
@@ -1222,12 +1382,24 @@ impl InboundManager {
             else {
                 return Err(RemoveInboundError::NotFound);
             };
-            state.configs.remove(index);
-            state.tasks.remove(tag)
+            let removed = state.configs.remove(index);
+            let generation = removed.generation;
+            state.pending.insert(
+                tag.to_string(),
+                PendingInboundLifecycle {
+                    generation,
+                    lifecycle: InboundLifecycleState::Stopping,
+                },
+            );
+            (generation, state.tasks.remove(tag))
         };
-        if let Some(task_set) = task_set {
-            stop_task_set(task_set).await;
-        }
+        let mut cleanup = RemoveCleanupGuard::new(
+            Arc::clone(self),
+            tag.to_string(),
+            generation,
+            task_set,
+        );
+        cleanup.finish().await;
         Ok(())
     }
 
@@ -1949,6 +2121,98 @@ mod tests {
         }
         assert!(abort_handle.is_finished());
         assert!(!manager.stop_tasks("primary").await);
+    }
+
+    #[tokio::test]
+    async fn dynamic_add_publishes_running_and_remove_clears_lifecycle() {
+        let port = free_localhost_port();
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let manager = runtime.inbound_manager();
+
+        manager
+            .add_started(runtime.clone(), inbound("primary", port))
+            .await
+            .expect("dynamic add");
+        assert_eq!(
+            manager.lifecycle_state("primary"),
+            Some(InboundLifecycleState::Running)
+        );
+        assert!(wait_for_tcp_listener(port).await);
+
+        manager
+            .remove_started("primary")
+            .await
+            .expect("dynamic remove");
+        assert_eq!(manager.lifecycle_state("primary"), None);
+        assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn failed_dynamic_add_clears_starting_reservation() {
+        let occupied =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind occupied port");
+        let port = occupied.local_addr().unwrap().port();
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let manager = runtime.inbound_manager();
+
+        assert!(
+            manager
+                .add_started(runtime, inbound("primary", port))
+                .await
+                .is_err()
+        );
+        assert_eq!(manager.lifecycle_state("primary"), None);
+        assert!(manager.config_by_tag("primary").is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_remove_keeps_tombstone_until_task_reaped() {
+        let manager = Arc::new(InboundManager::new(vec![inbound("primary", 10001)]));
+        let generation = manager.generation("primary").unwrap();
+        let task = tokio::task::spawn_blocking(|| {
+            std::thread::sleep(Duration::from_millis(500));
+        });
+        assert!(manager.register_tasks_for_generation(
+            "primary",
+            generation,
+            vec![task]
+        ));
+
+        let removing_manager = Arc::clone(&manager);
+        let removing =
+            tokio::spawn(
+                async move { removing_manager.remove_started("primary").await },
+            );
+        for _ in 0..50 {
+            if manager.lifecycle_state("primary")
+                == Some(InboundLifecycleState::Stopping)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            manager.lifecycle_state("primary"),
+            Some(InboundLifecycleState::Stopping)
+        );
+        assert!(manager.config_by_tag("primary").is_none());
+
+        removing.abort();
+        let _ = removing.await;
+        assert_eq!(
+            manager.lifecycle_state("primary"),
+            Some(InboundLifecycleState::Stopping)
+        );
+        assert!(manager.add_config(inbound("primary", 10002)).is_err());
+
+        for _ in 0..100 {
+            if manager.lifecycle_state("primary").is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(manager.lifecycle_state("primary"), None);
+        assert!(manager.add_config(inbound("primary", 10002)).is_ok());
     }
 
     #[tokio::test]
