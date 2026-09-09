@@ -83,6 +83,129 @@ struct AuthInfo {
     vless_route: u32,
 }
 
+#[derive(Debug)]
+struct HysteriaUserState {
+    clients: Vec<Hysteria2Client>,
+    masked_ids: HashMap<[u8; 16], String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct HysteriaUserStore {
+    state: RwLock<HysteriaUserState>,
+}
+
+impl HysteriaUserStore {
+    pub(crate) fn new(clients: Vec<Hysteria2Client>) -> Self {
+        let mut state = HysteriaUserState {
+            clients: Vec::with_capacity(clients.len()),
+            masked_ids: HashMap::new(),
+        };
+        for client in clients {
+            if client.xray_uuid_route {
+                upsert_xray_hysteria_user(&mut state, client);
+            } else {
+                state.clients.push(client);
+            }
+        }
+        Self {
+            state: RwLock::new(state),
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<Hysteria2Client> {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clients
+            .clone()
+    }
+
+    pub(crate) fn add_user(&self, client: Hysteria2Client) {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        upsert_xray_hysteria_user(&mut state, client);
+    }
+
+    pub(crate) fn remove_user_by_email(&self, email: &str) {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(index) = state.clients.iter().position(|client| {
+            client.xray_uuid_route && client.email.as_deref().unwrap_or("") == email
+        }) else {
+            return;
+        };
+        let client = state.clients.remove(index);
+        if let Some((masked_id, _)) = xray_uuid_auth_key(&client.password) {
+            // Xray deletes the secondary UUID index directly. It does not
+            // restore an older user that shared the same masked ID.
+            state.masked_ids.remove(&masked_id);
+        }
+    }
+
+    fn match_auth(
+        &self,
+        provided: &str,
+        xray_compat: bool,
+    ) -> Option<(Hysteria2Client, u32)> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let xray_has_users =
+            xray_compat && state.clients.iter().any(|client| client.xray_uuid_route);
+
+        if let Some(client) = state
+            .clients
+            .iter()
+            .rev()
+            .find(|client| {
+                !client.xray_uuid_route
+                    && (!xray_has_users || !client.xray_transport_auth_fallback)
+                    && client.password == provided
+            })
+            .cloned()
+        {
+            return Some((client, 0));
+        }
+
+        if let Some((masked_id, vless_route)) = xray_uuid_auth_key(provided) {
+            let auth = state.masked_ids.get(&masked_id)?;
+            let client = state
+                .clients
+                .iter()
+                .rev()
+                .find(|client| client.xray_uuid_route && client.password == *auth)?
+                .clone();
+            return Some((client, vless_route));
+        }
+
+        state
+            .clients
+            .iter()
+            .rev()
+            .find(|client| client.xray_uuid_route && client.password == provided)
+            .cloned()
+            .map(|client| (client, 0))
+    }
+}
+
+fn upsert_xray_hysteria_user(
+    state: &mut HysteriaUserState,
+    client: Hysteria2Client,
+) {
+    state.clients.retain(|existing| {
+        !existing.xray_uuid_route || existing.password != client.password
+    });
+    if let Some((masked_id, _)) = xray_uuid_auth_key(&client.password) {
+        state.masked_ids.insert(masked_id, client.password.clone());
+    }
+    state.clients.push(client);
+}
+
 fn hysteria2_traffic_context(
     client: &Hysteria2Client,
     inbound_tag: &str,
@@ -120,10 +243,12 @@ pub async fn process_hysteria2_connection(
     debug!("hysteria2 QUIC established");
     debug!("hysteria2 H3 driver created");
 
+    let user_store = runtime.hysteria_user_store(inbound_tag.as_str());
     let auth_ctx = match await_authentication(
         auth_hysteria2_connection(
             &mut h3_conn,
             config.as_ref(),
+            user_store.as_deref(),
             tx_bps.clone(),
             xray_proxy_transport.as_deref(),
         ),
@@ -214,6 +339,7 @@ where
 async fn auth_hysteria2_connection(
     h3_conn: &mut h3::server::Connection<h3_quinn::Connection, Bytes>,
     config: &Hysteria2ServerConfig,
+    user_store: Option<&HysteriaUserStore>,
     tx_bps: Arc<AtomicU64>,
     xray_proxy_transport: Option<&XrayProxyTransport>,
 ) -> std::io::Result<AuthContext> {
@@ -230,11 +356,19 @@ async fn auth_hysteria2_connection(
                 let request_method = req.method().clone();
                 let request_uri = req.uri().clone();
                 let request_headers = req.headers().clone();
-                match validate_auth_request(
-                    req,
-                    config.clients.as_ref(),
-                    config.xray_compat,
-                ) {
+                let auth_result = match user_store {
+                    Some(store) => validate_auth_request_with_store(
+                        req,
+                        store,
+                        config.xray_compat,
+                    ),
+                    None => validate_auth_request(
+                        req,
+                        config.clients.as_ref(),
+                        config.xray_compat,
+                    ),
+                };
+                match auth_result {
                     Ok(auth_info) => {
                         let (actual_tx, response_rx, response_rx_auto) =
                             resolve_bandwidth_settings(
@@ -686,6 +820,29 @@ fn validate_auth_request(
     clients: &[Hysteria2Client],
     xray_compat: bool,
 ) -> Result<AuthInfo, AuthReject> {
+    validate_auth_request_with_match(req, xray_compat, |provided| {
+        match_hysteria_auth(provided, clients, xray_compat)
+    })
+}
+
+fn validate_auth_request_with_store(
+    req: Request<()>,
+    store: &HysteriaUserStore,
+    xray_compat: bool,
+) -> Result<AuthInfo, AuthReject> {
+    validate_auth_request_with_match(req, xray_compat, |provided| {
+        store.match_auth(provided, xray_compat)
+    })
+}
+
+fn validate_auth_request_with_match<F>(
+    req: Request<()>,
+    xray_compat: bool,
+    match_auth: F,
+) -> Result<AuthInfo, AuthReject>
+where
+    F: FnOnce(&str) -> Option<(Hysteria2Client, u32)>,
+{
     let is_auth_request = if xray_compat {
         req.method() == http::Method::POST
             && req.uri().authority().map(|authority| authority.as_str())
@@ -707,8 +864,8 @@ fn validate_auth_request(
         None => return Err(AuthReject::Unauthorized("missing auth header")),
     };
 
-    let (client, vless_route) = match_hysteria_auth(provided, clients, xray_compat)
-        .ok_or(AuthReject::Unauthorized("password mismatch"))?;
+    let (client, vless_route) =
+        match_auth(provided).ok_or(AuthReject::Unauthorized("password mismatch"))?;
 
     // Xray ignores Hysteria-CC-RX parse errors, while shoes does not consume
     // this header at all. Treat malformed values as an unspecified/zero limit
@@ -6033,6 +6190,68 @@ mod tests {
         assert!(
             match_hysteria_auth("transport-fallback", &clients, true).is_some(),
             "removing the last Xray user must re-enable transport auth fallback"
+        );
+    }
+
+    #[test]
+    fn runtime_user_store_matches_xray_validator_index_lifecycle() {
+        let fallback = Hysteria2Client {
+            password: "transport-fallback".to_string(),
+            email: None,
+            level: 0,
+            xray_uuid_route: false,
+            xray_transport_auth_fallback: true,
+        };
+        let store = HysteriaUserStore::new(vec![fallback]);
+        assert!(store.match_auth("transport-fallback", true).is_some());
+
+        store.add_user(Hysteria2Client {
+            password: "00112233-4455-6677-8899-aabbccddeeff".to_string(),
+            email: Some("first@example.com".to_string()),
+            level: 3,
+            xray_uuid_route: true,
+            xray_transport_auth_fallback: false,
+        });
+        assert!(
+            store.match_auth("transport-fallback", true).is_none(),
+            "a non-empty Xray validator disables transport auth fallback"
+        );
+        let first = store
+            .match_auth("00112233-4455-abcd-8899-aabbccddeeff", true)
+            .expect("masked UUID should authenticate the first user");
+        assert_eq!(first.0.email.as_deref(), Some("first@example.com"));
+        assert_eq!(first.1, 0xabcd);
+
+        store.add_user(Hysteria2Client {
+            password: "00112233-4455-1234-8899-aabbccddeeff".to_string(),
+            email: Some("second@example.com".to_string()),
+            level: 7,
+            xray_uuid_route: true,
+            xray_transport_auth_fallback: false,
+        });
+        let shadowed = store
+            .match_auth("00112233-4455-beef-8899-aabbccddeeff", true)
+            .expect("later masked UUID user should own the secondary index");
+        assert_eq!(shadowed.0.email.as_deref(), Some("second@example.com"));
+        assert_eq!(shadowed.0.level, 7);
+        assert_eq!(shadowed.1, 0xbeef);
+
+        store.remove_user_by_email("first@example.com");
+        assert!(
+            store
+                .match_auth("00112233-4455-beef-8899-aabbccddeeff", true)
+                .is_none(),
+            "deleting a colliding UUID user must remove the masked index without resurrecting another user"
+        );
+        assert!(
+            store.match_auth("transport-fallback", true).is_none(),
+            "the remaining validator user must keep transport fallback disabled"
+        );
+
+        store.remove_user_by_email("second@example.com");
+        assert!(
+            store.match_auth("transport-fallback", true).is_some(),
+            "removing the final validator user re-enables transport fallback"
         );
     }
 

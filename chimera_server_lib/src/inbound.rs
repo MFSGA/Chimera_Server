@@ -9,6 +9,8 @@ use tokio::{sync::Mutex, task::JoinHandle};
 
 #[cfg(feature = "vless")]
 use crate::config::server_config::VlessUser;
+#[cfg(feature = "hysteria")]
+use crate::handler::hysteria2::connection::HysteriaUserStore;
 use crate::{
     beginning::start_servers,
     config::server_config::{ServerConfig, ServerProxyConfig},
@@ -51,6 +53,8 @@ struct VersionedConfig {
     vmess_users: Option<Arc<VmessUserStore>>,
     #[cfg(feature = "trojan")]
     trojan_users: Option<Arc<TrojanUserStore>>,
+    #[cfg(feature = "hysteria")]
+    hysteria_users: Option<Arc<HysteriaUserStore>>,
 }
 
 #[cfg(feature = "vless")]
@@ -93,6 +97,13 @@ impl VersionedConfig {
             trojan_users: single_trojan_users(&config.protocol)
                 .map(TrojanUserStore::new)
                 .map(Arc::new),
+            #[cfg(feature = "hysteria")]
+            hysteria_users: match &config.protocol {
+                ServerProxyConfig::Hysteria2 { config } => {
+                    Some(Arc::new(HysteriaUserStore::new(config.clients.clone())))
+                }
+                _ => None,
+            },
             generation,
             config,
         }
@@ -114,6 +125,13 @@ impl VersionedConfig {
         if let Some(store) = &self.trojan_users {
             let users = store.snapshot();
             let _ = replace_single_trojan_users(&mut config.protocol, &users);
+        }
+        #[cfg(feature = "hysteria")]
+        if let Some(store) = &self.hysteria_users
+            && let ServerProxyConfig::Hysteria2 { config: hysteria } =
+                &mut config.protocol
+        {
+            hysteria.clients = store.snapshot();
         }
         config
     }
@@ -552,6 +570,21 @@ impl InboundManager {
             .iter()
             .find(|entry| entry.config.tag == tag)
             .and_then(|entry| entry.trojan_users.as_ref())
+            .cloned()
+    }
+
+    #[cfg(feature = "hysteria")]
+    pub(crate) fn hysteria_user_store(
+        &self,
+        tag: &str,
+    ) -> Option<Arc<HysteriaUserStore>> {
+        self.state
+            .read()
+            .expect("inbound manager lock poisoned")
+            .configs
+            .iter()
+            .find(|entry| entry.config.tag == tag)
+            .and_then(|entry| entry.hysteria_users.as_ref())
             .cloned()
     }
 

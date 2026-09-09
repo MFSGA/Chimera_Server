@@ -8,6 +8,8 @@ use tokio::{sync::broadcast, task::JoinHandle};
 
 #[cfg(feature = "vless")]
 use crate::config::server_config::VlessUser;
+#[cfg(feature = "hysteria")]
+use crate::handler::hysteria2::connection::HysteriaUserStore;
 #[cfg(feature = "trojan")]
 use crate::handler::trojan::TrojanUserStore;
 #[cfg(feature = "vmess")]
@@ -304,6 +306,14 @@ impl RuntimeState {
         tag: &str,
     ) -> Option<Arc<TrojanUserStore>> {
         self.inbound_manager.trojan_user_store(tag)
+    }
+
+    #[cfg(feature = "hysteria")]
+    pub(crate) fn hysteria_user_store(
+        &self,
+        tag: &str,
+    ) -> Option<Arc<HysteriaUserStore>> {
+        self.inbound_manager.hysteria_user_store(tag)
     }
 
     #[cfg(feature = "vmess")]
