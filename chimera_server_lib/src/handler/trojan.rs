@@ -1,10 +1,11 @@
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::{
+    collections::HashMap,
+    net::{Ipv4Addr, Ipv6Addr},
+    sync::{Arc, OnceLock, RwLock},
+};
 
 use async_trait::async_trait;
-use aws_lc_rs::{
-    constant_time::verify_slices_are_equal,
-    digest::{SHA224, digest},
-};
+use aws_lc_rs::digest::{SHA224, digest};
 use tokio::io::AsyncReadExt;
 
 use crate::{
@@ -33,14 +34,99 @@ type FallbackSelection<'a> = Option<(&'a TrojanFallback, FallbackScore)>;
 
 #[derive(Debug, Clone)]
 struct TrojanCredential {
-    password_hash: Box<[u8]>,
     identity: Option<String>,
     user_level: u32,
 }
 
 #[derive(Debug)]
+struct TrojanUserState {
+    users: Vec<TrojanUser>,
+    credentials: HashMap<Vec<u8>, TrojanCredential>,
+}
+
+#[derive(Debug)]
+pub(crate) struct TrojanUserStore {
+    state: RwLock<TrojanUserState>,
+}
+
+impl TrojanUserStore {
+    pub(crate) fn new(users: Vec<TrojanUser>) -> Self {
+        let mut credentials = HashMap::with_capacity(users.len());
+        for user in &users {
+            credentials.insert(
+                create_password_hash(&user.password).into_vec(),
+                credential_from_user(user),
+            );
+        }
+        Self {
+            state: RwLock::new(TrojanUserState { users, credentials }),
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<TrojanUser> {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .users
+            .clone()
+    }
+
+    fn credential(&self, password_line: &[u8]) -> Option<TrojanCredential> {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .credentials
+            .get(password_line)
+            .cloned()
+    }
+
+    fn contains_password_hash(&self, password_line: &[u8]) -> bool {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .credentials
+            .contains_key(password_line)
+    }
+
+    #[cfg(test)]
+    fn replace_for_test(&self, users: Vec<TrojanUser>) {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.credentials.clear();
+        for user in &users {
+            state.credentials.insert(
+                create_password_hash(&user.password).into_vec(),
+                credential_from_user(user),
+            );
+        }
+        state.users = users;
+    }
+}
+
+fn credential_from_user(user: &TrojanUser) -> TrojanCredential {
+    let identity = user
+        .email
+        .clone()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            if user.password.is_empty() {
+                None
+            } else {
+                Some(user.password.clone())
+            }
+        });
+    TrojanCredential {
+        identity,
+        user_level: user.user_level,
+    }
+}
+
+#[derive(Debug)]
 pub struct TrojanTcpHandler {
-    credentials: Vec<TrojanCredential>,
+    credentials: Arc<TrojanUserStore>,
+    runtime_credentials: OnceLock<Arc<TrojanUserStore>>,
     fallbacks: Vec<TrojanFallback>,
     inbound_tag: String,
 }
@@ -51,26 +137,9 @@ impl TrojanTcpHandler {
         fallbacks: Vec<TrojanFallback>,
         inbound_tag: &str,
     ) -> Self {
-        let credentials = users
-            .into_iter()
-            .map(|user| {
-                let identity =
-                    user.email.filter(|value| !value.is_empty()).or_else(|| {
-                        if user.password.is_empty() {
-                            None
-                        } else {
-                            Some(user.password.clone())
-                        }
-                    });
-                TrojanCredential {
-                    password_hash: create_password_hash(&user.password),
-                    identity,
-                    user_level: user.user_level,
-                }
-            })
-            .collect();
         Self {
-            credentials,
+            credentials: Arc::new(TrojanUserStore::new(users)),
+            runtime_credentials: OnceLock::new(),
             fallbacks,
             inbound_tag: inbound_tag.to_string(),
         }
@@ -78,6 +147,13 @@ impl TrojanTcpHandler {
 }
 
 impl TrojanTcpHandler {
+    fn selected_credentials(&self) -> &TrojanUserStore {
+        self.runtime_credentials
+            .get()
+            .map(Arc::as_ref)
+            .unwrap_or_else(|| self.credentials.as_ref())
+    }
+
     async fn setup_server_stream_with_metadata(
         &self,
         mut server_stream: Box<dyn AsyncStream>,
@@ -112,9 +188,9 @@ impl TrojanTcpHandler {
             };
 
             if password_line.len() != 56
-                || self.credentials.iter().all(|credential| {
-                    !credential_matches(credential, &password_line)
-                })
+                || !self
+                    .selected_credentials()
+                    .contains_password_hash(&password_line)
             {
                 let fallback = select_trojan_fallback(
                     &self.fallbacks,
@@ -149,9 +225,8 @@ impl TrojanTcpHandler {
         }
 
         let credential = self
-            .credentials
-            .iter()
-            .find(|credential| credential_matches(credential, &password_line))
+            .selected_credentials()
+            .credential(&password_line)
             .ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -217,6 +292,13 @@ impl TcpServerHandler for TrojanTcpHandler {
         server_stream: Box<dyn AsyncStream>,
         context: TcpServerConnectionContext,
     ) -> std::io::Result<TcpServerSetupResult> {
+        if let Some(store) = context
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.trojan_user_store(&self.inbound_tag))
+        {
+            let _ = self.runtime_credentials.set(store);
+        }
         self.setup_server_stream_with_metadata(
             server_stream,
             context.server_name.as_deref().unwrap_or(""),
@@ -437,10 +519,6 @@ fn fallback_forward(
     }
 }
 
-fn credential_matches(credential: &TrojanCredential, password_line: &[u8]) -> bool {
-    verify_slices_are_equal(credential.password_hash.as_ref(), password_line).is_ok()
-}
-
 fn create_password_hash(password: &str) -> Box<[u8]> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let digest = digest(&SHA224, password.as_bytes());
@@ -465,7 +543,14 @@ mod tests {
         duplex,
     };
 
-    use crate::async_stream::AsyncPing;
+    use crate::{
+        async_stream::AsyncPing,
+        config::{
+            Transport,
+            server_config::{ServerConfig, ServerProxyConfig},
+        },
+        runtime::RuntimeState,
+    };
 
     use super::*;
 
@@ -626,6 +711,90 @@ mod tests {
         request.extend_from_slice(&port.to_be_bytes());
         request.extend_from_slice(&CRLF);
         request
+    }
+
+    #[tokio::test]
+    async fn runtime_user_store_updates_existing_handler_without_rebuild() {
+        let inbound_tag = "trojan-runtime-users";
+        let first = TrojanUser {
+            password: "first-password".into(),
+            email: Some("first-user".into()),
+            user_level: 3,
+        };
+        let second = TrojanUser {
+            password: "second-password".into(),
+            email: Some("second-user".into()),
+            user_level: 7,
+        };
+        let runtime = RuntimeState::new(
+            vec![ServerConfig {
+                tag: inbound_tag.to_string(),
+                bind_location: crate::address::BindLocation::Address(
+                    NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 10001),
+                ),
+                protocol: ServerProxyConfig::Trojan {
+                    users: vec![first.clone()],
+                    fallbacks: Vec::new(),
+                },
+                transport: Transport::Tcp,
+                quic_settings: None,
+                sniffing: None,
+                tcp_socket_policy: None,
+            }],
+            Vec::new(),
+        );
+        let handler = TrojanTcpHandler::new(vec![first], Vec::new(), inbound_tag);
+        let context = TcpServerConnectionContext {
+            runtime: Some(runtime.clone()),
+            ..TcpServerConnectionContext::default()
+        };
+
+        let request = build_trojan_request(
+            "first-password",
+            CMD_CONNECT,
+            ADDR_TYPE_IPV4,
+            &Ipv4Addr::LOCALHOST.octets(),
+            443,
+        );
+        let (mut client, server) = duplex(1024);
+        client.write_all(&request).await.unwrap();
+        handler
+            .setup_server_stream_with_context(
+                Box::new(TestStream(server)),
+                context.clone(),
+            )
+            .await
+            .expect("initial Trojan user should authenticate");
+
+        runtime
+            .trojan_user_store(inbound_tag)
+            .expect("single Trojan inbound should expose runtime users")
+            .replace_for_test(vec![second]);
+
+        let request = build_trojan_request(
+            "second-password",
+            CMD_CONNECT,
+            ADDR_TYPE_IPV4,
+            &Ipv4Addr::LOCALHOST.octets(),
+            443,
+        );
+        let (mut client, server) = duplex(1024);
+        client.write_all(&request).await.unwrap();
+        let result = handler
+            .setup_server_stream_with_context(Box::new(TestStream(server)), context)
+            .await
+            .expect(
+                "new Trojan user should authenticate without rebuilding handler",
+            );
+        let TcpServerSetupResult::TcpForward {
+            traffic_context, ..
+        } = result
+        else {
+            panic!("Trojan TCP request should produce a TCP forward");
+        };
+        let traffic_context = traffic_context.expect("Trojan traffic context");
+        assert_eq!(traffic_context.identity.as_deref(), Some("second-user"));
+        assert_eq!(traffic_context.user_level, 7);
     }
 
     #[tokio::test]

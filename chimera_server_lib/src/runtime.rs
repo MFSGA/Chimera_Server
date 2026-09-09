@@ -8,6 +8,8 @@ use tokio::{sync::broadcast, task::JoinHandle};
 
 #[cfg(feature = "vless")]
 use crate::config::server_config::VlessUser;
+#[cfg(feature = "trojan")]
+use crate::handler::trojan::TrojanUserStore;
 #[cfg(feature = "vmess")]
 use crate::{
     config::server_config::VmessUser, handler::vmess::vmess_handler::VmessUserStore,
@@ -294,6 +296,14 @@ impl RuntimeState {
     #[cfg(feature = "vmess")]
     pub(crate) fn vmess_user_store(&self, tag: &str) -> Option<Arc<VmessUserStore>> {
         self.inbound_manager.vmess_user_store(tag)
+    }
+
+    #[cfg(feature = "trojan")]
+    pub(crate) fn trojan_user_store(
+        &self,
+        tag: &str,
+    ) -> Option<Arc<TrojanUserStore>> {
+        self.inbound_manager.trojan_user_store(tag)
     }
 
     #[cfg(feature = "vmess")]

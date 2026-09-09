@@ -14,6 +14,8 @@ use crate::{
     config::server_config::{ServerConfig, ServerProxyConfig},
     runtime::RuntimeState,
 };
+#[cfg(feature = "trojan")]
+use crate::{config::server_config::TrojanUser, handler::trojan::TrojanUserStore};
 #[cfg(feature = "vmess")]
 use crate::{
     config::server_config::VmessUser, handler::vmess::vmess_handler::VmessUserStore,
@@ -47,6 +49,8 @@ struct VersionedConfig {
     vless_users: Option<VlessUserStore>,
     #[cfg(feature = "vmess")]
     vmess_users: Option<Arc<VmessUserStore>>,
+    #[cfg(feature = "trojan")]
+    trojan_users: Option<Arc<TrojanUserStore>>,
 }
 
 #[cfg(feature = "vless")]
@@ -85,6 +89,10 @@ impl VersionedConfig {
             vmess_users: single_vmess_users(&config.protocol)
                 .map(VmessUserStore::new)
                 .map(Arc::new),
+            #[cfg(feature = "trojan")]
+            trojan_users: single_trojan_users(&config.protocol)
+                .map(TrojanUserStore::new)
+                .map(Arc::new),
             generation,
             config,
         }
@@ -101,6 +109,11 @@ impl VersionedConfig {
         if let Some(store) = &self.vmess_users {
             let users = store.snapshot();
             let _ = replace_single_vmess_users(&mut config.protocol, &users);
+        }
+        #[cfg(feature = "trojan")]
+        if let Some(store) = &self.trojan_users {
+            let users = store.snapshot();
+            let _ = replace_single_trojan_users(&mut config.protocol, &users);
         }
         config
     }
@@ -296,6 +309,101 @@ fn replace_single_vmess_users(
     }
 }
 
+#[cfg(feature = "trojan")]
+fn single_trojan_users(protocol: &ServerProxyConfig) -> Option<Vec<TrojanUser>> {
+    let mut matches = Vec::new();
+    collect_trojan_users(protocol, &mut matches);
+    (matches.len() == 1).then(|| matches.remove(0))
+}
+
+#[cfg(feature = "trojan")]
+fn collect_trojan_users(
+    protocol: &ServerProxyConfig,
+    matches: &mut Vec<Vec<TrojanUser>>,
+) {
+    match protocol {
+        ServerProxyConfig::Trojan { users, .. } => matches.push(users.clone()),
+        #[cfg(feature = "ws")]
+        ServerProxyConfig::Websocket { targets } => match targets.as_ref() {
+            crate::util::option::OneOrSome::One(target) => {
+                collect_trojan_users(&target.protocol, matches);
+            }
+            crate::util::option::OneOrSome::Some(targets) => {
+                for target in targets {
+                    collect_trojan_users(&target.protocol, matches);
+                }
+            }
+        },
+        #[cfg(feature = "tls")]
+        ServerProxyConfig::Tls(config) => {
+            collect_trojan_users(&config.inner, matches)
+        }
+        #[cfg(feature = "reality")]
+        ServerProxyConfig::Reality(config) => {
+            collect_trojan_users(&config.inner, matches)
+        }
+        ServerProxyConfig::Xhttp { inner, .. } => {
+            collect_trojan_users(inner, matches)
+        }
+        #[cfg(feature = "httpupgrade")]
+        ServerProxyConfig::HttpUpgrade(config) => {
+            collect_trojan_users(&config.inner, matches)
+        }
+        #[cfg(feature = "grpc_transport")]
+        ServerProxyConfig::Grpc(config) => {
+            collect_trojan_users(&config.inner, matches)
+        }
+        _ => {}
+    }
+}
+
+#[cfg(feature = "trojan")]
+fn replace_single_trojan_users(
+    protocol: &mut ServerProxyConfig,
+    users: &[TrojanUser],
+) -> bool {
+    match protocol {
+        ServerProxyConfig::Trojan { users: current, .. } => {
+            *current = users.to_vec();
+            true
+        }
+        #[cfg(feature = "ws")]
+        ServerProxyConfig::Websocket { targets } => match targets.as_mut() {
+            crate::util::option::OneOrSome::One(target) => {
+                replace_single_trojan_users(&mut target.protocol, users)
+            }
+            crate::util::option::OneOrSome::Some(targets) => {
+                let mut replaced = false;
+                for target in targets {
+                    replaced |=
+                        replace_single_trojan_users(&mut target.protocol, users);
+                }
+                replaced
+            }
+        },
+        #[cfg(feature = "tls")]
+        ServerProxyConfig::Tls(config) => {
+            replace_single_trojan_users(&mut config.inner, users)
+        }
+        #[cfg(feature = "reality")]
+        ServerProxyConfig::Reality(config) => {
+            replace_single_trojan_users(&mut config.inner, users)
+        }
+        ServerProxyConfig::Xhttp { inner, .. } => {
+            replace_single_trojan_users(inner, users)
+        }
+        #[cfg(feature = "httpupgrade")]
+        ServerProxyConfig::HttpUpgrade(config) => {
+            replace_single_trojan_users(&mut config.inner, users)
+        }
+        #[cfg(feature = "grpc_transport")]
+        ServerProxyConfig::Grpc(config) => {
+            replace_single_trojan_users(&mut config.inner, users)
+        }
+        _ => false,
+    }
+}
+
 #[derive(Debug)]
 struct InboundTaskSet {
     generation: u64,
@@ -429,6 +537,21 @@ impl InboundManager {
             .iter()
             .find(|entry| entry.config.tag == tag)
             .and_then(|entry| entry.vmess_users.as_ref())
+            .cloned()
+    }
+
+    #[cfg(feature = "trojan")]
+    pub(crate) fn trojan_user_store(
+        &self,
+        tag: &str,
+    ) -> Option<Arc<TrojanUserStore>> {
+        self.state
+            .read()
+            .expect("inbound manager lock poisoned")
+            .configs
+            .iter()
+            .find(|entry| entry.config.tag == tag)
+            .and_then(|entry| entry.trojan_users.as_ref())
             .cloned()
     }
 
