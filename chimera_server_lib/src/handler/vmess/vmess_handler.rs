@@ -1594,6 +1594,21 @@ mod tests {
         assert_eq!(user_b.user_label, "user-b");
     }
 
+    #[test]
+    fn runtime_store_same_uuid_authenticates_last_added_user_like_xray() {
+        let user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
+        let store = VmessUserStore::new(vec![
+            vmess_user(user_id, "first-user", "none"),
+            vmess_user(user_id, "second-user", "none"),
+        ]);
+        let now = current_time_secs();
+
+        let user = store
+            .authenticate_at(&build_auth_id(user_id, now), now)
+            .expect("duplicate VMess UUID should still authenticate");
+        assert_eq!(user.user_label, "second-user");
+    }
+
     #[tokio::test]
     async fn setup_server_stream_authenticates_each_configured_user() {
         let user_a_id = "3ac9b383-75a1-431c-8184-106c80eb2273";

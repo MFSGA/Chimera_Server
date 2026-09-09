@@ -682,6 +682,40 @@ impl InboundManager {
         self.alter_started_locked(runtime, tag, update_config).await
     }
 
+    #[cfg(feature = "vmess")]
+    pub(crate) async fn alter_vmess_users<E, F, U>(
+        &self,
+        runtime: RuntimeState,
+        tag: &str,
+        update_config: F,
+        update_vmess_users: U,
+    ) -> Result<(), AlterInboundError<E>>
+    where
+        E: Send,
+        F: FnOnce(&ServerConfig) -> Result<ServerConfig, E> + Send,
+        U: FnOnce(&mut Vec<VmessUser>) -> Result<(), E> + Send,
+    {
+        let _operation_guard = self.operation_lock(tag).lock().await;
+        let vmess_store = {
+            let state = self.state.read().expect("inbound manager lock poisoned");
+            let Some(entry) =
+                state.configs.iter().find(|entry| entry.config.tag == tag)
+            else {
+                return Err(AlterInboundError::NotFound);
+            };
+            entry.vmess_users.clone()
+        };
+
+        if let Some(store) = vmess_store {
+            store
+                .update(update_vmess_users)
+                .map_err(AlterInboundError::Update)?;
+            return Ok(());
+        }
+
+        self.alter_started_locked(runtime, tag, update_config).await
+    }
+
     async fn alter_started_locked<E, F>(
         &self,
         runtime: RuntimeState,

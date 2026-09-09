@@ -1050,6 +1050,74 @@ impl HandlerServiceImpl {
         })
     }
 
+    #[cfg(feature = "vmess")]
+    fn add_vmess_user(
+        &self,
+        users: &mut Vec<VmessUser>,
+        user: &proto::xray::common::protocol::User,
+    ) -> Result<(), Status> {
+        let parsed = self.parse_vmess_user(user)?;
+        let email = user.email.trim();
+        if !email.is_empty()
+            && users
+                .iter()
+                .any(|existing| existing.user_label.eq_ignore_ascii_case(email))
+        {
+            return Err(Status::already_exists(format!(
+                "VMess user {email} already exists"
+            )));
+        }
+        users.push(parsed);
+        Ok(())
+    }
+
+    #[cfg(feature = "vmess")]
+    fn remove_vmess_user(
+        &self,
+        users: &mut Vec<VmessUser>,
+        email: &str,
+    ) -> Result<(), Status> {
+        let Some(index) = users
+            .iter()
+            .position(|user| user.user_label.eq_ignore_ascii_case(email))
+        else {
+            return Err(Status::not_found(format!("VMess user {email} not found")));
+        };
+        users.swap_remove(index);
+        Ok(())
+    }
+
+    #[cfg(feature = "vmess")]
+    fn apply_vmess_runtime_operation(
+        &self,
+        users: &mut Vec<VmessUser>,
+        operation: AlterInboundOperation,
+    ) -> Result<(), Status> {
+        match operation {
+            AlterInboundOperation::Noop => Ok(()),
+            AlterInboundOperation::AddUser(operation) => {
+                let user = operation.user.as_ref().ok_or_else(|| {
+                    Status::invalid_argument("AddUserOperation.user is required")
+                })?;
+                self.add_vmess_user(users, user)?;
+                let stats = self.runtime.policy_user_stats(user.level);
+                if stats.uplink || stats.downlink {
+                    register_identity(user.email.clone());
+                }
+                Ok(())
+            }
+            AlterInboundOperation::RemoveUser(operation) => {
+                let email = operation.email.trim();
+                if email.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "RemoveUserOperation.email is required",
+                    ));
+                }
+                self.remove_vmess_user(users, email)
+            }
+        }
+    }
+
     #[cfg(feature = "shadowsocks")]
     fn parse_shadowsocks_user(
         &self,
@@ -2420,18 +2488,7 @@ impl HandlerServiceImpl {
             }
             #[cfg(feature = "vmess")]
             ServerProxyConfig::Vmess { users } => {
-                let parsed = self.parse_vmess_user(user)?;
-                let email = user.email.trim();
-                if !email.is_empty()
-                    && users.iter().any(|existing| {
-                        existing.user_label.eq_ignore_ascii_case(email)
-                    })
-                {
-                    return Err(Status::already_exists(format!(
-                        "VMess user {email} already exists"
-                    )));
-                }
-                users.push(parsed);
+                self.add_vmess_user(users, user)?;
                 Ok(true)
             }
             #[cfg(feature = "trojan")]
@@ -2571,13 +2628,7 @@ impl HandlerServiceImpl {
             }
             #[cfg(feature = "vmess")]
             ServerProxyConfig::Vmess { users } => {
-                let before = users.len();
-                users.retain(|user| !user.user_label.eq_ignore_ascii_case(email));
-                if before == users.len() {
-                    return Err(Status::not_found(format!(
-                        "VMess user {email} not found"
-                    )));
-                }
+                self.remove_vmess_user(users, email)?;
                 Ok(true)
             }
             #[cfg(feature = "trojan")]
@@ -2693,6 +2744,26 @@ impl HandlerServiceImpl {
             AlterInboundOperation::RemoveUser(op) => {
                 self.apply_remove_user_operation(&mut inbound.protocol, op)
             }
+        }
+    }
+
+    fn map_alter_inbound_error(error: AlterInboundError<Status>) -> Status {
+        match error {
+            AlterInboundError::NotFound => Status::not_found("inbound not found"),
+            AlterInboundError::Update(error) => error,
+            AlterInboundError::State(error) => Status::internal(error),
+            AlterInboundError::Restart {
+                start_error,
+                rollback_error: None,
+            } => Status::unknown(format!(
+                "failed to restart inbound handler: {start_error}; previous inbound restored"
+            )),
+            AlterInboundError::Restart {
+                start_error,
+                rollback_error: Some(rollback_error),
+            } => Status::unknown(format!(
+                "failed to restart inbound handler: {start_error}; rollback failed: {rollback_error}"
+            )),
         }
     }
 
@@ -3056,6 +3127,29 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
             ));
         }
 
+        #[cfg(feature = "vmess")]
+        if self.runtime.vmess_user_store(&request.tag).is_some() {
+            let config_operation = operation.clone();
+            self.runtime
+                .alter_vmess_users(
+                    &request.tag,
+                    |current| {
+                        let mut updated = Self::detached_inbound(current);
+                        self.apply_alter_inbound_operation(
+                            &mut updated,
+                            config_operation,
+                        )?;
+                        Ok::<ServerConfig, Status>(updated)
+                    },
+                    |users| self.apply_vmess_runtime_operation(users, operation),
+                )
+                .await
+                .map_err(Self::map_alter_inbound_error)?;
+            return Ok(Response::new(
+                proto::xray::app::proxyman::command::AlterInboundResponse {},
+            ));
+        }
+
         #[cfg(feature = "vless")]
         let alter_result = {
             let config_operation = operation.clone();
@@ -3084,23 +3178,7 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
             })
             .await;
 
-        alter_result.map_err(|error| match error {
-                AlterInboundError::NotFound => Status::not_found("inbound not found"),
-                AlterInboundError::Update(error) => error,
-                AlterInboundError::State(error) => Status::internal(error),
-                AlterInboundError::Restart {
-                    start_error,
-                    rollback_error: None,
-                } => Status::unknown(format!(
-                    "failed to restart inbound handler: {start_error}; previous inbound restored"
-                )),
-                AlterInboundError::Restart {
-                    start_error,
-                    rollback_error: Some(rollback_error),
-                } => Status::unknown(format!(
-                    "failed to restart inbound handler: {start_error}; rollback failed: {rollback_error}"
-                )),
-            })?;
+        alter_result.map_err(Self::map_alter_inbound_error)?;
 
         Ok(Response::new(
             proto::xray::app::proxyman::command::AlterInboundResponse {},
@@ -4014,6 +4092,75 @@ mod tests {
             );
         assert_eq!(tuned.protocol, "trojan");
         assert!(tuned.sender_settings_value.is_some());
+    }
+
+    #[cfg(feature = "vmess")]
+    #[tokio::test]
+    async fn handler_alter_vmess_users_does_not_restart_listener() {
+        let occupied = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let inbound_tag = unique_tag("vmess-no-restart-inbound");
+        let runtime = RuntimeState::new(
+            vec![ServerConfig {
+                tag: inbound_tag.clone(),
+                bind_location: BindLocation::Address(NetLocation::new(
+                    Address::Ipv4(Ipv4Addr::LOCALHOST),
+                    port,
+                )),
+                protocol: ServerProxyConfig::Vmess { users: Vec::new() },
+                transport: Transport::Tcp,
+                quic_settings: None,
+                sniffing: None,
+                tcp_socket_policy: None,
+            }],
+            Vec::new(),
+        );
+        let placeholder_task = tokio::spawn(std::future::pending::<()>());
+        let abort_handle = placeholder_task.abort_handle();
+        runtime.register_inbound_tasks(&inbound_tag, vec![placeholder_task]);
+        let service = HandlerServiceImpl::new(runtime.clone());
+        let added_email = unique_tag("vmess-dynamic-user");
+        let operation = proto::xray::app::proxyman::command::AddUserOperation {
+            user: Some(proto::xray::common::protocol::User {
+                level: 0,
+                email: added_email.clone(),
+                account: Some(proto::xray::common::serial::TypedMessage {
+                    r#type: TYPE_PROXY_VMESS_ACCOUNT.to_string(),
+                    value: VmessAccountPayload {
+                        id: "3ac9b383-75a1-431c-8184-106c80eb2273".to_string(),
+                        security_settings: Some(VmessSecurityConfigPayload {
+                            r#type: 3,
+                        }),
+                        tests_enabled: String::new(),
+                    }
+                    .encode_to_vec(),
+                }),
+            }),
+        };
+
+        service
+            .alter_inbound(Request::new(
+                proto::xray::app::proxyman::command::AlterInboundRequest {
+                    tag: inbound_tag.clone(),
+                    operation: Some(proto::xray::common::serial::TypedMessage {
+                        r#type: TYPE_ADD_USER_OPERATION.to_string(),
+                        value: operation.encode_to_vec(),
+                    }),
+                },
+            ))
+            .await
+            .expect("VMess user update must not rebind the occupied listener");
+
+        assert!(!abort_handle.is_finished());
+        let updated = runtime.inbound_by_tag(&inbound_tag).unwrap();
+        let ServerProxyConfig::Vmess { users } = updated.protocol else {
+            panic!("expected vmess inbound");
+        };
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].user_label, added_email);
+        assert!(runtime.stop_inbound_tasks(&inbound_tag).await);
     }
 
     #[cfg(feature = "vless")]
@@ -5432,7 +5579,7 @@ mod tests {
 
         let remove_operation =
             proto::xray::app::proxyman::command::RemoveUserOperation {
-                email: email.clone(),
+                email: email.to_ascii_uppercase(),
             };
         service
             .alter_inbound(Request::new(
@@ -5445,7 +5592,7 @@ mod tests {
                 },
             ))
             .await
-            .expect("vmess remove user should succeed");
+            .expect("vmess remove user should succeed case-insensitively");
 
         let count_after_remove = service
             .get_inbound_users_count(Request::new(
