@@ -599,6 +599,25 @@ mod tests {
         time::Duration,
     };
 
+    #[tokio::test]
+    async fn stopping_inbound_tasks_releases_listener_before_return() {
+        let listener =
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("bind test listener");
+        let address = listener.local_addr().expect("read test listener address");
+        let task = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        runtime.register_inbound_tasks("listener-release", vec![task]);
+
+        assert!(runtime.stop_inbound_tasks("listener-release").await);
+        tokio::net::TcpListener::bind(address)
+            .await
+            .expect("listener should be released before stop returns");
+    }
+
     #[test]
     fn xray_handshake_policy_uses_level_override_and_default() {
         let runtime = RuntimeState::new(Vec::new(), Vec::new());
