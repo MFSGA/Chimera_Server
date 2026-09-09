@@ -14,6 +14,10 @@ use crate::{
     config::server_config::{ServerConfig, ServerProxyConfig},
     runtime::RuntimeState,
 };
+#[cfg(feature = "vmess")]
+use crate::{
+    config::server_config::VmessUser, handler::vmess::vmess_handler::VmessUserStore,
+};
 
 const OPERATION_LOCK_SHARDS: usize = 64;
 
@@ -41,6 +45,8 @@ struct VersionedConfig {
     config: ServerConfig,
     #[cfg(feature = "vless")]
     vless_users: Option<VlessUserStore>,
+    #[cfg(feature = "vmess")]
+    vmess_users: Option<Arc<VmessUserStore>>,
 }
 
 #[cfg(feature = "vless")]
@@ -75,6 +81,10 @@ impl VersionedConfig {
             #[cfg(feature = "vless")]
             vless_users: single_vless_users(&config.protocol)
                 .map(VlessUserStore::new),
+            #[cfg(feature = "vmess")]
+            vmess_users: single_vmess_users(&config.protocol)
+                .map(VmessUserStore::new)
+                .map(Arc::new),
             generation,
             config,
         }
@@ -86,6 +96,11 @@ impl VersionedConfig {
         if let Some(store) = &self.vless_users {
             let users = store.snapshot();
             let _ = replace_single_vless_users(&mut config.protocol, &users);
+        }
+        #[cfg(feature = "vmess")]
+        if let Some(store) = &self.vmess_users {
+            let users = store.snapshot();
+            let _ = replace_single_vmess_users(&mut config.protocol, &users);
         }
         config
     }
@@ -181,6 +196,101 @@ fn replace_single_vless_users(
         #[cfg(feature = "grpc_transport")]
         ServerProxyConfig::Grpc(config) => {
             replace_single_vless_users(&mut config.inner, users)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(feature = "vmess")]
+fn single_vmess_users(protocol: &ServerProxyConfig) -> Option<Vec<VmessUser>> {
+    let mut matches = Vec::new();
+    collect_vmess_users(protocol, &mut matches);
+    (matches.len() == 1).then(|| matches.remove(0))
+}
+
+#[cfg(feature = "vmess")]
+fn collect_vmess_users(
+    protocol: &ServerProxyConfig,
+    matches: &mut Vec<Vec<VmessUser>>,
+) {
+    match protocol {
+        ServerProxyConfig::Vmess { users } => matches.push(users.clone()),
+        #[cfg(feature = "ws")]
+        ServerProxyConfig::Websocket { targets } => match targets.as_ref() {
+            crate::util::option::OneOrSome::One(target) => {
+                collect_vmess_users(&target.protocol, matches);
+            }
+            crate::util::option::OneOrSome::Some(targets) => {
+                for target in targets {
+                    collect_vmess_users(&target.protocol, matches);
+                }
+            }
+        },
+        #[cfg(feature = "tls")]
+        ServerProxyConfig::Tls(config) => {
+            collect_vmess_users(&config.inner, matches)
+        }
+        #[cfg(feature = "reality")]
+        ServerProxyConfig::Reality(config) => {
+            collect_vmess_users(&config.inner, matches)
+        }
+        ServerProxyConfig::Xhttp { inner, .. } => {
+            collect_vmess_users(inner, matches)
+        }
+        #[cfg(feature = "httpupgrade")]
+        ServerProxyConfig::HttpUpgrade(config) => {
+            collect_vmess_users(&config.inner, matches)
+        }
+        #[cfg(feature = "grpc_transport")]
+        ServerProxyConfig::Grpc(config) => {
+            collect_vmess_users(&config.inner, matches)
+        }
+        _ => {}
+    }
+}
+
+#[cfg(feature = "vmess")]
+fn replace_single_vmess_users(
+    protocol: &mut ServerProxyConfig,
+    users: &[VmessUser],
+) -> bool {
+    match protocol {
+        ServerProxyConfig::Vmess { users: current } => {
+            *current = users.to_vec();
+            true
+        }
+        #[cfg(feature = "ws")]
+        ServerProxyConfig::Websocket { targets } => match targets.as_mut() {
+            crate::util::option::OneOrSome::One(target) => {
+                replace_single_vmess_users(&mut target.protocol, users)
+            }
+            crate::util::option::OneOrSome::Some(targets) => {
+                let mut replaced = false;
+                for target in targets {
+                    replaced |=
+                        replace_single_vmess_users(&mut target.protocol, users);
+                }
+                replaced
+            }
+        },
+        #[cfg(feature = "tls")]
+        ServerProxyConfig::Tls(config) => {
+            replace_single_vmess_users(&mut config.inner, users)
+        }
+        #[cfg(feature = "reality")]
+        ServerProxyConfig::Reality(config) => {
+            replace_single_vmess_users(&mut config.inner, users)
+        }
+        ServerProxyConfig::Xhttp { inner, .. } => {
+            replace_single_vmess_users(inner, users)
+        }
+        #[cfg(feature = "httpupgrade")]
+        ServerProxyConfig::HttpUpgrade(config) => {
+            replace_single_vmess_users(&mut config.inner, users)
+        }
+        #[cfg(feature = "grpc_transport")]
+        ServerProxyConfig::Grpc(config) => {
+            replace_single_vmess_users(&mut config.inner, users)
         }
         _ => false,
     }
@@ -308,6 +418,18 @@ impl InboundManager {
             .find(|entry| entry.config.tag == tag)
             .and_then(|entry| entry.vless_users.as_ref())
             .map(VlessUserStore::snapshot)
+    }
+
+    #[cfg(feature = "vmess")]
+    pub(crate) fn vmess_user_store(&self, tag: &str) -> Option<Arc<VmessUserStore>> {
+        self.state
+            .read()
+            .expect("inbound manager lock poisoned")
+            .configs
+            .iter()
+            .find(|entry| entry.config.tag == tag)
+            .and_then(|entry| entry.vmess_users.as_ref())
+            .cloned()
     }
 
     pub(crate) fn with_config_mut<R, F>(&self, tag: &str, mutator: F) -> Option<R>

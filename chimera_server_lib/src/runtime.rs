@@ -8,6 +8,8 @@ use tokio::{sync::broadcast, task::JoinHandle};
 
 #[cfg(feature = "vless")]
 use crate::config::server_config::VlessUser;
+#[cfg(feature = "vmess")]
+use crate::handler::vmess::vmess_handler::VmessUserStore;
 use crate::{
     config::{def::PolicyConfig, server_config::ServerConfig},
     inbound::InboundManager,
@@ -285,6 +287,11 @@ impl RuntimeState {
         self.inbound_manager
             .alter_users(self.clone(), tag, update_config, update_vless_users)
             .await
+    }
+
+    #[cfg(feature = "vmess")]
+    pub(crate) fn vmess_user_store(&self, tag: &str) -> Option<Arc<VmessUserStore>> {
+        self.inbound_manager.vmess_user_store(tag)
     }
 
     pub fn outbounds(&self) -> Vec<OutboundSummary> {

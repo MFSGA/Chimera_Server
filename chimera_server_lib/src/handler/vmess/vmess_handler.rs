@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     net::{Ipv4Addr, Ipv6Addr},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock, RwLock},
     time::SystemTime,
 };
 
@@ -26,7 +26,9 @@ use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
 use crate::config::server_config::{VmessUser, parse_vmess_user_id};
 use crate::handler::{
-    tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
+    tcp::tcp_handler::{
+        TcpServerConnectionContext, TcpServerHandler, TcpServerSetupResult,
+    },
     xudp::message_stream::XudpMessageStream,
 };
 use crate::resolver::NativeResolver;
@@ -49,10 +51,9 @@ enum DataCipher {
 }
 
 struct VmessServerUser {
+    config: VmessUser,
     instruction_key: [u8; 16],
     aead_decrypting_key: CipherDecryptingKey,
-    user_label: String,
-    user_level: u32,
 }
 
 impl VmessServerUser {
@@ -66,82 +67,83 @@ impl VmessServerUser {
         let aead_decrypting_key = CipherDecryptingKey::ecb(unbound_key).unwrap();
 
         Self {
+            config: user,
             instruction_key,
             aead_decrypting_key,
-            user_label: user.user_label,
-            user_level: user.user_level,
         }
     }
 }
 
-#[derive(Default)]
-struct VmessReplayCache {
-    current: HashSet<[u8; 16]>,
-    previous: HashSet<[u8; 16]>,
-    last_rotation: u64,
+#[derive(Debug, Clone)]
+struct AuthenticatedVmessUser {
+    instruction_key: [u8; 16],
+    user_label: String,
+    user_level: u32,
 }
 
-impl VmessReplayCache {
-    fn check_and_insert(&mut self, auth_id: [u8; 16], now: u64) -> bool {
-        if now.saturating_sub(self.last_rotation) >= VMESS_AUTH_ID_WINDOW_SECS {
-            self.previous = std::mem::take(&mut self.current);
-            self.last_rotation = now;
-        }
-        if self.current.contains(&auth_id) || self.previous.contains(&auth_id) {
-            return false;
-        }
-        self.current.insert(auth_id);
-        true
-    }
+pub(crate) struct VmessUserStore {
+    users: RwLock<Vec<VmessServerUser>>,
 }
 
-pub struct VmessTcpServerHandler {
-    users: Vec<VmessServerUser>,
-    udp_enabled: bool,
-    inbound_tag: String,
-    replay_cache: Mutex<VmessReplayCache>,
-}
-
-impl std::fmt::Debug for VmessTcpServerHandler {
+impl std::fmt::Debug for VmessUserStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("VmessTcpServerHandler")
-            .field("user_count", &self.users.len())
-            .field("udp_enabled", &self.udp_enabled)
-            .finish_non_exhaustive()
+        let user_count = self
+            .users
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        f.debug_struct("VmessUserStore")
+            .field("user_count", &user_count)
+            .finish()
     }
 }
 
-impl VmessTcpServerHandler {
-    pub fn new(users: Vec<VmessUser>, udp_enabled: bool, inbound_tag: &str) -> Self {
+impl VmessUserStore {
+    pub(crate) fn new(users: Vec<VmessUser>) -> Self {
         Self {
-            users: users.into_iter().map(VmessServerUser::new).collect(),
-            udp_enabled,
-            inbound_tag: inbound_tag.to_string(),
-            replay_cache: Mutex::new(VmessReplayCache::default()),
+            users: RwLock::new(
+                users.into_iter().map(VmessServerUser::new).collect(),
+            ),
         }
     }
 
-    fn authenticate_user(
-        &self,
-        cert_hash: &[u8; 16],
-    ) -> std::io::Result<&VmessServerUser> {
-        let current_time_secs = SystemTime::UNIX_EPOCH
-            .elapsed()
-            .map_err(|error| {
-                std::io::Error::other(format!(
-                    "system clock is before Unix epoch: {error}"
-                ))
-            })?
-            .as_secs();
-        self.authenticate_user_at(cert_hash, current_time_secs)
+    pub(crate) fn snapshot(&self) -> Vec<VmessUser> {
+        self.users
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|user| user.config.clone())
+            .collect()
     }
 
-    fn authenticate_user_at(
+    pub(crate) fn update<R, E, F>(&self, update: F) -> Result<R, E>
+    where
+        F: FnOnce(&mut Vec<VmessUser>) -> Result<R, E>,
+    {
+        let mut configs = self.snapshot();
+        let result = update(&mut configs)?;
+        let compiled = configs.into_iter().map(VmessServerUser::new).collect();
+        *self
+            .users
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = compiled;
+        Ok(result)
+    }
+
+    fn authenticate_at(
         &self,
         cert_hash: &[u8; 16],
         current_time_secs: u64,
-    ) -> std::io::Result<&VmessServerUser> {
-        for user in &self.users {
+    ) -> std::io::Result<AuthenticatedVmessUser> {
+        let users = self
+            .users
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Xray's AuthIDDecoderHolder is keyed by command key, so adding the
+        // same UUID again replaces the decoder ticket. Preserve that
+        // last-write-wins authentication behavior while retaining all users
+        // for management queries.
+        for user in users.iter().rev() {
             let mut auth_id = *cert_hash;
             if user
                 .aead_decrypting_key
@@ -169,23 +171,110 @@ impl VmessTcpServerHandler {
                 ));
             }
 
-            let mut replay_cache = self
-                .replay_cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !replay_cache.check_and_insert(*cert_hash, current_time_secs) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "replayed VMess AuthID",
-                ));
-            }
-            return Ok(user);
+            return Ok(AuthenticatedVmessUser {
+                instruction_key: user.instruction_key,
+                user_label: user.config.user_label.clone(),
+                user_level: user.config.user_level,
+            });
         }
 
         Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "AEAD authentication failed: no matching VMess user",
         ))
+    }
+}
+
+#[derive(Default)]
+struct VmessReplayCache {
+    current: HashSet<[u8; 16]>,
+    previous: HashSet<[u8; 16]>,
+    last_rotation: u64,
+}
+
+impl VmessReplayCache {
+    fn check_and_insert(&mut self, auth_id: [u8; 16], now: u64) -> bool {
+        if now.saturating_sub(self.last_rotation) >= VMESS_AUTH_ID_WINDOW_SECS {
+            self.previous = std::mem::take(&mut self.current);
+            self.last_rotation = now;
+        }
+        if self.current.contains(&auth_id) || self.previous.contains(&auth_id) {
+            return false;
+        }
+        self.current.insert(auth_id);
+        true
+    }
+}
+
+pub struct VmessTcpServerHandler {
+    users: Arc<VmessUserStore>,
+    runtime_users: OnceLock<Arc<VmessUserStore>>,
+    udp_enabled: bool,
+    inbound_tag: String,
+    replay_cache: Mutex<VmessReplayCache>,
+}
+
+impl std::fmt::Debug for VmessTcpServerHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VmessTcpServerHandler")
+            .field("user_count", &self.users.snapshot().len())
+            .field("udp_enabled", &self.udp_enabled)
+            .finish_non_exhaustive()
+    }
+}
+
+impl VmessTcpServerHandler {
+    pub fn new(users: Vec<VmessUser>, udp_enabled: bool, inbound_tag: &str) -> Self {
+        Self {
+            users: Arc::new(VmessUserStore::new(users)),
+            runtime_users: OnceLock::new(),
+            udp_enabled,
+            inbound_tag: inbound_tag.to_string(),
+            replay_cache: Mutex::new(VmessReplayCache::default()),
+        }
+    }
+
+    fn selected_users(&self) -> &VmessUserStore {
+        self.runtime_users
+            .get()
+            .map(Arc::as_ref)
+            .unwrap_or_else(|| self.users.as_ref())
+    }
+
+    fn authenticate_user(
+        &self,
+        cert_hash: &[u8; 16],
+    ) -> std::io::Result<AuthenticatedVmessUser> {
+        let current_time_secs = SystemTime::UNIX_EPOCH
+            .elapsed()
+            .map_err(|error| {
+                std::io::Error::other(format!(
+                    "system clock is before Unix epoch: {error}"
+                ))
+            })?
+            .as_secs();
+        self.authenticate_user_at(cert_hash, current_time_secs)
+    }
+
+    fn authenticate_user_at(
+        &self,
+        cert_hash: &[u8; 16],
+        current_time_secs: u64,
+    ) -> std::io::Result<AuthenticatedVmessUser> {
+        let user = self
+            .selected_users()
+            .authenticate_at(cert_hash, current_time_secs)?;
+        let mut replay_cache = self
+            .replay_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !replay_cache.check_and_insert(*cert_hash, current_time_secs) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "replayed VMess AuthID",
+            ));
+        }
+        Ok(user)
     }
 }
 
@@ -609,6 +698,21 @@ impl TcpServerHandler for VmessTcpServerHandler {
             _ => unreachable!("VMess command was validated before stream creation"),
         }
     }
+
+    async fn setup_server_stream_with_context(
+        &self,
+        server_stream: Box<dyn AsyncStream>,
+        context: TcpServerConnectionContext,
+    ) -> std::io::Result<TcpServerSetupResult> {
+        if let Some(store) = context
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.vmess_user_store(&self.inbound_tag))
+        {
+            let _ = self.runtime_users.set(store);
+        }
+        self.setup_server_stream(server_stream).await
+    }
 }
 
 fn take_header_slice<'a>(
@@ -677,8 +781,13 @@ mod tests {
     };
 
     use crate::{
+        address::{Address, BindLocation, NetLocation},
         async_stream::AsyncPing,
         beginning::udp::run_session_based_udp,
+        config::{
+            Transport,
+            server_config::{ServerConfig, ServerProxyConfig},
+        },
         handler::xudp::frame::{
             FrameMetadata, FrameOption, SessionStatus, TargetNetwork,
         },
@@ -923,6 +1032,94 @@ mod tests {
 
     fn current_time_secs() -> u64 {
         SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs()
+    }
+
+    #[tokio::test]
+    async fn runtime_user_store_updates_existing_handler_without_rebuild() {
+        let inbound_tag = "vmess-runtime-users";
+        let first_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
+        let second_id = "e041e73e-a0a0-49f5-9754-6401aa621fb7";
+        let first = vmess_user(first_id, "first-user", "none");
+        let second = vmess_user(second_id, "second-user", "none");
+        let runtime = RuntimeState::new(
+            vec![ServerConfig {
+                tag: inbound_tag.to_string(),
+                bind_location: BindLocation::Address(NetLocation::new(
+                    Address::Ipv4(Ipv4Addr::LOCALHOST),
+                    10001,
+                )),
+                protocol: ServerProxyConfig::Vmess {
+                    users: vec![first.clone()],
+                },
+                transport: Transport::Tcp,
+                quic_settings: None,
+                sniffing: None,
+                tcp_socket_policy: None,
+            }],
+            Vec::new(),
+        );
+        let handler =
+            VmessTcpServerHandler::new(vec![first.clone()], true, inbound_tag);
+        let context = TcpServerConnectionContext {
+            runtime: Some(runtime.clone()),
+            ..TcpServerConnectionContext::default()
+        };
+
+        let (mut first_client, first_server) = duplex(1024);
+        first_client
+            .write_all(&build_tcp_request(first_id))
+            .await
+            .unwrap();
+        let first_result = handler
+            .setup_server_stream_with_context(
+                Box::new(TestStream(first_server)),
+                context.clone(),
+            )
+            .await
+            .expect("initial VMess user should authenticate");
+        let TcpServerSetupResult::TcpForward {
+            traffic_context, ..
+        } = first_result
+        else {
+            panic!("VMess TCP request should produce a TCP forward");
+        };
+        assert_eq!(
+            traffic_context.and_then(|context| context.identity),
+            Some("first-user".to_string())
+        );
+
+        let store = runtime
+            .vmess_user_store(inbound_tag)
+            .expect("single VMess inbound should expose runtime users");
+        store
+            .update::<(), (), _>(|users| {
+                users.push(second.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        let (mut second_client, second_server) = duplex(1024);
+        second_client
+            .write_all(&build_tcp_request(second_id))
+            .await
+            .unwrap();
+        let second_result = handler
+            .setup_server_stream_with_context(
+                Box::new(TestStream(second_server)),
+                context,
+            )
+            .await
+            .expect("new VMess user should authenticate without rebuilding handler");
+        let TcpServerSetupResult::TcpForward {
+            traffic_context, ..
+        } = second_result
+        else {
+            panic!("VMess TCP request should produce a TCP forward");
+        };
+        assert_eq!(
+            traffic_context.and_then(|context| context.identity),
+            Some("second-user".to_string())
+        );
     }
 
     #[tokio::test]
