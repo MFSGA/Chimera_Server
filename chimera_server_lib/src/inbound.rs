@@ -597,6 +597,56 @@ impl Drop for PendingTasks {
     }
 }
 
+struct AlterRecoveryGuard {
+    manager: Arc<InboundManager>,
+    runtime: RuntimeState,
+    tag: String,
+    generation: u64,
+    original: Option<ServerConfig>,
+}
+
+impl AlterRecoveryGuard {
+    fn new(
+        manager: Arc<InboundManager>,
+        runtime: RuntimeState,
+        tag: String,
+        generation: u64,
+        original: ServerConfig,
+    ) -> Self {
+        Self {
+            manager,
+            runtime,
+            tag,
+            generation,
+            original: Some(original),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.original = None;
+    }
+}
+
+impl Drop for AlterRecoveryGuard {
+    fn drop(&mut self) {
+        let Some(original) = self.original.take() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let manager = Arc::clone(&self.manager);
+        let runtime = self.runtime.clone();
+        let tag = self.tag.clone();
+        let generation = self.generation;
+        handle.spawn(async move {
+            manager
+                .recover_cancelled_alter(runtime, tag, generation, original)
+                .await;
+        });
+    }
+}
+
 impl InboundManager {
     pub(crate) fn new(configs: Vec<ServerConfig>) -> Self {
         let next_generation = u64::try_from(configs.len()).unwrap_or(u64::MAX);
@@ -1148,10 +1198,19 @@ impl InboundManager {
                 .map_err(AlterInboundError::State)?;
             return Ok(());
         };
+
+        let mut recovery = AlterRecoveryGuard::new(
+            runtime.inbound_manager(),
+            runtime.clone(),
+            tag.to_string(),
+            generation,
+            original.clone(),
+        );
         stop_task_set(task_set).await;
 
         match start_servers(updated.clone(), runtime.clone()).await {
             Ok(handles) => {
+                recovery.disarm();
                 let pending = PendingTasks::new(handles);
                 self.replace_running_generation(
                     tag,
@@ -1164,7 +1223,9 @@ impl InboundManager {
             }
             Err(start_error) => {
                 tokio::task::yield_now().await;
-                match start_servers(original.clone(), runtime).await {
+                let rollback = start_servers(original.clone(), runtime).await;
+                recovery.disarm();
+                match rollback {
                     Ok(handles) => {
                         let pending = PendingTasks::new(handles);
                         self.replace_running_generation(
@@ -1184,6 +1245,50 @@ impl InboundManager {
                         rollback_error: Some(rollback_error),
                     }),
                 }
+            }
+        }
+    }
+
+    async fn recover_cancelled_alter(
+        &self,
+        runtime: RuntimeState,
+        tag: String,
+        generation: u64,
+        original: ServerConfig,
+    ) {
+        let _operation_guard = self.operation_lock(&tag).lock().await;
+        let should_recover = {
+            let state = self.state.read().expect("inbound manager lock poisoned");
+            state.configs.iter().any(|entry| {
+                entry.config.tag == tag && entry.generation == generation
+            }) && !state.tasks.contains_key(&tag)
+        };
+        if !should_recover {
+            return;
+        }
+
+        match start_servers(original.clone(), runtime).await {
+            Ok(handles) => {
+                let pending = PendingTasks::new(handles);
+                if let Err(error) = self.replace_running_generation(
+                    &tag,
+                    generation,
+                    original,
+                    pending.commit(),
+                ) {
+                    tracing::warn!(
+                        inbound_tag = %tag,
+                        reason = error,
+                        "cancelled inbound alter recovery was superseded"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    inbound_tag = %tag,
+                    error = %error,
+                    "failed to recover inbound after cancelled alter"
+                );
             }
         }
     }
@@ -1263,15 +1368,40 @@ async fn stop_task_set(task_set: InboundTaskSet) {
 
 #[cfg(test)]
 mod tests {
-    use super::InboundManager;
+    use super::{AlterRecoveryGuard, InboundManager, stop_task_set};
     use crate::{
         address::{BindLocation, NetLocation},
+        beginning::start_servers,
         config::{
             Transport,
             server_config::{ServerConfig, ServerProxyConfig, SocksUserStore},
         },
+        runtime::RuntimeState,
     };
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, TcpListener};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn free_localhost_port() -> u16 {
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("bind ephemeral port")
+            .local_addr()
+            .expect("read local addr")
+            .port()
+    }
+
+    async fn wait_for_tcp_listener(port: u16) -> bool {
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+                .await
+                .is_ok()
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
 
     fn inbound(tag: &str, port: u16) -> ServerConfig {
         ServerConfig {
@@ -1359,5 +1489,97 @@ mod tests {
         ));
         tokio::task::yield_now().await;
         assert!(abort_handle.is_finished());
+    }
+
+    #[tokio::test]
+    async fn cancelled_alter_recovers_original_listener() {
+        let port = free_localhost_port();
+        let original = inbound("primary", port);
+        let runtime = RuntimeState::new(vec![original.clone()], Vec::new());
+        let manager = runtime.inbound_manager();
+        let generation = manager.generation("primary").unwrap();
+        let handles = start_servers(original.clone(), runtime.clone())
+            .await
+            .expect("start original listener");
+        assert!(
+            manager.register_tasks_for_generation("primary", generation, handles)
+        );
+        assert!(wait_for_tcp_listener(port).await);
+
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        let transition_manager = Arc::clone(&manager);
+        let transition_runtime = runtime.clone();
+        let transition_original = original.clone();
+        let transition = tokio::spawn(async move {
+            let _operation_guard =
+                transition_manager.operation_lock("primary").lock().await;
+            let task_set = transition_manager
+                .state
+                .write()
+                .expect("inbound manager lock poisoned")
+                .tasks
+                .remove("primary")
+                .expect("original listener tasks registered");
+            let _recovery = AlterRecoveryGuard::new(
+                Arc::clone(&transition_manager),
+                transition_runtime,
+                "primary".to_string(),
+                generation,
+                transition_original,
+            );
+            stop_task_set(task_set).await;
+            let _ = armed_tx.send(());
+            std::future::pending::<()>().await;
+        });
+
+        armed_rx.await.expect("alter recovery guard armed");
+        transition.abort();
+        let _ = transition.await;
+
+        assert!(
+            wait_for_tcp_listener(port).await,
+            "cancelling alter must restore the original listener"
+        );
+        assert!(manager.stop_tasks("primary").await);
+    }
+
+    #[tokio::test]
+    async fn cancelled_alter_recovery_does_not_revive_stale_generation() {
+        let old_port = free_localhost_port();
+        let new_port = free_localhost_port();
+        let original = inbound("primary", old_port);
+        let runtime = RuntimeState::new(vec![original.clone()], Vec::new());
+        let manager = runtime.inbound_manager();
+        let old_generation = manager.generation("primary").unwrap();
+
+        assert!(manager.remove_config("primary").is_some());
+        manager.add_config(inbound("primary", new_port)).unwrap();
+        let new_generation = manager.generation("primary").unwrap();
+        let new_task = tokio::spawn(std::future::pending());
+        let new_abort = new_task.abort_handle();
+        assert!(manager.register_tasks_for_generation(
+            "primary",
+            new_generation,
+            vec![new_task]
+        ));
+
+        drop(AlterRecoveryGuard::new(
+            Arc::clone(&manager),
+            runtime,
+            "primary".to_string(),
+            old_generation,
+            original,
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(manager.generation("primary"), Some(new_generation));
+        assert!(!new_abort.is_finished());
+        assert!(
+            tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, old_port))
+                .await
+                .is_err(),
+            "stale recovery must not revive the removed generation"
+        );
+        assert!(manager.stop_tasks("primary").await);
     }
 }

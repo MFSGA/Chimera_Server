@@ -58,6 +58,38 @@ mod tcp_relay;
 pub(crate) mod udp;
 mod xhttp;
 
+struct StartingTasks {
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl StartingTasks {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            handles: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn push(&mut self, handle: JoinHandle<()>) {
+        self.handles.push(handle);
+    }
+
+    fn commit(mut self) -> Vec<JoinHandle<()>> {
+        std::mem::take(&mut self.handles)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.handles.is_empty()
+    }
+}
+
+impl Drop for StartingTasks {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+}
+
 pub async fn start_servers(
     config: ServerConfig,
     runtime: RuntimeState,
@@ -72,7 +104,7 @@ pub async fn start_servers(
         return grpc_transport::start_grpc_server(config, runtime).await;
     }
 
-    let mut join_handles = Vec::with_capacity(3);
+    let mut join_handles = StartingTasks::with_capacity(3);
 
     match config.transport {
         Transport::Tcp => {
@@ -81,12 +113,7 @@ pub async fn start_servers(
                     join_handles.push(handle);
                 }
                 Ok(None) => (),
-                Err(e) => {
-                    for join_handle in join_handles {
-                        join_handle.abort();
-                    }
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             }
         }
         Transport::TcpAndUdp => {
@@ -100,12 +127,7 @@ pub async fn start_servers(
             match start_udp_server(config.clone(), runtime).await {
                 Ok(Some(handle)) => join_handles.push(handle),
                 Ok(None) => {}
-                Err(error) => {
-                    for join_handle in join_handles {
-                        join_handle.abort();
-                    }
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             }
         }
         Transport::Quic => match start_quic_server(config.clone(), runtime).await {
@@ -113,12 +135,7 @@ pub async fn start_servers(
                 join_handles.push(handle);
             }
             Ok(None) => (),
-            Err(e) => {
-                for join_handle in join_handles {
-                    join_handle.abort();
-                }
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         },
         // UDP listeners need runtime state for routing/outbound selection.
         Transport::Udp => match start_udp_server(config.clone(), runtime).await {
@@ -126,12 +143,7 @@ pub async fn start_servers(
                 join_handles.push(handle);
             }
             Ok(None) => (),
-            Err(e) => {
-                for join_handle in join_handles {
-                    join_handle.abort();
-                }
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         },
     }
 
@@ -142,7 +154,7 @@ pub async fn start_servers(
         )));
     }
 
-    Ok(join_handles)
+    Ok(join_handles.commit())
 }
 
 fn register_stats_identity(runtime: &RuntimeState, level: u32, identity: String) {
