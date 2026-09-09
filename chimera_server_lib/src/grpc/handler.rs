@@ -2482,7 +2482,10 @@ impl HandlerServiceImpl {
             Status::invalid_argument("AddUserOperation.user is required")
         })?;
         if self.apply_add_user_to_protocol(protocol, &user)? {
-            register_identity(user.email.clone());
+            let stats = self.runtime.policy_user_stats(user.level);
+            if stats.uplink || stats.downlink {
+                register_identity(user.email.clone());
+            }
             return Ok(());
         }
 

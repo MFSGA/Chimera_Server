@@ -62,7 +62,7 @@ pub async fn start_servers(
     config: ServerConfig,
     runtime: RuntimeState,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
-    register_configured_identities(&config.protocol);
+    register_configured_identities(&config.protocol, &runtime);
 
     if is_xhttp_server_protocol(&config.protocol) {
         return xhttp::start_xhttp_server(config, runtime).await;
@@ -145,74 +145,125 @@ pub async fn start_servers(
     Ok(join_handles)
 }
 
-fn register_configured_identities(protocol: &ServerProxyConfig) {
+fn register_stats_identity(runtime: &RuntimeState, level: u32, identity: String) {
+    if identity.is_empty() {
+        return;
+    }
+    let policy = runtime.policy_user_stats(level);
+    if policy.uplink || policy.downlink {
+        register_identity(identity);
+    }
+}
+
+fn register_configured_identities(
+    protocol: &ServerProxyConfig,
+    runtime: &RuntimeState,
+) {
     match protocol {
         #[cfg(feature = "http")]
-        ServerProxyConfig::Http { accounts, .. } => {
+        ServerProxyConfig::Http {
+            accounts,
+            user_level,
+            ..
+        } => {
             for account in accounts {
-                register_identity(account.username.clone());
+                register_stats_identity(
+                    runtime,
+                    *user_level,
+                    account.username.clone(),
+                );
             }
         }
         #[cfg(feature = "mixed")]
         ServerProxyConfig::Mixed { accounts, .. } => {
             for account in accounts.snapshot() {
-                register_identity(account.username);
+                register_stats_identity(runtime, 0, account.username);
             }
         }
-        ServerProxyConfig::Socks { accounts, .. } => {
+        ServerProxyConfig::Socks {
+            accounts,
+            user_level,
+            ..
+        } => {
             for account in accounts.snapshot() {
-                register_identity(account.username);
+                register_stats_identity(runtime, *user_level, account.username);
             }
         }
         #[cfg(feature = "vless")]
         ServerProxyConfig::Vless { users, .. } => {
             for user in users {
-                if !user.user_label.is_empty() {
-                    register_identity(user.user_label.clone());
-                }
+                register_stats_identity(
+                    runtime,
+                    user.user_level,
+                    user.user_label.clone(),
+                );
             }
         }
         #[cfg(feature = "vmess")]
         ServerProxyConfig::Vmess { users } => {
             for user in users {
-                if !user.user_label.is_empty() {
-                    register_identity(user.user_label.clone());
-                }
+                register_stats_identity(
+                    runtime,
+                    user.user_level,
+                    user.user_label.clone(),
+                );
             }
         }
         #[cfg(feature = "trojan")]
         ServerProxyConfig::Trojan { users, .. } => {
             for user in users {
-                if let Some(email) = user.email.as_deref() {
-                    register_identity(email.to_string());
-                }
+                let identity = user
+                    .email
+                    .clone()
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| user.password.clone());
+                register_stats_identity(runtime, user.user_level, identity);
             }
         }
         #[cfg(feature = "shadowsocks")]
         ServerProxyConfig::Shadowsocks { users, .. } => {
             for user in users {
-                if !user.email.is_empty() {
-                    register_identity(user.email.clone());
-                }
+                register_stats_identity(
+                    runtime,
+                    user.user_level,
+                    user.email.clone(),
+                );
             }
         }
         #[cfg(feature = "hysteria")]
         ServerProxyConfig::Hysteria2 { config } => {
             for user in &config.clients {
-                if let Some(email) = user.email.as_deref() {
-                    register_identity(email.to_string());
-                }
+                let identity = user
+                    .email
+                    .clone()
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| user.password.clone());
+                register_stats_identity(runtime, user.level, identity);
             }
         }
+        #[cfg(feature = "tuic")]
+        ServerProxyConfig::TuicV5 { config } => {
+            register_stats_identity(runtime, 0, config.uuid.clone());
+        }
         ServerProxyConfig::Xhttp { inner, .. } => {
-            register_configured_identities(inner);
+            register_configured_identities(inner, runtime);
+        }
+        #[cfg(feature = "httpupgrade")]
+        ServerProxyConfig::HttpUpgrade(config) => {
+            register_configured_identities(config.inner.as_ref(), runtime);
+        }
+        #[cfg(feature = "grpc_transport")]
+        ServerProxyConfig::Grpc(config) => {
+            register_configured_identities(config.inner.as_ref(), runtime);
         }
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(config) => {
-            register_configured_identities(config.inner.as_ref());
+            register_configured_identities(config.inner.as_ref(), runtime);
         }
         #[cfg(feature = "reality")]
-        ServerProxyConfig::Reality(_) => {}
+        ServerProxyConfig::Reality(config) => {
+            register_configured_identities(config.inner.as_ref(), runtime);
+        }
         _ => {}
     }
 }
@@ -1103,6 +1154,9 @@ where
         };
         let mut traffic_context =
             traffic_context.map(|context| context.with_client_ip(peer_addr.ip()));
+        if let Some(context) = traffic_context.as_mut() {
+            runtime.apply_traffic_stats_policy(context);
+        }
         let (inbound_tag, user) = routing_identity(traffic_context.as_ref());
         let (client_stream, outbound_tag) = match timeout(
             Duration::from_secs(60),
@@ -1219,6 +1273,9 @@ where
         } => {
             let mut traffic_context = traffic_context
                 .map(|context| context.with_client_ip(peer_addr.ip()));
+            if let Some(context) = traffic_context.as_mut() {
+                runtime.apply_traffic_stats_policy(context);
+            }
             let (sniffed_stream, sniffed_metadata) =
                 sniff_stream_protocol(server_stream, sniffing.as_ref()).await?;
             server_stream = sniffed_stream;
@@ -1353,8 +1410,11 @@ where
             user_level,
             traffic_context,
         } => {
-            let traffic_context = traffic_context
+            let mut traffic_context = traffic_context
                 .map(|context| context.with_client_ip(peer_addr.ip()));
+            if let Some(context) = traffic_context.as_mut() {
+                runtime.apply_traffic_stats_policy(context);
+            }
             let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
             run_udp_relay_with_expected_client(
                 udp_socket,
@@ -1370,8 +1430,11 @@ where
         TcpServerSetupResult::BidirectionalUdp {
             remote_location,
             stream,
-            traffic_context,
+            mut traffic_context,
         } => {
+            if let Some(context) = traffic_context.as_mut() {
+                runtime.apply_traffic_stats_policy(context);
+            }
             run_bidirectional_udp(
                 stream,
                 remote_location,
@@ -1385,8 +1448,11 @@ where
         }
         TcpServerSetupResult::MultiDirectionalUdp {
             stream,
-            traffic_context,
+            mut traffic_context,
         } => {
+            if let Some(context) = traffic_context.as_mut() {
+                runtime.apply_traffic_stats_policy(context);
+            }
             run_multi_directional_udp(
                 stream,
                 resolver,
@@ -1399,8 +1465,11 @@ where
         }
         TcpServerSetupResult::SessionBasedUdp {
             stream,
-            traffic_context,
+            mut traffic_context,
         } => {
+            if let Some(context) = traffic_context.as_mut() {
+                runtime.apply_traffic_stats_policy(context);
+            }
             run_session_based_udp(
                 stream,
                 runtime,
@@ -1494,6 +1563,39 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn configured_identity_registration_respects_user_stats_policy() {
+        let disabled_identity = "stats-policy-disabled-identity";
+        let disabled_runtime = RuntimeState::new(Vec::new(), Vec::new());
+        register_stats_identity(&disabled_runtime, 7, disabled_identity.to_string());
+        assert!(
+            !crate::traffic::snapshot()
+                .known_identities
+                .contains(disabled_identity)
+        );
+
+        let enabled_identity = "stats-policy-enabled-identity";
+        let enabled_runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let mut levels = std::collections::HashMap::new();
+        levels.insert(
+            7,
+            Some(crate::config::def::PolicyLevelConfig {
+                stats_user_uplink: true,
+                ..crate::config::def::PolicyLevelConfig::default()
+            }),
+        );
+        enabled_runtime.replace_policy(Some(&crate::config::def::PolicyConfig {
+            levels,
+            ..crate::config::def::PolicyConfig::default()
+        }));
+        register_stats_identity(&enabled_runtime, 7, enabled_identity.to_string());
+        assert!(
+            crate::traffic::snapshot()
+                .known_identities
+                .contains(enabled_identity)
+        );
+    }
 
     #[test]
     fn sniffed_http_metadata_drives_xray_override_and_exclusions() {

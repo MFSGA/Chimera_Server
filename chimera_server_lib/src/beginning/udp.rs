@@ -2538,6 +2538,7 @@ async fn relay_shadowsocks_udp_packet(
     if !request.identity.is_empty() {
         traffic_context = traffic_context.with_identity(request.identity.clone());
     }
+    runtime.apply_traffic_stats_policy(&mut traffic_context);
 
     match outbound_action {
         DirectOutboundAction::Blackhole { tag } => {
@@ -2703,6 +2704,7 @@ async fn run_dokodemo_udp_server(
                 datagram_target,
                 target_location,
                 inbound_tag,
+                config.user_level,
                 runtime,
                 payload,
             )
@@ -2723,6 +2725,7 @@ async fn relay_dokodemo_udp_datagram(
     target_addr: SocketAddr,
     target_location: NetLocation,
     inbound_tag: String,
+    user_level: u32,
     runtime: RuntimeState,
     payload: Vec<u8>,
 ) -> std::io::Result<()> {
@@ -2736,9 +2739,11 @@ async fn relay_dokodemo_udp_datagram(
     )
     .await?;
 
-    let traffic_context = TrafficContext::new("dokodemo-door")
+    let mut traffic_context = TrafficContext::new("dokodemo-door")
         .with_inbound_tag(inbound_tag)
-        .with_client_ip(client_addr.ip());
+        .with_client_ip(client_addr.ip())
+        .with_user_level(user_level);
+    runtime.apply_traffic_stats_policy(&mut traffic_context);
 
     match outbound_action {
         UdpOutboundAction::Blackhole { tag } => {

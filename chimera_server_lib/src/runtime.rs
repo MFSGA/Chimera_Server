@@ -12,11 +12,27 @@ use crate::{
         BalancerTargetMap, OutboundObservation, RouteMatch, RoutingEvent,
         RoutingInput, RoutingState,
     },
+    traffic::TrafficContext,
     user_domain::{
         UserDomainAccessFailure, UserDomainAccessRevision, UserDomainAccessStatus,
         UserDomainAccessStore, parse_publication,
     },
 };
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PolicyUserStats {
+    pub uplink: bool,
+    pub downlink: bool,
+    pub online: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PolicySystemStats {
+    pub inbound_uplink: bool,
+    pub inbound_downlink: bool,
+    pub outbound_uplink: bool,
+    pub outbound_downlink: bool,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct PolicyRelayTimeouts {
@@ -135,6 +151,42 @@ impl RuntimeState {
             .map(u64::from)
             .unwrap_or(DEFAULT_CONNECTION_IDLE_TIMEOUT_SECS);
         Duration::from_secs(seconds)
+    }
+
+    pub(crate) fn policy_user_stats(&self, level: u32) -> PolicyUserStats {
+        let policy = self.policy.read().expect("runtime policy lock poisoned");
+        let level_policy = policy.levels.get(&level).and_then(Option::as_ref);
+        PolicyUserStats {
+            uplink: level_policy.is_some_and(|policy| policy.stats_user_uplink),
+            downlink: level_policy.is_some_and(|policy| policy.stats_user_downlink),
+            online: level_policy.is_some_and(|policy| policy.stats_user_online),
+        }
+    }
+
+    pub(crate) fn policy_system_stats(&self) -> PolicySystemStats {
+        let policy = self.policy.read().expect("runtime policy lock poisoned");
+        let system = policy.system.as_ref();
+        PolicySystemStats {
+            inbound_uplink: system.is_some_and(|policy| policy.stats_inbound_uplink),
+            inbound_downlink: system
+                .is_some_and(|policy| policy.stats_inbound_downlink),
+            outbound_uplink: system
+                .is_some_and(|policy| policy.stats_outbound_uplink),
+            outbound_downlink: system
+                .is_some_and(|policy| policy.stats_outbound_downlink),
+        }
+    }
+
+    pub(crate) fn apply_traffic_stats_policy(&self, context: &mut TrafficContext) {
+        let user = self.policy_user_stats(context.user_level);
+        let system = self.policy_system_stats();
+        context.set_user_stats_policy(user.uplink, user.downlink, user.online);
+        context.set_system_stats_policy(
+            system.inbound_uplink,
+            system.inbound_downlink,
+            system.outbound_uplink,
+            system.outbound_downlink,
+        );
     }
 
     pub(crate) fn policy_relay_timeouts(&self, level: u32) -> PolicyRelayTimeouts {
@@ -536,7 +588,7 @@ mod tests {
     use super::RuntimeState;
     use crate::{
         config::{
-            def::{PolicyConfig, PolicyLevelConfig},
+            def::{PolicyConfig, PolicyLevelConfig, SystemPolicyConfig},
             rule::BalancerConfig,
         },
         routing_state::{OutboundObservation, RoutingState},
@@ -694,6 +746,53 @@ mod tests {
         assert_eq!(zeroed.uplink_only, Some(Duration::ZERO));
         assert_eq!(zeroed.downlink_only, Some(Duration::ZERO));
         assert_eq!(zeroed.buffer_size, None);
+    }
+
+    #[test]
+    fn xray_stats_policy_uses_level_and_system_switches() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let default_user = runtime.policy_user_stats(7);
+        assert!(!default_user.uplink);
+        assert!(!default_user.downlink);
+        assert!(!default_user.online);
+        let default_system = runtime.policy_system_stats();
+        assert!(!default_system.inbound_uplink);
+        assert!(!default_system.inbound_downlink);
+        assert!(!default_system.outbound_uplink);
+        assert!(!default_system.outbound_downlink);
+
+        let mut levels = HashMap::new();
+        levels.insert(
+            7,
+            Some(PolicyLevelConfig {
+                stats_user_uplink: true,
+                stats_user_downlink: false,
+                stats_user_online: true,
+                ..PolicyLevelConfig::default()
+            }),
+        );
+        runtime.replace_policy(Some(&PolicyConfig {
+            levels,
+            system: Some(SystemPolicyConfig {
+                stats_inbound_uplink: false,
+                stats_inbound_downlink: true,
+                stats_outbound_uplink: true,
+                stats_outbound_downlink: false,
+            }),
+        }));
+
+        let user = runtime.policy_user_stats(7);
+        assert!(user.uplink);
+        assert!(!user.downlink);
+        assert!(user.online);
+        let missing = runtime.policy_user_stats(8);
+        assert_eq!(missing, super::PolicyUserStats::default());
+
+        let system = runtime.policy_system_stats();
+        assert!(!system.inbound_uplink);
+        assert!(system.inbound_downlink);
+        assert!(system.outbound_uplink);
+        assert!(!system.outbound_downlink);
     }
 
     #[test]

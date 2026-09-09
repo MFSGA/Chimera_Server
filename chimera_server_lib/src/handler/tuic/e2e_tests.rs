@@ -124,6 +124,23 @@ async fn start_test_connection() -> (
             sender_settings_value: None,
         }],
     );
+    runtime.replace_policy(Some(&crate::config::def::PolicyConfig {
+        levels: std::collections::HashMap::from([(
+            0,
+            Some(crate::config::def::PolicyLevelConfig {
+                stats_user_uplink: true,
+                stats_user_downlink: true,
+                stats_user_online: true,
+                ..crate::config::def::PolicyLevelConfig::default()
+            }),
+        )]),
+        system: Some(crate::config::def::SystemPolicyConfig {
+            stats_inbound_uplink: true,
+            stats_inbound_downlink: true,
+            stats_outbound_uplink: true,
+            stats_outbound_downlink: true,
+        }),
+    }));
     let server_task = tokio::spawn(run_tuic_server(
         server_addr,
         server_config,
