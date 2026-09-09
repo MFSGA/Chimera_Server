@@ -806,6 +806,32 @@ inbound totals and per-inbound-user cardinality remain unchanged. This keeps the
 optimization limited to the internal write-side layout: no interning, unsafe,
 extra lock, or steady-state allocation is introduced.
 
+The next identity-index follow-up isolates a second duplicated outer lookup.
+Identity records previously updated `per_protocol[protocol]` and then separately
+looked up `per_identity[protocol][identity]`, hashing the same static protocol
+key twice. A first attempt to merge every protocol record into one larger value
+was rejected because repeated `protocol-only` measurements showed a material
+regression. The accepted layout therefore keeps the original `per_protocol`
+hot path for identity-free records and uses a separate `IdentityProtocolStats`
+entry only when an identity is present; that entry holds both protocol totals
+for identity-bearing records and the per-identity map. Snapshot reconstruction
+merges the two internal protocol-total sources, preserving the public
+`per_protocol` and `per_identity` maps.
+
+For a stricter A/B than comparing measurements from different build periods,
+the HEAD baseline and candidate were compiled into separate release test
+binaries and executed in alternating order on CPU 0-3. Eight independent pairs
+per shape used four writers, five million records/sample, one warmup pair and
+one measured pair per process. The borrowed-ref CPU ratio candidate/baseline
+had a median of **0.7905** for `identity-only` (**8/8** favorable pairs) and
+**0.8812** for full Shadowsocks (**8/8** favorable pairs). `protocol-only`,
+whose production update path is intentionally unchanged, was also favorable in
+that run (**8/8**, median ratio **0.8806**) but is treated as a noise/control
+result rather than part of the claimed mechanism. A focused unit test verifies
+that two identities plus an identity-free record under one protocol still emit
+correct aggregate protocol totals and per-identity cardinality. No new lock,
+unsafe code, interning, or steady-state allocation is introduced.
+
 ## UDP freedom session batching probe
 
 `udp_session_probe` is a Linux-only follow-up that mirrors the hot structure of

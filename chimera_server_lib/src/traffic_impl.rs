@@ -127,10 +127,16 @@ struct InboundStats {
 }
 
 #[derive(Debug, Default)]
+struct IdentityProtocolStats {
+    totals: TransferTotals,
+    per_identity: HashMap<String, TransferTotals>,
+}
+
+#[derive(Debug, Default)]
 struct StatsInner {
     total: TransferTotals,
     per_protocol: HashMap<&'static str, TransferTotals>,
-    per_identity: HashMap<&'static str, HashMap<String, TransferTotals>>,
+    per_identity: HashMap<&'static str, IdentityProtocolStats>,
     per_inbound: HashMap<String, InboundStats>,
     per_outbound: HashMap<String, TransferTotals>,
     known_identities: HashSet<String>,
@@ -187,14 +193,11 @@ impl StatsInner {
         } = plan;
 
         self.total.accumulate(upload, download);
-        self.per_protocol
-            .entry(protocol)
-            .or_default()
-            .accumulate(upload, download);
-
         if let Some(identity) = identity {
+            let protocol_stats = self.per_identity.entry(protocol).or_default();
+            protocol_stats.totals.accumulate(upload, download);
             let identity_inserted = accumulate_string_key(
-                self.per_identity.entry(protocol).or_default(),
+                &mut protocol_stats.per_identity,
                 identity,
                 upload,
                 download,
@@ -202,6 +205,11 @@ impl StatsInner {
             if identity_inserted && !self.known_identities.contains(identity) {
                 self.known_identities.insert(identity.to_owned());
             }
+        } else {
+            self.per_protocol
+                .entry(protocol)
+                .or_default()
+                .accumulate(upload, download);
         }
         if let Some(tag) = inbound_tag {
             accumulate_inbound(
@@ -248,8 +256,13 @@ fn merge_stats_into_snapshot(snapshot: &mut TrafficSnapshot, stats: &StatsInner)
             .or_default()
             .merge(totals);
     }
-    for (protocol, identities) in &stats.per_identity {
-        for (identity, totals) in identities {
+    for (protocol, protocol_stats) in &stats.per_identity {
+        snapshot
+            .per_protocol
+            .entry((*protocol).to_owned())
+            .or_default()
+            .merge(&protocol_stats.totals);
+        for (identity, totals) in &protocol_stats.per_identity {
             snapshot
                 .per_identity
                 .entry(((*protocol).to_owned(), identity.clone()))
@@ -577,6 +590,35 @@ mod tests {
             1
         );
         assert_eq!(snapshot.per_inbound_user.len(), 2);
+    }
+
+    #[test]
+    fn protocol_totals_and_identities_share_internal_entry_without_changing_snapshot()
+     {
+        let mut stats = StatsInner::default();
+        for context in [
+            TrafficContext::new("vless").with_identity("alice"),
+            TrafficContext::new("vless").with_identity("bob"),
+            TrafficContext::new("vless"),
+        ] {
+            stats.apply(plan_traffic_record(&context, 5, 7));
+        }
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.per_protocol["vless"].connections, 3);
+        assert_eq!(snapshot.per_protocol["vless"].upload_bytes, 15);
+        assert_eq!(snapshot.per_protocol["vless"].download_bytes, 21);
+        assert_eq!(
+            snapshot.per_identity[&("vless".to_string(), "alice".to_string())]
+                .connections,
+            1
+        );
+        assert_eq!(
+            snapshot.per_identity[&("vless".to_string(), "bob".to_string())]
+                .connections,
+            1
+        );
+        assert_eq!(snapshot.per_identity.len(), 2);
     }
 
     #[test]
