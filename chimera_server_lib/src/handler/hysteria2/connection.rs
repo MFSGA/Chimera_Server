@@ -404,7 +404,8 @@ async fn handle_tcp_stream(
     let mut context = TrafficContext::new("hysteria2")
         .with_identity(context_identity)
         .with_inbound_tag((*inbound_tag).clone())
-        .with_client_ip(peer_addr.ip());
+        .with_client_ip(peer_addr.ip())
+        .with_user_level(auth_ctx.client.level);
     if let Some(tag) = connection.outbound_tag {
         context = context.with_outbound_tag(tag);
     }
@@ -2664,7 +2665,8 @@ async fn drive_udp_datagrams(
     let base_context = TrafficContext::new("hysteria2")
         .with_identity(identity.clone())
         .with_inbound_tag((*inbound_tag).clone())
-        .with_client_ip(peer_addr.ip());
+        .with_client_ip(peer_addr.ip())
+        .with_user_level(auth_ctx.client.level);
 
     loop {
         let data_result = loop {

@@ -59,7 +59,7 @@ const SERVER_RESPONSE_HEADER: &[u8] = &[0u8, 0u8];
 
 #[derive(Debug)]
 pub struct VlessTcpHandler {
-    users: Vec<(Box<[u8]>, String, String)>,
+    users: Vec<(Box<[u8]>, String, String, u32)>,
     fallbacks: Vec<VlessFallback>,
     inbound_tag: String,
 }
@@ -82,6 +82,7 @@ impl VlessTcpHandler {
                         parse_hex(&user.user_id),
                         user.user_label.clone(),
                         user.flow.clone(),
+                        user.user_level,
                     )
                 })
                 .collect(),
@@ -117,7 +118,7 @@ impl VlessTcpHandler {
                 None => read_vless_auth_prefix(&mut server_stream).await,
             };
             let authenticated = candidate.is_some_and(|candidate| {
-                self.users.iter().any(|(stored_user_id, _, _)| {
+                self.users.iter().any(|(stored_user_id, _, _, _)| {
                     stored_user_id.len() == 16
                         && stored_user_id.as_ref() == candidate.as_slice()
                 })
@@ -165,16 +166,16 @@ impl VlessTcpHandler {
             command,
             remote_location,
         } = header;
-        let matched_user = self.users.iter().find(|(stored_user_id, _, _)| {
+        let matched_user = self.users.iter().find(|(stored_user_id, _, _, _)| {
             stored_user_id.len() == 16
                 && stored_user_id.as_ref() == user_id.as_slice()
         });
 
-        let Some((_, user_label, configured_flow)) = matched_user else {
+        let Some((_, user_label, configured_flow, user_level)) = matched_user else {
             let expected = self
                 .users
                 .iter()
-                .map(|(user_id, _, _)| encode_hex(user_id.as_ref()))
+                .map(|(user_id, _, _, _)| encode_hex(user_id.as_ref()))
                 .collect::<Vec<_>>()
                 .join(",");
             let got = encode_hex(&user_id);
@@ -196,7 +197,8 @@ impl VlessTcpHandler {
         let traffic_context = Some(
             TrafficContext::new("vless")
                 .with_identity(user_label.clone())
-                .with_inbound_tag(self.inbound_tag.clone()),
+                .with_inbound_tag(self.inbound_tag.clone())
+                .with_user_level(*user_level),
         );
 
         match command {
@@ -525,10 +527,19 @@ mod tests {
     impl AsyncStream for TestStream {}
 
     fn plain_vless_handler(user_id: &str, user_label: &str) -> VlessTcpHandler {
+        plain_vless_handler_with_level(user_id, user_label, 0)
+    }
+
+    fn plain_vless_handler_with_level(
+        user_id: &str,
+        user_label: &str,
+        user_level: u32,
+    ) -> VlessTcpHandler {
         VlessTcpHandler::new(
             &[VlessUser {
                 user_id: user_id.into(),
                 user_label: user_label.into(),
+                user_level,
                 flow: String::new(),
             }],
             "vless-test",
@@ -540,6 +551,7 @@ mod tests {
             &[VlessUser {
                 user_id: user_id.into(),
                 user_label: "fallback-user".into(),
+                user_level: 0,
                 flow: String::new(),
             }],
             &[VlessFallback {
@@ -567,6 +579,30 @@ mod tests {
             request.extend_from_slice(&[127, 0, 0, 1]);
         }
         request
+    }
+
+    #[tokio::test]
+    async fn authenticated_user_level_reaches_traffic_context() {
+        let user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
+        let handler = plain_vless_handler_with_level(user_id, "vless-level-user", 7);
+        let (mut client, server) = duplex(1024);
+        client
+            .write_all(&build_plain_vless_request(user_id, COMMAND_TCP))
+            .await
+            .expect("write VLESS request");
+
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+            .expect("VLESS request should authenticate");
+        let TcpServerSetupResult::TcpForward {
+            traffic_context, ..
+        } = result
+        else {
+            panic!("VLESS TCP request should produce a TCP forward");
+        };
+        let context = traffic_context.expect("VLESS traffic context");
+        assert_eq!(context.user_level, 7);
     }
 
     #[tokio::test]
@@ -773,6 +809,7 @@ mod tests {
             &[VlessUser {
                 user_id: user_id.into(),
                 user_label: "vless-udp-user".into(),
+                user_level: 0,
                 flow: String::new(),
             }],
             "vless-udp",
@@ -860,6 +897,7 @@ mod tests {
             &[VlessUser {
                 user_id: user_id.into(),
                 user_label: "vless-runtime-user".into(),
+                user_level: 0,
                 flow: String::new(),
             }],
             "vless-runtime-udp",
@@ -920,6 +958,7 @@ mod tests {
             &[VlessUser {
                 user_id: user_id.into(),
                 user_label: "fragmented-xudp-user".into(),
+                user_level: 0,
                 flow: String::new(),
             }],
             "vless-fragmented-xudp",
@@ -1024,6 +1063,7 @@ mod tests {
             &[VlessUser {
                 user_id: user_id.into(),
                 user_label: "vless-xudp-user".into(),
+                user_level: 0,
                 flow: String::new(),
             }],
             "vless-xudp",

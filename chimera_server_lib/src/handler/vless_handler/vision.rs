@@ -23,7 +23,7 @@ use super::tls_vision::{RustlsVisionSession, VisionRecordIo};
 use super::vision_stream::VisionServerStream;
 use super::{SERVER_RESPONSE_HEADER, encode_hex, parse_hex};
 
-pub(crate) type ParsedVisionUser = (Box<[u8]>, String);
+pub(crate) type ParsedVisionUser = (Box<[u8]>, String, u32);
 
 #[derive(Debug)]
 pub struct VisionVlessTcpHandler {
@@ -86,6 +86,7 @@ pub async fn setup_reality_mixed_vless_server_stream(
 
     let user = find_matching_vless_user(users, &user_id, inbound_tag)?;
     let user_label = user.user_label.clone();
+    let user_level = user.user_level;
 
     match request_flow.as_str() {
         "" => {
@@ -112,7 +113,8 @@ pub async fn setup_reality_mixed_vless_server_stream(
                 traffic_context: Some(
                     TrafficContext::new("vless")
                         .with_identity(user_label)
-                        .with_inbound_tag(inbound_tag.to_string()),
+                        .with_inbound_tag(inbound_tag.to_string())
+                        .with_user_level(user_level),
                 ),
             })
         }
@@ -153,7 +155,8 @@ pub async fn setup_reality_mixed_vless_server_stream(
                 traffic_context: Some(
                     TrafficContext::new("vless")
                         .with_identity(user_label)
-                        .with_inbound_tag(inbound_tag.to_string()),
+                        .with_inbound_tag(inbound_tag.to_string())
+                        .with_user_level(user_level),
                 ),
             })
         }
@@ -186,7 +189,7 @@ pub async fn setup_tls_vision_server_stream(
     let header = if !fallbacks.is_empty() {
         let (mut prefix, candidate) = read_vless_auth_prefix(&mut tls_stream).await;
         let authenticated = candidate.is_some_and(|candidate| {
-            users.iter().any(|(stored_user_id, _)| {
+            users.iter().any(|(stored_user_id, _, _)| {
                 stored_user_id.len() == 16
                     && stored_user_id.as_ref() == candidate.as_slice()
             })
@@ -226,7 +229,8 @@ pub async fn setup_tls_vision_server_stream(
         remote_location,
     } = header;
 
-    let user_label = find_matching_user_label(users, &user_id, inbound_tag)?;
+    let (user_label, user_level) =
+        find_matching_user_label(users, &user_id, inbound_tag)?;
     validate_vision_request_flow(&request_flow, command)?;
 
     let (io, connection) = tls_stream.into_inner();
@@ -249,7 +253,8 @@ pub async fn setup_tls_vision_server_stream(
         traffic_context: Some(
             TrafficContext::new("vless")
                 .with_identity(user_label)
-                .with_inbound_tag(inbound_tag.to_string()),
+                .with_inbound_tag(inbound_tag.to_string())
+                .with_user_level(user_level),
         ),
     })
 }
@@ -263,7 +268,7 @@ pub async fn setup_reality_vision_server_stream(
     let header = if !fallbacks.is_empty() {
         let (mut prefix, candidate) = read_vless_auth_prefix(&mut tls_stream).await;
         let authenticated = candidate.is_some_and(|candidate| {
-            users.iter().any(|(stored_user_id, _)| {
+            users.iter().any(|(stored_user_id, _, _)| {
                 stored_user_id.len() == 16
                     && stored_user_id.as_ref() == candidate.as_slice()
             })
@@ -298,7 +303,8 @@ pub async fn setup_reality_vision_server_stream(
         remote_location,
     } = header;
 
-    let user_label = find_matching_user_label(users, &user_id, inbound_tag)?;
+    let (user_label, user_level) =
+        find_matching_user_label(users, &user_id, inbound_tag)?;
     validate_vision_request_flow(&request_flow, command)?;
 
     let (tcp, mut session) = tls_stream.into_inner();
@@ -320,7 +326,8 @@ pub async fn setup_reality_vision_server_stream(
         traffic_context: Some(
             TrafficContext::new("vless")
                 .with_identity(user_label)
-                .with_inbound_tag(inbound_tag.to_string()),
+                .with_inbound_tag(inbound_tag.to_string())
+                .with_user_level(user_level),
         ),
     })
 }
@@ -338,7 +345,7 @@ impl TcpServerHandler for VisionVlessTcpHandler {
             remote_location,
         } = read_request_header(&mut server_stream).await?;
 
-        let user_label =
+        let (user_label, user_level) =
             find_matching_user_label(&self.users, &user_id, &self.inbound_tag)?;
 
         validate_vision_request_flow(&request_flow, command)?;
@@ -351,7 +358,8 @@ impl TcpServerHandler for VisionVlessTcpHandler {
             traffic_context: Some(
                 TrafficContext::new("vless")
                     .with_identity(user_label)
-                    .with_inbound_tag(self.inbound_tag.clone()),
+                    .with_inbound_tag(self.inbound_tag.clone())
+                    .with_user_level(user_level),
             ),
         })
     }
@@ -360,7 +368,13 @@ impl TcpServerHandler for VisionVlessTcpHandler {
 pub(crate) fn parse_vision_users(users: &[VlessUser]) -> Vec<ParsedVisionUser> {
     users
         .iter()
-        .map(|user| (parse_hex(&user.user_id), user.user_label.clone()))
+        .map(|user| {
+            (
+                parse_hex(&user.user_id),
+                user.user_label.clone(),
+                user.user_level,
+            )
+        })
         .collect()
 }
 
@@ -401,15 +415,15 @@ fn find_matching_user_label(
     users: &[ParsedVisionUser],
     user_id: &[u8; 16],
     inbound_tag: &str,
-) -> std::io::Result<String> {
-    let matched_user = users.iter().find(|(stored_user_id, _)| {
+) -> std::io::Result<(String, u32)> {
+    let matched_user = users.iter().find(|(stored_user_id, _, _)| {
         stored_user_id.len() == 16 && stored_user_id.as_ref() == user_id.as_slice()
     });
 
-    let Some((_, user_label)) = matched_user else {
+    let Some((_, user_label, user_level)) = matched_user else {
         let expected = users
             .iter()
-            .map(|(user_id, _)| encode_hex(user_id.as_ref()))
+            .map(|(user_id, _, _)| encode_hex(user_id.as_ref()))
             .collect::<Vec<_>>()
             .join(",");
         let got = encode_hex(user_id);
@@ -426,7 +440,7 @@ fn find_matching_user_label(
         ));
     };
 
-    Ok(user_label.clone())
+    Ok((user_label.clone(), *user_level))
 }
 
 fn validate_vision_request_flow(

@@ -276,6 +276,8 @@ pub struct TuicServerConfig {
 pub struct TrojanUser {
     pub password: String,
     pub email: Option<String>,
+    #[serde(default)]
+    pub user_level: u32,
 }
 
 #[cfg(feature = "trojan")]
@@ -301,6 +303,8 @@ pub struct ShadowsocksUser {
     pub password: String,
     #[serde(default)]
     pub email: String,
+    #[serde(default)]
+    pub user_level: u32,
 }
 
 #[cfg(feature = "shadowsocks")]
@@ -420,6 +424,8 @@ pub struct VlessUser {
     pub user_id: String,
     pub user_label: String,
     #[serde(default)]
+    pub user_level: u32,
+    #[serde(default)]
     pub flow: String,
 }
 
@@ -429,6 +435,8 @@ pub struct VmessUser {
     pub user_id: String,
     #[serde(default)]
     pub user_label: String,
+    #[serde(default)]
+    pub user_level: u32,
     #[serde(default)]
     pub cipher: String,
 }
@@ -577,6 +585,8 @@ pub struct DokodemoDoorConfig {
     pub target: NetLocation,
     #[serde(default)]
     pub follow_redirect: bool,
+    #[serde(default)]
+    pub user_level: u32,
 }
 
 #[cfg(feature = "tls")]

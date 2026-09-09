@@ -190,6 +190,10 @@ impl TcpRelayResult {
         }
     }
 
+    pub(super) fn policy_userspace(left_to_right: u64, right_to_left: u64) -> Self {
+        Self::userspace(configured_relay_backend(), left_to_right, right_to_left)
+    }
+
     fn userspace_fallback(
         configured_backend: RelayBackend,
         fallback_reason: RelayFallbackReason,
@@ -568,6 +572,10 @@ where
         prelude_left_to_right.saturating_add(left_to_right),
         prelude_right_to_left.saturating_add(right_to_left),
     ))
+}
+
+pub(super) fn configured_copy_buffer_size() -> usize {
+    configured_copy_buffer().size
 }
 
 fn configured_copy_buffer() -> CopyBufferConfig {

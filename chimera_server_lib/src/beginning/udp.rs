@@ -2533,7 +2533,8 @@ async fn relay_shadowsocks_udp_packet(
     .await?;
     let mut traffic_context = TrafficContext::new("shadowsocks")
         .with_inbound_tag(inbound_tag)
-        .with_client_ip(client_addr.ip());
+        .with_client_ip(client_addr.ip())
+        .with_user_level(request.user_level);
     if !request.identity.is_empty() {
         traffic_context = traffic_context.with_identity(request.identity.clone());
     }
@@ -5102,6 +5103,7 @@ mod tests {
                     observation_addr.port(),
                 ),
                 follow_redirect: true,
+                user_level: 0,
             },
             None::<SocketAddr>,
             "dokodemo-follow-redirect".into(),
@@ -5146,6 +5148,7 @@ mod tests {
             method: "xchacha20-poly1305".to_string(),
             password: "password".to_string(),
             email: "ss-user@example.com".to_string(),
+            user_level: 0,
         };
         let server_codec = Arc::new(
             ShadowsocksUdpCodec::new(vec![user.clone()], None)
@@ -5224,6 +5227,7 @@ mod tests {
             DokodemoDoorConfig {
                 target: target.clone(),
                 follow_redirect: false,
+                user_level: 0,
             },
             Some(target_addr),
             "dokodemo-trojan".to_string(),
@@ -5280,6 +5284,7 @@ mod tests {
             DokodemoDoorConfig {
                 target: target.clone(),
                 follow_redirect: false,
+                user_level: 0,
             },
             echo_addr,
             "dokodemo-udp-test".into(),
@@ -5338,6 +5343,7 @@ mod tests {
             DokodemoDoorConfig {
                 target: target.clone(),
                 follow_redirect: false,
+                user_level: 0,
             },
             echo_addr,
             "dokodemo-udp-test".into(),
@@ -5411,6 +5417,7 @@ mod tests {
             DokodemoDoorConfig {
                 target: target.clone(),
                 follow_redirect: false,
+                user_level: 0,
             },
             echo_addr,
             "dokodemo-udp-test".into(),

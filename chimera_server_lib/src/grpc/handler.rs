@@ -913,6 +913,7 @@ impl HandlerServiceImpl {
             } else {
                 user.email.clone()
             },
+            user_level: user.level,
             flow: account.flow,
         })
     }
@@ -968,6 +969,7 @@ impl HandlerServiceImpl {
                 user.email.clone()
             },
             user_id,
+            user_level: user.level,
             cipher,
         })
     }
@@ -1039,6 +1041,7 @@ impl HandlerServiceImpl {
             method,
             password,
             email: user.email.clone(),
+            user_level: user.level,
         };
         crate::handler::shadowsocks::validate_user(&parsed).map_err(|err| {
             Status::invalid_argument(format!("invalid shadowsocks user: {err}"))
@@ -1070,6 +1073,7 @@ impl HandlerServiceImpl {
             users.push(TrojanUser {
                 password,
                 email: (!user.email.trim().is_empty()).then(|| user.email.clone()),
+                user_level: user.level,
             });
         }
 
@@ -2375,6 +2379,7 @@ impl HandlerServiceImpl {
                     users.push(TrojanUser {
                         password,
                         email: None,
+                        user_level: user.level,
                     });
                     return Ok(true);
                 }
@@ -2390,6 +2395,7 @@ impl HandlerServiceImpl {
                 users.push(TrojanUser {
                     password,
                     email: Some(email.to_string()),
+                    user_level: user.level,
                 });
                 Ok(true)
             }
@@ -5192,6 +5198,7 @@ mod tests {
                 users: vec![VmessUser {
                     user_id: "3ac9b383-75a1-431c-8184-106c80eb2273".to_string(),
                     user_label: "first-vmess@example.com".to_string(),
+                    user_level: 0,
                     cipher: "aes-128-gcm".to_string(),
                 }],
             },
@@ -5332,11 +5339,13 @@ mod tests {
                     VlessUser {
                         user_id: "5df5643d-4e28-4399-bb9e-22014a2d3246".to_string(),
                         user_label: "first-user@example.com".to_string(),
+                        user_level: 0,
                         flow: String::new(),
                     },
                     VlessUser {
                         user_id: "4571894c-7ece-4b27-a734-746330d1a984".to_string(),
                         user_label: "second-user@example.com".to_string(),
+                        user_level: 0,
                         flow: "xtls-rprx-vision".to_string(),
                     },
                 ],
@@ -5780,6 +5789,7 @@ mod tests {
                 users: vec![TrojanUser {
                     password: "initial-password".to_string(),
                     email: Some("initial-user".to_string()),
+                    user_level: 0,
                 }],
                 fallbacks: Vec::new(),
             },
