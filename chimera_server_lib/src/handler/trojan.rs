@@ -44,6 +44,13 @@ struct TrojanUserState {
     credentials: HashMap<Vec<u8>, TrojanCredential>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TrojanUserStoreError {
+    EmptyEmail,
+    DuplicateEmail(String),
+    NotFound(String),
+}
+
 #[derive(Debug)]
 pub(crate) struct TrojanUserStore {
     state: RwLock<TrojanUserState>,
@@ -69,6 +76,57 @@ impl TrojanUserStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .users
             .clone()
+    }
+
+    pub(crate) fn add_user(
+        &self,
+        user: TrojanUser,
+    ) -> Result<(), TrojanUserStoreError> {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(email) = user.email.as_deref().filter(|email| !email.is_empty())
+            && state.users.iter().any(|existing| {
+                existing
+                    .email
+                    .as_deref()
+                    .is_some_and(|current| current.eq_ignore_ascii_case(email))
+            })
+        {
+            return Err(TrojanUserStoreError::DuplicateEmail(email.to_string()));
+        }
+        state.credentials.insert(
+            create_password_hash(&user.password).into_vec(),
+            credential_from_user(&user),
+        );
+        state.users.push(user);
+        Ok(())
+    }
+
+    pub(crate) fn remove_user_by_email(
+        &self,
+        email: &str,
+    ) -> Result<(), TrojanUserStoreError> {
+        if email.is_empty() {
+            return Err(TrojanUserStoreError::EmptyEmail);
+        }
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(index) = state.users.iter().position(|user| {
+            user.email
+                .as_deref()
+                .is_some_and(|current| current.eq_ignore_ascii_case(email))
+        }) else {
+            return Err(TrojanUserStoreError::NotFound(email.to_string()));
+        };
+        let user = state.users.swap_remove(index);
+        state
+            .credentials
+            .remove(create_password_hash(&user.password).as_ref());
+        Ok(())
     }
 
     fn credential(&self, password_line: &[u8]) -> Option<TrojanCredential> {
@@ -795,6 +853,68 @@ mod tests {
         let traffic_context = traffic_context.expect("Trojan traffic context");
         assert_eq!(traffic_context.identity.as_deref(), Some("second-user"));
         assert_eq!(traffic_context.user_level, 7);
+    }
+
+    #[test]
+    fn runtime_store_matches_xray_email_and_password_index_semantics() {
+        let shared_password = "shared-password";
+        let store = TrojanUserStore::new(vec![TrojanUser {
+            password: shared_password.into(),
+            email: Some("first@example.com".into()),
+            user_level: 3,
+        }]);
+
+        store
+            .add_user(TrojanUser {
+                password: shared_password.into(),
+                email: Some("second@example.com".into()),
+                user_level: 7,
+            })
+            .expect("same password with a distinct email is allowed");
+        let hash = create_password_hash(shared_password);
+        let credential = store
+            .credential(hash.as_ref())
+            .expect("last writer should own the shared password hash");
+        assert_eq!(credential.identity.as_deref(), Some("second@example.com"));
+        assert_eq!(credential.user_level, 7);
+
+        let duplicate = store
+            .add_user(TrojanUser {
+                password: "other-password".into(),
+                email: Some("SECOND@EXAMPLE.COM".into()),
+                user_level: 9,
+            })
+            .expect_err("email uniqueness is case insensitive");
+        assert_eq!(
+            duplicate,
+            TrojanUserStoreError::DuplicateEmail("SECOND@EXAMPLE.COM".into())
+        );
+
+        store
+            .remove_user_by_email("SECOND@EXAMPLE.COM")
+            .expect("removal should be case insensitive");
+        assert!(
+            store.credential(hash.as_ref()).is_none(),
+            "deleting the hash owner must not resurrect an older shared-password user"
+        );
+        assert_eq!(store.snapshot().len(), 1);
+        assert_eq!(
+            store.snapshot()[0].email.as_deref(),
+            Some("first@example.com")
+        );
+
+        store
+            .add_user(TrojanUser {
+                password: "anonymous-password".into(),
+                email: None,
+                user_level: 11,
+            })
+            .expect("Xray permits Trojan users without email");
+        assert!(
+            store
+                .credential(create_password_hash("anonymous-password").as_ref())
+                .is_some()
+        );
     }
 
     #[tokio::test]

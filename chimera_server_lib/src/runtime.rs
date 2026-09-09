@@ -323,6 +323,28 @@ impl RuntimeState {
             .await
     }
 
+    #[cfg(feature = "trojan")]
+    pub(crate) async fn alter_trojan_users<E, F, U>(
+        &self,
+        tag: &str,
+        update_config: F,
+        update_trojan_users: U,
+    ) -> Result<(), crate::inbound::AlterInboundError<E>>
+    where
+        E: Send,
+        F: FnOnce(&ServerConfig) -> Result<ServerConfig, E> + Send,
+        U: FnOnce(&TrojanUserStore) -> Result<(), E> + Send,
+    {
+        self.inbound_manager
+            .alter_trojan_users(
+                self.clone(),
+                tag,
+                update_config,
+                update_trojan_users,
+            )
+            .await
+    }
+
     pub fn outbounds(&self) -> Vec<OutboundSummary> {
         self.outbound_snapshot().as_ref().clone()
     }

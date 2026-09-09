@@ -8,8 +8,6 @@ use crate::config::server_config::Hysteria2Client;
 use crate::config::server_config::RealityTransportConfig;
 #[cfg(feature = "tls")]
 use crate::config::server_config::TlsServerConfig;
-#[cfg(feature = "trojan")]
-use crate::config::server_config::TrojanUser;
 #[cfg(feature = "vless")]
 use crate::config::server_config::VlessUser;
 #[cfg(feature = "ws")]
@@ -31,6 +29,11 @@ use crate::{
     },
     runtime::{OutboundSummary, RuntimeState},
     traffic::register_identity,
+};
+#[cfg(feature = "trojan")]
+use crate::{
+    config::server_config::TrojanUser,
+    handler::trojan::{TrojanUserStore, TrojanUserStoreError},
 };
 use prost::Message;
 
@@ -1207,19 +1210,27 @@ impl HandlerServiceImpl {
     }
 
     #[cfg(feature = "trojan")]
+    fn parse_trojan_user(
+        &self,
+        user: &proto::xray::common::protocol::User,
+    ) -> Result<TrojanUser, Status> {
+        Ok(TrojanUser {
+            password: self.parse_trojan_password(user)?,
+            email: (!user.email.is_empty()).then(|| user.email.clone()),
+            user_level: user.level,
+        })
+    }
+
+    #[cfg(feature = "trojan")]
     fn parse_trojan_inbound_config(
         &self,
         config: TrojanServerConfigPayload,
     ) -> Result<ServerProxyConfig, Status> {
-        let mut users = Vec::with_capacity(config.users.len());
-        for user in &config.users {
-            let password = self.parse_trojan_password(user)?;
-            users.push(TrojanUser {
-                password,
-                email: (!user.email.trim().is_empty()).then(|| user.email.clone()),
-                user_level: user.level,
-            });
-        }
+        let users = config
+            .users
+            .iter()
+            .map(|user| self.parse_trojan_user(user))
+            .collect::<Result<Vec<_>, _>>()?;
 
         let mut fallbacks = Vec::with_capacity(config.fallbacks.len());
         for fallback in config.fallbacks {
@@ -2428,13 +2439,50 @@ impl HandlerServiceImpl {
                     "invalid trojan account payload: {err}"
                 ))
             })?;
-        let password = payload.password.trim();
-        if password.is_empty() {
-            return Err(Status::invalid_argument(
-                "trojan account password is required",
-            ));
+        Ok(payload.password)
+    }
+
+    #[cfg(feature = "trojan")]
+    fn map_trojan_user_store_error(error: TrojanUserStoreError) -> Status {
+        match error {
+            TrojanUserStoreError::EmptyEmail => {
+                Status::invalid_argument("RemoveUserOperation.email is required")
+            }
+            TrojanUserStoreError::DuplicateEmail(email) => {
+                Status::already_exists(format!("Trojan user {email} already exists"))
+            }
+            TrojanUserStoreError::NotFound(email) => {
+                Status::not_found(format!("Trojan user {email} not found"))
+            }
         }
-        Ok(password.to_string())
+    }
+
+    #[cfg(feature = "trojan")]
+    fn apply_trojan_runtime_operation(
+        &self,
+        store: &TrojanUserStore,
+        operation: AlterInboundOperation,
+    ) -> Result<(), Status> {
+        match operation {
+            AlterInboundOperation::Noop => Ok(()),
+            AlterInboundOperation::AddUser(operation) => {
+                let user = operation.user.as_ref().ok_or_else(|| {
+                    Status::invalid_argument("AddUserOperation.user is required")
+                })?;
+                let parsed = self.parse_trojan_user(user)?;
+                store
+                    .add_user(parsed)
+                    .map_err(Self::map_trojan_user_store_error)?;
+                let stats = self.runtime.policy_user_stats(user.level);
+                if stats.uplink || stats.downlink {
+                    register_identity(user.email.clone());
+                }
+                Ok(())
+            }
+            AlterInboundOperation::RemoveUser(operation) => store
+                .remove_user_by_email(&operation.email)
+                .map_err(Self::map_trojan_user_store_error),
+        }
     }
 
     #[cfg(feature = "hysteria")]
@@ -2493,33 +2541,19 @@ impl HandlerServiceImpl {
             }
             #[cfg(feature = "trojan")]
             ServerProxyConfig::Trojan { users, .. } => {
-                let password = self.parse_trojan_password(user)?;
-                let email = user.email.trim();
-                if email.is_empty() {
-                    if users.iter().any(|existing| existing.password == password) {
-                        return Ok(true);
-                    }
-                    users.push(TrojanUser {
-                        password,
-                        email: None,
-                        user_level: user.level,
-                    });
-                    return Ok(true);
-                }
-
-                if users
-                    .iter()
-                    .any(|existing| existing.email.as_deref() == Some(email))
+                let parsed = self.parse_trojan_user(user)?;
+                if let Some(email) = parsed.email.as_deref()
+                    && users.iter().any(|existing| {
+                        existing.email.as_deref().is_some_and(|current| {
+                            current.eq_ignore_ascii_case(email)
+                        })
+                    })
                 {
                     return Err(Status::already_exists(format!(
                         "Trojan user {email} already exists"
                     )));
                 }
-                users.push(TrojanUser {
-                    password,
-                    email: Some(email.to_string()),
-                    user_level: user.level,
-                });
+                users.push(parsed);
                 Ok(true)
             }
             #[cfg(feature = "hysteria")]
@@ -2633,13 +2667,16 @@ impl HandlerServiceImpl {
             }
             #[cfg(feature = "trojan")]
             ServerProxyConfig::Trojan { users, .. } => {
-                let before = users.len();
-                users.retain(|user| user.email.as_deref() != Some(email));
-                if before == users.len() {
+                let Some(index) = users.iter().position(|user| {
+                    user.email
+                        .as_deref()
+                        .is_some_and(|current| current.eq_ignore_ascii_case(email))
+                }) else {
                     return Err(Status::not_found(format!(
                         "Trojan user {email} not found"
                     )));
-                }
+                };
+                users.swap_remove(index);
                 Ok(true)
             }
             #[cfg(feature = "hysteria")]
@@ -2781,9 +2818,17 @@ impl HandlerServiceImpl {
                 Some(users.iter().map(|user| user.user_label.clone()).collect())
             }
             #[cfg(feature = "trojan")]
-            ServerProxyConfig::Trojan { users, .. } => {
-                Some(users.iter().filter_map(|user| user.email.clone()).collect())
-            }
+            ServerProxyConfig::Trojan { users, .. } => Some(
+                users
+                    .iter()
+                    .filter_map(|user| {
+                        user.email
+                            .as_ref()
+                            .filter(|email| !email.is_empty())
+                            .cloned()
+                    })
+                    .collect(),
+            ),
             #[cfg(feature = "hysteria")]
             ServerProxyConfig::Hysteria2 { config } => Some(
                 config
@@ -2927,8 +2972,11 @@ impl HandlerServiceImpl {
             ServerProxyConfig::Trojan { users, .. } => Some(
                 users
                     .iter()
+                    .filter(|user| {
+                        user.email.as_deref().is_some_and(|email| !email.is_empty())
+                    })
                     .map(|user| proto::xray::common::protocol::User {
-                        level: 0,
+                        level: user.user_level,
                         email: user.email.clone().unwrap_or_default(),
                         account: Some(proto::xray::common::serial::TypedMessage {
                             r#type: TYPE_PROXY_TROJAN_ACCOUNT.to_string(),
@@ -3122,6 +3170,29 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
         let request = request.into_inner();
         let operation = self.parse_alter_inbound_operation(request.operation)?;
         if matches!(&operation, AlterInboundOperation::Noop) {
+            return Ok(Response::new(
+                proto::xray::app::proxyman::command::AlterInboundResponse {},
+            ));
+        }
+
+        #[cfg(feature = "trojan")]
+        if self.runtime.trojan_user_store(&request.tag).is_some() {
+            let config_operation = operation.clone();
+            self.runtime
+                .alter_trojan_users(
+                    &request.tag,
+                    |current| {
+                        let mut updated = Self::detached_inbound(current);
+                        self.apply_alter_inbound_operation(
+                            &mut updated,
+                            config_operation,
+                        )?;
+                        Ok::<ServerConfig, Status>(updated)
+                    },
+                    |store| self.apply_trojan_runtime_operation(store, operation),
+                )
+                .await
+                .map_err(Self::map_alter_inbound_error)?;
             return Ok(Response::new(
                 proto::xray::app::proxyman::command::AlterInboundResponse {},
             ));
@@ -4092,6 +4163,76 @@ mod tests {
             );
         assert_eq!(tuned.protocol, "trojan");
         assert!(tuned.sender_settings_value.is_some());
+    }
+
+    #[cfg(feature = "trojan")]
+    #[tokio::test]
+    async fn handler_alter_trojan_users_does_not_restart_listener() {
+        let occupied = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let inbound_tag = unique_tag("trojan-no-restart-inbound");
+        let runtime = RuntimeState::new(
+            vec![ServerConfig {
+                tag: inbound_tag.clone(),
+                bind_location: BindLocation::Address(NetLocation::new(
+                    Address::Ipv4(Ipv4Addr::LOCALHOST),
+                    port,
+                )),
+                protocol: ServerProxyConfig::Trojan {
+                    users: Vec::new(),
+                    fallbacks: Vec::new(),
+                },
+                transport: Transport::Tcp,
+                quic_settings: None,
+                sniffing: None,
+                tcp_socket_policy: None,
+            }],
+            Vec::new(),
+        );
+        let placeholder_task = tokio::spawn(std::future::pending::<()>());
+        let abort_handle = placeholder_task.abort_handle();
+        runtime.register_inbound_tasks(&inbound_tag, vec![placeholder_task]);
+        let service = HandlerServiceImpl::new(runtime.clone());
+        let added_email = unique_tag("trojan-dynamic-user");
+        let operation = proto::xray::app::proxyman::command::AddUserOperation {
+            user: Some(proto::xray::common::protocol::User {
+                level: 7,
+                email: added_email.clone(),
+                account: Some(proto::xray::common::serial::TypedMessage {
+                    r#type: TYPE_PROXY_TROJAN_ACCOUNT.to_string(),
+                    value: TrojanAccountPayload {
+                        password: "  dynamic-password  ".to_string(),
+                    }
+                    .encode_to_vec(),
+                }),
+            }),
+        };
+
+        service
+            .alter_inbound(Request::new(
+                proto::xray::app::proxyman::command::AlterInboundRequest {
+                    tag: inbound_tag.clone(),
+                    operation: Some(proto::xray::common::serial::TypedMessage {
+                        r#type: TYPE_ADD_USER_OPERATION.to_string(),
+                        value: operation.encode_to_vec(),
+                    }),
+                },
+            ))
+            .await
+            .expect("Trojan user update must not rebind the occupied listener");
+
+        assert!(!abort_handle.is_finished());
+        let updated = runtime.inbound_by_tag(&inbound_tag).unwrap();
+        let ServerProxyConfig::Trojan { users, .. } = updated.protocol else {
+            panic!("expected trojan inbound");
+        };
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].email.as_deref(), Some(added_email.as_str()));
+        assert_eq!(users[0].password, "  dynamic-password  ");
+        assert_eq!(users[0].user_level, 7);
+        assert!(runtime.stop_inbound_tasks(&inbound_tag).await);
     }
 
     #[cfg(feature = "vmess")]
@@ -6056,6 +6197,40 @@ mod tests {
             .expect_err("SOCKS should not expose Xray UserManager mutations");
         assert_eq!(err.code(), Code::Unknown);
         assert_eq!(err.message(), ERR_PROXY_NOT_USER_MANAGER);
+    }
+
+    #[cfg(feature = "trojan")]
+    #[test]
+    fn trojan_user_reads_hide_empty_email_and_preserve_level() {
+        let service =
+            HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+        let protocol = ServerProxyConfig::Trojan {
+            users: vec![
+                TrojanUser {
+                    password: "anonymous".into(),
+                    email: None,
+                    user_level: 11,
+                },
+                TrojanUser {
+                    password: "visible".into(),
+                    email: Some("Visible@Example.com".into()),
+                    user_level: 7,
+                },
+            ],
+            fallbacks: Vec::new(),
+        };
+
+        let users = service
+            .get_user_manager_users(&protocol)
+            .expect("Trojan exposes UserManager reads");
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].email, "Visible@Example.com");
+        assert_eq!(users[0].level, 7);
+
+        let identities = service
+            .get_user_manager_identities(&protocol)
+            .expect("Trojan exposes UserManager count");
+        assert_eq!(identities, vec!["Visible@Example.com"]);
     }
 
     #[cfg(feature = "trojan")]
