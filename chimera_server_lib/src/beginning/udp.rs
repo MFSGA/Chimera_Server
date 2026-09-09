@@ -103,9 +103,7 @@ enum GlobalUdpWorkerKey {
         outbound_tag: Option<String>,
     },
     #[cfg(feature = "trojan")]
-    Trojan {
-        outbound: OutboundSummary,
-    },
+    Trojan { outbound: OutboundSummary },
 }
 
 impl From<&TargetedUdpSessionKey> for GlobalUdpWorkerKey {
@@ -1523,24 +1521,23 @@ async fn attach_global_session_udp_session(
     };
 
     if worker_plan == GlobalUdpWorkerPlan::Replace {
-        let worker =
-            match start_global_session_udp_worker(
-                worker_key.clone(),
-                key.target_addr,
-                idle_timeout,
-                backend_start,
-            )
-            .await
-            {
-                Ok(worker) => worker,
-                Err(error) => {
-                    let mut guard = globals.lock().await;
-                    guard
-                        .registry
-                        .remove_current(global_id, transition.current.token);
-                    return Err(error);
-                }
-            };
+        let worker = match start_global_session_udp_worker(
+            worker_key.clone(),
+            key.target_addr,
+            idle_timeout,
+            backend_start,
+        )
+        .await
+        {
+            Ok(worker) => worker,
+            Err(error) => {
+                let mut guard = globals.lock().await;
+                guard
+                    .registry
+                    .remove_current(global_id, transition.current.token);
+                return Err(error);
+            }
+        };
 
         let mut guard = globals.lock().await;
         if guard.registry.current(global_id, Instant::now())
