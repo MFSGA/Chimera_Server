@@ -265,6 +265,100 @@ fn original_destination_from_message(
 }
 
 #[cfg(target_os = "linux")]
+pub fn set_tcp_congestion(fd: RawFd, congestion: &str) -> io::Result<()> {
+    if congestion.as_bytes().contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "TCP congestion-control name contains NUL",
+        ));
+    }
+    let value = congestion.as_bytes();
+    // SAFETY: `value` remains alive for the duration of setsockopt and points
+    // to exactly the byte string expected by TCP_CONGESTION.
+    let result = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_CONGESTION,
+            value.as_ptr().cast(),
+            value.len() as libc::socklen_t,
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+const TCP_BRUTAL_PARAMS: libc::c_int = 23_301;
+
+#[cfg(target_os = "linux")]
+fn tcp_brutal_params_bytes(
+    rate_bytes_per_sec: u64,
+    cwnd_gain: u32,
+    group_id: u64,
+) -> [u8; 20] {
+    let mut value = [0_u8; 20];
+    value[0..8].copy_from_slice(&rate_bytes_per_sec.to_ne_bytes());
+    value[8..12].copy_from_slice(&cwnd_gain.to_ne_bytes());
+    value[12..20].copy_from_slice(&group_id.to_ne_bytes());
+    value
+}
+
+#[cfg(target_os = "linux")]
+pub fn set_tcp_brutal_params(
+    fd: RawFd,
+    rate_bytes_per_sec: u64,
+    cwnd_gain: u32,
+    group_id: u64,
+) -> io::Result<()> {
+    let value = tcp_brutal_params_bytes(rate_bytes_per_sec, cwnd_gain, group_id);
+    // TCP Brutal v2 uses a packed 20-byte native-endian ABI:
+    // u64 rate, u32 cwnd_gain, u64 group_id.
+    let result = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            TCP_BRUTAL_PARAMS,
+            value.as_ptr().cast(),
+            value.len() as libc::socklen_t,
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn tcp_brutal_group_id(listener: SocketAddr, peer: SocketAddr) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn mix(mut hash: u64, bytes: &[u8]) -> u64 {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
+    }
+
+    fn mix_ip(hash: u64, ip: std::net::IpAddr) -> u64 {
+        match ip {
+            std::net::IpAddr::V4(ip) => mix(mix(hash, &[4]), &ip.octets()),
+            std::net::IpAddr::V6(ip) => mix(mix(hash, &[6]), &ip.octets()),
+        }
+    }
+
+    let mut hash = mix(FNV_OFFSET, b"chimera-tcp-brutal-v2");
+    hash = mix_ip(hash, listener.ip());
+    hash = mix(hash, &listener.port().to_be_bytes());
+    hash = mix_ip(hash, peer.ip());
+    if hash == 0 { 1 } else { hash }
+}
+
+#[cfg(target_os = "linux")]
 fn socket_addr_from_v4(address: &libc::sockaddr_in) -> SocketAddr {
     SocketAddr::new(
         Ipv4Addr::from(u32::from_be(address.sin_addr.s_addr)).into(),
@@ -296,6 +390,32 @@ mod original_destination_tests {
     fn tokio_udp_socket(socket: Socket) -> UdpSocket {
         let socket: std::net::UdpSocket = socket.into();
         UdpSocket::from_std(socket).expect("convert nonblocking UDP socket")
+    }
+
+    #[test]
+    fn brutal_group_is_shared_by_peer_ip_on_one_inbound() {
+        let listener = SocketAddr::from((Ipv4Addr::LOCALHOST, 1234));
+        let first = SocketAddr::from(([203, 0, 113, 7], 40000));
+        let second = SocketAddr::from(([203, 0, 113, 7], 50000));
+        let other_listener = SocketAddr::from((Ipv4Addr::LOCALHOST, 9443));
+
+        assert_eq!(
+            tcp_brutal_group_id(listener, first),
+            tcp_brutal_group_id(listener, second)
+        );
+        assert_ne!(
+            tcp_brutal_group_id(listener, first),
+            tcp_brutal_group_id(other_listener, first)
+        );
+        assert_ne!(tcp_brutal_group_id(listener, first), 0);
+    }
+
+    #[test]
+    fn brutal_v2_params_use_packed_native_endian_layout() {
+        let value = tcp_brutal_params_bytes(18_750_000, 20, 0x0102_0304_0506_0708);
+        assert_eq!(&value[0..8], &18_750_000_u64.to_ne_bytes());
+        assert_eq!(&value[8..12], &20_u32.to_ne_bytes());
+        assert_eq!(&value[12..20], &0x0102_0304_0506_0708_u64.to_ne_bytes());
     }
 
     #[tokio::test]

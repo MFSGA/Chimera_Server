@@ -115,9 +115,14 @@ impl InboudItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OutboundItem {
     pub protocol: String,
     pub tag: String,
+    #[serde(default)]
+    pub settings: Option<SettingObject>,
+    #[serde(default, alias = "streamSettings")]
+    pub stream_settings: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -109,6 +109,8 @@ mod tests {
                     protocol: (*protocol).to_string(),
                     proxy_settings_type: None,
                     proxy_settings_value: None,
+                    sender_settings_type: None,
+                    sender_settings_value: None,
                 })
                 .collect(),
         )

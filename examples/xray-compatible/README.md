@@ -42,8 +42,8 @@ These examples are parse/build examples. TLS and QUIC examples use placeholder c
 | HTTP inbound | Not implemented in this stage |
 | Shadowsocks inbound | Not implemented in this stage |
 | Mixed inbound | Not implemented in this stage |
-| gRPC transport | Not implemented in this stage |
-| HTTPUpgrade transport | Not implemented in this stage |
+| gRPC transport | Inbound is supported; Trojan outbound supports Xray Tun and TunMulti over raw TCP, TLS, or REALITY, including gRPC keepalive/window tuning. |
+| HTTPUpgrade transport | Inbound is supported; Trojan outbound supports raw/TLS HTTPUpgrade, including Xray `ed` behavior. |
 | mKCP transport | Not implemented in this stage |
 | Legacy QUIC transport | Not implemented in this stage |
 | TUN | Not implemented in this stage |
@@ -51,7 +51,9 @@ These examples are parse/build examples. TLS and QUIC examples use placeholder c
 
 ## Notes
 
-- Examples use `freedom` and `blackhole` outbounds because Chimera Server is currently inbound-first.
-- REALITY support is inbound/server-side only. Client-side fields such as `publicKey`, `fingerprint`, and `spiderX` are intentionally rejected.
+- The materialized examples still emphasize inbound compatibility, but runtime outbound support now also includes SOCKS, VLESS, and Trojan paths used by routing and observatory tests.
+- Trojan outbound supports raw TCP, TLS, WebSocket/WSS (including Xray `ed`), HTTPUpgrade/TLS (including Xray `ed`), REALITY, and gRPC Tun/TunMulti over raw TCP, TLS, or REALITY. gRPC keepalive and initial-window settings are mapped to the underlying HTTP/2 client with Xray/grpc-go-compatible defaults.
+- Trojan UDP outbound uses the same transport stack and is wired into fixed-target, targeted, ordinary XUDP session, SOCKS shared/UDP_ASSOCIATE, Shadowsocks UDP, and Dokodemo UDP routing paths. GlobalID XUDP + Trojan remains intentionally unsupported until the proxy tunnel can preserve detach/reattach semantics across inbound reconnects.
+- REALITY remains broader on the inbound/server side, but Trojan outbound can consume Xray client-side `publicKey`, `serverName`, `shortId`, and related REALITY settings for raw TCP and gRPC transports.
 - VLESS examples explicitly set `settings.decryption: "none"` to match xray semantics and Chimera validation.
 - Hysteria uses xray protocol name `hysteria`; Chimera maps it internally to the existing Hysteria2 path.

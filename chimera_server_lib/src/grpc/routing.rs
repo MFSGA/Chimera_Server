@@ -1,19 +1,17 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, RwLock},
-};
+use std::collections::HashMap;
 
 use prost::Message;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use crate::{
     config::rule::{
         BalancerConfig, NetworkListConfig, PortListConfig, PortRangeConfig,
-        RuleConfig,
+        RuleConfig, WebhookRuleConfig,
     },
-    routing_state::{DomainStrategy, RoutingInput},
+    routing_process::enrich_routing_input,
+    routing_state::{RouteMatch, RoutingEvent, RoutingInput},
     runtime::RuntimeState,
 };
 
@@ -27,9 +25,6 @@ const TYPE_ROUTER_CONFIG_V2RAY: &str = "v2ray.core.app.router.Config";
 #[derive(Clone)]
 pub(super) struct RoutingServiceImpl {
     runtime: RuntimeState,
-    balancer_overrides: Arc<RwLock<HashMap<String, String>>>,
-    routing_stats_tx:
-        broadcast::Sender<proto::xray::app::router::command::RoutingContext>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -86,6 +81,10 @@ struct RoutingRulePayload {
     local_port_list: Option<PortListPayload>,
     #[prost(message, optional, tag = "20")]
     vless_route_list: Option<PortListPayload>,
+    #[prost(string, repeated, tag = "21")]
+    process: Vec<String>,
+    #[prost(message, optional, tag = "22")]
+    webhook: Option<WebhookConfigPayload>,
 }
 
 mod routing_rule_payload {
@@ -148,23 +147,56 @@ struct PortRangePayload {
 }
 
 #[derive(Clone, PartialEq, Message)]
+struct WebhookConfigPayload {
+    #[prost(string, tag = "1")]
+    url: String,
+    #[prost(uint32, tag = "2")]
+    deduplication: u32,
+    #[prost(map = "string, string", tag = "3")]
+    headers: HashMap<String, String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
 struct BalancingRulePayload {
     #[prost(string, tag = "1")]
     tag: String,
     #[prost(string, repeated, tag = "2")]
     outbound_selector: Vec<String>,
+    #[prost(string, tag = "3")]
+    strategy: String,
+    #[prost(message, optional, tag = "4")]
+    strategy_settings: Option<proto::xray::common::serial::TypedMessage>,
     #[prost(string, tag = "5")]
     fallback_tag: String,
 }
 
+#[derive(Clone, PartialEq, Message)]
+struct StrategyWeightPayload {
+    #[prost(bool, tag = "1")]
+    regexp: bool,
+    #[prost(string, tag = "2")]
+    r#match: String,
+    #[prost(float, tag = "3")]
+    value: f32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct StrategyLeastLoadConfigPayload {
+    #[prost(message, repeated, tag = "2")]
+    costs: Vec<StrategyWeightPayload>,
+    #[prost(int64, repeated, tag = "3")]
+    baselines: Vec<i64>,
+    #[prost(int32, tag = "4")]
+    expected: i32,
+    #[prost(int64, tag = "5")]
+    max_rtt: i64,
+    #[prost(float, tag = "6")]
+    tolerance: f32,
+}
+
 impl RoutingServiceImpl {
     fn new(runtime: RuntimeState) -> Self {
-        let (routing_stats_tx, _) = broadcast::channel(128);
-        Self {
-            runtime,
-            balancer_overrides: Arc::new(RwLock::new(HashMap::new())),
-            routing_stats_tx,
-        }
+        Self { runtime }
     }
 
     fn has_outbound_tag(&self, tag: &str) -> bool {
@@ -200,23 +232,22 @@ impl RoutingServiceImpl {
     fn resolve_outbound_group_tags(
         &self,
         group_tags: &[String],
-    ) -> Result<(String, Vec<String>), Status> {
+    ) -> Result<RouteMatch, Status> {
         if group_tags.is_empty() {
             return Err(Status::unknown(ERR_NOT_ENOUGH_INFO));
         }
 
-        let overrides = self
-            .balancer_overrides
-            .read()
-            .expect("routing balancer overrides lock poisoned");
+        let overrides = self.runtime.balancer_overrides();
         for group_tag in group_tags {
-            if let Some(target) = overrides.get(group_tag)
-                && self.has_outbound_tag(target)
-            {
-                return Ok((target.clone(), vec![group_tag.clone()]));
+            if let Some(target) = overrides.get(group_tag) {
+                return Ok(RouteMatch {
+                    outbound_tag: target.clone(),
+                    outbound_group_tags: vec![group_tag.clone()],
+                    rule_tag: String::new(),
+                    resolution_error: None,
+                });
             }
         }
-        drop(overrides);
 
         let routing = self.runtime.routing();
         let outbounds = self.runtime.outbounds();
@@ -226,87 +257,113 @@ impl RoutingServiceImpl {
                 .into_iter()
                 .next()
             {
-                return Ok((target, vec![group_tag.clone()]));
+                return Ok(RouteMatch {
+                    outbound_tag: target,
+                    outbound_group_tags: vec![group_tag.clone()],
+                    rule_tag: String::new(),
+                    resolution_error: None,
+                });
             }
             if self.has_outbound_tag(group_tag) {
-                return Ok((group_tag.clone(), vec![group_tag.clone()]));
+                return Ok(RouteMatch {
+                    outbound_tag: group_tag.clone(),
+                    outbound_group_tags: vec![group_tag.clone()],
+                    rule_tag: String::new(),
+                    resolution_error: None,
+                });
             }
         }
 
         Err(Status::unknown(ERR_NOT_ENOUGH_INFO))
     }
 
-    fn resolve_outbound_tag(
+    async fn resolve_route(
         &self,
         context: &proto::xray::app::router::command::RoutingContext,
-    ) -> Result<(String, Vec<String>), Status> {
-        if !context.outbound_tag.is_empty() {
-            return if self.has_outbound_tag(&context.outbound_tag) {
-                Ok((
-                    context.outbound_tag.clone(),
-                    context.outbound_group_tags.clone(),
-                ))
-            } else {
-                Err(Status::not_found(format!(
-                    "outbound {} not found",
-                    context.outbound_tag
-                )))
-            };
+    ) -> Result<(RoutingInput, RouteMatch), Status> {
+        let mut input = routing_input_from_context(context);
+        if self.runtime.routing().requires_process_lookup() {
+            enrich_routing_input(&mut input).await;
         }
-
         let route = self.runtime.routing().route(
-            &RoutingInput {
-                inbound_tag: context.inbound_tag.clone(),
-                network: context.network,
-                source_ips: context.source_i_ps.clone(),
-                target_ips: context.target_i_ps.clone(),
-                source_port: context.source_port,
-                target_port: context.target_port,
-                target_domain: context.target_domain.clone(),
-                protocol: context.protocol.clone(),
-                user: context.user.clone(),
-                process_id: 0,
-                process_name: String::new(),
-                process_path: String::new(),
-                attributes: context.attributes.clone(),
-                local_ips: context.local_i_ps.clone(),
-                local_port: context.local_port,
-                vless_route: context.vless_route,
-            },
+            &input,
             &self.runtime.outbounds(),
-            &self
-                .balancer_overrides
-                .read()
-                .expect("routing balancer overrides lock poisoned"),
+            &self.runtime.balancer_overrides(),
         );
         if let Some(route) = route {
-            if let Some(error) = route.resolution_error {
-                return Err(Status::unknown(error));
+            if let Some(error) = route.resolution_error.as_ref() {
+                return Err(Status::unknown(error.clone()));
             }
-            return Ok((route.outbound_tag, route.outbound_group_tags));
+            return Ok((input, route));
         }
 
         self.resolve_outbound_group_tags(&context.outbound_group_tags)
+            .map(|route| (input, route))
     }
 
-    fn principle_targets(&self, balancer_tag: &str) -> Vec<String> {
-        let outbounds = self.runtime.outbounds();
-        let targets = self
-            .runtime
-            .routing()
-            .balancer_targets(balancer_tag, &outbounds);
-        if targets.is_empty() {
-            outbounds.into_iter().map(|outbound| outbound.tag).collect()
-        } else {
-            targets
+    fn principle_targets(&self, balancer_tag: &str) -> Result<Vec<String>, Status> {
+        let routing = self.runtime.routing();
+        if !routing.has_balancer(balancer_tag) {
+            return Err(Status::not_found(format!(
+                "routing balancer {balancer_tag} not found"
+            )));
         }
+        let outbounds = self.runtime.outbounds();
+        Ok(routing.balancer_principle_targets(balancer_tag, &outbounds))
     }
 }
 
-fn selector_enabled(selectors: &[String], target: &str) -> bool {
-    selectors
-        .iter()
-        .any(|selector| selector.eq_ignore_ascii_case(target))
+fn routing_input_from_context(
+    context: &proto::xray::app::router::command::RoutingContext,
+) -> RoutingInput {
+    RoutingInput {
+        inbound_tag: context.inbound_tag.clone(),
+        network: context.network,
+        source_ips: context.source_i_ps.clone(),
+        target_ips: context.target_i_ps.clone(),
+        source_port: context.source_port,
+        target_port: context.target_port,
+        target_domain: context.target_domain.clone(),
+        protocol: context.protocol.clone(),
+        user: context.user.clone(),
+        process_id: 0,
+        process_name: String::new(),
+        process_path: String::new(),
+        attributes: context.attributes.clone(),
+        local_ips: context.local_i_ps.clone(),
+        local_port: context.local_port,
+        vless_route: context.vless_route,
+    }
+}
+
+fn routing_event_to_context(
+    event: RoutingEvent,
+) -> proto::xray::app::router::command::RoutingContext {
+    proto::xray::app::router::command::RoutingContext {
+        inbound_tag: event.input.inbound_tag,
+        network: event.input.network,
+        source_i_ps: event.input.source_ips,
+        target_i_ps: event.input.target_ips,
+        source_port: event.input.source_port,
+        target_port: event.input.target_port,
+        target_domain: event.input.target_domain,
+        protocol: event.input.protocol,
+        user: event.input.user,
+        attributes: event.input.attributes,
+        outbound_group_tags: event.route.outbound_group_tags,
+        outbound_tag: event.route.outbound_tag,
+        local_i_ps: event.input.local_ips,
+        local_port: event.input.local_port,
+        vless_route: event.input.vless_route,
+    }
+}
+
+fn selector_enabled(selectors: &[String], field: &str) -> bool {
+    selectors.iter().any(|selector| {
+        field
+            .to_ascii_lowercase()
+            .starts_with(&selector.to_ascii_lowercase())
+    })
 }
 
 fn filter_routing_context(
@@ -317,9 +374,6 @@ fn filter_routing_context(
         return context;
     }
 
-    let include_ip = selector_enabled(selectors, "ip");
-    let include_port = selector_enabled(selectors, "port");
-    let include_outbound = selector_enabled(selectors, "outbound");
     let mut filtered = proto::xray::app::router::command::RoutingContext::default();
 
     if selector_enabled(selectors, "inbound") {
@@ -328,17 +382,23 @@ fn filter_routing_context(
     if selector_enabled(selectors, "network") {
         filtered.network = context.network;
     }
-    if include_ip || selector_enabled(selectors, "ip_source") {
+    if selector_enabled(selectors, "ip_source") {
         filtered.source_i_ps = context.source_i_ps;
     }
-    if include_ip || selector_enabled(selectors, "ip_target") {
+    if selector_enabled(selectors, "ip_target") {
         filtered.target_i_ps = context.target_i_ps;
     }
-    if include_port || selector_enabled(selectors, "port_source") {
+    if selector_enabled(selectors, "ip_local") {
+        filtered.local_i_ps = context.local_i_ps;
+    }
+    if selector_enabled(selectors, "port_source") {
         filtered.source_port = context.source_port;
     }
-    if include_port || selector_enabled(selectors, "port_target") {
+    if selector_enabled(selectors, "port_target") {
         filtered.target_port = context.target_port;
+    }
+    if selector_enabled(selectors, "port_local") {
+        filtered.local_port = context.local_port;
     }
     if selector_enabled(selectors, "domain") {
         filtered.target_domain = context.target_domain;
@@ -352,10 +412,10 @@ fn filter_routing_context(
     if selector_enabled(selectors, "attributes") {
         filtered.attributes = context.attributes;
     }
-    if include_outbound || selector_enabled(selectors, "outbound_group") {
+    if selector_enabled(selectors, "outbound_group") {
         filtered.outbound_group_tags = context.outbound_group_tags;
     }
-    if include_outbound {
+    if selector_enabled(selectors, "outbound") {
         filtered.outbound_tag = context.outbound_tag;
     }
 
@@ -364,22 +424,10 @@ fn filter_routing_context(
 
 fn convert_router_config(
     config: RouterConfigPayload,
-) -> Result<(DomainStrategy, Vec<RuleConfig>, Vec<BalancerConfig>), Status> {
-    let domain_strategy =
-        match RouterDomainStrategyPayload::try_from(config.domain_strategy) {
-            Ok(RouterDomainStrategyPayload::AsIs) => DomainStrategy::AsIs,
-            Ok(RouterDomainStrategyPayload::IpIfNonMatch) => {
-                DomainStrategy::IpIfNonMatch
-            }
-            Ok(RouterDomainStrategyPayload::IpOnDemand) => {
-                DomainStrategy::IpOnDemand
-            }
-            Err(_) => {
-                return Err(Status::invalid_argument(
-                    "unsupported routing domain strategy",
-                ));
-            }
-        };
+) -> Result<(Vec<RuleConfig>, Vec<BalancerConfig>), Status> {
+    // Xray's RoutingService.AddRule calls Router.ReloadRules(), which replaces
+    // rules/balancers but intentionally leaves the Router's initialized
+    // domainStrategy unchanged. The protobuf field is therefore ignored here.
     let rules = config
         .rule
         .into_iter()
@@ -388,15 +436,70 @@ fn convert_router_config(
     let balancers = config
         .balancing_rule
         .into_iter()
-        .map(|balancer| BalancerConfig {
-            tag: balancer.tag,
-            outbound_selector: balancer.outbound_selector,
-            strategy: Default::default(),
-            fallback_tag: (!balancer.fallback_tag.is_empty())
-                .then_some(balancer.fallback_tag),
-        })
-        .collect::<Vec<_>>();
-    Ok((domain_strategy, rules, balancers))
+        .map(convert_balancer_payload)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((rules, balancers))
+}
+
+fn convert_balancer_payload(
+    balancer: BalancingRulePayload,
+) -> Result<BalancerConfig, Status> {
+    let strategy_kind = balancer.strategy.trim().to_ascii_lowercase();
+    let settings = match strategy_kind.as_str() {
+        "" | "random" | "roundrobin" | "leastping" => None,
+        "leastload" => balancer
+            .strategy_settings
+            .map(convert_least_load_settings)
+            .transpose()?,
+        other => {
+            return Err(Status::invalid_argument(format!(
+                "unsupported routing balancer strategy: {other}"
+            )));
+        }
+    };
+    Ok(BalancerConfig {
+        tag: balancer.tag,
+        outbound_selector: balancer.outbound_selector,
+        strategy: crate::config::rule::BalancerStrategyConfig {
+            kind: if strategy_kind.is_empty() {
+                "random".into()
+            } else {
+                strategy_kind
+            },
+            settings,
+        },
+        fallback_tag: (!balancer.fallback_tag.is_empty())
+            .then_some(balancer.fallback_tag),
+    })
+}
+
+fn convert_least_load_settings(
+    settings: proto::xray::common::serial::TypedMessage,
+) -> Result<serde_json::Value, Status> {
+    let message_type = settings.r#type.trim_start_matches('.');
+    if !message_type.is_empty() && !message_type.ends_with("StrategyLeastLoadConfig")
+    {
+        return Err(Status::invalid_argument(format!(
+            "unsupported leastLoad strategy settings type: {message_type}"
+        )));
+    }
+    let settings = StrategyLeastLoadConfigPayload::decode(settings.value.as_slice())
+        .map_err(|error| {
+            Status::invalid_argument(format!(
+                "invalid leastLoad strategy settings payload: {error}"
+            ))
+        })?;
+    Ok(serde_json::json!({
+        "costs": settings.costs.into_iter().map(|cost| serde_json::json!({
+            "regexp": cost.regexp,
+            "match": cost.r#match,
+            "value": cost.value,
+        })).collect::<Vec<_>>(),
+        "baselines": settings.baselines.into_iter().map(|value| format!("{value}ns")).collect::<Vec<_>>(),
+        "expected": settings.expected.max(0),
+        "maxRTT": format!("{}ns", settings.max_rtt.max(0)),
+        "tolerance": settings.tolerance.clamp(0.0, 1.0),
+    }))
 }
 
 fn convert_rule_payload(rule: RoutingRulePayload) -> Result<RuleConfig, Status> {
@@ -443,8 +546,14 @@ fn convert_rule_payload(rule: RoutingRulePayload) -> Result<RuleConfig, Status> 
         attrs: rule.attributes,
         local_ip: convert_geo_ip_payloads(rule.local_geoip)?,
         local_port: convert_port_list(rule.local_port_list),
-        process: Vec::new(),
-        webhook: None,
+        process: rule.process,
+        webhook: rule.webhook.and_then(|webhook| {
+            (!webhook.url.is_empty()).then_some(WebhookRuleConfig {
+                url: webhook.url,
+                deduplication: webhook.deduplication,
+                headers: webhook.headers,
+            })
+        }),
     })
 }
 
@@ -529,20 +638,23 @@ impl proto::xray::app::router::command::routing_service_server::RoutingService
         >,
     ) -> Result<Response<Self::SubscribeRoutingStatsStream>, Status> {
         let selectors = request.into_inner().field_selectors;
-        let mut routing_updates = self.routing_stats_tx.subscribe();
+        let mut routing_updates = self.runtime.subscribe_routing_events();
         let (tx, rx) = mpsc::channel(32);
 
         tokio::spawn(async move {
             loop {
                 match routing_updates.recv().await {
-                    Ok(context) => {
+                    Ok(event) => {
+                        let context = routing_event_to_context(event);
                         let filtered = filter_routing_context(context, &selectors);
                         if tx.send(Ok(filtered)).await.is_err() {
                             break;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
@@ -559,13 +671,13 @@ impl proto::xray::app::router::command::routing_service_server::RoutingService
         let mut context = request.routing_context.ok_or_else(|| {
             Status::invalid_argument("routing_context is required")
         })?;
-        let (outbound_tag, outbound_group_tags) =
-            self.resolve_outbound_tag(&context)?;
-        context.outbound_tag = outbound_tag;
-        context.outbound_group_tags = outbound_group_tags;
+        let (input, route) = self.resolve_route(&context).await?;
+        context.outbound_tag = route.outbound_tag.clone();
+        context.outbound_group_tags = route.outbound_group_tags.clone();
 
         if request.publish_result {
-            let _ = self.routing_stats_tx.send(context.clone());
+            self.runtime
+                .publish_routing_event(RoutingEvent { input, route });
         }
 
         Ok(Response::new(filter_routing_context(
@@ -587,17 +699,8 @@ impl proto::xray::app::router::command::routing_service_server::RoutingService
             return Err(Status::invalid_argument("balancer tag is required"));
         }
 
-        let principle_targets = self.principle_targets(balancer_tag);
-        if principle_targets.is_empty() {
-            return Err(Status::failed_precondition("no outbounds configured"));
-        }
-
-        let override_target = self
-            .balancer_overrides
-            .read()
-            .expect("routing balancer overrides lock poisoned")
-            .get(balancer_tag)
-            .cloned();
+        let principle_targets = self.principle_targets(balancer_tag)?;
+        let override_target = self.runtime.balancer_override(balancer_tag);
 
         Ok(Response::new(
             proto::xray::app::router::command::GetBalancerInfoResponse {
@@ -630,23 +733,22 @@ impl proto::xray::app::router::command::routing_service_server::RoutingService
             return Err(Status::invalid_argument("balancer_tag is required"));
         }
 
+        if !self.runtime.routing().has_balancer(balancer_tag) {
+            return Err(Status::not_found(format!(
+                "routing balancer {balancer_tag} not found"
+            )));
+        }
+
         let target = request.target.trim();
-        let mut overrides = self
-            .balancer_overrides
-            .write()
-            .expect("routing balancer overrides lock poisoned");
         if target.is_empty() {
-            overrides.remove(balancer_tag);
+            self.runtime.remove_balancer_override(balancer_tag);
             return Ok(Response::new(
                 proto::xray::app::router::command::OverrideBalancerTargetResponse {},
             ));
         }
 
-        if !self.has_outbound_tag(target) {
-            return Err(Status::not_found(format!("outbound {} not found", target)));
-        }
-
-        overrides.insert(balancer_tag.to_string(), target.to_string());
+        self.runtime
+            .set_balancer_override(balancer_tag.to_string(), target.to_string());
         Ok(Response::new(
             proto::xray::app::router::command::OverrideBalancerTargetResponse {},
         ))
@@ -661,7 +763,7 @@ impl proto::xray::app::router::command::routing_service_server::RoutingService
         let config = request
             .config
             .ok_or_else(|| Status::invalid_argument("routing config is required"))?;
-        let (domain_strategy, rules, balancers) =
+        let (rules, balancers) =
             convert_router_config(self.decode_router_config(&config)?)?;
         self.runtime
             .with_routing_mut(|routing| {
@@ -669,7 +771,7 @@ impl proto::xray::app::router::command::routing_service_server::RoutingService
                     rules,
                     balancers,
                     request.should_append,
-                    Some(domain_strategy),
+                    None,
                 )
             })
             .map_err(Status::invalid_argument)?;
@@ -689,14 +791,30 @@ impl proto::xray::app::router::command::routing_service_server::RoutingService
         if request.rule_tag.trim().is_empty() {
             return Err(Status::invalid_argument("rule_tag is required"));
         }
-        let removed = self
-            .runtime
+        self.runtime
             .with_routing_mut(|routing| routing.remove_rule(&request.rule_tag));
-        if !removed {
-            return Err(Status::not_found("routing rule not found"));
-        }
         Ok(Response::new(
             proto::xray::app::router::command::RemoveRuleResponse {},
+        ))
+    }
+
+    async fn list_rule(
+        &self,
+        _request: Request<proto::xray::app::router::command::ListRuleRequest>,
+    ) -> Result<Response<proto::xray::app::router::command::ListRuleResponse>, Status>
+    {
+        let rules = self
+            .runtime
+            .routing()
+            .list_rules()
+            .into_iter()
+            .map(|rule| proto::xray::app::router::command::ListRuleItem {
+                tag: rule.outbound_tag,
+                rule_tag: rule.rule_tag,
+            })
+            .collect();
+        Ok(Response::new(
+            proto::xray::app::router::command::ListRuleResponse { rules },
         ))
     }
 }
@@ -739,6 +857,8 @@ mod tests {
                     protocol: "freedom".to_string(),
                     proxy_settings_type: None,
                     proxy_settings_value: None,
+                    sender_settings_type: None,
+                    sender_settings_value: None,
                 })
                 .collect(),
         )
@@ -913,15 +1033,14 @@ mod tests {
             .expect_err("expected route to disappear after remove_rule");
         assert_eq!(err.code(), Code::Unknown);
 
-        let err = service
+        service
             .remove_rule(Request::new(
                 proto::xray::app::router::command::RemoveRuleRequest {
                     rule_tag: "missing".into(),
                 },
             ))
             .await
-            .expect_err("expected missing routing rule");
-        assert_eq!(err.code(), Code::NotFound);
+            .expect("Xray-compatible missing rule removal should be idempotent");
         assert!(
             runtime
                 .routing()
@@ -938,7 +1057,124 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routing_add_rule_applies_ip_on_demand_strategy() {
+    async fn routing_add_rule_preserves_process_webhook_and_balancer_strategy() {
+        let runtime = build_runtime(&["direct", "backup"]);
+        let service = RoutingServiceImpl::new(runtime.clone());
+        let least_load = StrategyLeastLoadConfigPayload {
+            expected: 1,
+            ..Default::default()
+        };
+        let router_config = RouterConfigPayload {
+            domain_strategy: RouterDomainStrategyPayload::AsIs as i32,
+            rule: vec![RoutingRulePayload {
+                target_tag: Some(routing_rule_payload::TargetTag::BalancingTag(
+                    "auto".into(),
+                )),
+                rule_tag: "process-rule".into(),
+                process: vec!["self/".into()],
+                webhook: Some(WebhookConfigPayload {
+                    url: "/tmp/chimera-routing-test.sock:/routing".into(),
+                    deduplication: 10,
+                    headers: HashMap::from([("x-test".into(), "ok".into())]),
+                }),
+                ..RoutingRulePayload::default()
+            }],
+            balancing_rule: vec![BalancingRulePayload {
+                tag: "auto".into(),
+                outbound_selector: vec!["direct".into(), "backup".into()],
+                strategy: "leastLoad".into(),
+                strategy_settings: Some(proto::xray::common::serial::TypedMessage {
+                    r#type: "xray.app.router.StrategyLeastLoadConfig".into(),
+                    value: least_load.encode_to_vec(),
+                }),
+                fallback_tag: String::new(),
+            }],
+        };
+
+        service
+            .add_rule(Request::new(
+                proto::xray::app::router::command::AddRuleRequest {
+                    config: Some(encode_router_config(router_config)),
+                    should_append: false,
+                },
+            ))
+            .await
+            .expect("dynamic rule with Xray-only fields should install");
+        assert!(runtime.routing().requires_process_lookup());
+
+        runtime.record_outbound_observation(
+            "direct",
+            crate::routing_state::OutboundObservation {
+                alive: true,
+                delay_ms: 20,
+                health_all: 10,
+                health_deviation_ms: 3,
+                health_average_ms: 20,
+                ..Default::default()
+            },
+        );
+        runtime.record_outbound_observation(
+            "backup",
+            crate::routing_state::OutboundObservation {
+                alive: true,
+                delay_ms: 30,
+                health_all: 10,
+                health_deviation_ms: 8,
+                health_average_ms: 30,
+                ..Default::default()
+            },
+        );
+        let info = service
+            .get_balancer_info(Request::new(
+                proto::xray::app::router::command::GetBalancerInfoRequest {
+                    tag: "auto".into(),
+                },
+            ))
+            .await
+            .expect("leastLoad balancer info")
+            .into_inner();
+        assert_eq!(
+            info.balancer
+                .and_then(|balancer| balancer.principle_target)
+                .map(|target| target.tag),
+            Some(vec!["direct".into()])
+        );
+    }
+
+    #[tokio::test]
+    async fn routing_add_rule_validates_dynamic_webhook_config() {
+        let service = RoutingServiceImpl::new(build_runtime(&["direct"]));
+        let router_config = RouterConfigPayload {
+            domain_strategy: RouterDomainStrategyPayload::AsIs as i32,
+            rule: vec![RoutingRulePayload {
+                target_tag: Some(routing_rule_payload::TargetTag::Tag(
+                    "direct".into(),
+                )),
+                rule_tag: "bad-webhook".into(),
+                inbound_tag: vec!["in".into()],
+                webhook: Some(WebhookConfigPayload {
+                    url: "not a url".into(),
+                    ..Default::default()
+                }),
+                ..RoutingRulePayload::default()
+            }],
+            balancing_rule: vec![],
+        };
+        let error = service
+            .add_rule(Request::new(
+                proto::xray::app::router::command::AddRuleRequest {
+                    config: Some(encode_router_config(router_config)),
+                    should_append: false,
+                },
+            ))
+            .await
+            .expect_err("invalid dynamic webhook must be rejected");
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("invalid routing webhook URL"));
+    }
+
+    #[tokio::test]
+    async fn routing_add_rule_keeps_initialized_domain_strategy() {
         let runtime = build_runtime(&["ip", "domain"]);
         let service = RoutingServiceImpl::new(runtime);
         let router_config = RouterConfigPayload {
@@ -982,7 +1218,7 @@ mod tests {
                 },
             ))
             .await
-            .expect("IPOnDemand add_rule should succeed");
+            .expect("dynamic add_rule should succeed");
 
         let matched = service
             .test_route(Request::new(
@@ -999,13 +1235,17 @@ mod tests {
                 },
             ))
             .await
-            .expect("IPOnDemand test_route should match")
+            .expect("dynamic test_route should match")
             .into_inner();
-        assert_eq!(matched.outbound_tag, "ip");
+        assert_eq!(matched.outbound_tag, "domain");
+        assert_eq!(
+            service.runtime.routing().domain_strategy(),
+            crate::routing_state::DomainStrategy::AsIs
+        );
     }
 
     #[tokio::test]
-    async fn routing_add_rule_rejects_unknown_strategy_without_mutation() {
+    async fn routing_add_rule_ignores_unknown_domain_strategy_like_xray() {
         let runtime = build_runtime(&["direct"]);
         install_rules(
             &runtime,
@@ -1030,7 +1270,7 @@ mod tests {
             balancing_rule: vec![],
         };
 
-        let error = service
+        service
             .add_rule(Request::new(
                 proto::xray::app::router::command::AddRuleRequest {
                     config: Some(encode_router_config(router_config)),
@@ -1038,13 +1278,7 @@ mod tests {
                 },
             ))
             .await
-            .expect_err("unknown routing strategy must be rejected");
-        assert_eq!(error.code(), Code::InvalidArgument);
-        assert!(
-            error
-                .message()
-                .contains("unsupported routing domain strategy")
-        );
+            .expect("Xray ignores dynamic domainStrategy during ReloadRules");
 
         assert!(
             runtime
@@ -1057,8 +1291,8 @@ mod tests {
                     &runtime.outbounds(),
                     &HashMap::new(),
                 )
-                .is_some(),
-            "existing routing state must survive rejected strategy"
+                .is_none(),
+            "replace update should remove previous rules"
         );
         assert!(
             runtime
@@ -1071,8 +1305,12 @@ mod tests {
                     &runtime.outbounds(),
                     &HashMap::new(),
                 )
-                .is_none(),
-            "rejected replacement rule must not be installed"
+                .is_some(),
+            "replacement rule should be installed"
+        );
+        assert_eq!(
+            runtime.routing().domain_strategy(),
+            crate::routing_state::DomainStrategy::AsIs
         );
     }
 
@@ -1350,5 +1588,182 @@ mod tests {
             .expect("routing stream returned error");
         assert_eq!(next.inbound_tag, "inbound-a");
         assert_eq!(next.outbound_tag, "direct");
+    }
+
+    #[tokio::test]
+    async fn routing_subscribe_receives_real_runtime_route_events() {
+        let runtime = build_runtime(&["direct"]);
+        install_rules(
+            &runtime,
+            vec![RuleConfig {
+                inbound_tag: vec!["real-in".into()],
+                outbound_tag: Some("direct".into()),
+                ..RuleConfig::default()
+            }],
+            vec![],
+        );
+        let service = RoutingServiceImpl::new(runtime.clone());
+        let mut stream = service
+            .subscribe_routing_stats(Request::new(
+                proto::xray::app::router::command::SubscribeRoutingStatsRequest {
+                    field_selectors: vec!["inbound".into(), "outbound".into()],
+                },
+            ))
+            .await
+            .expect("subscribe routing stats")
+            .into_inner();
+
+        let selected = runtime
+            .select_outbound_checked(&RoutingInput {
+                inbound_tag: "real-in".into(),
+                ..RoutingInput::default()
+            })
+            .expect("runtime route")
+            .expect("selected outbound");
+        assert_eq!(selected.tag, "direct");
+
+        let next = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("timed out waiting for real routing event")
+            .expect("routing stream closed")
+            .expect("routing stream returned error");
+        assert_eq!(next.inbound_tag, "real-in");
+        assert_eq!(next.outbound_tag, "direct");
+    }
+
+    #[tokio::test]
+    async fn routing_override_updates_real_runtime_data_plane() {
+        let runtime = build_runtime(&["direct", "backup"]);
+        install_rules(
+            &runtime,
+            vec![RuleConfig {
+                inbound_tag: vec!["in".into()],
+                balancer_tag: Some("auto".into()),
+                ..RuleConfig::default()
+            }],
+            vec![BalancerConfig {
+                tag: "auto".into(),
+                outbound_selector: vec!["direct".into(), "backup".into()],
+                strategy: Default::default(),
+                fallback_tag: None,
+            }],
+        );
+        let service = RoutingServiceImpl::new(runtime.clone());
+
+        service
+            .override_balancer_target(Request::new(
+                proto::xray::app::router::command::OverrideBalancerTargetRequest {
+                    balancer_tag: "auto".into(),
+                    target: "backup".into(),
+                },
+            ))
+            .await
+            .expect("override balancer target");
+
+        assert_eq!(runtime.balancer_override("auto").as_deref(), Some("backup"));
+        let selected = runtime
+            .select_outbound_checked(&RoutingInput {
+                inbound_tag: "in".into(),
+                ..RoutingInput::default()
+            })
+            .expect("runtime route")
+            .expect("selected outbound");
+        assert_eq!(selected.tag, "backup");
+
+        let info = service
+            .get_balancer_info(Request::new(
+                proto::xray::app::router::command::GetBalancerInfoRequest {
+                    tag: "auto".into(),
+                },
+            ))
+            .await
+            .expect("balancer info")
+            .into_inner();
+        assert_eq!(
+            info.balancer
+                .and_then(|balancer| balancer.r#override)
+                .map(|override_info| override_info.target)
+                .as_deref(),
+            Some("backup")
+        );
+
+        service
+            .override_balancer_target(Request::new(
+                proto::xray::app::router::command::OverrideBalancerTargetRequest {
+                    balancer_tag: "auto".into(),
+                    target: String::new(),
+                },
+            ))
+            .await
+            .expect("clear balancer override");
+        assert!(runtime.balancer_override("auto").is_none());
+    }
+
+    #[tokio::test]
+    async fn routing_list_rule_matches_xray_service_shape() {
+        let runtime = build_runtime(&["direct", "backup"]);
+        install_rules(
+            &runtime,
+            vec![
+                RuleConfig {
+                    rule_tag: Some("direct-rule".into()),
+                    inbound_tag: vec!["a".into()],
+                    outbound_tag: Some("direct".into()),
+                    ..RuleConfig::default()
+                },
+                RuleConfig {
+                    rule_tag: Some("balanced-rule".into()),
+                    inbound_tag: vec!["b".into()],
+                    balancer_tag: Some("auto".into()),
+                    ..RuleConfig::default()
+                },
+            ],
+            vec![BalancerConfig {
+                tag: "auto".into(),
+                outbound_selector: vec!["back".into()],
+                strategy: Default::default(),
+                fallback_tag: None,
+            }],
+        );
+        let service = RoutingServiceImpl::new(runtime);
+        let response = service
+            .list_rule(Request::new(
+                proto::xray::app::router::command::ListRuleRequest {},
+            ))
+            .await
+            .expect("list rule")
+            .into_inner();
+        assert_eq!(response.rules.len(), 2);
+        assert_eq!(response.rules[0].tag, "direct");
+        assert_eq!(response.rules[0].rule_tag, "direct-rule");
+        assert_eq!(response.rules[1].tag, "");
+        assert_eq!(response.rules[1].rule_tag, "balanced-rule");
+    }
+
+    #[test]
+    fn routing_field_selectors_follow_xray_prefix_semantics() {
+        let context = proto::xray::app::router::command::RoutingContext {
+            source_i_ps: vec![vec![192, 0, 2, 1]],
+            target_i_ps: vec![vec![198, 51, 100, 2]],
+            local_i_ps: vec![vec![203, 0, 113, 3]],
+            source_port: 1000,
+            target_port: 2000,
+            local_port: 3000,
+            outbound_group_tags: vec!["auto".into()],
+            outbound_tag: "direct".into(),
+            ..Default::default()
+        };
+        let filtered = filter_routing_context(
+            context,
+            &["ip".into(), "port".into(), "outbound".into()],
+        );
+        assert_eq!(filtered.source_i_ps, vec![vec![192, 0, 2, 1]]);
+        assert_eq!(filtered.target_i_ps, vec![vec![198, 51, 100, 2]]);
+        assert_eq!(filtered.local_i_ps, vec![vec![203, 0, 113, 3]]);
+        assert_eq!(filtered.source_port, 1000);
+        assert_eq!(filtered.target_port, 2000);
+        assert_eq!(filtered.local_port, 3000);
+        assert_eq!(filtered.outbound_group_tags, vec!["auto"]);
+        assert_eq!(filtered.outbound_tag, "direct");
     }
 }

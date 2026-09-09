@@ -18,12 +18,14 @@ use crate::{
     },
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundSummary {
     pub tag: String,
     pub protocol: String,
     pub proxy_settings_type: Option<String>,
     pub proxy_settings_value: Option<Vec<u8>>,
+    pub sender_settings_type: Option<String>,
+    pub sender_settings_value: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -220,6 +222,21 @@ impl RuntimeState {
         &self,
         input: &RoutingInput,
     ) -> Result<Option<OutboundSummary>, String> {
+        self.select_outbound_checked_internal(input, true)
+    }
+
+    pub(crate) fn match_outbound_checked(
+        &self,
+        input: &RoutingInput,
+    ) -> Result<Option<OutboundSummary>, String> {
+        self.select_outbound_checked_internal(input, false)
+    }
+
+    fn select_outbound_checked_internal(
+        &self,
+        input: &RoutingInput,
+        use_default: bool,
+    ) -> Result<Option<OutboundSummary>, String> {
         let publication = self.routing_publication();
         let outbounds = &publication.outbounds;
         let overrides = self.balancer_override_snapshot();
@@ -229,6 +246,9 @@ impl RuntimeState {
             overrides.as_ref(),
             &publication.balancer_targets,
         ) else {
+            if !use_default {
+                return Ok(None);
+            }
             let selected = outbounds.first().cloned();
             if let Some(outbound) = selected.as_ref() {
                 self.publish_routing_event(RoutingEvent {
@@ -323,6 +343,7 @@ impl RuntimeState {
         let mut outbounds = current.outbounds.as_ref().clone();
         let index = outbounds.iter().position(|cfg| cfg.tag == tag)?;
         let removed = outbounds.remove(index);
+        current.routing.remove_observation(tag);
         self.publish_routing_publication(RoutingPublication::new(
             Arc::clone(&current.routing),
             Arc::new(outbounds),
@@ -389,6 +410,14 @@ impl RuntimeState {
         self.routing().record_observation(tag, observation);
     }
 
+    pub(crate) fn record_passive_outbound_observation(
+        &self,
+        tag: impl Into<String>,
+        observation: OutboundObservation,
+    ) {
+        self.routing().record_passive_observation(tag, observation);
+    }
+
     pub(crate) fn outbound_observation(
         &self,
         tag: &str,
@@ -453,7 +482,7 @@ mod tests {
             def::{PolicyConfig, PolicyLevelConfig},
             rule::BalancerConfig,
         },
-        routing_state::RoutingState,
+        routing_state::{OutboundObservation, RoutingState},
     };
     use std::{
         collections::HashMap,
@@ -570,6 +599,8 @@ mod tests {
                 protocol: "freedom".into(),
                 proxy_settings_type: None,
                 proxy_settings_value: None,
+                sender_settings_type: None,
+                sender_settings_value: None,
             }],
         );
         let first_outbounds = runtime.outbound_snapshot();
@@ -582,6 +613,8 @@ mod tests {
                 protocol: "freedom".into(),
                 proxy_settings_type: None,
                 proxy_settings_value: None,
+                sender_settings_type: None,
+                sender_settings_value: None,
             })
             .expect("add outbound");
         let replaced_outbounds = runtime.outbound_snapshot();
@@ -608,6 +641,8 @@ mod tests {
                 protocol: "freedom".into(),
                 proxy_settings_type: None,
                 proxy_settings_value: None,
+                sender_settings_type: None,
+                sender_settings_value: None,
             }
         }
 
@@ -640,12 +675,22 @@ mod tests {
             added.balancer_targets["auto"].as_ref(),
             ["direct-a", "direct-b"]
         );
+        runtime.record_outbound_observation(
+            "direct-a",
+            OutboundObservation {
+                alive: true,
+                delay_ms: 12,
+                ..OutboundObservation::default()
+            },
+        );
+        assert!(runtime.outbound_observation("direct-a").is_some());
 
         runtime
             .remove_outbound("direct-a")
             .expect("remove matching outbound");
         let removed = runtime.routing_publication();
         assert_eq!(removed.balancer_targets["auto"].as_ref(), ["direct-b"]);
+        assert!(runtime.outbound_observation("direct-a").is_none());
     }
 
     #[test]

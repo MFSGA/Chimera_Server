@@ -9,6 +9,7 @@ mod parsed_http;
 mod websocket_stream;
 
 pub use websocket_handler::{WebsocketServerTarget, WebsocketTcpServerHandler};
+pub(crate) use websocket_stream::WebsocketStream;
 
 use super::tcp::tcp_handler_util::create_tcp_server_handler;
 

@@ -494,7 +494,7 @@ impl TcpRequest {
 async fn proxy_tcp(
     send: quinn::SendStream,
     recv: quinn::RecvStream,
-    tcp_stream: tokio::net::TcpStream,
+    tcp_stream: Box<dyn crate::async_stream::AsyncStream>,
     context: TrafficContext,
 ) -> std::io::Result<()> {
     let _connection_guard = register_connection(Some(&context));
@@ -2931,6 +2931,12 @@ async fn drive_udp_datagrams(
                 traffic_context = traffic_context.with_outbound_tag(tag);
             }
             DirectOutboundAction::Freedom { tag: None } => {}
+            DirectOutboundAction::Socks { outbound }
+            | DirectOutboundAction::Vless { outbound }
+            | DirectOutboundAction::Trojan { outbound } => {
+                warn!("hysteria2 UDP outbound {} is not implemented", outbound.tag);
+                continue;
+            }
         }
 
         session

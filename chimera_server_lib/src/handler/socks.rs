@@ -10,6 +10,9 @@ use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
 
+#[cfg(feature = "trojan")]
+use crate::outbound::connect_trojan_udp_via_outbound;
+
 use crate::{
     address::{Address, NetLocation},
     async_stream::AsyncStream,
@@ -21,10 +24,11 @@ use crate::{
         },
     },
     outbound::{
-        DirectOutboundAction, connection_routing_input, select_direct_outbound,
+        DirectOutboundAction, InboundRoutingMetadata, OutboundRoutingContext,
+        select_direct_outbound_for_location,
     },
-    resolver::{Resolver, resolve_single_address},
-    runtime::RuntimeState,
+    resolver::Resolver,
+    runtime::{OutboundSummary, RuntimeState},
     traffic::{TrafficContext, record_transfer, register_connection},
     util::prefixed_stream::PrefixedStream,
 };
@@ -643,6 +647,30 @@ impl Drop for SocksUdpClientSession {
     }
 }
 
+#[cfg(feature = "trojan")]
+struct SocksTrojanUdpClientSession {
+    sender: mpsc::Sender<(NetLocation, Vec<u8>, Option<TrafficContext>)>,
+    task: JoinHandle<()>,
+}
+
+#[cfg(feature = "trojan")]
+#[derive(Clone)]
+struct SocksTrojanUdpSessionStart {
+    outbound: OutboundSummary,
+    resolver: Arc<dyn Resolver>,
+    runtime: RuntimeState,
+    client_endpoint: SocketAddr,
+    client_socket: Arc<tokio::net::UdpSocket>,
+    association_activity: Option<Arc<Notify>>,
+}
+
+#[cfg(feature = "trojan")]
+impl Drop for SocksTrojanUdpClientSession {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 #[derive(Debug)]
 struct XrayUdpActivityWindow {
     downstream_activity: bool,
@@ -748,6 +776,171 @@ fn start_udp_client_session(
     Ok(SocksUdpClientSession { sender, task })
 }
 
+#[cfg(feature = "trojan")]
+async fn start_trojan_udp_client_session(
+    initial_target: NetLocation,
+    start: SocksTrojanUdpSessionStart,
+) -> std::io::Result<SocksTrojanUdpClientSession> {
+    let mut proxy = connect_trojan_udp_via_outbound(
+        &start.resolver,
+        &initial_target,
+        &start.runtime,
+        &start.outbound,
+    )
+    .await?;
+    let (sender, mut receiver) =
+        mpsc::channel::<(NetLocation, Vec<u8>, Option<TrafficContext>)>(32);
+    let SocksTrojanUdpSessionStart {
+        outbound,
+        client_endpoint,
+        client_socket,
+        association_activity,
+        ..
+    } = start;
+    let task = tokio::spawn(async move {
+        let mut response_buf = vec![0u8; XRAY_SOCKS_UDP_PACKET_SIZE];
+        let mut activity_checks = interval(UDP_TARGET_SESSION_ACTIVITY_CHECK);
+        activity_checks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        activity_checks.tick().await;
+        let mut activity = XrayUdpActivityWindow::new();
+        let mut response_contexts =
+            HashMap::<NetLocation, Option<TrafficContext>>::new();
+        let mut last_context = None::<TrafficContext>;
+
+        loop {
+            tokio::select! {
+                message = receiver.recv() => {
+                    let Some((target, payload, traffic_context)) = message else {
+                        return;
+                    };
+                    if let Err(error) = proxy.send_to(&target, &payload).await {
+                        tracing::warn!(
+                            "SOCKS5 Trojan UDP relay: failed to send to {} via {}: {}",
+                            target,
+                            outbound.tag,
+                            error
+                        );
+                        return;
+                    }
+                    record_transfer(
+                        traffic_context.clone(),
+                        payload.len() as u64,
+                        0,
+                    );
+                    if let Some(context) = traffic_context.clone() {
+                        last_context = Some(context);
+                    }
+                    response_contexts.insert(target, traffic_context);
+                }
+                result = proxy.recv_from(&mut response_buf) => {
+                    let (source, resp_len) = match result {
+                        Ok(response) => response,
+                        Err(error) => {
+                            tracing::warn!(
+                                "SOCKS5 Trojan UDP relay: failed to receive via {}: {}",
+                                outbound.tag,
+                                error
+                            );
+                            return;
+                        }
+                    };
+                    activity.record_downstream();
+                    if let Some(activity) = association_activity.as_ref() {
+                        activity.notify_one();
+                    }
+                    let socks5_response = match build_udp_response_packet_location(
+                        &source,
+                        &response_buf[..resp_len],
+                    ) {
+                        Ok(response) => response,
+                        Err(error) => {
+                            tracing::warn!(
+                                "SOCKS5 Trojan UDP relay: invalid response source {}: {}",
+                                source,
+                                error
+                            );
+                            return;
+                        }
+                    };
+                    let forwarded_payload_len = if socks5_response.is_empty() {
+                        0
+                    } else {
+                        resp_len
+                    };
+                    if let Err(error) = client_socket
+                        .send_to(&socks5_response, client_endpoint)
+                        .await
+                    {
+                        tracing::warn!(
+                            "SOCKS5 Trojan UDP relay: failed to send response to client: {}",
+                            error
+                        );
+                    } else {
+                        let context = response_contexts
+                            .get(&source)
+                            .cloned()
+                            .flatten()
+                            .or_else(|| last_context.clone());
+                        record_transfer(
+                            context,
+                            0,
+                            forwarded_payload_len as u64,
+                        );
+                    }
+                }
+                _ = activity_checks.tick() => {
+                    if !activity.keep_alive_on_check() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(SocksTrojanUdpClientSession { sender, task })
+}
+
+#[cfg(feature = "trojan")]
+async fn send_trojan_udp_target_payload(
+    client_sessions: &mut HashMap<(SocketAddr, String), SocksTrojanUdpClientSession>,
+    target: NetLocation,
+    payload: Vec<u8>,
+    traffic_context: Option<TrafficContext>,
+    start: SocksTrojanUdpSessionStart,
+) -> std::io::Result<()> {
+    let session_key = (start.client_endpoint, start.outbound.tag.clone());
+    let message = (target.clone(), payload, traffic_context);
+    for attempt in 0..2 {
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            client_sessions.entry(session_key.clone())
+        {
+            entry.insert(
+                start_trojan_udp_client_session(target.clone(), start.clone())
+                    .await?,
+            );
+        }
+
+        let sender = &client_sessions
+            .get(&session_key)
+            .expect("SOCKS5 Trojan UDP client session exists after insertion")
+            .sender;
+        match sender.send(message.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(_) if attempt == 0 => {
+                client_sessions.remove(&session_key);
+            }
+            Err(_) => {
+                client_sessions.remove(&session_key);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "SOCKS5 Trojan UDP client session closed before payload was sent",
+                ));
+            }
+        }
+    }
+    unreachable!("SOCKS5 Trojan UDP target payload retry loop is bounded")
+}
+
 async fn send_udp_target_payload(
     client_sessions: &mut HashMap<(SocketAddr, bool), SocksUdpClientSession>,
     target_addr: SocketAddr,
@@ -808,6 +1001,9 @@ pub(crate) async fn run_shared_udp_relay(
     let mut recv_buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
     let mut client_sessions =
         HashMap::<(SocketAddr, bool), SocksUdpClientSession>::new();
+    #[cfg(feature = "trojan")]
+    let mut trojan_sessions =
+        HashMap::<(SocketAddr, String), SocksTrojanUdpClientSession>::new();
     let mut session_cleanup = interval(UDP_TARGET_SESSION_ACTIVITY_CHECK);
     session_cleanup.set_missed_tick_behavior(MissedTickBehavior::Delay);
     session_cleanup.tick().await;
@@ -817,6 +1013,8 @@ pub(crate) async fn run_shared_udp_relay(
             result = udp_socket.recv_from(&mut recv_buf) => result?,
             _ = session_cleanup.tick() => {
                 prune_closed_udp_sessions(&mut client_sessions);
+                #[cfg(feature = "trojan")]
+                trojan_sessions.retain(|_, session| !session.sender.is_closed());
                 continue;
             }
         };
@@ -844,34 +1042,34 @@ pub(crate) async fn run_shared_udp_relay(
         if payload.is_empty() {
             continue;
         }
-        let target_addr =
-            match resolve_single_address(&resolver, &target_location).await {
-                Ok(addr) => addr,
-                Err(error) => {
-                    tracing::warn!(
-                        "SOCKS5 shared UDP target resolution failed: {}",
-                        error
-                    );
-                    continue;
-                }
-            };
-        let datagram_context = traffic_context
+        let mut datagram_context = traffic_context
             .clone()
             .map(|context| context.with_client_ip(client_addr.ip()));
         let inbound_tag = datagram_context
             .as_ref()
             .and_then(|context| context.inbound_tag.as_deref())
             .unwrap_or_default();
-        let route_input = connection_routing_input(
-            inbound_tag,
-            "",
-            3,
-            client_addr,
-            target_addr,
+        let identity = datagram_context
+            .as_ref()
+            .and_then(|context| context.identity.as_deref())
+            .unwrap_or_default();
+        let (action, target_addr) = select_direct_outbound_for_location(
+            &resolver,
             &target_location,
-        );
-        let action = select_direct_outbound(&runtime, &route_input, "udp")?;
-        let mut datagram_context = datagram_context;
+            &runtime,
+            OutboundRoutingContext::new(
+                inbound_tag,
+                identity,
+                client_addr,
+                3,
+                "udp",
+                InboundRoutingMetadata {
+                    local_addr: udp_socket.local_addr().ok(),
+                    ..InboundRoutingMetadata::default()
+                },
+            ),
+        )
+        .await?;
         match action {
             DirectOutboundAction::Blackhole { tag } => {
                 datagram_context = datagram_context
@@ -884,7 +1082,62 @@ pub(crate) async fn run_shared_udp_relay(
                     datagram_context.map(|context| context.with_outbound_tag(tag));
             }
             DirectOutboundAction::Freedom { tag: None } => {}
+            DirectOutboundAction::Trojan { outbound } => {
+                #[cfg(feature = "trojan")]
+                {
+                    datagram_context = datagram_context.map(|context| {
+                        context.with_outbound_tag(outbound.tag.clone())
+                    });
+                    if let Err(error) = send_trojan_udp_target_payload(
+                        &mut trojan_sessions,
+                        target_location.clone(),
+                        payload.to_vec(),
+                        datagram_context,
+                        SocksTrojanUdpSessionStart {
+                            outbound,
+                            resolver: resolver.clone(),
+                            runtime: runtime.clone(),
+                            client_endpoint: client_addr,
+                            client_socket: udp_socket.clone(),
+                            association_activity: None,
+                        },
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            "SOCKS5 shared Trojan UDP forwarding failed: {}",
+                            error
+                        );
+                    }
+                    continue;
+                }
+                #[cfg(not(feature = "trojan"))]
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        format!(
+                            "Trojan outbound {} requires the trojan feature",
+                            outbound.tag
+                        ),
+                    ));
+                }
+            }
+            DirectOutboundAction::Socks { outbound }
+            | DirectOutboundAction::Vless { outbound } => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "TCP proxy outbound {} cannot be used for UDP",
+                        outbound.tag
+                    ),
+                ));
+            }
         }
+        let target_addr = target_addr.ok_or_else(|| {
+            std::io::Error::other(
+                "SOCKS5 shared UDP freedom route did not resolve target",
+            )
+        })?;
         if let Err(error) = send_udp_target_payload(
             &mut client_sessions,
             target_addr,
@@ -960,6 +1213,9 @@ pub(crate) async fn run_udp_relay_with_expected_client(
     // first IPv4 target cannot make a later IPv6 target unusable (or vice versa).
     let mut client_sessions =
         HashMap::<(SocketAddr, bool), SocksUdpClientSession>::new();
+    #[cfg(feature = "trojan")]
+    let mut trojan_sessions =
+        HashMap::<(SocketAddr, String), SocksTrojanUdpClientSession>::new();
     let association_activity = Arc::new(Notify::new());
     let association_idle = tokio::time::sleep(association_idle_timeout);
     tokio::pin!(association_idle);
@@ -1036,17 +1292,6 @@ pub(crate) async fn run_udp_relay_with_expected_client(
         if payload.is_empty() {
             continue;
         }
-        let target_addr =
-            match resolve_single_address(&resolver, &target_location).await {
-                Ok(addr) => addr,
-                Err(error) => {
-                    tracing::warn!(
-                        "SOCKS5 UDP relay: failed to resolve target: {}",
-                        error
-                    );
-                    continue;
-                }
-            };
         let inbound_tag = traffic_context
             .as_ref()
             .and_then(|context| context.inbound_tag.as_deref())
@@ -1055,15 +1300,23 @@ pub(crate) async fn run_udp_relay_with_expected_client(
             .as_ref()
             .and_then(|context| context.identity.as_deref())
             .unwrap_or_default();
-        let route_input = connection_routing_input(
-            inbound_tag,
-            identity,
-            3,
-            client_addr,
-            target_addr,
+        let (action, target_addr) = select_direct_outbound_for_location(
+            &resolver,
             &target_location,
-        );
-        let action = select_direct_outbound(&runtime, &route_input, "udp")?;
+            &runtime,
+            OutboundRoutingContext::new(
+                inbound_tag,
+                identity,
+                client_addr,
+                3,
+                "udp",
+                InboundRoutingMetadata {
+                    local_addr: udp_socket_clone.local_addr().ok(),
+                    ..InboundRoutingMetadata::default()
+                },
+            ),
+        )
+        .await?;
         let mut datagram_context = traffic_context.clone();
         match action {
             DirectOutboundAction::Blackhole { tag } => {
@@ -1081,8 +1334,61 @@ pub(crate) async fn run_udp_relay_with_expected_client(
                     datagram_context.map(|context| context.with_outbound_tag(tag));
             }
             DirectOutboundAction::Freedom { tag: None } => {}
+            DirectOutboundAction::Trojan { outbound } => {
+                #[cfg(feature = "trojan")]
+                {
+                    datagram_context = datagram_context.map(|context| {
+                        context.with_outbound_tag(outbound.tag.clone())
+                    });
+                    if let Err(error) = send_trojan_udp_target_payload(
+                        &mut trojan_sessions,
+                        target_location.clone(),
+                        payload.to_vec(),
+                        datagram_context,
+                        SocksTrojanUdpSessionStart {
+                            outbound,
+                            resolver: resolver.clone(),
+                            runtime: runtime.clone(),
+                            client_endpoint: response_endpoint,
+                            client_socket: udp_socket_clone.clone(),
+                            association_activity: Some(association_activity.clone()),
+                        },
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            "SOCKS5 Trojan UDP forwarding failed: {}",
+                            error
+                        );
+                    }
+                    continue;
+                }
+                #[cfg(not(feature = "trojan"))]
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        format!(
+                            "Trojan outbound {} requires the trojan feature",
+                            outbound.tag
+                        ),
+                    ));
+                }
+            }
+            DirectOutboundAction::Socks { outbound }
+            | DirectOutboundAction::Vless { outbound } => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "TCP proxy outbound {} cannot be used for UDP",
+                        outbound.tag
+                    ),
+                ));
+            }
         }
 
+        let target_addr = target_addr.ok_or_else(|| {
+            std::io::Error::other("SOCKS5 UDP freedom route did not resolve target")
+        })?;
         if let Err(error) = send_udp_target_payload(
             &mut client_sessions,
             target_addr,
@@ -1287,6 +1593,38 @@ fn build_udp_response_packet(src_addr: SocketAddr, payload: &[u8]) -> Vec<u8> {
     response
 }
 
+#[cfg(feature = "trojan")]
+fn build_udp_response_packet_location(
+    source: &NetLocation,
+    payload: &[u8],
+) -> std::io::Result<Vec<u8>> {
+    if let Some(source) = source.to_socket_addr_nonblocking() {
+        return Ok(build_udp_response_packet(source, payload));
+    }
+
+    let Address::Hostname(domain) = source.address() else {
+        unreachable!("non-socket SOCKS UDP source must be a hostname")
+    };
+    let bytes = domain.as_bytes();
+    if bytes.is_empty() || bytes.len() > u8::MAX as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "SOCKS5 UDP response domain must contain 1..=255 bytes",
+        ));
+    }
+    let mut response = Vec::with_capacity(7 + bytes.len() + payload.len());
+    response.extend_from_slice(&[0x00, 0x00, 0x00, ADDR_TYPE_DOMAIN]);
+    response.push(bytes.len() as u8);
+    response.extend_from_slice(bytes);
+    response.extend_from_slice(&source.port().to_be_bytes());
+    if response.len().saturating_add(payload.len()) > XRAY_SOCKS_UDP_PACKET_SIZE {
+        response.clear();
+        return Ok(response);
+    }
+    response.extend_from_slice(payload);
+    Ok(response)
+}
+
 /// Create a UDP socket for forwarding to the target address.
 /// Uses the same address family as the target.
 fn create_udp_socket_for_target(
@@ -1358,12 +1696,115 @@ mod tests {
     use tokio::{net::UdpSocket, time::timeout};
 
     use super::*;
+    #[cfg(all(feature = "trojan", feature = "traffic"))]
+    use crate::{
+        address::NetLocation,
+        config::{
+            def::OutboundItem,
+            rule::{NetworkListConfig, RoutingConfig, RuleConfig},
+        },
+        handler::trojan_udp::TrojanUdpStream,
+        outbound::compile_static_outbound,
+        routing_state::RoutingState,
+    };
     #[cfg(feature = "traffic")]
     use crate::{
         resolver::NativeResolver,
         runtime::OutboundSummary,
         traffic::{active_connections, snapshot},
     };
+
+    #[cfg(all(feature = "trojan", feature = "traffic"))]
+    async fn start_fake_trojan_udp_proxy(
+        expected_target: NetLocation,
+    ) -> (OutboundSummary, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut password_hash = [0u8; 56];
+            stream.read_exact(&mut password_hash).await.unwrap();
+            let digest =
+                aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA224, b"secret");
+            let expected_hash = digest
+                .as_ref()
+                .iter()
+                .flat_map(|byte| format!("{byte:02x}").into_bytes())
+                .collect::<Vec<_>>();
+            assert_eq!(password_hash.as_slice(), expected_hash.as_slice());
+            let mut crlf = [0u8; 2];
+            stream.read_exact(&mut crlf).await.unwrap();
+            assert_eq!(crlf, *b"\r\n");
+            assert_eq!(stream.read_u8().await.unwrap(), 0x03);
+            assert_eq!(stream.read_u8().await.unwrap(), ADDR_TYPE_DOMAIN);
+            let domain_len = stream.read_u8().await.unwrap() as usize;
+            let mut domain = vec![0u8; domain_len];
+            stream.read_exact(&mut domain).await.unwrap();
+            assert_eq!(
+                std::str::from_utf8(&domain).unwrap(),
+                expected_target.address().hostname().unwrap()
+            );
+            assert_eq!(stream.read_u16().await.unwrap(), expected_target.port());
+            stream.read_exact(&mut crlf).await.unwrap();
+            assert_eq!(crlf, *b"\r\n");
+
+            let mut udp = TrojanUdpStream::new(Box::new(stream));
+            let mut buffer = [0u8; 8192];
+            while let Ok((target, length)) = udp.recv_from(&mut buffer).await {
+                assert_eq!(target, expected_target);
+                if udp.send_to(&target, &buffer[..length]).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let item: OutboundItem = serde_json::from_value(serde_json::json!({
+            "protocol": "trojan",
+            "tag": "proxy",
+            "settings": {
+                "address": proxy_addr.ip().to_string(),
+                "port": proxy_addr.port(),
+                "password": "secret"
+            }
+        }))
+        .unwrap();
+        (compile_static_outbound(&item).unwrap(), task)
+    }
+
+    #[cfg(all(feature = "trojan", feature = "traffic"))]
+    fn runtime_routing_udp_to(outbound: OutboundSummary) -> RuntimeState {
+        let runtime = RuntimeState::new(Vec::new(), vec![outbound]);
+        runtime.replace_routing(
+            RoutingState::from_config(Some(&RoutingConfig {
+                rules: vec![RuleConfig {
+                    network: NetworkListConfig(vec!["udp".into()]),
+                    outbound_tag: Some("proxy".into()),
+                    ..RuleConfig::default()
+                }],
+                ..RoutingConfig::default()
+            }))
+            .unwrap(),
+        );
+        runtime
+    }
+
+    #[cfg(all(feature = "trojan", feature = "traffic"))]
+    fn socks_udp_request(target: &NetLocation, payload: &[u8]) -> Vec<u8> {
+        let mut request = vec![0, 0, 0, ADDR_TYPE_DOMAIN];
+        let domain = target.address().hostname().unwrap().as_bytes();
+        request.push(domain.len() as u8);
+        request.extend_from_slice(domain);
+        request.extend_from_slice(&target.port().to_be_bytes());
+        request.extend_from_slice(payload);
+        request
+    }
+
+    #[cfg(all(feature = "trojan", feature = "traffic"))]
+    fn parse_socks_udp_response(data: &[u8]) -> (NetLocation, &[u8]) {
+        assert!(data.len() >= 4);
+        assert_eq!(&data[..3], &[0, 0, 0]);
+        let (target, payload_offset) = parse_udp_address(data, 3).unwrap();
+        (target, &data[payload_offset..])
+    }
 
     #[tokio::test]
     async fn socks_handshake_policy_starts_after_protocol_discriminator_like_xray() {
@@ -2535,6 +2976,97 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "trojan", feature = "traffic"))]
+    #[tokio::test]
+    async fn shared_udp_listener_routes_through_trojan_outbound() {
+        let target = NetLocation::from_str("origin.example:53", None).unwrap();
+        let (proxy, proxy_task) = start_fake_trojan_udp_proxy(target.clone()).await;
+        let runtime = runtime_routing_udp_to(proxy);
+        let relay =
+            Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let relay_addr = relay.local_addr().unwrap();
+        let relay_task = tokio::spawn(run_shared_udp_relay(
+            relay,
+            Arc::new(NativeResolver::new()),
+            runtime,
+            SocksUserStore::with_auth_required(Vec::new(), false),
+            None,
+        ));
+
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        client
+            .send_to(
+                &socks_udp_request(&target, b"shared-via-trojan"),
+                relay_addr,
+            )
+            .await
+            .unwrap();
+        let mut response = [0u8; 256];
+        let (length, _) =
+            timeout(Duration::from_secs(5), client.recv_from(&mut response))
+                .await
+                .expect("SOCKS shared Trojan UDP response timeout")
+                .unwrap();
+        let (source, payload) = parse_socks_udp_response(&response[..length]);
+        assert_eq!(source, target);
+        assert_eq!(payload, b"shared-via-trojan");
+
+        relay_task.abort();
+        proxy_task.abort();
+    }
+
+    #[cfg(all(feature = "trojan", feature = "traffic"))]
+    #[tokio::test]
+    async fn udp_associate_routes_through_trojan_outbound() {
+        let target = NetLocation::from_str("origin.example:53", None).unwrap();
+        let (proxy, proxy_task) = start_fake_trojan_udp_proxy(target.clone()).await;
+        let runtime = runtime_routing_udp_to(proxy);
+        let relay_socket =
+            Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let relay_addr = relay_socket.local_addr().unwrap();
+
+        let control_listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let control_addr = control_listener.local_addr().unwrap();
+        let client_control = TcpStream::connect(control_addr).await.unwrap();
+        let (server_control, _) = control_listener.accept().await.unwrap();
+        let relay_task = tokio::spawn(run_udp_relay(
+            relay_socket,
+            Box::new(server_control),
+            Arc::new(NativeResolver::new()),
+            runtime,
+            client_control.local_addr().unwrap(),
+            false,
+            None,
+        ));
+
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        client
+            .send_to(
+                &socks_udp_request(&target, b"associate-via-trojan"),
+                relay_addr,
+            )
+            .await
+            .unwrap();
+        let mut response = [0u8; 256];
+        let (length, _) =
+            timeout(Duration::from_secs(5), client.recv_from(&mut response))
+                .await
+                .expect("SOCKS UDP_ASSOCIATE Trojan response timeout")
+                .unwrap();
+        let (source, payload) = parse_socks_udp_response(&response[..length]);
+        assert_eq!(source, target);
+        assert_eq!(payload, b"associate-via-trojan");
+
+        drop(client_control);
+        timeout(Duration::from_secs(2), relay_task)
+            .await
+            .expect("SOCKS UDP_ASSOCIATE relay shutdown timeout")
+            .unwrap()
+            .unwrap();
+        proxy_task.abort();
+    }
+
     #[cfg(feature = "traffic")]
     async fn udp_source_from_alternate_loopback_is_forwarded(
         restrict_client_ip_to_tcp_peer: bool,
@@ -2558,6 +3090,8 @@ mod tests {
                 protocol: "freedom".into(),
                 proxy_settings_type: None,
                 proxy_settings_value: None,
+                sender_settings_type: None,
+                sender_settings_value: None,
             }],
         );
         let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
@@ -2625,6 +3159,8 @@ mod tests {
                     protocol: "freedom".into(),
                     proxy_settings_type: None,
                     proxy_settings_value: None,
+                    sender_settings_type: None,
+                    sender_settings_value: None,
                 }],
             );
             let task = tokio::spawn(run_shared_udp_relay(
@@ -2699,6 +3235,8 @@ mod tests {
                 protocol: "freedom".into(),
                 proxy_settings_type: None,
                 proxy_settings_value: None,
+                sender_settings_type: None,
+                sender_settings_value: None,
             }],
         );
         let relay_task = tokio::spawn(run_shared_udp_relay(
@@ -2835,6 +3373,8 @@ mod tests {
                 protocol: "freedom".into(),
                 proxy_settings_type: None,
                 proxy_settings_value: None,
+                sender_settings_type: None,
+                sender_settings_value: None,
             }],
         );
         let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
@@ -2928,6 +3468,8 @@ mod tests {
                 protocol: "freedom".into(),
                 proxy_settings_type: None,
                 proxy_settings_value: None,
+                sender_settings_type: None,
+                sender_settings_value: None,
             }],
         );
         let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
@@ -3115,6 +3657,8 @@ mod tests {
                 protocol: "freedom".into(),
                 proxy_settings_type: None,
                 proxy_settings_value: None,
+                sender_settings_type: None,
+                sender_settings_value: None,
             }],
         );
         let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
@@ -3183,6 +3727,8 @@ mod tests {
                 protocol: "freedom".into(),
                 proxy_settings_type: None,
                 proxy_settings_value: None,
+                sender_settings_type: None,
+                sender_settings_value: None,
             }],
         );
         let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
@@ -3245,6 +3791,8 @@ mod tests {
                 protocol: "freedom".into(),
                 proxy_settings_type: None,
                 proxy_settings_value: None,
+                sender_settings_type: None,
+                sender_settings_value: None,
             }],
         );
         let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
@@ -3320,6 +3868,8 @@ mod tests {
                 protocol: "freedom".into(),
                 proxy_settings_type: None,
                 proxy_settings_value: None,
+                sender_settings_type: None,
+                sender_settings_value: None,
             }],
         );
         let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());

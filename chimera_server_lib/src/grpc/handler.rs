@@ -56,6 +56,11 @@ const TYPE_PROXY_VLESS_INBOUND_CONFIG: &str = "xray.proxy.vless.inbound.Config";
 const TYPE_PROXY_VLESS_INBOUND_CONFIG_V2RAY: &str =
     "v2ray.core.proxy.vless.inbound.Config";
 #[cfg(feature = "vless")]
+const TYPE_PROXY_VLESS_OUTBOUND_CONFIG: &str = "xray.proxy.vless.outbound.Config";
+#[cfg(feature = "vless")]
+const TYPE_PROXY_VLESS_OUTBOUND_CONFIG_V2RAY: &str =
+    "v2ray.core.proxy.vless.outbound.Config";
+#[cfg(feature = "vless")]
 const TYPE_PROXY_VLESS_ACCOUNT: &str = "xray.proxy.vless.Account";
 #[cfg(feature = "vless")]
 const TYPE_PROXY_VLESS_ACCOUNT_V2RAY: &str = "v2ray.core.proxy.vless.Account";
@@ -81,6 +86,11 @@ const TYPE_PROXY_TROJAN_SERVER_CONFIG: &str = "xray.proxy.trojan.ServerConfig";
 #[cfg(feature = "trojan")]
 const TYPE_PROXY_TROJAN_SERVER_CONFIG_V2RAY: &str =
     "v2ray.core.proxy.trojan.ServerConfig";
+#[cfg(feature = "trojan")]
+const TYPE_PROXY_TROJAN_CLIENT_CONFIG: &str = "xray.proxy.trojan.ClientConfig";
+#[cfg(feature = "trojan")]
+const TYPE_PROXY_TROJAN_CLIENT_CONFIG_V2RAY: &str =
+    "v2ray.core.proxy.trojan.ClientConfig";
 const TYPE_PROXY_FREEDOM_CONFIG: &str = "xray.proxy.freedom.Config";
 const TYPE_PROXY_FREEDOM_CONFIG_V2RAY: &str = "v2ray.core.proxy.freedom.Config";
 const TYPE_PROXY_SOCKS_CLIENT_CONFIG: &str = "xray.proxy.socks.ClientConfig";
@@ -97,6 +107,18 @@ const TYPE_TRANSPORT_WEBSOCKET_CONFIG: &str =
 #[cfg(feature = "ws")]
 const TYPE_TRANSPORT_WEBSOCKET_CONFIG_V2RAY: &str =
     "v2ray.core.transport.internet.websocket.Config";
+#[cfg(feature = "httpupgrade")]
+const TYPE_TRANSPORT_HTTPUPGRADE_CONFIG: &str =
+    "xray.transport.internet.httpupgrade.Config";
+#[cfg(feature = "httpupgrade")]
+const TYPE_TRANSPORT_HTTPUPGRADE_CONFIG_V2RAY: &str =
+    "v2ray.core.transport.internet.httpupgrade.Config";
+#[cfg(feature = "grpc_transport")]
+const TYPE_TRANSPORT_GRPC_CONFIG: &str =
+    "xray.transport.internet.grpc.encoding.Config";
+#[cfg(feature = "grpc_transport")]
+const TYPE_TRANSPORT_GRPC_CONFIG_V2RAY: &str =
+    "v2ray.core.transport.internet.grpc.encoding.Config";
 #[cfg(feature = "tls")]
 const TYPE_TRANSPORT_TLS_CONFIG: &str = "xray.transport.internet.tls.Config";
 #[cfg(feature = "tls")]
@@ -225,6 +247,31 @@ struct SocksClientConfigPayload {
     server: Option<SocksServerEndpointPayload>,
 }
 
+#[cfg(feature = "vless")]
+#[derive(Clone, PartialEq, Message)]
+struct VlessOutboundConfigPayload {
+    #[prost(message, optional, tag = "1")]
+    vnext: Option<SocksServerEndpointPayload>,
+}
+
+#[cfg(feature = "trojan")]
+#[derive(Clone, PartialEq, Message)]
+struct TrojanClientConfigPayload {
+    #[prost(message, optional, tag = "1")]
+    server: Option<SocksServerEndpointPayload>,
+}
+
+#[cfg(feature = "vless")]
+#[derive(Clone, PartialEq, Message)]
+struct VlessOutboundAccountPayload {
+    #[prost(string, tag = "1")]
+    id: String,
+    #[prost(string, tag = "2")]
+    flow: String,
+    #[prost(string, tag = "3")]
+    encryption: String,
+}
+
 #[derive(Clone, PartialEq, Message)]
 struct SocksServerEndpointPayload {
     #[prost(message, optional, tag = "1")]
@@ -237,6 +284,12 @@ struct SocksServerEndpointPayload {
 
 #[derive(Clone, PartialEq, Message)]
 struct BlackholeConfigPayload {}
+
+#[derive(Clone, PartialEq, Message)]
+struct SenderConfigPayload {
+    #[prost(message, optional, tag = "2")]
+    stream_settings: Option<StreamConfigPayload>,
+}
 
 #[derive(Clone, PartialEq, Message)]
 struct StreamConfigPayload {
@@ -442,8 +495,46 @@ struct WebsocketConfigPayload {
     header: std::collections::HashMap<String, String>,
     #[prost(bool, tag = "4")]
     accept_proxy_protocol: bool,
+    #[prost(uint32, tag = "5")]
+    ed: u32,
     #[prost(uint32, tag = "6")]
     heartbeat_period: u32,
+}
+
+#[cfg(feature = "httpupgrade")]
+#[derive(Clone, PartialEq, Message)]
+struct HttpUpgradeConfigPayload {
+    #[prost(string, tag = "1")]
+    host: String,
+    #[prost(string, tag = "2")]
+    path: String,
+    #[prost(map = "string, string", tag = "3")]
+    header: std::collections::HashMap<String, String>,
+    #[prost(bool, tag = "4")]
+    accept_proxy_protocol: bool,
+    #[prost(uint32, tag = "5")]
+    ed: u32,
+}
+
+#[cfg(feature = "grpc_transport")]
+#[derive(Clone, PartialEq, Message)]
+struct GrpcConfigPayload {
+    #[prost(string, tag = "1")]
+    authority: String,
+    #[prost(string, tag = "2")]
+    service_name: String,
+    #[prost(bool, tag = "3")]
+    multi_mode: bool,
+    #[prost(int32, tag = "4")]
+    idle_timeout: i32,
+    #[prost(int32, tag = "5")]
+    health_check_timeout: i32,
+    #[prost(bool, tag = "6")]
+    permit_without_stream: bool,
+    #[prost(int32, tag = "7")]
+    initial_windows_size: i32,
+    #[prost(string, tag = "8")]
+    user_agent: String,
 }
 
 #[cfg(feature = "tls")]
@@ -451,8 +542,12 @@ struct WebsocketConfigPayload {
 struct TlsConfigPayload {
     #[prost(message, repeated, tag = "2")]
     certificate: Vec<TlsCertificatePayload>,
+    #[prost(string, tag = "3")]
+    server_name: String,
     #[prost(string, repeated, tag = "4")]
     next_protocol: Vec<String>,
+    #[prost(bool, tag = "6")]
+    disable_system_root: bool,
 }
 
 #[cfg(feature = "tls")]
@@ -471,8 +566,14 @@ struct TlsCertificatePayload {
 #[cfg(feature = "reality")]
 #[derive(Clone, PartialEq, Message)]
 struct RealityConfigPayload {
+    #[prost(bool, tag = "1")]
+    show: bool,
     #[prost(string, tag = "2")]
     dest: String,
+    #[prost(string, tag = "3")]
+    r#type: String,
+    #[prost(uint64, tag = "4")]
+    xver: u64,
     #[prost(string, repeated, tag = "5")]
     server_names: Vec<String>,
     #[prost(bytes = "vec", tag = "6")]
@@ -485,6 +586,24 @@ struct RealityConfigPayload {
     max_time_diff: u64,
     #[prost(bytes = "vec", repeated, tag = "10")]
     short_ids: Vec<Vec<u8>>,
+    #[prost(bytes = "vec", tag = "11")]
+    mldsa65_seed: Vec<u8>,
+    #[prost(string, tag = "21")]
+    fingerprint: String,
+    #[prost(string, tag = "22")]
+    server_name: String,
+    #[prost(bytes = "vec", tag = "23")]
+    public_key: Vec<u8>,
+    #[prost(bytes = "vec", tag = "24")]
+    short_id: Vec<u8>,
+    #[prost(bytes = "vec", tag = "25")]
+    mldsa65_verify: Vec<u8>,
+    #[prost(string, tag = "26")]
+    spider_x: String,
+    #[prost(int64, repeated, tag = "27")]
+    spider_y: Vec<i64>,
+    #[prost(string, tag = "31")]
+    master_key_log: String,
 }
 
 #[derive(Clone)]
@@ -656,6 +775,7 @@ impl HandlerServiceImpl {
             transport: Transport::Tcp,
             quic_settings: None,
             sniffing: None,
+            tcp_socket_policy: None,
         })
     }
 
@@ -1421,14 +1541,6 @@ impl HandlerServiceImpl {
         let proxy_settings = outbound.proxy_settings.as_ref().ok_or_else(|| {
             Status::invalid_argument("outbound.proxy_settings is required")
         })?;
-        if matches!(
-            Self::parse_typed_message_type(proxy_settings),
-            "xray.proxy.socks.ClientConfig" | "v2ray.core.proxy.socks.ClientConfig"
-        ) {
-            return Err(Status::unimplemented(
-                "socks outbound is parsed but its data-plane connector is not implemented",
-            ));
-        }
         let protocol = match Self::parse_typed_message_type(proxy_settings) {
             TYPE_PROXY_FREEDOM_CONFIG | TYPE_PROXY_FREEDOM_CONFIG_V2RAY => {
                 let _ = self.decode_typed_message::<FreedomConfigPayload>(
@@ -1461,6 +1573,133 @@ impl HandlerServiceImpl {
                 }
                 "socks"
             }
+            #[cfg(feature = "vless")]
+            TYPE_PROXY_VLESS_OUTBOUND_CONFIG
+            | TYPE_PROXY_VLESS_OUTBOUND_CONFIG_V2RAY => {
+                if outbound.sender_settings.is_some() {
+                    return Err(Status::unimplemented(
+                        "dynamic VLESS outbound senderSettings/transport are not implemented yet",
+                    ));
+                }
+                let config = self
+                    .decode_typed_message::<VlessOutboundConfigPayload>(
+                        proxy_settings,
+                        &[
+                            TYPE_PROXY_VLESS_OUTBOUND_CONFIG,
+                            TYPE_PROXY_VLESS_OUTBOUND_CONFIG_V2RAY,
+                        ],
+                        "vless outbound proxy settings",
+                    )?;
+                let server = config.vnext.ok_or_else(|| {
+                    Status::invalid_argument(
+                        "vless outbound requires a vnext endpoint",
+                    )
+                })?;
+                let _ = self.parse_address(server.address)?;
+                if !(1..=u32::from(u16::MAX)).contains(&server.port) {
+                    return Err(Status::invalid_argument(
+                        "vless outbound server port must be between 1 and 65535",
+                    ));
+                }
+                let account =
+                    server.user.and_then(|user| user.account).ok_or_else(|| {
+                        Status::invalid_argument(
+                            "vless outbound requires exactly one user",
+                        )
+                    })?;
+                let account_type = Self::parse_typed_message_type(&account);
+                if account_type != TYPE_PROXY_VLESS_ACCOUNT
+                    && account_type != TYPE_PROXY_VLESS_ACCOUNT_V2RAY
+                {
+                    return Err(Status::invalid_argument(format!(
+                        "unsupported vless outbound account type: {account_type}"
+                    )));
+                }
+                let account =
+                    VlessOutboundAccountPayload::decode(account.value.as_slice())
+                        .map_err(|error| {
+                            Status::invalid_argument(format!(
+                                "invalid vless outbound account payload: {error}"
+                            ))
+                        })?;
+                crate::outbound::parse_xray_uuid(&account.id)
+                    .map_err(Status::invalid_argument)?;
+                if !account.flow.trim().is_empty() {
+                    return Err(Status::unimplemented(format!(
+                        "dynamic VLESS outbound flow {} is not implemented yet",
+                        account.flow
+                    )));
+                }
+                if !account.encryption.trim().eq_ignore_ascii_case("none") {
+                    return Err(Status::unimplemented(format!(
+                        "dynamic VLESS outbound encryption {} is not implemented",
+                        account.encryption
+                    )));
+                }
+                "vless"
+            }
+            #[cfg(feature = "trojan")]
+            TYPE_PROXY_TROJAN_CLIENT_CONFIG
+            | TYPE_PROXY_TROJAN_CLIENT_CONFIG_V2RAY => {
+                if let Some(sender_settings) = outbound.sender_settings.as_ref() {
+                    crate::outbound::validate_outbound_sender_settings(
+                        Some(sender_settings.r#type.as_str()),
+                        Some(sender_settings.value.as_slice()),
+                    )
+                    .map_err(|error| match error.kind() {
+                        std::io::ErrorKind::Unsupported => {
+                            Status::unimplemented(error.to_string())
+                        }
+                        _ => Status::invalid_argument(error.to_string()),
+                    })?;
+                }
+                let config = self
+                    .decode_typed_message::<TrojanClientConfigPayload>(
+                        proxy_settings,
+                        &[
+                            TYPE_PROXY_TROJAN_CLIENT_CONFIG,
+                            TYPE_PROXY_TROJAN_CLIENT_CONFIG_V2RAY,
+                        ],
+                        "trojan outbound proxy settings",
+                    )?;
+                let server = config.server.ok_or_else(|| {
+                    Status::invalid_argument(
+                        "trojan outbound requires a server endpoint",
+                    )
+                })?;
+                let _ = self.parse_address(server.address)?;
+                if !(1..=u32::from(u16::MAX)).contains(&server.port) {
+                    return Err(Status::invalid_argument(
+                        "trojan outbound server port must be between 1 and 65535",
+                    ));
+                }
+                let account =
+                    server.user.and_then(|user| user.account).ok_or_else(|| {
+                        Status::invalid_argument(
+                            "trojan outbound requires exactly one user",
+                        )
+                    })?;
+                let account_type = Self::parse_typed_message_type(&account);
+                if account_type != TYPE_PROXY_TROJAN_ACCOUNT
+                    && account_type != TYPE_PROXY_TROJAN_ACCOUNT_V2RAY
+                {
+                    return Err(Status::invalid_argument(format!(
+                        "unsupported trojan outbound account type: {account_type}"
+                    )));
+                }
+                let account = TrojanAccountPayload::decode(account.value.as_slice())
+                    .map_err(|error| {
+                        Status::invalid_argument(format!(
+                            "invalid trojan outbound account payload: {error}"
+                        ))
+                    })?;
+                if account.password.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "trojan outbound password is required",
+                    ));
+                }
+                "trojan"
+            }
             TYPE_PROXY_BLACKHOLE_CONFIG => {
                 let _ = self.decode_typed_message::<BlackholeConfigPayload>(
                     proxy_settings,
@@ -1480,6 +1719,14 @@ impl HandlerServiceImpl {
             protocol: protocol.to_string(),
             proxy_settings_type: Some(proxy_settings.r#type.clone()),
             proxy_settings_value: Some(proxy_settings.value.clone()),
+            sender_settings_type: outbound
+                .sender_settings
+                .as_ref()
+                .map(|settings| settings.r#type.clone()),
+            sender_settings_value: outbound
+                .sender_settings
+                .as_ref()
+                .map(|settings| settings.value.clone()),
         })
     }
 
@@ -1813,6 +2060,7 @@ impl HandlerServiceImpl {
                         path: target.matching_path.clone().unwrap_or_default(),
                         header: headers,
                         accept_proxy_protocol: target.accept_proxy_protocol,
+                        ed: 0,
                         heartbeat_period: target.heartbeat_period,
                     },
                 );
@@ -1865,7 +2113,9 @@ impl HandlerServiceImpl {
                                     .unwrap_or_default(),
                             })
                             .collect(),
+                        server_name: tls.server_name.clone().unwrap_or_default(),
                         next_protocol: tls.alpn_protocols.clone(),
+                        disable_system_root: false,
                     },
                 ));
                 (stream_settings, proxy_settings)
@@ -1903,6 +2153,7 @@ impl HandlerServiceImpl {
                             .iter()
                             .map(|short_id| short_id.to_vec())
                             .collect(),
+                        ..RealityConfigPayload::default()
                     },
                 ));
                 (stream_settings, proxy_settings)
@@ -3001,6 +3252,7 @@ mod tests {
             transport: Transport::Tcp,
             quic_settings: None,
             sniffing: None,
+            tcp_socket_policy: None,
         };
 
         let outbound = OutboundSummary {
@@ -3008,6 +3260,8 @@ mod tests {
             protocol: "freedom".to_string(),
             proxy_settings_type: None,
             proxy_settings_value: None,
+            sender_settings_type: None,
+            sender_settings_value: None,
         };
 
         let runtime = RuntimeState::new(vec![inbound], vec![outbound]);
@@ -3102,25 +3356,591 @@ mod tests {
     }
 
     #[test]
-    fn handler_rejects_socks_outbound_until_connector_exists() {
+    fn handler_accepts_executable_socks_outbound() {
         let service =
             HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
-        let error = service
+        let config = SocksClientConfigPayload {
+            server: Some(SocksServerEndpointPayload {
+                address: Some(localhost_ip_payload()),
+                port: 1080,
+                user: None,
+            }),
+        };
+        let outbound = service
             .parse_add_outbound(proto::xray::core::OutboundHandlerConfig {
                 tag: "socks-outbound".to_string(),
                 proxy_settings: Some(proto::xray::common::serial::TypedMessage {
-                    r#type: "xray.proxy.socks.ClientConfig".to_string(),
-                    value: Vec::new(),
+                    r#type: TYPE_PROXY_SOCKS_CLIENT_CONFIG.to_string(),
+                    value: config.encode_to_vec(),
                 }),
                 ..proto::xray::core::OutboundHandlerConfig::default()
             })
-            .expect_err("SOCKS outbound must not be advertised as executable yet");
+            .expect("SOCKS outbound should be executable");
 
-        assert_eq!(error.code(), Code::Unimplemented);
+        assert_eq!(outbound.tag, "socks-outbound");
+        assert_eq!(outbound.protocol, "socks");
         assert_eq!(
-            error.message(),
-            "socks outbound is parsed but its data-plane connector is not implemented"
+            outbound.proxy_settings_type.as_deref(),
+            Some(TYPE_PROXY_SOCKS_CLIENT_CONFIG)
         );
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn handler_accepts_raw_vless_outbound_and_rejects_dynamic_transport() {
+        let service =
+            HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+        let config = VlessOutboundConfigPayload {
+            vnext: Some(SocksServerEndpointPayload {
+                address: Some(localhost_ip_payload()),
+                port: 1234,
+                user: Some(proto::xray::common::protocol::User {
+                    level: 0,
+                    email: "vless@example.test".into(),
+                    account: Some(proto::xray::common::serial::TypedMessage {
+                        r#type: TYPE_PROXY_VLESS_ACCOUNT.to_string(),
+                        value: VlessOutboundAccountPayload {
+                            id: "3ac9b383-75a1-431c-8184-106c80eb2273".into(),
+                            flow: String::new(),
+                            encryption: "none".into(),
+                        }
+                        .encode_to_vec(),
+                    }),
+                }),
+            }),
+        };
+        let proxy_settings = proto::xray::common::serial::TypedMessage {
+            r#type: TYPE_PROXY_VLESS_OUTBOUND_CONFIG.to_string(),
+            value: config.encode_to_vec(),
+        };
+        let outbound = service
+            .parse_add_outbound(proto::xray::core::OutboundHandlerConfig {
+                tag: "vless-outbound".into(),
+                proxy_settings: Some(proxy_settings.clone()),
+                ..proto::xray::core::OutboundHandlerConfig::default()
+            })
+            .expect("raw VLESS outbound should be executable");
+        assert_eq!(outbound.protocol, "vless");
+        assert_eq!(
+            outbound.proxy_settings_type.as_deref(),
+            Some(TYPE_PROXY_VLESS_OUTBOUND_CONFIG)
+        );
+
+        let error = service
+            .parse_add_outbound(proto::xray::core::OutboundHandlerConfig {
+                tag: "secure-vless".into(),
+                sender_settings: Some(proto::xray::common::serial::TypedMessage {
+                    r#type: "xray.app.proxyman.SenderConfig".into(),
+                    value: Vec::new(),
+                }),
+                proxy_settings: Some(proxy_settings),
+                ..proto::xray::core::OutboundHandlerConfig::default()
+            })
+            .expect_err("dynamic VLESS transport must fail closed");
+        assert_eq!(error.code(), Code::Unimplemented);
+    }
+
+    #[cfg(all(feature = "trojan", feature = "reality"))]
+    #[test]
+    fn handler_accepts_reality_trojan_outbound() {
+        let service =
+            HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+        let config = TrojanClientConfigPayload {
+            server: Some(SocksServerEndpointPayload {
+                address: Some(localhost_ip_payload()),
+                port: 443,
+                user: Some(proto::xray::common::protocol::User {
+                    level: 0,
+                    email: "trojan-reality@example.test".into(),
+                    account: Some(proto::xray::common::serial::TypedMessage {
+                        r#type: TYPE_PROXY_TROJAN_ACCOUNT.to_string(),
+                        value: TrojanAccountPayload {
+                            password: "secret".into(),
+                        }
+                        .encode_to_vec(),
+                    }),
+                }),
+            }),
+        };
+        let proxy_settings = proto::xray::common::serial::TypedMessage {
+            r#type: TYPE_PROXY_TROJAN_CLIENT_CONFIG.to_string(),
+            value: config.encode_to_vec(),
+        };
+        let reality_settings = proto::xray::common::serial::TypedMessage {
+            r#type: TYPE_TRANSPORT_REALITY_CONFIG.to_string(),
+            value: RealityConfigPayload {
+                fingerprint: "chrome".into(),
+                server_name: "reality.example.test".into(),
+                public_key: vec![7; 32],
+                short_id: vec![0, 1, 2, 3, 4, 5, 6, 7],
+                spider_x: "/".into(),
+                ..RealityConfigPayload::default()
+            }
+            .encode_to_vec(),
+        };
+        let sender_settings = proto::xray::common::serial::TypedMessage {
+            r#type: "xray.app.proxyman.SenderConfig".into(),
+            value: SenderConfigPayload {
+                stream_settings: Some(StreamConfigPayload {
+                    protocol_name: "tcp".into(),
+                    transport_settings: Vec::new(),
+                    security_type: TYPE_TRANSPORT_REALITY_CONFIG.to_string(),
+                    security_settings: vec![reality_settings],
+                    quic_params: None,
+                }),
+            }
+            .encode_to_vec(),
+        };
+        let outbound = service
+            .parse_add_outbound(proto::xray::core::OutboundHandlerConfig {
+                tag: "reality-trojan".into(),
+                sender_settings: Some(sender_settings),
+                proxy_settings: Some(proxy_settings),
+                ..proto::xray::core::OutboundHandlerConfig::default()
+            })
+            .expect("dynamic Trojan REALITY senderSettings should be accepted");
+        assert_eq!(outbound.protocol, "trojan");
+        assert_eq!(
+            outbound.sender_settings_type.as_deref(),
+            Some("xray.app.proxyman.SenderConfig")
+        );
+    }
+
+    #[cfg(all(feature = "trojan", feature = "reality", feature = "grpc_transport"))]
+    #[test]
+    fn handler_accepts_grpc_reality_trojan_outbound() {
+        let service =
+            HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+        let proxy_settings = proto::xray::common::serial::TypedMessage {
+            r#type: TYPE_PROXY_TROJAN_CLIENT_CONFIG.to_string(),
+            value: TrojanClientConfigPayload {
+                server: Some(SocksServerEndpointPayload {
+                    address: Some(localhost_ip_payload()),
+                    port: 443,
+                    user: Some(proto::xray::common::protocol::User {
+                        level: 0,
+                        email: "trojan-grpc-reality@example.test".into(),
+                        account: Some(proto::xray::common::serial::TypedMessage {
+                            r#type: TYPE_PROXY_TROJAN_ACCOUNT.to_string(),
+                            value: TrojanAccountPayload {
+                                password: "secret".into(),
+                            }
+                            .encode_to_vec(),
+                        }),
+                    }),
+                }),
+            }
+            .encode_to_vec(),
+        };
+        let grpc_settings = proto::xray::common::serial::TypedMessage {
+            r#type: TYPE_TRANSPORT_GRPC_CONFIG.to_string(),
+            value: GrpcConfigPayload {
+                authority: "grpc.example.test".into(),
+                service_name: "GunService".into(),
+                multi_mode: false,
+                idle_timeout: 0,
+                health_check_timeout: 0,
+                permit_without_stream: false,
+                initial_windows_size: 0,
+                user_agent: "chimera-test".into(),
+            }
+            .encode_to_vec(),
+        };
+        let reality_settings = proto::xray::common::serial::TypedMessage {
+            r#type: TYPE_TRANSPORT_REALITY_CONFIG.to_string(),
+            value: RealityConfigPayload {
+                fingerprint: "chrome".into(),
+                server_name: "reality.example.test".into(),
+                public_key: vec![7; 32],
+                short_id: vec![0, 1, 2, 3, 4, 5, 6, 7],
+                spider_x: "/".into(),
+                ..RealityConfigPayload::default()
+            }
+            .encode_to_vec(),
+        };
+        let sender_settings = proto::xray::common::serial::TypedMessage {
+            r#type: "xray.app.proxyman.SenderConfig".into(),
+            value: SenderConfigPayload {
+                stream_settings: Some(StreamConfigPayload {
+                    protocol_name: "grpc".into(),
+                    transport_settings: vec![TransportConfigPayload {
+                        settings: Some(grpc_settings),
+                        protocol_name: "grpc".into(),
+                    }],
+                    security_type: TYPE_TRANSPORT_REALITY_CONFIG.to_string(),
+                    security_settings: vec![reality_settings],
+                    quic_params: None,
+                }),
+            }
+            .encode_to_vec(),
+        };
+        let outbound = service
+            .parse_add_outbound(proto::xray::core::OutboundHandlerConfig {
+                tag: "grpc-reality-trojan".into(),
+                sender_settings: Some(sender_settings),
+                proxy_settings: Some(proxy_settings),
+                ..proto::xray::core::OutboundHandlerConfig::default()
+            })
+            .expect("dynamic Trojan gRPC REALITY senderSettings should be accepted");
+        assert_eq!(outbound.protocol, "trojan");
+        assert_eq!(
+            outbound.sender_settings_type.as_deref(),
+            Some("xray.app.proxyman.SenderConfig")
+        );
+    }
+
+    #[cfg(all(feature = "trojan", feature = "tls", feature = "ws"))]
+    #[test]
+    fn handler_accepts_raw_tls_and_websocket_trojan_outbounds() {
+        let service =
+            HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+        let config = TrojanClientConfigPayload {
+            server: Some(SocksServerEndpointPayload {
+                address: Some(localhost_ip_payload()),
+                port: 443,
+                user: Some(proto::xray::common::protocol::User {
+                    level: 0,
+                    email: "trojan@example.test".into(),
+                    account: Some(proto::xray::common::serial::TypedMessage {
+                        r#type: TYPE_PROXY_TROJAN_ACCOUNT.to_string(),
+                        value: TrojanAccountPayload {
+                            password: "secret".into(),
+                        }
+                        .encode_to_vec(),
+                    }),
+                }),
+            }),
+        };
+        let proxy_settings = proto::xray::common::serial::TypedMessage {
+            r#type: TYPE_PROXY_TROJAN_CLIENT_CONFIG.to_string(),
+            value: config.encode_to_vec(),
+        };
+        let outbound = service
+            .parse_add_outbound(proto::xray::core::OutboundHandlerConfig {
+                tag: "trojan-outbound".into(),
+                proxy_settings: Some(proxy_settings.clone()),
+                ..proto::xray::core::OutboundHandlerConfig::default()
+            })
+            .expect("raw Trojan outbound should be executable");
+        assert_eq!(outbound.protocol, "trojan");
+        assert_eq!(
+            outbound.proxy_settings_type.as_deref(),
+            Some(TYPE_PROXY_TROJAN_CLIENT_CONFIG)
+        );
+
+        let tls_settings = proto::xray::common::serial::TypedMessage {
+            r#type: TYPE_TRANSPORT_TLS_CONFIG.to_string(),
+            value: TlsConfigPayload {
+                certificate: Vec::new(),
+                server_name: "trojan.example.test".into(),
+                next_protocol: vec!["http/1.1".into()],
+                disable_system_root: false,
+            }
+            .encode_to_vec(),
+        };
+        let sender_settings = proto::xray::common::serial::TypedMessage {
+            r#type: "xray.app.proxyman.SenderConfig".into(),
+            value: SenderConfigPayload {
+                stream_settings: Some(StreamConfigPayload {
+                    protocol_name: "tcp".into(),
+                    transport_settings: Vec::new(),
+                    security_type: TYPE_TRANSPORT_TLS_CONFIG.to_string(),
+                    security_settings: vec![tls_settings],
+                    quic_params: None,
+                }),
+            }
+            .encode_to_vec(),
+        };
+        let secure = service
+            .parse_add_outbound(proto::xray::core::OutboundHandlerConfig {
+                tag: "secure-trojan".into(),
+                sender_settings: Some(sender_settings),
+                proxy_settings: Some(proxy_settings.clone()),
+                ..proto::xray::core::OutboundHandlerConfig::default()
+            })
+            .expect("dynamic Trojan TLS senderSettings should be accepted");
+        assert_eq!(secure.protocol, "trojan");
+        assert_eq!(
+            secure.sender_settings_type.as_deref(),
+            Some("xray.app.proxyman.SenderConfig")
+        );
+
+        let websocket_settings = proto::xray::common::serial::TypedMessage {
+            r#type: TYPE_TRANSPORT_WEBSOCKET_CONFIG.to_string(),
+            value: WebsocketConfigPayload {
+                host: "ws.example.test".into(),
+                path: "/trojan".into(),
+                header: std::collections::HashMap::from([(
+                    "X-Test".into(),
+                    "chimera".into(),
+                )]),
+                accept_proxy_protocol: false,
+                ed: 0,
+                heartbeat_period: 30,
+            }
+            .encode_to_vec(),
+        };
+        let websocket_sender = proto::xray::common::serial::TypedMessage {
+            r#type: "xray.app.proxyman.SenderConfig".into(),
+            value: SenderConfigPayload {
+                stream_settings: Some(StreamConfigPayload {
+                    protocol_name: "websocket".into(),
+                    transport_settings: vec![TransportConfigPayload {
+                        settings: Some(websocket_settings),
+                        protocol_name: "websocket".into(),
+                    }],
+                    security_type: String::new(),
+                    security_settings: Vec::new(),
+                    quic_params: None,
+                }),
+            }
+            .encode_to_vec(),
+        };
+        let websocket = service
+            .parse_add_outbound(proto::xray::core::OutboundHandlerConfig {
+                tag: "websocket-trojan".into(),
+                sender_settings: Some(websocket_sender),
+                proxy_settings: Some(proxy_settings.clone()),
+                ..proto::xray::core::OutboundHandlerConfig::default()
+            })
+            .expect("dynamic Trojan WebSocket senderSettings should be accepted");
+        assert_eq!(websocket.protocol, "trojan");
+
+        let early_data_settings = proto::xray::common::serial::TypedMessage {
+            r#type: TYPE_TRANSPORT_WEBSOCKET_CONFIG.to_string(),
+            value: WebsocketConfigPayload {
+                host: String::new(),
+                path: "/trojan".into(),
+                header: std::collections::HashMap::new(),
+                accept_proxy_protocol: false,
+                ed: 16,
+                heartbeat_period: 0,
+            }
+            .encode_to_vec(),
+        };
+        let early_data_sender = proto::xray::common::serial::TypedMessage {
+            r#type: "xray.app.proxyman.SenderConfig".into(),
+            value: SenderConfigPayload {
+                stream_settings: Some(StreamConfigPayload {
+                    protocol_name: "websocket".into(),
+                    transport_settings: vec![TransportConfigPayload {
+                        settings: Some(early_data_settings),
+                        protocol_name: "websocket".into(),
+                    }],
+                    security_type: String::new(),
+                    security_settings: Vec::new(),
+                    quic_params: None,
+                }),
+            }
+            .encode_to_vec(),
+        };
+        let early_data = service
+            .parse_add_outbound(proto::xray::core::OutboundHandlerConfig {
+                tag: "early-data-trojan".into(),
+                sender_settings: Some(early_data_sender),
+                proxy_settings: Some(proxy_settings.clone()),
+                ..proto::xray::core::OutboundHandlerConfig::default()
+            })
+            .expect("Trojan WebSocket early-data should be accepted");
+        assert_eq!(early_data.protocol, "trojan");
+
+        let unsupported_sender = proto::xray::common::serial::TypedMessage {
+            r#type: "xray.app.proxyman.SenderConfig".into(),
+            value: SenderConfigPayload {
+                stream_settings: Some(StreamConfigPayload {
+                    protocol_name: "xhttp".into(),
+                    transport_settings: Vec::new(),
+                    security_type: String::new(),
+                    security_settings: Vec::new(),
+                    quic_params: None,
+                }),
+            }
+            .encode_to_vec(),
+        };
+        let error = service
+            .parse_add_outbound(proto::xray::core::OutboundHandlerConfig {
+                tag: "unsupported-trojan".into(),
+                sender_settings: Some(unsupported_sender),
+                proxy_settings: Some(proxy_settings),
+                ..proto::xray::core::OutboundHandlerConfig::default()
+            })
+            .expect_err("unsupported Trojan transport must fail closed");
+        assert_eq!(error.code(), Code::Unimplemented);
+    }
+
+    #[cfg(all(feature = "trojan", feature = "httpupgrade"))]
+    #[test]
+    fn handler_accepts_httpupgrade_trojan_outbound_with_early_data() {
+        let service =
+            HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+        let proxy_settings = proto::xray::common::serial::TypedMessage {
+            r#type: TYPE_PROXY_TROJAN_CLIENT_CONFIG.to_string(),
+            value: TrojanClientConfigPayload {
+                server: Some(SocksServerEndpointPayload {
+                    address: Some(localhost_ip_payload()),
+                    port: 443,
+                    user: Some(proto::xray::common::protocol::User {
+                        level: 0,
+                        email: "trojan-httpupgrade@example.test".into(),
+                        account: Some(proto::xray::common::serial::TypedMessage {
+                            r#type: TYPE_PROXY_TROJAN_ACCOUNT.to_string(),
+                            value: TrojanAccountPayload {
+                                password: "secret".into(),
+                            }
+                            .encode_to_vec(),
+                        }),
+                    }),
+                }),
+            }
+            .encode_to_vec(),
+        };
+        let transport_settings = proto::xray::common::serial::TypedMessage {
+            r#type: TYPE_TRANSPORT_HTTPUPGRADE_CONFIG.to_string(),
+            value: HttpUpgradeConfigPayload {
+                host: "upgrade.example.test".into(),
+                path: "/trojan".into(),
+                header: std::collections::HashMap::from([(
+                    "X-Test".into(),
+                    "chimera".into(),
+                )]),
+                accept_proxy_protocol: false,
+                ed: 1,
+            }
+            .encode_to_vec(),
+        };
+        let sender_settings = proto::xray::common::serial::TypedMessage {
+            r#type: "xray.app.proxyman.SenderConfig".into(),
+            value: SenderConfigPayload {
+                stream_settings: Some(StreamConfigPayload {
+                    protocol_name: "httpupgrade".into(),
+                    transport_settings: vec![TransportConfigPayload {
+                        settings: Some(transport_settings),
+                        protocol_name: "httpupgrade".into(),
+                    }],
+                    security_type: String::new(),
+                    security_settings: Vec::new(),
+                    quic_params: None,
+                }),
+            }
+            .encode_to_vec(),
+        };
+        let outbound = service
+            .parse_add_outbound(proto::xray::core::OutboundHandlerConfig {
+                tag: "httpupgrade-trojan".into(),
+                sender_settings: Some(sender_settings),
+                proxy_settings: Some(proxy_settings),
+                ..proto::xray::core::OutboundHandlerConfig::default()
+            })
+            .expect("dynamic Trojan HTTPUpgrade early-data should be accepted");
+        assert_eq!(outbound.protocol, "trojan");
+        assert_eq!(
+            outbound.sender_settings_type.as_deref(),
+            Some("xray.app.proxyman.SenderConfig")
+        );
+    }
+
+    #[cfg(all(feature = "trojan", feature = "grpc_transport"))]
+    #[test]
+    fn handler_accepts_grpc_trojan_outbound_modes_and_tuning() {
+        let service =
+            HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+        let proxy_settings = proto::xray::common::serial::TypedMessage {
+            r#type: TYPE_PROXY_TROJAN_CLIENT_CONFIG.to_string(),
+            value: TrojanClientConfigPayload {
+                server: Some(SocksServerEndpointPayload {
+                    address: Some(localhost_ip_payload()),
+                    port: 443,
+                    user: Some(proto::xray::common::protocol::User {
+                        level: 0,
+                        email: "trojan-grpc@example.test".into(),
+                        account: Some(proto::xray::common::serial::TypedMessage {
+                            r#type: TYPE_PROXY_TROJAN_ACCOUNT.to_string(),
+                            value: TrojanAccountPayload {
+                                password: "secret".into(),
+                            }
+                            .encode_to_vec(),
+                        }),
+                    }),
+                }),
+            }
+            .encode_to_vec(),
+        };
+        let sender = |config: GrpcConfigPayload| {
+            let transport_settings = proto::xray::common::serial::TypedMessage {
+                r#type: TYPE_TRANSPORT_GRPC_CONFIG.to_string(),
+                value: config.encode_to_vec(),
+            };
+            proto::xray::common::serial::TypedMessage {
+                r#type: "xray.app.proxyman.SenderConfig".into(),
+                value: SenderConfigPayload {
+                    stream_settings: Some(StreamConfigPayload {
+                        protocol_name: "grpc".into(),
+                        transport_settings: vec![TransportConfigPayload {
+                            settings: Some(transport_settings),
+                            protocol_name: "grpc".into(),
+                        }],
+                        security_type: String::new(),
+                        security_settings: Vec::new(),
+                        quic_params: None,
+                    }),
+                }
+                .encode_to_vec(),
+            }
+        };
+        let baseline = GrpcConfigPayload {
+            authority: "grpc.example.test".into(),
+            service_name: "GunService".into(),
+            multi_mode: false,
+            idle_timeout: 0,
+            health_check_timeout: 0,
+            permit_without_stream: false,
+            initial_windows_size: 0,
+            user_agent: "chimera-test".into(),
+        };
+        let outbound = service
+            .parse_add_outbound(proto::xray::core::OutboundHandlerConfig {
+                tag: "grpc-trojan".into(),
+                sender_settings: Some(sender(baseline.clone())),
+                proxy_settings: Some(proxy_settings.clone()),
+                ..proto::xray::core::OutboundHandlerConfig::default()
+            })
+            .expect("dynamic Trojan gRPC Tun should be accepted");
+        assert_eq!(outbound.protocol, "trojan");
+        assert_eq!(
+            outbound.sender_settings_type.as_deref(),
+            Some("xray.app.proxyman.SenderConfig")
+        );
+
+        let mut multi_mode = baseline.clone();
+        multi_mode.multi_mode = true;
+        let multi = service
+            .parse_add_outbound(proto::xray::core::OutboundHandlerConfig {
+                tag: "grpc-multimode-trojan".into(),
+                sender_settings: Some(sender(multi_mode)),
+                proxy_settings: Some(proxy_settings.clone()),
+                ..proto::xray::core::OutboundHandlerConfig::default()
+            })
+            .expect("dynamic Trojan gRPC TunMulti should be accepted");
+        assert_eq!(multi.protocol, "trojan");
+        assert!(multi.sender_settings_value.is_some());
+
+        let mut tuned = baseline;
+        tuned.idle_timeout = 10;
+        tuned.health_check_timeout = 7;
+        tuned.permit_without_stream = true;
+        tuned.initial_windows_size = 1 << 20;
+        let tuned = service
+            .parse_add_outbound(proto::xray::core::OutboundHandlerConfig {
+                tag: "grpc-tuned-trojan".into(),
+                sender_settings: Some(sender(tuned)),
+                proxy_settings: Some(proxy_settings),
+                ..proto::xray::core::OutboundHandlerConfig::default()
+            })
+            .expect(
+                "dynamic Trojan gRPC keepalive/window tuning should be accepted",
+            );
+        assert_eq!(tuned.protocol, "trojan");
+        assert!(tuned.sender_settings_value.is_some());
     }
 
     #[cfg(feature = "vless")]
@@ -3144,6 +3964,7 @@ mod tests {
             transport: Transport::Tcp,
             quic_settings: None,
             sniffing: None,
+            tcp_socket_policy: None,
         };
         let runtime = RuntimeState::new(vec![inbound], Vec::new());
         let placeholder_task = tokio::spawn(std::future::pending::<()>());
@@ -3275,6 +4096,7 @@ mod tests {
             transport: Transport::Tcp,
             quic_settings: None,
             sniffing: None,
+            tcp_socket_policy: None,
         };
         let runtime = RuntimeState::new(vec![inbound], Vec::new());
         let service = HandlerServiceImpl::new(runtime);
@@ -3653,6 +4475,7 @@ mod tests {
                                     "ignored-inbound".to_string(),
                                 )]),
                                 accept_proxy_protocol: false,
+                                ed: 0,
                                 heartbeat_period: 0,
                             }
                             .encode_to_vec(),
@@ -3670,10 +4493,12 @@ mod tests {
                                         .to_string(),
                                     key_path: "/tmp/test-key.pem".to_string(),
                                 }],
+                                server_name: String::new(),
                                 next_protocol: vec![
                                     "h2".to_string(),
                                     "http/1.1".to_string(),
                                 ],
+                                disable_system_root: false,
                             }
                             .encode_to_vec(),
                         },
@@ -4034,7 +4859,9 @@ mod tests {
                                     certificate_path: String::new(),
                                     key_path: String::new(),
                                 }],
+                                server_name: String::new(),
                                 next_protocol: vec!["h3".to_string()],
+                                disable_system_root: false,
                             },
                         )],
                         quic_params: None,
@@ -4102,7 +4929,9 @@ mod tests {
                                     certificate_path: String::new(),
                                     key_path: String::new(),
                                 }],
+                                server_name: String::new(),
                                 next_protocol: vec!["h3".to_string()],
+                                disable_system_root: false,
                             },
                         )],
                         quic_params: Some(QuicParamsPayload {
@@ -4192,6 +5021,7 @@ mod tests {
                                 max_client_ver: Vec::new(),
                                 max_time_diff: 30,
                                 short_ids: vec![vec![1, 2, 3, 4, 5, 6, 7, 8]],
+                                ..RealityConfigPayload::default()
                             },
                         )],
                         quic_params: None,
@@ -4297,6 +5127,7 @@ mod tests {
                                 max_client_ver: vec![1, 8, 9],
                                 max_time_diff: 30,
                                 short_ids: vec![vec![1, 2, 3, 4, 5, 6, 7, 8]],
+                                ..RealityConfigPayload::default()
                             }
                             .encode_to_vec(),
                         },
@@ -4367,6 +5198,7 @@ mod tests {
             transport: Transport::Tcp,
             quic_settings: None,
             sniffing: None,
+            tcp_socket_policy: None,
         };
         let runtime = RuntimeState::new(vec![inbound], Vec::new());
         let service = HandlerServiceImpl::new(runtime);
@@ -4513,6 +5345,7 @@ mod tests {
             transport: Transport::Tcp,
             quic_settings: None,
             sniffing: None,
+            tcp_socket_policy: None,
         };
         let runtime = RuntimeState::new(vec![inbound], Vec::new());
         let service = HandlerServiceImpl::new(runtime);
@@ -4709,6 +5542,7 @@ mod tests {
             transport: Transport::Tcp,
             quic_settings: None,
             sniffing: None,
+            tcp_socket_policy: None,
         };
         let runtime = RuntimeState::new(vec![inbound.clone()], Vec::new());
         let handles = start_servers(inbound, runtime.clone())
@@ -4952,6 +5786,7 @@ mod tests {
             transport: Transport::Tcp,
             quic_settings: None,
             sniffing: None,
+            tcp_socket_policy: None,
         };
         let runtime = RuntimeState::new(vec![inbound], Vec::new());
         let service = HandlerServiceImpl::new(runtime);
@@ -5309,6 +6144,7 @@ mod tests {
             transport: Transport::Quic,
             quic_settings: None,
             sniffing: None,
+            tcp_socket_policy: None,
         };
         let runtime = RuntimeState::new(vec![inbound], Vec::new());
         let service = HandlerServiceImpl::new(runtime.clone());

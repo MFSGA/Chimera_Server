@@ -25,8 +25,8 @@ pub use types::{
 #[allow(unused_imports)]
 pub use types::{
     InboundSniffingConfig, ServerConfig, ServerProxyConfig, SocksUser,
-    SocksUserStore, XhttpDataPlacement, XhttpMode, XhttpPaddingMethod,
-    XhttpPaddingPlacement, XhttpPlacement, XhttpServerConfig,
+    SocksUserStore, TcpBrutalConfig, TcpSocketPolicy, XhttpDataPlacement, XhttpMode,
+    XhttpPaddingMethod, XhttpPaddingPlacement, XhttpPlacement, XhttpServerConfig,
 };
 
 #[cfg(feature = "reality")]

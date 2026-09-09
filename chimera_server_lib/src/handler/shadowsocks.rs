@@ -904,6 +904,28 @@ impl ShadowsocksUdpCodec {
         Ok(request)
     }
 
+    #[cfg(test)]
+    pub(crate) fn encrypt_test_request(
+        &self,
+        target: &NetLocation,
+        payload: &[u8],
+    ) -> io::Result<Vec<u8>> {
+        let user = self.users.first().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Shadowsocks UDP test codec has no users",
+            )
+        })?;
+        let request = ShadowsocksUdpRequest {
+            target_location: target.clone(),
+            payload: Vec::new(),
+            identity: String::new(),
+            user_index: 0,
+            client_session_id: None,
+        };
+        user.encrypt_packet(&request, target, payload)
+    }
+
     pub(crate) fn encrypt_packet(
         &self,
         request: &ShadowsocksUdpRequest,

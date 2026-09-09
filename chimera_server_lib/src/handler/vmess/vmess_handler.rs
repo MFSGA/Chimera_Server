@@ -1647,6 +1647,7 @@ mod tests {
             stream,
             RuntimeState::new(Vec::new(), Vec::new()),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 43152)),
+            None,
             traffic_context,
         ));
 

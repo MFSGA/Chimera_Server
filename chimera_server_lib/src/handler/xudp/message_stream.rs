@@ -1643,6 +1643,7 @@ mod tests {
             RuntimeState::new(Vec::new(), Vec::new()),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 43024)),
             None,
+            None,
         ));
 
         for expected in [b"first".as_slice(), b"second".as_slice()] {
@@ -1729,6 +1730,7 @@ mod tests {
             Box::new(stream),
             RuntimeState::new(Vec::new(), Vec::new()),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 43025)),
+            None,
             None,
         ));
 
@@ -1842,6 +1844,7 @@ mod tests {
             Box::new(stream),
             RuntimeState::new(Vec::new(), Vec::new()),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 43023)),
+            None,
             None,
         ));
 
