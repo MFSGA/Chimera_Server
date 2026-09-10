@@ -53,7 +53,7 @@ pub(crate) struct XudpMessageStream {
     pending_write_offset: usize,
     write_prefix: Option<Vec<u8>>,
     pending_end_reply: Option<(u16, bool)>,
-    reader_task: JoinHandle<()>,
+    reader_task: Option<JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for XudpMessageStream {
@@ -93,7 +93,23 @@ impl XudpMessageStream {
             pending_write_offset: 0,
             write_prefix: (!write_prefix.is_empty()).then_some(write_prefix),
             pending_end_reply: None,
-            reader_task,
+            reader_task: Some(reader_task),
+        }
+    }
+
+    fn poll_reader_task_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        let finished = match self.reader_task.as_mut() {
+            Some(task) => {
+                task.abort();
+                std::future::Future::poll(Pin::new(task), cx).is_ready()
+            }
+            None => true,
+        };
+        if finished {
+            self.reader_task = None;
+            Poll::Ready(())
+        } else {
+            Poll::Pending
         }
     }
 
@@ -167,7 +183,9 @@ impl XudpMessageStream {
 
 impl Drop for XudpMessageStream {
     fn drop(&mut self) {
-        self.reader_task.abort();
+        if let Some(task) = self.reader_task.as_ref() {
+            task.abort();
+        }
     }
 }
 
@@ -321,6 +339,9 @@ impl AsyncShutdownMessage for XudpMessageStream {
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
+        if this.poll_reader_task_shutdown(cx).is_pending() {
+            return Poll::Pending;
+        }
         match this.poll_pending_write(cx) {
             Poll::Ready(Ok(())) => Pin::new(&mut this.writer).poll_shutdown(cx),
             Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
@@ -1938,6 +1959,10 @@ mod tests {
             poll_fn(|cx| Pin::new(&mut stream).poll_shutdown_message(cx))
                 .await
                 .expect("shutdown XUDP one-byte transport");
+            assert!(
+                stream.reader_task.is_none(),
+                "explicit XUDP shutdown must await the reader task"
+            );
         });
 
         let mut actual = Vec::new();

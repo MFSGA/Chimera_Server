@@ -35,7 +35,7 @@ pub(crate) struct TrojanUdpStream {
     writer: WriteHalf<Box<dyn AsyncStream>>,
     pending_write: Vec<u8>,
     pending_write_offset: usize,
-    reader_task: JoinHandle<()>,
+    reader_task: Option<JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for TrojanUdpStream {
@@ -67,7 +67,7 @@ impl TrojanUdpStream {
             writer,
             pending_write: Vec::new(),
             pending_write_offset: 0,
-            reader_task,
+            reader_task: Some(reader_task),
         }
     }
 
@@ -79,6 +79,22 @@ impl TrojanUdpStream {
         let packet = encode_location_packet(target, payload)?;
         self.writer.write_all(&packet).await?;
         self.writer.flush().await
+    }
+
+    fn poll_reader_task_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        let finished = match self.reader_task.as_mut() {
+            Some(task) => {
+                task.abort();
+                std::future::Future::poll(Pin::new(task), cx).is_ready()
+            }
+            None => true,
+        };
+        if finished {
+            self.reader_task = None;
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
     }
 
     pub(crate) async fn recv_from(
@@ -111,7 +127,9 @@ impl TrojanUdpStream {
 
 impl Drop for TrojanUdpStream {
     fn drop(&mut self) {
-        self.reader_task.abort();
+        if let Some(task) = self.reader_task.as_ref() {
+            task.abort();
+        }
     }
 }
 
@@ -198,7 +216,11 @@ impl AsyncShutdownMessage for TrojanUdpStream {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().writer).poll_shutdown(cx)
+        let this = self.get_mut();
+        if this.poll_reader_task_shutdown(cx).is_pending() {
+            return Poll::Pending;
+        }
+        Pin::new(&mut this.writer).poll_shutdown(cx)
     }
 }
 
@@ -574,6 +596,10 @@ mod tests {
             poll_fn(|cx| Pin::new(&mut stream).poll_shutdown_message(cx))
                 .await
                 .expect("shutdown Trojan UDP partial writer");
+            assert!(
+                stream.reader_task.is_none(),
+                "explicit Trojan UDP shutdown must await the reader task"
+            );
         });
 
         let mut actual = Vec::new();
