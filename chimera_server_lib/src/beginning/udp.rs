@@ -1638,7 +1638,7 @@ async fn attach_global_session_udp_session(
     let now = Instant::now();
     let worker_key = backend_start.worker_key(&key);
 
-    let (transition, attachment, worker_plan) = {
+    let (transition, attachment, worker_plan, replaced_worker) = {
         let mut guard = globals.lock().await;
         purge_expired_global_udp_workers(&mut guard, now);
 
@@ -1656,13 +1656,17 @@ async fn attach_global_session_udp_session(
             guard.workers.get(&global_id),
             &worker_key,
         ));
-        if worker_plan == GlobalUdpWorkerPlan::Replace
-            && let Some(worker) = guard.workers.remove(&global_id)
-        {
-            worker.task.abort();
-        }
-        (transition, attachment, worker_plan)
+        let replaced_worker = if worker_plan == GlobalUdpWorkerPlan::Replace {
+            guard.workers.remove(&global_id)
+        } else {
+            None
+        };
+        (transition, attachment, worker_plan, replaced_worker)
     };
+
+    if let Some(worker) = replaced_worker {
+        stop_global_udp_worker(worker).await;
+    }
 
     if worker_plan == GlobalUdpWorkerPlan::Replace {
         let worker = match start_global_session_udp_worker(
@@ -1683,17 +1687,27 @@ async fn attach_global_session_udp_session(
             }
         };
 
-        let mut guard = globals.lock().await;
-        if guard.registry.current(global_id, Instant::now())
-            != Some(transition.current)
-        {
-            worker.task.abort();
-            return Err(std::io::Error::other(
-                "global XUDP attachment changed during worker startup",
-            ));
-        }
-        if let Some(previous_worker) = guard.workers.insert(global_id, worker) {
-            previous_worker.task.abort();
+        let install_result = {
+            let mut guard = globals.lock().await;
+            if guard.registry.current(global_id, Instant::now())
+                != Some(transition.current)
+            {
+                Err(worker)
+            } else {
+                Ok(guard.workers.insert(global_id, worker))
+            }
+        };
+        match install_result {
+            Ok(Some(previous_worker)) => {
+                stop_global_udp_worker(previous_worker).await;
+            }
+            Ok(None) => {}
+            Err(worker) => {
+                stop_global_udp_worker(worker).await;
+                return Err(std::io::Error::other(
+                    "global XUDP attachment changed during worker startup",
+                ));
+            }
         }
     }
 
@@ -3890,6 +3904,82 @@ mod tests {
                 .is_ok(),
             "the next same-ID operation should proceed after release",
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn global_xudp_replacement_waits_for_previous_worker_cleanup() {
+        let global_id = [217, 218, 219, 220, 221, 222, 223, 224];
+        let (payload_sender, _payload_receiver) = mpsc::channel(1);
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let old_task = tokio::spawn(async move {
+            let _ = ready_sender.send(());
+            let _ = release_receiver.recv();
+            std::future::pending::<()>().await;
+        });
+        let old_abort = old_task.abort_handle();
+        ready_receiver
+            .await
+            .expect("previous GlobalID worker must start before replacement");
+
+        let globals = global_xudp_workers();
+        {
+            let mut guard = globals.lock().await;
+            assert!(
+                guard
+                    .workers
+                    .insert(
+                        global_id,
+                        GlobalSessionUdpWorker {
+                            key: GlobalUdpWorkerKey::Direct {
+                                target_is_ipv6: true,
+                                outbound_tag: None,
+                            },
+                            sender: payload_sender,
+                            attachment: Arc::new(RwLock::new(None)),
+                            attachment_notify: Arc::new(Notify::new()),
+                            task: old_task,
+                        },
+                    )
+                    .is_none(),
+                "replacement test GlobalID must be unused",
+            );
+        }
+
+        let (response_sender, _response_receiver) = mpsc::channel(1);
+        let replacement = tokio::spawn(start_session_udp_session(
+            604,
+            1,
+            TargetedUdpSessionKey {
+                target_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
+                outbound_tag: None,
+            },
+            response_sender,
+            None,
+            Some(global_id),
+            Duration::from_secs(5),
+        ));
+
+        sleep(Duration::from_millis(20)).await;
+        let returned_before_cleanup = replacement.is_finished();
+        release_sender
+            .send(())
+            .expect("release previous GlobalID worker cleanup");
+        let worker = timeout(Duration::from_secs(1), replacement)
+            .await
+            .expect("GlobalID replacement timeout")
+            .expect("GlobalID replacement task must not panic")
+            .expect("GlobalID replacement must succeed");
+
+        assert!(
+            !returned_before_cleanup,
+            "GlobalID replacement must not publish a new worker before the previous task exits",
+        );
+        assert!(old_abort.is_finished());
+
+        let mut sessions = HashMap::from([(604, worker)]);
+        terminate_session_udp_worker(&mut sessions, 604).await;
+        assert!(sessions.is_empty());
     }
 
     #[test]
