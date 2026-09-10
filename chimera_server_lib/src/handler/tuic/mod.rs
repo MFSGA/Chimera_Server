@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     num::NonZeroUsize,
     pin::Pin,
@@ -96,6 +97,13 @@ fn fragment_cache_size() -> NonZeroUsize {
         .unwrap_or_else(|| NonZeroUsize::new(1).expect("non-zero"))
 }
 
+fn spawn_tuic_connection<F>(runtime: &RuntimeState, future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    runtime.spawn_inbound_connection(future);
+}
+
 /// Run a TUIC v5 server bound to the provided address with the given TLS config.
 pub async fn run_tuic_server(
     bind_address: SocketAddr,
@@ -185,7 +193,8 @@ pub async fn run_tuic_server(
                 let uuid = uuid.clone();
                 let password = password.clone();
                 let connection_context = connection_context.clone();
-                tokio::spawn(async move {
+                let connection_runtime = connection_context.runtime.clone();
+                spawn_tuic_connection(&connection_runtime, async move {
                     if let Err(e) = process_connection(
                         resolver,
                         uuid,
@@ -1570,6 +1579,34 @@ mod tests {
         runtime::OutboundSummary,
         traffic::{register_connection, snapshot},
     };
+
+    #[tokio::test]
+    async fn tuic_connection_task_uses_server_owner() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+
+        spawn_tuic_connection(&runtime, async move {
+            let _ = release_rx.await;
+        });
+        for _ in 0..50 {
+            if runtime.tracked_inbound_connection_count() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(runtime.tracked_inbound_connection_count(), 1);
+
+        release_tx
+            .send(())
+            .expect("release tracked TUIC connection");
+        for _ in 0..50 {
+            if runtime.tracked_inbound_connection_count() == 0 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("completed TUIC connection should leave server owner");
+    }
 
     #[test]
     fn traffic_context_applies_level_zero_and_system_stats_policy() {
