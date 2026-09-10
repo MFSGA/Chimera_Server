@@ -248,7 +248,12 @@ cargo check -p chimera_server_app --no-default-features --features minimal-vless
   Reuse existing helpers when available; do not assume a `tests/common` module exists.
 - Read prerequisites before running ignored or environment-dependent tests. Select related
   tests with `cargo test -p <package> <filter> -- --ignored`; do not run every network or
-  performance probe by default.
+  performance probe by default. `#[ignore]` suppresses execution, not compilation: integration
+  tests and their helpers must still compile on every CI target that builds the test target.
+- Treat direct uses of `libc`, Unix signals/file descriptors, platform socket options, shell/process
+  behavior and path conventions as platform-sensitive. Shared code and test targets must either
+  use a portable abstraction or an explicit `#[cfg(...)]` boundary, and affected Windows/Linux CI
+  targets must be checked before considering the change release-ready.
 - `cargo test --locked` requires the existing lockfile to remain unchanged; it does not update
   or pin dependencies itself. After an intentional lockfile update, use it to verify the result.
 - Root workspace commands do not cover `bench/chimera_perf/`. For probe changes, use
@@ -290,7 +295,11 @@ cargo test --locked
 ```
 
 - Also check the current CI matrix for applicable platform and feature coverage. CI coverage
-  does not replace the required release checks above.
+  does not replace the required release checks above. Before any stable tag is created, the normal
+  CI matrix for the exact candidate SHA must be green on all required supported targets, including
+  Windows tests where configured; a local Linux run or Ubuntu-only release gate is not a substitute.
+  Release workflow design must keep tag/Release publication downstream of those cross-platform
+  preflight results rather than publishing first and appending platform artifacts afterward.
 - Publish the completed goal directly as `vX.Y.Z`, then deploy and validate that released
   version before beginning the next primary protocol goal.
 - If deployed validation fails, fix that same goal and publish a new patch version before
@@ -303,8 +312,15 @@ cargo test --locked
 - Preserve other contributors' modified and untracked files. Do not revert unrelated changes
   or include them in a commit. Keep commits focused on the requested behavior.
 - Never amend a commit unless you created HEAD in this conversation and no hook rejected it.
+- Treat release preparation and remote publication as separate authorization boundaries. Running
+  gates, preparing a version, or discussing a release does not authorize pushing/moving tags,
+  publishing/deleting GitHub Releases, force-pushing rewritten history, or deleting remote refs.
+  Before any such irreversible remote mutation, state the exact candidate/ref and mutation, then
+  obtain explicit authorization for that operation.
 - Do not run destructive commands such as `git reset --hard` or `git checkout --` without
-  explicit instruction.
+  explicit instruction. For an explicitly authorized history rewrite, preserve recovery refs,
+  prefer an isolated worktree, review with `git range-diff`, and update shared branches only with
+  `--force-with-lease` against a recorded expected remote SHA; never use a blind `--force`.
 - Check for applicable editor or contributor instructions when needed rather than relying on
   dated claims that particular rule files do not exist.
 - A TODO describes unfinished work; it does not override current instructions or authorize
