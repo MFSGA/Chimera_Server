@@ -763,9 +763,6 @@ impl HandlerServiceImpl {
         &self,
         inbound: proto::xray::core::InboundHandlerConfig,
     ) -> Result<ServerConfig, Status> {
-        if inbound.tag.trim().is_empty() {
-            return Err(Status::invalid_argument("inbound tag is required"));
-        }
         let receiver_settings =
             inbound.receiver_settings.as_ref().ok_or_else(|| {
                 Status::invalid_argument("inbound.receiver_settings is required")
@@ -3324,6 +3321,9 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
     > {
         let request = request.into_inner();
         let operation = self.parse_alter_inbound_operation(request.operation)?;
+        if request.tag.is_empty() {
+            return Err(Status::not_found("inbound not found"));
+        }
         if matches!(&operation, AlterInboundOperation::Noop) {
             return Ok(Response::new(
                 proto::xray::app::proxyman::command::AlterInboundResponse {},
@@ -5075,6 +5075,72 @@ mod tests {
                 | std::io::ErrorKind::ConnectionAborted
                 | std::io::ErrorKind::TimedOut
         ));
+    }
+
+    #[tokio::test]
+    async fn handler_allows_multiple_untagged_inbounds_but_cannot_remove_by_empty_tag()
+     {
+        let fixture = build_fixture();
+        let service = HandlerServiceImpl::new(fixture.runtime.clone());
+        let first_port = free_localhost_port();
+        let second_port = free_localhost_port();
+
+        service
+            .add_inbound(Request::new(build_add_inbound_request("", first_port)))
+            .await
+            .expect("first untagged AddInbound should succeed");
+        service
+            .add_inbound(Request::new(build_add_inbound_request("", second_port)))
+            .await
+            .expect("second untagged AddInbound should succeed");
+
+        let listed = service
+            .list_inbounds(Request::new(
+                proto::xray::app::proxyman::command::ListInboundsRequest {
+                    is_only_tags: true,
+                },
+            ))
+            .await
+            .expect("list untagged inbounds")
+            .into_inner();
+        assert_eq!(
+            listed
+                .inbounds
+                .iter()
+                .filter(|item| item.tag.is_empty())
+                .count(),
+            2
+        );
+
+        for port in [first_port, second_port] {
+            tokio::net::TcpStream::connect(SocketAddrV4::new(
+                Ipv4Addr::LOCALHOST,
+                port,
+            ))
+            .await
+            .expect("untagged listener should accept connections");
+        }
+
+        let error = service
+            .remove_inbound(Request::new(
+                proto::xray::app::proxyman::command::RemoveInboundRequest {
+                    tag: String::new(),
+                },
+            ))
+            .await
+            .expect_err("Xray does not address untagged inbounds by empty tag");
+        assert_eq!(error.code(), Code::NotFound);
+
+        assert_eq!(
+            fixture
+                .runtime
+                .inbounds()
+                .iter()
+                .filter(|item| item.tag.is_empty())
+                .count(),
+            2
+        );
+        assert_eq!(fixture.runtime.inbound_manager().stop_all_tasks().await, 2);
     }
 
     #[cfg(all(feature = "vless", feature = "ws", feature = "tls"))]

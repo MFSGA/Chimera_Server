@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, hash_map::DefaultHasher},
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     io,
     sync::{Arc, RwLock},
@@ -1139,10 +1139,11 @@ impl InboundManager {
 
     pub(crate) fn add_config(&self, config: ServerConfig) -> Result<(), String> {
         let mut state = self.state.write().expect("inbound manager lock poisoned");
-        if state
-            .configs
-            .iter()
-            .any(|current| current.config.tag == config.tag)
+        if (!config.tag.is_empty()
+            && state
+                .configs
+                .iter()
+                .any(|current| current.config.tag == config.tag))
             || state.pending.contains_key(&config.tag)
         {
             return Err(format!("inbound {} already exists", config.tag));
@@ -1311,7 +1312,8 @@ impl InboundManager {
         let generation = {
             let mut state =
                 self.state.write().expect("inbound manager lock poisoned");
-            if state.configs.iter().any(|entry| entry.config.tag == tag)
+            if (!tag.is_empty()
+                && state.configs.iter().any(|entry| entry.config.tag == tag))
                 || state.pending.contains_key(&tag)
             {
                 return Err(AddInboundError::AlreadyExists(format!(
@@ -1339,7 +1341,9 @@ impl InboundManager {
                 .into_handles(),
         );
         let mut state = self.state.write().expect("inbound manager lock poisoned");
-        if state.configs.iter().any(|entry| entry.config.tag == tag) {
+        if !tag.is_empty()
+            && state.configs.iter().any(|entry| entry.config.tag == tag)
+        {
             return Err(AddInboundError::AlreadyExists(format!(
                 "inbound {tag} already exists"
             )));
@@ -1369,15 +1373,28 @@ impl InboundManager {
         skip_tag: Option<&str>,
     ) -> io::Result<usize> {
         let manager = runtime.inbound_manager();
-        let tags = self
-            .configs()
-            .into_iter()
-            .map(|config| config.tag)
-            .collect::<Vec<_>>();
+        let identities = {
+            let state = self.state.read().expect("inbound manager lock poisoned");
+            let mut tagged = HashSet::new();
+            for entry in &state.configs {
+                let tag = entry.config.tag.as_str();
+                if !tag.is_empty() && !tagged.insert(tag) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("inbound {tag} already exists"),
+                    ));
+                }
+            }
+            state
+                .configs
+                .iter()
+                .map(|entry| (entry.config.tag.clone(), entry.generation))
+                .collect::<Vec<_>>()
+        };
         let mut rollback = ConfiguredStartGuard::new(Arc::clone(&manager));
         let mut started = 0usize;
 
-        for tag in tags {
+        for (tag, expected_generation) in identities {
             if skip_tag == Some(tag.as_str()) {
                 continue;
             }
@@ -1385,11 +1402,10 @@ impl InboundManager {
             let prepared = {
                 let mut state =
                     self.state.write().expect("inbound manager lock poisoned");
-                match state
-                    .configs
-                    .iter()
-                    .position(|entry| entry.config.tag == tag)
-                {
+                match state.configs.iter().position(|entry| {
+                    entry.config.tag == tag
+                        && entry.generation == expected_generation
+                }) {
                     None => Err(io::Error::other(format!(
                         "configured inbound {tag} disappeared during startup"
                     ))),
@@ -1459,6 +1475,9 @@ impl InboundManager {
         self: &Arc<Self>,
         tag: &str,
     ) -> Result<(), RemoveInboundError> {
+        if tag.is_empty() {
+            return Err(RemoveInboundError::NotFound);
+        }
         let _operation_guard = self.operation_lock(tag).lock().await;
         let (generation, task_set) = {
             let mut state =
@@ -1999,6 +2018,63 @@ mod tests {
             manager.config_by_tag("primary").map(|config| config.tag),
             Some("primary".to_string())
         );
+    }
+
+    #[test]
+    fn config_registry_allows_multiple_untagged_inbounds() {
+        let manager = InboundManager::new(Vec::new());
+
+        manager
+            .add_config(inbound("", 10001))
+            .expect("first untagged inbound");
+        manager
+            .add_config(inbound("", 10002))
+            .expect("second untagged inbound");
+        assert_eq!(manager.configs().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn configured_start_uses_generation_for_untagged_inbounds() {
+        let first_port = free_localhost_port();
+        let second_port = free_localhost_port();
+        let runtime = RuntimeState::new(
+            vec![inbound("", first_port), inbound("", second_port)],
+            Vec::new(),
+        );
+        let manager = runtime.inbound_manager();
+
+        assert_eq!(
+            manager
+                .start_configured_inbounds(runtime.clone(), None)
+                .await
+                .expect("start untagged inbounds"),
+            2
+        );
+        assert!(wait_for_tcp_listener(first_port).await);
+        assert!(wait_for_tcp_listener(second_port).await);
+        assert_eq!(manager.stop_all_tasks().await, 2);
+    }
+
+    #[tokio::test]
+    async fn configured_start_rejects_duplicate_nonempty_tags_before_binding() {
+        let first_port = free_localhost_port();
+        let second_port = free_localhost_port();
+        let runtime = RuntimeState::new(
+            vec![
+                inbound("duplicate", first_port),
+                inbound("duplicate", second_port),
+            ],
+            Vec::new(),
+        );
+        let manager = runtime.inbound_manager();
+
+        let error = manager
+            .start_configured_inbounds(runtime, None)
+            .await
+            .expect_err("duplicate nonempty tags must fail startup");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, first_port)).is_ok());
+        assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, second_port)).is_ok());
     }
 
     #[tokio::test]
