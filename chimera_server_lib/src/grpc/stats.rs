@@ -1,5 +1,8 @@
 use super::proto;
-use crate::{runtime::RuntimeState, traffic};
+use crate::{
+    runtime::{RuntimeLifecycleState, RuntimeState},
+    traffic,
+};
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -345,13 +348,20 @@ impl proto::xray::app::stats::command::stats_service_server::StatsService
         _request: Request<proto::xray::app::stats::command::SysStatsRequest>,
     ) -> Result<Response<proto::xray::app::stats::command::SysStatsResponse>, Status>
     {
-        if let Some(runtime) = &self.runtime
-            && !runtime.is_ready()
-        {
-            return Err(Status::unavailable(format!(
-                "server is {}",
-                runtime.lifecycle_state().as_str()
-            )));
+        if let Some(runtime) = &self.runtime {
+            let lifecycle = runtime.lifecycle_state();
+            if lifecycle != RuntimeLifecycleState::Running {
+                return Err(Status::unavailable(format!(
+                    "server is {}",
+                    lifecycle.as_str()
+                )));
+            }
+            if let Some(failure) = runtime.unhealthy_inbound() {
+                return Err(Status::unavailable(format!(
+                    "inbound {} generation {} is unhealthy",
+                    failure.tag, failure.generation
+                )));
+            }
         }
 
         let stats = self.sys_stats();
@@ -576,7 +586,14 @@ pub(super) fn build_service(
 mod tests {
     use super::proto::xray::app::stats::command::stats_service_server::StatsService;
     use super::*;
-    use crate::traffic::{self, TrafficContext};
+    use crate::{
+        address::{BindLocation, NetLocation},
+        config::{
+            Transport,
+            server_config::{ServerConfig, ServerProxyConfig, SocksUserStore},
+        },
+        traffic::{self, TrafficContext},
+    };
     use std::{
         collections::HashMap,
         net::{IpAddr, Ipv4Addr},
@@ -989,6 +1006,49 @@ mod tests {
             .await
             .expect_err("stopped runtime must not report ready");
         assert_eq!(stopped.code(), Code::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn stats_get_sys_stats_reports_unhealthy_inbound_identity() {
+        let runtime = RuntimeState::new(
+            vec![ServerConfig {
+                tag: "failed-listener".to_string(),
+                bind_location: BindLocation::Address(NetLocation::from_ip_addr(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    10001,
+                )),
+                protocol: ServerProxyConfig::Socks {
+                    accounts: SocksUserStore::new(Vec::new()),
+                    udp_enabled: false,
+                    udp_response_ip: None,
+                    user_level: 0,
+                },
+                transport: Transport::Tcp,
+                quic_settings: None,
+                sniffing: None,
+                tcp_socket_policy: None,
+            }],
+            Vec::new(),
+        );
+        let generation = runtime
+            .inbound_manager()
+            .generation("failed-listener")
+            .expect("inbound generation");
+        assert!(runtime.mark_running());
+        runtime
+            .register_inbound_tasks("failed-listener", vec![tokio::spawn(async {})]);
+        tokio::task::yield_now().await;
+        let service = StatsServiceImpl::with_runtime(runtime);
+
+        let error = service
+            .get_sys_stats(Request::new(
+                proto::xray::app::stats::command::SysStatsRequest {},
+            ))
+            .await
+            .expect_err("failed inbound should make readiness unavailable");
+        assert_eq!(error.code(), Code::Unavailable);
+        assert!(error.message().contains("failed-listener"));
+        assert!(error.message().contains(&generation.to_string()));
     }
 
     #[tokio::test]

@@ -3,6 +3,7 @@ use std::{
     hash::{Hash, Hasher},
     io,
     sync::{Arc, RwLock},
+    time::Duration,
 };
 
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -50,8 +51,10 @@ enum InboundLifecycleState {
     Prepared,
     Starting,
     Running,
+    Draining,
     Stopping,
     Recovering,
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -569,6 +572,12 @@ fn replace_single_shadowsocks_users(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InboundFailure {
+    pub(crate) tag: String,
+    pub(crate) generation: u64,
+}
+
 #[derive(Debug)]
 struct InboundTaskSet {
     generation: u64,
@@ -944,6 +953,66 @@ impl InboundManager {
             .or_else(|| state.pending.get(tag).map(|entry| entry.lifecycle))
     }
 
+    pub(crate) fn unhealthy_inbound(&self) -> Option<InboundFailure> {
+        self.state
+            .read()
+            .expect("inbound manager lock poisoned")
+            .configs
+            .iter()
+            .find(|entry| {
+                entry.lifecycle == InboundLifecycleState::Failed
+                    || (entry.lifecycle == InboundLifecycleState::Running
+                        && entry.tasks.as_ref().is_some_and(|handles| {
+                            handles.iter().any(JoinHandle::is_finished)
+                        }))
+            })
+            .map(|entry| InboundFailure {
+                tag: entry.config.tag.clone(),
+                generation: entry.generation,
+            })
+    }
+
+    pub(crate) fn has_unhealthy_inbound(&self) -> bool {
+        self.state
+            .read()
+            .expect("inbound manager lock poisoned")
+            .configs
+            .iter()
+            .any(|entry| {
+                entry.lifecycle == InboundLifecycleState::Failed
+                    || (entry.lifecycle == InboundLifecycleState::Running
+                        && entry.tasks.as_ref().is_some_and(|handles| {
+                            handles.iter().any(JoinHandle::is_finished)
+                        }))
+            })
+    }
+
+    fn detect_running_failure(&self) -> Option<InboundFailure> {
+        let mut state = self.state.write().expect("inbound manager lock poisoned");
+        let entry = state.configs.iter_mut().find(|entry| {
+            entry.lifecycle == InboundLifecycleState::Running
+                && entry.tasks.as_ref().is_some_and(|handles| {
+                    handles.iter().any(JoinHandle::is_finished)
+                })
+        })?;
+        entry.lifecycle = InboundLifecycleState::Failed;
+        Some(InboundFailure {
+            tag: entry.config.tag.clone(),
+            generation: entry.generation,
+        })
+    }
+
+    pub(crate) async fn wait_for_failure(&self) -> InboundFailure {
+        const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+        loop {
+            if let Some(failure) = self.detect_running_failure() {
+                return failure;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
     pub(crate) fn configs(&self) -> Vec<ServerConfig> {
         self.state
             .read()
@@ -1131,9 +1200,13 @@ impl InboundManager {
                 .iter_mut()
                 .filter_map(|entry| {
                     let handles = entry.tasks.take()?;
-                    entry.lifecycle = InboundLifecycleState::Stopping;
+                    let failed = entry.lifecycle == InboundLifecycleState::Failed;
+                    if !failed {
+                        entry.lifecycle = InboundLifecycleState::Draining;
+                    }
                     Some((
                         entry.config.tag.clone(),
+                        failed,
                         InboundTaskSet {
                             generation: entry.generation,
                             handles,
@@ -1145,19 +1218,21 @@ impl InboundManager {
 
         // Abort every listener before awaiting any of them so server shutdown
         // stops accepting new connections across all inbounds promptly.
-        for (_, task_set) in &task_sets {
+        for (_, _, task_set) in &task_sets {
             abort_tasks(&task_set.handles);
         }
 
         let stopped = task_sets.len();
-        for (tag, task_set) in task_sets {
+        for (tag, failed, task_set) in task_sets {
             let generation = task_set.generation;
             stop_task_set(task_set).await;
-            self.set_lifecycle_for_generation(
-                &tag,
-                generation,
-                InboundLifecycleState::Prepared,
-            );
+            if !failed {
+                self.set_lifecycle_for_generation(
+                    &tag,
+                    generation,
+                    InboundLifecycleState::Prepared,
+                );
+            }
         }
         stopped
     }
@@ -1975,6 +2050,89 @@ mod tests {
         );
         assert_eq!(manager.configs().len(), 2);
         assert_eq!(manager.stop_all_tasks().await, 0);
+    }
+
+    #[tokio::test]
+    async fn server_shutdown_exposes_per_inbound_draining_state() {
+        let manager = Arc::new(InboundManager::new(vec![inbound("primary", 10001)]));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).expect("signal blocking task start");
+            release_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("wait for test release");
+        });
+        started_rx.recv().expect("blocking task should start");
+        manager.register_tasks("primary", vec![task]);
+
+        let stopping = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.stop_all_tasks().await })
+        };
+        for _ in 0..50 {
+            if manager.lifecycle_state("primary")
+                == Some(InboundLifecycleState::Draining)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            manager.lifecycle_state("primary"),
+            Some(InboundLifecycleState::Draining)
+        );
+
+        release_tx.send(()).expect("release blocking task");
+        assert_eq!(stopping.await.expect("join stop task"), 1);
+        assert_eq!(
+            manager.lifecycle_state("primary"),
+            Some(InboundLifecycleState::Prepared)
+        );
+    }
+
+    #[tokio::test]
+    async fn unexpected_listener_completion_marks_generation_failed() {
+        let manager = InboundManager::new(vec![inbound("primary", 10001)]);
+        let generation = manager.generation("primary").expect("generation");
+        manager.register_tasks("primary", vec![tokio::spawn(async {})]);
+        tokio::task::yield_now().await;
+
+        assert!(manager.has_unhealthy_inbound());
+        let failure =
+            tokio::time::timeout(Duration::from_secs(1), manager.wait_for_failure())
+                .await
+                .expect("listener failure should be detected");
+        assert_eq!(failure.tag, "primary");
+        assert_eq!(failure.generation, generation);
+        assert_eq!(
+            manager.lifecycle_state("primary"),
+            Some(InboundLifecycleState::Failed)
+        );
+
+        assert_eq!(manager.stop_all_tasks().await, 1);
+        assert_eq!(
+            manager.lifecycle_state("primary"),
+            Some(InboundLifecycleState::Failed)
+        );
+    }
+
+    #[tokio::test]
+    async fn intentional_listener_stop_is_not_reported_as_failure() {
+        let manager = InboundManager::new(vec![inbound("primary", 10001)]);
+        manager
+            .register_tasks("primary", vec![tokio::spawn(std::future::pending())]);
+
+        assert!(manager.stop_tasks("primary").await);
+        assert!(!manager.has_unhealthy_inbound());
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                manager.wait_for_failure()
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]

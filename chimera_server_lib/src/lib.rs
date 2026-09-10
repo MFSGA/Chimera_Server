@@ -128,6 +128,7 @@ enum ServerExit {
     Signal(&'static str),
     SignalError(std::io::Error),
     ServiceTask(Result<(), JoinError>),
+    InboundFailure(crate::inbound::InboundFailure),
 }
 
 async fn wait_for_shutdown_signal() -> std::io::Result<&'static str> {
@@ -643,23 +644,36 @@ async fn start_async(
     let exit = {
         let shutdown_signal = wait_for_shutdown_signal();
         let service_task = wait_for_service_task(&mut join_handles);
+        let inbound_failure = runtime_state.wait_for_inbound_failure();
         tokio::pin!(shutdown_signal);
         tokio::pin!(service_task);
+        tokio::pin!(inbound_failure);
         tokio::select! {
             result = &mut shutdown_signal => match result {
                 Ok(signal) => ServerExit::Signal(signal),
                 Err(error) => ServerExit::SignalError(error),
             },
             result = &mut service_task => ServerExit::ServiceTask(result),
+            failure = &mut inbound_failure => ServerExit::InboundFailure(failure),
         }
     };
 
-    if let ServerExit::Signal(signal) = &exit {
-        tracing::info!(
-            %signal,
-            grace_period_seconds = connection_drain_timeout.as_secs(),
-            "shutdown requested; stopping listeners"
-        );
+    match &exit {
+        ServerExit::Signal(signal) => {
+            tracing::info!(
+                %signal,
+                grace_period_seconds = connection_drain_timeout.as_secs(),
+                "shutdown requested; stopping listeners"
+            );
+        }
+        ServerExit::InboundFailure(failure) => {
+            tracing::error!(
+                inbound_tag = %failure.tag,
+                generation = failure.generation,
+                "inbound listener exited unexpectedly; shutting down server"
+            );
+        }
+        ServerExit::SignalError(_) | ServerExit::ServiceTask(_) => {}
     }
 
     let failed = !matches!(&exit, ServerExit::Signal(_));
@@ -691,6 +705,12 @@ async fn start_async(
         ServerExit::ServiceTask(Err(error)) => {
             tracing::error!(%error, "runtime task failed; server shut down");
             Err(Error::Io(std::io::Error::other(error)))
+        }
+        ServerExit::InboundFailure(failure) => {
+            Err(Error::Io(std::io::Error::other(format!(
+                "inbound {} generation {} listener exited unexpectedly",
+                failure.tag, failure.generation
+            ))))
         }
     }
 }

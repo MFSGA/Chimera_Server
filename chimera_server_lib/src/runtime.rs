@@ -23,7 +23,7 @@ use crate::{
 };
 use crate::{
     config::{def::PolicyConfig, server_config::ServerConfig},
-    inbound::InboundManager,
+    inbound::{InboundFailure, InboundManager},
     routing_state::{
         BalancerTargetMap, OutboundObservation, RouteMatch, RoutingEvent,
         RoutingInput, RoutingState,
@@ -176,6 +176,15 @@ impl RuntimeState {
 
     pub(crate) fn is_ready(&self) -> bool {
         self.lifecycle_state() == RuntimeLifecycleState::Running
+            && !self.inbound_manager.has_unhealthy_inbound()
+    }
+
+    pub(crate) fn unhealthy_inbound(&self) -> Option<InboundFailure> {
+        self.inbound_manager.unhealthy_inbound()
+    }
+
+    pub(crate) async fn wait_for_inbound_failure(&self) -> InboundFailure {
+        self.inbound_manager.wait_for_failure().await
     }
 
     pub(crate) fn mark_running(&self) -> bool {
@@ -855,6 +864,43 @@ mod tests {
         runtime.finish_shutdown(true);
         assert_eq!(runtime.lifecycle_state(), RuntimeLifecycleState::Failed);
         assert!(!runtime.is_ready());
+    }
+
+    #[tokio::test]
+    async fn runtime_readiness_fails_when_listener_exits_unexpectedly() {
+        let runtime = RuntimeState::new(
+            vec![ServerConfig {
+                tag: "failed-listener".to_string(),
+                bind_location: BindLocation::Address(NetLocation::from_ip_addr(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    10001,
+                )),
+                protocol: ServerProxyConfig::Socks {
+                    accounts: SocksUserStore::new(Vec::new()),
+                    udp_enabled: false,
+                    udp_response_ip: None,
+                    user_level: 0,
+                },
+                transport: Transport::Tcp,
+                quic_settings: None,
+                sniffing: None,
+                tcp_socket_policy: None,
+            }],
+            Vec::new(),
+        );
+        assert!(runtime.mark_running());
+        runtime
+            .register_inbound_tasks("failed-listener", vec![tokio::spawn(async {})]);
+        tokio::task::yield_now().await;
+
+        assert!(!runtime.is_ready());
+        let failure = tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.wait_for_inbound_failure(),
+        )
+        .await
+        .expect("listener failure should reach runtime");
+        assert_eq!(failure.tag, "failed-listener");
     }
 
     #[tokio::test]
