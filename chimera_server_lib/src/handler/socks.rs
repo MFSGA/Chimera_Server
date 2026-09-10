@@ -644,19 +644,30 @@ fn build_udp_associate_response(
 /// When the TCP connection closes, the UDP relay is terminated.
 struct SocksUdpClientSession {
     sender: mpsc::Sender<(SocketAddr, Vec<u8>, Option<TrafficContext>)>,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl SocksUdpClientSession {
+    async fn stop(mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
 }
 
 impl Drop for SocksUdpClientSession {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(task) = self.task.as_ref() {
+            task.abort();
+        }
     }
 }
 
 #[cfg(feature = "trojan")]
 struct SocksTrojanUdpClientSession {
     sender: mpsc::Sender<(NetLocation, Vec<u8>, Option<TrafficContext>)>,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
 }
 
 #[cfg(feature = "trojan")]
@@ -671,9 +682,21 @@ struct SocksTrojanUdpSessionStart {
 }
 
 #[cfg(feature = "trojan")]
+impl SocksTrojanUdpClientSession {
+    async fn stop(mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+#[cfg(feature = "trojan")]
 impl Drop for SocksTrojanUdpClientSession {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(task) = self.task.as_ref() {
+            task.abort();
+        }
     }
 }
 
@@ -779,7 +802,10 @@ fn start_udp_client_session(
         }
     });
 
-    Ok(SocksUdpClientSession { sender, task })
+    Ok(SocksUdpClientSession {
+        sender,
+        task: Some(task),
+    })
 }
 
 #[cfg(feature = "trojan")]
@@ -903,7 +929,10 @@ async fn start_trojan_udp_client_session(
         }
     });
 
-    Ok(SocksTrojanUdpClientSession { sender, task })
+    Ok(SocksTrojanUdpClientSession {
+        sender,
+        task: Some(task),
+    })
 }
 
 #[cfg(feature = "trojan")]
@@ -933,10 +962,14 @@ async fn send_trojan_udp_target_payload(
         match sender.send(message.clone()).await {
             Ok(()) => return Ok(()),
             Err(_) if attempt == 0 => {
-                client_sessions.remove(&session_key);
+                if let Some(session) = client_sessions.remove(&session_key) {
+                    session.stop().await;
+                }
             }
             Err(_) => {
-                client_sessions.remove(&session_key);
+                if let Some(session) = client_sessions.remove(&session_key) {
+                    session.stop().await;
+                }
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "SOCKS5 Trojan UDP client session closed before payload was sent",
@@ -977,10 +1010,14 @@ async fn send_udp_target_payload(
         match sender.send(message.clone()).await {
             Ok(()) => return Ok(()),
             Err(_) if attempt == 0 => {
-                client_sessions.remove(&session_key);
+                if let Some(session) = client_sessions.remove(&session_key) {
+                    session.stop().await;
+                }
             }
             Err(_) => {
-                client_sessions.remove(&session_key);
+                if let Some(session) = client_sessions.remove(&session_key) {
+                    session.stop().await;
+                }
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "SOCKS5 UDP client session closed before payload was sent",
@@ -995,6 +1032,23 @@ fn prune_closed_udp_sessions(
     client_sessions: &mut HashMap<(SocketAddr, bool), SocksUdpClientSession>,
 ) {
     client_sessions.retain(|_, session| !session.sender.is_closed());
+}
+
+async fn stop_udp_client_sessions(
+    client_sessions: &mut HashMap<(SocketAddr, bool), SocksUdpClientSession>,
+) {
+    for (_, session) in client_sessions.drain() {
+        session.stop().await;
+    }
+}
+
+#[cfg(feature = "trojan")]
+async fn stop_trojan_udp_client_sessions(
+    client_sessions: &mut HashMap<(SocketAddr, String), SocksTrojanUdpClientSession>,
+) {
+    for (_, session) in client_sessions.drain() {
+        session.stop().await;
+    }
 }
 
 pub(crate) async fn run_shared_udp_relay(
@@ -1226,11 +1280,13 @@ pub(crate) async fn run_udp_relay_with_expected_client(
     let association_idle = tokio::time::sleep(association_idle_timeout);
     tokio::pin!(association_idle);
     let mut association_active = true;
-    loop {
+    let mut tcp_monitor_finished = false;
+    let result = loop {
         let (len, client_addr) = tokio::select! {
             _ = &mut tcp_monitor => {
+                tcp_monitor_finished = true;
                 tracing::debug!("SOCKS5 UDP relay: TCP connection closed, terminating");
-                return Ok(());
+                break Ok(());
             }
             _ = association_activity.notified() => {
                 association_active = true;
@@ -1245,11 +1301,13 @@ pub(crate) async fn run_udp_relay_with_expected_client(
                     continue;
                 }
                 tracing::debug!("SOCKS5 UDP relay: association idle timeout, terminating");
-                tcp_monitor.abort();
-                return Ok(());
+                break Ok(());
             }
             result = udp_socket_clone.recv_from(&mut recv_buf) => {
-                result?
+                match result {
+                    Ok(result) => result,
+                    Err(error) => break Err(error),
+                }
             }
         };
 
@@ -1306,7 +1364,7 @@ pub(crate) async fn run_udp_relay_with_expected_client(
             .as_ref()
             .and_then(|context| context.identity.as_deref())
             .unwrap_or_default();
-        let (action, target_addr) = select_direct_outbound_for_location(
+        let (action, target_addr) = match select_direct_outbound_for_location(
             &resolver,
             &target_location,
             &runtime,
@@ -1322,7 +1380,11 @@ pub(crate) async fn run_udp_relay_with_expected_client(
                 },
             ),
         )
-        .await?;
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => break Err(error),
+        };
         let mut datagram_context = traffic_context.clone();
         match action {
             DirectOutboundAction::Blackhole { tag } => {
@@ -1371,7 +1433,7 @@ pub(crate) async fn run_udp_relay_with_expected_client(
                 }
                 #[cfg(not(feature = "trojan"))]
                 {
-                    return Err(std::io::Error::new(
+                    break Err(std::io::Error::new(
                         std::io::ErrorKind::Unsupported,
                         format!(
                             "Trojan outbound {} requires the trojan feature",
@@ -1382,7 +1444,7 @@ pub(crate) async fn run_udp_relay_with_expected_client(
             }
             DirectOutboundAction::Socks { outbound }
             | DirectOutboundAction::Vless { outbound } => {
-                return Err(std::io::Error::new(
+                break Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
                         "TCP proxy outbound {} cannot be used for UDP",
@@ -1392,9 +1454,14 @@ pub(crate) async fn run_udp_relay_with_expected_client(
             }
         }
 
-        let target_addr = target_addr.ok_or_else(|| {
-            std::io::Error::other("SOCKS5 UDP freedom route did not resolve target")
-        })?;
+        let target_addr = match target_addr {
+            Some(target_addr) => target_addr,
+            None => {
+                break Err(std::io::Error::other(
+                    "SOCKS5 UDP freedom route did not resolve target",
+                ));
+            }
+        };
         if let Err(error) = send_udp_target_payload(
             &mut client_sessions,
             target_addr,
@@ -1412,7 +1479,16 @@ pub(crate) async fn run_udp_relay_with_expected_client(
                 error
             );
         }
+    };
+
+    stop_udp_client_sessions(&mut client_sessions).await;
+    #[cfg(feature = "trojan")]
+    stop_trojan_udp_client_sessions(&mut trojan_sessions).await;
+    if !tcp_monitor_finished {
+        tcp_monitor.abort();
+        let _ = tcp_monitor.await;
     }
+    result
 }
 
 /// Parse a SOCKS5 UDP address starting at `offset` in `data`.
@@ -1904,14 +1980,14 @@ mod tests {
                 closed_key,
                 SocksUdpClientSession {
                     sender: closed_sender,
-                    task: closed_task,
+                    task: Some(closed_task),
                 },
             ),
             (
                 open_key,
                 SocksUdpClientSession {
                     sender: open_sender,
-                    task: open_task,
+                    task: Some(open_task),
                 },
             ),
         ]);
@@ -3535,6 +3611,78 @@ mod tests {
 
     #[cfg(feature = "traffic")]
     #[tokio::test]
+    async fn udp_relay_tcp_close_waits_for_target_session_cleanup() {
+        let origin_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let origin_addr = origin_socket.local_addr().unwrap();
+        let relay_socket =
+            Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let relay_addr = relay_socket.local_addr().unwrap();
+        let control_listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let control_addr = control_listener.local_addr().unwrap();
+        let client_control = TcpStream::connect(control_addr).await.unwrap();
+        let (server_control, _) = control_listener.accept().await.unwrap();
+
+        let runtime = RuntimeState::new(
+            Vec::new(),
+            vec![OutboundSummary {
+                tag: "direct".into(),
+                protocol: "freedom".into(),
+                proxy_settings_type: None,
+                proxy_settings_value: None,
+                sender_settings_type: None,
+                sender_settings_value: None,
+            }],
+        );
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let relay_task = tokio::spawn(run_udp_relay(
+            relay_socket,
+            Box::new(server_control),
+            resolver,
+            runtime,
+            client_control.local_addr().unwrap(),
+            false,
+            None,
+        ));
+
+        let client_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let mut request = vec![0, 0, 0, ADDR_TYPE_IPV4];
+        let IpAddr::V4(origin_ip) = origin_addr.ip() else {
+            unreachable!("test origin socket must use IPv4");
+        };
+        request.extend_from_slice(&origin_ip.octets());
+        request.extend_from_slice(&origin_addr.port().to_be_bytes());
+        request.extend_from_slice(b"cleanup");
+        client_socket.send_to(&request, relay_addr).await.unwrap();
+
+        let mut buffer = [0u8; 64];
+        let (length, worker_peer) =
+            timeout(Duration::from_secs(2), origin_socket.recv_from(&mut buffer))
+                .await
+                .expect("SOCKS UDP target request timeout")
+                .expect("receive SOCKS UDP target request");
+        assert_eq!(&buffer[..length], b"cleanup");
+        assert!(
+            UdpSocket::bind((Ipv4Addr::UNSPECIFIED, worker_peer.port()))
+                .await
+                .is_err(),
+            "SOCKS UDP target socket must still be owned before association teardown"
+        );
+
+        drop(client_control);
+        timeout(Duration::from_secs(2), relay_task)
+            .await
+            .expect("SOCKS UDP association teardown timeout")
+            .expect("SOCKS UDP association task must not panic")
+            .expect("SOCKS UDP association teardown must succeed");
+
+        UdpSocket::bind((Ipv4Addr::UNSPECIFIED, worker_peer.port()))
+            .await
+            .expect("association teardown must release target UDP socket before returning");
+    }
+
+    #[cfg(feature = "traffic")]
+    #[tokio::test]
     async fn udp_target_session_retries_payload_after_idle_task_closed() {
         let origin_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let origin_addr = origin_socket.local_addr().unwrap();
@@ -3551,7 +3699,7 @@ mod tests {
             (client_endpoint, origin_addr.is_ipv6()),
             SocksUdpClientSession {
                 sender,
-                task: closed_task,
+                task: Some(closed_task),
             },
         )]);
 
