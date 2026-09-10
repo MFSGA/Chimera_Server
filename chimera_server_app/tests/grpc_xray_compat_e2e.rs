@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     env,
     fs::{self, File},
-    io,
+    io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -951,6 +951,205 @@ fn grpc_inbound_failure_status_compat_with_xray_core() {
     assert_eq!(chimera_duplicate.grpc_code, xray_duplicate.grpc_code);
     assert_eq!(chimera_missing.grpc_code, xray_missing.grpc_code);
     assert_eq!(chimera_alter.grpc_code, xray_alter.grpc_code);
+}
+
+#[test]
+#[ignore = "compares RemoveInbound behavior for an already accepted SOCKS TCP tunnel"]
+fn grpc_remove_inbound_preserves_existing_tcp_tunnel_like_xray() {
+    trace_step(
+        "==== test grpc_remove_inbound_preserves_existing_tcp_tunnel_like_xray start ====",
+    );
+    let _guard = global_test_lock()
+        .lock()
+        .expect("failed to acquire global test lock");
+
+    fn run_target(target: TargetKind) -> io::Result<()> {
+        let grpc_port = free_localhost_port()?;
+        let mut socks_port = free_localhost_port()?;
+        while socks_port == grpc_port {
+            socks_port = free_localhost_port()?;
+        }
+        let echo_listener =
+            TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+        let echo_addr = echo_listener.local_addr()?;
+        let echo_thread = thread::spawn(move || -> io::Result<()> {
+            let (mut stream, _) = echo_listener.accept()?;
+            stream.set_read_timeout(Some(IO_TIMEOUT))?;
+            stream.set_write_timeout(Some(IO_TIMEOUT))?;
+            let mut buf = [0u8; 64];
+            for _ in 0..2 {
+                let len = stream.read(&mut buf)?;
+                if len == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "echo tunnel closed",
+                    ));
+                }
+                stream.write_all(&buf[..len])?;
+            }
+            Ok(())
+        });
+
+        let config = match target {
+            TargetKind::Chimera => build_chimera_config(grpc_port, socks_port),
+            TargetKind::Xray => build_xray_config(grpc_port, socks_port),
+        };
+        let harness = Harness::start_with_config(target, grpc_port, config)?;
+        let socks_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, socks_port);
+        let mut stream =
+            TcpStream::connect_timeout(&SocketAddr::V4(socks_addr), IO_TIMEOUT)?;
+        stream.set_read_timeout(Some(IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(IO_TIMEOUT))?;
+
+        stream.write_all(&[0x05, 0x01, 0x02])?;
+        let mut method = [0u8; 2];
+        stream.read_exact(&mut method)?;
+        if method != [0x05, 0x02] {
+            return Err(io::Error::other(format!(
+                "unexpected SOCKS method response: {method:?}"
+            )));
+        }
+        let username = TEST_USERNAME.as_bytes();
+        let password = TEST_PASSWORD.as_bytes();
+        let mut auth = Vec::with_capacity(3 + username.len() + password.len());
+        auth.extend_from_slice(&[0x01, username.len() as u8]);
+        auth.extend_from_slice(username);
+        auth.push(password.len() as u8);
+        auth.extend_from_slice(password);
+        stream.write_all(&auth)?;
+        let mut auth_reply = [0u8; 2];
+        stream.read_exact(&mut auth_reply)?;
+        if auth_reply != [0x01, 0x00] {
+            return Err(io::Error::other(format!(
+                "SOCKS auth failed: {auth_reply:?}"
+            )));
+        }
+
+        let SocketAddr::V4(echo_addr) = echo_addr else {
+            unreachable!();
+        };
+        let mut connect = vec![0x05, 0x01, 0x00, 0x01];
+        connect.extend_from_slice(&echo_addr.ip().octets());
+        connect.extend_from_slice(&echo_addr.port().to_be_bytes());
+        stream.write_all(&connect)?;
+        let mut connect_reply = [0u8; 10];
+        stream.read_exact(&mut connect_reply)?;
+        if connect_reply[1] != 0x00 {
+            return Err(io::Error::other(format!(
+                "SOCKS connect failed: {connect_reply:?}"
+            )));
+        }
+
+        for payload in [b"before-remove".as_slice(), b"after-remove".as_slice()] {
+            if payload == b"after-remove" {
+                let _: RemoveInboundResponse = harness
+                    .unary(
+                        PATH_HANDLER_REMOVE_INBOUND,
+                        RemoveInboundRequest {
+                            tag: SOCKS_TAG.to_string(),
+                        },
+                    )
+                    .map_err(|status| {
+                        io::Error::other(format!("RemoveInbound failed: {status}"))
+                    })?;
+                thread::sleep(Duration::from_millis(50));
+                if TcpStream::connect_timeout(
+                    &SocketAddr::V4(socks_addr),
+                    Duration::from_millis(200),
+                )
+                .is_ok()
+                {
+                    return Err(io::Error::other(
+                        "removed SOCKS listener still accepts new TCP connections",
+                    ));
+                }
+            }
+            stream.write_all(payload)?;
+            let mut echoed = vec![0u8; payload.len()];
+            stream.read_exact(&mut echoed)?;
+            if echoed != payload {
+                return Err(io::Error::other(format!(
+                    "tunnel payload mismatch: {echoed:?}"
+                )));
+            }
+        }
+
+        echo_thread
+            .join()
+            .map_err(|_| io::Error::other("echo thread panicked"))??;
+        Ok(())
+    }
+
+    run_target(TargetKind::Xray)
+        .expect("xray should preserve accepted SOCKS tunnel after RemoveInbound");
+    run_target(TargetKind::Chimera)
+        .expect("chimera should preserve accepted SOCKS tunnel after RemoveInbound");
+}
+
+#[test]
+#[ignore = "records AddInbound bind-failure publication behavior for xray and chimera"]
+fn grpc_add_inbound_bind_failure_rollback_baseline() {
+    trace_step(
+        "==== test grpc_add_inbound_bind_failure_rollback_baseline start ====",
+    );
+    let _guard = global_test_lock()
+        .lock()
+        .expect("failed to acquire global test lock");
+
+    fn probe(target: TargetKind) -> io::Result<(Code, bool, Code)> {
+        let harness = Harness::start_unlocked(target)?;
+        let occupied = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+        let occupied_port = occupied.local_addr()?.port();
+        let first: Result<AddInboundResponse, Status> = harness.unary(
+            PATH_HANDLER_ADD_INBOUND,
+            AddInboundRequest {
+                inbound: Some(build_added_inbound_config(occupied_port)),
+            },
+        );
+        let first_code = first.expect_err("occupied AddInbound must fail").code();
+        let listed: ListInboundsResponse = harness
+            .unary(
+                PATH_HANDLER_LIST_INBOUNDS,
+                ListInboundsRequest { is_only_tags: true },
+            )
+            .map_err(|status| {
+                io::Error::other(format!("ListInbounds failed: {status}"))
+            })?;
+        let retained = listed
+            .inbounds
+            .iter()
+            .any(|inbound| inbound.tag == ADDED_INBOUND_TAG);
+        drop(occupied);
+        let second: Result<AddInboundResponse, Status> = harness.unary(
+            PATH_HANDLER_ADD_INBOUND,
+            AddInboundRequest {
+                inbound: Some(build_added_inbound_config(occupied_port)),
+            },
+        );
+        let second_code = match second {
+            Ok(_) => Code::Ok,
+            Err(status) => status.code(),
+        };
+        Ok((first_code, retained, second_code))
+    }
+
+    let xray = probe(TargetKind::Xray).expect("probe xray bind-failure behavior");
+    let chimera =
+        probe(TargetKind::Chimera).expect("probe chimera bind-failure behavior");
+    eprintln!("bind failure baseline: xray={xray:?} chimera={chimera:?}");
+    assert_eq!(xray.0, Code::Unknown);
+    assert!(xray.1, "fixed Xray baseline retains the failed handler tag");
+    assert_eq!(xray.2, Code::Unknown);
+    assert_eq!(chimera.0, Code::Unknown);
+    assert!(
+        !chimera.1,
+        "Chimera intentionally rolls back failed publication"
+    );
+    assert_eq!(
+        chimera.2,
+        Code::Ok,
+        "Chimera allows retry after the port becomes available"
+    );
 }
 
 #[test]
