@@ -5492,8 +5492,8 @@ mod tests {
     #[cfg(feature = "trojan")]
     #[tokio::test]
     async fn multi_directional_udp_routes_through_trojan_outbound() {
-        let target = NetLocation::from_str("origin.example:53", None)
-            .expect("Trojan UDP targeted target");
+        let target_addr = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 53), 53));
+        let target = NetLocation::from_ip_addr(target_addr.ip(), target_addr.port());
         let (proxy, proxy_task) = start_fake_trojan_udp_proxy(target.clone()).await;
         let runtime = runtime_routing_udp_to(proxy, "trojan-udp");
         let (client, server) = duplex(4096);
