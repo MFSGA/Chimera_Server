@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     net::SocketAddr,
     sync::{Arc, atomic::AtomicU64},
     time::Duration,
@@ -110,6 +111,13 @@ fn create_hysteria2_listener_socket(
 
     socket.bind(&socket2::SockAddr::from(bind_address))?;
     Ok(socket)
+}
+
+fn spawn_hysteria2_connection<F>(runtime: &RuntimeState, future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    runtime.spawn_inbound_connection(future);
 }
 
 pub async fn run_hysteria2_server(
@@ -231,7 +239,8 @@ pub async fn run_hysteria2_server(
                 let mut server_config = base_server_config.clone();
                 server_config.transport_config(Arc::new(transport));
 
-                tokio::spawn(async move {
+                let connection_runtime = runtime.clone();
+                spawn_hysteria2_connection(&runtime, async move {
                     let connecting =
                         match incoming.accept_with(Arc::new(server_config)) {
                             Ok(connecting) => connecting,
@@ -261,7 +270,7 @@ pub async fn run_hysteria2_server(
                         tx_bps,
                         connection,
                         Arc::new(inbound_tag),
-                        runtime,
+                        connection_runtime,
                         xray_proxy_transport,
                     )
                     .await
@@ -456,8 +465,10 @@ mod tests {
         configured_max_incoming_uni_streams, configured_mtu_discovery,
         configured_receive_window, configured_send_window,
         configured_server_migration, configured_udp_socket_buffer_size,
-        create_hysteria2_listener_socket,
+        create_hysteria2_listener_socket, spawn_hysteria2_connection,
     };
+
+    use crate::runtime::RuntimeState;
 
     #[cfg(target_os = "linux")]
     use crate::config::server_config::TcpSocketPolicy;
@@ -466,6 +477,34 @@ mod tests {
         net::{Ipv4Addr, Ipv6Addr, SocketAddr},
         os::fd::AsRawFd,
     };
+
+    #[tokio::test]
+    async fn hysteria2_connection_task_uses_server_owner() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+
+        spawn_hysteria2_connection(&runtime, async move {
+            let _ = release_rx.await;
+        });
+        for _ in 0..50 {
+            if runtime.tracked_inbound_connection_count() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(runtime.tracked_inbound_connection_count(), 1);
+
+        release_tx
+            .send(())
+            .expect("release tracked Hysteria2 connection");
+        for _ in 0..50 {
+            if runtime.tracked_inbound_connection_count() == 0 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("completed Hysteria2 connection should leave server owner");
+    }
 
     #[test]
     fn server_migration_matches_xray_and_shoes() {

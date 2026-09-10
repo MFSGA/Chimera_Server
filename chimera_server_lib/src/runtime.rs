@@ -137,6 +137,11 @@ impl RuntimeState {
         self.connection_tasks.spawn(future);
     }
 
+    #[cfg(test)]
+    pub(crate) fn tracked_inbound_connection_count(&self) -> usize {
+        self.connection_tasks.len()
+    }
+
     pub fn replace_policy(&self, policy: Option<&PolicyConfig>) {
         *self.policy.write().expect("runtime policy lock poisoned") =
             policy.cloned().unwrap_or_default();
