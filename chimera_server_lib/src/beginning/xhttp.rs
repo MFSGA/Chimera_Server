@@ -42,6 +42,10 @@ use std::os::fd::AsRawFd;
 #[cfg(all(feature = "tls", feature = "hysteria"))]
 use std::sync::atomic::AtomicU64;
 
+#[cfg(feature = "reality")]
+use crate::handler::reality::accept_reality_stream;
+#[cfg(feature = "tls")]
+use crate::handler::tls::build_server_config;
 use crate::{
     address::BindLocation,
     async_stream::{AsyncPing, AsyncStream},
@@ -56,17 +60,11 @@ use crate::{
     resolver::{NativeResolver, Resolver},
     runtime::RuntimeState,
 };
-#[cfg(feature = "reality")]
-use crate::{
-    config::server_config::RealityTransportConfig,
-    handler::reality::accept_reality_stream,
-};
-#[cfg(feature = "tls")]
-use crate::{
-    config::server_config::TlsServerConfig, handler::tls::build_server_config,
-};
 
-use super::process_stream_with_sniffing_and_local_addr;
+use super::{
+    process_stream_with_sniffing_and_local_addr,
+    transport_plan::{ListenerSecurityPlan, XhttpListenerPlan},
+};
 
 const XHTTP_PIPE_CAPACITY: usize = 64 * 1024;
 const XHTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(4);
@@ -185,17 +183,18 @@ async fn send_h3_response(
 pub async fn start_xhttp_server(
     config: ServerConfig,
     runtime: RuntimeState,
+    plan: XhttpListenerPlan,
 ) -> std::io::Result<Vec<tokio::task::JoinHandle<()>>> {
     let ServerConfig {
         tag,
         bind_location,
-        protocol,
+        protocol: _,
         sniffing,
         tcp_socket_policy,
         ..
     } = config;
 
-    let listener_config = parse_listener_protocol(protocol)?;
+    let listener_config = prepare_xhttp_listener(plan)?;
 
     let bind_addr = match bind_location {
         BindLocation::Address(address) => address.to_socket_addr()?,
@@ -332,7 +331,7 @@ enum XhttpSecurityLayer {
     #[cfg(feature = "tls")]
     H3Tls(Arc<rustls::ServerConfig>),
     #[cfg(feature = "reality")]
-    Reality(RealityTransportConfig),
+    Reality(crate::config::server_config::RealityTransportConfig),
 }
 
 #[cfg(feature = "tls")]
@@ -686,73 +685,55 @@ async fn accept_xhttp_tls(
     }
 }
 
-fn parse_listener_protocol(
-    protocol: ServerProxyConfig,
+fn prepare_xhttp_listener(
+    plan: XhttpListenerPlan,
 ) -> std::io::Result<XhttpListenerConfig> {
-    match protocol {
-        ServerProxyConfig::Xhttp { config, inner } => Ok(XhttpListenerConfig {
-            xhttp_config: config,
-            inner: *inner,
-            security: XhttpSecurityLayer::None,
-        }),
+    let XhttpListenerPlan {
+        config: xhttp_config,
+        protocol: inner,
+        security,
+    } = plan;
+    let security = match security {
+        ListenerSecurityPlan::None => XhttpSecurityLayer::None,
         #[cfg(feature = "tls")]
-        ServerProxyConfig::Tls(TlsServerConfig {
-            certificates,
-            mut alpn_protocols,
-            enable_session_resumption,
-            reject_unknown_sni,
-            min_version,
-            max_version,
-            server_name: _,
-            inner,
-        }) => match *inner {
-            ServerProxyConfig::Xhttp { config, inner } => {
-                let is_h3 = alpn_protocols.as_slice() == ["h3"];
-                if !is_h3 && !alpn_protocols.iter().any(|proto| proto == "h2") {
-                    alpn_protocols.push("h2".to_string());
-                }
-
-                let tls_config = build_server_config(
-                    &certificates,
-                    &alpn_protocols,
-                    enable_session_resumption,
-                    reject_unknown_sni,
-                    min_version.as_deref(),
-                    max_version.as_deref(),
-                )?;
-
-                let tls_config = Arc::new(tls_config);
-                Ok(XhttpListenerConfig {
-                    xhttp_config: config,
-                    inner: *inner,
-                    security: if is_h3 {
-                        XhttpSecurityLayer::H3Tls(tls_config)
-                    } else {
-                        XhttpSecurityLayer::Tls(TlsAcceptor::from(tls_config))
-                    },
-                })
+        ListenerSecurityPlan::Tls(tls_config) => {
+            let crate::config::server_config::TlsServerConfig {
+                certificates,
+                mut alpn_protocols,
+                enable_session_resumption,
+                reject_unknown_sni,
+                min_version,
+                max_version,
+                ..
+            } = tls_config;
+            let is_h3 = alpn_protocols.as_slice() == ["h3"];
+            if !is_h3 && !alpn_protocols.iter().any(|proto| proto == "h2") {
+                alpn_protocols.push("h2".to_string());
             }
-            _ => Err(std::io::Error::other(
-                "invalid tls-wrapped protocol for xhttp server",
-            )),
-        },
-        #[cfg(feature = "reality")]
-        ServerProxyConfig::Reality(reality_config) => {
-            match reality_config.inner.as_ref() {
-                ServerProxyConfig::Xhttp { config, inner } => {
-                    Ok(XhttpListenerConfig {
-                        xhttp_config: config.clone(),
-                        inner: (**inner).clone(),
-                        security: XhttpSecurityLayer::Reality(reality_config),
-                    })
-                }
-                _ => Err(std::io::Error::other(
-                    "invalid reality-wrapped protocol for xhttp server",
-                )),
+            let tls_config = Arc::new(build_server_config(
+                &certificates,
+                &alpn_protocols,
+                enable_session_resumption,
+                reject_unknown_sni,
+                min_version.as_deref(),
+                max_version.as_deref(),
+            )?);
+            if is_h3 {
+                XhttpSecurityLayer::H3Tls(tls_config)
+            } else {
+                XhttpSecurityLayer::Tls(TlsAcceptor::from(tls_config))
             }
         }
-        _ => Err(std::io::Error::other("invalid protocol for xhttp server")),
-    }
+        #[cfg(feature = "reality")]
+        ListenerSecurityPlan::Reality(reality_config) => {
+            XhttpSecurityLayer::Reality(reality_config)
+        }
+    };
+    Ok(XhttpListenerConfig {
+        xhttp_config,
+        inner,
+        security,
+    })
 }
 
 const XHTTP_HTTP1_HEADER_SLOP_BYTES: usize = 4096;
@@ -2764,6 +2745,11 @@ fn apply_response_padding_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::beginning::transport_plan::{
+        InboundListenerPlan, compile_listener_plan,
+    };
+    #[cfg(feature = "tls")]
+    use crate::config::server_config::TlsServerConfig;
 
     #[derive(Debug)]
     struct PendingXhttpHandler;
@@ -2938,7 +2924,12 @@ mod tests {
             tcp_socket_policy: None,
         };
         let runtime = RuntimeState::new(vec![config.clone()], Vec::new());
-        let mut listener_tasks = start_xhttp_server(config, runtime)
+        let InboundListenerPlan::Xhttp(plan) =
+            compile_listener_plan(&config.protocol)
+        else {
+            panic!("expected XHTTP listener plan");
+        };
+        let mut listener_tasks = start_xhttp_server(config, runtime, *plan)
             .await
             .expect("start XHTTP listener");
         let listener_task = listener_tasks.pop().expect("listener task");
@@ -3652,7 +3643,13 @@ mod tests {
             }),
         });
 
-        let parsed = parse_listener_protocol(protocol).expect("valid TLS XHTTP");
+        let parsed = {
+            let InboundListenerPlan::Xhttp(plan) = compile_listener_plan(&protocol)
+            else {
+                panic!("expected XHTTP listener plan");
+            };
+            prepare_xhttp_listener(*plan).expect("valid TLS XHTTP")
+        };
         let XhttpSecurityLayer::Tls(acceptor) = parsed.security else {
             panic!("expected TLS XHTTP security");
         };

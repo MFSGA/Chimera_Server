@@ -350,12 +350,8 @@ fn apply_grpc_layer(
     if !stream_settings.network.eq_ignore_ascii_case("grpc") {
         return Ok(protocol);
     }
-    let settings = stream_settings.grpc_settings.clone().ok_or_else(|| {
-        Error::InvalidConfig("grpc inbound requires grpcSettings".into())
-    })?;
-    let service_name = settings
-        .service_name
-        .unwrap_or_else(|| "GunService".to_string());
+    let settings = stream_settings.grpc_settings.clone().unwrap_or_default();
+    let service_name = settings.service_name.unwrap_or_default();
     let _ = (
         settings.authority,
         settings.permit_without_stream,
@@ -392,15 +388,10 @@ fn apply_httpupgrade_layer(
     if !stream_settings.network.eq_ignore_ascii_case("httpupgrade") {
         return Ok(protocol);
     }
-    let settings =
-        stream_settings
-            .httpupgrade_settings
-            .clone()
-            .ok_or_else(|| {
-                Error::InvalidConfig(
-                    "httpupgrade inbound requires httpupgradeSettings".into(),
-                )
-            })?;
+    let settings = stream_settings
+        .httpupgrade_settings
+        .clone()
+        .unwrap_or_default();
     // Xray's HTTPUpgrade server does not consume `ed`; the field only changes
     // whether the client waits for the 101 response before sending protocol data.
     // Accept it on inbound configs so early protocol bytes can already be queued
@@ -448,15 +439,18 @@ fn apply_websocket_layer(
     protocol: ServerProxyConfig,
     stream_settings: &crate::config::StreamSettings,
 ) -> ServerProxyConfig {
-    match stream_settings.ws_settings.clone() {
-        Some(ws_setting) => ServerProxyConfig::Websocket {
-            targets: Box::new(OneOrSome::One(websocket_server_config(
-                ws_setting,
-                stream_settings,
-                protocol,
-            ))),
-        },
-        None => protocol,
+    let network = stream_settings.network.trim();
+    if !network.eq_ignore_ascii_case("ws")
+        && !network.eq_ignore_ascii_case("websocket")
+    {
+        return protocol;
+    }
+    ServerProxyConfig::Websocket {
+        targets: Box::new(OneOrSome::One(websocket_server_config(
+            stream_settings.ws_settings.clone().unwrap_or_default(),
+            stream_settings,
+            protocol,
+        ))),
     }
 }
 
@@ -492,7 +486,7 @@ fn validate_standard_tcp_network(
     let network = stream_settings.network.trim().to_ascii_lowercase();
     if matches!(
         network.as_str(),
-        "" | "tcp" | "ws" | "websocket" | "httpupgrade" | "grpc"
+        "" | "raw" | "tcp" | "ws" | "websocket" | "httpupgrade" | "grpc"
     ) {
         Ok(())
     } else {
@@ -1102,7 +1096,11 @@ fn plan_vless_transport(
     uses_vision: bool,
 ) -> Result<VlessTransportPlan, Error> {
     let uses_xhttp = stream_settings
-        .map(|settings| settings.network.eq_ignore_ascii_case("xhttp"))
+        .map(|settings| {
+            let network = settings.network.trim();
+            network.eq_ignore_ascii_case("xhttp")
+                || network.eq_ignore_ascii_case("splithttp")
+        })
         .unwrap_or(false);
     let security = stream_settings
         .and_then(|settings| settings.security.as_deref())
@@ -1122,7 +1120,11 @@ fn plan_vless_transport(
             ));
         }
         #[cfg(feature = "ws")]
-        if stream_settings.is_some_and(|settings| settings.ws_settings.is_some()) {
+        if stream_settings.is_some_and(|settings| {
+            let network = settings.network.trim();
+            network.eq_ignore_ascii_case("ws")
+                || network.eq_ignore_ascii_case("websocket")
+        }) {
             return Err(Error::InvalidConfig(
                 "xtls-rprx-vision does not support websocket transport".into(),
             ));
@@ -1156,10 +1158,7 @@ fn apply_vless_xhttp_transport(
     stream_settings: &crate::config::StreamSettings,
     security: &str,
 ) -> Result<ServerProxyConfig, Error> {
-    let xhttp_settings =
-        stream_settings.xhttp_settings.clone().ok_or_else(|| {
-            Error::InvalidConfig("xhttp inbound requires xhttpSettings".into())
-        })?;
+    let xhttp_settings = stream_settings.xhttp_settings.clone().unwrap_or_default();
     let mut xhttp_config = collect_xhttp_settings(xhttp_settings)?;
     xhttp_config.trusted_x_forwarded_for =
         xray_trusted_x_forwarded_for(stream_settings);
@@ -1208,25 +1207,10 @@ fn apply_vless_xhttp_transport(
 
 #[cfg(feature = "vless")]
 fn apply_vless_transport_plan(
-    mut protocol: ServerProxyConfig,
+    protocol: ServerProxyConfig,
     stream_settings: Option<&crate::config::StreamSettings>,
     plan: &VlessTransportPlan,
 ) -> Result<ServerProxyConfig, Error> {
-    #[cfg(feature = "ws")]
-    if plan.kind == VlessTransportKind::Standard
-        && let Some(stream_settings) = stream_settings
-        && let Some(ws_settings) = stream_settings.ws_settings.clone()
-    {
-        tracing::info!("use websocket");
-        protocol = ServerProxyConfig::Websocket {
-            targets: Box::new(OneOrSome::One(websocket_server_config(
-                ws_settings,
-                stream_settings,
-                protocol,
-            ))),
-        };
-    }
-
     let Some(stream_settings) = stream_settings else {
         return Ok(protocol);
     };
@@ -1235,6 +1219,7 @@ fn apply_vless_transport_plan(
             apply_vless_xhttp_transport(protocol, stream_settings, &plan.security)
         }
         VlessTransportKind::Standard => {
+            let protocol = apply_websocket_layer(protocol, stream_settings);
             let protocol = apply_httpupgrade_layer(protocol, stream_settings)?;
             let protocol = apply_grpc_layer(protocol, stream_settings)?;
             apply_security_layers(protocol, stream_settings)
@@ -1626,13 +1611,6 @@ fn build_vmess_server(
             })
         })
         .collect::<Result<Vec<_>, Error>>()?;
-    #[cfg(feature = "ws")]
-    if context
-        .stream_settings()
-        .is_some_and(|settings| settings.ws_settings.is_some())
-    {
-        tracing::info!("use websocket");
-    }
     let protocol = apply_standard_stream_layers(
         ServerProxyConfig::Vmess { users },
         context.stream_settings(),
@@ -1650,13 +1628,6 @@ fn build_trojan_server(
     })?;
     let fallbacks = collect_trojan_fallbacks(&settings)?;
     let users = collect_trojan_clients(settings)?;
-    #[cfg(feature = "ws")]
-    if context
-        .stream_settings()
-        .is_some_and(|settings| settings.ws_settings.is_some())
-    {
-        tracing::info!("use websocket");
-    }
     let protocol = apply_standard_stream_layers(
         ServerProxyConfig::Trojan { users, fallbacks },
         context.stream_settings(),
@@ -1740,13 +1711,6 @@ fn build_socks_server(
     })?;
     let (accounts, udp_enabled, udp_response_ip, user_level) =
         collect_socks_settings(settings)?;
-    #[cfg(feature = "ws")]
-    if context
-        .stream_settings()
-        .is_some_and(|settings| settings.ws_settings.is_some())
-    {
-        tracing::info!("use websocket");
-    }
     let protocol = apply_standard_stream_layers(
         ServerProxyConfig::Socks {
             accounts,
@@ -2332,6 +2296,157 @@ mod tests {
             let error = ServerConfig::try_from(inbound)
                 .expect_err("invalid TCP Brutal socket policy must be rejected");
             assert!(error.to_string().contains("tcpBrutal"), "{error}");
+        }
+    }
+
+    #[cfg(feature = "ws")]
+    #[test]
+    fn websocket_network_uses_default_settings_when_omitted_like_xray() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "socks",
+            "tag": "socks-ws-defaults",
+            "settings": {},
+            "streamSettings": {"network": "ws", "security": "none"}
+        }))
+        .expect("valid WebSocket inbound without wsSettings");
+
+        let config = ServerConfig::try_from(inbound)
+            .expect("Xray creates default WebSocket settings when omitted");
+        let ServerProxyConfig::Websocket { targets } = config.protocol else {
+            panic!("expected WebSocket transport wrapper");
+        };
+        let OneOrSome::One(target) = *targets else {
+            panic!("expected one WebSocket target");
+        };
+        assert_eq!(target.matching_path.as_deref(), Some("/"));
+        assert!(matches!(target.protocol, ServerProxyConfig::Socks { .. }));
+    }
+
+    #[cfg(all(feature = "grpc_transport", feature = "ws"))]
+    #[test]
+    fn selected_grpc_network_ignores_unrelated_websocket_settings_like_xray() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "socks",
+            "tag": "socks-grpc-ignore-ws",
+            "settings": {},
+            "streamSettings": {
+                "network": "grpc",
+                "security": "none",
+                "wsSettings": {"path": "/must-not-run"},
+                "grpcSettings": {"serviceName": "selected"}
+            }
+        }))
+        .expect("valid gRPC inbound with unrelated wsSettings");
+
+        let config = ServerConfig::try_from(inbound)
+            .expect("only the selected Xray transport should be compiled");
+        let ServerProxyConfig::Grpc(config) = config.protocol else {
+            panic!("expected gRPC transport wrapper");
+        };
+        assert_eq!(config.service_name, "selected");
+        assert!(matches!(*config.inner, ServerProxyConfig::Socks { .. }));
+    }
+
+    #[cfg(feature = "ws")]
+    #[test]
+    fn tcp_network_ignores_unrelated_websocket_settings_like_xray() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "socks",
+            "tag": "socks-tcp-ignore-ws",
+            "settings": {},
+            "streamSettings": {
+                "network": "tcp",
+                "security": "none",
+                "wsSettings": {"path": "/must-not-run"}
+            }
+        }))
+        .expect("valid raw TCP inbound with unrelated wsSettings");
+
+        let config = ServerConfig::try_from(inbound)
+            .expect("unselected WebSocket settings must not affect raw TCP");
+        assert!(matches!(config.protocol, ServerProxyConfig::Socks { .. }));
+    }
+
+    #[cfg(feature = "grpc_transport")]
+    #[test]
+    fn grpc_network_uses_empty_xray_defaults_when_settings_are_omitted() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "socks",
+            "tag": "socks-grpc-defaults",
+            "settings": {},
+            "streamSettings": {"network": "grpc", "security": "none"}
+        }))
+        .expect("valid gRPC inbound without grpcSettings");
+
+        let config = ServerConfig::try_from(inbound)
+            .expect("Xray creates default gRPC settings when omitted");
+        let ServerProxyConfig::Grpc(config) = config.protocol else {
+            panic!("expected gRPC transport wrapper");
+        };
+        assert!(config.service_name.is_empty());
+        assert_eq!(config.idle_timeout, 0);
+        assert_eq!(config.health_check_timeout, 0);
+        assert!(matches!(*config.inner, ServerProxyConfig::Socks { .. }));
+    }
+
+    #[cfg(feature = "httpupgrade")]
+    #[test]
+    fn httpupgrade_network_uses_default_settings_when_omitted_like_xray() {
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1",
+            "port": 10000,
+            "protocol": "socks",
+            "tag": "socks-httpupgrade-defaults",
+            "settings": {},
+            "streamSettings": {"network": "httpupgrade", "security": "none"}
+        }))
+        .expect("valid HTTPUpgrade inbound without settings");
+
+        let config = ServerConfig::try_from(inbound)
+            .expect("Xray creates default HTTPUpgrade settings when omitted");
+        let ServerProxyConfig::HttpUpgrade(config) = config.protocol else {
+            panic!("expected HTTPUpgrade transport wrapper");
+        };
+        assert!(config.host.is_none());
+        assert_eq!(config.path, "/");
+        assert!(matches!(*config.inner, ServerProxyConfig::Socks { .. }));
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn xhttp_alias_uses_default_settings_when_omitted_like_xray() {
+        for network in ["xhttp", "splithttp"] {
+            let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+                "listen": "127.0.0.1",
+                "port": 10000,
+                "protocol": "vless",
+                "tag": format!("vless-{network}-defaults"),
+                "settings": {
+                    "clients": [{
+                        "id": "3ac9b383-75a1-431c-8184-106c80eb2273"
+                    }],
+                    "decryption": "none"
+                },
+                "streamSettings": {"network": network, "security": "none"}
+            }))
+            .expect("valid XHTTP inbound without xhttpSettings");
+
+            let config = ServerConfig::try_from(inbound)
+                .expect("Xray creates default XHTTP settings when omitted");
+            let ServerProxyConfig::Xhttp { config, inner } = config.protocol else {
+                panic!("expected XHTTP transport wrapper for {network}");
+            };
+            assert_eq!(config.mode, crate::config::server_config::XhttpMode::Auto);
+            assert_eq!(config.path, "/");
+            assert!(matches!(*inner, ServerProxyConfig::Vless { .. }));
         }
     }
 
@@ -3681,6 +3796,7 @@ mod tests {
                 "decryption": "none"
             },
             "streamSettings": {
+                "network": "ws",
                 "security": "tls",
                 "wsSettings": {
                     "host": "example.com",

@@ -221,6 +221,7 @@ pub(crate) mod grpc_transport;
 mod policy_stream;
 mod quic;
 mod tcp_relay;
+mod transport_plan;
 pub(crate) mod udp;
 mod xhttp;
 
@@ -308,12 +309,15 @@ async fn start_server_tasks(
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     register_configured_identities(&config.protocol, &runtime);
 
-    if is_xhttp_server_protocol(&config.protocol) {
-        return xhttp::start_xhttp_server(config, runtime).await;
-    }
-    #[cfg(feature = "grpc_transport")]
-    if is_grpc_server_protocol(&config.protocol) {
-        return grpc_transport::start_grpc_server(config, runtime).await;
+    match transport_plan::compile_listener_plan(&config.protocol) {
+        transport_plan::InboundListenerPlan::Xhttp(plan) => {
+            return xhttp::start_xhttp_server(config, runtime, *plan).await;
+        }
+        #[cfg(feature = "grpc_transport")]
+        transport_plan::InboundListenerPlan::Grpc(plan) => {
+            return grpc_transport::start_grpc_server(config, runtime, *plan).await;
+        }
+        transport_plan::InboundListenerPlan::Stream => {}
     }
 
     let mut join_handles = StartingTasks::with_capacity(3);
@@ -489,40 +493,6 @@ fn register_configured_identities(
             register_configured_identities(config.inner.as_ref(), runtime);
         }
         _ => {}
-    }
-}
-
-#[cfg(feature = "grpc_transport")]
-fn is_grpc_server_protocol(protocol: &ServerProxyConfig) -> bool {
-    match protocol {
-        ServerProxyConfig::Grpc(_) => true,
-        #[cfg(feature = "tls")]
-        ServerProxyConfig::Tls(tls_config) => {
-            matches!(tls_config.inner.as_ref(), ServerProxyConfig::Grpc(_))
-        }
-        #[cfg(feature = "reality")]
-        ServerProxyConfig::Reality(reality_config) => {
-            matches!(reality_config.inner.as_ref(), ServerProxyConfig::Grpc(_))
-        }
-        _ => false,
-    }
-}
-
-fn is_xhttp_server_protocol(protocol: &ServerProxyConfig) -> bool {
-    match protocol {
-        ServerProxyConfig::Xhttp { .. } => true,
-        #[cfg(feature = "tls")]
-        ServerProxyConfig::Tls(tls_config) => {
-            matches!(tls_config.inner.as_ref(), ServerProxyConfig::Xhttp { .. })
-        }
-        #[cfg(feature = "reality")]
-        ServerProxyConfig::Reality(reality_config) => {
-            matches!(
-                reality_config.inner.as_ref(),
-                ServerProxyConfig::Xhttp { .. }
-            )
-        }
-        _ => false,
     }
 }
 

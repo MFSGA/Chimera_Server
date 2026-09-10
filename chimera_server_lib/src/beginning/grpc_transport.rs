@@ -35,27 +35,22 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::io::ReaderStream;
 use tracing::{debug, error, info};
 
+#[cfg(feature = "reality")]
+use crate::handler::reality::accept_reality_stream;
+#[cfg(feature = "tls")]
+use crate::handler::tls::build_server_config;
 use crate::{
     address::BindLocation,
     async_stream::{AsyncPing, AsyncStream},
-    config::server_config::{
-        GrpcServerConfig, InboundSniffingConfig, ServerConfig, ServerProxyConfig,
-    },
+    config::server_config::{InboundSniffingConfig, ServerConfig},
     handler::tcp::{
         tcp_handler::TcpServerHandler, tcp_handler_util::create_tcp_server_handler,
     },
     resolver::{NativeResolver, Resolver},
     runtime::RuntimeState,
 };
-#[cfg(feature = "reality")]
-use crate::{
-    config::server_config::RealityTransportConfig,
-    handler::reality::accept_reality_stream,
-};
-#[cfg(feature = "tls")]
-use crate::{
-    config::server_config::TlsServerConfig, handler::tls::build_server_config,
-};
+
+use super::transport_plan::{GrpcListenerPlan, ListenerSecurityPlan};
 
 const GRPC_PIPE_CAPACITY: usize = 64 * 1024;
 const MAX_GRPC_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
@@ -287,22 +282,28 @@ enum GrpcSecurity {
     #[cfg(feature = "tls")]
     Tls(Arc<rustls::ServerConfig>),
     #[cfg(feature = "reality")]
-    Reality(RealityTransportConfig),
+    Reality(crate::config::server_config::RealityTransportConfig),
 }
 
 pub(super) async fn start_grpc_server(
     config: ServerConfig,
     runtime: RuntimeState,
+    plan: GrpcListenerPlan,
 ) -> io::Result<Vec<JoinHandle<()>>> {
     let ServerConfig {
         tag,
         bind_location,
-        protocol,
+        protocol: _,
         sniffing,
         tcp_socket_policy,
         ..
     } = config;
-    let (grpc_config, inner_protocol, security) = parse_listener_protocol(protocol)?;
+    let GrpcListenerPlan {
+        config: grpc_config,
+        protocol: inner_protocol,
+        security,
+    } = plan;
+    let security = prepare_grpc_security(security)?;
     let mut rules_stack = Vec::new();
     let server_handler: Arc<Box<dyn TcpServerHandler>> = Arc::new(
         create_tcp_server_handler(inner_protocol, &tag, &mut rules_stack)?,
@@ -470,32 +471,22 @@ pub(super) async fn start_grpc_server(
     Ok(vec![handle])
 }
 
-fn parse_listener_protocol(
-    protocol: ServerProxyConfig,
-) -> io::Result<(GrpcServerConfig, ServerProxyConfig, GrpcSecurity)> {
-    match protocol {
-        ServerProxyConfig::Grpc(config) => {
-            let inner = (*config.inner).clone();
-            Ok((config, inner, GrpcSecurity::Plain))
-        }
+fn prepare_grpc_security(
+    security: ListenerSecurityPlan,
+) -> io::Result<GrpcSecurity> {
+    match security {
+        ListenerSecurityPlan::None => Ok(GrpcSecurity::Plain),
         #[cfg(feature = "tls")]
-        ServerProxyConfig::Tls(tls_config) => {
-            let TlsServerConfig {
+        ListenerSecurityPlan::Tls(tls_config) => {
+            let crate::config::server_config::TlsServerConfig {
                 certificates,
                 mut alpn_protocols,
                 enable_session_resumption,
                 reject_unknown_sni,
                 min_version,
                 max_version,
-                server_name: _,
-                inner,
+                ..
             } = tls_config;
-            let ServerProxyConfig::Grpc(config) = *inner else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "TLS gRPC listener requires Grpc as the inner protocol",
-                ));
-            };
             if !alpn_protocols.iter().any(|value| value == "h2") {
                 alpn_protocols.push("h2".to_string());
             }
@@ -507,26 +498,12 @@ fn parse_listener_protocol(
                 min_version.as_deref(),
                 max_version.as_deref(),
             )?;
-            let inner = (*config.inner).clone();
-            Ok((config, inner, GrpcSecurity::Tls(Arc::new(server_config))))
+            Ok(GrpcSecurity::Tls(Arc::new(server_config)))
         }
         #[cfg(feature = "reality")]
-        ServerProxyConfig::Reality(reality_config) => {
-            let ServerProxyConfig::Grpc(config) = reality_config.inner.as_ref()
-            else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "REALITY gRPC listener requires Grpc as the inner protocol",
-                ));
-            };
-            let config = config.clone();
-            let inner = (*config.inner).clone();
-            Ok((config, inner, GrpcSecurity::Reality(reality_config)))
+        ListenerSecurityPlan::Reality(reality_config) => {
+            Ok(GrpcSecurity::Reality(reality_config))
         }
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid protocol for gRPC transport server: {other}"),
-        )),
     }
 }
 

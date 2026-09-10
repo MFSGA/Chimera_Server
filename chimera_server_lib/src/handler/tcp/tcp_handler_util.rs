@@ -2,14 +2,8 @@ use std::io::{Error, ErrorKind, Result};
 
 #[cfg(feature = "http")]
 use crate::handler::http::HttpTcpServerHandler;
-#[cfg(feature = "httpupgrade")]
-use crate::handler::httpupgrade::HttpUpgradeTcpServerHandler;
 #[cfg(feature = "mixed")]
 use crate::handler::mixed::MixedTcpServerHandler;
-#[cfg(feature = "reality")]
-use crate::handler::reality::{
-    RealityServerHandler, RealityVisionVlessServerHandler,
-};
 #[cfg(feature = "shadowsocks")]
 use crate::handler::shadowsocks::ShadowsocksTcpServerHandler;
 #[cfg(feature = "vless")]
@@ -18,14 +12,6 @@ use crate::handler::vless_handler::{
 };
 #[cfg(feature = "vmess")]
 use crate::handler::vmess::vmess_handler::VmessTcpServerHandler;
-#[cfg(feature = "ws")]
-use crate::handler::ws::{
-    WebsocketTcpServerHandler, create_websocket_server_target,
-};
-#[cfg(feature = "tls")]
-use crate::{
-    config::server_config::TlsServerConfig, handler::tls::TlsServerHandler,
-};
 use crate::{
     config::{rule::RuleConfig, server_config::ServerProxyConfig},
     handler::dokodemo::DokodemoDoorTcpHandler,
@@ -34,15 +20,25 @@ use crate::{
 
 use super::tcp_handler::TcpServerHandler;
 
-#[allow(clippy::only_used_in_recursion)]
+/// Compatibility facade for callers that still hold the recursive compiled
+/// config shape. Transport/security composition lives in the sibling module;
+/// the protocol factory below accepts protocol leaves only.
 pub fn create_tcp_server_handler(
     server_proxy_config: ServerProxyConfig,
     inbound_tag: &str,
     rules_stack: &mut Vec<Vec<RuleConfig>>,
 ) -> Result<Box<dyn TcpServerHandler>> {
-    #[cfg(not(any(feature = "ws", feature = "tls", feature = "reality")))]
-    let _ = rules_stack;
+    super::transport_handler_util::create_tcp_transport_handler(
+        server_proxy_config,
+        inbound_tag,
+        rules_stack,
+    )
+}
 
+pub(crate) fn create_tcp_protocol_handler(
+    server_proxy_config: ServerProxyConfig,
+    inbound_tag: &str,
+) -> Result<Box<dyn TcpServerHandler>> {
     match server_proxy_config {
         #[cfg(feature = "vless")]
         ServerProxyConfig::Vless { users, fallbacks } => {
@@ -56,7 +52,6 @@ pub fn create_tcp_server_handler(
                 )))
             }
         }
-
         #[cfg(feature = "vmess")]
         ServerProxyConfig::Vmess { users } => {
             if users.is_empty() {
@@ -71,90 +66,12 @@ pub fn create_tcp_server_handler(
                 inbound_tag,
             )))
         }
-
-        #[cfg(feature = "ws")]
-        ServerProxyConfig::Websocket { targets } => {
-            let server_targets = targets
-                .into_vec()
-                .into_iter()
-                .map(|config| {
-                    create_websocket_server_target(config, inbound_tag, rules_stack)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(Box::new(WebsocketTcpServerHandler::new(server_targets)))
-        }
         #[cfg(feature = "trojan")]
         ServerProxyConfig::Trojan { users, fallbacks } => {
             Ok(Box::new(crate::handler::trojan::TrojanTcpHandler::new(
                 users,
                 fallbacks,
                 inbound_tag,
-            )))
-        }
-        #[cfg(feature = "tls")]
-        ServerProxyConfig::Tls(tls_config) => {
-            let TlsServerConfig {
-                certificates,
-                alpn_protocols,
-                enable_session_resumption,
-                reject_unknown_sni,
-                min_version,
-                max_version,
-                server_name,
-                inner,
-            } = tls_config;
-            #[cfg(feature = "vless")]
-            if let ServerProxyConfig::Vless { users, fallbacks } = inner.as_ref() {
-                return Ok(Box::new(TlsServerHandler::new_vision_vless(
-                    certificates,
-                    alpn_protocols,
-                    enable_session_resumption,
-                    reject_unknown_sni,
-                    min_version,
-                    max_version,
-                    server_name,
-                    users,
-                    fallbacks,
-                    inbound_tag,
-                )?));
-            }
-
-            let inner_handler =
-                create_tcp_server_handler(*inner, inbound_tag, rules_stack)?;
-            let tls_handler = TlsServerHandler::new(
-                certificates,
-                alpn_protocols,
-                enable_session_resumption,
-                reject_unknown_sni,
-                min_version,
-                max_version,
-                server_name,
-                inner_handler,
-            )?;
-            Ok(Box::new(tls_handler))
-        }
-        #[cfg(feature = "reality")]
-        ServerProxyConfig::Reality(reality_config) => {
-            #[cfg(feature = "vless")]
-            if let ServerProxyConfig::Vless { users, fallbacks } =
-                reality_config.inner.as_ref()
-            {
-                return Ok(Box::new(RealityVisionVlessServerHandler::new(
-                    reality_config.clone(),
-                    users.clone(),
-                    fallbacks.clone(),
-                    inbound_tag,
-                )));
-            }
-
-            let inner_handler = create_tcp_server_handler(
-                (*reality_config.inner).clone(),
-                inbound_tag,
-                rules_stack,
-            )?;
-            Ok(Box::new(RealityServerHandler::new(
-                reality_config,
-                inner_handler,
             )))
         }
         #[cfg(feature = "shadowsocks")]
@@ -197,27 +114,12 @@ pub fn create_tcp_server_handler(
         ServerProxyConfig::DokodemoDoor { config } => {
             Ok(Box::new(DokodemoDoorTcpHandler::new(config, inbound_tag)))
         }
-        #[cfg(feature = "httpupgrade")]
-        ServerProxyConfig::HttpUpgrade(config) => {
-            let inner =
-                create_tcp_server_handler(*config.inner, inbound_tag, rules_stack)?;
-            Ok(Box::new(HttpUpgradeTcpServerHandler::new(
-                config.host,
-                config.path,
-                config.accept_proxy_protocol,
-                config.trusted_x_forwarded_for,
-                inner,
-            )))
-        }
-        ServerProxyConfig::Xhttp { .. } => Err(Error::new(
-            ErrorKind::InvalidInput,
-            "Xhttp server should not be served via TCP handler",
-        )),
-
         #[allow(unreachable_patterns)]
-        unknown_config => Err(Error::new(
+        transport_config => Err(Error::new(
             ErrorKind::InvalidInput,
-            format!("Unsupported TCP proxy config: {unknown_config:?}"),
+            format!(
+                "transport/security config reached TCP protocol factory: {transport_config:?}"
+            ),
         )),
     }
 }

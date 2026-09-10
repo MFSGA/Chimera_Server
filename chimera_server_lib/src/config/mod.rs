@@ -181,7 +181,7 @@ pub struct HttpUpgradeSettings {
     ed: u32,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct XhttpSettings {
     #[serde(default)]
@@ -328,7 +328,7 @@ mod xhttp_range_tests {
 }
 
 #[cfg(feature = "ws")]
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct WsSettings {
     #[serde(default)]
     host: Option<String>,
