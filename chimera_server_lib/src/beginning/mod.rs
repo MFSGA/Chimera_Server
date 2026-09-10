@@ -446,10 +446,10 @@ async fn run_tcp_server(
         }
         let cloned_cache = resolver.clone();
         let cloned_handler = server_handler.clone();
-        let runtime = runtime.clone();
+        let connection_runtime = runtime.clone();
         let sniffing = sniffing.clone();
 
-        tokio::spawn(async move {
+        runtime.spawn_inbound_connection(async move {
             let connection_context = match tcp_server_connection_context(
                 &stream,
                 cloned_handler.as_ref().as_ref(),
@@ -457,7 +457,7 @@ async fn run_tcp_server(
                 Ok(mut context) => {
                     context.peer_addr = Some(addr);
                     context.listener_addr = Some(listener_addr);
-                    context.runtime = Some(runtime.clone());
+                    context.runtime = Some(connection_runtime.clone());
                     context
                 }
                 Err(error) => {
@@ -475,7 +475,7 @@ async fn run_tcp_server(
                 cloned_handler,
                 cloned_cache,
                 addr,
-                runtime,
+                connection_runtime,
                 connection_context,
                 sniffing,
             )

@@ -50,6 +50,7 @@ mod routing_observer;
 mod routing_process;
 mod routing_state;
 mod routing_webhook;
+mod session_tasks;
 mod tls_client_hello;
 
 pub mod traffic;

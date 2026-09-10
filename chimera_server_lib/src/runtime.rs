@@ -25,6 +25,7 @@ use crate::{
         BalancerTargetMap, OutboundObservation, RouteMatch, RoutingEvent,
         RoutingInput, RoutingState,
     },
+    session_tasks::ConnectionTaskOwner,
     traffic::TrafficContext,
     user_domain::{
         UserDomainAccessFailure, UserDomainAccessRevision, UserDomainAccessStatus,
@@ -104,6 +105,7 @@ pub struct RuntimeState {
     user_domain_access: UserDomainAccessStore,
     balancer_overrides: Arc<RwLock<Arc<HashMap<String, String>>>>,
     routing_events: broadcast::Sender<RoutingEvent>,
+    connection_tasks: ConnectionTaskOwner,
 }
 
 impl RuntimeState {
@@ -124,7 +126,15 @@ impl RuntimeState {
             user_domain_access: UserDomainAccessStore::default(),
             balancer_overrides: Arc::new(RwLock::new(Arc::new(HashMap::new()))),
             routing_events,
+            connection_tasks: ConnectionTaskOwner::default(),
         }
+    }
+
+    pub(crate) fn spawn_inbound_connection<F>(&self, future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.connection_tasks.spawn(future);
     }
 
     pub fn replace_policy(&self, policy: Option<&PolicyConfig>) {
