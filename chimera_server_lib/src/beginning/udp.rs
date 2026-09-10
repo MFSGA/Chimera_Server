@@ -2860,15 +2860,15 @@ async fn run_dokodemo_udp_server(
             };
         let payload = recv_buf[..len].to_vec();
         let inbound_tag = inbound_tag.clone();
-        let runtime = runtime.clone();
+        let task_runtime = runtime.clone();
         let relay_state = relay_state.clone();
 
-        tokio::spawn(async move {
+        runtime.spawn_inbound_connection(async move {
             if let Err(err) = relay_dokodemo_udp_datagram(
                 relay_state,
                 inbound_tag,
                 config.user_level,
-                runtime,
+                task_runtime,
                 DokodemoUdpDatagram {
                     client_addr,
                     target_addr: datagram_target,
@@ -2942,6 +2942,7 @@ async fn relay_dokodemo_udp_datagram(
                 target_location,
                 tag,
                 traffic_context,
+                &runtime,
             )
             .await?;
 
@@ -3029,7 +3030,7 @@ async fn trojan_dokodemo_udp_session_sender(
     sessions.insert(key.clone(), sender.clone());
     drop(sessions);
 
-    tokio::spawn(run_trojan_dokodemo_udp_session(
+    runtime.spawn_inbound_connection(run_trojan_dokodemo_udp_session(
         relay_state,
         key,
         traffic_context,
@@ -3133,6 +3134,7 @@ async fn freedom_udp_session_sender(
     target_location: NetLocation,
     outbound_tag: Option<String>,
     traffic_context: TrafficContext,
+    runtime: &RuntimeState,
 ) -> std::io::Result<mpsc::Sender<Vec<u8>>> {
     if let Some(sender) = relay_state.sessions.lock().await.get(&key).cloned() {
         return Ok(sender);
@@ -3153,7 +3155,7 @@ async fn freedom_udp_session_sender(
     sessions.insert(key.clone(), sender.clone());
     drop(sessions);
 
-    tokio::spawn(run_freedom_udp_session(
+    runtime.spawn_inbound_connection(run_freedom_udp_session(
         relay_state,
         key,
         target_location,
@@ -5752,7 +5754,7 @@ mod tests {
             },
             Some(target_addr),
             "dokodemo-trojan".to_string(),
-            runtime,
+            runtime.clone(),
         ));
 
         let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
@@ -5773,7 +5775,24 @@ mod tests {
             assert_eq!(&response[..length], payload);
         }
 
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if runtime.tracked_inbound_connection_count() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Dokodemo Trojan UDP session must enter the server task owner");
+
         server_task.abort();
+        let _ = server_task.await;
+        assert_eq!(
+            runtime.tracked_inbound_connection_count(),
+            1,
+            "stopping the UDP listener must not cancel the active Trojan UDP session",
+        );
         proxy_task.abort();
     }
 
@@ -5800,6 +5819,7 @@ mod tests {
         );
         let server_addr = server_socket.local_addr().expect("dokodemo addr");
         let target = NetLocation::from_ip_addr(echo_addr.ip(), echo_addr.port());
+        let runtime = runtime_with_outbounds(vec![outbound("direct", "freedom")]);
         let server_task = tokio::spawn(run_dokodemo_udp_server(
             server_socket,
             DokodemoDoorConfig {
@@ -5809,7 +5829,7 @@ mod tests {
             },
             echo_addr,
             "dokodemo-udp-test".into(),
-            runtime_with_outbounds(vec![outbound("direct", "freedom")]),
+            runtime.clone(),
         ));
 
         let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
@@ -5828,8 +5848,25 @@ mod tests {
                 .expect("client receive");
         assert_eq!(&response[..len], b"ping");
 
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if runtime.tracked_inbound_connection_count() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Dokodemo UDP logical session must enter the server task owner");
+
         echo_task.await.expect("echo task finished");
         server_task.abort();
+        let _ = server_task.await;
+        assert_eq!(
+            runtime.tracked_inbound_connection_count(),
+            1,
+            "stopping the UDP listener must not orphan or cancel the active logical session",
+        );
     }
 
     #[tokio::test]
