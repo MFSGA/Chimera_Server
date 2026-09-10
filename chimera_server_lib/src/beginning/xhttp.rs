@@ -889,6 +889,12 @@ impl AppState {
         sniffing: Option<InboundSniffingConfig>,
         shutdown: CancellationToken,
     ) -> Self {
+        let sessions = SessionStore::new(
+            Duration::from_secs(config.session_ttl_secs),
+            config.max_buffered_posts,
+            shutdown.clone(),
+            runtime.clone(),
+        );
         Self {
             mode: config.mode,
             host: config.host,
@@ -920,12 +926,8 @@ impl AppState {
             resolver,
             runtime,
             sniffing,
-            shutdown: shutdown.clone(),
-            sessions: SessionStore::new(
-                Duration::from_secs(config.session_ttl_secs),
-                config.max_buffered_posts,
-                shutdown,
-            ),
+            shutdown,
+            sessions,
         }
     }
 
@@ -1199,7 +1201,8 @@ where
 
     let mut upload_writer = client_upload;
     let shutdown = state.shutdown.clone();
-    tokio::spawn(async move {
+    let runtime = state.runtime.clone();
+    let _ = runtime.spawn_inbound_connection(async move {
         tokio::select! {
             _ = shutdown.cancelled() => {}
             _ = async {
@@ -1475,7 +1478,8 @@ fn spawn_handler_stream(
     local_addr: std::net::SocketAddr,
 ) {
     let shutdown = state.shutdown.clone();
-    tokio::spawn(async move {
+    let runtime = state.runtime.clone();
+    let _ = runtime.spawn_inbound_connection(async move {
         tokio::select! {
             _ = shutdown.cancelled() => {}
             result = process_stream_with_sniffing_and_local_addr(
@@ -1572,6 +1576,7 @@ struct SessionStore {
     ttl: Duration,
     max_buffered_posts: usize,
     shutdown: CancellationToken,
+    runtime: RuntimeState,
 }
 
 impl SessionStore {
@@ -1579,12 +1584,14 @@ impl SessionStore {
         ttl: Duration,
         max_buffered_posts: usize,
         shutdown: CancellationToken,
+        runtime: RuntimeState,
     ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
             ttl,
             max_buffered_posts,
             shutdown,
+            runtime,
         }
     }
 
@@ -1600,7 +1607,10 @@ impl SessionStore {
         }
         sessions.insert(session_id.to_string(), session.clone());
         drop(sessions);
-        self.spawn_ttl_cleanup(session_id.to_string(), session.clone());
+        if !self.spawn_ttl_cleanup(session_id.to_string(), session.clone()) {
+            self.remove_if_current(session_id, &session);
+            session.close_upload_queue();
+        }
         session
     }
 
@@ -1615,35 +1625,47 @@ impl SessionStore {
         }
     }
 
-    fn spawn_ttl_cleanup(&self, session_id: String, session: Arc<XhttpSession>) {
+    fn spawn_ttl_cleanup(
+        &self,
+        session_id: String,
+        session: Arc<XhttpSession>,
+    ) -> bool {
         let ttl = self.ttl;
-        let store = self.clone();
+        let sessions = self.inner.clone();
         let shutdown = self.shutdown.clone();
-        tokio::spawn(async move {
+        self.runtime.spawn_inbound_connection(async move {
             tokio::select! {
                 _ = sleep(ttl) => {}
                 _ = shutdown.cancelled() => {
-                    store.remove_if_current(&session_id, &session);
+                    let mut current = sessions.write().unwrap();
+                    if same_xhttp_session(current.get(&session_id), &session) {
+                        current.remove(&session_id);
+                    }
+                    drop(current);
                     session.close_upload_queue();
                     return;
                 }
             }
 
             let snapshot = {
-                let sessions = store.inner.read().unwrap();
+                let current = sessions.read().unwrap();
                 SessionTtlSnapshot {
                     is_current: same_xhttp_session(
-                        sessions.get(&session_id),
+                        current.get(&session_id),
                         &session,
                     ),
                     fully_connected: session.fully_connected.load(Ordering::Acquire),
                 }
             };
             if plan_session_ttl(snapshot) == SessionTtlPlan::RemoveAndClose {
-                store.remove_if_current(&session_id, &session);
+                let mut current = sessions.write().unwrap();
+                if same_xhttp_session(current.get(&session_id), &session) {
+                    current.remove(&session_id);
+                }
+                drop(current);
                 session.close_upload_queue();
             }
-        });
+        })
     }
 }
 
@@ -2743,6 +2765,20 @@ fn apply_response_padding_value(
 mod tests {
     use super::*;
 
+    #[derive(Debug)]
+    struct PendingXhttpHandler;
+
+    #[async_trait::async_trait]
+    impl TcpServerHandler for PendingXhttpHandler {
+        async fn setup_server_stream(
+            &self,
+            _server_stream: Box<dyn AsyncStream>,
+        ) -> std::io::Result<crate::handler::tcp::tcp_handler::TcpServerSetupResult>
+        {
+            std::future::pending().await
+        }
+    }
+
     fn test_xhttp_server_config() -> XhttpServerConfig {
         XhttpServerConfig {
             mode: XhttpMode::Auto,
@@ -2781,6 +2817,93 @@ mod tests {
             xray_max_connection_receive_window: None,
             xray_disable_path_mtu_discovery: None,
         }
+    }
+
+    fn pending_xhttp_state(
+        runtime: RuntimeState,
+        shutdown: CancellationToken,
+    ) -> Arc<AppState> {
+        let handler: Arc<Box<dyn TcpServerHandler>> =
+            Arc::new(Box::new(PendingXhttpHandler));
+        Arc::new(AppState::new(
+            test_xhttp_server_config(),
+            handler,
+            Arc::new(NativeResolver::new()),
+            runtime,
+            None,
+            shutdown,
+        ))
+    }
+
+    async fn wait_for_tracked_xhttp_tasks(runtime: &RuntimeState, expected: usize) {
+        for _ in 0..100 {
+            if runtime.tracked_inbound_connection_count() == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(runtime.tracked_inbound_connection_count(), expected);
+    }
+
+    #[tokio::test]
+    async fn stream_one_background_tasks_use_server_owner() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let shutdown = CancellationToken::new();
+        let state = pending_xhttp_state(runtime.clone(), shutdown.clone());
+        let body = StreamBody::new(futures::stream::pending::<
+            Result<Frame<Bytes>, Infallible>,
+        >());
+
+        let response = handle_stream_one(
+            body,
+            state,
+            "127.0.0.1:12345".parse().unwrap(),
+            "127.0.0.1:443".parse().unwrap(),
+        )
+        .await;
+
+        wait_for_tracked_xhttp_tasks(&runtime, 2).await;
+        shutdown.cancel();
+        wait_for_tracked_xhttp_tasks(&runtime, 0).await;
+        drop(response);
+    }
+
+    #[tokio::test]
+    async fn split_session_handler_and_ttl_use_server_owner() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let shutdown = CancellationToken::new();
+        let state = pending_xhttp_state(runtime.clone(), shutdown.clone());
+
+        let response = handle_stream_down(
+            state,
+            "session".to_string(),
+            "127.0.0.1:12345".parse().unwrap(),
+            "127.0.0.1:443".parse().unwrap(),
+        )
+        .await;
+
+        wait_for_tracked_xhttp_tasks(&runtime, 2).await;
+        shutdown.cancel();
+        wait_for_tracked_xhttp_tasks(&runtime, 0).await;
+        drop(response);
+    }
+
+    #[tokio::test]
+    async fn session_without_task_registration_is_closed_immediately() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        assert!(runtime.close_inbound_connection_tasks());
+        let store = SessionStore::new(
+            Duration::from_secs(30),
+            30,
+            CancellationToken::new(),
+            runtime,
+        );
+
+        let session = store.get_or_create("session");
+
+        assert!(!store.inner.read().unwrap().contains_key("session"));
+        assert!(session.closed.is_cancelled());
+        assert!(session.upload_queue.closed.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -4322,6 +4445,7 @@ mod tests {
             Duration::from_millis(20),
             1,
             CancellationToken::new(),
+            RuntimeState::new(Vec::new(), Vec::new()),
         );
         let session = store.get_or_create("session");
         session
@@ -4412,6 +4536,7 @@ mod tests {
             Duration::from_millis(60),
             30,
             CancellationToken::new(),
+            RuntimeState::new(Vec::new(), Vec::new()),
         );
         let old = store.get_or_create("session");
         old.fully_connected.store(true, Ordering::Release);
@@ -4439,8 +4564,12 @@ mod tests {
 
     #[tokio::test]
     async fn stream_down_cleanup_guard_removes_connected_session() {
-        let store =
-            SessionStore::new(Duration::from_secs(30), 30, CancellationToken::new());
+        let store = SessionStore::new(
+            Duration::from_secs(30),
+            30,
+            CancellationToken::new(),
+            RuntimeState::new(Vec::new(), Vec::new()),
+        );
         let session = store.get_or_create("session");
         session.fully_connected.store(true, Ordering::Release);
         assert!(store.inner.read().unwrap().contains_key("session"));
