@@ -24,10 +24,11 @@ use hyper_util::{
     server::conn::auto,
 };
 use rand::RngExt;
+#[cfg(feature = "tls")]
+use tokio::task::JoinSet;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex},
     sync::mpsc,
-    task::JoinSet,
     time::{Duration, sleep},
 };
 #[cfg(feature = "tls")]
@@ -245,78 +246,65 @@ pub async fn start_xhttp_server(
     let security = listener_config.security.clone();
 
     let handle = tokio::spawn(async move {
-        let _cancel_on_drop = CancelOnDrop(shutdown);
-        let mut connections = JoinSet::new();
         loop {
-            tokio::select! {
-                accepted = listener.accept() => {
-                    let (stream, peer_addr) = match accepted {
-                        Ok(pair) => pair,
-                        Err(err) => {
-                            error!("xhttp accept failed: {}", err);
-                            continue;
-                        }
-                    };
-                    let _ = stream.set_nodelay(true);
-                    if let Some(policy) = tcp_socket_policy.as_ref()
-                        && let Err(err) = super::apply_tcp_socket_policy(
-                            &stream,
-                            bind_addr,
-                            peer_addr,
-                            policy,
-                        )
-                    {
-                        error!("xhttp TCP socket policy for {} failed: {}", peer_addr, err);
-                        continue;
-                    }
-                    let local_addr = match stream.local_addr() {
-                        Ok(addr) => addr,
-                        Err(err) => {
-                            error!("xhttp local address for {} failed: {}", peer_addr, err);
-                            continue;
-                        }
-                    };
-
-                    let state = state.clone();
-                    let security = security.clone();
-                    connections.spawn(async move {
-                        let stream: Box<dyn AsyncStream> = Box::new(stream);
-                        let wrapped_stream: std::io::Result<Box<dyn AsyncStream>> =
-                            match security {
-                                XhttpSecurityLayer::None => Ok(stream),
-                                #[cfg(feature = "tls")]
-                                XhttpSecurityLayer::Tls(acceptor) => {
-                                    accept_xhttp_tls(acceptor, stream).await
-                                }
-                                #[cfg(feature = "tls")]
-                                XhttpSecurityLayer::H3Tls(_) => unreachable!(
-                                    "HTTP/3 XHTTP listener is dispatched before TCP accept"
-                                ),
-                                #[cfg(feature = "reality")]
-                                XhttpSecurityLayer::Reality(config) => {
-                                    accept_reality_stream(stream, &config).await.map(
-                                        |stream| Box::new(stream) as Box<dyn AsyncStream>,
-                                    )
-                                }
-                            };
-
-                        match wrapped_stream {
-                            Ok(stream) => {
-                                serve_http_connection(stream, state, peer_addr, local_addr)
-                                    .await
-                            }
-                            Err(err) => {
-                                error!("xhttp accept {} failed: {}", peer_addr, err);
-                            }
-                        }
-                    });
+            let (stream, peer_addr) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(err) => {
+                    error!("xhttp accept failed: {}", err);
+                    continue;
                 }
-                result = connections.join_next(), if !connections.is_empty() => {
-                    if let Some(Err(err)) = result {
-                        error!("xhttp connection task failed: {}", err);
-                    }
-                }
+            };
+            let _ = stream.set_nodelay(true);
+            if let Some(policy) = tcp_socket_policy.as_ref()
+                && let Err(err) = super::apply_tcp_socket_policy(
+                    &stream, bind_addr, peer_addr, policy,
+                )
+            {
+                error!("xhttp TCP socket policy for {} failed: {}", peer_addr, err);
+                continue;
             }
+            let local_addr = match stream.local_addr() {
+                Ok(addr) => addr,
+                Err(err) => {
+                    error!("xhttp local address for {} failed: {}", peer_addr, err);
+                    continue;
+                }
+            };
+
+            let state = state.clone();
+            let security = security.clone();
+            let connection_runtime = state.runtime.clone();
+            connection_runtime.spawn_inbound_connection(async move {
+                let stream: Box<dyn AsyncStream> = Box::new(stream);
+                let wrapped_stream: std::io::Result<Box<dyn AsyncStream>> =
+                    match security {
+                        XhttpSecurityLayer::None => Ok(stream),
+                        #[cfg(feature = "tls")]
+                        XhttpSecurityLayer::Tls(acceptor) => {
+                            accept_xhttp_tls(acceptor, stream).await
+                        }
+                        #[cfg(feature = "tls")]
+                        XhttpSecurityLayer::H3Tls(_) => unreachable!(
+                            "HTTP/3 XHTTP listener is dispatched before TCP accept"
+                        ),
+                        #[cfg(feature = "reality")]
+                        XhttpSecurityLayer::Reality(config) => {
+                            accept_reality_stream(stream, &config).await.map(
+                                |stream| Box::new(stream) as Box<dyn AsyncStream>,
+                            )
+                        }
+                    };
+
+                match wrapped_stream {
+                    Ok(stream) => {
+                        serve_http_connection(stream, state, peer_addr, local_addr)
+                            .await
+                    }
+                    Err(err) => {
+                        error!("xhttp accept {} failed: {}", peer_addr, err);
+                    }
+                }
+            });
         }
     });
 
@@ -2736,6 +2724,136 @@ fn apply_response_padding_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_xhttp_server_config() -> XhttpServerConfig {
+        XhttpServerConfig {
+            mode: XhttpMode::Auto,
+            host: None,
+            path: "/xhttp".to_string(),
+            trusted_x_forwarded_for: Vec::new(),
+            min_padding: 100,
+            max_padding: 1000,
+            max_each_post_bytes: 1_000_000,
+            max_buffered_posts: 30,
+            session_ttl_secs: 300,
+            stream_up_server_secs: (20, 80),
+            server_max_header_bytes: 8192,
+            padding_obfs_mode: false,
+            padding_key: "x_padding".to_string(),
+            padding_header: "X-Padding".to_string(),
+            padding_placement: XhttpPaddingPlacement::QueryInHeader,
+            padding_method: XhttpPaddingMethod::RepeatX,
+            no_grpc_header: false,
+            no_sse_header: false,
+            uplink_http_method: "POST".to_string(),
+            min_posts_interval_ms: (30, 30),
+            session_placement: XhttpPlacement::Path,
+            session_key: String::new(),
+            seq_placement: XhttpPlacement::Path,
+            seq_key: String::new(),
+            uplink_data_placement: XhttpDataPlacement::Auto,
+            uplink_data_key: "x_data".to_string(),
+            xray_congestion: None,
+            xray_brutal_up: None,
+            xray_max_idle_timeout_secs: None,
+            xray_max_incoming_streams: None,
+            xray_init_stream_receive_window: None,
+            xray_max_stream_receive_window: None,
+            xray_init_connection_receive_window: None,
+            xray_max_connection_receive_window: None,
+            xray_disable_path_mtu_discovery: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_listener_stop_preserves_accepted_connection_like_xray() {
+        let probe = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("reserve test port");
+        let port = probe.local_addr().expect("test address").port();
+        drop(probe);
+
+        let config = ServerConfig {
+            tag: "xhttp-lifecycle".to_string(),
+            bind_location: BindLocation::Address(
+                crate::address::NetLocation::from_ip_addr(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    port,
+                ),
+            ),
+            protocol: ServerProxyConfig::Xhttp {
+                config: test_xhttp_server_config(),
+                inner: Box::new(ServerProxyConfig::Socks {
+                    accounts: crate::config::server_config::SocksUserStore::new(
+                        Vec::new(),
+                    ),
+                    udp_enabled: false,
+                    udp_response_ip: None,
+                    user_level: 0,
+                }),
+            },
+            transport: crate::config::Transport::Tcp,
+            quic_settings: None,
+            sniffing: None,
+            tcp_socket_policy: None,
+        };
+        let runtime = RuntimeState::new(vec![config.clone()], Vec::new());
+        let mut listener_tasks = start_xhttp_server(config, runtime)
+            .await
+            .expect("start XHTTP listener");
+        let listener_task = listener_tasks.pop().expect("listener task");
+
+        let stream =
+            tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+                .await
+                .expect("connect XHTTP client");
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                .await
+                .expect("HTTP/1 handshake");
+        let client_task = tokio::spawn(connection);
+
+        let request = || {
+            Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/xhttp/")
+                .header(header::HOST, "localhost")
+                .body(Empty::<Bytes>::new())
+                .expect("OPTIONS request")
+        };
+        let first = sender
+            .send_request(request())
+            .await
+            .expect("first request on accepted connection");
+        assert_eq!(first.status(), StatusCode::OK);
+        first
+            .into_body()
+            .collect()
+            .await
+            .expect("first response body");
+
+        listener_task.abort();
+        let _ = listener_task.await;
+        assert!(
+            tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+                .await
+                .is_err(),
+            "stopped XHTTP listener must reject new TCP connections"
+        );
+
+        let second = sender
+            .send_request(request())
+            .await
+            .expect("accepted XHTTP connection should survive listener stop");
+        assert_eq!(second.status(), StatusCode::OK);
+        second
+            .into_body()
+            .collect()
+            .await
+            .expect("second response body");
+
+        drop(sender);
+        client_task.abort();
+    }
 
     #[cfg(feature = "tls")]
     #[test]
