@@ -2162,9 +2162,13 @@ mod tests {
     async fn cancelled_remove_keeps_tombstone_until_task_reaped() {
         let manager = Arc::new(InboundManager::new(vec![inbound("primary", 10001)]));
         let generation = manager.generation("primary").unwrap();
-        let task = tokio::task::spawn_blocking(|| {
-            std::thread::sleep(Duration::from_millis(500));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
         });
+        started_rx.await.expect("blocking task should start");
         assert!(manager.register_tasks_for_generation(
             "primary",
             generation,
@@ -2198,6 +2202,7 @@ mod tests {
         );
         assert!(manager.add_config(inbound("primary", 10002)).is_err());
 
+        release_tx.send(()).expect("release blocking task");
         for _ in 0..100 {
             if manager.lifecycle_state("primary").is_none() {
                 break;
