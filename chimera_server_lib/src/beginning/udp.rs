@@ -2039,15 +2039,25 @@ async fn detach_global_udp_worker(global_id: [u8; 8], attachment_token: u64) {
     });
 }
 
+async fn stop_global_udp_worker(worker: GlobalSessionUdpWorker) {
+    worker.task.abort();
+    let _ = worker.task.await;
+}
+
 async fn terminate_global_udp_worker(global_id: [u8; 8], attachment_token: u64) {
     let gate = global_xudp_gate(global_id).await;
     let _gate_guard = gate.lock().await;
     let globals = global_xudp_workers();
-    let mut guard = globals.lock().await;
-    if guard.registry.remove_current(global_id, attachment_token)
-        && let Some(worker) = guard.workers.remove(&global_id)
-    {
-        worker.task.abort();
+    let worker = {
+        let mut guard = globals.lock().await;
+        if guard.registry.remove_current(global_id, attachment_token) {
+            guard.workers.remove(&global_id)
+        } else {
+            None
+        }
+    };
+    if let Some(worker) = worker {
+        stop_global_udp_worker(worker).await;
     }
 }
 
@@ -4524,6 +4534,64 @@ mod tests {
         .expect("terminated GlobalID sender must not hang")
         .expect_err("terminated GlobalID sender must reject its payload");
         assert_eq!(payload, b"terminated");
+    }
+
+    #[tokio::test]
+    async fn terminating_global_xudp_worker_waits_for_task_cleanup() {
+        struct CleanupSignal(Option<oneshot::Sender<()>>);
+
+        impl Drop for CleanupSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let global_id = [157, 158, 159, 160, 161, 162, 163, 164];
+        let now = Instant::now();
+        let (payload_sender, _payload_receiver) = mpsc::channel(1);
+        let (cleanup_sender, mut cleanup_receiver) = oneshot::channel();
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _cleanup = CleanupSignal(Some(cleanup_sender));
+            let _ = ready_sender.send(());
+            std::future::pending::<()>().await;
+        });
+        ready_receiver
+            .await
+            .expect("GlobalID cleanup test task must start before termination");
+        let globals = global_xudp_workers();
+        let attachment_token = {
+            let mut guard = globals.lock().await;
+            let transition = guard
+                .registry
+                .attach(global_id, 603, 1, now)
+                .expect("attach GlobalID before explicit termination cleanup test");
+            guard.workers.insert(
+                global_id,
+                GlobalSessionUdpWorker {
+                    key: GlobalUdpWorkerKey::Direct {
+                        target_is_ipv6: false,
+                        outbound_tag: None,
+                    },
+                    sender: payload_sender,
+                    attachment: Arc::new(RwLock::new(None)),
+                    attachment_notify: Arc::new(Notify::new()),
+                    task,
+                },
+            );
+            transition.current.token
+        };
+
+        terminate_global_udp_worker(global_id, attachment_token).await;
+
+        cleanup_receiver.try_recv().expect(
+            "explicit GlobalID termination must await task cleanup before returning",
+        );
+        let mut guard = globals.lock().await;
+        assert!(guard.registry.current(global_id, Instant::now()).is_none());
+        assert!(!guard.workers.contains_key(&global_id));
     }
 
     #[tokio::test]
