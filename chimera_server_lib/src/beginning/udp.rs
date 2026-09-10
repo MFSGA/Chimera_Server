@@ -938,7 +938,7 @@ pub(crate) async fn run_session_based_udp(
                         ) {
                             SessionUdpWorkerPlan::Reuse(sender) => sender,
                             SessionUdpWorkerPlan::Replace => {
-                                replace_session_udp_worker(
+                                match replace_session_udp_worker(
                                     &mut sessions,
                                     session_id,
                                     &mut next_generation,
@@ -950,12 +950,16 @@ pub(crate) async fn run_session_based_udp(
                                         idle_timeout: UDP_SESSION_IDLE_TIMEOUT,
                                     },
                                 )
-                                .await?
+                                .await
+                                {
+                                    Ok(sender) => sender,
+                                    Err(error) => break Err(error),
+                                }
                             }
                         };
 
                         if let Err(retry_payload) = sender.send_to(payload, target_addr).await {
-                            let retry_sender = replace_session_udp_worker(
+                            let retry_sender = match replace_session_udp_worker(
                                 &mut sessions,
                                 session_id,
                                 &mut next_generation,
@@ -967,16 +971,21 @@ pub(crate) async fn run_session_based_udp(
                                     idle_timeout: UDP_SESSION_IDLE_TIMEOUT,
                                 },
                             )
-                            .await?;
-                            retry_sender
+                            .await
+                            {
+                                Ok(sender) => sender,
+                                Err(error) => break Err(error),
+                            };
+                            if retry_sender
                                 .send_to(retry_payload, target_addr)
                                 .await
-                                .map_err(|_| {
-                                    std::io::Error::new(
-                                        std::io::ErrorKind::BrokenPipe,
-                                        "session udp socket closed before payload was sent",
-                                    )
-                                })?;
+                                .is_err()
+                            {
+                                break Err(std::io::Error::new(
+                                    std::io::ErrorKind::BrokenPipe,
+                                    "session udp socket closed before payload was sent",
+                                ));
+                            }
                         }
                     }
                     DirectOutboundAction::Trojan { outbound } => {
@@ -1002,7 +1011,7 @@ pub(crate) async fn run_session_based_udp(
                             ) {
                                 SessionUdpWorkerPlan::Reuse(sender) => sender,
                                 SessionUdpWorkerPlan::Replace => {
-                                    replace_trojan_session_udp_worker(
+                                    match replace_trojan_session_udp_worker(
                                         &mut sessions,
                                         session_id,
                                         &mut next_generation,
@@ -1017,12 +1026,16 @@ pub(crate) async fn run_session_based_udp(
                                             idle_timeout: UDP_SESSION_IDLE_TIMEOUT,
                                         },
                                     )
-                                    .await?
+                                    .await
+                                    {
+                                        Ok(sender) => sender,
+                                        Err(error) => break Err(error),
+                                    }
                                 }
                             };
 
                             if let Err(retry_payload) = sender.send_to(payload, target_addr).await {
-                                let retry_sender = replace_trojan_session_udp_worker(
+                                let retry_sender = match replace_trojan_session_udp_worker(
                                     &mut sessions,
                                     session_id,
                                     &mut next_generation,
@@ -1037,16 +1050,21 @@ pub(crate) async fn run_session_based_udp(
                                         idle_timeout: UDP_SESSION_IDLE_TIMEOUT,
                                     },
                                 )
-                                .await?;
-                                retry_sender
+                                .await
+                                {
+                                    Ok(sender) => sender,
+                                    Err(error) => break Err(error),
+                                };
+                                if retry_sender
                                     .send_to(retry_payload, target_addr)
                                     .await
-                                    .map_err(|_| {
-                                        std::io::Error::new(
-                                            std::io::ErrorKind::BrokenPipe,
-                                            "Trojan session UDP tunnel closed before payload was sent",
-                                        )
-                                    })?;
+                                    .is_err()
+                                {
+                                    break Err(std::io::Error::new(
+                                        std::io::ErrorKind::BrokenPipe,
+                                        "Trojan session UDP tunnel closed before payload was sent",
+                                    ));
+                                }
                             }
                         }
                         #[cfg(not(feature = "trojan"))]
@@ -1082,14 +1100,21 @@ pub(crate) async fn run_session_based_udp(
                             );
                             continue;
                         }
-                        write_session_message(
+                        if let Err(error) = write_session_message(
                             &mut *server_stream,
                             response.session_id,
                             &response.payload,
                             &response.source,
                         )
-                        .await?;
-                        flush_session_message(&mut *server_stream).await?;
+                        .await
+                        {
+                            break Err(error);
+                        }
+                        if let Err(error) =
+                            flush_session_message(&mut *server_stream).await
+                        {
+                            break Err(error);
+                        }
                         record_transfer(
                             response.traffic_context,
                             0,
@@ -1113,13 +1138,20 @@ pub(crate) async fn run_session_based_udp(
                             continue;
                         }
                         expire_session_udp_worker(&mut sessions, session_id).await;
-                        write_session_end(
+                        if let Err(error) = write_session_end(
                             &mut *server_stream,
                             session_id,
                             has_error,
                         )
-                        .await?;
-                        flush_session_message(&mut *server_stream).await?;
+                        .await
+                        {
+                            break Err(error);
+                        }
+                        if let Err(error) =
+                            flush_session_message(&mut *server_stream).await
+                        {
+                            break Err(error);
+                        }
                     }
                 }
             }
@@ -1204,6 +1236,11 @@ async fn replace_trojan_session_udp_worker(
     Ok(sender)
 }
 
+async fn stop_local_session_udp_task(task: JoinHandle<()>) {
+    task.abort();
+    let _ = task.await;
+}
+
 async fn terminate_session_udp_worker(
     sessions: &mut HashMap<u16, SessionUdpWorker>,
     session_id: u16,
@@ -1212,7 +1249,7 @@ async fn terminate_session_udp_worker(
         return;
     };
     if let Some(task) = worker.task {
-        task.abort();
+        stop_local_session_udp_task(task).await;
     }
     if let (
         Some(global_id),
@@ -1236,7 +1273,7 @@ async fn expire_session_udp_worker(
 
 async fn detach_session_udp_worker(worker: SessionUdpWorker) {
     if let Some(task) = worker.task {
-        task.abort();
+        stop_local_session_udp_task(task).await;
     }
     if let (
         Some(global_id),
@@ -3417,6 +3454,88 @@ mod tests {
     #[cfg(any(feature = "trojan", feature = "vless", feature = "vmess"))]
     impl AsyncStream for TestStream {}
 
+    #[cfg(any(feature = "vless", feature = "vmess"))]
+    struct FailingSessionResponseStream {
+        request: Option<(SessionMessage, Vec<u8>)>,
+    }
+
+    #[cfg(any(feature = "vless", feature = "vmess"))]
+    impl crate::async_stream::AsyncReadSessionMessage for FailingSessionResponseStream {
+        fn poll_read_session_message(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<SessionMessage>> {
+            let Some((message, payload)) = self.request.take() else {
+                return Poll::Pending;
+            };
+            buffer.put_slice(&payload);
+            Poll::Ready(Ok(message))
+        }
+    }
+
+    #[cfg(any(feature = "vless", feature = "vmess"))]
+    impl crate::async_stream::AsyncWriteSessionMessage for FailingSessionResponseStream {
+        fn poll_write_session_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _session_id: u16,
+            _buffer: &[u8],
+            _target: &SocketAddr,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "test session response write failure",
+            )))
+        }
+
+        fn poll_write_session_end(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _session_id: u16,
+            _has_error: bool,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[cfg(any(feature = "vless", feature = "vmess"))]
+    impl crate::async_stream::AsyncFlushMessage for FailingSessionResponseStream {
+        fn poll_flush_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[cfg(any(feature = "vless", feature = "vmess"))]
+    impl crate::async_stream::AsyncShutdownMessage for FailingSessionResponseStream {
+        fn poll_shutdown_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[cfg(any(feature = "vless", feature = "vmess"))]
+    impl AsyncPing for FailingSessionResponseStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    #[cfg(any(feature = "vless", feature = "vmess"))]
+    impl AsyncSessionMessageStream for FailingSessionResponseStream {}
+
     fn runtime_with_outbounds(outbounds: Vec<OutboundSummary>) -> RuntimeState {
         RuntimeState::new(Vec::new(), outbounds)
     }
@@ -4757,7 +4876,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removing_session_udp_worker_aborts_task() {
+    async fn removing_session_udp_worker_waits_for_aborted_task() {
         let (sender, _receiver) = mpsc::channel(1);
         let task = tokio::spawn(std::future::pending::<()>());
         let abort_handle = task.abort_handle();
@@ -4777,10 +4896,86 @@ mod tests {
         );
 
         terminate_session_udp_worker(&mut sessions, 23).await;
-        tokio::task::yield_now().await;
 
         assert!(abort_handle.is_finished());
         assert!(!sessions.contains_key(&23));
+    }
+
+    #[cfg(any(feature = "vless", feature = "vmess"))]
+    #[tokio::test]
+    async fn session_udp_write_error_waits_for_local_worker_cleanup() {
+        let target = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind session UDP cleanup target");
+        let target_addr = target
+            .local_addr()
+            .expect("session UDP cleanup target address");
+        let (peer_sender, peer_receiver) = oneshot::channel();
+        let (release_sender, release_receiver) = oneshot::channel();
+        let target_task = tokio::spawn(async move {
+            let mut buffer = [0u8; 64];
+            let (length, peer) = target
+                .recv_from(&mut buffer)
+                .await
+                .expect("receive session UDP cleanup request");
+            peer_sender
+                .send(peer)
+                .expect("report session UDP worker address");
+            release_receiver
+                .await
+                .expect("release session UDP cleanup response");
+            target
+                .send_to(&buffer[..length], peer)
+                .await
+                .expect("send session UDP cleanup response");
+        });
+
+        let stream = FailingSessionResponseStream {
+            request: Some((
+                SessionMessage::Data {
+                    session_id: 24,
+                    target: target_addr,
+                    global_id: None,
+                    is_new: true,
+                },
+                b"cleanup".to_vec(),
+            )),
+        };
+        let relay = tokio::spawn(run_session_based_udp(
+            Box::new(stream),
+            runtime_with_outbounds(vec![outbound("direct", "freedom")]),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 43124)),
+            None,
+            None,
+        ));
+
+        let worker_addr = timeout(Duration::from_secs(1), peer_receiver)
+            .await
+            .expect("session UDP worker address timeout")
+            .expect("session UDP worker address channel");
+        assert!(
+            UdpSocket::bind((Ipv4Addr::UNSPECIFIED, worker_addr.port()))
+                .await
+                .is_err(),
+            "local session UDP socket must still be owned before relay teardown"
+        );
+
+        release_sender
+            .send(())
+            .expect("release session UDP cleanup target response");
+        target_task
+            .await
+            .expect("session UDP cleanup target task must not panic");
+        let error = timeout(Duration::from_secs(1), relay)
+            .await
+            .expect("session UDP write failure must finish promptly")
+            .expect("session UDP relay task must not panic")
+            .expect_err("session UDP response write must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+
+        UdpSocket::bind((Ipv4Addr::UNSPECIFIED, worker_addr.port()))
+            .await
+            .expect("relay error teardown must release local session UDP socket before returning");
     }
 
     #[cfg(feature = "trojan")]
