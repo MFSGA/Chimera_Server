@@ -1,5 +1,5 @@
 use super::proto;
-use crate::traffic;
+use crate::{runtime::RuntimeState, traffic};
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -36,12 +36,21 @@ impl StatsReset {
 pub(super) struct StatsServiceImpl {
     start_time: Instant,
     reset: Arc<StatsReset>,
+    runtime: Option<RuntimeState>,
 }
 impl StatsServiceImpl {
     fn new() -> Self {
         Self {
             start_time: Instant::now(),
             reset: Arc::new(StatsReset::default()),
+            runtime: None,
+        }
+    }
+
+    fn with_runtime(runtime: RuntimeState) -> Self {
+        Self {
+            runtime: Some(runtime),
+            ..Self::new()
         }
     }
     fn current_stats(&self) -> HashMap<String, i64> {
@@ -336,6 +345,15 @@ impl proto::xray::app::stats::command::stats_service_server::StatsService
         _request: Request<proto::xray::app::stats::command::SysStatsRequest>,
     ) -> Result<Response<proto::xray::app::stats::command::SysStatsResponse>, Status>
     {
+        if let Some(runtime) = &self.runtime
+            && !runtime.is_ready()
+        {
+            return Err(Status::unavailable(format!(
+                "server is {}",
+                runtime.lifecycle_state().as_str()
+            )));
+        }
+
         let stats = self.sys_stats();
         Ok(Response::new(
             proto::xray::app::stats::command::SysStatsResponse {
@@ -544,12 +562,13 @@ fn parse_status_kib_value(status: &str, key: &str) -> Option<u64> {
     Some(value)
 }
 
-pub(super) fn build_service()
--> proto::xray::app::stats::command::stats_service_server::StatsServiceServer<
+pub(super) fn build_service(
+    runtime: RuntimeState,
+) -> proto::xray::app::stats::command::stats_service_server::StatsServiceServer<
     StatsServiceImpl,
 > {
     proto::xray::app::stats::command::stats_service_server::StatsServiceServer::new(
-        StatsServiceImpl::new(),
+        StatsServiceImpl::with_runtime(runtime),
     )
 }
 
@@ -935,6 +954,41 @@ mod tests {
             .await
             .expect_err("expected localhost-only online stats to be absent");
         assert_eq!(err.code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn stats_get_sys_stats_is_unavailable_until_runtime_is_ready() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let service = StatsServiceImpl::with_runtime(runtime.clone());
+
+        let request =
+            || Request::new(proto::xray::app::stats::command::SysStatsRequest {});
+
+        let starting = service
+            .get_sys_stats(request())
+            .await
+            .expect_err("starting runtime must not report ready");
+        assert_eq!(starting.code(), Code::Unavailable);
+
+        assert!(runtime.mark_running());
+        service
+            .get_sys_stats(request())
+            .await
+            .expect("running runtime should report ready");
+
+        assert!(runtime.begin_draining());
+        let draining = service
+            .get_sys_stats(request())
+            .await
+            .expect_err("draining runtime must not report ready");
+        assert_eq!(draining.code(), Code::Unavailable);
+
+        runtime.finish_shutdown(false);
+        let stopped = service
+            .get_sys_stats(request())
+            .await
+            .expect_err("stopped runtime must not report ready");
+        assert_eq!(stopped.code(), Code::Unavailable);
     }
 
     #[tokio::test]

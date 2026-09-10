@@ -1,6 +1,9 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicU8, Ordering},
+    },
     time::Duration,
 };
 
@@ -96,6 +99,39 @@ impl RoutingPublication {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum RuntimeLifecycleState {
+    Starting = 0,
+    Running = 1,
+    Draining = 2,
+    Stopped = 3,
+    Failed = 4,
+}
+
+impl RuntimeLifecycleState {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Draining => "draining",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Starting,
+            1 => Self::Running,
+            2 => Self::Draining,
+            3 => Self::Stopped,
+            4 => Self::Failed,
+            _ => unreachable!("invalid runtime lifecycle state"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeState {
     inbound_manager: Arc<InboundManager>,
@@ -106,6 +142,7 @@ pub struct RuntimeState {
     balancer_overrides: Arc<RwLock<Arc<HashMap<String, String>>>>,
     routing_events: broadcast::Sender<RoutingEvent>,
     connection_tasks: ConnectionTaskOwner,
+    lifecycle: Arc<AtomicU8>,
 }
 
 impl RuntimeState {
@@ -127,7 +164,64 @@ impl RuntimeState {
             balancer_overrides: Arc::new(RwLock::new(Arc::new(HashMap::new()))),
             routing_events,
             connection_tasks: ConnectionTaskOwner::default(),
+            lifecycle: Arc::new(AtomicU8::new(
+                RuntimeLifecycleState::Starting as u8,
+            )),
         }
+    }
+
+    pub(crate) fn lifecycle_state(&self) -> RuntimeLifecycleState {
+        RuntimeLifecycleState::from_u8(self.lifecycle.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn is_ready(&self) -> bool {
+        self.lifecycle_state() == RuntimeLifecycleState::Running
+    }
+
+    pub(crate) fn mark_running(&self) -> bool {
+        self.lifecycle
+            .compare_exchange(
+                RuntimeLifecycleState::Starting as u8,
+                RuntimeLifecycleState::Running as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub(crate) fn begin_draining(&self) -> bool {
+        loop {
+            let current = self.lifecycle.load(Ordering::Acquire);
+            let state = RuntimeLifecycleState::from_u8(current);
+            match state {
+                RuntimeLifecycleState::Starting | RuntimeLifecycleState::Running => {
+                    if self
+                        .lifecycle
+                        .compare_exchange(
+                            current,
+                            RuntimeLifecycleState::Draining as u8,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+                RuntimeLifecycleState::Draining
+                | RuntimeLifecycleState::Stopped
+                | RuntimeLifecycleState::Failed => return false,
+            }
+        }
+    }
+
+    pub(crate) fn finish_shutdown(&self, failed: bool) {
+        let state = if failed {
+            RuntimeLifecycleState::Failed
+        } else {
+            RuntimeLifecycleState::Stopped
+        };
+        self.lifecycle.store(state as u8, Ordering::Release);
     }
 
     pub(crate) fn spawn_inbound_connection<F>(&self, future: F) -> bool
@@ -714,7 +808,7 @@ impl RuntimeState {
 
 #[cfg(test)]
 mod tests {
-    use super::RuntimeState;
+    use super::{RuntimeLifecycleState, RuntimeState};
     use crate::{
         address::{BindLocation, NetLocation},
         config::{
@@ -730,6 +824,38 @@ mod tests {
         sync::{Arc, mpsc},
         time::Duration,
     };
+
+    #[test]
+    fn runtime_lifecycle_transitions_are_monotonic() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        assert_eq!(runtime.lifecycle_state(), RuntimeLifecycleState::Starting);
+        assert!(!runtime.is_ready());
+
+        assert!(runtime.mark_running());
+        assert_eq!(runtime.lifecycle_state(), RuntimeLifecycleState::Running);
+        assert!(runtime.is_ready());
+        assert!(!runtime.mark_running());
+
+        assert!(runtime.begin_draining());
+        assert_eq!(runtime.lifecycle_state(), RuntimeLifecycleState::Draining);
+        assert!(!runtime.is_ready());
+        assert!(!runtime.begin_draining());
+
+        runtime.finish_shutdown(false);
+        assert_eq!(runtime.lifecycle_state(), RuntimeLifecycleState::Stopped);
+        assert!(!runtime.is_ready());
+        assert!(!runtime.begin_draining());
+    }
+
+    #[test]
+    fn failed_shutdown_has_explicit_terminal_state() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        assert!(runtime.mark_running());
+        assert!(runtime.begin_draining());
+        runtime.finish_shutdown(true);
+        assert_eq!(runtime.lifecycle_state(), RuntimeLifecycleState::Failed);
+        assert!(!runtime.is_ready());
+    }
 
     #[tokio::test]
     async fn stopping_inbound_tasks_releases_listener_before_return() {

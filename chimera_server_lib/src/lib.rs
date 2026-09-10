@@ -2,10 +2,13 @@
 #![allow(dead_code)]
 
 pub use beginning::start_tcp_server;
-use config::{def::ApiConfig, rule::RoutingConfig};
 pub use config::{
     def::LiteralConfig,
     server_config::{ServerConfig, ServerProxyConfig},
+};
+use config::{
+    def::{ApiConfig, DEFAULT_SHUTDOWN_GRACE_PERIOD_SECONDS},
+    rule::RoutingConfig,
 };
 pub use config_loader::{ConfigFormat, resolve_config_source};
 pub use runtime::{OutboundSummary, RuntimeState};
@@ -113,8 +116,6 @@ pub struct ServerRuntime {
     pub runtime_state: RuntimeState,
 }
 
-const SERVER_CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
-
 #[derive(Debug)]
 struct ServerShutdownReport {
     stopped_inbounds: usize,
@@ -167,7 +168,10 @@ async fn shutdown_server_runtime(
     runtime_state: &RuntimeState,
     service_tasks: Vec<JoinHandle<()>>,
     connection_grace_period: Duration,
+    failed: bool,
 ) -> ServerShutdownReport {
+    runtime_state.begin_draining();
+
     // Close connection registration first so an accept racing with listener
     // teardown cannot escape the server-level owner.
     runtime_state.close_inbound_connection_tasks();
@@ -188,6 +192,7 @@ async fn shutdown_server_runtime(
         .await;
     let stopped_global_xudp_workers =
         beginning::udp::shutdown_global_xudp_workers().await;
+    runtime_state.finish_shutdown(failed);
 
     ServerShutdownReport {
         stopped_inbounds,
@@ -478,6 +483,14 @@ async fn start_async(
     cwd: Option<&str>,
     log_file: Option<&str>,
 ) -> Result<(), Error> {
+    let connection_drain_timeout = Duration::from_secs(
+        config
+            .shutdown
+            .as_ref()
+            .map(|shutdown| shutdown.grace_period_seconds)
+            .unwrap_or(DEFAULT_SHUTDOWN_GRACE_PERIOD_SECONDS),
+    );
+
     //  todo: log mod
     log::init(config.log.as_ref(), cwd, log_file)?;
     // 2. api config
@@ -621,6 +634,11 @@ async fn start_async(
             "no servers started; check inbounds/api configuration".into(),
         ));
     }
+    if !runtime_state.mark_running() {
+        return Err(Error::Io(std::io::Error::other(
+            "runtime lifecycle left starting state before startup completed",
+        )));
+    }
 
     let exit = {
         let shutdown_signal = wait_for_shutdown_signal();
@@ -637,13 +655,19 @@ async fn start_async(
     };
 
     if let ServerExit::Signal(signal) = &exit {
-        tracing::info!(%signal, "shutdown requested; stopping listeners");
+        tracing::info!(
+            %signal,
+            grace_period_seconds = connection_drain_timeout.as_secs(),
+            "shutdown requested; stopping listeners"
+        );
     }
 
+    let failed = !matches!(&exit, ServerExit::Signal(_));
     let shutdown = shutdown_server_runtime(
         &runtime_state,
         join_handles,
-        SERVER_CONNECTION_DRAIN_TIMEOUT,
+        connection_drain_timeout,
+        failed,
     )
     .await;
     tracing::info!(
@@ -651,6 +675,7 @@ async fn start_async(
         drained_connections = shutdown.drained_connections,
         cancelled_connections = shutdown.cancelled_connections,
         stopped_global_xudp_workers = shutdown.stopped_global_xudp_workers,
+        lifecycle = runtime_state.lifecycle_state().as_str(),
         "server shutdown complete"
     );
 

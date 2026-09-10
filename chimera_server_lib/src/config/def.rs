@@ -29,6 +29,8 @@ pub struct LiteralConfig {
     pub observatory: Option<ObservatoryConfig>,
     #[serde(default, rename = "burstObservatory")]
     pub burst_observatory: Option<BurstObservatoryConfig>,
+    #[serde(default)]
+    pub shutdown: Option<ShutdownConfig>,
     // mcp settings
     pub mcp: Option<McpConfig>,
 }
@@ -291,6 +293,27 @@ where
     deserializer.deserialize_option(PolicyLevelsVisitor)
 }
 
+pub const DEFAULT_SHUTDOWN_GRACE_PERIOD_SECONDS: u64 = 10;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShutdownConfig {
+    #[serde(default = "default_shutdown_grace_period_seconds")]
+    pub grace_period_seconds: u64,
+}
+
+impl Default for ShutdownConfig {
+    fn default() -> Self {
+        Self {
+            grace_period_seconds: DEFAULT_SHUTDOWN_GRACE_PERIOD_SECONDS,
+        }
+    }
+}
+
+fn default_shutdown_grace_period_seconds() -> u64 {
+    DEFAULT_SHUTDOWN_GRACE_PERIOD_SECONDS
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpConfig {
@@ -312,7 +335,9 @@ fn default_mcp_update_interval_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{LiteralConfig, PolicyConfig, Protocol};
+    use super::{
+        DEFAULT_SHUTDOWN_GRACE_PERIOD_SECONDS, LiteralConfig, PolicyConfig, Protocol,
+    };
 
     #[test]
     fn policy_levels_match_xray_uint32_json_semantics() {
@@ -412,6 +437,41 @@ mod tests {
         "#;
         let c = cfg.parse::<LiteralConfig>().expect("should parse");
         println!("{:?}", c);
+    }
+
+    #[test]
+    fn parses_shutdown_grace_period_extension() {
+        let explicit: LiteralConfig = serde_json::from_str(
+            r#"{
+                "inbounds": [],
+                "outbounds": [],
+                "shutdown": {"gracePeriodSeconds": 3}
+            }"#,
+        )
+        .expect("shutdown config should parse");
+        assert_eq!(
+            explicit
+                .shutdown
+                .expect("shutdown config missing")
+                .grace_period_seconds,
+            3
+        );
+
+        let defaulted: LiteralConfig = serde_json::from_str(
+            r#"{
+                "inbounds": [],
+                "outbounds": [],
+                "shutdown": {}
+            }"#,
+        )
+        .expect("default shutdown config should parse");
+        assert_eq!(
+            defaulted
+                .shutdown
+                .expect("shutdown config missing")
+                .grace_period_seconds,
+            DEFAULT_SHUTDOWN_GRACE_PERIOD_SECONDS
+        );
     }
 
     #[test]
