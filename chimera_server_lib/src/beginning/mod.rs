@@ -1,4 +1,9 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use quic::start_quic_server;
 #[cfg(target_os = "linux")]
@@ -49,6 +54,139 @@ use tracing::{error, info};
 
 const SNIFFING_MAX_BYTES: usize = 32_767;
 const SNIFFING_TIMEOUT: Duration = Duration::from_millis(200);
+const ACCEPT_ERROR_UNHEALTHY_AFTER: Duration = Duration::from_secs(5);
+const ACCEPT_ERROR_MIN_FAILURES: u32 = 8;
+const ACCEPT_ERROR_INITIAL_BACKOFF: Duration = Duration::from_millis(25);
+const ACCEPT_ERROR_MAX_BACKOFF: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptErrorDisposition {
+    Retry(Duration),
+    Fatal,
+}
+
+#[derive(Debug)]
+pub(super) struct TcpAcceptHealth {
+    first_failure: Option<Instant>,
+    retry_backoff: Duration,
+    consecutive_failures: u32,
+}
+
+impl Default for TcpAcceptHealth {
+    fn default() -> Self {
+        Self {
+            first_failure: None,
+            retry_backoff: ACCEPT_ERROR_INITIAL_BACKOFF,
+            consecutive_failures: 0,
+        }
+    }
+}
+
+impl TcpAcceptHealth {
+    fn reset(&mut self) {
+        self.first_failure = None;
+        self.retry_backoff = ACCEPT_ERROR_INITIAL_BACKOFF;
+        self.consecutive_failures = 0;
+    }
+
+    fn record_success(&mut self) {
+        self.reset();
+    }
+
+    fn classify_error(&mut self, error: &std::io::Error) -> AcceptErrorDisposition {
+        self.classify_error_at(error, Instant::now())
+    }
+
+    fn classify_error_at(
+        &mut self,
+        error: &std::io::Error,
+        now: Instant,
+    ) -> AcceptErrorDisposition {
+        use std::io::ErrorKind;
+
+        match error.kind() {
+            // These can describe one failed connection attempt rather than a
+            // broken listening socket. Do not let a client-side abort poison
+            // listener health.
+            ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
+            | ErrorKind::Interrupted => {
+                self.reset();
+                return AcceptErrorDisposition::Retry(Duration::ZERO);
+            }
+            ErrorKind::WouldBlock => {
+                self.reset();
+                return AcceptErrorDisposition::Retry(ACCEPT_ERROR_INITIAL_BACKOFF);
+            }
+            // A listening socket returning these states cannot meaningfully
+            // recover by spinning in accept(). Normal shutdown aborts the task
+            // before this path, so these indicate an unexpected listener fault.
+            ErrorKind::BrokenPipe
+            | ErrorKind::InvalidInput
+            | ErrorKind::NotConnected
+            | ErrorKind::Unsupported => {
+                self.consecutive_failures =
+                    self.consecutive_failures.saturating_add(1);
+                return AcceptErrorDisposition::Fatal;
+            }
+            _ => {}
+        }
+
+        let first_failure = *self.first_failure.get_or_insert(now);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if self.consecutive_failures >= ACCEPT_ERROR_MIN_FAILURES
+            && now.saturating_duration_since(first_failure)
+                >= ACCEPT_ERROR_UNHEALTHY_AFTER
+        {
+            return AcceptErrorDisposition::Fatal;
+        }
+
+        let backoff = self.retry_backoff;
+        self.retry_backoff = self
+            .retry_backoff
+            .saturating_mul(2)
+            .min(ACCEPT_ERROR_MAX_BACKOFF);
+        AcceptErrorDisposition::Retry(backoff)
+    }
+}
+
+pub(super) async fn accept_tcp_with_health(
+    listener: &tokio::net::TcpListener,
+    health: &mut TcpAcceptHealth,
+    listener_kind: &'static str,
+) -> std::io::Result<(tokio::net::TcpStream, SocketAddr)> {
+    loop {
+        match listener.accept().await {
+            Ok(accepted) => {
+                health.record_success();
+                return Ok(accepted);
+            }
+            Err(error) => match health.classify_error(&error) {
+                AcceptErrorDisposition::Retry(backoff) => {
+                    error!(
+                        listener_kind,
+                        consecutive_failures = health.consecutive_failures,
+                        retry_after_ms = backoff.as_millis(),
+                        %error,
+                        "listener accept failed; retrying"
+                    );
+                    if !backoff.is_zero() {
+                        tokio::time::sleep(backoff).await;
+                    }
+                }
+                AcceptErrorDisposition::Fatal => {
+                    error!(
+                        listener_kind,
+                        consecutive_failures = health.consecutive_failures,
+                        %error,
+                        "listener accept remained unhealthy; stopping listener task"
+                    );
+                    return Err(error);
+                }
+            },
+        }
+    }
+}
 
 #[cfg(feature = "grpc_transport")]
 pub(crate) mod grpc_transport;
@@ -420,14 +558,10 @@ async fn run_tcp_server(
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
     let listener_addr = listener.local_addr()?;
 
+    let mut accept_health = TcpAcceptHealth::default();
     loop {
-        let (stream, addr) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                error!("Accept failed: {}", e);
-                continue;
-            }
-        };
+        let (stream, addr) =
+            accept_tcp_with_health(&listener, &mut accept_health, "tcp").await?;
         if let Err(e) = stream.set_nodelay(true) {
             error!("Failed to set TCP nodelay: {}", e);
         }
@@ -1621,6 +1755,98 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn tcp_accept_health_fails_only_after_sustained_listener_errors() {
+        let mut health = TcpAcceptHealth::default();
+        let error = std::io::Error::other("simulated listener resource failure");
+        let started = Instant::now();
+
+        for attempt in 0..(ACCEPT_ERROR_MIN_FAILURES - 1) {
+            let disposition = health.classify_error_at(
+                &error,
+                started + Duration::from_millis(u64::from(attempt) * 100),
+            );
+            assert!(matches!(disposition, AcceptErrorDisposition::Retry(_)));
+        }
+        assert_eq!(
+            health.classify_error_at(
+                &error,
+                started + ACCEPT_ERROR_UNHEALTHY_AFTER - Duration::from_millis(1),
+            ),
+            AcceptErrorDisposition::Retry(ACCEPT_ERROR_MAX_BACKOFF)
+        );
+        assert_eq!(
+            health
+                .classify_error_at(&error, started + ACCEPT_ERROR_UNHEALTHY_AFTER,),
+            AcceptErrorDisposition::Fatal
+        );
+    }
+
+    #[test]
+    fn tcp_accept_health_resets_on_success_or_connection_scoped_error() {
+        let mut health = TcpAcceptHealth::default();
+        let listener_error =
+            std::io::Error::other("simulated listener resource failure");
+        let aborted = std::io::Error::from(std::io::ErrorKind::ConnectionAborted);
+        let started = Instant::now();
+
+        assert_eq!(
+            health.classify_error_at(&listener_error, started),
+            AcceptErrorDisposition::Retry(ACCEPT_ERROR_INITIAL_BACKOFF)
+        );
+        assert_eq!(
+            health.classify_error_at(&aborted, started + Duration::from_secs(4)),
+            AcceptErrorDisposition::Retry(Duration::ZERO)
+        );
+        assert_eq!(
+            health.classify_error_at(
+                &listener_error,
+                started + Duration::from_secs(10)
+            ),
+            AcceptErrorDisposition::Retry(ACCEPT_ERROR_INITIAL_BACKOFF)
+        );
+
+        health.record_success();
+        assert_eq!(
+            health.classify_error_at(
+                &listener_error,
+                started + Duration::from_secs(20)
+            ),
+            AcceptErrorDisposition::Retry(ACCEPT_ERROR_INITIAL_BACKOFF)
+        );
+    }
+
+    #[test]
+    fn tcp_accept_health_bounds_backoff_and_fails_terminal_states_immediately() {
+        let mut health = TcpAcceptHealth::default();
+        let error = std::io::Error::other("simulated listener resource failure");
+        let started = Instant::now();
+        let mut last_retry = Duration::ZERO;
+        for attempt in 0..6 {
+            let disposition = health.classify_error_at(
+                &error,
+                started + Duration::from_millis(attempt * 100),
+            );
+            let AcceptErrorDisposition::Retry(backoff) = disposition else {
+                panic!("short error streak should remain retryable");
+            };
+            last_retry = backoff;
+        }
+        assert_eq!(last_retry, ACCEPT_ERROR_MAX_BACKOFF);
+
+        let would_block = std::io::Error::from(std::io::ErrorKind::WouldBlock);
+        assert_eq!(
+            health.classify_error_at(&would_block, started + Duration::from_secs(1)),
+            AcceptErrorDisposition::Retry(ACCEPT_ERROR_INITIAL_BACKOFF)
+        );
+
+        let terminal = std::io::Error::from(std::io::ErrorKind::NotConnected);
+        assert_eq!(
+            health.classify_error_at(&terminal, started + Duration::from_secs(1)),
+            AcceptErrorDisposition::Fatal
+        );
+    }
 
     #[tokio::test]
     async fn bound_inbound_tasks_drop_releases_ready_listener() {

@@ -323,12 +323,19 @@ pub(super) async fn start_grpc_server(
         grpc_service_paths(&grpc_config.service_name);
 
     let handle = tokio::spawn(async move {
+        let mut accept_health = super::TcpAcceptHealth::default();
         loop {
-            let (stream, peer_addr) = match listener.accept().await {
+            let (stream, peer_addr) = match super::accept_tcp_with_health(
+                &listener,
+                &mut accept_health,
+                "grpc_transport",
+            )
+            .await
+            {
                 Ok(value) => value,
                 Err(error) => {
-                    error!("gRPC transport accept failed: {error}");
-                    continue;
+                    error!("gRPC transport listener stopped: {error}");
+                    return;
                 }
             };
             if let Some(policy) = tcp_socket_policy.as_ref()

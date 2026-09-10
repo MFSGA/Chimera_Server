@@ -246,12 +246,19 @@ pub async fn start_xhttp_server(
     let security = listener_config.security.clone();
 
     let handle = tokio::spawn(async move {
+        let mut accept_health = super::TcpAcceptHealth::default();
         loop {
-            let (stream, peer_addr) = match listener.accept().await {
+            let (stream, peer_addr) = match super::accept_tcp_with_health(
+                &listener,
+                &mut accept_health,
+                "xhttp_tcp",
+            )
+            .await
+            {
                 Ok(pair) => pair,
                 Err(err) => {
-                    error!("xhttp accept failed: {}", err);
-                    continue;
+                    error!("xhttp TCP listener stopped: {err}");
+                    return;
                 }
             };
             let _ = stream.set_nodelay(true);
