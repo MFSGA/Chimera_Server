@@ -19,6 +19,7 @@ use tokio::{
     task::JoinHandle,
     time::{Instant, sleep},
 };
+use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "shadowsocks")]
@@ -576,12 +577,33 @@ pub(crate) async fn run_bidirectional_udp(
 }
 
 pub(crate) async fn run_multi_directional_udp(
+    server_stream: Box<dyn AsyncTargetedMessageStream>,
+    resolver: Arc<dyn Resolver>,
+    runtime: RuntimeState,
+    peer_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
+    traffic_context: Option<TrafficContext>,
+) -> std::io::Result<()> {
+    run_multi_directional_udp_with_tasks(
+        server_stream,
+        resolver,
+        runtime,
+        peer_addr,
+        local_addr,
+        traffic_context,
+        TaskTracker::new(),
+    )
+    .await
+}
+
+async fn run_multi_directional_udp_with_tasks(
     mut server_stream: Box<dyn AsyncTargetedMessageStream>,
     resolver: Arc<dyn Resolver>,
     runtime: RuntimeState,
     peer_addr: SocketAddr,
     local_addr: Option<SocketAddr>,
     traffic_context: Option<TrafficContext>,
+    session_tasks: TaskTracker,
 ) -> std::io::Result<()> {
     let traffic_context =
         traffic_context.map(|context| context.with_client_ip(peer_addr.ip()));
@@ -605,8 +627,9 @@ pub(crate) async fn run_multi_directional_udp(
         HashMap::<TrojanUdpSessionKey, mpsc::Sender<Vec<u8>>>::new();
     let mut client_buffer = vec![0u8; UDP_BUFFER_SIZE];
 
-    let result = loop {
-        tokio::select! {
+    let result: std::io::Result<()> = async {
+        loop {
+            tokio::select! {
             request = read_targeted_message(&mut *server_stream, &mut client_buffer) => {
                 let (target_location, payload_length) = match request {
                     Ok(request) => request,
@@ -669,6 +692,7 @@ pub(crate) async fn run_multi_directional_udp(
                             Some(sender) if !sender.is_closed() => sender.clone(),
                             _ => {
                                 let sender = start_targeted_udp_session(
+                                    &session_tasks,
                                     key.clone(),
                                     response_sender.clone(),
                                     packet_context.clone(),
@@ -682,6 +706,7 @@ pub(crate) async fn run_multi_directional_udp(
                         if sender.send(payload).await.is_err() {
                             sessions.remove(&key);
                             let sender = start_targeted_udp_session(
+                                &session_tasks,
                                 key.clone(),
                                 response_sender.clone(),
                                 packet_context,
@@ -712,6 +737,7 @@ pub(crate) async fn run_multi_directional_udp(
                                 Some(sender) if !sender.is_closed() => sender.clone(),
                                 _ => {
                                     let sender = start_trojan_targeted_udp_session(
+                                        &session_tasks,
                                         resolver.clone(),
                                         runtime.clone(),
                                         key.clone(),
@@ -728,6 +754,7 @@ pub(crate) async fn run_multi_directional_udp(
                             if sender.send(payload).await.is_err() {
                                 trojan_sessions.remove(&key);
                                 let sender = start_trojan_targeted_udp_session(
+                                    &session_tasks,
                                     resolver.clone(),
                                     runtime.clone(),
                                     key.clone(),
@@ -768,26 +795,35 @@ pub(crate) async fn run_multi_directional_udp(
                     }
                 }
             }
-            response = response_receiver.recv() => {
-                let Some(response) = response else {
-                    break Ok(());
-                };
-                write_sourced_message(
-                    &mut *server_stream,
-                    &response.payload,
-                    &response.source,
-                )
-                .await?;
-                flush_targeted_message(&mut *server_stream).await?;
-                record_transfer(
-                    response.traffic_context,
-                    0,
-                    response.payload.len() as u64,
-                );
+                response = response_receiver.recv() => {
+                    let Some(response) = response else {
+                        break Ok(());
+                    };
+                    write_sourced_message(
+                        &mut *server_stream,
+                        &response.payload,
+                        &response.source,
+                    )
+                    .await?;
+                    flush_targeted_message(&mut *server_stream).await?;
+                    record_transfer(
+                        response.traffic_context,
+                        0,
+                        response.payload.len() as u64,
+                    );
+                }
             }
         }
-    };
+    }
+    .await;
 
+    drop(sessions);
+    #[cfg(feature = "trojan")]
+    drop(trojan_sessions);
+    drop(response_sender);
+    drop(response_receiver);
+    session_tasks.close();
+    session_tasks.wait().await;
     let _ = shutdown_targeted_message(&mut *server_stream).await;
     result
 }
@@ -1988,6 +2024,7 @@ async fn shutdown_session_message(
 
 #[cfg(feature = "trojan")]
 async fn start_trojan_targeted_udp_session(
+    session_tasks: &TaskTracker,
     resolver: Arc<dyn Resolver>,
     runtime: RuntimeState,
     key: TrojanUdpSessionKey,
@@ -2001,7 +2038,7 @@ async fn start_trojan_targeted_udp_session(
     let (sender, mut receiver) =
         mpsc::channel::<Vec<u8>>(UDP_SESSION_CHANNEL_CAPACITY);
 
-    tokio::spawn(async move {
+    session_tasks.spawn(async move {
         let mut response_buffer = vec![0u8; VMESS_UDP_MESSAGE_BUFFER_SIZE];
         let mut idle = Box::pin(sleep(UDP_SESSION_IDLE_TIMEOUT));
         loop {
@@ -2072,6 +2109,7 @@ async fn start_trojan_targeted_udp_session(
 }
 
 async fn start_targeted_udp_session(
+    session_tasks: &TaskTracker,
     key: TargetedUdpSessionKey,
     response_sender: mpsc::Sender<TargetedUdpResponse>,
     traffic_context: Option<TrafficContext>,
@@ -2085,7 +2123,7 @@ async fn start_targeted_udp_session(
     let (sender, mut receiver) =
         mpsc::channel::<Vec<u8>>(UDP_SESSION_CHANNEL_CAPACITY);
 
-    tokio::spawn(async move {
+    session_tasks.spawn(async move {
         let mut response_buffer = vec![0u8; UDP_BUFFER_SIZE];
         let mut idle = Box::pin(sleep(UDP_SESSION_IDLE_TIMEOUT));
         loop {
@@ -4765,7 +4803,9 @@ mod tests {
         });
 
         let (mut client, server) = duplex(4096);
-        let relay_task = tokio::spawn(run_multi_directional_udp(
+        let session_tasks = TaskTracker::new();
+        let observed_session_tasks = session_tasks.clone();
+        let relay_task = tokio::spawn(run_multi_directional_udp_with_tasks(
             Box::new(TrojanUdpStream::new(Box::new(TestStream(server)))),
             Arc::new(NativeResolver::new()),
             runtime_with_outbounds(vec![outbound("direct", "freedom")]),
@@ -4776,6 +4816,7 @@ mod tests {
                     .with_identity("udp-user")
                     .with_inbound_tag("trojan-udp"),
             ),
+            session_tasks,
         ));
 
         let mut request = vec![1];
@@ -4811,7 +4852,13 @@ mod tests {
         assert_eq!(&suffix_and_payload[2..], b"ping");
 
         echo_task.await.expect("Trojan UDP echo task finished");
-        relay_task.abort();
+        drop(client);
+        let relay_result = timeout(Duration::from_secs(1), relay_task)
+            .await
+            .expect("multi-directional UDP relay teardown timeout")
+            .expect("multi-directional UDP relay task panicked");
+        assert!(relay_result.is_ok());
+        assert_eq!(observed_session_tasks.len(), 0);
     }
 
     #[cfg(feature = "trojan")]
