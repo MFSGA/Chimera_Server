@@ -19,7 +19,7 @@ use tokio::{
     task::JoinHandle,
     time::{Instant, sleep},
 };
-use tokio_util::task::TaskTracker;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "shadowsocks")]
@@ -330,12 +330,35 @@ impl SessionUdpSender {
     }
 }
 
+struct LocalSessionUdpTask {
+    cancellation: CancellationToken,
+    join: Option<JoinHandle<()>>,
+}
+
+impl LocalSessionUdpTask {
+    async fn stop(mut self) {
+        self.cancellation.cancel();
+        if let Some(join) = self.join.take() {
+            let _ = join.await;
+        }
+    }
+}
+
+impl Drop for LocalSessionUdpTask {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        if let Some(join) = self.join.as_ref() {
+            join.abort();
+        }
+    }
+}
+
 struct SessionUdpWorker {
     key: TargetedUdpSessionKey,
     global_id: Option<[u8; 8]>,
     generation: u64,
     sender: SessionUdpSender,
-    task: Option<JoinHandle<()>>,
+    task: Option<LocalSessionUdpTask>,
 }
 
 enum SessionUdpWorkerPlan {
@@ -1236,9 +1259,8 @@ async fn replace_trojan_session_udp_worker(
     Ok(sender)
 }
 
-async fn stop_local_session_udp_task(task: JoinHandle<()>) {
-    task.abort();
-    let _ = task.await;
+async fn stop_local_session_udp_task(task: LocalSessionUdpTask) {
+    task.stop().await;
 }
 
 async fn terminate_session_udp_worker(
@@ -1362,15 +1384,19 @@ async fn start_local_session_udp_session(
         mpsc::channel::<LocalUdpPayload>(UDP_SESSION_CHANNEL_CAPACITY);
 
     let worker_key = key.clone();
-    let task = tokio::spawn(async move {
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
+    let join = tokio::spawn(async move {
         let mut response_buffer = vec![0u8; UDP_BUFFER_SIZE];
         let mut idle = Box::pin(sleep(idle_timeout));
-        let has_error = loop {
-            tokio::select! {
+        let has_error = task_cancellation
+            .run_until_cancelled(async {
+                loop {
+                    tokio::select! {
                 _ = idle.as_mut() => break false,
                 request = receiver.recv() => {
                     let Some(request) = request else {
-                        return;
+                        break false;
                     };
                     match socket
                         .send_to(&request.payload, request.target_addr)
@@ -1422,11 +1448,16 @@ async fn start_local_session_udp_session(
                         .await
                         .is_err()
                     {
-                        return;
+                        break false;
                     }
                     idle.as_mut().reset(Instant::now() + idle_timeout);
                 }
-            }
+                    }
+                }
+            })
+            .await;
+        let Some(has_error) = has_error else {
+            return;
         };
         let _ = response_sender
             .send(SessionUdpEvent::End {
@@ -1442,7 +1473,10 @@ async fn start_local_session_udp_session(
         global_id: None,
         generation,
         sender: SessionUdpSender::Local(sender),
-        task: Some(task),
+        task: Some(LocalSessionUdpTask {
+            cancellation,
+            join: Some(join),
+        }),
     })
 }
 
@@ -1486,16 +1520,20 @@ async fn start_trojan_session_udp_session(
     let traffic_context = start.traffic_context;
     let resolver = start.resolver;
     let idle_timeout = start.idle_timeout;
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
 
-    let task = tokio::spawn(async move {
+    let join = tokio::spawn(async move {
         let mut response_buffer = vec![0u8; VMESS_UDP_MESSAGE_BUFFER_SIZE];
         let mut idle = Box::pin(sleep(idle_timeout));
-        let has_error = loop {
-            tokio::select! {
+        let has_error = task_cancellation
+            .run_until_cancelled(async {
+                loop {
+                    tokio::select! {
                 _ = idle.as_mut() => break false,
                 request = receiver.recv() => {
                     let Some(request) = request else {
-                        return;
+                        break false;
                     };
                     let target = NetLocation::from_ip_addr(
                         request.target_addr.ip(),
@@ -1548,13 +1586,18 @@ async fn start_trojan_session_udp_session(
                         .await
                         .is_err()
                     {
-                        return;
+                        break false;
                     }
                     idle.as_mut().reset(Instant::now() + idle_timeout);
                 }
-            }
-        };
+                    }
+                }
+            })
+            .await;
         let _ = shutdown_targeted_message(&mut proxy).await;
+        let Some(has_error) = has_error else {
+            return;
+        };
         let _ = response_sender
             .send(SessionUdpEvent::End {
                 session_id,
@@ -1569,7 +1612,10 @@ async fn start_trojan_session_udp_session(
         global_id: None,
         generation,
         sender: SessionUdpSender::Trojan(sender),
-        task: Some(task),
+        task: Some(LocalSessionUdpTask {
+            cancellation,
+            join: Some(join),
+        }),
     })
 }
 
@@ -4021,7 +4067,11 @@ mod tests {
     #[tokio::test]
     async fn session_udp_response_requires_current_generation() {
         let (sender, _receiver) = mpsc::channel(1);
-        let task = tokio::spawn(std::future::pending::<()>());
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let join = tokio::spawn(async move {
+            task_cancellation.cancelled().await;
+        });
         let mut sessions = HashMap::new();
         sessions.insert(
             17,
@@ -4033,7 +4083,10 @@ mod tests {
                 global_id: None,
                 generation: 2,
                 sender: SessionUdpSender::Local(sender),
-                task: Some(task),
+                task: Some(LocalSessionUdpTask {
+                    cancellation,
+                    join: Some(join),
+                }),
             },
         );
         let mut response = SessionUdpResponse {
@@ -4783,9 +4836,10 @@ mod tests {
             }
         ));
 
-        worker
-            .task
-            .expect("local session UDP worker task")
+        let mut task = worker.task.expect("local session UDP worker task");
+        task.join
+            .take()
+            .expect("local session UDP worker join handle")
             .await
             .expect("idle session UDP worker should finish cleanly");
     }
@@ -4876,10 +4930,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removing_session_udp_worker_waits_for_aborted_task() {
+    async fn removing_session_udp_worker_waits_for_cancelled_task() {
         let (sender, _receiver) = mpsc::channel(1);
-        let task = tokio::spawn(std::future::pending::<()>());
-        let abort_handle = task.abort_handle();
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let (stopped_sender, stopped_receiver) = oneshot::channel();
+        let join = tokio::spawn(async move {
+            task_cancellation.cancelled().await;
+            let _ = stopped_sender.send(());
+        });
         let mut sessions = HashMap::new();
         sessions.insert(
             23,
@@ -4891,13 +4950,19 @@ mod tests {
                 global_id: None,
                 generation: 1,
                 sender: SessionUdpSender::Local(sender),
-                task: Some(task),
+                task: Some(LocalSessionUdpTask {
+                    cancellation,
+                    join: Some(join),
+                }),
             },
         );
 
         terminate_session_udp_worker(&mut sessions, 23).await;
 
-        assert!(abort_handle.is_finished());
+        timeout(Duration::from_secs(1), stopped_receiver)
+            .await
+            .expect("local session UDP cancellation timeout")
+            .expect("local session UDP task must observe cancellation");
         assert!(!sessions.contains_key(&23));
     }
 
@@ -5249,8 +5314,33 @@ mod tests {
             .expect("read Trojan-routed XUDP response payload");
         assert_eq!(response, b"xudp-via-trojan");
 
-        relay_task.abort();
-        proxy_task.abort();
+        let mut end_frame = BytesMut::new();
+        FrameMetadata {
+            session_id: 77,
+            status: SessionStatus::End,
+            option: FrameOption::default(),
+            target: None,
+            network: None,
+            global_id: None,
+        }
+        .encode(&mut end_frame)
+        .expect("encode Trojan-routed XUDP End metadata");
+        client
+            .write_all(&end_frame)
+            .await
+            .expect("write Trojan-routed XUDP End");
+
+        timeout(Duration::from_secs(1), proxy_task)
+            .await
+            .expect("Trojan session UDP cleanup must close proxy promptly")
+            .expect("fake Trojan UDP proxy task must not panic");
+
+        drop(client);
+        timeout(Duration::from_secs(1), relay_task)
+            .await
+            .expect("Trojan-routed XUDP relay teardown timeout")
+            .expect("Trojan-routed XUDP relay task must not panic")
+            .expect("Trojan-routed XUDP relay teardown must succeed");
     }
 
     #[tokio::test]
