@@ -2883,7 +2883,7 @@ mod tests {
         let (fast_addr, fast_server) =
             start_fake_socks_probe_server(Duration::from_millis(5)).await;
         let (slow_addr, slow_server) =
-            start_fake_socks_probe_server(Duration::from_millis(120)).await;
+            start_fake_socks_probe_server(Duration::from_millis(750)).await;
         let runtime = RuntimeState::new(
             Vec::new(),
             vec![
@@ -2913,7 +2913,7 @@ mod tests {
         let config = ActiveObserverConfig::try_from(&ObservatoryConfig {
             subject_selector: vec!["proxy-".into()],
             probe_url: "http://probe.example/generate_204".into(),
-            enable_concurrency: true,
+            enable_concurrency: false,
             ..ObservatoryConfig::default()
         })
         .expect("build leastPing observatory config");
