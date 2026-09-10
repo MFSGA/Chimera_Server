@@ -1712,7 +1712,7 @@ async fn xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2_with_xray_d
     assert_socks5_udp_echo(
         socks_addr,
         udp_echo_addr,
-        &deterministic_payload(4 * 1024),
+        &deterministic_payload(hysteria_udp_interop_payload_size(&workspace)),
     )
     .await;
     assert_socks5_udp_domain_echo(
@@ -2415,8 +2415,8 @@ fn start_chimera_with_env(
     })
 }
 
-fn start_xray(workspace: &Path, work_dir: &Path, config: &Path) -> ChildGuard {
-    let binary = env::var_os("XRAY_BIN")
+fn xray_binary(workspace: &Path) -> PathBuf {
+    env::var_os("XRAY_BIN")
         .map(PathBuf::from)
         .map(|path| {
             if path.is_absolute() {
@@ -2425,7 +2425,63 @@ fn start_xray(workspace: &Path, work_dir: &Path, config: &Path) -> ChildGuard {
                 workspace.join(path)
             }
         })
-        .unwrap_or_else(|| workspace.join("xray"));
+        .unwrap_or_else(|| workspace.join("xray"))
+}
+
+fn xray_version_triplet(workspace: &Path) -> (u32, u32, u32) {
+    let binary = xray_binary(workspace);
+    let output = Command::new(&binary)
+        .arg("version")
+        .output()
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to query Xray version from {}: {err}",
+                binary.display()
+            )
+        });
+    assert!(
+        output.status.success(),
+        "Xray version command failed for {}: {}",
+        binary.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let version = stdout
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or_else(|| panic!("unexpected Xray version output: {stdout}"));
+    let mut parts = version.split('.').map(|part| {
+        part.parse::<u32>()
+            .unwrap_or_else(|err| panic!("invalid Xray version {version:?}: {err}"))
+    });
+    let triplet = (
+        parts.next().expect("Xray version major"),
+        parts.next().expect("Xray version minor"),
+        parts.next().expect("Xray version patch"),
+    );
+    assert!(
+        parts.next().is_none(),
+        "unexpected Xray version {version:?}"
+    );
+    triplet
+}
+
+fn hysteria_udp_interop_payload_size(workspace: &Path) -> usize {
+    // Xray before v26.5.3 allocated exactly MaxUDPSize (4096 bytes) for the
+    // complete Hysteria UDPMessage. A 4096-byte UDP payload plus its Hysteria
+    // header therefore overflowed that client-side serialization buffer and was
+    // silently dropped before QUIC fragmentation. 1d62941b, first released in
+    // v26.5.3, switched the writer to the regular 8192-byte buffer.
+    if xray_version_triplet(workspace) >= (26, 5, 3) {
+        4 * 1024
+    } else {
+        4000
+    }
+}
+
+fn start_xray(workspace: &Path, work_dir: &Path, config: &Path) -> ChildGuard {
+    let binary = xray_binary(workspace);
     ChildGuard::spawn(
         "xray",
         &binary,
