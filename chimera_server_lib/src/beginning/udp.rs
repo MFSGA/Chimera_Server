@@ -2624,49 +2624,62 @@ async fn start_shadowsocks_udp_server(
     let bind_addr = bind_location_to_socket_addr(&bind_location)?;
     let socket = create_udp_listener(bind_addr, socket_policy.as_ref(), false)?;
     let codec = Arc::new(ShadowsocksUdpCodec::new(users, identity)?);
-    let runtime_users = runtime.shadowsocks_user_store(&inbound_tag);
     info!("Starting Shadowsocks UDP server at {}", bind_location);
 
-    Ok(Some(tokio::spawn(async move {
-        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
-        let mut buffer = vec![0u8; UDP_BUFFER_SIZE];
-        loop {
-            let (len, client_addr) = match socket.recv_from(&mut buffer).await {
-                Ok(value) => value,
-                Err(error) => {
-                    error!("Shadowsocks UDP receive failed: {error}");
-                    break;
-                }
-            };
-            let packet = buffer[..len].to_vec();
-            let socket = socket.clone();
-            let codec = runtime_users
-                .as_ref()
-                .map(|store| Arc::new(store.udp_codec(codec.as_ref())))
-                .unwrap_or_else(|| codec.clone());
-            let runtime = runtime.clone();
-            let resolver = resolver.clone();
-            let inbound_tag = inbound_tag.clone();
-            tokio::spawn(async move {
-                if let Err(error) = relay_shadowsocks_udp_packet(
-                    socket,
-                    codec,
-                    resolver,
-                    runtime,
-                    inbound_tag,
-                    client_addr,
-                    packet,
-                )
-                .await
-                {
-                    debug!(
-                        "Shadowsocks UDP packet from {} failed: {}",
-                        client_addr, error
-                    );
-                }
-            });
-        }
-    })))
+    Ok(Some(tokio::spawn(run_shadowsocks_udp_server(
+        socket,
+        codec,
+        inbound_tag,
+        runtime,
+    ))))
+}
+
+#[cfg(feature = "shadowsocks")]
+async fn run_shadowsocks_udp_server(
+    socket: Arc<UdpSocket>,
+    codec: Arc<ShadowsocksUdpCodec>,
+    inbound_tag: String,
+    runtime: RuntimeState,
+) {
+    let runtime_users = runtime.shadowsocks_user_store(&inbound_tag);
+    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let mut buffer = vec![0u8; UDP_BUFFER_SIZE];
+    loop {
+        let (len, client_addr) = match socket.recv_from(&mut buffer).await {
+            Ok(value) => value,
+            Err(error) => {
+                error!("Shadowsocks UDP receive failed: {error}");
+                break;
+            }
+        };
+        let packet = buffer[..len].to_vec();
+        let socket = socket.clone();
+        let codec = runtime_users
+            .as_ref()
+            .map(|store| Arc::new(store.udp_codec(codec.as_ref())))
+            .unwrap_or_else(|| codec.clone());
+        let task_runtime = runtime.clone();
+        let resolver = resolver.clone();
+        let inbound_tag = inbound_tag.clone();
+        runtime.spawn_inbound_connection(async move {
+            if let Err(error) = relay_shadowsocks_udp_packet(
+                socket,
+                codec,
+                resolver,
+                task_runtime,
+                inbound_tag,
+                client_addr,
+                packet,
+            )
+            .await
+            {
+                debug!(
+                    "Shadowsocks UDP packet from {} failed: {}",
+                    client_addr, error
+                );
+            }
+        });
+    }
 }
 
 #[cfg(feature = "shadowsocks")]
@@ -3372,7 +3385,7 @@ mod tests {
 
     #[cfg(any(feature = "trojan", feature = "vless", feature = "vmess"))]
     use crate::async_stream::{AsyncPing, AsyncStream};
-    #[cfg(all(feature = "shadowsocks", feature = "trojan"))]
+    #[cfg(feature = "shadowsocks")]
     use crate::config::server_config::ShadowsocksUser;
     #[cfg(any(feature = "vless", feature = "vmess"))]
     use crate::handler::xudp::{
@@ -5658,6 +5671,102 @@ mod tests {
         );
 
         server_task.abort();
+    }
+
+    #[cfg(feature = "shadowsocks")]
+    #[tokio::test]
+    async fn shadowsocks_udp_packet_stays_owned_after_listener_stop() {
+        let target_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind Shadowsocks UDP target socket");
+        let target_addr = target_socket
+            .local_addr()
+            .expect("Shadowsocks UDP target address");
+        let target = NetLocation::from_ip_addr(target_addr.ip(), target_addr.port());
+        let runtime = runtime_with_outbounds(vec![outbound("direct", "freedom")]);
+        let user = ShadowsocksUser {
+            method: "xchacha20-poly1305".to_string(),
+            password: "password".to_string(),
+            email: "ss-owner@example.com".to_string(),
+            user_level: 0,
+        };
+        let server_codec = Arc::new(
+            ShadowsocksUdpCodec::new(vec![user.clone()], None)
+                .expect("create Shadowsocks UDP server codec"),
+        );
+        let client_codec = ShadowsocksUdpCodec::new(vec![user], None)
+            .expect("create Shadowsocks UDP client codec");
+        let request = client_codec
+            .encrypt_test_request(&target, b"before-listener-stop")
+            .expect("encrypt Shadowsocks UDP request");
+
+        let server_socket = Arc::new(
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("bind Shadowsocks UDP server socket"),
+        );
+        let server_addr = server_socket
+            .local_addr()
+            .expect("Shadowsocks UDP server address");
+        let server_task = tokio::spawn(run_shadowsocks_udp_server(
+            server_socket,
+            server_codec,
+            "ss-owner".to_string(),
+            runtime.clone(),
+        ));
+        let client_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind Shadowsocks UDP client socket");
+        client_socket
+            .send_to(&request, server_addr)
+            .await
+            .expect("send Shadowsocks UDP request");
+
+        let mut target_request = [0u8; 128];
+        let (request_len, outbound_peer) = timeout(
+            Duration::from_secs(1),
+            target_socket.recv_from(&mut target_request),
+        )
+        .await
+        .expect("Shadowsocks UDP target request timeout")
+        .expect("receive Shadowsocks UDP target request");
+        assert_eq!(&target_request[..request_len], b"before-listener-stop");
+        assert_eq!(runtime.tracked_inbound_connection_count(), 1);
+
+        server_task.abort();
+        let _ = server_task.await;
+        assert_eq!(
+            runtime.tracked_inbound_connection_count(),
+            1,
+            "stopping the Shadowsocks UDP listener must not orphan or cancel an active packet task",
+        );
+
+        target_socket
+            .send_to(b"after-listener-stop", outbound_peer)
+            .await
+            .expect("send Shadowsocks UDP target response");
+        let mut encrypted_response = vec![0u8; 4096];
+        let (response_len, source) = timeout(
+            Duration::from_secs(1),
+            client_socket.recv_from(&mut encrypted_response),
+        )
+        .await
+        .expect("Shadowsocks UDP response after listener stop timeout")
+        .expect("receive Shadowsocks UDP response after listener stop");
+        assert_eq!(source, server_addr);
+        let response = client_codec
+            .decrypt_packet(&encrypted_response[..response_len])
+            .expect("decrypt Shadowsocks UDP response after listener stop");
+        assert_eq!(response.target_location, target);
+        assert_eq!(response.payload, b"after-listener-stop");
+
+        timeout(Duration::from_secs(1), async {
+            while runtime.tracked_inbound_connection_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed Shadowsocks UDP packet task must leave the server owner");
     }
 
     #[cfg(all(feature = "shadowsocks", feature = "trojan"))]
