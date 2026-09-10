@@ -1,0 +1,22 @@
+{
+  "inbounds": [
+    {
+      "tag": "shadowsocks-tcp-udp",
+      "listen": "127.0.0.1",
+      "port": 11022,
+      "protocol": "shadowsocks",
+      "settings": {
+        "method": "aes-128-gcm",
+        "password": "replace-with-a-strong-password",
+        "email": "legacy@example.test",
+        "network": "tcp,udp"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    }
+  ]
+}

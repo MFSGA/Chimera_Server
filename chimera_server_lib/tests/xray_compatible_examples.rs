@@ -118,6 +118,8 @@ fn xray_compatible_example_matrix_contains_materialized_stage_one_files() {
         "trojan-tcp-tls.json5",
         "trojan-ws-tls.json5",
         "hysteria-quic-tls.json5",
+        "shadowsocks-tcp-udp.json5",
+        "shadowsocks-2022-eih-tcp-udp.json5",
     ] {
         assert!(files.contains(expected), "missing {expected}");
     }

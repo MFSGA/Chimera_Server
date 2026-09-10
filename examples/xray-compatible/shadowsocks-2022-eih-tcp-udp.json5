@@ -1,0 +1,31 @@
+{
+  "inbounds": [
+    {
+      "tag": "shadowsocks-2022-eih-tcp-udp",
+      "listen": "127.0.0.1",
+      "port": 11023,
+      "protocol": "shadowsocks",
+      "settings": {
+        "method": "2022-blake3-aes-128-gcm",
+        "password": "AAECAwQFBgcICQoLDA0ODw==",
+        "clients": [
+          {
+            "password": "EBESExQVFhcYGRobHB0eHw==",
+            "email": "eih-a@example.test"
+          },
+          {
+            "password": "ICEiIyQlJicoKSorLC0uLw==",
+            "email": "eih-b@example.test"
+          }
+        ],
+        "network": "tcp,udp"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    }
+  ]
+}
