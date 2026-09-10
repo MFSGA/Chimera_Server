@@ -30,7 +30,7 @@ use tokio::{
         AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf,
     },
     sync::oneshot,
-    task,
+    task::{self, JoinHandle},
 };
 use tracing::debug;
 
@@ -1394,7 +1394,7 @@ fn spawn_aead_codec(
     let (plain_reader, plain_writer) = tokio::io::split(plain_codec);
 
     let decrypt_key = master_key.clone();
-    task::spawn(async move {
+    let decrypt_task = task::spawn(async move {
         if let Err(error) = decrypt_stream(
             encrypted_reader,
             plain_writer,
@@ -1407,7 +1407,7 @@ fn spawn_aead_codec(
             debug!("Shadowsocks decrypt task ended with error: {error}");
         }
     });
-    task::spawn(async move {
+    let encrypt_task = task::spawn(async move {
         if let Err(error) =
             encrypt_stream(plain_reader, encrypted_writer, cipher, master_key).await
         {
@@ -1415,7 +1415,7 @@ fn spawn_aead_codec(
         }
     });
 
-    TaskBackedStream(plain_client)
+    TaskBackedStream::new(plain_client, decrypt_task, encrypt_task)
 }
 
 fn spawn_aead2022_codec(
@@ -1430,7 +1430,7 @@ fn spawn_aead2022_codec(
     let (request_salt_tx, request_salt_rx) = oneshot::channel();
 
     let decrypt_key = psk.clone();
-    task::spawn(async move {
+    let decrypt_task = task::spawn(async move {
         if let Err(error) = decrypt_aead2022_stream(
             encrypted_reader,
             plain_writer,
@@ -1444,7 +1444,7 @@ fn spawn_aead2022_codec(
             debug!("Shadowsocks 2022 decrypt task ended with error: {error}");
         }
     });
-    task::spawn(async move {
+    let encrypt_task = task::spawn(async move {
         if let Err(error) = encrypt_aead2022_stream(
             plain_reader,
             encrypted_writer,
@@ -1458,7 +1458,7 @@ fn spawn_aead2022_codec(
         }
     });
 
-    TaskBackedStream(plain_client)
+    TaskBackedStream::new(plain_client, decrypt_task, encrypt_task)
 }
 
 async fn decrypt_aead2022_stream<R, W>(
@@ -2318,7 +2318,56 @@ where
     }
 }
 
-struct TaskBackedStream(DuplexStream);
+struct TaskBackedStream {
+    stream: DuplexStream,
+    decrypt_task: JoinHandle<()>,
+    encrypt_task: Option<JoinHandle<()>>,
+}
+
+impl TaskBackedStream {
+    fn new(
+        stream: DuplexStream,
+        decrypt_task: JoinHandle<()>,
+        encrypt_task: JoinHandle<()>,
+    ) -> Self {
+        Self {
+            stream,
+            decrypt_task,
+            encrypt_task: Some(encrypt_task),
+        }
+    }
+
+    fn poll_encrypt_shutdown(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        let Some(task) = self.encrypt_task.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        match std::future::Future::poll(Pin::new(task), cx) {
+            Poll::Ready(Ok(())) => {
+                self.encrypt_task = None;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(error)) => {
+                self.encrypt_task = None;
+                Poll::Ready(Err(io::Error::other(format!(
+                    "Shadowsocks encrypt task failed: {error}"
+                ))))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for TaskBackedStream {
+    fn drop(&mut self) {
+        self.decrypt_task.abort();
+        if let Some(task) = self.encrypt_task.as_ref() {
+            task.abort();
+        }
+    }
+}
 
 impl std::fmt::Debug for TaskBackedStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2333,7 +2382,7 @@ impl AsyncRead for TaskBackedStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+        Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
     }
 }
 
@@ -2343,21 +2392,26 @@ impl AsyncWrite for TaskBackedStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+        Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
     }
 
     fn poll_flush(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().0).poll_flush(cx)
+        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
     }
 
     fn poll_shutdown(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+        let this = self.get_mut();
+        match Pin::new(&mut this.stream).poll_shutdown(cx) {
+            Poll::Ready(Ok(())) => this.poll_encrypt_shutdown(cx),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -2379,23 +2433,191 @@ impl AsyncStream for TaskBackedStream {}
 #[cfg(test)]
 mod tests {
     use std::{
+        io,
         net::Ipv4Addr,
+        pin::Pin,
         sync::{Arc, Mutex},
+        task::{Context, Poll},
+        time::Duration,
     };
 
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+    use tokio::{
+        io::{
+            AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream,
+            ReadBuf, duplex,
+        },
+        sync::oneshot,
+        time::timeout,
+    };
 
     use crate::{
         address::{Address, NetLocation},
+        async_stream::{AsyncPing, AsyncStream},
         config::server_config::ShadowsocksUser,
     };
 
     use super::{
         ShadowsocksCipher, ShadowsocksTcpServerHandler, ShadowsocksUdpCodec,
         ShadowsocksUdpRequest, ShadowsocksUdpUserCodec, ShadowsocksUserStore,
-        TimedSaltChecker, decrypt_stream, derive_aead2022_session_key,
-        derive_master_key, encrypt_stream,
+        TaskBackedStream, TimedSaltChecker, decrypt_stream,
+        derive_aead2022_session_key, derive_master_key, encrypt_stream,
+        spawn_aead_codec, spawn_aead2022_codec,
     };
+
+    struct DropNotifyingStream {
+        inner: DuplexStream,
+        dropped: Option<oneshot::Sender<()>>,
+    }
+
+    impl Drop for DropNotifyingStream {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    impl AsyncRead for DropNotifyingStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for DropNotifyingStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    impl AsyncPing for DropNotifyingStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for DropNotifyingStream {}
+
+    async fn dropping_codec_releases_underlying_stream(
+        codec: TaskBackedStream,
+        dropped: oneshot::Receiver<()>,
+    ) {
+        tokio::task::yield_now().await;
+        drop(codec);
+        timeout(Duration::from_secs(1), dropped)
+            .await
+            .expect("dropping codec should cancel both workers")
+            .expect("underlying encrypted stream should be released");
+    }
+
+    #[tokio::test]
+    async fn dropping_legacy_codec_cancels_blocked_workers() {
+        let cipher = ShadowsocksCipher::parse("aes-128-gcm").unwrap();
+        let master_key: Arc<[u8]> =
+            derive_master_key("password", cipher.key_len()).into();
+        let (_peer, encrypted) = duplex(256);
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let codec = spawn_aead_codec(
+            Box::new(DropNotifyingStream {
+                inner: encrypted,
+                dropped: Some(dropped_tx),
+            }),
+            cipher,
+            master_key,
+            Arc::new(Mutex::new(TimedSaltChecker::default())),
+        );
+
+        dropping_codec_releases_underlying_stream(codec, dropped_rx).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_aead2022_codec_cancels_blocked_workers() {
+        let cipher = ShadowsocksCipher::parse("aes-128-gcm").unwrap();
+        let psk: Arc<[u8]> = Arc::from(*b"0123456789abcdef");
+        let (_peer, encrypted) = duplex(256);
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let codec = spawn_aead2022_codec(
+            Box::new(DropNotifyingStream {
+                inner: encrypted,
+                dropped: Some(dropped_tx),
+            }),
+            cipher,
+            psk,
+            Arc::new(Mutex::new(TimedSaltChecker::default())),
+        );
+
+        dropping_codec_releases_underlying_stream(codec, dropped_rx).await;
+    }
+
+    #[tokio::test]
+    async fn codec_shutdown_waits_for_encrypt_worker_and_preserves_read_half() {
+        let cipher = ShadowsocksCipher::parse("aes-128-gcm").unwrap();
+        let master_key: Arc<[u8]> =
+            derive_master_key("password", cipher.key_len()).into();
+        let (mut peer, encrypted) = duplex(4096);
+        let mut codec = spawn_aead_codec(
+            Box::new(DropNotifyingStream {
+                inner: encrypted,
+                dropped: None,
+            }),
+            cipher,
+            master_key,
+            Arc::new(Mutex::new(TimedSaltChecker::default())),
+        );
+
+        codec.write_all(b"response").await.unwrap();
+        timeout(Duration::from_secs(1), codec.shutdown())
+            .await
+            .expect("codec write-half shutdown should finish")
+            .unwrap();
+
+        assert!(
+            codec.encrypt_task.is_none(),
+            "shutdown must wait until the encrypt worker closes the encrypted write half"
+        );
+        assert!(
+            !codec.decrypt_task.is_finished(),
+            "write-half shutdown must preserve the independent decrypt/read half"
+        );
+
+        let mut encrypted_response = Vec::new();
+        timeout(
+            Duration::from_secs(1),
+            peer.read_to_end(&mut encrypted_response),
+        )
+        .await
+        .expect("peer should observe encrypted write-half EOF")
+        .unwrap();
+        assert!(!encrypted_response.is_empty());
+    }
 
     #[test]
     fn runtime_user_store_preserves_state_and_updates_udp_auth() {
