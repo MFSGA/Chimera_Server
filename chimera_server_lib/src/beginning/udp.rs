@@ -436,6 +436,7 @@ struct GlobalXudpWorkers {
     registry: XudpGlobalRegistry,
     workers: HashMap<[u8; 8], GlobalSessionUdpWorker>,
     gates: HashMap<[u8; 8], Weak<Mutex<()>>>,
+    maintenance_tasks: TaskTracker,
 }
 
 static GLOBAL_XUDP_WORKERS: OnceLock<Arc<Mutex<GlobalXudpWorkers>>> =
@@ -1638,10 +1639,10 @@ async fn attach_global_session_udp_session(
     let now = Instant::now();
     let worker_key = backend_start.worker_key(&key);
 
-    let (transition, attachment, worker_plan, replaced_worker) = {
+    let (expired_worker, transition, attachment, worker_plan, replaced_worker) = {
         let mut guard = globals.lock().await;
-        purge_expired_global_udp_workers(&mut guard, now);
-
+        let expired_worker =
+            take_expired_global_udp_worker(&mut guard, global_id, now);
         let transition = guard
             .registry
             .attach(global_id, session_id, generation, now)?;
@@ -1661,9 +1662,18 @@ async fn attach_global_session_udp_session(
         } else {
             None
         };
-        (transition, attachment, worker_plan, replaced_worker)
+        (
+            expired_worker,
+            transition,
+            attachment,
+            worker_plan,
+            replaced_worker,
+        )
     };
 
+    if let Some(worker) = expired_worker {
+        stop_global_udp_worker(worker).await;
+    }
     if let Some(worker) = replaced_worker {
         stop_global_udp_worker(worker).await;
     }
@@ -2010,19 +2020,47 @@ async fn start_global_session_udp_worker(
     })
 }
 
-fn purge_expired_global_udp_workers(globals: &mut GlobalXudpWorkers, now: Instant) {
-    for global_id in globals.registry.take_expired(now) {
-        if let Some(worker) = globals.workers.remove(&global_id) {
-            worker.task.abort();
-        }
+fn take_expired_global_udp_worker(
+    globals: &mut GlobalXudpWorkers,
+    global_id: [u8; 8],
+    now: Instant,
+) -> Option<GlobalSessionUdpWorker> {
+    if globals.registry.remove_expired_id(global_id, now) {
+        globals.workers.remove(&global_id)
+    } else {
+        None
     }
+}
+
+async fn expire_global_udp_worker(global_id: [u8; 8], now: Instant) {
+    let gate = global_xudp_gate(global_id).await;
+    let _gate_guard = gate.lock().await;
+    let globals = global_xudp_workers();
+    let worker = {
+        let mut guard = globals.lock().await;
+        take_expired_global_udp_worker(&mut guard, global_id, now)
+    };
+    if let Some(worker) = worker {
+        stop_global_udp_worker(worker).await;
+    }
+}
+
+fn schedule_global_udp_worker_expiry(
+    maintenance_tasks: TaskTracker,
+    global_id: [u8; 8],
+    delay: Duration,
+) {
+    drop(maintenance_tasks.spawn(async move {
+        sleep(delay).await;
+        expire_global_udp_worker(global_id, Instant::now()).await;
+    }));
 }
 
 async fn detach_global_udp_worker(global_id: [u8; 8], attachment_token: u64) {
     let gate = global_xudp_gate(global_id).await;
     let _gate_guard = gate.lock().await;
     let globals = global_xudp_workers();
-    let worker_state = {
+    let (worker_state, maintenance_tasks) = {
         let mut guard = globals.lock().await;
         if !guard
             .registry
@@ -2030,9 +2068,12 @@ async fn detach_global_udp_worker(global_id: [u8; 8], attachment_token: u64) {
         {
             return;
         }
-        guard.workers.get(&global_id).map(|worker| {
-            (worker.attachment.clone(), worker.attachment_notify.clone())
-        })
+        (
+            guard.workers.get(&global_id).map(|worker| {
+                (worker.attachment.clone(), worker.attachment_notify.clone())
+            }),
+            guard.maintenance_tasks.clone(),
+        )
     };
 
     if let Some((attachment_state, attachment_notify)) = worker_state {
@@ -2045,12 +2086,11 @@ async fn detach_global_udp_worker(global_id: [u8; 8], attachment_token: u64) {
         }
     }
 
-    tokio::spawn(async move {
-        sleep(XUDP_GLOBAL_REATTACH_TTL).await;
-        let globals = global_xudp_workers();
-        let mut guard = globals.lock().await;
-        purge_expired_global_udp_workers(&mut guard, Instant::now());
-    });
+    schedule_global_udp_worker_expiry(
+        maintenance_tasks,
+        global_id,
+        XUDP_GLOBAL_REATTACH_TTL,
+    );
 }
 
 async fn stop_global_udp_worker(worker: GlobalSessionUdpWorker) {
@@ -4700,6 +4740,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expiring_global_xudp_worker_waits_for_task_cleanup() {
+        struct CleanupSignal(Option<oneshot::Sender<()>>);
+
+        impl Drop for CleanupSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let global_id = [165, 166, 167, 168, 169, 170, 171, 172];
+        let now = Instant::now();
+        let detached_at = now - XUDP_GLOBAL_REATTACH_TTL;
+        let (payload_sender, _payload_receiver) = mpsc::channel(1);
+        let (cleanup_sender, mut cleanup_receiver) = oneshot::channel();
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _cleanup = CleanupSignal(Some(cleanup_sender));
+            let _ = ready_sender.send(());
+            std::future::pending::<()>().await;
+        });
+        ready_receiver
+            .await
+            .expect("GlobalID expiry cleanup test task must start");
+
+        let globals = global_xudp_workers();
+        {
+            let mut guard = globals.lock().await;
+            let transition = guard
+                .registry
+                .attach(global_id, 604, 1, detached_at)
+                .expect("attach GlobalID before expiry cleanup test");
+            assert!(guard.registry.detach(
+                global_id,
+                transition.current.token,
+                detached_at,
+            ));
+            guard.workers.insert(
+                global_id,
+                GlobalSessionUdpWorker {
+                    key: GlobalUdpWorkerKey::Direct {
+                        target_is_ipv6: false,
+                        outbound_tag: None,
+                    },
+                    sender: payload_sender,
+                    attachment: Arc::new(RwLock::new(None)),
+                    attachment_notify: Arc::new(Notify::new()),
+                    task,
+                },
+            );
+        }
+
+        expire_global_udp_worker(global_id, now).await;
+
+        cleanup_receiver.try_recv().expect(
+            "GlobalID expiry must await worker task cleanup before returning",
+        );
+        let mut guard = globals.lock().await;
+        assert!(guard.registry.current(global_id, now).is_none());
+        assert!(!guard.workers.contains_key(&global_id));
+    }
+
+    #[tokio::test]
+    async fn global_xudp_expiry_timer_is_task_tracked() {
+        let maintenance_tasks = TaskTracker::new();
+        let global_id = [173, 174, 175, 176, 177, 178, 179, 180];
+
+        schedule_global_udp_worker_expiry(
+            maintenance_tasks.clone(),
+            global_id,
+            Duration::from_millis(10),
+        );
+        assert_eq!(maintenance_tasks.len(), 1);
+
+        timeout(Duration::from_secs(1), async {
+            while !maintenance_tasks.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("GlobalID expiry timer must leave its task owner after completion");
+    }
+
+    #[tokio::test]
     async fn ended_global_xudp_attachment_resumes_same_socket() {
         let echo_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -4857,9 +4982,14 @@ mod tests {
             traffic_context: None,
         });
 
-        purge_expired_global_udp_workers(
+        let expired_worker = take_expired_global_udp_worker(
             &mut globals,
+            global_id,
             now + XUDP_GLOBAL_REATTACH_TTL + Duration::from_secs(1),
+        );
+        assert!(
+            expired_worker.is_none(),
+            "stale expiry cleanup must not remove a reattached worker",
         );
 
         assert_eq!(
@@ -4870,12 +5000,11 @@ mod tests {
             Some(reattached.current)
         );
         assert!(globals.workers.contains_key(&global_id));
-        globals
+        let worker = globals
             .workers
             .remove(&global_id)
-            .expect("GlobalID worker survives stale cleanup")
-            .task
-            .abort();
+            .expect("GlobalID worker survives stale cleanup");
+        stop_global_udp_worker(worker).await;
     }
 
     #[tokio::test]

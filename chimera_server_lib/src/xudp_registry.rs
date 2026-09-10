@@ -175,7 +175,11 @@ impl XudpGlobalRegistry {
         expired
     }
 
-    fn remove_expired_id(&mut self, global_id: [u8; 8], now: Instant) {
+    pub(crate) fn remove_expired_id(
+        &mut self,
+        global_id: [u8; 8],
+        now: Instant,
+    ) -> bool {
         let expired = self
             .sessions
             .get(&global_id)
@@ -184,6 +188,7 @@ impl XudpGlobalRegistry {
         if expired {
             self.sessions.remove(&global_id);
         }
+        expired
     }
 }
 
