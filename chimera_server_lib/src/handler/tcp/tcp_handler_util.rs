@@ -104,9 +104,7 @@ pub fn create_tcp_server_handler(
                 inner,
             } = tls_config;
             #[cfg(feature = "vless")]
-            if let ServerProxyConfig::Vless { users, fallbacks } = inner.as_ref()
-                && users_require_vision(users)
-            {
+            if let ServerProxyConfig::Vless { users, fallbacks } = inner.as_ref() {
                 return Ok(Box::new(TlsServerHandler::new_vision_vless(
                     certificates,
                     alpn_protocols,
@@ -138,21 +136,13 @@ pub fn create_tcp_server_handler(
         #[cfg(feature = "reality")]
         ServerProxyConfig::Reality(reality_config) => {
             #[cfg(feature = "vless")]
-            let vision_config = match reality_config.inner.as_ref() {
-                ServerProxyConfig::Vless { users, fallbacks }
-                    if users_require_vision(users) =>
-                {
-                    Some((users.clone(), fallbacks.clone()))
-                }
-                _ => None,
-            };
-
-            #[cfg(feature = "vless")]
-            if let Some((users, fallbacks)) = vision_config {
+            if let ServerProxyConfig::Vless { users, fallbacks } =
+                reality_config.inner.as_ref()
+            {
                 return Ok(Box::new(RealityVisionVlessServerHandler::new(
-                    reality_config,
-                    users,
-                    fallbacks,
+                    reality_config.clone(),
+                    users.clone(),
+                    fallbacks.clone(),
                     inbound_tag,
                 )));
             }

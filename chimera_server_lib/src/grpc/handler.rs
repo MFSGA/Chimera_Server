@@ -977,8 +977,6 @@ impl HandlerServiceImpl {
         users: &mut Vec<VlessUser>,
         operation: AlterInboundOperation,
     ) -> Result<bool, Status> {
-        let required_vision_before =
-            crate::handler::vless_handler::users_require_vision(users);
         match operation {
             AlterInboundOperation::Noop => return Ok(true),
             AlterInboundOperation::AddUser(operation) => {
@@ -1001,8 +999,7 @@ impl HandlerServiceImpl {
                 self.remove_vless_user(users, email)?;
             }
         }
-        Ok(required_vision_before
-            == crate::handler::vless_handler::users_require_vision(users))
+        Ok(true)
     }
 
     #[cfg(feature = "vmess")]
@@ -4583,7 +4580,7 @@ mod tests {
 
     #[cfg(feature = "vless")]
     #[tokio::test]
-    async fn handler_vless_vision_mode_change_keeps_restart_fallback() {
+    async fn handler_vless_vision_mode_change_does_not_restart_listener() {
         let occupied = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -4607,10 +4604,9 @@ mod tests {
             }],
             Vec::new(),
         );
-        runtime.register_inbound_tasks(
-            &inbound_tag,
-            vec![tokio::spawn(std::future::pending::<()>())],
-        );
+        let placeholder_task = tokio::spawn(std::future::pending::<()>());
+        let abort_handle = placeholder_task.abort_handle();
+        runtime.register_inbound_tasks(&inbound_tag, vec![placeholder_task]);
         let service = HandlerServiceImpl::new(runtime.clone());
         let operation = proto::xray::app::proxyman::command::AddUserOperation {
             user: Some(proto::xray::common::protocol::User {
@@ -4627,7 +4623,7 @@ mod tests {
             }),
         };
 
-        let error = service
+        service
             .alter_inbound(Request::new(
                 proto::xray::app::proxyman::command::AlterInboundRequest {
                     tag: inbound_tag.clone(),
@@ -4638,15 +4634,15 @@ mod tests {
                 },
             ))
             .await
-            .expect_err("Vision mode transition must retain restart fallback");
+            .expect("Xray VLESS AddUser must not restart the listener");
 
-        assert_eq!(error.code(), Code::Unknown);
-        assert!(error.message().contains("rollback failed"));
+        assert!(!abort_handle.is_finished());
         let current = runtime.inbound_by_tag(&inbound_tag).unwrap();
         let ServerProxyConfig::Vless { users, .. } = current.protocol else {
             panic!("expected VLESS inbound");
         };
-        assert!(users.is_empty());
+        assert_eq!(users[0].flow, "xtls-rprx-vision");
+        assert!(runtime.stop_inbound_tasks(&inbound_tag).await);
     }
 
     #[tokio::test]
@@ -5409,7 +5405,7 @@ mod tests {
                 },
             ))
             .await
-            .expect("xhttp add user should restart listener");
+            .expect("xhttp add user should update the shared VLESS user store");
         let users = service
             .get_inbound_users(Request::new(
                 proto::xray::app::proxyman::command::GetInboundUserRequest {
@@ -5439,7 +5435,7 @@ mod tests {
                 },
             ))
             .await
-            .expect("xhttp remove user should restart listener");
+            .expect("xhttp remove user should update the shared VLESS user store");
         let users = service
             .get_inbound_users(Request::new(
                 proto::xray::app::proxyman::command::GetInboundUserRequest {

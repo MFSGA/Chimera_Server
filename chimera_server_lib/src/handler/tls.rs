@@ -2,6 +2,7 @@ use std::{
     fs::File,
     io::{self, BufReader, Cursor},
     sync::Arc,
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -31,17 +32,14 @@ use crate::{
 #[cfg(feature = "vless")]
 use crate::{
     config::server_config::{VlessFallback, VlessUser},
-    handler::vless_handler::{
-        ParsedVisionUser, VisionRecordIo, parse_vision_users,
-        setup_tls_vision_server_stream,
-    },
+    handler::vless_handler::{VisionRecordIo, setup_tls_mixed_vless_server_stream},
 };
 
 enum TlsInner {
     Handler(Box<dyn TcpServerHandler>),
     #[cfg(feature = "vless")]
     VisionVless {
-        users: Vec<ParsedVisionUser>,
+        users: Vec<VlessUser>,
         fallbacks: Vec<VlessFallback>,
         inbound_tag: String,
     },
@@ -148,7 +146,7 @@ impl TlsServerHandler {
         Ok(Self {
             acceptor: TlsAcceptor::from(Arc::new(config)),
             inner: TlsInner::VisionVless {
-                users: parse_vision_users(users),
+                users: users.to_vec(),
                 fallbacks: fallbacks.to_vec(),
                 inbound_tag: inbound_tag.to_string(),
             },
@@ -160,7 +158,7 @@ fn tls_inner_manages_handshake_timeout(inner: &TlsInner) -> bool {
     match inner {
         TlsInner::Handler(inner) => inner.manages_handshake_timeout(),
         #[cfg(feature = "vless")]
-        TlsInner::VisionVless { .. } => false,
+        TlsInner::VisionVless { .. } => true,
     }
 }
 
@@ -227,23 +225,35 @@ impl TcpServerHandler for TlsServerHandler {
                 fallbacks,
                 inbound_tag,
             } => {
+                let timeout = context
+                    .runtime
+                    .as_ref()
+                    .map(|runtime| runtime.xray_handshake_timeout_for_level(0))
+                    .unwrap_or(Duration::from_secs(60));
                 let dynamic_users = context
                     .runtime
                     .as_ref()
-                    .and_then(|runtime| runtime.vless_users_snapshot(inbound_tag))
-                    .map(|users| parse_vision_users(&users));
+                    .and_then(|runtime| runtime.vless_users_snapshot(inbound_tag));
                 let users = dynamic_users.as_deref().unwrap_or(users);
-                let tls_stream = self
-                    .acceptor
-                    .accept(VisionRecordIo::new(server_stream))
-                    .await?;
-                setup_tls_vision_server_stream(
-                    tls_stream,
-                    users,
-                    fallbacks,
-                    inbound_tag,
-                )
-                .await
+                let setup = async {
+                    let tls_stream = self
+                        .acceptor
+                        .accept(VisionRecordIo::new(server_stream))
+                        .await?;
+                    setup_tls_mixed_vless_server_stream(
+                        tls_stream,
+                        users,
+                        fallbacks,
+                        inbound_tag,
+                    )
+                    .await
+                };
+                tokio::time::timeout(timeout, setup).await.map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "TLS VLESS handshake timed out",
+                    )
+                })?
             }
         }
     }
@@ -470,6 +480,28 @@ fn tls_versions(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "vless")]
+    use crate::{
+        address::{Address, BindLocation, NetLocation},
+        config::{
+            Transport,
+            server_config::{ServerConfig, ServerProxyConfig},
+        },
+        handler::vless_handler::protocol::{
+            COMMAND_TCP, XTLS_VISION_FLOW, encode_flow_addon_data,
+        },
+        runtime::RuntimeState,
+    };
+    #[cfg(feature = "vless")]
+    use std::net::Ipv4Addr;
+    #[cfg(feature = "vless")]
+    use tokio::{
+        io::AsyncWriteExt,
+        net::{TcpListener, TcpStream},
+    };
+    #[cfg(feature = "vless")]
+    use tokio_rustls::TlsConnector;
+
     #[derive(Debug)]
     struct ManagedTestHandler;
 
@@ -491,6 +523,177 @@ mod tests {
     fn tls_propagates_inner_handshake_timeout_ownership() {
         let inner = TlsInner::Handler(Box::new(ManagedTestHandler));
         assert!(tls_inner_manages_handshake_timeout(&inner));
+    }
+
+    #[cfg(feature = "vless")]
+    fn vision_vless_tcp_request(user_id: [u8; 16]) -> Vec<u8> {
+        let addon = encode_flow_addon_data(XTLS_VISION_FLOW)
+            .expect("valid VLESS Vision addon");
+        let mut request = Vec::with_capacity(32 + addon.len());
+        request.push(0);
+        request.extend_from_slice(&user_id);
+        request.push(addon.len() as u8);
+        request.extend_from_slice(&addon);
+        request.push(COMMAND_TCP);
+        request.extend_from_slice(&443u16.to_be_bytes());
+        request.push(1);
+        request.extend_from_slice(&[127, 0, 0, 1]);
+        request
+    }
+
+    #[cfg(feature = "vless")]
+    async fn setup_tls_vless_request(
+        handler: Arc<TlsServerHandler>,
+        runtime: RuntimeState,
+        connector: &TlsConnector,
+        request: Vec<u8>,
+    ) -> TcpServerSetupResult {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind TLS VLESS test listener");
+        let address = listener.local_addr().expect("TLS VLESS listener address");
+        let server_task = tokio::spawn(async move {
+            let (server_io, _) = listener.accept().await?;
+            handler
+                .setup_server_stream_with_context(
+                    Box::new(server_io),
+                    TcpServerConnectionContext {
+                        runtime: Some(runtime),
+                        ..TcpServerConnectionContext::default()
+                    },
+                )
+                .await
+        });
+        let client_io = TcpStream::connect(address)
+            .await
+            .expect("connect TLS VLESS test listener");
+        let mut client = connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost")
+                    .expect("valid test server name"),
+                client_io,
+            )
+            .await
+            .expect("establish test TLS connection");
+        client
+            .write_all(&request)
+            .await
+            .expect("write VLESS request over TLS");
+        client.flush().await.expect("flush VLESS TLS request");
+        let result = server_task
+            .await
+            .expect("TLS VLESS server task")
+            .expect("TLS VLESS setup");
+        drop(client);
+        result
+    }
+
+    #[cfg(feature = "vless")]
+    #[tokio::test]
+    async fn tls_vless_handler_accepts_dynamic_vision_without_rebuild() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let generated =
+            rcgen::generate_simple_self_signed(["localhost".to_string()])
+                .expect("generate test certificate");
+        let certificate = TlsCertificateConfig {
+            certificate_path: None,
+            certificate_pem: generated.cert.pem().into_bytes(),
+            key_path: None,
+            key_pem: Some(generated.signing_key.serialize_pem().into_bytes()),
+            usage: TlsCertificateUsage::Encipherment,
+        };
+        let plain_user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
+        let vision_user_id = "e041e73e-a0a0-49f5-9754-6401aa621fb7";
+        let vision_user_bytes = [
+            0xe0, 0x41, 0xe7, 0x3e, 0xa0, 0xa0, 0x49, 0xf5, 0x97, 0x54, 0x64, 0x01,
+            0xaa, 0x62, 0x1f, 0xb7,
+        ];
+        let plain_user = VlessUser {
+            user_id: plain_user_id.into(),
+            user_label: "plain-user".into(),
+            user_level: 0,
+            flow: String::new(),
+        };
+        let handler = Arc::new(
+            TlsServerHandler::new_vision_vless(
+                vec![certificate],
+                Vec::new(),
+                true,
+                false,
+                None,
+                None,
+                None,
+                std::slice::from_ref(&plain_user),
+                &[],
+                "tls-vless-dynamic",
+            )
+            .expect("build mixed TLS VLESS handler"),
+        );
+        let runtime = RuntimeState::new(
+            vec![ServerConfig {
+                tag: "tls-vless-dynamic".into(),
+                bind_location: BindLocation::Address(NetLocation::new(
+                    Address::Ipv4(Ipv4Addr::LOCALHOST),
+                    0,
+                )),
+                protocol: ServerProxyConfig::Vless {
+                    users: vec![plain_user],
+                    fallbacks: Vec::new(),
+                },
+                transport: Transport::Tcp,
+                quic_settings: None,
+                sniffing: None,
+                tcp_socket_policy: None,
+            }],
+            Vec::new(),
+        );
+        runtime
+            .alter_inbound_users(
+                "tls-vless-dynamic",
+                |_| -> Result<ServerConfig, ()> {
+                    panic!("dynamic VLESS user update must not rebuild TLS handler")
+                },
+                |users| {
+                    users.push(VlessUser {
+                        user_id: vision_user_id.into(),
+                        user_label: "vision-user".into(),
+                        user_level: 7,
+                        flow: XTLS_VISION_FLOW.into(),
+                    });
+                    Ok(true)
+                },
+            )
+            .await
+            .expect("add dynamic Vision user");
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(
+                generated.cert.der().to_vec(),
+            ))
+            .expect("trust test certificate");
+        let connector = TlsConnector::from(Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        ));
+
+        let vision = setup_tls_vless_request(
+            handler.clone(),
+            runtime.clone(),
+            &connector,
+            vision_vless_tcp_request(vision_user_bytes),
+        )
+        .await;
+        let TcpServerSetupResult::TcpForward {
+            traffic_context, ..
+        } = vision
+        else {
+            panic!("Vision user should produce TCP forwarding");
+        };
+        let context = traffic_context.expect("Vision traffic context");
+        assert_eq!(context.identity.as_deref(), Some("vision-user"));
+        assert_eq!(context.user_level, 7);
     }
 
     #[test]

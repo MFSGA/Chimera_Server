@@ -56,9 +56,7 @@ pub use vision::VisionVlessTcpHandler;
 #[cfg(feature = "reality")]
 pub use vision::setup_reality_mixed_vless_server_stream;
 #[cfg(feature = "tls")]
-pub(crate) use vision::{
-    ParsedVisionUser, parse_vision_users, setup_tls_vision_server_stream,
-};
+pub(crate) use vision::setup_tls_mixed_vless_server_stream;
 
 const SERVER_RESPONSE_HEADER: &[u8] = &[0u8, 0u8];
 

@@ -836,7 +836,12 @@ impl TcpServerHandler for RealityVisionVlessServerHandler {
             .as_ref()
             .and_then(|runtime| runtime.vless_users_snapshot(&self.inbound_tag));
         let users = dynamic_users.as_deref().unwrap_or(&self.users);
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let timeout = context
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.xray_handshake_timeout_for_level(0))
+            .unwrap_or(Duration::from_secs(60));
+        let deadline = Instant::now() + timeout;
         let outcome = timeout_at(
             deadline,
             accept_reality_stream_outcome(server_stream, &self.transport_config),

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use tracing::warn;
 
@@ -6,7 +8,11 @@ use crate::reality::{RealityServerConnection, RealityTlsStream};
 use crate::{
     async_stream::AsyncStream,
     config::server_config::{VlessFallback, VlessUser},
-    handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
+    handler::{
+        tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
+        xudp::message_stream::XudpMessageStream,
+    },
+    resolver::NativeResolver,
     traffic::TrafficContext,
 };
 
@@ -15,15 +21,15 @@ use super::fallback::{
     vless_fallback_result,
 };
 use super::protocol::{
-    COMMAND_TCP, ParsedVlessHeader, XTLS_VISION_FLOW, read_request_header,
-    read_request_header_after_auth,
+    COMMAND_MUX, COMMAND_TCP, COMMAND_UDP, ParsedVlessHeader, XTLS_VISION_FLOW,
+    read_request_header, read_request_header_after_auth,
 };
 #[cfg(any(feature = "tls", feature = "reality"))]
 use super::reality_vision_stream::RealityVisionServerStream;
 #[cfg(feature = "tls")]
 use super::tls_vision::{RustlsVisionSession, VisionRecordIo};
-use super::vision_stream::VisionServerStream;
 use super::{SERVER_RESPONSE_HEADER, encode_hex, parse_hex};
+use super::{udp_stream::VlessUdpStream, vision_stream::VisionServerStream};
 
 pub(crate) type ParsedVisionUser = (Box<[u8]>, String, u32);
 
@@ -88,8 +94,12 @@ pub async fn setup_reality_mixed_vless_server_stream(
     } = header;
 
     let user = find_matching_vless_user(users, &user_id, inbound_tag)?;
-    let user_label = user.user_label.clone();
-    let user_level = user.user_level;
+    let traffic_context = Some(
+        TrafficContext::new("vless")
+            .with_identity(user.user_label.clone())
+            .with_inbound_tag(inbound_tag.to_string())
+            .with_user_level(user.user_level),
+    );
 
     match request_flow.as_str() {
         "" => {
@@ -99,27 +109,34 @@ pub async fn setup_reality_mixed_vless_server_stream(
                     "client flow is empty but account requires xtls-rprx-vision",
                 ));
             }
-            if command != COMMAND_TCP {
-                return Err(std::io::Error::new(
+            match command {
+                COMMAND_TCP => Ok(TcpServerSetupResult::TcpForward {
+                    remote_location,
+                    stream: Box::new(tls_stream),
+                    need_initial_flush: true,
+                    connection_success_response: Some(
+                        SERVER_RESPONSE_HEADER.to_vec().into_boxed_slice(),
+                    ),
+                    traffic_context,
+                }),
+                COMMAND_UDP => Ok(TcpServerSetupResult::BidirectionalUdp {
+                    remote_location,
+                    stream: Box::new(VlessUdpStream::new(Box::new(tls_stream))),
+                    traffic_context,
+                }),
+                COMMAND_MUX => Ok(TcpServerSetupResult::SessionBasedUdp {
+                    stream: Box::new(XudpMessageStream::with_write_prefix(
+                        Box::new(tls_stream),
+                        Arc::new(NativeResolver::new()),
+                        SERVER_RESPONSE_HEADER.to_vec(),
+                    )),
+                    traffic_context,
+                }),
+                unknown_protocol_type => Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "UDP was requested",
-                ));
+                    format!("Unknown requested protocol: {unknown_protocol_type}"),
+                )),
             }
-
-            Ok(TcpServerSetupResult::TcpForward {
-                remote_location,
-                stream: Box::new(tls_stream),
-                need_initial_flush: true,
-                connection_success_response: Some(
-                    SERVER_RESPONSE_HEADER.to_vec().into_boxed_slice(),
-                ),
-                traffic_context: Some(
-                    TrafficContext::new("vless")
-                        .with_identity(user_label)
-                        .with_inbound_tag(inbound_tag.to_string())
-                        .with_user_level(user_level),
-                ),
-            })
         }
         XTLS_VISION_FLOW => {
             if user.flow != XTLS_VISION_FLOW {
@@ -155,12 +172,7 @@ pub async fn setup_reality_mixed_vless_server_stream(
                 )?),
                 need_initial_flush: false,
                 connection_success_response: None,
-                traffic_context: Some(
-                    TrafficContext::new("vless")
-                        .with_identity(user_label)
-                        .with_inbound_tag(inbound_tag.to_string())
-                        .with_user_level(user_level),
-                ),
+                traffic_context,
             })
         }
         other => Err(std::io::Error::new(
@@ -171,11 +183,11 @@ pub async fn setup_reality_mixed_vless_server_stream(
 }
 
 #[cfg(feature = "tls")]
-pub async fn setup_tls_vision_server_stream(
+pub async fn setup_tls_mixed_vless_server_stream(
     mut tls_stream: tokio_rustls::server::TlsStream<
         VisionRecordIo<Box<dyn AsyncStream>>,
     >,
-    users: &[ParsedVisionUser],
+    users: &[VlessUser],
     fallbacks: &[VlessFallback],
     inbound_tag: &str,
 ) -> std::io::Result<TcpServerSetupResult> {
@@ -192,7 +204,8 @@ pub async fn setup_tls_vision_server_stream(
     let header = if !fallbacks.is_empty() {
         let (mut prefix, candidate) = read_vless_auth_prefix(&mut tls_stream).await;
         let authenticated = candidate.is_some_and(|candidate| {
-            users.iter().any(|(stored_user_id, _, _)| {
+            users.iter().any(|user| {
+                let stored_user_id = parse_hex(&user.user_id);
                 stored_user_id.len() == 16
                     && stored_user_id.as_ref() == candidate.as_slice()
             })
@@ -232,34 +245,93 @@ pub async fn setup_tls_vision_server_stream(
         remote_location,
     } = header;
 
-    let (user_label, user_level) =
-        find_matching_user_label(users, &user_id, inbound_tag)?;
-    validate_vision_request_flow(&request_flow, command)?;
+    let user = find_matching_vless_user(users, &user_id, inbound_tag)?;
+    let user_label = user.user_label.clone();
+    let user_level = user.user_level;
+    let traffic_context = Some(
+        TrafficContext::new("vless")
+            .with_identity(user_label)
+            .with_inbound_tag(inbound_tag.to_string())
+            .with_user_level(user_level),
+    );
 
-    let (io, connection) = tls_stream.into_inner();
-    let mut session = io.session(connection);
-    let initial_plaintext = RealityVisionServerStream::<
-        VisionRecordIo<Box<dyn AsyncStream>>,
-        RustlsVisionSession,
-    >::drain_plaintext_from_session(&mut session)?;
+    match request_flow.as_str() {
+        "" => {
+            if user.flow == XTLS_VISION_FLOW {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "client flow is empty but account requires xtls-rprx-vision",
+                ));
+            }
+            match command {
+                COMMAND_TCP => Ok(TcpServerSetupResult::TcpForward {
+                    remote_location,
+                    stream: Box::new(tls_stream),
+                    need_initial_flush: true,
+                    connection_success_response: Some(
+                        SERVER_RESPONSE_HEADER.to_vec().into_boxed_slice(),
+                    ),
+                    traffic_context,
+                }),
+                COMMAND_UDP => Ok(TcpServerSetupResult::BidirectionalUdp {
+                    remote_location,
+                    stream: Box::new(VlessUdpStream::new(Box::new(tls_stream))),
+                    traffic_context,
+                }),
+                COMMAND_MUX => Ok(TcpServerSetupResult::SessionBasedUdp {
+                    stream: Box::new(XudpMessageStream::with_write_prefix(
+                        Box::new(tls_stream),
+                        Arc::new(NativeResolver::new()),
+                        SERVER_RESPONSE_HEADER.to_vec(),
+                    )),
+                    traffic_context,
+                }),
+                unknown_protocol_type => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Unknown requested protocol: {unknown_protocol_type}"),
+                )),
+            }
+        }
+        XTLS_VISION_FLOW => {
+            if user.flow != XTLS_VISION_FLOW {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("account is not allowed to use flow {XTLS_VISION_FLOW}"),
+                ));
+            }
+            if command != COMMAND_TCP {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "xtls-rprx-vision currently supports only TCP requests",
+                ));
+            }
 
-    Ok(TcpServerSetupResult::TcpForward {
-        remote_location,
-        stream: Box::new(RealityVisionServerStream::new(
-            io,
-            session,
-            user_id,
-            &initial_plaintext,
-        )?),
-        need_initial_flush: false,
-        connection_success_response: None,
-        traffic_context: Some(
-            TrafficContext::new("vless")
-                .with_identity(user_label)
-                .with_inbound_tag(inbound_tag.to_string())
-                .with_user_level(user_level),
-        ),
-    })
+            let (io, connection) = tls_stream.into_inner();
+            let mut session = io.session(connection);
+            let initial_plaintext =
+                RealityVisionServerStream::<
+                    VisionRecordIo<Box<dyn AsyncStream>>,
+                    RustlsVisionSession,
+                >::drain_plaintext_from_session(&mut session)?;
+
+            Ok(TcpServerSetupResult::TcpForward {
+                remote_location,
+                stream: Box::new(RealityVisionServerStream::new(
+                    io,
+                    session,
+                    user_id,
+                    &initial_plaintext,
+                )?),
+                need_initial_flush: false,
+                connection_success_response: None,
+                traffic_context,
+            })
+        }
+        other => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unknown request flow {other}"),
+        )),
+    }
 }
 
 #[cfg(feature = "reality")]
