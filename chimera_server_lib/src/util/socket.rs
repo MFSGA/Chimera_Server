@@ -133,7 +133,12 @@ pub fn new_socket2_udp_socket_with_buffer_size(
         socket.set_reuse_port(true)?;
 
         #[cfg(any(not(unix), target_os = "solaris", target_os = "illumos"))]
-        panic!("Cannot support reuse sockets");
+        {
+            // Xray treats SO_REUSEPORT as a no-op on platforms without a
+            // supported implementation (including Windows). A single UDP
+            // listener does not require it, so keep the listener available
+            // instead of panicking on these targets.
+        }
     }
 
     if let Some(ref _interface) = bind_interface {

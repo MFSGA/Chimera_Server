@@ -1,4 +1,4 @@
-#![cfg(feature = "traffic")]
+#![cfg(all(feature = "traffic", unix))]
 
 use std::{
     env,

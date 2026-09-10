@@ -163,6 +163,12 @@ fn spawn_echo_server() -> io::Result<(SocketAddrV4, thread::JoinHandle<()>)> {
                         "[socks-external-e2e] echo server accepted stream from {:?}",
                         stream.peer_addr()
                     );
+                    if let Err(err) = stream.set_nonblocking(false) {
+                        eprintln!(
+                            "[socks-external-e2e] failed to restore blocking echo stream: {err}"
+                        );
+                        return;
+                    }
                     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
                     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
                     let mut buf = [0u8; 1024];
@@ -373,7 +379,7 @@ fn socks_noauth_external_roundtrip() {
     trace_step("==== test socks_noauth_external_roundtrip start ====");
     let _guard = global_test_lock()
         .lock()
-        .expect("failed to acquire test lock");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (echo_addr, echo_handle) =
         spawn_echo_server().expect("failed to start echo server");
     let socks_port = free_localhost_port().expect("failed to allocate socks port");
@@ -430,7 +436,7 @@ fn socks_http_fallback_external_roundtrip() {
     trace_step("==== test socks_http_fallback_external_roundtrip start ====");
     let _guard = global_test_lock()
         .lock()
-        .expect("failed to acquire test lock");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (echo_addr, echo_handle) =
         spawn_echo_server().expect("failed to start echo server");
     let socks_port = free_localhost_port().expect("failed to allocate socks port");
@@ -484,7 +490,7 @@ fn socks_password_external_roundtrip() {
     trace_step("==== test socks_password_external_roundtrip start ====");
     let _guard = global_test_lock()
         .lock()
-        .expect("failed to acquire test lock");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (echo_addr, echo_handle) =
         spawn_echo_server().expect("failed to start echo server");
     let socks_port = free_localhost_port().expect("failed to allocate socks port");

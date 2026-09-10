@@ -1064,6 +1064,14 @@ mod tests {
             expected: 1,
             ..Default::default()
         };
+        #[cfg(unix)]
+        let webhook = Some(WebhookConfigPayload {
+            url: "/tmp/chimera-routing-test.sock:/routing".into(),
+            deduplication: 10,
+            headers: HashMap::from([("x-test".into(), "ok".into())]),
+        });
+        #[cfg(not(unix))]
+        let webhook = None;
         let router_config = RouterConfigPayload {
             domain_strategy: RouterDomainStrategyPayload::AsIs as i32,
             rule: vec![RoutingRulePayload {
@@ -1072,11 +1080,7 @@ mod tests {
                 )),
                 rule_tag: "process-rule".into(),
                 process: vec!["self/".into()],
-                webhook: Some(WebhookConfigPayload {
-                    url: "/tmp/chimera-routing-test.sock:/routing".into(),
-                    deduplication: 10,
-                    headers: HashMap::from([("x-test".into(), "ok".into())]),
-                }),
+                webhook,
                 ..RoutingRulePayload::default()
             }],
             balancing_rule: vec![BalancingRulePayload {
