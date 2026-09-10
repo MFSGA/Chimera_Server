@@ -1,0 +1,22 @@
+name: Setup pinned Xray
+description: Download and checksum-verify the repository-pinned Xray Linux binary for interop and benchmark jobs.
+
+runs:
+  using: composite
+  steps:
+    - name: Download pinned Xray
+      shell: bash
+      run: |
+        set -euo pipefail
+        version=$(cat bench/.xray-version)
+        expected_sha256=$(cat bench/.xray-linux-64.sha256)
+
+        rm -rf xray
+        mkdir -p xray
+        curl --fail --location --retry 3 \
+          "https://github.com/XTLS/Xray-core/releases/download/${version}/Xray-linux-64.zip" \
+          -o "$RUNNER_TEMP/xray-linux-64.zip"
+        echo "${expected_sha256}  $RUNNER_TEMP/xray-linux-64.zip" | sha256sum --check --strict
+        unzip -q -o "$RUNNER_TEMP/xray-linux-64.zip" -d xray/
+        chmod +x xray/xray
+        ./xray/xray version

@@ -1,0 +1,62 @@
+name: Rust CI setup
+description: Install stable Rust, cache Cargo state, and optionally install the repository-pinned cross tool.
+
+inputs:
+  components:
+    description: Optional comma-separated rustup components.
+    required: false
+    default: ""
+  target:
+    description: Optional Rust compilation target.
+    required: false
+    default: ""
+  cache-key:
+    description: Shared rust-cache key for this job class.
+    required: false
+    default: "default"
+  install-cross:
+    description: Install the repository-pinned cross tool.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust
+      if: inputs.components == '' && inputs.target == ''
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install Rust with components
+      if: inputs.components != '' && inputs.target == ''
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: ${{ inputs.components }}
+
+    - name: Install Rust with target
+      if: inputs.components == '' && inputs.target != ''
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ inputs.target }}
+
+    - name: Install Rust with components and target
+      if: inputs.components != '' && inputs.target != ''
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.target }}
+
+    - name: Cache Rust build state
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: ${{ inputs.cache-key }}
+        cache-on-failure: true
+
+    - name: Install pinned cross
+      if: inputs.install-cross == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        cargo install cross \
+          --git https://github.com/cross-rs/cross \
+          --rev 8c1a8aa4b661711f4b7b6ac07c2e8929ce2f7d27 \
+          --locked

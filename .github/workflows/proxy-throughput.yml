@@ -9,72 +9,65 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "bench/**"
+      - ".github/actions/**"
       - ".github/workflows/proxy-throughput.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
-  pull-requests: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  throughput:
-    name: Proxy Throughput (ubuntu-latest)
+  benchmark:
+    name: Proxy throughput
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: bash
+    timeout-minutes: 45
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-ci-setup
+        with:
+          cache-key: benchmark-throughput
 
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
-      - name: Download pinned xray-core
-        run: |
-          set -euo pipefail
-          VERSION=$(cat bench/.xray-version)
-          EXPECTED_SHA256=$(cat bench/.xray-linux-64.sha256)
-          mkdir -p xray
-          curl --fail --location --retry 3 \
-            "https://github.com/XTLS/Xray-core/releases/download/${VERSION}/Xray-linux-64.zip" \
-            -o /tmp/xray.zip
-          echo "${EXPECTED_SHA256}  /tmp/xray.zip" | sha256sum --check --strict
-          unzip -o /tmp/xray.zip -d xray/
-          chmod +x xray/xray
-          xray/xray version
+      - uses: ./.github/actions/setup-pinned-xray
 
       - name: Build Chimera release
-        run: cargo build --release --package chimera_server_app --all-features
+        run: cargo build --release --locked --package chimera_server_app --all-features
 
-      - name: Print environment info
+      - name: Record environment
         run: |
-          echo "### Environment"
-          echo "OS: $(uname -a)"
-          echo "CPUs: $(nproc)"
-          echo "Memory: $(free -h | awk '/^Mem:/ {print $2}')"
-          echo "Rustc: $(rustc --version)"
-          echo "Cargo: $(cargo --version)"
-          echo "Chimera: $(./target/release/chimera_server_app --version 2>&1 || echo 'N/A')"
-          echo "Xray: $(./xray/xray version 2>&1 | head -1)"
+          {
+            echo "### Environment"
+            echo "OS: $(uname -a)"
+            echo "CPUs: $(nproc)"
+            echo "Memory: $(free -h | awk '/^Mem:/ {print $2}')"
+            echo "Rustc: $(rustc --version)"
+            echo "Cargo: $(cargo --version)"
+            echo "Chimera: $(./target/release/chimera_server_app --version 2>&1 || echo 'N/A')"
+            echo "Xray: $(./xray/xray version 2>&1 | head -1)"
+          } | tee target/throughput-environment.txt
 
-      - name: Run throughput tests
+      - name: Run throughput benchmark
         run: |
-          python3 bench/throughput.py --only all --payload-size 33554432 --runs 3 \
+          python3 bench/throughput.py \
+            --only all \
+            --payload-size 33554432 \
+            --runs 3 \
             --chimera-bin ./target/release/chimera_server_app \
             --xray-bin ./xray/xray \
             --baseline bench/baseline-throughput.json \
-            --output target/throughput-results.jsonl --verbose \
+            --output target/throughput-results.jsonl \
+            --verbose \
             2>&1 | tee target/throughput-run.log
 
       - name: Generate report
@@ -85,7 +78,7 @@ jobs:
             --output target/throughput-report.md \
             --env-json "$ENV_JSON" \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          cat target/throughput-report.md >> $GITHUB_STEP_SUMMARY
+          cat target/throughput-report.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artifacts
         if: always()
@@ -96,39 +89,61 @@ jobs:
             target/throughput-results.jsonl
             target/throughput-report.md
             target/throughput-run.log
+            target/throughput-environment.txt
+          if-no-files-found: warn
           retention-days: 90
 
-      - name: Post PR comment
-        if: always() && github.event_name == 'pull_request'
+  comment:
+    name: Update throughput PR comment
+    needs: benchmark
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Download benchmark report
+        continue-on-error: true
+        uses: actions/download-artifact@v5
+        with:
+          name: proxy-throughput
+          path: target
+
+      - name: Update PR comment
+        continue-on-error: true
         uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');
+            const marker = '<!-- chimera-proxy-throughput -->';
             const report = 'target/throughput-report.md';
             let body = fs.existsSync(report)
               ? fs.readFileSync(report, 'utf8')
-              : '## Proxy Throughput Report\n\nNo report produced.';
-            body += '\n\n[View workflow run and artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})';
+              : '## Proxy Throughput Report\n\nNo report was produced. See the workflow run for details.';
+            body = `${marker}\n${body}\n\n[View workflow run and artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`;
+
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
             });
             const existing = comments.find(
-              c => c.user.type === 'Bot' && c.body.includes('Proxy Throughput Report')
+              comment => comment.user.type === 'Bot' && comment.body.includes(marker)
             );
             if (existing) {
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 comment_id: existing.id,
-                body: body,
+                body,
               });
             } else {
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: context.issue.number,
-                body: body,
+                body,
               });
             }

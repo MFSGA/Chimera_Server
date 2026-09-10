@@ -11,6 +11,7 @@ on:
       - "bench/.xray-linux-64.sha256"
       - "Cargo.toml"
       - "Cargo.lock"
+      - ".github/actions/**"
       - ".github/workflows/hysteria2-performance.yml"
   workflow_dispatch:
     inputs:
@@ -52,47 +53,37 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  netem:
-    name: Hysteria2 netem (ubuntu-latest)
+  benchmark:
+    name: Hysteria2 netem
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: bash
+    timeout-minutes: 60
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-ci-setup
+        with:
+          cache-key: benchmark-hysteria2
 
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+      - name: Install netem dependency
+        run: sudo apt-get update && sudo apt-get install -y iproute2
 
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y iproute2 protobuf-compiler unzip
-
-      - name: Self-test benchmark harness
+      - name: Validate benchmark harness
         run: |
           python3 -m py_compile bench/hysteria2_netem.py
           python3 bench/hysteria2_netem.py --self-test
 
-      - name: Download pinned xray-core
-        run: |
-          set -euo pipefail
-          VERSION=$(cat bench/.xray-version)
-          EXPECTED_SHA256=$(cat bench/.xray-linux-64.sha256)
-          mkdir -p xray
-          curl --fail --location --retry 3 \
-            "https://github.com/XTLS/Xray-core/releases/download/${VERSION}/Xray-linux-64.zip" \
-            -o /tmp/xray.zip
-          echo "${EXPECTED_SHA256}  /tmp/xray.zip" | sha256sum --check --strict
-          unzip -q -o /tmp/xray.zip -d xray/
-          chmod +x xray/xray
-          ./xray/xray version
+      - uses: ./.github/actions/setup-pinned-xray
 
       - name: Build Chimera release
-        run: cargo build --release --package chimera_server_app --all-features
+        run: cargo build --release --locked --package chimera_server_app --all-features
 
       - name: Resolve benchmark matrix
         id: matrix
@@ -120,16 +111,18 @@ jobs:
             PAYLOAD_MIB="$INPUT_PAYLOAD_MIB"
             RUNS="$INPUT_RUNS"
           fi
+
           echo "rtts=$RTTS" >> "$GITHUB_OUTPUT"
           echo "losses=$LOSSES" >> "$GITHUB_OUTPUT"
           echo "modes=$MODES" >> "$GITHUB_OUTPUT"
           echo "bandwidth=$BANDWIDTH" >> "$GITHUB_OUTPUT"
           echo "payload_bytes=$((PAYLOAD_MIB * 1024 * 1024))" >> "$GITHUB_OUTPUT"
           echo "runs=$RUNS" >> "$GITHUB_OUTPUT"
+
           printf 'RTTs=%s\nLosses per direction=%s\nModes=%s\nBandwidth=%s Mbps\nPayload=%s MiB\nRuns=%s\n' \
             "$RTTS" "$LOSSES" "$MODES" "$BANDWIDTH" "$PAYLOAD_MIB" "$RUNS"
 
-      - name: Run Hysteria2 RTT/loss benchmark
+      - name: Run RTT/loss benchmark
         run: |
           sudo -n true
           python3 bench/hysteria2_netem.py \
@@ -146,14 +139,14 @@ jobs:
             --verbose \
             2>&1 | tee target/hysteria2-netem.log
 
-      - name: Publish benchmark summary
+      - name: Publish summary
         if: always()
         run: |
           if [[ -f target/hysteria2-netem.md ]]; then
             cat target/hysteria2-netem.md >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Upload benchmark artifacts
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v7
         with:
