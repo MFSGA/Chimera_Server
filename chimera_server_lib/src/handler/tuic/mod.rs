@@ -131,7 +131,7 @@ pub async fn run_tuic_server(
         runtime,
     };
 
-    let mut join_handles = Vec::with_capacity(MAX_QUIC_ENDPOINTS);
+    let mut endpoint_tasks = tokio::task::JoinSet::new();
 
     for _ in 0..MAX_QUIC_ENDPOINTS {
         let quic_server_config = quic_server_config.clone();
@@ -140,7 +140,7 @@ pub async fn run_tuic_server(
         let password = password.clone();
         let connection_context = connection_context.clone();
 
-        let join_handle = tokio::spawn(async move {
+        endpoint_tasks.spawn(async move {
             let mut server_config =
                 quinn::ServerConfig::with_crypto(quic_server_config);
             let transport =
@@ -188,7 +188,15 @@ pub async fn run_tuic_server(
             )
             .map_err(std::io::Error::other)?;
 
-            while let Some(conn) = endpoint.accept().await {
+            loop {
+                let conn = match crate::beginning::accept_quic_with_health(
+                    &endpoint, "tuic",
+                )
+                .await
+                {
+                    Ok(conn) => conn,
+                    Err(error) => break Err(error),
+                };
                 let resolver = resolver.clone();
                 let uuid = uuid.clone();
                 let password = password.clone();
@@ -209,18 +217,19 @@ pub async fn run_tuic_server(
                     }
                 });
             }
-
-            Ok::<(), std::io::Error>(())
         });
-
-        join_handles.push(join_handle);
     }
 
-    for join_handle in join_handles {
-        join_handle.await.map_err(std::io::Error::other)??;
+    match endpoint_tasks.join_next().await {
+        Some(Ok(Ok(()))) => Err(std::io::Error::other(
+            "TUIC QUIC endpoint task ended unexpectedly",
+        )),
+        Some(Ok(Err(error))) => Err(error),
+        Some(Err(error)) => Err(std::io::Error::other(error)),
+        None => Err(std::io::Error::other(
+            "TUIC listener started without QUIC endpoint tasks",
+        )),
     }
-
-    Ok(())
 }
 
 async fn process_connection(

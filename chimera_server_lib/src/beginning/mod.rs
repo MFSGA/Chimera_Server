@@ -188,6 +188,34 @@ pub(super) async fn accept_tcp_with_health(
     }
 }
 
+/// Wait for the next QUIC connection attempt and surface endpoint-driver loss as
+/// a listener failure. Quinn 0.11 reports UDP socket I/O failure by terminating
+/// its internal endpoint driver; `Endpoint::accept()` then yields `None`, the
+/// same value used for an explicitly closed endpoint. Chimera does not close
+/// these endpoints directly during normal inbound stop (the owning listener
+/// task is aborted instead), so a naturally completed accept is unexpected and
+/// must terminate the listener task for generation-aware health propagation.
+pub(crate) async fn accept_quic_with_health(
+    endpoint: &quinn::Endpoint,
+    listener_kind: &'static str,
+) -> std::io::Result<quinn::Incoming> {
+    match endpoint.accept().await {
+        Some(incoming) => Ok(incoming),
+        None => {
+            let error = std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                format!("{listener_kind} QUIC endpoint stopped accepting"),
+            );
+            error!(
+                listener_kind,
+                %error,
+                "QUIC endpoint stopped unexpectedly; stopping listener task"
+            );
+            Err(error)
+        }
+    }
+}
+
 #[cfg(feature = "grpc_transport")]
 pub(crate) mod grpc_transport;
 mod policy_stream;
@@ -1742,8 +1770,18 @@ pub async fn setup_client_stream(
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::{
+        io::IoSliceMut,
+        net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+        pin::Pin,
+        sync::Arc,
+        task::{Context, Poll},
+    };
 
+    use quinn::{
+        AsyncUdpSocket, UdpPoller,
+        udp::{RecvMeta, Transmit},
+    };
     #[cfg(target_os = "linux")]
     use tokio::net::{TcpListener, TcpStream};
 
@@ -1755,6 +1793,99 @@ mod tests {
     };
 
     use super::*;
+
+    #[derive(Debug)]
+    struct AlwaysWritableUdpPoller;
+
+    impl UdpPoller for AlwaysWritableUdpPoller {
+        fn poll_writable(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingQuicUdpSocket {
+        local_addr: SocketAddr,
+    }
+
+    impl AsyncUdpSocket for FailingQuicUdpSocket {
+        fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+            Box::pin(AlwaysWritableUdpPoller)
+        }
+
+        fn try_send(&self, _transmit: &Transmit) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn poll_recv(
+            &self,
+            _cx: &mut Context<'_>,
+            _bufs: &mut [IoSliceMut<'_>],
+            _meta: &mut [RecvMeta],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::other(
+                "simulated QUIC UDP receive failure",
+            )))
+        }
+
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            Ok(self.local_addr)
+        }
+    }
+
+    #[tokio::test]
+    async fn quic_endpoint_driver_loss_reaches_inbound_health() {
+        let config = ServerConfig {
+            tag: "quic-driver-loss".to_string(),
+            bind_location: BindLocation::Address(NetLocation::from_ip_addr(
+                std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+                10002,
+            )),
+            protocol: ServerProxyConfig::Socks {
+                accounts: crate::config::server_config::SocksUserStore::new(
+                    Vec::new(),
+                ),
+                udp_enabled: false,
+                udp_response_ip: None,
+                user_level: 0,
+            },
+            transport: Transport::Quic,
+            quic_settings: None,
+            sniffing: None,
+            tcp_socket_policy: None,
+        };
+        let runtime = RuntimeState::new(vec![config], Vec::new());
+        assert!(runtime.mark_running());
+
+        let endpoint = quinn::Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            None,
+            Arc::new(FailingQuicUdpSocket {
+                local_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 10002)),
+            }),
+            Arc::new(quinn::TokioRuntime),
+        )
+        .expect("construct endpoint with controlled failing socket");
+        let task = tokio::spawn(async move {
+            let error = accept_quic_with_health(&endpoint, "test-quic")
+                .await
+                .expect_err("driver loss must end QUIC accept");
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        });
+        runtime.register_inbound_tasks("quic-driver-loss", vec![task]);
+
+        let failure = tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.wait_for_inbound_failure(),
+        )
+        .await
+        .expect("QUIC listener failure should reach runtime health");
+        assert_eq!(failure.tag, "quic-driver-loss");
+        assert!(!runtime.is_ready());
+    }
 
     #[test]
     fn tcp_accept_health_fails_only_after_sustained_listener_errors() {

@@ -546,7 +546,13 @@ async fn start_xhttp_h3_server(
 
     let handle = tokio::spawn(async move {
         let _cancel_on_drop = CancelOnDrop(state.shutdown.clone());
-        while let Some(incoming) = endpoint.accept().await {
+        loop {
+            let incoming =
+                match super::accept_quic_with_health(&endpoint, "xhttp-http3").await
+                {
+                    Ok(incoming) => incoming,
+                    Err(_) => return,
+                };
             let state = state.clone();
             let runtime = state.runtime.clone();
             let shutdown = state.shutdown.clone();

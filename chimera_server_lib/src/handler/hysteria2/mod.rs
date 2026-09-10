@@ -195,7 +195,16 @@ pub async fn run_hysteria2_server(
         )?;
 
         let join_handle = tokio::spawn(async move {
-            while let Some(incoming) = endpoint.accept().await {
+            loop {
+                let incoming = match crate::beginning::accept_quic_with_health(
+                    &endpoint,
+                    "hysteria2",
+                )
+                .await
+                {
+                    Ok(incoming) => incoming,
+                    Err(_) => return,
+                };
                 let cloned_resolver = resolver.clone();
                 let config = config.clone();
                 let inbound_tag = inbound_tag.clone();
