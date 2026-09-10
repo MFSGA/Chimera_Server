@@ -1692,6 +1692,167 @@ async fn xray_client_can_proxy_tcp_through_chimera_vmess_wss() {
     run_xray_client_vmess_transport_case(VlessTransportCase::WebSocketTls).await;
 }
 
+#[derive(Clone, Copy)]
+enum TrojanTransportCase {
+    Tcp,
+    TcpTls,
+    WebSocketTls,
+}
+
+impl TrojanTransportCase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp-none",
+            Self::TcpTls => "tcp-tls",
+            Self::WebSocketTls => "ws-tls",
+        }
+    }
+}
+
+async fn run_xray_client_trojan_transport_case(case: TrojanTransportCase) {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir(&format!("trojan-{}", case.name()));
+    let echo_addr = start_tcp_echo_server();
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let cert_path = workspace.join("cert/cert.pem");
+    let key_path = workspace.join("cert/key.pem");
+    let pinned_peer_cert_sha256 = first_cert_sha256_hex(&cert_path);
+    let chimera_config_path = work_dir.join("chimera.json");
+    let xray_config_path = work_dir.join("xray-client.json");
+
+    let (chimera_stream, xray_stream) = match case {
+        TrojanTransportCase::Tcp => (
+            json!({"network": "tcp", "security": "none"}),
+            json!({"network": "tcp", "security": "none"}),
+        ),
+        TrojanTransportCase::TcpTls => (
+            json!({
+                "network": "tcp",
+                "security": "tls",
+                "tlsSettings": {
+                    "serverName": "localhost",
+                    "certificates": [{
+                        "certificateFile": cert_path,
+                        "keyFile": key_path
+                    }]
+                }
+            }),
+            json!({
+                "network": "tcp",
+                "security": "tls",
+                "tlsSettings": {
+                    "serverName": "localhost",
+                    "pinnedPeerCertSha256": pinned_peer_cert_sha256
+                }
+            }),
+        ),
+        TrojanTransportCase::WebSocketTls => (
+            json!({
+                "network": "ws",
+                "security": "tls",
+                "wsSettings": {"host": "localhost", "path": "/trojan-wss"},
+                "tlsSettings": {
+                    "serverName": "localhost",
+                    "certificates": [{
+                        "certificateFile": cert_path,
+                        "keyFile": key_path
+                    }]
+                }
+            }),
+            json!({
+                "network": "ws",
+                "security": "tls",
+                "wsSettings": {"host": "localhost", "path": "/trojan-wss"},
+                "tlsSettings": {
+                    "serverName": "localhost",
+                    "pinnedPeerCertSha256": pinned_peer_cert_sha256
+                }
+            }),
+        ),
+    };
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "trojan",
+                "tag": format!("chimera-trojan-{}", case.name()),
+                "settings": {
+                    "clients": [{
+                        "password": "trojan-password",
+                        "email": "trojan-transport@example.test"
+                    }]
+                },
+                "streamSettings": chimera_stream
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth"}
+            }],
+            "outbounds": [{
+                "protocol": "trojan",
+                "settings": {
+                    "servers": [{
+                        "address": "127.0.0.1",
+                        "port": chimera_port,
+                        "password": "trojan-password"
+                    }]
+                },
+                "streamSettings": xray_stream
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+    let first_payload = format!("Trojan {} through Xray", case.name()).into_bytes();
+    let large_payload = deterministic_payload(64 * 1024);
+    // Xray 26.2.6 buffers the first Trojan payload before disabling its
+    // outbound buffer. A single 64 KiB first write overflows that Xray-owned
+    // buffer, so establish the tunnel with a small payload and exercise the
+    // 64 KiB data plane on the same authenticated connection.
+    assert_socks5_echo_sequence(
+        socks_addr,
+        echo_addr,
+        &[first_payload.as_slice(), large_payload.as_slice()],
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera as server and ./xray as client for Trojan TCP"]
+async fn xray_client_can_proxy_tcp_through_chimera_trojan_tcp() {
+    run_xray_client_trojan_transport_case(TrojanTransportCase::Tcp).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera as server and ./xray as client for Trojan TCP over TLS"]
+async fn xray_client_can_proxy_tcp_through_chimera_trojan_tls() {
+    run_xray_client_trojan_transport_case(TrojanTransportCase::TcpTls).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera as server and ./xray as client for Trojan WebSocket over TLS"]
+async fn xray_client_can_proxy_tcp_through_chimera_trojan_wss() {
+    run_xray_client_trojan_transport_case(TrojanTransportCase::WebSocketTls).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts Chimera and ./xray for VLESS gRPC h2c"]
 async fn xray_client_can_proxy_tcp_through_chimera_grpc() {
@@ -3530,6 +3691,14 @@ fn assert_socks5_echo(
     target_addr: SocketAddr,
     payload: &[u8],
 ) {
+    assert_socks5_echo_sequence(socks_addr, target_addr, &[payload]);
+}
+
+fn assert_socks5_echo_sequence(
+    socks_addr: SocketAddr,
+    target_addr: SocketAddr,
+    payloads: &[&[u8]],
+) {
     let mut request = vec![0x05, 0x01, 0x00];
     match target_addr.ip() {
         std::net::IpAddr::V4(ip) => {
@@ -3554,7 +3723,31 @@ fn assert_socks5_echo(
             request.extend_from_slice(&port);
         }
     }
-    assert_socks5_request_echo(socks_addr, &request, payload);
+
+    let mut stream = TcpStream::connect_timeout(&socks_addr, IO_TIMEOUT)
+        .expect("connect xray socks inbound");
+    stream
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .expect("set read timeout");
+    stream
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .expect("set write timeout");
+    stream.write_all(&request[..3]).expect("socks hello");
+    let mut hello = [0u8; 2];
+    stream.read_exact(&mut hello).expect("socks hello response");
+    assert_eq!(hello, [0x05, 0x00], "SOCKS no-auth negotiation failed");
+    stream
+        .write_all(&request[3..])
+        .expect("socks connect request");
+    read_socks_connect_response(&mut stream).expect("socks connect response");
+
+    for payload in payloads {
+        stream.write_all(payload).expect("write tunneled payload");
+        let mut echoed = vec![0u8; payload.len()];
+        read_exact_with_deadline(&mut stream, &mut echoed)
+            .expect("read tunneled echo response");
+        assert_eq!(echoed.as_slice(), *payload);
+    }
 }
 
 fn assert_socks5_echo_does_not_succeed(
