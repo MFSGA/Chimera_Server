@@ -22,7 +22,7 @@ current code has an explicit config path and runtime handler path for it.
 | `vless` + XHTTP | Experimental | Use `protocol: "vless"` with `streamSettings.network: "xhttp"` and `xhttpSettings`. |
 | `vless` + TLS | Supported | Requires `streamSettings.security: "tls"` and `tlsSettings` certificates. |
 | `vless` + REALITY | Partial | Inbound-only REALITY. `publicKey`, `fingerprint`, `spiderX`, and non-zero `xver` are rejected. |
-| `vless` Vision | Partial | Only `flow: "xtls-rprx-vision"` is accepted. Vision users cannot share one inbound with plain VLESS users. |
+| `vless` Vision | Partial | Only `flow: "xtls-rprx-vision"` is accepted. Direct TLS/REALITY VLESS now uses a stable mixed-capable handler, so plain and Vision users may share one inbound; transports that do not support Vision (for example WebSocket, gRPC, HTTPUpgrade and XHTTP) still reject/avoid Vision semantics. |
 | `vmess` over TCP | Partial | Requires `settings.clients`; cipher handling is currently normalized internally. |
 | `vmess` + WebSocket | Partial | Uses `streamSettings.wsSettings`; compatibility coverage should be expanded before calling it stable. |
 | `trojan` over TCP | Partial | Requires non-empty client passwords. Fallbacks require explicit `host:port` destinations. |
@@ -60,6 +60,18 @@ current code has an explicit config path and runtime handler path for it.
 | MCP push service | Partial | Listen/path/update interval are parsed and served, but operational docs are still thin. |
 | Outbounds | Partial | Tags and protocol names are surfaced in runtime state; forwarding behavior is still materializing. |
 | Routing and policy | Partial | Routing state and gRPC controls exist; policy parsing is mostly a compatibility placeholder. |
+
+## Re-certification evidence (2026-09-11)
+
+The current pre-M5 compatibility baseline was refreshed against the repository-pinned `xray` binary (`Xray 26.2.6`) and the local fixed xray-core reference. Passing real-client/server checks in this refresh include:
+
+- Xray client -> Chimera: VLESS TLS+Vision TCP, VLESS gRPC h2c, VLESS HTTPUpgrade, HTTP/Mixed TCP proxying, legacy Shadowsocks TCP, Shadowsocks 2022 TCP + AES UDP, and Hysteria2 TCP + UDP with Xray defaults.
+- XHTTP security matrix with a real Xray peer: none, TLS, HTTP/3, and REALITY, each with 64 KiB payload coverage.
+- REALITY Vision parity: payload/framing boundary transfer and TCP half-close behavior compared with an Xray server baseline.
+- gRPC control-plane dual-server matrix: 18 strict/baseline-supported cases passed, 2 Xray-unsupported probes skipped, and 2 informational cases recorded; the VLESS multi-user flow also matched the Xray baseline.
+- Inbound lifecycle parity: RemoveInbound rejects new SOCKS TCP connections while preserving an already accepted tunnel on both Xray and Chimera; lifecycle failure gRPC codes match Xray. Chimera intentionally differs from Xray on AddInbound bind failure by rolling the failed instance back instead of retaining a dead handler tag.
+
+One top-level Xray-client REALITY+Vision test remains environment-blocked on this machine because its IPv6 echo bind fails with `EADDRNOTAVAIL`; the IPv4 REALITY parity tests above pass and exercise the same server handler path. Plain VLESS TCP, VLESS WS/WSS, VMess TCP/WS/TLS, and Trojan TCP/TLS/WS still need refreshed real Xray-client evidence before the pre-M5 certification pass is considered complete.
 
 ## Known Engineering Gaps
 

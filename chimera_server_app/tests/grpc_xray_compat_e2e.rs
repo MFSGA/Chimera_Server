@@ -437,6 +437,15 @@ fn build_chimera_config(grpc_port: u16, socks_port: u16) -> String {
       "RoutingService",
       "ObservatoryService"
     ]
+  }},
+  "routing": {{
+    "domainStrategy": "AsIs",
+    "balancers": [
+      {{
+        "tag": "{BALANCER_TAG}",
+        "selector": ["{DIRECT_TAG}", "{BACKUP_TAG}"]
+      }}
+    ]
   }}
 }}"#
     )
