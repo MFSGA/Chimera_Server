@@ -12,6 +12,7 @@ pub use runtime::{OutboundSummary, RuntimeState};
 use std::net::SocketAddr;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::task::{JoinError, JoinHandle};
 use tokio_rustls::rustls;
 
 mod address;
@@ -110,6 +111,90 @@ pub enum Error {
 pub struct ServerRuntime {
     pub inbounds: Vec<ServerConfig>,
     pub runtime_state: RuntimeState,
+}
+
+const SERVER_CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug)]
+struct ServerShutdownReport {
+    stopped_inbounds: usize,
+    drained_connections: bool,
+    cancelled_connections: usize,
+    stopped_global_xudp_workers: usize,
+}
+
+enum ServerExit {
+    Signal(&'static str),
+    SignalError(std::io::Error),
+    ServiceTask(Result<(), JoinError>),
+}
+
+async fn wait_for_shutdown_signal() -> std::io::Result<&'static str> {
+    #[cfg(unix)]
+    {
+        let mut terminate = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        )?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result?;
+                Ok("SIGINT")
+            }
+            signal = terminate.recv() => {
+                signal.ok_or_else(|| std::io::Error::other("SIGTERM listener closed"))?;
+                Ok("SIGTERM")
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        Ok("CTRL_C")
+    }
+}
+
+async fn wait_for_service_task(
+    handles: &mut [JoinHandle<()>],
+) -> Result<(), JoinError> {
+    if handles.is_empty() {
+        return std::future::pending().await;
+    }
+    futures::future::select_all(handles.iter_mut()).await.0
+}
+
+async fn shutdown_server_runtime(
+    runtime_state: &RuntimeState,
+    service_tasks: Vec<JoinHandle<()>>,
+    connection_grace_period: Duration,
+) -> ServerShutdownReport {
+    // Close connection registration first so an accept racing with listener
+    // teardown cannot escape the server-level owner.
+    runtime_state.close_inbound_connection_tasks();
+
+    // Stop every non-inbound service promptly before waiting for data-plane
+    // listener cleanup. InboundManager aborts all listeners before awaiting any
+    // one handle, so the process stops accepting across the whole server first.
+    for task in &service_tasks {
+        task.abort();
+    }
+    let stopped_inbounds = runtime_state.inbound_manager().stop_all_tasks().await;
+    for task in service_tasks {
+        let _ = task.await;
+    }
+
+    let connection_shutdown = runtime_state
+        .drain_inbound_connection_tasks(connection_grace_period)
+        .await;
+    let stopped_global_xudp_workers =
+        beginning::udp::shutdown_global_xudp_workers().await;
+
+    ServerShutdownReport {
+        stopped_inbounds,
+        drained_connections: connection_shutdown.drained,
+        cancelled_connections: connection_shutdown.cancelled_tasks,
+        stopped_global_xudp_workers,
+    }
 }
 
 fn install_configured_user_domain_policy(
@@ -537,15 +622,50 @@ async fn start_async(
         ));
     }
 
-    join_handles.push(tokio::spawn(std::future::pending()));
-    let result = futures::future::select_all(join_handles).await.0;
-    match result {
-        Ok(()) => Err(Error::Io(std::io::Error::other(
+    let exit = {
+        let shutdown_signal = wait_for_shutdown_signal();
+        let service_task = wait_for_service_task(&mut join_handles);
+        tokio::pin!(shutdown_signal);
+        tokio::pin!(service_task);
+        tokio::select! {
+            result = &mut shutdown_signal => match result {
+                Ok(signal) => ServerExit::Signal(signal),
+                Err(error) => ServerExit::SignalError(error),
+            },
+            result = &mut service_task => ServerExit::ServiceTask(result),
+        }
+    };
+
+    if let ServerExit::Signal(signal) = &exit {
+        tracing::info!(%signal, "shutdown requested; stopping listeners");
+    }
+
+    let shutdown = shutdown_server_runtime(
+        &runtime_state,
+        join_handles,
+        SERVER_CONNECTION_DRAIN_TIMEOUT,
+    )
+    .await;
+    tracing::info!(
+        stopped_inbounds = shutdown.stopped_inbounds,
+        drained_connections = shutdown.drained_connections,
+        cancelled_connections = shutdown.cancelled_connections,
+        stopped_global_xudp_workers = shutdown.stopped_global_xudp_workers,
+        "server shutdown complete"
+    );
+
+    match exit {
+        ServerExit::Signal(_) => Ok(()),
+        ServerExit::SignalError(error) => {
+            tracing::error!(%error, "shutdown signal listener failed");
+            Err(Error::Io(error))
+        }
+        ServerExit::ServiceTask(Ok(())) => Err(Error::Io(std::io::Error::other(
             "server task finished unexpectedly",
         ))),
-        Err(x) => {
-            tracing::error!("runtime error: {}, shutting down", x);
-            Err(Error::Io(std::io::Error::other(x)))
+        ServerExit::ServiceTask(Err(error)) => {
+            tracing::error!(%error, "runtime task failed; server shut down");
+            Err(Error::Io(std::io::Error::other(error)))
         }
     }
 }

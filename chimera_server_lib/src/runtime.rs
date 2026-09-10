@@ -25,7 +25,7 @@ use crate::{
         BalancerTargetMap, OutboundObservation, RouteMatch, RoutingEvent,
         RoutingInput, RoutingState,
     },
-    session_tasks::ConnectionTaskOwner,
+    session_tasks::{ConnectionTaskOwner, ConnectionTaskShutdown},
     traffic::TrafficContext,
     user_domain::{
         UserDomainAccessFailure, UserDomainAccessRevision, UserDomainAccessStatus,
@@ -130,11 +130,22 @@ impl RuntimeState {
         }
     }
 
-    pub(crate) fn spawn_inbound_connection<F>(&self, future: F)
+    pub(crate) fn spawn_inbound_connection<F>(&self, future: F) -> bool
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        self.connection_tasks.spawn(future);
+        self.connection_tasks.spawn(future)
+    }
+
+    pub(crate) fn close_inbound_connection_tasks(&self) -> bool {
+        self.connection_tasks.close()
+    }
+
+    pub(crate) async fn drain_inbound_connection_tasks(
+        &self,
+        grace_period: Duration,
+    ) -> ConnectionTaskShutdown {
+        self.connection_tasks.drain_or_cancel(grace_period).await
     }
 
     #[cfg(test)]

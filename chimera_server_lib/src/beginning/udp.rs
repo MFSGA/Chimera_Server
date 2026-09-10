@@ -437,6 +437,7 @@ struct GlobalXudpWorkers {
     workers: HashMap<[u8; 8], GlobalSessionUdpWorker>,
     gates: HashMap<[u8; 8], Weak<Mutex<()>>>,
     maintenance_tasks: TaskTracker,
+    maintenance_cancellation: CancellationToken,
 }
 
 static GLOBAL_XUDP_WORKERS: OnceLock<Arc<Mutex<GlobalXudpWorkers>>> =
@@ -2047,12 +2048,15 @@ async fn expire_global_udp_worker(global_id: [u8; 8], now: Instant) {
 
 fn schedule_global_udp_worker_expiry(
     maintenance_tasks: TaskTracker,
+    maintenance_cancellation: CancellationToken,
     global_id: [u8; 8],
     delay: Duration,
 ) {
     drop(maintenance_tasks.spawn(async move {
-        sleep(delay).await;
-        expire_global_udp_worker(global_id, Instant::now()).await;
+        tokio::select! {
+            _ = maintenance_cancellation.cancelled() => {}
+            _ = sleep(delay) => expire_global_udp_worker(global_id, Instant::now()).await,
+        }
     }));
 }
 
@@ -2060,7 +2064,7 @@ async fn detach_global_udp_worker(global_id: [u8; 8], attachment_token: u64) {
     let gate = global_xudp_gate(global_id).await;
     let _gate_guard = gate.lock().await;
     let globals = global_xudp_workers();
-    let (worker_state, maintenance_tasks) = {
+    let (worker_state, maintenance_tasks, maintenance_cancellation) = {
         let mut guard = globals.lock().await;
         if !guard
             .registry
@@ -2073,6 +2077,7 @@ async fn detach_global_udp_worker(global_id: [u8; 8], attachment_token: u64) {
                 (worker.attachment.clone(), worker.attachment_notify.clone())
             }),
             guard.maintenance_tasks.clone(),
+            guard.maintenance_cancellation.clone(),
         )
     };
 
@@ -2088,9 +2093,39 @@ async fn detach_global_udp_worker(global_id: [u8; 8], attachment_token: u64) {
 
     schedule_global_udp_worker_expiry(
         maintenance_tasks,
+        maintenance_cancellation,
         global_id,
         XUDP_GLOBAL_REATTACH_TTL,
     );
+}
+
+pub(crate) async fn shutdown_global_xudp_workers() -> usize {
+    let globals = global_xudp_workers();
+    let (workers, maintenance_tasks) = {
+        let mut guard = globals.lock().await;
+        guard.maintenance_cancellation.cancel();
+        let maintenance_tasks = std::mem::take(&mut guard.maintenance_tasks);
+        maintenance_tasks.close();
+        guard.maintenance_cancellation = CancellationToken::new();
+        guard.registry = XudpGlobalRegistry::default();
+        guard.gates.clear();
+        (
+            std::mem::take(&mut guard.workers)
+                .into_values()
+                .collect::<Vec<_>>(),
+            maintenance_tasks,
+        )
+    };
+
+    let stopped = workers.len();
+    for worker in &workers {
+        worker.task.abort();
+    }
+    for worker in workers {
+        let _ = worker.task.await;
+    }
+    maintenance_tasks.wait().await;
+    stopped
 }
 
 async fn stop_global_udp_worker(worker: GlobalSessionUdpWorker) {
@@ -4810,6 +4845,7 @@ mod tests {
 
         schedule_global_udp_worker_expiry(
             maintenance_tasks.clone(),
+            CancellationToken::new(),
             global_id,
             Duration::from_millis(10),
         );
@@ -4822,6 +4858,27 @@ mod tests {
         })
         .await
         .expect("GlobalID expiry timer must leave its task owner after completion");
+    }
+
+    #[tokio::test]
+    async fn global_xudp_expiry_timer_cancels_promptly_on_server_shutdown() {
+        let maintenance_tasks = TaskTracker::new();
+        let cancellation = CancellationToken::new();
+        let global_id = [181, 182, 183, 184, 185, 186, 187, 188];
+
+        schedule_global_udp_worker_expiry(
+            maintenance_tasks.clone(),
+            cancellation.clone(),
+            global_id,
+            Duration::from_secs(60),
+        );
+        assert_eq!(maintenance_tasks.len(), 1);
+        maintenance_tasks.close();
+        cancellation.cancel();
+
+        timeout(Duration::from_secs(1), maintenance_tasks.wait())
+            .await
+            .expect("server shutdown must cancel GlobalID expiry timers promptly");
     }
 
     #[tokio::test]

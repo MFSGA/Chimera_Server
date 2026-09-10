@@ -1122,6 +1122,46 @@ impl InboundManager {
         true
     }
 
+    pub(crate) async fn stop_all_tasks(&self) -> usize {
+        let task_sets = {
+            let mut state =
+                self.state.write().expect("inbound manager lock poisoned");
+            state
+                .configs
+                .iter_mut()
+                .filter_map(|entry| {
+                    let handles = entry.tasks.take()?;
+                    entry.lifecycle = InboundLifecycleState::Stopping;
+                    Some((
+                        entry.config.tag.clone(),
+                        InboundTaskSet {
+                            generation: entry.generation,
+                            handles,
+                        },
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Abort every listener before awaiting any of them so server shutdown
+        // stops accepting new connections across all inbounds promptly.
+        for (_, task_set) in &task_sets {
+            abort_tasks(&task_set.handles);
+        }
+
+        let stopped = task_sets.len();
+        for (tag, task_set) in task_sets {
+            let generation = task_set.generation;
+            stop_task_set(task_set).await;
+            self.set_lifecycle_for_generation(
+                &tag,
+                generation,
+                InboundLifecycleState::Prepared,
+            );
+        }
+        stopped
+    }
+
     pub(crate) async fn stop_tasks(&self, tag: &str) -> bool {
         let task_set = {
             let mut state =
@@ -1907,6 +1947,34 @@ mod tests {
         );
         assert!(manager.config_by_tag("primary").is_some());
         assert!(!manager.stop_tasks("primary").await);
+    }
+
+    #[tokio::test]
+    async fn stopping_all_tasks_aborts_every_listener_before_reset() {
+        let manager = InboundManager::new(vec![
+            inbound("first", 10001),
+            inbound("second", 10002),
+        ]);
+        let first = tokio::spawn(std::future::pending());
+        let second = tokio::spawn(std::future::pending());
+        let first_abort = first.abort_handle();
+        let second_abort = second.abort_handle();
+        manager.register_tasks("first", vec![first]);
+        manager.register_tasks("second", vec![second]);
+
+        assert_eq!(manager.stop_all_tasks().await, 2);
+        assert!(first_abort.is_finished());
+        assert!(second_abort.is_finished());
+        assert_eq!(
+            manager.lifecycle_state("first"),
+            Some(InboundLifecycleState::Prepared)
+        );
+        assert_eq!(
+            manager.lifecycle_state("second"),
+            Some(InboundLifecycleState::Prepared)
+        );
+        assert_eq!(manager.configs().len(), 2);
+        assert_eq!(manager.stop_all_tasks().await, 0);
     }
 
     #[tokio::test]
