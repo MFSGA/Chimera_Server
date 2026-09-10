@@ -868,6 +868,92 @@ fn grpc_all_interfaces_compat_with_xray_core() {
 }
 
 #[test]
+#[ignore = "compares inbound mutation failure status codes with xray baseline"]
+fn grpc_inbound_failure_status_compat_with_xray_core() {
+    trace_step(
+        "==== test grpc_inbound_failure_status_compat_with_xray_core start ====",
+    );
+    let _guard = global_test_lock()
+        .lock()
+        .expect("failed to acquire global test lock");
+    let chimera = Harness::start_unlocked(TargetKind::Chimera)
+        .expect("failed to start Chimera harness");
+    let xray = Harness::start_unlocked(TargetKind::Xray)
+        .expect("failed to start Xray harness");
+
+    let duplicate_add = |harness: &Harness| {
+        let port = free_localhost_port().expect("allocate duplicate inbound port");
+        let mut inbound = build_added_inbound_config(port);
+        inbound.tag = SOCKS_TAG.to_string();
+        let result: Result<AddInboundResponse, Status> = harness.unary(
+            PATH_HANDLER_ADD_INBOUND,
+            AddInboundRequest {
+                inbound: Some(inbound),
+            },
+        );
+        snapshot_from_result(result, |_| "ok".to_string())
+    };
+    let missing_remove = |harness: &Harness| {
+        let result: Result<RemoveInboundResponse, Status> = harness.unary(
+            PATH_HANDLER_REMOVE_INBOUND,
+            RemoveInboundRequest {
+                tag: "missing-inbound".to_string(),
+            },
+        );
+        snapshot_from_result(result, |_| "ok".to_string())
+    };
+    let missing_alter = |harness: &Harness| {
+        let operation = AddUserOperation {
+            user: Some(User {
+                level: 0,
+                email: "missing@example.test".to_string(),
+                account: Some(TypedMessage {
+                    r#type: "xray.proxy.vless.Account".to_string(),
+                    value: VlessAccount {
+                        id: VLESS_ADDED_USER_ID.to_string(),
+                        flow: String::new(),
+                    }
+                    .encode_to_vec(),
+                }),
+            }),
+        };
+        let result: Result<AlterInboundResponse, Status> = harness.unary(
+            PATH_HANDLER_ALTER_INBOUND,
+            AlterInboundRequest {
+                tag: "missing-inbound".to_string(),
+                operation: Some(TypedMessage {
+                    r#type: "xray.app.proxyman.command.AddUserOperation".to_string(),
+                    value: operation.encode_to_vec(),
+                }),
+            },
+        );
+        snapshot_from_result(result, |_| "ok".to_string())
+    };
+
+    let xray_duplicate = duplicate_add(&xray);
+    let chimera_duplicate = duplicate_add(&chimera);
+    eprintln!(
+        "duplicate AddInbound: xray={} chimera={}",
+        xray_duplicate.raw, chimera_duplicate.raw
+    );
+    let xray_missing = missing_remove(&xray);
+    let chimera_missing = missing_remove(&chimera);
+    eprintln!(
+        "missing RemoveInbound: xray={} chimera={}",
+        xray_missing.raw, chimera_missing.raw
+    );
+    let xray_alter = missing_alter(&xray);
+    let chimera_alter = missing_alter(&chimera);
+    eprintln!(
+        "missing AlterInbound: xray={} chimera={}",
+        xray_alter.raw, chimera_alter.raw
+    );
+    assert_eq!(chimera_duplicate.grpc_code, xray_duplicate.grpc_code);
+    assert_eq!(chimera_missing.grpc_code, xray_missing.grpc_code);
+    assert_eq!(chimera_alter.grpc_code, xray_alter.grpc_code);
+}
+
+#[test]
 #[ignore = "runs vless multi-user grpc compatibility against xray baseline"]
 fn grpc_vless_multi_user_compat_with_xray_core() {
     trace_step("==== test grpc_vless_multi_user_compat_with_xray_core start ====");

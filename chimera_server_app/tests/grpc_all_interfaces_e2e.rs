@@ -1052,8 +1052,10 @@ fn handler_add_inbound_rejects_missing_inbound() {
 }
 
 #[test]
-fn handler_remove_inbound_returns_not_found() {
-    trace_step("==== test handler_remove_inbound_returns_not_found start ====");
+fn handler_remove_inbound_matches_xray_unknown_status() {
+    trace_step(
+        "==== test handler_remove_inbound_matches_xray_unknown_status start ====",
+    );
     let harness = Harness::start().expect("failed to start test harness");
     let result: Result<RemoveInboundResponse, Status> = harness.unary(
         PATH_HANDLER_REMOVE_INBOUND,
@@ -1063,7 +1065,7 @@ fn handler_remove_inbound_returns_not_found() {
     );
     harness.assert_status_code(
         result,
-        Code::NotFound,
+        Code::Unknown,
         "HandlerService/RemoveInbound",
     );
 }

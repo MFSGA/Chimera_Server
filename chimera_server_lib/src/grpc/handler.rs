@@ -2895,7 +2895,7 @@ impl HandlerServiceImpl {
 
     fn map_alter_inbound_error(error: AlterInboundError<Status>) -> Status {
         match error {
-            AlterInboundError::NotFound => Status::not_found("inbound not found"),
+            AlterInboundError::NotFound => Status::unknown("inbound not found"),
             AlterInboundError::Update(error) => error,
             AlterInboundError::State(error) => Status::internal(error),
             AlterInboundError::Restart {
@@ -3278,7 +3278,7 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
             .await
             .map_err(|error| match error {
                 AddInboundError::AlreadyExists(error) => {
-                    Status::already_exists(format!("existing tag: {error}"))
+                    Status::unknown(format!("existing tag: {error}"))
                 }
                 AddInboundError::Start(error) => Status::unknown(format!(
                     "failed to start inbound handler: {error}"
@@ -3303,9 +3303,7 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
             .remove_started(&request.tag)
             .await
             .map_err(|error| match error {
-                RemoveInboundError::NotFound => {
-                    Status::not_found("inbound not found")
-                }
+                RemoveInboundError::NotFound => Status::unknown("inbound not found"),
             })?;
         Ok(Response::new(
             proto::xray::app::proxyman::command::RemoveInboundResponse {},
@@ -3322,7 +3320,7 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
         let request = request.into_inner();
         let operation = self.parse_alter_inbound_operation(request.operation)?;
         if request.tag.is_empty() {
-            return Err(Status::not_found("inbound not found"));
+            return Err(Status::unknown("inbound not found"));
         }
         if matches!(&operation, AlterInboundOperation::Noop) {
             return Ok(Response::new(
@@ -4940,7 +4938,7 @@ mod tests {
             ))
             .await
             .expect_err("expected remove_inbound to report not found");
-        assert_eq!(err.code(), Code::NotFound);
+        assert_eq!(err.code(), Code::Unknown);
 
         let err = service
             .add_outbound(Request::new(
@@ -5129,7 +5127,7 @@ mod tests {
             ))
             .await
             .expect_err("Xray does not address untagged inbounds by empty tag");
-        assert_eq!(error.code(), Code::NotFound);
+        assert_eq!(error.code(), Code::Unknown);
 
         assert_eq!(
             fixture
