@@ -362,10 +362,11 @@ pub(super) async fn start_grpc_server(
             let server_handler = server_handler.clone();
             let resolver = resolver.clone();
             let runtime = runtime.clone();
+            let connection_runtime = runtime.clone();
             let sniffing = sniffing.clone();
             match &security {
                 GrpcSecurity::Plain => {
-                    tokio::spawn(serve_grpc_connection(
+                    runtime.spawn_inbound_connection(serve_grpc_connection(
                         stream,
                         GrpcConnectionContext {
                             peer_addr,
@@ -379,13 +380,13 @@ pub(super) async fn start_grpc_server(
                         keepalive,
                         server_handler,
                         resolver,
-                        runtime,
+                        connection_runtime,
                     ));
                 }
                 #[cfg(feature = "tls")]
                 GrpcSecurity::Tls(server_config) => {
                     let acceptor = TlsAcceptor::from(server_config.clone());
-                    tokio::spawn(async move {
+                    runtime.spawn_inbound_connection(async move {
                         let setup_deadline =
                             Instant::now() + GRPC_CONNECTION_SETUP_TIMEOUT;
                         match tokio::time::timeout_at(
@@ -408,7 +409,7 @@ pub(super) async fn start_grpc_server(
                                     keepalive,
                                     server_handler,
                                     resolver,
-                                    runtime,
+                                    connection_runtime,
                                 )
                                 .await;
                             }
@@ -424,7 +425,7 @@ pub(super) async fn start_grpc_server(
                 #[cfg(feature = "reality")]
                 GrpcSecurity::Reality(reality_config) => {
                     let reality_config = reality_config.clone();
-                    tokio::spawn(async move {
+                    runtime.spawn_inbound_connection(async move {
                         match accept_reality_stream(
                             Box::new(stream),
                             &reality_config,
@@ -446,7 +447,7 @@ pub(super) async fn start_grpc_server(
                                     keepalive,
                                     server_handler,
                                     resolver,
-                                    runtime,
+                                    connection_runtime,
                                 )
                                 .await;
                             }
