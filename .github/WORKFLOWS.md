@@ -9,9 +9,9 @@ The repository uses four entry-point workflows and two shared local actions. Kee
 | `ci.yml` | `master` push, pull request, manual | Fast correctness gate: format, clippy, cross-platform tests, release-target builds |
 | `proxy-throughput.yml` | Relevant pull requests, manual | End-to-end proxy throughput benchmark against the pinned Xray binary |
 | `hysteria2-performance.yml` | Hysteria2-relevant pull requests, manual | RTT/loss/congestion benchmark under Linux netem |
-| `release.yml` | Manual only | Resolve one immutable candidate, validate it, build every release artifact, then publish |
+| `release.yml` | Manual only | Choose a SemVer increment, create one temporary release commit, validate/build it, then atomically advance `master` with the new tag and publish |
 
-Tag pushes do not run the ordinary CI workflow. A release already runs its own exact-SHA gates before creating the tag, and historical release sources may predate the current local composite actions.
+Tag pushes do not run the ordinary CI workflow. A release already runs its own exact-SHA gates before creating the tag.
 
 ## Shared actions
 
@@ -19,7 +19,9 @@ Tag pushes do not run the ordinary CI workflow. A release already runs its own e
 
 `actions/setup-pinned-xray/action.yml` owns benchmark Xray download and checksum verification. The selected version and checksum remain in `bench/.xray-version` and `bench/.xray-linux-64.sha256`.
 
-The release workflow intentionally does not depend on these local actions. `source_ref` supports historical commits, and an old candidate may not contain the current `.github/actions` directory. Release setup therefore remains self-contained while using the same pinned tool revision.
+The release workflow uses `actions/rust-ci-setup/action.yml` after it creates the candidate commit. Stable releases always start from the current `master`; historical backfills are intentionally kept out of the normal release path so the main workflow has one predictable versioning model.
+
+`.github/scripts/release_version.py` owns stable SemVer calculation and the workspace-version edit. It compares the committed workspace version with the highest stable `vX.Y.Z` tag, uses the newer value as the release baseline, and then applies the selected `patch`, `minor`, or `major` increment. This prevents a stale workspace version from reusing an already-published tag.
 
 ## CI contract
 
@@ -45,14 +47,22 @@ Build/reference rules:
 
 ## Release contract
 
-A release is an orchestration pipeline, not a second general CI system:
+A release is an orchestration pipeline, not a second general CI system. The manual dispatch exposes only the SemVer increment and release goal; callers do not type the target version themselves.
 
 ```text
-resolve exact candidate
-        |
-        +--> Linux/Windows preflight tests
-        |
-        +--> repository release gates
+choose patch / minor / major
+            |
+   compute next stable version
+            |
+ update Cargo.toml + Cargo.lock
+            |
+ create temporary candidate commit/branch
+            |
+        +---+-------------------+
+        |                       |
+ Linux/Windows preflight   repository release gates
+        |                       |
+        +-----------+-----------+
                     |
           +---------+---------+
           |                   |
@@ -60,16 +70,22 @@ resolve exact candidate
           |                   |
           +---------+---------+
                     |
-             verify artifacts
+      verify artifacts + checksums
                     |
-              create tag
+ re-check that origin/master did not move
+                    |
+ atomic push: master + annotated tag
                     |
              publish release
+                    |
+       delete candidate branch
 ```
 
-Only the final publish job has `contents: write`. Tests and artifact jobs run with read-only repository permissions. No tag may be created until both platform artifact jobs have succeeded and all expected checksums are present and verified.
+The release candidate is a direct child of the `master` commit captured when the workflow starts. It is first pushed to a temporary `release-candidate-*` branch so all operating-system tests and release artifacts can validate the exact version-bump commit without modifying `master`. If validation fails, `master` and stable tags remain unchanged and cleanup removes the temporary branch.
 
-The candidate is resolved once to a full commit SHA. Every subsequent release job checks out that SHA, even when the dispatch input used a branch, short SHA, or historical tag.
+Before publication, the workflow verifies that remote `master` is still the original base commit. It then uses one atomic Git push for both the fast-forward of `master` and creation of the annotated stable tag. A concurrent change to `master` therefore fails closed and requires a fresh release dispatch.
+
+Repository permissions default to `contents: read`. Only the prepare, publish, and cleanup jobs receive `contents: write`, and each uses it for a narrowly defined release mutation. No stable tag or `master` version bump may become visible until both platform artifact jobs have succeeded and all expected checksums are present and verified.
 
 ## Benchmark contract
 

@@ -3,25 +3,25 @@ name: Release
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: "Stable version without the v prefix, for example 0.8.1"
+      bump:
+        description: "SemVer increment to publish"
         required: true
-        type: string
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
       release_goal:
         description: "Single primary protocol goal completed by this version"
         required: true
-        type: string
-      source_ref:
-        description: "Optional historical commit/tag; must be an ancestor of master"
-        required: false
-        default: ""
         type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ inputs.version }}
+  group: release
   cancel-in-progress: false
 
 defaults:
@@ -32,99 +32,112 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  candidate:
-    name: Resolve candidate
+  prepare:
+    name: Prepare release commit
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    permissions:
+      contents: write
     outputs:
-      source_commit: ${{ steps.meta.outputs.source_commit }}
-      tag: ${{ steps.meta.outputs.tag }}
-      version: ${{ steps.meta.outputs.version }}
-      release_goal: ${{ steps.meta.outputs.release_goal }}
-      tag_preexists: ${{ steps.meta.outputs.tag_preexists }}
+      base_commit: ${{ steps.prepare.outputs.base_commit }}
+      candidate_commit: ${{ steps.prepare.outputs.candidate_commit }}
+      candidate_branch: ${{ steps.prepare.outputs.candidate_branch }}
+      workspace_version: ${{ steps.prepare.outputs.workspace_version }}
+      base_version: ${{ steps.prepare.outputs.base_version }}
+      version: ${{ steps.prepare.outputs.version }}
+      tag: ${{ steps.prepare.outputs.tag }}
+      release_goal: ${{ steps.prepare.outputs.release_goal }}
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          token: ${{ github.token }}
 
-      - name: Resolve metadata
-        id: meta
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Compute version and create candidate
+        id: prepare
         env:
-          VERSION_INPUT: ${{ inputs.version }}
-          RELEASE_GOAL_INPUT: ${{ inputs.release_goal }}
-          SOURCE_REF_INPUT: ${{ inputs.source_ref }}
+          BUMP: ${{ inputs.bump }}
+          RELEASE_GOAL: ${{ inputs.release_goal }}
         run: |
           set -euo pipefail
-
-          version="$VERSION_INPUT"
-          release_goal="$RELEASE_GOAL_INPUT"
 
           [[ "$GITHUB_REF_NAME" == "master" ]] || {
             echo "releases must be dispatched from master" >&2
             exit 1
           }
-          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
-            echo "version must use stable SemVer form such as 0.8.1" >&2
-            exit 1
-          }
-          [[ -n "${release_goal// }" ]] || {
-            echo "release_goal must describe the single primary protocol goal" >&2
+          [[ -n "${RELEASE_GOAL// }" && "$RELEASE_GOAL" != *$'\n'* ]] || {
+            echo "release_goal must be one non-empty line" >&2
             exit 1
           }
 
           git fetch origin master --tags
-          if [[ -n "$SOURCE_REF_INPUT" ]]; then
-            source_commit=$(git rev-parse --verify "$SOURCE_REF_INPUT^{commit}") || {
-              echo "unable to resolve release source: $SOURCE_REF_INPUT" >&2
-              exit 1
-            }
-          else
-            source_commit=$(git rev-parse --verify "$GITHUB_SHA^{commit}")
-          fi
-
-          git merge-base --is-ancestor "$source_commit" origin/master || {
-            echo "release source must be an ancestor of master: ${SOURCE_REF_INPUT:-$source_commit}" >&2
+          base_commit=$(git rev-parse origin/master)
+          dispatch_commit=$(git rev-parse "$GITHUB_SHA^{commit}")
+          [[ "$dispatch_commit" == "$base_commit" ]] || {
+            echo "master advanced after this release was dispatched" >&2
+            echo "dispatch: $dispatch_commit" >&2
+            echo "current:  $base_commit" >&2
+            echo "dispatch a fresh release from the current master" >&2
             exit 1
           }
 
-          tag="v${version}"
-          tag_preexists=false
-          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-            tag_commit=$(git rev-parse "$tag^{commit}")
-            [[ "$tag_commit" == "$source_commit" ]] || {
-              echo "tag $tag points to $tag_commit, expected $source_commit" >&2
-              exit 1
-            }
-            tag_preexists=true
-          fi
+          python3 .github/scripts/release_version.py \
+            --bump "$BUMP" \
+            --write \
+            --github-output "$GITHUB_OUTPUT"
 
-          echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "release_goal=$release_goal" >> "$GITHUB_OUTPUT"
-          echo "tag_preexists=$tag_preexists" >> "$GITHUB_OUTPUT"
-          echo "Candidate: $tag @ $source_commit — $release_goal"
-
-      - name: Check workspace version
-        env:
-          SOURCE_COMMIT: ${{ steps.meta.outputs.source_commit }}
-          EXPECTED_VERSION: ${{ steps.meta.outputs.version }}
-        run: |
-          set -euo pipefail
-          git checkout --detach "$SOURCE_COMMIT"
-          actual_version=$(awk -F '"' '
+          version=$(awk -F '"' '
             /^\[workspace\.package\]$/ { in_workspace = 1; next }
             /^\[/ { in_workspace = 0 }
             in_workspace && /^version = / { print $2; exit }
           ' Cargo.toml)
-          [[ "$actual_version" == "$EXPECTED_VERSION" ]] || {
-            echo "workspace version is $actual_version, expected $EXPECTED_VERSION" >&2
+          tag="v${version}"
+
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null || \
+             git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "release tag already exists: $tag" >&2
+            exit 1
+          fi
+
+          # The helper updates only workspace package versions in Cargo.lock. Prove the
+          # resulting committed lockfile is self-consistent without allowing dependency drift.
+          cargo metadata --format-version 1 --no-deps --locked >/dev/null
+
+          unexpected=$(git diff --name-only | grep -Ev '^(Cargo\.toml|Cargo\.lock)$' || true)
+          [[ -z "$unexpected" ]] || {
+            echo "release preparation changed unexpected files:" >&2
+            echo "$unexpected" >&2
             exit 1
           }
+          git diff --check
+
+          git add Cargo.toml Cargo.lock
+          git diff --cached --quiet && {
+            echo "release preparation produced no version changes" >&2
+            exit 1
+          }
+          git -c commit.gpgSign=false commit -m "chore(release): prepare $tag"
+
+          candidate_commit=$(git rev-parse HEAD)
+          candidate_branch="release-candidate-${tag}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git push origin "HEAD:refs/heads/$candidate_branch"
+
+          echo "base_commit=$base_commit" >> "$GITHUB_OUTPUT"
+          echo "candidate_commit=$candidate_commit" >> "$GITHUB_OUTPUT"
+          echo "candidate_branch=$candidate_branch" >> "$GITHUB_OUTPUT"
+          echo "release_goal=$RELEASE_GOAL" >> "$GITHUB_OUTPUT"
+          echo "Prepared $tag from $base_commit as $candidate_commit"
 
   preflight:
     name: Preflight (${{ matrix.os }})
-    needs: candidate
+    needs: prepare
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -134,34 +147,29 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ needs.candidate.outputs.source_commit }}
+          ref: ${{ needs.prepare.outputs.candidate_commit }}
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-ci-setup
         with:
-          shared-key: release-preflight-${{ runner.os }}
+          cache-key: release-preflight-${{ runner.os }}
 
       - name: Workspace tests
         run: cargo test --workspace --all-features --locked
 
   gates:
     name: Release gates
-    needs: candidate
+    needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ needs.candidate.outputs.source_commit }}
+          ref: ${{ needs.prepare.outputs.candidate_commit }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-ci-setup
         with:
           components: rustfmt,clippy
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-gates
+          cache-key: release-gates
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -180,26 +188,19 @@ jobs:
 
   linux-artifacts:
     name: Linux artifacts
-    needs: [candidate, preflight, gates]
+    needs: [prepare, preflight, gates]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ needs.candidate.outputs.source_commit }}
+          ref: ${{ needs.prepare.outputs.candidate_commit }}
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-ci-setup
         with:
-          shared-key: release-linux
-
-      - name: Install pinned cross
-        run: |
-          cargo install cross \
-            --git https://github.com/cross-rs/cross \
-            --rev 8c1a8aa4b661711f4b7b6ac07c2e8929ce2f7d27 \
-            --locked
+          target: x86_64-unknown-linux-musl
+          install-cross: "true"
+          cache-key: release-linux
 
       - name: Build GNU binary
         run: cargo build --release --locked --package chimera_server_app
@@ -209,7 +210,7 @@ jobs:
 
       - name: Package Linux artifacts
         env:
-          TAG: ${{ needs.candidate.outputs.tag }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -221,25 +222,23 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: release-linux-${{ needs.candidate.outputs.tag }}
+          name: release-linux-${{ needs.prepare.outputs.tag }}
           path: dist/*
           if-no-files-found: error
 
   windows-artifacts:
     name: Windows artifacts
-    needs: [candidate, preflight, gates]
+    needs: [prepare, preflight, gates]
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ needs.candidate.outputs.source_commit }}
+          ref: ${{ needs.prepare.outputs.candidate_commit }}
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-ci-setup
         with:
-          shared-key: release-windows
+          cache-key: release-windows
 
       - name: Build Windows binary
         run: cargo build --release --locked --package chimera_server_app
@@ -247,7 +246,7 @@ jobs:
       - name: Package Windows artifacts
         shell: pwsh
         env:
-          TAG: ${{ needs.candidate.outputs.tag }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           $binary = "dist\chimera_server_app-$env:TAG-windows-x86_64.exe"
@@ -258,13 +257,13 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: release-windows-${{ needs.candidate.outputs.tag }}
+          name: release-windows-${{ needs.prepare.outputs.tag }}
           path: dist/*
           if-no-files-found: error
 
   publish:
     name: Publish
-    needs: [candidate, linux-artifacts, windows-artifacts]
+    needs: [prepare, linux-artifacts, windows-artifacts]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -273,7 +272,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          ref: ${{ needs.candidate.outputs.source_commit }}
+          ref: ${{ needs.prepare.outputs.candidate_commit }}
           token: ${{ github.token }}
 
       - name: Configure Git
@@ -283,13 +282,13 @@ jobs:
 
       - uses: actions/download-artifact@v5
         with:
-          pattern: release-*-${{ needs.candidate.outputs.tag }}
+          pattern: release-*-${{ needs.prepare.outputs.tag }}
           path: dist
           merge-multiple: true
 
       - name: Verify artifacts
         env:
-          TAG: ${{ needs.candidate.outputs.tag }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
           cd dist
@@ -312,33 +311,79 @@ jobs:
             "chimera_server_app-${TAG}-linux-x86_64-musl.sha256" \
             "chimera_server_app-${TAG}-windows-x86_64.exe.sha256"
 
-      - name: Create annotated tag
-        if: needs.candidate.outputs.tag_preexists != 'true'
+      - name: Atomically update master and tag
         env:
-          TAG: ${{ needs.candidate.outputs.tag }}
-          RELEASE_GOAL: ${{ needs.candidate.outputs.release_goal }}
+          BASE_COMMIT: ${{ needs.prepare.outputs.base_commit }}
+          CANDIDATE_COMMIT: ${{ needs.prepare.outputs.candidate_commit }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_GOAL: ${{ needs.prepare.outputs.release_goal }}
         run: |
           set -euo pipefail
-          git tag -a "$TAG" -m "$TAG: $RELEASE_GOAL"
-          git push origin "$TAG"
+          git fetch origin master --tags
+          remote_master=$(git rev-parse origin/master)
+          [[ "$remote_master" == "$BASE_COMMIT" ]] || {
+            echo "master advanced while release validation was running" >&2
+            echo "expected: $BASE_COMMIT" >&2
+            echo "current:  $remote_master" >&2
+            exit 1
+          }
+          [[ "$(git rev-parse HEAD)" == "$CANDIDATE_COMMIT" ]] || {
+            echo "checked-out candidate changed unexpectedly" >&2
+            exit 1
+          }
+          [[ "$(git rev-parse "$CANDIDATE_COMMIT^")" == "$BASE_COMMIT" ]] || {
+            echo "release commit is no longer a direct child of the validated base" >&2
+            exit 1
+          }
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "release tag appeared while validation was running: $TAG" >&2
+            exit 1
+          fi
+
+          git -c tag.gpgSign=false tag -a "$TAG" "$CANDIDATE_COMMIT" -m "$TAG: $RELEASE_GOAL"
+          git push --atomic origin \
+            "$CANDIDATE_COMMIT:refs/heads/master" \
+            "refs/tags/$TAG"
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ needs.candidate.outputs.tag }}
-          name: ${{ needs.candidate.outputs.tag }} — ${{ needs.candidate.outputs.release_goal }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.tag }} — ${{ needs.prepare.outputs.release_goal }}
           generate_release_notes: true
           body: |
-            Primary protocol goal: ${{ needs.candidate.outputs.release_goal }}
+            Primary protocol goal: ${{ needs.prepare.outputs.release_goal }}
+            SemVer increment: ${{ inputs.bump }}
+            Previous release baseline: ${{ needs.prepare.outputs.base_version }}
 
-            Published from ${{ needs.candidate.outputs.source_commit }} only after Linux/Windows preflight tests, repository release gates, and all platform artifacts passed.
+            The workflow created ${{ needs.prepare.outputs.version }} from the validated release candidate and atomically advanced master with the release tag only after Linux/Windows preflight tests, repository release gates, and all platform artifacts passed.
             Validate this release before starting the next primary protocol goal.
           files: |
-            dist/chimera_server_app-${{ needs.candidate.outputs.tag }}-linux-x86_64
-            dist/chimera_server_app-${{ needs.candidate.outputs.tag }}-linux-x86_64.sha256
-            dist/chimera_server_app-${{ needs.candidate.outputs.tag }}-linux-x86_64-musl
-            dist/chimera_server_app-${{ needs.candidate.outputs.tag }}-linux-x86_64-musl.sha256
-            dist/chimera_server_app-${{ needs.candidate.outputs.tag }}-windows-x86_64.exe
-            dist/chimera_server_app-${{ needs.candidate.outputs.tag }}-windows-x86_64.exe.sha256
+            dist/chimera_server_app-${{ needs.prepare.outputs.tag }}-linux-x86_64
+            dist/chimera_server_app-${{ needs.prepare.outputs.tag }}-linux-x86_64.sha256
+            dist/chimera_server_app-${{ needs.prepare.outputs.tag }}-linux-x86_64-musl
+            dist/chimera_server_app-${{ needs.prepare.outputs.tag }}-linux-x86_64-musl.sha256
+            dist/chimera_server_app-${{ needs.prepare.outputs.tag }}-windows-x86_64.exe
+            dist/chimera_server_app-${{ needs.prepare.outputs.tag }}-windows-x86_64.exe.sha256
         env:
           GITHUB_TOKEN: ${{ github.token }}
+
+  cleanup:
+    name: Cleanup candidate branch
+    if: always() && needs.prepare.result == 'success'
+    needs: [prepare, preflight, gates, linux-artifacts, windows-artifacts, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.base_commit }}
+          token: ${{ github.token }}
+
+      - name: Delete candidate branch
+        continue-on-error: true
+        env:
+          CANDIDATE_BRANCH: ${{ needs.prepare.outputs.candidate_branch }}
+        run: git push origin --delete "$CANDIDATE_BRANCH"

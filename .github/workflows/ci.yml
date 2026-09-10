@@ -37,6 +37,9 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
+      - name: Release version helper
+        run: python3 .github/scripts/release_version.py --self-test
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 

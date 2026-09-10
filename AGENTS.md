@@ -282,8 +282,12 @@ configuration. Do not assume launcher scripts or example configs fit the current
 - Parsing, validation or field preservation not consumed by runtime behavior is development
   groundwork, not a completed protocol goal. Keep it out of a stable release unless the release
   goal is explicitly configuration/schema alignment.
-- Prepare the workspace package version before release. The release workflow must not silently
-  bump source versions or push `master` on behalf of the release.
+- Stable releases are started manually through the release workflow by choosing a SemVer increment
+  (`patch`, `minor`, or `major`). That explicit dispatch authorizes the workflow to compute the next
+  stable version, update the workspace package version and lockfile in a temporary release-candidate
+  commit, validate that exact commit, and only after every release gate succeeds atomically fast-forward
+  `master` together with the new release tag. A failed validation must not leave the version bump on
+  `master` or create a stable tag. Ordinary development tasks still do not authorize release publication.
 - Every release must pass all of the following before a tag is created:
 
 ```sh
@@ -305,7 +309,10 @@ cargo test --locked
 - If deployed validation fails, fix that same goal and publish a new patch version before
   moving on. Record validation evidence and unresolved limitations.
 - Apply this sequence when a release is in scope; an ordinary code or documentation task does
-  not itself request tagging, publishing or deployment.
+  not itself request tagging, publishing or deployment. The manual release dispatch itself is the
+  explicit authorization for its candidate-branch push, atomic `master`/tag update, and GitHub Release
+  publication according to the reviewed workflow; unrelated force-pushes, tag moves/deletions, or
+  Release deletion still require separate explicit authorization.
 
 ## Git and Collaboration
 
