@@ -469,68 +469,93 @@ fn dest_handshake_looks_complete(records: &[Bytes]) -> bool {
             .is_some_and(|record| record.len() > LARGE_CERTIFICATE_RECORD_MIN_LEN)
 }
 
-fn start_forward_to_dest(
-    mut client_stream: Box<dyn AsyncStream>,
-    mut dest_stream: Box<dyn AsyncStream>,
+struct RealityFallback {
+    client_stream: Box<dyn AsyncStream>,
+    dest_stream: Box<dyn AsyncStream>,
     dest_records: Vec<Bytes>,
     remaining_data: Bytes,
-) {
-    tokio::spawn(async move {
-        let dest_record_count = dest_records.len();
-        for record in dest_records {
-            if let Err(err) = client_stream.write_all(&record).await {
+    reason: io::Error,
+}
+
+impl RealityFallback {
+    async fn run(mut self) -> io::Error {
+        let dest_record_count = self.dest_records.len();
+        for record in self.dest_records {
+            if let Err(err) = self.client_stream.write_all(&record).await {
                 tracing::debug!(
                     "REALITY fallback failed to forward dest record: {err}"
                 );
-                let _ =
-                    futures::join!(client_stream.shutdown(), dest_stream.shutdown());
-                return;
+                let _ = futures::join!(
+                    self.client_stream.shutdown(),
+                    self.dest_stream.shutdown()
+                );
+                return self.reason;
             }
-            if let Err(err) = client_stream.flush().await {
+            if let Err(err) = self.client_stream.flush().await {
                 tracing::debug!(
                     "REALITY fallback failed to flush dest record: {err}"
                 );
-                let _ =
-                    futures::join!(client_stream.shutdown(), dest_stream.shutdown());
-                return;
+                let _ = futures::join!(
+                    self.client_stream.shutdown(),
+                    self.dest_stream.shutdown()
+                );
+                return self.reason;
             }
         }
 
-        if !remaining_data.is_empty()
-            && let Err(err) = client_stream.write_all(&remaining_data).await
+        if !self.remaining_data.is_empty()
+            && let Err(err) =
+                self.client_stream.write_all(&self.remaining_data).await
         {
             tracing::debug!("REALITY fallback failed to forward dest tail: {err}");
-            let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
-            return;
+            let _ = futures::join!(
+                self.client_stream.shutdown(),
+                self.dest_stream.shutdown()
+            );
+            return self.reason;
         }
 
         tracing::debug!(
             "REALITY fallback forwarded {} dest records and {} remaining bytes",
             dest_record_count,
-            remaining_data.len()
+            self.remaining_data.len()
         );
 
-        if let Err(err) = client_stream.flush().await {
+        if let Err(err) = self.client_stream.flush().await {
             tracing::debug!("REALITY fallback failed to flush client stream: {err}");
-            let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
-            return;
+            let _ = futures::join!(
+                self.client_stream.shutdown(),
+                self.dest_stream.shutdown()
+            );
+            return self.reason;
         }
 
-        let result =
-            tokio::io::copy_bidirectional(&mut client_stream, &mut dest_stream)
-                .await;
-        let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
+        let result = tokio::io::copy_bidirectional(
+            &mut self.client_stream,
+            &mut self.dest_stream,
+        )
+        .await;
+        let _ = futures::join!(
+            self.client_stream.shutdown(),
+            self.dest_stream.shutdown()
+        );
 
         if let Err(err) = result {
             tracing::debug!("REALITY fallback copy ended with error: {err}");
         }
-    });
+        self.reason
+    }
 }
 
-pub async fn accept_reality_stream(
+enum RealityAcceptOutcome {
+    Accepted(Box<RealityTlsStream<Box<dyn AsyncStream>, RealityServerConnection>>),
+    Fallback(RealityFallback),
+}
+
+async fn accept_reality_stream_outcome(
     mut server_stream: Box<dyn AsyncStream>,
     config: &RealityTransportConfig,
-) -> io::Result<RealityTlsStream<Box<dyn AsyncStream>, RealityServerConnection>> {
+) -> io::Result<RealityAcceptOutcome> {
     let client_hello = read_client_hello(&mut server_stream).await?;
     let sni = extract_sni_from_client_hello(&client_hello)?;
 
@@ -544,8 +569,13 @@ pub async fn accept_reality_stream(
             dest = %config.dest,
             "REALITY SNI validation failed, forwarding to dest: {err}"
         );
-        start_forward_to_dest(server_stream, dest_stream, vec![], Bytes::new());
-        return Err(err);
+        return Ok(RealityAcceptOutcome::Fallback(RealityFallback {
+            client_stream: server_stream,
+            dest_stream,
+            dest_records: vec![],
+            remaining_data: Bytes::new(),
+            reason: err,
+        }));
     }
 
     if !client_hello_supports_tls13(&client_hello)? {
@@ -554,11 +584,16 @@ pub async fn accept_reality_stream(
             dest = %config.dest,
             "REALITY client does not support TLS 1.3, forwarding to dest"
         );
-        start_forward_to_dest(server_stream, dest_stream, vec![], Bytes::new());
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "REALITY client does not support TLS 1.3, forwarding to dest",
-        ));
+        return Ok(RealityAcceptOutcome::Fallback(RealityFallback {
+            client_stream: server_stream,
+            dest_stream,
+            dest_records: vec![],
+            remaining_data: Bytes::new(),
+            reason: io::Error::new(
+                io::ErrorKind::Unsupported,
+                "REALITY client does not support TLS 1.3, forwarding to dest",
+            ),
+        }));
     }
 
     let mut reality_conn =
@@ -578,13 +613,13 @@ pub async fn accept_reality_stream(
             records = dest_read.records.len(),
             "REALITY dest TLS handshake incomplete, forwarding to dest: {fallback_error}"
         );
-        start_forward_to_dest(
-            server_stream,
+        return Ok(RealityAcceptOutcome::Fallback(RealityFallback {
+            client_stream: server_stream,
             dest_stream,
-            dest_read.records,
-            dest_read.remaining_data,
-        );
-        return Err(fallback_error);
+            dest_records: dest_read.records,
+            remaining_data: dest_read.remaining_data,
+            reason: fallback_error,
+        }));
     }
     let dest_records = dest_read.records;
     let remaining_dest_data = dest_read.remaining_data;
@@ -599,16 +634,16 @@ pub async fn accept_reality_stream(
                 dest = %config.dest,
                 "REALITY auth failed, forwarding to dest: {err}"
             );
-            start_forward_to_dest(
-                server_stream,
+            return Ok(RealityAcceptOutcome::Fallback(RealityFallback {
+                client_stream: server_stream,
                 dest_stream,
                 dest_records,
-                remaining_dest_data,
-            );
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("REALITY auth failed, forwarding to dest: {err}"),
-            ));
+                remaining_data: remaining_dest_data,
+                reason: io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("REALITY auth failed, forwarding to dest: {err}"),
+                ),
+            }));
         }
         Err(err) => return Err(err),
     }
@@ -645,7 +680,19 @@ pub async fn accept_reality_stream(
         server_stream.flush().await?;
     }
 
-    Ok(RealityTlsStream::new(server_stream, reality_conn))
+    Ok(RealityAcceptOutcome::Accepted(Box::new(
+        RealityTlsStream::new(server_stream, reality_conn),
+    )))
+}
+
+pub async fn accept_reality_stream(
+    server_stream: Box<dyn AsyncStream>,
+    config: &RealityTransportConfig,
+) -> io::Result<RealityTlsStream<Box<dyn AsyncStream>, RealityServerConnection>> {
+    match accept_reality_stream_outcome(server_stream, config).await? {
+        RealityAcceptOutcome::Accepted(stream) => Ok(*stream),
+        RealityAcceptOutcome::Fallback(fallback) => Err(fallback.run().await),
+    }
 }
 
 #[derive(Debug)]
@@ -669,18 +716,18 @@ impl RealityServerHandler {
 #[async_trait]
 impl TcpServerHandler for RealityServerHandler {
     fn manages_handshake_timeout(&self) -> bool {
-        self.inner.manages_handshake_timeout()
+        true
     }
 
     async fn setup_server_stream(
         &self,
         server_stream: Box<dyn AsyncStream>,
     ) -> io::Result<TcpServerSetupResult> {
-        self.setup_server_stream_with_context(
-            server_stream,
-            TcpServerConnectionContext::default(),
-        )
-        .await
+        let wrapped_stream =
+            accept_reality_stream(server_stream, &self.transport_config).await?;
+        self.inner
+            .setup_server_stream(Box::new(wrapped_stream))
+            .await
     }
 
     async fn setup_server_stream_with_context(
@@ -688,23 +735,49 @@ impl TcpServerHandler for RealityServerHandler {
         server_stream: Box<dyn AsyncStream>,
         context: TcpServerConnectionContext,
     ) -> io::Result<TcpServerSetupResult> {
-        let timeout = self.inner.pre_transport_handshake_timeout(&context);
-        let setup = async {
-            let wrapped_stream =
-                accept_reality_stream(server_stream, &self.transport_config).await?;
-            self.inner
-                .setup_server_stream_with_context(Box::new(wrapped_stream), context)
-                .await
-        };
+        let timeout = self
+            .inner
+            .pre_transport_handshake_timeout(&context)
+            .or_else(|| {
+                (!self.inner.manages_handshake_timeout())
+                    .then_some(Duration::from_secs(60))
+            });
+        let accept =
+            accept_reality_stream_outcome(server_stream, &self.transport_config);
         let Some(timeout) = timeout else {
-            return setup.await;
+            return match accept.await? {
+                RealityAcceptOutcome::Accepted(stream) => {
+                    self.inner
+                        .setup_server_stream_with_context(stream, context)
+                        .await
+                }
+                RealityAcceptOutcome::Fallback(fallback) => {
+                    Err(fallback.run().await)
+                }
+            };
         };
-        tokio::time::timeout(timeout, setup).await.map_err(|_| {
+
+        let deadline = Instant::now() + timeout;
+        let outcome = timeout_at(deadline, accept).await.map_err(|_| {
             io::Error::new(
                 io::ErrorKind::TimedOut,
                 "REALITY inner handshake timed out",
             )
-        })?
+        })??;
+        match outcome {
+            RealityAcceptOutcome::Fallback(fallback) => Err(fallback.run().await),
+            RealityAcceptOutcome::Accepted(stream) => timeout_at(
+                deadline,
+                self.inner.setup_server_stream_with_context(stream, context),
+            )
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "REALITY inner handshake timed out",
+                )
+            })?,
+        }
     }
 }
 
@@ -734,6 +807,10 @@ impl RealityVisionVlessServerHandler {
 
 #[async_trait]
 impl TcpServerHandler for RealityVisionVlessServerHandler {
+    fn manages_handshake_timeout(&self) -> bool {
+        true
+    }
+
     async fn setup_server_stream(
         &self,
         server_stream: Box<dyn AsyncStream>,
@@ -759,21 +836,95 @@ impl TcpServerHandler for RealityVisionVlessServerHandler {
             .as_ref()
             .and_then(|runtime| runtime.vless_users_snapshot(&self.inbound_tag));
         let users = dynamic_users.as_deref().unwrap_or(&self.users);
-        let tls_stream =
-            accept_reality_stream(server_stream, &self.transport_config).await?;
-        setup_reality_mixed_vless_server_stream(
-            tls_stream,
-            users,
-            &self.fallbacks,
-            &self.inbound_tag,
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let outcome = timeout_at(
+            deadline,
+            accept_reality_stream_outcome(server_stream, &self.transport_config),
         )
         .await
+        .map_err(|_| {
+            io::Error::new(io::ErrorKind::TimedOut, "server setup timed out")
+        })??;
+
+        match outcome {
+            RealityAcceptOutcome::Fallback(fallback) => Err(fallback.run().await),
+            RealityAcceptOutcome::Accepted(tls_stream) => timeout_at(
+                deadline,
+                setup_reality_mixed_vless_server_stream(
+                    *tls_stream,
+                    users,
+                    &self.fallbacks,
+                    &self.inbound_tag,
+                ),
+            )
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "server setup timed out")
+            })?,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
     use super::*;
+    use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+
+    struct TestStream(DuplexStream);
+
+    impl AsyncRead for TestStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for TestStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+        }
+    }
+
+    impl crate::async_stream::AsyncPing for TestStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for TestStream {}
 
     fn client_hello_with_raw_extensions(extensions: &[u8]) -> Vec<u8> {
         let mut body = Vec::new();
@@ -1064,5 +1215,50 @@ mod tests {
         ];
 
         assert!(!dest_handshake_looks_complete(&records));
+    }
+
+    #[tokio::test]
+    async fn reality_fallback_relay_remains_in_parent_future() {
+        let (mut client_peer, client_relay) = tokio::io::duplex(1024);
+        let (dest_relay, mut dest_peer) = tokio::io::duplex(1024);
+        let fallback = RealityFallback {
+            client_stream: Box::new(TestStream(client_relay)),
+            dest_stream: Box::new(TestStream(dest_relay)),
+            dest_records: vec![Bytes::from_static(b"server")],
+            remaining_data: Bytes::from_static(b"tail"),
+            reason: io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "fallback reason",
+            ),
+        };
+
+        let relay = tokio::spawn(async move { fallback.run().await });
+
+        let mut initial = [0u8; 10];
+        client_peer.read_exact(&mut initial).await.unwrap();
+        assert_eq!(&initial, b"servertail");
+        assert!(!relay.is_finished());
+
+        client_peer.write_all(b"request").await.unwrap();
+        client_peer.flush().await.unwrap();
+        let mut request = [0u8; 7];
+        dest_peer.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"request");
+
+        dest_peer.write_all(b"response").await.unwrap();
+        dest_peer.flush().await.unwrap();
+        let mut response = [0u8; 8];
+        client_peer.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"response");
+        assert!(!relay.is_finished());
+
+        drop(client_peer);
+        drop(dest_peer);
+        let error = tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .expect("fallback relay should finish after both peers close")
+            .expect("fallback relay task should not panic");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "fallback reason");
     }
 }

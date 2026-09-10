@@ -30,6 +30,7 @@ use rand::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::UdpSocket,
+    task::JoinSet,
 };
 use tracing::{debug, warn};
 
@@ -440,17 +441,28 @@ async fn drive_tcp_streams(
     peer_addr: SocketAddr,
     runtime: RuntimeState,
 ) -> std::io::Result<()> {
-    loop {
-        let stream = match next_hysteria_stream(h3_conn).await {
-            Ok(stream) => stream,
-            Err(err) if err.is_h3_no_error() => return Ok(()),
-            Err(err) => return Err(map_h3_error(err)),
+    let mut stream_tasks = JoinSet::new();
+    let result = loop {
+        let stream = tokio::select! {
+            accepted = next_hysteria_stream(h3_conn) => {
+                match accepted {
+                    Ok(stream) => stream,
+                    Err(err) if err.is_h3_no_error() => break Ok(()),
+                    Err(err) => break Err(map_h3_error(err)),
+                }
+            }
+            completed = stream_tasks.join_next(), if !stream_tasks.is_empty() => {
+                if let Some(Err(err)) = completed {
+                    warn!("hysteria2 tcp stream task ended unexpectedly: {err}");
+                }
+                continue;
+            }
         };
         let resolver = resolver.clone();
         let auth_ctx = auth_ctx.clone();
         let inbound_tag = inbound_tag.clone();
         let runtime = runtime.clone();
-        tokio::spawn(async move {
+        stream_tasks.spawn(async move {
             if let Err(err) = handle_tcp_stream(
                 H3RawStream::new(stream),
                 resolver,
@@ -464,6 +476,20 @@ async fn drive_tcp_streams(
                 debug!("hysteria2 tcp stream ended with error: {}", err);
             }
         });
+    };
+
+    abort_and_drain_hysteria_stream_tasks(&mut stream_tasks).await;
+    result
+}
+
+async fn abort_and_drain_hysteria_stream_tasks(stream_tasks: &mut JoinSet<()>) {
+    stream_tasks.abort_all();
+    while let Some(result) = stream_tasks.join_next().await {
+        if let Err(err) = result
+            && !err.is_cancelled()
+        {
+            warn!("hysteria2 tcp stream task failed during cleanup: {err}");
+        }
     }
 }
 
@@ -3697,6 +3723,10 @@ mod tests {
     use std::{
         future::pending,
         io::ErrorKind,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
         time::{Instant, SystemTime, UNIX_EPOCH},
     };
 
@@ -3728,6 +3758,14 @@ mod tests {
             .header(AUTH_HEADER, auth)
             .body(())
             .expect("valid Hysteria2 auth request")
+    }
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
     }
 
     #[test]
@@ -3791,6 +3829,29 @@ mod tests {
 
         assert_eq!(err.kind(), ErrorKind::TimedOut);
         assert!(started.elapsed() >= AUTH_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn hysteria_tcp_stream_cleanup_aborts_and_drains_children() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_drop = dropped.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut stream_tasks = JoinSet::new();
+        stream_tasks.spawn(async move {
+            let _drop_flag = DropFlag(task_drop);
+            let _ = started_tx.send(());
+            pending::<()>().await;
+        });
+
+        started_rx
+            .await
+            .expect("Hysteria2 child task should start before cleanup");
+        assert_eq!(stream_tasks.len(), 1);
+
+        abort_and_drain_hysteria_stream_tasks(&mut stream_tasks).await;
+
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(stream_tasks.is_empty());
     }
 
     #[tokio::test]

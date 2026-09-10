@@ -16,7 +16,7 @@ use tokio::{
     net::UdpSocket,
     time::timeout,
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{debug, error};
 
 use crate::{
@@ -102,6 +102,57 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     runtime.spawn_inbound_connection(future);
+}
+
+struct TuicConnectionTaskOwnerInner {
+    runtime: RuntimeState,
+    tracker: TaskTracker,
+    cancellation: CancellationToken,
+}
+
+impl Drop for TuicConnectionTaskOwnerInner {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.tracker.close();
+    }
+}
+
+#[derive(Clone)]
+struct TuicConnectionTaskOwner {
+    inner: Arc<TuicConnectionTaskOwnerInner>,
+}
+
+impl TuicConnectionTaskOwner {
+    fn new(runtime: RuntimeState) -> Self {
+        Self {
+            inner: Arc::new(TuicConnectionTaskOwnerInner {
+                runtime,
+                tracker: TaskTracker::new(),
+                cancellation: CancellationToken::new(),
+            }),
+        }
+    }
+
+    fn spawn<F>(&self, future: F) -> bool
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let cancellation = self.inner.cancellation.clone();
+        let future = self.inner.tracker.track_future(async move {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {}
+                _ = future => {}
+            }
+        });
+        self.inner.runtime.spawn_inbound_connection(future)
+    }
+
+    async fn shutdown(&self) {
+        self.inner.tracker.close();
+        self.inner.cancellation.cancel();
+        self.inner.tracker.wait().await;
+    }
 }
 
 /// Run a TUIC v5 server bound to the provided address with the given TLS config.
@@ -277,6 +328,8 @@ async fn process_connection(
     };
     let cancel_token = CancellationToken::new();
     let udp_session_map = Arc::new(DashMap::new());
+    let child_tasks =
+        TuicConnectionTaskOwner::new(context.connection.runtime.clone());
 
     let heartbeat_loop =
         run_heartbeat_loop(connection.clone(), cancel_token.clone());
@@ -284,6 +337,7 @@ async fn process_connection(
         connection.clone(),
         resolver.clone(),
         context.clone(),
+        child_tasks.clone(),
     );
     let uni_loop = run_unidirectional_loop(
         connection.clone(),
@@ -291,6 +345,7 @@ async fn process_connection(
         udp_session_map.clone(),
         cancel_token.clone(),
         context.clone(),
+        child_tasks.clone(),
     );
     let datagram_loop = run_datagram_loop(
         connection.clone(),
@@ -298,6 +353,7 @@ async fn process_connection(
         udp_session_map.clone(),
         cancel_token.clone(),
         context.clone(),
+        child_tasks.clone(),
     );
 
     let result = tokio::try_join!(heartbeat_loop, bi_loop, uni_loop, datagram_loop);
@@ -309,6 +365,7 @@ async fn process_connection(
         connection.close(0u32.into(), b"");
     }
 
+    child_tasks.shutdown().await;
     result.map(|_| ())
 }
 
@@ -400,6 +457,7 @@ async fn run_bidirectional_loop(
     connection: quinn::Connection,
     resolver: Arc<dyn Resolver>,
     context: TuicFlowContext,
+    child_tasks: TuicConnectionTaskOwner,
 ) -> std::io::Result<()> {
     loop {
         let (send_stream, recv_stream) = match connection.accept_bi().await {
@@ -418,7 +476,7 @@ async fn run_bidirectional_loop(
         let conn = connection.clone();
         let resolver = resolver.clone();
         let context = context.clone();
-        tokio::spawn(async move {
+        if !child_tasks.spawn(async move {
             match process_tcp_stream(resolver, send_stream, recv_stream, context)
                 .await
             {
@@ -433,7 +491,9 @@ async fn run_bidirectional_loop(
                     error!("Error processing TCP stream: {e}");
                 }
             }
-        });
+        }) {
+            return Ok(());
+        }
     }
     Ok(())
 }
@@ -631,6 +691,11 @@ fn serialize_socket_addr(addr: &SocketAddr) -> Vec<u8> {
     res
 }
 
+struct TuicUdpTaskScope<'a> {
+    parent_cancel_token: &'a CancellationToken,
+    child_tasks: &'a TuicConnectionTaskOwner,
+}
+
 struct UdpSession {
     send_socket: Arc<UdpSocket>,
     last_location: NetLocation,
@@ -657,10 +722,10 @@ impl UdpSession {
         client_socket: Arc<UdpSocket>,
         initial_location: NetLocation,
         initial_socket_addr: SocketAddr,
-        parent_cancel_token: &CancellationToken,
         base_context: TrafficContext,
-    ) -> Self {
-        let session_cancel_token = parent_cancel_token.child_token();
+        task_scope: TuicUdpTaskScope<'_>,
+    ) -> std::io::Result<Self> {
+        let session_cancel_token = task_scope.parent_cancel_token.child_token();
         let response_contexts = Arc::new(DashMap::new());
         let connection_guard = register_connection(Some(&base_context));
 
@@ -675,7 +740,7 @@ impl UdpSession {
             _connection_guard: connection_guard,
         };
 
-        tokio::spawn(async move {
+        if !task_scope.child_tasks.spawn(async move {
             if let Err(e) = run_udp_remote_to_local_stream_loop(
                 assoc_id,
                 send_stream,
@@ -688,9 +753,14 @@ impl UdpSession {
             {
                 error!("UDP remote-to-local write loop ended with error: {e}");
             }
-        });
+        }) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "server is no longer accepting TUIC connection tasks",
+            ));
+        }
 
-        session
+        Ok(session)
     }
 
     fn start_with_datagram(
@@ -699,10 +769,10 @@ impl UdpSession {
         client_socket: Arc<UdpSocket>,
         initial_location: NetLocation,
         initial_socket_addr: SocketAddr,
-        parent_cancel_token: &CancellationToken,
         base_context: TrafficContext,
-    ) -> Self {
-        let session_cancel_token = parent_cancel_token.child_token();
+        task_scope: TuicUdpTaskScope<'_>,
+    ) -> std::io::Result<Self> {
+        let session_cancel_token = task_scope.parent_cancel_token.child_token();
         let response_contexts = Arc::new(DashMap::new());
         let connection_guard = register_connection(Some(&base_context));
 
@@ -717,7 +787,7 @@ impl UdpSession {
             _connection_guard: connection_guard,
         };
 
-        tokio::spawn(async move {
+        if !task_scope.child_tasks.spawn(async move {
             if let Err(e) = run_udp_remote_to_local_datagram_loop(
                 assoc_id,
                 connection,
@@ -730,9 +800,14 @@ impl UdpSession {
             {
                 error!("UDP remote-to-local write loop ended with error: {e}");
             }
-        });
+        }) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "server is no longer accepting TUIC connection tasks",
+            ));
+        }
 
-        session
+        Ok(session)
     }
 
     async fn resolve_address(
@@ -827,10 +902,12 @@ async fn run_udp_remote_to_local_stream_loop(
 
         let mut i = start_offset;
         while i < end_offset {
-            let count = send_stream
-                .write(&buf[i..end_offset])
-                .await
-                .map_err(std::io::Error::other)?;
+            let count = tokio::select! {
+                _ = cancel_token.cancelled() => return Ok(()),
+                result = send_stream.write(&buf[i..end_offset]) => {
+                    result.map_err(std::io::Error::other)?
+                }
+            };
             i += count;
         }
         record_transfer(Some(traffic_context), 0, payload_len as u64);
@@ -963,10 +1040,11 @@ async fn run_unidirectional_loop(
     udp_session_map: UdpSessionMap,
     cancel_token: CancellationToken,
     context: TuicFlowContext,
+    child_tasks: TuicConnectionTaskOwner,
 ) -> std::io::Result<()> {
     let cleanup_session_map = udp_session_map.clone();
     let cleanup_cancel_token = cancel_token.clone();
-    tokio::spawn(async move {
+    if !child_tasks.spawn(async move {
         let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
         loop {
             tokio::select! {
@@ -986,7 +1064,9 @@ async fn run_unidirectional_loop(
                 }
             }
         }
-    });
+    }) {
+        return Ok(());
+    }
 
     loop {
         let recv_stream = match connection.accept_uni().await {
@@ -1007,7 +1087,8 @@ async fn run_unidirectional_loop(
         let udp_session_map = udp_session_map.clone();
         let cancel_token = cancel_token.clone();
         let context = context.clone();
-        tokio::spawn(async move {
+        let stream_child_tasks = child_tasks.clone();
+        if !child_tasks.spawn(async move {
             match process_uni_stream(
                 &connection,
                 resolver,
@@ -1015,6 +1096,7 @@ async fn run_unidirectional_loop(
                 udp_session_map,
                 cancel_token,
                 context,
+                stream_child_tasks,
             )
             .await
             {
@@ -1024,7 +1106,9 @@ async fn run_unidirectional_loop(
                     connection.close(0u32.into(), b"");
                 }
             }
-        });
+        }) {
+            return Ok(());
+        }
     }
     Ok(())
 }
@@ -1036,6 +1120,7 @@ async fn process_uni_stream(
     udp_session_map: UdpSessionMap,
     cancel_token: CancellationToken,
     context: TuicFlowContext,
+    child_tasks: TuicConnectionTaskOwner,
 ) -> std::io::Result<()> {
     let tuic_version = recv_stream.read_u8().await?;
     if tuic_version != TUIC_VERSION {
@@ -1089,6 +1174,7 @@ async fn process_uni_stream(
         true,
         &cancel_token,
         &context,
+        &child_tasks,
     )
     .await
 }
@@ -1108,6 +1194,7 @@ async fn process_udp_packet(
     is_uni_stream: bool,
     cancel_token: &CancellationToken,
     context: &TuicFlowContext,
+    child_tasks: &TuicConnectionTaskOwner,
 ) -> std::io::Result<()> {
     if frag_total == 0 {
         return Err(std::io::Error::other(
@@ -1153,9 +1240,12 @@ async fn process_udp_packet(
                     Arc::new(socket),
                     remote_location,
                     resolved_address,
-                    cancel_token,
                     base_context.clone(),
-                )
+                    TuicUdpTaskScope {
+                        parent_cancel_token: cancel_token,
+                        child_tasks,
+                    },
+                )?
             } else {
                 UdpSession::start_with_datagram(
                     assoc_id,
@@ -1163,9 +1253,12 @@ async fn process_udp_packet(
                     Arc::new(socket),
                     remote_location,
                     resolved_address,
-                    cancel_token,
                     base_context,
-                )
+                    TuicUdpTaskScope {
+                        parent_cancel_token: cancel_token,
+                        child_tasks,
+                    },
+                )?
             };
 
             udp_session_map.insert(assoc_id, session);
@@ -1357,6 +1450,7 @@ async fn run_datagram_loop(
     udp_session_map: UdpSessionMap,
     cancel_token: CancellationToken,
     context: TuicFlowContext,
+    child_tasks: TuicConnectionTaskOwner,
 ) -> std::io::Result<()> {
     let mut fragments: LruCache<u16, FragmentedPacket> =
         LruCache::new(fragment_cache_size());
@@ -1501,6 +1595,7 @@ async fn run_datagram_loop(
             false,
             &cancel_token,
             &context,
+            &child_tasks,
         )
         .await
         {
@@ -1589,6 +1684,26 @@ mod tests {
         traffic::{register_connection, snapshot},
     };
 
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    async fn wait_for_no_tracked_connection_tasks(runtime: &RuntimeState) {
+        timeout(Duration::from_secs(1), async {
+            while runtime.tracked_inbound_connection_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("TUIC child task should leave the server owner");
+    }
+
     #[tokio::test]
     async fn tuic_connection_task_uses_server_owner() {
         let runtime = RuntimeState::new(Vec::new(), Vec::new());
@@ -1615,6 +1730,52 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("completed TUIC connection should leave server owner");
+    }
+
+    #[tokio::test]
+    async fn tuic_child_task_shutdown_cancels_and_waits() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let child_tasks = TuicConnectionTaskOwner::new(runtime.clone());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+
+        assert!(child_tasks.spawn(async move {
+            let _drop_signal = DropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        started_rx.await.expect("TUIC child task should start");
+        assert_eq!(runtime.tracked_inbound_connection_count(), 1);
+
+        child_tasks.shutdown().await;
+        timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("TUIC child task should be cancelled")
+            .expect("TUIC child task drop signal should be sent");
+        wait_for_no_tracked_connection_tasks(&runtime).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_tuic_child_owner_cancels_server_owned_task() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let child_tasks = TuicConnectionTaskOwner::new(runtime.clone());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+
+        assert!(child_tasks.spawn(async move {
+            let _drop_signal = DropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        started_rx.await.expect("TUIC child task should start");
+        assert_eq!(runtime.tracked_inbound_connection_count(), 1);
+
+        drop(child_tasks);
+        timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("dropping TUIC child owner should cancel the task")
+            .expect("TUIC child task drop signal should be sent");
+        wait_for_no_tracked_connection_tasks(&runtime).await;
     }
 
     #[test]
