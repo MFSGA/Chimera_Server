@@ -539,105 +539,110 @@ async fn start_xhttp_h3_server(
 
     let handle = tokio::spawn(async move {
         let _cancel_on_drop = CancelOnDrop(state.shutdown.clone());
-        let mut connections = JoinSet::new();
-        loop {
-            tokio::select! {
-                incoming = endpoint.accept() => {
-                    let Some(incoming) = incoming else {
-                        break;
+        while let Some(incoming) = endpoint.accept().await {
+            let state = state.clone();
+            let runtime = state.runtime.clone();
+            let shutdown = state.shutdown.clone();
+            spawn_xhttp_h3_connection(&runtime, shutdown, async move {
+                let local_addr = xhttp_h3_connection_local_addr(
+                    listener_addr,
+                    incoming.local_ip(),
+                );
+                let connection = match incoming.await {
+                    Ok(connection) => connection,
+                    Err(err) => {
+                        debug!("xhttp H3 QUIC handshake failed: {}", err);
+                        return;
+                    }
+                };
+                let peer_addr = connection.remote_address();
+                let h3_quinn_connection = h3_quinn::Connection::new(connection);
+                let mut h3_builder = h3::server::builder();
+                // Xray's quic-go HTTP/3 server uses Go's http.DefaultMaxHeaderBytes,
+                // advertises extended CONNECT, and doesn't emit HTTP/3 GREASE values.
+                h3_builder
+                    .max_field_section_size(XRAY_XHTTP_H3_MAX_FIELD_SECTION_SIZE)
+                    .enable_extended_connect(true)
+                    .send_grease(false);
+                let mut h3_connection =
+                    match h3_builder.build(h3_quinn_connection).await {
+                        Ok(connection) => connection,
+                        Err(err) => {
+                            debug!(
+                                "xhttp H3 connection setup from {} failed: {}",
+                                peer_addr, err
+                            );
+                            return;
+                        }
                     };
-                    let state = state.clone();
-                    connections.spawn(async move {
-                        let local_addr = xhttp_h3_connection_local_addr(
-                            listener_addr,
-                            incoming.local_ip(),
-                        );
-                        let connection = match incoming.await {
-                            Ok(connection) => connection,
-                            Err(err) => {
-                                debug!("xhttp H3 QUIC handshake failed: {}", err);
-                                return;
-                            }
-                        };
-                        let peer_addr = connection.remote_address();
-                        let h3_quinn_connection = h3_quinn::Connection::new(connection);
-                        let mut h3_builder = h3::server::builder();
-                        // Xray's quic-go HTTP/3 server uses Go's http.DefaultMaxHeaderBytes,
-                        // advertises extended CONNECT, and doesn't emit HTTP/3 GREASE values.
-                        h3_builder
-                            .max_field_section_size(XRAY_XHTTP_H3_MAX_FIELD_SECTION_SIZE)
-                            .enable_extended_connect(true)
-                            .send_grease(false);
-                        let mut h3_connection =
-                            match h3_builder.build(h3_quinn_connection).await {
-                                Ok(connection) => connection,
+                let mut requests = JoinSet::new();
+
+                loop {
+                    tokio::select! {
+                        resolved = h3_connection.accept() => {
+                            let resolver = match resolved {
+                                Ok(Some(resolver)) => resolver,
+                                Ok(None) => break,
                                 Err(err) => {
                                     debug!(
-                                        "xhttp H3 connection setup from {} failed: {}",
+                                        "xhttp H3 accept from {} failed: {}",
                                         peer_addr, err
                                     );
-                                    return;
+                                    break;
                                 }
                             };
-                        let mut requests = JoinSet::new();
-
-                        loop {
-                            tokio::select! {
-                                resolved = h3_connection.accept() => {
-                                    let resolver = match resolved {
-                                        Ok(Some(resolver)) => resolver,
-                                        Ok(None) => break,
-                                        Err(err) => {
-                                            debug!(
-                                                "xhttp H3 accept from {} failed: {}",
-                                                peer_addr, err
-                                            );
-                                            break;
-                                        }
-                                    };
-                                    let (request, stream) = match resolver.resolve_request().await {
-                                        Ok(request) => request,
-                                        Err(err) => {
-                                            debug!(
-                                                "xhttp H3 request from {} failed: {}",
-                                                peer_addr, err
-                                            );
-                                            continue;
-                                        }
-                                    };
-                                    let state = state.clone();
-                                    requests.spawn(async move {
-                                        if let Err(err) = handle_h3_request_stream(
-                                            request, stream, state, peer_addr, local_addr,
-                                        )
-                                        .await
-                                        {
-                                            debug!(
-                                                "xhttp H3 response to {} failed: {}",
-                                                peer_addr, err
-                                            );
-                                        }
-                                    });
+                            let (request, stream) = match resolver.resolve_request().await {
+                                Ok(request) => request,
+                                Err(err) => {
+                                    debug!(
+                                        "xhttp H3 request from {} failed: {}",
+                                        peer_addr, err
+                                    );
+                                    continue;
                                 }
-                                result = requests.join_next(), if !requests.is_empty() => {
-                                    if let Some(Err(err)) = result {
-                                        debug!("xhttp H3 request task failed: {}", err);
-                                    }
+                            };
+                            let state = state.clone();
+                            requests.spawn(async move {
+                                if let Err(err) = handle_h3_request_stream(
+                                    request, stream, state, peer_addr, local_addr,
+                                )
+                                .await
+                                {
+                                    debug!(
+                                        "xhttp H3 response to {} failed: {}",
+                                        peer_addr, err
+                                    );
                                 }
+                            });
+                        }
+                        result = requests.join_next(), if !requests.is_empty() => {
+                            if let Some(Err(err)) = result {
+                                debug!("xhttp H3 request task failed: {}", err);
                             }
                         }
-                    });
-                }
-                result = connections.join_next(), if !connections.is_empty() => {
-                    if let Some(Err(err)) = result {
-                        debug!("xhttp H3 connection task failed: {}", err);
                     }
                 }
-            }
+            });
         }
     });
 
     Ok(vec![handle])
+}
+
+#[cfg(feature = "tls")]
+fn spawn_xhttp_h3_connection<F>(
+    runtime: &RuntimeState,
+    shutdown: CancellationToken,
+    future: F,
+) where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    runtime.spawn_inbound_connection(async move {
+        tokio::select! {
+            _ = shutdown.cancelled() => {}
+            _ = future => {}
+        }
+    });
 }
 
 #[cfg(feature = "tls")]
@@ -3913,6 +3918,35 @@ mod tests {
             hyper::header::HeaderValue::from_static("https://example.com/"),
         );
         assert!(stream_up_padding_enabled(&headers, false));
+    }
+
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn h3_connection_task_uses_server_owner_and_listener_shutdown() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new());
+        let shutdown = CancellationToken::new();
+
+        spawn_xhttp_h3_connection(
+            &runtime,
+            shutdown.clone(),
+            std::future::pending(),
+        );
+        for _ in 0..50 {
+            if runtime.tracked_inbound_connection_count() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(runtime.tracked_inbound_connection_count(), 1);
+
+        shutdown.cancel();
+        for _ in 0..50 {
+            if runtime.tracked_inbound_connection_count() == 0 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("XHTTP H3 connection should leave owner when listener closes");
     }
 
     #[cfg(feature = "tls")]
