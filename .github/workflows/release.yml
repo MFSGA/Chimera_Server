@@ -4,15 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Target stable version without the v prefix, for example 0.7.6"
+        description: "Stable version without the v prefix, for example 0.8.1"
         required: true
         type: string
       release_goal:
-        description: "The single primary protocol goal completed by this version"
+        description: "Single primary protocol goal completed by this version"
         required: true
         type: string
       source_ref:
-        description: "Optional historical commit/tag to release; must be an ancestor of master"
+        description: "Optional historical commit/tag; must be an ancestor of master"
         required: false
         default: ""
         type: string
@@ -21,13 +21,21 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.event.inputs.version }}
+  group: release-${{ inputs.version }}
   cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   candidate:
-    name: Resolve release candidate
+    name: Resolve candidate
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       source_commit: ${{ steps.meta.outputs.source_commit }}
       tag: ${{ steps.meta.outputs.tag }}
@@ -39,166 +47,167 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Resolve release metadata
+      - name: Resolve metadata
         id: meta
-        shell: bash
         env:
-          VERSION_INPUT: ${{ github.event.inputs.version }}
-          RELEASE_GOAL_INPUT: ${{ github.event.inputs.release_goal }}
-          SOURCE_REF_INPUT: ${{ github.event.inputs.source_ref }}
+          VERSION_INPUT: ${{ inputs.version }}
+          RELEASE_GOAL_INPUT: ${{ inputs.release_goal }}
+          SOURCE_REF_INPUT: ${{ inputs.source_ref }}
         run: |
           set -euo pipefail
 
-          VERSION="$VERSION_INPUT"
-          RELEASE_GOAL="$RELEASE_GOAL_INPUT"
+          version="$VERSION_INPUT"
+          release_goal="$RELEASE_GOAL_INPUT"
 
-          if [[ "$GITHUB_REF_NAME" != "master" ]]; then
+          [[ "$GITHUB_REF_NAME" == "master" ]] || {
             echo "releases must be dispatched from master" >&2
             exit 1
-          fi
-
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "version must use stable SemVer form such as 0.7.6" >&2
+          }
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "version must use stable SemVer form such as 0.8.1" >&2
             exit 1
-          fi
-
-          if [[ -z "${RELEASE_GOAL// }" ]]; then
+          }
+          [[ -n "${release_goal// }" ]] || {
             echo "release_goal must describe the single primary protocol goal" >&2
             exit 1
-          fi
+          }
 
           git fetch origin master --tags
           if [[ -n "$SOURCE_REF_INPUT" ]]; then
-            if ! SOURCE_COMMIT=$(git rev-parse --verify "$SOURCE_REF_INPUT^{commit}"); then
+            source_commit=$(git rev-parse --verify "$SOURCE_REF_INPUT^{commit}") || {
               echo "unable to resolve release source: $SOURCE_REF_INPUT" >&2
               exit 1
-            fi
+            }
           else
-            SOURCE_COMMIT=$(git rev-parse --verify "$GITHUB_SHA^{commit}")
+            source_commit=$(git rev-parse --verify "$GITHUB_SHA^{commit}")
           fi
 
-          if ! git merge-base --is-ancestor "$SOURCE_COMMIT" origin/master; then
-            echo "release source must be an ancestor of master: ${SOURCE_REF_INPUT:-$SOURCE_COMMIT}" >&2
+          git merge-base --is-ancestor "$source_commit" origin/master || {
+            echo "release source must be an ancestor of master: ${SOURCE_REF_INPUT:-$source_commit}" >&2
             exit 1
-          fi
+          }
 
-          TAG="v${VERSION}"
-          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-            TAG_COMMIT=$(git rev-parse "$TAG^{commit}")
-            if [[ "$TAG_COMMIT" != "$SOURCE_COMMIT" ]]; then
-              echo "tag $TAG points to $TAG_COMMIT, expected $SOURCE_COMMIT" >&2
+          tag="v${version}"
+          tag_preexists=false
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            tag_commit=$(git rev-parse "$tag^{commit}")
+            [[ "$tag_commit" == "$source_commit" ]] || {
+              echo "tag $tag points to $tag_commit, expected $source_commit" >&2
               exit 1
-            fi
-            echo "tag_preexists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag_preexists=false" >> "$GITHUB_OUTPUT"
+            }
+            tag_preexists=true
           fi
 
-          echo "source_commit=$SOURCE_COMMIT" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "release_goal=$RELEASE_GOAL" >> "$GITHUB_OUTPUT"
-          echo "Preparing $TAG from $SOURCE_COMMIT (dispatched from $GITHUB_REF_NAME): $RELEASE_GOAL"
+          echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "release_goal=$release_goal" >> "$GITHUB_OUTPUT"
+          echo "tag_preexists=$tag_preexists" >> "$GITHUB_OUTPUT"
+          echo "Candidate: $tag @ $source_commit — $release_goal"
 
-      - name: Check out exact candidate
-        shell: bash
+      - name: Check workspace version
         env:
           SOURCE_COMMIT: ${{ steps.meta.outputs.source_commit }}
-        run: git checkout --detach "$SOURCE_COMMIT"
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Verify prepared workspace version
-        shell: bash
-        env:
           EXPECTED_VERSION: ${{ steps.meta.outputs.version }}
         run: |
           set -euo pipefail
-          ACTUAL_VERSION=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "chimera_server_app") | .version')
-          if [[ "$ACTUAL_VERSION" != "$EXPECTED_VERSION" ]]; then
-            echo "workspace version is $ACTUAL_VERSION, expected $EXPECTED_VERSION" >&2
-            echo "prepare and review the version bump before dispatching a release" >&2
+          git checkout --detach "$SOURCE_COMMIT"
+          actual_version=$(awk -F '"' '
+            /^\[workspace\.package\]$/ { in_workspace = 1; next }
+            /^\[/ { in_workspace = 0 }
+            in_workspace && /^version = / { print $2; exit }
+          ' Cargo.toml)
+          [[ "$actual_version" == "$EXPECTED_VERSION" ]] || {
+            echo "workspace version is $actual_version, expected $EXPECTED_VERSION" >&2
             exit 1
-          fi
+          }
 
-  cross-platform-preflight:
-    name: Cross-platform preflight (${{ matrix.os }})
+  preflight:
+    name: Preflight (${{ matrix.os }})
     needs: candidate
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v6
         with:
-          fetch-depth: 0
           ref: ${{ needs.candidate.outputs.source_commit }}
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Workspace test gate
-        run: cargo test --workspace --all-features
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-preflight-${{ runner.os }}
 
-  release-gates:
-    name: Repository release gates
+      - name: Workspace tests
+        run: cargo test --workspace --all-features --locked
+
+  gates:
+    name: Release gates
     needs: candidate
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
         with:
-          fetch-depth: 0
           ref: ${{ needs.candidate.outputs.source_commit }}
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
 
-      - name: Format gate
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-gates
+
+      - name: Format
         run: cargo fmt --all -- --check
 
-      - name: Build gate
+      - name: Build all features
         run: cargo build --all-features
 
-      - name: Clippy gate
+      - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Test gate
+      - name: Tests
         run: cargo test
 
-      - name: Locked dependency gate
+      - name: Locked tests
         run: cargo test --locked
 
-  build-linux:
-    name: Build Linux release artifacts
-    needs:
-      - candidate
-      - cross-platform-preflight
-      - release-gates
+  linux-artifacts:
+    name: Linux artifacts
+    needs: [candidate, preflight, gates]
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
         with:
-          fetch-depth: 0
           ref: ${{ needs.candidate.outputs.source_commit }}
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Install cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-linux
 
-      - name: Build GNU release binary
-        run: cargo build --release --package chimera_server_app
+      - name: Install pinned cross
+        run: |
+          cargo install cross \
+            --git https://github.com/cross-rs/cross \
+            --rev 8c1a8aa4b661711f4b7b6ac07c2e8929ce2f7d27 \
+            --locked
 
-      - name: Build musl release binary
-        run: cross build --release --target x86_64-unknown-linux-musl --package chimera_server_app
+      - name: Build GNU binary
+        run: cargo build --release --locked --package chimera_server_app
 
-      - name: Prepare Linux artifacts
-        shell: bash
+      - name: Build musl binary
+        run: cross build --release --locked --target x86_64-unknown-linux-musl --package chimera_server_app
+
+      - name: Package Linux artifacts
         env:
           TAG: ${{ needs.candidate.outputs.tag }}
         run: |
@@ -206,63 +215,58 @@ jobs:
           mkdir -p dist
           cp target/release/chimera_server_app "dist/chimera_server_app-${TAG}-linux-x86_64"
           cp target/x86_64-unknown-linux-musl/release/chimera_server_app "dist/chimera_server_app-${TAG}-linux-x86_64-musl"
-          chmod +x "dist/chimera_server_app-${TAG}-linux-x86_64"
-          chmod +x "dist/chimera_server_app-${TAG}-linux-x86_64-musl"
+          chmod +x dist/chimera_server_app-*
           (cd dist && sha256sum "chimera_server_app-${TAG}-linux-x86_64" > "chimera_server_app-${TAG}-linux-x86_64.sha256")
           (cd dist && sha256sum "chimera_server_app-${TAG}-linux-x86_64-musl" > "chimera_server_app-${TAG}-linux-x86_64-musl.sha256")
-          ls -lh dist
 
-      - name: Upload Linux artifacts
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: release-linux-${{ needs.candidate.outputs.tag }}
           path: dist/*
           if-no-files-found: error
 
-  build-windows:
-    name: Build Windows release artifacts
-    needs:
-      - candidate
-      - cross-platform-preflight
-      - release-gates
+  windows-artifacts:
+    name: Windows artifacts
+    needs: [candidate, preflight, gates]
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
         with:
-          fetch-depth: 0
           ref: ${{ needs.candidate.outputs.source_commit }}
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build release binary
-        run: cargo build --release --package chimera_server_app
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-windows
 
-      - name: Prepare Windows artifacts
+      - name: Build Windows binary
+        run: cargo build --release --locked --package chimera_server_app
+
+      - name: Package Windows artifacts
         shell: pwsh
         env:
           TAG: ${{ needs.candidate.outputs.tag }}
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target\release\chimera_server_app.exe "dist\chimera_server_app-$env:TAG-windows-x86_64.exe"
-          $hash = (Get-FileHash "dist\chimera_server_app-$env:TAG-windows-x86_64.exe" -Algorithm SHA256).Hash.ToLower()
-          "$hash  chimera_server_app-$env:TAG-windows-x86_64.exe" | Out-File -Encoding ascii "dist\chimera_server_app-$env:TAG-windows-x86_64.exe.sha256"
-          Get-ChildItem -Path dist
+          $binary = "dist\chimera_server_app-$env:TAG-windows-x86_64.exe"
+          Copy-Item target\release\chimera_server_app.exe $binary
+          $hash = (Get-FileHash $binary -Algorithm SHA256).Hash.ToLower()
+          "$hash  chimera_server_app-$env:TAG-windows-x86_64.exe" |
+            Out-File -Encoding ascii "$binary.sha256"
 
-      - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: release-windows-${{ needs.candidate.outputs.tag }}
           path: dist/*
           if-no-files-found: error
 
   publish:
-    name: Publish release
-    needs:
-      - candidate
-      - build-linux
-      - build-windows
+    name: Publish
+    needs: [candidate, linux-artifacts, windows-artifacts]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
@@ -277,21 +281,18 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Download release artifacts
-        uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v5
         with:
           pattern: release-*-${{ needs.candidate.outputs.tag }}
           path: dist
           merge-multiple: true
 
-      - name: Verify release artifacts
-        shell: bash
+      - name: Verify artifacts
         env:
           TAG: ${{ needs.candidate.outputs.tag }}
         run: |
           set -euo pipefail
           cd dist
-
           expected=(
             "chimera_server_app-${TAG}-linux-x86_64"
             "chimera_server_app-${TAG}-linux-x86_64.sha256"
@@ -306,16 +307,13 @@ jobs:
               exit 1
             }
           done
-
           sha256sum -c \
             "chimera_server_app-${TAG}-linux-x86_64.sha256" \
             "chimera_server_app-${TAG}-linux-x86_64-musl.sha256" \
             "chimera_server_app-${TAG}-windows-x86_64.exe.sha256"
-          ls -lh
 
-      - name: Create annotated release tag
+      - name: Create annotated tag
         if: needs.candidate.outputs.tag_preexists != 'true'
-        shell: bash
         env:
           TAG: ${{ needs.candidate.outputs.tag }}
           RELEASE_GOAL: ${{ needs.candidate.outputs.release_goal }}
@@ -333,8 +331,8 @@ jobs:
           body: |
             Primary protocol goal: ${{ needs.candidate.outputs.release_goal }}
 
-            This release contains one primary protocol goal and was published only after the repository release gates, Linux/Windows preflight tests, and all release artifacts completed successfully for the exact candidate commit.
-            Validate this release before starting the next protocol goal.
+            Published from ${{ needs.candidate.outputs.source_commit }} only after Linux/Windows preflight tests, repository release gates, and all platform artifacts passed.
+            Validate this release before starting the next primary protocol goal.
           files: |
             dist/chimera_server_app-${{ needs.candidate.outputs.tag }}-linux-x86_64
             dist/chimera_server_app-${{ needs.candidate.outputs.tag }}-linux-x86_64.sha256
