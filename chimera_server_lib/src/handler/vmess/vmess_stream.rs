@@ -92,6 +92,7 @@ pub struct VmessStream {
 
     write_cache: Box<[u8]>,
     write_cache_size: usize,
+    pending_write_len: Option<usize>,
 
     write_packet: Box<[u8]>,
     write_packet_start_offset: usize,
@@ -237,6 +238,7 @@ impl VmessStream {
             processed_message_lengths: VecDeque::new(),
             write_cache,
             write_cache_size: 0,
+            pending_write_len: None,
             write_packet,
             write_packet_start_offset: 0,
             write_packet_end_offset: 0,
@@ -735,6 +737,23 @@ impl VmessStream {
         true
     }
 
+    fn drain_accepted_write(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> std::io::Result<bool> {
+        while self.write_packet_end_offset > 0 || self.write_cache_size > 0 {
+            if self.write_packet_end_offset == 0 && !self.create_write_packet() {
+                return Err(std::io::Error::other(
+                    "VMess write buffer cannot make framing progress",
+                ));
+            }
+            if !self.do_write_packet(cx)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     #[inline]
     fn do_write_packet(&mut self, cx: &mut Context<'_>) -> std::io::Result<bool> {
         loop {
@@ -906,34 +925,40 @@ impl AsyncWrite for VmessStream {
     ) -> std::task::Poll<std::io::Result<usize>> {
         let this = self.get_mut();
 
-        let mut cache_space =
-            this.write_cache.len().saturating_sub(this.write_cache_size);
-
-        if cache_space == 0 {
-            while this.write_cache_size > 0 && this.create_write_packet() {}
-            match this.do_write_packet(cx) {
-                Ok(all_written) => {
-                    if !all_written {
-                        return Poll::Pending;
-                    }
+        if let Some(write_len) = this.pending_write_len {
+            return match this.drain_accepted_write(cx) {
+                Ok(true) => {
+                    this.pending_write_len = None;
+                    Poll::Ready(Ok(write_len))
                 }
-                Err(e) => {
-                    return Poll::Ready(Err(e));
+                Ok(false) => Poll::Pending,
+                Err(error) => {
+                    this.pending_write_len = None;
+                    Poll::Ready(Err(error))
                 }
-            }
-            while this.write_cache_size > 0 && this.create_write_packet() {}
-            cache_space =
-                this.write_cache.len().saturating_sub(this.write_cache_size);
-            assert!(cache_space > 0);
+            };
         }
 
-        let write_count = std::cmp::min(cache_space, buf.len());
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
 
-        this.write_cache[this.write_cache_size..this.write_cache_size + write_count]
-            .copy_from_slice(&buf[0..write_count]);
-        this.write_cache_size += write_count;
+        let write_count = std::cmp::min(this.write_cache.len(), buf.len());
+        this.write_cache[..write_count].copy_from_slice(&buf[..write_count]);
+        this.write_cache_size = write_count;
+        this.pending_write_len = Some(write_count);
 
-        Poll::Ready(Ok(write_count))
+        match this.drain_accepted_write(cx) {
+            Ok(true) => {
+                this.pending_write_len = None;
+                Poll::Ready(Ok(write_count))
+            }
+            Ok(false) => Poll::Pending,
+            Err(error) => {
+                this.pending_write_len = None;
+                Poll::Ready(Err(error))
+            }
+        }
     }
 
     fn poll_flush(
@@ -1238,6 +1263,7 @@ mod tests {
         future::poll_fn,
         pin::Pin,
         task::{Context, Poll},
+        time::Duration,
     };
 
     use sha3::{
@@ -1954,6 +1980,66 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("too large"));
+    }
+
+    #[tokio::test]
+    async fn small_tcp_write_is_framed_without_explicit_flush() {
+        let (mut client, mut stream) = plain_stream(false);
+        stream
+            .write_all(b"ping")
+            .await
+            .expect("write small plain VMess TCP payload");
+
+        let frame = tokio::time::timeout(Duration::from_millis(100), async {
+            let length = client.read_u16().await.expect("read VMess frame length");
+            let mut payload = vec![0u8; length as usize];
+            client
+                .read_exact(&mut payload)
+                .await
+                .expect("read VMess frame payload");
+            payload
+        })
+        .await
+        .expect("small VMess write must not wait for flush or EOF");
+        assert_eq!(frame, b"ping");
+    }
+
+    #[tokio::test]
+    async fn padded_tcp_write_drains_tail_without_explicit_flush() {
+        let seed = [0x12, 0x34];
+        let mut preview = LengthMask::new(shake_reader(&seed), true);
+        assert!(preview.next_values().0 > 0, "fixture must split the write");
+
+        let (mut client, mut stream) = plain_stream(false);
+        stream.write_length_mask = Some(LengthMask::new(shake_reader(&seed), true));
+        let payload = (0..MAX_ENCRYPTED_WRITE_DATA_SIZE)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        stream
+            .write_all(&payload)
+            .await
+            .expect("write padded VMess TCP payload");
+
+        let decoded = tokio::time::timeout(Duration::from_millis(100), async {
+            let mut mask = LengthMask::new(shake_reader(&seed), true);
+            let mut decoded = Vec::with_capacity(payload.len());
+            while decoded.len() < payload.len() {
+                let (padding_len, length_mask) = mask.next_values();
+                let wire_length =
+                    client.read_u16().await.expect("read masked frame length");
+                let frame_length = (wire_length ^ length_mask) as usize;
+                let mut frame = vec![0u8; frame_length];
+                client
+                    .read_exact(&mut frame)
+                    .await
+                    .expect("read padded VMess frame");
+                decoded.extend_from_slice(&frame[..frame_length - padding_len]);
+            }
+            decoded
+        })
+        .await
+        .expect("padded VMess write tail must not wait for flush or EOF");
+        assert_eq!(decoded, payload);
     }
 
     #[tokio::test]

@@ -1416,6 +1416,282 @@ async fn xray_client_can_proxy_tcp_and_aes_udp_through_chimera_shadowsocks_2022(
     }
 }
 
+#[derive(Clone, Copy)]
+enum VlessTransportCase {
+    Tcp,
+    WebSocket,
+    WebSocketTls,
+}
+
+impl VlessTransportCase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp-none",
+            Self::WebSocket => "ws-none",
+            Self::WebSocketTls => "ws-tls",
+        }
+    }
+}
+
+async fn run_xray_client_vless_transport_case(case: VlessTransportCase) {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir(&format!("vless-{}", case.name()));
+    let echo_addr = start_tcp_echo_server();
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let cert_path = workspace.join("cert/cert.pem");
+    let key_path = workspace.join("cert/key.pem");
+    let pinned_peer_cert_sha256 = first_cert_sha256_hex(&cert_path);
+    let chimera_config_path = work_dir.join("chimera.json");
+    let xray_config_path = work_dir.join("xray-client.json");
+
+    let (chimera_stream, xray_stream) = match case {
+        VlessTransportCase::Tcp => (
+            json!({"network": "tcp", "security": "none"}),
+            json!({"network": "tcp", "security": "none"}),
+        ),
+        VlessTransportCase::WebSocket => (
+            json!({
+                "network": "ws",
+                "security": "none",
+                "wsSettings": {"host": "localhost", "path": "/vless-ws"}
+            }),
+            json!({
+                "network": "ws",
+                "security": "none",
+                "wsSettings": {"host": "localhost", "path": "/vless-ws"}
+            }),
+        ),
+        VlessTransportCase::WebSocketTls => (
+            json!({
+                "network": "ws",
+                "security": "tls",
+                "wsSettings": {"host": "localhost", "path": "/vless-wss"},
+                "tlsSettings": {
+                    "serverName": "localhost",
+                    "certificates": [{
+                        "certificateFile": cert_path,
+                        "keyFile": key_path
+                    }]
+                }
+            }),
+            json!({
+                "network": "ws",
+                "security": "tls",
+                "wsSettings": {"host": "localhost", "path": "/vless-wss"},
+                "tlsSettings": {
+                    "serverName": "localhost",
+                    "pinnedPeerCertSha256": pinned_peer_cert_sha256
+                }
+            }),
+        ),
+    };
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "vless",
+                "tag": format!("chimera-vless-{}", case.name()),
+                "settings": {
+                    "clients": [{"id": TEST_UUID, "email": "vless-transport@example.test"}],
+                    "decryption": "none"
+                },
+                "streamSettings": chimera_stream
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth"}
+            }],
+            "outbounds": [{
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": chimera_port,
+                        "users": [{"id": TEST_UUID, "encryption": "none"}]
+                    }]
+                },
+                "streamSettings": xray_stream
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+    assert_socks5_echo(
+        socks_addr,
+        echo_addr,
+        format!("VLESS {} through Xray", case.name()).as_bytes(),
+    );
+    assert_socks5_echo(socks_addr, echo_addr, &deterministic_payload(64 * 1024));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera as server and ./xray as client for plain VLESS TCP"]
+async fn xray_client_can_proxy_tcp_through_chimera_vless_tcp() {
+    run_xray_client_vless_transport_case(VlessTransportCase::Tcp).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera as server and ./xray as client for VLESS WebSocket"]
+async fn xray_client_can_proxy_tcp_through_chimera_vless_ws() {
+    run_xray_client_vless_transport_case(VlessTransportCase::WebSocket).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera as server and ./xray as client for VLESS WebSocket over TLS"]
+async fn xray_client_can_proxy_tcp_through_chimera_vless_wss() {
+    run_xray_client_vless_transport_case(VlessTransportCase::WebSocketTls).await;
+}
+
+async fn run_xray_client_vmess_transport_case(case: VlessTransportCase) {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir(&format!("vmess-{}", case.name()));
+    let echo_addr = start_tcp_echo_server();
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let cert_path = workspace.join("cert/cert.pem");
+    let key_path = workspace.join("cert/key.pem");
+    let pinned_peer_cert_sha256 = first_cert_sha256_hex(&cert_path);
+    let chimera_config_path = work_dir.join("chimera.json");
+    let xray_config_path = work_dir.join("xray-client.json");
+
+    let (chimera_stream, xray_stream) = match case {
+        VlessTransportCase::Tcp => (
+            json!({"network": "tcp", "security": "none"}),
+            json!({"network": "tcp", "security": "none"}),
+        ),
+        VlessTransportCase::WebSocket => (
+            json!({
+                "network": "ws",
+                "security": "none",
+                "wsSettings": {"host": "localhost", "path": "/vmess-ws"}
+            }),
+            json!({
+                "network": "ws",
+                "security": "none",
+                "wsSettings": {"host": "localhost", "path": "/vmess-ws"}
+            }),
+        ),
+        VlessTransportCase::WebSocketTls => (
+            json!({
+                "network": "ws",
+                "security": "tls",
+                "wsSettings": {"host": "localhost", "path": "/vmess-wss"},
+                "tlsSettings": {
+                    "serverName": "localhost",
+                    "certificates": [{
+                        "certificateFile": cert_path,
+                        "keyFile": key_path
+                    }]
+                }
+            }),
+            json!({
+                "network": "ws",
+                "security": "tls",
+                "wsSettings": {"host": "localhost", "path": "/vmess-wss"},
+                "tlsSettings": {
+                    "serverName": "localhost",
+                    "pinnedPeerCertSha256": pinned_peer_cert_sha256
+                }
+            }),
+        ),
+    };
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "vmess",
+                "tag": format!("chimera-vmess-{}", case.name()),
+                "settings": {
+                    "clients": [{
+                        "id": TEST_UUID,
+                        "email": "vmess-transport@example.test",
+                        "security": "auto"
+                    }]
+                },
+                "streamSettings": chimera_stream
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth"}
+            }],
+            "outbounds": [{
+                "protocol": "vmess",
+                "settings": {
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": chimera_port,
+                        "users": [{"id": TEST_UUID, "security": "auto"}]
+                    }]
+                },
+                "streamSettings": xray_stream
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+    assert_socks5_echo(socks_addr, echo_addr, &deterministic_payload(64 * 1024));
+    assert_socks5_echo(
+        socks_addr,
+        echo_addr,
+        format!("VMess {} through Xray", case.name()).as_bytes(),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera as server and ./xray as client for VMess TCP"]
+async fn xray_client_can_proxy_tcp_through_chimera_vmess_tcp() {
+    run_xray_client_vmess_transport_case(VlessTransportCase::Tcp).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera as server and ./xray as client for VMess WebSocket"]
+async fn xray_client_can_proxy_tcp_through_chimera_vmess_ws() {
+    run_xray_client_vmess_transport_case(VlessTransportCase::WebSocket).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera as server and ./xray as client for VMess WebSocket over TLS"]
+async fn xray_client_can_proxy_tcp_through_chimera_vmess_wss() {
+    run_xray_client_vmess_transport_case(VlessTransportCase::WebSocketTls).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts Chimera and ./xray for VLESS gRPC h2c"]
 async fn xray_client_can_proxy_tcp_through_chimera_grpc() {

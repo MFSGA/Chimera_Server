@@ -65,13 +65,13 @@ current code has an explicit config path and runtime handler path for it.
 
 The current pre-M5 compatibility baseline was refreshed against the repository-pinned `xray` binary (`Xray 26.2.6`) and the local fixed xray-core reference. Passing real-client/server checks in this refresh include:
 
-- Xray client -> Chimera: VLESS TLS+Vision TCP, VLESS gRPC h2c, VLESS HTTPUpgrade, HTTP/Mixed TCP proxying, legacy Shadowsocks TCP, Shadowsocks 2022 TCP + AES UDP, and Hysteria2 TCP + UDP with Xray defaults.
+- Xray client -> Chimera: plain VLESS TCP, VLESS WebSocket/WSS, VLESS TLS+Vision TCP, VLESS gRPC h2c, VLESS HTTPUpgrade, VMess TCP/WebSocket/WSS, HTTP/Mixed TCP proxying, legacy Shadowsocks TCP, Shadowsocks 2022 TCP + AES UDP, and Hysteria2 TCP + UDP with Xray defaults.
 - XHTTP security matrix with a real Xray peer: none, TLS, HTTP/3, and REALITY, each with 64 KiB payload coverage.
 - REALITY Vision parity: payload/framing boundary transfer and TCP half-close behavior compared with an Xray server baseline.
 - gRPC control-plane dual-server matrix: 18 strict/baseline-supported cases passed, 2 Xray-unsupported probes skipped, and 2 informational cases recorded; the VLESS multi-user flow also matched the Xray baseline.
 - Inbound lifecycle parity: RemoveInbound rejects new SOCKS TCP connections while preserving an already accepted tunnel on both Xray and Chimera; lifecycle failure gRPC codes match Xray. Chimera intentionally differs from Xray on AddInbound bind failure by rolling the failed instance back instead of retaining a dead handler tag.
 
-One top-level Xray-client REALITY+Vision test remains environment-blocked on this machine because its IPv6 echo bind fails with `EADDRNOTAVAIL`; the IPv4 REALITY parity tests above pass and exercise the same server handler path. Plain VLESS TCP, VLESS WS/WSS, VMess TCP/WS/TLS, and Trojan TCP/TLS/WS still need refreshed real Xray-client evidence before the pre-M5 certification pass is considered complete.
+One top-level Xray-client REALITY+Vision test remains environment-blocked on this machine because its IPv6 echo bind fails with `EADDRNOTAVAIL`; the IPv4 REALITY parity tests above pass and exercise the same server handler path. The refreshed VMess matrix also caught and fixed a real data-plane issue: `VmessStream::poll_write` could acknowledge an application write while random global padding left the final plaintext remainder buffered until a later write/flush, stalling interactive or tail traffic; accepted VMess writes now drain every generated frame before being acknowledged. Trojan TCP/TLS/WS still needs refreshed real Xray-client evidence before the pre-M5 certification pass is considered complete.
 
 ## Known Engineering Gaps
 
