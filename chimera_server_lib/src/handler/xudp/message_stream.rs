@@ -1661,7 +1661,7 @@ mod tests {
         );
         let relay_task = tokio::spawn(run_session_based_udp(
             Box::new(stream),
-            RuntimeState::new(Vec::new(), Vec::new()),
+            RuntimeState::new(Vec::new(), Vec::new()).data_plane(),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 43024)),
             None,
             None,
@@ -1749,7 +1749,7 @@ mod tests {
         );
         let relay_task = tokio::spawn(run_session_based_udp(
             Box::new(stream),
-            RuntimeState::new(Vec::new(), Vec::new()),
+            RuntimeState::new(Vec::new(), Vec::new()).data_plane(),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 43025)),
             None,
             None,
@@ -1863,7 +1863,7 @@ mod tests {
         );
         let relay_task = tokio::spawn(run_session_based_udp(
             Box::new(stream),
-            RuntimeState::new(Vec::new(), Vec::new()),
+            RuntimeState::new(Vec::new(), Vec::new()).data_plane(),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 43023)),
             None,
             None,

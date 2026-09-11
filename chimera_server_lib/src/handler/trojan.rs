@@ -803,7 +803,7 @@ mod tests {
         );
         let handler = TrojanTcpHandler::new(vec![first], Vec::new(), inbound_tag);
         let context = TcpServerConnectionContext {
-            runtime: Some(runtime.clone()),
+            runtime: Some(runtime.data_plane()),
             ..TcpServerConnectionContext::default()
         };
 

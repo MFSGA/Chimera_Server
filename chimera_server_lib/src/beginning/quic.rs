@@ -75,7 +75,7 @@ pub async fn start_quic_server(
                         config,
                         tcp_socket_policy,
                         tag,
-                        runtime,
+                        runtime.data_plane(),
                     )
                     .await
                     {
@@ -100,7 +100,7 @@ pub async fn start_quic_server(
                         server_config,
                         config,
                         tag,
-                        runtime,
+                        runtime.data_plane(),
                     )
                     .await
                     {

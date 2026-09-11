@@ -18,7 +18,7 @@ use crate::{
         Hysteria2ServerConfig, Hysteria2UdpFinalMask, TcpSocketPolicy,
     },
     resolver::{NativeResolver, Resolver},
-    runtime::RuntimeState,
+    runtime::DataPlaneRuntime,
     util::socket::new_socket2_udp_socket_with_buffer_size,
 };
 
@@ -113,7 +113,7 @@ fn create_hysteria2_listener_socket(
     Ok(socket)
 }
 
-fn spawn_hysteria2_connection<F>(runtime: &RuntimeState, future: F)
+fn spawn_hysteria2_connection<F>(runtime: &DataPlaneRuntime, future: F)
 where
     F: Future<Output = ()> + Send + 'static,
 {
@@ -126,7 +126,7 @@ pub async fn run_hysteria2_server(
     config: Hysteria2ServerConfig,
     socket_policy: Option<TcpSocketPolicy>,
     inbound_tag: String,
-    runtime: RuntimeState,
+    runtime: DataPlaneRuntime,
 ) -> std::io::Result<()> {
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
 
@@ -492,7 +492,7 @@ mod tests {
         let runtime = RuntimeState::new(Vec::new(), Vec::new());
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
 
-        spawn_hysteria2_connection(&runtime, async move {
+        spawn_hysteria2_connection(&runtime.data_plane(), async move {
             let _ = release_rx.await;
         });
         for _ in 0..50 {

@@ -411,11 +411,22 @@ pub fn start(opts: Options) -> Result<(), Error> {
     })
 }
 
+fn compile_configured_outbounds(
+    outbounds: &[config::def::OutboundItem],
+) -> Result<Vec<OutboundSummary>, Error> {
+    outbounds
+        .iter()
+        .map(outbound::compile_static_outbound)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Error::InvalidConfig)
+}
+
 pub fn validate(opts: Options) -> Result<(), Error> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     // 1. config parse
     let config = opts.config.try_parse(opts.config_format)?;
+    let _ = compile_configured_outbounds(&config.outbounds)?;
 
     let validation_runtime = RuntimeState::new(Vec::new(), Vec::new());
     install_configured_user_domain_policy(
@@ -507,12 +518,7 @@ async fn start_async(
         burst_observatory_config.as_ref(),
     )
     .map_err(Error::InvalidConfig)?;
-    let outbounds = config
-        .outbounds
-        .iter()
-        .map(outbound::compile_static_outbound)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(Error::InvalidConfig)?;
+    let outbounds = compile_configured_outbounds(&config.outbounds)?;
 
     let all_inbounds = config
         .inbounds
@@ -719,7 +725,9 @@ async fn start_async(
 mod tests {
     use std::time::Duration;
 
-    use super::{prepare_server_runtime, resolve_api_config};
+    use super::{
+        compile_configured_outbounds, prepare_server_runtime, resolve_api_config,
+    };
     use crate::{
         address::{Address, BindLocation, NetLocation},
         config::{
@@ -729,6 +737,27 @@ mod tests {
             server_config::{DokodemoDoorConfig, ServerConfig, ServerProxyConfig},
         },
     };
+
+    #[test]
+    fn check_compiles_outbounds_like_startup() {
+        let config: crate::config::def::LiteralConfig = serde_json::from_str(
+            r#"{
+                "inbounds": [],
+                "outbounds": [
+                    {"tag": "broken", "protocol": "vless"}
+                ]
+            }"#,
+        )
+        .expect("parse outbound validation config");
+
+        let error = compile_configured_outbounds(&config.outbounds)
+            .expect_err("VLESS outbound without settings must fail validation");
+        assert!(matches!(
+            error,
+            crate::Error::InvalidConfig(message)
+                if message == "vless outbound broken requires settings"
+        ));
+    }
 
     #[test]
     fn prepare_server_runtime_applies_root_xray_policy() {

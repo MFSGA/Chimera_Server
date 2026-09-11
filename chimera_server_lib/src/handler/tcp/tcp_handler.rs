@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use crate::{
     address::NetLocation,
     async_stream::{AsyncMessageStream, AsyncStream, AsyncTargetedMessageStream},
-    runtime::RuntimeState,
+    runtime::DataPlaneRuntime,
     traffic::TrafficContext,
 };
 
@@ -17,7 +17,7 @@ pub struct TcpServerConnectionContext {
     pub listener_addr: Option<std::net::SocketAddr>,
     pub server_name: Option<String>,
     pub alpn_protocol: Option<String>,
-    pub runtime: Option<RuntimeState>,
+    pub runtime: Option<DataPlaneRuntime>,
 }
 
 #[async_trait]

@@ -41,7 +41,7 @@ use crate::{
     },
     outbound::{InboundRoutingMetadata, connect_tcp_outbound_with_routing_metadata},
     resolver::{NativeResolver, Resolver, resolve_single_address},
-    runtime::RuntimeState,
+    runtime::{DataPlaneRuntime, RuntimeState},
     tls_client_hello::{ClientHelloInspection, inspect_client_hello},
     traffic::{
         MeteredStream, TrafficContext, TrafficDirection, record_transfer,
@@ -578,7 +578,7 @@ async fn run_tcp_server(
         }
         let cloned_cache = resolver.clone();
         let cloned_handler = server_handler.clone();
-        let connection_runtime = runtime.clone();
+        let connection_runtime = runtime.data_plane();
         let sniffing = sniffing.clone();
 
         runtime.spawn_inbound_connection(async move {
@@ -1136,7 +1136,7 @@ pub(super) async fn process_stream<AS>(
     server_handler: Arc<Box<dyn TcpServerHandler>>,
     resolver: Arc<dyn Resolver>,
     peer_addr: SocketAddr,
-    runtime: RuntimeState,
+    runtime: DataPlaneRuntime,
 ) -> std::io::Result<()>
 where
     AS: AsyncStream + 'static,
@@ -1158,7 +1158,7 @@ pub(super) async fn process_stream_with_local_addr<AS>(
     resolver: Arc<dyn Resolver>,
     peer_addr: SocketAddr,
     local_addr: Option<SocketAddr>,
-    runtime: RuntimeState,
+    runtime: DataPlaneRuntime,
 ) -> std::io::Result<()>
 where
     AS: AsyncStream + 'static,
@@ -1181,7 +1181,7 @@ pub(super) async fn process_stream_with_sniffing_and_local_addr<AS>(
     resolver: Arc<dyn Resolver>,
     peer_addr: SocketAddr,
     local_addr: Option<SocketAddr>,
-    runtime: RuntimeState,
+    runtime: DataPlaneRuntime,
     sniffing: Option<InboundSniffingConfig>,
 ) -> std::io::Result<()>
 where
@@ -1201,7 +1201,7 @@ where
 }
 
 fn stream_connection_context(
-    runtime: &RuntimeState,
+    runtime: &DataPlaneRuntime,
     local_addr: Option<SocketAddr>,
 ) -> TcpServerConnectionContext {
     TcpServerConnectionContext {
@@ -1284,7 +1284,7 @@ async fn process_stream_with_context<AS>(
     server_handler: Arc<Box<dyn TcpServerHandler>>,
     resolver: Arc<dyn Resolver>,
     peer_addr: SocketAddr,
-    runtime: RuntimeState,
+    runtime: DataPlaneRuntime,
     connection_context: TcpServerConnectionContext,
     sniffing: Option<InboundSniffingConfig>,
 ) -> std::io::Result<()>
@@ -1690,7 +1690,7 @@ where
 async fn setup_routed_client_stream(
     resolver: Arc<dyn Resolver>,
     remote_location: NetLocation,
-    runtime: &RuntimeState,
+    runtime: &DataPlaneRuntime,
     inbound_tag: &str,
     user: &str,
     peer_addr: SocketAddr,
@@ -2146,7 +2146,8 @@ mod tests {
     fn logical_stream_context_preserves_local_addr() {
         let runtime = RuntimeState::new(Vec::new(), Vec::new());
         let local_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        let context = stream_connection_context(&runtime, Some(local_addr));
+        let context =
+            stream_connection_context(&runtime.data_plane(), Some(local_addr));
 
         assert_eq!(context.local_addr, Some(local_addr));
         assert!(context.runtime.is_some());

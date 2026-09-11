@@ -150,7 +150,7 @@ async fn start_test_connection() -> (
             zero_rtt_handshake: false,
         },
         TEST_INBOUND.into(),
-        runtime,
+        runtime.data_plane(),
     ));
 
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());

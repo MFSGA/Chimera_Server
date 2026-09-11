@@ -688,7 +688,7 @@ mod tests {
             .setup_server_stream_with_context(
                 Box::new(TestStream(server)),
                 TcpServerConnectionContext {
-                    runtime: Some(runtime.clone()),
+                    runtime: Some(runtime.data_plane()),
                     ..TcpServerConnectionContext::default()
                 },
             )
@@ -727,7 +727,7 @@ mod tests {
             .setup_server_stream_with_context(
                 Box::new(TestStream(server)),
                 TcpServerConnectionContext {
-                    runtime: Some(runtime),
+                    runtime: Some(runtime.data_plane()),
                     ..TcpServerConnectionContext::default()
                 },
             )
@@ -754,7 +754,7 @@ mod tests {
         );
         runtime.replace_policy(Some(&policy));
         let context = TcpServerConnectionContext {
-            runtime: Some(runtime),
+            runtime: Some(runtime.data_plane()),
             ..TcpServerConnectionContext::default()
         };
         assert_eq!(
@@ -1068,7 +1068,7 @@ mod tests {
             stream,
             remote_location,
             Arc::new(NativeResolver::new()),
-            RuntimeState::new(Vec::new(), Vec::new()),
+            RuntimeState::new(Vec::new(), Vec::new()).data_plane(),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 43123)),
             None,
             traffic_context,
@@ -1248,7 +1248,7 @@ mod tests {
 
         let relay_task = tokio::spawn(run_session_based_udp(
             stream,
-            RuntimeState::new(Vec::new(), Vec::new()),
+            RuntimeState::new(Vec::new(), Vec::new()).data_plane(),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 43141)),
             None,
             traffic_context,

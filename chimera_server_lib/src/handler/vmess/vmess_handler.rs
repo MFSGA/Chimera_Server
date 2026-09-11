@@ -1061,7 +1061,7 @@ mod tests {
         let handler =
             VmessTcpServerHandler::new(vec![first.clone()], true, inbound_tag);
         let context = TcpServerConnectionContext {
-            runtime: Some(runtime.clone()),
+            runtime: Some(runtime.data_plane()),
             ..TcpServerConnectionContext::default()
         };
 
@@ -1872,7 +1872,7 @@ mod tests {
 
         let relay_task = tokio::spawn(run_session_based_udp(
             stream,
-            RuntimeState::new(Vec::new(), Vec::new()),
+            RuntimeState::new(Vec::new(), Vec::new()).data_plane(),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 43152)),
             None,
             traffic_context,

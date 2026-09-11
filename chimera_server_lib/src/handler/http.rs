@@ -1685,7 +1685,7 @@ mod tests {
         let handler = HttpTcpServerHandler::new(Vec::new(), false, "http-policy")
             .with_user_level(7);
         let context = TcpServerConnectionContext {
-            runtime: Some(runtime),
+            runtime: Some(runtime.data_plane()),
             ..TcpServerConnectionContext::default()
         };
         assert_eq!(

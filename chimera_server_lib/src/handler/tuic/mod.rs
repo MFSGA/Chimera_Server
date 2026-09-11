@@ -27,7 +27,7 @@ use crate::{
         select_direct_outbound,
     },
     resolver::{NativeResolver, Resolver, resolve_single_address},
-    runtime::RuntimeState,
+    runtime::DataPlaneRuntime,
     traffic::{
         ConnectionGuard, MeteredStream, TrafficContext, TrafficDirection,
         record_transfer, register_connection,
@@ -69,7 +69,7 @@ type UdpSessionMap = Arc<DashMap<u16, UdpSession>>;
 struct TuicConnectionContext {
     identity: Arc<String>,
     inbound_tag: Arc<String>,
-    runtime: RuntimeState,
+    runtime: DataPlaneRuntime,
 }
 
 #[derive(Clone)]
@@ -97,7 +97,7 @@ fn fragment_cache_size() -> NonZeroUsize {
         .unwrap_or_else(|| NonZeroUsize::new(1).expect("non-zero"))
 }
 
-fn spawn_tuic_connection<F>(runtime: &RuntimeState, future: F)
+fn spawn_tuic_connection<F>(runtime: &DataPlaneRuntime, future: F)
 where
     F: Future<Output = ()> + Send + 'static,
 {
@@ -105,7 +105,7 @@ where
 }
 
 struct TuicConnectionTaskOwnerInner {
-    runtime: RuntimeState,
+    runtime: DataPlaneRuntime,
     tracker: TaskTracker,
     cancellation: CancellationToken,
 }
@@ -123,7 +123,7 @@ struct TuicConnectionTaskOwner {
 }
 
 impl TuicConnectionTaskOwner {
-    fn new(runtime: RuntimeState) -> Self {
+    fn new(runtime: DataPlaneRuntime) -> Self {
         Self {
             inner: Arc::new(TuicConnectionTaskOwnerInner {
                 runtime,
@@ -161,7 +161,7 @@ pub async fn run_tuic_server(
     server_config: Arc<rustls::ServerConfig>,
     config: TuicServerConfig,
     inbound_tag: String,
-    runtime: RuntimeState,
+    runtime: DataPlaneRuntime,
 ) -> std::io::Result<()> {
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
 
@@ -1680,7 +1680,7 @@ mod tests {
     use tokio::time::timeout;
 
     use crate::{
-        runtime::OutboundSummary,
+        runtime::{OutboundSummary, RuntimeState},
         traffic::{register_connection, snapshot},
     };
 
@@ -1709,7 +1709,7 @@ mod tests {
         let runtime = RuntimeState::new(Vec::new(), Vec::new());
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
 
-        spawn_tuic_connection(&runtime, async move {
+        spawn_tuic_connection(&runtime.data_plane(), async move {
             let _ = release_rx.await;
         });
         for _ in 0..50 {
@@ -1735,7 +1735,7 @@ mod tests {
     #[tokio::test]
     async fn tuic_child_task_shutdown_cancels_and_waits() {
         let runtime = RuntimeState::new(Vec::new(), Vec::new());
-        let child_tasks = TuicConnectionTaskOwner::new(runtime.clone());
+        let child_tasks = TuicConnectionTaskOwner::new(runtime.data_plane());
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
 
@@ -1758,7 +1758,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_tuic_child_owner_cancels_server_owned_task() {
         let runtime = RuntimeState::new(Vec::new(), Vec::new());
-        let child_tasks = TuicConnectionTaskOwner::new(runtime.clone());
+        let child_tasks = TuicConnectionTaskOwner::new(runtime.data_plane());
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
 
@@ -1804,7 +1804,7 @@ mod tests {
             connection: TuicConnectionContext {
                 identity: Arc::new("tuic-policy-user".into()),
                 inbound_tag: Arc::new("tuic-policy-in".into()),
-                runtime,
+                runtime: runtime.data_plane(),
             },
             peer_addr: "127.0.0.1:12345".parse().unwrap(),
         }
@@ -1876,7 +1876,7 @@ mod tests {
             connection: TuicConnectionContext {
                 identity: Arc::new("tuic-test-user".into()),
                 inbound_tag: Arc::new("tuic-test-in".into()),
-                runtime,
+                runtime: runtime.data_plane(),
             },
             peer_addr: "127.0.0.1:12345".parse().unwrap(),
         };

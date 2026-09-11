@@ -558,7 +558,7 @@ mod tests {
                 .setup_server_stream_with_context(
                     Box::new(server_io),
                     TcpServerConnectionContext {
-                        runtime: Some(runtime),
+                        runtime: Some(runtime.data_plane()),
                         ..TcpServerConnectionContext::default()
                     },
                 )

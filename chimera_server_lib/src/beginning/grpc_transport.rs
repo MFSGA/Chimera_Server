@@ -47,7 +47,7 @@ use crate::{
         tcp_handler::TcpServerHandler, tcp_handler_util::create_tcp_server_handler,
     },
     resolver::{NativeResolver, Resolver},
-    runtime::RuntimeState,
+    runtime::{DataPlaneRuntime, RuntimeState},
 };
 
 use super::transport_plan::{GrpcListenerPlan, ListenerSecurityPlan};
@@ -309,6 +309,7 @@ pub(super) async fn start_grpc_server(
         create_tcp_server_handler(inner_protocol, &tag, &mut rules_stack)?,
     );
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let data_plane = runtime.data_plane();
     let listen_addr = match bind_location {
         BindLocation::Address(location) => location.to_socket_addr()?,
     };
@@ -369,7 +370,7 @@ pub(super) async fn start_grpc_server(
                 Arc::new(grpc_config.trusted_x_forwarded_for.clone());
             let server_handler = server_handler.clone();
             let resolver = resolver.clone();
-            let runtime = runtime.clone();
+            let runtime = data_plane.clone();
             let connection_runtime = runtime.clone();
             let sniffing = sniffing.clone();
             match &security {
@@ -601,7 +602,7 @@ async fn serve_grpc_connection<IO>(
     keepalive: GrpcKeepalive,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
     resolver: Arc<dyn Resolver>,
-    runtime: RuntimeState,
+    runtime: DataPlaneRuntime,
 ) where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -642,7 +643,7 @@ async fn handle_request(
     tun_multi_service_path: String,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
     resolver: Arc<dyn Resolver>,
-    runtime: RuntimeState,
+    runtime: DataPlaneRuntime,
     peer_context: GrpcPeerContext,
 ) -> Result<Response<ResponseBody>, Infallible> {
     let (logical_peer_addr, logical_local_addr) =
