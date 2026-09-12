@@ -351,8 +351,7 @@ impl TcpServerHandler for TrojanTcpHandler {
         context: TcpServerConnectionContext,
     ) -> std::io::Result<TcpServerSetupResult> {
         if let Some(store) = context
-            .runtime
-            .as_ref()
+            .inbound_handshake_runtime()
             .and_then(|runtime| runtime.trojan_user_store(&self.inbound_tag))
         {
             let _ = self.runtime_credentials.set(store);
@@ -803,7 +802,9 @@ mod tests {
         );
         let handler = TrojanTcpHandler::new(vec![first], Vec::new(), inbound_tag);
         let context = TcpServerConnectionContext {
-            runtime: Some(runtime.data_plane()),
+            handshake_runtime: Some(
+                runtime.data_plane().inbound_handshake_runtime(),
+            ),
             ..TcpServerConnectionContext::default()
         };
 

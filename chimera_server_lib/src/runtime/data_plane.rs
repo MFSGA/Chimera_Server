@@ -32,6 +32,61 @@ use super::{
     RoutingPublication,
 };
 
+#[derive(Debug, Clone)]
+pub struct InboundHandshakeRuntime {
+    inbound_manager: Arc<InboundManager>,
+    policy: Arc<RwLock<PolicyConfig>>,
+}
+
+impl InboundHandshakeRuntime {
+    pub fn xray_handshake_timeout_for_level(&self, level: u32) -> Duration {
+        xray_handshake_timeout_for_policy(&self.policy, level)
+    }
+
+    #[cfg(feature = "vless")]
+    pub(crate) fn vless_users_snapshot(&self, tag: &str) -> Option<Vec<VlessUser>> {
+        self.inbound_manager.vless_users_snapshot(tag)
+    }
+
+    #[cfg(feature = "vmess")]
+    pub(crate) fn vmess_user_store(&self, tag: &str) -> Option<Arc<VmessUserStore>> {
+        self.inbound_manager.vmess_user_store(tag)
+    }
+
+    #[cfg(feature = "trojan")]
+    pub(crate) fn trojan_user_store(
+        &self,
+        tag: &str,
+    ) -> Option<Arc<TrojanUserStore>> {
+        self.inbound_manager.trojan_user_store(tag)
+    }
+
+    #[cfg(feature = "shadowsocks")]
+    pub(crate) fn shadowsocks_user_store(
+        &self,
+        tag: &str,
+    ) -> Option<Arc<ShadowsocksUserStore>> {
+        self.inbound_manager.shadowsocks_user_store(tag)
+    }
+}
+
+fn xray_handshake_timeout_for_policy(
+    policy: &RwLock<PolicyConfig>,
+    level: u32,
+) -> Duration {
+    const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 60;
+    let seconds = policy
+        .read()
+        .expect("runtime policy lock poisoned")
+        .levels
+        .get(&level)
+        .and_then(Option::as_ref)
+        .and_then(|policy| policy.handshake)
+        .map(u64::from)
+        .unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT_SECS);
+    Duration::from_secs(seconds)
+}
+
 #[derive(Debug)]
 pub(super) struct DataPlaneState {
     pub(super) inbound_manager: Arc<InboundManager>,
@@ -57,18 +112,7 @@ impl DataPlaneState {
     }
 
     pub(super) fn xray_handshake_timeout_for_level(&self, level: u32) -> Duration {
-        const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 60;
-        let seconds = self
-            .policy
-            .read()
-            .expect("runtime policy lock poisoned")
-            .levels
-            .get(&level)
-            .and_then(Option::as_ref)
-            .and_then(|policy| policy.handshake)
-            .map(u64::from)
-            .unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT_SECS);
-        Duration::from_secs(seconds)
+        xray_handshake_timeout_for_policy(&self.policy, level)
     }
 
     pub(super) fn xray_connection_idle_timeout_for_level(
@@ -272,6 +316,13 @@ impl DataPlaneState {
 pub struct DataPlaneRuntime(pub(super) Arc<DataPlaneState>);
 
 impl DataPlaneRuntime {
+    pub fn inbound_handshake_runtime(&self) -> InboundHandshakeRuntime {
+        InboundHandshakeRuntime {
+            inbound_manager: Arc::clone(&self.0.inbound_manager),
+            policy: Arc::clone(&self.0.policy),
+        }
+    }
+
     pub(crate) fn spawn_inbound_connection<F>(&self, future: F) -> bool
     where
         F: std::future::Future<Output = ()> + Send + 'static,

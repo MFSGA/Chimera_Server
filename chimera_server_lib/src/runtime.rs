@@ -133,8 +133,8 @@ impl RuntimeLifecycleState {
 }
 
 mod data_plane;
-pub use data_plane::DataPlaneRuntime;
 use data_plane::DataPlaneState;
+pub use data_plane::{DataPlaneRuntime, InboundHandshakeRuntime};
 
 #[derive(Debug, Clone)]
 pub struct RuntimeState {

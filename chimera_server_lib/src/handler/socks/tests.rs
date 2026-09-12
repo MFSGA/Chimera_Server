@@ -160,7 +160,7 @@ async fn socks_handshake_policy_starts_after_protocol_discriminator_like_xray() 
         peer_addr: Some(peer_addr),
         local_addr: Some(local_addr),
         listener_addr: Some(listener_addr),
-        runtime: Some(runtime.data_plane()),
+        handshake_runtime: Some(runtime.data_plane().inbound_handshake_runtime()),
         ..TcpServerConnectionContext::default()
     };
     let mut task = tokio::spawn(async move {

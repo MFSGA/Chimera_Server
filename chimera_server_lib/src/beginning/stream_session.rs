@@ -382,7 +382,7 @@ pub(super) fn stream_connection_context(
 ) -> TcpServerConnectionContext {
     TcpServerConnectionContext {
         local_addr,
-        runtime: Some(runtime.clone()),
+        handshake_runtime: Some(runtime.inbound_handshake_runtime()),
         ..TcpServerConnectionContext::default()
     }
 }

@@ -831,13 +831,12 @@ impl TcpServerHandler for RealityVisionVlessServerHandler {
         server_stream: Box<dyn AsyncStream>,
         context: TcpServerConnectionContext,
     ) -> io::Result<TcpServerSetupResult> {
-        let dynamic_users = context
-            .runtime
+        let handshake_runtime = context.inbound_handshake_runtime();
+        let dynamic_users = handshake_runtime
             .as_ref()
             .and_then(|runtime| runtime.vless_users_snapshot(&self.inbound_tag));
         let users = dynamic_users.as_deref().unwrap_or(&self.users);
-        let timeout = context
-            .runtime
+        let timeout = handshake_runtime
             .as_ref()
             .map(|runtime| runtime.xray_handshake_timeout_for_level(0))
             .unwrap_or(Duration::from_secs(60));

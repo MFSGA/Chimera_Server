@@ -300,7 +300,7 @@ async fn runtime_user_store_updates_existing_handler_without_rebuild() {
     );
     let handler = VmessTcpServerHandler::new(vec![first.clone()], true, inbound_tag);
     let context = TcpServerConnectionContext {
-        runtime: Some(runtime.data_plane()),
+        handshake_runtime: Some(runtime.data_plane().inbound_handshake_runtime()),
         ..TcpServerConnectionContext::default()
     };
 

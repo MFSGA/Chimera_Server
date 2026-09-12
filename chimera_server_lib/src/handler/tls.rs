@@ -225,13 +225,12 @@ impl TcpServerHandler for TlsServerHandler {
                 fallbacks,
                 inbound_tag,
             } => {
-                let timeout = context
-                    .runtime
+                let handshake_runtime = context.inbound_handshake_runtime();
+                let timeout = handshake_runtime
                     .as_ref()
                     .map(|runtime| runtime.xray_handshake_timeout_for_level(0))
                     .unwrap_or(Duration::from_secs(60));
-                let dynamic_users = context
-                    .runtime
+                let dynamic_users = handshake_runtime
                     .as_ref()
                     .and_then(|runtime| runtime.vless_users_snapshot(inbound_tag));
                 let users = dynamic_users.as_deref().unwrap_or(users);
@@ -558,7 +557,9 @@ mod tests {
                 .setup_server_stream_with_context(
                     Box::new(server_io),
                     TcpServerConnectionContext {
-                        runtime: Some(runtime.data_plane()),
+                        handshake_runtime: Some(
+                            runtime.data_plane().inbound_handshake_runtime(),
+                        ),
                         ..TcpServerConnectionContext::default()
                     },
                 )

@@ -566,7 +566,8 @@ async fn run_tcp_server(
                 Ok(mut context) => {
                     context.peer_addr = Some(addr);
                     context.listener_addr = Some(listener_addr);
-                    context.runtime = Some(connection_runtime.clone());
+                    context.handshake_runtime =
+                        Some(connection_runtime.inbound_handshake_runtime());
                     context
                 }
                 Err(error) => {

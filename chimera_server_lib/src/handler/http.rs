@@ -58,8 +58,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
         context: &TcpServerConnectionContext,
     ) -> Option<std::time::Duration> {
         context
-            .runtime
-            .as_ref()
+            .inbound_handshake_runtime()
             .map(|runtime| runtime.xray_handshake_timeout_for_level(self.user_level))
     }
 
@@ -75,7 +74,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
         server_stream: Box<dyn AsyncStream>,
         context: TcpServerConnectionContext,
     ) -> std::io::Result<TcpServerSetupResult> {
-        let Some(runtime) = context.runtime.as_ref() else {
+        let Some(runtime) = context.inbound_handshake_runtime() else {
             return self.setup_server_stream_inner(server_stream).await;
         };
         let timeout = runtime.xray_handshake_timeout_for_level(self.user_level);

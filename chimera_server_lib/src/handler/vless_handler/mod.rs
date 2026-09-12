@@ -252,8 +252,7 @@ impl TcpServerHandler for VlessTcpHandler {
         context: &TcpServerConnectionContext,
     ) -> Option<Duration> {
         context
-            .runtime
-            .as_ref()
+            .inbound_handshake_runtime()
             .map(|runtime| runtime.xray_handshake_timeout_for_level(0))
     }
 
@@ -276,12 +275,11 @@ impl TcpServerHandler for VlessTcpHandler {
         server_stream: Box<dyn AsyncStream>,
         context: TcpServerConnectionContext,
     ) -> std::io::Result<TcpServerSetupResult> {
-        let handshake_timeout = context
-            .runtime
+        let handshake_runtime = context.inbound_handshake_runtime();
+        let handshake_timeout = handshake_runtime
             .as_ref()
             .map(|runtime| runtime.xray_handshake_timeout_for_level(0));
-        let dynamic_users = context
-            .runtime
+        let dynamic_users = handshake_runtime
             .as_ref()
             .and_then(|runtime| runtime.vless_users_snapshot(&self.inbound_tag))
             .map(|users| parse_vless_users(&users));
@@ -688,7 +686,9 @@ mod tests {
             .setup_server_stream_with_context(
                 Box::new(TestStream(server)),
                 TcpServerConnectionContext {
-                    runtime: Some(runtime.data_plane()),
+                    handshake_runtime: Some(
+                        runtime.data_plane().inbound_handshake_runtime(),
+                    ),
                     ..TcpServerConnectionContext::default()
                 },
             )
@@ -727,7 +727,9 @@ mod tests {
             .setup_server_stream_with_context(
                 Box::new(TestStream(server)),
                 TcpServerConnectionContext {
-                    runtime: Some(runtime.data_plane()),
+                    handshake_runtime: Some(
+                        runtime.data_plane().inbound_handshake_runtime(),
+                    ),
                     ..TcpServerConnectionContext::default()
                 },
             )
@@ -754,7 +756,9 @@ mod tests {
         );
         runtime.replace_policy(Some(&policy));
         let context = TcpServerConnectionContext {
-            runtime: Some(runtime.data_plane()),
+            handshake_runtime: Some(
+                runtime.data_plane().inbound_handshake_runtime(),
+            ),
             ..TcpServerConnectionContext::default()
         };
         assert_eq!(

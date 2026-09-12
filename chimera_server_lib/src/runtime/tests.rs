@@ -124,8 +124,13 @@ async fn stopping_inbound_tasks_releases_listener_before_return() {
 fn data_plane_capability_observes_live_policy_updates() {
     let runtime = RuntimeState::new(Vec::new(), Vec::new());
     let data_plane = runtime.data_plane();
+    let handshake = data_plane.inbound_handshake_runtime();
     assert_eq!(
         data_plane.xray_handshake_timeout_for_level(7),
+        Duration::from_secs(60)
+    );
+    assert_eq!(
+        handshake.xray_handshake_timeout_for_level(7),
         Duration::from_secs(60)
     );
 
@@ -144,6 +149,10 @@ fn data_plane_capability_observes_live_policy_updates() {
 
     assert_eq!(
         data_plane.xray_handshake_timeout_for_level(7),
+        Duration::from_secs(5)
+    );
+    assert_eq!(
+        handshake.xray_handshake_timeout_for_level(7),
         Duration::from_secs(5)
     );
 }

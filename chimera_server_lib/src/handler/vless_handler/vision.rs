@@ -457,7 +457,7 @@ impl TcpServerHandler for VisionVlessTcpHandler {
         context: crate::handler::tcp::tcp_handler::TcpServerConnectionContext,
     ) -> std::io::Result<TcpServerSetupResult> {
         let dynamic_users = context
-            .runtime
+            .inbound_handshake_runtime()
             .as_ref()
             .and_then(|runtime| runtime.vless_users_snapshot(&self.inbound_tag))
             .map(|users| parse_vision_users(&users));

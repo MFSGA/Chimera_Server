@@ -291,7 +291,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
         server_stream: Box<dyn AsyncStream>,
         context: TcpServerConnectionContext,
     ) -> std::io::Result<TcpServerSetupResult> {
-        let handshake_timeout = context.runtime.as_ref().map(|runtime| {
+        let handshake_timeout = context.inbound_handshake_runtime().map(|runtime| {
             runtime.xray_handshake_timeout_for_level(self.user_level)
         });
         self.setup_server_stream_inner(

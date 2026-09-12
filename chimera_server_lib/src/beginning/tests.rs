@@ -402,7 +402,8 @@ fn logical_stream_context_preserves_local_addr() {
     let context = stream_connection_context(&runtime.data_plane(), Some(local_addr));
 
     assert_eq!(context.local_addr, Some(local_addr));
-    assert!(context.runtime.is_some());
+    assert!(context.handshake_runtime.is_some());
+    assert!(context.runtime.is_none());
 }
 
 #[test]

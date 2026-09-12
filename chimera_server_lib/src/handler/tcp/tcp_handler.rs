@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use crate::{
     address::NetLocation,
     async_stream::{AsyncMessageStream, AsyncStream, AsyncTargetedMessageStream},
-    runtime::DataPlaneRuntime,
+    runtime::{DataPlaneRuntime, InboundHandshakeRuntime},
     traffic::TrafficContext,
 };
 
@@ -17,7 +17,23 @@ pub struct TcpServerConnectionContext {
     pub listener_addr: Option<std::net::SocketAddr>,
     pub server_name: Option<String>,
     pub alpn_protocol: Option<String>,
+    /// Narrow capability used by built-in protocol handlers for handshake
+    /// policy and dynamic inbound identity snapshots.
+    pub handshake_runtime: Option<InboundHandshakeRuntime>,
+    /// Legacy compatibility capability for callers that still populate the
+    /// pre-Phase-B context shape. Internal listener/session paths leave this
+    /// unset and project `DataPlaneRuntime` into `handshake_runtime` instead.
     pub runtime: Option<DataPlaneRuntime>,
+}
+
+impl TcpServerConnectionContext {
+    pub fn inbound_handshake_runtime(&self) -> Option<InboundHandshakeRuntime> {
+        self.handshake_runtime.clone().or_else(|| {
+            self.runtime
+                .as_ref()
+                .map(DataPlaneRuntime::inbound_handshake_runtime)
+        })
+    }
 }
 
 #[async_trait]

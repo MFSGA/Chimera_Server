@@ -612,8 +612,7 @@ impl TcpServerHandler for ShadowsocksTcpServerHandler {
         context: TcpServerConnectionContext,
     ) -> io::Result<TcpServerSetupResult> {
         if let Some(store) = context
-            .runtime
-            .as_ref()
+            .inbound_handshake_runtime()
             .and_then(|runtime| runtime.shadowsocks_user_store(&self.inbound_tag))
         {
             let _ = self.runtime_users.set(store);
