@@ -3,11 +3,11 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{io::AsyncWriteExt, time::timeout};
 
 use crate::{
+    address::NetLocation,
     async_stream::AsyncStream,
     beginning::{
         build_proxy_protocol_header, copy_bidirectional,
-        copy_bidirectional_with_timeouts, setup_routed_client_stream,
-        setup_server_stream,
+        copy_bidirectional_with_timeouts,
         udp::{
             run_bidirectional_udp, run_multi_directional_udp, run_session_based_udp,
         },
@@ -21,7 +21,7 @@ use crate::{
             TcpServerSetupResult,
         },
     },
-    outbound::InboundRoutingMetadata,
+    outbound::{InboundRoutingMetadata, connect_tcp_outbound_with_routing_metadata},
     resolver::{NativeResolver, Resolver},
     runtime::DataPlaneRuntime,
     session::sniff::{
@@ -97,6 +97,48 @@ pub(crate) fn stream_connection_context(
         handshake_runtime: Some(runtime.inbound_handshake_runtime()),
         ..TcpServerConnectionContext::default()
     }
+}
+
+async fn setup_server_stream<AS>(
+    stream: AS,
+    server_handler: Arc<Box<dyn TcpServerHandler>>,
+    connection_context: TcpServerConnectionContext,
+) -> std::io::Result<TcpServerSetupResult>
+where
+    AS: AsyncStream + 'static,
+{
+    server_handler
+        .setup_server_stream_with_context(Box::new(stream), connection_context)
+        .await
+}
+
+async fn setup_routed_client_stream(
+    resolver: Arc<dyn Resolver>,
+    remote_location: NetLocation,
+    runtime: &DataPlaneRuntime,
+    inbound_tag: &str,
+    user: &str,
+    peer_addr: SocketAddr,
+    routing_metadata: InboundRoutingMetadata,
+) -> std::io::Result<Option<(Box<dyn AsyncStream>, Option<String>)>> {
+    connect_tcp_outbound_with_routing_metadata(
+        &resolver,
+        &remote_location,
+        runtime,
+        inbound_tag,
+        user,
+        peer_addr,
+        routing_metadata,
+    )
+    .await
+    .map(|connection| {
+        connection.map(|connection| {
+            (
+                Box::new(connection.stream) as Box<dyn AsyncStream>,
+                connection.outbound_tag,
+            )
+        })
+    })
 }
 
 pub(crate) async fn process_stream_with_sniffing_and_local_addr<AS>(
