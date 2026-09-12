@@ -22,7 +22,8 @@ use crate::{
 };
 
 use crate::{
-    handler::tcp::tcp_handler::TcpServerSetupResult, traffic::TrafficContext,
+    handler::tcp::tcp_handler::{TcpServerSetupOutcome, TcpServerSetupResult},
+    traffic::TrafficContext,
 };
 
 use super::*;
@@ -430,7 +431,31 @@ fn setup_result_normalization_uses_innermost_peer_override() {
     let (peer_addr, normalized) =
         normalize_setup_result(result, original, None).unwrap();
     assert_eq!(peer_addr, inner);
-    assert!(matches!(normalized, TcpServerSetupResult::AlreadyHandled));
+    assert!(matches!(normalized, TcpServerSetupOutcome::AlreadyHandled));
+}
+
+#[test]
+fn setup_result_normalization_reapplies_followup_peer_override() {
+    let original: SocketAddr = "192.0.2.1:1000".parse().unwrap();
+    let first: SocketAddr = "192.0.2.2:2000".parse().unwrap();
+    let followup: SocketAddr = "192.0.2.3:3000".parse().unwrap();
+
+    let first_result = TcpServerSetupResult::PeerAddrOverride {
+        peer_addr: first,
+        inner: Box::new(TcpServerSetupResult::AlreadyHandled),
+    };
+    let (peer_addr, _) =
+        normalize_setup_result(first_result, original, None).unwrap();
+    assert_eq!(peer_addr, first);
+
+    let followup_result = TcpServerSetupResult::PeerAddrOverride {
+        peer_addr: followup,
+        inner: Box::new(TcpServerSetupResult::AlreadyHandled),
+    };
+    let (peer_addr, normalized) =
+        normalize_setup_result(followup_result, peer_addr, None).unwrap();
+    assert_eq!(peer_addr, followup);
+    assert!(matches!(normalized, TcpServerSetupOutcome::AlreadyHandled));
 }
 
 #[test]

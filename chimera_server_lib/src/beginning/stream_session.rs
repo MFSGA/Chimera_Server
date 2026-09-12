@@ -19,7 +19,8 @@ use crate::{
         http::relay_plain_http_response,
         socks::run_udp_relay_with_expected_client,
         tcp::tcp_handler::{
-            TcpServerConnectionContext, TcpServerHandler, TcpServerSetupResult,
+            TcpServerConnectionContext, TcpServerHandler, TcpServerSetupOutcome,
+            TcpServerSetupResult,
         },
     },
     outbound::{InboundRoutingMetadata, connect_tcp_outbound_with_routing_metadata},
@@ -386,31 +387,13 @@ pub(super) fn stream_connection_context(
     }
 }
 
-fn peel_peer_addr_overrides(
-    mut setup_result: TcpServerSetupResult,
-    mut peer_addr: SocketAddr,
-) -> (SocketAddr, TcpServerSetupResult) {
-    loop {
-        match setup_result {
-            TcpServerSetupResult::PeerAddrOverride {
-                peer_addr: overridden,
-                inner,
-            } => {
-                peer_addr = overridden;
-                setup_result = *inner;
-            }
-            result => return (peer_addr, result),
-        }
-    }
-}
-
 fn normalize_tcp_fallback(
-    setup_result: TcpServerSetupResult,
+    setup_outcome: TcpServerSetupOutcome,
     peer_addr: SocketAddr,
     local_addr: Option<SocketAddr>,
-) -> std::io::Result<TcpServerSetupResult> {
-    match setup_result {
-        TcpServerSetupResult::TcpFallback {
+) -> std::io::Result<TcpServerSetupOutcome> {
+    match setup_outcome {
+        TcpServerSetupOutcome::TcpFallback {
             remote_location,
             stream,
             proxy_protocol_version,
@@ -421,7 +404,7 @@ fn normalize_tcp_fallback(
                 peer_addr,
                 local_addr,
             )?;
-            Ok(TcpServerSetupResult::TcpForward {
+            Ok(TcpServerSetupOutcome::TcpForward {
                 remote_location,
                 stream: Box::new(PrefixedStream::new(prefix, stream)),
                 need_initial_flush: false,
@@ -429,7 +412,7 @@ fn normalize_tcp_fallback(
                 traffic_context,
             })
         }
-        result => Ok(result),
+        outcome => Ok(outcome),
     }
 }
 
@@ -437,11 +420,11 @@ pub(super) fn normalize_setup_result(
     setup_result: TcpServerSetupResult,
     peer_addr: SocketAddr,
     local_addr: Option<SocketAddr>,
-) -> std::io::Result<(SocketAddr, TcpServerSetupResult)> {
-    let (peer_addr, setup_result) =
-        peel_peer_addr_overrides(setup_result, peer_addr);
-    normalize_tcp_fallback(setup_result, peer_addr, local_addr)
-        .map(|setup_result| (peer_addr, setup_result))
+) -> std::io::Result<(SocketAddr, TcpServerSetupOutcome)> {
+    let normalized = setup_result.into_normalized();
+    let peer_addr = normalized.peer_addr_override.unwrap_or(peer_addr);
+    normalize_tcp_fallback(normalized.outcome, peer_addr, local_addr)
+        .map(|setup_outcome| (peer_addr, setup_outcome))
 }
 
 pub(super) fn routing_identity(
@@ -503,11 +486,14 @@ where
             }
         }
     };
-    let (peer_addr, mut setup_result) =
+    let (mut peer_addr, mut setup_outcome) =
         normalize_setup_result(setup_result, peer_addr, local_addr)?;
 
-    while matches!(&setup_result, TcpServerSetupResult::HttpPlainForward { .. }) {
-        let TcpServerSetupResult::HttpPlainForward {
+    while matches!(
+        &setup_outcome,
+        TcpServerSetupOutcome::HttpPlainForward { .. }
+    ) {
+        let TcpServerSetupOutcome::HttpPlainForward {
             remote_location,
             stream: mut server_stream,
             request_head,
@@ -515,7 +501,7 @@ where
             keep_alive,
             next_handler,
             traffic_context,
-        } = setup_result
+        } = setup_outcome
         else {
             unreachable!("HTTP plain-forward loop only accepts HTTP results");
         };
@@ -594,7 +580,7 @@ where
             return Ok(());
         }
 
-        setup_result = if next_handler.manages_handshake_timeout() {
+        let next_result = if next_handler.manages_handshake_timeout() {
             match next_handler
                 .setup_server_stream_with_context(
                     server_stream,
@@ -628,10 +614,12 @@ where
                 Err(_) => return Ok(()),
             }
         };
+        (peer_addr, setup_outcome) =
+            normalize_setup_result(next_result, peer_addr, local_addr)?;
     }
 
-    match setup_result {
-        TcpServerSetupResult::TcpForward {
+    match setup_outcome {
+        TcpServerSetupOutcome::TcpForward {
             remote_location,
             stream: mut server_stream,
             need_initial_flush: _need_initial_flush,
@@ -757,20 +745,15 @@ where
             );
             Ok(())
         }
-        TcpServerSetupResult::HttpPlainForward { .. } => {
+        TcpServerSetupOutcome::HttpPlainForward { .. } => {
             unreachable!(
                 "HTTP plain-forward results must be handled before generic forwarding"
             )
         }
-        TcpServerSetupResult::PeerAddrOverride { .. } => {
-            unreachable!(
-                "peer address override must be normalized before forwarding"
-            )
-        }
-        TcpServerSetupResult::TcpFallback { .. } => {
+        TcpServerSetupOutcome::TcpFallback { .. } => {
             unreachable!("fallback result must be normalized before forwarding")
         }
-        TcpServerSetupResult::UdpAssociate {
+        TcpServerSetupOutcome::UdpAssociate {
             stream,
             udp_socket,
             expected_client,
@@ -794,7 +777,7 @@ where
             )
             .await
         }
-        TcpServerSetupResult::BidirectionalUdp {
+        TcpServerSetupOutcome::BidirectionalUdp {
             remote_location,
             stream,
             mut traffic_context,
@@ -813,7 +796,7 @@ where
             )
             .await
         }
-        TcpServerSetupResult::MultiDirectionalUdp {
+        TcpServerSetupOutcome::MultiDirectionalUdp {
             stream,
             mut traffic_context,
         } => {
@@ -830,7 +813,7 @@ where
             )
             .await
         }
-        TcpServerSetupResult::SessionBasedUdp {
+        TcpServerSetupOutcome::SessionBasedUdp {
             stream,
             mut traffic_context,
         } => {
@@ -846,7 +829,7 @@ where
             )
             .await
         }
-        TcpServerSetupResult::AlreadyHandled => Ok(()),
+        TcpServerSetupOutcome::AlreadyHandled => Ok(()),
     }
 }
 
