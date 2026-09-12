@@ -26,6 +26,7 @@ use crate::{
     },
     resolver::{NativeResolver, Resolver},
     runtime::RuntimeState,
+    session::dispatcher::process_stream_with_context,
     traffic::register_identity,
 };
 
@@ -845,7 +846,6 @@ pub(crate) fn build_proxy_protocol_header(
 }
 
 mod stream_session;
-use stream_session::*;
 pub(crate) use stream_session::{setup_routed_client_stream, setup_server_stream};
 
 #[cfg(test)]

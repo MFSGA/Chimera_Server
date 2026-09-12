@@ -41,16 +41,14 @@ use crate::{
     },
     resolver::{NativeResolver, Resolver},
     runtime::{DataPlaneRuntime, RuntimeState},
+    session::dispatcher::process_stream_with_sniffing_and_local_addr,
 };
 #[cfg(feature = "tls")]
 use crate::{
     config::server_config::TcpSocketPolicy, handler::tls::build_server_config,
 };
 
-use super::{
-    process_stream_with_sniffing_and_local_addr,
-    transport_plan::{ListenerSecurityPlan, XhttpListenerPlan},
-};
+use super::transport_plan::{ListenerSecurityPlan, XhttpListenerPlan};
 
 #[cfg(feature = "tls")]
 mod h3_transport;

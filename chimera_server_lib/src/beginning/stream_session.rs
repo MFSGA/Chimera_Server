@@ -3,7 +3,6 @@ use std::{net::SocketAddr, sync::Arc};
 use crate::{
     address::NetLocation,
     async_stream::AsyncStream,
-    config::server_config::InboundSniffingConfig,
     handler::tcp::tcp_handler::{
         TcpServerConnectionContext, TcpServerHandler, TcpServerSetupResult,
     },
@@ -14,92 +13,6 @@ use crate::{
 };
 
 use tracing::error;
-
-pub(super) use crate::session::dispatcher::process_stream_with_context;
-#[cfg(test)]
-pub(super) use crate::session::dispatcher::{
-    normalize_setup_result, routing_identity,
-};
-
-pub(super) async fn process_stream<AS>(
-    stream: AS,
-    server_handler: Arc<Box<dyn TcpServerHandler>>,
-    resolver: Arc<dyn Resolver>,
-    peer_addr: SocketAddr,
-    runtime: DataPlaneRuntime,
-) -> std::io::Result<()>
-where
-    AS: AsyncStream + 'static,
-{
-    process_stream_with_local_addr(
-        stream,
-        server_handler,
-        resolver,
-        peer_addr,
-        None,
-        runtime,
-    )
-    .await
-}
-
-pub(super) async fn process_stream_with_local_addr<AS>(
-    stream: AS,
-    server_handler: Arc<Box<dyn TcpServerHandler>>,
-    resolver: Arc<dyn Resolver>,
-    peer_addr: SocketAddr,
-    local_addr: Option<SocketAddr>,
-    runtime: DataPlaneRuntime,
-) -> std::io::Result<()>
-where
-    AS: AsyncStream + 'static,
-{
-    process_stream_with_sniffing_and_local_addr(
-        stream,
-        server_handler,
-        resolver,
-        peer_addr,
-        local_addr,
-        runtime,
-        None,
-    )
-    .await
-}
-
-pub(super) async fn process_stream_with_sniffing_and_local_addr<AS>(
-    stream: AS,
-    server_handler: Arc<Box<dyn TcpServerHandler>>,
-    resolver: Arc<dyn Resolver>,
-    peer_addr: SocketAddr,
-    local_addr: Option<SocketAddr>,
-    runtime: DataPlaneRuntime,
-    sniffing: Option<InboundSniffingConfig>,
-) -> std::io::Result<()>
-where
-    AS: AsyncStream + 'static,
-{
-    let connection_context = stream_connection_context(&runtime, local_addr);
-    process_stream_with_context(
-        stream,
-        server_handler,
-        resolver,
-        peer_addr,
-        runtime,
-        connection_context,
-        sniffing,
-    )
-    .await
-}
-
-pub(super) fn stream_connection_context(
-    runtime: &DataPlaneRuntime,
-    local_addr: Option<SocketAddr>,
-) -> TcpServerConnectionContext {
-    TcpServerConnectionContext {
-        local_addr,
-        handshake_runtime: Some(runtime.inbound_handshake_runtime()),
-        ..TcpServerConnectionContext::default()
-    }
-}
 
 pub(crate) async fn setup_server_stream<AS>(
     stream: AS,

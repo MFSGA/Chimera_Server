@@ -88,6 +88,42 @@ pub(crate) fn routing_identity(
     (inbound_tag, user)
 }
 
+pub(crate) fn stream_connection_context(
+    runtime: &DataPlaneRuntime,
+    local_addr: Option<SocketAddr>,
+) -> TcpServerConnectionContext {
+    TcpServerConnectionContext {
+        local_addr,
+        handshake_runtime: Some(runtime.inbound_handshake_runtime()),
+        ..TcpServerConnectionContext::default()
+    }
+}
+
+pub(crate) async fn process_stream_with_sniffing_and_local_addr<AS>(
+    stream: AS,
+    server_handler: Arc<Box<dyn TcpServerHandler>>,
+    resolver: Arc<dyn Resolver>,
+    peer_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
+    runtime: DataPlaneRuntime,
+    sniffing: Option<InboundSniffingConfig>,
+) -> std::io::Result<()>
+where
+    AS: AsyncStream + 'static,
+{
+    let connection_context = stream_connection_context(&runtime, local_addr);
+    process_stream_with_context(
+        stream,
+        server_handler,
+        resolver,
+        peer_addr,
+        runtime,
+        connection_context,
+        sniffing,
+    )
+    .await
+}
+
 pub(crate) async fn process_stream_with_context<AS>(
     stream: AS,
     server_handler: Arc<Box<dyn TcpServerHandler>>,

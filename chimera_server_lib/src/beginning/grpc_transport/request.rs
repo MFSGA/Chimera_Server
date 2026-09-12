@@ -29,11 +29,11 @@ use tracing::debug;
 
 use crate::{
     async_stream::{AsyncPing, AsyncStream},
-    beginning::process_stream_with_sniffing_and_local_addr,
     config::server_config::InboundSniffingConfig,
     handler::tcp::tcp_handler::TcpServerHandler,
     resolver::Resolver,
     runtime::DataPlaneRuntime,
+    session::dispatcher::process_stream_with_sniffing_and_local_addr,
 };
 
 mod wire;
