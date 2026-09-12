@@ -256,6 +256,8 @@ stateDiagram-v2
 
 专用服务入口和公共 library API 是需要保护的使用方，不因为主 CLI 通过就视为迁移完成。优先提取职责和收窄可见性，再移动文件；不做大规模纯重命名。
 
+迁移状态（2026-09-13）：`session` 目录已开始承接会话域职责，第一步将 `beginning::stream_session` 中的 sniffing 解析、目标覆盖与 route-plan 纯逻辑，以及前缀读取/回放 helper 收敛到 `session::sniff`。高层 `process_stream*`、setup outcome dispatch、TCP/UDP relay 与 outbound connection 仍暂留 `beginning::stream_session`，因此这只建立职责归属，不表示 `beginning` 已完成迁移，也不改变 listener、connection 或 session task owner。
+
 ### 11.1 功能隔离：模块、Cargo feature 与运行时配置
 
 目标是让能力可隔离、可验证，并帮助缩小线上故障范围。模块和类型负责职责与依赖；Cargo feature 负责构建时裁剪可选能力；运行时配置负责选择已编译能力的启用方式。不能通过增加 feature 数量代替职责拆分，也不要求每个模块对应一个 feature。

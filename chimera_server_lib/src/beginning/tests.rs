@@ -23,6 +23,10 @@ use crate::{
 
 use crate::{
     handler::tcp::tcp_handler::{TcpServerSetupOutcome, TcpServerSetupResult},
+    session::sniff::{
+        SniffInspection, build_sniffed_route_plan, inspect_sniffed_routing_metadata,
+        route_only_sniffed_domain, sniff_stream_protocol, sniffed_outbound_target,
+    },
     traffic::TrafficContext,
 };
 
