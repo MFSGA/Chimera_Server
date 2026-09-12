@@ -256,7 +256,7 @@ stateDiagram-v2
 
 专用服务入口和公共 library API 是需要保护的使用方，不因为主 CLI 通过就视为迁移完成。优先提取职责和收窄可见性，再移动文件；不做大规模纯重命名。
 
-迁移状态（2026-09-13）：`session` 目录已开始承接会话域职责，第一步将 `beginning::stream_session` 中的 sniffing 解析、目标覆盖与 route-plan 纯逻辑，以及前缀读取/回放 helper 收敛到 `session::sniff`。高层 `process_stream*`、setup outcome dispatch、TCP/UDP relay 与 outbound connection 仍暂留 `beginning::stream_session`，因此这只建立职责归属，不表示 `beginning` 已完成迁移，也不改变 listener、connection 或 session task owner。
+迁移状态（2026-09-13）：`session` 目录已开始承接会话域职责。第一步将 `beginning::stream_session` 中的 sniffing 解析、目标覆盖与 route-plan 纯逻辑，以及前缀读取/回放 helper 收敛到 `session::sniff`；随后将 setup outcome 规范化、routing identity 投影与核心 `process_stream_with_context` 分发收敛到 `session::dispatcher`。普通 TCP、gRPC transport 与 XHTTP 仍通过 `beginning::stream_session` 的 compatibility entry 进入该 dispatcher，低层 handler setup、outbound connect、TCP/UDP relay helper 也暂由 `beginning` 窄接口提供，因此 `beginning` 尚未完成迁移，listener、connection/session task owner、响应时机与 relay 行为均未改变。
 
 ### 11.1 功能隔离：模块、Cargo feature 与运行时配置
 

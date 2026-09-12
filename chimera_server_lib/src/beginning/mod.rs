@@ -198,6 +198,9 @@ pub(crate) mod grpc_transport;
 mod policy_stream;
 mod quic;
 mod tcp_relay;
+
+pub(crate) use policy_stream::copy_bidirectional_with_timeouts;
+pub(crate) use tcp_relay::copy_bidirectional;
 mod transport_plan;
 pub(crate) mod udp;
 mod xhttp;
@@ -784,7 +787,7 @@ fn tcp_server_connection_context(
     })
 }
 
-fn build_proxy_protocol_header(
+pub(crate) fn build_proxy_protocol_header(
     version: u8,
     source: SocketAddr,
     destination: Option<SocketAddr>,
@@ -843,6 +846,7 @@ fn build_proxy_protocol_header(
 
 mod stream_session;
 use stream_session::*;
+pub(crate) use stream_session::{setup_routed_client_stream, setup_server_stream};
 
 #[cfg(test)]
 mod tests;

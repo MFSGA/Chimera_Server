@@ -141,7 +141,7 @@ async fn wait_for_activity(
     }
 }
 
-pub(super) async fn copy_bidirectional_with_timeouts<A, B>(
+pub(crate) async fn copy_bidirectional_with_timeouts<A, B>(
     left: &mut A,
     right: &mut B,
     timeouts: PolicyRelayTimeouts,
