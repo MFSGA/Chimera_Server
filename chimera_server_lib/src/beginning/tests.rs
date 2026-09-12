@@ -16,12 +16,12 @@ use tokio::net::{TcpListener, TcpStream};
 
 #[cfg(target_os = "linux")]
 use crate::{
-    address::{Address, NetLocation},
     config::server_config::DokodemoDoorConfig,
     handler::dokodemo::DokodemoDoorTcpHandler,
 };
 
 use crate::{
+    address::{Address, NetLocation},
     handler::tcp::tcp_handler::{TcpServerSetupOutcome, TcpServerSetupResult},
     session::{
         dispatcher::{
