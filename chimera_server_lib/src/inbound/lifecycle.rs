@@ -298,8 +298,7 @@ impl InboundManager {
         else {
             return false;
         };
-        entry.lifecycle = lifecycle;
-        true
+        entry.lifecycle.transition_to(lifecycle).is_ok()
     }
 
     fn restore_prepared_state(&self, tag: &str, generation: u64) {
@@ -309,7 +308,9 @@ impl InboundManager {
                 && entry.generation == generation
                 && entry.lifecycle == InboundLifecycleState::Starting
         }) {
-            entry.lifecycle = InboundLifecycleState::Prepared;
+            let _ = entry
+                .lifecycle
+                .transition_to(InboundLifecycleState::Prepared);
         }
     }
 
@@ -388,7 +389,10 @@ impl InboundManager {
                     handles.iter().any(JoinHandle::is_finished)
                 })
         })?;
-        entry.lifecycle = InboundLifecycleState::Failed;
+        entry
+            .lifecycle
+            .transition_to(InboundLifecycleState::Failed)
+            .expect("running inbound failure must transition to failed");
         Some(InboundFailure {
             tag: entry.config.tag.clone(),
             generation: entry.generation,
@@ -416,7 +420,14 @@ impl InboundManager {
             abort_tasks(&handles);
             return;
         };
-        entry.lifecycle = InboundLifecycleState::Running;
+        if entry
+            .lifecycle
+            .transition_to(InboundLifecycleState::Running)
+            .is_err()
+        {
+            abort_tasks(&handles);
+            return;
+        }
         if let Some(previous) = entry.tasks.replace(handles) {
             abort_tasks(&previous);
         }
@@ -437,7 +448,14 @@ impl InboundManager {
             abort_tasks(&handles);
             return false;
         };
-        entry.lifecycle = InboundLifecycleState::Running;
+        if entry
+            .lifecycle
+            .transition_to(InboundLifecycleState::Running)
+            .is_err()
+        {
+            abort_tasks(&handles);
+            return false;
+        }
         if let Some(previous) = entry.tasks.replace(handles) {
             abort_tasks(&previous);
         }
@@ -452,11 +470,16 @@ impl InboundManager {
                 .configs
                 .iter_mut()
                 .filter_map(|entry| {
-                    let handles = entry.tasks.take()?;
                     let failed = entry.lifecycle == InboundLifecycleState::Failed;
-                    if !failed {
-                        entry.lifecycle = InboundLifecycleState::Draining;
+                    if !failed
+                        && entry
+                            .lifecycle
+                            .transition_to(InboundLifecycleState::Draining)
+                            .is_err()
+                    {
+                        return None;
                     }
+                    let handles = entry.tasks.take()?;
                     Some((
                         entry.config.tag.clone(),
                         failed,
@@ -504,7 +527,13 @@ impl InboundManager {
             let Some(handles) = entry.tasks.take() else {
                 return false;
             };
-            entry.lifecycle = InboundLifecycleState::Stopping;
+            if entry
+                .lifecycle
+                .transition_to(InboundLifecycleState::Stopping)
+                .is_err()
+            {
+                return false;
+            }
             Some(InboundTaskSet {
                 generation: entry.generation,
                 handles,
@@ -539,7 +568,13 @@ impl InboundManager {
             let Some(handles) = entry.tasks.take() else {
                 return false;
             };
-            entry.lifecycle = InboundLifecycleState::Stopping;
+            if entry
+                .lifecycle
+                .transition_to(InboundLifecycleState::Stopping)
+                .is_err()
+            {
+                return false;
+            }
             InboundTaskSet {
                 generation,
                 handles,
@@ -571,8 +606,10 @@ impl InboundManager {
                 if entry.tasks.is_some() {
                     false
                 } else {
-                    entry.lifecycle = InboundLifecycleState::Recovering;
-                    true
+                    entry
+                        .lifecycle
+                        .transition_to(InboundLifecycleState::Recovering)
+                        .is_ok()
                 }
             } else {
                 false

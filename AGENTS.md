@@ -10,6 +10,9 @@ report any necessary deviation from the project conventions.
 - Read [ARCHITECTURE.md](ARCHITECTURE.md) at the start of each new task, before planning or
   editing code; then inspect the relevant implementation and more specific instructions.
   It records the user's intended server architecture and is the primary internal design reference.
+- Read [ITERATION_GUIDE.md](ITERATION_GUIDE.md) for the confirmed priorities and maintenance
+  workflow before selecting an iteration; consult its relevant sections for architecture, feature
+  isolation, diagnostics and handoff. It supplements ARCHITECTURE, not implementation evidence.
 - Follow its boundaries for configuration compilation, inbound lifecycle, transport/protocol
   separation, connection/session ownership, and control/data-plane capabilities.
 - The document describes a target architecture, not completed implementation. Check its migration
@@ -41,6 +44,12 @@ report any necessary deviation from the project conventions.
   complete, unless the user changes priorities. Preserve existing outbound behavior. Implement
   the destination connection, DNS resolution, TCP/UDP forwarding, timeout and routing/policy
   integration necessary to validate an inbound end to end; those dependencies remain in scope.
+- WireGuard and broader Xray outbound support are future goals; their relative order is undecided.
+  TUN may be implemented last. Preserve suitable extension boundaries without adding placeholder
+  modules, dependencies or support claims before those goals are in scope.
+- MCP is optional and is not a core delivery or release requirement. If retained, prefer an
+  independent adapter over the management gRPC API, with capability and failure semantics checked.
+  This preference does not authorize deleting the existing MCP implementation.
 - Use `ref/xray-core/` as the canonical reference for server configuration **and observable
   protocol/runtime behavior**, including defaults, validation and failure handling.
   Use `ref/shoes/` as an implementation aid and `ref/clash-rs/` for architectural layering.
@@ -179,7 +188,8 @@ Paths below are relative to the repository root.
   and lifetime bounds where the executor or API requires them; do not require `Sync` universally.
 - Preserve server task supervision and shutdown behavior. Inspect the existing lifecycle before
   adding tasks; handle termination and errors instead of silently detaching essential services.
-- Reuse `tracing` for logs, `traffic` for metrics, and gRPC/MCP for control-plane exposure.
+- Reuse `tracing` for logs, `traffic` for metrics, and management gRPC for control-plane exposure;
+  MCP remains optional.
   Use structured tags and addresses where useful; avoid noisy per-packet logs in normal operation.
   Preserve public statistics and serialization compatibility.
 - Keep optional behavior consistent with Cargo feature gates and runtime configuration. Test

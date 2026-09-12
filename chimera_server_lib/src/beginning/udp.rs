@@ -43,6 +43,7 @@ const VMESS_UDP_MESSAGE_BUFFER_SIZE: usize = 8192;
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const UDP_SESSION_CHANNEL_CAPACITY: usize = 64;
 
+mod dokodemo;
 mod global_xudp;
 use global_xudp::*;
 mod session_worker;

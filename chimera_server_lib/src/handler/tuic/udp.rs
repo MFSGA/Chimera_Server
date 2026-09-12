@@ -1,19 +1,17 @@
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    num::NonZeroUsize,
     sync::Arc,
     time::Instant,
 };
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{BufMut, BytesMut};
 use dashmap::DashMap;
-use lru::LruCache;
 use tokio::{io::AsyncReadExt, net::UdpSocket};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
 use crate::{
-    address::{Address, NetLocation},
+    address::NetLocation,
     outbound::{
         DirectOutboundAction, connection_routing_input, select_direct_outbound,
     },
@@ -25,40 +23,19 @@ use crate::{
 };
 
 use super::{
-    CLEANUP_INTERVAL, COMMAND_TYPE_DISSOCIATE, COMMAND_TYPE_HEARTBEAT,
-    COMMAND_TYPE_PACKET, IDLE_TIMEOUT, MAX_HEADER_LEN, TUIC_VERSION,
-    TuicConnectionTaskOwner, TuicFlowContext, read_address,
+    CLEANUP_INTERVAL, COMMAND_TYPE_DISSOCIATE, COMMAND_TYPE_PACKET, IDLE_TIMEOUT,
+    MAX_HEADER_LEN, TUIC_VERSION, TuicConnectionTaskOwner, TuicFlowContext,
+    read_address,
 };
 
-const MAX_FRAGMENT_CACHE_SIZE: usize = 256;
+mod codec;
+
+pub(super) use codec::serialize_socket_addr;
+use codec::{
+    FragmentAssembler, ParsedDatagram, parse_datagram, validate_fragment_header,
+};
 
 pub(super) type UdpSessionMap = Arc<DashMap<u16, UdpSession>>;
-
-fn fragment_cache_size() -> NonZeroUsize {
-    NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE)
-        .unwrap_or_else(|| NonZeroUsize::new(1).expect("non-zero"))
-}
-
-pub(super) fn serialize_socket_addr(addr: &SocketAddr) -> Vec<u8> {
-    let mut res = match addr {
-        SocketAddr::V4(addr_v4) => {
-            let mut res = Vec::with_capacity(1 + 4 + 2);
-            res.push(0x01);
-            res.extend_from_slice(&addr_v4.ip().octets());
-            res
-        }
-        SocketAddr::V6(addr_v6) => {
-            let mut res = Vec::with_capacity(1 + 16 + 2);
-            res.push(0x02);
-            res.extend_from_slice(&addr_v6.ip().octets());
-            res
-        }
-    };
-
-    res.extend_from_slice(&addr.port().to_be_bytes());
-
-    res
-}
 
 struct TuicUdpTaskScope<'a> {
     parent_cancel_token: &'a CancellationToken,
@@ -74,14 +51,6 @@ pub(super) struct UdpSession {
     pub(super) base_context: TrafficContext,
     pub(super) response_contexts: Arc<DashMap<SocketAddr, TrafficContext>>,
     pub(super) _connection_guard: ConnectionGuard,
-}
-
-struct FragmentedPacket {
-    fragment_count: u8,
-    fragment_received: u8,
-    packet_len: usize,
-    received: Vec<Option<Bytes>>,
-    remote_location: Option<NetLocation>,
 }
 
 impl UdpSession {
@@ -526,8 +495,7 @@ async fn process_uni_stream(
         .await
         .map_err(std::io::Error::other)?;
 
-    let mut fragments: LruCache<u16, FragmentedPacket> =
-        LruCache::new(fragment_cache_size());
+    let mut fragments = FragmentAssembler::new();
 
     process_udp_packet(
         connection,
@@ -553,7 +521,7 @@ async fn process_udp_packet(
     connection: &quinn::Connection,
     resolver: &Arc<dyn Resolver>,
     udp_session_map: &UdpSessionMap,
-    fragments: &mut LruCache<u16, FragmentedPacket>,
+    fragments: &mut FragmentAssembler,
     assoc_id: u16,
     packet_id: u16,
     frag_total: u8,
@@ -565,17 +533,7 @@ async fn process_udp_packet(
     context: &TuicFlowContext,
     child_tasks: &TuicConnectionTaskOwner,
 ) -> std::io::Result<()> {
-    if frag_total == 0 {
-        return Err(std::io::Error::other(
-            "ignoring packet with empty fragment total",
-        ));
-    }
-
-    if frag_id >= frag_total {
-        return Err(std::io::Error::other(format!(
-            "invalid fragment id {frag_id} >= total {frag_total}"
-        )));
-    }
+    validate_fragment_header(frag_total, frag_id)?;
 
     let session = match udp_session_map.get(&assoc_id) {
         Some(s) => s,
@@ -637,91 +595,16 @@ async fn process_udp_packet(
         }
     };
 
-    let (remote_location, complete_payload) = if frag_total == 1 {
-        let remote_location = remote_location.ok_or_else(|| {
-            std::io::Error::other(
-                "ignoring packet with single fragment and no address",
-            )
-        })?;
-        (remote_location, Bytes::copy_from_slice(payload_fragment))
-    } else {
-        let is_new = !fragments.contains(&packet_id);
-
-        if is_new {
-            fragments.put(
-                packet_id,
-                FragmentedPacket {
-                    fragment_count: frag_total,
-                    fragment_received: 0,
-                    packet_len: 0,
-                    received: vec![None; frag_total as usize],
-                    remote_location: remote_location.clone(),
-                },
-            );
-        }
-
-        let packet = match fragments.get_mut(&packet_id) {
-            Some(p) => p,
-            None => {
-                return Err(std::io::Error::other("fragment cache error"));
-            }
-        };
-
-        if is_new && frag_id == 0 && packet.remote_location.is_none() {
-            if remote_location.is_none() {
-                fragments.pop(&packet_id);
-                return Err(std::io::Error::other(format!(
-                    "ignoring packet with empty first fragment address for session {assoc_id}"
-                )));
-            }
-            packet.remote_location = remote_location.clone();
-        }
-
-        if packet.fragment_count != frag_total {
-            fragments.pop(&packet_id);
-            return Err(std::io::Error::other(format!(
-                "mismatched fragment count for session {assoc_id} packet {packet_id}"
-            )));
-        }
-        if packet.received[frag_id as usize].is_some() {
-            fragments.pop(&packet_id);
-            return Err(std::io::Error::other(format!(
-                "duplicate fragment for session {assoc_id} packet {packet_id}"
-            )));
-        }
-
-        packet.fragment_received += 1;
-        packet.packet_len += payload_fragment.len();
-        packet.received[frag_id as usize] = Some(payload_fragment.to_vec().into());
-
-        if packet.fragment_received != packet.fragment_count {
-            return Ok(());
-        }
-
-        let FragmentedPacket {
-            remote_location,
-            received,
-            packet_len,
-            ..
-        } = fragments
-            .pop(&packet_id)
-            .ok_or_else(|| std::io::Error::other("fragment cache missing"))?;
-
-        let remote_location = remote_location
-            .ok_or_else(|| std::io::Error::other("missing fragment address"))?;
-
-        let mut complete_payload = BytesMut::with_capacity(packet_len);
-        for frag in received.iter() {
-            match frag.as_ref() {
-                Some(bytes) => complete_payload.extend_from_slice(bytes),
-                None => {
-                    return Err(std::io::Error::other(
-                        "missing fragment while assembling payload",
-                    ));
-                }
-            }
-        }
-        (remote_location, complete_payload.freeze())
+    let Some((remote_location, complete_payload)) = fragments.assemble(
+        assoc_id,
+        packet_id,
+        frag_total,
+        frag_id,
+        remote_location,
+        payload_fragment,
+    )?
+    else {
+        return Ok(());
     };
 
     let (socket_addr, is_updated) =
@@ -821,8 +704,7 @@ pub(super) async fn run_datagram_loop(
     context: TuicFlowContext,
     child_tasks: TuicConnectionTaskOwner,
 ) -> std::io::Result<()> {
-    let mut fragments: LruCache<u16, FragmentedPacket> =
-        LruCache::new(fragment_cache_size());
+    let mut fragments = FragmentAssembler::new();
     let mut last_cleanup = Instant::now();
 
     loop {
@@ -844,123 +726,21 @@ pub(super) async fn run_datagram_loop(
             std::io::Error::other(format!("failed to read datagram: {err}"))
         })?;
 
-        if data.len() < 2 {
-            return Err(std::io::Error::other("invalid message: too short"));
-        }
-
-        let tuic_version = data[0];
-        if tuic_version != TUIC_VERSION {
-            return Err(std::io::Error::other(format!(
-                "unknown version: {tuic_version}"
-            )));
-        }
-
-        let command_type = data[1];
-        if command_type == COMMAND_TYPE_HEARTBEAT {
+        let ParsedDatagram::Packet(packet) = parse_datagram(&data)? else {
             continue;
-        } else if command_type != COMMAND_TYPE_PACKET {
-            return Err(std::io::Error::other(format!(
-                "unknown command: {command_type}"
-            )));
-        }
-
-        let data_len = data.len();
-        if data_len < 11 {
-            return Err(std::io::Error::other("decode UDP message: too short"));
-        }
-
-        let assoc_id = u16::from_be_bytes([data[2], data[3]]);
-        let packet_id = u16::from_be_bytes([data[4], data[5]]);
-        let frag_total = data[6];
-        let frag_id = data[7];
-        let payload_size = u16::from_be_bytes([data[8], data[9]]) as usize;
-
-        let address_type = data[10];
-
-        let (remote_location, offset) = match address_type {
-            0xff => (None, 11),
-            0x00 => {
-                if data_len < 14 {
-                    return Err(std::io::Error::other(
-                        "decode UDP message: hostname too short",
-                    ));
-                }
-                let address_len = data[11] as usize;
-                if data_len < 12 + address_len + 2 + payload_size {
-                    return Err(std::io::Error::other(
-                        "decode UDP message: truncated hostname",
-                    ));
-                }
-                let address_bytes = &data[12..12 + address_len];
-                let address_str =
-                    std::str::from_utf8(address_bytes).map_err(|e| {
-                        std::io::Error::other(format!(
-                            "decode UDP message: invalid UTF-8: {e}"
-                        ))
-                    })?;
-                let address = Address::from(address_str).map_err(|e| {
-                    std::io::Error::other(format!(
-                        "decode UDP message: invalid address: {e}"
-                    ))
-                })?;
-                let port = u16::from_be_bytes([
-                    data[12 + address_len],
-                    data[12 + address_len + 1],
-                ]);
-                (Some(NetLocation::new(address, port)), 12 + address_len + 2)
-            }
-            0x01 => {
-                if data_len < 17 + payload_size {
-                    return Err(std::io::Error::other(
-                        "decode UDP message: IPv4 too short",
-                    ));
-                }
-                let ipv4_addr =
-                    Ipv4Addr::new(data[11], data[12], data[13], data[14]);
-                let port = u16::from_be_bytes([data[15], data[16]]);
-                (Some(NetLocation::new(Address::Ipv4(ipv4_addr), port)), 17)
-            }
-            0x02 => {
-                if data_len < 29 + payload_size {
-                    return Err(std::io::Error::other(
-                        "decode UDP message: IPv6 too short",
-                    ));
-                }
-                let ipv6_bytes: [u8; 16] =
-                    data[11..27].try_into().map_err(|_| {
-                        std::io::Error::other(
-                            "decode UDP message: invalid IPv6 bytes",
-                        )
-                    })?;
-                let ipv6_addr = Ipv6Addr::from(ipv6_bytes);
-                let port = u16::from_be_bytes([data[27], data[28]]);
-                (Some(NetLocation::new(Address::Ipv6(ipv6_addr), port)), 29)
-            }
-            _ => {
-                return Err(std::io::Error::other(format!(
-                    "decode UDP message: invalid address type: {address_type}"
-                )));
-            }
         };
-
-        if data_len < offset + payload_size {
-            return Err(std::io::Error::other(
-                "decode UDP message: truncated payload",
-            ));
-        }
-        let payload_fragment = &data[offset..offset + payload_size];
 
         if let Err(e) = process_udp_packet(
             &connection,
             &resolver,
             &udp_session_map,
             &mut fragments,
-            assoc_id,
-            packet_id,
-            frag_total,
-            frag_id,
-            remote_location,
-            payload_fragment,
+            packet.assoc_id,
+            packet.packet_id,
+            packet.frag_total,
+            packet.frag_id,
+            packet.remote_location,
+            packet.payload_fragment,
             false,
             &cancel_token,
             &context,

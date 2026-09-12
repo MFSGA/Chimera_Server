@@ -44,23 +44,6 @@ struct InboundState {
     next_generation: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InboundLifecycleState {
-    Prepared,
-    Starting,
-    Running,
-    Draining,
-    Stopping,
-    Recovering,
-    Failed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PendingInboundLifecycle {
-    generation: u64,
-    lifecycle: InboundLifecycleState,
-}
-
 #[derive(Debug)]
 struct InboundInstance {
     generation: u64,
@@ -83,6 +66,9 @@ mod identity;
 
 #[cfg(feature = "vless")]
 use identity::VlessUserStore;
+
+mod state;
+use state::{InboundLifecycleState, PendingInboundLifecycle};
 
 mod lifecycle;
 use lifecycle::{
@@ -407,8 +393,10 @@ impl InboundManager {
                         )))
                     }
                     Some(index) => {
-                        state.configs[index].lifecycle =
-                            InboundLifecycleState::Starting;
+                        state.configs[index]
+                            .lifecycle
+                            .transition_to(InboundLifecycleState::Starting)
+                            .map_err(io::Error::other)?;
                         Ok((
                             state.configs[index].generation,
                             state.configs[index].config_view(),
@@ -724,7 +712,10 @@ impl InboundManager {
                 ));
             };
             entry.tasks.take().map(|handles| {
-                entry.lifecycle = InboundLifecycleState::Stopping;
+                entry
+                    .lifecycle
+                    .transition_to(InboundLifecycleState::Stopping)
+                    .expect("running inbound with tasks must be stoppable");
                 InboundTaskSet {
                     generation,
                     handles,

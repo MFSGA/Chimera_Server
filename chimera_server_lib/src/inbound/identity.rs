@@ -81,7 +81,9 @@ impl InboundInstance {
         mut self,
         handles: Vec<JoinHandle<()>>,
     ) -> Self {
-        self.lifecycle = InboundLifecycleState::Running;
+        self.lifecycle
+            .transition_to(InboundLifecycleState::Running)
+            .expect("new inbound instance must transition from prepared to running");
         self.tasks = Some(handles);
         self
     }

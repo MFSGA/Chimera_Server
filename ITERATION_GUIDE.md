@@ -84,7 +84,7 @@ Xray 规定外部行为；clash-rs、sing-box、Envoy、shadowsocks-rust、Pingo
 
 ## 4. 编写时的项目基线与已有成果
 
-本手册编写时仓库 HEAD 为 `a05e780c05a6b2b5e166202eca571244f0a0550a`，工作树包含正在进行的职责提取，因此该 SHA 不代表本次工作树的全部内容。本地 Xray 参考为 `5ca6f4b7d4dc20a881d4330e498892697627ec0c`。本次仅编写文档，没有重新运行 Rust 构建或互通测试。
+本手册编写开始时仓库 HEAD 为 `a05e780c05a6b2b5e166202eca571244f0a0550a`，工作树包含正在进行的职责提取，因此该 SHA 不代表本次工作树的全部内容。本地 Xray 参考为 `5ca6f4b7d4dc20a881d4330e498892697627ec0c`。本次仅编写文档，没有重新运行 Rust 构建或互通测试。
 
 维护者可从这些实际入口核验已形成的边界：
 
@@ -100,7 +100,7 @@ Xray 规定外部行为；clash-rs、sing-box、Envoy、shadowsocks-rust、Pingo
 
 ARCHITECTURE 第 12 节记录了 2026-09-11 的 M2–M6 阶段结果及细节。它是已有工作记录，不是本手册重新测试的声明。不得因为新的目标目录尚未出现，就把已完成的动态用户、任务所有权、readiness 或 DataPlaneRuntime 迁移从头重做。
 
-当前未提交的 beginning、relay、XHTTP、配置 builder、gRPC stats 及多个协议拆分是工作树事实，不等于存在并发 writer。后续先检查具体 diff 和任务归属，再选择不冲突的切片。
+编写开始时观察到的未提交改动涉及 beginning、relay、XHTTP、配置 builder、gRPC stats 及多个协议拆分。该清单是历史快照，不是实时任务列表，也不单凭脏文件推断存在并发 writer。整理期间 HEAD 已推进，后续必须重新检查 git status、具体 diff 和任务归属，再选择不冲突的切片。
 
 ## 5. 两条流程与单向依赖
 
@@ -512,7 +512,7 @@ Feature 减少后故障消失，只说明条件发生改变。编译优化、线
 
 ## 16. 调整后的迁移路线
 
-原有 Phase 0–10 适合作为责任地图和候选顺序，不能成为每次重新开始的线性清单。[ARCHITECTURE.md 第 12 节](ARCHITECTURE.md#12-渐进迁移路线)已有迁移记录，新的工作应在核验现状后继续。
+原有 Phase 0–10 适合作为责任地图和候选顺序，不能成为每次重新开始的线性清单。[ARCHITECTURE.md 第 12 节](ARCHITECTURE.md#12-渐进迁移路线与验收)已有迁移记录，新的工作应在核验现状后继续。
 
 ### 16.1 为什么调整原顺序
 
