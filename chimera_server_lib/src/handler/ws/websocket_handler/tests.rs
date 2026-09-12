@@ -113,7 +113,7 @@ impl TcpServerHandler for AcceptingInner {
         &self,
         _server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
-        Ok(TcpServerSetupResult::AlreadyHandled)
+        Ok(TcpServerSetupResult::Completed)
     }
 }
 
@@ -126,7 +126,7 @@ impl TcpServerHandler for CapturingInner {
         let mut data = [0u8; 4];
         server_stream.read_exact(&mut data).await?;
         self.captured.lock().unwrap().extend_from_slice(&data);
-        Ok(TcpServerSetupResult::AlreadyHandled)
+        Ok(TcpServerSetupResult::Completed)
     }
 }
 
@@ -145,7 +145,7 @@ impl TcpServerHandler for ContextCapturingInner {
         context: TcpServerConnectionContext,
     ) -> std::io::Result<TcpServerSetupResult> {
         *self.captured_peer.lock().unwrap() = context.peer_addr;
-        Ok(TcpServerSetupResult::AlreadyHandled)
+        Ok(TcpServerSetupResult::Completed)
     }
 }
 
@@ -523,7 +523,7 @@ async fn websocket_handshake_matches_xray_request_target_paths() {
             "GET {target} HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
         );
         let (result, response) = run_handshake(&request).await;
-        assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
+        assert!(matches!(result, Ok(TcpServerSetupResult::Completed)));
         assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
     }
 
@@ -804,7 +804,7 @@ async fn websocket_handshake_validates_header_names_like_xray_v26_2_6() {
         "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\n{suffix}"
     ))
     .await;
-    assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
+    assert!(matches!(result, Ok(TcpServerSetupResult::Completed)));
     assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
 
     let (result, response) = run_handshake(&format!(
@@ -848,7 +848,7 @@ async fn websocket_handshake_accepts_folded_headers_like_xray_v26_2_6() {
         ),
     ] {
         let (result, response) = run_handshake(&request).await;
-        assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
+        assert!(matches!(result, Ok(TcpServerSetupResult::Completed)));
         assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
     }
 
@@ -872,7 +872,7 @@ async fn websocket_handshake_validates_header_values_like_xray_v26_2_6() {
         request.extend_from_slice(value);
         request.extend_from_slice(b"\r\n\r\n");
         let (result, response) = run_handshake_bytes(&request).await;
-        assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
+        assert!(matches!(result, Ok(TcpServerSetupResult::Completed)));
         assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
     }
 
@@ -925,7 +925,7 @@ async fn websocket_handshake_validates_content_length_like_xray_v26_2_6() {
     ] {
         let (result, response) =
             run_handshake(&format!("{base}{content_length}\r\n")).await;
-        assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
+        assert!(matches!(result, Ok(TcpServerSetupResult::Completed)));
         assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
     }
 
@@ -964,7 +964,7 @@ async fn websocket_handshake_validates_transfer_encoding_like_xray_v26_2_6() {
     ] {
         let (result, response) =
             run_handshake(&format!("{base}{transfer_encoding}\r\n")).await;
-        assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
+        assert!(matches!(result, Ok(TcpServerSetupResult::Completed)));
         assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
     }
 
@@ -1001,7 +1001,7 @@ async fn websocket_handshake_validates_chunked_trailers_like_xray_v26_2_6() {
     ] {
         let (result, response) =
             run_handshake(&format!("{base}{trailers}\r\n")).await;
-        assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
+        assert!(matches!(result, Ok(TcpServerSetupResult::Completed)));
         assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
     }
 
@@ -1031,7 +1031,7 @@ async fn websocket_handshake_matches_xray_header_budget() {
 
     let large_but_valid = format!("{base}X-Fill: {}\r\n\r\n", "a".repeat(12_000));
     let (result, response) = run_handshake(&large_but_valid).await;
-    assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
+    assert!(matches!(result, Ok(TcpServerSetupResult::Completed)));
     assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
 
     let many_headers = format!(
@@ -1041,7 +1041,7 @@ async fn websocket_handshake_matches_xray_header_budget() {
             .collect::<String>()
     );
     let (result, response) = run_handshake(&many_headers).await;
-    assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
+    assert!(matches!(result, Ok(TcpServerSetupResult::Completed)));
     assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
 
     let oversized = format!("{base}X-Fill: {}\r\n\r\n", "a".repeat(13_000));
@@ -1060,7 +1060,7 @@ async fn websocket_handshake_validates_xray_upgrade_headers() {
         "GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: WebSocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
     );
     let (result, response) = run_handshake(&valid).await;
-    assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
+    assert!(matches!(result, Ok(TcpServerSetupResult::Completed)));
     assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
     assert!(!response.contains("Host: example.com\r\n"));
     assert!(!response.contains("Sec-WebSocket-Version: 13\r\n"));
@@ -1136,7 +1136,7 @@ async fn websocket_x_forwarded_for_overrides_inner_peer_like_xray() {
 
     assert!(matches!(
         task.await.unwrap(),
-        Ok(TcpServerSetupResult::AlreadyHandled)
+        Ok(TcpServerSetupResult::Completed)
     ));
     assert!(
         String::from_utf8(response)
@@ -1244,7 +1244,7 @@ async fn websocket_handshake_matches_xray_early_data_subprotocol() {
 
     assert!(matches!(
         task.await.unwrap(),
-        Ok(TcpServerSetupResult::AlreadyHandled)
+        Ok(TcpServerSetupResult::Completed)
     ));
     assert_eq!(&*captured.lock().unwrap(), b"ping");
     let response = String::from_utf8(response).unwrap();
@@ -1260,7 +1260,7 @@ async fn websocket_handshake_matches_xray_duplicate_header_semantics() {
         "GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Key: bad\r\nSec-WebSocket-Version: 13\r\n\r\n"
     );
     let (result, response) = run_handshake(&valid_first_key).await;
-    assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
+    assert!(matches!(result, Ok(TcpServerSetupResult::Completed)));
     assert!(
         response.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n")
     );
@@ -1281,7 +1281,7 @@ async fn websocket_handshake_matches_xray_duplicate_header_semantics() {
         ),
     ] {
         let (result, response) = run_handshake(&request).await;
-        assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
+        assert!(matches!(result, Ok(TcpServerSetupResult::Completed)));
         assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
     }
 }

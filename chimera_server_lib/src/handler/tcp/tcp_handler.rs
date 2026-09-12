@@ -118,10 +118,11 @@ pub enum TcpServerSetupResult {
         stream: Box<dyn crate::async_stream::AsyncSessionMessageStream>,
         traffic_context: Option<TrafficContext>,
     },
-    /// The handler has taken full ownership of the stream and all work is
-    /// already handled (via a spawned task). `process_stream` should
-    /// return `Ok(())` immediately.
-    AlreadyHandled,
+    /// The handler has synchronously completed processing this connection.
+    /// This does not transfer ownership of detached/background tasks: any
+    /// spawned work must already be registered with an existing lifecycle
+    /// owner before this result is returned.
+    Completed,
 }
 
 /// Handler result after transport-only compatibility wrappers have been
@@ -170,7 +171,9 @@ pub(crate) enum TcpServerSetupOutcome {
         stream: Box<dyn crate::async_stream::AsyncSessionMessageStream>,
         traffic_context: Option<TrafficContext>,
     },
-    AlreadyHandled,
+    /// Connection processing is complete. No task ownership is transferred
+    /// through this outcome.
+    Completed,
 }
 
 pub(crate) struct NormalizedTcpServerSetup {
@@ -312,10 +315,10 @@ impl TcpServerSetupResult {
                         },
                     };
                 }
-                TcpServerSetupResult::AlreadyHandled => {
+                TcpServerSetupResult::Completed => {
                     return NormalizedTcpServerSetup {
                         peer_addr_override,
-                        outcome: TcpServerSetupOutcome::AlreadyHandled,
+                        outcome: TcpServerSetupOutcome::Completed,
                     };
                 }
             }

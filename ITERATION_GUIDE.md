@@ -237,7 +237,7 @@ chimera_server_lib/src/
 
 TransportContext 保存源/本地地址、SNI、ALPN 和已证明可用的传输能力。Protocol 产生认证身份与请求语义；SessionContext 持有执行该会话所需的有限能力。不要把它们统一成包含全局 RuntimeState 的万能 Context。
 
-ProtocolOutcome 建议表达互斥结果：TCP、固定目标 UDP、多目标 UDP、会话型 UDP、回落、可跟踪的专用执行结果。避免多个 Option 同时为空或同时有效。不能用一个 `AlreadyHandled` 标记掩盖没有 owner 的任务。
+ProtocolOutcome 建议表达互斥结果：TCP、固定目标 UDP、多目标 UDP、会话型 UDP、回落、可跟踪的专用执行结果。避免多个 Option 同时为空或同时有效。`Completed` 只表示同步处理结束，不能用它掩盖没有 owner 的后台任务。
 
 REALITY/Vision、HTTP keep-alive、SOCKS UDP_ASSOCIATE、QUIC stream/datagram 都可保留必要专用接口。统一的是生命周期和能力契约，不是所有协议必须共用一个 relay 循环。
 

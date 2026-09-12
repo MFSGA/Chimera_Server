@@ -425,14 +425,14 @@ fn setup_result_normalization_uses_innermost_peer_override() {
         peer_addr: outer,
         inner: Box::new(TcpServerSetupResult::PeerAddrOverride {
             peer_addr: inner,
-            inner: Box::new(TcpServerSetupResult::AlreadyHandled),
+            inner: Box::new(TcpServerSetupResult::Completed),
         }),
     };
 
     let (peer_addr, normalized) =
         normalize_setup_result(result, original, None).unwrap();
     assert_eq!(peer_addr, inner);
-    assert!(matches!(normalized, TcpServerSetupOutcome::AlreadyHandled));
+    assert!(matches!(normalized, TcpServerSetupOutcome::Completed));
 }
 
 #[test]
@@ -443,7 +443,7 @@ fn setup_result_normalization_reapplies_followup_peer_override() {
 
     let first_result = TcpServerSetupResult::PeerAddrOverride {
         peer_addr: first,
-        inner: Box::new(TcpServerSetupResult::AlreadyHandled),
+        inner: Box::new(TcpServerSetupResult::Completed),
     };
     let (peer_addr, _) =
         normalize_setup_result(first_result, original, None).unwrap();
@@ -451,12 +451,12 @@ fn setup_result_normalization_reapplies_followup_peer_override() {
 
     let followup_result = TcpServerSetupResult::PeerAddrOverride {
         peer_addr: followup,
-        inner: Box::new(TcpServerSetupResult::AlreadyHandled),
+        inner: Box::new(TcpServerSetupResult::Completed),
     };
     let (peer_addr, normalized) =
         normalize_setup_result(followup_result, peer_addr, None).unwrap();
     assert_eq!(peer_addr, followup);
-    assert!(matches!(normalized, TcpServerSetupOutcome::AlreadyHandled));
+    assert!(matches!(normalized, TcpServerSetupOutcome::Completed));
 }
 
 #[test]

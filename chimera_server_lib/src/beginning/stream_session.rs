@@ -829,7 +829,7 @@ where
             )
             .await
         }
-        TcpServerSetupOutcome::AlreadyHandled => Ok(()),
+        TcpServerSetupOutcome::Completed => Ok(()),
     }
 }
 
