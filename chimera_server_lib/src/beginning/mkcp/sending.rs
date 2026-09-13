@@ -54,8 +54,12 @@ impl MkcpSendingState {
         }
     }
 
+    pub(crate) fn can_push(&self) -> bool {
+        !self.closed && self.window.len() as u32 <= self.window_size
+    }
+
     pub(crate) fn push(&mut self, payload: Vec<u8>) -> bool {
-        if self.closed || self.window.len() as u32 > self.window_size {
+        if !self.can_push() {
             return false;
         }
 
@@ -208,6 +212,10 @@ impl MkcpSendingState {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.window.is_empty()
+    }
+
+    pub(crate) fn update_necessary(&self) -> bool {
+        !self.window.is_empty()
     }
 
     pub(crate) fn first_unacknowledged(&self) -> u32 {

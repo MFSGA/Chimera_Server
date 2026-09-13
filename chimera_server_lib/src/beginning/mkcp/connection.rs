@@ -123,6 +123,26 @@ impl MkcpConnectionState {
         self.receiving.drain_ordered_payloads()
     }
 
+    pub(crate) fn pop_ordered_payload(&mut self) -> Option<Vec<u8>> {
+        self.receiving.pop_ordered_payload()
+    }
+
+    pub(crate) fn data_available(&self) -> bool {
+        self.receiving.is_data_available()
+    }
+
+    pub(crate) fn can_push_payload(&self) -> bool {
+        self.sending.can_push()
+    }
+
+    pub(crate) fn push_payload(&mut self, payload: Vec<u8>) -> bool {
+        self.sending.push(payload)
+    }
+
+    pub(crate) fn update_necessary(&self) -> bool {
+        self.receiving.update_necessary() || self.sending.update_necessary()
+    }
+
     pub(crate) fn input(
         &mut self,
         current: u32,

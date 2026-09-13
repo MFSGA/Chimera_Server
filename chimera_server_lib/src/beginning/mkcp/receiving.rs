@@ -83,11 +83,20 @@ impl MkcpReceivingState {
 
     pub(crate) fn drain_ordered_payloads(&mut self) -> Vec<Vec<u8>> {
         let mut payloads = Vec::new();
-        while let Some(payload) = self.window.remove(&self.next_number) {
+        while let Some(payload) = self.pop_ordered_payload() {
             payloads.push(payload);
-            self.next_number = self.next_number.wrapping_add(1);
         }
         payloads
+    }
+
+    pub(crate) fn pop_ordered_payload(&mut self) -> Option<Vec<u8>> {
+        let payload = self.window.remove(&self.next_number)?;
+        self.next_number = self.next_number.wrapping_add(1);
+        Some(payload)
+    }
+
+    pub(crate) fn update_necessary(&self) -> bool {
+        !self.pending_acks.is_empty()
     }
 
     pub(crate) fn next_number(&self) -> u32 {
