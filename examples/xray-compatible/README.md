@@ -84,7 +84,18 @@ XRAY_BIN=/path/to/xray cargo test -p chimera_server_app \
   -- --ignored --exact --nocapture
 ```
 
-The fixture passed 3/3 runs with Xray 26.9.9 / `52a412d` / go1.27.1 linux/amd64, which was the newest published Xray build and marked pre-release at verification time. It also passed 1/1 with the latest non-pre-release GitHub release, Xray 26.3.27 / `d2758a0` / go1.26.1 linux/amd64. This is a narrow interoperability claim for plain VLESS TCP streams over default mKCP settings with no transport security; it does not certify every protocol/security combination, packet-loss profile, or mKCP masking mode.
+The fixture passed 3/3 runs with Xray 26.9.9 / `52a412d` / go1.27.1 linux/amd64, which was the newest published Xray build and marked pre-release at verification time. It also passed 1/1 with the latest non-pre-release GitHub release, Xray 26.3.27 / `d2758a0` / go1.26.1 linux/amd64.
+
+A second ignored test places a deterministic UDP fault proxy between Xray and Chimera. In each direction it drops every 17th datagram and holds every 13th datagram until the next packet so the pair is delivered out of order. The test requires a 256 KiB TCP echo roundtrip and asserts that client-to-server and server-to-client loss and reordering were all actually exercised:
+
+```sh
+XRAY_BIN=/path/to/xray cargo test -p chimera_server_app \
+  --test xray_client_proxy_e2e \
+  xray_client_vless_mkcp_recovers_from_loss_and_reordering \
+  -- --ignored --exact --nocapture
+```
+
+That recovery test passed 3/3 runs with Xray 26.9.9 / `52a412d` on 2026-09-13. It specifically exercises mKCP ACK/RTO retransmission and out-of-order receive behavior after successful UDP sends; it does not simulate local `send_to` system-call failures, arbitrary burst-loss distributions, or every protocol/security combination and masking mode.
 
 ### Shadowsocks candidate release goal: PASS
 
@@ -153,7 +164,7 @@ Hysteria2 is therefore **not currently release-blocked by the previously observe
 
 | Area | Status |
 | --- | --- |
-| mKCP combinations beyond verified VLESS + none | Plain VLESS TCP streams over default mKCP settings are Xray-verified as described above. Other proxy/security combinations, packet-loss/reordering recovery evidence, and masking variants are not yet certified; mKCP + DokodemoDoor `followRedirect` still fails closed because UDP original-destination extraction is not implemented. |
+| mKCP combinations beyond verified VLESS + none | Plain VLESS TCP streams over default mKCP settings are Xray-verified, including the deterministic bidirectional loss/reordering profile described above. Other proxy/security combinations, broader loss/error profiles, and masking variants are not yet certified; mKCP + DokodemoDoor `followRedirect` still fails closed because UDP original-destination extraction is not implemented. |
 | Legacy QUIC transport | Not materialized or release-verified in this matrix. |
 | TUN | Not part of this inbound compatibility matrix. |
 | WireGuard | Not part of this inbound compatibility matrix. |

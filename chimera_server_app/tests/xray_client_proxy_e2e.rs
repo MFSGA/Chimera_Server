@@ -1736,6 +1736,82 @@ async fn xray_client_can_proxy_tcp_through_chimera_vless_mkcp() {
     xray.assert_running();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Xray VLESS over mKCP through deterministic UDP loss and reordering"]
+async fn xray_client_vless_mkcp_recovers_from_loss_and_reordering() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("vless-mkcp-fault-proxy");
+    let echo_addr = start_tcp_echo_server();
+    let chimera_port = free_localhost_udp_port();
+    let xray_socks_port = free_localhost_port();
+    let chimera_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port));
+    let chimera_config_path = work_dir.join("chimera.json");
+    let xray_config_path = work_dir.join("xray-client.json");
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "vless",
+                "tag": "chimera-vless-mkcp-faults",
+                "settings": {
+                    "clients": [{"id": TEST_UUID, "email": "vless-mkcp-faults@example.test"}],
+                    "decryption": "none"
+                },
+                "streamSettings": {"network": "kcp", "security": "none"}
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    thread::sleep(CONNECT_RETRY_INTERVAL);
+    chimera.assert_running();
+    let proxy = start_mkcp_fault_proxy(chimera_addr).await;
+
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth"}
+            }],
+            "outbounds": [{
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": proxy.addr.port(),
+                        "users": [{"id": TEST_UUID, "encryption": "none"}]
+                    }]
+                },
+                "streamSettings": {"network": "kcp", "security": "none"}
+            }]
+        }),
+    );
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+
+    assert_socks5_echo_async_with_timeout(
+        socks_addr,
+        echo_addr,
+        &deterministic_payload(256 * 1024),
+        Duration::from_secs(30),
+    )
+    .await;
+    proxy.assert_bidirectional_faults_exercised();
+    chimera.assert_running();
+    xray.assert_running();
+}
+
 async fn run_xray_client_vmess_transport_case(case: VlessTransportCase) {
     let workspace = workspace_root();
     let work_dir = create_test_dir(&format!("vmess-{}", case.name()));
@@ -3307,6 +3383,131 @@ async fn start_udp_echo_server() -> SocketAddr {
         }
     });
     addr
+}
+
+#[derive(Default)]
+struct MkcpFaultStats {
+    client_to_server_dropped: AtomicUsize,
+    server_to_client_dropped: AtomicUsize,
+    client_to_server_reordered: AtomicUsize,
+    server_to_client_reordered: AtomicUsize,
+}
+
+struct MkcpFaultProxy {
+    addr: SocketAddr,
+    stats: Arc<MkcpFaultStats>,
+}
+
+impl MkcpFaultProxy {
+    fn assert_bidirectional_faults_exercised(&self) {
+        for (label, counter) in [
+            (
+                "client-to-server drops",
+                &self.stats.client_to_server_dropped,
+            ),
+            (
+                "server-to-client drops",
+                &self.stats.server_to_client_dropped,
+            ),
+            (
+                "client-to-server reorders",
+                &self.stats.client_to_server_reordered,
+            ),
+            (
+                "server-to-client reorders",
+                &self.stats.server_to_client_reordered,
+            ),
+        ] {
+            assert!(
+                counter.load(Ordering::Relaxed) > 0,
+                "mKCP fault proxy did not exercise {label}"
+            );
+        }
+    }
+}
+
+async fn forward_mkcp_fault_packet(
+    socket: &TokioUdpSocket,
+    target: SocketAddr,
+    packet: &[u8],
+    packet_index: usize,
+    held: &mut Option<Vec<u8>>,
+    dropped: &AtomicUsize,
+    reordered: &AtomicUsize,
+) -> io::Result<()> {
+    const DROP_EVERY: usize = 17;
+    const REORDER_EVERY: usize = 13;
+
+    if packet_index.is_multiple_of(DROP_EVERY) {
+        dropped.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    }
+    if let Some(held_packet) = held.take() {
+        socket.send_to(packet, target).await?;
+        socket.send_to(&held_packet, target).await?;
+        reordered.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    }
+    if packet_index.is_multiple_of(REORDER_EVERY) {
+        *held = Some(packet.to_vec());
+        return Ok(());
+    }
+    socket.send_to(packet, target).await?;
+    Ok(())
+}
+
+async fn start_mkcp_fault_proxy(server_addr: SocketAddr) -> MkcpFaultProxy {
+    let socket = TokioUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind mKCP fault proxy");
+    let addr = socket.local_addr().expect("mKCP fault proxy addr");
+    let stats = Arc::new(MkcpFaultStats::default());
+    let task_stats = stats.clone();
+
+    tokio::spawn(async move {
+        let mut client_addr = None;
+        let mut client_packet_index = 0usize;
+        let mut server_packet_index = 0usize;
+        let mut held_to_server = None;
+        let mut held_to_client = None;
+        let mut buf = [0u8; 65_535];
+        while let Ok((len, peer)) = socket.recv_from(&mut buf).await {
+            let result = if peer == server_addr {
+                let Some(client_addr) = client_addr else {
+                    continue;
+                };
+                server_packet_index += 1;
+                forward_mkcp_fault_packet(
+                    &socket,
+                    client_addr,
+                    &buf[..len],
+                    server_packet_index,
+                    &mut held_to_client,
+                    &task_stats.server_to_client_dropped,
+                    &task_stats.server_to_client_reordered,
+                )
+                .await
+            } else {
+                client_addr = Some(peer);
+                client_packet_index += 1;
+                forward_mkcp_fault_packet(
+                    &socket,
+                    server_addr,
+                    &buf[..len],
+                    client_packet_index,
+                    &mut held_to_server,
+                    &task_stats.client_to_server_dropped,
+                    &task_stats.client_to_server_reordered,
+                )
+                .await
+            };
+            if result.is_err() {
+                break;
+            }
+        }
+    });
+
+    MkcpFaultProxy { addr, stats }
 }
 
 #[cfg(feature = "brutal-pacing-trace")]
