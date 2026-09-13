@@ -32,6 +32,7 @@ Config validation is necessary but is not protocol interoperability evidence. Te
 | `dokodemo-door-tcp.json5` | dokodemo-door | tcp | none | config-validated |
 | `dokodemo-door-udp.json5` | dokodemo-door | udp | none | config-validated |
 | `dokodemo-door-udp-routing-blackhole.json5` | dokodemo-door | udp | none | config-validated; routing example |
+| `http-tcp-password.json5` | http | tcp | none | config-validated; Xray-verified Basic-auth CONNECT with repository fixture |
 | `vless-tcp-none.json5` | vless | tcp | none | config-validated |
 | `vless-ws-none.json5` | vless | websocket | none | config-validated |
 | `vless-ws-tls.json5` | vless | websocket | tls | config-validated |
@@ -50,7 +51,19 @@ Config validation is necessary but is not protocol interoperability evidence. Te
 
 The two Shadowsocks examples intentionally omit `streamSettings`: Chimera's combined Shadowsocks `network: "tcp,udp"` listener rejects `streamSettings` because the same inbound also owns a UDP listener.
 
-## Real Xray-client verification recorded on 2026-09-10
+## Real Xray-client verification recorded on 2026-09-10 and 2026-09-13
+
+### HTTP inbound Basic authentication: PASS
+
+On 2026-09-13 the repository-local Xray 26.2.6 / `12ee51e` client was configured with a SOCKS inbound and an HTTP outbound pointing at Chimera's password-protected HTTP inbound. The positive CONNECT tunnel completed a TCP echo roundtrip, while a second Xray client using the wrong HTTP proxy password failed to establish the tunnel and left the Chimera listener running.
+
+```sh
+cargo test -p chimera_server_app --test xray_client_proxy_e2e \
+  xray_client_can_proxy_tcp_through_chimera_http \
+  -- --ignored --exact --nocapture
+```
+
+This refresh covers Xray HTTP-outbound interoperability for TCP CONNECT and Basic authentication success/failure. Chimera's separate `http_and_mixed_inbounds_proxy_tcp` test continues to cover direct absolute-form forwarding and `allowTransparent`; those paths were not exercised through the Xray HTTP outbound in this certification.
 
 ### Shadowsocks candidate release goal: PASS
 
@@ -112,7 +125,6 @@ Hysteria2 is therefore **not currently release-blocked by the previously observe
 | VLESS + XHTTP + none/TLS/REALITY | Active XHTTP protocol/security matrices pass under ordinary tests; no goal-specific real Xray-client certification was refreshed in this round. |
 | VLESS + gRPC | Inbound and real Xray-client tests exist; not re-run as release evidence in this round. |
 | VLESS + HTTPUpgrade | Inbound and real Xray-client tests exist; not re-run as release evidence in this round. |
-| HTTP inbound | Runtime/config support exists; no materialized example or refreshed real Xray-client release certification in this directory. |
 | Mixed inbound | Runtime/config support exists; no materialized example or refreshed real Xray-client release certification in this directory. |
 | Chimera-only TUIC inbound | Runtime/config tests exist; xray-core does not provide a TUIC inbound baseline. |
 
@@ -120,7 +132,7 @@ Hysteria2 is therefore **not currently release-blocked by the previously observe
 
 | Area | Status |
 | --- | --- |
-| mKCP transport | Not materialized or release-verified in this matrix. |
+| mKCP transport | Xray `kcp` / `mkcp` aliases and current `kcpSettings` defaults/validation are modeled, but Chimera still rejects the transport before runtime instead of falling back to raw TCP; listener/wire interoperability is not yet implemented or claimed. |
 | Legacy QUIC transport | Not materialized or release-verified in this matrix. |
 | TUN | Not part of this inbound compatibility matrix. |
 | WireGuard | Not part of this inbound compatibility matrix. |

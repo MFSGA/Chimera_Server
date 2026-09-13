@@ -13,6 +13,181 @@ fn inbound_for_protocol(protocol: &str) -> InboudItem {
     .expect("valid inbound item")
 }
 
+#[cfg(all(feature = "vless", feature = "vmess", feature = "trojan"))]
+fn standard_inbound_with_network(
+    protocol: &str,
+    settings: serde_json::Value,
+    network: &str,
+) -> InboudItem {
+    serde_json::from_value(serde_json::json!({
+        "listen": "127.0.0.1",
+        "port": 10000,
+        "protocol": protocol,
+        "tag": format!("{protocol}-{network}-transport-test"),
+        "settings": settings,
+        "streamSettings": {
+            "network": network,
+            "security": "none"
+        }
+    }))
+    .expect("valid standard inbound JSON shape")
+}
+
+#[cfg(all(feature = "vless", feature = "vmess", feature = "trojan"))]
+#[test]
+fn mkcp_aliases_fail_closed_until_transport_is_implemented() {
+    let protocols = [
+        (
+            "vless",
+            serde_json::json!({
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            }),
+        ),
+        (
+            "vmess",
+            serde_json::json!({
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}]
+            }),
+        ),
+        (
+            "trojan",
+            serde_json::json!({"clients": [{"password": "secret"}]}),
+        ),
+        ("socks", serde_json::json!({"auth": "noauth"})),
+    ];
+
+    for network in ["kcp", "mkcp"] {
+        for (protocol, settings) in &protocols {
+            let inbound =
+                standard_inbound_with_network(protocol, settings.clone(), network);
+            let error = ServerConfig::try_from(inbound)
+                .expect_err("mKCP must not silently fall back to raw TCP");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "invalid config: {protocol} inbound streamSettings.network={network} is not supported"
+                )
+            );
+        }
+    }
+}
+
+#[cfg(all(feature = "vless", feature = "vmess", feature = "trojan"))]
+#[test]
+fn raw_alias_remains_standard_tcp_like_xray() {
+    let protocols = [
+        (
+            "vless",
+            serde_json::json!({
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}],
+                "decryption": "none"
+            }),
+        ),
+        (
+            "vmess",
+            serde_json::json!({
+                "clients": [{"id": "3ac9b383-75a1-431c-8184-106c80eb2273"}]
+            }),
+        ),
+        (
+            "trojan",
+            serde_json::json!({"clients": [{"password": "secret"}]}),
+        ),
+        ("socks", serde_json::json!({"auth": "noauth"})),
+    ];
+
+    for (protocol, settings) in protocols {
+        let inbound = standard_inbound_with_network(protocol, settings, "raw");
+        let config = ServerConfig::try_from(inbound)
+            .expect("Xray raw transport alias should remain supported");
+        assert_eq!(config.transport, Transport::Tcp);
+    }
+}
+
+#[test]
+fn mkcp_plan_matches_current_xray_defaults_and_overrides() {
+    let defaults: crate::config::StreamSettings =
+        serde_json::from_value(serde_json::json!({"network": "mkcp"}))
+            .expect("default mKCP stream settings should deserialize");
+    let plan = plan_mkcp_transport(&defaults)
+        .expect("default mKCP settings should validate")
+        .expect("mKCP network should produce a plan");
+    assert_eq!(plan.mtu, 1350);
+    assert_eq!(plan.tti, 50);
+    assert_eq!(plan.uplink_capacity, 5);
+    assert_eq!(plan.downlink_capacity, 20);
+    assert_eq!(plan.cwnd_multiplier, 1);
+    assert_eq!(plan.max_sending_window, 2 * 1024 * 1024);
+
+    let overridden: crate::config::StreamSettings =
+        serde_json::from_value(serde_json::json!({
+            "network": "kcp",
+            "kcpSettings": {
+                "mtu": 1400,
+                "tti": 100,
+                "uplinkCapacity": 12,
+                "downlinkCapacity": 34,
+                "cwndMultiplier": 3,
+                "maxSendingWindow": 2800
+            }
+        }))
+        .expect("overridden mKCP stream settings should deserialize");
+    let plan = plan_mkcp_transport(&overridden)
+        .expect("overridden mKCP settings should validate")
+        .expect("kcp alias should produce an mKCP plan");
+    assert_eq!(plan.mtu, 1400);
+    assert_eq!(plan.tti, 100);
+    assert_eq!(plan.uplink_capacity, 12);
+    assert_eq!(plan.downlink_capacity, 34);
+    assert_eq!(plan.cwnd_multiplier, 3);
+    assert_eq!(plan.max_sending_window, 2800);
+}
+
+#[test]
+fn mkcp_plan_matches_current_xray_validation() {
+    let cases = [
+        (serde_json::json!({"mtu": 20}), "Mtu must be at least 21"),
+        (serde_json::json!({"tti": 9}), "invalid mKCP TTI: 9"),
+        (serde_json::json!({"tti": 1001}), "invalid mKCP TTI: 1001"),
+        (
+            serde_json::json!({"cwndMultiplier": 0}),
+            "CwndMultiplier must be at least 1",
+        ),
+        (
+            serde_json::json!({"mtu": 1350, "maxSendingWindow": 1349}),
+            "MaxSendingWindow must be >= Mtu",
+        ),
+        (
+            serde_json::json!({"header": null}),
+            "header and seed have been removed",
+        ),
+        (
+            serde_json::json!({"header": {"type": "none"}}),
+            "header and seed have been removed",
+        ),
+        (
+            serde_json::json!({"seed": "legacy-seed"}),
+            "header and seed have been removed",
+        ),
+    ];
+
+    for (kcp_settings, expected) in cases {
+        let stream_settings: crate::config::StreamSettings =
+            serde_json::from_value(serde_json::json!({
+                "network": "mkcp",
+                "kcpSettings": kcp_settings
+            }))
+            .expect("invalid mKCP values should deserialize before validation");
+        let error = plan_mkcp_transport(&stream_settings)
+            .expect_err("invalid current-Xray mKCP settings must be rejected");
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected:?}, got {error}"
+        );
+    }
+}
+
 #[test]
 fn tcp_sockopt_preserves_xray_congestion_and_validates_brutal_v2() {
     let inbound: InboudItem = serde_json::from_value(serde_json::json!({

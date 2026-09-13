@@ -1035,6 +1035,113 @@ async fn http_and_mixed_inbounds_proxy_tcp() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera HTTP inbound and ./xray as client"]
+async fn xray_client_can_proxy_tcp_through_chimera_http() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("http-xray-client");
+    let echo_addr = start_tcp_echo_server();
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let bad_xray_socks_port = free_localhost_port();
+
+    let chimera_config_path = work_dir.join("chimera-http.json");
+    let xray_config_path = work_dir.join("xray-http-client.json");
+    let bad_xray_config_path = work_dir.join("xray-http-client-bad-auth.json");
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "http",
+                "tag": "chimera-http",
+                "settings": {
+                    "accounts": [{
+                        "user": "alice",
+                        "pass": "secret"
+                    }]
+                },
+                "streamSettings": {
+                    "network": "tcp"
+                }
+            }],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }]
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "tag": "socks-in",
+                "settings": {"auth": "noauth"}
+            }],
+            "outbounds": [{
+                "tag": "to-chimera",
+                "protocol": "http",
+                "settings": {
+                    "address": "127.0.0.1",
+                    "port": chimera_port,
+                    "user": "alice",
+                    "pass": "secret"
+                }
+            }]
+        }),
+    );
+    write_json(
+        &bad_xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": bad_xray_socks_port,
+                "protocol": "socks",
+                "tag": "socks-in",
+                "settings": {"auth": "noauth"}
+            }],
+            "outbounds": [{
+                "tag": "to-chimera",
+                "protocol": "http",
+                "settings": {
+                    "address": "127.0.0.1",
+                    "port": chimera_port,
+                    "user": "alice",
+                    "pass": "wrong-password"
+                }
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port)));
+    xray.assert_running();
+
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    assert_socks5_echo(socks_addr, echo_addr, b"HTTP CONNECT through Xray client");
+    drop(xray);
+
+    let mut bad_xray = start_xray(&workspace, &work_dir, &bad_xray_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, bad_xray_socks_port)));
+    bad_xray.assert_running();
+    assert_socks5_echo_does_not_succeed(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, bad_xray_socks_port)),
+        echo_addr,
+    );
+    chimera.assert_running();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts Chimera and ./xray for legacy Shadowsocks AEAD TCP"]
 async fn xray_client_can_proxy_tcp_through_chimera_shadowsocks() {
     let workspace = workspace_root();

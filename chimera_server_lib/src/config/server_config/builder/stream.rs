@@ -282,6 +282,80 @@ pub(super) fn apply_standard_stream_layers(
     apply_security_layers(protocol, stream_settings)
 }
 
+const XRAY_MKCP_DEFAULT_MTU: u32 = 1350;
+const XRAY_MKCP_DEFAULT_TTI: u32 = 50;
+const XRAY_MKCP_DEFAULT_UPLINK_CAPACITY: u32 = 5;
+const XRAY_MKCP_DEFAULT_DOWNLINK_CAPACITY: u32 = 20;
+const XRAY_MKCP_DEFAULT_CWND_MULTIPLIER: u32 = 1;
+const XRAY_MKCP_DEFAULT_MAX_SENDING_WINDOW: u32 = 2 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MkcpTransportPlan {
+    pub(super) mtu: u32,
+    pub(super) tti: u32,
+    pub(super) uplink_capacity: u32,
+    pub(super) downlink_capacity: u32,
+    pub(super) cwnd_multiplier: u32,
+    pub(super) max_sending_window: u32,
+}
+
+pub(super) fn plan_mkcp_transport(
+    stream_settings: &crate::config::StreamSettings,
+) -> Result<Option<MkcpTransportPlan>, Error> {
+    let network = stream_settings.network.trim();
+    if !network.eq_ignore_ascii_case("kcp") && !network.eq_ignore_ascii_case("mkcp")
+    {
+        return Ok(None);
+    }
+
+    let settings = stream_settings.kcp_settings.clone().unwrap_or_default();
+    if settings.header.is_some() || settings.seed.is_some() {
+        return Err(Error::InvalidConfig(
+            "mKCP header and seed have been removed; use finalmask/udp instead"
+                .into(),
+        ));
+    }
+
+    let plan = MkcpTransportPlan {
+        mtu: settings.mtu.unwrap_or(XRAY_MKCP_DEFAULT_MTU),
+        tti: settings.tti.unwrap_or(XRAY_MKCP_DEFAULT_TTI),
+        uplink_capacity: settings
+            .uplink_capacity
+            .unwrap_or(XRAY_MKCP_DEFAULT_UPLINK_CAPACITY),
+        downlink_capacity: settings
+            .downlink_capacity
+            .unwrap_or(XRAY_MKCP_DEFAULT_DOWNLINK_CAPACITY),
+        cwnd_multiplier: settings
+            .cwnd_multiplier
+            .unwrap_or(XRAY_MKCP_DEFAULT_CWND_MULTIPLIER),
+        max_sending_window: settings
+            .max_sending_window
+            .unwrap_or(XRAY_MKCP_DEFAULT_MAX_SENDING_WINDOW),
+    };
+
+    if plan.mtu < 21 {
+        return Err(Error::InvalidConfig("mKCP Mtu must be at least 21".into()));
+    }
+    if !(10..=1000).contains(&plan.tti) {
+        return Err(Error::InvalidConfig(format!(
+            "invalid mKCP TTI: {}",
+            plan.tti
+        )));
+    }
+    if plan.cwnd_multiplier < 1 {
+        return Err(Error::InvalidConfig(
+            "mKCP CwndMultiplier must be at least 1".into(),
+        ));
+    }
+    if plan.max_sending_window / plan.mtu == 0 {
+        return Err(Error::InvalidConfig(
+            "mKCP MaxSendingWindow must be >= Mtu".into(),
+        ));
+    }
+
+    Ok(Some(plan))
+}
+
 pub(super) fn validate_standard_tcp_network(
     stream_settings: Option<&crate::config::StreamSettings>,
     inbound_protocol: &str,
@@ -290,6 +364,9 @@ pub(super) fn validate_standard_tcp_network(
         return Ok(());
     };
     let network = stream_settings.network.trim().to_ascii_lowercase();
+    if matches!(network.as_str(), "kcp" | "mkcp") {
+        let _ = plan_mkcp_transport(stream_settings)?;
+    }
     if matches!(
         network.as_str(),
         "" | "raw" | "tcp" | "ws" | "websocket" | "httpupgrade" | "grpc"

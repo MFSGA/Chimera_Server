@@ -525,6 +525,7 @@ fn build_vmess_server(
             })
         })
         .collect::<Result<Vec<_>, Error>>()?;
+    validate_standard_tcp_network(context.stream_settings(), "vmess")?;
     let protocol = apply_standard_stream_layers(
         ServerProxyConfig::Vmess { users },
         context.stream_settings(),
@@ -542,6 +543,7 @@ fn build_trojan_server(
     })?;
     let fallbacks = collect_trojan_fallbacks(&settings)?;
     let users = collect_trojan_clients(settings)?;
+    validate_standard_tcp_network(context.stream_settings(), "trojan")?;
     let protocol = apply_standard_stream_layers(
         ServerProxyConfig::Trojan { users, fallbacks },
         context.stream_settings(),
@@ -625,6 +627,7 @@ fn build_socks_server(
     })?;
     let (accounts, udp_enabled, udp_response_ip, user_level) =
         collect_socks_settings(settings)?;
+    validate_standard_tcp_network(context.stream_settings(), "socks")?;
     let protocol = apply_standard_stream_layers(
         ServerProxyConfig::Socks {
             accounts,

@@ -69,6 +69,8 @@ pub struct StreamSettings {
     #[cfg(feature = "grpc_transport")]
     #[serde(alias = "grpcSettings")]
     grpc_settings: Option<GrpcSettings>,
+    #[serde(alias = "kcpSettings")]
+    kcp_settings: Option<KcpSettings>,
     #[serde(alias = "hysteriaSettings")]
     hysteria_settings: Option<HysteriaSettings>,
     #[serde(default, rename = "finalmask", alias = "finalMask")]
@@ -78,6 +80,36 @@ pub struct StreamSettings {
     reality_settings: Option<RealitySettings>,
     #[serde(default)]
     sockopt: Option<SocketSettings>,
+}
+
+fn deserialize_present_json<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct KcpSettings {
+    #[serde(default)]
+    mtu: Option<u32>,
+    #[serde(default)]
+    tti: Option<u32>,
+    #[serde(default)]
+    uplink_capacity: Option<u32>,
+    #[serde(default)]
+    downlink_capacity: Option<u32>,
+    #[serde(default)]
+    cwnd_multiplier: Option<u32>,
+    #[serde(default)]
+    max_sending_window: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_present_json")]
+    header: Option<serde_json::Value>,
+    #[serde(default)]
+    seed: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
