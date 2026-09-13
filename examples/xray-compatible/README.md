@@ -95,7 +95,7 @@ XRAY_BIN=/path/to/xray cargo test -p chimera_server_app \
   -- --ignored --exact --nocapture
 ```
 
-That recovery test passed 3/3 runs with Xray 26.9.9 / `52a412d` on 2026-09-13. It specifically exercises mKCP ACK/RTO retransmission and out-of-order receive behavior after successful UDP sends; it does not simulate local `send_to` system-call failures, arbitrary burst-loss distributions, or every protocol/security combination and masking mode.
+That recovery test passed 3/3 runs with Xray 26.9.9 / `52a412d` on 2026-09-13. It specifically exercises mKCP ACK/RTO retransmission and out-of-order receive behavior after successful UDP sends. Chimera's listener also mirrors Xray's `RetryableWriter` policy for local segment-write failures: one connection serializes each segment, makes at most five write attempts separated by 100 ms, and waits the final 100 ms before giving up, without stalling unrelated mKCP sessions. Focused injected-sender tests cover that local failure path; the real-client fault proxy still does not force kernel `send_to` failures. Arbitrary burst-loss distributions, every protocol/security combination, and masking modes remain outside this certification.
 
 ### Shadowsocks candidate release goal: PASS
 
@@ -164,7 +164,7 @@ Hysteria2 is therefore **not currently release-blocked by the previously observe
 
 | Area | Status |
 | --- | --- |
-| mKCP combinations beyond verified VLESS + none | Plain VLESS TCP streams over default mKCP settings are Xray-verified, including the deterministic bidirectional loss/reordering profile described above. Other proxy/security combinations, broader loss/error profiles, and masking variants are not yet certified; mKCP + DokodemoDoor `followRedirect` still fails closed because UDP original-destination extraction is not implemented. |
+| mKCP combinations beyond verified VLESS + none | Plain VLESS TCP streams over default mKCP settings are Xray-verified, including the deterministic bidirectional loss/reordering profile described above. Xray's five-attempt/100 ms local segment-write retry policy is runtime-implemented and unit-covered, but kernel `send_to` failure injection is not part of the real-client evidence. Other proxy/security combinations, broader loss/error profiles, and masking variants are not yet certified; mKCP + DokodemoDoor `followRedirect` still fails closed because UDP original-destination extraction is not implemented. |
 | Legacy QUIC transport | Not materialized or release-verified in this matrix. |
 | TUN | Not part of this inbound compatibility matrix. |
 | WireGuard | Not part of this inbound compatibility matrix. |
