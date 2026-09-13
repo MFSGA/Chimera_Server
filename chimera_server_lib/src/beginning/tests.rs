@@ -129,6 +129,46 @@ async fn quic_endpoint_driver_loss_reaches_inbound_health() {
     assert!(!runtime.is_ready());
 }
 
+#[tokio::test]
+async fn mkcp_transport_fails_closed_before_listener_runtime_exists() {
+    let config = ServerConfig {
+        tag: "mkcp-runtime-pending".to_string(),
+        bind_location: BindLocation::Address(NetLocation::from_ip_addr(
+            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+            10003,
+        )),
+        protocol: ServerProxyConfig::Socks {
+            accounts: crate::config::server_config::SocksUserStore::new(Vec::new()),
+            udp_enabled: false,
+            udp_response_ip: None,
+            user_level: 0,
+        },
+        transport: Transport::Mkcp(crate::config::MkcpTransportConfig {
+            mtu: 1350,
+            tti: 50,
+            uplink_capacity: 5,
+            downlink_capacity: 20,
+            cwnd_multiplier: 1,
+            max_sending_window: 2 * 1024 * 1024,
+        }),
+        quic_settings: None,
+        sniffing: None,
+        tcp_socket_policy: None,
+    };
+    let runtime = RuntimeState::new(vec![config.clone()], Vec::new());
+    let error = match start_bound_servers(config, runtime).await {
+        Ok(_) => {
+            panic!("mKCP must fail before any TCP/QUIC fallback listener starts")
+        }
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert_eq!(
+        error.to_string(),
+        "mKCP transport runtime is not implemented"
+    );
+}
+
 #[test]
 fn tcp_accept_health_fails_only_after_sustained_listener_errors() {
     let mut health = TcpAcceptHealth::default();

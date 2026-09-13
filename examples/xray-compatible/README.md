@@ -132,7 +132,7 @@ Hysteria2 is therefore **not currently release-blocked by the previously observe
 
 | Area | Status |
 | --- | --- |
-| mKCP transport | Xray `kcp` / `mkcp` aliases and current `kcpSettings` defaults/validation are modeled, but Chimera still rejects the transport before runtime instead of falling back to raw TCP; listener/wire interoperability is not yet implemented or claimed. |
+| mKCP transport | Xray `kcp` / `mkcp` aliases and current `kcpSettings` defaults/validation now materialize as an explicit `Mkcp` server transport capability. Startup fails closed with `Unsupported` until the UDP/KCP listener exists; listener/wire interoperability is not yet implemented or claimed. |
 | Legacy QUIC transport | Not materialized or release-verified in this matrix. |
 | TUN | Not part of this inbound compatibility matrix. |
 | WireGuard | Not part of this inbound compatibility matrix. |

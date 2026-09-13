@@ -282,26 +282,9 @@ pub(super) fn apply_standard_stream_layers(
     apply_security_layers(protocol, stream_settings)
 }
 
-const XRAY_MKCP_DEFAULT_MTU: u32 = 1350;
-const XRAY_MKCP_DEFAULT_TTI: u32 = 50;
-const XRAY_MKCP_DEFAULT_UPLINK_CAPACITY: u32 = 5;
-const XRAY_MKCP_DEFAULT_DOWNLINK_CAPACITY: u32 = 20;
-const XRAY_MKCP_DEFAULT_CWND_MULTIPLIER: u32 = 1;
-const XRAY_MKCP_DEFAULT_MAX_SENDING_WINDOW: u32 = 2 * 1024 * 1024;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct MkcpTransportPlan {
-    pub(super) mtu: u32,
-    pub(super) tti: u32,
-    pub(super) uplink_capacity: u32,
-    pub(super) downlink_capacity: u32,
-    pub(super) cwnd_multiplier: u32,
-    pub(super) max_sending_window: u32,
-}
-
 pub(super) fn plan_mkcp_transport(
     stream_settings: &crate::config::StreamSettings,
-) -> Result<Option<MkcpTransportPlan>, Error> {
+) -> Result<Option<crate::config::MkcpTransportConfig>, Error> {
     let network = stream_settings.network.trim();
     if !network.eq_ignore_ascii_case("kcp") && !network.eq_ignore_ascii_case("mkcp")
     {
@@ -316,22 +299,8 @@ pub(super) fn plan_mkcp_transport(
         ));
     }
 
-    let plan = MkcpTransportPlan {
-        mtu: settings.mtu.unwrap_or(XRAY_MKCP_DEFAULT_MTU),
-        tti: settings.tti.unwrap_or(XRAY_MKCP_DEFAULT_TTI),
-        uplink_capacity: settings
-            .uplink_capacity
-            .unwrap_or(XRAY_MKCP_DEFAULT_UPLINK_CAPACITY),
-        downlink_capacity: settings
-            .downlink_capacity
-            .unwrap_or(XRAY_MKCP_DEFAULT_DOWNLINK_CAPACITY),
-        cwnd_multiplier: settings
-            .cwnd_multiplier
-            .unwrap_or(XRAY_MKCP_DEFAULT_CWND_MULTIPLIER),
-        max_sending_window: settings
-            .max_sending_window
-            .unwrap_or(XRAY_MKCP_DEFAULT_MAX_SENDING_WINDOW),
-    };
+    let plan =
+        crate::config::MkcpTransportConfig::from_kcp_settings(Some(&settings));
 
     if plan.mtu < 21 {
         return Err(Error::InvalidConfig("mKCP Mtu must be at least 21".into()));
@@ -364,12 +333,16 @@ pub(super) fn validate_standard_tcp_network(
         return Ok(());
     };
     let network = stream_settings.network.trim().to_ascii_lowercase();
-    if matches!(network.as_str(), "kcp" | "mkcp") {
-        let _ = plan_mkcp_transport(stream_settings)?;
-    }
     if matches!(
         network.as_str(),
-        "" | "raw" | "tcp" | "ws" | "websocket" | "httpupgrade" | "grpc"
+        "" | "raw"
+            | "tcp"
+            | "ws"
+            | "websocket"
+            | "httpupgrade"
+            | "grpc"
+            | "kcp"
+            | "mkcp"
     ) {
         Ok(())
     } else {

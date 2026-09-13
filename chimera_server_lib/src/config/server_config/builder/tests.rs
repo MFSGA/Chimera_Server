@@ -35,7 +35,7 @@ fn standard_inbound_with_network(
 
 #[cfg(all(feature = "vless", feature = "vmess", feature = "trojan"))]
 #[test]
-fn mkcp_aliases_fail_closed_until_transport_is_implemented() {
+fn mkcp_aliases_materialize_transport_plan_without_tcp_fallback() {
     let protocols = [
         (
             "vless",
@@ -61,16 +61,53 @@ fn mkcp_aliases_fail_closed_until_transport_is_implemented() {
         for (protocol, settings) in &protocols {
             let inbound =
                 standard_inbound_with_network(protocol, settings.clone(), network);
-            let error = ServerConfig::try_from(inbound)
-                .expect_err("mKCP must not silently fall back to raw TCP");
-            assert_eq!(
-                error.to_string(),
-                format!(
-                    "invalid config: {protocol} inbound streamSettings.network={network} is not supported"
-                )
+            let config = ServerConfig::try_from(inbound).expect(
+                "recognized mKCP aliases should materialize transport capability",
             );
+            let Transport::Mkcp(plan) = config.transport else {
+                panic!("{protocol} network={network} must not fall back to raw TCP");
+            };
+            assert_eq!(plan.mtu, 1350);
+            assert_eq!(plan.tti, 50);
+            assert_eq!(plan.uplink_capacity, 5);
+            assert_eq!(plan.downlink_capacity, 20);
+            assert_eq!(plan.cwnd_multiplier, 1);
+            assert_eq!(plan.max_sending_window, 2 * 1024 * 1024);
         }
     }
+}
+
+#[test]
+fn legacy_transport_helper_recognizes_mkcp_without_quic_alias() {
+    let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+        "listen": "127.0.0.1",
+        "port": 10000,
+        "protocol": "socks",
+        "tag": "mkcp-helper",
+        "settings": {"auth": "noauth"},
+        "streamSettings": {
+            "network": "kcp",
+            "kcpSettings": {
+                "mtu": 1400,
+                "tti": 100,
+                "uplinkCapacity": 12,
+                "downlinkCapacity": 34,
+                "cwndMultiplier": 3,
+                "maxSendingWindow": 2800
+            }
+        }
+    }))
+    .expect("valid mKCP inbound shape");
+
+    let Transport::Mkcp(plan) = inbound.get_transport_type() else {
+        panic!("legacy transport helper must not alias mKCP to QUIC");
+    };
+    assert_eq!(plan.mtu, 1400);
+    assert_eq!(plan.tti, 100);
+    assert_eq!(plan.uplink_capacity, 12);
+    assert_eq!(plan.downlink_capacity, 34);
+    assert_eq!(plan.cwnd_multiplier, 3);
+    assert_eq!(plan.max_sending_window, 2800);
 }
 
 #[cfg(all(feature = "vless", feature = "vmess", feature = "trojan"))]
@@ -103,6 +140,30 @@ fn raw_alias_remains_standard_tcp_like_xray() {
             .expect("Xray raw transport alias should remain supported");
         assert_eq!(config.transport, Transport::Tcp);
     }
+}
+
+#[cfg(feature = "shadowsocks")]
+#[test]
+fn shadowsocks_mkcp_stream_does_not_fall_back_to_tcp() {
+    let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+        "listen": "127.0.0.1",
+        "port": 10000,
+        "protocol": "shadowsocks",
+        "tag": "shadowsocks-mkcp",
+        "settings": {
+            "method": "aes-128-gcm",
+            "password": "chimera-shadow-password"
+        },
+        "streamSettings": {
+            "network": "mkcp",
+            "security": "none"
+        }
+    }))
+    .expect("valid Shadowsocks mKCP inbound shape");
+
+    let config = ServerConfig::try_from(inbound)
+        .expect("Shadowsocks mKCP intent should materialize transport capability");
+    assert!(matches!(config.transport, Transport::Mkcp(_)));
 }
 
 #[test]

@@ -8,7 +8,8 @@ use serde_json::Value;
 use crate::{Error, log::LogConfig};
 
 use super::{
-    Protocol, SettingObject, StreamSettings, Transport, rule::RoutingConfig,
+    MkcpTransportConfig, Protocol, SettingObject, StreamSettings, Transport,
+    rule::RoutingConfig,
 };
 
 #[derive(Deserialize, Debug)]
@@ -109,7 +110,12 @@ impl InboudItem {
 
         match settings.network.to_ascii_lowercase().as_str() {
             "" | "tcp" => Transport::Tcp,
-            "quic" | "kcp" => Transport::Quic,
+            "quic" => Transport::Quic,
+            "kcp" | "mkcp" => {
+                Transport::Mkcp(MkcpTransportConfig::from_kcp_settings(
+                    settings.kcp_settings.as_ref(),
+                ))
+            }
             "udp" => Transport::Udp,
             _ => Transport::Tcp,
         }

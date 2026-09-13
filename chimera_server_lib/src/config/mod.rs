@@ -16,13 +16,36 @@ pub enum SupportedFileType {
     Json5,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub struct MkcpTransportConfig {
+    pub mtu: u32,
+    pub tti: u32,
+    pub uplink_capacity: u32,
+    pub downlink_capacity: u32,
+    pub cwnd_multiplier: u32,
+    pub max_sending_window: u32,
+}
 
+impl Default for MkcpTransportConfig {
+    fn default() -> Self {
+        Self {
+            mtu: 1350,
+            tti: 50,
+            uplink_capacity: 5,
+            downlink_capacity: 20,
+            cwnd_multiplier: 1,
+            max_sending_window: 2 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub enum Transport {
     Tcp,
     TcpAndUdp,
     Quic,
     Udp,
+    Mkcp(MkcpTransportConfig),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -110,6 +133,31 @@ pub(crate) struct KcpSettings {
     header: Option<serde_json::Value>,
     #[serde(default)]
     seed: Option<String>,
+}
+
+impl MkcpTransportConfig {
+    pub(crate) fn from_kcp_settings(settings: Option<&KcpSettings>) -> Self {
+        let defaults = Self::default();
+        let Some(settings) = settings else {
+            return defaults;
+        };
+        Self {
+            mtu: settings.mtu.unwrap_or(defaults.mtu),
+            tti: settings.tti.unwrap_or(defaults.tti),
+            uplink_capacity: settings
+                .uplink_capacity
+                .unwrap_or(defaults.uplink_capacity),
+            downlink_capacity: settings
+                .downlink_capacity
+                .unwrap_or(defaults.downlink_capacity),
+            cwnd_multiplier: settings
+                .cwnd_multiplier
+                .unwrap_or(defaults.cwnd_multiplier),
+            max_sending_window: settings
+                .max_sending_window
+                .unwrap_or(defaults.max_sending_window),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

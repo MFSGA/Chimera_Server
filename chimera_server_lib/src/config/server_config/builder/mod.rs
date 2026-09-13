@@ -29,6 +29,7 @@ struct InboundBuildContext {
     port: u16,
     bind_location: BindLocation,
     stream_settings: Option<crate::config::StreamSettings>,
+    mkcp_transport: Option<crate::config::MkcpTransportConfig>,
     sniffing: Option<InboundSniffingConfig>,
     tcp_socket_policy: Option<TcpSocketPolicy>,
 }
@@ -56,7 +57,11 @@ impl InboundBuildContext {
     }
 
     fn finish_tcp(self, protocol: ServerProxyConfig) -> ServerConfig {
-        self.finish(protocol, Transport::Tcp, None)
+        let transport = self
+            .mkcp_transport
+            .map(Transport::Mkcp)
+            .unwrap_or(Transport::Tcp);
+        self.finish(protocol, transport, None)
     }
 }
 
@@ -615,7 +620,11 @@ fn build_shadowsocks_server(
         ServerProxyConfig::Shadowsocks { users, identity },
         context.stream_settings(),
     )?;
-    Ok(context.finish(protocol, transport, None))
+    if matches!(transport, Transport::Tcp) {
+        Ok(context.finish_tcp(protocol))
+    } else {
+        Ok(context.finish(protocol, transport, None))
+    }
 }
 
 fn build_socks_server(
@@ -711,6 +720,11 @@ impl TryFrom<InboudItem> for ServerConfig {
         } = value;
         let sniffing = collect_sniffing_config(&tag, sniffing)?;
         let tcp_socket_policy = collect_tcp_socket_policy(stream_settings.as_ref())?;
+        let mkcp_transport = stream_settings
+            .as_ref()
+            .map(plan_mkcp_transport)
+            .transpose()?
+            .flatten();
 
         let listen = listen.unwrap_or_else(|| "0.0.0.0".to_string());
         let address = Address::from(&listen).map_err(|err| {
@@ -725,6 +739,7 @@ impl TryFrom<InboudItem> for ServerConfig {
             port,
             bind_location,
             stream_settings,
+            mkcp_transport,
             sniffing,
             tcp_socket_policy,
         };
