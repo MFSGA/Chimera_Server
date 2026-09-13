@@ -9,14 +9,17 @@ use crate::{
 
 use super::udp::{bind_location_to_socket_addr, create_udp_listener};
 
+pub(crate) mod connection;
 pub(crate) mod receiving;
 pub(crate) mod sending;
+use connection::MkcpConnectionState;
 use receiving::MkcpReceivingState;
 use sending::MkcpSendingState;
 
 const COMMAND_ACK: u8 = 0;
 const COMMAND_DATA: u8 = 1;
 const COMMAND_TERMINATE: u8 = 2;
+const COMMAND_PING: u8 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MkcpSegment {
@@ -248,23 +251,8 @@ pub(crate) enum MkcpDemuxOutcome {
 }
 
 #[derive(Debug)]
-pub(crate) struct MkcpSessionState {
-    receiving: MkcpReceivingState,
-    sending: MkcpSendingState,
-}
-
-impl MkcpSessionState {
-    fn new(config: MkcpTransportConfig) -> Self {
-        Self {
-            receiving: MkcpReceivingState::new(config),
-            sending: MkcpSendingState::new(config),
-        }
-    }
-}
-
-#[derive(Debug)]
 pub(crate) struct MkcpSessionDemux {
-    sessions: HashMap<MkcpSessionKey, MkcpSessionState>,
+    sessions: HashMap<MkcpSessionKey, MkcpConnectionState>,
     config: MkcpTransportConfig,
 }
 
@@ -295,7 +283,7 @@ impl MkcpSessionDemux {
             return MkcpDemuxOutcome::IgnoreUnknownTerminate(key);
         }
         self.sessions
-            .insert(key, MkcpSessionState::new(self.config));
+            .insert(key, MkcpConnectionState::new(key.conversation, self.config));
         MkcpDemuxOutcome::New(key)
     }
 
@@ -305,7 +293,7 @@ impl MkcpSessionDemux {
     ) -> Option<&mut MkcpReceivingState> {
         self.sessions
             .get_mut(&key)
-            .map(|session| &mut session.receiving)
+            .map(MkcpConnectionState::receiving_mut)
     }
 
     pub(crate) fn sending_mut(
@@ -314,7 +302,7 @@ impl MkcpSessionDemux {
     ) -> Option<&mut MkcpSendingState> {
         self.sessions
             .get_mut(&key)
-            .map(|session| &mut session.sending)
+            .map(MkcpConnectionState::sending_mut)
     }
 
     pub(crate) fn remove(&mut self, key: MkcpSessionKey) -> bool {
