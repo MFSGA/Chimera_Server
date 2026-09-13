@@ -13,6 +13,7 @@ pub(crate) mod connection;
 pub(crate) mod receiving;
 pub(crate) mod runtime;
 pub(crate) mod sending;
+pub(crate) mod server;
 use connection::MkcpConnectionState;
 use receiving::MkcpReceivingState;
 use sending::MkcpSendingState;

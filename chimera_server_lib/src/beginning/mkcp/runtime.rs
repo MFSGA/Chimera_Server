@@ -12,7 +12,10 @@ use tokio::{
 };
 use tokio_util::sync::PollSender;
 
-use crate::config::MkcpTransportConfig;
+use crate::{
+    async_stream::{AsyncPing, AsyncStream},
+    config::MkcpTransportConfig,
+};
 
 use super::{
     MkcpSegment,
@@ -45,6 +48,27 @@ pub(crate) struct MkcpByteStream {
     mss: usize,
     write_shutdown: bool,
 }
+
+impl Drop for MkcpByteStream {
+    fn drop(&mut self) {
+        self.wake.notify_one();
+    }
+}
+
+impl AsyncPing for MkcpByteStream {
+    fn supports_ping(&self) -> bool {
+        false
+    }
+
+    fn poll_write_ping(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<io::Result<bool>> {
+        Poll::Ready(Ok(false))
+    }
+}
+
+impl AsyncStream for MkcpByteStream {}
 
 impl AsyncRead for MkcpByteStream {
     fn poll_read(
@@ -151,11 +175,18 @@ impl MkcpConnectionRuntime {
         conversation: u16,
         config: MkcpTransportConfig,
     ) -> (Self, MkcpByteStream) {
+        Self::new_with_wake(conversation, config, Arc::new(Notify::new()))
+    }
+
+    pub(crate) fn new_with_wake(
+        conversation: u16,
+        config: MkcpTransportConfig,
+        wake: Arc<Notify>,
+    ) -> (Self, MkcpByteStream) {
         let (stream_read_sender, read_receiver) =
             mpsc::channel(STREAM_CHANNEL_CAPACITY);
         let (write_sender, stream_write_receiver) =
             mpsc::channel(STREAM_CHANNEL_CAPACITY);
-        let wake = Arc::new(Notify::new());
         let mss = config.mtu.saturating_sub(DATA_SEGMENT_OVERHEAD).max(1) as usize;
         let stream = MkcpByteStream {
             read_receiver,

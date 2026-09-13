@@ -130,12 +130,17 @@ async fn quic_endpoint_driver_loss_reaches_inbound_health() {
 }
 
 #[tokio::test]
-async fn mkcp_transport_fails_closed_before_listener_runtime_exists() {
+async fn mkcp_transport_binds_udp_and_tracks_protocol_session() {
+    let probe = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .expect("bind ephemeral UDP port");
+    let address = probe.local_addr().expect("read ephemeral UDP address");
+    drop(probe);
+
     let config = ServerConfig {
-        tag: "mkcp-runtime-pending".to_string(),
+        tag: "mkcp-runtime".to_string(),
         bind_location: BindLocation::Address(NetLocation::from_ip_addr(
-            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
-            10003,
+            address.ip(),
+            address.port(),
         )),
         protocol: ServerProxyConfig::Socks {
             accounts: crate::config::server_config::SocksUserStore::new(Vec::new()),
@@ -143,14 +148,68 @@ async fn mkcp_transport_fails_closed_before_listener_runtime_exists() {
             udp_response_ip: None,
             user_level: 0,
         },
-        transport: Transport::Mkcp(crate::config::MkcpTransportConfig {
-            mtu: 1350,
-            tti: 50,
-            uplink_capacity: 5,
-            downlink_capacity: 20,
-            cwnd_multiplier: 1,
-            max_sending_window: 2 * 1024 * 1024,
-        }),
+        transport: Transport::Mkcp(crate::config::MkcpTransportConfig::default()),
+        quic_settings: None,
+        sniffing: None,
+        tcp_socket_policy: None,
+    };
+    let runtime = RuntimeState::new(vec![config.clone()], Vec::new());
+    let bound = start_bound_servers(config, runtime.clone())
+        .await
+        .expect("start mKCP UDP listener");
+
+    let client = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind mKCP test client");
+    let ping = super::mkcp::encode_packet(&[super::mkcp::MkcpSegment::Command {
+        conversation: 7,
+        command: 3,
+        option: 0,
+        sending_next: 0,
+        receiving_next: 0,
+        peer_rto: 100,
+    }])
+    .expect("encode mKCP ping");
+    client
+        .send_to(&ping, address)
+        .await
+        .expect("send mKCP ping");
+
+    for _ in 0..50 {
+        if runtime.tracked_inbound_connection_count() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(runtime.tracked_inbound_connection_count(), 1);
+
+    drop(bound);
+    for _ in 0..50 {
+        if runtime.tracked_inbound_connection_count() == 0 {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("dropping mKCP listener owner must release tracked protocol session");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn mkcp_follow_redirect_fails_closed_without_original_destination() {
+    let config = ServerConfig {
+        tag: "mkcp-dokodemo-follow-redirect".to_string(),
+        bind_location: BindLocation::Address(NetLocation::from_ip_addr(
+            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+            0,
+        )),
+        protocol: ServerProxyConfig::DokodemoDoor {
+            config: DokodemoDoorConfig {
+                target: NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 1),
+                follow_redirect: true,
+                user_level: 0,
+            },
+        },
+        transport: Transport::Mkcp(crate::config::MkcpTransportConfig::default()),
         quic_settings: None,
         sniffing: None,
         tcp_socket_policy: None,
@@ -158,14 +217,14 @@ async fn mkcp_transport_fails_closed_before_listener_runtime_exists() {
     let runtime = RuntimeState::new(vec![config.clone()], Vec::new());
     let error = match start_bound_servers(config, runtime).await {
         Ok(_) => {
-            panic!("mKCP must fail before any TCP/QUIC fallback listener starts")
+            panic!("mKCP followRedirect must fail without original destination")
         }
         Err(error) => error,
     };
     assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
     assert_eq!(
         error.to_string(),
-        "mKCP transport runtime is not implemented"
+        "mKCP original-destination handling is not implemented"
     );
 }
 

@@ -335,11 +335,14 @@ async fn start_server_tasks(
             Ok(None) => (),
             Err(e) => return Err(e),
         },
-        Transport::Mkcp(_) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "mKCP transport runtime is not implemented",
-            ));
+        Transport::Mkcp(mkcp) => {
+            match mkcp::server::start_mkcp_server(config.clone(), runtime, mkcp)
+                .await
+            {
+                Ok(Some(handle)) => join_handles.push(handle),
+                Ok(None) => {}
+                Err(error) => return Err(error),
+            }
         }
         // UDP listeners need runtime state for routing/outbound selection.
         Transport::Udp => match start_udp_server(config.clone(), runtime).await {

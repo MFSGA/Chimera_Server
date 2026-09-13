@@ -132,7 +132,7 @@ Hysteria2 is therefore **not currently release-blocked by the previously observe
 
 | Area | Status |
 | --- | --- |
-| mKCP transport | Xray `kcp` / `mkcp` aliases and current `kcpSettings` defaults/validation materialize as an explicit `Mkcp` server transport capability. A prepared UDP listener, Xray-compatible raw KCP segment codec, `(remote, conv)` connection ownership, receive/send ARQ state, RTO/ping/close handling, owner-driven updater timing, and a bounded MSS byte-stream adapter now exist, but startup still fails closed with `Unsupported` until the UDP listener owns and drives those runtimes; interoperability is not yet claimed. |
+| mKCP transport | Xray `kcp` / `mkcp` aliases and current `kcpSettings` defaults/validation materialize as an explicit `Mkcp` server transport capability. The UDP listener now owns `(remote, conv)` runtimes, drives receive/send ARQ + RTO/ping/close timing, and hands the bounded MSS byte stream to existing protocol/session dispatch. Real Xray interoperability is not yet claimed; mKCP + DokodemoDoor `followRedirect` still fails closed because UDP original-destination extraction is not implemented. |
 | Legacy QUIC transport | Not materialized or release-verified in this matrix. |
 | TUN | Not part of this inbound compatibility matrix. |
 | WireGuard | Not part of this inbound compatibility matrix. |
