@@ -1,4 +1,4 @@
-use std::{collections::HashSet, io, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
 
 use tokio::net::UdpSocket;
 
@@ -8,6 +8,9 @@ use crate::{
 };
 
 use super::udp::{bind_location_to_socket_addr, create_udp_listener};
+
+pub(crate) mod receiving;
+use receiving::MkcpReceivingState;
 
 const COMMAND_ACK: u8 = 0;
 const COMMAND_DATA: u8 = 1;
@@ -242,12 +245,20 @@ pub(crate) enum MkcpDemuxOutcome {
     Invalid,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct MkcpSessionDemux {
-    sessions: HashSet<MkcpSessionKey>,
+    sessions: HashMap<MkcpSessionKey, MkcpReceivingState>,
+    config: MkcpTransportConfig,
 }
 
 impl MkcpSessionDemux {
+    pub(crate) fn new(config: MkcpTransportConfig) -> Self {
+        Self {
+            sessions: HashMap::new(),
+            config,
+        }
+    }
+
     pub(crate) fn observe(
         &mut self,
         remote: SocketAddr,
@@ -260,18 +271,26 @@ impl MkcpSessionDemux {
             remote,
             conversation: first.conversation(),
         };
-        if self.sessions.contains(&key) {
+        if self.sessions.contains_key(&key) {
             return MkcpDemuxOutcome::Existing(key);
         }
         if first.command() == COMMAND_TERMINATE {
             return MkcpDemuxOutcome::IgnoreUnknownTerminate(key);
         }
-        self.sessions.insert(key);
+        self.sessions
+            .insert(key, MkcpReceivingState::new(self.config));
         MkcpDemuxOutcome::New(key)
     }
 
+    pub(crate) fn receiving_mut(
+        &mut self,
+        key: MkcpSessionKey,
+    ) -> Option<&mut MkcpReceivingState> {
+        self.sessions.get_mut(&key)
+    }
+
     pub(crate) fn remove(&mut self, key: MkcpSessionKey) -> bool {
-        self.sessions.remove(&key)
+        self.sessions.remove(&key).is_some()
     }
 }
 
@@ -376,13 +395,20 @@ mod tests {
     fn session_demux_matches_xray_remote_port_and_conversation_identity() {
         let first = SocketAddr::from((Ipv4Addr::LOCALHOST, 10001));
         let second = SocketAddr::from((Ipv4Addr::LOCALHOST, 10002));
-        let mut demux = MkcpSessionDemux::default();
+        let mut demux = MkcpSessionDemux::new(MkcpTransportConfig::default());
         let segments = vec![ping(7)];
 
-        assert!(matches!(
-            demux.observe(first, &segments),
-            MkcpDemuxOutcome::New(_)
-        ));
+        let first_key = match demux.observe(first, &segments) {
+            MkcpDemuxOutcome::New(key) => key,
+            other => panic!("expected new mKCP session, got {other:?}"),
+        };
+        assert_eq!(
+            demux
+                .receiving_mut(first_key)
+                .expect("new session owns receive state")
+                .next_number(),
+            0
+        );
         assert!(matches!(
             demux.observe(first, &segments),
             MkcpDemuxOutcome::Existing(_)
