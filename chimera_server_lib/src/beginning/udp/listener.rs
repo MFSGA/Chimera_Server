@@ -131,7 +131,7 @@ pub async fn start_udp_server(
     })))
 }
 
-pub(super) fn bind_location_to_socket_addr(
+pub(crate) fn bind_location_to_socket_addr(
     bind_location: &BindLocation,
 ) -> std::io::Result<SocketAddr> {
     match bind_location {
@@ -139,7 +139,7 @@ pub(super) fn bind_location_to_socket_addr(
     }
 }
 
-pub(super) fn create_udp_listener(
+pub(crate) fn create_udp_listener(
     bind_addr: SocketAddr,
     policy: Option<&TcpSocketPolicy>,
     force_original_destination: bool,

@@ -196,6 +196,7 @@ pub(crate) async fn accept_quic_with_health(
 
 #[cfg(feature = "grpc_transport")]
 pub(crate) mod grpc_transport;
+mod mkcp;
 mod policy_stream;
 mod quic;
 mod tcp_relay;

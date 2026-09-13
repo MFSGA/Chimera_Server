@@ -56,10 +56,8 @@ use targeted_session::shutdown_targeted_message;
 mod listener;
 pub use listener::start_udp_server;
 #[cfg(test)]
-use listener::{
-    UdpOutboundAction, bind_location_to_socket_addr, create_udp_listener,
-    run_dokodemo_udp_server, select_udp_outbound,
-};
+use listener::{UdpOutboundAction, run_dokodemo_udp_server, select_udp_outbound};
+pub(crate) use listener::{bind_location_to_socket_addr, create_udp_listener};
 #[cfg(all(test, feature = "shadowsocks"))]
 use listener::{relay_shadowsocks_udp_packet, run_shadowsocks_udp_server};
 
