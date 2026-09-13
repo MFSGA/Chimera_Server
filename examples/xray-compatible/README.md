@@ -4,14 +4,21 @@ This directory is the authoritative materialized config matrix for Chimera Serve
 
 Fixed implementation reference: local `ref/xray-core` at `5ca6f4b7d4dc20a881d4330e498892697627ec0c`.
 
-The real-client checks recorded below were run on 2026-09-10 with two Xray client builds:
+The release-prep real-client checks recorded below were run on 2026-09-10 with two Xray client builds:
 
 ```text
 repository fixture: Xray 26.2.6 / 12ee51e / go1.25.7 linux/amd64
 fixed reference:    Xray 26.7.28 source at 5ca6f4b7d4dc20a881d4330e498892697627ec0c, built with go1.26.5 linux/amd64
 ```
 
-The older repository fixture remains useful for compatibility coverage, but its Hysteria UDP writer has a client-side 4096-byte serialization-buffer limit described in the Hysteria evidence section below. Fixed-reference release claims use the second build where that distinction matters.
+The mKCP interoperability refresh on 2026-09-13 additionally used the then-newest published Xray pre-release and the latest non-pre-release GitHub release:
+
+```text
+latest published:   Xray 26.9.9 / 52a412d / go1.27.1 linux/amd64 (pre-release)
+latest stable:      Xray 26.3.27 / d2758a0 / go1.26.1 linux/amd64
+```
+
+The official release archives used for that mKCP refresh were checksum-verified before execution. The older repository fixture remains useful for compatibility coverage, but its Hysteria UDP writer has a client-side 4096-byte serialization-buffer limit described in the Hysteria evidence section below. Fixed-reference release claims use the second build where that distinction matters.
 
 ## Evidence levels
 
@@ -34,6 +41,7 @@ Config validation is necessary but is not protocol interoperability evidence. Te
 | `dokodemo-door-udp-routing-blackhole.json5` | dokodemo-door | udp | none | config-validated; routing example |
 | `http-tcp-password.json5` | http | tcp | none | config-validated; Xray-verified Basic-auth CONNECT with repository fixture |
 | `vless-tcp-none.json5` | vless | tcp | none | config-validated |
+| `vless-mkcp-none.json5` | vless | mkcp | none | config-validated; Xray-verified TCP stream interoperability with Xray 26.9.9 and 26.3.27 |
 | `vless-ws-none.json5` | vless | websocket | none | config-validated |
 | `vless-ws-tls.json5` | vless | websocket | tls | config-validated |
 | `vless-tcp-tls-vision.json5` | vless | tcp | tls + vision | config-validated |
@@ -64,6 +72,19 @@ cargo test -p chimera_server_app --test xray_client_proxy_e2e \
 ```
 
 This refresh covers Xray HTTP-outbound interoperability for TCP CONNECT and Basic authentication success/failure. Chimera's separate `http_and_mixed_inbounds_proxy_tcp` test continues to cover direct absolute-form forwarding and `allowTransparent`; those paths were not exercised through the Xray HTTP outbound in this certification.
+
+### VLESS over mKCP: PASS with current Xray clients
+
+On 2026-09-13 the ignored mKCP fixture was run with Xray as a SOCKS5 client front end and Chimera as a VLESS-over-mKCP server. The path was `SOCKS5 -> Xray VLESS client -> mKCP -> Chimera -> local TCP echo`. Each run verifies a small request plus 64 KiB and 256 KiB deterministic payload roundtrips and checks that both client and server processes remain alive afterward.
+
+```sh
+XRAY_BIN=/path/to/xray cargo test -p chimera_server_app \
+  --test xray_client_proxy_e2e \
+  xray_client_can_proxy_tcp_through_chimera_vless_mkcp \
+  -- --ignored --exact --nocapture
+```
+
+The fixture passed 3/3 runs with Xray 26.9.9 / `52a412d` / go1.27.1 linux/amd64, which was the newest published Xray build and marked pre-release at verification time. It also passed 1/1 with the latest non-pre-release GitHub release, Xray 26.3.27 / `d2758a0` / go1.26.1 linux/amd64. This is a narrow interoperability claim for plain VLESS TCP streams over default mKCP settings with no transport security; it does not certify every protocol/security combination, packet-loss profile, or mKCP masking mode.
 
 ### Shadowsocks candidate release goal: PASS
 
@@ -132,7 +153,7 @@ Hysteria2 is therefore **not currently release-blocked by the previously observe
 
 | Area | Status |
 | --- | --- |
-| mKCP transport | Xray `kcp` / `mkcp` aliases and current `kcpSettings` defaults/validation materialize as an explicit `Mkcp` server transport capability. The UDP listener now owns `(remote, conv)` runtimes, drives receive/send ARQ + RTO/ping/close timing, and hands the bounded MSS byte stream to existing protocol/session dispatch. Real Xray interoperability is not yet claimed; mKCP + DokodemoDoor `followRedirect` still fails closed because UDP original-destination extraction is not implemented. |
+| mKCP combinations beyond verified VLESS + none | Plain VLESS TCP streams over default mKCP settings are Xray-verified as described above. Other proxy/security combinations, packet-loss/reordering recovery evidence, and masking variants are not yet certified; mKCP + DokodemoDoor `followRedirect` still fails closed because UDP original-destination extraction is not implemented. |
 | Legacy QUIC transport | Not materialized or release-verified in this matrix. |
 | TUN | Not part of this inbound compatibility matrix. |
 | WireGuard | Not part of this inbound compatibility matrix. |

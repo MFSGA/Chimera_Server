@@ -1668,6 +1668,74 @@ async fn xray_client_can_proxy_tcp_through_chimera_vless_wss() {
     run_xray_client_vless_transport_case(VlessTransportCase::WebSocketTls).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera as server and ./xray as client for VLESS over mKCP"]
+async fn xray_client_can_proxy_tcp_through_chimera_vless_mkcp() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("vless-mkcp-none");
+    let echo_addr = start_tcp_echo_server();
+    let chimera_port = free_localhost_udp_port();
+    let xray_socks_port = free_localhost_port();
+    let chimera_config_path = work_dir.join("chimera.json");
+    let xray_config_path = work_dir.join("xray-client.json");
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "vless",
+                "tag": "chimera-vless-mkcp-none",
+                "settings": {
+                    "clients": [{"id": TEST_UUID, "email": "vless-mkcp@example.test"}],
+                    "decryption": "none"
+                },
+                "streamSettings": {"network": "kcp", "security": "none"}
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth"}
+            }],
+            "outbounds": [{
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": chimera_port,
+                        "users": [{"id": TEST_UUID, "encryption": "none"}]
+                    }]
+                },
+                "streamSettings": {"network": "kcp", "security": "none"}
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    thread::sleep(CONNECT_RETRY_INTERVAL);
+    chimera.assert_running();
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+
+    assert_socks5_echo(socks_addr, echo_addr, b"VLESS mKCP through Xray");
+    assert_socks5_echo(socks_addr, echo_addr, &deterministic_payload(64 * 1024));
+    assert_socks5_echo(socks_addr, echo_addr, &deterministic_payload(256 * 1024));
+    chimera.assert_running();
+    xray.assert_running();
+}
+
 async fn run_xray_client_vmess_transport_case(case: VlessTransportCase) {
     let workspace = workspace_root();
     let work_dir = create_test_dir(&format!("vmess-{}", case.name()));
@@ -4056,6 +4124,14 @@ fn free_localhost_port() -> u16 {
         .expect("bind ephemeral port")
         .local_addr()
         .expect("ephemeral local addr")
+        .port()
+}
+
+fn free_localhost_udp_port() -> u16 {
+    std::net::UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .expect("bind ephemeral UDP port")
+        .local_addr()
+        .expect("ephemeral UDP local addr")
         .port()
 }
 

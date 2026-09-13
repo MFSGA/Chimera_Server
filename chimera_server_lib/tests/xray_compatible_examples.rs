@@ -107,6 +107,7 @@ fn xray_compatible_example_matrix_contains_materialized_stage_one_files() {
         "dokodemo-door-udp-routing-blackhole.json5",
         "http-tcp-password.json5",
         "vless-tcp-none.json5",
+        "vless-mkcp-none.json5",
         "vless-ws-none.json5",
         "vless-ws-tls.json5",
         "vless-tcp-tls-vision.json5",
