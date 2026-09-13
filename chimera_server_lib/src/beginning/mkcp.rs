@@ -10,7 +10,9 @@ use crate::{
 use super::udp::{bind_location_to_socket_addr, create_udp_listener};
 
 pub(crate) mod receiving;
+pub(crate) mod sending;
 use receiving::MkcpReceivingState;
+use sending::MkcpSendingState;
 
 const COMMAND_ACK: u8 = 0;
 const COMMAND_DATA: u8 = 1;
@@ -246,8 +248,23 @@ pub(crate) enum MkcpDemuxOutcome {
 }
 
 #[derive(Debug)]
+pub(crate) struct MkcpSessionState {
+    receiving: MkcpReceivingState,
+    sending: MkcpSendingState,
+}
+
+impl MkcpSessionState {
+    fn new(config: MkcpTransportConfig) -> Self {
+        Self {
+            receiving: MkcpReceivingState::new(config),
+            sending: MkcpSendingState::new(config),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct MkcpSessionDemux {
-    sessions: HashMap<MkcpSessionKey, MkcpReceivingState>,
+    sessions: HashMap<MkcpSessionKey, MkcpSessionState>,
     config: MkcpTransportConfig,
 }
 
@@ -278,7 +295,7 @@ impl MkcpSessionDemux {
             return MkcpDemuxOutcome::IgnoreUnknownTerminate(key);
         }
         self.sessions
-            .insert(key, MkcpReceivingState::new(self.config));
+            .insert(key, MkcpSessionState::new(self.config));
         MkcpDemuxOutcome::New(key)
     }
 
@@ -286,7 +303,18 @@ impl MkcpSessionDemux {
         &mut self,
         key: MkcpSessionKey,
     ) -> Option<&mut MkcpReceivingState> {
-        self.sessions.get_mut(&key)
+        self.sessions
+            .get_mut(&key)
+            .map(|session| &mut session.receiving)
+    }
+
+    pub(crate) fn sending_mut(
+        &mut self,
+        key: MkcpSessionKey,
+    ) -> Option<&mut MkcpSendingState> {
+        self.sessions
+            .get_mut(&key)
+            .map(|session| &mut session.sending)
     }
 
     pub(crate) fn remove(&mut self, key: MkcpSessionKey) -> bool {
@@ -407,6 +435,13 @@ mod tests {
                 .receiving_mut(first_key)
                 .expect("new session owns receive state")
                 .next_number(),
+            0
+        );
+        assert_eq!(
+            demux
+                .sending_mut(first_key)
+                .expect("new session owns send state")
+                .first_unacknowledged(),
             0
         );
         assert!(matches!(
