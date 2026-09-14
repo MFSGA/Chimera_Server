@@ -277,9 +277,48 @@ pub fn is_tcp_reality_server(config: &ServerConfig) -> bool {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ApiListen {
+    Tcp(SocketAddr),
+    AbstractUnix(String),
+}
+
+impl ApiListen {
+    fn abstract_unix(value: &str) -> Result<Self, Error> {
+        if !cfg!(target_os = "linux") {
+            return Err(Error::InvalidConfig(
+                "abstract Unix API listeners are supported only on Linux".into(),
+            ));
+        }
+
+        let Some(name) = value.strip_prefix('@') else {
+            return Err(Error::InvalidConfig(
+                "abstract Unix API listen name must start with @".into(),
+            ));
+        };
+        if name.is_empty() {
+            return Err(Error::InvalidConfig(
+                "abstract Unix API listen name must not be empty".into(),
+            ));
+        }
+        if name.as_bytes().contains(&0) {
+            return Err(Error::InvalidConfig(
+                "abstract Unix API listen name must not contain NUL".into(),
+            ));
+        }
+        if name.len() > 107 {
+            return Err(Error::InvalidConfig(
+                "abstract Unix API listen name exceeds Linux sun_path capacity"
+                    .into(),
+            ));
+        }
+        Ok(Self::AbstractUnix(name.to_string()))
+    }
+}
+
 #[derive(Default)]
 struct ResolvedApiConfig<'a> {
-    listen_addr: Option<SocketAddr>,
+    listen: Option<ApiListen>,
     inbound: Option<&'a ServerConfig>,
 }
 
@@ -297,7 +336,7 @@ fn resolve_api_config<'a>(
             Error::InvalidConfig(format!("invalid api.listen {}: {}", listen, err))
         })?;
         return Ok(ResolvedApiConfig {
-            listen_addr: Some(listen_addr),
+            listen: Some(ApiListen::Tcp(listen_addr)),
             inbound: None,
         });
     }
@@ -306,7 +345,10 @@ fn resolve_api_config<'a>(
         return Ok(ResolvedApiConfig::default());
     };
     let Some(routing) = routing_config else {
-        return Ok(ResolvedApiConfig::default());
+        return Err(Error::InvalidConfig(format!(
+            "api tag {} requires a routing rule to an API inbound",
+            api_tag
+        )));
     };
 
     let mut matched_api_rule = false;
@@ -326,7 +368,7 @@ fn resolve_api_config<'a>(
 
             ensure_api_inbound_protocol(inbound)?;
             return Ok(ResolvedApiConfig {
-                listen_addr: Some(api_inbound_listen_addr(inbound)?),
+                listen: Some(api_inbound_listen(inbound)?),
                 inbound: Some(inbound),
             });
         }
@@ -339,12 +381,24 @@ fn resolve_api_config<'a>(
         )));
     }
 
-    Ok(ResolvedApiConfig::default())
+    Err(Error::InvalidConfig(format!(
+        "api tag {} is not referenced by any routing rule",
+        api_tag
+    )))
 }
 
-fn api_inbound_listen_addr(inbound: &ServerConfig) -> Result<SocketAddr, Error> {
-    match &inbound.bind_location {
-        crate::address::BindLocation::Address(addr) => Ok(addr.to_socket_addr()?),
+fn api_inbound_listen(inbound: &ServerConfig) -> Result<ApiListen, Error> {
+    match &inbound.protocol {
+        ServerProxyConfig::Tunnel => match &inbound.bind_location {
+            crate::address::BindLocation::Address(addr) => {
+                ApiListen::abstract_unix(&addr.address().to_string())
+            }
+        },
+        _ => match &inbound.bind_location {
+            crate::address::BindLocation::Address(addr) => {
+                Ok(ApiListen::Tcp(addr.to_socket_addr()?))
+            }
+        },
     }
 }
 
@@ -354,14 +408,14 @@ fn ensure_api_inbound_protocol(inbound: &ServerConfig) -> Result<(), Error> {
     }
 
     Err(Error::InvalidConfig(format!(
-        "api inbound {} must use dokodemo-door semantics",
+        "api inbound {} must use dokodemo-door or tunnel semantics",
         inbound.tag
     )))
 }
 
 fn is_api_inbound_protocol(protocol: &ServerProxyConfig) -> bool {
     match protocol {
-        ServerProxyConfig::DokodemoDoor { .. } => true,
+        ServerProxyConfig::DokodemoDoor { .. } | ServerProxyConfig::Tunnel => true,
         #[cfg(feature = "tls")]
         ServerProxyConfig::Tls(tls_config) => matches!(
             tls_config.inner.as_ref(),
@@ -369,6 +423,28 @@ fn is_api_inbound_protocol(protocol: &ServerProxyConfig) -> bool {
         ),
         _ => false,
     }
+}
+
+fn ensure_api_tunnels_are_control_only(
+    all_inbounds: &[ServerConfig],
+    resolved_api: &ResolvedApiConfig<'_>,
+) -> Result<(), Error> {
+    let selected_tunnel_tag = resolved_api
+        .inbound
+        .filter(|inbound| matches!(inbound.protocol, ServerProxyConfig::Tunnel))
+        .map(|inbound| inbound.tag.as_str());
+
+    if let Some(inbound) = all_inbounds.iter().find(|inbound| {
+        matches!(inbound.protocol, ServerProxyConfig::Tunnel)
+            && Some(inbound.tag.as_str()) != selected_tunnel_tag
+    }) {
+        return Err(Error::InvalidConfig(format!(
+            "tunnel inbound {} is reserved for api.tag routing and cannot run as a proxy inbound",
+            inbound.tag
+        )));
+    }
+
+    Ok(())
 }
 
 fn api_inbound_uses_tls(_protocol: &ServerProxyConfig) -> bool {
@@ -458,7 +534,8 @@ pub fn validate(opts: Options) -> Result<(), Error> {
         routing_config.as_ref(),
         &all_inbounds,
     )?;
-    let api_addr = resolved_api.listen_addr;
+    ensure_api_tunnels_are_control_only(&all_inbounds, &resolved_api)?;
+    let api_listen = resolved_api.listen;
 
     if let Some(mcp) = mcp_config.as_ref()
         && let Some(listen) = mcp.listen.as_ref()
@@ -471,7 +548,7 @@ pub fn validate(opts: Options) -> Result<(), Error> {
 
     let mut any_server = !all_inbounds.is_empty();
     if let Some(api) = api_config.as_ref()
-        && api_addr.is_some()
+        && api_listen.is_some()
         && !api.services.is_empty()
     {
         any_server = true;
@@ -543,7 +620,8 @@ async fn start_async(
         routing_config.as_ref(),
         &all_inbounds,
     )?;
-    let api_addr = resolved_api.listen_addr;
+    ensure_api_tunnels_are_control_only(&all_inbounds, &resolved_api)?;
+    let api_listen = resolved_api.listen;
     let skip_inbound_tag = resolved_api.inbound.map(|inbound| inbound.tag.clone());
     if api_config.is_some() {
         if let Some(inbound) = resolved_api.inbound
@@ -554,7 +632,7 @@ async fn start_async(
                 inbound.tag
             );
         }
-        if api_addr.is_none() {
+        if api_listen.is_none() {
             tracing::warn!("api is configured but no listen address was resolved");
         }
     }
@@ -610,7 +688,7 @@ async fn start_async(
     }
     #[cfg(feature = "api")]
     if let Some(api) = api_config.as_ref()
-        && let Some(listen) = api_addr
+        && let Some(listen) = api_listen
     {
         if !api.services.is_empty() {
             let grpc_handle = grpc::start_grpc_server(
@@ -727,7 +805,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        compile_configured_outbounds, prepare_server_runtime, resolve_api_config,
+        ApiListen, compile_configured_outbounds,
+        ensure_api_tunnels_are_control_only, prepare_server_runtime,
+        resolve_api_config,
     };
     use crate::{
         address::{Address, BindLocation, NetLocation},
@@ -806,6 +886,33 @@ mod tests {
         }
     }
 
+    fn make_tunnel_inbound(tag: &str, listen: &str) -> ServerConfig {
+        ServerConfig {
+            tag: tag.to_string(),
+            bind_location: BindLocation::Address(NetLocation::new(
+                Address::from(listen).expect("valid abstract API name"),
+                0,
+            )),
+            protocol: ServerProxyConfig::Tunnel,
+            transport: Transport::Tcp,
+            quic_settings: None,
+            sniffing: None,
+            tcp_socket_policy: None,
+        }
+    }
+
+    #[test]
+    fn abstract_api_listen_validates_namespace_name() {
+        assert_eq!(
+            ApiListen::abstract_unix("@/run/chimera/xtls.sock")
+                .expect("slashes are valid bytes in the abstract namespace"),
+            ApiListen::AbstractUnix("/run/chimera/xtls.sock".into())
+        );
+        assert!(ApiListen::abstract_unix("@").is_err());
+        assert!(ApiListen::abstract_unix("chimera-api").is_err());
+        assert!(ApiListen::abstract_unix(&format!("@{}", "a".repeat(108))).is_err());
+    }
+
     #[test]
     fn resolve_api_config_prefers_explicit_listen() {
         let api = ApiConfig {
@@ -827,10 +934,101 @@ mod tests {
             .expect("api config should resolve");
 
         assert_eq!(
-            resolved.listen_addr.map(|addr| addr.to_string()),
-            Some("127.0.0.1:7000".into())
+            resolved.listen,
+            Some(ApiListen::Tcp(
+                "127.0.0.1:7000".parse().expect("valid API listen")
+            ))
         );
         assert!(resolved.inbound.is_none());
+    }
+
+    #[test]
+    fn resolve_api_config_rejects_api_tag_without_routing() {
+        let api = ApiConfig {
+            tag: Some("chimera-api".into()),
+            services: vec!["StatsService".into()],
+            listen: None,
+        };
+
+        let error = match resolve_api_config(Some(&api), None, &[]) {
+            Ok(_) => panic!("api.tag without routing must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("api tag chimera-api requires a routing rule")
+        );
+    }
+
+    #[test]
+    fn resolve_api_config_rejects_unreferenced_api_tag() {
+        let api = ApiConfig {
+            tag: Some("chimera-api".into()),
+            services: vec!["StatsService".into()],
+            listen: None,
+        };
+        let routing = RoutingConfig {
+            rules: vec![RuleConfig {
+                inbound_tag: vec!["other-api-in".into()],
+                outbound_tag: Some("other-api".into()),
+                ..RuleConfig::default()
+            }],
+            ..RoutingConfig::default()
+        };
+
+        let error = match resolve_api_config(Some(&api), Some(&routing), &[]) {
+            Ok(_) => panic!("unreferenced api.tag must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains(
+                "api tag chimera-api is not referenced by any routing rule"
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_api_config_uses_abstract_tunnel_for_api_tag() {
+        let api = ApiConfig {
+            tag: Some("chimera-api".into()),
+            services: vec!["StatsService".into(), "HandlerService".into()],
+            listen: None,
+        };
+        let routing = RoutingConfig {
+            rules: vec![RuleConfig {
+                inbound_tag: vec!["chimera-api-in".into()],
+                outbound_tag: Some("chimera-api".into()),
+                ..RuleConfig::default()
+            }],
+            ..RoutingConfig::default()
+        };
+        let inbounds = vec![make_tunnel_inbound("chimera-api-in", "@chimera-api")];
+
+        let resolved = resolve_api_config(Some(&api), Some(&routing), &inbounds)
+            .expect("abstract API tunnel should resolve from routing");
+
+        assert_eq!(
+            resolved.listen,
+            Some(ApiListen::AbstractUnix("chimera-api".into()))
+        );
+        assert_eq!(
+            resolved.inbound.map(|inbound| inbound.tag.as_str()),
+            Some("chimera-api-in")
+        );
+    }
+
+    #[test]
+    fn unclaimed_tunnel_cannot_run_as_proxy_inbound() {
+        let inbounds = vec![make_tunnel_inbound("chimera-api-in", "@chimera-api")];
+        let resolved = resolve_api_config(None, None, &inbounds)
+            .expect("absence of api config should resolve to no API listener");
+
+        let error = ensure_api_tunnels_are_control_only(&inbounds, &resolved)
+            .expect_err("unclaimed tunnel must fail closed");
+        assert!(error.to_string().contains(
+            "tunnel inbound chimera-api-in is reserved for api.tag routing"
+        ));
     }
 
     #[test]
@@ -854,8 +1052,10 @@ mod tests {
             .expect("api inbound should resolve from routing");
 
         assert_eq!(
-            resolved.listen_addr.map(|addr| addr.to_string()),
-            Some("127.0.0.1:61000".into())
+            resolved.listen,
+            Some(ApiListen::Tcp(
+                "127.0.0.1:61000".parse().expect("valid API listen")
+            ))
         );
         assert_eq!(
             resolved.inbound.map(|inbound| inbound.tag.as_str()),

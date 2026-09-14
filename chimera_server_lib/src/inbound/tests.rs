@@ -483,6 +483,47 @@ async fn dynamic_add_publishes_running_and_remove_clears_lifecycle() {
 }
 
 #[tokio::test]
+async fn remove_then_readd_same_tag_keeps_new_generation_running() {
+    let first_port = free_localhost_port();
+    let second_port = free_localhost_port();
+    let runtime = RuntimeState::new(Vec::new(), Vec::new());
+    let manager = runtime.inbound_manager();
+
+    manager
+        .add_started(runtime.clone(), inbound("primary", first_port))
+        .await
+        .expect("first dynamic add");
+    let first_generation = manager.generation("primary").expect("first generation");
+
+    manager
+        .remove_started("primary")
+        .await
+        .expect("remove first generation");
+    assert_eq!(manager.lifecycle_state("primary"), None);
+
+    manager
+        .add_started(runtime.clone(), inbound("primary", second_port))
+        .await
+        .expect("second dynamic add");
+    let second_generation =
+        manager.generation("primary").expect("second generation");
+
+    assert!(second_generation > first_generation);
+    assert_eq!(
+        manager.lifecycle_state("primary"),
+        Some(InboundLifecycleState::Running)
+    );
+    assert!(wait_for_tcp_listener(second_port).await);
+
+    manager
+        .remove_started("primary")
+        .await
+        .expect("remove second generation");
+    assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, first_port)).is_ok());
+    assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, second_port)).is_ok());
+}
+
+#[tokio::test]
 async fn failed_dynamic_add_clears_starting_reservation() {
     let occupied =
         TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind occupied port");
