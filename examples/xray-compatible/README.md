@@ -44,7 +44,7 @@ Config validation is necessary but is not protocol interoperability evidence. Te
 | `vless-mkcp-none.json5` | vless | mkcp | none | config-validated; Xray-verified TCP stream interoperability with Xray 26.9.9 and 26.3.27 |
 | `vless-ws-none.json5` | vless | websocket | none | config-validated |
 | `vless-ws-tls.json5` | vless | websocket | tls | config-validated |
-| `vless-tcp-tls-vision.json5` | vless | tcp | tls + vision | config-validated |
+| `vless-tcp-tls-vision.json5` | vless | tcp | tls + vision | config-validated; Xray-verified TCP stream + inner TLS Vision with repository fixture |
 | `vless-xhttp-none.json5` | vless | xhttp | none | config-validated; runtime-covered |
 | `vless-xhttp-tls.json5` | vless | xhttp | tls | config-validated; runtime-covered |
 | `vmess-tcp-none.json5` | vmess | tcp | none | config-validated; runtime-covered |
@@ -72,6 +72,18 @@ cargo test -p chimera_server_app --test xray_client_proxy_e2e \
 ```
 
 This refresh covers Xray HTTP-outbound interoperability for TCP CONNECT and Basic authentication success/failure. Chimera's separate `http_and_mixed_inbounds_proxy_tcp` test continues to cover direct absolute-form forwarding and `allowTransparent`; those paths were not exercised through the Xray HTTP outbound in this certification.
+
+### VLESS TCP + TLS + Vision: PASS with repository fixture
+
+On 2026-09-14 the repository-local Xray 26.2.6 / `12ee51e` client was run as a SOCKS5 front end with a VLESS outbound using TCP, TLS and `xtls-rprx-vision`. Chimera used its repository certificate, and the Xray client pinned that certificate's SHA-256 fingerprint. The interoperability test completed a small TCP echo, deterministic 64 KiB and 1 MiB TCP echo roundtrips, and a real inner TLS application-data exchange through Vision direct mode.
+
+```sh
+cargo test -p chimera_server_app --test xray_client_proxy_e2e \
+  xray_client_can_proxy_tcp_through_chimera_tls_vision \
+  -- --ignored --exact --nocapture
+```
+
+This certifies the positive TCP/TLS/Vision path with the repository fixture. It does not by itself certify invalid-VLESS-authentication behavior, every TLS option, fallback selection, or other Xray client versions.
 
 ### VLESS over mKCP: PASS with current Xray clients
 

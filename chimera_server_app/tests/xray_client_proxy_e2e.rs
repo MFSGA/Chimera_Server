@@ -657,6 +657,7 @@ async fn xray_client_can_proxy_tcp_through_chimera_tls_vision() {
     let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
     assert_socks5_echo(socks_addr, echo_addr, b"tls-vision through xray client");
     assert_socks5_echo(socks_addr, echo_addr, &deterministic_payload(64 * 1024));
+    assert_socks5_echo(socks_addr, echo_addr, &deterministic_payload(1024 * 1024));
     assert_tls_echo_through_socks(
         socks_addr,
         tls_echo_addr,
