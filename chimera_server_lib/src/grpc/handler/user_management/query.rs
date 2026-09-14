@@ -91,7 +91,9 @@ impl HandlerServiceImpl {
             ServerProxyConfig::Shadowsocks { users, .. } => {
                 Some(users.iter().map(|user| user.email.clone()).collect())
             }
-            ServerProxyConfig::DokodemoDoor { .. } => None,
+            ServerProxyConfig::DokodemoDoor { .. } | ServerProxyConfig::Tunnel => {
+                None
+            }
         }
     }
 
@@ -334,7 +336,9 @@ impl HandlerServiceImpl {
                     })
                     .collect(),
             ),
-            ServerProxyConfig::DokodemoDoor { .. } => None,
+            ServerProxyConfig::DokodemoDoor { .. } | ServerProxyConfig::Tunnel => {
+                None
+            }
         }
     }
 }

@@ -4,6 +4,10 @@ use std::{
     fs::{self, File},
     io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream},
+    os::linux::net::SocketAddrExt,
+    os::unix::{
+        net::SocketAddr as UnixSocketAddr, net::UnixStream as StdUnixStream,
+    },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -16,6 +20,7 @@ use std::{
 
 use prost::Message;
 use serde::Serialize;
+
 use tonic::{
     Code, Request, Status,
     codegen::http::uri::PathAndQuery,
@@ -25,6 +30,21 @@ use tonic::{
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Debug)]
+enum GrpcTarget {
+    Tcp(SocketAddr),
+    AbstractUnix(String),
+}
+
+impl GrpcTarget {
+    fn display(&self) -> String {
+        match self {
+            Self::Tcp(addr) => addr.to_string(),
+            Self::AbstractUnix(name) => format!("@{name}"),
+        }
+    }
+}
 
 const XRAY_BIN_ENV: &str = "XRAY_BIN";
 const DEFAULT_XRAY_BIN: &str = "xray";
@@ -220,7 +240,7 @@ impl ServerProcess {
         })
     }
 
-    fn wait_until_ready(&mut self, listen_addr: SocketAddr) -> io::Result<()> {
+    fn wait_until_ready(&mut self, target: &GrpcTarget) -> io::Result<()> {
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         loop {
             if let Some(status) = self.child.try_wait()? {
@@ -230,17 +250,30 @@ impl ServerProcess {
                     self.logs()
                 )));
             }
-            if let Ok(stream) = TcpStream::connect_timeout(&listen_addr, IO_TIMEOUT)
-            {
-                drop(stream);
+            let ready = match target {
+                GrpcTarget::Tcp(listen_addr) => {
+                    TcpStream::connect_timeout(listen_addr, IO_TIMEOUT).is_ok()
+                }
+                GrpcTarget::AbstractUnix(name) => {
+                    let addr = UnixSocketAddr::from_abstract_name(name.as_bytes())
+                        .map_err(|err| {
+                        io::Error::other(format!(
+                            "invalid abstract socket {name}: {err}"
+                        ))
+                    })?;
+                    std::os::unix::net::UnixStream::connect_addr(&addr).is_ok()
+                }
+            };
+            if ready {
                 return Ok(());
             }
             if Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!(
-                        "timeout waiting for {} listener {listen_addr}; logs:\n{}",
+                        "timeout waiting for {} listener {}; logs:\n{}",
                         self.target.as_str(),
+                        target.display(),
                         self.logs()
                     ),
                 ));
@@ -281,28 +314,30 @@ impl Harness {
             socks_port = free_localhost_port()?;
         }
 
+        let grpc_target = GrpcTarget::Tcp(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            grpc_port,
+        )));
         let config = match target {
             TargetKind::Chimera => build_chimera_config(grpc_port, socks_port),
             TargetKind::Xray => build_xray_config(grpc_port, socks_port),
         };
-        Self::start_with_config(target, grpc_port, config)
+        Self::start_with_config(target, grpc_target, config)
     }
 
     fn start_with_config(
         target: TargetKind,
-        grpc_port: u16,
+        grpc_target: GrpcTarget,
         config: String,
     ) -> io::Result<Self> {
-        let grpc_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, grpc_port);
-
         let mut server = ServerProcess::spawn(target, &config)?;
-        server.wait_until_ready(SocketAddr::V4(grpc_addr))?;
+        server.wait_until_ready(&grpc_target)?;
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         let channel = runtime
-            .block_on(connect_channel(SocketAddr::V4(grpc_addr)))
+            .block_on(connect_channel(grpc_target.clone()))
             .map_err(|err| {
                 io::Error::other(format!(
                     "failed to connect grpc channel to {}: {err}; logs:\n{}",
@@ -396,6 +431,48 @@ fn unique_test_dir(prefix: &str) -> io::Result<PathBuf> {
 fn free_localhost_port() -> io::Result<u16> {
     let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
     Ok(listener.local_addr()?.port())
+}
+
+fn build_chimera_abstract_config(socket_name: &str, socks_port: u16) -> String {
+    format!(
+        r#"{{
+  "inbounds": [
+    {{
+      "listen": "127.0.0.1",
+      "port": {socks_port},
+      "protocol": "socks",
+      "settings": {{
+        "auth": "password",
+        "accounts": [{{"user": "{TEST_USERNAME}", "pass": "{TEST_PASSWORD}"}}]
+      }},
+      "tag": "{SOCKS_TAG}"
+    }},
+    {{
+      "listen": "@{socket_name}",
+      "protocol": "tunnel",
+      "tag": "{API_INBOUND_TAG}"
+    }}
+  ],
+  "outbounds": [
+    {{
+      "protocol": "freedom",
+      "tag": "{DIRECT_TAG}"
+    }},
+    {{
+      "protocol": "freedom",
+      "tag": "{API_OUTBOUND_TAG}"
+    }}
+  ],
+  "api": {{
+    "tag": "{API_OUTBOUND_TAG}",
+    "services": [
+      "StatsService",
+      "HandlerService"
+    ]
+  }},
+  "routing": {{"rules": [{{"type": "field", "inboundTag": ["{API_INBOUND_TAG}"], "outboundTag": "{API_OUTBOUND_TAG}"}}]}}
+}}"#
+    )
 }
 
 fn build_chimera_config(grpc_port: u16, socks_port: u16) -> String {
@@ -631,31 +708,38 @@ fn build_xray_vless_multi_user_config(grpc_port: u16, vless_port: u16) -> String
     )
 }
 
-async fn connect_channel(grpc_addr: SocketAddr) -> io::Result<Channel> {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    let endpoint =
-        Endpoint::from_shared(format!("http://{grpc_addr}")).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid grpc endpoint for {grpc_addr}: {err}"),
-            )
-        })?;
-    let endpoint = endpoint.connect_timeout(IO_TIMEOUT).timeout(IO_TIMEOUT);
+async fn connect_channel(target: GrpcTarget) -> io::Result<Channel> {
+    let endpoint = Endpoint::from_static("http://localhost")
+        .connect_timeout(IO_TIMEOUT)
+        .timeout(IO_TIMEOUT);
 
-    loop {
-        match endpoint.clone().connect().await {
-            Ok(channel) => return Ok(channel),
-            Err(err) => {
-                if Instant::now() >= deadline {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        format!(
-                            "timeout connecting to grpc endpoint {grpc_addr}; last error: {err}"
-                        ),
-                    ));
-                }
-                tokio::time::sleep(CONNECT_RETRY_INTERVAL).await;
-            }
+    match target {
+        GrpcTarget::Tcp(addr) => endpoint.connect().await.map_err(|err| {
+            io::Error::other(format!("failed connecting tcp grpc {addr}: {err}"))
+        }),
+        GrpcTarget::AbstractUnix(name) => {
+            let channel = endpoint
+                .connect_with_connector(tower::service_fn(move |_| {
+                    let name = name.clone();
+                    async move {
+                        let addr =
+                            UnixSocketAddr::from_abstract_name(name.as_bytes())
+                                .map_err(io::Error::other)?;
+                        let stream = StdUnixStream::connect_addr(&addr)
+                            .map_err(io::Error::other)?;
+                        stream.set_nonblocking(true).map_err(io::Error::other)?;
+                        let stream = tokio::net::UnixStream::from_std(stream)
+                            .map_err(io::Error::other)?;
+                        Ok::<_, io::Error>(hyper_util::rt::TokioIo::new(stream))
+                    }
+                }))
+                .await
+                .map_err(|err| {
+                    io::Error::other(format!(
+                        "failed connecting abstract grpc: {err}"
+                    ))
+                })?;
+            Ok(channel)
         }
     }
 }
@@ -840,6 +924,34 @@ fn compat_cases() -> Vec<CaseDef> {
 }
 
 #[test]
+#[ignore = "runs Chimera control-plane calls over a Linux abstract Unix gRPC transport"]
+fn chimera_grpc_abstract_unix_control_plane() {
+    let _guard = global_test_lock()
+        .lock()
+        .expect("failed to acquire global test lock");
+    let socket_name = format!("chimera-grpc-abstract-{}", std::process::id());
+    let socks_port = free_localhost_port().expect("allocate socks port");
+    let harness = Harness::start_with_config(
+        TargetKind::Chimera,
+        GrpcTarget::AbstractUnix(socket_name.clone()),
+        build_chimera_abstract_config(&socket_name, socks_port),
+    )
+    .expect("start abstract grpc harness");
+
+    let _: GetAllOnlineUsersResponse = harness
+        .unary(PATH_STATS_GET_ALL_ONLINE_USERS, GetAllOnlineUsersRequest {})
+        .expect("stats rpc over abstract unix");
+    let _: ListInboundsResponse = harness
+        .unary(
+            PATH_HANDLER_LIST_INBOUNDS,
+            ListInboundsRequest {
+                is_only_tags: false,
+            },
+        )
+        .expect("handler rpc over abstract unix");
+}
+
+#[test]
 #[ignore = "runs xray baseline gRPC compatibility matrix and writes target/grpc-xray-compat/report.{json,md}"]
 fn grpc_all_interfaces_compat_with_xray_core() {
     trace_step("==== test grpc_all_interfaces_compat_with_xray_core start ====");
@@ -1003,7 +1115,14 @@ fn grpc_remove_inbound_preserves_existing_tcp_tunnel_like_xray() {
             TargetKind::Chimera => build_chimera_config(grpc_port, socks_port),
             TargetKind::Xray => build_xray_config(grpc_port, socks_port),
         };
-        let harness = Harness::start_with_config(target, grpc_port, config)?;
+        let harness = Harness::start_with_config(
+            target,
+            GrpcTarget::Tcp(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::LOCALHOST,
+                grpc_port,
+            ))),
+            config,
+        )?;
         let socks_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, socks_port);
         let mut stream =
             TcpStream::connect_timeout(&SocketAddr::V4(socks_addr), IO_TIMEOUT)?;
@@ -1198,13 +1317,19 @@ fn grpc_vless_multi_user_compat_with_xray_core() {
 
     let chimera = Harness::start_with_config(
         TargetKind::Chimera,
-        chimera_grpc_port,
+        GrpcTarget::Tcp(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            chimera_grpc_port,
+        ))),
         build_chimera_vless_multi_user_config(chimera_grpc_port, chimera_vless_port),
     )
     .expect("failed to start chimera vless harness");
     let xray = Harness::start_with_config(
         TargetKind::Xray,
-        xray_grpc_port,
+        GrpcTarget::Tcp(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            xray_grpc_port,
+        ))),
         build_xray_vless_multi_user_config(xray_grpc_port, xray_vless_port),
     )
     .expect("failed to start xray vless harness");
