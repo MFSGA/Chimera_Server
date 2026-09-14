@@ -199,6 +199,40 @@ Paths below are relative to the repository root.
 - Treat changes to `vendor/quinn-proto/` as dependency patches: explain their purpose and test
   the affected transport behavior. Do not hand-edit generated protobuf bindings.
 
+## Platform Portability and Conditional Compilation
+
+- Classify new code before relying on it across targets. Code confirmed to use portable Rust,
+  portable dependency APIs and platform-independent behavior may remain unconditional; do not add
+  speculative `cfg` gates to code whose portability is established.
+- Code known to depend on an operating system, target family or architecture must use the narrowest
+  accurate `#[cfg(...)]` boundary. Match the real API contract: for example, an API under
+  `std::os::linux` requires `target_os = "linux"`; `unix` is appropriate only when the complete
+  implementation is valid for every intended Unix target.
+- Apply platform gates consistently to all affected imports, types, trait implementations, helper
+  functions, call sites and tests. Keep portable paths and their cross-platform test coverage
+  unconditional. Do not exclude an entire integration-test target when only one helper or case is
+  platform-specific, unless the complete target genuinely has that platform contract.
+- When portability cannot yet be determined, do not assume the code is cross-platform. Identify the
+  actual platform used to develop and verify the current change, then provisionally gate the uncertain
+  code to that exact platform. "Current development platform" means the platform of that task; it is
+  not a permanent synonym for Linux and may be Windows, macOS or another supported target.
+- Place a concise comment next to every provisional platform gate stating why the restriction exists,
+  which targets remain unverified, and what implementation or validation is needed before widening
+  it. Treat this as an explicit portability task, not as a claim that the other platforms are unsupported.
+  A later contribution performed on, or extending support to, one of those platforms must address the
+  marker first by adding the appropriate implementation, conditional branch and tests, or by recording
+  concrete evidence that the existing implementation is portable.
+- Conditional compilation must not silently change authentication, security, configuration or
+  protocol semantics. When a compiled target lacks a required capability, return an explicit
+  unsupported-platform/configuration error where applicable instead of silently disabling the behavior.
+- `#[ignore]` controls test execution only; ignored tests and their helpers are still compiled. Give
+  platform-specific tests accurate `cfg` boundaries, and verify that ordinary portable cases continue
+  to compile and run on the other maintained targets.
+- Do not use `cfg` merely to hide an unrelated compile failure. Validate the affected path on the
+  current development platform and run or rely on the relevant maintained-target CI checks. If another
+  target, toolchain or runtime environment is unavailable, report that limitation and preserve the
+  provisional comment until evidence exists to broaden the platform declaration.
+
 ## Feature Isolation and Diagnostics
 
 - Follow ARCHITECTURE.md section 11: modules define responsibility, Cargo features select compiled
