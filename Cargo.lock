@@ -405,6 +405,7 @@ dependencies = [
  "aws-lc-rs",
  "chimera_server_lib",
  "clap",
+ "hyper-util",
  "prost",
  "rcgen",
  "rustls",
@@ -415,6 +416,7 @@ dependencies = [
  "tokio-rustls",
  "tonic",
  "tonic-prost",
+ "tower",
 ]
 
 [[package]]

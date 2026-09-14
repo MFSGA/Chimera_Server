@@ -730,6 +730,9 @@ pub enum ServerProxyConfig {
     DokodemoDoor {
         config: DokodemoDoorConfig,
     },
+    /// Internal control-plane tunnel. It is resolved into the management API
+    /// listener and must never be started as a user-facing proxy inbound.
+    Tunnel,
 }
 
 impl std::fmt::Display for ServerProxyConfig {
@@ -767,6 +770,7 @@ impl std::fmt::Display for ServerProxyConfig {
                 Self::Shadowsocks { .. } => "Shadowsocks",
                 Self::Socks { .. } => "Socks",
                 Self::DokodemoDoor { .. } => "DokodemoDoor",
+                Self::Tunnel => "Tunnel",
             }
         )
     }

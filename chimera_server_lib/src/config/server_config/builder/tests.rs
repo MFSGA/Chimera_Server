@@ -1395,25 +1395,40 @@ fn dokodemo_door_rejects_udp_security_layers() {
 }
 
 #[test]
-fn xray_internal_tunnel_uses_rewrite_address_and_dokodemo_semantics() {
+fn xray_internal_tunnel_preserves_control_plane_identity() {
     let inbound: InboudItem = serde_json::from_value(serde_json::json!({
-        "listen": "127.0.0.1",
-        "port": 62789,
+        "listen": "@chimera-api",
         "protocol": "tunnel",
-        "settings": {"rewriteAddress": "127.0.0.1"},
         "tag": "api"
     }))
-    .expect("valid Xray internal tunnel inbound");
+    .expect("valid internal API tunnel inbound");
 
     let config =
-        ServerConfig::try_from(inbound).expect("Xray internal tunnel should build");
-    match config.protocol {
-        ServerProxyConfig::DokodemoDoor { config } => {
-            assert_eq!(config.target.port(), 62789);
-            assert_eq!(config.target.address().to_string(), "127.0.0.1");
+        ServerConfig::try_from(inbound).expect("internal API tunnel should build");
+    assert!(matches!(config.protocol, ServerProxyConfig::Tunnel));
+    match config.bind_location {
+        crate::address::BindLocation::Address(location) => {
+            assert_eq!(location.address().to_string(), "@chimera-api");
+            assert_eq!(location.port(), 0);
         }
-        other => panic!("expected dokodemo-door semantics, got {other:?}"),
     }
+}
+
+#[test]
+fn non_tunnel_inbound_still_requires_port() {
+    let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+        "listen": "127.0.0.1",
+        "protocol": "dokodemo-door",
+        "tag": "missing-port"
+    }))
+    .expect("literal inbound may preserve an omitted port until build");
+
+    let error = ServerConfig::try_from(inbound)
+        .expect_err("ordinary proxy inbound must still require port");
+    assert_eq!(
+        error.to_string(),
+        "invalid config: inbound missing-port requires port"
+    );
 }
 
 #[cfg(all(feature = "reality", feature = "vless"))]

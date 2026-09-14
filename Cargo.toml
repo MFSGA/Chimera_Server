@@ -92,6 +92,7 @@ h2 = "0.4"
 hyper = { version = "1", features = ["full"] }
 mime_guess = "2"
 hyper-util = { version = "0.1", features = ["full"] }
+tower = "0.5"
 serde = { version = "1.0.228", features = ["derive"] }
 uuid = { version = "1.23.2", features = ["v4"] }
 

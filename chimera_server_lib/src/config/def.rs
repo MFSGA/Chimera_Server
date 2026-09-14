@@ -93,7 +93,7 @@ impl FromStr for LiteralConfig {
 pub struct InboudItem {
     pub allocate: Option<Value>,
     pub listen: Option<String>,
-    pub port: u16,
+    pub port: Option<u16>,
     pub protocol: Protocol,
     pub settings: Option<SettingObject>,
     pub sniffing: Option<Value>,
@@ -510,10 +510,8 @@ mod tests {
         let config: LiteralConfig = serde_json::from_str(
             r#"{
                 "inbounds": [{
-                    "listen": "127.0.0.1",
-                    "port": 62789,
+                    "listen": "@chimera-api",
                     "protocol": "tunnel",
-                    "settings": {"rewriteAddress": "127.0.0.1"},
                     "tag": "api"
                 }],
                 "outbounds": []
@@ -521,10 +519,10 @@ mod tests {
         )
         .expect("parse Xray internal tunnel inbound");
 
-        assert!(matches!(
-            config.inbounds.first().map(|inbound| &inbound.protocol),
-            Some(Protocol::Tunnel)
-        ));
+        let inbound = config.inbounds.first().expect("tunnel inbound");
+        assert!(matches!(inbound.protocol, Protocol::Tunnel));
+        assert_eq!(inbound.listen.as_deref(), Some("@chimera-api"));
+        assert_eq!(inbound.port, None);
     }
 
     #[test]

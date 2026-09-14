@@ -433,6 +433,48 @@ fn collect_sniffing_config(
         .then_some(config))
 }
 
+fn build_api_tunnel_server(
+    tag: String,
+    listen: Option<String>,
+    port: Option<u16>,
+    settings: Option<crate::config::SettingObject>,
+    stream_settings: Option<crate::config::StreamSettings>,
+    sniffing: Option<serde_json::Value>,
+) -> Result<ServerConfig, Error> {
+    if port.is_some() {
+        return Err(Error::InvalidConfig(format!(
+            "api tunnel inbound {tag} must not configure a TCP/UDP port"
+        )));
+    }
+    if settings.is_some() || stream_settings.is_some() || sniffing.is_some() {
+        return Err(Error::InvalidConfig(format!(
+            "api tunnel inbound {tag} must not configure proxy or stream settings"
+        )));
+    }
+    let listen = listen.ok_or_else(|| {
+        Error::InvalidConfig(format!(
+            "api tunnel inbound {tag} requires an abstract Unix listen name"
+        ))
+    })?;
+    if !listen.starts_with('@') {
+        return Err(Error::InvalidConfig(format!(
+            "api tunnel inbound {tag} listen must start with @"
+        )));
+    }
+    Ok(ServerConfig {
+        tag,
+        bind_location: BindLocation::Address(NetLocation::new(
+            Address::Hostname(listen),
+            0,
+        )),
+        protocol: ServerProxyConfig::Tunnel,
+        transport: Transport::Tcp,
+        quic_settings: None,
+        sniffing: None,
+        tcp_socket_policy: None,
+    })
+}
+
 fn build_dokodemo_server(
     context: InboundBuildContext,
     settings: Option<crate::config::SettingObject>,
@@ -718,6 +760,20 @@ impl TryFrom<InboudItem> for ServerConfig {
             sniffing,
             ..
         } = value;
+        if matches!(&protocol, Protocol::Tunnel) {
+            return build_api_tunnel_server(
+                tag,
+                listen,
+                port,
+                settings,
+                stream_settings,
+                sniffing,
+            );
+        }
+
+        let port = port.ok_or_else(|| {
+            Error::InvalidConfig(format!("inbound {tag} requires port"))
+        })?;
         let sniffing = collect_sniffing_config(&tag, sniffing)?;
         let tcp_socket_policy = collect_tcp_socket_policy(stream_settings.as_ref())?;
         let mkcp_transport = stream_settings
@@ -745,9 +801,8 @@ impl TryFrom<InboudItem> for ServerConfig {
         };
 
         match protocol {
-            Protocol::DokodemoDoor | Protocol::Tunnel => {
-                build_dokodemo_server(context, settings)
-            }
+            Protocol::DokodemoDoor => build_dokodemo_server(context, settings),
+            Protocol::Tunnel => unreachable!("tunnel returned before proxy build"),
             #[cfg(feature = "hysteria")]
             Protocol::Hysteria2 => build_hysteria2_server(context, settings),
             #[cfg(feature = "vless")]

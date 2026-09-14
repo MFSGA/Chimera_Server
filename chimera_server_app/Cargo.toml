@@ -11,6 +11,8 @@ clap = { workspace = true }
 
 [dev-dependencies]
 aws-lc-rs = { workspace = true }
+hyper-util = { workspace = true }
+tower = { workspace = true }
 prost = { workspace = true }
 rcgen = { workspace = true, features = ["aws_lc_rs"] }
 rustls = { workspace = true }
