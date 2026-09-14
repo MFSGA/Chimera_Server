@@ -13,11 +13,19 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use prost::Message;
 use tonic::{
     Request, Status,
     codegen::http::uri::PathAndQuery,
     transport::{Channel, Endpoint},
 };
+
+#[cfg(target_os = "linux")]
+use hyper_util::rt::TokioIo;
+#[cfg(target_os = "linux")]
+use std::os::linux::net::SocketAddrExt as _;
+#[cfg(target_os = "linux")]
+use tonic::codegen::{Service, http::Uri};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
@@ -25,6 +33,8 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const SOCKS_TAG: &str = "socks-grpc-e2e";
 const DIRECT_TAG: &str = "direct";
 const BACKUP_TAG: &str = "backup";
+const ABSTRACT_API_TAG: &str = "chimera-api";
+const ABSTRACT_API_INBOUND_TAG: &str = "chimera-api-in";
 static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
 
 fn trace_step(step: impl AsRef<str>) {
@@ -37,6 +47,10 @@ const PATH_LOGGER_RESTART: &str =
     "/xray.app.log.command.LoggerService/RestartLogger";
 const PATH_HANDLER_LIST_INBOUNDS: &str =
     "/xray.app.proxyman.command.HandlerService/ListInbounds";
+const PATH_HANDLER_ADD_INBOUND: &str =
+    "/xray.app.proxyman.command.HandlerService/AddInbound";
+const PATH_HANDLER_REMOVE_INBOUND: &str =
+    "/xray.app.proxyman.command.HandlerService/RemoveInbound";
 const PATH_HANDLER_GET_INBOUND_USERS_COUNT: &str =
     "/xray.app.proxyman.command.HandlerService/GetInboundUsersCount";
 const PATH_HANDLER_LIST_OUTBOUNDS: &str =
@@ -165,6 +179,52 @@ fn free_localhost_port() -> io::Result<u16> {
     Ok(port)
 }
 
+#[cfg(target_os = "linux")]
+fn build_abstract_tunnel_config(socket_name: &str, socks_port: u16) -> String {
+    format!(
+        r#"{{
+  "inbounds": [
+    {{
+      "listen": "127.0.0.1",
+      "port": {socks_port},
+      "protocol": "socks",
+      "settings": {{
+        "auth": "password",
+        "accounts": [{{"user": "grpc-e2e-user", "pass": "grpc-e2e-pass"}}]
+      }},
+      "tag": "{SOCKS_TAG}"
+    }},
+    {{
+      "listen": "@{socket_name}",
+      "protocol": "tunnel",
+      "tag": "{ABSTRACT_API_INBOUND_TAG}"
+    }}
+  ],
+  "outbounds": [
+    {{"protocol": "freedom", "tag": "{DIRECT_TAG}"}},
+    {{"protocol": "blackhole", "tag": "{BACKUP_TAG}"}}
+  ],
+  "api": {{
+    "tag": "{ABSTRACT_API_TAG}",
+    "services": ["StatsService", "HandlerService"]
+  }},
+  "routing": {{
+    "domainStrategy": "AsIs",
+    "rules": [
+      {{
+        "inboundTag": ["{ABSTRACT_API_INBOUND_TAG}"],
+        "outboundTag": "{ABSTRACT_API_TAG}"
+      }},
+      {{
+        "inboundTag": ["{SOCKS_TAG}"],
+        "outboundTag": "{DIRECT_TAG}"
+      }}
+    ]
+  }}
+}}"#
+    )
+}
+
 fn build_config(grpc_port: u16, socks_port: u16) -> String {
     trace_step(format!(
         "building integration config grpc_port={} socks_port={}",
@@ -256,6 +316,73 @@ async fn connect_channel(grpc_addr: SocketAddr) -> io::Result<Channel> {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct AbstractUnixConnector {
+    name: String,
+}
+
+#[cfg(target_os = "linux")]
+impl Service<Uri> for AbstractUnixConnector {
+    type Response = TokioIo<tokio::net::UnixStream>;
+    type Error = io::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = io::Result<Self::Response>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _uri: Uri) -> Self::Future {
+        let name = self.name.clone();
+        Box::pin(async move {
+            let stream = tokio::task::spawn_blocking(move || {
+                let address = std::os::unix::net::SocketAddr::from_abstract_name(
+                    name.as_bytes(),
+                )?;
+                std::os::unix::net::UnixStream::connect_addr(&address)
+            })
+            .await
+            .map_err(io::Error::other)??;
+            stream.set_nonblocking(true)?;
+            let stream = tokio::net::UnixStream::from_std(stream)?;
+            Ok(TokioIo::new(stream))
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn connect_abstract_channel(name: &str) -> io::Result<Channel> {
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let endpoint = Endpoint::from_static("http://chimera.abstract")
+        .connect_timeout(IO_TIMEOUT)
+        .timeout(IO_TIMEOUT);
+
+    loop {
+        let connector = AbstractUnixConnector {
+            name: name.to_string(),
+        };
+        match endpoint.clone().connect_with_connector(connector).await {
+            Ok(channel) => return Ok(channel),
+            Err(_err) if Instant::now() < deadline => {
+                tokio::time::sleep(CONNECT_RETRY_INTERVAL).await;
+            }
+            Err(err) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "timeout connecting to abstract grpc socket @{name}; last error: {err}"
+                    ),
+                ));
+            }
+        }
+    }
+}
+
 async fn grpc_unary<Req, Resp>(
     channel: Channel,
     path: &'static str,
@@ -313,6 +440,86 @@ struct ListInboundsResponse {
 struct InboundHandlerConfig {
     #[prost(string, tag = "1")]
     tag: String,
+    #[prost(message, optional, tag = "2")]
+    receiver_settings: Option<TypedMessage>,
+    #[prost(message, optional, tag = "3")]
+    proxy_settings: Option<TypedMessage>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct TypedMessage {
+    #[prost(string, tag = "1")]
+    r#type: String,
+    #[prost(bytes, tag = "2")]
+    value: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct AddInboundRequest {
+    #[prost(message, optional, tag = "1")]
+    inbound: Option<InboundHandlerConfig>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct AddInboundResponse {}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct RemoveInboundRequest {
+    #[prost(string, tag = "1")]
+    tag: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct RemoveInboundResponse {}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct PortRangePayload {
+    #[prost(uint32, tag = "1")]
+    from: u32,
+    #[prost(uint32, tag = "2")]
+    to: u32,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct PortListPayload {
+    #[prost(message, repeated, tag = "1")]
+    range: Vec<PortRangePayload>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct IpOrDomainPayload {
+    #[prost(oneof = "ip_or_domain_payload::Address", tags = "1, 2")]
+    address: Option<ip_or_domain_payload::Address>,
+}
+
+mod ip_or_domain_payload {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Address {
+        #[prost(bytes, tag = "1")]
+        Ip(Vec<u8>),
+        #[prost(string, tag = "2")]
+        Domain(String),
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct ReceiverConfigPayload {
+    #[prost(message, optional, tag = "1")]
+    port_list: Option<PortListPayload>,
+    #[prost(message, optional, tag = "2")]
+    listen: Option<IpOrDomainPayload>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct SocksServerConfigPayload {
+    #[prost(int32, tag = "1")]
+    auth_type: i32,
+    #[prost(map = "string, string", tag = "2")]
+    accounts: std::collections::HashMap<String, String>,
+    #[prost(bool, tag = "4")]
+    udp_enabled: bool,
+    #[prost(uint32, tag = "6")]
+    user_level: u32,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -385,6 +592,46 @@ struct OutboundStatus {
     alive: bool,
     #[prost(string, tag = "4")]
     outbound_tag: String,
+}
+
+fn build_dynamic_add_inbound_request(tag: &str, port: u16) -> AddInboundRequest {
+    let mut accounts = std::collections::HashMap::new();
+    accounts.insert(
+        "grpc-dynamic-user".to_string(),
+        "grpc-dynamic-pass".to_string(),
+    );
+    AddInboundRequest {
+        inbound: Some(InboundHandlerConfig {
+            tag: tag.to_string(),
+            receiver_settings: Some(TypedMessage {
+                r#type: "xray.app.proxyman.ReceiverConfig".to_string(),
+                value: ReceiverConfigPayload {
+                    port_list: Some(PortListPayload {
+                        range: vec![PortRangePayload {
+                            from: port as u32,
+                            to: port as u32,
+                        }],
+                    }),
+                    listen: Some(IpOrDomainPayload {
+                        address: Some(ip_or_domain_payload::Address::Ip(
+                            Ipv4Addr::LOCALHOST.octets().to_vec(),
+                        )),
+                    }),
+                }
+                .encode_to_vec(),
+            }),
+            proxy_settings: Some(TypedMessage {
+                r#type: "xray.proxy.socks.ServerConfig".to_string(),
+                value: SocksServerConfigPayload {
+                    auth_type: 1,
+                    accounts,
+                    udp_enabled: false,
+                    user_level: 0,
+                }
+                .encode_to_vec(),
+            }),
+        }),
+    }
 }
 
 #[test]
@@ -556,4 +803,144 @@ fn grpc_services_external_end_to_end() {
     assert!(observed_tags.contains(BACKUP_TAG));
     trace_step("observatory rpc returned expected outbound tags");
     trace_step("==== test grpc_services_external_end_to_end done ====");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn grpc_services_over_abstract_unix_tunnel_end_to_end() {
+    trace_step("==== test abstract Unix grpc tunnel start ====");
+    let _guard = global_test_lock()
+        .lock()
+        .expect("failed to acquire test lock");
+    let socks_port = free_localhost_port().expect("failed to allocate socks port");
+    let socket_name = format!(
+        "chimera-grpc-e2e-{}-{}",
+        std::process::id(),
+        NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let config = build_abstract_tunnel_config(&socket_name, socks_port);
+    let mut server =
+        ServerProcess::spawn(&config).expect("failed to spawn chimera process");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+
+    let channel = runtime
+        .block_on(connect_abstract_channel(&socket_name))
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to connect abstract grpc channel @{socket_name}: {err}; logs:\n{}",
+                server.logs()
+            )
+        });
+
+    let dynamic_tag = format!(
+        "grpc-dynamic-in-{}",
+        NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let dynamic_port =
+        free_localhost_port().expect("failed to allocate dynamic inbound port");
+    let _: AddInboundResponse = runtime
+        .block_on(grpc_unary(
+            channel.clone(),
+            PATH_HANDLER_ADD_INBOUND,
+            build_dynamic_add_inbound_request(&dynamic_tag, dynamic_port),
+        ))
+        .unwrap_or_else(|err| {
+            panic!(
+                "abstract HandlerService/AddInbound failed: {err}; logs:\n{}",
+                server.logs()
+            )
+        });
+
+    let inbounds_after_add: ListInboundsResponse = runtime
+        .block_on(grpc_unary(
+            channel.clone(),
+            PATH_HANDLER_LIST_INBOUNDS,
+            ListInboundsRequest { is_only_tags: true },
+        ))
+        .unwrap_or_else(|err| {
+            panic!(
+                "abstract HandlerService/ListInbounds after AddInbound failed: {err}; logs:\n{}",
+                server.logs()
+            )
+        });
+    assert!(
+        inbounds_after_add
+            .inbounds
+            .iter()
+            .any(|inbound| inbound.tag == dynamic_tag)
+    );
+    TcpStream::connect_timeout(
+        &SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, dynamic_port)),
+        IO_TIMEOUT,
+    )
+    .expect("dynamically added inbound listener should accept connections");
+
+    let _: RemoveInboundResponse = runtime
+        .block_on(grpc_unary(
+            channel.clone(),
+            PATH_HANDLER_REMOVE_INBOUND,
+            RemoveInboundRequest {
+                tag: dynamic_tag.clone(),
+            },
+        ))
+        .unwrap_or_else(|err| {
+            panic!(
+                "abstract HandlerService/RemoveInbound failed: {err}; logs:\n{}",
+                server.logs()
+            )
+        });
+    TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, dynamic_port))
+        .expect("removed inbound listener should release its port");
+
+    let sys_stats: SysStatsResponse = runtime
+        .block_on(grpc_unary(
+            channel.clone(),
+            PATH_STATS_GET_SYS_STATS,
+            SysStatsRequest {},
+        ))
+        .unwrap_or_else(|err| {
+            panic!(
+                "abstract StatsService/GetSysStats failed: {err}; logs:\n{}",
+                server.logs()
+            )
+        });
+    let _ = sys_stats.uptime;
+
+    let inbounds: ListInboundsResponse = runtime
+        .block_on(grpc_unary(
+            channel,
+            PATH_HANDLER_LIST_INBOUNDS,
+            ListInboundsRequest { is_only_tags: true },
+        ))
+        .unwrap_or_else(|err| {
+            panic!(
+                "abstract HandlerService/ListInbounds failed: {err}; logs:\n{}",
+                server.logs()
+            )
+        });
+    assert!(
+        inbounds
+            .inbounds
+            .iter()
+            .any(|inbound| inbound.tag == SOCKS_TAG),
+        "expected data-plane inbound tag {SOCKS_TAG}, got {:?}",
+        inbounds
+            .inbounds
+            .iter()
+            .map(|inbound| inbound.tag.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        server
+            .child
+            .try_wait()
+            .expect("query chimera status")
+            .is_none(),
+        "chimera exited after abstract Unix gRPC calls; logs:\n{}",
+        server.logs()
+    );
+    trace_step("==== test abstract Unix grpc tunnel done ====");
 }
