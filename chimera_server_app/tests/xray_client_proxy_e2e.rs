@@ -36,6 +36,7 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const TEST_UUID: &str = "3ac9b383-75a1-431c-8184-106c80eb2273";
+const WRONG_TEST_UUID: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 const REALITY_PRIVATE_KEY: &str = "dnprBfWdJgo5yaGClSaZ12TZW-SiD988YmjDKOhXLKI";
 const REALITY_PUBLIC_KEY: &str = "lpaMu0U01fKbRO9mgkSiOArWZz4V0TRW7pR543Pm9Xg";
 const REALITY_SHORT_ID: &str = "4ac97aaf8b9b0356";
@@ -664,6 +665,112 @@ async fn xray_client_can_proxy_tcp_through_chimera_tls_vision() {
         b"real tls application data through tls vision direct",
     )
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera as server and ./xray as client with wrong VLESS UUID over tcp+tls+vision"]
+async fn xray_client_with_wrong_uuid_cannot_proxy_through_chimera_tls_vision() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("tls-vision-wrong-uuid");
+    let (echo_addr, target_accepts) = start_tcp_echo_server_with_counter();
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let cert_path = workspace.join("cert/cert.pem");
+    let key_path = workspace.join("cert/key.pem");
+    let pinned_peer_cert_sha256 = first_cert_sha256_hex(&cert_path);
+    let chimera_config_path = work_dir.join("chimera-tls-vision-wrong-uuid.json");
+    let xray_config_path = work_dir.join("xray-tls-vision-wrong-uuid-client.json");
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "vless",
+                "tag": "chimera-tls-vision-wrong-uuid",
+                "settings": {
+                    "clients": [{
+                        "id": TEST_UUID,
+                        "flow": "xtls-rprx-vision",
+                        "email": "tls-vision@example.test"
+                    }],
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "certificates": [{
+                            "certificateFile": cert_path,
+                            "keyFile": key_path
+                        }]
+                    }
+                }
+            }],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }]
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "tag": "socks-in",
+                "settings": {"auth": "noauth"}
+            }],
+            "outbounds": [{
+                "tag": "to-chimera",
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": chimera_port,
+                        "users": [{
+                            "id": WRONG_TEST_UUID,
+                            "encryption": "none",
+                            "flow": "xtls-rprx-vision"
+                        }]
+                    }]
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "pinnedPeerCertSha256": pinned_peer_cert_sha256
+                    }
+                }
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port)));
+    xray.assert_running();
+
+    assert_socks5_echo_does_not_succeed(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port)),
+        echo_addr,
+    );
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        target_accepts.load(Ordering::SeqCst),
+        0,
+        "wrong VLESS UUID must be rejected before Chimera dials the requested target"
+    );
+    chimera.assert_running();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3191,6 +3298,39 @@ fn start_tcp_echo_server() -> SocketAddr {
 
 fn start_tcp_echo_server_v6() -> SocketAddr {
     start_tcp_echo_server_on(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)))
+}
+
+fn start_tcp_echo_server_with_counter() -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind echo server");
+    let addr = listener.local_addr().expect("echo addr");
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let accepted_task = accepted.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().take(16) {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            accepted_task.fetch_add(1, Ordering::SeqCst);
+            let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+            let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if stream.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+    });
+    (addr, accepted)
 }
 
 fn start_http_capture_server() -> (SocketAddr, mpsc::Receiver<String>) {

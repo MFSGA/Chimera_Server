@@ -83,7 +83,15 @@ cargo test -p chimera_server_app --test xray_client_proxy_e2e \
   -- --ignored --exact --nocapture
 ```
 
-This certifies the positive TCP/TLS/Vision path with the repository fixture. It does not by itself certify invalid-VLESS-authentication behavior, every TLS option, fallback selection, or other Xray client versions.
+This certifies the positive TCP/TLS/Vision path with the repository fixture. A companion negative-authentication case runs the same TLS/Vision transport with a validly formed but unconfigured VLESS UUID and verifies that Xray cannot proxy the request, Chimera does not dial the requested target, and the Chimera listener remains running:
+
+```sh
+cargo test -p chimera_server_app --test xray_client_proxy_e2e \
+  xray_client_with_wrong_uuid_cannot_proxy_through_chimera_tls_vision \
+  -- --ignored --exact --nocapture
+```
+
+Together these cases cover successful VLESS authentication plus rejection of an unknown UUID for this TCP/TLS/Vision combination. They do not by themselves certify every TLS option, fallback selection, malformed/truncated VLESS frames, or other Xray client versions.
 
 ### VLESS over mKCP: PASS with current Xray clients
 
