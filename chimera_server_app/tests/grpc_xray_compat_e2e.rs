@@ -4,10 +4,6 @@ use std::{
     fs::{self, File},
     io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream},
-    os::linux::net::SocketAddrExt,
-    os::unix::{
-        net::SocketAddr as UnixSocketAddr, net::UnixStream as StdUnixStream,
-    },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -16,6 +12,13 @@ use std::{
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+#[cfg(target_os = "linux")]
+use std::os::linux::net::SocketAddrExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::{
+    net::SocketAddr as UnixSocketAddr, net::UnixStream as StdUnixStream,
 };
 
 use prost::Message;
@@ -34,6 +37,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone, Debug)]
 enum GrpcTarget {
     Tcp(SocketAddr),
+    #[cfg(target_os = "linux")]
     AbstractUnix(String),
 }
 
@@ -41,6 +45,7 @@ impl GrpcTarget {
     fn display(&self) -> String {
         match self {
             Self::Tcp(addr) => addr.to_string(),
+            #[cfg(target_os = "linux")]
             Self::AbstractUnix(name) => format!("@{name}"),
         }
     }
@@ -254,6 +259,7 @@ impl ServerProcess {
                 GrpcTarget::Tcp(listen_addr) => {
                     TcpStream::connect_timeout(listen_addr, IO_TIMEOUT).is_ok()
                 }
+                #[cfg(target_os = "linux")]
                 GrpcTarget::AbstractUnix(name) => {
                     let addr = UnixSocketAddr::from_abstract_name(name.as_bytes())
                         .map_err(|err| {
@@ -433,6 +439,7 @@ fn free_localhost_port() -> io::Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
+#[cfg(target_os = "linux")]
 fn build_chimera_abstract_config(socket_name: &str, socks_port: u16) -> String {
     format!(
         r#"{{
@@ -717,6 +724,7 @@ async fn connect_channel(target: GrpcTarget) -> io::Result<Channel> {
         GrpcTarget::Tcp(addr) => endpoint.connect().await.map_err(|err| {
             io::Error::other(format!("failed connecting tcp grpc {addr}: {err}"))
         }),
+        #[cfg(target_os = "linux")]
         GrpcTarget::AbstractUnix(name) => {
             let channel = endpoint
                 .connect_with_connector(tower::service_fn(move |_| {
@@ -924,6 +932,7 @@ fn compat_cases() -> Vec<CaseDef> {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 #[ignore = "runs Chimera control-plane calls over a Linux abstract Unix gRPC transport"]
 fn chimera_grpc_abstract_unix_control_plane() {
     let _guard = global_test_lock()

@@ -902,6 +902,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn abstract_api_listen_validates_namespace_name() {
         assert_eq!(
             ApiListen::abstract_unix("@/run/chimera/xtls.sock")
@@ -989,6 +990,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn resolve_api_config_uses_abstract_tunnel_for_api_tag() {
         let api = ApiConfig {
             tag: Some("chimera-api".into()),
