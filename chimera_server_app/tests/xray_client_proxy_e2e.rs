@@ -774,6 +774,142 @@ async fn xray_client_with_wrong_uuid_cannot_proxy_through_chimera_tls_vision() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera, sends a truncated VLESS request over TLS Vision, then verifies Xray recovery"]
+async fn truncated_vless_request_over_tls_vision_does_not_dial_target() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("tls-vision-truncated-request");
+    let (echo_addr, target_accepts) = start_tcp_echo_server_with_counter();
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let cert_path = workspace.join("cert/cert.pem");
+    let key_path = workspace.join("cert/key.pem");
+    let pinned_peer_cert_sha256 = first_cert_sha256_hex(&cert_path);
+    let chimera_config_path =
+        work_dir.join("chimera-tls-vision-truncated-request.json");
+    let xray_config_path = work_dir.join("xray-tls-vision-recovery-client.json");
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "vless",
+                "tag": "chimera-tls-vision-truncated-request",
+                "settings": {
+                    "clients": [{
+                        "id": TEST_UUID,
+                        "flow": "xtls-rprx-vision",
+                        "email": "tls-vision@example.test"
+                    }],
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "certificates": [{
+                            "certificateFile": cert_path,
+                            "keyFile": key_path
+                        }]
+                    }
+                }
+            }],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }]
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "tag": "socks-in",
+                "settings": {"auth": "noauth"}
+            }],
+            "outbounds": [{
+                "tag": "to-chimera",
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": chimera_port,
+                        "users": [{
+                            "id": TEST_UUID,
+                            "encryption": "none",
+                            "flow": "xtls-rprx-vision"
+                        }]
+                    }]
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "pinnedPeerCertSha256": pinned_peer_cert_sha256
+                    }
+                }
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    let chimera_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port));
+    wait_for_tcp(chimera_addr);
+    chimera.assert_running();
+
+    let connector = TlsConnector::from(Arc::new(tls_test_client_config()));
+    let tcp = tokio::net::TcpStream::connect(chimera_addr)
+        .await
+        .expect("connect truncated VLESS TLS client");
+    let server_name =
+        ServerName::try_from("localhost").expect("valid TLS server name");
+    let mut tls = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("complete TLS handshake before truncated VLESS request");
+    let authenticated_prefix = [
+        0x00, 0x3a, 0xc9, 0xb3, 0x83, 0x75, 0xa1, 0x43, 0x1c, 0x81, 0x84, 0x10,
+        0x6c, 0x80, 0xeb, 0x22, 0x73,
+    ];
+    tls.write_all(&authenticated_prefix)
+        .await
+        .expect("write authenticated VLESS prefix");
+    tls.shutdown()
+        .await
+        .expect("truncate VLESS request after authenticated prefix");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        target_accepts.load(Ordering::SeqCst),
+        0,
+        "truncated VLESS request must fail before Chimera dials the requested target"
+    );
+    chimera.assert_running();
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port)));
+    xray.assert_running();
+    assert_socks5_echo(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port)),
+        echo_addr,
+        b"valid TLS Vision request after truncated peer",
+    );
+    assert_eq!(
+        target_accepts.load(Ordering::SeqCst),
+        1,
+        "only the valid recovery request should reach the target"
+    );
+    chimera.assert_running();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts Chimera as server and a plain TLS client for REALITY fallback"]
 async fn plain_tls_client_falls_back_to_reality_dest_on_sni_mismatch() {
     let workspace = workspace_root();

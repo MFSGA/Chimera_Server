@@ -91,7 +91,15 @@ cargo test -p chimera_server_app --test xray_client_proxy_e2e \
   -- --ignored --exact --nocapture
 ```
 
-Together these cases cover successful VLESS authentication plus rejection of an unknown UUID for this TCP/TLS/Vision combination. They do not by themselves certify every TLS option, fallback selection, malformed/truncated VLESS frames, or other Xray client versions.
+A third case uses a plain TLS client to send the correct VLESS version and UUID, then closes immediately before the addon-length byte. It verifies that this authenticated-but-truncated request never dials the requested target, leaves Chimera running, and that a subsequent real Xray TLS/Vision request succeeds through the same listener:
+
+```sh
+cargo test -p chimera_server_app --test xray_client_proxy_e2e \
+  truncated_vless_request_over_tls_vision_does_not_dial_target \
+  -- --ignored --exact --nocapture
+```
+
+Together these cases cover successful VLESS authentication, rejection of an unknown UUID, and one authenticated truncation boundary for this TCP/TLS/Vision combination. They do not by themselves certify every TLS option, fallback selection, all malformed/truncated VLESS frame positions, or other Xray client versions.
 
 ### VLESS over mKCP: PASS with current Xray clients
 
