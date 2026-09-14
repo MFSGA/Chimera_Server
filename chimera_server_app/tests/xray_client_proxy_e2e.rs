@@ -774,7 +774,7 @@ async fn xray_client_with_wrong_uuid_cannot_proxy_through_chimera_tls_vision() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "starts Chimera, sends a truncated VLESS request over TLS Vision, then verifies Xray recovery"]
+#[ignore = "starts Chimera, sends truncated VLESS requests across TLS Vision header boundaries, then verifies Xray recovery"]
 async fn truncated_vless_request_over_tls_vision_does_not_dial_target() {
     let workspace = workspace_root();
     let work_dir = create_test_dir("tls-vision-truncated-request");
@@ -864,34 +864,74 @@ async fn truncated_vless_request_over_tls_vision_does_not_dial_target() {
     wait_for_tcp(chimera_addr);
     chimera.assert_running();
 
-    let connector = TlsConnector::from(Arc::new(tls_test_client_config()));
-    let tcp = tokio::net::TcpStream::connect(chimera_addr)
-        .await
-        .expect("connect truncated VLESS TLS client");
-    let server_name =
-        ServerName::try_from("localhost").expect("valid TLS server name");
-    let mut tls = connector
-        .connect(server_name, tcp)
-        .await
-        .expect("complete TLS handshake before truncated VLESS request");
     let authenticated_prefix = [
         0x00, 0x3a, 0xc9, 0xb3, 0x83, 0x75, 0xa1, 0x43, 0x1c, 0x81, 0x84, 0x10,
         0x6c, 0x80, 0xeb, 0x22, 0x73,
     ];
-    tls.write_all(&authenticated_prefix)
-        .await
-        .expect("write authenticated VLESS prefix");
-    tls.shutdown()
-        .await
-        .expect("truncate VLESS request after authenticated prefix");
+    let vision_addon = b"\x0a\x10xtls-rprx-vision";
+    let truncated_requests = [
+        ("before addon length", authenticated_prefix.to_vec()),
+        (
+            "inside addon payload",
+            [
+                authenticated_prefix.as_slice(),
+                &[vision_addon.len() as u8],
+                &vision_addon[..5],
+            ]
+            .concat(),
+        ),
+        (
+            "before command",
+            [
+                authenticated_prefix.as_slice(),
+                &[vision_addon.len() as u8],
+                vision_addon,
+            ]
+            .concat(),
+        ),
+        (
+            "inside address",
+            [
+                authenticated_prefix.as_slice(),
+                &[vision_addon.len() as u8],
+                vision_addon,
+                &[0x01, 0x00, 0x50, 0x01, 127, 0],
+            ]
+            .concat(),
+        ),
+    ];
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(
-        target_accepts.load(Ordering::SeqCst),
-        0,
-        "truncated VLESS request must fail before Chimera dials the requested target"
-    );
-    chimera.assert_running();
+    for (boundary, request) in truncated_requests {
+        let connector = TlsConnector::from(Arc::new(tls_test_client_config()));
+        let tcp = tokio::net::TcpStream::connect(chimera_addr)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("connect truncated VLESS TLS client at {boundary}: {error}")
+            });
+        let server_name =
+            ServerName::try_from("localhost").expect("valid TLS server name");
+        let mut tls =
+            connector
+                .connect(server_name, tcp)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("complete TLS handshake at {boundary}: {error}")
+                });
+        tls.write_all(&request).await.unwrap_or_else(|error| {
+            panic!("write truncated VLESS request at {boundary}: {error}")
+        });
+        tls.shutdown().await.unwrap_or_else(|error| {
+            panic!("truncate VLESS request at {boundary}: {error}")
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            target_accepts.load(Ordering::SeqCst),
+            0,
+            "truncated VLESS request at {boundary} must fail before Chimera dials the requested target"
+        );
+        chimera.assert_running();
+    }
 
     let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
     wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port)));
