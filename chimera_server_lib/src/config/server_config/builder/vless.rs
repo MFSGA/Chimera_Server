@@ -358,7 +358,7 @@ fn apply_vless_transport_plan(
         }
         VlessTransportKind::Standard => {
             validate_standard_tcp_network(Some(stream_settings), "vless")?;
-            let protocol = apply_websocket_layer(protocol, stream_settings);
+            let protocol = apply_websocket_layer(protocol, stream_settings)?;
             let protocol = apply_httpupgrade_layer(protocol, stream_settings)?;
             let protocol = apply_grpc_layer(protocol, stream_settings)?;
             apply_security_layers(protocol, stream_settings)

@@ -244,28 +244,38 @@ pub(super) fn apply_httpupgrade_layer(
 pub(super) fn apply_websocket_layer(
     protocol: ServerProxyConfig,
     stream_settings: &crate::config::StreamSettings,
-) -> ServerProxyConfig {
+) -> Result<ServerProxyConfig, Error> {
     let network = stream_settings.network.trim();
     if !network.eq_ignore_ascii_case("ws")
         && !network.eq_ignore_ascii_case("websocket")
     {
-        return protocol;
+        return Ok(protocol);
     }
-    ServerProxyConfig::Websocket {
+    Ok(ServerProxyConfig::Websocket {
         targets: Box::new(OneOrSome::One(websocket_server_config(
             stream_settings.ws_settings.clone().unwrap_or_default(),
             stream_settings,
             protocol,
         ))),
-    }
+    })
 }
 
 #[cfg(not(feature = "ws"))]
 pub(super) fn apply_websocket_layer(
     protocol: ServerProxyConfig,
-    _stream_settings: &crate::config::StreamSettings,
-) -> ServerProxyConfig {
-    protocol
+    stream_settings: &crate::config::StreamSettings,
+) -> Result<ServerProxyConfig, Error> {
+    if stream_settings.network.trim().eq_ignore_ascii_case("ws")
+        || stream_settings
+            .network
+            .trim()
+            .eq_ignore_ascii_case("websocket")
+    {
+        return Err(Error::InvalidConfig(
+            "websocket transport requires the ws feature".into(),
+        ));
+    }
+    Ok(protocol)
 }
 
 pub(super) fn apply_standard_stream_layers(
@@ -276,7 +286,7 @@ pub(super) fn apply_standard_stream_layers(
         return Ok(protocol);
     };
 
-    let protocol = apply_websocket_layer(protocol, stream_settings);
+    let protocol = apply_websocket_layer(protocol, stream_settings)?;
     let protocol = apply_httpupgrade_layer(protocol, stream_settings)?;
     let protocol = apply_grpc_layer(protocol, stream_settings)?;
     apply_security_layers(protocol, stream_settings)

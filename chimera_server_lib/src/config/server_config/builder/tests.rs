@@ -422,6 +422,29 @@ fn websocket_network_uses_default_settings_when_omitted_like_xray() {
     assert!(matches!(target.protocol, ServerProxyConfig::Socks { .. }));
 }
 
+#[cfg(not(feature = "ws"))]
+#[test]
+fn websocket_network_requires_ws_feature() {
+    let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+        "listen": "127.0.0.1",
+        "port": 10000,
+        "protocol": "socks",
+        "tag": "socks-ws-without-feature",
+        "settings": {},
+        "streamSettings": {"network": "ws", "security": "none"}
+    }))
+    .expect("valid WebSocket inbound shape");
+
+    let error = ServerConfig::try_from(inbound)
+        .expect_err("WebSocket must be rejected without the ws feature");
+    assert!(
+        error
+            .to_string()
+            .contains("websocket transport requires the ws feature"),
+        "{error}"
+    );
+}
+
 #[cfg(all(feature = "grpc_transport", feature = "ws"))]
 #[test]
 fn selected_grpc_network_ignores_unrelated_websocket_settings_like_xray() {
