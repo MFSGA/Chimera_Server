@@ -231,6 +231,7 @@ pub(crate) fn build_sniffed_route_plan(
         routing_metadata: InboundRoutingMetadata {
             local_addr,
             vless_route: 0,
+            inbound_protocol: None,
             sniffed_protocol: sniffed.protocol,
             route_target_domain,
             attributes: sniffed.attributes,

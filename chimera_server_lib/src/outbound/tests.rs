@@ -683,6 +683,22 @@ struct CountingResolver {
     addresses: Vec<SocketAddr>,
 }
 
+struct FailingResolver;
+
+impl Resolver for FailingResolver {
+    fn resolve_location(
+        &self,
+        _location: &NetLocation,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>> {
+        Box::pin(async {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "fixture DNS failure",
+            ))
+        })
+    }
+}
+
 impl CountingResolver {
     fn new(addresses: Vec<SocketAddr>) -> Self {
         Self {
@@ -726,6 +742,7 @@ fn routing_metadata_is_applied_as_value_transformation() {
             local_addr: Some("203.0.113.7:8443".parse().unwrap()),
             vless_route: 42,
             policy_identities: Vec::new(),
+            inbound_protocol: None,
             sniffed_protocol: Some("tls".into()),
             route_target_domain: Some("sniffed.example".into()),
             attributes: HashMap::from([("x-test".into(), "ok".into())]),
@@ -3320,6 +3337,72 @@ async fn as_is_domain_match_does_not_resolve_before_routing() {
 }
 
 #[tokio::test]
+async fn as_is_route_only_domain_keeps_original_ip_rule() {
+    let runtime = RuntimeState::new(
+        Vec::new(),
+        vec![
+            outbound("direct", "freedom"),
+            outbound("blocked", "blackhole"),
+        ],
+    );
+    runtime.replace_routing(
+        RoutingState::from_config(Some(&RoutingConfig {
+            domain_strategy: Some("AsIs".into()),
+            rules: vec![RuleConfig {
+                ip: vec!["198.51.100.7/32".into()],
+                outbound_tag: Some("blocked".into()),
+                ..RuleConfig::default()
+            }],
+            ..RoutingConfig::default()
+        }))
+        .expect("AsIs routing config"),
+    );
+    let counting = CountingResolver::new(vec!["203.0.113.2:443".parse().unwrap()]);
+    let resolver: Arc<dyn Resolver> = Arc::new(counting.clone());
+    let target = NetLocation::from_ip_addr("198.51.100.7".parse().unwrap(), 443);
+
+    let connection = connect_tcp_outbound_with_routing_metadata(
+        &resolver,
+        &target,
+        &runtime.data_plane(),
+        "in",
+        "",
+        "192.0.2.10:12345".parse().unwrap(),
+        InboundRoutingMetadata {
+            route_target_domain: Some("example.test".into()),
+            ..InboundRoutingMetadata::default()
+        },
+    )
+    .await
+    .expect("AsIs route-only domain should use original IP rule");
+
+    assert!(connection.is_none());
+    assert_eq!(counting.calls(), 0);
+}
+
+#[tokio::test]
+async fn tcp_domain_dns_failure_is_recorded_separately_from_policy_rejection() {
+    let runtime = RuntimeState::new(Vec::new(), vec![outbound("direct", "freedom")]);
+    let resolver: Arc<dyn Resolver> = Arc::new(FailingResolver);
+    let target = NetLocation::from_str("dns-failure.example:443", None).unwrap();
+
+    let result = connect_tcp_outbound(
+        &resolver,
+        &target,
+        &runtime.data_plane(),
+        "in",
+        "",
+        "192.0.2.10:12345".parse().unwrap(),
+    )
+    .await;
+    assert!(result.is_err(), "DNS failure must reach the TCP caller");
+
+    let stats = runtime.user_domain_policy_status().stats;
+    assert_eq!(stats.dns_failures, 1);
+    assert_eq!(stats.rejected, 0);
+}
+
+#[tokio::test]
 async fn ip_if_non_match_resolves_after_domain_miss_and_matches_any_ip() {
     let runtime = RuntimeState::new(
         Vec::new(),
@@ -3364,6 +3447,50 @@ async fn ip_if_non_match_resolves_after_domain_miss_and_matches_any_ip() {
     )
     .await
     .expect("resolved IP rule should route");
+
+    assert!(connection.is_none());
+    assert_eq!(counting.calls(), 1);
+}
+
+#[tokio::test]
+async fn ip_if_non_match_resolves_route_only_domain_over_original_ip() {
+    let runtime = RuntimeState::new(
+        Vec::new(),
+        vec![
+            outbound("direct", "freedom"),
+            outbound("blocked", "blackhole"),
+        ],
+    );
+    runtime.replace_routing(
+        RoutingState::from_config(Some(&RoutingConfig {
+            domain_strategy: Some("IpIfNonMatch".into()),
+            rules: vec![RuleConfig {
+                ip: vec!["203.0.113.2/32".into()],
+                outbound_tag: Some("blocked".into()),
+                ..RuleConfig::default()
+            }],
+            ..RoutingConfig::default()
+        }))
+        .expect("IpIfNonMatch routing config"),
+    );
+    let counting = CountingResolver::new(vec!["203.0.113.2:443".parse().unwrap()]);
+    let resolver: Arc<dyn Resolver> = Arc::new(counting.clone());
+    let target = NetLocation::from_ip_addr("198.51.100.7".parse().unwrap(), 443);
+
+    let connection = connect_tcp_outbound_with_routing_metadata(
+        &resolver,
+        &target,
+        &runtime.data_plane(),
+        "in",
+        "",
+        "192.0.2.10:12345".parse().unwrap(),
+        InboundRoutingMetadata {
+            route_target_domain: Some("example.test".into()),
+            ..InboundRoutingMetadata::default()
+        },
+    )
+    .await
+    .expect("resolved route-only domain should match");
 
     assert!(connection.is_none());
     assert_eq!(counting.calls(), 1);
@@ -3454,6 +3581,50 @@ async fn ip_on_demand_resolves_when_reachable_rule_requires_target_ip() {
     )
     .await
     .expect("on-demand IP rule should route");
+
+    assert!(connection.is_none());
+    assert_eq!(counting.calls(), 1);
+}
+
+#[tokio::test]
+async fn ip_on_demand_resolves_route_only_domain_with_original_ip() {
+    let runtime = RuntimeState::new(
+        Vec::new(),
+        vec![
+            outbound("direct", "freedom"),
+            outbound("blocked", "blackhole"),
+        ],
+    );
+    runtime.replace_routing(
+        RoutingState::from_config(Some(&RoutingConfig {
+            domain_strategy: Some("IpOnDemand".into()),
+            rules: vec![RuleConfig {
+                ip: vec!["203.0.113.2/32".into()],
+                outbound_tag: Some("blocked".into()),
+                ..RuleConfig::default()
+            }],
+            ..RoutingConfig::default()
+        }))
+        .expect("IpOnDemand routing config"),
+    );
+    let counting = CountingResolver::new(vec!["203.0.113.2:443".parse().unwrap()]);
+    let resolver: Arc<dyn Resolver> = Arc::new(counting.clone());
+    let target = NetLocation::from_ip_addr("198.51.100.7".parse().unwrap(), 443);
+
+    let connection = connect_tcp_outbound_with_routing_metadata(
+        &resolver,
+        &target,
+        &runtime.data_plane(),
+        "in",
+        "",
+        "192.0.2.10:12345".parse().unwrap(),
+        InboundRoutingMetadata {
+            route_target_domain: Some("example.test".into()),
+            ..InboundRoutingMetadata::default()
+        },
+    )
+    .await
+    .expect("IpOnDemand route-only domain should resolve for IP rule");
 
     assert!(connection.is_none());
     assert_eq!(counting.calls(), 1);

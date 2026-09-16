@@ -12,10 +12,11 @@ use crate::{
         RuleConfig, WebhookRuleConfig,
     },
     outbound::USER_DOMAIN_ACCESS_BLACKHOLE_TAG,
-    resolver::{NativeResolver, Resolver},
+    resolver::Resolver,
     routing_process::enrich_routing_input,
     routing_state::{RouteMatch, RoutingEvent, RoutingInput},
     runtime::RuntimeState,
+    user_domain::UserDomainAccessAuditContext,
 };
 
 use super::proto;
@@ -200,10 +201,8 @@ struct StrategyLeastLoadConfigPayload {
 
 impl RoutingServiceImpl {
     fn new(runtime: RuntimeState) -> Self {
-        Self {
-            runtime,
-            resolver: Arc::new(NativeResolver::new()),
-        }
+        let resolver = runtime.data_plane().resolver();
+        Self { runtime, resolver }
     }
 
     #[cfg(test)]
@@ -239,10 +238,20 @@ impl RoutingServiceImpl {
         context: &proto::xray::app::router::command::RoutingContext,
     ) -> Result<(RoutingInput, RouteMatch), Status> {
         let mut input = routing_input_from_context(context);
-        if !self
-            .runtime
-            .allows_user_domain_access(&input.user, &input.target_domain)
-        {
+        let target_summary = routing_target_summary(&input);
+        let network_name = routing_network_name(input.network);
+        let audit_context = UserDomainAccessAuditContext {
+            inbound_tag: &input.inbound_tag,
+            protocol: &input.protocol,
+            network: &network_name,
+            target: &target_summary,
+            routing_user: &input.user,
+        };
+        if !self.runtime.allows_user_domain_access_with_context(
+            &input.user,
+            &input.target_domain,
+            audit_context,
+        ) {
             return Ok((
                 input,
                 RouteMatch {
@@ -270,7 +279,7 @@ impl RoutingServiceImpl {
             && routing.domain_strategy()
                 == crate::routing_state::DomainStrategy::IpIfNonMatch
             && !input.target_domain.is_empty()
-            && input.target_ips.is_empty()
+            && !input.target_ips_are_resolved
         {
             self.resolve_target_ips(&mut input).await?;
             if routing.requires_process_lookup() {
@@ -303,9 +312,11 @@ impl RoutingServiceImpl {
                 .resolve_location(&location)
                 .await
                 .map_err(|error| {
+                    self.runtime.data_plane().record_user_domain_dns_failure();
                     Status::unknown(format!("routing DNS lookup failed: {error}"))
                 })?;
         if addresses.is_empty() {
+            self.runtime.data_plane().record_user_domain_dns_failure();
             return Err(Status::unknown(format!(
                 "routing DNS lookup returned no addresses for {}",
                 input.target_domain
@@ -318,6 +329,7 @@ impl RoutingServiceImpl {
                 IpAddr::V6(ip) => ip.octets().to_vec(),
             })
             .collect();
+        input.target_ips_are_resolved = true;
         Ok(())
     }
 
@@ -341,6 +353,11 @@ fn routing_input_from_context(
         network: context.network,
         source_ips: context.source_i_ps.clone(),
         target_ips: context.target_i_ps.clone(),
+        // TestRoute receives the candidate IPs from its caller. Preserve the
+        // command API's existing meaning: these are already available for
+        // routing and must not be mistaken for an inbound literal IP that
+        // still needs route-only domain resolution.
+        target_ips_are_resolved: !context.target_i_ps.is_empty(),
         source_port: context.source_port,
         target_port: context.target_port,
         target_domain: context.target_domain.clone(),
@@ -354,6 +371,34 @@ fn routing_input_from_context(
         local_port: context.local_port,
         vless_route: context.vless_route,
     }
+}
+
+fn routing_target_summary(input: &RoutingInput) -> String {
+    let target = if input.target_domain.is_empty() {
+        input
+            .target_ips
+            .first()
+            .and_then(|bytes| decode_target_ip(bytes))
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    } else {
+        input.target_domain.clone()
+    };
+    format!("{target}:{}", input.target_port)
+}
+
+fn decode_target_ip(bytes: &[u8]) -> Option<IpAddr> {
+    match bytes.len() {
+        4 => Some(IpAddr::from(<[u8; 4]>::try_from(bytes).ok()?)),
+        16 => Some(IpAddr::from(<[u8; 16]>::try_from(bytes).ok()?)),
+        _ => None,
+    }
+}
+
+fn routing_network_name(network: i32) -> String {
+    proto::xray::common::net::Network::try_from(network)
+        .map(|network| network.as_str_name().to_ascii_lowercase())
+        .unwrap_or_else(|_| format!("unknown({network})"))
 }
 
 fn routing_event_to_context(
@@ -883,6 +928,23 @@ mod tests {
         }
     }
 
+    struct FailingResolver;
+
+    impl Resolver for FailingResolver {
+        fn resolve_location(
+            &self,
+            _location: &crate::address::NetLocation,
+        ) -> Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send>>
+        {
+            Box::pin(async {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "fixture DNS failure",
+                ))
+            })
+        }
+    }
+
     fn build_runtime(outbounds: &[&str]) -> RuntimeState {
         RuntimeState::new(
             vec![],
@@ -1065,6 +1127,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn routing_test_route_records_dns_failure_separately_from_rejection() {
+        let runtime = build_runtime(&["direct"]);
+        runtime.replace_routing(
+            RoutingState::from_config(Some(&RoutingConfig {
+                domain_strategy: Some("IpOnDemand".into()),
+                rules: vec![RuleConfig {
+                    ip: vec!["203.0.113.2/32".into()],
+                    outbound_tag: Some("direct".into()),
+                    ..RuleConfig::default()
+                }],
+                ..RoutingConfig::default()
+            }))
+            .expect("DNS failure routing config should build"),
+        );
+        let service = RoutingServiceImpl::with_resolver(
+            runtime.clone(),
+            Arc::new(FailingResolver),
+        );
+
+        let error = service
+            .test_route(Request::new(
+                proto::xray::app::router::command::TestRouteRequest {
+                    routing_context: Some(
+                        proto::xray::app::router::command::RoutingContext {
+                            target_domain: "dns-failure.example".into(),
+                            target_port: 443,
+                            ..Default::default()
+                        },
+                    ),
+                    field_selectors: vec![],
+                    publish_result: false,
+                },
+            ))
+            .await
+            .expect_err("DNS failure should be returned to TestRoute");
+
+        assert_eq!(error.code(), Code::Unknown);
+        assert!(error.message().contains("routing DNS lookup failed"));
+        let stats = runtime.user_domain_policy_status().stats;
+        assert_eq!(stats.dns_failures, 1);
+        assert_eq!(stats.rejected, 0);
+    }
+
+    #[tokio::test]
     async fn routing_test_route_requires_route_clues() {
         let service = RoutingServiceImpl::new(build_runtime(&["direct", "backup"]));
         let err = service
@@ -1180,6 +1286,111 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn routing_add_rule_matches_user_and_domain_like_xray() {
+        let runtime = build_runtime(&["direct", "blocked"]);
+        let service = RoutingServiceImpl::new(runtime);
+        let router_config = RouterConfigPayload {
+            domain_strategy: RouterDomainStrategyPayload::AsIs as i32,
+            rule: vec![
+                RoutingRulePayload {
+                    target_tag: Some(routing_rule_payload::TargetTag::Tag(
+                        "direct".into(),
+                    )),
+                    rule_tag: "alice-allowed".into(),
+                    user_email: vec!["alice@example.com".into()],
+                    domain: vec![DomainPayload {
+                        r#type: DomainTypePayload::Full as i32,
+                        value: "allowed.example".into(),
+                    }],
+                    ..RoutingRulePayload::default()
+                },
+                RoutingRulePayload {
+                    target_tag: Some(routing_rule_payload::TargetTag::Tag(
+                        "blocked".into(),
+                    )),
+                    rule_tag: "alice-blocked".into(),
+                    user_email: vec!["alice@example.com".into()],
+                    domain: vec![DomainPayload {
+                        r#type: DomainTypePayload::Full as i32,
+                        value: "blocked.example".into(),
+                    }],
+                    ..RoutingRulePayload::default()
+                },
+            ],
+            balancing_rule: vec![],
+        };
+
+        service
+            .add_rule(Request::new(
+                proto::xray::app::router::command::AddRuleRequest {
+                    config: Some(encode_router_config(router_config)),
+                    should_append: false,
+                },
+            ))
+            .await
+            .expect("user and domain routing rules should be accepted");
+
+        let allowed = service
+            .test_route(Request::new(
+                proto::xray::app::router::command::TestRouteRequest {
+                    routing_context: Some(
+                        proto::xray::app::router::command::RoutingContext {
+                            user: "alice@example.com".into(),
+                            target_domain: "allowed.example".into(),
+                            target_port: 443,
+                            ..Default::default()
+                        },
+                    ),
+                    field_selectors: vec![],
+                    publish_result: false,
+                },
+            ))
+            .await
+            .expect("allowed user-domain route should match")
+            .into_inner();
+        assert_eq!(allowed.outbound_tag, "direct");
+
+        let blocked = service
+            .test_route(Request::new(
+                proto::xray::app::router::command::TestRouteRequest {
+                    routing_context: Some(
+                        proto::xray::app::router::command::RoutingContext {
+                            user: "alice@example.com".into(),
+                            target_domain: "blocked.example".into(),
+                            target_port: 443,
+                            ..Default::default()
+                        },
+                    ),
+                    field_selectors: vec![],
+                    publish_result: false,
+                },
+            ))
+            .await
+            .expect("blocked user-domain route should match")
+            .into_inner();
+        assert_eq!(blocked.outbound_tag, "blocked");
+
+        let other_user = service
+            .test_route(Request::new(
+                proto::xray::app::router::command::TestRouteRequest {
+                    routing_context: Some(
+                        proto::xray::app::router::command::RoutingContext {
+                            user: "bob@example.com".into(),
+                            target_domain: "blocked.example".into(),
+                            target_port: 443,
+                            ..Default::default()
+                        },
+                    ),
+                    field_selectors: vec![],
+                    publish_result: false,
+                },
+            ))
+            .await
+            .expect_err("a different user must not match Alice's rule");
+        assert_eq!(other_user.code(), Code::Unknown);
     }
 
     #[tokio::test]

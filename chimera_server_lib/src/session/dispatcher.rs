@@ -22,7 +22,7 @@ use crate::{
         },
     },
     outbound::{InboundRoutingMetadata, connect_tcp_outbound_with_routing_metadata},
-    resolver::{NativeResolver, Resolver},
+    resolver::Resolver,
     runtime::DataPlaneRuntime,
     session::sniff::{
         SniffedRoutePlan, build_sniffed_route_plan, sniff_stream_protocol,
@@ -249,6 +249,9 @@ where
                 peer_addr,
                 InboundRoutingMetadata {
                     local_addr,
+                    inbound_protocol: traffic_context
+                        .as_ref()
+                        .map(|context| context.protocol.to_string()),
                     policy_identities: traffic_context
                         .as_ref()
                         .map(|context| context.policy_identities.clone())
@@ -387,6 +390,9 @@ where
                     peer_addr,
                     {
                         let mut routing_metadata = routing_metadata;
+                        routing_metadata.inbound_protocol = traffic_context
+                            .as_ref()
+                            .map(|context| context.protocol.to_string());
                         routing_metadata.policy_identities = traffic_context
                             .as_ref()
                             .map(|context| context.policy_identities.clone())
@@ -502,7 +508,7 @@ where
             if let Some(context) = traffic_context.as_mut() {
                 runtime.apply_traffic_stats_policy(context);
             }
-            let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+            let resolver = runtime.resolver();
             run_udp_relay_with_expected_client(
                 udp_socket,
                 stream,

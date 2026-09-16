@@ -356,8 +356,27 @@ fn resolved_domain_input(domain: &str) -> RoutingInput {
     RoutingInput {
         target_domain: domain.into(),
         target_ips: vec![vec![203, 0, 113, 7]],
+        target_ips_are_resolved: true,
         ..RoutingInput::default()
     }
+}
+
+#[test]
+fn domain_strategy_keeps_original_target_ips_available_to_as_is() {
+    let state = strategy_state("AsIs", domain_and_ip_rules());
+    let matched = state
+        .route(
+            &RoutingInput {
+                target_domain: "other.example".into(),
+                target_ips: vec![vec![203, 0, 113, 7]],
+                ..RoutingInput::default()
+            },
+            &[outbound("ip"), outbound("domain")],
+            &HashMap::new(),
+        )
+        .expect("AsIs must retain the original target IP");
+
+    assert_eq!(matched.outbound_tag, "ip");
 }
 
 #[test]

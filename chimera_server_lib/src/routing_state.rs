@@ -142,6 +142,10 @@ pub struct RoutingInput {
     pub network: i32,
     pub source_ips: Vec<Vec<u8>>,
     pub target_ips: Vec<Vec<u8>>,
+    /// Distinguishes resolver output from the original literal destination IP.
+    /// Xray's DNS routing context may retain both a route-only sniffed domain
+    /// and the original target IP, so a non-empty list alone is insufficient.
+    pub(crate) target_ips_are_resolved: bool,
     pub source_port: u32,
     pub target_port: u32,
     pub target_domain: String,
@@ -378,7 +382,7 @@ impl RoutingState {
     pub(crate) fn needs_target_ip_resolution(&self, input: &RoutingInput) -> bool {
         if self.domain_strategy != DomainStrategy::IpOnDemand
             || input.target_domain.is_empty()
-            || !input.target_ips.is_empty()
+            || input.target_ips_are_resolved
         {
             return false;
         }
@@ -476,9 +480,18 @@ impl RoutingState {
             );
         }
 
+        // A resolved target is supplied only on the second Xray
+        // IPIfNonMatch pass. An original literal target IP remains visible
+        // during the initial pass, including when a route-only sniffed domain
+        // is also present.
+        let first_pass_target_ips = if input.target_ips_are_resolved {
+            &[] as &[Vec<u8>]
+        } else {
+            input.target_ips.as_slice()
+        };
         let domain_match = self.route_once_with_target_ips(
             input,
-            &[],
+            first_pass_target_ips,
             outbounds,
             balancer_overrides,
             balancer_targets,

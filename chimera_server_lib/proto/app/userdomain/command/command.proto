@@ -20,6 +20,7 @@ message DecisionStats {
   uint64 allow_all_default = 7;
   uint64 allowlist_miss = 8;
   uint64 denylist_miss = 9;
+  uint64 dns_failures = 10;
 }
 
 message ApplyPolicyRequest {
@@ -45,8 +46,29 @@ message GetPolicyStatusResponse {
   DecisionStats stats = 2;
 }
 
+message AuditEvent {
+  uint64 observed_at_unix_ms = 1;
+  string decision = 2;
+  string reason = 3;
+  string inbound_tag = 4;
+  string protocol = 5;
+  string network = 6;
+  string target = 7;
+  string routing_user = 8;
+  uint64 identity_count = 9;
+}
+
+message GetAuditEventsRequest {
+  uint32 limit = 1;
+}
+
+message GetAuditEventsResponse {
+  repeated AuditEvent events = 1;
+}
+
 service UserDomainAccessService {
   rpc ApplyPolicy(ApplyPolicyRequest) returns (ApplyPolicyResponse);
   rpc RollbackPolicy(RollbackPolicyRequest) returns (RollbackPolicyResponse);
   rpc GetPolicyStatus(GetPolicyStatusRequest) returns (GetPolicyStatusResponse);
+  rpc GetAuditEvents(GetAuditEventsRequest) returns (GetAuditEventsResponse);
 }

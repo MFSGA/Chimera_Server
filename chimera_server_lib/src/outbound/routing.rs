@@ -10,6 +10,7 @@ use crate::{
     routing_process::enrich_routing_input,
     routing_state::{DomainStrategy, RoutingInput},
     runtime::{DataPlaneRuntime, OutboundSummary},
+    user_domain::UserDomainAccessAuditContext,
 };
 
 pub(crate) const USER_DOMAIN_ACCESS_BLACKHOLE_TAG: &str = "user-domain-access";
@@ -28,6 +29,10 @@ pub(crate) struct InboundRoutingMetadata {
     pub local_addr: Option<SocketAddr>,
     pub vless_route: u32,
     pub policy_identities: Vec<String>,
+    /// Protocol that authenticated the inbound request. This is kept
+    /// separate from `sniffed_protocol`, which describes the payload seen by
+    /// routing (for example `http1` or `tls`).
+    pub inbound_protocol: Option<String>,
     pub sniffed_protocol: Option<String>,
     pub route_target_domain: Option<String>,
     pub attributes: HashMap<String, String>,
@@ -161,6 +166,7 @@ pub(crate) async fn select_direct_outbound_for_location(
     context: OutboundRoutingContext<'_>,
 ) -> std::io::Result<(DirectOutboundAction, Option<SocketAddr>)> {
     let policy_identities = context.metadata.policy_identities.clone();
+    let inbound_protocol = context.metadata.inbound_protocol.clone();
     let mut route_input = apply_routing_metadata(
         unresolved_connection_routing_input(
             context.inbound_tag,
@@ -171,13 +177,25 @@ pub(crate) async fn select_direct_outbound_for_location(
         ),
         context.metadata,
     );
+    let target_summary = remote_location.to_string();
+    let audit_context = UserDomainAccessAuditContext {
+        inbound_tag: context.inbound_tag,
+        protocol: inbound_protocol.as_deref().unwrap_or(&route_input.protocol),
+        network: context.network_name,
+        target: &target_summary,
+        routing_user: &route_input.user,
+    };
     let allowed = if policy_identities.is_empty() {
-        runtime
-            .allows_user_domain_access(&route_input.user, &route_input.target_domain)
+        runtime.allows_user_domain_access_with_context(
+            &route_input.user,
+            &route_input.target_domain,
+            audit_context,
+        )
     } else {
-        runtime.allows_user_domain_access_with_identities(
+        runtime.allows_user_domain_access_with_identities_and_context(
             &policy_identities,
             &route_input.target_domain,
+            audit_context,
         )
     };
     if !allowed {
@@ -195,15 +213,17 @@ pub(crate) async fn select_direct_outbound_for_location(
     let mut resolved_for_routing = None;
 
     if runtime.routing_needs_target_ip_resolution(&route_input) {
-        let addresses = resolve_all_addresses(resolver, &routing_location).await?;
+        let addresses =
+            resolve_all_addresses(resolver, &routing_location, runtime).await?;
         route_input.target_ips = encode_target_ips(&addresses);
+        route_input.target_ips_are_resolved = true;
         resolved_for_routing = Some(addresses);
     }
     route_input = enrich_route_input_if_needed(runtime, route_input).await;
 
     let selected = if domain_strategy == DomainStrategy::IpIfNonMatch
         && !route_input.target_domain.is_empty()
-        && route_input.target_ips.is_empty()
+        && !route_input.target_ips_are_resolved
     {
         match runtime
             .match_outbound_checked(&route_input)
@@ -212,8 +232,10 @@ pub(crate) async fn select_direct_outbound_for_location(
             Some(outbound) => Some(outbound),
             None => {
                 let addresses =
-                    resolve_all_addresses(resolver, &routing_location).await?;
+                    resolve_all_addresses(resolver, &routing_location, runtime)
+                        .await?;
                 route_input.target_ips = encode_target_ips(&addresses);
+                route_input.target_ips_are_resolved = true;
                 resolved_for_routing = Some(addresses);
                 route_input =
                     enrich_route_input_if_needed(runtime, route_input).await;
@@ -241,9 +263,21 @@ pub(crate) async fn select_direct_outbound_for_location(
                     .as_ref()
                     .and_then(|addresses| addresses.first().copied())
                     .unwrap_or(
-                        resolve_single_address(resolver, remote_location).await?,
+                        resolve_single_address_recorded(
+                            resolver,
+                            remote_location,
+                            runtime,
+                        )
+                        .await?,
                     ),
-                None => resolve_single_address(resolver, remote_location).await?,
+                None => {
+                    resolve_single_address_recorded(
+                        resolver,
+                        remote_location,
+                        runtime,
+                    )
+                    .await?
+                }
             };
             Ok((action, Some(target_addr)))
         }
@@ -257,15 +291,33 @@ fn invalid_routing_error(error: String) -> std::io::Error {
 async fn resolve_all_addresses(
     resolver: &Arc<dyn Resolver>,
     location: &NetLocation,
+    runtime: &DataPlaneRuntime,
 ) -> std::io::Result<Vec<SocketAddr>> {
-    let addresses = resolver.resolve_location(location).await?;
+    let addresses = resolver.resolve_location(location).await.map_err(|error| {
+        runtime.record_user_domain_dns_failure();
+        error
+    })?;
     if addresses.is_empty() {
+        runtime.record_user_domain_dns_failure();
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("DNS lookup returned no addresses for {location}"),
         ));
     }
     Ok(addresses)
+}
+
+async fn resolve_single_address_recorded(
+    resolver: &Arc<dyn Resolver>,
+    location: &NetLocation,
+    runtime: &DataPlaneRuntime,
+) -> std::io::Result<SocketAddr> {
+    resolve_single_address(resolver, location)
+        .await
+        .map_err(|error| {
+            runtime.record_user_domain_dns_failure();
+            error
+        })
 }
 
 fn encode_target_ips(addresses: &[SocketAddr]) -> Vec<Vec<u8>> {
@@ -279,8 +331,7 @@ fn routing_resolution_location(
     input: &RoutingInput,
     remote_location: &NetLocation,
 ) -> NetLocation {
-    if remote_location.address().is_hostname()
-        && !input.target_domain.is_empty()
+    if !input.target_domain.is_empty()
         && remote_location.address().hostname() != Some(input.target_domain.as_str())
     {
         return NetLocation::new(
@@ -360,12 +411,25 @@ pub(crate) fn select_direct_outbound_with_policy_identities(
     network_name: &str,
     policy_identities: &[String],
 ) -> std::io::Result<DirectOutboundAction> {
+    let target_summary = routing_target_summary(input);
+    let audit_context = UserDomainAccessAuditContext {
+        inbound_tag: &input.inbound_tag,
+        protocol: &input.protocol,
+        network: network_name,
+        target: &target_summary,
+        routing_user: &input.user,
+    };
     let allowed = if policy_identities.is_empty() {
-        runtime.allows_user_domain_access(&input.user, &input.target_domain)
+        runtime.allows_user_domain_access_with_context(
+            &input.user,
+            &input.target_domain,
+            audit_context,
+        )
     } else {
-        runtime.allows_user_domain_access_with_identities(
+        runtime.allows_user_domain_access_with_identities_and_context(
             policy_identities,
             &input.target_domain,
+            audit_context,
         )
     };
     if !allowed {
@@ -378,6 +442,28 @@ pub(crate) fn select_direct_outbound_with_policy_identities(
         .select_outbound_checked(input)
         .map_err(invalid_routing_error)?;
     classify_selected_outbound(outbound, network_name)
+}
+
+fn routing_target_summary(input: &RoutingInput) -> String {
+    let target = if input.target_domain.is_empty() {
+        input
+            .target_ips
+            .first()
+            .and_then(|bytes| decode_target_ip(bytes))
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    } else {
+        input.target_domain.clone()
+    };
+    format!("{target}:{}", input.target_port)
+}
+
+fn decode_target_ip(bytes: &[u8]) -> Option<IpAddr> {
+    match bytes.len() {
+        4 => Some(IpAddr::from(<[u8; 4]>::try_from(bytes).ok()?)),
+        16 => Some(IpAddr::from(<[u8; 16]>::try_from(bytes).ok()?)),
+        _ => None,
+    }
 }
 
 fn classify_selected_outbound(

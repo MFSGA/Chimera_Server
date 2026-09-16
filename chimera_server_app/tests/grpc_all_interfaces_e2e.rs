@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
-    io,
+    io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream},
     path::PathBuf,
     process::{Child, Command, Stdio},
@@ -81,6 +81,15 @@ const PATH_ROUTING_ADD_RULE: &str =
     "/xray.app.router.command.RoutingService/AddRule";
 const PATH_ROUTING_REMOVE_RULE: &str =
     "/xray.app.router.command.RoutingService/RemoveRule";
+
+const PATH_USER_DOMAIN_APPLY_POLICY: &str =
+    "/chimera.app.userdomain.command.UserDomainAccessService/ApplyPolicy";
+const PATH_USER_DOMAIN_ROLLBACK_POLICY: &str =
+    "/chimera.app.userdomain.command.UserDomainAccessService/RollbackPolicy";
+const PATH_USER_DOMAIN_GET_POLICY_STATUS: &str =
+    "/chimera.app.userdomain.command.UserDomainAccessService/GetPolicyStatus";
+const PATH_USER_DOMAIN_GET_AUDIT_EVENTS: &str =
+    "/chimera.app.userdomain.command.UserDomainAccessService/GetAuditEvents";
 
 const PATH_OBSERVATORY_GET_OUTBOUND_STATUS: &str =
     "/xray.core.app.observatory.command.ObservatoryService/GetOutboundStatus";
@@ -201,6 +210,7 @@ struct Harness {
     server: ServerProcess,
     runtime: tokio::runtime::Runtime,
     channel: Channel,
+    socks_addr: SocketAddr,
 }
 
 impl Harness {
@@ -246,6 +256,10 @@ impl Harness {
             server,
             runtime,
             channel,
+            socks_addr: SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::LOCALHOST,
+                socks_port,
+            )),
         })
     }
 
@@ -294,6 +308,10 @@ impl Harness {
             server,
             runtime,
             channel,
+            socks_addr: SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::LOCALHOST,
+                data_port,
+            )),
         })
     }
 
@@ -427,7 +445,8 @@ fn build_config(grpc_port: u16, socks_port: u16) -> String {
       "LoggerService",
       "HandlerService",
       "RoutingService",
-      "ObservatoryService"
+      "ObservatoryService",
+      "UserDomainAccessService"
     ]
   }},
   "routing": {{
@@ -447,6 +466,28 @@ fn build_config(grpc_port: u16, socks_port: u16) -> String {
   }}
 }}"#
     )
+}
+
+fn build_dynamic_domain_config(
+    grpc_port: u16,
+    socks_port: u16,
+    echo_ip: &str,
+) -> String {
+    let mut config: serde_json::Value =
+        serde_json::from_str(&build_config(grpc_port, socks_port))
+            .expect("base gRPC config should be valid JSON");
+    let settings = config["inbounds"][0]["settings"]
+        .as_object_mut()
+        .expect("SOCKS settings should be an object");
+    settings.insert("auth".into(), serde_json::Value::String("noauth".into()));
+    settings.remove("accounts");
+    config["dns"] = serde_json::json!({
+        "hosts": {
+            "allowed.example": echo_ip,
+            "blocked.example": echo_ip
+        }
+    });
+    serde_json::to_string(&config).expect("dynamic domain config should serialize")
 }
 
 fn build_vless_config(grpc_port: u16, vless_port: u16) -> String {
@@ -561,6 +602,99 @@ where
     let response = grpc.unary(Request::new(request), path, codec).await?;
     trace_step("rpc unary response received");
     Ok(response.into_inner())
+}
+
+fn start_tcp_echo_server() -> SocketAddr {
+    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .expect("bind TCP echo server");
+    let address = listener.local_addr().expect("read TCP echo address");
+    thread::spawn(move || {
+        for stream in listener.incoming().take(32) {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            thread::spawn(move || {
+                let mut buffer = [0u8; 16 * 1024];
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(length) => {
+                            if stream.write_all(&buffer[..length]).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    address
+}
+
+fn socks5_domain_roundtrip(
+    socks_addr: SocketAddr,
+    domain: &str,
+    port: u16,
+    payload: &[u8],
+) -> io::Result<()> {
+    let mut stream = TcpStream::connect_timeout(&socks_addr, IO_TIMEOUT)?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    stream.write_all(&[0x05, 0x01, 0x00])?;
+    let mut greeting = [0u8; 2];
+    stream.read_exact(&mut greeting)?;
+    if greeting != [0x05, 0x00] {
+        return Err(io::Error::other(format!(
+            "SOCKS greeting failed: {greeting:02x?}"
+        )));
+    }
+    if domain.len() > u8::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "domain too long",
+        ));
+    }
+    let mut request = vec![0x05, 0x01, 0x00, 0x03, domain.len() as u8];
+    request.extend_from_slice(domain.as_bytes());
+    request.extend_from_slice(&port.to_be_bytes());
+    stream.write_all(&request)?;
+
+    let mut header = [0u8; 4];
+    stream.read_exact(&mut header)?;
+    if header[0] != 0x05 || header[1] != 0x00 {
+        return Err(io::Error::other(format!(
+            "SOCKS connect failed: {header:02x?}"
+        )));
+    }
+    match header[3] {
+        0x01 => {
+            let mut tail = [0u8; 6];
+            stream.read_exact(&mut tail)?;
+        }
+        0x03 => {
+            let mut length = [0u8; 1];
+            stream.read_exact(&mut length)?;
+            let mut tail = vec![0u8; length[0] as usize + 2];
+            stream.read_exact(&mut tail)?;
+        }
+        0x04 => {
+            let mut tail = [0u8; 18];
+            stream.read_exact(&mut tail)?;
+        }
+        address_type => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported SOCKS address type {address_type:#x}"),
+            ));
+        }
+    }
+    stream.write_all(payload)?;
+    let mut echoed = vec![0u8; payload.len()];
+    stream.read_exact(&mut echoed)?;
+    if echoed != payload {
+        return Err(io::Error::other("TCP echo payload mismatch"));
+    }
+    Ok(())
 }
 
 async fn grpc_server_stream<Req, Resp>(
@@ -823,6 +957,14 @@ struct ListOutboundsResponse {
 struct RoutingContext {
     #[prost(string, tag = "1")]
     inbound_tag: String,
+    #[prost(uint32, tag = "6")]
+    target_port: u32,
+    #[prost(string, tag = "7")]
+    target_domain: String,
+    #[prost(bytes, repeated, tag = "4")]
+    target_ips: Vec<Vec<u8>>,
+    #[prost(string, tag = "9")]
+    user: String,
     #[prost(string, repeated, tag = "11")]
     outbound_group_tags: Vec<String>,
     #[prost(string, tag = "12")]
@@ -907,6 +1049,113 @@ struct RemoveRuleRequest {
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct RemoveRuleResponse {}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct UserDomainApplyPolicyRequest {
+    #[prost(string, tag = "1")]
+    json_config: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct UserDomainApplyPolicyResponse {
+    #[prost(message, optional, tag = "1")]
+    revision: Option<UserDomainRevisionInfo>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct UserDomainRollbackPolicyRequest {
+    #[prost(uint64, tag = "1")]
+    version: u64,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct UserDomainRollbackPolicyResponse {
+    #[prost(message, optional, tag = "1")]
+    revision: Option<UserDomainRevisionInfo>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct UserDomainGetPolicyStatusRequest {}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct UserDomainGetPolicyStatusResponse {
+    #[prost(message, optional, tag = "1")]
+    revision: Option<UserDomainRevisionInfo>,
+    #[prost(message, optional, tag = "2")]
+    stats: Option<UserDomainDecisionStats>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct UserDomainGetAuditEventsRequest {
+    #[prost(uint32, tag = "1")]
+    limit: u32,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct UserDomainGetAuditEventsResponse {
+    #[prost(message, repeated, tag = "1")]
+    events: Vec<UserDomainAuditEvent>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct UserDomainAuditEvent {
+    #[prost(uint64, tag = "1")]
+    observed_at_unix_ms: u64,
+    #[prost(string, tag = "2")]
+    decision: String,
+    #[prost(string, tag = "3")]
+    reason: String,
+    #[prost(string, tag = "4")]
+    inbound_tag: String,
+    #[prost(string, tag = "5")]
+    protocol: String,
+    #[prost(string, tag = "6")]
+    network: String,
+    #[prost(string, tag = "7")]
+    target: String,
+    #[prost(string, tag = "8")]
+    routing_user: String,
+    #[prost(uint64, tag = "9")]
+    identity_count: u64,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct UserDomainRevisionInfo {
+    #[prost(uint64, tag = "1")]
+    version: u64,
+    #[prost(string, tag = "2")]
+    generated_at: String,
+    #[prost(string, tag = "3")]
+    target_node_uuid: String,
+    #[prost(string, tag = "4")]
+    checksum: String,
+    #[prost(string, tag = "5")]
+    source_backend_version: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct UserDomainDecisionStats {
+    #[prost(uint64, tag = "1")]
+    evaluations: u64,
+    #[prost(uint64, tag = "2")]
+    allowed: u64,
+    #[prost(uint64, tag = "3")]
+    rejected: u64,
+    #[prost(uint64, tag = "4")]
+    matched_rule: u64,
+    #[prost(uint64, tag = "5")]
+    no_user_policy: u64,
+    #[prost(uint64, tag = "6")]
+    unknown_target: u64,
+    #[prost(uint64, tag = "7")]
+    allow_all_default: u64,
+    #[prost(uint64, tag = "8")]
+    allowlist_miss: u64,
+    #[prost(uint64, tag = "9")]
+    denylist_miss: u64,
+    #[prost(uint64, tag = "10")]
+    dns_failures: u64,
+}
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct GetOutboundStatusRequest {}
@@ -1412,6 +1661,7 @@ fn routing_subscribe_routing_stats_executes() {
                     inbound_tag: SOCKS_TAG.to_string(),
                     outbound_group_tags: Vec::new(),
                     outbound_tag: String::new(),
+                    ..Default::default()
                 }),
                 field_selectors: Vec::new(),
                 publish_result: true,
@@ -1443,6 +1693,7 @@ fn routing_test_route_executes() {
                     inbound_tag: SOCKS_TAG.to_string(),
                     outbound_group_tags: Vec::new(),
                     outbound_tag: String::new(),
+                    ..Default::default()
                 }),
                 field_selectors: Vec::new(),
                 publish_result: false,
@@ -1571,6 +1822,146 @@ fn routing_remove_missing_rule_is_idempotent_like_xray() {
         ),
         "RoutingService/RemoveRule(missing rule)",
     );
+}
+
+#[test]
+fn user_domain_access_service_applies_reports_and_rolls_back_policy() {
+    trace_step(
+        "==== test user_domain_access_service_applies_reports_and_rolls_back_policy start ====",
+    );
+    let harness = Harness::start().expect("failed to start test harness");
+    let response: UserDomainApplyPolicyResponse = harness.expect_ok(
+        harness.unary(
+            PATH_USER_DOMAIN_APPLY_POLICY,
+            UserDomainApplyPolicyRequest {
+                json_config: signed_user_domain_policy(),
+            },
+        ),
+        "UserDomainAccessService/ApplyPolicy",
+    );
+    let revision = response
+        .revision
+        .expect("applied revision should be present");
+    assert_eq!(revision.version, 1);
+    assert_eq!(revision.target_node_uuid, "node-1");
+
+    let routed: RoutingContext = harness.expect_ok(
+        harness.unary(
+            PATH_ROUTING_TEST_ROUTE,
+            TestRouteRequest {
+                routing_context: Some(RoutingContext {
+                    inbound_tag: SOCKS_TAG.to_string(),
+                    target_port: 443,
+                    target_domain: "blocked.example".to_string(),
+                    user: "alice@example.com".to_string(),
+                    ..Default::default()
+                }),
+                field_selectors: Vec::new(),
+                publish_result: false,
+            },
+        ),
+        "RoutingService/TestRoute(after user-domain policy)",
+    );
+    assert_eq!(routed.outbound_tag, "user-domain-access");
+
+    let status: UserDomainGetPolicyStatusResponse = harness.expect_ok(
+        harness.unary(
+            PATH_USER_DOMAIN_GET_POLICY_STATUS,
+            UserDomainGetPolicyStatusRequest {},
+        ),
+        "UserDomainAccessService/GetPolicyStatus",
+    );
+    assert_eq!(status.revision.expect("active revision").version, 1);
+    let stats = status.stats.expect("decision stats");
+    assert_eq!(stats.evaluations, 1);
+    assert_eq!(stats.rejected, 1);
+
+    let _: RoutingContext = harness.expect_ok(
+        harness.unary(
+            PATH_ROUTING_TEST_ROUTE,
+            TestRouteRequest {
+                routing_context: Some(RoutingContext {
+                    inbound_tag: SOCKS_TAG.to_string(),
+                    target_ips: vec![vec![203, 0, 113, 10]],
+                    target_port: 443,
+                    user: "alice@example.com".to_string(),
+                    ..Default::default()
+                }),
+                field_selectors: Vec::new(),
+                publish_result: false,
+            },
+        ),
+        "RoutingService/TestRoute(unknown target audit)",
+    );
+
+    let audit: UserDomainGetAuditEventsResponse = harness.expect_ok(
+        harness.unary(
+            PATH_USER_DOMAIN_GET_AUDIT_EVENTS,
+            UserDomainGetAuditEventsRequest { limit: 1 },
+        ),
+        "UserDomainAccessService/GetAuditEvents",
+    );
+    let event = audit.events.first().expect("unknown target audit event");
+    assert_eq!(event.decision, "allow");
+    assert_eq!(event.reason, "domain_not_available");
+    assert_eq!(event.target, "203.0.113.10:443");
+    assert!(event.routing_user.starts_with("sha256:"));
+    assert!(!event.routing_user.contains("alice@example.com"));
+
+    let response: UserDomainRollbackPolicyResponse = harness.expect_ok(
+        harness.unary(
+            PATH_USER_DOMAIN_ROLLBACK_POLICY,
+            UserDomainRollbackPolicyRequest { version: 1 },
+        ),
+        "UserDomainAccessService/RollbackPolicy",
+    );
+    assert_eq!(response.revision.expect("rollback revision").version, 1);
+}
+
+#[test]
+fn dynamic_user_domain_policy_reaches_new_socks_tcp_requests() {
+    trace_step(
+        "==== test dynamic_user_domain_policy_reaches_new_socks_tcp_requests start ====",
+    );
+    let echo_addr = start_tcp_echo_server();
+    let echo_ip = echo_addr.ip().to_string();
+    let harness = Harness::start_with_config_builder(|grpc_port, socks_port| {
+        build_dynamic_domain_config(grpc_port, socks_port, &echo_ip)
+    })
+    .expect("failed to start dynamic policy test harness");
+
+    socks5_domain_roundtrip(
+        harness.socks_addr,
+        "allowed.example",
+        echo_addr.port(),
+        b"before dynamic policy",
+    )
+    .expect("domain should be allowed before policy update");
+
+    let _: UserDomainApplyPolicyResponse = harness.expect_ok(
+        harness.unary(
+            PATH_USER_DOMAIN_APPLY_POLICY,
+            UserDomainApplyPolicyRequest {
+                json_config: signed_user_domain_policy(),
+            },
+        ),
+        "UserDomainAccessService/ApplyPolicy(data-plane test)",
+    );
+
+    let rejected = socks5_domain_roundtrip(
+        harness.socks_addr,
+        "blocked.example",
+        echo_addr.port(),
+        b"after dynamic policy",
+    );
+    assert!(
+        rejected.is_err(),
+        "a newly created blocked domain request must be rejected: {rejected:?}"
+    );
+}
+
+fn signed_user_domain_policy() -> String {
+    "{\"version\":1,\"generatedAt\":\"2026-01-01T00:00:00.000Z\",\"sourceBackendVersion\":\"test\",\"targetNodeUuid\":\"node-1\",\"defaultAction\":\"reject\",\"users\":[],\"checksum\":\"sha256:5dbfd6c39173b845c52cf308e01156f5fbd6011600118d0fc6adc410217b871a\"}".to_string()
 }
 
 #[test]
