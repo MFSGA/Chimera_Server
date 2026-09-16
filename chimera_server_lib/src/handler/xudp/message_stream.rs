@@ -2,7 +2,6 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -20,7 +19,6 @@ use crate::{
         AsyncSessionMessageStream, AsyncShutdownMessage, AsyncStream,
         AsyncWriteSessionMessage, SessionMessage,
     },
-    resolver::Resolver,
 };
 
 use super::frame::{FrameMetadata, FrameOption, SessionStatus, TargetNetwork};
@@ -36,7 +34,7 @@ enum IncomingMessage {
     Data {
         session_id: u16,
         payload: BytesMut,
-        target: SocketAddr,
+        target: NetLocation,
         global_id: Option<[u8; 8]>,
         is_new: bool,
     },
@@ -71,21 +69,17 @@ impl std::fmt::Debug for XudpMessageStream {
 }
 
 impl XudpMessageStream {
-    pub(crate) fn new(
-        stream: Box<dyn AsyncStream>,
-        resolver: Arc<dyn Resolver>,
-    ) -> Self {
-        Self::with_write_prefix(stream, resolver, Vec::new())
+    pub(crate) fn new(stream: Box<dyn AsyncStream>) -> Self {
+        Self::with_write_prefix(stream, Vec::new())
     }
 
     pub(crate) fn with_write_prefix(
         stream: Box<dyn AsyncStream>,
-        resolver: Arc<dyn Resolver>,
         write_prefix: Vec<u8>,
     ) -> Self {
         let (reader, writer) = split(stream);
         let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
-        let reader_task = tokio::spawn(run_reader(reader, resolver, sender));
+        let reader_task = tokio::spawn(run_reader(reader, sender));
         Self {
             receiver,
             writer,
@@ -365,11 +359,8 @@ impl AsyncPing for XudpMessageStream {
 
 impl AsyncSessionMessageStream for XudpMessageStream {}
 
-async fn run_reader<R>(
-    mut reader: R,
-    resolver: Arc<dyn Resolver>,
-    sender: mpsc::Sender<IncomingResult>,
-) where
+async fn run_reader<R>(mut reader: R, sender: mpsc::Sender<IncomingResult>)
+where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut buffer = BytesMut::with_capacity(READ_CHUNK_SIZE);
@@ -389,18 +380,7 @@ async fn run_reader<R>(
                 global_id,
                 is_new,
             })) => {
-                let resolved =
-                    resolver
-                        .resolve_location(&target)
-                        .await
-                        .and_then(|addresses| {
-                            addresses.into_iter().next().ok_or_else(|| {
-                                std::io::Error::other(format!(
-                                    "could not resolve XUDP target: {target}"
-                                ))
-                            })
-                        });
-                let result = resolved.map(|target| IncomingMessage::Data {
+                let result = Ok(IncomingMessage::Data {
                     session_id,
                     payload,
                     target,

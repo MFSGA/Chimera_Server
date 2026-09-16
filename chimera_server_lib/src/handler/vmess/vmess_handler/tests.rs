@@ -1021,7 +1021,10 @@ async fn fragmented_mux_request_preserves_first_xudp_frame() {
         panic!("fragmented VMess XUDP first frame decoded as End");
     };
     assert_eq!(session_id, 43);
-    assert_eq!(actual_target, target);
+    assert_eq!(
+        actual_target,
+        NetLocation::from_ip_addr(target.ip(), target.port())
+    );
     assert_eq!(global_id, None);
     assert!(is_new);
     assert_eq!(&payload[..length], b"ping");

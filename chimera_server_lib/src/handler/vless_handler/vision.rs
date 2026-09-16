@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use tracing::warn;
 
@@ -12,7 +10,6 @@ use crate::{
         tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
         xudp::message_stream::XudpMessageStream,
     },
-    resolver::NativeResolver,
     traffic::TrafficContext,
 };
 
@@ -128,7 +125,6 @@ pub async fn setup_reality_mixed_vless_server_stream(
                 COMMAND_MUX => Ok(TcpServerSetupResult::SessionBasedUdp {
                     stream: Box::new(XudpMessageStream::with_write_prefix(
                         Box::new(tls_stream),
-                        Arc::new(NativeResolver::new()),
                         SERVER_RESPONSE_HEADER.to_vec(),
                     )),
                     traffic_context,
@@ -283,7 +279,6 @@ pub async fn setup_tls_mixed_vless_server_stream(
                 COMMAND_MUX => Ok(TcpServerSetupResult::SessionBasedUdp {
                     stream: Box::new(XudpMessageStream::with_write_prefix(
                         Box::new(tls_stream),
-                        Arc::new(NativeResolver::new()),
                         SERVER_RESPONSE_HEADER.to_vec(),
                     )),
                     traffic_context,

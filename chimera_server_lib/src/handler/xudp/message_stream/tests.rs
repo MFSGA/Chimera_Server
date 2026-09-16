@@ -1,7 +1,4 @@
-use std::{
-    future::{Future, poll_fn},
-    net::Ipv4Addr,
-};
+use std::{collections::HashMap, future::poll_fn, net::Ipv4Addr, sync::Arc};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, duplex},
@@ -13,24 +10,11 @@ use crate::{
     address::Address,
     async_stream::{AsyncReadSessionMessage, AsyncWriteSessionMessage},
     beginning::udp::run_session_based_udp,
+    resolver::NativeResolver,
     runtime::RuntimeState,
 };
 
 use super::*;
-
-struct StaticResolver;
-
-impl Resolver for StaticResolver {
-    fn resolve_location(
-        &self,
-        location: &NetLocation,
-    ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>> {
-        let port = location.port();
-        Box::pin(
-            async move { Ok(vec![SocketAddr::from((Ipv4Addr::LOCALHOST, port))]) },
-        )
-    }
-}
 
 fn encode_data_frame(
     status: SessionStatus,
@@ -470,7 +454,6 @@ async fn unknown_keep_writes_end_reply_and_keeps_stream_open() {
 
     let mut stream = XudpMessageStream::with_write_prefix(
         Box::new(TestStream(server)),
-        Arc::new(StaticResolver),
         vec![0, 0],
     );
     let mut buffer = [0u8; 32];
@@ -588,10 +571,7 @@ async fn payload_larger_than_read_buffer_is_rejected_without_truncation() {
         .write_all(&frame)
         .await
         .expect("write oversized-for-caller XUDP frame");
-    let mut stream = XudpMessageStream::new(
-        Box::new(TestStream(server)),
-        Arc::new(StaticResolver),
-    );
+    let mut stream = XudpMessageStream::new(Box::new(TestStream(server)));
     let mut buffer = [0u8; 4];
 
     let error = poll_fn(|cx| {
@@ -748,10 +728,7 @@ async fn fragmented_frame_is_reassembled_across_single_byte_reads() {
             tokio::task::yield_now().await;
         }
     });
-    let mut stream = XudpMessageStream::new(
-        Box::new(TestStream(server)),
-        Arc::new(StaticResolver),
-    );
+    let mut stream = XudpMessageStream::new(Box::new(TestStream(server)));
     let mut payload = [0u8; 32];
 
     let (message, length) = timeout(
@@ -803,10 +780,7 @@ async fn coalesced_frames_preserve_order_across_channel_backpressure() {
         .write_all(&frames)
         .await
         .expect("write coalesced XUDP frames");
-    let mut stream = XudpMessageStream::new(
-        Box::new(TestStream(server)),
-        Arc::new(StaticResolver),
-    );
+    let mut stream = XudpMessageStream::new(Box::new(TestStream(server)));
 
     for expected in 0..FRAME_COUNT {
         let mut payload = [0u8; 1];
@@ -849,10 +823,7 @@ async fn partial_frame_eof_is_reported_without_hanging() {
         .shutdown()
         .await
         .expect("shutdown partial XUDP writer");
-    let mut stream = XudpMessageStream::new(
-        Box::new(TestStream(server)),
-        Arc::new(StaticResolver),
-    );
+    let mut stream = XudpMessageStream::new(Box::new(TestStream(server)));
     let mut payload = [0u8; 32];
 
     let error = timeout(
@@ -889,10 +860,7 @@ async fn reads_new_and_keep_frames_for_same_session() {
     ));
     client.write_all(&frames).await.expect("write XUDP frames");
 
-    let mut stream = XudpMessageStream::new(
-        Box::new(TestStream(server)),
-        Arc::new(StaticResolver),
-    );
+    let mut stream = XudpMessageStream::new(Box::new(TestStream(server)));
     let mut buffer = [0u8; 32];
     for (expected, expected_is_new) in
         [(b"first".as_slice(), true), (b"second".as_slice(), false)]
@@ -928,7 +896,10 @@ async fn reads_new_and_keep_frames_for_same_session() {
         .expect("read XUDP message");
         assert_eq!(&buffer[..length], expected);
         assert_eq!(session_id, 17);
-        assert_eq!(target, SocketAddr::from((Ipv4Addr::LOCALHOST, 53)));
+        assert_eq!(
+            target,
+            NetLocation::new(Address::from("example.test").unwrap(), 53)
+        );
         assert_eq!(actual_global_id, Some(global_id));
         assert_eq!(is_new, expected_is_new);
     }
@@ -985,10 +956,7 @@ async fn repeated_global_new_preserves_queued_payload_and_udp_socket() {
         .write_all(&frames)
         .await
         .expect("write repeated GlobalID New frames");
-    let stream = XudpMessageStream::new(
-        Box::new(TestStream(server)),
-        Arc::new(StaticResolver),
-    );
+    let stream = XudpMessageStream::new(Box::new(TestStream(server)));
     let relay_task = tokio::spawn(run_session_based_udp(
         Box::new(stream),
         RuntimeState::new(Vec::new(), Vec::new()).data_plane(),
@@ -1070,10 +1038,7 @@ async fn global_id_takeover_across_session_ids_rebinds_responses() {
         .write_all(&frames)
         .await
         .expect("write cross-session GlobalID New frames");
-    let stream = XudpMessageStream::new(
-        Box::new(TestStream(server)),
-        Arc::new(StaticResolver),
-    );
+    let stream = XudpMessageStream::new(Box::new(TestStream(server)));
     let relay_task = tokio::spawn(run_session_based_udp(
         Box::new(stream),
         RuntimeState::new(Vec::new(), Vec::new()).data_plane(),
@@ -1133,10 +1098,7 @@ async fn end_frame_is_forwarded_and_clears_codec_session() {
         .await
         .expect("write XUDP session frames");
 
-    let mut stream = XudpMessageStream::new(
-        Box::new(TestStream(server)),
-        Arc::new(StaticResolver),
-    );
+    let mut stream = XudpMessageStream::new(Box::new(TestStream(server)));
     let mut buffer = [0u8; 32];
     let first = poll_fn(|cx| {
         let mut read_buffer = ReadBuf::new(&mut buffer);
@@ -1184,10 +1146,7 @@ async fn session_runtime_roundtrips_udp_payload() {
         b"ping",
     );
     client.write_all(&frame).await.expect("write XUDP request");
-    let stream = XudpMessageStream::new(
-        Box::new(TestStream(server)),
-        Arc::new(StaticResolver),
-    );
+    let stream = XudpMessageStream::new(Box::new(TestStream(server)));
     let relay_task = tokio::spawn(run_session_based_udp(
         Box::new(stream),
         RuntimeState::new(Vec::new(), Vec::new()).data_plane(),
@@ -1230,6 +1189,94 @@ async fn session_runtime_roundtrips_udp_payload() {
 }
 
 #[tokio::test]
+async fn session_runtime_uses_updated_user_domain_policy_for_new_session() {
+    let echo_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind dynamic XUDP echo socket");
+    let echo_address = echo_socket.local_addr().expect("dynamic XUDP echo address");
+    let echo_task = tokio::spawn(async move {
+        let mut buffer = [0u8; 64];
+        let (length, peer) = echo_socket
+            .recv_from(&mut buffer)
+            .await
+            .expect("receive pre-update XUDP echo request");
+        assert_eq!(&buffer[..length], b"before policy update");
+        echo_socket
+            .send_to(&buffer[..length], peer)
+            .await
+            .expect("send pre-update XUDP echo response");
+    });
+
+    let mut hosts = HashMap::new();
+    hosts.insert("allowed.example".to_string(), vec![echo_address.ip()]);
+    hosts.insert("blocked.example".to_string(), vec![echo_address.ip()]);
+    let runtime = RuntimeState::new_with_resolver(
+        Vec::new(),
+        Vec::new(),
+        Arc::new(NativeResolver::with_hosts(hosts)),
+    );
+
+    let (mut client, server) = duplex(4096);
+    let allowed_target = NetLocation::new(
+        Address::from("allowed.example").expect("allowed XUDP hostname"),
+        echo_address.port(),
+    );
+    client
+        .write_all(&encode_data_frame(
+            SessionStatus::New,
+            41,
+            Some(allowed_target),
+            b"before policy update",
+        ))
+        .await
+        .expect("write pre-update XUDP request");
+
+    let stream = XudpMessageStream::new(Box::new(TestStream(server)));
+    let relay_task = tokio::spawn(run_session_based_udp(
+        Box::new(stream),
+        runtime.clone().data_plane(),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 43041)),
+        None,
+        None,
+    ));
+
+    let (metadata, payload) = read_response_frame(&mut client).await;
+    assert_eq!(metadata.session_id, 41);
+    assert_eq!(metadata.status, SessionStatus::Keep);
+    assert_eq!(payload, b"before policy update");
+
+    runtime
+        .apply_user_domain_policy(
+            "{\"version\":1,\"generatedAt\":\"2026-01-01T00:00:00.000Z\",\"sourceBackendVersion\":\"test\",\"targetNodeUuid\":\"node-1\",\"defaultAction\":\"reject\",\"users\":[],\"checksum\":\"sha256:5dbfd6c39173b845c52cf308e01156f5fbd6011600118d0fc6adc410217b871a\"}",
+        )
+        .expect("apply dynamic XUDP policy");
+
+    let blocked_target = NetLocation::new(
+        Address::from("blocked.example").expect("blocked XUDP hostname"),
+        echo_address.port(),
+    );
+    client
+        .write_all(&encode_data_frame(
+            SessionStatus::New,
+            42,
+            Some(blocked_target),
+            b"after policy update",
+        ))
+        .await
+        .expect("write post-update XUDP request");
+    let response = timeout(Duration::from_millis(500), client.read_u8()).await;
+    assert!(
+        response.is_err(),
+        "a new XUDP session must observe the updated reject policy: {response:?}"
+    );
+
+    echo_task
+        .await
+        .expect("pre-update XUDP echo task should finish");
+    relay_task.abort();
+}
+
+#[tokio::test]
 async fn partial_writes_preserve_prefix_data_and_end_frames() {
     let source = SocketAddr::from((Ipv4Addr::new(1, 1, 1, 1), 53));
     let mut expected = BytesMut::from(&[0, 0][..]);
@@ -1266,7 +1313,6 @@ async fn partial_writes_preserve_prefix_data_and_end_frames() {
     let writer_task = tokio::spawn(async move {
         let mut stream = XudpMessageStream::with_write_prefix(
             Box::new(TestStream(server)),
-            Arc::new(StaticResolver),
             vec![0, 0],
         );
         poll_fn(|cx| {
@@ -1306,7 +1352,6 @@ async fn oversized_write_does_not_consume_or_emit_prefix() {
     let (mut client, server) = duplex(128);
     let mut stream = XudpMessageStream::with_write_prefix(
         Box::new(TestStream(server)),
-        Arc::new(StaticResolver),
         vec![0, 0],
     );
     let payload = vec![0u8; u16::MAX as usize + 1];
@@ -1356,10 +1401,7 @@ async fn oversized_write_does_not_consume_or_emit_prefix() {
 async fn writes_session_end_with_optional_error_flag() {
     for (session_id, has_error) in [(81, false), (82, true)] {
         let (mut client, server) = duplex(2048);
-        let mut stream = XudpMessageStream::new(
-            Box::new(TestStream(server)),
-            Arc::new(StaticResolver),
-        );
+        let mut stream = XudpMessageStream::new(Box::new(TestStream(server)));
 
         poll_fn(|cx| {
             Pin::new(&mut stream).poll_write_session_end(cx, session_id, has_error)
@@ -1393,10 +1435,7 @@ async fn writes_session_end_with_optional_error_flag() {
 #[tokio::test]
 async fn writes_keep_udp_response_frame() {
     let (mut client, server) = duplex(2048);
-    let mut stream = XudpMessageStream::new(
-        Box::new(TestStream(server)),
-        Arc::new(StaticResolver),
-    );
+    let mut stream = XudpMessageStream::new(Box::new(TestStream(server)));
     let source = SocketAddr::from((Ipv4Addr::new(1, 1, 1, 1), 53));
 
     poll_fn(|cx| {

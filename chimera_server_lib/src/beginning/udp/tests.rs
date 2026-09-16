@@ -752,10 +752,7 @@ async fn session_udp_blackhole_drops_without_contacting_target() {
         .write_all(&frame)
         .await
         .expect("write blackholed XUDP request");
-    let stream = XudpMessageStream::new(
-        Box::new(TestStream(server)),
-        Arc::new(NativeResolver::new()),
-    );
+    let stream = XudpMessageStream::new(Box::new(TestStream(server)));
     let relay = tokio::spawn(run_session_based_udp(
         Box::new(stream),
         runtime_with_outbounds(vec![outbound("blocked", "blackhole")]).data_plane(),
@@ -801,10 +798,7 @@ async fn global_id_xudp_trojan_outbound_fails_closed() {
         .write_all(&frame)
         .await
         .expect("write GlobalID Trojan XUDP request");
-    let stream = XudpMessageStream::new(
-        Box::new(TestStream(server)),
-        Arc::new(NativeResolver::new()),
-    );
+    let stream = XudpMessageStream::new(Box::new(TestStream(server)));
     let relay = tokio::spawn(run_session_based_udp(
         Box::new(stream),
         runtime_with_outbounds(vec![outbound("proxy", "trojan")]).data_plane(),
@@ -853,10 +847,7 @@ async fn session_udp_unsupported_outbound_fails_without_contacting_target() {
         .write_all(&frame)
         .await
         .expect("write unsupported-outbound XUDP request");
-    let stream = XudpMessageStream::new(
-        Box::new(TestStream(server)),
-        Arc::new(NativeResolver::new()),
-    );
+    let stream = XudpMessageStream::new(Box::new(TestStream(server)));
     let relay = tokio::spawn(run_session_based_udp(
         Box::new(stream),
         runtime_with_outbounds(vec![outbound("proxy", "vmess")]).data_plane(),
@@ -1982,7 +1973,10 @@ async fn session_udp_write_error_waits_for_local_worker_cleanup() {
         request: Some((
             SessionMessage::Data {
                 session_id: 24,
-                target: target_addr,
+                target: NetLocation::from_ip_addr(
+                    target_addr.ip(),
+                    target_addr.port(),
+                ),
                 global_id: None,
                 is_new: true,
             },
@@ -2211,6 +2205,58 @@ async fn multi_directional_udp_routes_through_trojan_outbound() {
     proxy_task.abort();
 }
 
+#[cfg(any(feature = "vless", feature = "vmess"))]
+#[tokio::test]
+async fn session_udp_checks_xudp_domain_before_resolving_it() {
+    let runtime = runtime_with_outbounds(vec![outbound("direct", "freedom")]);
+    runtime
+        .apply_user_domain_policy(&signed_user_domain_policy("reject"))
+        .expect("user-domain access policy should apply");
+
+    let target = NetLocation::new(Address::Hostname("blocked.example".into()), 53);
+    let mut frame = BytesMut::new();
+    FrameMetadata {
+        session_id: 25,
+        status: SessionStatus::New,
+        option: FrameOption::default().with_data(),
+        target: Some(target),
+        network: Some(TargetNetwork::Udp),
+        global_id: None,
+    }
+    .encode(&mut frame)
+    .expect("encode XUDP domain policy request metadata");
+    frame.put_u16(7);
+    frame.extend_from_slice(b"blocked");
+
+    let (mut client, server) = duplex(2048);
+    client
+        .write_all(&frame)
+        .await
+        .expect("write XUDP domain policy request");
+    client
+        .shutdown()
+        .await
+        .expect("close XUDP domain policy request");
+    let relay = tokio::spawn(run_session_based_udp(
+        Box::new(XudpMessageStream::new(Box::new(TestStream(server)))),
+        runtime.data_plane(),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 43125)),
+        None,
+        Some(
+            crate::traffic::TrafficContext::new("vless")
+                .with_identity("blocked-domain-user")
+                .with_inbound_tag("xudp-domain-policy"),
+        ),
+    ));
+
+    timeout(Duration::from_secs(1), relay)
+        .await
+        .expect("XUDP domain policy relay timeout")
+        .expect("XUDP domain policy relay task failed")
+        .expect("XUDP domain policy relay should close cleanly");
+    assert_eq!(runtime.user_domain_policy_status().stats.rejected, 1);
+}
+
 #[cfg(all(feature = "trojan", any(feature = "vless", feature = "vmess")))]
 #[tokio::test]
 async fn session_udp_routes_through_trojan_outbound() {
@@ -2239,10 +2285,7 @@ async fn session_udp_routes_through_trojan_outbound() {
         .write_all(&frame)
         .await
         .expect("write Trojan-routed XUDP request");
-    let relay_stream = XudpMessageStream::new(
-        Box::new(TestStream(server)),
-        Arc::new(NativeResolver::new()),
-    );
+    let relay_stream = XudpMessageStream::new(Box::new(TestStream(server)));
     let relay_task = tokio::spawn(run_session_based_udp(
         Box::new(relay_stream),
         runtime,

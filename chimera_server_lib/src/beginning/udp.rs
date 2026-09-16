@@ -19,7 +19,6 @@ use tracing::{debug, warn};
 #[cfg(feature = "trojan")]
 use crate::{
     handler::trojan_udp::TrojanUdpStream, outbound::connect_trojan_udp_via_outbound,
-    resolver::NativeResolver,
 };
 
 use crate::{
@@ -30,9 +29,7 @@ use crate::{
     },
     outbound::{
         DirectOutboundAction, InboundRoutingMetadata, OutboundRoutingContext,
-        apply_routing_metadata, connection_routing_input,
         select_direct_outbound_for_location,
-        select_direct_outbound_with_policy_identities,
     },
     resolver::Resolver,
     runtime::DataPlaneRuntime,
@@ -126,6 +123,9 @@ pub(crate) async fn run_bidirectional_udp(
             "udp",
             InboundRoutingMetadata {
                 local_addr,
+                inbound_protocol: traffic_context
+                    .as_ref()
+                    .map(|context| context.protocol.to_string()),
                 ..InboundRoutingMetadata::default()
             },
         )
@@ -266,8 +266,9 @@ pub(crate) async fn run_session_based_udp(
         .map(|context| context.policy_identities.as_slice())
         .unwrap_or_default();
     let _connection_guard = register_connection(traffic_context.as_ref());
+    let resolver = runtime.resolver();
     #[cfg(feature = "trojan")]
-    let trojan_resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let trojan_resolver = resolver.clone();
     let (response_sender, mut response_receiver) =
         mpsc::channel::<SessionUdpEvent>(UDP_SESSION_CHANNEL_CAPACITY);
     let mut sessions = HashMap::<u16, SessionUdpWorker>::new();
@@ -279,7 +280,7 @@ pub(crate) async fn run_session_based_udp(
             request = read_session_message(&mut *server_stream, &mut client_buffer) => {
                 let (
                     session_id,
-                    target_addr,
+                    target_location,
                     global_id,
                     is_new,
                     payload_length,
@@ -306,29 +307,29 @@ pub(crate) async fn run_session_based_udp(
                     expire_session_udp_worker(&mut sessions, session_id).await;
                 }
                 let payload = client_buffer[..payload_length].to_vec();
-                let target_location =
-                    NetLocation::from_ip_addr(target_addr.ip(), target_addr.port());
-                let route_input = apply_routing_metadata(
-                    connection_routing_input(
+                let (action, routed_target_addr) = match select_direct_outbound_for_location(
+                    &resolver,
+                    &target_location,
+                    &runtime,
+                    OutboundRoutingContext::new(
                         &inbound_tag,
                         &identity,
-                        3,
                         peer_addr,
-                        target_addr,
-                        &target_location,
-                    ),
-                    InboundRoutingMetadata {
-                        local_addr,
-                        ..InboundRoutingMetadata::default()
-                    },
-                );
-                let action = match select_direct_outbound_with_policy_identities(
-                    &runtime,
-                    &route_input,
-                    "udp",
-                    policy_identities,
-                ) {
-                    Ok(action) => action,
+                        3,
+                        "udp",
+                        InboundRoutingMetadata {
+                            local_addr,
+                            inbound_protocol: traffic_context
+                                .as_ref()
+                                .map(|context| context.protocol.to_string()),
+                            ..InboundRoutingMetadata::default()
+                        },
+                    )
+                    .with_policy_identities(policy_identities),
+                )
+                .await
+                {
+                    Ok(result) => result,
                     Err(error) => break Err(error),
                 };
 
@@ -344,6 +345,14 @@ pub(crate) async fn run_session_based_udp(
                         );
                     }
                     DirectOutboundAction::Freedom { tag } => {
+                        let target_addr = match routed_target_addr {
+                            Some(target_addr) => target_addr,
+                            None => {
+                                break Err(std::io::Error::other(
+                                    "session UDP freedom route did not resolve target",
+                                ));
+                            }
+                        };
                         let packet_context = match &tag {
                             Some(tag) => traffic_context
                                 .clone()
@@ -420,6 +429,28 @@ pub(crate) async fn run_session_based_udp(
                                     "Trojan outbound for GlobalID XUDP is not implemented yet",
                                 ));
                             }
+                            let target_addr = match target_location.to_socket_addr_nonblocking() {
+                                Some(target_addr) => target_addr,
+                                None => match resolver.resolve_location(&target_location).await {
+                                    Ok(addresses) => match addresses.into_iter().next() {
+                                        Some(target_addr) => target_addr,
+                                        None => {
+                                            runtime
+                                                .record_user_domain_dns_failure();
+                                            break Err(std::io::Error::other(
+                                                format!(
+                                                    "DNS lookup returned no addresses for {target_location}"
+                                                ),
+                                            ));
+                                        }
+                                    },
+                                    Err(error) => {
+                                        runtime
+                                            .record_user_domain_dns_failure();
+                                        break Err(error);
+                                    }
+                                },
+                            };
                             let packet_context = traffic_context
                                 .clone()
                                 .map(|context| context.with_outbound_tag(outbound.tag.clone()));

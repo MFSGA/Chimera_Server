@@ -28,7 +28,6 @@ use crate::handler::{
     },
     xudp::message_stream::XudpMessageStream,
 };
-use crate::resolver::NativeResolver;
 use crate::traffic::TrafficContext;
 use crate::util::allocate_vec;
 
@@ -503,10 +502,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                 traffic_context,
             }),
             COMMAND_MUX => Ok(TcpServerSetupResult::SessionBasedUdp {
-                stream: Box::new(XudpMessageStream::new(
-                    Box::new(vmess_stream),
-                    Arc::new(NativeResolver::new()),
-                )),
+                stream: Box::new(XudpMessageStream::new(Box::new(vmess_stream))),
                 traffic_context,
             }),
             _ => unreachable!("VMess command was validated before stream creation"),

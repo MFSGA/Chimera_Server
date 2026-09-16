@@ -1,6 +1,6 @@
 #![cfg(feature = "vless")]
 
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::{Buf, BytesMut};
@@ -10,7 +10,6 @@ use tracing::warn;
 use crate::{
     async_stream::AsyncStream,
     config::server_config::{VlessFallback, VlessUser},
-    resolver::NativeResolver,
     traffic::TrafficContext,
     util::prefixed_stream::PrefixedStream,
 };
@@ -232,7 +231,6 @@ impl VlessTcpHandler {
             COMMAND_MUX => Ok(TcpServerSetupResult::SessionBasedUdp {
                 stream: Box::new(XudpMessageStream::with_write_prefix(
                     server_stream,
-                    Arc::new(NativeResolver::new()),
                     SERVER_RESPONSE_HEADER.to_vec(),
                 )),
                 traffic_context,
@@ -1173,7 +1171,10 @@ mod tests {
             panic!("fragmented VLESS XUDP first frame decoded as End");
         };
         assert_eq!(session_id, 42);
-        assert_eq!(actual_target, target);
+        assert_eq!(
+            actual_target,
+            NetLocation::from_ip_addr(target.ip(), target.port())
+        );
         assert_eq!(global_id, None);
         assert!(is_new);
         assert_eq!(&payload[..length], b"ping");

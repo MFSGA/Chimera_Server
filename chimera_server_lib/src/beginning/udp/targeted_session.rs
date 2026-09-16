@@ -107,6 +107,9 @@ pub(super) async fn run_multi_directional_udp_with_tasks(
                         "udp",
                         InboundRoutingMetadata {
                             local_addr,
+                            inbound_protocol: traffic_context
+                                .as_ref()
+                                .map(|context| context.protocol.to_string()),
                             ..InboundRoutingMetadata::default()
                         },
                     )
