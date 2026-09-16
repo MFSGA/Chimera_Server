@@ -45,31 +45,36 @@ pub async fn start_mcp_server(
     } = config;
     let path = normalize_path(path);
 
+    let listener = tokio::net::TcpListener::bind(listen).await?;
     let initial = traffic::active_connection_count() as u64;
     let (update_tx, _update_rx) = watch::channel(initial);
-    let update_tx_task = update_tx.clone();
-    tokio::spawn(async move {
-        let mut last = initial;
-        let mut interval = time::interval(update_interval);
-        loop {
-            interval.tick().await;
-            let current = traffic::active_connection_count() as u64;
-            if current != last {
-                last = current;
-                let _ = update_tx_task.send(current);
-            }
-        }
-    });
-
     let state = AppState { update_tx };
+    let update_tx_for_task = state.update_tx.clone();
     let router = Router::new()
         .route(&path, get(mcp_ws_handler))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(listen).await?;
     Ok(tokio::spawn(async move {
-        if let Err(err) = axum::serve(listener, router).await {
-            error!("mcp server exited: {}", err);
+        let server = axum::serve(listener, router).into_future();
+        tokio::pin!(server);
+        let mut last = initial;
+        let mut interval = time::interval(update_interval);
+        loop {
+            tokio::select! {
+                result = &mut server => {
+                    if let Err(err) = result {
+                        error!("mcp server exited: {}", err);
+                    }
+                    break;
+                }
+                _ = interval.tick() => {
+                    let current = traffic::active_connection_count() as u64;
+                    if current != last {
+                        last = current;
+                        let _ = update_tx_for_task.send(current);
+                    }
+                }
+            }
         }
     }))
 }

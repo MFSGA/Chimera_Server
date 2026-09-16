@@ -1,4 +1,5 @@
 mod builder;
+mod plan;
 pub mod quic;
 mod types;
 
@@ -6,6 +7,7 @@ pub(crate) use builder::collect_xhttp_settings_from_json;
 #[cfg(feature = "ws")]
 pub mod ws;
 
+pub(crate) use plan::InboundPlan;
 pub use types::DokodemoDoorConfig;
 pub use types::HttpUser;
 #[cfg(feature = "tuic")]

@@ -7,16 +7,19 @@ pub use config::{
     server_config::{ServerConfig, ServerProxyConfig},
 };
 use config::{
-    def::{ApiConfig, DEFAULT_SHUTDOWN_GRACE_PERIOD_SECONDS},
+    def::{ApiConfig, DEFAULT_SHUTDOWN_GRACE_PERIOD_SECONDS, PolicyConfig},
     rule::RoutingConfig,
+    server_config::InboundPlan,
 };
 pub use config_loader::{ConfigFormat, resolve_config_source};
 use resolver::{HostRuleValue, NativeResolver, Resolver};
+use routing_state::RoutingState;
 pub use runtime::{OutboundSummary, RuntimeState};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::task::{JoinError, JoinHandle};
 use tokio_rustls::rustls;
+use user_domain::{UserDomainAccessPublication, parse_publication};
 
 mod address;
 
@@ -206,19 +209,14 @@ async fn shutdown_server_runtime(
 
 fn install_configured_user_domain_policy(
     runtime_state: &RuntimeState,
-    policy: Option<&serde_json::Value>,
+    policy: Option<&UserDomainAccessPublication>,
 ) -> Result<(), Error> {
     let Some(policy) = policy else {
         return Ok(());
     };
 
-    let json_config = serde_json::to_string(policy).map_err(|error| {
-        Error::InvalidConfig(format!(
-            "could not serialize userDomainAccess configuration: {error}"
-        ))
-    })?;
     runtime_state
-        .apply_user_domain_policy(&json_config)
+        .apply_user_domain_publication(policy.clone())
         .map(|_| ())
         .map_err(|failure| {
             Error::InvalidConfig(format!(
@@ -233,23 +231,24 @@ pub fn prepare_server_runtime(
     cwd: Option<&str>,
     log_file: Option<&str>,
 ) -> Result<ServerRuntime, Error> {
-    let policy_config = config.policy.clone();
-    let dns_config = config.dns.clone();
-    let user_domain_access = config.user_domain_access.clone();
-    let inbounds = prepare_server_inbounds(config, cwd, log_file)?;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    log::init(config.log.as_ref(), cwd, log_file)?;
+
+    let plan = ValidatedServerPlan::compile(config)?;
     let runtime_state = RuntimeState::new_with_resolver(
-        inbounds.clone(),
-        Vec::new(),
-        compile_configured_resolver(dns_config.as_ref())?,
+        plan.inbounds.clone(),
+        plan.outbounds.clone(),
+        plan.resolver.clone(),
     );
-    runtime_state.replace_policy(policy_config.as_ref());
+    runtime_state.replace_policy(plan.policy.as_ref());
     install_configured_user_domain_policy(
         &runtime_state,
-        user_domain_access.as_ref(),
+        plan.user_domain_access.as_ref(),
     )?;
+    runtime_state.replace_routing(plan.routing);
 
     Ok(ServerRuntime {
-        inbounds,
+        inbounds: plan.inbounds,
         runtime_state,
     })
 }
@@ -262,10 +261,18 @@ pub fn prepare_server_inbounds(
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     log::init(config.log.as_ref(), cwd, log_file)?;
 
-    config
-        .inbounds
+    compile_inbounds(config.inbounds)
+}
+
+fn compile_inbounds(
+    inbounds: Vec<config::def::InboudItem>,
+) -> Result<Vec<ServerConfig>, Error> {
+    inbounds
         .into_iter()
-        .map(ServerConfig::try_from)
+        .map(|inbound| {
+            InboundPlan::from_compiled(ServerConfig::try_from(inbound)?)
+                .map(InboundPlan::into_server_config)
+        })
         .collect::<Result<Vec<_>, _>>()
 }
 
@@ -322,16 +329,17 @@ impl ApiListen {
 }
 
 #[derive(Default)]
-struct ResolvedApiConfig<'a> {
+struct ResolvedApiConfig {
     listen: Option<ApiListen>,
-    inbound: Option<&'a ServerConfig>,
+    inbound_tag: Option<String>,
+    inbound_uses_tls: bool,
 }
 
-fn resolve_api_config<'a>(
+fn resolve_api_config(
     api_config: Option<&ApiConfig>,
     routing_config: Option<&RoutingConfig>,
-    all_inbounds: &'a [ServerConfig],
-) -> Result<ResolvedApiConfig<'a>, Error> {
+    all_inbounds: &[ServerConfig],
+) -> Result<ResolvedApiConfig, Error> {
     let Some(api) = api_config else {
         return Ok(ResolvedApiConfig::default());
     };
@@ -342,7 +350,8 @@ fn resolve_api_config<'a>(
         })?;
         return Ok(ResolvedApiConfig {
             listen: Some(ApiListen::Tcp(listen_addr)),
-            inbound: None,
+            inbound_tag: None,
+            inbound_uses_tls: false,
         });
     }
 
@@ -374,7 +383,8 @@ fn resolve_api_config<'a>(
             ensure_api_inbound_protocol(inbound)?;
             return Ok(ResolvedApiConfig {
                 listen: Some(api_inbound_listen(inbound)?),
-                inbound: Some(inbound),
+                inbound_tag: Some(inbound.tag.clone()),
+                inbound_uses_tls: api_inbound_uses_tls(&inbound.protocol),
             });
         }
     }
@@ -432,12 +442,14 @@ fn is_api_inbound_protocol(protocol: &ServerProxyConfig) -> bool {
 
 fn ensure_api_tunnels_are_control_only(
     all_inbounds: &[ServerConfig],
-    resolved_api: &ResolvedApiConfig<'_>,
+    resolved_api: &ResolvedApiConfig,
 ) -> Result<(), Error> {
-    let selected_tunnel_tag = resolved_api
-        .inbound
-        .filter(|inbound| matches!(inbound.protocol, ServerProxyConfig::Tunnel))
-        .map(|inbound| inbound.tag.as_str());
+    let selected_tunnel_tag = resolved_api.inbound_tag.as_deref().filter(|tag| {
+        all_inbounds.iter().any(|inbound| {
+            inbound.tag == *tag
+                && matches!(inbound.protocol, ServerProxyConfig::Tunnel)
+        })
+    });
 
     if let Some(inbound) = all_inbounds.iter().find(|inbound| {
         matches!(inbound.protocol, ServerProxyConfig::Tunnel)
@@ -459,6 +471,141 @@ fn api_inbound_uses_tls(_protocol: &ServerProxyConfig) -> bool {
     }
 
     false
+}
+
+struct ValidatedServerPlan {
+    inbounds: Vec<ServerConfig>,
+    outbounds: Vec<OutboundSummary>,
+    routing: RoutingState,
+    resolver: Arc<dyn Resolver>,
+    policy: Option<PolicyConfig>,
+    user_domain_access: Option<UserDomainAccessPublication>,
+    api: Option<ApiConfig>,
+    mcp: Option<mcp::McpServerConfig>,
+    mcp_configured_without_listen: bool,
+    observatory: Option<config::def::ObservatoryConfig>,
+    burst_observatory: Option<config::def::BurstObservatoryConfig>,
+    resolved_api: ResolvedApiConfig,
+    shutdown_grace_period: Duration,
+}
+
+impl ValidatedServerPlan {
+    fn compile(config: LiteralConfig) -> Result<Self, Error> {
+        let LiteralConfig {
+            inbounds,
+            outbounds,
+            api,
+            policy,
+            routing,
+            dns,
+            user_domain_access,
+            observatory,
+            burst_observatory,
+            shutdown,
+            mcp,
+            ..
+        } = config;
+
+        #[cfg(not(feature = "api"))]
+        if api
+            .as_ref()
+            .is_some_and(|config| !config.services.is_empty())
+        {
+            return Err(Error::InvalidConfig(
+                "api services configured but the \"api\" feature is disabled".into(),
+            ));
+        }
+
+        let inbounds = compile_inbounds(inbounds)?;
+        let outbounds = compile_configured_outbounds(&outbounds)?;
+        let resolver = compile_configured_resolver(dns.as_ref())?;
+        let routing_state = RoutingState::from_config(routing.as_ref())
+            .map_err(Error::InvalidConfig)?;
+        routing_observer::validate_observatory_config(
+            observatory.as_ref(),
+            burst_observatory.as_ref(),
+        )
+        .map_err(Error::InvalidConfig)?;
+
+        let user_domain_access = user_domain_access
+            .map(|policy| {
+                let json_config = serde_json::to_string(&policy).map_err(|error| {
+                    Error::InvalidConfig(format!(
+                        "could not serialize userDomainAccess configuration: {error}"
+                    ))
+                })?;
+                parse_publication(&json_config).map_err(|failure| {
+                    Error::InvalidConfig(format!(
+                        "invalid userDomainAccess configuration: {}",
+                        failure.message
+                    ))
+                })
+            })
+            .transpose()?;
+
+        let resolved_api =
+            resolve_api_config(api.as_ref(), routing.as_ref(), &inbounds)?;
+        ensure_api_tunnels_are_control_only(&inbounds, &resolved_api)?;
+
+        let mcp_configured_without_listen =
+            mcp.as_ref().is_some_and(|config| config.listen.is_none());
+        let mcp = match mcp {
+            Some(config) => match config.listen {
+                Some(listen) => {
+                    let listen = listen.parse::<SocketAddr>().map_err(|err| {
+                        Error::InvalidConfig(format!(
+                            "invalid mcp.listen {}: {}",
+                            listen, err
+                        ))
+                    })?;
+                    Some(mcp::McpServerConfig {
+                        listen,
+                        path: config.path,
+                        update_interval: Duration::from_millis(
+                            config.update_interval_ms.max(100),
+                        ),
+                    })
+                }
+                None => None,
+            },
+            None => None,
+        };
+
+        let shutdown_grace_period = Duration::from_secs(
+            shutdown
+                .as_ref()
+                .map(|config| config.grace_period_seconds)
+                .unwrap_or(DEFAULT_SHUTDOWN_GRACE_PERIOD_SECONDS),
+        );
+
+        Ok(Self {
+            inbounds,
+            outbounds,
+            routing: routing_state,
+            resolver,
+            policy,
+            user_domain_access,
+            api,
+            mcp,
+            mcp_configured_without_listen,
+            observatory,
+            burst_observatory,
+            resolved_api,
+            shutdown_grace_period,
+        })
+    }
+
+    fn ensure_server_component(&self) -> Result<(), Error> {
+        let api_started = self.api.as_ref().is_some_and(|api| {
+            self.resolved_api.listen.is_some() && !api.services.is_empty()
+        });
+        if self.inbounds.is_empty() && !api_started && self.mcp.is_none() {
+            return Err(Error::InvalidConfig(
+                "no servers started; check inbounds/api configuration".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub fn start(opts: Options) -> Result<(), Error> {
@@ -561,72 +708,10 @@ fn compile_configured_resolver(
 pub fn validate(opts: Options) -> Result<(), Error> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    // 1. config parse
+    // Parse and compile the same plan that startup consumes. Validation does
+    // not construct RuntimeState or start any task/listener.
     let config = opts.config.try_parse(opts.config_format)?;
-    let _ = compile_configured_outbounds(&config.outbounds)?;
-    let _ = compile_configured_resolver(config.dns.as_ref())?;
-
-    let validation_runtime = RuntimeState::new(Vec::new(), Vec::new());
-    install_configured_user_domain_policy(
-        &validation_runtime,
-        config.user_domain_access.as_ref(),
-    )?;
-
-    // 2. api/mcp config validation
-    let api_config = config.api.clone();
-    let mcp_config = config.mcp.clone();
-    let routing_config = config.routing.clone();
-    routing_observer::validate_observatory_config(
-        config.observatory.as_ref(),
-        config.burst_observatory.as_ref(),
-    )
-    .map_err(Error::InvalidConfig)?;
-
-    let all_inbounds = config
-        .inbounds
-        .into_iter()
-        .map(ServerConfig::try_from)
-        .collect::<Result<Vec<_>, _>>()?;
-    routing_state::RoutingState::from_config(config.routing.as_ref())
-        .map_err(Error::InvalidConfig)?;
-
-    let resolved_api = resolve_api_config(
-        api_config.as_ref(),
-        routing_config.as_ref(),
-        &all_inbounds,
-    )?;
-    ensure_api_tunnels_are_control_only(&all_inbounds, &resolved_api)?;
-    let api_listen = resolved_api.listen;
-
-    if let Some(mcp) = mcp_config.as_ref()
-        && let Some(listen) = mcp.listen.as_ref()
-    {
-        let _ = listen.parse::<std::net::SocketAddr>().map_err(|err| {
-            Error::InvalidConfig(format!("invalid mcp.listen {}: {}", listen, err))
-        })?;
-        let _ = mcp.update_interval_ms.max(100);
-    }
-
-    let mut any_server = !all_inbounds.is_empty();
-    if let Some(api) = api_config.as_ref()
-        && api_listen.is_some()
-        && !api.services.is_empty()
-    {
-        any_server = true;
-    }
-    if let Some(mcp) = mcp_config.as_ref()
-        && mcp.listen.as_ref().is_some()
-    {
-        any_server = true;
-    }
-
-    if !any_server {
-        return Err(Error::InvalidConfig(
-            "no servers started; check inbounds/api configuration".into(),
-        ));
-    }
-
-    Ok(())
+    ValidatedServerPlan::compile(config)?.ensure_server_component()
 }
 
 async fn start_async(
@@ -634,68 +719,38 @@ async fn start_async(
     cwd: Option<&str>,
     log_file: Option<&str>,
 ) -> Result<(), Error> {
-    let connection_drain_timeout = Duration::from_secs(
-        config
-            .shutdown
-            .as_ref()
-            .map(|shutdown| shutdown.grace_period_seconds)
-            .unwrap_or(DEFAULT_SHUTDOWN_GRACE_PERIOD_SECONDS),
-    );
-
     //  todo: log mod
     log::init(config.log.as_ref(), cwd, log_file)?;
-    // 2. api config
-    let api_config = config.api.clone();
-    let mcp_config = config.mcp.clone();
-    let routing_config = config.routing.clone();
-    let policy_config = config.policy.clone();
-    let dns_config = config.dns.clone();
-    let user_domain_access = config.user_domain_access.clone();
-    let observatory_config = config.observatory.clone();
-    let burst_observatory_config = config.burst_observatory.clone();
-    routing_observer::validate_observatory_config(
-        observatory_config.as_ref(),
-        burst_observatory_config.as_ref(),
-    )
-    .map_err(Error::InvalidConfig)?;
-    let outbounds = compile_configured_outbounds(&config.outbounds)?;
-
-    let all_inbounds = config
-        .inbounds
-        .into_iter()
-        .map(ServerConfig::try_from)
-        .collect::<Result<Vec<_>, _>>()?;
+    let plan = ValidatedServerPlan::compile(config)?;
+    plan.ensure_server_component()?;
+    let connection_drain_timeout = plan.shutdown_grace_period;
+    let api_config = plan.api;
+    let mcp_configured_without_listen = plan.mcp_configured_without_listen;
+    let mcp_config = plan.mcp;
+    let observatory_config = plan.observatory;
+    let burst_observatory_config = plan.burst_observatory;
+    let resolved_api = plan.resolved_api;
+    let api_listen = resolved_api.listen.clone();
+    let skip_inbound_tag = resolved_api.inbound_tag.clone();
 
     let runtime_state = RuntimeState::new_with_resolver(
-        all_inbounds.clone(),
-        outbounds,
-        compile_configured_resolver(dns_config.as_ref())?,
+        plan.inbounds,
+        plan.outbounds,
+        plan.resolver,
     );
-    runtime_state.replace_policy(policy_config.as_ref());
+    runtime_state.replace_policy(plan.policy.as_ref());
     install_configured_user_domain_policy(
         &runtime_state,
-        user_domain_access.as_ref(),
+        plan.user_domain_access.as_ref(),
     )?;
-    runtime_state.replace_routing(
-        routing_state::RoutingState::from_config(config.routing.as_ref())
-            .map_err(Error::InvalidConfig)?,
-    );
-
-    let resolved_api = resolve_api_config(
-        api_config.as_ref(),
-        routing_config.as_ref(),
-        &all_inbounds,
-    )?;
-    ensure_api_tunnels_are_control_only(&all_inbounds, &resolved_api)?;
-    let api_listen = resolved_api.listen;
-    let skip_inbound_tag = resolved_api.inbound.map(|inbound| inbound.tag.clone());
+    runtime_state.replace_routing(plan.routing);
     if api_config.is_some() {
-        if let Some(inbound) = resolved_api.inbound
-            && api_inbound_uses_tls(&inbound.protocol)
+        if let Some(inbound_tag) = resolved_api.inbound_tag.as_deref()
+            && resolved_api.inbound_uses_tls
         {
             tracing::warn!(
                 "api inbound {} uses tls settings, but local grpc currently listens without tls",
-                inbound.tag
+                inbound_tag
             );
         }
         if api_listen.is_none() {
@@ -704,89 +759,107 @@ async fn start_async(
     }
 
     let mut join_handles = Vec::with_capacity(4);
-    let mut has_started_server = false;
-    if let Some(mcp) = mcp_config.as_ref() {
-        if let Some(listen) = mcp.listen.as_ref() {
-            let listen = listen.parse::<std::net::SocketAddr>().map_err(|err| {
-                Error::InvalidConfig(format!(
-                    "invalid mcp.listen {}: {}",
-                    listen, err
-                ))
-            })?;
-            let interval_ms = mcp.update_interval_ms.max(100);
-            let mcp_handle = mcp::start_mcp_server(mcp::McpServerConfig {
-                listen,
-                path: mcp.path.clone(),
-                update_interval: Duration::from_millis(interval_ms),
-            })
-            .await?;
+    let startup_result: Result<(), Error> = async {
+        let mut has_started_server = false;
+        if let Some(mcp) = mcp_config {
+            let mcp_handle = mcp::start_mcp_server(mcp).await?;
             join_handles.push(mcp_handle);
             has_started_server = true;
-        } else {
+        } else if mcp_configured_without_listen {
             tracing::warn!("mcp is configured but no listen address was resolved");
         }
-    }
 
-    // Bind every configured data-plane listener before advertising the control
-    // plane. rnode uses GetSysStats as its readiness probe, so starting gRPC
-    // first would allow a process with a failed inbound bind to look healthy.
-    if let Some(tag) = skip_inbound_tag.as_deref() {
-        tracing::info!("skip api inbound {} to avoid grpc port conflict", tag);
-    }
-    let started_inbounds = runtime_state
-        .inbound_manager()
-        .start_configured_inbounds(
-            runtime_state.clone(),
-            skip_inbound_tag.as_deref(),
-        )
-        .await?;
-    has_started_server |= started_inbounds > 0;
-
-    if let Some(observer) = routing_observer::start_observer(
-        runtime_state.data_plane(),
-        observatory_config,
-        burst_observatory_config,
-    )
-    .map_err(Error::InvalidConfig)?
-    {
-        join_handles.push(observer);
-        has_started_server = true;
-    }
-    #[cfg(feature = "api")]
-    if let Some(api) = api_config.as_ref()
-        && let Some(listen) = api_listen
-    {
-        if !api.services.is_empty() {
-            let grpc_handle = grpc::start_grpc_server(
-                grpc::GrpcServerConfig {
-                    listen,
-                    services: api.services.clone(),
-                },
+        // Bind every configured data-plane listener before advertising the
+        // control plane. rnode uses GetSysStats as its readiness probe, so
+        // starting gRPC first would allow a process with a failed inbound
+        // bind to look healthy.
+        if let Some(tag) = skip_inbound_tag.as_deref() {
+            tracing::info!("skip api inbound {} to avoid grpc port conflict", tag);
+        }
+        let started_inbounds = runtime_state
+            .inbound_manager()
+            .start_configured_inbounds(
                 runtime_state.clone(),
+                skip_inbound_tag.as_deref(),
             )
             .await?;
-            join_handles.push(grpc_handle);
+        has_started_server |= started_inbounds > 0;
+
+        if let Some(observer) = routing_observer::start_observer(
+            runtime_state.data_plane(),
+            observatory_config,
+            burst_observatory_config,
+        )
+        .map_err(Error::InvalidConfig)?
+        {
+            join_handles.push(observer);
             has_started_server = true;
-        } else {
-            tracing::warn!("api is configured but no services are enabled");
         }
-    }
+        #[cfg(feature = "api")]
+        if let Some(api) = api_config.as_ref()
+            && let Some(listen) = api_listen
+        {
+            if !api.services.is_empty() {
+                let grpc_handle = grpc::start_grpc_server(
+                    grpc::GrpcServerConfig {
+                        listen,
+                        services: api.services.clone(),
+                    },
+                    runtime_state.clone(),
+                )
+                .await?;
+                join_handles.push(grpc_handle);
+                has_started_server = true;
+            } else {
+                tracing::warn!("api is configured but no services are enabled");
+            }
+        }
 
-    #[cfg(not(feature = "api"))]
-    if let Some(api) = api_config.as_ref()
-        && !api.services.is_empty()
-    {
-        tracing::warn!(
-            "api services configured but the \"api\" feature is disabled; grpc support is unavailable"
+        #[cfg(not(feature = "api"))]
+        if let Some(api) = api_config.as_ref()
+            && !api.services.is_empty()
+        {
+            tracing::warn!(
+                "api services configured but the \"api\" feature is disabled; grpc support is unavailable"
+            );
+        }
+
+        if !has_started_server {
+            return Err(Error::InvalidConfig(
+                "no servers started; check inbounds/api configuration".into(),
+            ));
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = startup_result {
+        let shutdown = shutdown_server_runtime(
+            &runtime_state,
+            join_handles,
+            connection_drain_timeout,
+            true,
+        )
+        .await;
+        tracing::error!(
+            stopped_inbounds = shutdown.stopped_inbounds,
+            cancelled_connections = shutdown.cancelled_connections,
+            "server startup failed; startup resources rolled back"
         );
-    }
-
-    if !has_started_server {
-        return Err(Error::InvalidConfig(
-            "no servers started; check inbounds/api configuration".into(),
-        ));
+        return Err(error);
     }
     if !runtime_state.mark_running() {
+        let shutdown = shutdown_server_runtime(
+            &runtime_state,
+            join_handles,
+            connection_drain_timeout,
+            true,
+        )
+        .await;
+        tracing::error!(
+            stopped_inbounds = shutdown.stopped_inbounds,
+            cancelled_connections = shutdown.cancelled_connections,
+            "server startup lifecycle transition failed; startup resources rolled back"
+        );
         return Err(Error::Io(std::io::Error::other(
             "runtime lifecycle left starting state before startup completed",
         )));
@@ -971,6 +1044,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prepare_server_runtime_does_not_bind_inbound_listeners() {
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("allocate an inbound test port");
+        let port = probe.local_addr().expect("read test port").port();
+        drop(probe);
+        let config: crate::config::def::LiteralConfig =
+            serde_json::from_str(&format!(
+                r#"{{
+                    "inbounds": [{{
+                        "tag": "prepared-only",
+                        "listen": "127.0.0.1",
+                        "port": {port},
+                        "protocol": "dokodemo-door",
+                        "settings": {{"address": "example.com", "port": 80}},
+                        "streamSettings": {{"network": "tcp"}}
+                    }}],
+                    "outbounds": [{{"tag": "direct", "protocol": "freedom"}}]
+                }}"#
+            ))
+            .expect("parse prepared-only config");
+
+        let _prepared = prepare_server_runtime(config, None, None)
+            .expect("prepare server runtime without binding");
+        std::net::TcpListener::bind(("127.0.0.1", port))
+            .expect("preparation must not bind the inbound listener");
+    }
+
     fn make_inbound(tag: &str, port: u16) -> ServerConfig {
         ServerConfig {
             tag: tag.to_string(),
@@ -1049,7 +1150,7 @@ mod tests {
                 "127.0.0.1:7000".parse().expect("valid API listen")
             ))
         );
-        assert!(resolved.inbound.is_none());
+        assert!(resolved.inbound_tag.is_none());
     }
 
     #[test]
@@ -1123,10 +1224,7 @@ mod tests {
             resolved.listen,
             Some(ApiListen::AbstractUnix("chimera-api".into()))
         );
-        assert_eq!(
-            resolved.inbound.map(|inbound| inbound.tag.as_str()),
-            Some("chimera-api-in")
-        );
+        assert_eq!(resolved.inbound_tag.as_deref(), Some("chimera-api-in"));
     }
 
     #[test]
@@ -1169,7 +1267,7 @@ mod tests {
             ))
         );
         assert_eq!(
-            resolved.inbound.map(|inbound| inbound.tag.as_str()),
+            resolved.inbound_tag.as_deref(),
             Some("REMNAWAVE_API_INBOUND")
         );
     }

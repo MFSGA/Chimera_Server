@@ -441,6 +441,20 @@ publication 的现有语义。验证：`cargo fmt --all -- --check`、
 `cargo test -p chimera_server_lib --lib routing_observer::tests`（27 passed）；QUIC/mKCP
 和外部真实 observatory 部署组合仍需单独验证。
 
+2026-09-16 第一阶段配置计划与启动事务决策：新增 `ValidatedServerPlan` 作为应用装配边界，
+统一消费文件配置的 inbound/outbound、DNS、路由、用户域名策略、API/MCP、observatory 和
+关闭参数。`validate` 只解析并编译该计划，不再创建 `RuntimeState`；`prepare_server_runtime`
+和正式 startup 复用相同的编译结果，准备阶段不绑定 listener、不启动 task。正式启动把 MCP、
+inbound、observatory 和 gRPC 纳入同一个 startup transaction，任一后续阶段失败都会调用
+统一 shutdown 清理已创建资源；MCP 的更新循环与 HTTP 服务共用一个可取消 owner。API 的
+protobuf 输入仍保留其 presence 语义，由既有 adapter 转成 `ServerConfig` 后进入共用的
+`InboundPlan` 结构校验；更深的 protobuf 字段编译仍由 adapter 保持，避免强制序列化成 JSON。
+未编译的 API feature 现在返回显式配置错误。选择该切片是为了先固定“配置语义一次编译、资源准备无副作用、
+启动失败可回收”三个可观察不变量，而不是移动目录制造形式进度。验证：
+`cargo test -p chimera_server_lib --lib`（1480 passed）、
+`cargo check -p chimera_server_app`、`cargo test -p chimera_server_lib --lib tests::prepare_server_runtime_does_not_bind_inbound_listeners -- --exact`；
+真实 Xray 客户端互通组合未因本切片改变，QUIC/mKCP 等已标记未验证范围保持不变。
+
 ## 14. 参考资料
 
 - [Xray inbound 管理源码（本地）](ref/xray-core/app/proxyman/inbound/inbound.go)：外部管理行为的核对入口。

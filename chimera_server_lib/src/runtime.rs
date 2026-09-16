@@ -33,8 +33,9 @@ use crate::{
     traffic::TrafficContext,
     user_domain::{
         UserDomainAccessAuditContext, UserDomainAccessAuditEvent,
-        UserDomainAccessFailure, UserDomainAccessRevision, UserDomainAccessStatus,
-        UserDomainAccessStore, parse_publication,
+        UserDomainAccessFailure, UserDomainAccessPublication,
+        UserDomainAccessRevision, UserDomainAccessStatus, UserDomainAccessStore,
+        parse_publication,
     },
 };
 
@@ -865,6 +866,13 @@ impl RuntimeState {
         json_config: &str,
     ) -> Result<UserDomainAccessRevision, UserDomainAccessFailure> {
         let publication = parse_publication(json_config)?;
+        self.apply_user_domain_publication(publication)
+    }
+
+    pub(crate) fn apply_user_domain_publication(
+        &self,
+        publication: UserDomainAccessPublication,
+    ) -> Result<UserDomainAccessRevision, UserDomainAccessFailure> {
         self.data_plane.0.user_domain_access.apply(publication)
     }
 

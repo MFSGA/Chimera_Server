@@ -104,7 +104,7 @@ impl HandlerServiceImpl {
                 self.apply_add_inbound_stream_settings(protocol, stream_settings)?;
         }
 
-        Ok(ServerConfig {
+        let config = ServerConfig {
             tag: inbound.tag,
             bind_location: BindLocation::Address(NetLocation::new(address, port)),
             protocol,
@@ -112,7 +112,10 @@ impl HandlerServiceImpl {
             quic_settings: None,
             sniffing: None,
             tcp_socket_policy: None,
-        })
+        };
+        crate::config::server_config::InboundPlan::from_compiled(config)
+            .map(crate::config::server_config::InboundPlan::into_server_config)
+            .map_err(|error| Status::invalid_argument(error.to_string()))
     }
 
     pub(super) fn parse_add_inbound_protocol(
