@@ -362,7 +362,11 @@ async fn bound_inbound_tasks_drop_releases_ready_listener() {
 fn configured_identity_registration_respects_user_stats_policy() {
     let disabled_identity = "stats-policy-disabled-identity";
     let disabled_runtime = RuntimeState::new(Vec::new(), Vec::new());
-    register_stats_identity(&disabled_runtime, 7, disabled_identity.to_string());
+    register_stats_identity(
+        &disabled_runtime.data_plane(),
+        7,
+        disabled_identity.to_string(),
+    );
     assert!(
         !crate::traffic::snapshot()
             .known_identities
@@ -383,7 +387,11 @@ fn configured_identity_registration_respects_user_stats_policy() {
         levels,
         ..crate::config::def::PolicyConfig::default()
     }));
-    register_stats_identity(&enabled_runtime, 7, enabled_identity.to_string());
+    register_stats_identity(
+        &enabled_runtime.data_plane(),
+        7,
+        enabled_identity.to_string(),
+    );
     assert!(
         crate::traffic::snapshot()
             .known_identities

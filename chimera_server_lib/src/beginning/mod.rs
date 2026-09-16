@@ -24,8 +24,7 @@ use crate::{
         tcp_handler::{TcpServerConnectionContext, TcpServerHandler},
         tcp_handler_util::create_tcp_server_handler,
     },
-    resolver::{NativeResolver, Resolver},
-    runtime::RuntimeState,
+    runtime::{DataPlaneRuntime, RuntimeState},
     session::dispatcher::process_stream_with_context,
     traffic::register_identity,
 };
@@ -273,7 +272,7 @@ pub(crate) async fn start_bound_servers(
     config: ServerConfig,
     runtime: RuntimeState,
 ) -> std::io::Result<BoundInboundTasks> {
-    start_server_tasks(config, runtime)
+    start_server_tasks(config, runtime.data_plane())
         .await
         .map(BoundInboundTasks::new)
 }
@@ -287,7 +286,7 @@ pub async fn start_servers(
 
 async fn start_server_tasks(
     config: ServerConfig,
-    runtime: RuntimeState,
+    runtime: DataPlaneRuntime,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     register_configured_identities(&config.protocol, &runtime);
 
@@ -364,7 +363,11 @@ async fn start_server_tasks(
     Ok(join_handles.commit())
 }
 
-fn register_stats_identity(runtime: &RuntimeState, level: u32, identity: String) {
+fn register_stats_identity(
+    runtime: &DataPlaneRuntime,
+    level: u32,
+    identity: String,
+) {
     if identity.is_empty() {
         return;
     }
@@ -376,7 +379,7 @@ fn register_stats_identity(runtime: &RuntimeState, level: u32, identity: String)
 
 fn register_configured_identities(
     protocol: &ServerProxyConfig,
-    runtime: &RuntimeState,
+    runtime: &DataPlaneRuntime,
 ) {
     match protocol {
         #[cfg(feature = "http")]
@@ -491,12 +494,12 @@ pub async fn start_tcp_server(
     config: ServerConfig,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let runtime = RuntimeState::new(vec![config.clone()], Vec::new());
-    start_tcp_server_with_runtime(config, runtime).await
+    start_tcp_server_with_runtime(config, runtime.data_plane()).await
 }
 
 async fn start_tcp_server_with_runtime(
     config: ServerConfig,
-    runtime: RuntimeState,
+    runtime: DataPlaneRuntime,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let ServerConfig {
         tag,
@@ -540,11 +543,11 @@ async fn start_tcp_server_with_runtime(
 async fn run_tcp_server(
     listener: tokio::net::TcpListener,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
-    runtime: RuntimeState,
+    runtime: DataPlaneRuntime,
     sniffing: Option<InboundSniffingConfig>,
     tcp_socket_policy: Option<TcpSocketPolicy>,
 ) -> std::io::Result<()> {
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let resolver = runtime.resolver();
     let listener_addr = listener.local_addr()?;
 
     let mut accept_health = TcpAcceptHealth::default();
@@ -569,7 +572,7 @@ async fn run_tcp_server(
         }
         let cloned_cache = resolver.clone();
         let cloned_handler = server_handler.clone();
-        let connection_runtime = runtime.data_plane();
+        let connection_runtime = runtime.clone();
         let sniffing = sniffing.clone();
 
         runtime.spawn_inbound_connection(async move {

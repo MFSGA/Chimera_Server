@@ -39,8 +39,8 @@ use crate::{
     handler::tcp::{
         tcp_handler::TcpServerHandler, tcp_handler_util::create_tcp_server_handler,
     },
-    resolver::{NativeResolver, Resolver},
-    runtime::{DataPlaneRuntime, RuntimeState},
+    resolver::Resolver,
+    runtime::DataPlaneRuntime,
     session::dispatcher::process_stream_with_sniffing_and_local_addr,
 };
 #[cfg(feature = "tls")]
@@ -78,7 +78,7 @@ type ResponseBody = UnsyncBoxBody<Bytes, Infallible>;
 
 pub async fn start_xhttp_server(
     config: ServerConfig,
-    runtime: RuntimeState,
+    runtime: DataPlaneRuntime,
     plan: XhttpListenerPlan,
 ) -> std::io::Result<Vec<tokio::task::JoinHandle<()>>> {
     let ServerConfig {
@@ -102,7 +102,7 @@ pub async fn start_xhttp_server(
         &tag,
         &mut rules_stack,
     )?);
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let resolver = runtime.resolver();
     let shutdown = CancellationToken::new();
     #[cfg(feature = "tls")]
     let h3_transport_config =
@@ -111,7 +111,7 @@ pub async fn start_xhttp_server(
         listener_config.xhttp_config,
         server_handler,
         resolver,
-        runtime.data_plane(),
+        runtime,
         sniffing,
         shutdown.clone(),
     ));

@@ -16,8 +16,8 @@ use crate::{
     handler::tcp::{
         tcp_handler::TcpServerHandler, tcp_handler_util::create_tcp_server_handler,
     },
-    resolver::{NativeResolver, Resolver},
-    runtime::RuntimeState,
+    resolver::Resolver,
+    runtime::DataPlaneRuntime,
     session::dispatcher::{process_stream_with_context, stream_connection_context},
 };
 
@@ -153,7 +153,7 @@ impl ActiveSession {
 
 pub(crate) async fn start_mkcp_server(
     config: ServerConfig,
-    runtime: RuntimeState,
+    runtime: DataPlaneRuntime,
     mkcp: MkcpTransportConfig,
 ) -> io::Result<Option<JoinHandle<()>>> {
     let ServerConfig {
@@ -202,11 +202,11 @@ async fn run_mkcp_server(
     listener: PreparedMkcpListener,
     local_addr: std::net::SocketAddr,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
-    runtime: RuntimeState,
+    runtime: DataPlaneRuntime,
     sniffing: Option<crate::config::server_config::InboundSniffingConfig>,
     mkcp: MkcpTransportConfig,
 ) -> io::Result<()> {
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let resolver = runtime.resolver();
     let shared_wake = Arc::new(Notify::new());
     let mut sessions = HashMap::<MkcpSessionKey, ActiveSession>::new();
     let mut receive_buffer = vec![0u8; RECEIVE_BUFFER_SIZE];
@@ -256,7 +256,7 @@ async fn handle_packet(
     local_addr: std::net::SocketAddr,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
     resolver: Arc<dyn Resolver>,
-    runtime: &RuntimeState,
+    runtime: &DataPlaneRuntime,
     sniffing: Option<crate::config::server_config::InboundSniffingConfig>,
     mkcp: MkcpTransportConfig,
 ) -> io::Result<()> {
@@ -311,10 +311,10 @@ fn spawn_protocol_session(
     local_addr: std::net::SocketAddr,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
     resolver: Arc<dyn Resolver>,
-    runtime: &RuntimeState,
+    runtime: &DataPlaneRuntime,
     sniffing: Option<crate::config::server_config::InboundSniffingConfig>,
 ) -> bool {
-    let data_plane = runtime.data_plane();
+    let data_plane = runtime.clone();
     let mut connection_context =
         stream_connection_context(&data_plane, Some(local_addr));
     connection_context.peer_addr = Some(remote);

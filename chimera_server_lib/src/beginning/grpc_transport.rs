@@ -29,8 +29,8 @@ use crate::{
     handler::tcp::{
         tcp_handler::TcpServerHandler, tcp_handler_util::create_tcp_server_handler,
     },
-    resolver::{NativeResolver, Resolver},
-    runtime::{DataPlaneRuntime, RuntimeState},
+    resolver::Resolver,
+    runtime::DataPlaneRuntime,
 };
 
 use super::transport_plan::{GrpcListenerPlan, ListenerSecurityPlan};
@@ -192,7 +192,7 @@ enum GrpcSecurity {
 
 pub(super) async fn start_grpc_server(
     config: ServerConfig,
-    runtime: RuntimeState,
+    runtime: DataPlaneRuntime,
     plan: GrpcListenerPlan,
 ) -> io::Result<Vec<JoinHandle<()>>> {
     let ServerConfig {
@@ -213,8 +213,8 @@ pub(super) async fn start_grpc_server(
     let server_handler: Arc<Box<dyn TcpServerHandler>> = Arc::new(
         create_tcp_server_handler(inner_protocol, &tag, &mut rules_stack)?,
     );
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
-    let data_plane = runtime.data_plane();
+    let resolver = runtime.resolver();
+    let data_plane = runtime;
     let listen_addr = match bind_location {
         BindLocation::Address(location) => location.to_socket_addr()?,
     };

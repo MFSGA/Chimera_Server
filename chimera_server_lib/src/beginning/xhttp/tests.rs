@@ -2,6 +2,7 @@ use super::*;
 use crate::beginning::transport_plan::{InboundListenerPlan, compile_listener_plan};
 #[cfg(feature = "tls")]
 use crate::config::server_config::TlsServerConfig;
+use crate::runtime::RuntimeState;
 
 #[derive(Debug)]
 struct PendingXhttpHandler;
@@ -66,7 +67,7 @@ fn pending_xhttp_state(
     Arc::new(AppState::new(
         test_xhttp_server_config(),
         handler,
-        Arc::new(NativeResolver::new()),
+        runtime.data_plane().resolver(),
         runtime.data_plane(),
         None,
         shutdown,
@@ -180,7 +181,7 @@ async fn tcp_listener_stop_preserves_accepted_connection_like_xray() {
     else {
         panic!("expected XHTTP listener plan");
     };
-    let mut listener_tasks = start_xhttp_server(config, runtime, *plan)
+    let mut listener_tasks = start_xhttp_server(config, runtime.data_plane(), *plan)
         .await
         .expect("start XHTTP listener");
     let listener_task = listener_tasks.pop().expect("listener task");

@@ -25,16 +25,17 @@ use crate::{
 #[cfg(all(feature = "shadowsocks", feature = "trojan"))]
 use crate::outbound::connect_trojan_udp_via_outbound;
 
+#[cfg(feature = "shadowsocks")]
+use crate::resolver::Resolver;
 use crate::{
     address::BindLocation,
     config::server_config::{ServerConfig, ServerProxyConfig, TcpSocketPolicy},
-    resolver::{NativeResolver, Resolver, resolve_single_address},
-    runtime::RuntimeState,
+    resolver::resolve_single_address,
+    runtime::DataPlaneRuntime,
 };
 #[cfg(feature = "shadowsocks")]
 use crate::{
     address::NetLocation,
-    runtime::DataPlaneRuntime,
     traffic::{TrafficContext, record_transfer, record_transfer_ref},
 };
 
@@ -49,7 +50,7 @@ pub(super) use super::dokodemo::{UdpOutboundAction, select_udp_outbound};
 
 pub async fn start_udp_server(
     config: ServerConfig,
-    runtime: RuntimeState,
+    runtime: DataPlaneRuntime,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let ServerConfig {
         tag,
@@ -68,7 +69,7 @@ pub async fn start_udp_server(
                 users,
                 identity,
                 tcp_socket_policy,
-                runtime.data_plane(),
+                runtime.clone(),
             )
             .await;
         }
@@ -95,7 +96,7 @@ pub async fn start_udp_server(
     let target_addr = if dokodemo_config.follow_redirect {
         None
     } else {
-        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let resolver = runtime.resolver();
         Some(resolve_single_address(&resolver, &dokodemo_config.target).await?)
     };
 
@@ -122,7 +123,7 @@ pub async fn start_udp_server(
             dokodemo_config,
             target_addr,
             tag,
-            runtime.data_plane(),
+            runtime,
         )
         .await
         {
@@ -233,7 +234,7 @@ pub(super) async fn run_shadowsocks_udp_server(
     runtime: DataPlaneRuntime,
 ) {
     let runtime_users = runtime.shadowsocks_user_store(&inbound_tag);
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let resolver = runtime.resolver();
     let mut buffer = vec![0u8; UDP_BUFFER_SIZE];
     loop {
         let (len, client_addr) = match socket.recv_from(&mut buffer).await {
@@ -296,6 +297,7 @@ pub(super) async fn relay_shadowsocks_udp_packet(
             "udp",
             InboundRoutingMetadata {
                 local_addr: server_socket.local_addr().ok(),
+                inbound_protocol: Some("shadowsocks".to_string()),
                 ..InboundRoutingMetadata::default()
             },
         ),

@@ -17,15 +17,15 @@ use crate::{
     config::server_config::{
         ServerConfig, ServerProxyConfig, quic::ServerQuicConfig,
     },
-    runtime::RuntimeState,
+    runtime::DataPlaneRuntime,
     util::rustls_util::create_server_config,
 };
 #[cfg(not(any(feature = "hysteria", feature = "tuic")))]
-use crate::{config::server_config::ServerConfig, runtime::RuntimeState};
+use crate::{config::server_config::ServerConfig, runtime::DataPlaneRuntime};
 
 pub async fn start_quic_server(
     config: ServerConfig,
-    runtime: RuntimeState,
+    runtime: DataPlaneRuntime,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     #[cfg(any(feature = "hysteria", feature = "tuic"))]
     {
@@ -75,7 +75,7 @@ pub async fn start_quic_server(
                         config,
                         tcp_socket_policy,
                         tag,
-                        runtime.data_plane(),
+                        runtime.clone(),
                     )
                     .await
                     {
@@ -100,7 +100,7 @@ pub async fn start_quic_server(
                         server_config,
                         config,
                         tag,
-                        runtime.data_plane(),
+                        runtime,
                     )
                     .await
                     {
