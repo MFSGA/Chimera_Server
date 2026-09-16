@@ -16,9 +16,8 @@ use crate::{
     address::{Address, NetLocation},
     config::def::{BurstObservatoryConfig, ObservatoryConfig},
     outbound::{connect_tcp_via_outbound, reqwest_proxy_for_outbound},
-    resolver::{NativeResolver, Resolver},
     routing_state::OutboundObservation,
-    runtime::{OutboundSummary, RuntimeState},
+    runtime::{DataPlaneRuntime, OutboundSummary},
 };
 
 mod config;
@@ -62,7 +61,7 @@ pub(crate) fn validate_observatory_config(
 }
 
 pub(crate) fn start_observer(
-    runtime: RuntimeState,
+    runtime: DataPlaneRuntime,
     config: Option<ObservatoryConfig>,
     burst: Option<BurstObservatoryConfig>,
 ) -> Result<Option<JoinHandle<()>>, String> {
@@ -78,7 +77,7 @@ pub(crate) fn start_observer(
     })))
 }
 
-async fn run_observer(runtime: RuntimeState, config: ActiveObserverConfig) {
+async fn run_observer(runtime: DataPlaneRuntime, config: ActiveObserverConfig) {
     let client = match Client::builder()
         .timeout(config.timeout)
         .redirect(Policy::none())
@@ -142,7 +141,7 @@ async fn run_observer(runtime: RuntimeState, config: ActiveObserverConfig) {
 }
 
 async fn probe_once(
-    runtime: &RuntimeState,
+    runtime: &DataPlaneRuntime,
     config: &ActiveObserverConfig,
     windows: &mut HashMap<String, ProbeWindow>,
 ) -> usize {
@@ -198,7 +197,7 @@ async fn probe_once(
 }
 
 fn selected_outbounds(
-    runtime: &RuntimeState,
+    runtime: &DataPlaneRuntime,
     selectors: &[String],
 ) -> Vec<OutboundSummary> {
     runtime
@@ -213,7 +212,7 @@ fn selected_outbounds(
 }
 
 async fn probe_outbound(
-    runtime: &RuntimeState,
+    runtime: &DataPlaneRuntime,
     direct_client: Client,
     config: ActiveObserverConfig,
     outbound: OutboundSummary,
@@ -345,7 +344,7 @@ async fn probe_outbound(
 }
 
 async fn probe_tagged_http(
-    runtime: &RuntimeState,
+    runtime: &DataPlaneRuntime,
     config: &ActiveObserverConfig,
     outbound: &OutboundSummary,
 ) -> std::io::Result<()> {
@@ -362,14 +361,9 @@ async fn probe_tagged_http(
         )
     })?;
     let target = NetLocation::new(Address::from(host)?, port);
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
-    let connection = connect_tcp_via_outbound(
-        &resolver,
-        &target,
-        &runtime.data_plane(),
-        outbound,
-    )
-    .await?;
+    let resolver = runtime.resolver();
+    let connection =
+        connect_tcp_via_outbound(&resolver, &target, runtime, outbound).await?;
     let path = probe_request_target(&config.probe_url);
     let host_header = probe_host_header(&config.probe_url, host, port);
 
@@ -634,7 +628,7 @@ fn build_probe_observation(
 }
 
 fn apply_probe_result(
-    runtime: &RuntimeState,
+    runtime: &DataPlaneRuntime,
     windows: &mut HashMap<String, ProbeWindow>,
     tag: String,
     result: ProbeResult,

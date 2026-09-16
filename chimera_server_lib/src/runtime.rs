@@ -24,6 +24,7 @@ use crate::{
 use crate::{
     config::{def::PolicyConfig, server_config::ServerConfig},
     inbound::{InboundFailure, InboundManager},
+    resolver::{NativeResolver, Resolver},
     routing_state::{
         BalancerTargetMap, OutboundObservation, RouteMatch, RoutingEvent,
         RoutingInput, RoutingState,
@@ -31,6 +32,7 @@ use crate::{
     session_tasks::{ConnectionTaskOwner, ConnectionTaskShutdown},
     traffic::TrafficContext,
     user_domain::{
+        UserDomainAccessAuditContext, UserDomainAccessAuditEvent,
         UserDomainAccessFailure, UserDomainAccessRevision, UserDomainAccessStatus,
         UserDomainAccessStore, parse_publication,
     },
@@ -152,6 +154,14 @@ impl RuntimeState {
         inbounds: Vec<ServerConfig>,
         outbounds: Vec<OutboundSummary>,
     ) -> Self {
+        Self::new_with_resolver(inbounds, outbounds, Arc::new(NativeResolver::new()))
+    }
+
+    pub(crate) fn new_with_resolver(
+        inbounds: Vec<ServerConfig>,
+        outbounds: Vec<OutboundSummary>,
+        resolver: Arc<dyn Resolver>,
+    ) -> Self {
         let (routing_events, _) = broadcast::channel(256);
         let routing = Arc::new(RoutingState::default());
         let outbounds = Arc::new(outbounds);
@@ -161,6 +171,7 @@ impl RuntimeState {
                 RoutingPublication::new(routing, outbounds),
             ))),
             policy: Arc::new(RwLock::new(PolicyConfig::default())),
+            resolver,
             user_domain_access: UserDomainAccessStore::default(),
             balancer_overrides: Arc::new(RwLock::new(Arc::new(HashMap::new()))),
             routing_events,
@@ -868,6 +879,13 @@ impl RuntimeState {
         self.data_plane.0.user_domain_access.status()
     }
 
+    pub(crate) fn user_domain_audit_events(
+        &self,
+        limit: usize,
+    ) -> Vec<UserDomainAccessAuditEvent> {
+        self.data_plane.0.user_domain_access.audit_events(limit)
+    }
+
     pub(crate) fn allows_user_domain_access(
         &self,
         identity: &str,
@@ -879,6 +897,19 @@ impl RuntimeState {
             .allows(identity, target_domain)
     }
 
+    pub(crate) fn allows_user_domain_access_with_context(
+        &self,
+        identity: &str,
+        target_domain: &str,
+        audit_context: UserDomainAccessAuditContext<'_>,
+    ) -> bool {
+        self.data_plane.0.user_domain_access.allows_with_context(
+            identity,
+            target_domain,
+            audit_context,
+        )
+    }
+
     pub(crate) fn allows_user_domain_access_with_identities(
         &self,
         identities: &[String],
@@ -887,6 +918,22 @@ impl RuntimeState {
         self.data_plane
             .0
             .allows_user_domain_access_with_identities(identities, target_domain)
+    }
+
+    pub(crate) fn allows_user_domain_access_with_identities_and_context(
+        &self,
+        identities: &[String],
+        target_domain: &str,
+        audit_context: UserDomainAccessAuditContext<'_>,
+    ) -> bool {
+        self.data_plane
+            .0
+            .user_domain_access
+            .allows_with_identities_and_context(
+                identities,
+                target_domain,
+                audit_context,
+            )
     }
 }
 

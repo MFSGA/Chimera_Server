@@ -11,9 +11,9 @@ use config::{
     rule::RoutingConfig,
 };
 pub use config_loader::{ConfigFormat, resolve_config_source};
+use resolver::{HostRuleValue, NativeResolver, Resolver};
 pub use runtime::{OutboundSummary, RuntimeState};
-use std::net::SocketAddr;
-use std::time::Duration;
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::task::{JoinError, JoinHandle};
 use tokio_rustls::rustls;
@@ -234,9 +234,14 @@ pub fn prepare_server_runtime(
     log_file: Option<&str>,
 ) -> Result<ServerRuntime, Error> {
     let policy_config = config.policy.clone();
+    let dns_config = config.dns.clone();
     let user_domain_access = config.user_domain_access.clone();
     let inbounds = prepare_server_inbounds(config, cwd, log_file)?;
-    let runtime_state = RuntimeState::new(inbounds.clone(), Vec::new());
+    let runtime_state = RuntimeState::new_with_resolver(
+        inbounds.clone(),
+        Vec::new(),
+        compile_configured_resolver(dns_config.as_ref())?,
+    );
     runtime_state.replace_policy(policy_config.as_ref());
     install_configured_user_domain_policy(
         &runtime_state,
@@ -498,12 +503,68 @@ fn compile_configured_outbounds(
         .map_err(Error::InvalidConfig)
 }
 
+fn compile_configured_resolver(
+    config: Option<&config::def::DnsConfig>,
+) -> Result<Arc<dyn Resolver>, Error> {
+    let query_strategy = config
+        .map(config::def::DnsConfig::compile_query_strategy)
+        .unwrap_or_default();
+    let client_ip = config
+        .map(config::def::DnsConfig::compile_client_ip)
+        .transpose()
+        .map_err(Error::InvalidConfig)?
+        .flatten();
+    let disable_cache = config.and_then(|dns| dns.disable_cache).unwrap_or(false);
+    let enable_parallel_query = config
+        .map(config::def::DnsConfig::compile_enable_parallel_query)
+        .unwrap_or(false);
+    let (disable_fallback, disable_fallback_if_match) = config
+        .map(config::def::DnsConfig::compile_fallback_options)
+        .unwrap_or_default();
+    let servers = config
+        .map(config::def::DnsConfig::compile_server_configs)
+        .transpose()
+        .map_err(Error::InvalidConfig)?
+        .unwrap_or_default();
+    let hosts = config
+        .map(config::def::DnsConfig::compile_hosts)
+        .transpose()
+        .map_err(Error::InvalidConfig)?
+        .unwrap_or_default();
+    let rules = hosts
+        .into_iter()
+        .map(|host| {
+            let value = match (host.response_code, host.proxied_domain) {
+                (Some(code), _) => HostRuleValue::ResponseCode(code),
+                (None, Some(domain)) => HostRuleValue::ProxiedDomain(domain),
+                (None, None) => HostRuleValue::Ips(host.addresses),
+            };
+            (host.rule, value)
+        })
+        .collect();
+    NativeResolver::with_host_rules_and_server_configs_with_query_strategy_and_fallback_options_and_runtime_options(
+        rules,
+        servers,
+        query_strategy,
+        disable_fallback,
+        disable_fallback_if_match,
+        client_ip,
+        resolver::NativeResolverOptions {
+            disable_cache,
+            enable_parallel_query,
+        },
+    )
+    .map(|resolver| Arc::new(resolver) as Arc<dyn Resolver>)
+    .map_err(|error| Error::InvalidConfig(format!("invalid dns.hosts: {error}")))
+}
+
 pub fn validate(opts: Options) -> Result<(), Error> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     // 1. config parse
     let config = opts.config.try_parse(opts.config_format)?;
     let _ = compile_configured_outbounds(&config.outbounds)?;
+    let _ = compile_configured_resolver(config.dns.as_ref())?;
 
     let validation_runtime = RuntimeState::new(Vec::new(), Vec::new());
     install_configured_user_domain_policy(
@@ -588,6 +649,7 @@ async fn start_async(
     let mcp_config = config.mcp.clone();
     let routing_config = config.routing.clone();
     let policy_config = config.policy.clone();
+    let dns_config = config.dns.clone();
     let user_domain_access = config.user_domain_access.clone();
     let observatory_config = config.observatory.clone();
     let burst_observatory_config = config.burst_observatory.clone();
@@ -604,7 +666,11 @@ async fn start_async(
         .map(ServerConfig::try_from)
         .collect::<Result<Vec<_>, _>>()?;
 
-    let runtime_state = RuntimeState::new(all_inbounds.clone(), outbounds);
+    let runtime_state = RuntimeState::new_with_resolver(
+        all_inbounds.clone(),
+        outbounds,
+        compile_configured_resolver(dns_config.as_ref())?,
+    );
     runtime_state.replace_policy(policy_config.as_ref());
     install_configured_user_domain_policy(
         &runtime_state,
@@ -677,7 +743,7 @@ async fn start_async(
     has_started_server |= started_inbounds > 0;
 
     if let Some(observer) = routing_observer::start_observer(
-        runtime_state.clone(),
+        runtime_state.data_plane(),
         observatory_config,
         burst_observatory_config,
     )
@@ -859,6 +925,49 @@ mod tests {
         assert_eq!(
             prepared.runtime_state.xray_handshake_timeout_for_level(8),
             Duration::from_secs(60)
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_server_runtime_uses_configured_dns_hosts() {
+        let config: crate::config::def::LiteralConfig = serde_json::from_str(
+            r#"{
+                "inbounds": [],
+                "outbounds": [],
+                "dns": {"hosts": {
+                    "domain:example.com": "192.0.2.10",
+                    "alias.example": "mapped.example",
+                    "mapped.example": "192.0.2.11"
+                }}
+            }"#,
+        )
+        .expect("parse dns hosts config");
+        let prepared = prepare_server_runtime(config, None, None)
+            .expect("prepare server runtime with dns hosts");
+        let location = NetLocation::from_str("WWW.EXAMPLE.COM.:8443", None)
+            .expect("parse mapped domain");
+
+        assert_eq!(
+            prepared
+                .runtime_state
+                .data_plane()
+                .resolver()
+                .resolve_location(&location)
+                .await
+                .expect("resolve configured host"),
+            vec!["192.0.2.10:8443".parse().unwrap()]
+        );
+        let alias = NetLocation::from_str("alias.example:8443", None)
+            .expect("parse proxied mapped domain");
+        assert_eq!(
+            prepared
+                .runtime_state
+                .data_plane()
+                .resolver()
+                .resolve_location(&alias)
+                .await
+                .expect("resolve proxied configured host"),
+            vec!["192.0.2.11:8443".parse().unwrap()]
         );
     }
 

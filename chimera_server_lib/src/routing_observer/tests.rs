@@ -14,6 +14,7 @@ use crate::{
     },
     outbound::compile_static_outbound,
     routing_state::{RoutingInput, RoutingState},
+    runtime::RuntimeState,
 };
 #[cfg(feature = "ws")]
 use base64::Engine as _;
@@ -1113,7 +1114,10 @@ async fn probes_selected_freedom_and_blackhole_outbounds() {
     .expect("build observatory test config");
     let mut windows = HashMap::new();
 
-    assert_eq!(probe_once(&runtime, &config, &mut windows).await, 2);
+    assert_eq!(
+        probe_once(&runtime.data_plane(), &config, &mut windows).await,
+        2
+    );
     server.await.expect("observatory server task");
     let observations = runtime.outbound_observations();
     assert!(observations["direct"].alive);
@@ -1197,7 +1201,10 @@ async fn observatory_probe_uses_configured_socks_outbound() {
     .expect("build SOCKS observatory config");
     let mut windows = HashMap::new();
 
-    assert_eq!(probe_once(&runtime, &config, &mut windows).await, 1);
+    assert_eq!(
+        probe_once(&runtime.data_plane(), &config, &mut windows).await,
+        1
+    );
     server.await.expect("fake SOCKS observatory task");
     let observation = runtime
         .outbound_observation("proxy")
@@ -1317,7 +1324,10 @@ async fn observatory_probe_uses_configured_trojan_tls_outbound() {
     .expect("build Trojan TLS observatory config");
     let mut windows = HashMap::new();
 
-    assert_eq!(probe_once(&runtime, &config, &mut windows).await, 1);
+    assert_eq!(
+        probe_once(&runtime.data_plane(), &config, &mut windows).await,
+        1
+    );
     server.await.expect("fake Trojan TLS observatory task");
     let observation = runtime
         .outbound_observation("proxy")
@@ -1346,7 +1356,10 @@ async fn observatory_probe_uses_configured_trojan_grpc_outbound() {
     .expect("build Trojan gRPC observatory config");
     let mut windows = HashMap::new();
 
-    assert_eq!(probe_once(&runtime, &config, &mut windows).await, 1);
+    assert_eq!(
+        probe_once(&runtime.data_plane(), &config, &mut windows).await,
+        1
+    );
     server.await.expect("fake Trojan gRPC observatory task");
     let observation = runtime
         .outbound_observation("proxy")
@@ -1399,7 +1412,10 @@ async fn least_ping_uses_real_trojan_grpc_observatory_rtt() {
     .expect("build Trojan gRPC leastPing observatory config");
     let mut windows = HashMap::new();
 
-    assert_eq!(probe_once(&runtime, &config, &mut windows).await, 2);
+    assert_eq!(
+        probe_once(&runtime.data_plane(), &config, &mut windows).await,
+        2
+    );
     fast_server.await.expect("fast Trojan gRPC probe task");
     slow_server.await.expect("slow Trojan gRPC probe task");
     let fast = runtime
@@ -1479,7 +1495,10 @@ async fn observatory_probe_and_least_ping_use_trojan_grpc_multi_outbound() {
     .expect("build Trojan gRPC TunMulti observatory config");
     let mut windows = HashMap::new();
 
-    assert_eq!(probe_once(&runtime, &config, &mut windows).await, 2);
+    assert_eq!(
+        probe_once(&runtime.data_plane(), &config, &mut windows).await,
+        2
+    );
     fast_server
         .await
         .expect("fast Trojan gRPC TunMulti probe task");
@@ -1546,7 +1565,10 @@ async fn observatory_and_least_ping_use_trojan_grpc_reality_outbound() {
     .expect("build Trojan gRPC REALITY observatory config");
     let mut windows = HashMap::new();
 
-    assert_eq!(probe_once(&runtime, &config, &mut windows).await, 2);
+    assert_eq!(
+        probe_once(&runtime.data_plane(), &config, &mut windows).await,
+        2
+    );
     fast_server
         .await
         .expect("fast Trojan gRPC REALITY probe task");
@@ -1589,7 +1611,10 @@ async fn observatory_probe_uses_configured_trojan_httpupgrade_outbound() {
     .expect("build Trojan HTTPUpgrade observatory config");
     let mut windows = HashMap::new();
 
-    assert_eq!(probe_once(&runtime, &config, &mut windows).await, 1);
+    assert_eq!(
+        probe_once(&runtime.data_plane(), &config, &mut windows).await,
+        1
+    );
     server
         .await
         .expect("fake Trojan HTTPUpgrade observatory task");
@@ -1644,7 +1669,10 @@ async fn least_ping_uses_real_trojan_httpupgrade_observatory_rtt() {
     .expect("build Trojan HTTPUpgrade leastPing observatory config");
     let mut windows = HashMap::new();
 
-    assert_eq!(probe_once(&runtime, &config, &mut windows).await, 2);
+    assert_eq!(
+        probe_once(&runtime.data_plane(), &config, &mut windows).await,
+        2
+    );
     fast_server
         .await
         .expect("fast Trojan HTTPUpgrade probe task");
@@ -1681,7 +1709,10 @@ async fn observatory_probe_uses_configured_trojan_reality_outbound() {
     .expect("build Trojan REALITY observatory config");
     let mut windows = HashMap::new();
 
-    assert_eq!(probe_once(&runtime, &config, &mut windows).await, 1);
+    assert_eq!(
+        probe_once(&runtime.data_plane(), &config, &mut windows).await,
+        1
+    );
     server.await.expect("fake Trojan REALITY observatory task");
     let observation = runtime
         .outbound_observation("proxy")
@@ -1734,7 +1765,10 @@ async fn least_ping_uses_real_trojan_reality_observatory_rtt() {
     .expect("build Trojan REALITY leastPing observatory config");
     let mut windows = HashMap::new();
 
-    assert_eq!(probe_once(&runtime, &config, &mut windows).await, 2);
+    assert_eq!(
+        probe_once(&runtime.data_plane(), &config, &mut windows).await,
+        2
+    );
     fast_server.await.expect("fast Trojan REALITY probe task");
     slow_server.await.expect("slow Trojan REALITY probe task");
     let fast = runtime
@@ -1776,7 +1810,10 @@ async fn observatory_probe_uses_configured_trojan_websocket_outbound() {
     .expect("build Trojan WebSocket observatory config");
     let mut windows = HashMap::new();
 
-    assert_eq!(probe_once(&runtime, &config, &mut windows).await, 1);
+    assert_eq!(
+        probe_once(&runtime.data_plane(), &config, &mut windows).await,
+        1
+    );
     server
         .await
         .expect("fake Trojan WebSocket observatory task");
@@ -1831,7 +1868,10 @@ async fn least_ping_uses_real_trojan_websocket_observatory_rtt() {
     .expect("build Trojan WebSocket leastPing observatory config");
     let mut windows = HashMap::new();
 
-    assert_eq!(probe_once(&runtime, &config, &mut windows).await, 2);
+    assert_eq!(
+        probe_once(&runtime.data_plane(), &config, &mut windows).await,
+        2
+    );
     fast_server.await.expect("fast Trojan WebSocket probe task");
     slow_server.await.expect("slow Trojan WebSocket probe task");
     let fast = runtime.outbound_observation("trojan-ws-fast").unwrap();
@@ -1869,7 +1909,10 @@ async fn observatory_probe_uses_configured_trojan_outbound() {
     .expect("build Trojan observatory config");
     let mut windows = HashMap::new();
 
-    assert_eq!(probe_once(&runtime, &config, &mut windows).await, 1);
+    assert_eq!(
+        probe_once(&runtime.data_plane(), &config, &mut windows).await,
+        1
+    );
     server.await.expect("fake Trojan observatory task");
     let observation = runtime
         .outbound_observation("proxy")
@@ -1922,7 +1965,10 @@ async fn least_ping_uses_real_trojan_observatory_rtt() {
     .expect("build Trojan leastPing observatory config");
     let mut windows = HashMap::new();
 
-    assert_eq!(probe_once(&runtime, &config, &mut windows).await, 2);
+    assert_eq!(
+        probe_once(&runtime.data_plane(), &config, &mut windows).await,
+        2
+    );
     fast_server.await.expect("fast Trojan probe task");
     slow_server.await.expect("slow Trojan probe task");
     let fast = runtime.outbound_observation("trojan-fast").unwrap();
@@ -1983,7 +2029,10 @@ async fn least_ping_uses_real_socks_observatory_rtt() {
     .expect("build leastPing observatory config");
     let mut windows = HashMap::new();
 
-    assert_eq!(probe_once(&runtime, &config, &mut windows).await, 2);
+    assert_eq!(
+        probe_once(&runtime.data_plane(), &config, &mut windows).await,
+        2
+    );
     fast_server.await.expect("fast SOCKS probe task");
     slow_server.await.expect("slow SOCKS probe task");
     let fast = runtime.outbound_observation("proxy-fast").unwrap();
@@ -2010,7 +2059,7 @@ async fn rolling_health_window_is_bounded() {
     let mut windows = HashMap::new();
     for delay in 1..=15 {
         apply_probe_result(
-            &runtime,
+            &runtime.data_plane(),
             &mut windows,
             "direct".into(),
             ProbeResult {
@@ -2054,7 +2103,7 @@ async fn burst_liveness_uses_health_window_not_latest_sample() {
         },
     ] {
         apply_probe_result(
-            &runtime,
+            &runtime.data_plane(),
             &mut windows,
             "direct".into(),
             result,
@@ -2077,7 +2126,7 @@ async fn single_successful_burst_sample_uses_half_rtt_deviation() {
     let mut windows = HashMap::new();
 
     apply_probe_result(
-        &runtime,
+        &runtime.data_plane(),
         &mut windows,
         "direct".into(),
         ProbeResult {
@@ -2101,7 +2150,7 @@ async fn all_failed_burst_samples_report_zero_rtt_statistics() {
     let mut windows = HashMap::new();
     for _ in 0..3 {
         apply_probe_result(
-            &runtime,
+            &runtime.data_plane(),
             &mut windows,
             "direct".into(),
             ProbeResult {
@@ -2141,7 +2190,7 @@ async fn expired_burst_samples_are_removed_before_statistics() {
     )]);
 
     apply_probe_result(
-        &runtime,
+        &runtime.data_plane(),
         &mut windows,
         "direct".into(),
         ProbeResult {
@@ -2193,7 +2242,7 @@ async fn burst_get_probe_consumes_body_and_uses_sampling_count() {
     .expect("build burst GET config");
     let mut windows = HashMap::new();
 
-    probe_once(&runtime, &config, &mut windows).await;
+    probe_once(&runtime.data_plane(), &config, &mut windows).await;
     let request = server.await.expect("burst probe server task");
     assert!(request.starts_with("GET /probe HTTP/1.1"));
     let observation = runtime.outbound_observations().remove("direct").unwrap();
@@ -2220,7 +2269,10 @@ async fn failed_connectivity_check_skips_observation_sample() {
     .expect("build connectivity skip config");
     let mut windows = HashMap::new();
 
-    assert_eq!(probe_once(&runtime, &config, &mut windows).await, 1);
+    assert_eq!(
+        probe_once(&runtime.data_plane(), &config, &mut windows).await,
+        1
+    );
     assert!(runtime.outbound_observations().is_empty());
     assert!(windows.is_empty());
 }

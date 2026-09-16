@@ -19,12 +19,13 @@ use crate::handler::vmess::vmess_handler::VmessUserStore;
 use crate::{
     config::def::PolicyConfig,
     inbound::InboundManager,
+    resolver::Resolver,
     routing_state::{
         OutboundObservation, RouteMatch, RoutingEvent, RoutingInput, RoutingState,
     },
     session_tasks::ConnectionTaskOwner,
     traffic::TrafficContext,
-    user_domain::UserDomainAccessStore,
+    user_domain::{UserDomainAccessAuditContext, UserDomainAccessStore},
 };
 
 use super::{
@@ -87,15 +88,30 @@ fn xray_handshake_timeout_for_policy(
     Duration::from_secs(seconds)
 }
 
-#[derive(Debug)]
 pub(super) struct DataPlaneState {
     pub(super) inbound_manager: Arc<InboundManager>,
     pub(super) routing_publication: Arc<RwLock<Arc<RoutingPublication>>>,
     pub(super) policy: Arc<RwLock<PolicyConfig>>,
+    pub(super) resolver: Arc<dyn Resolver>,
     pub(super) user_domain_access: UserDomainAccessStore,
     pub(super) balancer_overrides: Arc<RwLock<Arc<HashMap<String, String>>>>,
     pub(super) routing_events: broadcast::Sender<RoutingEvent>,
     pub(super) connection_tasks: ConnectionTaskOwner,
+}
+
+impl std::fmt::Debug for DataPlaneState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DataPlaneState")
+            .field("inbound_manager", &self.inbound_manager)
+            .field("routing_publication", &self.routing_publication)
+            .field("policy", &self.policy)
+            .field("user_domain_access", &self.user_domain_access)
+            .field("balancer_overrides", &self.balancer_overrides)
+            .field("routing_events", &self.routing_events)
+            .field("connection_tasks", &self.connection_tasks)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DataPlaneState {
@@ -303,6 +319,19 @@ impl DataPlaneState {
         self.user_domain_access.allows(identity, target_domain)
     }
 
+    pub(super) fn allows_user_domain_access_with_context(
+        &self,
+        identity: &str,
+        target_domain: &str,
+        audit_context: UserDomainAccessAuditContext<'_>,
+    ) -> bool {
+        self.user_domain_access.allows_with_context(
+            identity,
+            target_domain,
+            audit_context,
+        )
+    }
+
     pub(super) fn allows_user_domain_access_with_identities(
         &self,
         identities: &[String],
@@ -310,6 +339,19 @@ impl DataPlaneState {
     ) -> bool {
         self.user_domain_access
             .allows_with_identities(identities, target_domain)
+    }
+
+    pub(super) fn allows_user_domain_access_with_identities_and_context(
+        &self,
+        identities: &[String],
+        target_domain: &str,
+        audit_context: UserDomainAccessAuditContext<'_>,
+    ) -> bool {
+        self.user_domain_access.allows_with_identities_and_context(
+            identities,
+            target_domain,
+            audit_context,
+        )
     }
 
     pub(super) fn record_passive_outbound_observation(
@@ -325,6 +367,33 @@ impl DataPlaneState {
 pub struct DataPlaneRuntime(pub(super) Arc<DataPlaneState>);
 
 impl DataPlaneRuntime {
+    pub(crate) fn resolver(&self) -> Arc<dyn Resolver> {
+        Arc::clone(&self.0.resolver)
+    }
+
+    pub(crate) fn outbounds(&self) -> Vec<OutboundSummary> {
+        self.0.routing_publication().outbounds.as_ref().clone()
+    }
+
+    pub(crate) fn outbound_observation(
+        &self,
+        tag: &str,
+    ) -> Option<OutboundObservation> {
+        self.0.routing().observation(tag)
+    }
+
+    pub(crate) fn record_outbound_observation(
+        &self,
+        tag: impl Into<String>,
+        observation: OutboundObservation,
+    ) {
+        self.0.routing().record_observation(tag, observation);
+    }
+
+    pub(crate) fn record_user_domain_dns_failure(&self) {
+        self.0.user_domain_access.record_dns_failure();
+    }
+
     pub fn inbound_handshake_runtime(&self) -> InboundHandshakeRuntime {
         InboundHandshakeRuntime {
             inbound_manager: Arc::clone(&self.0.inbound_manager),
@@ -437,6 +506,19 @@ impl DataPlaneRuntime {
         self.0.allows_user_domain_access(identity, target_domain)
     }
 
+    pub(crate) fn allows_user_domain_access_with_context(
+        &self,
+        identity: &str,
+        target_domain: &str,
+        audit_context: UserDomainAccessAuditContext<'_>,
+    ) -> bool {
+        self.0.allows_user_domain_access_with_context(
+            identity,
+            target_domain,
+            audit_context,
+        )
+    }
+
     pub(crate) fn allows_user_domain_access_with_identities(
         &self,
         identities: &[String],
@@ -444,6 +526,20 @@ impl DataPlaneRuntime {
     ) -> bool {
         self.0
             .allows_user_domain_access_with_identities(identities, target_domain)
+    }
+
+    pub(crate) fn allows_user_domain_access_with_identities_and_context(
+        &self,
+        identities: &[String],
+        target_domain: &str,
+        audit_context: UserDomainAccessAuditContext<'_>,
+    ) -> bool {
+        self.0
+            .allows_user_domain_access_with_identities_and_context(
+                identities,
+                target_domain,
+                audit_context,
+            )
     }
 
     pub(crate) fn record_passive_outbound_observation(

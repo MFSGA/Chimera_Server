@@ -17,7 +17,6 @@ use crate::{
     config::server_config::{
         Hysteria2ServerConfig, Hysteria2UdpFinalMask, TcpSocketPolicy,
     },
-    resolver::{NativeResolver, Resolver},
     runtime::DataPlaneRuntime,
     util::socket::new_socket2_udp_socket_with_buffer_size,
 };
@@ -128,7 +127,7 @@ pub async fn run_hysteria2_server(
     inbound_tag: String,
     runtime: DataPlaneRuntime,
 ) -> std::io::Result<()> {
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let resolver = runtime.resolver();
 
     let quic_server_config: quinn::crypto::rustls::QuicServerConfig =
         server_config.try_into().map_err(std::io::Error::other)?;

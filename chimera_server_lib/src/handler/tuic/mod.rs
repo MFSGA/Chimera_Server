@@ -23,7 +23,7 @@ use crate::{
     address::{Address, NetLocation},
     config::server_config::TuicServerConfig,
     outbound::connect_tcp_outbound,
-    resolver::{NativeResolver, Resolver},
+    resolver::Resolver,
     runtime::DataPlaneRuntime,
     traffic::{
         MeteredStream, TrafficContext, TrafficDirection, register_connection,
@@ -147,7 +147,7 @@ pub async fn run_tuic_server(
     inbound_tag: String,
     runtime: DataPlaneRuntime,
 ) -> std::io::Result<()> {
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let resolver = runtime.resolver();
 
     let quic_server_config: quinn::crypto::rustls::QuicServerConfig =
         server_config.try_into().map_err(std::io::Error::other)?;

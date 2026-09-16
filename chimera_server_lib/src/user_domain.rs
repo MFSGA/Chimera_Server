@@ -1,7 +1,8 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env,
     sync::{Arc, RwLock},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::Deserialize;
@@ -12,6 +13,11 @@ const MAX_POLICY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_USERS: usize = 100_000;
 const MAX_RULES_PER_USER: usize = 1_000;
 const MAX_TOTAL_RULES: usize = 1_000_000;
+const UNKNOWN_TARGET_AUDIT_DEDUP_WINDOW: Duration = Duration::from_secs(1);
+const MAX_UNKNOWN_TARGET_AUDIT_KEYS: usize = 4_096;
+const MAX_UNSUPPORTED_PROTOCOL_AUDIT_KEYS: usize = 128;
+const MAX_AUDIT_EVENTS: usize = 1_024;
+const MAX_AUDIT_FIELD_LENGTH: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UserDomainAccessError {
@@ -69,6 +75,9 @@ pub(crate) struct UserDomainAccessProtocolIdentity {
     pub(crate) trojan_password: String,
     pub(crate) http_username: String,
     pub(crate) socks_username: String,
+    /// Xray's Shadowsocks inbound exposes the authenticated `MemoryUser.Email`.
+    #[serde(default)]
+    pub(crate) shadowsocks_email: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -142,12 +151,36 @@ pub(crate) struct UserDomainAccessDecisionStats {
     pub(crate) allow_all_default: u64,
     pub(crate) allowlist_miss: u64,
     pub(crate) denylist_miss: u64,
+    pub(crate) dns_failures: u64,
 }
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct UserDomainAccessStatus {
     pub(crate) revision: Option<UserDomainAccessRevision>,
     pub(crate) stats: UserDomainAccessDecisionStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UserDomainAccessAuditEvent {
+    pub(crate) observed_at_unix_ms: u64,
+    pub(crate) decision: String,
+    pub(crate) reason: String,
+    pub(crate) inbound_tag: String,
+    pub(crate) protocol: String,
+    pub(crate) network: String,
+    pub(crate) target: String,
+    pub(crate) routing_user: String,
+    pub(crate) identity_count: u64,
+}
+
+/// Safe, non-authoritative context used only for user-domain audit logs.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UserDomainAccessAuditContext<'a> {
+    pub(crate) inbound_tag: &'a str,
+    pub(crate) protocol: &'a str,
+    pub(crate) network: &'a str,
+    pub(crate) target: &'a str,
+    pub(crate) routing_user: &'a str,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -185,6 +218,9 @@ struct UserDomainAccessInner {
     revisions: BTreeMap<u64, Arc<UserDomainAccessPublication>>,
     highest_version: u64,
     stats: UserDomainAccessDecisionStats,
+    unknown_target_audit: HashMap<String, Instant>,
+    unsupported_protocol_audit: HashSet<String>,
+    audit_events: VecDeque<UserDomainAccessAuditEvent>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -197,6 +233,20 @@ impl UserDomainAccessStore {
         &self,
         publication: UserDomainAccessPublication,
     ) -> Result<UserDomainAccessRevision, UserDomainAccessFailure> {
+        let legacy_reject_users = publication
+            .users
+            .iter()
+            .filter(|user| {
+                matches!(user.unknown_target_action, UserDomainAccessAction::Reject)
+            })
+            .count();
+        if legacy_reject_users > 0 {
+            tracing::warn!(
+                event = "user_domain_access_unknown_target_action_ignored",
+                legacy_reject_users,
+                "unknown targets are always allowed and audited; the legacy reject action is ignored"
+            );
+        }
         let revision = revision_of(&publication);
         let publication = Arc::new(publication);
         let mut inner = self
@@ -221,6 +271,9 @@ impl UserDomainAccessStore {
             .insert(publication.version, Arc::clone(&publication));
         inner.active = Some(ActiveUserDomainAccessPublication::new(publication));
         inner.stats = UserDomainAccessDecisionStats::default();
+        inner.unknown_target_audit.clear();
+        inner.unsupported_protocol_audit.clear();
+        inner.audit_events.clear();
         Ok(revision)
     }
 
@@ -241,6 +294,9 @@ impl UserDomainAccessStore {
         let revision = revision_of(&publication);
         inner.active = Some(ActiveUserDomainAccessPublication::new(publication));
         inner.stats = UserDomainAccessDecisionStats::default();
+        inner.unknown_target_audit.clear();
+        inner.unsupported_protocol_audit.clear();
+        inner.audit_events.clear();
         Ok(revision)
     }
 
@@ -255,12 +311,47 @@ impl UserDomainAccessStore {
         }
     }
 
+    pub(crate) fn record_dns_failure(&self) {
+        let mut inner = self
+            .inner
+            .write()
+            .expect("user-domain access lock poisoned");
+        bump(&mut inner.stats.dns_failures);
+    }
+
+    pub(crate) fn audit_events(
+        &self,
+        limit: usize,
+    ) -> Vec<UserDomainAccessAuditEvent> {
+        let inner = self.inner.read().expect("user-domain access lock poisoned");
+        inner
+            .audit_events
+            .iter()
+            .rev()
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
     /// Applies the active policy to a resolved target domain before an
-    /// outbound connection is established. An empty target domain represents
-    /// an IP-only or otherwise unknown target and follows the configured
-    /// unknown-target action.
+    /// outbound connection is established. An empty or invalid target domain
+    /// represents an IP-only or otherwise unknown target and is always
+    /// allowed; the decision is recorded for auditing.
     pub(crate) fn allows(&self, identity: &str, target_domain: &str) -> bool {
-        self.allows_identity_iter(std::iter::once(identity), target_domain)
+        self.allows_identity_iter(std::iter::once(identity), target_domain, None)
+    }
+
+    pub(crate) fn allows_with_context(
+        &self,
+        identity: &str,
+        target_domain: &str,
+        audit_context: UserDomainAccessAuditContext<'_>,
+    ) -> bool {
+        self.allows_identity_iter(
+            std::iter::once(identity),
+            target_domain,
+            Some(audit_context),
+        )
     }
 
     pub(crate) fn allows_with_identities(
@@ -271,10 +362,29 @@ impl UserDomainAccessStore {
         self.allows_identity_iter(
             identities.iter().map(String::as_str),
             target_domain,
+            None,
         )
     }
 
-    fn allows_identity_iter<'a, I>(&self, identities: I, target_domain: &str) -> bool
+    pub(crate) fn allows_with_identities_and_context(
+        &self,
+        identities: &[String],
+        target_domain: &str,
+        audit_context: UserDomainAccessAuditContext<'_>,
+    ) -> bool {
+        self.allows_identity_iter(
+            identities.iter().map(String::as_str),
+            target_domain,
+            Some(audit_context),
+        )
+    }
+
+    fn allows_identity_iter<'a, 'b, I>(
+        &self,
+        identities: I,
+        target_domain: &'b str,
+        audit_context: Option<UserDomainAccessAuditContext<'b>>,
+    ) -> bool
     where
         I: IntoIterator<Item = &'a str>,
     {
@@ -291,10 +401,11 @@ impl UserDomainAccessStore {
             active
         };
 
+        let identities = identities.into_iter().collect::<Vec<_>>();
         let enforcement_mode = active.publication.enforcement_mode;
         let (allowed, reason) = evaluate_public_with_identities(
             &active.publication,
-            identities,
+            identities.iter().copied(),
             target_domain,
         );
 
@@ -302,14 +413,89 @@ impl UserDomainAccessStore {
             .inner
             .write()
             .expect("user-domain access lock poisoned");
-        if inner
+        let active_is_current = inner
             .active
             .as_ref()
-            .is_some_and(|current| current.same_activation(&active))
-        {
+            .is_some_and(|current| current.same_activation(&active));
+        let should_log_unknown_target = if active_is_current {
             record_decision_stats(&mut inner.stats, allowed, reason);
+            matches!(reason, DecisionReason::UnknownTarget)
+                && should_emit_unknown_target_audit(
+                    &mut inner,
+                    target_domain,
+                    audit_context,
+                    Instant::now(),
+                )
+        } else {
+            false
+        };
+        let unsupported_protocol = audit_context.filter(|context| {
+            !context.protocol.trim().is_empty()
+                && !is_user_domain_protocol_supported(context.protocol)
+        });
+        let should_warn_unsupported_protocol = active_is_current
+            && unsupported_protocol.is_some_and(|context| {
+                should_emit_unsupported_protocol_audit(&mut inner, context)
+            });
+        let audit_event = should_log_unknown_target.then(|| {
+            let routing_user = audit_context
+                .map(|context| safe_routing_user_summary(context.routing_user))
+                .unwrap_or_else(|| "unavailable".to_string());
+            let event = UserDomainAccessAuditEvent {
+                observed_at_unix_ms: unix_timestamp_ms(),
+                decision: "allow".to_string(),
+                reason: "domain_not_available".to_string(),
+                inbound_tag: audit_context
+                    .map_or("", |context| context.inbound_tag)
+                    .to_string(),
+                protocol: audit_context
+                    .map_or("", |context| context.protocol)
+                    .to_string(),
+                network: audit_context
+                    .map_or("", |context| context.network)
+                    .to_string(),
+                target: audit_context
+                    .map_or(target_domain, |context| context.target)
+                    .to_string(),
+                routing_user,
+                identity_count: identities.len() as u64,
+            };
+            limit_audit_event_fields(event)
+        });
+        if let Some(event) = audit_event.as_ref() {
+            if inner.audit_events.len() >= MAX_AUDIT_EVENTS {
+                inner.audit_events.pop_front();
+            }
+            inner.audit_events.push_back(event.clone());
         }
         drop(inner);
+
+        if let Some(event) = audit_event {
+            tracing::info!(
+                event = "user_domain_access_unknown_target",
+                decision = %event.decision,
+                reason = %event.reason,
+                inbound_tag = %event.inbound_tag,
+                protocol = %event.protocol,
+                network = %event.network,
+                target = %event.target,
+                routing_user = %event.routing_user,
+                enforcement_mode = ?enforcement_mode,
+                identity_count = event.identity_count,
+                "user-domain access policy allowed a target without a usable domain"
+            );
+        }
+        if should_warn_unsupported_protocol
+            && let Some(context) = unsupported_protocol
+        {
+            tracing::warn!(
+                event = "user_domain_access_unsupported_protocol",
+                inbound_tag = %context.inbound_tag,
+                protocol = %context.protocol,
+                network = %context.network,
+                "user-domain access is not a verified capability for this inbound protocol; protocol-specific support remains pending"
+            );
+        }
 
         if enforcement_mode == UserDomainEnforcementMode::Shadow {
             true
@@ -333,10 +519,17 @@ impl UserDomainAccessPublicationUser {
             self.protocol_identity.trojan_password.as_str(),
             self.protocol_identity.http_username.as_str(),
             self.protocol_identity.socks_username.as_str(),
+            self.protocol_identity.shadowsocks_email.as_str(),
         ]
         .iter()
         .any(|candidate| !candidate.is_empty() && *candidate == identity)
     }
+}
+
+fn is_user_domain_protocol_supported(protocol: &str) -> bool {
+    ["vless", "xhttp", "hysteria2", "socks", "socks5", "trojan"]
+        .iter()
+        .any(|supported| protocol.trim().eq_ignore_ascii_case(supported))
 }
 
 impl UserDomainAccessRule {
@@ -371,6 +564,10 @@ fn evaluate_public_with_identities<'a, I>(
 where
     I: IntoIterator<Item = &'a str>,
 {
+    let Some(target_domain) = normalize_domain_for_match(target_domain) else {
+        return (true, DecisionReason::UnknownTarget);
+    };
+
     let identities = identities.into_iter().collect::<Vec<_>>();
     let Some(user) = publication.users.iter().find(|user| {
         identities
@@ -380,13 +577,6 @@ where
         return (
             publication.default_action.is_allowed(),
             DecisionReason::NoUserPolicy,
-        );
-    };
-
-    let Some(target_domain) = normalize_domain_for_match(target_domain) else {
-        return (
-            user.unknown_target_action.is_allowed(),
-            DecisionReason::UnknownTarget,
         );
     };
 
@@ -615,6 +805,104 @@ fn normalize_domain_for_match(value: &str) -> Option<String> {
     }
 }
 
+fn safe_routing_user_summary(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        return "none".to_string();
+    }
+    let digest = Sha256::digest(value.as_bytes());
+    format!("sha256:{digest:x}")
+}
+
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn limit_audit_event_fields(
+    mut event: UserDomainAccessAuditEvent,
+) -> UserDomainAccessAuditEvent {
+    event.inbound_tag = truncate_audit_field(&event.inbound_tag);
+    event.protocol = truncate_audit_field(&event.protocol);
+    event.network = truncate_audit_field(&event.network);
+    event.target = truncate_audit_field(&event.target);
+    event.routing_user = truncate_audit_field(&event.routing_user);
+    event
+}
+
+fn truncate_audit_field(value: &str) -> String {
+    value.chars().take(MAX_AUDIT_FIELD_LENGTH).collect()
+}
+
+fn should_emit_unknown_target_audit(
+    inner: &mut UserDomainAccessInner,
+    target_domain: &str,
+    audit_context: Option<UserDomainAccessAuditContext<'_>>,
+    now: Instant,
+) -> bool {
+    inner.unknown_target_audit.retain(|_, last_seen| {
+        now.duration_since(*last_seen) < UNKNOWN_TARGET_AUDIT_DEDUP_WINDOW
+    });
+    let key = unknown_target_audit_key(target_domain, audit_context);
+    if let Some(last_seen) = inner.unknown_target_audit.get_mut(&key) {
+        if now.duration_since(*last_seen) < UNKNOWN_TARGET_AUDIT_DEDUP_WINDOW {
+            return false;
+        }
+        *last_seen = now;
+        return true;
+    }
+    if inner.unknown_target_audit.len() >= MAX_UNKNOWN_TARGET_AUDIT_KEYS {
+        return false;
+    }
+    inner.unknown_target_audit.insert(key, now);
+    true
+}
+
+fn should_emit_unsupported_protocol_audit(
+    inner: &mut UserDomainAccessInner,
+    context: UserDomainAccessAuditContext<'_>,
+) -> bool {
+    let key = format!(
+        "{}\0{}",
+        context.inbound_tag,
+        context.protocol.trim().to_ascii_lowercase()
+    );
+    if !inner.unsupported_protocol_audit.insert(key) {
+        return false;
+    }
+    if inner.unsupported_protocol_audit.len() > MAX_UNSUPPORTED_PROTOCOL_AUDIT_KEYS {
+        if let Some(key) = inner.unsupported_protocol_audit.iter().next().cloned() {
+            inner.unsupported_protocol_audit.remove(&key);
+        }
+    }
+    true
+}
+
+fn unknown_target_audit_key(
+    target_domain: &str,
+    audit_context: Option<UserDomainAccessAuditContext<'_>>,
+) -> String {
+    let mut key = String::new();
+    if let Some(context) = audit_context {
+        key.push_str(context.inbound_tag);
+        key.push('\0');
+        key.push_str(context.protocol);
+        key.push('\0');
+        key.push_str(context.network);
+        key.push('\0');
+        key.push_str(context.target);
+        key.push('\0');
+        key.push_str(context.routing_user);
+    } else {
+        key.push_str(target_domain);
+    }
+    let digest = Sha256::digest(key.as_bytes());
+    format!("{digest:x}")
+}
+
 fn revision_of(
     publication: &UserDomainAccessPublication,
 ) -> UserDomainAccessRevision {
@@ -692,6 +980,8 @@ fn record_decision_stats(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
+
     use super::*;
 
     fn publication_json(version: u64, checksum: Option<&str>) -> String {
@@ -797,6 +1087,128 @@ mod tests {
     }
 
     #[test]
+    fn unknown_targets_are_always_allowed_and_recorded() {
+        let store = UserDomainAccessStore::default();
+        let mut value: Value =
+            serde_json::from_str(&publication_json(1, None)).unwrap();
+        value["defaultAction"] = Value::String("reject".to_string());
+        value["checksum"] = Value::String(checksum_for_value(&value).unwrap());
+        store
+            .apply(parse_publication(&value.to_string()).unwrap())
+            .unwrap();
+
+        assert!(store.allows("vless-1", ""));
+        assert!(store.allows("unknown-user", "203.0.113.10"));
+
+        let stats = store.status().stats;
+        assert_eq!(stats.evaluations, 2);
+        assert_eq!(stats.allowed, 2);
+        assert_eq!(stats.rejected, 0);
+        assert_eq!(stats.unknown_target, 2);
+        assert_eq!(stats.no_user_policy, 0);
+
+        let events = store.audit_events(10);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].decision, "allow");
+        assert_eq!(events[0].reason, "domain_not_available");
+        assert_eq!(events[0].routing_user, "unavailable");
+    }
+
+    #[test]
+    fn audit_events_keep_safe_context_and_return_newest_first() {
+        let store = UserDomainAccessStore::default();
+        store
+            .apply(parse_publication(&signed_publication(1)).unwrap())
+            .unwrap();
+        let context = UserDomainAccessAuditContext {
+            inbound_tag: "vless-in",
+            protocol: "vless",
+            network: "tcp",
+            target: "203.0.113.10:443",
+            routing_user: "alice@example.com",
+        };
+
+        assert!(store.allows_with_context("vless-1", "", context));
+        assert_eq!(store.audit_events(1).len(), 1);
+        let event = &store.audit_events(1)[0];
+        assert_eq!(event.target, "203.0.113.10:443");
+        assert_eq!(
+            event.routing_user,
+            safe_routing_user_summary("alice@example.com")
+        );
+        assert!(!event.routing_user.contains("alice@example.com"));
+    }
+
+    #[test]
+    fn unknown_target_audit_is_deduplicated_within_the_window() {
+        let mut inner = UserDomainAccessInner::default();
+        let context = UserDomainAccessAuditContext {
+            inbound_tag: "vless-in",
+            protocol: "vless",
+            network: "tcp",
+            target: "203.0.113.10:443",
+            routing_user: "alice@example.com",
+        };
+        let start = Instant::now();
+
+        assert!(should_emit_unknown_target_audit(
+            &mut inner,
+            "",
+            Some(context),
+            start,
+        ));
+        assert!(!should_emit_unknown_target_audit(
+            &mut inner,
+            "",
+            Some(context),
+            start + Duration::from_millis(500),
+        ));
+        assert!(should_emit_unknown_target_audit(
+            &mut inner,
+            "",
+            Some(context),
+            start + UNKNOWN_TARGET_AUDIT_DEDUP_WINDOW,
+        ));
+    }
+
+    #[test]
+    fn unsupported_protocol_diagnostic_is_explicit_and_deduplicated() {
+        let mut inner = UserDomainAccessInner::default();
+        let context = UserDomainAccessAuditContext {
+            inbound_tag: "vmess-in",
+            protocol: "vmess",
+            network: "tcp",
+            target: "blocked.example",
+            routing_user: "user@example.com",
+        };
+
+        assert!(!is_user_domain_protocol_supported(context.protocol));
+        assert!(should_emit_unsupported_protocol_audit(&mut inner, context));
+        assert!(!should_emit_unsupported_protocol_audit(&mut inner, context));
+        assert_eq!(inner.unsupported_protocol_audit.len(), 1);
+
+        assert!(is_user_domain_protocol_supported("VLESS"));
+        assert!(is_user_domain_protocol_supported("xhttp"));
+        assert!(is_user_domain_protocol_supported("socks5"));
+        assert!(!is_user_domain_protocol_supported("tuic"));
+
+        let store = UserDomainAccessStore::default();
+        store
+            .apply(parse_publication(&signed_publication(1)).unwrap())
+            .unwrap();
+        assert!(store.allows_with_context("vless-1", "api.example.com", context));
+    }
+
+    #[test]
+    fn audit_user_summary_does_not_expose_the_routing_user() {
+        let summary = safe_routing_user_summary("alice@example.com");
+
+        assert!(!summary.contains("alice@example.com"));
+        assert!(summary.starts_with("sha256:"));
+        assert_eq!(summary, safe_routing_user_summary("alice@example.com"));
+    }
+
+    #[test]
     fn policy_matches_any_authenticated_protocol_identity() {
         let store = UserDomainAccessStore::default();
         store
@@ -805,6 +1217,24 @@ mod tests {
 
         let identities = vec!["user-label".to_string(), "vless-1".to_string()];
         assert!(store.allows_with_identities(&identities, "api.example.com"));
+    }
+
+    #[test]
+    fn policy_matches_shadowsocks_email_identity() {
+        let mut value: Value =
+            serde_json::from_str(&publication_json(1, None)).unwrap();
+        value["defaultAction"] = Value::String("reject".to_string());
+        value["users"][0]["protocolIdentity"]["shadowsocksEmail"] =
+            Value::String("ss-user@example.com".to_string());
+        value["checksum"] = Value::String(checksum_for_value(&value).unwrap());
+
+        let store = UserDomainAccessStore::default();
+        store
+            .apply(parse_publication(&value.to_string()).unwrap())
+            .unwrap();
+
+        assert!(store.allows("ss-user@example.com", "api.example.com"));
+        assert!(!store.allows("other@example.com", "api.example.com"));
     }
 
     #[test]
@@ -907,6 +1337,42 @@ mod tests {
 
         assert!(Arc::ptr_eq(&original.publication, &rolled_back.publication));
         assert!(!original.same_activation(&rolled_back));
+    }
+
+    #[test]
+    fn concurrent_same_version_activation_has_one_winner() {
+        let store = Arc::new(UserDomainAccessStore::default());
+        let publication = parse_publication(&signed_publication(7)).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+
+        let first_store = Arc::clone(&store);
+        let first_barrier = Arc::clone(&barrier);
+        let first_publication = publication.clone();
+        let first = std::thread::spawn(move || {
+            first_barrier.wait();
+            first_store.apply(first_publication)
+        });
+
+        let second_store = Arc::clone(&store);
+        let second_barrier = Arc::clone(&barrier);
+        let second = std::thread::spawn(move || {
+            second_barrier.wait();
+            second_store.apply(publication)
+        });
+
+        barrier.wait();
+        let first = first.join().expect("first concurrent apply task");
+        let second = second.join().expect("second concurrent apply task");
+        assert_eq!(first.is_ok() as u8 + second.is_ok() as u8, 1);
+
+        let failure = if first.is_err() {
+            first.err()
+        } else {
+            second.err()
+        }
+        .expect("one concurrent apply must fail");
+        assert_eq!(failure.kind, UserDomainAccessError::FailedPrecondition);
+        assert_eq!(store.status().revision.expect("active revision").version, 7);
     }
 
     #[test]
