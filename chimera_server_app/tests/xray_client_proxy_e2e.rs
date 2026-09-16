@@ -15,6 +15,7 @@ use std::{
 };
 
 use aws_lc_rs::digest::{SHA256, digest};
+use prost::Message;
 use rustls::{
     ClientConfig as RustlsClientConfig, DigitallySignedStruct, Error as RustlsError,
     ServerConfig as RustlsServerConfig, SignatureScheme,
@@ -25,12 +26,17 @@ use rustls::{
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
 use rustls_pemfile::{certs, private_key};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener as TokioTcpListener, UdpSocket as TokioUdpSocket},
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tonic::{
+    Request, Status,
+    codegen::http::uri::PathAndQuery,
+    transport::{Channel, Endpoint},
+};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
@@ -42,6 +48,8 @@ const REALITY_PUBLIC_KEY: &str = "lpaMu0U01fKbRO9mgkSiOArWZz4V0TRW7pR543Pm9Xg";
 const REALITY_SHORT_ID: &str = "4ac97aaf8b9b0356";
 const REALITY_SERVER_NAME: &str = "www.apple.com";
 const HYSTERIA_AUTH: &str = "hysteria-auth-token";
+const PATH_USER_DOMAIN_APPLY_POLICY: &str =
+    "/chimera.app.userdomain.command.UserDomainAccessService/ApplyPolicy";
 static RUSTLS_PROVIDER: Once = Once::new();
 
 #[derive(Debug)]
@@ -1941,6 +1949,1462 @@ async fn xray_client_can_proxy_tcp_through_chimera_vless_tcp() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera and ./xray to verify per-user domain allow/reject"]
+async fn xray_client_domain_access_policy_allows_and_rejects_vless_target() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("vless-domain-access-policy");
+    let (echo_addr, accepted) = start_tcp_echo_server_with_counter();
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let chimera_config_path = work_dir.join("chimera.json");
+    let xray_config_path = work_dir.join("xray-client.json");
+    let echo_ip = echo_addr.ip().to_string();
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "vless",
+                "tag": "chimera-vless-domain-access",
+                "settings": {
+                    "clients": [{"id": TEST_UUID, "email": "domain-access@example.test"}],
+                    "decryption": "none"
+                },
+                "streamSettings": {"network": "tcp", "security": "none"}
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "dns": {
+                "hosts": {
+                    "allowed.example": echo_ip,
+                    "blocked.example": echo_ip
+                }
+            },
+            "userDomainAccess": signed_vless_domain_access_policy(
+                TEST_UUID,
+                "blocked.example"
+            )
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth"}
+            }],
+            "dns": {
+                "hosts": {
+                    "allowed.example": echo_ip,
+                    "blocked.example": echo_ip
+                }
+            },
+            "outbounds": [{
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": chimera_port,
+                        "users": [{"id": TEST_UUID, "encryption": "none"}]
+                    }]
+                },
+                "streamSettings": {"network": "tcp", "security": "none"}
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+
+    assert_socks5_domain_echo(
+        socks_addr,
+        "allowed.example",
+        echo_addr.port(),
+        b"allowed domain through Xray",
+    );
+    wait_for_counter(&accepted, 1);
+    assert_socks5_domain_echo_does_not_succeed(
+        socks_addr,
+        "blocked.example",
+        echo_addr.port(),
+    );
+    thread::sleep(CONNECT_RETRY_INTERVAL * 4);
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+
+    assert_socks5_echo(
+        socks_addr,
+        echo_addr,
+        b"direct IP remains allowed and audited",
+    );
+    wait_for_counter(&accepted, 2);
+    let deadline = Instant::now() + IO_TIMEOUT;
+    loop {
+        let logs = read_lossy(&chimera.stderr_path);
+        if logs.contains("user_domain_access_unknown_target") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "missing unknown-target audit event; logs={logs}"
+        );
+        thread::sleep(CONNECT_RETRY_INTERVAL);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera and ./xray to verify XHTTP user-domain policy"]
+async fn xray_client_xhttp_domain_access_policy_allows_and_rejects_target() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("vless-xhttp-domain-access-policy");
+    let (echo_addr, accepted) = start_tcp_echo_server_with_counter();
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let chimera_config_path = work_dir.join("chimera.json");
+    let xray_config_path = work_dir.join("xray-client.json");
+    let echo_ip = echo_addr.ip().to_string();
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "vless",
+                "tag": "chimera-vless-xhttp-domain-access",
+                "settings": {
+                    "clients": [{"id": TEST_UUID, "email": "xhttp-domain-access@example.test"}],
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "xhttp",
+                    "security": "none",
+                    "xhttpSettings": {
+                        "path": "/xhttp",
+                        "mode": "packet-up",
+                        "noGRPCHeader": true,
+                        "noSSEHeader": true,
+                        "sessionIDPlacement": "header",
+                        "sessionIDKey": "X-Session",
+                        "seqPlacement": "header",
+                        "seqKey": "X-Seq",
+                        "uplinkDataPlacement": "body"
+                    }
+                }
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "dns": {"hosts": {
+                "allowed.example": echo_ip,
+                "blocked.example": echo_ip
+            }},
+            "userDomainAccess": signed_vless_domain_access_policy(
+                TEST_UUID,
+                "blocked.example"
+            )
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth"}
+            }],
+            "dns": {"hosts": {
+                "allowed.example": echo_ip,
+                "blocked.example": echo_ip
+            }},
+            "outbounds": [{
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": chimera_port,
+                        "users": [{"id": TEST_UUID, "encryption": "none"}]
+                    }]
+                },
+                "streamSettings": {
+                    "network": "xhttp",
+                    "security": "none",
+                    "xhttpSettings": {
+                        "path": "/xhttp",
+                        "mode": "packet-up",
+                        "noGRPCHeader": true,
+                        "sessionPlacement": "header",
+                        "sessionKey": "X-Session",
+                        "sessionIDPlacement": "header",
+                        "sessionIDKey": "X-Session",
+                        "seqPlacement": "header",
+                        "seqKey": "X-Seq",
+                        "uplinkDataPlacement": "body"
+                    }
+                }
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+
+    assert_socks5_domain_echo(
+        socks_addr,
+        "allowed.example",
+        echo_addr.port(),
+        b"allowed XHTTP domain",
+    );
+    wait_for_counter(&accepted, 1);
+    assert_socks5_domain_echo_does_not_succeed(
+        socks_addr,
+        "blocked.example",
+        echo_addr.port(),
+    );
+    thread::sleep(CONNECT_RETRY_INTERVAL * 4);
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera and ./xray to verify XHTTP TLS user-domain policy"]
+async fn xray_client_xhttp_tls_domain_access_policy_allows_and_rejects_target() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("vless-xhttp-tls-domain-access-policy");
+    let (echo_addr, accepted) = start_tcp_echo_server_with_counter();
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let (cert_path, key_path) = generate_test_certificate(&work_dir);
+    let pinned_peer_cert_sha256 = first_cert_sha256_hex(&cert_path);
+    let chimera_config_path = work_dir.join("chimera.json");
+    let xray_config_path = work_dir.join("xray-client.json");
+    let echo_ip = echo_addr.ip().to_string();
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "vless",
+                "tag": "chimera-vless-xhttp-tls-domain-access",
+                "settings": {
+                    "clients": [{"id": TEST_UUID, "email": "xhttp-tls-domain-access@example.test"}],
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "xhttp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "certificates": [{
+                            "certificateFile": cert_path,
+                            "keyFile": key_path
+                        }]
+                    },
+                    "xhttpSettings": {
+                        "path": "/xhttp",
+                        "mode": "packet-up",
+                        "noGRPCHeader": true,
+                        "noSSEHeader": true,
+                        "sessionIDPlacement": "header",
+                        "sessionIDKey": "X-Session",
+                        "seqPlacement": "header",
+                        "seqKey": "X-Seq",
+                        "uplinkDataPlacement": "body"
+                    }
+                }
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "dns": {"hosts": {
+                "allowed.example": echo_ip,
+                "blocked.example": echo_ip
+            }},
+            "userDomainAccess": signed_vless_domain_access_policy(
+                TEST_UUID,
+                "blocked.example"
+            )
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth"}
+            }],
+            "dns": {"hosts": {
+                "allowed.example": echo_ip,
+                "blocked.example": echo_ip
+            }},
+            "outbounds": [{
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": chimera_port,
+                        "users": [{"id": TEST_UUID, "encryption": "none"}]
+                    }]
+                },
+                "streamSettings": {
+                    "network": "xhttp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "pinnedPeerCertSha256": pinned_peer_cert_sha256
+                    },
+                    "xhttpSettings": {
+                        "path": "/xhttp",
+                        "mode": "packet-up",
+                        "noGRPCHeader": true,
+                        "sessionPlacement": "header",
+                        "sessionKey": "X-Session",
+                        "sessionIDPlacement": "header",
+                        "sessionIDKey": "X-Session",
+                        "seqPlacement": "header",
+                        "seqKey": "X-Seq",
+                        "uplinkDataPlacement": "body"
+                    }
+                }
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+
+    assert_socks5_domain_echo(
+        socks_addr,
+        "allowed.example",
+        echo_addr.port(),
+        b"allowed XHTTP TLS domain",
+    );
+    wait_for_counter(&accepted, 1);
+    assert_socks5_domain_echo_does_not_succeed(
+        socks_addr,
+        "blocked.example",
+        echo_addr.port(),
+    );
+    thread::sleep(CONNECT_RETRY_INTERVAL * 4);
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera and ./xray to verify Socks5 user-domain policy"]
+async fn xray_client_socks5_username_domain_access_policy_allows_and_rejects_target()
+{
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("socks5-username-domain-access-policy");
+    let (echo_addr, accepted) = start_tcp_echo_server_with_counter();
+    let udp_echo_addr = start_udp_echo_server().await;
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let chimera_config_path = work_dir.join("chimera.json");
+    let xray_config_path = work_dir.join("xray-client.json");
+    let echo_ip = echo_addr.ip().to_string();
+    let username = "socks5-domain-access-user";
+    let password = "socks5-domain-access-password";
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "socks",
+                "tag": "chimera-socks5-domain-access",
+                "settings": {
+                    "auth": "password",
+                    "accounts": [{"user": username, "pass": password}],
+                    "udp": true
+                },
+                "streamSettings": {"network": "tcp"}
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "dns": {"hosts": {
+                "allowed.example": echo_ip,
+                "blocked.example": echo_ip
+            }},
+            "userDomainAccess": signed_socks_domain_access_policy(
+                username,
+                "blocked.example"
+            )
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth", "udp": true}
+            }],
+            "dns": {"hosts": {
+                "allowed.example": echo_ip,
+                "blocked.example": echo_ip
+            }},
+            "outbounds": [{
+                "protocol": "socks",
+                "settings": {
+                    "servers": [{
+                        "address": "127.0.0.1",
+                        "port": chimera_port,
+                        "users": [{"user": username, "pass": password}]
+                    }]
+                }
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+
+    assert_socks5_domain_echo(
+        socks_addr,
+        "allowed.example",
+        echo_addr.port(),
+        b"allowed Socks5 username domain",
+    );
+    wait_for_counter(&accepted, 1);
+    assert_socks5_udp_domain_echo(
+        socks_addr,
+        "allowed.example",
+        udp_echo_addr.port(),
+        b"allowed Socks5 UDP username domain",
+    )
+    .await;
+    assert_socks5_domain_echo_does_not_succeed(
+        socks_addr,
+        "blocked.example",
+        echo_addr.port(),
+    );
+    assert_socks5_udp_domain_echo_does_not_succeed(
+        socks_addr,
+        "blocked.example",
+        udp_echo_addr.port(),
+    )
+    .await;
+    thread::sleep(CONNECT_RETRY_INTERVAL * 4);
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera and ./xray to verify Shadowsocks email user-domain policy"]
+async fn xray_client_shadowsocks_email_domain_access_policy_allows_and_rejects_target()
+ {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("shadowsocks-email-domain-access-policy");
+    let (echo_addr, accepted) = start_tcp_echo_server_with_counter();
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let chimera_config_path = work_dir.join("chimera.json");
+    let xray_config_path = work_dir.join("xray-client.json");
+    let echo_ip = echo_addr.ip().to_string();
+    let email = "shadowsocks-domain-access@example.test";
+    let password = "shadowsocks-domain-access-password";
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "shadowsocks",
+                "tag": "chimera-shadowsocks-domain-access",
+                "settings": {
+                    "method": "aes-128-gcm",
+                    "password": password,
+                    "email": email,
+                    "network": "tcp"
+                }
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "dns": {"hosts": {
+                "allowed.example": echo_ip,
+                "blocked.example": echo_ip
+            }},
+            "userDomainAccess": signed_shadowsocks_domain_access_policy(
+                email,
+                "blocked.example"
+            )
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth"}
+            }],
+            "dns": {"hosts": {
+                "allowed.example": echo_ip,
+                "blocked.example": echo_ip
+            }},
+            "outbounds": [{
+                "protocol": "shadowsocks",
+                "settings": {"servers": [{
+                    "address": "127.0.0.1",
+                    "port": chimera_port,
+                    "method": "aes-128-gcm",
+                    "password": password
+                }]}
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+
+    assert_socks5_domain_echo(
+        socks_addr,
+        "allowed.example",
+        echo_addr.port(),
+        b"allowed Shadowsocks email domain",
+    );
+    wait_for_counter(&accepted, 1);
+    assert_socks5_domain_echo_does_not_succeed(
+        socks_addr,
+        "blocked.example",
+        echo_addr.port(),
+    );
+    thread::sleep(CONNECT_RETRY_INTERVAL * 4);
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera and ./xray to verify Shadowsocks UDP email user-domain policy"]
+async fn xray_client_shadowsocks_udp_email_domain_access_policy_allows_and_rejects_target()
+ {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("shadowsocks-udp-email-domain-access-policy");
+    let udp_echo_addr = start_udp_echo_server().await;
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let chimera_config_path = work_dir.join("chimera.json");
+    let xray_config_path = work_dir.join("xray-client.json");
+    let echo_ip = udp_echo_addr.ip().to_string();
+    let email = "shadowsocks-udp-domain-access@example.test";
+    let password = "shadowsocks-udp-domain-access-password";
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "shadowsocks",
+                "tag": "chimera-shadowsocks-udp-domain-access",
+                "settings": {
+                    "method": "aes-128-gcm",
+                    "password": password,
+                    "email": email,
+                    "network": "tcp,udp"
+                }
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "dns": {"hosts": {
+                "allowed.example": echo_ip,
+                "blocked.example": echo_ip
+            }},
+            "userDomainAccess": signed_shadowsocks_domain_access_policy(
+                email,
+                "blocked.example"
+            )
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth", "udp": true}
+            }],
+            "dns": {"hosts": {
+                "allowed.example": echo_ip,
+                "blocked.example": echo_ip
+            }},
+            "outbounds": [{
+                "protocol": "shadowsocks",
+                "settings": {"servers": [{
+                    "address": "127.0.0.1",
+                    "port": chimera_port,
+                    "method": "aes-128-gcm",
+                    "password": password
+                }]}
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+
+    assert_socks5_udp_domain_echo(
+        socks_addr,
+        "allowed.example",
+        udp_echo_addr.port(),
+        b"allowed Shadowsocks UDP email domain",
+    )
+    .await;
+    assert_socks5_udp_domain_echo_does_not_succeed(
+        socks_addr,
+        "blocked.example",
+        udp_echo_addr.port(),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera and ./xray to verify Shadowsocks 2022 EIH UDP email user-domain policy"]
+async fn xray_client_shadowsocks_2022_eih_udp_email_domain_access_policy_allows_and_rejects_target()
+ {
+    let workspace = workspace_root();
+    let work_dir =
+        create_test_dir("shadowsocks-2022-eih-udp-email-domain-access-policy");
+    let udp_echo_addr = start_udp_echo_server().await;
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let chimera_config_path = work_dir.join("chimera.json");
+    let xray_config_path = work_dir.join("xray-client.json");
+    let echo_ip = udp_echo_addr.ip().to_string();
+    let server_psk = "AAECAwQFBgcICQoLDA0ODw==";
+    let user_psk = "EBESExQVFhcYGRobHB0eHw==";
+    let email = "shadowsocks-2022-eih-domain-access@example.test";
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "shadowsocks",
+                "tag": "chimera-shadowsocks-2022-eih-domain-access",
+                "settings": {
+                    "method": "2022-blake3-aes-128-gcm",
+                    "password": server_psk,
+                    "clients": [{"password": user_psk, "email": email}],
+                    "network": "tcp,udp"
+                }
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "dns": {"hosts": {
+                "allowed.example": echo_ip,
+                "blocked.example": echo_ip
+            }},
+            "userDomainAccess": signed_shadowsocks_domain_access_policy(
+                email,
+                "blocked.example"
+            )
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth", "udp": true}
+            }],
+            "dns": {"hosts": {
+                "allowed.example": echo_ip,
+                "blocked.example": echo_ip
+            }},
+            "outbounds": [{
+                "protocol": "shadowsocks",
+                "settings": {"servers": [{
+                    "address": "127.0.0.1",
+                    "port": chimera_port,
+                    "method": "2022-blake3-aes-128-gcm",
+                    "password": format!("{server_psk}:{user_psk}")
+                }]}
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+
+    assert_socks5_udp_domain_echo(
+        socks_addr,
+        "allowed.example",
+        udp_echo_addr.port(),
+        b"allowed Shadowsocks 2022 EIH email domain",
+    )
+    .await;
+    assert_socks5_udp_domain_echo_does_not_succeed(
+        socks_addr,
+        "blocked.example",
+        udp_echo_addr.port(),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera and ./xray to verify route-only HTTP domain routing"]
+async fn xray_client_route_only_sniffed_domain_reaches_user_policy() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("vless-route-only-sniffing-domain-policy");
+    let (echo_addr, accepted) = start_tcp_echo_server_with_counter();
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let chimera_config_path = work_dir.join("chimera.json");
+    let xray_config_path = work_dir.join("xray-client.json");
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "vless",
+                "tag": "chimera-vless-route-only-domain-policy",
+                "settings": {
+                    "clients": [{"id": TEST_UUID, "email": "route-only@example.test"}],
+                    "decryption": "none"
+                },
+                "sniffing": {
+                    "enabled": true,
+                    "destOverride": ["http"],
+                    "routeOnly": true
+                },
+                "streamSettings": {"network": "tcp", "security": "none"}
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "userDomainAccess": signed_vless_domain_access_policy(
+                TEST_UUID,
+                "blocked.example"
+            )
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth"}
+            }],
+            "outbounds": [{
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": chimera_port,
+                        "users": [{"id": TEST_UUID, "encryption": "none"}]
+                    }]
+                },
+                "streamSettings": {"network": "tcp", "security": "none"}
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+
+    assert_socks5_ip_http_host_echo(
+        socks_addr,
+        echo_addr,
+        "allowed.example",
+        b"allowed route-only domain",
+    );
+    wait_for_counter(&accepted, 1);
+    assert_socks5_ip_http_host_echo_does_not_succeed(
+        socks_addr,
+        echo_addr,
+        "blocked.example",
+        b"blocked route-only domain",
+    );
+    thread::sleep(CONNECT_RETRY_INTERVAL * 4);
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        1,
+        "route-only policy rejection must not dial the target"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera and ./xray to verify native routing user/domain matching"]
+async fn xray_client_native_routing_user_domain_rule_allows_and_rejects_target() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("vless-native-routing-user-domain");
+    let (echo_addr, accepted) = start_tcp_echo_server_with_counter();
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let chimera_config_path = work_dir.join("chimera.json");
+    let xray_config_path = work_dir.join("xray-client.json");
+    let echo_ip = echo_addr.ip().to_string();
+    let routing_user = "native-routing@example.test";
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "vless",
+                "tag": "chimera-vless-native-routing",
+                "settings": {
+                    "clients": [{
+                        "id": TEST_UUID,
+                        "email": routing_user
+                    }],
+                    "decryption": "none"
+                },
+                "streamSettings": {"network": "tcp", "security": "none"}
+            }],
+            "outbounds": [
+                {"tag": "direct", "protocol": "freedom"},
+                {"tag": "blocked", "protocol": "blackhole"}
+            ],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "user": [routing_user],
+                    "domain": ["full:blocked.example"],
+                    "outboundTag": "blocked"
+                }]
+            },
+            "dns": {"hosts": {
+                "allowed.example": echo_ip,
+                "blocked.example": echo_ip
+            }}
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth"}
+            }],
+            "dns": {"hosts": {
+                "allowed.example": echo_ip,
+                "blocked.example": echo_ip
+            }},
+            "outbounds": [{
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": chimera_port,
+                        "users": [{"id": TEST_UUID, "encryption": "none"}]
+                    }]
+                },
+                "streamSettings": {"network": "tcp", "security": "none"}
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+
+    assert_socks5_domain_echo(
+        socks_addr,
+        "allowed.example",
+        echo_addr.port(),
+        b"allowed native routing domain through Xray",
+    );
+    wait_for_counter(&accepted, 1);
+    assert_socks5_domain_echo_does_not_succeed(
+        socks_addr,
+        "blocked.example",
+        echo_addr.port(),
+    );
+    thread::sleep(CONNECT_RETRY_INTERVAL * 4);
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera and ./xray to verify VMess per-user domain allow/reject"]
+async fn xray_client_vmess_domain_access_policy_allows_and_rejects_target() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("vmess-domain-access-policy");
+    let (echo_addr, accepted) = start_tcp_echo_server_with_counter();
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let chimera_config_path = work_dir.join("chimera.json");
+    let xray_config_path = work_dir.join("xray-client.json");
+    let echo_ip = echo_addr.ip().to_string();
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "vmess",
+                "tag": "chimera-vmess-domain-access",
+                "settings": {
+                    "clients": [{
+                        "id": TEST_UUID,
+                        "email": "vmess-domain-access@example.test",
+                        "security": "auto"
+                    }]
+                },
+                "streamSettings": {"network": "tcp", "security": "none"}
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "dns": {"hosts": {
+                "allowed.example": echo_ip,
+                "blocked.example": echo_ip
+            }},
+            "userDomainAccess": signed_vmess_domain_access_policy(
+                TEST_UUID,
+                "blocked.example"
+            )
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth"}
+            }],
+            "dns": {"hosts": {
+                "allowed.example": echo_ip,
+                "blocked.example": echo_ip
+            }},
+            "outbounds": [{
+                "protocol": "vmess",
+                "settings": {"vnext": [{
+                    "address": "127.0.0.1",
+                    "port": chimera_port,
+                    "users": [{"id": TEST_UUID, "security": "auto"}]
+                }]},
+                "streamSettings": {"network": "tcp", "security": "none"}
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+
+    assert_socks5_domain_echo(
+        socks_addr,
+        "allowed.example",
+        echo_addr.port(),
+        b"allowed VMess domain through Xray",
+    );
+    wait_for_counter(&accepted, 1);
+    assert_socks5_domain_echo_does_not_succeed(
+        socks_addr,
+        "blocked.example",
+        echo_addr.port(),
+    );
+    thread::sleep(CONNECT_RETRY_INTERVAL * 4);
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera and ./xray to verify Trojan per-user domain allow/reject"]
+async fn xray_client_trojan_domain_access_policy_allows_and_rejects_target() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("trojan-domain-access-policy");
+    let (echo_addr, accepted) = start_tcp_echo_server_with_counter();
+    let udp_echo_addr = start_udp_echo_server().await;
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let chimera_config_path = work_dir.join("chimera.json");
+    let xray_config_path = work_dir.join("xray-client.json");
+    let echo_ip = echo_addr.ip().to_string();
+    let password = "trojan-domain-password";
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "trojan",
+                "tag": "chimera-trojan-domain-access",
+                "settings": {
+                    "clients": [{
+                        "password": password,
+                        "email": "trojan-domain-access@example.test"
+                    }]
+                },
+                "streamSettings": {"network": "tcp", "security": "none"}
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "dns": {"hosts": {
+                "allowed.example": echo_ip,
+                "blocked.example": echo_ip
+            }},
+            "userDomainAccess": signed_trojan_domain_access_policy(
+                password,
+                "blocked.example"
+            )
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth", "udp": true}
+            }],
+            "dns": {"hosts": {
+                "allowed.example": echo_ip,
+                "blocked.example": echo_ip
+            }},
+            "outbounds": [{
+                "protocol": "trojan",
+                "settings": {
+                    "servers": [{
+                        "address": "127.0.0.1",
+                        "port": chimera_port,
+                        "password": password
+                    }]
+                },
+                "streamSettings": {"network": "tcp", "security": "none"}
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+
+    assert_socks5_domain_echo(
+        socks_addr,
+        "allowed.example",
+        echo_addr.port(),
+        b"allowed Trojan domain through Xray",
+    );
+    wait_for_counter(&accepted, 1);
+    assert_socks5_udp_domain_echo(
+        socks_addr,
+        "allowed.example",
+        udp_echo_addr.port(),
+        b"allowed Trojan UDP domain through Xray",
+    )
+    .await;
+    assert_socks5_domain_echo_does_not_succeed(
+        socks_addr,
+        "blocked.example",
+        echo_addr.port(),
+    );
+    assert_socks5_udp_domain_echo_does_not_succeed(
+        socks_addr,
+        "blocked.example",
+        udp_echo_addr.port(),
+    )
+    .await;
+    thread::sleep(CONNECT_RETRY_INTERVAL * 4);
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera and ./xray to verify Hysteria2 per-user domain allow/reject"]
+async fn xray_client_hysteria2_domain_access_policy_allows_and_rejects_target() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("hysteria2-domain-access-policy");
+    let (echo_addr, accepted) = start_tcp_echo_server_with_counter();
+    let udp_echo_addr = start_udp_echo_server().await;
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let (cert_path, key_path) = generate_test_certificate(&work_dir);
+    let pinned_peer_cert_sha256 = first_cert_sha256_hex(&cert_path);
+    let chimera_config_path = work_dir.join("chimera-hysteria2.json");
+    let xray_config_path = work_dir.join("xray-hysteria2-client.json");
+    let echo_ip = echo_addr.ip().to_string();
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "hysteria",
+                "tag": "chimera-hysteria2-domain-access",
+                "settings": {
+                    "version": 2,
+                    "clients": [{
+                        "auth": HYSTERIA_AUTH,
+                        "email": "hysteria2-domain-access@example.test"
+                    }]
+                },
+                "streamSettings": {
+                    "network": "quic",
+                    "security": "tls",
+                    "hysteriaSettings": {"version": 2},
+                    "tlsSettings": {
+                        "alpn": ["h3"],
+                        "certificates": [{
+                            "certificateFile": cert_path,
+                            "keyFile": key_path
+                        }]
+                    }
+                }
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "dns": {"hosts": {
+                "allowed.example": echo_ip,
+                "blocked.example": echo_ip
+            }},
+            "userDomainAccess": signed_hysteria2_domain_access_policy(
+                HYSTERIA_AUTH,
+                "blocked.example"
+            )
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth", "udp": true}
+            }],
+            "dns": {"hosts": {
+                "allowed.example": echo_ip,
+                "blocked.example": echo_ip
+            }},
+            "outbounds": [{
+                "protocol": "hysteria",
+                "settings": {
+                    "version": 2,
+                    "address": "127.0.0.1",
+                    "port": chimera_port
+                },
+                "streamSettings": {
+                    "network": "hysteria",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "pinnedPeerCertSha256": pinned_peer_cert_sha256,
+                        "alpn": ["h3"]
+                    },
+                    "hysteriaSettings": {
+                        "version": 2,
+                        "auth": HYSTERIA_AUTH
+                    }
+                }
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    chimera.assert_running();
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+
+    assert_socks5_domain_echo(
+        socks_addr,
+        "allowed.example",
+        echo_addr.port(),
+        b"allowed Hysteria2 domain through Xray",
+    );
+    wait_for_counter(&accepted, 1);
+    assert_socks5_udp_domain_echo(
+        socks_addr,
+        "allowed.example",
+        udp_echo_addr.port(),
+        b"allowed Hysteria2 UDP domain through Xray",
+    )
+    .await;
+    assert_socks5_domain_echo_does_not_succeed(
+        socks_addr,
+        "blocked.example",
+        echo_addr.port(),
+    );
+    assert_socks5_udp_domain_echo_does_not_succeed(
+        socks_addr,
+        "blocked.example",
+        udp_echo_addr.port(),
+    )
+    .await;
+    thread::sleep(CONNECT_RETRY_INTERVAL * 4);
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera and ./xray to verify per-user XUDP domain allow/reject"]
+async fn xray_client_xudp_domain_access_policy_allows_and_rejects_target() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("vless-xudp-domain-access-policy");
+    let udp_echo_addr = start_udp_echo_server().await;
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let chimera_config_path = work_dir.join("chimera.json");
+    let xray_config_path = work_dir.join("xray-client.json");
+    let echo_ip = udp_echo_addr.ip().to_string();
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "vless",
+                "tag": "chimera-vless-xudp-domain-access",
+                "settings": {
+                    "clients": [{"id": TEST_UUID, "email": "xudp-domain@example.test"}],
+                    "decryption": "none"
+                },
+                "streamSettings": {"network": "tcp", "security": "none"}
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "dns": {
+                "hosts": {
+                    "allowed.example": echo_ip,
+                    "blocked.example": echo_ip
+                }
+            },
+            "userDomainAccess": signed_vless_domain_access_policy(
+                TEST_UUID,
+                "blocked.example"
+            )
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth", "udp": true}
+            }],
+            "dns": {
+                "hosts": {
+                    "allowed.example": echo_ip,
+                    "blocked.example": echo_ip
+                }
+            },
+            "outbounds": [{
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": chimera_port,
+                        "users": [{"id": TEST_UUID, "encryption": "none"}]
+                    }]
+                },
+                "streamSettings": {"network": "tcp", "security": "none"},
+                "mux": {"enabled": true, "concurrency": 4, "xudpConcurrency": 1}
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+
+    assert_socks5_udp_domain_echo(
+        socks_addr,
+        "allowed.example",
+        udp_echo_addr.port(),
+        b"allowed XUDP domain through Xray",
+    )
+    .await;
+    assert_socks5_udp_domain_echo_does_not_succeed(
+        socks_addr,
+        "blocked.example",
+        udp_echo_addr.port(),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera and Xray, then updates user-domain policy through gRPC"]
+async fn xray_client_remote_policy_update_reaches_new_xudp_session() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("vless-xudp-remote-policy-update");
+    let udp_echo_addr = start_udp_echo_server().await;
+    let chimera_port = free_localhost_port();
+    let grpc_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let chimera_config_path = work_dir.join("chimera.json");
+    let xray_config_path = work_dir.join("xray-client.json");
+    let echo_ip = udp_echo_addr.ip().to_string();
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "vless",
+                "tag": "chimera-vless-xudp-remote-policy",
+                "settings": {
+                    "clients": [{"id": TEST_UUID, "email": "xudp-remote@example.test"}],
+                    "decryption": "none"
+                },
+                "streamSettings": {"network": "tcp", "security": "none"}
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "dns": {"hosts": {
+                "allowed.example": echo_ip,
+                "blocked.example": echo_ip
+            }},
+            "api": {
+                "listen": format!("127.0.0.1:{grpc_port}"),
+                "services": ["UserDomainAccessService"]
+            }
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth", "udp": true}
+            }],
+            "dns": {"hosts": {
+                "allowed.example": echo_ip,
+                "blocked.example": echo_ip
+            }},
+            "outbounds": [{
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": chimera_port,
+                        "users": [{"id": TEST_UUID, "encryption": "none"}]
+                    }]
+                },
+                "streamSettings": {"network": "tcp", "security": "none"},
+                "mux": {"enabled": true, "concurrency": 4, "xudpConcurrency": 1}
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, grpc_port)));
+    chimera.assert_running();
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+
+    assert_socks5_udp_domain_echo(
+        socks_addr,
+        "allowed.example",
+        udp_echo_addr.port(),
+        b"allowed before remote policy update",
+    )
+    .await;
+
+    let channel =
+        connect_grpc_channel(SocketAddr::from((Ipv4Addr::LOCALHOST, grpc_port)))
+            .await;
+    let response: UserDomainApplyPolicyResponse = grpc_unary(
+        channel,
+        PATH_USER_DOMAIN_APPLY_POLICY,
+        UserDomainApplyPolicyRequest {
+            json_config: signed_vless_domain_access_policy(
+                TEST_UUID,
+                "blocked.example",
+            )
+            .to_string(),
+        },
+    )
+    .await
+    .expect("remote ApplyPolicy should succeed");
+    assert_eq!(response.revision.expect("applied revision").version, 1);
+
+    assert_socks5_udp_domain_echo_does_not_succeed(
+        socks_addr,
+        "blocked.example",
+        udp_echo_addr.port(),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts Chimera as server and ./xray as client for VLESS WebSocket"]
 async fn xray_client_can_proxy_tcp_through_chimera_vless_ws() {
     run_xray_client_vless_transport_case(VlessTransportCase::WebSocket).await;
@@ -3329,6 +4793,182 @@ fn write_json(path: &Path, value: serde_json::Value) {
     fs::write(path, content).expect("write json config");
 }
 
+#[derive(Clone, PartialEq, Message)]
+struct UserDomainApplyPolicyRequest {
+    #[prost(string, tag = "1")]
+    json_config: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct UserDomainApplyPolicyResponse {
+    #[prost(message, optional, tag = "1")]
+    revision: Option<UserDomainRevisionInfo>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct UserDomainRevisionInfo {
+    #[prost(uint64, tag = "1")]
+    version: u64,
+}
+
+fn signed_vless_domain_access_policy(uuid: &str, blocked_domain: &str) -> Value {
+    let mut value = json!({
+        "version": 1,
+        "generatedAt": "2026-01-01T00:00:00.000Z",
+        "sourceBackendVersion": "xray-client-e2e",
+        "targetNodeUuid": "node-1",
+        "defaultAction": "allow",
+        "users": [{
+            "userUuid": "xray-vless-domain-user",
+            "protocolIdentity": {
+                "vlessUuid": uuid,
+                "vmessUuid": "",
+                "tuicUuid": "",
+                "hysteria2Password": "",
+                "trojanPassword": "",
+                "httpUsername": "",
+                "socksUsername": ""
+            },
+            "mode": "denylist",
+            "unknownTargetAction": "allow",
+            "rules": [{
+                "id": "blocked-domain",
+                "domain": blocked_domain,
+                "match": "exact",
+                "action": "reject"
+            }]
+        }]
+    });
+    let checksum =
+        to_lower_hex(digest(&SHA256, canonical_json(&value).as_bytes()).as_ref());
+    value["checksum"] = Value::String(format!("sha256:{checksum}"));
+    value
+}
+
+fn signed_vmess_domain_access_policy(uuid: &str, blocked_domain: &str) -> Value {
+    let mut value = signed_vless_domain_access_policy(uuid, blocked_domain);
+    value["users"][0]["protocolIdentity"]["vlessUuid"] =
+        Value::String(String::new());
+    value["users"][0]["protocolIdentity"]["vmessUuid"] =
+        Value::String(uuid.to_string());
+    value
+        .as_object_mut()
+        .expect("signed policy must be an object")
+        .remove("checksum");
+    value["checksum"] = Value::String(format!(
+        "sha256:{}",
+        to_lower_hex(digest(&SHA256, canonical_json(&value).as_bytes()).as_ref())
+    ));
+    value
+}
+
+fn signed_shadowsocks_domain_access_policy(
+    email: &str,
+    blocked_domain: &str,
+) -> Value {
+    let mut value = signed_vless_domain_access_policy("", blocked_domain);
+    value["users"][0]["protocolIdentity"]["shadowsocksEmail"] =
+        Value::String(email.to_string());
+    value
+        .as_object_mut()
+        .expect("signed policy must be an object")
+        .remove("checksum");
+    value["checksum"] = Value::String(format!(
+        "sha256:{}",
+        to_lower_hex(digest(&SHA256, canonical_json(&value).as_bytes()).as_ref())
+    ));
+    value
+}
+
+fn signed_trojan_domain_access_policy(
+    password: &str,
+    blocked_domain: &str,
+) -> Value {
+    let mut value = signed_vless_domain_access_policy("", blocked_domain);
+    value["users"][0]["protocolIdentity"]["vlessUuid"] =
+        Value::String(String::new());
+    value["users"][0]["protocolIdentity"]["trojanPassword"] =
+        Value::String(password.to_string());
+    value
+        .as_object_mut()
+        .expect("signed policy must be an object")
+        .remove("checksum");
+    value["checksum"] = Value::String(format!(
+        "sha256:{}",
+        to_lower_hex(digest(&SHA256, canonical_json(&value).as_bytes()).as_ref())
+    ));
+    value
+}
+
+fn signed_socks_domain_access_policy(username: &str, blocked_domain: &str) -> Value {
+    let mut value = signed_vless_domain_access_policy("", blocked_domain);
+    value["users"][0]["protocolIdentity"]["socksUsername"] =
+        Value::String(username.to_string());
+    value
+        .as_object_mut()
+        .expect("signed policy must be an object")
+        .remove("checksum");
+    value["checksum"] = Value::String(format!(
+        "sha256:{}",
+        to_lower_hex(digest(&SHA256, canonical_json(&value).as_bytes()).as_ref())
+    ));
+    value
+}
+
+fn signed_hysteria2_domain_access_policy(
+    password: &str,
+    blocked_domain: &str,
+) -> Value {
+    let mut value = signed_vless_domain_access_policy("", blocked_domain);
+    value["users"][0]["protocolIdentity"]["vlessUuid"] =
+        Value::String(String::new());
+    value["users"][0]["protocolIdentity"]["hysteria2Password"] =
+        Value::String(password.to_string());
+    value
+        .as_object_mut()
+        .expect("signed policy must be an object")
+        .remove("checksum");
+    value["checksum"] = Value::String(format!(
+        "sha256:{}",
+        to_lower_hex(digest(&SHA256, canonical_json(&value).as_bytes()).as_ref())
+    ));
+    value
+}
+
+fn canonical_json(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => serde_json::to_string(value).unwrap(),
+        Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(canonical_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Value::Object(values) => {
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort();
+            format!(
+                "{{{}}}",
+                keys.into_iter()
+                    .map(|key| {
+                        format!(
+                            "{}:{}",
+                            serde_json::to_string(key).unwrap(),
+                            canonical_json(&values[key])
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
+    }
+}
+
 fn first_cert_sha256_hex(cert_path: &Path) -> String {
     let cert_file = File::open(cert_path).expect("open pinned cert");
     let first_cert = certs(&mut BufReader::new(cert_file))
@@ -4154,21 +5794,118 @@ async fn assert_socks5_udp_domain_echo(
         .await
         .expect("SOCKS UDP domain echo timeout")
         .expect("receive SOCKS UDP domain echo");
-    assert!(
-        len >= 7 + domain_bytes.len(),
-        "SOCKS UDP domain response too short"
-    );
-    assert_eq!(&response[..3], &[0x00, 0x00, 0x00]);
-    assert_eq!(response[3], 0x03, "SOCKS UDP response lost domain identity");
-    let returned_len = response[4] as usize;
-    assert_eq!(returned_len, domain_bytes.len());
-    assert_eq!(&response[5..5 + returned_len], domain_bytes);
-    let port_start = 5 + returned_len;
+    let payload_offset = socks_udp_payload_offset(&response[..len]);
+    assert!(payload_offset >= 2, "SOCKS UDP response missing port");
+    let port_start = payload_offset - 2;
     assert_eq!(
         u16::from_be_bytes([response[port_start], response[port_start + 1]]),
         target_port
     );
     assert_eq!(&response[port_start + 2..len], payload);
+}
+
+async fn assert_socks5_udp_domain_echo_does_not_succeed(
+    socks_addr: SocketAddr,
+    target_domain: &str,
+    target_port: u16,
+) {
+    let mut control = tokio::net::TcpStream::connect(socks_addr)
+        .await
+        .expect("connect xray SOCKS UDP rejected-domain control");
+    control
+        .write_all(&[0x05, 0x01, 0x00])
+        .await
+        .expect("SOCKS UDP rejected-domain hello");
+    let mut hello = [0u8; 2];
+    control
+        .read_exact(&mut hello)
+        .await
+        .expect("SOCKS UDP rejected-domain hello response");
+    assert_eq!(hello, [0x05, 0x00]);
+
+    control
+        .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+        .expect("SOCKS UDP rejected-domain associate request");
+    let mut header = [0u8; 4];
+    control
+        .read_exact(&mut header)
+        .await
+        .expect("SOCKS UDP rejected-domain associate response");
+    assert_eq!(header[1], 0x00, "SOCKS UDP associate failed");
+    let mut relay_addr =
+        read_async_socks_bound_address(&mut control, header[3]).await;
+    if relay_addr.ip().is_unspecified() {
+        relay_addr.set_ip(socks_addr.ip());
+    }
+
+    let udp = TokioUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind SOCKS UDP rejected-domain client");
+    let domain_bytes = target_domain.as_bytes();
+    let domain_len = u8::try_from(domain_bytes.len()).expect("SOCKS domain length");
+    let mut request = vec![0x00, 0x00, 0x00, 0x03, domain_len];
+    request.extend_from_slice(domain_bytes);
+    request.extend_from_slice(&target_port.to_be_bytes());
+    request.extend_from_slice(b"blocked XUDP payload");
+    udp.send_to(&request, relay_addr)
+        .await
+        .expect("send SOCKS UDP rejected-domain payload");
+
+    let mut response = vec![0u8; 256];
+    if let Ok(Ok((len, _))) =
+        tokio::time::timeout(IO_TIMEOUT, udp.recv_from(&mut response)).await
+    {
+        let payload_offset = socks_udp_payload_offset(&response[..len]);
+        assert_ne!(
+            &response[payload_offset..len],
+            b"blocked XUDP payload",
+            "unexpected successful XUDP domain policy echo"
+        );
+    }
+}
+
+async fn connect_grpc_channel(addr: SocketAddr) -> Channel {
+    let endpoint = Endpoint::from_shared(format!("http://{addr}"))
+        .expect("valid gRPC endpoint")
+        .connect_timeout(IO_TIMEOUT)
+        .timeout(IO_TIMEOUT);
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        match endpoint.clone().connect().await {
+            Ok(channel) => return channel,
+            Err(error) if Instant::now() < deadline => {
+                tokio::time::sleep(CONNECT_RETRY_INTERVAL).await;
+                drop(error);
+            }
+            Err(error) => panic!(
+                "timed out connecting to Chimera gRPC endpoint {addr}: {error}"
+            ),
+        }
+    }
+}
+
+async fn grpc_unary<Req, Resp>(
+    channel: Channel,
+    path: &'static str,
+    request: Req,
+) -> Result<Resp, Status>
+where
+    Req: Message + Default + Send + Sync + 'static,
+    Resp: Message + Default + Send + Sync + 'static,
+{
+    let mut grpc = tonic::client::Grpc::new(channel);
+    grpc.ready().await.map_err(|error| {
+        Status::unknown(format!("gRPC service not ready: {error}"))
+    })?;
+    let response = grpc
+        .unary(
+            Request::new(request),
+            PathAndQuery::from_static(path),
+            tonic_prost::ProstCodec::default(),
+        )
+        .await?;
+    Ok(response.into_inner())
 }
 
 async fn assert_tls_echo_through_socks(
@@ -4504,6 +6241,138 @@ fn assert_socks5_domain_echo(
     request.extend_from_slice(domain);
     request.extend_from_slice(&port.to_be_bytes());
     assert_socks5_request_echo(socks_addr, &request, payload);
+}
+
+fn assert_socks5_ip_http_host_echo(
+    socks_addr: SocketAddr,
+    target_addr: SocketAddr,
+    host: &str,
+    body: &[u8],
+) {
+    let request = socks5_ip_connect_request(target_addr);
+    let http_request = format!(
+        "POST /route-only HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        String::from_utf8_lossy(body)
+    );
+    assert_socks5_request_echo(socks_addr, &request, http_request.as_bytes());
+}
+
+fn assert_socks5_ip_http_host_echo_does_not_succeed(
+    socks_addr: SocketAddr,
+    target_addr: SocketAddr,
+    host: &str,
+    body: &[u8],
+) {
+    let request = socks5_ip_connect_request(target_addr);
+    let http_request = format!(
+        "POST /route-only HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        String::from_utf8_lossy(body)
+    );
+    assert_socks5_request_does_not_succeed(
+        socks_addr,
+        &request,
+        http_request.as_bytes(),
+    );
+}
+
+fn socks5_ip_connect_request(target_addr: SocketAddr) -> Vec<u8> {
+    let mut request = vec![0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x01];
+    match target_addr.ip() {
+        std::net::IpAddr::V4(ip) => request.extend_from_slice(&ip.octets()),
+        std::net::IpAddr::V6(ip) => {
+            request[6] = 0x04;
+            request.extend_from_slice(&ip.octets());
+        }
+    }
+    request.extend_from_slice(&target_addr.port().to_be_bytes());
+    request
+}
+
+fn assert_socks5_request_does_not_succeed(
+    socks_addr: SocketAddr,
+    request: &[u8],
+    payload: &[u8],
+) {
+    let mut stream = TcpStream::connect_timeout(&socks_addr, IO_TIMEOUT)
+        .expect("connect xray socks inbound");
+    stream
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .expect("set read timeout");
+    stream
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .expect("set write timeout");
+    stream.write_all(&request[..3]).expect("socks hello");
+    let mut hello = [0u8; 2];
+    stream.read_exact(&mut hello).expect("socks hello response");
+    assert_eq!(hello, [0x05, 0x00], "SOCKS no-auth negotiation failed");
+    stream
+        .write_all(&request[3..])
+        .expect("socks connect request");
+
+    let mut response = [0u8; 4];
+    if stream.read_exact(&mut response).is_err() {
+        return;
+    }
+    assert_eq!(response[0], 0x05);
+    if response[1] != 0x00 {
+        return;
+    }
+    read_socks_bound_address_tail(&mut stream, response[3])
+        .expect("read successful SOCKS response tail");
+
+    stream.write_all(payload).expect("write blocked payload");
+    let mut echoed = vec![0u8; payload.len()];
+    if stream.read_exact(&mut echoed).is_ok() {
+        assert_ne!(echoed, payload, "unexpected successful policy echo");
+    }
+}
+
+fn assert_socks5_domain_echo_does_not_succeed(
+    socks_addr: SocketAddr,
+    domain: &str,
+    port: u16,
+) {
+    let domain = domain.as_bytes();
+    assert!(domain.len() <= u8::MAX as usize);
+    let mut stream = TcpStream::connect_timeout(&socks_addr, IO_TIMEOUT)
+        .expect("connect xray socks inbound");
+    stream
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .expect("set read timeout");
+    stream
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .expect("set write timeout");
+    stream.write_all(&[0x05, 0x01, 0x00]).expect("socks hello");
+    let mut hello = [0u8; 2];
+    stream.read_exact(&mut hello).expect("socks hello response");
+    assert_eq!(hello, [0x05, 0x00], "SOCKS no-auth negotiation failed");
+
+    let mut request = vec![0x05, 0x01, 0x00, 0x03, domain.len() as u8];
+    request.extend_from_slice(domain);
+    request.extend_from_slice(&port.to_be_bytes());
+    stream
+        .write_all(&request)
+        .expect("socks domain connect request");
+
+    let mut response = [0u8; 4];
+    if stream.read_exact(&mut response).is_err() {
+        return;
+    }
+    assert_eq!(response[0], 0x05);
+    if response[1] != 0x00 {
+        return;
+    }
+    read_socks_bound_address_tail(&mut stream, response[3])
+        .expect("read successful SOCKS domain response tail");
+
+    let payload = b"blocked domain must not echo";
+    stream.write_all(payload).expect("write blocked payload");
+    let mut echoed = vec![0u8; payload.len()];
+    if stream.read_exact(&mut echoed).is_ok() {
+        assert_ne!(echoed, payload, "unexpected successful domain policy echo");
+    }
 }
 
 fn assert_socks5_request_echo(

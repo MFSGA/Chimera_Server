@@ -28,6 +28,7 @@ use crate::{
     traffic::{
         ConnectionGuard, TrafficContext, record_transfer, register_connection,
     },
+    user_domain::UserDomainAccessAuditContext,
     util::socket::new_socket2_udp_socket,
 };
 
@@ -128,6 +129,20 @@ pub(super) async fn drive_udp_datagrams(
             }
         };
 
+        // Check the authenticated user's domain policy before the first DNS
+        // lookup needed to create a UDP session. The later routing check is
+        // still required because policy and destination can change while a
+        // Hysteria2 session is alive.
+        if !allows_hysteria2_domain(
+            &runtime,
+            &policy_identities,
+            &identity,
+            &inbound_tag,
+            &remote_location,
+        ) {
+            continue;
+        }
+
         let session = match sessions.entry(session_id) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
@@ -139,6 +154,7 @@ pub(super) async fn drive_udp_datagrams(
                 {
                     Ok(addr) => addr,
                     Err(err) => {
+                        runtime.record_user_domain_dns_failure();
                         warn!(
                             "Failed to resolve hysteria2 UDP destination {}: {}",
                             remote_location, err
@@ -272,6 +288,15 @@ pub(super) async fn drive_udp_datagrams(
         // after defragmentation completes. Incomplete fragments must not resolve
         // or mutate the session destination on their own.
         if completed_location != session.last_location {
+            if !allows_hysteria2_domain(
+                &runtime,
+                &policy_identities,
+                &identity,
+                &inbound_tag,
+                &completed_location,
+            ) {
+                continue;
+            }
             let updated_addr = match resolve_single_address(
                 &resolver,
                 &completed_location,
@@ -280,6 +305,7 @@ pub(super) async fn drive_udp_datagrams(
             {
                 Ok(addr) => addr,
                 Err(err) => {
+                    runtime.record_user_domain_dns_failure();
                     warn!(
                         "Failed to resolve updated hysteria2 UDP destination {}: {}",
                         completed_location, err
@@ -299,6 +325,7 @@ pub(super) async fn drive_udp_datagrams(
             session.last_socket_addr,
             &session.last_location,
         );
+        route_input.protocol = "hysteria2".to_string();
         route_input.vless_route = auth_ctx.vless_route;
         let action = match select_direct_outbound_with_policy_identities(
             &runtime,
@@ -375,6 +402,29 @@ pub(super) async fn drive_udp_datagrams(
             }
         }
     }
+}
+
+pub(super) fn allows_hysteria2_domain(
+    runtime: &DataPlaneRuntime,
+    policy_identities: &[String],
+    identity: &str,
+    inbound_tag: &str,
+    target_location: &NetLocation,
+) -> bool {
+    let target_domain = target_location.address().hostname().unwrap_or_default();
+    let target_summary = target_location.to_string();
+    let audit_context = UserDomainAccessAuditContext {
+        inbound_tag,
+        protocol: "hysteria2",
+        network: "udp",
+        target: &target_summary,
+        routing_user: identity,
+    };
+    runtime.allows_user_domain_access_with_identities_and_context(
+        policy_identities,
+        target_domain,
+        audit_context,
+    )
 }
 
 pub(super) fn prune_idle_udp_sessions(

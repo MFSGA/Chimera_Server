@@ -239,6 +239,28 @@ fn tcp_request_timeout_uses_xray_user_level_policy_only() {
 }
 
 #[test]
+fn hysteria2_udp_domain_policy_rejects_target_before_resolution() {
+    let runtime = RuntimeState::new(Vec::new(), Vec::new());
+    runtime
+        .apply_user_domain_policy(
+            "{\"version\":1,\"generatedAt\":\"2026-01-01T00:00:00.000Z\",\"sourceBackendVersion\":\"test\",\"targetNodeUuid\":\"node-1\",\"defaultAction\":\"reject\",\"users\":[],\"checksum\":\"sha256:5dbfd6c39173b845c52cf308e01156f5fbd6011600118d0fc6adc410217b871a\"}",
+        )
+        .expect("install a valid rejecting domain policy");
+
+    let policy_identities = vec!["hysteria-secret".to_string()];
+    let target = NetLocation::from_str("blocked.example:443", None)
+        .expect("valid Hysteria2 UDP target");
+
+    assert!(!allows_hysteria2_domain(
+        &runtime.data_plane(),
+        &policy_identities,
+        "hysteria-secret",
+        "hysteria-in",
+        &target,
+    ));
+}
+
+#[test]
 fn auth_success_content_length_matches_xray_and_shoes_writers() {
     let shoes = build_auth_success_response(true, 750_000, false, false)
         .expect("valid shoes auth response");

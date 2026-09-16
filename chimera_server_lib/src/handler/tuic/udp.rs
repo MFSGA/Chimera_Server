@@ -642,7 +642,7 @@ pub(super) async fn forward_udp_payload(
     socket_addr: SocketAddr,
     payload: &[u8],
 ) -> std::io::Result<bool> {
-    let route_input = connection_routing_input(
+    let mut route_input = connection_routing_input(
         context.connection.inbound_tag.as_str(),
         context.connection.identity.as_str(),
         3,
@@ -650,6 +650,7 @@ pub(super) async fn forward_udp_payload(
         socket_addr,
         remote_location,
     );
+    route_input.protocol = "tuic".to_string();
     let action =
         select_direct_outbound(&context.connection.runtime, &route_input, "udp")?;
     let mut traffic_context = session.base_context.clone();

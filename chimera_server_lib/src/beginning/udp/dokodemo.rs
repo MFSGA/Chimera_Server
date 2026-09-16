@@ -11,8 +11,6 @@ use tokio::{
 };
 use tracing::{debug, warn};
 
-#[cfg(feature = "trojan")]
-use crate::resolver::{NativeResolver, Resolver};
 #[cfg(target_os = "linux")]
 use crate::util::socket::recv_udp_with_original_destination;
 use crate::{
@@ -23,6 +21,7 @@ use crate::{
     routing_state::RoutingInput,
     runtime::{DataPlaneRuntime, OutboundSummary},
     traffic::{TrafficContext, record_transfer, record_transfer_ref},
+    user_domain::UserDomainAccessAuditContext,
 };
 #[cfg(feature = "trojan")]
 use crate::{
@@ -282,7 +281,7 @@ async fn trojan_dokodemo_udp_session_sender(
         return Ok(sender);
     }
 
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let resolver = runtime.resolver();
     let mut proxy =
         connect_trojan_udp_via_outbound(&resolver, &key.target, &runtime, &outbound)
             .await?;
@@ -561,9 +560,19 @@ pub(super) async fn select_udp_outbound(
         local_port: local_addr.map_or(0, |address| address.port() as u32),
         ..RoutingInput::default()
     };
-    if !runtime
-        .allows_user_domain_access(&route_input.user, &route_input.target_domain)
-    {
+    let target_summary = target_location.to_string();
+    let audit_context = UserDomainAccessAuditContext {
+        inbound_tag,
+        protocol: "dokodemo-door",
+        network: "udp",
+        target: &target_summary,
+        routing_user: &route_input.user,
+    };
+    if !runtime.allows_user_domain_access_with_context(
+        &route_input.user,
+        &route_input.target_domain,
+        audit_context,
+    ) {
         return Ok(UdpOutboundAction::Blackhole {
             tag: USER_DOMAIN_ACCESS_BLACKHOLE_TAG.to_string(),
         });

@@ -111,6 +111,9 @@ pub(crate) async fn run_shared_udp_relay(
                 "udp",
                 InboundRoutingMetadata {
                     local_addr: udp_socket.local_addr().ok(),
+                    inbound_protocol: datagram_context
+                        .as_ref()
+                        .map(|context| context.protocol.to_string()),
                     ..InboundRoutingMetadata::default()
                 },
             ),
@@ -362,6 +365,9 @@ pub(crate) async fn run_udp_relay_with_expected_client(
                 "udp",
                 InboundRoutingMetadata {
                     local_addr: udp_socket_clone.local_addr().ok(),
+                    inbound_protocol: traffic_context
+                        .as_ref()
+                        .map(|context| context.protocol.to_string()),
                     ..InboundRoutingMetadata::default()
                 },
             ),

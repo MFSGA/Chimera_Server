@@ -128,6 +128,7 @@ pub(super) async fn handle_tcp_stream(
             peer_addr,
             InboundRoutingMetadata {
                 vless_route: auth_ctx.vless_route,
+                inbound_protocol: Some("hysteria2".to_string()),
                 policy_identities,
                 ..InboundRoutingMetadata::default()
             },
