@@ -725,6 +725,7 @@ fn routing_metadata_is_applied_as_value_transformation() {
         InboundRoutingMetadata {
             local_addr: Some("203.0.113.7:8443".parse().unwrap()),
             vless_route: 42,
+            policy_identities: Vec::new(),
             sniffed_protocol: Some("tls".into()),
             route_target_domain: Some("sniffed.example".into()),
             attributes: HashMap::from([("x-test".into(), "ok".into())]),

@@ -36,7 +36,7 @@ use std::path::Path;
 use crate::{
     address::NetLocation,
     config::server_config::{Hysteria2Client, Hysteria2ServerConfig},
-    outbound::connect_tcp_outbound_with_vless_route,
+    outbound::{InboundRoutingMetadata, connect_tcp_outbound_with_vless_route},
     resolver::Resolver,
     runtime::DataPlaneRuntime,
     traffic::{
@@ -210,6 +210,7 @@ fn hysteria2_traffic_context(
         .unwrap_or_else(|| client.password.clone());
     let mut context = TrafficContext::new("hysteria2")
         .with_identity(identity)
+        .with_policy_identity(client.password.clone())
         .with_inbound_tag(inbound_tag.to_string())
         .with_client_ip(peer_addr.ip())
         .with_user_level(client.level);

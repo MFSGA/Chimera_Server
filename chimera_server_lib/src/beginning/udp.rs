@@ -30,8 +30,9 @@ use crate::{
     },
     outbound::{
         DirectOutboundAction, InboundRoutingMetadata, OutboundRoutingContext,
-        apply_routing_metadata, connection_routing_input, select_direct_outbound,
+        apply_routing_metadata, connection_routing_input,
         select_direct_outbound_for_location,
+        select_direct_outbound_with_policy_identities,
     },
     resolver::Resolver,
     runtime::DataPlaneRuntime,
@@ -127,6 +128,12 @@ pub(crate) async fn run_bidirectional_udp(
                 local_addr,
                 ..InboundRoutingMetadata::default()
             },
+        )
+        .with_policy_identities(
+            traffic_context
+                .as_ref()
+                .map(|context| context.policy_identities.as_slice())
+                .unwrap_or_default(),
         ),
     )
     .await?;
@@ -254,6 +261,10 @@ pub(crate) async fn run_session_based_udp(
         .and_then(|context| context.identity.as_deref())
         .unwrap_or_default()
         .to_string();
+    let policy_identities = traffic_context
+        .as_ref()
+        .map(|context| context.policy_identities.as_slice())
+        .unwrap_or_default();
     let _connection_guard = register_connection(traffic_context.as_ref());
     #[cfg(feature = "trojan")]
     let trojan_resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
@@ -311,7 +322,12 @@ pub(crate) async fn run_session_based_udp(
                         ..InboundRoutingMetadata::default()
                     },
                 );
-                let action = match select_direct_outbound(&runtime, &route_input, "udp") {
+                let action = match select_direct_outbound_with_policy_identities(
+                    &runtime,
+                    &route_input,
+                    "udp",
+                    policy_identities,
+                ) {
                     Ok(action) => action,
                     Err(error) => break Err(error),
                 };

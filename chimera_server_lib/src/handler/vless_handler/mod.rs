@@ -60,7 +60,7 @@ pub(crate) use vision::setup_tls_mixed_vless_server_stream;
 
 const SERVER_RESPONSE_HEADER: &[u8] = &[0u8, 0u8];
 
-type ParsedVlessUser = (Box<[u8]>, String, String, u32);
+type ParsedVlessUser = (Box<[u8]>, String, String, String, u32);
 
 #[derive(Debug)]
 pub struct VlessTcpHandler {
@@ -93,6 +93,7 @@ fn parse_vless_users(users: &[VlessUser]) -> Vec<ParsedVlessUser> {
         .map(|user| {
             (
                 parse_hex(&user.user_id),
+                user.user_id.clone(),
                 user.user_label.clone(),
                 user.flow.clone(),
                 user.user_level,
@@ -128,7 +129,7 @@ impl VlessTcpHandler {
                 None => read_vless_auth_prefix(&mut server_stream).await,
             };
             let authenticated = candidate.is_some_and(|candidate| {
-                users.iter().any(|(stored_user_id, _, _, _)| {
+                users.iter().any(|(stored_user_id, _, _, _, _)| {
                     stored_user_id.len() == 16
                         && stored_user_id.as_ref() == candidate.as_slice()
                 })
@@ -176,15 +177,17 @@ impl VlessTcpHandler {
             command,
             remote_location,
         } = header;
-        let matched_user = users.iter().find(|(stored_user_id, _, _, _)| {
+        let matched_user = users.iter().find(|(stored_user_id, _, _, _, _)| {
             stored_user_id.len() == 16
                 && stored_user_id.as_ref() == user_id.as_slice()
         });
 
-        let Some((_, user_label, configured_flow, user_level)) = matched_user else {
+        let Some((_, user_id, user_label, configured_flow, user_level)) =
+            matched_user
+        else {
             let expected = users
                 .iter()
-                .map(|(user_id, _, _, _)| encode_hex(user_id.as_ref()))
+                .map(|(user_id, _, _, _, _)| encode_hex(user_id.as_ref()))
                 .collect::<Vec<_>>()
                 .join(",");
             let got = encode_hex(&user_id);
@@ -206,6 +209,7 @@ impl VlessTcpHandler {
         let traffic_context = Some(
             TrafficContext::new("vless")
                 .with_identity(user_label.clone())
+                .with_policy_identity(user_id.clone())
                 .with_inbound_tag(self.inbound_tag.clone())
                 .with_user_level(*user_level),
         );
@@ -817,6 +821,7 @@ mod tests {
         );
         let context = traffic_context.expect("VLESS TCP context must exist");
         assert_eq!(context.identity.as_deref(), Some("vless-tcp-user"));
+        assert_eq!(context.policy_identities, vec![user_id.to_string()]);
         assert_eq!(context.inbound_tag.as_deref(), Some("vless-test"));
     }
 

@@ -260,6 +260,24 @@ impl UserDomainAccessStore {
     /// an IP-only or otherwise unknown target and follows the configured
     /// unknown-target action.
     pub(crate) fn allows(&self, identity: &str, target_domain: &str) -> bool {
+        self.allows_identity_iter(std::iter::once(identity), target_domain)
+    }
+
+    pub(crate) fn allows_with_identities(
+        &self,
+        identities: &[String],
+        target_domain: &str,
+    ) -> bool {
+        self.allows_identity_iter(
+            identities.iter().map(String::as_str),
+            target_domain,
+        )
+    }
+
+    fn allows_identity_iter<'a, I>(&self, identities: I, target_domain: &str) -> bool
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
         let active = {
             let inner = self.inner.read().expect("user-domain access lock poisoned");
             let Some(active) = inner.active.clone() else {
@@ -274,8 +292,11 @@ impl UserDomainAccessStore {
         };
 
         let enforcement_mode = active.publication.enforcement_mode;
-        let (allowed, reason) =
-            evaluate_publication(&active.publication, identity, target_domain);
+        let (allowed, reason) = evaluate_public_with_identities(
+            &active.publication,
+            identities,
+            target_domain,
+        );
 
         let mut inner = self
             .inner
@@ -335,11 +356,27 @@ fn evaluate_publication(
     identity: &str,
     target_domain: &str,
 ) -> (bool, DecisionReason) {
-    let Some(user) = publication
-        .users
-        .iter()
-        .find(|user| user.matches_identity(identity))
-    else {
+    evaluate_public_with_identities(
+        publication,
+        std::iter::once(identity),
+        target_domain,
+    )
+}
+
+fn evaluate_public_with_identities<'a, I>(
+    publication: &UserDomainAccessPublication,
+    identities: I,
+    target_domain: &str,
+) -> (bool, DecisionReason)
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let identities = identities.into_iter().collect::<Vec<_>>();
+    let Some(user) = publication.users.iter().find(|user| {
+        identities
+            .iter()
+            .any(|identity| user.matches_identity(identity))
+    }) else {
         return (
             publication.default_action.is_allowed(),
             DecisionReason::NoUserPolicy,
@@ -757,6 +794,17 @@ mod tests {
         assert_eq!(stats.matched_rule, 1);
         assert_eq!(stats.allowlist_miss, 1);
         assert_eq!(stats.no_user_policy, 1);
+    }
+
+    #[test]
+    fn policy_matches_any_authenticated_protocol_identity() {
+        let store = UserDomainAccessStore::default();
+        store
+            .apply(parse_publication(&signed_publication(1)).unwrap())
+            .unwrap();
+
+        let identities = vec!["user-label".to_string(), "vless-1".to_string()];
+        assert!(store.allows_with_identities(&identities, "api.example.com"));
     }
 
     #[test]

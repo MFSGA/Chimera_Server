@@ -119,6 +119,7 @@ mod traffic_noop {
     pub struct TrafficContext {
         pub protocol: &'static str,
         pub identity: Option<String>,
+        pub policy_identities: Vec<String>,
         pub inbound_tag: Option<String>,
         pub outbound_tag: Option<String>,
         pub client_ip: Option<IpAddr>,
@@ -137,6 +138,7 @@ mod traffic_noop {
             Self {
                 protocol,
                 identity: None,
+                policy_identities: Vec::new(),
                 inbound_tag: None,
                 outbound_tag: None,
                 client_ip: None,
@@ -153,6 +155,14 @@ mod traffic_noop {
 
         pub fn with_identity(mut self, identity: impl Into<String>) -> Self {
             self.identity = Some(identity.into());
+            self
+        }
+
+        pub fn with_policy_identity(mut self, identity: impl Into<String>) -> Self {
+            let identity = identity.into();
+            if !identity.is_empty() && !self.policy_identities.contains(&identity) {
+                self.policy_identities.push(identity);
+            }
             self
         }
 
@@ -206,6 +216,7 @@ mod traffic_noop {
             Self {
                 protocol: "unknown",
                 identity: None,
+                policy_identities: Vec::new(),
                 inbound_tag: None,
                 outbound_tag: None,
                 client_ip: None,

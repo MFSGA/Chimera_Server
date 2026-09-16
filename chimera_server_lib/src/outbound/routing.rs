@@ -12,7 +12,7 @@ use crate::{
     runtime::{DataPlaneRuntime, OutboundSummary},
 };
 
-const USER_DOMAIN_ACCESS_BLACKHOLE_TAG: &str = "user-domain-access";
+pub(crate) const USER_DOMAIN_ACCESS_BLACKHOLE_TAG: &str = "user-domain-access";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DirectOutboundAction {
@@ -27,6 +27,7 @@ pub(crate) enum DirectOutboundAction {
 pub(crate) struct InboundRoutingMetadata {
     pub local_addr: Option<SocketAddr>,
     pub vless_route: u32,
+    pub policy_identities: Vec<String>,
     pub sniffed_protocol: Option<String>,
     pub route_target_domain: Option<String>,
     pub attributes: HashMap<String, String>,
@@ -58,6 +59,11 @@ impl<'a> OutboundRoutingContext<'a> {
             network_name,
             metadata,
         }
+    }
+
+    pub fn with_policy_identities(mut self, policy_identities: &[String]) -> Self {
+        self.metadata.policy_identities = policy_identities.to_vec();
+        self
     }
 }
 
@@ -154,6 +160,7 @@ pub(crate) async fn select_direct_outbound_for_location(
     runtime: &DataPlaneRuntime,
     context: OutboundRoutingContext<'_>,
 ) -> std::io::Result<(DirectOutboundAction, Option<SocketAddr>)> {
+    let policy_identities = context.metadata.policy_identities.clone();
     let mut route_input = apply_routing_metadata(
         unresolved_connection_routing_input(
             context.inbound_tag,
@@ -164,9 +171,16 @@ pub(crate) async fn select_direct_outbound_for_location(
         ),
         context.metadata,
     );
-    if !runtime
-        .allows_user_domain_access(&route_input.user, &route_input.target_domain)
-    {
+    let allowed = if policy_identities.is_empty() {
+        runtime
+            .allows_user_domain_access(&route_input.user, &route_input.target_domain)
+    } else {
+        runtime.allows_user_domain_access_with_identities(
+            &policy_identities,
+            &route_input.target_domain,
+        )
+    };
+    if !allowed {
         return Ok((
             DirectOutboundAction::Blackhole {
                 tag: USER_DOMAIN_ACCESS_BLACKHOLE_TAG.to_string(),
@@ -337,7 +351,24 @@ pub(crate) fn select_direct_outbound(
     input: &RoutingInput,
     network_name: &str,
 ) -> std::io::Result<DirectOutboundAction> {
-    if !runtime.allows_user_domain_access(&input.user, &input.target_domain) {
+    select_direct_outbound_with_policy_identities(runtime, input, network_name, &[])
+}
+
+pub(crate) fn select_direct_outbound_with_policy_identities(
+    runtime: &DataPlaneRuntime,
+    input: &RoutingInput,
+    network_name: &str,
+    policy_identities: &[String],
+) -> std::io::Result<DirectOutboundAction> {
+    let allowed = if policy_identities.is_empty() {
+        runtime.allows_user_domain_access(&input.user, &input.target_domain)
+    } else {
+        runtime.allows_user_domain_access_with_identities(
+            policy_identities,
+            &input.target_domain,
+        )
+    };
+    if !allowed {
         return Ok(DirectOutboundAction::Blackhole {
             tag: USER_DOMAIN_ACCESS_BLACKHOLE_TAG.to_string(),
         });

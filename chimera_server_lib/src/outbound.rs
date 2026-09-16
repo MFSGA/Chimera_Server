@@ -43,8 +43,10 @@ use protocol::{
 
 pub(crate) use routing::{
     DirectOutboundAction, InboundRoutingMetadata, OutboundRoutingContext,
-    apply_routing_metadata, connection_routing_input, select_direct_outbound,
+    USER_DOMAIN_ACCESS_BLACKHOLE_TAG, apply_routing_metadata,
+    connection_routing_input, select_direct_outbound,
     select_direct_outbound_for_location,
+    select_direct_outbound_with_policy_identities,
 };
 use routing::{TcpRoutePlan, plan_tcp_route};
 
@@ -175,7 +177,7 @@ pub(crate) async fn connect_tcp_outbound(
         inbound_tag,
         user,
         source_addr,
-        0,
+        InboundRoutingMetadata::default(),
     )
     .await
 }
@@ -187,7 +189,7 @@ pub(crate) async fn connect_tcp_outbound_with_vless_route(
     inbound_tag: &str,
     user: &str,
     source_addr: SocketAddr,
-    vless_route: u32,
+    routing_metadata: InboundRoutingMetadata,
 ) -> std::io::Result<Option<TcpOutboundConnection>> {
     connect_tcp_outbound_with_routing_metadata(
         resolver,
@@ -196,10 +198,7 @@ pub(crate) async fn connect_tcp_outbound_with_vless_route(
         inbound_tag,
         user,
         source_addr,
-        InboundRoutingMetadata {
-            vless_route,
-            ..InboundRoutingMetadata::default()
-        },
+        routing_metadata,
     )
     .await
 }

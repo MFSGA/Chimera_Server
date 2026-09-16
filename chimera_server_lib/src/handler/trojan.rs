@@ -35,6 +35,7 @@ type FallbackSelection<'a> = Option<(&'a TrojanFallback, FallbackScore)>;
 #[derive(Debug, Clone)]
 struct TrojanCredential {
     identity: Option<String>,
+    policy_identity: Option<String>,
     user_level: u32,
 }
 
@@ -177,6 +178,7 @@ fn credential_from_user(user: &TrojanUser) -> TrojanCredential {
         });
     TrojanCredential {
         identity,
+        policy_identity: (!user.password.is_empty()).then(|| user.password.clone()),
         user_level: user.user_level,
     }
 }
@@ -312,10 +314,17 @@ impl TrojanTcpHandler {
         }
 
         let traffic_context = credential.identity.as_ref().map(|label| {
-            TrafficContext::new("trojan")
+            let context = TrafficContext::new("trojan")
                 .with_identity(label.clone())
                 .with_inbound_tag(self.inbound_tag.clone())
-                .with_user_level(credential.user_level)
+                .with_user_level(credential.user_level);
+            credential
+                .policy_identity
+                .as_ref()
+                .map(|identity| {
+                    context.clone().with_policy_identity(identity.clone())
+                })
+                .unwrap_or(context)
         });
 
         if command == CMD_UDP_ASSOCIATE {

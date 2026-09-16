@@ -69,6 +69,10 @@ pub(super) async fn run_multi_directional_udp_with_tasks(
         .and_then(|context| context.identity.as_deref())
         .unwrap_or_default()
         .to_string();
+    let policy_identities = traffic_context
+        .as_ref()
+        .map(|context| context.policy_identities.as_slice())
+        .unwrap_or_default();
     let _connection_guard = register_connection(traffic_context.as_ref());
     let (response_sender, mut response_receiver) =
         mpsc::channel::<TargetedUdpResponse>(UDP_SESSION_CHANNEL_CAPACITY);
@@ -105,7 +109,8 @@ pub(super) async fn run_multi_directional_udp_with_tasks(
                             local_addr,
                             ..InboundRoutingMetadata::default()
                         },
-                    ),
+                    )
+                    .with_policy_identities(policy_identities),
                 )
                 .await
                 {

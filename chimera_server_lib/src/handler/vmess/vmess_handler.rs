@@ -69,6 +69,7 @@ impl VmessServerUser {
 #[derive(Debug, Clone)]
 struct AuthenticatedVmessUser {
     instruction_key: [u8; 16],
+    policy_identity: String,
     user_label: String,
     user_level: u32,
 }
@@ -165,6 +166,7 @@ impl VmessUserStore {
 
             return Ok(AuthenticatedVmessUser {
                 instruction_key: user.instruction_key,
+                policy_identity: user.config.user_id.clone(),
                 user_label: user.config.user_label.clone(),
                 user_level: user.config.user_level,
             });
@@ -281,6 +283,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
 
         let user = self.authenticate_user(&cert_hash)?;
         let instruction_key = user.instruction_key;
+        let policy_identity = user.policy_identity.clone();
         let user_label = user.user_label.clone();
         let user_level = user.user_level;
 
@@ -481,6 +484,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
         let traffic_context = Some(
             TrafficContext::new("vmess")
                 .with_identity(user_label)
+                .with_policy_identity(policy_identity)
                 .with_inbound_tag(self.inbound_tag.clone())
                 .with_user_level(user_level),
         );

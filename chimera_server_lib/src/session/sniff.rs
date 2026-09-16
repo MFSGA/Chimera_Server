@@ -234,6 +234,7 @@ pub(crate) fn build_sniffed_route_plan(
             sniffed_protocol: sniffed.protocol,
             route_target_domain,
             attributes: sniffed.attributes,
+            policy_identities: Vec::new(),
         },
     }
 }

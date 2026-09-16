@@ -878,6 +878,16 @@ impl RuntimeState {
             .user_domain_access
             .allows(identity, target_domain)
     }
+
+    pub(crate) fn allows_user_domain_access_with_identities(
+        &self,
+        identities: &[String],
+        target_domain: &str,
+    ) -> bool {
+        self.data_plane
+            .0
+            .allows_user_domain_access_with_identities(identities, target_domain)
+    }
 }
 
 #[cfg(test)]

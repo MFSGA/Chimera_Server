@@ -13,6 +13,7 @@ use std::{
 
 #[cfg(any(feature = "vless", feature = "vmess"))]
 use bytes::{BufMut, BytesMut};
+use sha2::{Digest, Sha256};
 #[cfg(any(feature = "trojan", feature = "vless", feature = "vmess"))]
 use tokio::io::{
     AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf,
@@ -287,6 +288,55 @@ fn outbound(tag: &str, protocol: &str) -> OutboundSummary {
         proxy_settings_value: None,
         sender_settings_type: None,
         sender_settings_value: None,
+    }
+}
+
+fn signed_user_domain_policy(default_action: &str) -> String {
+    let mut value = serde_json::json!({
+        "version": 1,
+        "generatedAt": "2026-01-01T00:00:00.000Z",
+        "sourceBackendVersion": "test",
+        "targetNodeUuid": "node-1",
+        "defaultAction": default_action,
+        "users": []
+    });
+    let canonical = canonical_json(&value);
+    let digest = Sha256::digest(canonical.as_bytes());
+    value["checksum"] = serde_json::Value::String(format!("sha256:{digest:x}"));
+    value.to_string()
+}
+
+fn canonical_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::String(value) => serde_json::to_string(value).unwrap(),
+        serde_json::Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(canonical_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        serde_json::Value::Object(values) => {
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort();
+            format!(
+                "{{{}}}",
+                keys.into_iter()
+                    .map(|key| {
+                        format!(
+                            "{}:{}",
+                            serde_json::to_string(key).unwrap(),
+                            canonical_json(&values[key])
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
     }
 }
 
@@ -2903,6 +2953,32 @@ async fn udp_routing_selects_blackhole_outbound() {
         action,
         UdpOutboundAction::Blackhole {
             tag: "blocked".into()
+        }
+    );
+}
+
+#[tokio::test]
+async fn udp_routing_rejects_user_domain_policy_before_outbound_selection() {
+    let runtime = runtime_with_outbounds(vec![outbound("direct", "freedom")]);
+    runtime
+        .apply_user_domain_policy(&signed_user_domain_policy("reject"))
+        .expect("user-domain access policy should apply");
+
+    let action = select_udp_outbound(
+        &runtime.data_plane(),
+        "dokodemo-udp",
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 12345)),
+        None,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 53)),
+        &NetLocation::new(Address::Hostname("example.com".into()), 53),
+    )
+    .await
+    .expect("user-domain policy decision should succeed");
+
+    assert_eq!(
+        action,
+        UdpOutboundAction::Blackhole {
+            tag: "user-domain-access".into()
         }
     );
 }

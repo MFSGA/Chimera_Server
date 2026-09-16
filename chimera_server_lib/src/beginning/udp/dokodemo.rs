@@ -18,6 +18,7 @@ use crate::util::socket::recv_udp_with_original_destination;
 use crate::{
     address::{Address, NetLocation},
     config::server_config::DokodemoDoorConfig,
+    outbound::USER_DOMAIN_ACCESS_BLACKHOLE_TAG,
     routing_process::enrich_routing_input,
     routing_state::RoutingInput,
     runtime::{DataPlaneRuntime, OutboundSummary},
@@ -560,6 +561,13 @@ pub(super) async fn select_udp_outbound(
         local_port: local_addr.map_or(0, |address| address.port() as u32),
         ..RoutingInput::default()
     };
+    if !runtime
+        .allows_user_domain_access(&route_input.user, &route_input.target_domain)
+    {
+        return Ok(UdpOutboundAction::Blackhole {
+            tag: USER_DOMAIN_ACCESS_BLACKHOLE_TAG.to_string(),
+        });
+    }
     if runtime.routing_needs_process_lookup(&route_input) {
         enrich_routing_input(&mut route_input).await;
     }

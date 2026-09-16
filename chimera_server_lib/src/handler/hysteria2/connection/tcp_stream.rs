@@ -116,6 +116,7 @@ pub(super) async fn handle_tcp_stream(
         .email
         .clone()
         .unwrap_or(auth_ctx.client.password.clone());
+    let policy_identities = vec![auth_ctx.client.password.clone()];
     let connection = match tokio::time::timeout(
         TCP_CONNECT_TIMEOUT,
         connect_tcp_outbound_with_vless_route(
@@ -125,7 +126,11 @@ pub(super) async fn handle_tcp_stream(
             inbound_tag.as_str(),
             &context_identity,
             peer_addr,
-            auth_ctx.vless_route,
+            InboundRoutingMetadata {
+                vless_route: auth_ctx.vless_route,
+                policy_identities,
+                ..InboundRoutingMetadata::default()
+            },
         ),
     )
     .await

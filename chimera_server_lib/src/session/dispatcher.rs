@@ -249,6 +249,10 @@ where
                 peer_addr,
                 InboundRoutingMetadata {
                     local_addr,
+                    policy_identities: traffic_context
+                        .as_ref()
+                        .map(|context| context.policy_identities.clone())
+                        .unwrap_or_default(),
                     ..InboundRoutingMetadata::default()
                 },
             ),
@@ -381,7 +385,14 @@ where
                     inbound_tag,
                     user,
                     peer_addr,
-                    routing_metadata,
+                    {
+                        let mut routing_metadata = routing_metadata;
+                        routing_metadata.policy_identities = traffic_context
+                            .as_ref()
+                            .map(|context| context.policy_identities.clone())
+                            .unwrap_or_default();
+                        routing_metadata
+                    },
                 ),
             );
 

@@ -20,7 +20,8 @@ use super::{
 use crate::{
     address::NetLocation,
     outbound::{
-        DirectOutboundAction, connection_routing_input, select_direct_outbound,
+        DirectOutboundAction, connection_routing_input,
+        select_direct_outbound_with_policy_identities,
     },
     resolver::{Resolver, resolve_single_address},
     runtime::DataPlaneRuntime,
@@ -56,6 +57,7 @@ pub(super) async fn drive_udp_datagrams(
         .email
         .clone()
         .unwrap_or(auth_ctx.client.password.clone());
+    let policy_identities = vec![auth_ctx.client.password.clone()];
     let base_context = hysteria2_traffic_context(
         &auth_ctx.client,
         inbound_tag.as_str(),
@@ -298,7 +300,12 @@ pub(super) async fn drive_udp_datagrams(
             &session.last_location,
         );
         route_input.vless_route = auth_ctx.vless_route;
-        let action = match select_direct_outbound(&runtime, &route_input, "udp") {
+        let action = match select_direct_outbound_with_policy_identities(
+            &runtime,
+            &route_input,
+            "udp",
+            &policy_identities,
+        ) {
             Ok(action) => action,
             Err(err) => {
                 warn!(

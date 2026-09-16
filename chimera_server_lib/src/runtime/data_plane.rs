@@ -303,6 +303,15 @@ impl DataPlaneState {
         self.user_domain_access.allows(identity, target_domain)
     }
 
+    pub(super) fn allows_user_domain_access_with_identities(
+        &self,
+        identities: &[String],
+        target_domain: &str,
+    ) -> bool {
+        self.user_domain_access
+            .allows_with_identities(identities, target_domain)
+    }
+
     pub(super) fn record_passive_outbound_observation(
         &self,
         tag: impl Into<String>,
@@ -426,6 +435,15 @@ impl DataPlaneRuntime {
         target_domain: &str,
     ) -> bool {
         self.0.allows_user_domain_access(identity, target_domain)
+    }
+
+    pub(crate) fn allows_user_domain_access_with_identities(
+        &self,
+        identities: &[String],
+        target_domain: &str,
+    ) -> bool {
+        self.0
+            .allows_user_domain_access_with_identities(identities, target_domain)
     }
 
     pub(crate) fn record_passive_outbound_observation(

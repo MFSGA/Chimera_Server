@@ -877,6 +877,10 @@ async fn setup_server_stream_authenticates_each_configured_user() {
                     Some(expected_label)
                 );
                 assert_eq!(
+                    traffic_context.policy_identities,
+                    vec![user_id.to_string()]
+                );
+                assert_eq!(
                     traffic_context.inbound_tag.as_deref(),
                     Some("vmess-multi")
                 );
