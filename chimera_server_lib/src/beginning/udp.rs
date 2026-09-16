@@ -80,6 +80,7 @@ struct SessionUdpResponse {
     traffic_context: Option<TrafficContext>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum SessionUdpEvent {
     Data(SessionUdpResponse),
     End {

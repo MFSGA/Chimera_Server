@@ -41,11 +41,12 @@ use protocol::{
     trojan_connect, vless_tcp_connect,
 };
 
+#[cfg(test)]
+pub(crate) use routing::apply_routing_metadata;
 pub(crate) use routing::{
     DirectOutboundAction, InboundRoutingMetadata, OutboundRoutingContext,
-    USER_DOMAIN_ACCESS_BLACKHOLE_TAG, apply_routing_metadata,
-    connection_routing_input, select_direct_outbound,
-    select_direct_outbound_for_location,
+    USER_DOMAIN_ACCESS_BLACKHOLE_TAG, connection_routing_input,
+    select_direct_outbound, select_direct_outbound_for_location,
     select_direct_outbound_with_policy_identities,
 };
 use routing::{TcpRoutePlan, plan_tcp_route};

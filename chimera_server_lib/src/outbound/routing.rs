@@ -293,10 +293,10 @@ async fn resolve_all_addresses(
     location: &NetLocation,
     runtime: &DataPlaneRuntime,
 ) -> std::io::Result<Vec<SocketAddr>> {
-    let addresses = resolver.resolve_location(location).await.map_err(|error| {
-        runtime.record_user_domain_dns_failure();
-        error
-    })?;
+    let addresses = resolver
+        .resolve_location(location)
+        .await
+        .inspect_err(|_| runtime.record_user_domain_dns_failure())?;
     if addresses.is_empty() {
         runtime.record_user_domain_dns_failure();
         return Err(std::io::Error::new(
@@ -314,10 +314,7 @@ async fn resolve_single_address_recorded(
 ) -> std::io::Result<SocketAddr> {
     resolve_single_address(resolver, location)
         .await
-        .map_err(|error| {
-            runtime.record_user_domain_dns_failure();
-            error
-        })
+        .inspect_err(|_| runtime.record_user_domain_dns_failure())
 }
 
 fn encode_target_ips(addresses: &[SocketAddr]) -> Vec<Vec<u8>> {

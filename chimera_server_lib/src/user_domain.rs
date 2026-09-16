@@ -873,10 +873,10 @@ fn should_emit_unsupported_protocol_audit(
     if !inner.unsupported_protocol_audit.insert(key) {
         return false;
     }
-    if inner.unsupported_protocol_audit.len() > MAX_UNSUPPORTED_PROTOCOL_AUDIT_KEYS {
-        if let Some(key) = inner.unsupported_protocol_audit.iter().next().cloned() {
-            inner.unsupported_protocol_audit.remove(&key);
-        }
+    if inner.unsupported_protocol_audit.len() > MAX_UNSUPPORTED_PROTOCOL_AUDIT_KEYS
+        && let Some(key) = inner.unsupported_protocol_audit.iter().next().cloned()
+    {
+        inner.unsupported_protocol_audit.remove(&key);
     }
     true
 }
