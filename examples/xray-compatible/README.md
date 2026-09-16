@@ -39,6 +39,7 @@ Config validation is necessary but is not protocol interoperability evidence. Te
 | `dokodemo-door-tcp.json5` | dokodemo-door | tcp | none | config-validated |
 | `dokodemo-door-udp.json5` | dokodemo-door | udp | none | config-validated |
 | `dokodemo-door-udp-routing-blackhole.json5` | dokodemo-door | udp | none | config-validated; routing example |
+| `dns-hosts-dokodemo-tcp.json5` | dokodemo-door | tcp | none | config-validated; `dns.hosts` example |
 | `http-tcp-password.json5` | http | tcp | none | config-validated; Xray-verified Basic-auth CONNECT with repository fixture |
 | `vless-tcp-none.json5` | vless | tcp | none | config-validated |
 | `vless-mkcp-none.json5` | vless | mkcp | none | config-validated; Xray-verified TCP stream interoperability with Xray 26.9.9 and 26.3.27 |
@@ -58,6 +59,27 @@ Config validation is necessary but is not protocol interoperability evidence. Te
 | `shadowsocks-2022-eih-tcp-udp.json5` | shadowsocks 2022 EIH | tcp + udp | none | config-validated; Xray-verified |
 
 The two Shadowsocks examples intentionally omit `streamSettings`: Chimera's combined Shadowsocks `network: "tcp,udp"` listener rejects `streamSettings` because the same inbound also owns a UDP listener.
+
+For Chimera's `userDomainAccess` extension, a Shadowsocks user's configured `email` is the
+authenticated routing identity and can be supplied as `protocolIdentity.shadowsocksEmail`.
+This follows Xray's `MemoryUser.Email` convention; the Linux Xray 26.2.6 Shadowsocks TCP and
+legacy UDP and 2022 EIH UDP domain-policy allow/reject tests pass, while EIH TCP and other
+transports remain pending.
+
+## Routing and DNS compatibility scope
+
+| Area | Current evidence |
+| --- | --- |
+| Xray `routing.rules` domain/user matching | Runtime-covered by native routing tests, including `AsIs`, `IpIfNonMatch` and `IpOnDemand` domainStrategy behavior plus route-only sniffed-domain/original-IP unit coverage; Xray 26.2.6 VLESS TCP `user + domain` and route-only HTTP `Host` allow/reject interoperability pass, while other protocol/transport combinations remain pending. |
+| Chimera `userDomainAccess` known domains | Runtime-covered before outbound selection, including session-based XUDP domain preservation; local and real Xray-over-gRPC dynamic updates for new XUDP sessions pass; DNS failures are exposed separately from policy rejects; Xray 26.2.6 VLESS TCP/XUDP, Trojan TCP/UDP, Hysteria2 TCP/UDP, Socks5 TCP/UDP and VLESS XHTTP over TCP allow/reject interoperability passes, while existing-session lifecycle, GlobalID reattachment and other transport combinations remain pending. |
+| Unknown target domain access | Runtime-covered as allow + structured audit; direct IP, missing SNI/Host and unrecognized domains are not rejected by this policy. VLESS TCP direct-IP allow/audit interoperability passes with Xray 26.2.6. Recent events are queryable through Chimera's bounded `UserDomainAccessService/GetAuditEvents` extension. |
+| Xray `dns.hosts` | Config-validated and runtime-covered for IP, `proxiedDomain` and response-code mappings (for example `"#3"`; `"#0"` is an empty response) using Xray custom host rules: default/`full:`, `domain:`, `keyword:`, `regexp:`, and `dotless:`; matching entries are combined, with case, trailing-dot and IDN normalization for literal domain patterns. `proxiedDomain` chains are bounded and fall through to the final alias resolver when no static alias is present. Geosite/ext rules remain unsupported. |
+| Xray `dns.servers` and advanced DNS options | Plain UDP IP nameservers are config-validated and runtime-covered, including default port 53, explicit ports, A/AAAA queries, ordered server attempts and global `queryStrategy` family selection (`UseIP`, `UseIPv4`, `UseIPv6`, `UseSystem`), and top-level `disableFallback` / `disableFallbackIfMatch` fallback controls. String endpoints using `tcp://IP[:port]` are also runtime-covered with Xray's two-byte DNS-over-TCP framing; advanced object entries remain UDP-only. Basic nameserver objects with `address`, `port`, `clientIp`, `domains`, per-server `queryStrategy`, `timeoutMs`, `expectedIPs`/`expectIPs`, `unexpectedIPs`, `skipFallback` and `finalQuery` are also supported; top-level `clientIp` applies to plain UDP/TCP queries and a server object's value overrides it, emitting Xray-compatible EDNS Client Subnet (/24 IPv4, /96 IPv6). Matching nameservers are prioritized before the normal fallback order, per-server timeouts follow Xray's 4000ms default/zero semantics, and returned addresses are filtered according to the configured IP rules. `enableParallelQuery` is supported for the selected direct UDP/TCP nameservers: equivalent adjacent policies race, while lower-priority policy groups remain gated until higher-priority groups fail. Other fallback controls, URL schemes, remote dispatcher routing and DoH/DoT remain unsupported and are rejected explicitly. |
+
+The current user-domain policy iteration targets VLESS, VLESS over XHTTP, Hysteria2, Socks5 and
+Trojan on Linux. Other inbound protocols and unverified transport combinations are not claimed as
+supported; an active policy emits a bounded `user_domain_access_unsupported_protocol` warning when
+one of them reaches the policy check. Shadowsocks follow-up work is paused.
 
 ## Real Xray-client verification recorded on 2026-09-10 and 2026-09-13
 
@@ -182,7 +204,7 @@ Hysteria2 is therefore **not currently release-blocked by the previously observe
 | Area | Current status |
 | --- | --- |
 | VLESS + TCP + REALITY + Vision | Runtime and ignored real-client matrices exist; not re-run as release evidence in this round. |
-| VLESS + XHTTP + none/TLS/REALITY | Active XHTTP protocol/security matrices pass under ordinary tests; no goal-specific real Xray-client certification was refreshed in this round. |
+| VLESS + XHTTP + none/TLS/REALITY | Ordinary XHTTP protocol/security matrices pass; the routing goal has real Xray 26.2.6/Linux allow/reject certification for XHTTP over TCP with `none` and TLS. HTTP/3 and REALITY routing combinations remain pending. |
 | VLESS + gRPC | Inbound and real Xray-client tests exist; not re-run as release evidence in this round. |
 | VLESS + HTTPUpgrade | Inbound and real Xray-client tests exist; not re-run as release evidence in this round. |
 | Mixed inbound | Runtime/config support exists; no materialized example or refreshed real Xray-client release certification in this directory. |

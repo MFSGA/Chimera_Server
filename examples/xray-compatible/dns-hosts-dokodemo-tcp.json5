@@ -1,0 +1,30 @@
+{
+  "inbounds": [
+    {
+      "tag": "dns-hosts-dokodemo-tcp",
+      "listen": "127.0.0.1",
+      "port": 11026,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "example.com",
+        "port": 80,
+        "followRedirect": false
+      },
+      "streamSettings": {
+        "network": "tcp"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    }
+  ],
+  "dns": {
+    "hosts": {
+      "example.com": "192.0.2.10",
+      "api.example.com.": ["192.0.2.11", "2001:db8::11"]
+    }
+  }
+}
