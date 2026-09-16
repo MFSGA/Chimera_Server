@@ -59,7 +59,7 @@ current code has an explicit config path and runtime handler path for it.
 | xray-style API inbound routing | Partial | Resolves API listen address through routing, but local gRPC currently listens without TLS. |
 | MCP push service | Partial | Listen/path/update interval are parsed and served, but operational docs are still thin. |
 | Outbounds | Partial | Tags and protocol names are surfaced in runtime state; forwarding behavior is still materializing. |
-| Routing and policy | Partial | Routing state and gRPC controls exist; policy parsing is mostly a compatibility placeholder. |
+| Routing and policy | Partial | Xray-style routing state and gRPC controls exist. The Chimera-only `userDomainAccess` extension is parsed and enforced before outbound selection, including `TestRoute`, protocol identity aliases for VLESS/VMess and credential identities for Trojan/Hysteria2. `TestRoute` uses the native system resolver for `IpIfNonMatch`/`IpOnDemand`; Xray custom DNS client settings are not yet wired. It is not an Xray-native policy object, and real-client interoperability coverage for per-user domain decisions is still pending. |
 
 ## Re-certification evidence (2026-09-11)
 

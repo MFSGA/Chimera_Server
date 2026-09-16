@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, net::IpAddr, sync::Arc};
 
 use prost::Message;
 use tokio::sync::mpsc;
@@ -6,10 +6,13 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use crate::{
+    address::{Address, NetLocation},
     config::rule::{
         BalancerConfig, NetworkListConfig, PortListConfig, PortRangeConfig,
         RuleConfig, WebhookRuleConfig,
     },
+    outbound::USER_DOMAIN_ACCESS_BLACKHOLE_TAG,
+    resolver::{NativeResolver, Resolver},
     routing_process::enrich_routing_input,
     routing_state::{RouteMatch, RoutingEvent, RoutingInput},
     runtime::RuntimeState,
@@ -25,6 +28,7 @@ const TYPE_ROUTER_CONFIG_V2RAY: &str = "v2ray.core.app.router.Config";
 #[derive(Clone)]
 pub(super) struct RoutingServiceImpl {
     runtime: RuntimeState,
+    resolver: Arc<dyn Resolver>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -196,14 +200,15 @@ struct StrategyLeastLoadConfigPayload {
 
 impl RoutingServiceImpl {
     fn new(runtime: RuntimeState) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            resolver: Arc::new(NativeResolver::new()),
+        }
     }
 
-    fn has_outbound_tag(&self, tag: &str) -> bool {
-        self.runtime
-            .outbounds()
-            .iter()
-            .any(|outbound| outbound.tag == tag)
+    #[cfg(test)]
+    fn with_resolver(runtime: RuntimeState, resolver: Arc<dyn Resolver>) -> Self {
+        Self { runtime, resolver }
     }
 
     fn parse_typed_message_type(
@@ -229,76 +234,91 @@ impl RoutingServiceImpl {
         })
     }
 
-    fn resolve_outbound_group_tags(
-        &self,
-        group_tags: &[String],
-    ) -> Result<RouteMatch, Status> {
-        if group_tags.is_empty() {
-            return Err(Status::unknown(ERR_NOT_ENOUGH_INFO));
-        }
-
-        let overrides = self.runtime.balancer_overrides();
-        for group_tag in group_tags {
-            if let Some(target) = overrides.get(group_tag) {
-                return Ok(RouteMatch {
-                    outbound_tag: target.clone(),
-                    outbound_group_tags: vec![group_tag.clone()],
-                    rule_tag: String::new(),
-                    resolution_error: None,
-                });
-            }
-        }
-
-        let routing = self.runtime.routing();
-        let outbounds = self.runtime.outbounds();
-        for group_tag in group_tags {
-            if let Some(target) = routing
-                .balancer_targets(group_tag, &outbounds)
-                .into_iter()
-                .next()
-            {
-                return Ok(RouteMatch {
-                    outbound_tag: target,
-                    outbound_group_tags: vec![group_tag.clone()],
-                    rule_tag: String::new(),
-                    resolution_error: None,
-                });
-            }
-            if self.has_outbound_tag(group_tag) {
-                return Ok(RouteMatch {
-                    outbound_tag: group_tag.clone(),
-                    outbound_group_tags: vec![group_tag.clone()],
-                    rule_tag: String::new(),
-                    resolution_error: None,
-                });
-            }
-        }
-
-        Err(Status::unknown(ERR_NOT_ENOUGH_INFO))
-    }
-
     async fn resolve_route(
         &self,
         context: &proto::xray::app::router::command::RoutingContext,
     ) -> Result<(RoutingInput, RouteMatch), Status> {
         let mut input = routing_input_from_context(context);
-        if self.runtime.routing().requires_process_lookup() {
+        if !self
+            .runtime
+            .allows_user_domain_access(&input.user, &input.target_domain)
+        {
+            return Ok((
+                input,
+                RouteMatch {
+                    outbound_tag: USER_DOMAIN_ACCESS_BLACKHOLE_TAG.to_string(),
+                    outbound_group_tags: Vec::new(),
+                    rule_tag: String::new(),
+                    resolution_error: None,
+                },
+            ));
+        }
+        let routing = self.runtime.routing();
+        if routing.domain_strategy()
+            == crate::routing_state::DomainStrategy::IpOnDemand
+            && routing.needs_target_ip_resolution(&input)
+        {
+            self.resolve_target_ips(&mut input).await?;
+        }
+        if routing.requires_process_lookup() {
             enrich_routing_input(&mut input).await;
         }
-        let route = self.runtime.routing().route(
-            &input,
-            &self.runtime.outbounds(),
-            &self.runtime.balancer_overrides(),
-        );
-        if let Some(route) = route {
-            if let Some(error) = route.resolution_error.as_ref() {
-                return Err(Status::unknown(error.clone()));
+        let outbounds = self.runtime.outbounds();
+        let overrides = self.runtime.balancer_overrides();
+        let mut route = routing.route(&input, &outbounds, &overrides);
+        if route.is_none()
+            && routing.domain_strategy()
+                == crate::routing_state::DomainStrategy::IpIfNonMatch
+            && !input.target_domain.is_empty()
+            && input.target_ips.is_empty()
+        {
+            self.resolve_target_ips(&mut input).await?;
+            if routing.requires_process_lookup() {
+                enrich_routing_input(&mut input).await;
             }
-            return Ok((input, route));
+            route = routing.route(&input, &outbounds, &overrides);
         }
+        let Some(route) = route else {
+            return Err(Status::unknown(ERR_NOT_ENOUGH_INFO));
+        };
+        if let Some(error) = route.resolution_error.as_ref() {
+            return Err(Status::unknown(error.clone()));
+        }
+        Ok((input, route))
+    }
 
-        self.resolve_outbound_group_tags(&context.outbound_group_tags)
-            .map(|route| (input, route))
+    async fn resolve_target_ips(
+        &self,
+        input: &mut RoutingInput,
+    ) -> Result<(), Status> {
+        if input.target_domain.is_empty() {
+            return Ok(());
+        }
+        let location = NetLocation::new(
+            Address::Hostname(input.target_domain.clone()),
+            input.target_port as u16,
+        );
+        let addresses =
+            self.resolver
+                .resolve_location(&location)
+                .await
+                .map_err(|error| {
+                    Status::unknown(format!("routing DNS lookup failed: {error}"))
+                })?;
+        if addresses.is_empty() {
+            return Err(Status::unknown(format!(
+                "routing DNS lookup returned no addresses for {}",
+                input.target_domain
+            )));
+        }
+        input.target_ips = addresses
+            .into_iter()
+            .map(|address| match address.ip() {
+                IpAddr::V4(ip) => ip.octets().to_vec(),
+                IpAddr::V6(ip) => ip.octets().to_vec(),
+            })
+            .collect();
+        Ok(())
     }
 
     fn principle_targets(&self, balancer_tag: &str) -> Result<Vec<String>, Status> {
@@ -672,6 +692,7 @@ impl proto::xray::app::router::command::routing_service_server::RoutingService
             Status::invalid_argument("routing_context is required")
         })?;
         let (input, route) = self.resolve_route(&context).await?;
+        context.target_i_ps = input.target_ips.clone();
         context.outbound_tag = route.outbound_tag.clone();
         context.outbound_group_tags = route.outbound_group_tags.clone();
 
@@ -831,21 +852,36 @@ pub(super) fn build_service(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        future::Future, io, net::SocketAddr, pin::Pin, sync::Arc, time::Duration,
+    };
 
     use prost::Message;
     use tokio_stream::StreamExt;
     use tonic::{Code, Request};
 
     use crate::{
-        config::rule::{BalancerConfig, RuleConfig},
+        config::rule::{BalancerConfig, RoutingConfig, RuleConfig},
         geodata::{GeodataStore, proto as geodata_proto},
+        resolver::Resolver,
         routing_state::RoutingState,
         runtime::OutboundSummary,
     };
 
     use super::proto::xray::app::router::command::routing_service_server::RoutingService;
     use super::*;
+
+    struct StaticResolver;
+
+    impl Resolver for StaticResolver {
+        fn resolve_location(
+            &self,
+            _location: &crate::address::NetLocation,
+        ) -> Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send>>
+        {
+            Box::pin(async { Ok(vec![SocketAddr::from(([203, 0, 113, 2], 443))]) })
+        }
+    }
 
     fn build_runtime(outbounds: &[&str]) -> RuntimeState {
         RuntimeState::new(
@@ -898,6 +934,11 @@ mod tests {
         );
     }
 
+    fn signed_user_domain_policy(default_action: &str) -> String {
+        assert_eq!(default_action, "reject");
+        "{\"version\":1,\"generatedAt\":\"2026-01-01T00:00:00.000Z\",\"sourceBackendVersion\":\"test\",\"targetNodeUuid\":\"node-1\",\"defaultAction\":\"reject\",\"users\":[],\"checksum\":\"sha256:5dbfd6c39173b845c52cf308e01156f5fbd6011600118d0fc6adc410217b871a\"}".to_string()
+    }
+
     fn encode_router_config(
         config: RouterConfigPayload,
     ) -> proto::xray::common::serial::TypedMessage {
@@ -941,6 +982,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn routing_test_route_applies_user_domain_policy_before_runtime_rules() {
+        let runtime = build_runtime(&["direct"]);
+        install_rules(
+            &runtime,
+            vec![RuleConfig {
+                inbound_tag: vec!["inbound-a".into()],
+                outbound_tag: Some("direct".into()),
+                ..RuleConfig::default()
+            }],
+            vec![],
+        );
+        runtime
+            .apply_user_domain_policy(&signed_user_domain_policy("reject"))
+            .expect("user-domain policy should install");
+        let service = RoutingServiceImpl::new(runtime.clone());
+
+        let response = service
+            .test_route(Request::new(
+                proto::xray::app::router::command::TestRouteRequest {
+                    routing_context: Some(
+                        proto::xray::app::router::command::RoutingContext {
+                            inbound_tag: "inbound-a".to_string(),
+                            target_domain: "blocked.example".to_string(),
+                            user: "user-1".to_string(),
+                            ..Default::default()
+                        },
+                    ),
+                    field_selectors: vec![],
+                    publish_result: false,
+                },
+            ))
+            .await
+            .expect("policy rejection should return a route result")
+            .into_inner();
+
+        assert_eq!(response.outbound_tag, USER_DOMAIN_ACCESS_BLACKHOLE_TAG);
+        assert!(response.outbound_group_tags.is_empty());
+        assert_eq!(runtime.user_domain_policy_status().stats.rejected, 1);
+    }
+
+    #[tokio::test]
+    async fn routing_test_route_resolves_domain_for_ip_strategies() {
+        for strategy in ["IpIfNonMatch", "IpOnDemand"] {
+            let runtime = build_runtime(&["direct"]);
+            runtime.replace_routing(
+                RoutingState::from_config(Some(&RoutingConfig {
+                    domain_strategy: Some(strategy.into()),
+                    rules: vec![RuleConfig {
+                        ip: vec!["203.0.113.2/32".into()],
+                        outbound_tag: Some("direct".into()),
+                        ..RuleConfig::default()
+                    }],
+                    ..RoutingConfig::default()
+                }))
+                .expect("domain strategy routing config should build"),
+            );
+            let service =
+                RoutingServiceImpl::with_resolver(runtime, Arc::new(StaticResolver));
+
+            let response = service
+                .test_route(Request::new(
+                    proto::xray::app::router::command::TestRouteRequest {
+                        routing_context: Some(
+                            proto::xray::app::router::command::RoutingContext {
+                                target_domain: "example.test".into(),
+                                target_port: 443,
+                                ..Default::default()
+                            },
+                        ),
+                        field_selectors: vec![],
+                        publish_result: false,
+                    },
+                ))
+                .await
+                .expect("resolved IP route should match")
+                .into_inner();
+
+            assert_eq!(response.outbound_tag, "direct");
+            assert_eq!(response.target_i_ps, vec![vec![203, 0, 113, 2]]);
+        }
+    }
+
+    #[tokio::test]
     async fn routing_test_route_requires_route_clues() {
         let service = RoutingServiceImpl::new(build_runtime(&["direct", "backup"]));
         let err = service
@@ -949,6 +1073,8 @@ mod tests {
                     routing_context: Some(
                         proto::xray::app::router::command::RoutingContext {
                             inbound_tag: "inbound-a".to_string(),
+                            outbound_tag: "direct".to_string(),
+                            outbound_group_tags: vec!["direct".to_string()],
                             ..Default::default()
                         },
                     ),
