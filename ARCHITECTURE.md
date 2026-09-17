@@ -455,6 +455,15 @@ protobuf 输入仍保留其 presence 语义，由既有 adapter 转成 `ServerCo
 `cargo check -p chimera_server_app`、`cargo test -p chimera_server_lib --lib tests::prepare_server_runtime_does_not_bind_inbound_listeners -- --exact`；
 真实 Xray 客户端互通组合未因本切片改变，QUIC/mKCP 等已标记未验证范围保持不变。
 
+2026-09-17 第三阶段 TCP transport 归位决策：将 TCP listener、accept health、socket policy、
+原始目标地址读取、TCP connection task 启动和 PROXY header helper 从 `beginning/mod.rs`
+迁移到 `transport/tcp.rs`。`beginning` 暂时保留 `start_servers`、`start_bound_servers`、
+`start_tcp_server` 以及 gRPC/XHTTP 所需的窄 facade，避免调用方和生命周期发布规则同时变化；
+本切片不迁移 UDP、relay 或协议行为。验证：`cargo check -p chimera_server_lib`、
+`cargo test -p chimera_server_lib --lib beginning::tests`（18 passed）、
+`cargo test -p chimera_server_lib --lib`（1480 passed）、`git diff --check`；
+日志、listener bind、connection/session owner 和既有兼容入口保持不变。
+
 ## 14. 参考资料
 
 - [Xray inbound 管理源码（本地）](ref/xray-core/app/proxyman/inbound/inbound.go)：外部管理行为的核对入口。
