@@ -208,9 +208,7 @@ fn plan_vless_core(
                 .collect::<Result<Vec<_>, Error>>()
         })
         .transpose()?
-        .ok_or_else(|| {
-            Error::InvalidConfig("vless inbound requires at least one client".into())
-        })?;
+        .unwrap_or_default();
     let uses_vision = has_vless_vision_flow(&users);
     let fallbacks = collect_vless_fallbacks(vless_settings.fallbacks)?;
 

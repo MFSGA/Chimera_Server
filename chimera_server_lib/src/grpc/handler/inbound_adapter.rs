@@ -211,11 +211,6 @@ impl HandlerServiceImpl {
         &self,
         config: VlessInboundConfigPayload,
     ) -> Result<ServerProxyConfig, Status> {
-        if config.clients.is_empty() {
-            return Err(Status::invalid_argument(
-                "vless AddInbound requires at least one client",
-            ));
-        }
         let users = config
             .clients
             .iter()

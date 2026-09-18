@@ -60,6 +60,11 @@ Config validation is necessary but is not protocol interoperability evidence. Te
 
 The two Shadowsocks examples intentionally omit `streamSettings`: Chimera's combined Shadowsocks `network: "tcp,udp"` listener rejects `streamSettings` because the same inbound also owns a UDP listener.
 
+VLESS, Trojan, and Hysteria2 inbound configurations may explicitly contain an empty
+`clients` array. Chimera starts the listener with no authorized users, so authentication
+fails until a user is added through the management API; this matches the checked-in Xray
+server behavior and is covered by configuration-builder regression tests.
+
 For Chimera's `userDomainAccess` extension, a Shadowsocks user's configured `email` is the
 authenticated routing identity and can be supplied as `protocolIdentity.shadowsocksEmail`.
 This follows Xray's `MemoryUser.Email` convention; the Linux Xray 26.2.6 Shadowsocks TCP and
