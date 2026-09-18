@@ -274,11 +274,6 @@ pub(super) fn build_hysteria2_server(
         stream_settings.hysteria_settings.as_ref(),
     )?;
     let config = apply_hysteria2_xray_quic_plan(config, xray_quic_plan);
-    if config.clients.is_empty() {
-        return Err(Error::InvalidConfig(
-            "hysteria2 inbound requires at least one client".into(),
-        ));
-    }
     Ok(context.finish(
         ServerProxyConfig::Hysteria2 { config },
         Transport::Quic,

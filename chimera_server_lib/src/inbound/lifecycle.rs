@@ -90,6 +90,7 @@ impl Drop for ConfiguredStartGuard {
     }
 }
 
+#[allow(dead_code)] // Recovery guards are activated by dynamic lifecycle operations.
 pub(super) struct PendingAddGuard {
     manager: Arc<InboundManager>,
     tag: String,
@@ -97,6 +98,7 @@ pub(super) struct PendingAddGuard {
     armed: bool,
 }
 
+#[allow(dead_code)]
 impl PendingAddGuard {
     pub(super) fn new(
         manager: Arc<InboundManager>,
@@ -128,6 +130,7 @@ impl Drop for PendingAddGuard {
     }
 }
 
+#[allow(dead_code)] // Recovery guards are activated by dynamic lifecycle operations.
 pub(super) struct RemoveCleanupGuard {
     manager: Arc<InboundManager>,
     tag: String,
@@ -136,6 +139,7 @@ pub(super) struct RemoveCleanupGuard {
     armed: bool,
 }
 
+#[allow(dead_code)]
 impl RemoveCleanupGuard {
     pub(super) fn new(
         manager: Arc<InboundManager>,
@@ -283,6 +287,7 @@ impl Drop for AlterRecoveryGuard {
     }
 }
 
+#[allow(dead_code)] // Lifecycle operations are reached through optional management paths.
 impl InboundManager {
     pub(super) fn set_lifecycle_for_generation(
         &self,
@@ -366,6 +371,7 @@ impl InboundManager {
             })
     }
 
+    #[allow(dead_code)] // Readiness uses the richer failure record; tests also query this boolean.
     pub(crate) fn has_unhealthy_inbound(&self) -> bool {
         self.state
             .read()

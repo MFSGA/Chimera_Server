@@ -298,6 +298,7 @@ pub(super) fn decode_outbound_transport(
     )
 }
 
+#[cfg(feature = "api")]
 pub(crate) fn validate_outbound_sender_settings(
     message_type: Option<&str>,
     value: Option<&[u8]>,

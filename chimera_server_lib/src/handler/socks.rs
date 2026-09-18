@@ -26,8 +26,9 @@ pub(crate) use udp_session::run_udp_relay_with_expected_client;
 #[cfg(test)]
 use udp_session::{
     SocksUdpClientSession, XrayUdpActivityWindow, prune_closed_udp_sessions,
-    run_shared_udp_relay, run_udp_relay, send_udp_target_payload,
 };
+#[cfg(all(test, feature = "traffic"))]
+use udp_session::{run_shared_udp_relay, run_udp_relay, send_udp_target_payload};
 
 const SOCKS4_VERSION: u8 = 0x04;
 const SOCKS_VERSION: u8 = 0x05;
@@ -43,7 +44,6 @@ const ADDR_TYPE_IPV4: u8 = 0x01;
 const ADDR_TYPE_DOMAIN: u8 = 0x03;
 const ADDR_TYPE_IPV6: u8 = 0x04;
 const REP_SUCCEEDED: u8 = 0x00;
-const REP_GENERAL_FAILURE: u8 = 0x01;
 const REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 const SOCKS4_REQUEST_GRANTED: u8 = 90;
 const SOCKS4_REQUEST_REJECTED: u8 = 91;
@@ -54,6 +54,7 @@ const XRAY_SOCKS4_NULL_FIELD_SIZE: usize = 8192;
 // on the second one-minute check.
 const UDP_TARGET_SESSION_ACTIVITY_CHECK: Duration = Duration::from_secs(60);
 
+#[cfg(test)]
 const SUCCESS_RESPONSE: [u8; 10] = [
     SOCKS_VERSION,
     REP_SUCCEEDED,

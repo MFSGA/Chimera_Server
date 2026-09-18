@@ -488,6 +488,7 @@ pub(super) fn raw_xray_request_target(first_line: &[u8]) -> Option<&[u8]> {
     Some(&rest[..second_space])
 }
 
+#[cfg(test)]
 pub(super) fn xray_websocket_request_path(
     request_target: &str,
 ) -> Result<Vec<u8>, ()> {

@@ -409,6 +409,7 @@ pub(in crate::handler::socks) async fn send_udp_target_payload(
     unreachable!("SOCKS5 UDP target payload retry loop is bounded")
 }
 
+#[cfg(test)]
 pub(in crate::handler::socks) fn prune_closed_udp_sessions(
     client_sessions: &mut HashMap<(SocketAddr, bool), SocksUdpClientSession>,
 ) {

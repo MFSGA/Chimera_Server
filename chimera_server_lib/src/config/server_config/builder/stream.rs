@@ -27,6 +27,7 @@ pub(super) fn normalize_xray_websocket_path(path: Option<String>) -> String {
     }
 }
 
+#[cfg(feature = "ws")]
 pub(super) fn strip_xray_websocket_early_data_query(path: String) -> String {
     let Some(query_start) = path.find('?') else {
         return path;
@@ -60,6 +61,7 @@ pub(super) fn strip_xray_websocket_early_data_query(path: String) -> String {
     }
 }
 
+#[cfg(feature = "ws")]
 pub(super) fn parse_xray_websocket_query_pair(
     pair: &str,
 ) -> Option<(String, String)> {
@@ -73,6 +75,7 @@ pub(super) fn parse_xray_websocket_query_pair(
     ))
 }
 
+#[cfg(feature = "ws")]
 pub(super) fn decode_xray_websocket_query_component(value: &str) -> Option<String> {
     let mut decoded = Vec::with_capacity(value.len());
     let bytes = value.as_bytes();

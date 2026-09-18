@@ -60,6 +60,11 @@ Config validation is necessary but is not protocol interoperability evidence. Te
 
 The two Shadowsocks examples intentionally omit `streamSettings`: Chimera's combined Shadowsocks `network: "tcp,udp"` listener rejects `streamSettings` because the same inbound also owns a UDP listener.
 
+VLESS, VMess, Trojan, and Hysteria2 inbound configurations may explicitly contain an empty
+`clients` array. Chimera starts the listener with no authorized users, so authentication
+fails until a user is added through the management API; this matches the checked-in Xray
+server behavior and is covered by configuration-builder regression tests.
+
 For Chimera's `userDomainAccess` extension, a Shadowsocks user's configured `email` is the
 authenticated routing identity and can be supplied as `protocolIdentity.shadowsocksEmail`.
 This follows Xray's `MemoryUser.Email` convention; the Linux Xray 26.2.6 Shadowsocks TCP and
@@ -76,10 +81,11 @@ transports remain pending.
 | Xray `dns.hosts` | Config-validated and runtime-covered for IP, `proxiedDomain` and response-code mappings (for example `"#3"`; `"#0"` is an empty response) using Xray custom host rules: default/`full:`, `domain:`, `keyword:`, `regexp:`, and `dotless:`; matching entries are combined, with case, trailing-dot and IDN normalization for literal domain patterns. `proxiedDomain` chains are bounded and fall through to the final alias resolver when no static alias is present. Geosite/ext rules remain unsupported. |
 | Xray `dns.servers` and advanced DNS options | Plain UDP IP nameservers are config-validated and runtime-covered, including default port 53, explicit ports, A/AAAA queries, ordered server attempts and global `queryStrategy` family selection (`UseIP`, `UseIPv4`, `UseIPv6`, `UseSystem`), and top-level `disableFallback` / `disableFallbackIfMatch` fallback controls. String endpoints using `tcp://IP[:port]` are also runtime-covered with Xray's two-byte DNS-over-TCP framing; advanced object entries remain UDP-only. Basic nameserver objects with `address`, `port`, `clientIp`, `domains`, per-server `queryStrategy`, `timeoutMs`, `expectedIPs`/`expectIPs`, `unexpectedIPs`, `skipFallback` and `finalQuery` are also supported; top-level `clientIp` applies to plain UDP/TCP queries and a server object's value overrides it, emitting Xray-compatible EDNS Client Subnet (/24 IPv4, /96 IPv6). Matching nameservers are prioritized before the normal fallback order, per-server timeouts follow Xray's 4000ms default/zero semantics, and returned addresses are filtered according to the configured IP rules. `enableParallelQuery` is supported for the selected direct UDP/TCP nameservers: equivalent adjacent policies race, while lower-priority policy groups remain gated until higher-priority groups fail. Other fallback controls, URL schemes, remote dispatcher routing and DoH/DoT remain unsupported and are rejected explicitly. |
 
-The current user-domain policy iteration targets VLESS, VLESS over XHTTP, Hysteria2, Socks5 and
-Trojan on Linux. Other inbound protocols and unverified transport combinations are not claimed as
-supported; an active policy emits a bounded `user_domain_access_unsupported_protocol` warning when
-one of them reaches the policy check. Shadowsocks follow-up work is paused.
+The current user-domain policy iteration targets VLESS, VLESS over XHTTP, Hysteria2, Socks5,
+Trojan, and the verified Shadowsocks TCP/legacy UDP/2022 EIH UDP paths on Linux. Other inbound
+protocols and unverified transport combinations are not claimed as supported; an active policy
+emits a bounded `user_domain_access_unsupported_protocol` warning when one of them reaches the
+policy check. Shadowsocks EIH TCP and other transports remain pending.
 
 ## Real Xray-client verification recorded on 2026-09-10 and 2026-09-13
 

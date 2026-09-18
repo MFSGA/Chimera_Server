@@ -170,10 +170,13 @@ pub struct RouteMatch {
 
 #[derive(Debug, Clone)]
 pub(crate) struct RoutingEvent {
+    #[allow(dead_code)]
     pub input: RoutingInput,
+    #[allow(dead_code)]
     pub route: RouteMatch,
 }
 
+#[allow(dead_code)] // Rule/observer summaries are optional control-plane capabilities.
 impl RoutingState {
     pub fn from_config(config: Option<&RoutingConfig>) -> Result<Self, String> {
         let Some(config) = config else {

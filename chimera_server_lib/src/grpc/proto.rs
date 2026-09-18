@@ -1,3 +1,5 @@
+// Xray management protobuf bindings expose wire-compatible messages beyond the
+// currently enabled control-plane handlers; keep the generated surface intact.
 #![allow(dead_code)]
 
 pub mod xray {

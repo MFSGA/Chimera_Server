@@ -204,6 +204,7 @@ impl VmessStream {
         }
     }
 
+    #[cfg(test)]
     pub fn feed_initial_read_data(&mut self, data: &[u8]) -> std::io::Result<()> {
         assert!(self.unprocessed_end_offset == 0);
 

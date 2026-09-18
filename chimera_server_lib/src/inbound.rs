@@ -84,6 +84,7 @@ pub(crate) struct InboundFailure {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // Dynamic inbound mutation is provided by the optional API.
 pub(crate) enum AddInboundError {
     AlreadyExists(String),
     Start(io::Error),
@@ -91,11 +92,13 @@ pub(crate) enum AddInboundError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Dynamic inbound mutation is provided by the optional API.
 pub(crate) enum RemoveInboundError {
     NotFound,
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // Dynamic inbound mutation is provided by the optional API.
 pub(crate) enum AlterInboundError<E> {
     NotFound,
     Update(E),
@@ -106,6 +109,7 @@ pub(crate) enum AlterInboundError<E> {
     },
 }
 
+#[allow(dead_code)] // Lifecycle/mutation edges are selected by startup and API paths.
 impl InboundManager {
     pub(crate) fn new(configs: Vec<ServerConfig>) -> Self {
         let next_generation = u64::try_from(configs.len()).unwrap_or(u64::MAX);
@@ -155,6 +159,7 @@ impl InboundManager {
             .map(InboundInstance::config_view)
     }
 
+    #[cfg(test)]
     pub(crate) fn generation(&self, tag: &str) -> Option<u64> {
         self.state
             .read()
@@ -490,6 +495,7 @@ impl InboundManager {
         Ok(())
     }
 
+    #[cfg(not(feature = "vless"))]
     pub(crate) async fn alter_started<E, F>(
         &self,
         runtime: RuntimeState,

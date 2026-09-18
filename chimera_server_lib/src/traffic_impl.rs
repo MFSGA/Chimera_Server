@@ -331,6 +331,7 @@ impl StatsInner {
         }
     }
 
+    #[cfg(test)]
     fn snapshot(&self) -> TrafficSnapshot {
         let mut snapshot = TrafficSnapshot::default();
         merge_stats_into_snapshot(&mut snapshot, self);

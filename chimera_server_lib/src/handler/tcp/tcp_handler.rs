@@ -46,6 +46,7 @@ pub trait TcpServerHandler: Send + Sync + Debug {
         false
     }
 
+    #[allow(dead_code)] // Used by transports that own the pre-protocol handshake.
     fn pre_transport_handshake_timeout(
         &self,
         _context: &TcpServerConnectionContext,
@@ -71,6 +72,8 @@ pub enum TcpServerSetupResult {
     /// Transport wrappers may override the effective peer address while
     /// preserving the inner protocol/session outcome. This compatibility
     /// wrapper is normalized before the session dispatcher sees the result.
+    #[allow(dead_code)]
+    // Constructed by HTTP Upgrade and related transport wrappers.
     PeerAddrOverride {
         peer_addr: std::net::SocketAddr,
         inner: Box<TcpServerSetupResult>,
@@ -110,6 +113,7 @@ pub enum TcpServerSetupResult {
         stream: Box<dyn AsyncMessageStream>,
         traffic_context: Option<TrafficContext>,
     },
+    #[allow(dead_code)] // Constructed by Trojan multi-target UDP handlers.
     MultiDirectionalUdp {
         stream: Box<dyn AsyncTargetedMessageStream>,
         traffic_context: Option<TrafficContext>,
@@ -122,6 +126,8 @@ pub enum TcpServerSetupResult {
     /// This does not transfer ownership of detached/background tasks: any
     /// spawned work must already be registered with an existing lifecycle
     /// owner before this result is returned.
+    #[allow(dead_code)]
+    // Used by transport-handler tests and completion adapters.
     Completed,
 }
 
@@ -182,6 +188,7 @@ pub(crate) struct NormalizedTcpServerSetup {
 }
 
 impl TcpServerSetupResult {
+    #[allow(dead_code)] // Used by transport wrappers that adjust response flushing.
     pub fn set_need_initial_flush(&mut self, need_initial_flush: bool) {
         if let TcpServerSetupResult::TcpForward {
             need_initial_flush: flush,

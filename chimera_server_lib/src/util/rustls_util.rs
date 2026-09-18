@@ -1,3 +1,5 @@
+#![allow(dead_code)] // TLS config helpers are consumed by optional QUIC/REALITY paths.
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -13,19 +15,6 @@ fn get_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
 
 fn get_supported_algorithms() -> rustls::crypto::WebPkiSupportedAlgorithms {
     get_crypto_provider().signature_verification_algorithms
-}
-
-fn get_disabled_verifier() -> Arc<ClientFingerprintVerifier> {
-    static INSTANCE: OnceLock<Arc<ClientFingerprintVerifier>> = OnceLock::new();
-    INSTANCE
-        .get_or_init(|| {
-            Arc::new(ClientFingerprintVerifier {
-                supported_algs: get_supported_algorithms(),
-                webpki_verifier: None,
-                client_fingerprints: BTreeSet::new(),
-            })
-        })
-        .clone()
 }
 
 #[derive(Debug)]

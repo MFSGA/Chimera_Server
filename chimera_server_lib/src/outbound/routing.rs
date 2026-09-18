@@ -349,6 +349,7 @@ async fn enrich_route_input_if_needed(
     input
 }
 
+#[cfg(any(test, feature = "hysteria", feature = "tuic"))]
 pub(crate) fn connection_routing_input(
     inbound_tag: &str,
     user: &str,
@@ -394,6 +395,7 @@ fn unresolved_connection_routing_input(
     }
 }
 
+#[cfg(any(test, feature = "tuic"))]
 pub(crate) fn select_direct_outbound(
     runtime: &DataPlaneRuntime,
     input: &RoutingInput,
@@ -402,6 +404,7 @@ pub(crate) fn select_direct_outbound(
     select_direct_outbound_with_policy_identities(runtime, input, network_name, &[])
 }
 
+#[cfg(any(test, feature = "hysteria"))]
 pub(crate) fn select_direct_outbound_with_policy_identities(
     runtime: &DataPlaneRuntime,
     input: &RoutingInput,
@@ -441,6 +444,7 @@ pub(crate) fn select_direct_outbound_with_policy_identities(
     classify_selected_outbound(outbound, network_name)
 }
 
+#[cfg(any(test, feature = "hysteria", feature = "tuic"))]
 fn routing_target_summary(input: &RoutingInput) -> String {
     let target = if input.target_domain.is_empty() {
         input
@@ -455,6 +459,7 @@ fn routing_target_summary(input: &RoutingInput) -> String {
     format!("{target}:{}", input.target_port)
 }
 
+#[cfg(any(test, feature = "hysteria", feature = "tuic"))]
 fn decode_target_ip(bytes: &[u8]) -> Option<IpAddr> {
     match bytes.len() {
         4 => Some(IpAddr::from(<[u8; 4]>::try_from(bytes).ok()?)),

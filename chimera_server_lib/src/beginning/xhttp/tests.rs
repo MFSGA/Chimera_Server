@@ -321,6 +321,7 @@ fn h3_receive_window_uses_xray_initial_value_and_defaults() {
     );
 }
 
+#[cfg(feature = "tls")]
 #[test]
 fn request_dispatch_accepts_transport_neutral_http_body() {
     fn assert_body<B>()
@@ -335,6 +336,7 @@ fn request_dispatch_accepts_transport_neutral_http_body() {
     assert_body::<H3RequestBody>();
 }
 
+#[cfg(feature = "tls")]
 #[test]
 fn h3_request_stream_split_preserves_response_half_type() {
     fn assert_splitter(

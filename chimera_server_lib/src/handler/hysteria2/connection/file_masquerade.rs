@@ -606,6 +606,7 @@ fn xray_file_html_escape_bytes(value: &[u8]) -> Vec<u8> {
     escaped
 }
 
+#[cfg(test)]
 pub(super) fn xray_file_url_escape(value: &str) -> String {
     xray_file_url_escape_bytes(value.as_bytes())
 }
@@ -639,10 +640,7 @@ fn xray_file_url_escape_bytes(value: &[u8]) -> String {
     escaped
 }
 
-fn decode_file_masquerade_path(uri_path: &str) -> Option<PathBuf> {
-    decode_file_masquerade_path_for_platform(uri_path, cfg!(windows))
-}
-
+#[cfg(test)]
 pub(super) fn decode_file_masquerade_path_for_platform(
     uri_path: &str,
     windows: bool,
@@ -728,10 +726,6 @@ fn xray_file_normalize_utf8_path(decoded: &str) -> Option<PathBuf> {
         }
     }
     Some(normalized)
-}
-
-fn xray_file_hex_escape_non_ascii(value: &str) -> String {
-    xray_file_hex_escape_non_ascii_bytes(value.as_bytes())
 }
 
 fn xray_file_hex_escape_non_ascii_bytes(value: &[u8]) -> String {

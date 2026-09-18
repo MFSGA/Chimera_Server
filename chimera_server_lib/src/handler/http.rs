@@ -41,6 +41,7 @@ impl HttpTcpServerHandler {
         }
     }
 
+    #[cfg(any(test, feature = "http"))]
     pub fn with_user_level(mut self, user_level: u32) -> Self {
         self.user_level = user_level;
         self

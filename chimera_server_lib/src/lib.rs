@@ -1,6 +1,3 @@
-// TODO: remove this once WIP modules stabilize and dead code is pruned
-#![allow(dead_code)]
-
 pub use beginning::start_tcp_server;
 pub use config::{
     def::LiteralConfig,

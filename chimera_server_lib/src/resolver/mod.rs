@@ -59,6 +59,7 @@ impl Default for ResolverCacheOptions {
 
 /// Point-in-time counters for resolver cache behavior.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(dead_code)] // Public cache metrics are consumed by optional diagnostics.
 pub struct ResolverCacheStats {
     pub cache_entries: usize,
     pub cache_hits: u64,
@@ -113,6 +114,7 @@ struct ResolverCache {
     evictions: AtomicU64,
 }
 
+#[allow(dead_code)]
 impl ResolverCache {
     fn new(options: ResolverCacheOptions) -> Self {
         Self {
@@ -285,6 +287,7 @@ pub struct CachedResolver {
     cache: Option<Arc<ResolverCache>>,
 }
 
+#[allow(dead_code)]
 impl CachedResolver {
     pub fn new(inner: Arc<dyn Resolver>) -> Self {
         Self::with_options(inner, ResolverCacheOptions::default())
@@ -390,10 +393,12 @@ fn cached_result_to_io(result: CachedLookupResult) -> io::Result<Vec<SocketAddr>
 
 /// Resolver that tries multiple upstreams in order until one returns addresses.
 #[derive(Clone)]
+#[allow(dead_code)] // Public fallback resolver retained for resolver composition.
 pub struct CompositeResolver {
     resolvers: Vec<Arc<dyn Resolver>>,
 }
 
+#[allow(dead_code)]
 impl CompositeResolver {
     pub fn new(resolvers: Vec<Arc<dyn Resolver>>) -> Self {
         Self { resolvers }
@@ -458,6 +463,7 @@ impl Resolver for CompositeResolver {
 
 /// Address-family ordering applied to resolver results.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(dead_code)] // Exposed for callers that need an explicit family preference.
 pub enum AddressFamilyPreference {
     #[default]
     Preserve,
@@ -828,6 +834,7 @@ fn make_dns_server_groups(
     groups
 }
 
+#[allow(dead_code)]
 impl UdpDnsResolver {
     pub fn new(servers: Vec<SocketAddr>) -> Self {
         Self::with_query_strategy(servers, DnsQueryStrategy::UseIp)
@@ -1858,6 +1865,7 @@ pub struct NativeResolverOptions {
     pub enable_parallel_query: bool,
 }
 
+#[allow(dead_code)]
 impl NativeResolver {
     pub fn new() -> Self {
         Self::with_hosts(HashMap::new())

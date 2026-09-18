@@ -3,6 +3,7 @@ use super::*;
 #[cfg(feature = "ws")]
 use crate::util::option::OneOrSome;
 
+#[cfg(any(feature = "http", feature = "mixed"))]
 fn inbound_for_protocol(protocol: &str) -> InboudItem {
     serde_json::from_value(serde_json::json!({
         "listen": "127.0.0.1",
@@ -1536,6 +1537,81 @@ fn vless_builder_preserves_multiple_clients() {
 
 #[cfg(feature = "vless")]
 #[test]
+fn vless_builder_accepts_empty_clients() {
+    let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+        "listen": "127.0.0.1",
+        "port": 443,
+        "protocol": "vless",
+        "tag": "vless-no-users",
+        "settings": {
+            "clients": [],
+            "decryption": "none"
+        }
+    }))
+    .expect("valid empty-user vless inbound item");
+
+    let config = ServerConfig::try_from(inbound)
+        .expect("vless inbound with no clients should build");
+    match config.protocol {
+        ServerProxyConfig::Vless { users, .. } => assert!(users.is_empty()),
+        other => panic!("expected vless protocol, got {other:?}"),
+    }
+}
+
+#[cfg(feature = "trojan")]
+#[test]
+fn trojan_builder_accepts_empty_clients() {
+    let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+        "listen": "127.0.0.1",
+        "port": 443,
+        "protocol": "trojan",
+        "tag": "trojan-no-users",
+        "settings": {"clients": []}
+    }))
+    .expect("valid empty-user trojan inbound item");
+
+    let config = ServerConfig::try_from(inbound)
+        .expect("trojan inbound with no clients should build");
+    match config.protocol {
+        ServerProxyConfig::Trojan { users, .. } => assert!(users.is_empty()),
+        other => panic!("expected trojan protocol, got {other:?}"),
+    }
+}
+
+#[cfg(feature = "hysteria")]
+#[test]
+fn hysteria2_builder_accepts_empty_clients() {
+    let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+        "listen": "127.0.0.1",
+        "port": 443,
+        "protocol": "hysteria2",
+        "tag": "hysteria2-no-users",
+        "settings": {"clients": []},
+        "streamSettings": {
+            "network": "hysteria2",
+            "security": "tls",
+            "tlsSettings": {
+                "certificates": [{
+                    "certificateFile": "cert.pem",
+                    "keyFile": "key.pem"
+                }]
+            }
+        }
+    }))
+    .expect("valid empty-user hysteria2 inbound item");
+
+    let config = ServerConfig::try_from(inbound)
+        .expect("hysteria2 inbound with no clients should build");
+    match config.protocol {
+        ServerProxyConfig::Hysteria2 { config } => {
+            assert!(config.clients.is_empty());
+        }
+        other => panic!("expected hysteria2 protocol, got {other:?}"),
+    }
+}
+
+#[cfg(all(feature = "reality", feature = "vless"))]
+#[test]
 fn vless_builder_preserves_client_flow() {
     let inbound: InboudItem = serde_json::from_value(serde_json::json!({
         "listen": "127.0.0.1",
@@ -1719,7 +1795,7 @@ fn vless_reality_rejects_outbound_only_settings() {
     );
 }
 
-#[cfg(feature = "vless")]
+#[cfg(all(feature = "reality", feature = "vless"))]
 #[test]
 fn vless_builder_inherits_settings_flow() {
     let inbound: InboudItem = serde_json::from_value(serde_json::json!({

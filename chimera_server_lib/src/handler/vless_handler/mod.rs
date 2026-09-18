@@ -26,6 +26,7 @@ mod vision_pad;
 #[cfg(any(feature = "tls", feature = "reality"))]
 mod vision_session;
 mod vision_stream;
+#[cfg(any(feature = "tls", feature = "reality"))]
 mod vision_tls;
 mod vision_unpad;
 
@@ -69,6 +70,7 @@ pub struct VlessTcpHandler {
 }
 
 impl VlessTcpHandler {
+    #[cfg(test)]
     pub fn new(users: &[VlessUser], inbound_tag: &str) -> Self {
         Self::new_with_fallbacks(users, &[], inbound_tag)
     }
@@ -393,6 +395,7 @@ pub(crate) fn drain_pending_read(
     true
 }
 
+#[cfg(any(test, feature = "tls", feature = "reality"))]
 pub(crate) fn append_plaintext_to_read_buf(
     pending_read: &mut BytesMut,
     buf: &mut ReadBuf<'_>,

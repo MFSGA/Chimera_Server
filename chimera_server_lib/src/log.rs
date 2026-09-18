@@ -150,6 +150,7 @@ impl LogConfig {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // Restart state is an optional management-plane capability.
 struct LogState {
     cfg: LogConfig,
     cwd: Option<String>,
@@ -173,6 +174,7 @@ impl LogState {
     }
 }
 
+#[allow(dead_code)] // Called by the optional logger management service.
 pub fn restart() -> Result<(), Error> {
     let state = LOG_STATE
         .get()

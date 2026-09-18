@@ -452,10 +452,6 @@ pub(super) fn parse_http_request_line(
     Ok((method, target, version))
 }
 
-fn validate_chunk_size_line(line: &[u8]) -> std::io::Result<()> {
-    parse_chunk_size_line(line).map(|_| ())
-}
-
 pub(super) fn parse_chunk_size_line(line: &[u8]) -> std::io::Result<u64> {
     let mut size = line.split(|byte| *byte == b';').next().unwrap_or_default();
     while matches!(size.last(), Some(b' ' | b'\t')) {

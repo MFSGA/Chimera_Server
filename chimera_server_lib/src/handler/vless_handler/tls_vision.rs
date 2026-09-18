@@ -275,14 +275,6 @@ impl VisionSession for RustlsVisionSession {
         self.connection.wants_write()
     }
 
-    fn wants_read(&self) -> bool {
-        self.connection.wants_read()
-    }
-
-    fn is_handshaking(&self) -> bool {
-        self.connection.is_handshaking()
-    }
-
     fn take_remaining_ciphertext(&mut self) -> Vec<u8> {
         self.record_state
             .lock()
@@ -295,10 +287,6 @@ impl VisionSession for RustlsVisionSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .vision_mode = true;
-    }
-
-    fn send_close_notify(&mut self) {
-        self.connection.send_close_notify();
     }
 }
 

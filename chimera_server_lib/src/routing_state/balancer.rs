@@ -131,6 +131,7 @@ impl BalancerTargetSet {
 pub(crate) type BalancerTargetMap = HashMap<String, BalancerTargetSet>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Exposed for optional routing introspection.
 pub(crate) struct RoutingRuleSummary {
     pub outbound_tag: String,
     pub rule_tag: String,
@@ -223,6 +224,7 @@ impl TryFrom<BalancerConfig> for CompiledBalancer {
     }
 }
 
+#[allow(dead_code)] // Balancer introspection is consumed by optional management APIs.
 impl CompiledBalancer {
     pub(super) fn needs_observations(&self) -> bool {
         self.fallback_tag.is_some()

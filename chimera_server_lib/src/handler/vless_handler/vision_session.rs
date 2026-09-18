@@ -37,13 +37,10 @@ pub(super) trait VisionSession {
     fn writer(&mut self) -> Self::Writer<'_>;
     fn write_tls(&mut self, wr: &mut dyn Write) -> io::Result<usize>;
     fn wants_write(&self) -> bool;
-    fn wants_read(&self) -> bool;
-    fn is_handshaking(&self) -> bool;
     fn take_remaining_ciphertext(&mut self) -> Vec<u8> {
         Vec::new()
     }
     fn enable_vision_direct_transition(&mut self) {}
-    fn send_close_notify(&mut self);
 }
 
 pub(super) struct SyncReadAdapter<'a, 'b, T> {
@@ -113,14 +110,6 @@ impl VisionSession for crate::reality::RealityServerConnection {
         crate::reality::RealityServerConnection::wants_write(self)
     }
 
-    fn wants_read(&self) -> bool {
-        crate::reality::RealityServerConnection::wants_read(self)
-    }
-
-    fn is_handshaking(&self) -> bool {
-        crate::reality::RealityServerConnection::is_handshaking(self)
-    }
-
     fn take_remaining_ciphertext(&mut self) -> Vec<u8> {
         crate::reality::RealityServerConnection::take_remaining_ciphertext(self)
     }
@@ -129,9 +118,5 @@ impl VisionSession for crate::reality::RealityServerConnection {
         crate::reality::RealityServerConnection::enable_vision_direct_transition(
             self,
         )
-    }
-
-    fn send_close_notify(&mut self) {
-        crate::reality::RealityServerConnection::send_close_notify(self)
     }
 }

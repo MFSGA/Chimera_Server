@@ -7,6 +7,8 @@ use super::{SocksOutboundEndpoint, TrojanOutboundEndpoint, VlessOutboundEndpoint
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TrojanCommand {
     Tcp,
+    #[allow(dead_code)]
+    // UDP is selected by protocol combinations not present in minimal builds.
     Udp,
 }
 

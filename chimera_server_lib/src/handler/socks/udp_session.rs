@@ -1,14 +1,13 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
-use tokio::{
-    io::AsyncReadExt,
-    sync::Notify,
-    time::{MissedTickBehavior, interval},
-};
+#[cfg(all(test, feature = "traffic"))]
+use tokio::time::{MissedTickBehavior, interval};
+use tokio::{io::AsyncReadExt, sync::Notify};
 
+#[cfg(all(test, feature = "traffic"))]
+use crate::config::server_config::SocksUserStore;
 use crate::{
     async_stream::AsyncStream,
-    config::server_config::SocksUserStore,
     outbound::{
         DirectOutboundAction, InboundRoutingMetadata, OutboundRoutingContext,
         select_direct_outbound_for_location,
@@ -18,25 +17,25 @@ use crate::{
     traffic::{TrafficContext, record_transfer, register_connection},
 };
 
-use super::{
-    MAX_UDP_DATAGRAM_SIZE, UDP_TARGET_SESSION_ACTIVITY_CHECK,
-    XRAY_SOCKS_UDP_PACKET_SIZE, parse_udp_address,
-};
+#[cfg(all(test, feature = "traffic"))]
+use super::UDP_TARGET_SESSION_ACTIVITY_CHECK;
+use super::{MAX_UDP_DATAGRAM_SIZE, XRAY_SOCKS_UDP_PACKET_SIZE, parse_udp_address};
 
 mod target_sessions;
 
 #[cfg(test)]
 pub(super) use target_sessions::XrayUdpActivityWindow;
+#[cfg(test)]
+pub(super) use target_sessions::prune_closed_udp_sessions;
 use target_sessions::stop_udp_client_sessions;
 #[cfg(feature = "trojan")]
 use target_sessions::{
     SocksTrojanUdpClientSession, SocksTrojanUdpSessionStart,
     send_trojan_udp_target_payload, stop_trojan_udp_client_sessions,
 };
-pub(super) use target_sessions::{
-    SocksUdpClientSession, prune_closed_udp_sessions, send_udp_target_payload,
-};
+pub(super) use target_sessions::{SocksUdpClientSession, send_udp_target_payload};
 
+#[cfg(all(test, feature = "traffic"))]
 pub(crate) async fn run_shared_udp_relay(
     udp_socket: Arc<tokio::net::UdpSocket>,
     resolver: Arc<dyn Resolver>,
@@ -203,6 +202,7 @@ pub(crate) async fn run_shared_udp_relay(
     }
 }
 
+#[cfg(all(test, feature = "traffic"))]
 pub(crate) async fn run_udp_relay(
     udp_socket: Arc<tokio::net::UdpSocket>,
     tcp_stream: Box<dyn AsyncStream>,

@@ -4,9 +4,9 @@ use std::{
     net::IpAddr,
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
-    time::Duration,
 };
 
+#[cfg(feature = "ws")]
 use base64::Engine as _;
 #[cfg(feature = "grpc_transport")]
 use bytes::BytesMut;
@@ -22,25 +22,38 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use prost::Message;
 #[cfg(feature = "grpc_transport")]
 use std::convert::Infallible;
+#[cfg(any(
+    feature = "grpc_transport",
+    feature = "httpupgrade",
+    feature = "ws"
+))]
+use std::time::Duration;
 #[cfg(feature = "grpc_transport")]
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+#[cfg(feature = "trojan")]
+use super::decode::decode_sender_transport;
+use super::routing::{
+    apply_routing_metadata, connection_routing_input, select_direct_outbound,
+};
 use super::*;
 #[cfg(feature = "grpc_transport")]
 use crate::beginning::grpc_transport::{
     decode_grpc_message_payloads, encode_grpc_message,
 };
+#[cfg(feature = "ws")]
+use crate::handler::ws::WebsocketStream;
+#[cfg(feature = "ws")]
+use crate::util::prefixed_stream::PrefixedStream;
 use crate::{
     config::{
         def::OutboundItem,
         rule::{BalancerConfig, RoutingConfig, RuleConfig},
     },
-    handler::ws::WebsocketStream,
     resolver::NativeResolver,
     routing_state::{RoutingInput, RoutingState},
     runtime::{OutboundSummary, RuntimeState},
-    util::prefixed_stream::PrefixedStream,
 };
 
 fn outbound(tag: &str, protocol: &str) -> OutboundSummary {
@@ -629,6 +642,7 @@ async fn accept_test_httpupgrade_early_data(
     stream
 }
 
+#[cfg(feature = "trojan")]
 async fn assert_trojan_connect<S>(stream: &mut S)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized,
@@ -668,6 +682,7 @@ where
     assert_eq!(crlf, *b"\r\n");
 }
 
+#[cfg(feature = "trojan")]
 async fn assert_trojan_connect_and_reply<S>(stream: &mut S)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized,

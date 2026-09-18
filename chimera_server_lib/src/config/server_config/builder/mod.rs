@@ -67,12 +67,14 @@ impl InboundBuildContext {
 
 #[cfg(any(feature = "hysteria", feature = "tuic"))]
 use super::quic::ServerQuicConfig;
+#[cfg(feature = "api")]
+use super::types::XhttpServerConfig;
 use super::types::{
     InboundSniffingConfig, ServerConfig, ServerProxyConfig, TcpSocketPolicy,
-    XhttpServerConfig,
 };
 use crate::routing_state::SniffExclusionMatcher;
 
+#[cfg(feature = "api")]
 pub(crate) fn collect_xhttp_settings_from_json(
     value: serde_json::Value,
 ) -> Result<XhttpServerConfig, Error> {
@@ -341,12 +343,6 @@ fn collect_http_settings(
             .collect(),
         raw.allow_transparent,
         raw.user_level,
-    ))
-}
-
-fn planned_unsupported_protocol_error(protocol: &str) -> Error {
-    Error::InvalidConfig(format!(
-        "protocol={protocol} is recognized but not supported in this stage"
     ))
 }
 

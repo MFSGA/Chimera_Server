@@ -146,6 +146,9 @@ pub struct RuntimeState {
     lifecycle: Arc<AtomicU8>,
 }
 
+// Runtime/control-plane methods are consumed through feature-selected services and
+// dynamic inbound handlers, so a library-only build cannot see every call edge.
+#[allow(dead_code)]
 impl RuntimeState {
     pub fn data_plane(&self) -> DataPlaneRuntime {
         self.data_plane.clone()
@@ -894,6 +897,7 @@ impl RuntimeState {
         self.data_plane.0.user_domain_access.audit_events(limit)
     }
 
+    #[cfg(test)]
     pub(crate) fn allows_user_domain_access(
         &self,
         identity: &str,
@@ -918,6 +922,7 @@ impl RuntimeState {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn allows_user_domain_access_with_identities(
         &self,
         identities: &[String],

@@ -409,6 +409,8 @@ struct AppState {
     padding_placement: XhttpPaddingPlacement,
     padding_method: XhttpPaddingMethod,
     no_sse_header: bool,
+    #[allow(dead_code)]
+    // Parsed for the pending XHTTP uplink-method enforcement path.
     uplink_http_method: String,
     session_placement: XhttpPlacement,
     session_key: String,

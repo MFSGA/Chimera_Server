@@ -1,6 +1,8 @@
 use std::io;
 
-use bytes::{BufMut, Bytes, BytesMut};
+#[cfg(test)]
+use bytes::Bytes;
+use bytes::{BufMut, BytesMut};
 use rand::RngExt;
 
 const LONG_PADDING_MIN: usize = 900;
@@ -8,6 +10,7 @@ const LONG_PADDING_RANDOM_MAX: usize = 500;
 const SHORT_PADDING_RANDOM_MAX: usize = 256;
 const MAX_PADDING_SIZE: usize = 8171;
 
+#[cfg(test)]
 pub fn pad_with_uuid_and_command(
     data: &[u8],
     uuid: &[u8; 16],
@@ -19,6 +22,7 @@ pub fn pad_with_uuid_and_command(
     Ok(output.freeze())
 }
 
+#[cfg(test)]
 pub fn pad_with_command(
     data: &[u8],
     command: u8,

@@ -14,8 +14,6 @@ mod routing;
 mod static_config;
 mod wire;
 
-#[cfg(test)]
-use decode::decode_sender_transport;
 #[cfg(feature = "api")]
 pub(crate) use decode::validate_outbound_sender_settings;
 use decode::{
@@ -41,13 +39,15 @@ use protocol::{
     trojan_connect, vless_tcp_connect,
 };
 
-#[cfg(test)]
-pub(crate) use routing::apply_routing_metadata;
+#[cfg(any(feature = "hysteria", feature = "tuic"))]
+pub(crate) use routing::connection_routing_input;
+#[cfg(feature = "tuic")]
+pub(crate) use routing::select_direct_outbound;
+#[cfg(feature = "hysteria")]
+pub(crate) use routing::select_direct_outbound_with_policy_identities;
 pub(crate) use routing::{
     DirectOutboundAction, InboundRoutingMetadata, OutboundRoutingContext,
-    USER_DOMAIN_ACCESS_BLACKHOLE_TAG, connection_routing_input,
-    select_direct_outbound, select_direct_outbound_for_location,
-    select_direct_outbound_with_policy_identities,
+    USER_DOMAIN_ACCESS_BLACKHOLE_TAG, select_direct_outbound_for_location,
 };
 use routing::{TcpRoutePlan, plan_tcp_route};
 
@@ -163,6 +163,7 @@ pub(crate) struct TcpOutboundConnection {
     pub outbound_tag: Option<String>,
 }
 
+#[cfg(any(test, feature = "tuic"))]
 pub(crate) async fn connect_tcp_outbound(
     resolver: &Arc<dyn Resolver>,
     remote_location: &NetLocation,
@@ -183,6 +184,7 @@ pub(crate) async fn connect_tcp_outbound(
     .await
 }
 
+#[cfg(any(test, feature = "hysteria"))]
 pub(crate) async fn connect_tcp_outbound_with_vless_route(
     resolver: &Arc<dyn Resolver>,
     remote_location: &NetLocation,
@@ -377,6 +379,7 @@ async fn connect_planned_tcp_outbound(
                     "WebSocket outbound is missing its server identity",
                 )
             })?;
+            #[cfg(feature = "ws")]
             let tls_server_name = tls
                 .as_ref()
                 .map(|settings| settings.server_name.trim())
@@ -450,6 +453,7 @@ async fn connect_planned_tcp_outbound(
                     "HTTPUpgrade outbound is missing its server identity",
                 )
             })?;
+            #[cfg(feature = "httpupgrade")]
             let tls_server_name = tls
                 .as_ref()
                 .map(|settings| settings.server_name.trim())

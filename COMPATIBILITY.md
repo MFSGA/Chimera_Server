@@ -17,19 +17,19 @@ current code has an explicit config path and runtime handler path for it.
 
 | Inbound | Status | Current boundary |
 | --- | --- | --- |
-| `vless` over TCP | Supported | Requires at least one `settings.clients` entry. |
+| `vless` over TCP | Supported | Requires `settings.decryption: "none"`; `settings.clients` may be an explicit empty array, in which case the listener starts with no authenticated users until users are added through the management API. |
 | `vless` + WebSocket | Supported | Uses `streamSettings.wsSettings`; `xtls-rprx-vision` cannot use WebSocket. |
 | `vless` + XHTTP | Experimental | Use `protocol: "vless"` with `streamSettings.network: "xhttp"` and `xhttpSettings`. |
 | `vless` + TLS | Supported | Requires `streamSettings.security: "tls"` and `tlsSettings` certificates. |
 | `vless` + REALITY | Partial | Inbound-only REALITY. `publicKey`, `fingerprint`, `spiderX`, and non-zero `xver` are rejected. |
 | `vless` Vision | Partial | Only `flow: "xtls-rprx-vision"` is accepted. Direct TLS/REALITY VLESS now uses a stable mixed-capable handler, so plain and Vision users may share one inbound; transports that do not support Vision (for example WebSocket, gRPC, HTTPUpgrade and XHTTP) still reject/avoid Vision semantics. |
-| `vmess` over TCP | Partial | Requires `settings.clients`; cipher handling is currently normalized internally. |
+| `vmess` over TCP | Partial | Requires the `settings.clients` field; an empty array starts with no authenticated users. Cipher handling is currently normalized internally. |
 | `vmess` + WebSocket | Partial | Uses `streamSettings.wsSettings`; compatibility coverage should be expanded before calling it stable. |
-| `trojan` over TCP | Partial | Requires non-empty client passwords. Fallbacks require explicit `host:port` destinations. |
+| `trojan` over TCP | Partial | Requires a `settings` object; an explicit empty `clients` array starts with no authenticated users, while every listed client must have a non-empty password. Fallbacks require explicit `host:port` destinations. |
 | `trojan` + WebSocket | Partial | Uses `streamSettings.wsSettings`; fallback and TLS behavior need more xray/shoes comparison tests. |
 | `socks` | Supported | Supports no-auth and username/password accounts. |
 | `dokodemo-door` | Supported | Supports explicit target address/port and `followRedirect` parsing. |
-| `hysteria2` | Experimental | Requires QUIC/TLS certificate files and at least one client. |
+| `hysteria2` | Experimental | Requires a QUIC/TLS certificate and `settings`; `clients`/`users` may be empty when no user is configured, or Xray's transport-level `hysteriaSettings.auth` can provide the fallback credential. |
 | `tuic` / `tuicV5` | Experimental | Requires UUID, password, QUIC/TLS certificate files, and optional zero-RTT flag. |
 | `xhttp` as top-level protocol | Not supported | Use VLESS with `streamSettings.network: "xhttp"` instead. |
 
@@ -41,10 +41,10 @@ current code has an explicit config path and runtime handler path for it.
 | WebSocket transport | Partial | Wrapped around supported TCP protocols when the `ws` feature is enabled. |
 | XHTTP transport | Experimental | Currently attached through VLESS; top-level `protocol=xhttp` is rejected. |
 | QUIC transport | Experimental | Used by Hysteria2 and TUIC server paths. |
-| UDP transport | Not supported | `streamSettings.network: "udp"` maps to UDP transport, but server startup currently rejects it. |
+| UDP transport | Partial | `streamSettings.network: "udp"` is implemented for `dokodemo-door`; Shadowsocks also supports UDP-only or combined `tcp,udp` listeners. Other inbound protocol/transport combinations are rejected explicitly. Linux-only `dokodemo-door` `followRedirect` behavior remains platform-specific. |
 | TLS security | Supported | Requires at least one certificate. Inline certificate/key and file paths are parsed. |
 | REALITY security | Partial | Inbound server path exists, but unsupported xray-core client-side fields are rejected. |
-| Unknown security value | Partial | Non-XHTTP paths currently pass through unknown values as no extra security layer. |
+| Unknown security value | Not supported | Recognized but unimplemented `streamSettings.security` values are rejected explicitly; they are never silently downgraded to plaintext. |
 
 ## Config Surface
 
@@ -59,25 +59,27 @@ current code has an explicit config path and runtime handler path for it.
 | xray-style API inbound routing | Partial | Resolves API listen address through routing, but local gRPC currently listens without TLS. |
 | MCP push service | Partial | Listen/path/update interval are parsed and served, but operational docs are still thin. |
 | Outbounds | Partial | Tags and protocol names are surfaced in runtime state; forwarding behavior is still materializing. |
-| Routing and policy | Partial | Xray-style routing state and gRPC controls exist. The Chimera-only `userDomainAccess` extension is parsed and enforced before outbound selection, including `TestRoute`, protocol identity aliases for VLESS/VMess and credential identities for Trojan/Hysteria2, plus HTTP Basic Auth username identity. Known domains follow per-user allow/reject rules; IP-only, missing or invalid domains are always allowed and audited, while native Xray `routing.rules` may still independently match other conditions. `dns.hosts` mappings now support Xray custom host rule forms (default/`full:`, `domain:`, `keyword:`, `regexp:`, `dotless:`), static IP values, bounded `proxiedDomain` replacement and response-code values such as `#3` (`#0` is an empty response); plain UDP `dns.servers` IP endpoints are also supported with default/explicit ports, A/AAAA queries and ordered server attempts, string `tcp://IP[:port]` endpoints use Xray's two-byte DNS-over-TCP framing, and basic nameserver objects support `address`, `port`, `clientIp`, `domains`, per-server `queryStrategy`, `timeoutMs`, `expectedIPs`/`expectIPs`, `unexpectedIPs`, `skipFallback` and `finalQuery`, with global/per-server EDNS Client Subnet, matching nameservers prioritized before fallback, per-server timeout default/zero semantics aligned to Xray, and returned addresses filtered according to Xray IP rules. `enableParallelQuery` is supported for selected direct UDP/TCP nameservers with Xray-style policy-group gating. These DNS capabilities are normalized and shared by `TestRoute` and the main runtime resolver. Geosite/ext rules, other per-server fallback controls, URL schemes, remote dispatcher routing and DoH/DoT settings are explicitly rejected until implemented; global query strategies `UseIP`, `UseIPv4`, `UseIPv6` and `UseSystem` plus DNS fallback controls `disableFallback` and `disableFallbackIfMatch` are supported for the shared resolver. Session-based XUDP now preserves the original domain and applies shared routing before resolving; dynamic policy updates have local and real Xray-over-gRPC evidence for new XUDP sessions; DNS errors are exposed separately as `GetPolicyStatus.stats.dnsFailures` and are not counted as domain-policy rejects; recent unknown-target audit events are exposed through the Chimera-only `GetAuditEvents` RPC with bounded storage and hashed routing users; REALITY fallback and observatory still use separate native resolvers. `AsIs`, `IpIfNonMatch` and `IpOnDemand` now have local tests for both domain routing and route-only sniffed-domain/original-IP boundaries, with `TestRoute` preserving caller-provided candidate IP semantics. Xray 26.2.6 VLESS/VMess/HTTP TCP and VLESS XUDP allow/reject interoperability, plus Trojan/Hysteria2/Socks5 TCP/UDP user-domain allow/reject interoperability, VLESS TCP unknown-target allow/audit interoperability, and VLESS TCP route-only HTTP `Host` allow/reject interoperability are verified; native Xray `routing.rules` `user + domain` interoperability is verified for VLESS TCP only; existing-session lifecycle, GlobalID reattachment, and other transport combinations remain pending. It is not an Xray-native policy object. |
+| Routing and policy | Partial | Xray-style routing state and gRPC controls exist. The Chimera-only `userDomainAccess` extension is parsed and enforced before outbound selection, including `TestRoute`, protocol identity aliases for VLESS/VMess, credential identities for Trojan/Hysteria2, HTTP Basic Auth username identity, and the verified Shadowsocks email identity. Known domains follow per-user allow/reject rules; IP-only, missing or invalid domains are always allowed and audited, while native Xray `routing.rules` may still independently match other conditions. `dns.hosts` mappings now support Xray custom host rule forms (default/`full:`, `domain:`, `keyword:`, `regexp:`, `dotless:`), static IP values, bounded `proxiedDomain` replacement and response-code values such as `#3` (`#0` is an empty response); plain UDP `dns.servers` IP endpoints are also supported with default/explicit ports, A/AAAA queries and ordered server attempts, string `tcp://IP[:port]` endpoints use Xray's two-byte DNS-over-TCP framing, and basic nameserver objects support `address`, `port`, `clientIp`, `domains`, per-server `queryStrategy`, `timeoutMs`, `expectedIPs`/`expectIPs`, `unexpectedIPs`, `skipFallback` and `finalQuery`, with global/per-server EDNS Client Subnet, matching nameservers prioritized before fallback, per-server timeout default/zero semantics aligned to Xray, and returned addresses filtered according to Xray IP rules. `enableParallelQuery` is supported for selected direct UDP/TCP nameservers with Xray-style policy-group gating. These DNS capabilities are normalized and shared by `TestRoute` and the main runtime resolver. Geosite/ext rules, other per-server fallback controls, URL schemes, remote dispatcher routing and DoH/DoT settings are explicitly rejected until implemented; global query strategies `UseIP`, `UseIPv4`, `UseIPv6` and `UseSystem` plus DNS fallback controls `disableFallback` and `disableFallbackIfMatch` are supported for the shared resolver. Session-based XUDP now preserves the original domain and applies shared routing before resolving; dynamic policy updates have local and real Xray-over-gRPC evidence for new XUDP sessions; DNS errors are exposed separately as `GetPolicyStatus.stats.dnsFailures` and are not counted as domain-policy rejects; recent unknown-target audit events are exposed through the Chimera-only `GetAuditEvents` RPC with bounded storage and hashed routing users; REALITY fallback and observatory still use separate native resolvers. `AsIs`, `IpIfNonMatch` and `IpOnDemand` now have local tests for both domain routing and route-only sniffed-domain/original-IP boundaries, with `TestRoute` preserving caller-provided candidate IP semantics. Xray 26.2.6 VLESS/VMess/HTTP TCP, VLESS XUDP, and Shadowsocks TCP/legacy UDP/2022 EIH UDP allow/reject interoperability, plus Trojan/Hysteria2/Socks5 TCP/UDP user-domain allow/reject interoperability, VLESS TCP unknown-target allow/audit interoperability, and VLESS TCP route-only HTTP `Host` allow/reject interoperability are verified; native Xray `routing.rules` `user + domain` interoperability is verified for VLESS TCP only; existing-session lifecycle, GlobalID reattachment, EIH TCP and other transport combinations remain pending. It is not an Xray-native policy object. |
 
 The current user-domain routing iteration targets VLESS, VLESS over XHTTP, Hysteria2, Socks5,
-and Trojan on Linux. XHTTP over TCP with `security: none`/TLS, Socks5 TCP/UDP, Hysteria2
-TCP/UDP, and Trojan TCP/UDP have passing Xray 26.2.6 allow/reject interoperability checks;
+Trojan, and the verified Shadowsocks TCP/legacy UDP/2022 EIH UDP paths on Linux. XHTTP over
+TCP with `security: none`/TLS, Socks5 TCP/UDP, Hysteria2 TCP/UDP, Trojan TCP/UDP, and those
+Shadowsocks paths have passing Xray 26.2.6 allow/reject interoperability checks; EIH TCP and
 the remaining target combinations are tracked separately.
 Other protocol identities and transport combinations are not expanded in this iteration and
 must not be presented as verified support. When an active user-domain policy is evaluated from
 one of those inbound protocols, Chimera emits a bounded
 `user_domain_access_unsupported_protocol` warning; the diagnostic does not change the existing
-decision. Shadowsocks follow-up work is paused.
+decision. Shadowsocks EIH TCP and other transports remain pending.
 
 ## Re-certification evidence (2026-09-11)
 
 `userDomainAccess.protocolIdentity.shadowsocksEmail` maps to the authenticated Shadowsocks
 user email, matching Xray's `MemoryUser.Email` routing identity. The field is optional for
 backward compatibility; a policy that omits it does not acquire a Shadowsocks identity by
-accident. The Linux Xray 26.2.6 Shadowsocks TCP and legacy UDP domain allow/reject
-interoperability tests pass; EIH TCP and other transports remain outside that claim.
+accident. The Linux Xray 26.2.6 Shadowsocks TCP, legacy UDP, and 2022 EIH UDP domain
+allow/reject interoperability tests pass; EIH TCP and other transports remain outside that
+claim.
 
 The current pre-M5 compatibility baseline was refreshed against the repository-pinned `xray` binary (`Xray 26.2.6`) and the local fixed xray-core reference. Passing real-client/server checks in this refresh include:
 
@@ -95,4 +97,4 @@ The pre-M5 certification pass is complete for the matrix above. One top-level Xr
 - Promote more protocol paths from partial or experimental only after xray-core/shoes compatibility tests cover success and failure cases.
 - Document exact xray-core field differences next to each protocol builder.
 - Split the compatibility tests by protocol so regressions can be traced to one inbound surface quickly.
-- Remove global dead-code suppression once unfinished surfaces are either implemented or gated behind explicit features.
+- Keep the remaining dead-code exceptions local and documented; the crate-wide suppression has been removed, while generated Xray protobuf bindings and optional control-plane/WIP surfaces retain narrowly scoped exceptions where their wire/API surface is intentionally broader than the current feature build.

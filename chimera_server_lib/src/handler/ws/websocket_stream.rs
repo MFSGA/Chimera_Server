@@ -19,6 +19,7 @@ pub enum WebsocketPingType {
     Disabled,
     #[default]
     PingFrame,
+    #[allow(dead_code)] // Kept for the Xray empty-frame heartbeat mode.
     EmptyFrame,
 }
 
@@ -84,6 +85,7 @@ impl OpCode {
 }
 
 impl WebsocketStream {
+    #[cfg(test)]
     pub fn new(
         stream: Box<dyn AsyncStream>,
         is_client: bool,

@@ -325,12 +325,6 @@ pub(super) fn collect_trojan_clients(
     settings: SettingObject,
 ) -> Result<Vec<TrojanUser>, Error> {
     let clients = settings.trojan_clients().unwrap_or_default();
-    if clients.is_empty() {
-        return Err(Error::InvalidConfig(
-            "trojan inbound requires at least one client".into(),
-        ));
-    }
-
     clients
         .into_iter()
         .map(|client| {

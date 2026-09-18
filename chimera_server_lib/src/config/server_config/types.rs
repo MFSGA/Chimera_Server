@@ -71,6 +71,7 @@ pub struct TcpSocketPolicy {
 }
 
 impl TcpSocketPolicy {
+    #[allow(dead_code)] // Socket-policy consumers are selected by transport feature.
     pub(crate) fn has_connection_options(&self) -> bool {
         !self.congestion.is_empty()
             || self.brutal.is_some()
@@ -80,6 +81,7 @@ impl TcpSocketPolicy {
             || self.window_clamp.is_some()
     }
 
+    #[allow(dead_code)] // Socket-policy consumers are selected by transport feature.
     pub(crate) fn has_tcp_only_options(&self) -> bool {
         self.has_connection_options()
             || self.fast_open.is_some()

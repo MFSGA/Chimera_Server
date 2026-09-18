@@ -161,6 +161,7 @@ impl XudpGlobalRegistry {
         current
     }
 
+    #[cfg(test)]
     pub(crate) fn take_expired(&mut self, now: Instant) -> Vec<[u8; 8]> {
         let expired = self
             .sessions

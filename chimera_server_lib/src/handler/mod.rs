@@ -11,7 +11,7 @@ pub(crate) mod proxy_protocol;
 pub mod tcp;
 #[cfg(feature = "tls")]
 pub mod tls;
-#[cfg(any(feature = "reality", feature = "vless"))]
+#[cfg(any(feature = "tls", feature = "reality"))]
 pub mod tls_deframer;
 #[cfg(feature = "vless")]
 pub mod vless_handler;

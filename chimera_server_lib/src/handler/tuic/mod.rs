@@ -625,6 +625,7 @@ async fn read_address(
     Ok(Some(NetLocation::new(address, port)))
 }
 
+#[cfg(test)]
 fn serialize_address(location: &NetLocation) -> Vec<u8> {
     let mut address_bytes = match location.address() {
         Address::Hostname(hostname) => {

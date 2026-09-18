@@ -10,6 +10,7 @@ pub mod server_config;
 
 pub mod rule;
 
+#[allow(dead_code)] // Public format marker retained for configuration adapters.
 pub enum SupportedFileType {
     Yaml,
     Json,

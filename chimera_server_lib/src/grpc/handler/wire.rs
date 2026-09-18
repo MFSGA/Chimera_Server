@@ -92,16 +92,18 @@ pub(super) const TYPE_TRANSPORT_WEBSOCKET_CONFIG: &str =
 #[cfg(feature = "ws")]
 pub(super) const TYPE_TRANSPORT_WEBSOCKET_CONFIG_V2RAY: &str =
     "v2ray.core.transport.internet.websocket.Config";
-#[cfg(feature = "httpupgrade")]
+#[cfg(all(test, feature = "httpupgrade"))]
 pub(super) const TYPE_TRANSPORT_HTTPUPGRADE_CONFIG: &str =
     "xray.transport.internet.httpupgrade.Config";
-#[cfg(feature = "httpupgrade")]
+#[cfg(all(test, feature = "httpupgrade"))]
+#[allow(dead_code)] // Kept for the Xray/v2ray wire-format test matrix.
 pub(super) const TYPE_TRANSPORT_HTTPUPGRADE_CONFIG_V2RAY: &str =
     "v2ray.core.transport.internet.httpupgrade.Config";
-#[cfg(feature = "grpc_transport")]
+#[cfg(all(test, feature = "grpc_transport"))]
 pub(super) const TYPE_TRANSPORT_GRPC_CONFIG: &str =
     "xray.transport.internet.grpc.encoding.Config";
-#[cfg(feature = "grpc_transport")]
+#[cfg(all(test, feature = "grpc_transport"))]
+#[allow(dead_code)] // Kept for the Xray/v2ray wire-format test matrix.
 pub(super) const TYPE_TRANSPORT_GRPC_CONFIG_V2RAY: &str =
     "v2ray.core.transport.internet.grpc.encoding.Config";
 #[cfg(feature = "tls")]
@@ -273,6 +275,7 @@ pub(super) struct SocksServerEndpointPayload {
 #[derive(Clone, PartialEq, Message)]
 pub(super) struct BlackholeConfigPayload {}
 
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 pub(super) struct SenderConfigPayload {
     #[prost(message, optional, tag = "2")]
@@ -490,6 +493,7 @@ pub(super) struct WebsocketConfigPayload {
 }
 
 #[cfg(feature = "httpupgrade")]
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 pub(super) struct HttpUpgradeConfigPayload {
     #[prost(string, tag = "1")]
@@ -505,6 +509,7 @@ pub(super) struct HttpUpgradeConfigPayload {
 }
 
 #[cfg(feature = "grpc_transport")]
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 pub(super) struct GrpcConfigPayload {
     #[prost(string, tag = "1")]

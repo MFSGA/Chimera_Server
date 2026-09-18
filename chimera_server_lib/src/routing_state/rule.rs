@@ -359,6 +359,7 @@ impl TryFrom<RuleConfig> for CompiledRule {
 }
 
 impl CompiledRule {
+    #[allow(dead_code)] // The dispatcher uses the staged match methods below.
     fn matches(&self, input: &RoutingInput) -> bool {
         self.matches_with_target_ips(input, &input.target_ips)
     }

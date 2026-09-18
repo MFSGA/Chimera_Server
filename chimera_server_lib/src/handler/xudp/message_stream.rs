@@ -69,6 +69,7 @@ impl std::fmt::Debug for XudpMessageStream {
 }
 
 impl XudpMessageStream {
+    #[cfg(any(test, feature = "vmess"))]
     pub(crate) fn new(stream: Box<dyn AsyncStream>) -> Self {
         Self::with_write_prefix(stream, Vec::new())
     }

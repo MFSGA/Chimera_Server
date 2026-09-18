@@ -180,6 +180,7 @@ pub(super) fn parse_cookie_value_like_go(raw: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 pub(super) fn has_uplink_marker(
     headers: &hyper::HeaderMap,
     placement: XhttpDataPlacement,

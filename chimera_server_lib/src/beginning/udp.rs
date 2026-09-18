@@ -47,7 +47,7 @@ use global_xudp::*;
 mod session_worker;
 use session_worker::*;
 mod targeted_session;
-#[cfg(test)]
+#[cfg(all(test, feature = "trojan"))]
 use targeted_session::run_multi_directional_udp_with_tasks;
 #[cfg(feature = "trojan")]
 use targeted_session::shutdown_targeted_message;

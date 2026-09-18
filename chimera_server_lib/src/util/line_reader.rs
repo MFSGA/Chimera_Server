@@ -21,20 +21,6 @@ impl LineReader {
         }
     }
 
-    pub async fn read_line(
-        &mut self,
-        stream: &mut Box<dyn AsyncStream>,
-    ) -> std::io::Result<&str> {
-        let line_bytes = self.read_line_bytes(stream).await?;
-
-        std::str::from_utf8(line_bytes).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Failed to decode utf8: {}", e),
-            )
-        })
-    }
-
     pub async fn read_line_bytes(
         &mut self,
         stream: &mut Box<dyn AsyncStream>,

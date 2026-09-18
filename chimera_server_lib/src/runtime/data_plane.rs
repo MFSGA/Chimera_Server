@@ -114,6 +114,9 @@ impl std::fmt::Debug for DataPlaneState {
     }
 }
 
+// The data plane exposes capability methods to optional protocol/control-plane
+// handlers; not every feature build links every capability.
+#[allow(dead_code)]
 impl DataPlaneState {
     pub(super) fn spawn_inbound_connection<F>(&self, future: F) -> bool
     where
@@ -311,6 +314,7 @@ impl DataPlaneState {
         self.select_outbound_checked_internal(input, false)
     }
 
+    #[cfg(test)]
     pub(super) fn allows_user_domain_access(
         &self,
         identity: &str,
@@ -332,6 +336,7 @@ impl DataPlaneState {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn allows_user_domain_access_with_identities(
         &self,
         identities: &[String],
@@ -366,6 +371,7 @@ impl DataPlaneState {
 #[derive(Debug, Clone)]
 pub struct DataPlaneRuntime(pub(super) Arc<DataPlaneState>);
 
+#[allow(dead_code)]
 impl DataPlaneRuntime {
     pub(crate) fn resolver(&self) -> Arc<dyn Resolver> {
         Arc::clone(&self.0.resolver)
@@ -498,6 +504,7 @@ impl DataPlaneRuntime {
         self.0.routing().needs_process_lookup(input)
     }
 
+    #[cfg(test)]
     pub(crate) fn allows_user_domain_access(
         &self,
         identity: &str,
@@ -519,6 +526,7 @@ impl DataPlaneRuntime {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn allows_user_domain_access_with_identities(
         &self,
         identities: &[String],

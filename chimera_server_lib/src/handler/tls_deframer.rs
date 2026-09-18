@@ -97,6 +97,7 @@ impl TlsDeframer {
         }
     }
 
+    #[cfg(any(test, feature = "reality"))]
     pub fn next_records(&mut self) -> io::Result<Vec<Bytes>> {
         let mut records = Vec::new();
         while let Some(record) = self.next_record()? {
@@ -113,6 +114,7 @@ impl TlsDeframer {
         self.buffer.freeze()
     }
 
+    #[cfg(test)]
     pub fn clear(&mut self) {
         self.buffer.clear();
         self.state = DeframerState::ReadingHeader;

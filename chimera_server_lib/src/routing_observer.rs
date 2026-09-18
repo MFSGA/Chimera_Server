@@ -140,6 +140,7 @@ async fn run_observer(runtime: DataPlaneRuntime, config: ActiveObserverConfig) {
     }
 }
 
+#[allow(dead_code)] // Retained for the planned batched observatory scheduler.
 async fn probe_once(
     runtime: &DataPlaneRuntime,
     config: &ActiveObserverConfig,

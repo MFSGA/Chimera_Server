@@ -1,32 +1,39 @@
 use async_trait::async_trait;
 use tracing::warn;
 
+#[cfg(any(feature = "tls", feature = "reality"))]
+use crate::config::server_config::VlessFallback;
+#[cfg(any(feature = "tls", feature = "reality"))]
+use crate::handler::xudp::message_stream::XudpMessageStream;
 #[cfg(feature = "reality")]
 use crate::reality::{RealityServerConnection, RealityTlsStream};
 use crate::{
     async_stream::AsyncStream,
-    config::server_config::{VlessFallback, VlessUser},
-    handler::{
-        tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
-        xudp::message_stream::XudpMessageStream,
-    },
+    config::server_config::VlessUser,
+    handler::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
     traffic::TrafficContext,
 };
 
+#[cfg(any(feature = "tls", feature = "reality"))]
+use super::SERVER_RESPONSE_HEADER;
+#[cfg(any(feature = "tls", feature = "reality"))]
 use super::fallback::{
     extend_prefix_for_path, read_vless_auth_prefix, select_vless_fallback,
     vless_fallback_result,
 };
+#[cfg(any(feature = "tls", feature = "reality"))]
+use super::protocol::{COMMAND_MUX, COMMAND_UDP, read_request_header_after_auth};
 use super::protocol::{
-    COMMAND_MUX, COMMAND_TCP, COMMAND_UDP, ParsedVlessHeader, XTLS_VISION_FLOW,
-    read_request_header, read_request_header_after_auth,
+    COMMAND_TCP, ParsedVlessHeader, XTLS_VISION_FLOW, read_request_header,
 };
 #[cfg(any(feature = "tls", feature = "reality"))]
 use super::reality_vision_stream::RealityVisionServerStream;
 #[cfg(feature = "tls")]
 use super::tls_vision::{RustlsVisionSession, VisionRecordIo};
-use super::{SERVER_RESPONSE_HEADER, encode_hex, parse_hex};
-use super::{udp_stream::VlessUdpStream, vision_stream::VisionServerStream};
+#[cfg(any(feature = "tls", feature = "reality"))]
+use super::udp_stream::VlessUdpStream;
+use super::vision_stream::VisionServerStream;
+use super::{encode_hex, parse_hex};
 
 pub(crate) type ParsedVisionUser = (Box<[u8]>, String, String, u32);
 
@@ -332,6 +339,7 @@ pub async fn setup_tls_mixed_vless_server_stream(
 }
 
 #[cfg(feature = "reality")]
+#[allow(dead_code)] // Kept as the REALITY Vision entrypoint for the listener integration slice.
 pub async fn setup_reality_vision_server_stream(
     mut tls_stream: RealityTlsStream<Box<dyn AsyncStream>, RealityServerConnection>,
     users: &[ParsedVisionUser],
@@ -480,6 +488,7 @@ pub(crate) fn parse_vision_users(users: &[VlessUser]) -> Vec<ParsedVisionUser> {
         .collect()
 }
 
+#[cfg(any(feature = "tls", feature = "reality"))]
 fn find_matching_vless_user<'a>(
     users: &'a [VlessUser],
     user_id: &[u8; 16],

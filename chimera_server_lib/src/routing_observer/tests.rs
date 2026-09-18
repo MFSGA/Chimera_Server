@@ -349,6 +349,7 @@ async fn serve_fake_trojan_grpc_probe<IO>(
         .expect("serve fake Trojan gRPC probe connection");
 }
 
+#[cfg(all(feature = "trojan", feature = "grpc_transport"))]
 async fn start_fake_trojan_grpc_probe_server_with_mode(
     response_delay: Duration,
     multi_mode: bool,

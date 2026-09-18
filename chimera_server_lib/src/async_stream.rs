@@ -16,6 +16,7 @@ use tokio::{
 #[cfg(feature = "tls")]
 use tokio_rustls::{client::TlsStream as ClientTlsStream, server::TlsStream};
 
+#[allow(dead_code)] // Optional transport heartbeat capability; not all builds use ping frames.
 pub trait AsyncPing {
     fn supports_ping(&self) -> bool;
 
@@ -58,6 +59,7 @@ pub trait AsyncShutdownMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RawTcpRelayState {
     Unavailable,
+    #[allow(dead_code)] // Used by raw-relay tests and platform-specific adapters.
     Pending,
     Ready,
 }

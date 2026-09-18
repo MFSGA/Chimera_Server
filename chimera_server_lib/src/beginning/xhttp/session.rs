@@ -95,6 +95,7 @@ impl SessionStore {
         session
     }
 
+    #[cfg(test)]
     pub(super) fn remove(&self, session_id: &str) {
         self.inner.write().unwrap().remove(session_id);
     }

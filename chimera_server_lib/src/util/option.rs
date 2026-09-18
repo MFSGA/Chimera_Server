@@ -1,5 +1,6 @@
 use serde::Deserialize;
 
+#[cfg(any(feature = "ws", feature = "api"))]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum OneOrSome<T> {
@@ -8,6 +9,7 @@ pub enum OneOrSome<T> {
     Some(Vec<T>),
 }
 
+#[cfg(any(feature = "ws", feature = "api"))]
 fn validate_non_empty<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
 where
     D: serde::de::Deserializer<'de>,
@@ -23,6 +25,7 @@ where
     Ok(value)
 }
 
+#[cfg(any(feature = "ws", feature = "api"))]
 impl<T> OneOrSome<T> {
     pub fn into_vec(self) -> Vec<T> {
         match self {

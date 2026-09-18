@@ -14,10 +14,11 @@ use std::{
 #[cfg(any(feature = "vless", feature = "vmess"))]
 use bytes::{BufMut, BytesMut};
 use sha2::{Digest, Sha256};
+#[cfg(feature = "trojan")]
+use tokio::io::AsyncReadExt;
 #[cfg(any(feature = "trojan", feature = "vless", feature = "vmess"))]
 use tokio::io::{
-    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf,
-    duplex,
+    AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex,
 };
 use tokio::{net::UdpSocket, time::timeout};
 

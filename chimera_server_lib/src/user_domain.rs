@@ -36,6 +36,7 @@ impl UserDomainAccessError {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Failure details are serialized by the optional management API.
 pub(crate) struct UserDomainAccessFailure {
     pub(crate) kind: UserDomainAccessError,
     pub(crate) message: String,
@@ -132,6 +133,7 @@ pub(crate) enum UserDomainAccessMatch {
 }
 
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // Revision details are serialized by the optional management API.
 pub(crate) struct UserDomainAccessRevision {
     pub(crate) version: u64,
     pub(crate) generated_at: String,
@@ -155,6 +157,7 @@ pub(crate) struct UserDomainAccessDecisionStats {
 }
 
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // Status details are serialized by the optional management API.
 pub(crate) struct UserDomainAccessStatus {
     pub(crate) revision: Option<UserDomainAccessRevision>,
     pub(crate) stats: UserDomainAccessDecisionStats,
@@ -337,6 +340,7 @@ impl UserDomainAccessStore {
     /// outbound connection is established. An empty or invalid target domain
     /// represents an IP-only or otherwise unknown target and is always
     /// allowed; the decision is recorded for auditing.
+    #[cfg(test)]
     pub(crate) fn allows(&self, identity: &str, target_domain: &str) -> bool {
         self.allows_identity_iter(std::iter::once(identity), target_domain, None)
     }
@@ -354,6 +358,7 @@ impl UserDomainAccessStore {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn allows_with_identities(
         &self,
         identities: &[String],
@@ -544,6 +549,7 @@ impl UserDomainAccessRule {
     }
 }
 
+#[cfg(test)]
 fn evaluate_publication(
     publication: &UserDomainAccessPublication,
     identity: &str,

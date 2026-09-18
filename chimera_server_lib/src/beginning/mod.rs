@@ -19,6 +19,7 @@ use crate::{
 /// these endpoints directly during normal inbound stop (the owning listener
 /// task is aborted instead), so a naturally completed accept is unexpected and
 /// must terminate the listener task for generation-aware health propagation.
+#[allow(dead_code)] // Used by HTTP/3 and QUIC listener variants when enabled.
 pub(crate) async fn accept_quic_with_health(
     endpoint: &quinn::Endpoint,
     listener_kind: &'static str,
@@ -42,6 +43,8 @@ pub(crate) async fn accept_quic_with_health(
 
 #[cfg(feature = "grpc_transport")]
 pub(crate) mod grpc_transport;
+#[allow(dead_code)]
+// mKCP's demux/runtime slice is retained for the next transport integration.
 mod mkcp;
 mod policy_stream;
 mod quic;
@@ -129,6 +132,7 @@ pub(crate) async fn start_bound_servers(
         .map(BoundInboundTasks::new)
 }
 
+#[cfg(test)]
 pub async fn start_servers(
     config: ServerConfig,
     runtime: RuntimeState,

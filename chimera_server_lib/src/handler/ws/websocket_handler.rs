@@ -386,6 +386,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 use request::xray_websocket_request_path;
 
 #[cfg(test)]

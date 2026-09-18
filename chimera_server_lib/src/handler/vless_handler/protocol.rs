@@ -1,4 +1,5 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
+#[cfg(test)]
 use std::sync::LazyLock;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -76,6 +77,7 @@ where
     })
 }
 
+#[cfg(test)]
 pub fn encode_flow_addon_data(flow: &str) -> std::io::Result<Vec<u8>> {
     let flow_bytes = flow.as_bytes();
     let mut result = Vec::with_capacity(flow_bytes.len() + 3);
@@ -107,6 +109,7 @@ pub fn encode_flow_addon_data(flow: &str) -> std::io::Result<Vec<u8>> {
     Ok(result)
 }
 
+#[cfg(test)]
 pub fn vision_flow_addon_data() -> &'static [u8] {
     static INSTANCE: LazyLock<Vec<u8>> = LazyLock::new(|| {
         encode_flow_addon_data(XTLS_VISION_FLOW)
