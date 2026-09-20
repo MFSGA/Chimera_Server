@@ -71,7 +71,7 @@ Config validation is necessary but is not protocol interoperability evidence. Te
 | `vless-ws-tls.json5` | vless | websocket | tls | config-validated |
 | `vless-tcp-tls-vision.json5` | vless | tcp | tls + vision | config-validated; Xray-verified TCP stream + inner TLS Vision with repository fixture |
 | `vless-xhttp-none.json5` | vless | xhttp | none | config-validated; runtime-covered |
-| `vless-xhttp-tls.json5` | vless | xhttp | tls | config-validated; Xray 26.9.9-verified TLS/H2 packet-up (including xPadding obfuscation) and stream-up profiles |
+| `vless-xhttp-tls.json5` | vless | xhttp | tls | config-validated; Xray 26.9.9-verified TLS/H2 packet-up (including xPadding obfuscation, multi-request session reassembly and out-of-order sequence delivery), error-status parity, and stream-up profiles |
 | `vless-xhttp-tls-h2-stream-one.json5` | vless | xhttp | tls + h2 + stream-one | config-validated; Xray 26.9.9-verified 1 MiB bidirectional echo, client-cancellation liveness, and raw HTTP/2 half-close parity |
 | `vmess-tcp-none.json5` | vmess | tcp | none | config-validated; runtime-covered |
 | `vmess-ws-none.json5` | vmess | websocket | none | config-validated; runtime-covered |
