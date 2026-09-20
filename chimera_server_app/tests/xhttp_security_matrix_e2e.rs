@@ -32,6 +32,9 @@ static RUSTLS_PROVIDER: Once = Once::new();
 enum SecurityCase {
     None,
     Tls,
+    TlsPacketUp,
+    TlsPacketUpObfs,
+    TlsStreamUp,
     Http3,
     Reality,
 }
@@ -41,6 +44,9 @@ impl SecurityCase {
         match self {
             Self::None => "none",
             Self::Tls => "tls",
+            Self::TlsPacketUp => "tls-packet-up",
+            Self::TlsPacketUpObfs => "tls-packet-up-obfs",
+            Self::TlsStreamUp => "tls-stream-up",
             Self::Http3 => "h3",
             Self::Reality => "reality",
         }
@@ -50,6 +56,8 @@ impl SecurityCase {
         match self {
             Self::None => "packet-up",
             Self::Tls | Self::Http3 => "stream-one",
+            Self::TlsPacketUp | Self::TlsPacketUpObfs => "packet-up",
+            Self::TlsStreamUp => "stream-up",
             Self::Reality => "stream-up",
         }
     }
@@ -70,10 +78,16 @@ async fn run_security_case(case: SecurityCase, payload_len: usize, ack_trace: bo
     let chimera_config_path = work_dir.join("chimera.json");
     let xray_config_path = work_dir.join("xray.json");
     let pinned_cert = first_cert_sha256_hex(&cert_path);
-    let is_v1_tls = matches!(case, SecurityCase::Tls);
+    let is_v1_tls = matches!(
+        case,
+        SecurityCase::Tls
+            | SecurityCase::TlsPacketUp
+            | SecurityCase::TlsPacketUpObfs
+            | SecurityCase::TlsStreamUp
+    );
     let xhttp_path = if is_v1_tls { "/xhttp-v1/" } else { "/xhttp" };
     let no_grpc_header = !is_v1_tls;
-    let xhttp_settings = json!({
+    let mut xhttp_settings = json!({
         "path": xhttp_path,
         "mode": case.mode(),
         "noGRPCHeader": no_grpc_header,
@@ -97,6 +111,17 @@ async fn run_security_case(case: SecurityCase, payload_len: usize, ack_trace: bo
         "seqKey": "x_security_seq",
         "uplinkDataPlacement": "body"
     });
+    if matches!(case, SecurityCase::TlsPacketUpObfs) {
+        xhttp_settings["xPaddingBytes"] = json!({"from": 100, "to": 100});
+        xray_xhttp_settings["xPaddingBytes"] = json!("100-100");
+        for settings in [&mut xhttp_settings, &mut xray_xhttp_settings] {
+            settings["xPaddingObfsMode"] = json!(true);
+            settings["xPaddingKey"] = json!("x_security_padding");
+            settings["xPaddingHeader"] = json!("X-Security-Padding");
+            settings["xPaddingPlacement"] = json!("header");
+            settings["xPaddingMethod"] = json!("tokenish");
+        }
+    }
     if matches!(case, SecurityCase::Http3) {
         xray_xhttp_settings["headers"] = json!({
             "X-H3-Large-Header": "a".repeat(16 * 1024)
@@ -232,42 +257,54 @@ fn chimera_stream_settings(
             "security": "none",
             "xhttpSettings": xhttp_settings
         }),
-        SecurityCase::Tls | SecurityCase::Http3 => json!({
-            "network": "xhttp",
-            "security": "tls",
-            "xhttpSettings": xhttp_settings,
-            "finalmask": if matches!(case, SecurityCase::Http3) {
-                json!({
-                    "quicParams": {
-                        "congestion": "force-brutal",
-                        "brutalUp": "8 mbps",
-                        "maxIdleTimeout": 45,
-                        "maxIncomingStreams": 64,
-                        "initStreamReceiveWindow": 32768,
-                        "maxStreamReceiveWindow": 65536,
-                        "initConnectionReceiveWindow": 131072,
-                        "maxConnectionReceiveWindow": 262144,
-                        "disablePathMTUDiscovery": true
-                    }
-                })
-            } else {
-                Value::Null
-            },
-            "tlsSettings": {
-                "serverName": "localhost",
-                "alpn": if matches!(case, SecurityCase::Http3) {
-                    json!(["h3"])
-                } else if matches!(case, SecurityCase::Tls) {
-                    json!(["h2"])
+        SecurityCase::Tls
+        | SecurityCase::TlsPacketUp
+        | SecurityCase::TlsPacketUpObfs
+        | SecurityCase::TlsStreamUp
+        | SecurityCase::Http3 => {
+            json!({
+                "network": "xhttp",
+                "security": "tls",
+                "xhttpSettings": xhttp_settings,
+                "finalmask": if matches!(case, SecurityCase::Http3) {
+                    json!({
+                        "quicParams": {
+                            "congestion": "force-brutal",
+                            "brutalUp": "8 mbps",
+                            "maxIdleTimeout": 45,
+                            "maxIncomingStreams": 64,
+                            "initStreamReceiveWindow": 32768,
+                            "maxStreamReceiveWindow": 65536,
+                            "initConnectionReceiveWindow": 131072,
+                            "maxConnectionReceiveWindow": 262144,
+                            "disablePathMTUDiscovery": true
+                        }
+                    })
                 } else {
-                    json!(["h2", "http/1.1"])
+                    Value::Null
                 },
-                "certificates": [{
-                    "certificateFile": cert_path,
-                    "keyFile": key_path
-                }]
-            }
-        }),
+                "tlsSettings": {
+                    "serverName": "localhost",
+                    "alpn": if matches!(case, SecurityCase::Http3) {
+                        json!(["h3"])
+                    } else if matches!(
+                        case,
+                        SecurityCase::Tls
+                            | SecurityCase::TlsPacketUp
+                            | SecurityCase::TlsPacketUpObfs
+                            | SecurityCase::TlsStreamUp
+                    ) {
+                        json!(["h2"])
+                    } else {
+                        json!(["h2", "http/1.1"])
+                    },
+                    "certificates": [{
+                        "certificateFile": cert_path,
+                        "keyFile": key_path
+                    }]
+                }
+            })
+        }
         SecurityCase::Reality => json!({
             "network": "xhttp",
             "security": "reality",
@@ -295,22 +332,34 @@ fn xray_stream_settings(
             "security": "none",
             "xhttpSettings": xhttp_settings
         }),
-        SecurityCase::Tls | SecurityCase::Http3 => json!({
-            "network": "xhttp",
-            "security": "tls",
-            "xhttpSettings": xhttp_settings,
-            "tlsSettings": {
-                "serverName": "localhost",
-                "pinnedPeerCertSha256": pinned_cert,
-                "alpn": if matches!(case, SecurityCase::Http3) {
-                    json!(["h3"])
-                } else if matches!(case, SecurityCase::Tls) {
-                    json!(["h2"])
-                } else {
-                    json!(["h2", "http/1.1"])
+        SecurityCase::Tls
+        | SecurityCase::TlsPacketUp
+        | SecurityCase::TlsPacketUpObfs
+        | SecurityCase::TlsStreamUp
+        | SecurityCase::Http3 => {
+            json!({
+                "network": "xhttp",
+                "security": "tls",
+                "xhttpSettings": xhttp_settings,
+                "tlsSettings": {
+                    "serverName": "localhost",
+                    "pinnedPeerCertSha256": pinned_cert,
+                    "alpn": if matches!(case, SecurityCase::Http3) {
+                        json!(["h3"])
+                    } else if matches!(
+                        case,
+                        SecurityCase::Tls
+                            | SecurityCase::TlsPacketUp
+                            | SecurityCase::TlsPacketUpObfs
+                            | SecurityCase::TlsStreamUp
+                    ) {
+                        json!(["h2"])
+                    } else {
+                        json!(["h2", "http/1.1"])
+                    }
                 }
-            }
-        }),
+            })
+        }
         SecurityCase::Reality => json!({
             "network": "xhttp",
             "security": "reality",
@@ -336,7 +385,13 @@ async fn run_xray_security_case(case: SecurityCase) {
         );
         return;
     }
-    let payload_len = if matches!(case, SecurityCase::Tls) {
+    let payload_len = if matches!(
+        case,
+        SecurityCase::Tls
+            | SecurityCase::TlsPacketUp
+            | SecurityCase::TlsStreamUp
+            | SecurityCase::TlsPacketUpObfs
+    ) {
         1024 * 1024
     } else {
         64 * 1024
@@ -352,6 +407,21 @@ async fn xhttp_security_none() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn xhttp_security_tls() {
     run_xray_security_case(SecurityCase::Tls).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn xhttp_security_tls_packet_up() {
+    run_xray_security_case(SecurityCase::TlsPacketUp).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn xhttp_security_tls_packet_up_obfs() {
+    run_xray_security_case(SecurityCase::TlsPacketUpObfs).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn xhttp_security_tls_stream_up() {
+    run_xray_security_case(SecurityCase::TlsStreamUp).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
