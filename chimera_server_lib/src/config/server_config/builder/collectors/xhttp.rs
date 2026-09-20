@@ -402,9 +402,9 @@ fn normalize_xhttp_uplink_method(
     let method = if method.is_empty() {
         "POST".to_string()
     } else {
-        // Xray v26.2.6 applies strings.ToUpper without trimming or validating
-        // the value as an HTTP token. Preserve that exact config semantics;
-        // odd values simply never match a real request method at runtime.
+        // Xray applies strings.ToUpper without trimming or validating the
+        // value as an HTTP token. Preserve that exact client-config semantics;
+        // the server dispatches from the actual request method instead.
         method.to_ascii_uppercase()
     };
     if method == "GET" && mode != XhttpMode::PacketUp {

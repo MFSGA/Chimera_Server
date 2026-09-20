@@ -2311,6 +2311,321 @@ async fn xray_client_xhttp_tls_domain_access_policy_allows_and_rejects_target() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera and ./xray to verify XHTTP/3 user-domain policy"]
+async fn xray_client_xhttp_http3_domain_access_policy_allows_and_rejects_target() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("vless-xhttp-http3-domain-access-policy");
+    let (echo_addr, accepted) = start_tcp_echo_server_with_counter();
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let (cert_path, key_path) = generate_test_certificate(&work_dir);
+    let pinned_peer_cert_sha256 = first_cert_sha256_hex(&cert_path);
+    let chimera_config_path = work_dir.join("chimera.json");
+    let xray_config_path = work_dir.join("xray-client.json");
+    let echo_ip = echo_addr.ip().to_string();
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "vless",
+                "tag": "chimera-vless-xhttp-http3-domain-access",
+                "settings": {
+                    "clients": [{"id": TEST_UUID, "email": "xhttp-http3-domain-access@example.test"}],
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "xhttp",
+                    "security": "tls",
+                    "xhttpSettings": {
+                        "path": "/xhttp",
+                        "mode": "stream-one",
+                        "noGRPCHeader": true,
+                        "sessionIDPlacement": "header",
+                        "sessionIDKey": "X-Session",
+                        "seqPlacement": "query",
+                        "seqKey": "x_seq",
+                        "uplinkDataPlacement": "body"
+                    },
+                    "finalmask": {
+                        "quicParams": {
+                            "maxIdleTimeout": 45,
+                            "maxIncomingStreams": 64,
+                            "initStreamReceiveWindow": 32768,
+                            "maxStreamReceiveWindow": 65536,
+                            "initConnectionReceiveWindow": 131072,
+                            "maxConnectionReceiveWindow": 262144,
+                            "disablePathMTUDiscovery": true
+                        }
+                    },
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "alpn": ["h3"],
+                        "certificates": [{
+                            "certificateFile": cert_path,
+                            "keyFile": key_path
+                        }]
+                    }
+                }
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "dns": {"hosts": {
+                "allowed.example": echo_ip,
+                "blocked.example": echo_ip
+            }},
+            "userDomainAccess": signed_vless_domain_access_policy(
+                TEST_UUID,
+                "blocked.example"
+            )
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth"}
+            }],
+            "dns": {"hosts": {
+                "allowed.example": echo_ip,
+                "blocked.example": echo_ip
+            }},
+            "outbounds": [{
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": chimera_port,
+                        "users": [{"id": TEST_UUID, "encryption": "none"}]
+                    }]
+                },
+                "streamSettings": {
+                    "network": "xhttp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "pinnedPeerCertSha256": pinned_peer_cert_sha256,
+                        "alpn": ["h3"]
+                    },
+                    "xhttpSettings": {
+                        "path": "/xhttp",
+                        "mode": "stream-one",
+                        "noGRPCHeader": true,
+                        "sessionPlacement": "header",
+                        "sessionKey": "X-Session",
+                        "sessionIDPlacement": "header",
+                        "sessionIDKey": "X-Session",
+                        "seqPlacement": "query",
+                        "seqKey": "x_seq",
+                        "uplinkDataPlacement": "body"
+                    }
+                }
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    thread::sleep(Duration::from_millis(250));
+    chimera.assert_running();
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+
+    assert_socks5_domain_echo(
+        socks_addr,
+        "allowed.example",
+        echo_addr.port(),
+        b"allowed XHTTP HTTP/3 domain",
+    );
+    wait_for_counter(&accepted, 1);
+    assert_socks5_domain_echo_does_not_succeed(
+        socks_addr,
+        "blocked.example",
+        echo_addr.port(),
+    );
+    thread::sleep(CONNECT_RETRY_INTERVAL * 4);
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+
+    assert_socks5_echo(
+        socks_addr,
+        echo_addr,
+        b"direct IP remains allowed and audited through XHTTP HTTP/3",
+    );
+    wait_for_counter(&accepted, 2);
+    let deadline = Instant::now() + IO_TIMEOUT;
+    loop {
+        let logs = read_lossy(&chimera.stderr_path);
+        if logs.contains("user_domain_access_unknown_target") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "missing unknown-target audit event; logs={logs}"
+        );
+        thread::sleep(CONNECT_RETRY_INTERVAL);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera and ./xray to verify XHTTP REALITY user-domain policy"]
+async fn xray_client_xhttp_reality_domain_access_policy_allows_and_rejects_target() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("vless-xhttp-reality-domain-access-policy");
+    let reality_dest_addr = start_tls13_dest(&workspace).await;
+    let (echo_addr, accepted) = start_tcp_echo_server_with_counter();
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let chimera_config_path = work_dir.join("chimera.json");
+    let xray_config_path = work_dir.join("xray-client.json");
+    let echo_ip = echo_addr.ip().to_string();
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "vless",
+                "tag": "chimera-vless-xhttp-reality-domain-access",
+                "settings": {
+                    "clients": [{"id": TEST_UUID, "email": "xhttp-reality-domain-access@example.test"}],
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "xhttp",
+                    "security": "reality",
+                    "xhttpSettings": {
+                        "path": "/xhttp",
+                        "mode": "stream-up",
+                        "noGRPCHeader": true,
+                        "noSSEHeader": false,
+                        "scMinPostsIntervalMs": {"from": 1, "to": 1},
+                        "sessionIDPlacement": "header",
+                        "sessionIDKey": "X-Session",
+                        "seqPlacement": "query",
+                        "seqKey": "x_seq",
+                        "uplinkDataPlacement": "body"
+                    },
+                    "realitySettings": {
+                        "dest": reality_dest_addr.to_string(),
+                        "serverNames": [REALITY_SERVER_NAME],
+                        "privateKey": REALITY_PRIVATE_KEY,
+                        "shortIds": [REALITY_SHORT_ID],
+                        "maxTimeDiff": 0,
+                        "minClientVer": "26.2.6"
+                    }
+                }
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "dns": {"hosts": {
+                "allowed.example": echo_ip,
+                "blocked.example": echo_ip
+            }},
+            "userDomainAccess": signed_vless_domain_access_policy(
+                TEST_UUID,
+                "blocked.example"
+            )
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth"}
+            }],
+            "dns": {"hosts": {
+                "allowed.example": echo_ip,
+                "blocked.example": echo_ip
+            }},
+            "outbounds": [{
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": chimera_port,
+                        "users": [{"id": TEST_UUID, "encryption": "none"}]
+                    }]
+                },
+                "streamSettings": {
+                    "network": "xhttp",
+                    "security": "reality",
+                    "xhttpSettings": {
+                        "path": "/xhttp",
+                        "mode": "stream-up",
+                        "noGRPCHeader": true,
+                        "sessionPlacement": "header",
+                        "sessionKey": "X-Session",
+                        "sessionIDPlacement": "header",
+                        "sessionIDKey": "X-Session",
+                        "seqPlacement": "query",
+                        "seqKey": "x_seq",
+                        "uplinkDataPlacement": "body"
+                    },
+                    "realitySettings": {
+                        "serverName": REALITY_SERVER_NAME,
+                        "fingerprint": "chrome",
+                        "publicKey": REALITY_PUBLIC_KEY,
+                        "shortId": REALITY_SHORT_ID
+                    }
+                }
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+
+    assert_socks5_domain_echo(
+        socks_addr,
+        "allowed.example",
+        echo_addr.port(),
+        b"allowed XHTTP REALITY domain",
+    );
+    wait_for_counter(&accepted, 1);
+    assert_socks5_domain_echo_does_not_succeed(
+        socks_addr,
+        "blocked.example",
+        echo_addr.port(),
+    );
+    thread::sleep(CONNECT_RETRY_INTERVAL * 4);
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+
+    assert_socks5_echo(
+        socks_addr,
+        echo_addr,
+        b"direct IP remains allowed and audited through XHTTP REALITY",
+    );
+    wait_for_counter(&accepted, 2);
+    let deadline = Instant::now() + IO_TIMEOUT;
+    loop {
+        let logs = read_lossy(&chimera.stderr_path);
+        if logs.contains("user_domain_access_unknown_target") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "missing unknown-target audit event; logs={logs}"
+        );
+        thread::sleep(CONNECT_RETRY_INTERVAL);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts Chimera and ./xray to verify Socks5 user-domain policy"]
 async fn xray_client_socks5_username_domain_access_policy_allows_and_rejects_target()
 {

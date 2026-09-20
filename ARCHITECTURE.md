@@ -416,11 +416,17 @@ targeted UDP relay，并在创建目标 session 前复用统一的 `select_direc
 `xray_client_trojan_domain_access_policy_allows_and_rejects_target` 覆盖同一用户的
 TCP/UDP allow/reject，结果为 `1 passed; 0 failed`。
 
-2026-09-16 XHTTP TLS 用户域名策略验证决策：XHTTP over TCP 的 TLS 层继续包裹既有
-VLESS 认证和 XHTTP session，不复制或改变用户域名策略；VLESS UUID 仍是策略身份来源。
-验证：Xray 26.2.6/Linux 的 `xray_client_xhttp_tls_domain_access_policy_allows_and_rejects_target`
-覆盖 `security: tls` 的 allow/reject，结果为 `1 passed; 0 failed`。该证据不延伸到 XHTTP
-HTTP/3、REALITY 或其他传输组合。
+2026-09-20 XHTTP 用户域名策略与上行方法语义决策：XHTTP 的 TLS/H2、TLS/HTTP/3
+（`stream-one`、`packet-up`、`stream-up`）和 REALITY/TCP 层继续包裹既有 VLESS 认证与
+XHTTP session，不复制或改变用户域名策略；VLESS UUID 仍是策略身份来源。域名允许、拒绝、
+直接 IP 放行及审计事件已由 Xray 26.9.9/Linux 真实客户端组合测试覆盖。`uplinkHTTPMethod`
+保留 Xray 的配置/管理语义，但它是客户端生成上行请求时使用的字段；服务端根据实际 HTTP
+方法和序号分类请求，因此 Chimera 不把它作为服务端强制覆盖项。该语义与固定参考中的
+`splithttp/dialer.go`、`hub.go` 一致。验证：
+`xray_client_xhttp_tls_domain_access_policy_allows_and_rejects_target`、
+`xray_client_xhttp_http3_domain_access_policy_allows_and_rejects_target`、
+`xray_client_xhttp_reality_domain_access_policy_allows_and_rejects_target`、
+`xhttp_security_http3_packet_up` 和 `xhttp_security_http3_stream_up` 均通过。
 
 2026-09-16 数据面启动入口收窄决策：`beginning` 的 TCP、UDP、gRPC transport、XHTTP、QUIC
 和 mKCP listener/会话启动函数现在只接收 `DataPlaneRuntime`；`RuntimeState` 仅在 server、

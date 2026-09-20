@@ -36,6 +36,8 @@ enum SecurityCase {
     TlsPacketUpObfs,
     TlsStreamUp,
     Http3,
+    Http3PacketUp,
+    Http3StreamUp,
     Reality,
 }
 
@@ -48,6 +50,8 @@ impl SecurityCase {
             Self::TlsPacketUpObfs => "tls-packet-up-obfs",
             Self::TlsStreamUp => "tls-stream-up",
             Self::Http3 => "h3",
+            Self::Http3PacketUp => "h3-packet-up",
+            Self::Http3StreamUp => "h3-stream-up",
             Self::Reality => "reality",
         }
     }
@@ -58,8 +62,17 @@ impl SecurityCase {
             Self::Tls | Self::Http3 => "stream-one",
             Self::TlsPacketUp | Self::TlsPacketUpObfs => "packet-up",
             Self::TlsStreamUp => "stream-up",
+            Self::Http3PacketUp => "packet-up",
+            Self::Http3StreamUp => "stream-up",
             Self::Reality => "stream-up",
         }
+    }
+
+    fn is_http3(self) -> bool {
+        matches!(
+            self,
+            Self::Http3 | Self::Http3PacketUp | Self::Http3StreamUp
+        )
     }
 }
 
@@ -122,7 +135,7 @@ async fn run_security_case(case: SecurityCase, payload_len: usize, ack_trace: bo
             settings["xPaddingMethod"] = json!("tokenish");
         }
     }
-    if matches!(case, SecurityCase::Http3) {
+    if case.is_http3() {
         xray_xhttp_settings["headers"] = json!({
             "X-H3-Large-Header": "a".repeat(16 * 1024)
         });
@@ -200,7 +213,7 @@ async fn run_security_case(case: SecurityCase, payload_len: usize, ack_trace: bo
     } else {
         start_chimera(&workspace, &work_dir, &chimera_config_path)
     };
-    if matches!(case, SecurityCase::Http3) {
+    if case.is_http3() {
         std::thread::sleep(Duration::from_millis(250));
     } else {
         wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
@@ -261,12 +274,14 @@ fn chimera_stream_settings(
         | SecurityCase::TlsPacketUp
         | SecurityCase::TlsPacketUpObfs
         | SecurityCase::TlsStreamUp
-        | SecurityCase::Http3 => {
+        | SecurityCase::Http3
+        | SecurityCase::Http3PacketUp
+        | SecurityCase::Http3StreamUp => {
             json!({
                 "network": "xhttp",
                 "security": "tls",
                 "xhttpSettings": xhttp_settings,
-                "finalmask": if matches!(case, SecurityCase::Http3) {
+                "finalmask": if case.is_http3() {
                     json!({
                         "quicParams": {
                             "congestion": "force-brutal",
@@ -285,7 +300,7 @@ fn chimera_stream_settings(
                 },
                 "tlsSettings": {
                     "serverName": "localhost",
-                    "alpn": if matches!(case, SecurityCase::Http3) {
+                    "alpn": if case.is_http3() {
                         json!(["h3"])
                     } else if matches!(
                         case,
@@ -336,7 +351,9 @@ fn xray_stream_settings(
         | SecurityCase::TlsPacketUp
         | SecurityCase::TlsPacketUpObfs
         | SecurityCase::TlsStreamUp
-        | SecurityCase::Http3 => {
+        | SecurityCase::Http3
+        | SecurityCase::Http3PacketUp
+        | SecurityCase::Http3StreamUp => {
             json!({
                 "network": "xhttp",
                 "security": "tls",
@@ -344,7 +361,7 @@ fn xray_stream_settings(
                 "tlsSettings": {
                     "serverName": "localhost",
                     "pinnedPeerCertSha256": pinned_cert,
-                    "alpn": if matches!(case, SecurityCase::Http3) {
+                    "alpn": if case.is_http3() {
                         json!(["h3"])
                     } else if matches!(
                         case,
@@ -427,6 +444,16 @@ async fn xhttp_security_tls_stream_up() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn xhttp_security_http3() {
     run_xray_security_case(SecurityCase::Http3).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn xhttp_security_http3_packet_up() {
+    run_xray_security_case(SecurityCase::Http3PacketUp).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn xhttp_security_http3_stream_up() {
+    run_xray_security_case(SecurityCase::Http3StreamUp).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
