@@ -1,4 +1,5 @@
 use super::*;
+use tokio_util::sync::CancellationToken;
 
 pub(super) fn packet_up_success_response(
     body_payload_is_empty: bool,
@@ -84,20 +85,38 @@ pub(super) async fn stream_up_response(
     stream_response(StatusCode::OK, body_stream, true)
 }
 
-pub(super) fn reader_response(
+pub(super) fn reader_response_until_cancel(
     status: StatusCode,
     reader: DuplexStream,
     no_sse_header: bool,
+    cancel: CancellationToken,
 ) -> Response<ResponseBody> {
-    let body_stream = ReaderStream::new(reader).filter_map(|result| async move {
-        match result {
-            Ok(bytes) => Some(Ok(Frame::data(bytes))),
-            Err(err) => {
-                error!("xhttp response read failed: {}", err);
-                None
+    // Keep the first logical response chunk (the VLESS response header) even
+    // when the request body already reached EOF, then mirror Xray's
+    // stream-one response shutdown boundary.
+    let body_stream = futures::stream::unfold(
+        (ReaderStream::new(reader), cancel, false),
+        |(mut reader, cancel, started)| async move {
+            let next = if started {
+                tokio::select! {
+                    _ = cancel.cancelled() => return None,
+                    next = reader.next() => next,
+                }
+            } else {
+                reader.next().await
+            };
+            match next {
+                Some(Ok(bytes)) => {
+                    Some((Ok(Frame::data(bytes)), (reader, cancel, true)))
+                }
+                Some(Err(err)) => {
+                    error!("xhttp response read failed: {}", err);
+                    None
+                }
+                None => None,
             }
-        }
-    });
+        },
+    );
     stream_response(status, body_stream.boxed(), no_sse_header)
 }
 

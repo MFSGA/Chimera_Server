@@ -5,7 +5,7 @@ use std::{
     env,
     fs::{self, File},
     io::{self, Read, Write},
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream},
+    net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Mutex, MutexGuard},
@@ -213,46 +213,78 @@ pub fn start_tcp_echo_server() -> SocketAddr {
     addr
 }
 
+pub fn start_tcp_half_close_server() -> SocketAddr {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .expect("bind TCP half-close server");
+    let addr = listener
+        .local_addr()
+        .expect("TCP half-close server address");
+    thread::spawn(move || {
+        for stream in listener.incoming().take(8) {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            thread::spawn(move || {
+                let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+                let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+                let mut payload = Vec::new();
+                if stream.read_to_end(&mut payload).is_ok() {
+                    let response = format!("received:{}", payload.len());
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.shutdown(Shutdown::Write);
+                }
+            });
+        }
+    });
+    addr
+}
+
 pub fn assert_socks5_echo(
     socks_addr: SocketAddr,
     target_addr: SocketAddr,
     payload: &[u8],
 ) {
-    let mut stream = TcpStream::connect_timeout(&socks_addr, IO_TIMEOUT)
-        .expect("connect Xray SOCKS inbound");
-    stream
-        .set_read_timeout(Some(IO_TIMEOUT))
-        .expect("set SOCKS read timeout");
-    stream
-        .set_write_timeout(Some(IO_TIMEOUT))
-        .expect("set SOCKS write timeout");
-
-    stream
-        .write_all(&[0x05, 0x01, 0x00])
-        .expect("SOCKS greeting");
-    let mut greeting = [0u8; 2];
-    stream
-        .read_exact(&mut greeting)
-        .expect("SOCKS greeting response");
-    assert_eq!(greeting, [0x05, 0x00]);
-
-    let ip = match target_addr.ip() {
-        std::net::IpAddr::V4(ip) => ip.octets(),
-        std::net::IpAddr::V6(_) => panic!("XHTTP matrix uses an IPv4 echo target"),
-    };
-    let port = target_addr.port().to_be_bytes();
-    stream
-        .write_all(&[
-            0x05, 0x01, 0x00, 0x01, ip[0], ip[1], ip[2], ip[3], port[0], port[1],
-        ])
-        .expect("SOCKS connect request");
-    read_socks_connect_response(&mut stream).expect("SOCKS connect response");
+    let mut stream = connect_socks5_target(socks_addr, target_addr)
+        .expect("connect through Xray SOCKS inbound");
 
     stream.write_all(payload).expect("write tunneled payload");
     let mut echoed = vec![0u8; payload.len()];
     read_exact_with_deadline(&mut stream, &mut echoed)
         .expect("read tunneled echo response");
     assert_eq!(echoed, payload);
+}
+
+pub fn connect_socks5_target(
+    socks_addr: SocketAddr,
+    target_addr: SocketAddr,
+) -> io::Result<TcpStream> {
+    let mut stream = TcpStream::connect_timeout(&socks_addr, IO_TIMEOUT)?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    stream.write_all(&[0x05, 0x01, 0x00])?;
+    let mut greeting = [0u8; 2];
+    stream.read_exact(&mut greeting)?;
+    if greeting != [0x05, 0x00] {
+        return Err(io::Error::other(format!(
+            "SOCKS greeting failed: {greeting:02x?}"
+        )));
+    }
+
+    let ip = match target_addr.ip() {
+        std::net::IpAddr::V4(ip) => ip.octets(),
+        std::net::IpAddr::V6(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "XHTTP matrix uses an IPv4 target",
+            ));
+        }
+    };
+    let port = target_addr.port().to_be_bytes();
+    stream.write_all(&[
+        0x05, 0x01, 0x00, 0x01, ip[0], ip[1], ip[2], ip[3], port[0], port[1],
+    ])?;
+    read_socks_connect_response(&mut stream)?;
+    Ok(stream)
 }
 
 pub fn deterministic_payload(length: usize) -> Vec<u8> {

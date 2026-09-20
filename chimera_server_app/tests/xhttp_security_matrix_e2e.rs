@@ -2,7 +2,7 @@ mod xhttp_support;
 
 use std::{
     fs::File,
-    io::BufReader,
+    io::{BufReader, Write},
     net::{Ipv4Addr, SocketAddr},
     path::Path,
     sync::{Arc, Once},
@@ -16,10 +16,10 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use xhttp_support::{
-    TEST_UUID, assert_socks5_echo, create_test_dir, deterministic_payload,
-    free_localhost_port, serial_xray_guard, start_chimera, start_chimera_with_env,
-    start_tcp_echo_server, start_xray, wait_for_tcp, workspace_root, write_json,
-    xray_binary,
+    TEST_UUID, assert_socks5_echo, connect_socks5_target, create_test_dir,
+    deterministic_payload, free_localhost_port, serial_xray_guard, start_chimera,
+    start_chimera_with_env, start_tcp_echo_server, start_xray, wait_for_tcp,
+    workspace_root, write_json, xray_binary,
 };
 
 const REALITY_PRIVATE_KEY: &str = "dnprBfWdJgo5yaGClSaZ12TZW-SiD988YmjDKOhXLKI";
@@ -193,6 +193,18 @@ async fn run_security_case(case: SecurityCase, payload_len: usize, ack_trace: bo
     );
     assert_socks5_echo(socks_addr, echo_addr, &deterministic_payload(payload_len));
 
+    if matches!(case, SecurityCase::Tls) {
+        let mut cancelled = connect_socks5_target(socks_addr, echo_addr)
+            .expect("connect XHTTP stream-one cancellation probe");
+        cancelled
+            .write_all(b"cancelled XHTTP stream-one session")
+            .expect("write cancellation probe");
+        drop(cancelled);
+        std::thread::sleep(Duration::from_millis(100));
+        chimera.assert_running();
+        xray.assert_running();
+    }
+
     if ack_trace {
         std::thread::sleep(Duration::from_millis(100));
         let stderr = chimera.stderr_log();
@@ -324,7 +336,12 @@ async fn run_xray_security_case(case: SecurityCase) {
         );
         return;
     }
-    run_security_case(case, 64 * 1024, false).await;
+    let payload_len = if matches!(case, SecurityCase::Tls) {
+        1024 * 1024
+    } else {
+        64 * 1024
+    };
+    run_security_case(case, payload_len, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

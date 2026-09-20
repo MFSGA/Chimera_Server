@@ -765,6 +765,8 @@ where
 {
     let (client_upload, server_read) = duplex(XHTTP_PIPE_CAPACITY);
     let (server_write, client_download) = duplex(XHTTP_PIPE_CAPACITY);
+    let request_done = CancellationToken::new();
+    let request_done_for_body = request_done.clone();
     let logical_stream = XhttpLogicalStream::new(server_read, server_write);
 
     spawn_handler_stream(logical_stream, state.clone(), peer_addr, local_addr);
@@ -791,9 +793,18 @@ where
             } => {}
         }
         let _ = upload_writer.shutdown().await;
+        // Xray stream-one closes the logical response when the HTTP request
+        // body reaches EOF. The response helper preserves the initial VLESS
+        // response bytes before applying that cancellation boundary.
+        request_done_for_body.cancel();
     });
 
-    reader_response(StatusCode::OK, client_download, state.no_sse_header)
+    reader_response_until_cancel(
+        StatusCode::OK,
+        client_download,
+        state.no_sse_header,
+        request_done,
+    )
 }
 
 fn stream_up_padding_enabled(

@@ -403,8 +403,11 @@ name = "chimera_server_app"
 version = "0.8.3"
 dependencies = [
  "aws-lc-rs",
+ "bytes",
  "chimera_server_lib",
  "clap",
+ "h2",
+ "http",
  "hyper-util",
  "prost",
  "rcgen",
