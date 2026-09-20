@@ -1,0 +1,57 @@
+{
+  "inbounds": [
+    {
+      "tag": "vless-xhttp-tls-h2-stream-one",
+      "listen": "127.0.0.1",
+      "port": 11011,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "email": "vless-xhttp-tls-h2-stream-one@example.com"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "tls",
+        "xhttpSettings": {
+          "host": "proxy.example.com",
+          "path": "/xhttp-v1/",
+          "mode": "stream-one",
+          "xPaddingBytes": "100-1000",
+          "xPaddingObfsMode": false,
+          "xPaddingKey": "x_padding",
+          "xPaddingHeader": "X-Padding",
+          "xPaddingPlacement": "queryInHeader",
+          "xPaddingMethod": "repeat-x",
+          "uplinkHTTPMethod": "POST",
+          "noGRPCHeader": false,
+          "noSSEHeader": false,
+          "serverMaxHeaderBytes": 8192
+        },
+        "tlsSettings": {
+          "serverName": "proxy.example.com",
+          "alpn": ["h2"],
+          "enableSessionResumption": false,
+          "minVersion": "1.2",
+          "maxVersion": "1.3",
+          "certificates": [
+            {
+              "certificateFile": "cert/fullchain.pem",
+              "keyFile": "cert/privkey.pem"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    }
+  ]
+}

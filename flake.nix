@@ -88,6 +88,8 @@
             clang
             clippy
             cmake
+            # Xray-core v26.9.9 (52a412d9) requires Go 1.27.
+            go_1_27
             gnumake
             llvmPackages.libclang
             ninja

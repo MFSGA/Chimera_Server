@@ -76,7 +76,7 @@ targeted UDP relay，在创建 UDP session 前复用统一域名策略检查，�
 
 ## 2. 外部兼容基线
 
-- Xray 源码基线：`ref/xray-core/`，当前架构文档记录的提交为 `5ca6f4b7d4dc20a881d4330e498892697627ec0c`。
+- Xray 源码基线：`ref/xray-core/` 的 Xray-core `v26.9.9`，提交为 `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`（pre-release）。
 - 当前兼容性复核使用的 Xray 客户端：`Xray 26.2.6`。
 - 平台重点：Linux。
 - 兼容目标：Xray 客户端不修改配置即可连接 Chimera；Xray routing 配置在支持范围内产生等价的路由、DNS 时机和失败结果。

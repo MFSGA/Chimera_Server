@@ -8,10 +8,8 @@
       "settings": {
         "address": "127.0.0.1",
         "port": 5353,
+        "network": "udp",
         "followRedirect": false
-      },
-      "streamSettings": {
-        "network": "udp"
       }
     }
   ],

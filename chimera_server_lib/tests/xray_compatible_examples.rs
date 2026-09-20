@@ -114,6 +114,7 @@ fn xray_compatible_example_matrix_contains_materialized_stage_one_files() {
         "vless-tcp-tls-vision.json5",
         "vless-xhttp-none.json5",
         "vless-xhttp-tls.json5",
+        "vless-xhttp-tls-h2-stream-one.json5",
         "vmess-tcp-none.json5",
         "vmess-ws-none.json5",
         "vmess-ws-tls.json5",

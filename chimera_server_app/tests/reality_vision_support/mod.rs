@@ -41,7 +41,6 @@ pub const WRONG_REALITY_PUBLIC_KEY: &str =
     "YMN7dhY3BslQZ0LY8Fzb65vVgV6MY_QgVjQ9JOxV8gI";
 pub const REALITY_SHORT_ID: &str = "4ac97aaf8b9b0356";
 pub const REALITY_SERVER_NAME: &str = "www.apple.com";
-pub const CURRENT_XRAY_VERSION: &str = "26.2.6";
 pub const CHIMERA_CLIENT_REALITY_VERSION: &str = "1.8.0";
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -63,7 +62,9 @@ pub struct VisionServerOptions {
 impl Default for VisionServerOptions {
     fn default() -> Self {
         Self {
-            min_client_ver: Some(CURRENT_XRAY_VERSION.to_string()),
+            // Match the production/Xray default: an omitted minClientVer does
+            // not impose a minimum client version.
+            min_client_ver: None,
             max_client_ver: None,
             server_names: vec![REALITY_SERVER_NAME.to_string()],
             short_ids: vec![REALITY_SHORT_ID.to_string()],
@@ -671,16 +672,7 @@ fn start_xray_named(
     work_dir: &Path,
     config: &Path,
 ) -> ChildGuard {
-    let binary = env::var_os("XRAY_BIN")
-        .map(PathBuf::from)
-        .map(|path| {
-            if path.is_absolute() {
-                path
-            } else {
-                workspace.join(path)
-            }
-        })
-        .unwrap_or_else(|| workspace.join("xray"));
+    let binary = xray_binary_path(workspace);
     ChildGuard::spawn(
         name,
         &binary,
@@ -690,6 +682,82 @@ fn start_xray_named(
     .unwrap_or_else(|error| {
         panic!("failed to start Xray from {}: {error}", binary.display())
     })
+}
+
+fn xray_binary_path(workspace: &Path) -> PathBuf {
+    env::var_os("XRAY_BIN")
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                workspace.join(path)
+            }
+        })
+        .unwrap_or_else(|| workspace.join("xray"))
+}
+
+pub fn current_xray_version() -> String {
+    let workspace = workspace_root();
+    let binary = xray_binary_path(&workspace);
+    let output = Command::new(&binary)
+        .arg("version")
+        .output()
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to query Xray version from {}: {error}",
+                binary.display()
+            )
+        });
+    assert!(
+        output.status.success(),
+        "Xray version command failed for {}: {}",
+        binary.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let version = stdout
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or_else(|| {
+            panic!(
+                "unexpected Xray version output from {}: {}",
+                binary.display(),
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
+    let parts = version.split('.').collect::<Vec<_>>();
+    assert_eq!(
+        parts.len(),
+        3,
+        "Xray version must be major.minor.patch, got {version:?}"
+    );
+    for part in &parts {
+        part.parse::<u8>().unwrap_or_else(|error| {
+            panic!("invalid Xray version {version:?}: {error}")
+        });
+    }
+    version.to_string()
+}
+
+pub fn xray_version_with_patch_delta(delta: i16) -> String {
+    let version = current_xray_version();
+    let mut parts = version.split('.').map(|part| {
+        part.parse::<u16>().unwrap_or_else(|error| {
+            panic!("invalid Xray version {version:?}: {error}")
+        })
+    });
+    let major = parts.next().expect("Xray major version");
+    let minor = parts.next().expect("Xray minor version");
+    let patch = parts.next().expect("Xray patch version");
+    assert!(
+        parts.next().is_none(),
+        "unexpected Xray version {version:?}"
+    );
+    let patch = i32::from(patch) + i32::from(delta);
+    assert!((0..=u16::MAX as i32).contains(&patch));
+    format!("{major}.{minor}.{patch}")
 }
 
 pub fn start_tcp_echo_server() -> SocketAddr {

@@ -3,13 +3,12 @@ mod reality_vision_support;
 use std::{sync::Arc, thread};
 
 use reality_vision_support::{
-    CURRENT_XRAY_VERSION, REALITY_SERVER_NAME, REALITY_SHORT_ID,
-    VisionClientOptions, VisionServerOptions, assert_socks5_domain_echo,
-    assert_socks5_echo, assert_tls_echo_through_socks,
-    assert_tls13_only_echo_through_socks, deterministic_payload, probe_half_close,
-    serial_guard, start_half_close_server, start_tcp_echo_server,
-    start_tls_echo_server, start_vision_harness, start_xray_reference_harness,
-    try_start_tcp_echo_server_v6,
+    REALITY_SERVER_NAME, REALITY_SHORT_ID, VisionClientOptions, VisionServerOptions,
+    assert_socks5_domain_echo, assert_socks5_echo, assert_tls_echo_through_socks,
+    assert_tls13_only_echo_through_socks, current_xray_version,
+    deterministic_payload, probe_half_close, serial_guard, start_half_close_server,
+    start_tcp_echo_server, start_tls_echo_server, start_vision_harness,
+    start_xray_reference_harness, try_start_tcp_echo_server_v6,
 };
 
 async fn run_fingerprint_case(name: &str, fingerprint: &str) {
@@ -358,9 +357,10 @@ async fn reality_vision_accepts_second_configured_short_id() {
 async fn reality_vision_accepts_exact_client_version_bounds() {
     let _serial = serial_guard().await;
     let target = start_tcp_echo_server();
+    let current_xray_version = current_xray_version();
     let server = VisionServerOptions {
-        min_client_ver: Some(CURRENT_XRAY_VERSION.to_string()),
-        max_client_ver: Some(CURRENT_XRAY_VERSION.to_string()),
+        min_client_ver: Some(current_xray_version.clone()),
+        max_client_ver: Some(current_xray_version),
         ..VisionServerOptions::default()
     };
     let mut harness = start_vision_harness(

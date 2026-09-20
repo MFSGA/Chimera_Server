@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        Mutex, OnceLock,
+        Mutex, MutexGuard, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     thread,
@@ -33,6 +33,7 @@ use tonic::{
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+const GRPC_CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug)]
 enum GrpcTarget {
@@ -209,6 +210,12 @@ fn global_test_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn acquire_global_test_lock() -> MutexGuard<'static, ()> {
+    global_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 struct ServerProcess {
     target: TargetKind,
     child: Child,
@@ -342,8 +349,7 @@ impl Harness {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let channel = runtime
-            .block_on(connect_channel(grpc_target.clone()))
+        let channel = connect_channel_with_retry(&runtime, grpc_target.clone())
             .map_err(|err| {
                 io::Error::other(format!(
                     "failed to connect grpc channel to {}: {err}; logs:\n{}",
@@ -716,16 +722,23 @@ fn build_xray_vless_multi_user_config(grpc_port: u16, vless_port: u16) -> String
 }
 
 async fn connect_channel(target: GrpcTarget) -> io::Result<Channel> {
-    let endpoint = Endpoint::from_static("http://localhost")
-        .connect_timeout(IO_TIMEOUT)
-        .timeout(IO_TIMEOUT);
-
     match target {
-        GrpcTarget::Tcp(addr) => endpoint.connect().await.map_err(|err| {
-            io::Error::other(format!("failed connecting tcp grpc {addr}: {err}"))
-        }),
+        GrpcTarget::Tcp(addr) => {
+            let endpoint = Endpoint::from_shared(format!("http://{addr}"))
+                .map_err(|err| {
+                    io::Error::other(format!("invalid grpc endpoint {addr}: {err}"))
+                })?
+                .connect_timeout(GRPC_CONNECT_ATTEMPT_TIMEOUT)
+                .timeout(IO_TIMEOUT);
+            endpoint.connect().await.map_err(|err| {
+                io::Error::other(format!("failed connecting tcp grpc {addr}: {err}"))
+            })
+        }
         #[cfg(target_os = "linux")]
         GrpcTarget::AbstractUnix(name) => {
+            let endpoint = Endpoint::from_static("http://localhost")
+                .connect_timeout(GRPC_CONNECT_ATTEMPT_TIMEOUT)
+                .timeout(IO_TIMEOUT);
             let channel = endpoint
                 .connect_with_connector(tower::service_fn(move |_| {
                     let name = name.clone();
@@ -750,6 +763,25 @@ async fn connect_channel(target: GrpcTarget) -> io::Result<Channel> {
             Ok(channel)
         }
     }
+}
+
+fn connect_channel_with_retry(
+    runtime: &tokio::runtime::Runtime,
+    target: GrpcTarget,
+) -> io::Result<Channel> {
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let mut last_error = match runtime.block_on(connect_channel(target.clone())) {
+        Ok(channel) => return Ok(channel),
+        Err(error) => error,
+    };
+    while Instant::now() < deadline {
+        thread::sleep(CONNECT_RETRY_INTERVAL);
+        match runtime.block_on(connect_channel(target.clone())) {
+            Ok(channel) => return Ok(channel),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
 }
 
 async fn grpc_unary<Req, Resp>(
@@ -935,9 +967,7 @@ fn compat_cases() -> Vec<CaseDef> {
 #[cfg(target_os = "linux")]
 #[ignore = "runs Chimera control-plane calls over a Linux abstract Unix gRPC transport"]
 fn chimera_grpc_abstract_unix_control_plane() {
-    let _guard = global_test_lock()
-        .lock()
-        .expect("failed to acquire global test lock");
+    let _guard = acquire_global_test_lock();
     let socket_name = format!("chimera-grpc-abstract-{}", std::process::id());
     let socks_port = free_localhost_port().expect("allocate socks port");
     let harness = Harness::start_with_config(
@@ -964,9 +994,7 @@ fn chimera_grpc_abstract_unix_control_plane() {
 #[ignore = "runs xray baseline gRPC compatibility matrix and writes target/grpc-xray-compat/report.{json,md}"]
 fn grpc_all_interfaces_compat_with_xray_core() {
     trace_step("==== test grpc_all_interfaces_compat_with_xray_core start ====");
-    let _guard = global_test_lock()
-        .lock()
-        .expect("failed to acquire global test lock");
+    let _guard = acquire_global_test_lock();
 
     let mut results = Vec::new();
     for case in compat_cases() {
@@ -1003,9 +1031,7 @@ fn grpc_inbound_failure_status_compat_with_xray_core() {
     trace_step(
         "==== test grpc_inbound_failure_status_compat_with_xray_core start ====",
     );
-    let _guard = global_test_lock()
-        .lock()
-        .expect("failed to acquire global test lock");
+    let _guard = acquire_global_test_lock();
     let chimera = Harness::start_unlocked(TargetKind::Chimera)
         .expect("failed to start Chimera harness");
     let xray = Harness::start_unlocked(TargetKind::Xray)
@@ -1089,9 +1115,7 @@ fn grpc_remove_inbound_preserves_existing_tcp_tunnel_like_xray() {
     trace_step(
         "==== test grpc_remove_inbound_preserves_existing_tcp_tunnel_like_xray start ====",
     );
-    let _guard = global_test_lock()
-        .lock()
-        .expect("failed to acquire global test lock");
+    let _guard = acquire_global_test_lock();
 
     fn run_target(target: TargetKind) -> io::Result<()> {
         let grpc_port = free_localhost_port()?;
@@ -1229,9 +1253,7 @@ fn grpc_add_inbound_bind_failure_rollback_baseline() {
     trace_step(
         "==== test grpc_add_inbound_bind_failure_rollback_baseline start ====",
     );
-    let _guard = global_test_lock()
-        .lock()
-        .expect("failed to acquire global test lock");
+    let _guard = acquire_global_test_lock();
 
     fn probe(target: TargetKind) -> io::Result<(Code, bool, Code)> {
         let harness = Harness::start_unlocked(target)?;
@@ -1293,9 +1315,7 @@ fn grpc_add_inbound_bind_failure_rollback_baseline() {
 #[ignore = "runs vless multi-user grpc compatibility against xray baseline"]
 fn grpc_vless_multi_user_compat_with_xray_core() {
     trace_step("==== test grpc_vless_multi_user_compat_with_xray_core start ====");
-    let _guard = global_test_lock()
-        .lock()
-        .expect("failed to acquire global test lock");
+    let _guard = acquire_global_test_lock();
 
     let chimera_grpc_port =
         free_localhost_port().expect("failed to allocate chimera grpc port");

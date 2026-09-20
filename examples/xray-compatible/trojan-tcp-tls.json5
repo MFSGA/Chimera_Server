@@ -20,8 +20,8 @@
           "serverName": "example.com",
           "certificates": [
             {
-              "certificateFile": "cert/server.crt",
-              "keyFile": "cert/server.key"
+              "certificateFile": "cert/cert.pem",
+              "keyFile": "cert/key.pem"
             }
           ]
         }

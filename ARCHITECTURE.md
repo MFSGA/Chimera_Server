@@ -44,7 +44,7 @@ Chimera 的最终目标是完整兼容 xray-core 的服务端行为，使现有�
 
 本次设计核对的本地基线：
 
-- `ref/xray-core`：`5ca6f4b7d4dc20a881d4330e498892697627ec0c`。
+- `ref/xray-core`：Xray-core `v26.9.9`，提交 `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`（pre-release）。
 - `ref/clash-rs`：`c6f25ab847a15bf7628d34108eab6a171325dadb`。
 
 后续兼容工作须重新记录实际参考提交和客户端二进制版本。这些基线不是“永远最新”的声明；外部链接可能随分支更新，具体移植前必须固定所用版本。

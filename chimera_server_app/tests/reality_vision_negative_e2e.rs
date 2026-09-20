@@ -1,10 +1,11 @@
 mod reality_vision_support;
 
 use reality_vision_support::{
-    CURRENT_XRAY_VERSION, REALITY_PUBLIC_KEY, REALITY_SERVER_NAME, REALITY_SHORT_ID,
-    TEST_UUID, VisionClientOptions, VisionServerOptions, WRONG_REALITY_PUBLIC_KEY,
-    WRONG_UUID, assert_socks5_echo, assert_socks5_proxy_fails, serial_guard,
-    start_tcp_echo_server, start_vision_harness, wait_for_counter, wait_for_log,
+    REALITY_PUBLIC_KEY, REALITY_SERVER_NAME, REALITY_SHORT_ID, TEST_UUID,
+    VisionClientOptions, VisionServerOptions, WRONG_REALITY_PUBLIC_KEY, WRONG_UUID,
+    assert_socks5_echo, assert_socks5_proxy_fails, current_xray_version,
+    serial_guard, start_tcp_echo_server, start_vision_harness, wait_for_counter,
+    wait_for_log, xray_version_with_patch_delta,
 };
 
 async fn run_rejected_case(
@@ -21,7 +22,7 @@ async fn run_rejected_case(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts Chimera and Xray and validates omitted REALITY version bounds"]
-async fn reality_omitted_minimum_accepts_bundled_xray_26_2_6() {
+async fn reality_omitted_minimum_accepts_current_xray() {
     let _serial = serial_guard().await;
     let target = start_tcp_echo_server();
     let server = VisionServerOptions {
@@ -47,7 +48,7 @@ async fn reality_omitted_minimum_accepts_bundled_xray_26_2_6() {
 async fn reality_minimum_version_above_client_is_rejected() {
     let _serial = serial_guard().await;
     let server = VisionServerOptions {
-        min_client_ver: Some("26.2.7".to_string()),
+        min_client_ver: Some(xray_version_with_patch_delta(1)),
         ..VisionServerOptions::default()
     };
     let harness = run_rejected_case(
@@ -65,7 +66,7 @@ async fn reality_maximum_version_below_client_is_rejected() {
     let _serial = serial_guard().await;
     let server = VisionServerOptions {
         min_client_ver: Some("0.0.0".to_string()),
-        max_client_ver: Some("26.2.5".to_string()),
+        max_client_ver: Some(xray_version_with_patch_delta(-1)),
         ..VisionServerOptions::default()
     };
     let harness = run_rejected_case(
@@ -185,7 +186,8 @@ async fn reality_plain_account_rejects_client_vision_flow() {
 
 #[test]
 fn matrix_constants_match_bundled_client_contract() {
-    assert_eq!(CURRENT_XRAY_VERSION, "26.2.6");
+    let version = current_xray_version();
+    assert_eq!(version.split('.').count(), 3);
     assert_eq!(TEST_UUID, "3ac9b383-75a1-431c-8184-106c80eb2273");
     assert_eq!(REALITY_SERVER_NAME, "www.apple.com");
     assert_eq!(REALITY_SHORT_ID.len(), 16);

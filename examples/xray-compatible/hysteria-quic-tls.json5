@@ -1,7 +1,7 @@
 {
   "inbounds": [
     {
-      "tag": "hysteria-quic-tls",
+      "tag": "hysteria-h3-tls",
       "listen": "127.0.0.1",
       "port": 11018,
       "protocol": "hysteria",
@@ -15,9 +15,10 @@
         ]
       },
       "streamSettings": {
-        "network": "quic",
+        "network": "hysteria",
         "security": "tls",
         "hysteriaSettings": {
+          "version": 2,
           "up": "10 mbps",
           "down": "10 mbps"
         },
@@ -25,8 +26,8 @@
           "alpn": ["h3"],
           "certificates": [
             {
-              "certificateFile": "cert/server.crt",
-              "keyFile": "cert/server.key"
+              "certificateFile": "cert/cert.pem",
+              "keyFile": "cert/key.pem"
             }
           ]
         }

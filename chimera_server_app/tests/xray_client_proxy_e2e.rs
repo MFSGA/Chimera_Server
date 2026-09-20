@@ -256,12 +256,14 @@ async fn xray_client_can_proxy_tcp_through_chimera_reality_vision() {
     let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
     assert_socks5_echo(socks_addr, echo_addr, b"reality-vision through xray client");
     assert_socks5_echo(socks_addr, echo_addr, &deterministic_payload(64 * 1024));
-    assert_socks5_domain_echo(
-        socks_addr,
-        "localhost",
-        domain_echo_addr.port(),
-        b"reality-vision domain target",
-    );
+    if let Some(domain_echo_addr) = domain_echo_addr {
+        assert_socks5_domain_echo(
+            socks_addr,
+            "localhost",
+            domain_echo_addr.port(),
+            b"reality-vision domain target",
+        );
+    }
     assert_tls_echo_through_socks(
         socks_addr,
         tls_echo_addr,
@@ -5112,8 +5114,20 @@ fn start_tcp_echo_server() -> SocketAddr {
     )))
 }
 
-fn start_tcp_echo_server_v6() -> SocketAddr {
-    start_tcp_echo_server_on(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)))
+fn start_tcp_echo_server_v6() -> Option<SocketAddr> {
+    match try_start_tcp_echo_server_on(SocketAddr::from((Ipv6Addr::LOCALHOST, 0))) {
+        Ok(addr) => Some(addr),
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::AddrNotAvailable | io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            eprintln!("skipping IPv6 echo subcase: {err}");
+            None
+        }
+        Err(err) => panic!("bind IPv6 echo server: {err}"),
+    }
 }
 
 fn start_tcp_echo_server_with_counter() -> (SocketAddr, Arc<AtomicUsize>) {
@@ -5298,7 +5312,11 @@ fn start_proxy_protocol_marker_echo_server(
 }
 
 fn start_tcp_echo_server_on(bind_addr: SocketAddr) -> SocketAddr {
-    let listener = TcpListener::bind(bind_addr).expect("bind echo server");
+    try_start_tcp_echo_server_on(bind_addr).expect("bind echo server")
+}
+
+fn try_start_tcp_echo_server_on(bind_addr: SocketAddr) -> io::Result<SocketAddr> {
+    let listener = TcpListener::bind(bind_addr)?;
     let addr = listener.local_addr().expect("echo addr");
     thread::spawn(move || {
         for stream in listener.incoming().take(16) {
@@ -5323,7 +5341,7 @@ fn start_tcp_echo_server_on(bind_addr: SocketAddr) -> SocketAddr {
             });
         }
     });
-    addr
+    Ok(addr)
 }
 
 async fn start_udp_echo_server() -> SocketAddr {
@@ -5737,6 +5755,13 @@ async fn assert_socks5_udp_echo(
         .expect("SOCKS UDP echo timeout")
         .expect("receive SOCKS UDP echo");
     let payload_offset = socks_udp_payload_offset(&response[..len]);
+    assert_eq!(
+        len - payload_offset,
+        payload.len(),
+        "SOCKS UDP echo length mismatch: received {}, expected {}",
+        len - payload_offset,
+        payload.len()
+    );
     assert_eq!(&response[payload_offset..len], payload);
 }
 

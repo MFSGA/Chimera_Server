@@ -2,14 +2,38 @@
 
 This directory is the authoritative materialized config matrix for Chimera Server examples that intentionally use xray-core-shaped JSON/JSON5 fields such as `inbounds`, `outbounds`, `settings`, and `streamSettings`.
 
-Fixed implementation reference: local `ref/xray-core` at `5ca6f4b7d4dc20a881d4330e498892697627ec0c`.
+Current implementation reference: local `ref/xray-core` at Xray-core `v26.9.9`
+(`52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`, pre-release).
 
 The release-prep real-client checks recorded below were run on 2026-09-10 with two Xray client builds:
 
 ```text
 repository fixture: Xray 26.2.6 / 12ee51e / go1.25.7 linux/amd64
-fixed reference:    Xray 26.7.28 source at 5ca6f4b7d4dc20a881d4330e498892697627ec0c, built with go1.26.5 linux/amd64
+fixed reference used then: Xray 26.7.28 source at 5ca6f4b7d4dc20a881d4330e498892697627ec0c, built with go1.26.5 linux/amd64
 ```
+
+The source baseline was subsequently advanced to Xray-core `v26.9.9`. The historical
+release-prep results below retain the exact Xray source and client versions used when each
+test ran; they are not retroactively relabeled as `v26.9.9` verification.
+
+## 2026-09-20 verification refresh
+
+The repository-local Linux client was rebuilt from `ref/xray-core` commit
+`52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120` with the Nix development shell's Go `1.27rc2`:
+
+```text
+Xray 26.9.9 Custom (go1.27rc2 linux/amd64)
+sha256: 3626389b26d5b5b97663ca6ee60960d2075c0d4a442c8c0165f64e7c9e9624bc
+```
+
+Rust formatting, Nix flake evaluation, workspace locked tests, all-feature workspace build and
+Clippy passed. The ordinary XHTTP and example matrices also passed. After constraining Xray
+compatible Hysteria2 response frames to Xray's fixed 1200-byte UDP reader limit, all 47 ignored
+`xray_client_proxy_e2e` cases passed with this client. The REALITY+Vision test explicitly skipped
+only its IPv6 localhost subcase because this machine has no IPv6 localhost bind capability; its
+IPv4, TLS and REALITY checks passed. Xray's direct config checks now accept all 25 materialized
+examples. The examples use the Xray 26.9.9 UDP/Hysteria syntax and the project certificate paths
+`cert/cert.pem` and `cert/key.pem`; TLS checks still require those local certificate fixtures.
 
 The mKCP interoperability refresh on 2026-09-13 additionally used the then-newest published Xray pre-release and the latest non-pre-release GitHub release:
 
@@ -48,13 +72,14 @@ Config validation is necessary but is not protocol interoperability evidence. Te
 | `vless-tcp-tls-vision.json5` | vless | tcp | tls + vision | config-validated; Xray-verified TCP stream + inner TLS Vision with repository fixture |
 | `vless-xhttp-none.json5` | vless | xhttp | none | config-validated; runtime-covered |
 | `vless-xhttp-tls.json5` | vless | xhttp | tls | config-validated; runtime-covered |
+| `vless-xhttp-tls-h2-stream-one.json5` | vless | xhttp | tls + h2 + stream-one | config-validated; v1 Xray test profile |
 | `vmess-tcp-none.json5` | vmess | tcp | none | config-validated; runtime-covered |
 | `vmess-ws-none.json5` | vmess | websocket | none | config-validated; runtime-covered |
 | `vmess-ws-tls.json5` | vmess | websocket | tls | config-validated; runtime-covered |
 | `trojan-tcp-none.json5` | trojan | tcp | none | config-validated; runtime-covered |
 | `trojan-tcp-tls.json5` | trojan | tcp | tls | config-validated; runtime-covered |
 | `trojan-ws-tls.json5` | trojan | websocket | tls | config-validated; runtime-covered |
-| `hysteria-quic-tls.json5` | hysteria | quic | tls | config-validated; Xray-verified TCP/UDP with fixed reference; legacy 26.2.6 client has a documented 4 KiB serialization limit |
+| `hysteria-quic-tls.json5` | hysteria | hysteria (H3) | tls | current Xray syntax; filename retained for compatibility; legacy 26.2.6 client has a documented 4 KiB serialization limit |
 | `shadowsocks-tcp-udp.json5` | shadowsocks | tcp + udp | none | config-validated; Xray-verified |
 | `shadowsocks-2022-eih-tcp-udp.json5` | shadowsocks 2022 EIH | tcp + udp | none | config-validated; Xray-verified |
 
