@@ -13,6 +13,7 @@ use rand::RngExt;
 use tokio::net::UdpSocket;
 use tracing::{debug, warn};
 
+use super::super::XRAY_MAX_DATAGRAM_FRAME_SIZE;
 use super::{
     AuthContext, MAX_ADDRESS_LEN, decode_varint_from_slice,
     hysteria2_traffic_context, push_varint,
@@ -679,9 +680,11 @@ pub(super) async fn run_udp_remote_to_local_loop(
     fallback_context: TrafficContext,
     xray_compat: bool,
 ) -> std::io::Result<()> {
-    let max_datagram_size = connection
+    let connection_max_datagram_size = connection
         .max_datagram_size()
         .ok_or_else(|| Error::other("peer does not support datagrams"))?;
+    let max_datagram_size =
+        response_max_datagram_size(connection_max_datagram_size, xray_compat);
 
     let mut next_packet_id: u16 = 0;
     let mut buf = vec![0u8; 65535];
@@ -807,6 +810,22 @@ pub(super) fn udp_response_packet_id(
     }
 }
 
+fn response_max_datagram_size(
+    connection_max_datagram_size: usize,
+    xray_compat: bool,
+) -> usize {
+    if xray_compat {
+        // Xray's Hysteria UDP reader allocates a fixed 1200-byte receive
+        // buffer. Since Xray 26.9.9 omits max_datagram_frame_size from the
+        // client transport parameters, Quinn may report a larger local path
+        // limit (for example 1422) even though the peer still cannot parse a
+        // larger Hysteria datagram. Keep the wire frame within Xray's limit.
+        connection_max_datagram_size.min(XRAY_MAX_DATAGRAM_FRAME_SIZE as usize)
+    } else {
+        connection_max_datagram_size
+    }
+}
+
 pub(super) fn accept_unfragmented_udp_datagram(
     fragment_count: u8,
     xray_compat: bool,
@@ -854,4 +873,20 @@ pub(super) fn udp_datagram_address_bounds(
     }
 
     Ok((address_start, payload_start))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::response_max_datagram_size;
+
+    #[test]
+    fn xray_response_datagrams_are_capped_to_xray_reader_limit() {
+        assert_eq!(response_max_datagram_size(1422, true), 1200);
+        assert_eq!(response_max_datagram_size(1200, true), 1200);
+    }
+
+    #[test]
+    fn shoes_response_datagrams_keep_connection_limit() {
+        assert_eq!(response_max_datagram_size(1422, false), 1422);
+    }
 }

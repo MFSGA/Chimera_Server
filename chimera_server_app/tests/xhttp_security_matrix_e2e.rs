@@ -70,10 +70,13 @@ async fn run_security_case(case: SecurityCase, payload_len: usize, ack_trace: bo
     let chimera_config_path = work_dir.join("chimera.json");
     let xray_config_path = work_dir.join("xray.json");
     let pinned_cert = first_cert_sha256_hex(&cert_path);
+    let is_v1_tls = matches!(case, SecurityCase::Tls);
+    let xhttp_path = if is_v1_tls { "/xhttp-v1/" } else { "/xhttp" };
+    let no_grpc_header = !is_v1_tls;
     let xhttp_settings = json!({
-        "path": "/xhttp",
+        "path": xhttp_path,
         "mode": case.mode(),
-        "noGRPCHeader": true,
+        "noGRPCHeader": no_grpc_header,
         "noSSEHeader": false,
         "scMinPostsIntervalMs": {"from": 1, "to": 1},
         "sessionIDPlacement": "header",
@@ -83,9 +86,9 @@ async fn run_security_case(case: SecurityCase, payload_len: usize, ack_trace: bo
         "uplinkDataPlacement": "body"
     });
     let mut xray_xhttp_settings = json!({
-        "path": "/xhttp",
+        "path": xhttp_path,
         "mode": case.mode(),
-        "noGRPCHeader": true,
+        "noGRPCHeader": no_grpc_header,
         "sessionPlacement": "header",
         "sessionKey": "X-Security-Session",
         "sessionIDPlacement": "header",
@@ -242,6 +245,8 @@ fn chimera_stream_settings(
                 "serverName": "localhost",
                 "alpn": if matches!(case, SecurityCase::Http3) {
                     json!(["h3"])
+                } else if matches!(case, SecurityCase::Tls) {
+                    json!(["h2"])
                 } else {
                     json!(["h2", "http/1.1"])
                 },
@@ -287,6 +292,8 @@ fn xray_stream_settings(
                 "pinnedPeerCertSha256": pinned_cert,
                 "alpn": if matches!(case, SecurityCase::Http3) {
                     json!(["h3"])
+                } else if matches!(case, SecurityCase::Tls) {
+                    json!(["h2"])
                 } else {
                     json!(["h2", "http/1.1"])
                 }

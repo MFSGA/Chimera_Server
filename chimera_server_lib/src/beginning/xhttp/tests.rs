@@ -71,6 +71,7 @@ fn pending_xhttp_state(
         runtime.data_plane(),
         None,
         shutdown,
+        false,
     ))
 }
 
@@ -486,6 +487,33 @@ fn http_host_validation_matches_xray_v26_2_6() {
     assert!(!xray_valid_http_host("::1", "::1"));
     assert!(!xray_valid_http_host("[::1]", "::1"));
     assert!(!xray_valid_http_host("[::2]:443", "::1"));
+}
+
+#[tokio::test]
+async fn h2_only_xhttp_rejects_http1_before_request_dispatch() {
+    let runtime = RuntimeState::new(Vec::new(), Vec::new());
+    let shutdown = CancellationToken::new();
+    let mut state = pending_xhttp_state(runtime, shutdown);
+    Arc::get_mut(&mut state)
+        .expect("test state must be uniquely owned")
+        .http2_only = true;
+
+    let request = Request::builder()
+        .version(hyper::Version::HTTP_11)
+        .method(Method::POST)
+        .uri("/xhttp/?x_padding=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")
+        .body(Empty::<Bytes>::new())
+        .expect("valid HTTP/1 request");
+    let response = handle_request(
+        request,
+        state,
+        "127.0.0.1:12345".parse().unwrap(),
+        "127.0.0.1:443".parse().unwrap(),
+    )
+    .await
+    .expect("infallible request handler");
+
+    assert_eq!(response.status(), StatusCode::HTTP_VERSION_NOT_SUPPORTED);
 }
 
 #[test]

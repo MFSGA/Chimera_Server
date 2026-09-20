@@ -34,7 +34,7 @@ const SHOES_INITIAL_RTT: Duration = Duration::from_millis(100);
 const SHOES_UDP_SOCKET_BUFFER_SIZE: usize = 8_625_000;
 const SHOES_INITIAL_MTU: u16 = 1200;
 const XRAY_INITIAL_MTU: u16 = 1280;
-const XRAY_ASSUME_PEER_MAX_DATAGRAM_FRAME_SIZE: u32 = 1200;
+const XRAY_MAX_DATAGRAM_FRAME_SIZE: u32 = 1200;
 const DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 8 * 1024 * 1024;
 const DEFAULT_CONNECTION_RECEIVE_WINDOW: u64 = 20 * 1024 * 1024;
 
@@ -414,13 +414,13 @@ fn configured_udp_socket_buffer_size(xray_compat: bool) -> Option<usize> {
 }
 
 fn configured_max_datagram_frame_size(xray_compat: bool) -> Option<quinn::VarInt> {
-    xray_compat.then_some(XRAY_ASSUME_PEER_MAX_DATAGRAM_FRAME_SIZE.into())
+    xray_compat.then_some(XRAY_MAX_DATAGRAM_FRAME_SIZE.into())
 }
 
 fn configured_assume_peer_max_datagram_frame_size(
     xray_compat: bool,
 ) -> Option<quinn::VarInt> {
-    xray_compat.then_some(XRAY_ASSUME_PEER_MAX_DATAGRAM_FRAME_SIZE.into())
+    xray_compat.then_some(XRAY_MAX_DATAGRAM_FRAME_SIZE.into())
 }
 
 fn configured_mtu_discovery(
@@ -463,9 +463,8 @@ mod tests {
         CongestionMode, DEFAULT_CONNECTION_RECEIVE_WINDOW,
         DEFAULT_STREAM_RECEIVE_WINDOW, SHOES_INITIAL_MTU, SHOES_INITIAL_RTT,
         SHOES_KEEP_ALIVE_INTERVAL, SHOES_MAX_INCOMING_UNI_STREAMS,
-        SHOES_SEND_WINDOW, SHOES_UDP_SOCKET_BUFFER_SIZE,
-        XRAY_ASSUME_PEER_MAX_DATAGRAM_FRAME_SIZE, XRAY_INITIAL_MTU,
-        XRAY_MAX_INCOMING_UNI_STREAMS,
+        SHOES_SEND_WINDOW, SHOES_UDP_SOCKET_BUFFER_SIZE, XRAY_INITIAL_MTU,
+        XRAY_MAX_DATAGRAM_FRAME_SIZE, XRAY_MAX_INCOMING_UNI_STREAMS,
         configured_assume_peer_max_datagram_frame_size, configured_congestion_mode,
         configured_initial_mtu, configured_initial_rtt,
         configured_keep_alive_interval, configured_max_datagram_frame_size,
@@ -568,14 +567,14 @@ mod tests {
                     "Xray compatibility must advertise Xray's DATAGRAM frame size"
                 )
                 .into_inner(),
-            u64::from(XRAY_ASSUME_PEER_MAX_DATAGRAM_FRAME_SIZE)
+            u64::from(XRAY_MAX_DATAGRAM_FRAME_SIZE)
         );
         assert_eq!(configured_assume_peer_max_datagram_frame_size(false), None);
         assert_eq!(
             configured_assume_peer_max_datagram_frame_size(true)
                 .expect("Xray compatibility must assume peer DATAGRAM support")
                 .into_inner(),
-            u64::from(XRAY_ASSUME_PEER_MAX_DATAGRAM_FRAME_SIZE)
+            u64::from(XRAY_MAX_DATAGRAM_FRAME_SIZE)
         );
     }
 

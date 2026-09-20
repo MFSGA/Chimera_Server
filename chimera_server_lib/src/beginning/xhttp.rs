@@ -114,6 +114,7 @@ pub async fn start_xhttp_server(
         runtime,
         sniffing,
         shutdown.clone(),
+        listener_config.http2_only,
     ));
     #[cfg(feature = "tls")]
     if let XhttpSecurityLayer::H3Tls(server_config) = listener_config.security {
@@ -217,6 +218,7 @@ struct XhttpListenerConfig {
     xhttp_config: XhttpServerConfig,
     inner: ServerProxyConfig,
     security: XhttpSecurityLayer,
+    http2_only: bool,
 }
 
 #[derive(Clone)]
@@ -256,6 +258,14 @@ fn prepare_xhttp_listener(
         protocol: inner,
         security,
     } = plan;
+    #[cfg(feature = "tls")]
+    let http2_only = matches!(
+        &security,
+        ListenerSecurityPlan::Tls(tls_config)
+            if tls_config.alpn_protocols.as_slice() == ["h2"]
+    );
+    #[cfg(not(feature = "tls"))]
+    let http2_only = false;
     let security = match security {
         ListenerSecurityPlan::None => XhttpSecurityLayer::None,
         #[cfg(feature = "tls")]
@@ -296,6 +306,7 @@ fn prepare_xhttp_listener(
         xhttp_config,
         inner,
         security,
+        http2_only,
     })
 }
 
@@ -424,6 +435,7 @@ struct AppState {
     sniffing: Option<InboundSniffingConfig>,
     shutdown: CancellationToken,
     sessions: SessionStore,
+    http2_only: bool,
 }
 
 impl AppState {
@@ -434,6 +446,7 @@ impl AppState {
         runtime: DataPlaneRuntime,
         sniffing: Option<InboundSniffingConfig>,
         shutdown: CancellationToken,
+        http2_only: bool,
     ) -> Self {
         let sessions = SessionStore::new(
             Duration::from_secs(config.session_ttl_secs),
@@ -474,6 +487,7 @@ impl AppState {
             sniffing,
             shutdown,
             sessions,
+            http2_only,
         }
     }
 
@@ -589,6 +603,16 @@ where
     B::Error: std::error::Error + Send + Sync + 'static,
 {
     let request_headers = request.headers().clone();
+
+    if state.http2_only && request.version() != hyper::Version::HTTP_2 {
+        debug!(
+            method = %request.method(),
+            path = %request.uri().path(),
+            version = ?request.version(),
+            "xhttp request rejected because the listener requires HTTP/2"
+        );
+        return Ok(simple_response(StatusCode::HTTP_VERSION_NOT_SUPPORTED));
+    }
 
     let http1_header_limit =
         xray_http1_header_read_limit(state.server_max_header_bytes);
