@@ -205,9 +205,28 @@ fn select_peer_for_destination(
 }
 
 #[cfg(target_os = "linux")]
+#[async_trait::async_trait]
+trait PacketDevice: Send + Sync {
+    async fn recv(&self, buffer: &mut [u8]) -> std::io::Result<usize>;
+    async fn send(&self, buffer: &[u8]) -> std::io::Result<usize>;
+}
+
+#[cfg(target_os = "linux")]
+#[async_trait::async_trait]
+impl PacketDevice for tun::AsyncDevice {
+    async fn recv(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        tun::AsyncDevice::recv(self, buffer).await
+    }
+
+    async fn send(&self, buffer: &[u8]) -> std::io::Result<usize> {
+        tun::AsyncDevice::send(self, buffer).await
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) async fn start_server(
     config: ServerConfig,
-    runtime: DataPlaneRuntime,
+    _runtime: DataPlaneRuntime,
 ) -> std::io::Result<JoinHandle<()>> {
     let ServerConfig {
         tag,
@@ -275,7 +294,7 @@ pub(crate) async fn start_server(
         peers = peers.len(),
         "starting WireGuard inbound"
     );
-    Ok(tokio::spawn(run_server(socket, device, peers, runtime)))
+    Ok(tokio::spawn(run_server(socket, device, peers)))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -290,11 +309,10 @@ pub(crate) async fn start_server(
 }
 
 #[cfg(target_os = "linux")]
-async fn run_server(
+async fn run_server<D: PacketDevice + 'static>(
     socket: Arc<UdpSocket>,
-    device: tun::AsyncDevice,
+    device: D,
     peers: Vec<Arc<PeerRuntime>>,
-    _runtime: DataPlaneRuntime,
 ) {
     let mut udp_buffer = vec![0u8; PACKET_BUFFER_SIZE];
     let mut tun_buffer = vec![0u8; PACKET_BUFFER_SIZE];
@@ -323,9 +341,9 @@ async fn run_server(
 }
 
 #[cfg(target_os = "linux")]
-async fn process_udp_datagram(
+async fn process_udp_datagram<D: PacketDevice>(
     socket: &UdpSocket,
-    device: &tun::AsyncDevice,
+    device: &D,
     source: SocketAddr,
     datagram: &[u8],
     peers: &[Arc<PeerRuntime>],
@@ -437,6 +455,43 @@ mod tests {
     use crate::config::server_config::{
         WireGuardAddress, WireGuardDomainStrategy, WireGuardPeerConfig,
     };
+    #[cfg(target_os = "linux")]
+    use tokio::{sync::mpsc, time::timeout};
+
+    #[cfg(target_os = "linux")]
+    struct MemoryTun {
+        inbound: Mutex<mpsc::Receiver<Vec<u8>>>,
+        outbound: mpsc::Sender<Vec<u8>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[async_trait::async_trait]
+    impl PacketDevice for MemoryTun {
+        async fn recv(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let Some(packet) = self.inbound.lock().await.recv().await else {
+                return Ok(0);
+            };
+            if packet.len() > buffer.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "memory TUN packet exceeds test buffer",
+                ));
+            }
+            buffer[..packet.len()].copy_from_slice(&packet);
+            Ok(packet.len())
+        }
+
+        async fn send(&self, buffer: &[u8]) -> std::io::Result<usize> {
+            let length = buffer.len();
+            self.outbound.send(buffer.to_vec()).await.map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "memory TUN receiver closed",
+                )
+            })?;
+            Ok(length)
+        }
+    }
 
     fn ipv4_packet(source: [u8; 4], destination: [u8; 4]) -> Vec<u8> {
         let mut packet = vec![0u8; 20];
@@ -537,6 +592,120 @@ mod tests {
         };
         assert_eq!(client_reply, reply);
         assert_eq!(reply_source, Ipv4Addr::new(10, 0, 0, 1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn runtime_moves_packets_between_udp_and_tun() {
+        let server_secret = [7u8; 32];
+        let client_secret = [9u8; 32];
+        let client_public =
+            PublicKey::from(&StaticSecret::from(client_secret)).to_bytes();
+        let server_public = PublicKey::from(&StaticSecret::from(server_secret));
+        let config = WireGuardServerConfig {
+            secret_key: server_secret,
+            addresses: vec![WireGuardAddress {
+                address: "10.0.0.1".parse().unwrap(),
+                prefix_len: 24,
+            }],
+            peers: vec![WireGuardPeerConfig {
+                public_key: client_public,
+                pre_shared_key: None,
+                endpoint: None,
+                keep_alive: 0,
+                allowed_ips: vec![WireGuardAllowedIp {
+                    address: "10.0.0.2".parse().unwrap(),
+                    prefix_len: 32,
+                }],
+                level: 0,
+                email: "client".into(),
+            }],
+            mtu: 1420,
+            reserved: [0; 3],
+            domain_strategy: WireGuardDomainStrategy::ForceIp,
+            dns: Vec::new(),
+            no_kernel_tun: true,
+        };
+        let peers = build_peer_runtimes(&config).unwrap();
+        let (to_tun_tx, mut to_tun_rx) = mpsc::channel(4);
+        let (from_tun_tx, from_tun_rx) = mpsc::channel(4);
+        let device = MemoryTun {
+            inbound: Mutex::new(from_tun_rx),
+            outbound: to_tun_tx,
+        };
+        let server_socket =
+            Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let server_addr = server_socket.local_addr().unwrap();
+        let client_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let server_task = tokio::spawn(run_server(server_socket, device, peers));
+
+        let mut client = Tunn::new(
+            StaticSecret::from(client_secret),
+            server_public,
+            None,
+            None,
+            1,
+            None,
+        );
+        let mut client_output = vec![0u8; PACKET_BUFFER_SIZE];
+        let TunnResult::WriteToNetwork(handshake) =
+            client.encapsulate(&[], &mut client_output)
+        else {
+            panic!("client must start a handshake");
+        };
+        client_socket.send_to(handshake, server_addr).await.unwrap();
+
+        let mut udp_buffer = vec![0u8; PACKET_BUFFER_SIZE];
+        let (length, _) = timeout(
+            Duration::from_secs(1),
+            client_socket.recv_from(&mut udp_buffer),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut client_handshake_output = vec![0u8; PACKET_BUFFER_SIZE];
+        assert!(matches!(
+            client.decapsulate(
+                None,
+                &udp_buffer[..length],
+                &mut client_handshake_output,
+            ),
+            TunnResult::WriteToNetwork(_)
+        ));
+
+        let packet = ipv4_packet([10, 0, 0, 2], [10, 0, 0, 1]);
+        let TunnResult::WriteToNetwork(encrypted) =
+            client.encapsulate(&packet, &mut client_output)
+        else {
+            panic!("client must encrypt the data packet");
+        };
+        client_socket.send_to(encrypted, server_addr).await.unwrap();
+        let delivered = timeout(Duration::from_secs(1), to_tun_rx.recv())
+            .await
+            .unwrap()
+            .expect("server must write the decrypted packet to TUN");
+        assert_eq!(delivered, packet);
+
+        let reply = ipv4_packet([10, 0, 0, 1], [10, 0, 0, 2]);
+        from_tun_tx.send(reply.clone()).await.unwrap();
+        let (length, _) = timeout(
+            Duration::from_secs(1),
+            client_socket.recv_from(&mut udp_buffer),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut client_packet = vec![0u8; PACKET_BUFFER_SIZE];
+        let TunnResult::WriteToTunnelV4(client_reply, source) =
+            client.decapsulate(None, &udp_buffer[..length], &mut client_packet)
+        else {
+            panic!("client must decrypt the server reply");
+        };
+        assert_eq!(client_reply, reply);
+        assert_eq!(source, Ipv4Addr::new(10, 0, 0, 1));
+
+        server_task.abort();
+        assert!(server_task.await.unwrap_err().is_cancelled());
     }
 
     #[test]

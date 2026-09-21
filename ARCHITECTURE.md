@@ -348,7 +348,7 @@ cargo check -p chimera_server_app --no-default-features --features minimal-vless
 
 ### 13.1 WireGuard inbound first slice (2026-09-21)
 
-当前实现选择 WireGuard 服务端 inbound 作为第一切片：配置编译和 key/peer/AllowedIPs 校验进入 `wireguard` Cargo feature，Linux runtime 使用 userspace `boringtun` 协议状态加系统 L3 TUN 设备，UDP listener 与 TUN 生命周期由同一个 inbound task 持有。`noKernelTun`、userspace IP stack、Xray routing/outbound 注入、IPv6-only TUN、非 Linux 后端和真实 Xray 互操作尚未完成，不能据此宣称完整 WireGuard/Xray 兼容。下一步应先补充真实客户端握手、TCP/UDP 转发和关闭/重建测试，再决定是否引入 userspace IP stack。
+当前实现选择 WireGuard 服务端 inbound 作为第一切片：配置编译和 key/peer/AllowedIPs 校验进入 `wireguard` Cargo feature，Linux runtime 使用 userspace `boringtun` 协议状态加系统 L3 TUN 设备，UDP listener 与 TUN 生命周期由同一个 inbound task 持有。2026-09-21 已用无特权 loopback UDP + 内存 `PacketDevice` harness 验证握手、解密包写入 TUN、服务端回复加密和 task abort；真实 system TUN 权限/路由创建与版本化 Xray 客户端互操作仍未验证。`noKernelTun`、userspace IP stack、Xray routing/outbound 注入、IPv6-only TUN 和非 Linux 后端尚未完成，不能据此宣称完整 WireGuard/Xray 兼容。下一步应验证真实 system TUN 启动/停止与 TCP/UDP 转发，再决定是否引入 userspace IP stack。
 
 已选定的方向：单核心库内渐进分层；共用配置语义入口；计划与运行实体分离；管理器拥有生命周期；数据面仅接收必要能力；复用既有观测面。
 

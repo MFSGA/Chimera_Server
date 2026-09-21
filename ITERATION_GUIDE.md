@@ -351,7 +351,7 @@ UDP endpoint ↔ WireGuard peer/tunnel state ↔ IP packet path
 | 生命周期 | 更新 peer、关闭 endpoint、旧会话排空与资源回收的语义单独定义 |
 | 可选依赖 | 实现阶段再隔离依赖，不因规划让最小代理服务端构建带上网络栈 |
 
-这些是后续完整实现的设计约束。2026-09-21 起项目已有一个受 `wireguard` feature 控制的 Linux 服务端 inbound system-TUN 切片，但尚未覆盖 `noKernelTun`、userspace IP stack、Xray routing/outbound 注入、跨平台后端或真实 Xray 客户端互操作，因此仍不能视为完整 WireGuard 支持。
+这些是后续完整实现的设计约束。2026-09-21 起项目已有一个受 `wireguard` feature 控制的 Linux 服务端 inbound system-TUN 切片，并已通过无特权 loopback UDP + 内存 TUN harness 验证握手、双向包路径和 task abort；真实 system TUN 权限/路由创建、`noKernelTun`、userspace IP stack、Xray routing/outbound 注入、跨平台后端或真实 Xray 客户端互操作仍未完成，因此仍不能视为完整 WireGuard 支持。
 
 ### 12.3 TUN：可放在最后
 
