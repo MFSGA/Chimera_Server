@@ -2995,3 +2995,78 @@ fn websocket_deprecated_header_host_preserves_xray_text_semantics() {
     );
     assert_eq!(matching_host(serde_json::json!({"Host": ""})), None);
 }
+
+#[cfg(feature = "wireguard")]
+#[test]
+fn wireguard_builder_compiles_server_peers_and_normalizes_allowed_ips() {
+    let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+        "listen": "127.0.0.1",
+        "port": 51820,
+        "protocol": "wireguard",
+        "tag": "wireguard-server",
+        "settings": {
+            "secretKey": "0707070707070707070707070707070707070707070707070707070707070707",
+            "address": ["10.0.0.1/24"],
+            "mtu": 1380,
+            "reserved": [1, 2, 3],
+            "peers": [{
+                "publicKey": "0909090909090909090909090909090909090909090909090909090909090909",
+                "allowedIPs": ["10.0.0.42/32", "192.0.2.9/24"],
+                "keepAlive": 25,
+                "email": "client-a",
+                "level": 2
+            }]
+        }
+    }))
+    .expect("valid WireGuard inbound item");
+
+    let config = ServerConfig::try_from(inbound)
+        .expect("WireGuard inbound config should build");
+    assert_eq!(config.transport, Transport::Udp);
+    match config.protocol {
+        ServerProxyConfig::WireGuard { config } => {
+            assert_eq!(config.mtu, 1380);
+            assert_eq!(config.reserved, [1, 2, 3]);
+            assert_eq!(config.peers.len(), 1);
+            assert_eq!(config.peers[0].keep_alive, 25);
+            assert_eq!(config.peers[0].email, "client-a");
+            assert_eq!(
+                config.peers[0].allowed_ips[1].address.to_string(),
+                "192.0.2.0"
+            );
+            assert_eq!(config.peers[0].allowed_ips[1].prefix_len, 24);
+        }
+        other => panic!("expected WireGuard protocol, got {other:?}"),
+    }
+}
+
+#[cfg(feature = "wireguard")]
+#[test]
+fn wireguard_builder_rejects_invalid_key_and_stream_settings() {
+    let invalid_key: InboudItem = serde_json::from_value(serde_json::json!({
+        "listen": "127.0.0.1",
+        "port": 51820,
+        "protocol": "wireguard",
+        "tag": "wireguard-invalid-key",
+        "settings": {"secretKey": "not-a-key"}
+    }))
+    .expect("invalid-key config shape should parse");
+    let error =
+        ServerConfig::try_from(invalid_key).expect_err("invalid key must fail");
+    assert!(error.to_string().contains("secretKey"));
+
+    let stream_settings: InboudItem = serde_json::from_value(serde_json::json!({
+        "listen": "127.0.0.1",
+        "port": 51820,
+        "protocol": "wireguard",
+        "tag": "wireguard-stream-settings",
+        "settings": {
+            "secretKey": "0707070707070707070707070707070707070707070707070707070707070707"
+        },
+        "streamSettings": {"network": "tcp"}
+    }))
+    .expect("stream-settings config shape should parse");
+    let error = ServerConfig::try_from(stream_settings)
+        .expect_err("WireGuard must not accept proxy stream settings");
+    assert!(error.to_string().contains("UDP"));
+}

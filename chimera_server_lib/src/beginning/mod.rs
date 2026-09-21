@@ -145,7 +145,12 @@ async fn start_server_tasks(
     runtime: DataPlaneRuntime,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     register_configured_identities(&config.protocol, &runtime);
-
+    #[cfg(feature = "wireguard")]
+    if matches!(config.protocol, ServerProxyConfig::WireGuard { .. }) {
+        return crate::wireguard::start_server(config, runtime)
+            .await
+            .map(|handle| vec![handle]);
+    }
     match transport_plan::compile_listener_plan(&config.protocol) {
         transport_plan::InboundListenerPlan::Xhttp(plan) => {
             return xhttp::start_xhttp_server(config, runtime, *plan).await;
@@ -327,6 +332,14 @@ fn register_configured_identities(
         #[cfg(feature = "tuic")]
         ServerProxyConfig::TuicV5 { config } => {
             register_stats_identity(runtime, 0, config.uuid.clone());
+        }
+        #[cfg(feature = "wireguard")]
+        ServerProxyConfig::WireGuard { config } => {
+            for peer in &config.peers {
+                if !peer.email.is_empty() {
+                    register_stats_identity(runtime, peer.level, peer.email.clone());
+                }
+            }
         }
         ServerProxyConfig::Xhttp { inner, .. } => {
             register_configured_identities(inner, runtime);

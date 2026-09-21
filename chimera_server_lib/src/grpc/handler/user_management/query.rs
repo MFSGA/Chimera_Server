@@ -94,6 +94,8 @@ impl HandlerServiceImpl {
             ServerProxyConfig::DokodemoDoor { .. } | ServerProxyConfig::Tunnel => {
                 None
             }
+            #[cfg(feature = "wireguard")]
+            ServerProxyConfig::WireGuard { .. } => None,
         }
     }
 
@@ -339,6 +341,8 @@ impl HandlerServiceImpl {
             ServerProxyConfig::DokodemoDoor { .. } | ServerProxyConfig::Tunnel => {
                 None
             }
+            #[cfg(feature = "wireguard")]
+            ServerProxyConfig::WireGuard { .. } => None,
         }
     }
 }

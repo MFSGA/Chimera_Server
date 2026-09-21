@@ -74,6 +74,13 @@ pub async fn start_udp_server(
             .await;
         }
         ServerProxyConfig::DokodemoDoor { config } => config,
+        #[cfg(feature = "wireguard")]
+        ServerProxyConfig::WireGuard { .. } => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "wireguard inbound protocol engine is not connected to the UDP listener yet",
+            ));
+        }
         other => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,

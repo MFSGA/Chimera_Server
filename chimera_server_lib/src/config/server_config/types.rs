@@ -591,6 +591,55 @@ pub struct DokodemoDoorConfig {
     pub user_level: u32,
 }
 
+#[cfg(feature = "wireguard")]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct WireGuardAddress {
+    pub address: IpAddr,
+    pub prefix_len: u8,
+}
+
+#[cfg(feature = "wireguard")]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct WireGuardAllowedIp {
+    pub address: IpAddr,
+    pub prefix_len: u8,
+}
+
+#[cfg(feature = "wireguard")]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct WireGuardPeerConfig {
+    pub public_key: [u8; 32],
+    pub pre_shared_key: Option<[u8; 32]>,
+    pub endpoint: Option<String>,
+    pub keep_alive: u16,
+    pub allowed_ips: Vec<WireGuardAllowedIp>,
+    pub level: u32,
+    pub email: String,
+}
+
+#[cfg(feature = "wireguard")]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub enum WireGuardDomainStrategy {
+    ForceIp,
+    ForceIpv4,
+    ForceIpv6,
+    ForceIpv4v6,
+    ForceIpv6v4,
+}
+
+#[cfg(feature = "wireguard")]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct WireGuardServerConfig {
+    pub secret_key: [u8; 32],
+    pub addresses: Vec<WireGuardAddress>,
+    pub peers: Vec<WireGuardPeerConfig>,
+    pub mtu: u16,
+    pub reserved: [u8; 3],
+    pub domain_strategy: WireGuardDomainStrategy,
+    pub dns: Vec<String>,
+    pub no_kernel_tun: bool,
+}
+
 #[cfg(feature = "tls")]
 #[derive(Debug, Clone, Deserialize)]
 pub enum TlsCertificateUsage {
@@ -683,6 +732,10 @@ pub enum ServerProxyConfig {
     TuicV5 {
         config: TuicServerConfig,
     },
+    #[cfg(feature = "wireguard")]
+    WireGuard {
+        config: WireGuardServerConfig,
+    },
     #[cfg(feature = "trojan")]
     Trojan {
         users: Vec<TrojanUser>,
@@ -753,6 +806,8 @@ impl std::fmt::Display for ServerProxyConfig {
                 Self::Hysteria2 { .. } => "Hysteria2",
                 #[cfg(feature = "tuic")]
                 Self::TuicV5 { .. } => "TuicV5",
+                #[cfg(feature = "wireguard")]
+                Self::WireGuard { .. } => "WireGuard",
                 #[cfg(feature = "trojan")]
                 Self::Trojan { .. } => "Trojan",
                 #[cfg(feature = "reality")]

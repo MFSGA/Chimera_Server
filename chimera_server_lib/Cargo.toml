@@ -62,6 +62,8 @@ httpdate = { workspace = true }
 time = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
+boringtun = { workspace = true, optional = true }
+tun = { workspace = true, optional = true }
 reqwest = { workspace = true }
 flate2 = { workspace = true, optional = true }
 md-5 = { workspace = true, optional = true }
@@ -98,6 +100,7 @@ reality = ["rcgen", "x509-parser"]
 shadowsocks = ["md-5", "blake3", "aes", "chacha20poly1305"]
 vless = []
 vmess = ["md-5", "sha3", "sha1"]
+wireguard = ["boringtun", "tun"]
 tuic = ["dashmap", "lru", "uuid"]
 traffic = []
 api = ["tonic", "tonic-prost", "prost-types", "tokio-stream"]
@@ -115,6 +118,7 @@ full = [
     "shadowsocks",
     "vless",
     "vmess",
+    "wireguard",
     "tuic",
     "api",
     "traffic",

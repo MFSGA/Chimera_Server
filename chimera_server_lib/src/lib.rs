@@ -67,6 +67,9 @@ mod util;
 
 mod xudp_registry;
 
+#[cfg(feature = "wireguard")]
+mod wireguard;
+
 mod user_domain;
 
 #[allow(clippy::large_enum_variant)]

@@ -15,6 +15,11 @@ pub use types::HttpUser;
 pub use types::TuicServerConfig;
 #[cfg(feature = "vless")]
 pub use types::{VlessFallback, VlessUser};
+#[cfg(feature = "wireguard")]
+pub use types::{
+    WireGuardAddress, WireGuardAllowedIp, WireGuardDomainStrategy,
+    WireGuardPeerConfig, WireGuardServerConfig,
+};
 
 #[cfg(feature = "grpc_transport")]
 pub use types::GrpcServerConfig;

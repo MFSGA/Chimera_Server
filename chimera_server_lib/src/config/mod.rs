@@ -69,6 +69,9 @@ pub enum Protocol {
     #[cfg(feature = "tuic")]
     #[serde(alias = "tuic")]
     TuicV5,
+    #[cfg(feature = "wireguard")]
+    #[serde(alias = "wireguard")]
+    WireGuard,
     Xhttp,
     Socks,
     Http,

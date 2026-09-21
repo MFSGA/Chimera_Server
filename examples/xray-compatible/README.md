@@ -82,6 +82,7 @@ Config validation is necessary but is not protocol interoperability evidence. Te
 | `hysteria-quic-tls.json5` | hysteria | hysteria (H3) | tls | current Xray syntax; filename retained for compatibility; legacy 26.2.6 client has a documented 4 KiB serialization limit |
 | `shadowsocks-tcp-udp.json5` | shadowsocks | tcp + udp | none | config-validated; Xray-verified |
 | `shadowsocks-2022-eih-tcp-udp.json5` | shadowsocks 2022 EIH | tcp + udp | none | config-validated; Xray-verified |
+| `wireguard-inbound.json5` | wireguard | UDP + system TUN | WireGuard | config-validated; Linux runtime requires TUN/CAP_NET_ADMIN and host forwarding/NAT; interoperability not yet verified |
 
 The two Shadowsocks examples intentionally omit `streamSettings`: Chimera's combined Shadowsocks `network: "tcp,udp"` listener rejects `streamSettings` because the same inbound also owns a UDP listener.
 
@@ -248,7 +249,7 @@ Hysteria2 is therefore **not currently release-blocked by the previously observe
 | mKCP combinations beyond verified VLESS + none | Plain VLESS TCP streams over default mKCP settings are Xray-verified, including the deterministic bidirectional loss/reordering profile described above. Xray's five-attempt/100 ms local segment-write retry policy is runtime-implemented and unit-covered, but kernel `send_to` failure injection is not part of the real-client evidence. Other proxy/security combinations, broader loss/error profiles, and masking variants are not yet certified; mKCP + DokodemoDoor `followRedirect` still fails closed because UDP original-destination extraction is not implemented. |
 | Legacy QUIC transport | Not materialized or release-verified in this matrix. |
 | TUN | Not part of this inbound compatibility matrix. |
-| WireGuard | Not part of this inbound compatibility matrix. |
+| WireGuard inbound | Linux system-TUN runtime slice is implemented behind the `wireguard` feature; decrypted packets use host IP routing after TUN injection, so forwarding/NAT and a peer-covering `address` prefix are deployment prerequisites. Xray-client interoperability, routing/statistics parity, IPv6-only devices, `noKernelTun`, and non-Linux support remain unverified or unsupported. |
 
 ## Notes
 

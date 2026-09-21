@@ -8,6 +8,11 @@ mod tls;
 mod vless;
 
 use serde::Deserialize;
+#[cfg(feature = "wireguard")]
+use std::net::IpAddr;
+
+#[cfg(feature = "wireguard")]
+use base64::{Engine, engine::general_purpose};
 
 use crate::{
     Error,
@@ -165,6 +170,285 @@ struct DokodemoDoorSettings {
     follow_redirect: bool,
     #[serde(default)]
     user_level: u32,
+}
+
+#[cfg(feature = "wireguard")]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireGuardPeerSettings {
+    public_key: String,
+    #[serde(default)]
+    pre_shared_key: Option<String>,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    keep_alive: u32,
+    #[serde(default, rename = "allowedIPs", alias = "allowedIps")]
+    allowed_ips: Option<Vec<String>>,
+    #[serde(default)]
+    level: u32,
+    #[serde(default)]
+    email: String,
+}
+
+#[cfg(feature = "wireguard")]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireGuardInboundSettings {
+    secret_key: String,
+    #[serde(default)]
+    address: Option<Vec<String>>,
+    #[serde(default)]
+    peers: Vec<WireGuardPeerSettings>,
+    #[serde(default)]
+    mtu: Option<u32>,
+    #[serde(default)]
+    reserved: Vec<u8>,
+    #[serde(default)]
+    domain_strategy: Option<String>,
+    #[serde(default, rename = "remoteDNS")]
+    dns: Vec<String>,
+    #[serde(default)]
+    no_kernel_tun: bool,
+}
+
+#[cfg(feature = "wireguard")]
+fn decode_wireguard_key(value: &str, field: &str) -> Result<[u8; 32], Error> {
+    let value = value.trim();
+    let bytes = if value.len() == 64 {
+        let mut bytes = [0u8; 32];
+        for (index, chunk) in value.as_bytes().as_chunks::<2>().0.iter().enumerate()
+        {
+            let high = hex_nibble(chunk[0]).ok_or_else(|| {
+                Error::InvalidConfig(format!("wireguard {field} is not valid hex"))
+            })?;
+            let low = hex_nibble(chunk[1]).ok_or_else(|| {
+                Error::InvalidConfig(format!("wireguard {field} is not valid hex"))
+            })?;
+            bytes[index] = (high << 4) | low;
+        }
+        bytes
+    } else {
+        let decoded = [
+            general_purpose::STANDARD.decode(value),
+            general_purpose::STANDARD_NO_PAD.decode(value),
+            general_purpose::URL_SAFE.decode(value),
+            general_purpose::URL_SAFE_NO_PAD.decode(value),
+        ]
+        .into_iter()
+        .find_map(Result::ok)
+        .ok_or_else(|| {
+            Error::InvalidConfig(format!("wireguard {field} is not valid base64"))
+        })?;
+        decoded.try_into().map_err(|_| {
+            Error::InvalidConfig(format!(
+                "wireguard {field} must decode to exactly 32 bytes"
+            ))
+        })?
+    };
+    Ok(bytes)
+}
+
+#[cfg(feature = "wireguard")]
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "wireguard")]
+fn parse_wireguard_cidr(
+    value: &str,
+    field: &str,
+) -> Result<crate::config::server_config::WireGuardAllowedIp, Error> {
+    let (address, prefix_len) = value.split_once('/').ok_or_else(|| {
+        Error::InvalidConfig(format!("wireguard {field} must be an IP/prefix"))
+    })?;
+    let address = address.parse::<IpAddr>().map_err(|_| {
+        Error::InvalidConfig(format!("wireguard {field} has invalid IP {address:?}"))
+    })?;
+    let prefix_len = prefix_len.parse::<u8>().map_err(|_| {
+        Error::InvalidConfig(format!("wireguard {field} has invalid prefix length"))
+    })?;
+    let max_prefix = if address.is_ipv4() { 32 } else { 128 };
+    if prefix_len > max_prefix {
+        return Err(Error::InvalidConfig(format!(
+            "wireguard {field} prefix length exceeds {max_prefix}"
+        )));
+    }
+    Ok(crate::config::server_config::WireGuardAllowedIp {
+        address: normalize_cidr_address(address, prefix_len),
+        prefix_len,
+    })
+}
+
+#[cfg(feature = "wireguard")]
+fn normalize_cidr_address(address: IpAddr, prefix_len: u8) -> IpAddr {
+    match address {
+        IpAddr::V4(address) => {
+            let value = u32::from(address);
+            let mask = if prefix_len == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix_len)
+            };
+            IpAddr::V4(std::net::Ipv4Addr::from(value & mask))
+        }
+        IpAddr::V6(address) => {
+            let value = u128::from(address);
+            let mask = if prefix_len == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix_len)
+            };
+            IpAddr::V6(std::net::Ipv6Addr::from(value & mask))
+        }
+    }
+}
+
+#[cfg(feature = "wireguard")]
+fn parse_wireguard_address(
+    value: &str,
+) -> Result<crate::config::server_config::WireGuardAddress, Error> {
+    let (address, prefix_len) = value
+        .split_once('/')
+        .map_or((value, None), |(a, p)| (a, Some(p)));
+    let address = address.parse::<IpAddr>().map_err(|_| {
+        Error::InvalidConfig(format!("wireguard address has invalid IP {address:?}"))
+    })?;
+    let prefix_len = prefix_len
+        .map(|value| value.parse::<u8>())
+        .transpose()
+        .map_err(|_| {
+            Error::InvalidConfig(
+                "wireguard address has invalid prefix length".into(),
+            )
+        })?
+        .unwrap_or(if address.is_ipv4() { 32 } else { 128 });
+    let max_prefix = if address.is_ipv4() { 32 } else { 128 };
+    if prefix_len > max_prefix {
+        return Err(Error::InvalidConfig(
+            "wireguard address prefix is too large".into(),
+        ));
+    }
+    Ok(crate::config::server_config::WireGuardAddress {
+        address,
+        prefix_len,
+    })
+}
+
+#[cfg(feature = "wireguard")]
+fn collect_wireguard_settings(
+    settings: Option<crate::config::SettingObject>,
+) -> Result<crate::config::server_config::WireGuardServerConfig, Error> {
+    let settings = settings.ok_or_else(|| {
+        Error::InvalidConfig("wireguard inbound requires settings".into())
+    })?;
+    let raw =
+        settings
+            .deserialize::<WireGuardInboundSettings>()
+            .map_err(|error| {
+                Error::InvalidConfig(format!("invalid wireguard settings: {error}"))
+            })?;
+    let secret_key = decode_wireguard_key(&raw.secret_key, "secretKey")?;
+    if !raw.reserved.is_empty() && raw.reserved.len() != 3 {
+        return Err(Error::InvalidConfig(
+            "wireguard reserved must contain exactly 3 bytes".into(),
+        ));
+    }
+    let reserved = raw.reserved.as_slice().try_into().unwrap_or([0, 0, 0]);
+    let addresses = raw
+        .address
+        .unwrap_or_else(|| vec!["10.0.0.1/32".into()])
+        .into_iter()
+        .map(|value| parse_wireguard_address(&value))
+        .collect::<Result<Vec<_>, _>>()?;
+    if addresses.is_empty() {
+        return Err(Error::InvalidConfig("wireguard requires address".into()));
+    }
+    let domain_strategy = match raw
+        .domain_strategy
+        .as_deref()
+        .unwrap_or("forceip")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "forceip" => crate::config::server_config::WireGuardDomainStrategy::ForceIp,
+        "forceipv4" => {
+            crate::config::server_config::WireGuardDomainStrategy::ForceIpv4
+        }
+        "forceipv6" => {
+            crate::config::server_config::WireGuardDomainStrategy::ForceIpv6
+        }
+        "forceipv4v6" => {
+            crate::config::server_config::WireGuardDomainStrategy::ForceIpv4v6
+        }
+        "forceipv6v4" => {
+            crate::config::server_config::WireGuardDomainStrategy::ForceIpv6v4
+        }
+        value => {
+            return Err(Error::InvalidConfig(format!(
+                "unsupported wireguard domainStrategy {value:?}"
+            )));
+        }
+    };
+    let mut peers = Vec::with_capacity(raw.peers.len());
+    for peer in raw.peers {
+        let public_key = decode_wireguard_key(&peer.public_key, "peer.publicKey")?;
+        if peers.iter().any(
+            |current: &crate::config::server_config::WireGuardPeerConfig| {
+                current.public_key == public_key
+            },
+        ) {
+            return Err(Error::InvalidConfig(
+                "wireguard peers must have unique public keys".into(),
+            ));
+        }
+        let pre_shared_key = peer
+            .pre_shared_key
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| decode_wireguard_key(value, "peer.preSharedKey"))
+            .transpose()?;
+        let keep_alive = u16::try_from(peer.keep_alive).map_err(|_| {
+            Error::InvalidConfig("wireguard peer.keepAlive exceeds u16".into())
+        })?;
+        let allowed_ips = peer
+            .allowed_ips
+            .unwrap_or_default()
+            .into_iter()
+            .map(|value| parse_wireguard_cidr(&value, "peer.allowedIPs"))
+            .collect::<Result<Vec<_>, _>>()?;
+        peers.push(crate::config::server_config::WireGuardPeerConfig {
+            public_key,
+            pre_shared_key,
+            endpoint: peer.endpoint,
+            keep_alive,
+            allowed_ips,
+            level: peer.level,
+            email: peer.email,
+        });
+    }
+    let mtu = raw.mtu.unwrap_or(1420);
+    let mtu = u16::try_from(mtu)
+        .ok()
+        .filter(|mtu| (576..=65535).contains(mtu))
+        .ok_or_else(|| {
+            Error::InvalidConfig("wireguard mtu must be 576..=65535".into())
+        })?;
+    Ok(crate::config::server_config::WireGuardServerConfig {
+        secret_key,
+        addresses,
+        peers,
+        mtu,
+        reserved,
+        domain_strategy,
+        dns: raw.dns,
+        no_kernel_tun: raw.no_kernel_tun,
+    })
 }
 
 #[cfg(feature = "shadowsocks")]
@@ -744,7 +1028,7 @@ impl TryFrom<InboudItem> for ServerConfig {
     type Error = Error;
 
     fn try_from(value: InboudItem) -> Result<Self, Self::Error> {
-        tracing::info!("try from inbound item {:?}", &value);
+        tracing::debug!(tag = %value.tag, protocol = ?value.protocol, "compiling inbound configuration");
 
         let InboudItem {
             listen,
@@ -811,6 +1095,21 @@ impl TryFrom<InboudItem> for ServerConfig {
 
             #[cfg(feature = "tuic")]
             Protocol::TuicV5 => build_tuic_server(context, settings),
+
+            #[cfg(feature = "wireguard")]
+            Protocol::WireGuard => {
+                if context.stream_settings().is_some() {
+                    return Err(Error::InvalidConfig(
+                        "wireguard inbound only supports UDP without stream security".into(),
+                    ));
+                }
+                let config = collect_wireguard_settings(settings)?;
+                Ok(context.finish(
+                    ServerProxyConfig::WireGuard { config },
+                    Transport::Udp,
+                    None,
+                ))
+            }
 
             Protocol::Xhttp => {
                 Err(Error::InvalidConfig(

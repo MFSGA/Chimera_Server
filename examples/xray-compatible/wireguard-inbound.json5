@@ -1,0 +1,29 @@
+{
+  inbounds: [
+    {
+      listen: "0.0.0.0",
+      port: 51820,
+      protocol: "wireguard",
+      tag: "wireguard-in",
+      settings: {
+        // Replace with the server's 32-byte WireGuard private key.
+        secretKey: "0000000000000000000000000000000000000000000000000000000000000001",
+        address: ["10.0.0.1/24"],
+        mtu: 1420,
+        noKernelTun: false,
+        peers: [
+          {
+            // Replace with the client's WireGuard public key.
+            publicKey: "0000000000000000000000000000000000000000000000000000000000000002",
+            allowedIPs: ["10.0.0.2/32"],
+            email: "wireguard-client",
+            level: 0,
+          },
+        ],
+      },
+    },
+  ],
+  outbounds: [
+    { protocol: "freedom", tag: "direct" },
+  ],
+}

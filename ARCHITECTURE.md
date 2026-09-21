@@ -23,7 +23,7 @@ Chimera 的最终目标是完整兼容 xray-core 的服务端行为，使现有�
 
 ### 1.2 后置事项与非目标
 
-- 完整 outbound 协议生态和大规模路由功能扩展后置。WireGuard 也是后期目标，与完整 outbound 的先后顺序尚未确定。
+- 完整 outbound 协议生态和大规模路由功能扩展后置。WireGuard 仍是后期目标；当前仅落地 Linux 服务端 inbound 的 system-TUN 纵向切片，与完整 outbound、userspace IP stack 和跨平台支持分开推进。
 - TUN 可以最后做；当前仅保留包级接入与设备资源所有权的扩展空间，不提前引入网络栈、空模块或依赖。未来按固定 Xray 版本核验配置和平台行为，详见手册第 12 节。
 - MCP 可做可不做，不是核心交付或发布门槛。若保留，优先独立 Adapter 调用管理 gRPC，复用内部管理服务；现有实现的迁出或删除需纳入具体任务。
 - 当前不引入微服务、通用插件平台、分布式控制协议或全局依赖注入容器。
@@ -345,6 +345,10 @@ cargo check -p chimera_server_app --no-default-features --features minimal-vless
 执行 [AGENTS.md](AGENTS.md) 规定的格式、lint、测试和发布门禁。不能以架构迁移跳过“单一主要协议目标、发布后部署验证”的节奏。
 
 ## 13. 决策记录与待验证事项
+
+### 13.1 WireGuard inbound first slice (2026-09-21)
+
+当前实现选择 WireGuard 服务端 inbound 作为第一切片：配置编译和 key/peer/AllowedIPs 校验进入 `wireguard` Cargo feature，Linux runtime 使用 userspace `boringtun` 协议状态加系统 L3 TUN 设备，UDP listener 与 TUN 生命周期由同一个 inbound task 持有。`noKernelTun`、userspace IP stack、Xray routing/outbound 注入、IPv6-only TUN、非 Linux 后端和真实 Xray 互操作尚未完成，不能据此宣称完整 WireGuard/Xray 兼容。下一步应先补充真实客户端握手、TCP/UDP 转发和关闭/重建测试，再决定是否引入 userspace IP stack。
 
 已选定的方向：单核心库内渐进分层；共用配置语义入口；计划与运行实体分离；管理器拥有生命周期；数据面仅接收必要能力；复用既有观测面。
 
