@@ -421,6 +421,12 @@ pub struct VlessFallback {
 }
 
 #[cfg(feature = "vless")]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct VlessReverseConfig {
+    pub tag: String,
+}
+
+#[cfg(feature = "vless")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct VlessUser {
     pub user_id: String,
@@ -429,6 +435,8 @@ pub struct VlessUser {
     pub user_level: u32,
     #[serde(default)]
     pub flow: String,
+    #[serde(default)]
+    pub reverse: Option<VlessReverseConfig>,
 }
 
 #[cfg(feature = "vmess")]

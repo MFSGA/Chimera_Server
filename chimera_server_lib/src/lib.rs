@@ -505,9 +505,17 @@ impl ValidatedServerPlan {
             observatory,
             burst_observatory,
             shutdown,
+            legacy_reverse_configured,
             mcp,
             ..
         } = config;
+
+        if legacy_reverse_configured {
+            return Err(Error::InvalidConfig(
+                "root reverse configuration was removed by current Xray and is not supported"
+                    .into(),
+            ));
+        }
 
         #[cfg(not(feature = "api"))]
         if api
@@ -947,7 +955,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ApiListen, compile_configured_outbounds,
+        ApiListen, ValidatedServerPlan, compile_configured_outbounds,
         ensure_api_tunnels_are_control_only, prepare_server_runtime,
         resolve_api_config,
     };
@@ -980,6 +988,42 @@ mod tests {
             crate::Error::InvalidConfig(message)
                 if message == "vless outbound broken requires settings"
         ));
+    }
+
+    #[test]
+    fn prepare_server_runtime_rejects_removed_root_reverse_config() {
+        let config: crate::config::def::LiteralConfig =
+            serde_json::from_value(serde_json::json!({
+                "inbounds": [],
+                "outbounds": [],
+                "reverse": {}
+            }))
+            .expect("parse legacy root reverse config");
+
+        let error = match ValidatedServerPlan::compile(config) {
+            Ok(_) => panic!("legacy root reverse must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("root reverse configuration was removed by current Xray"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn prepare_server_runtime_accepts_null_root_reverse_like_xray() {
+        let config: crate::config::def::LiteralConfig =
+            serde_json::from_value(serde_json::json!({
+                "inbounds": [],
+                "outbounds": [],
+                "reverse": null
+            }))
+            .expect("parse null root reverse config");
+
+        ValidatedServerPlan::compile(config)
+            .expect("Xray treats a null root reverse pointer as unconfigured");
     }
 
     #[test]

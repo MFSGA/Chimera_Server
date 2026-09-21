@@ -847,6 +847,82 @@ fn static_vless_outbound_compiles_xray_short_form_and_rejects_transport_downgrad
     assert!(error.contains("refusing to downgrade transport security"));
 }
 
+#[cfg(all(feature = "vless", not(feature = "vless-reverse")))]
+#[test]
+fn static_vless_reverse_requires_feature() {
+    let item: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "vless",
+        "tag": "reverse-tunnel",
+        "settings": {
+            "address": "127.0.0.1",
+            "port": 1234,
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "encryption": "none",
+            "reverse": {"tag": "reverse-in"}
+        }
+    }))
+    .expect("parse reverse VLESS outbound");
+
+    let error = compile_static_outbound(&item)
+        .expect_err("reverse must fail when the feature is unavailable");
+    assert!(
+        error.contains("requires the vless-reverse feature"),
+        "{error}"
+    );
+}
+
+#[cfg(feature = "vless-reverse")]
+#[test]
+fn static_vless_reverse_recognizes_bridge_role_but_does_not_silently_accept_it() {
+    let item: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "vless",
+        "tag": "reverse-tunnel",
+        "settings": {
+            "address": "127.0.0.1",
+            "port": 1234,
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "encryption": "none",
+            "reverse": {"tag": "reverse-in"}
+        }
+    }))
+    .expect("parse reverse VLESS outbound");
+
+    let error = compile_static_outbound(&item)
+        .expect_err("Chimera Bridge is not implemented in batch A");
+    assert!(
+        error.contains("Reverse Bridge role is not implemented yet"),
+        "{error}"
+    );
+}
+
+#[cfg(feature = "vless")]
+#[test]
+fn static_vless_vnext_user_reverse_requires_simplified_outbound_style() {
+    let item: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "vless",
+        "tag": "legacy-reverse-style",
+        "settings": {
+            "vnext": [{
+                "address": "127.0.0.1",
+                "port": 1234,
+                "users": [{
+                    "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+                    "encryption": "none",
+                    "reverse": {"tag": "reverse-in"}
+                }]
+            }]
+        }
+    }))
+    .expect("parse vnext reverse VLESS outbound");
+
+    let error = compile_static_outbound(&item)
+        .expect_err("vnext user reverse must not be silently ignored");
+    assert!(
+        error.contains("use simplified outbound settings to use reverse"),
+        "{error}"
+    );
+}
+
 #[cfg(feature = "trojan")]
 #[test]
 fn static_trojan_outbound_compiles_xray_short_form_and_tls_sender_settings() {

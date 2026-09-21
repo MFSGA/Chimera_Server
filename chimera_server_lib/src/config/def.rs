@@ -33,8 +33,22 @@ pub struct LiteralConfig {
     pub burst_observatory: Option<BurstObservatoryConfig>,
     #[serde(default)]
     pub shutdown: Option<ShutdownConfig>,
+    #[serde(
+        default,
+        rename = "reverse",
+        deserialize_with = "deserialize_present_field"
+    )]
+    pub legacy_reverse_configured: bool,
     // mcp settings
     pub mcp: Option<McpConfig>,
+}
+
+fn deserialize_present_field<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<serde::de::IgnoredAny>::deserialize(deserializer)
+        .map(|value| value.is_some())
 }
 
 /// The current Xray-compatible DNS slice. Static host mappings (including

@@ -60,7 +60,7 @@ pub(crate) use vision::setup_tls_mixed_vless_server_stream;
 
 const SERVER_RESPONSE_HEADER: &[u8] = &[0u8, 0u8];
 
-type ParsedVlessUser = (Box<[u8]>, String, String, String, u32);
+type ParsedVlessUser = (Box<[u8]>, String, String, String, u32, bool);
 
 #[derive(Debug)]
 pub struct VlessTcpHandler {
@@ -98,6 +98,7 @@ fn parse_vless_users(users: &[VlessUser]) -> Vec<ParsedVlessUser> {
                 user.user_label.clone(),
                 user.flow.clone(),
                 user.user_level,
+                user.reverse.is_some(),
             )
         })
         .collect()
@@ -130,7 +131,7 @@ impl VlessTcpHandler {
                 None => read_vless_auth_prefix(&mut server_stream).await,
             };
             let authenticated = candidate.is_some_and(|candidate| {
-                users.iter().any(|(stored_user_id, _, _, _, _)| {
+                users.iter().any(|(stored_user_id, _, _, _, _, _)| {
                     stored_user_id.len() == 16
                         && stored_user_id.as_ref() == candidate.as_slice()
                 })
@@ -178,17 +179,23 @@ impl VlessTcpHandler {
             command,
             remote_location,
         } = header;
-        let matched_user = users.iter().find(|(stored_user_id, _, _, _, _)| {
+        let matched_user = users.iter().find(|(stored_user_id, _, _, _, _, _)| {
             stored_user_id.len() == 16
                 && stored_user_id.as_ref() == user_id.as_slice()
         });
 
-        let Some((_, user_id, user_label, configured_flow, user_level)) =
-            matched_user
+        let Some((
+            _,
+            user_id,
+            user_label,
+            configured_flow,
+            user_level,
+            reverse_only,
+        )) = matched_user
         else {
             let expected = users
                 .iter()
-                .map(|(user_id, _, _, _, _)| encode_hex(user_id.as_ref()))
+                .map(|(user_id, _, _, _, _, _)| encode_hex(user_id.as_ref()))
                 .collect::<Vec<_>>()
                 .join(",");
             let got = encode_hex(&user_id);
@@ -204,6 +211,13 @@ impl VlessTcpHandler {
                 format!("invalid VLESS user id: {got}"),
             ));
         };
+
+        if *reverse_only {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "VLESS reverse-only user cannot establish a forward proxy session",
+            ));
+        }
 
         validate_request_flow(configured_flow, &request_flow, command)?;
 
@@ -501,6 +515,9 @@ mod tests {
         runtime::RuntimeState,
     };
 
+    #[cfg(feature = "vless-reverse")]
+    use crate::config::server_config::VlessReverseConfig;
+
     use super::*;
 
     struct TestStream(DuplexStream);
@@ -569,6 +586,7 @@ mod tests {
                 user_label: user_label.into(),
                 user_level,
                 flow: String::new(),
+                reverse: None,
             }],
             "vless-test",
         )
@@ -581,6 +599,7 @@ mod tests {
                 user_label: "fallback-user".into(),
                 user_level: 0,
                 flow: String::new(),
+                reverse: None,
             }],
             &[VlessFallback {
                 name: String::new(),
@@ -633,6 +652,45 @@ mod tests {
         assert_eq!(context.user_level, 7);
     }
 
+    #[cfg(feature = "vless-reverse")]
+    #[tokio::test]
+    async fn reverse_only_user_cannot_fall_back_to_forward_proxy() {
+        let user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
+        let handler = VlessTcpHandler::new(
+            &[VlessUser {
+                user_id: user_id.into(),
+                user_label: "reverse-user".into(),
+                user_level: 0,
+                flow: String::new(),
+                reverse: Some(VlessReverseConfig {
+                    tag: "reverse-out".into(),
+                }),
+            }],
+            "vless-reverse-test",
+        );
+        let (mut client, server) = duplex(1024);
+        client
+            .write_all(&build_plain_vless_request(user_id, COMMAND_TCP))
+            .await
+            .expect("write forward VLESS request");
+
+        let error = match handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+        {
+            Ok(_) => {
+                panic!("reverse-only user must not become a forward proxy user")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            error.to_string().contains(
+                "reverse-only user cannot establish a forward proxy session"
+            )
+        );
+    }
+
     #[tokio::test]
     async fn runtime_vless_user_update_changes_authentication_without_rebuilding_handler()
      {
@@ -652,6 +710,7 @@ mod tests {
                         user_label: "original-user".into(),
                         user_level: 0,
                         flow: String::new(),
+                        reverse: None,
                     }],
                     fallbacks: Vec::new(),
                 },
@@ -675,6 +734,7 @@ mod tests {
                         user_label: "added-user".into(),
                         user_level: 7,
                         flow: String::new(),
+                        reverse: None,
                     });
                     Ok(true)
                 },
@@ -955,6 +1015,7 @@ mod tests {
                 user_label: "vless-udp-user".into(),
                 user_level: 0,
                 flow: String::new(),
+                reverse: None,
             }],
             "vless-udp",
         );
@@ -1043,6 +1104,7 @@ mod tests {
                 user_label: "vless-runtime-user".into(),
                 user_level: 0,
                 flow: String::new(),
+                reverse: None,
             }],
             "vless-runtime-udp",
         );
@@ -1104,6 +1166,7 @@ mod tests {
                 user_label: "fragmented-xudp-user".into(),
                 user_level: 0,
                 flow: String::new(),
+                reverse: None,
             }],
             "vless-fragmented-xudp",
         );
@@ -1212,6 +1275,7 @@ mod tests {
                 user_label: "vless-xudp-user".into(),
                 user_level: 0,
                 flow: String::new(),
+                reverse: None,
             }],
             "vless-xudp",
         );

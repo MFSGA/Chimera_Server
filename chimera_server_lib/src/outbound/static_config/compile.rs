@@ -549,6 +549,33 @@ fn encode_static_socks_config(
 fn encode_static_vless_config(
     mut config: StaticVlessClientConfig,
 ) -> Result<VlessClientConfigPayload, String> {
+    if let Some(reverse) = config.reverse.as_ref() {
+        #[cfg(not(feature = "vless-reverse"))]
+        {
+            let _ = (&reverse.tag, &reverse.sniffing);
+            return Err(
+                "VLESS outbound reverse requires the vless-reverse feature".into()
+            );
+        }
+
+        #[cfg(feature = "vless-reverse")]
+        {
+            if config.address.is_none() {
+                return Err(
+                    "VLESS outbound reverse requires simplified settings with address/port/id"
+                        .into(),
+                );
+            }
+            if reverse.tag.is_empty() {
+                return Err("VLESS reverse tag cannot be empty".into());
+            }
+            let _ = reverse.sniffing.as_ref();
+            return Err(
+                "Chimera VLESS Reverse Bridge role is not implemented yet".into()
+            );
+        }
+    }
+
     let (server, user) = if let Some(address) = config.address.take() {
         if config.port == 0 {
             return Err("VLESS outbound port must be between 1 and 65535".into());
@@ -565,6 +592,7 @@ fn encode_static_vless_config(
                 id: config.id,
                 flow: config.flow,
                 encryption: config.encryption,
+                reverse: None,
             },
         )
     } else {
@@ -585,6 +613,13 @@ fn encode_static_vless_config(
         let user = server.users.remove(0);
         (server, user)
     };
+
+    if user.reverse.is_some() {
+        return Err(
+            "VLESS users: please use simplified outbound settings to use reverse"
+                .into(),
+        );
+    }
 
     if !user.flow.trim().is_empty() {
         return Err(format!(

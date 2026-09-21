@@ -8,7 +8,30 @@ struct VlessInboundSettings {
     #[serde(default)]
     flow: Option<String>,
     #[serde(default)]
+    clients: Vec<VlessInboundClient>,
+    #[serde(default)]
     fallbacks: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VlessInboundClient {
+    id: String,
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    flow: String,
+    #[serde(default)]
+    level: u32,
+    #[serde(default)]
+    reverse: Option<VlessInboundReverse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VlessInboundReverse {
+    #[serde(default)]
+    tag: String,
+    #[serde(default)]
+    sniffing: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -148,6 +171,39 @@ fn has_vless_vision_flow(users: &[crate::config::server_config::VlessUser]) -> b
     users.iter().any(|user| user.flow == "xtls-rprx-vision")
 }
 
+fn compile_vless_inbound_reverse(
+    reverse: Option<VlessInboundReverse>,
+) -> Result<Option<crate::config::server_config::VlessReverseConfig>, Error> {
+    let Some(reverse) = reverse else {
+        return Ok(None);
+    };
+
+    #[cfg(not(feature = "vless-reverse"))]
+    {
+        let _ = (&reverse.tag, &reverse.sniffing);
+        return Err(Error::InvalidConfig(
+            "vless clients[].reverse requires the vless-reverse feature".into(),
+        ));
+    }
+
+    #[cfg(feature = "vless-reverse")]
+    {
+        if reverse.tag.is_empty() {
+            return Err(Error::InvalidConfig(
+                "vless clients[].reverse.tag cannot be empty".into(),
+            ));
+        }
+        if reverse.sniffing.is_some() {
+            return Err(Error::InvalidConfig(
+                "vless inbound clients[].reverse cannot have sniffing".into(),
+            ));
+        }
+        Ok(Some(crate::config::server_config::VlessReverseConfig {
+            tag: reverse.tag,
+        }))
+    }
+}
+
 struct VlessCorePlan {
     protocol: ServerProxyConfig,
     uses_vision: bool,
@@ -180,35 +236,42 @@ fn plan_vless_core(
         )));
     }
 
-    let settings_flow = vless_settings.flow.as_deref().map(str::trim).unwrap_or("");
-    validate_vless_flow(settings_flow)?;
-    let users = settings
-        .and_then(crate::config::SettingObject::clients)
-        .map(|clients| {
-            clients
-                .into_iter()
-                .map(|client| {
-                    let flow = if client.flow.trim().is_empty() {
-                        settings_flow.to_string()
-                    } else {
-                        client.flow
-                    };
-                    validate_vless_flow(&flow)?;
-                    Ok(crate::config::server_config::VlessUser {
-                        user_id: client.id.clone(),
-                        user_label: if client.email.is_empty() {
-                            client.id
-                        } else {
-                            client.email
-                        },
-                        user_level: client.level,
-                        flow,
-                    })
-                })
-                .collect::<Result<Vec<_>, Error>>()
+    let settings_flow = vless_settings
+        .flow
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    validate_vless_flow(&settings_flow)?;
+    let users = vless_settings
+        .clients
+        .into_iter()
+        .map(|client| {
+            let flow = if client.flow.trim().is_empty() {
+                settings_flow.clone()
+            } else {
+                client.flow
+            };
+            validate_vless_flow(&flow)?;
+            let reverse = compile_vless_inbound_reverse(client.reverse)?;
+            if reverse.is_some() && !flow.is_empty() {
+                return Err(Error::InvalidConfig(
+                    "vless reverse users currently require an empty flow".into(),
+                ));
+            }
+            Ok(crate::config::server_config::VlessUser {
+                user_id: client.id.clone(),
+                user_label: if client.email.is_empty() {
+                    client.id
+                } else {
+                    client.email
+                },
+                user_level: client.level,
+                flow,
+                reverse,
+            })
         })
-        .transpose()?
-        .unwrap_or_default();
+        .collect::<Result<Vec<_>, Error>>()?;
     let uses_vision = has_vless_vision_flow(&users);
     let fallbacks = collect_vless_fallbacks(vless_settings.fallbacks)?;
 

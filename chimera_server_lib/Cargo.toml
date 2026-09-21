@@ -99,6 +99,7 @@ tls = ["x509-parser"]
 reality = ["rcgen", "x509-parser"]
 shadowsocks = ["md-5", "blake3", "aes", "chacha20poly1305"]
 vless = []
+vless-reverse = ["vless"]
 vmess = ["md-5", "sha3", "sha1"]
 wireguard = ["boringtun", "tun"]
 tuic = ["dashmap", "lru", "uuid"]
@@ -117,6 +118,7 @@ full = [
     "reality",
     "shadowsocks",
     "vless",
+    "vless-reverse",
     "vmess",
     "wireguard",
     "tuic",

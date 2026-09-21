@@ -55,7 +55,17 @@ struct StaticVlessClientConfig {
     #[serde(default)]
     encryption: String,
     #[serde(default)]
+    reverse: Option<StaticVlessReverseConfig>,
+    #[serde(default)]
     vnext: Vec<StaticVlessServerConfig>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct StaticVlessReverseConfig {
+    #[serde(default)]
+    tag: String,
+    #[serde(default)]
+    sniffing: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -77,6 +87,8 @@ struct StaticVlessUserConfig {
     flow: String,
     #[serde(default)]
     encryption: String,
+    #[serde(default)]
+    reverse: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]

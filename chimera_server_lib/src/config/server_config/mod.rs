@@ -14,7 +14,7 @@ pub use types::HttpUser;
 #[cfg(feature = "tuic")]
 pub use types::TuicServerConfig;
 #[cfg(feature = "vless")]
-pub use types::{VlessFallback, VlessUser};
+pub use types::{VlessFallback, VlessReverseConfig, VlessUser};
 #[cfg(feature = "wireguard")]
 pub use types::{
     WireGuardAddress, WireGuardAllowedIp, WireGuardDomainStrategy,

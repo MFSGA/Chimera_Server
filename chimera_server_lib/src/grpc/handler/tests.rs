@@ -2377,6 +2377,85 @@ async fn handler_alter_inbound_adds_and_removes_vmess_users() {
     assert_eq!(count_after_remove.count, 1);
 }
 
+#[cfg(all(feature = "vless", not(feature = "vless-reverse")))]
+#[test]
+fn handler_vless_reverse_account_requires_feature() {
+    let service = HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+    let user = proto::xray::common::protocol::User {
+        level: 0,
+        email: "reverse-user@example.com".to_string(),
+        account: Some(HandlerServiceImpl::typed_message(
+            TYPE_PROXY_VLESS_ACCOUNT,
+            VlessAccountWirePayload {
+                id: "3ac9b383-75a1-431c-8184-106c80eb2273".to_string(),
+                flow: String::new(),
+                reverse: Some(VlessReversePayload {
+                    tag: "reverse-out".to_string(),
+                    sniffing: None,
+                }),
+            },
+        )),
+    };
+
+    let error = service
+        .parse_vless_user(&user)
+        .expect_err("management input must fail closed without vless-reverse");
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(
+        error
+            .message()
+            .contains("requires the vless-reverse feature"),
+        "{error}"
+    );
+}
+
+#[cfg(feature = "vless-reverse")]
+#[test]
+fn handler_vless_reverse_account_round_trips_without_downgrade() {
+    let service = HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+    let user = proto::xray::common::protocol::User {
+        level: 7,
+        email: "reverse-user@example.com".to_string(),
+        account: Some(HandlerServiceImpl::typed_message(
+            TYPE_PROXY_VLESS_ACCOUNT,
+            VlessAccountWirePayload {
+                id: "3ac9b383-75a1-431c-8184-106c80eb2273".to_string(),
+                flow: String::new(),
+                reverse: Some(VlessReversePayload {
+                    tag: "reverse-out".to_string(),
+                    sniffing: None,
+                }),
+            },
+        )),
+    };
+
+    let parsed = service
+        .parse_vless_user(&user)
+        .expect("management input should preserve reverse account metadata");
+    assert_eq!(
+        parsed.reverse.as_ref().map(|reverse| reverse.tag.as_str()),
+        Some("reverse-out")
+    );
+
+    let protocol = ServerProxyConfig::Vless {
+        users: vec![parsed],
+        fallbacks: Vec::new(),
+    };
+    let exposed = service
+        .get_user_manager_users(&protocol)
+        .expect("VLESS exposes UserManager reads");
+    let account = exposed[0]
+        .account
+        .as_ref()
+        .expect("reverse user should retain an account");
+    let decoded = VlessAccountWirePayload::decode(account.value.as_slice())
+        .expect("decode reverse VLESS account");
+    assert_eq!(
+        decoded.reverse.as_ref().map(|reverse| reverse.tag.as_str()),
+        Some("reverse-out")
+    );
+}
+
 #[cfg(feature = "vless")]
 #[tokio::test]
 async fn handler_alter_inbound_adds_and_removes_vless_users() {
@@ -2395,12 +2474,14 @@ async fn handler_alter_inbound_adds_and_removes_vless_users() {
                     user_label: "first-user@example.com".to_string(),
                     user_level: 0,
                     flow: String::new(),
+                    reverse: None,
                 },
                 VlessUser {
                     user_id: "4571894c-7ece-4b27-a734-746330d1a984".to_string(),
                     user_label: "second-user@example.com".to_string(),
                     user_level: 0,
                     flow: "xtls-rprx-vision".to_string(),
+                    reverse: None,
                 },
             ],
             fallbacks: Vec::new(),

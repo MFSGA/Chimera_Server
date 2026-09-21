@@ -173,9 +173,15 @@ impl HandlerServiceImpl {
                         email: user.user_label.clone(),
                         account: Some(proto::xray::common::serial::TypedMessage {
                             r#type: TYPE_PROXY_VLESS_ACCOUNT.to_string(),
-                            value: VlessAccountPayload {
+                            value: VlessAccountWirePayload {
                                 id: user.user_id.clone(),
                                 flow: user.flow.clone(),
+                                reverse: user.reverse.as_ref().map(|reverse| {
+                                    VlessReversePayload {
+                                        tag: reverse.tag.clone(),
+                                        sniffing: None,
+                                    }
+                                }),
                             }
                             .encode_to_vec(),
                         }),

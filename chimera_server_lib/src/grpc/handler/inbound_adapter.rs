@@ -230,7 +230,7 @@ impl HandlerServiceImpl {
         let account = user.account.as_ref().ok_or_else(|| {
             Status::invalid_argument("vless client account is required")
         })?;
-        let account = self.decode_typed_message::<VlessAccountPayload>(
+        let account = self.decode_typed_message::<VlessAccountWirePayload>(
             account,
             &[TYPE_PROXY_VLESS_ACCOUNT, TYPE_PROXY_VLESS_ACCOUNT_V2RAY],
             "vless account",
@@ -240,6 +240,42 @@ impl HandlerServiceImpl {
             return Err(Status::invalid_argument("vless client id is required"));
         }
         validate_vless_flow(&account.flow)?;
+
+        let reverse = match account.reverse {
+            None => None,
+            Some(reverse) => {
+                #[cfg(not(feature = "vless-reverse"))]
+                {
+                    let _ = (&reverse.tag, &reverse.sniffing);
+                    return Err(Status::invalid_argument(
+                        "vless account reverse requires the vless-reverse feature",
+                    ));
+                }
+
+                #[cfg(feature = "vless-reverse")]
+                {
+                    if reverse.tag.is_empty() {
+                        return Err(Status::invalid_argument(
+                            "vless account reverse.tag cannot be empty",
+                        ));
+                    }
+                    if reverse.sniffing.is_some() {
+                        return Err(Status::invalid_argument(
+                            "vless inbound account reverse cannot have sniffing",
+                        ));
+                    }
+                    if !account.flow.is_empty() {
+                        return Err(Status::invalid_argument(
+                            "vless reverse users currently require an empty flow",
+                        ));
+                    }
+                    Some(crate::config::server_config::VlessReverseConfig {
+                        tag: reverse.tag,
+                    })
+                }
+            }
+        };
+
         Ok(VlessUser {
             user_id: user_id.to_string(),
             user_label: if user.email.trim().is_empty() {
@@ -249,6 +285,7 @@ impl HandlerServiceImpl {
             },
             user_level: user.level,
             flow: account.flow,
+            reverse,
         })
     }
 

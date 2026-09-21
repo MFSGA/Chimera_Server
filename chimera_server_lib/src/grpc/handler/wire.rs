@@ -399,11 +399,35 @@ pub(super) struct VlessInboundConfigPayload {
 
 #[cfg(feature = "vless")]
 #[derive(Clone, PartialEq, Message)]
+pub(super) struct VlessReverseSniffingPayload {}
+
+#[cfg(feature = "vless")]
+#[derive(Clone, PartialEq, Message)]
+pub(super) struct VlessReversePayload {
+    #[prost(string, tag = "1")]
+    pub(super) tag: String,
+    #[prost(message, optional, tag = "2")]
+    pub(super) sniffing: Option<VlessReverseSniffingPayload>,
+}
+
+#[cfg(feature = "vless")]
+#[derive(Clone, PartialEq, Message)]
 pub(super) struct VlessAccountPayload {
     #[prost(string, tag = "1")]
     pub(super) id: String,
     #[prost(string, tag = "2")]
     pub(super) flow: String,
+}
+
+#[cfg(feature = "vless")]
+#[derive(Clone, PartialEq, Message)]
+pub(super) struct VlessAccountWirePayload {
+    #[prost(string, tag = "1")]
+    pub(super) id: String,
+    #[prost(string, tag = "2")]
+    pub(super) flow: String,
+    #[prost(message, optional, tag = "7")]
+    pub(super) reverse: Option<VlessReversePayload>,
 }
 
 #[cfg(feature = "vmess")]

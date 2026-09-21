@@ -51,20 +51,23 @@ Chimera_Server 是以 Xray 服务端兼容为目标的 Rust 网络核心。现�
 
 | 层级 | 内容 | 对当前迭代的含义 |
 | --- | --- | --- |
+| 用户已启动的专项 | 当前 Xray VLESS Reverse | 按 `VLESS_REVERSE_DESIGN.md` 分批实现，不恢复 legacy Reverse |
 | 当前主要目标 | 服务端 inbound 兼容与架构收口 | 默认优先选择相关可验证切片 |
 | 当前必要基础 | 既有目标连接、DNS、routing/policy、转发和管理能力 | 保持正确，允许修复直接阻碍 inbound 的问题 |
 | 后期目标 | WireGuard、Xray outbound 能力 | 两者实施顺序未定，不提前扩展功能生态 |
 | 更后期目标 | 与 Xray 对应接口及行为兼容的 TUN | 可以放到最后，目前只避免封死包级接入和设备生命周期 |
 | 可选能力 | MCP | 不列为必交付，不阻塞 inbound、架构收口或发布 |
 
-“后期考虑”不等于现在创建空模块、引入依赖、开放配置字段或调整默认 feature。既有功能也不因优先级降低而自动获得删除授权。
+“后期考虑”不等于现在创建空模块、引入依赖、开放配置字段或调整默认 feature。VLESS Reverse 已由
+用户明确启动，因此不再属于未授权的未来占位目标，但仍须在首个可执行切片中同步落地 feature、配置
+消费者和验证，不能先提交空 feature。既有功能也不因优先级降低而自动获得删除授权。
 
 ### 2.3 尚未确定的事项
 
 - WireGuard 与 outbound 的启动顺序、具体兼容版本及验收范围。
 - TUN 的首个平台、网络栈、设备后端及移动端接入方式。
 - MCP 是否保留、何时移出核心、是否采用独立程序。
-- 最终 crate 拆分、公共 API 命名、每一项新 feature 的名称。
+- 最终 crate 拆分、公共 API 命名，以及除已确认 `vless-reverse` 外的新 feature 名称。
 - 每个后期协议的完整实现策略与性能目标。
 
 这些应在具体目标启动时决策，不用当前手册替用户作无依据的承诺。
@@ -327,6 +330,13 @@ SessionRequest → Routing → RouteDecision → OutboundConnector
 
 真正开始时，每次选一个出口协议及明确组合，验证 TCP/UDP、DNS、超时、路由选择、错误传播和统计。不得用“有通用 connector”代替某个 Xray outbound 的互通证据。
 
+2026-09-21 用户已明确启动 VLESS Reverse 专项。第一阶段采用 Portal-first：公网 Chimera 复用
+DokodemoDoor 和 routing 暴露固定 TCP 端口，内网侧暂由固定版本 Xray 作为主动 Bridge，从而不等待
+Chimera VLESS outbound、UDP/XUDP 或完整 transport 矩阵。该阶段仍须实现 Xray-compatible VLESS
+`0x04`、Mux TCP 与 Reverse 控制 session，不能用私有 tunnel wire。后续 Chimera Bridge 需要一个受
+监督的 VLESS outbound 主动连接，但不授权扩展其他 outbound 协议；字段、owner、feature、阶段和
+验收边界见 [`VLESS_REVERSE_DESIGN.md`](VLESS_REVERSE_DESIGN.md)。
+
 ### 12.2 WireGuard
 
 WireGuard 不适合直接塞入“接收一个字节流，然后解析代理目标地址”的模型。规划应区分加密隧道、peer 状态、IP packet 处理与代理会话衔接。
@@ -408,6 +418,10 @@ WireGuard 和 TUN 可能复用包处理接口、网络栈适配代码或地址�
 | `brutal-ack-batch-trace`、`brutal-pacing-trace` | 现有诊断 feature；不等同于默认 full 功能集合 |
 
 不能据此推断所有依赖都被彻底裁掉。可选依赖、默认依赖 feature、workspace feature unification、构建目标和 dev-dependencies 均须实际检查。
+
+已确认但尚未写入 manifest 的下一项能力是 additive `vless-reverse = ["vless"]`。实现后 library/app
+`full` 包含它，`minimal-vless` 与 `minimal-vless-tls` 保持现有基础语义。未实现前不能把它列为当前
+可用构建入口；详见 [`VLESS_REVERSE_DESIGN.md`](VLESS_REVERSE_DESIGN.md#6-cargo-feature-设计)。
 
 ### 13.3 新增或调整 feature 的记录模板
 
@@ -506,7 +520,10 @@ Feature 减少后故障消失，只说明条件发生改变。编译优化、线
 
 ### 15.3 切片大小与完成边界
 
-优先选择一个可独立验证的行为或责任迁移。约 500 行以内可作为代码切片的软目标，不是质量指标；以本轮开始时的 diff 为参照，不把他人的历史未提交改动计入本轮成果。文档、生成代码和机械移动应分别说明，不为达标省略必要的生命周期处理。
+优先选择一个可独立验证的行为或责任迁移，不设置固定行数目标。以本轮开始时的 diff 为参照，
+不把他人的历史未提交改动计入本轮成果。切片是否继续拆分取决于责任是否单一、测试能否直接证明、
+失败能否回滚、审阅者能否区分行为变化与机械变化。文档、生成代码和机械移动应分别说明，不能为缩小
+表面 diff 省略必要的错误处理、测试或生命周期所有权。
 
 一次目录移动尽量不混入协议行为修改。无法分离时解释依赖和风险，保留可审阅证据。不要为了“干净提交”回退未知改动，也不要默认任务授权提交、推送或发布。
 

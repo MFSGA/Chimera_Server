@@ -1536,6 +1536,87 @@ fn vless_builder_preserves_multiple_clients() {
 }
 
 #[cfg(feature = "vless")]
+fn reverse_vless_inbound(reverse: serde_json::Value, flow: &str) -> InboudItem {
+    serde_json::from_value(serde_json::json!({
+        "listen": "127.0.0.1",
+        "port": 443,
+        "protocol": "vless",
+        "tag": "vless-reverse",
+        "settings": {
+            "clients": [{
+                "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+                "flow": flow,
+                "reverse": reverse
+            }],
+            "decryption": "none"
+        }
+    }))
+    .expect("parse reverse VLESS inbound")
+}
+
+#[cfg(all(feature = "vless", not(feature = "vless-reverse")))]
+#[test]
+fn vless_reverse_requires_feature_when_configured() {
+    let error = ServerConfig::try_from(reverse_vless_inbound(
+        serde_json::json!({"tag": "reverse-out"}),
+        "",
+    ))
+    .expect_err("reverse must fail when the capability is not compiled");
+    assert!(
+        error
+            .to_string()
+            .contains("requires the vless-reverse feature")
+    );
+}
+
+#[cfg(feature = "vless-reverse")]
+#[test]
+fn vless_builder_preserves_reverse_tag_and_rejects_invalid_inbound_fields() {
+    let config = ServerConfig::try_from(reverse_vless_inbound(
+        serde_json::json!({"tag": "reverse-out"}),
+        "",
+    ))
+    .expect("reverse VLESS config should compile");
+    let ServerProxyConfig::Vless { users, .. } = config.protocol else {
+        panic!("expected VLESS protocol");
+    };
+    assert_eq!(
+        users[0].reverse.as_ref().map(|r| r.tag.as_str()),
+        Some("reverse-out")
+    );
+
+    for (reverse, expected) in [
+        (
+            serde_json::json!({"tag": ""}),
+            "reverse.tag cannot be empty",
+        ),
+        (
+            serde_json::json!({"tag": "reverse-out", "sniffing": {}}),
+            "reverse cannot have sniffing",
+        ),
+    ] {
+        let error = ServerConfig::try_from(reverse_vless_inbound(reverse, ""))
+            .expect_err("invalid reverse config");
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+}
+
+#[cfg(feature = "vless-reverse")]
+#[test]
+fn vless_reverse_current_slice_rejects_nonempty_flow() {
+    let error = ServerConfig::try_from(reverse_vless_inbound(
+        serde_json::json!({"tag": "reverse-out"}),
+        "xtls-rprx-vision",
+    ))
+    .expect_err("the first reverse slice must not imply Vision support");
+    assert!(
+        error
+            .to_string()
+            .contains("reverse users currently require an empty flow")
+    );
+}
+
+#[cfg(feature = "vless")]
 #[test]
 fn vless_builder_accepts_empty_clients() {
     let inbound: InboudItem = serde_json::from_value(serde_json::json!({

@@ -614,6 +614,7 @@ mod tests {
             user_label: "plain-user".into(),
             user_level: 0,
             flow: String::new(),
+            reverse: None,
         };
         let handler = Arc::new(
             TlsServerHandler::new_vision_vless(
@@ -660,6 +661,7 @@ mod tests {
                         user_label: "vision-user".into(),
                         user_level: 7,
                         flow: XTLS_VISION_FLOW.into(),
+                        reverse: None,
                     });
                     Ok(true)
                 },
