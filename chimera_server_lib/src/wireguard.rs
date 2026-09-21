@@ -167,12 +167,41 @@ impl PeerRuntime {
     }
 
     pub(crate) fn allows_ip(&self, address: IpAddr) -> bool {
-        self.allowed_ips.is_empty()
-            || self
-                .allowed_ips
-                .iter()
-                .any(|allowed| cidr_contains(allowed, address))
+        self.matching_prefix_len(address).is_some()
     }
+
+    fn matching_prefix_len(&self, address: IpAddr) -> Option<u8> {
+        if self.allowed_ips.is_empty() {
+            return Some(0);
+        }
+        self.allowed_ips
+            .iter()
+            .filter(|allowed| cidr_contains(allowed, address))
+            .map(|allowed| allowed.prefix_len)
+            .max()
+    }
+}
+
+fn select_peer_for_destination(
+    peers: &[Arc<PeerRuntime>],
+    destination: IpAddr,
+) -> Option<&Arc<PeerRuntime>> {
+    peers
+        .iter()
+        .fold(None, |selected, peer| {
+            let Some(prefix_len) = peer.matching_prefix_len(destination) else {
+                return selected;
+            };
+            match selected {
+                Some((selected_prefix, selected_peer))
+                    if selected_prefix >= prefix_len =>
+                {
+                    Some((selected_prefix, selected_peer))
+                }
+                _ => Some((prefix_len, peer)),
+            }
+        })
+        .map(|(_, peer)| peer)
 }
 
 #[cfg(target_os = "linux")]
@@ -333,7 +362,7 @@ async fn process_tun_packet(
     let Some(destination) = Tunn::dst_address(packet) else {
         return;
     };
-    let Some(peer) = peers.iter().find(|peer| peer.allows_ip(destination)) else {
+    let Some(peer) = select_peer_for_destination(peers, destination) else {
         return;
     };
     let Some(endpoint) = peer.endpoint().await else {
@@ -409,6 +438,15 @@ mod tests {
         WireGuardAddress, WireGuardDomainStrategy, WireGuardPeerConfig,
     };
 
+    fn ipv4_packet(source: [u8; 4], destination: [u8; 4]) -> Vec<u8> {
+        let mut packet = vec![0u8; 20];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&(20u16).to_be_bytes());
+        packet[12..16].copy_from_slice(&source);
+        packet[16..20].copy_from_slice(&destination);
+        packet
+    }
+
     #[tokio::test]
     async fn peer_accepts_handshake_and_allowed_ip() {
         let server_secret = [7u8; 32];
@@ -468,21 +506,83 @@ mod tests {
             panic!("client must accept the handshake response");
         };
 
-        let mut packet = vec![0u8; 20];
-        packet[0] = 0x45;
-        packet[2..4].copy_from_slice(&(20u16).to_be_bytes());
-        packet[12..16].copy_from_slice(&[10, 0, 0, 2]);
-        packet[16..20].copy_from_slice(&[10, 0, 0, 1]);
+        let packet = ipv4_packet([10, 0, 0, 2], [10, 0, 0, 1]);
         let TunnResult::WriteToNetwork(encrypted) =
             client.encapsulate(&packet, &mut client_output)
         else {
             panic!("client must encrypt the IP packet");
         };
-        assert!(matches!(
-            peers[0]
-                .receive("192.0.2.10".parse().unwrap(), encrypted)
-                .await,
-            ReceiveResult::IpPacket { .. }
-        ));
+        let ReceiveResult::IpPacket {
+            packet: received,
+            source,
+        } = peers[0]
+            .receive("192.0.2.10".parse().unwrap(), encrypted)
+            .await
+        else {
+            panic!("server must decrypt the client packet");
+        };
+        assert_eq!(received, packet);
+        assert_eq!(source, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+
+        let reply = ipv4_packet([10, 0, 0, 1], [10, 0, 0, 2]);
+        let encrypted_reply = peers[0]
+            .encapsulate(&reply)
+            .await
+            .expect("server must encrypt a reply after receiving client data");
+        let mut client_packet = vec![0u8; PACKET_BUFFER_SIZE];
+        let TunnResult::WriteToTunnelV4(client_reply, reply_source) =
+            client.decapsulate(None, &encrypted_reply, &mut client_packet)
+        else {
+            panic!("client must decrypt the server reply");
+        };
+        assert_eq!(client_reply, reply);
+        assert_eq!(reply_source, Ipv4Addr::new(10, 0, 0, 1));
+    }
+
+    #[test]
+    fn selects_the_most_specific_peer_route() {
+        let config = WireGuardServerConfig {
+            secret_key: [7u8; 32],
+            addresses: vec![WireGuardAddress {
+                address: "10.0.0.1".parse().unwrap(),
+                prefix_len: 24,
+            }],
+            peers: vec![
+                WireGuardPeerConfig {
+                    public_key: [9u8; 32],
+                    pre_shared_key: None,
+                    endpoint: None,
+                    keep_alive: 0,
+                    allowed_ips: vec![WireGuardAllowedIp {
+                        address: "10.0.0.0".parse().unwrap(),
+                        prefix_len: 8,
+                    }],
+                    level: 0,
+                    email: "broad".into(),
+                },
+                WireGuardPeerConfig {
+                    public_key: [11u8; 32],
+                    pre_shared_key: None,
+                    endpoint: None,
+                    keep_alive: 0,
+                    allowed_ips: vec![WireGuardAllowedIp {
+                        address: "10.1.0.0".parse().unwrap(),
+                        prefix_len: 16,
+                    }],
+                    level: 0,
+                    email: "specific".into(),
+                },
+            ],
+            mtu: 1420,
+            reserved: [0; 3],
+            domain_strategy: WireGuardDomainStrategy::ForceIp,
+            dns: Vec::new(),
+            no_kernel_tun: true,
+        };
+        let peers = build_peer_runtimes(&config).unwrap();
+        let selected =
+            select_peer_for_destination(&peers, "10.1.2.3".parse().unwrap())
+                .expect("a peer should match the destination");
+        assert_eq!(selected.email, "specific");
     }
 }
