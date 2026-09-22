@@ -14,7 +14,10 @@ pub(crate) fn compile_static_outbound(
         .filter(|settings| !settings.is_null())
     {
         None => None,
-        Some(settings) if protocol == "trojan" => {
+        Some(settings)
+            if protocol == "trojan"
+                || (protocol == "vless" && static_vless_reverse_requested(item)) =>
+        {
             Some(encode_static_sender_settings(settings, &item.tag)?)
         }
         Some(_) if matches!(protocol.as_str(), "socks" | "vless") => {
@@ -81,6 +84,22 @@ pub(crate) fn compile_static_outbound(
         sender_settings_value: sender_settings
             .map(|settings| settings.encode_to_vec()),
     })
+}
+
+fn static_vless_reverse_requested(item: &OutboundItem) -> bool {
+    #[cfg(feature = "vless-reverse")]
+    {
+        item.settings
+            .as_ref()
+            .and_then(|settings| settings.0.get("reverse"))
+            .is_some_and(|reverse| !reverse.is_null())
+    }
+
+    #[cfg(not(feature = "vless-reverse"))]
+    {
+        let _ = item;
+        false
+    }
 }
 
 fn encode_static_sender_settings(

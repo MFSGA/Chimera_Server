@@ -18,6 +18,7 @@ const XRAY_BRIDGE_MAX_AVERAGE_CONNECTIONS: usize = 16;
 #[derive(Debug, Clone)]
 pub(crate) struct ReverseBridgePlan {
     pub(crate) outbound_tag: String,
+    pub(crate) outbound: OutboundSummary,
     pub(crate) endpoint: VlessReverseBridgeEndpoint,
 }
 
@@ -31,6 +32,7 @@ pub(crate) fn prepare_reverse_bridge_plans(
         };
         plans.push(ReverseBridgePlan {
             outbound_tag: outbound.tag.clone(),
+            outbound: outbound.clone(),
             endpoint,
         });
     }
@@ -72,11 +74,14 @@ async fn run_bridge_monitor(runtime: DataPlaneRuntime, plan: ReverseBridgePlan) 
             }
         }
 
-        if active_workers == 0
-            || active_connections / active_workers
-                > XRAY_BRIDGE_MAX_AVERAGE_CONNECTIONS
-        {
-            match connect_vless_reverse_bridge(&resolver, &plan.endpoint).await {
+        if should_add_worker(active_workers, active_connections) {
+            match connect_vless_reverse_bridge(
+                &resolver,
+                &plan.outbound,
+                &plan.endpoint,
+            )
+            .await
+            {
                 Ok(physical) => {
                     workers.push(MuxServerWorker::new(
                         physical,
@@ -98,6 +103,11 @@ async fn run_bridge_monitor(runtime: DataPlaneRuntime, plan: ReverseBridgePlan) 
     }
 }
 
+fn should_add_worker(active_workers: usize, active_connections: usize) -> bool {
+    active_workers == 0
+        || active_connections / active_workers > XRAY_BRIDGE_MAX_AVERAGE_CONNECTIONS
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -106,6 +116,15 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn monitor_scaling_matches_xray_average_connection_threshold() {
+        assert!(should_add_worker(0, 0));
+        assert!(!should_add_worker(1, 16));
+        assert!(should_add_worker(1, 17));
+        assert!(!should_add_worker(2, 33));
+        assert!(should_add_worker(2, 34));
+    }
 
     #[test]
     fn plan_collection_finds_only_reverse_vless_outbounds() {

@@ -216,3 +216,24 @@ async fn mux_server_rejects_udp_until_xudp_batch() {
         .expect("unsupported UDP frame closes the physical worker");
     assert!(worker.closed());
 }
+
+#[tokio::test]
+async fn dropping_mux_server_worker_closes_physical_stream() {
+    let (physical, mut portal) = duplex(4096);
+    let (local, _local_peer) = duplex(4096);
+    let dispatcher = Arc::new(FakeDispatcher::new(local));
+    let worker = MuxServerWorker::new(
+        Box::new(ReverseSessionStream::new(physical)),
+        "bridge-in".to_string(),
+        dispatcher,
+    );
+
+    drop(worker);
+
+    let mut byte = [0u8; 1];
+    let read = timeout(Duration::from_secs(1), portal.read(&mut byte))
+        .await
+        .expect("dropping the worker must close its physical stream")
+        .expect("physical stream closes cleanly");
+    assert_eq!(read, 0);
+}

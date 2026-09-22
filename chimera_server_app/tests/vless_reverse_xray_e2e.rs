@@ -50,6 +50,203 @@ fn xray_bridge_round_trips_public_dokodemo_tcp_over_tls_vless_reverse() {
     run_reverse_interop(ReverseSecurity::Tls);
 }
 
+#[test]
+fn chimera_bridge_round_trips_public_xray_portal_over_raw_vless_reverse() {
+    run_chimera_bridge_interop(ReverseSecurity::Raw);
+}
+
+#[test]
+fn chimera_bridge_round_trips_public_xray_portal_over_tls_vless_reverse() {
+    run_chimera_bridge_interop(ReverseSecurity::Tls);
+}
+
+fn run_chimera_bridge_interop(security: ReverseSecurity) {
+    let workspace = workspace_root();
+    let xray = xray_binary(&workspace);
+    if !xray.is_file() {
+        eprintln!(
+            "skipping VLESS Reverse Xray interoperability test because {} is unavailable; set XRAY_BIN to enable it",
+            xray.display()
+        );
+        return;
+    }
+
+    let _serial = serial_xray_guard();
+    let work_dir = create_test_dir(&format!(
+        "vless-reverse-chimera-bridge-{}",
+        security.name()
+    ));
+    let (echo_addr, echoed_bytes) = start_observed_echo_server();
+    let reverse_port = free_localhost_port();
+    let public_port = free_localhost_port();
+    let chimera_config = work_dir.join("chimera.json");
+    let xray_config = work_dir.join("xray.json");
+
+    let (xray_stream, chimera_stream) = match security {
+        ReverseSecurity::Raw => (
+            json!({"network": "tcp", "security": "none"}),
+            json!({"network": "tcp", "security": "none"}),
+        ),
+        ReverseSecurity::Tls => {
+            let (cert_path, key_path) = generate_test_certificate(&work_dir);
+            (
+                json!({
+                    "network": "tcp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "certificates": [{
+                            "certificateFile": cert_path,
+                            "keyFile": key_path
+                        }]
+                    }
+                }),
+                json!({
+                    "network": "tcp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "disableSystemRoot": true,
+                        "certificates": [{
+                            "certificateFile": cert_path,
+                            "usage": "verify"
+                        }]
+                    }
+                }),
+            )
+        }
+    };
+
+    write_json(
+        &xray_config,
+        json!({
+            "log": {"loglevel": "debug"},
+            "inbounds": [
+                {
+                    "listen": "127.0.0.1",
+                    "port": reverse_port,
+                    "protocol": "vless",
+                    "tag": "reverse-vless-in",
+                    "settings": {
+                        "clients": [{
+                            "id": TEST_UUID,
+                            "email": "chimera-bridge@example.test",
+                            "reverse": {"tag": "reverse-out"}
+                        }],
+                        "decryption": "none"
+                    },
+                    "streamSettings": xray_stream
+                },
+                {
+                    "listen": "127.0.0.1",
+                    "port": public_port,
+                    "protocol": "dokodemo-door",
+                    "tag": "public-echo",
+                    "settings": {
+                        "address": echo_addr.ip().to_string(),
+                        "port": echo_addr.port(),
+                        "network": "tcp",
+                        "followRedirect": false
+                    },
+                    "streamSettings": {"network": "tcp"}
+                }
+            ],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["public-echo"],
+                    "network": "tcp",
+                    "outboundTag": "reverse-out"
+                }]
+            }
+        }),
+    );
+
+    write_json(
+        &chimera_config,
+        json!({
+            "log": {"loglevel": "debug"},
+            "inbounds": [],
+            "outbounds": [
+                {
+                    "tag": "reverse-bridge",
+                    "protocol": "vless",
+                    "settings": {
+                        "address": "127.0.0.1",
+                        "port": reverse_port,
+                        "id": TEST_UUID,
+                        "encryption": "none",
+                        "reverse": {"tag": "bridge-in"}
+                    },
+                    "streamSettings": chimera_stream
+                },
+                {
+                    "tag": "direct",
+                    "protocol": "freedom"
+                }
+            ],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["bridge-in"],
+                    "network": "tcp",
+                    "outboundTag": "direct"
+                }]
+            }
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config);
+    chimera.assert_running();
+
+    // Xray waits two seconds before its first Reverse monitor tick. Start
+    // Chimera first and let that first dial fail so the successful path also
+    // proves periodic retry rather than only startup ordering.
+    std::thread::sleep(Duration::from_millis(2300));
+    chimera.assert_running();
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, reverse_port)));
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, public_port)));
+    xray.assert_running();
+
+    let public_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, public_port));
+    let first_payload = format!(
+        "chimera bridge through xray reverse portal ({})",
+        security.name()
+    );
+    assert_reverse_echo_with_retry(
+        public_addr,
+        first_payload.as_bytes(),
+        &echoed_bytes,
+    );
+
+    // Kill the Portal side and bring it back on the same ports. The physical
+    // Reverse worker must observe EOF and the monitor must create a new worker.
+    drop(xray);
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, reverse_port)));
+    wait_for_tcp(public_addr);
+    xray.assert_running();
+
+    let reconnect_payload = format!(
+        "chimera bridge reconnect through xray reverse portal ({})",
+        security.name()
+    );
+    assert_reverse_echo_with_retry(
+        public_addr,
+        reconnect_payload.as_bytes(),
+        &echoed_bytes,
+    );
+
+    chimera.assert_running();
+    xray.assert_running();
+}
+
 fn run_reverse_interop(security: ReverseSecurity) {
     let workspace = workspace_root();
     let xray = xray_binary(&workspace);

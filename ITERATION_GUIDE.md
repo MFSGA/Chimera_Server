@@ -334,9 +334,10 @@ SessionRequest → Routing → RouteDecision → OutboundConnector
 DokodemoDoor 和 routing 暴露固定 TCP 端口，内网侧暂由固定版本 Xray 作为主动 Bridge，从而不等待
 Chimera VLESS outbound、UDP/XUDP 或完整 transport 矩阵。2026-09-22 Batch A–E 已完成该 Portal-first
 TCP 里程碑：Xray-compatible VLESS `0x04`、Mux TCP、Reverse 控制 session、Portal registry/routing 和
-固定端口链路已落地，并用固定 Xray-core `v26.9.9` Bridge 验证 RAW 与 TLS。后续 Chimera Bridge 需要
-一个受监督的 VLESS outbound 主动连接，但不授权扩展其他 outbound 协议；UDP/XUDP、sniffing 和更广
-transport 矩阵仍后置。字段、owner、feature、阶段和验收边界见 [`VLESS_REVERSE_DESIGN.md`](VLESS_REVERSE_DESIGN.md)。
+固定端口链路已落地，并用固定 Xray-core `v26.9.9` Bridge 验证 RAW 与 TLS。2026-09-23 Batch F 又完成
+受监督的 Chimera VLESS Reverse Bridge TCP RAW/TLS：2 秒 monitor、失败重试、worker 扩容/摘除、重连和
+shutdown 均进入现有 lifecycle，并以固定 Xray Portal 做双向互操作。UDP/XUDP、sniffing 和更广 transport
+矩阵仍后置。字段、owner、feature、阶段和验收边界见 [`VLESS_REVERSE_DESIGN.md`](VLESS_REVERSE_DESIGN.md)。
 
 ### 12.2 WireGuard
 

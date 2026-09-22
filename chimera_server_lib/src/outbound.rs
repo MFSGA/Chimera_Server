@@ -182,7 +182,7 @@ pub(crate) struct TcpOutboundConnection {
 pub(crate) fn prepare_vless_reverse_bridge(
     outbound: &OutboundSummary,
 ) -> std::io::Result<Option<VlessReverseBridgeEndpoint>> {
-    if outbound.protocol != "vless" {
+    if !outbound.protocol.trim().eq_ignore_ascii_case("vless") {
         return Ok(None);
     }
     let Some(endpoint) = maybe_decode_vless_reverse_bridge(outbound)? else {
@@ -190,10 +190,23 @@ pub(crate) fn prepare_vless_reverse_bridge(
     };
     match decode_outbound_transport(outbound)? {
         OutboundTransport::Raw => Ok(Some(endpoint)),
+        OutboundTransport::Tls(_) => {
+            #[cfg(feature = "tls")]
+            {
+                Ok(Some(endpoint))
+            }
+            #[cfg(not(feature = "tls"))]
+            {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "VLESS Reverse Bridge TLS requires the tls feature",
+                ))
+            }
+        }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             format!(
-                "VLESS Reverse Bridge outbound {} currently supports only RAW TCP transport",
+                "VLESS Reverse Bridge outbound {} currently supports only RAW TCP or TLS",
                 outbound.tag
             ),
         )),
@@ -203,15 +216,46 @@ pub(crate) fn prepare_vless_reverse_bridge(
 #[cfg(feature = "vless-reverse")]
 pub(crate) async fn connect_vless_reverse_bridge(
     resolver: &Arc<dyn Resolver>,
+    outbound: &OutboundSummary,
     endpoint: &VlessReverseBridgeEndpoint,
 ) -> std::io::Result<Box<dyn AsyncStream>> {
+    let transport = decode_outbound_transport(outbound)?;
     let target = resolve_single_address(resolver, &endpoint.server).await?;
     let socket = new_tcp_socket(None, target.is_ipv6())?;
-    let stream = socket.connect(target).await?;
-    if let Err(error) = stream.set_nodelay(true) {
+    let raw_stream = socket.connect(target).await?;
+    if let Err(error) = raw_stream.set_nodelay(true) {
         warn!("Failed to set TCP no-delay on Reverse Bridge socket: {error}");
     }
-    let mut stream: Box<dyn AsyncStream> = Box::new(stream);
+
+    let mut stream: Box<dyn AsyncStream> = match transport {
+        OutboundTransport::Raw => Box::new(raw_stream),
+        OutboundTransport::Tls(settings) => {
+            #[cfg(feature = "tls")]
+            {
+                Box::new(
+                    connect_tls_transport(raw_stream, &settings, &endpoint.server)
+                        .await?,
+                )
+            }
+            #[cfg(not(feature = "tls"))]
+            {
+                let _ = (raw_stream, settings);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "VLESS Reverse Bridge TLS requires the tls feature",
+                ));
+            }
+        }
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!(
+                    "VLESS Reverse Bridge outbound {} currently supports only RAW TCP or TLS",
+                    outbound.tag
+                ),
+            ));
+        }
+    };
     vless_reverse_connect(&mut *stream, endpoint).await?;
     Ok(stream)
 }

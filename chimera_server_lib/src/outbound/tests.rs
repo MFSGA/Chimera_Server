@@ -952,6 +952,36 @@ fn static_vless_reverse_preserves_bridge_startup_plan() {
     assert_eq!(bridge.reverse_tag, "reverse-in");
 }
 
+#[cfg(all(feature = "vless-reverse", feature = "tls"))]
+#[test]
+fn static_vless_reverse_compiles_tcp_tls_sender_settings() {
+    let item: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "vless",
+        "tag": "reverse-tls",
+        "settings": {
+            "address": "127.0.0.1",
+            "port": 443,
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "encryption": "none",
+            "reverse": {"tag": "bridge-in"}
+        },
+        "streamSettings": {
+            "network": "tcp",
+            "security": "tls",
+            "tlsSettings": {"serverName": "localhost"}
+        }
+    }))
+    .expect("parse TLS Reverse Bridge outbound");
+
+    let outbound =
+        compile_static_outbound(&item).expect("compile TLS Reverse Bridge outbound");
+    assert!(outbound.sender_settings_value.is_some());
+    let endpoint = prepare_vless_reverse_bridge(&outbound)
+        .expect("validate TLS Reverse Bridge transport")
+        .expect("Reverse Bridge plan");
+    assert_eq!(endpoint.reverse_tag, "bridge-in");
+}
+
 #[cfg(feature = "vless-reverse")]
 #[test]
 fn static_vless_reverse_sniffing_fails_until_runtime_support_exists() {

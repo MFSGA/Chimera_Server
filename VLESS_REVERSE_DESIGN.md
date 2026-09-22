@@ -1,7 +1,7 @@
 # VLESS Reverse 支持设计与实施计划
 
-- 状态：Batch A–E 已实现（feature/config/account/`0x04`/Reverse Mux wire/TCP session core/Portal runtime 与 RAW+TLS 互操作）；Chimera Bridge、UDP/XUDP、sniffing 与更广 transport 仍未实现
-- 更新日期：2026-09-22
+- 状态：Batch A–F 的 TCP RAW/TLS 角色已实现（Portal + Chimera Bridge 双向 Xray 互操作）；UDP/XUDP、sniffing、动态管理与更广 transport/security 仍未实现
+- 更新日期：2026-09-23
 - 当前本地 Xray 基线：`ref/xray-core` `v26.9.9`，提交
   `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`
 - 最新字段复核：Xray-core 官方 `main` 提交
@@ -529,12 +529,15 @@ Chimera Bridge、UDP/XUDP 与更完整的 Reverse 兼容面。每批完成并提
 - 已使用固定 Xray-core `v26.9.9` Bridge 做真实互操作：RAW VLESS/TCP 与 VLESS/TCP+TLS 两条 loopback echo 均通过。测试中的 Xray Freedom 显式 allow `127.0.0.0/8`，因为当前 Xray 对来自 VLESS inbound 的 private IP 目标默认应用阻断 final rule。
 - 该里程碑只声明 **Chimera Portal + Xray Bridge + TCP + RAW/TLS**；Chimera Bridge、UDP/XUDP、sniffing、动态映射和其他 transport/security 组合仍不在 Batch E 支持范围。
 
-### F. 内网 Bridge runtime
+### F. 内网 Bridge runtime（TCP RAW/TLS 已完成）
 
-- 简化 VLESS outbound 启动受监督 Reverse monitor。
-- 复用 VLESS dial/transport/security，发送 command `0x04`。
-- 补全 Mux server worker，按 `reverse.tag` 注入 inbound context。
-- 覆盖失败退避、断线重连、多 worker 和 shutdown。
+- 简化 VLESS outbound 现在会编译为 Reverse Bridge startup plan，并由现有 server `service_tasks` 启动受监督 monitor；仅有 Reverse outbound、没有 inbound 的进程也属于有效 server component。
+- monitor 对齐固定 Xray：启动前等待 2 秒，之后每 2 秒清理失效 worker；没有 ACTIVE worker 或 `active_connections / active_workers > 16` 时补一个 worker。拨号失败只记录安全的 outbound tag/error 并在下一 tick 重试。
+- 物理 worker 复用现有 VLESS account、DNS/TCP dial 与 TLS client transport，发送无地址的 command `0x04` 并校验 VLESS response header；当前支持 RAW TCP 与 TLS，WS/gRPC/REALITY/其他 transport 仍 fail closed。
+- Mux server worker 按 Xray NEW/KEEP/END 处理 TCP logical session，`reverse.tag` 作为逻辑 inbound identity 重新进入现有 routing；source/local metadata 会传播给 dispatcher。`udp://reverse:0` control session 对齐 ACTIVE/DRAIN 生命周期；UDP/XUDP NEW 在 Batch G 前显式 Unsupported 并关闭物理 worker。
+- worker/monitor 由 server lifecycle 持有；物理 EOF、非法 frame 或 owner shutdown 会关闭/摘除 worker。定向测试锁定 Xray 的整数平均扩容阈值、worker Drop 关闭物理流和 TCP roundtrip。
+- 固定 Xray-core `v26.9.9` Portal 的真实互操作已验证 RAW 与 TLS：测试会先让 Chimera 首次拨号失败再启动 Xray，确认周期重试；随后重启 Xray Portal，确认 Chimera 自动建立新 worker 并再次完成 DokodemoDoor loopback echo。
+- 因此 Batch F 只声明 **Chimera Bridge + Xray Portal + TCP + RAW/TLS**；UDP/XUDP、Reverse sniffing、动态管理和其他 transport/security 组合仍不在支持范围。
 
 ### G. UDP/XUDP
 
