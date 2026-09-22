@@ -543,6 +543,7 @@ Chimera Bridge、UDP/XUDP 与更完整的 Reverse 兼容面。每批完成并提
 
 - 实现 packet session、目标覆盖、GlobalID 关联和清理。
 - 避免与现有全局 XUDP registry 形成两套竞争 owner。
+- Mux codec 已先对齐 Xray packet NEW 的 GlobalID wire 细节：携带 DATA 的 UDP NEW 即使没有可重附着 GlobalID，也固定写入 8 字节全零占位；解码时按 Xray server 语义把全零值视为“无 GlobalID”。这只属于 Batch G wire groundwork，不表示 UDP/XUDP runtime 已支持。
 
 ### H. Sniffing 与源地址
 

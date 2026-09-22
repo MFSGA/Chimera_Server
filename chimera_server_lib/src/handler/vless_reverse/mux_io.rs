@@ -8,6 +8,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use super::mux_frame::FrameMetadata;
 
 const MAX_MUX_PAYLOAD_LENGTH: usize = u16::MAX as usize;
+// Xray common/buf.Size. PacketReader rejects a single UDP packet above this size.
+const XRAY_PACKET_BUFFER_SIZE: usize = 8 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MuxFrame {
@@ -31,6 +33,11 @@ pub(crate) fn encode_frame(frame: &MuxFrame) -> std::io::Result<Bytes> {
             "Xray Mux payload requires the DATA option",
         ));
     }
+    validate_packet_payload(
+        &frame.metadata,
+        frame.payload.len(),
+        std::io::ErrorKind::InvalidInput,
+    )?;
 
     let mut encoded = BytesMut::new();
     frame.metadata.encode(&mut encoded)?;
@@ -85,6 +92,11 @@ where
 
     let payload = if metadata.option.has_data() {
         let payload_length = reader.read_u16().await? as usize;
+        validate_packet_payload(
+            &metadata,
+            payload_length,
+            std::io::ErrorKind::InvalidData,
+        )?;
         let mut payload = vec![0u8; payload_length];
         reader.read_exact(&mut payload).await?;
         Bytes::from(payload)
@@ -93,6 +105,24 @@ where
     };
 
     Ok(MuxFrame { metadata, payload })
+}
+
+fn validate_packet_payload(
+    metadata: &FrameMetadata,
+    payload_length: usize,
+    error_kind: std::io::ErrorKind,
+) -> std::io::Result<()> {
+    let is_packet_new = metadata.status == super::mux_frame::SessionStatus::New
+        && metadata.target.as_ref().is_some_and(|target| {
+            target.network == super::mux_frame::TargetNetwork::Udp
+        });
+    if is_packet_new && payload_length > XRAY_PACKET_BUFFER_SIZE {
+        return Err(std::io::Error::new(
+            error_kind,
+            format!("Xray Mux UDP packet size too large: {payload_length}"),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -211,6 +241,31 @@ mod tests {
             .await
             .expect_err("truncated payload must fail");
         assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn udp_new_rejects_packet_larger_than_xray_buffer() {
+        let error = encode_frame(&MuxFrame {
+            metadata: FrameMetadata {
+                session_id: 9,
+                status: SessionStatus::New,
+                option: FrameOption::default().with_data(),
+                target: Some(Destination {
+                    network: TargetNetwork::Udp,
+                    location: NetLocation::new(
+                        Address::Ipv4(Ipv4Addr::LOCALHOST),
+                        53,
+                    ),
+                }),
+                source: None,
+                local: None,
+                global_id: None,
+            },
+            payload: Bytes::from(vec![0; XRAY_PACKET_BUFFER_SIZE + 1]),
+        })
+        .expect_err("Xray PacketReader rejects packets above common/buf.Size");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("8193"));
     }
 
     #[test]

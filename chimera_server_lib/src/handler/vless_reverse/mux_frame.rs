@@ -166,11 +166,12 @@ impl FrameMetadata {
                             "Xray Reverse Mux local metadata requires source metadata",
                         ));
                     }
-                    if target.network == TargetNetwork::Udp
-                        && self.option.has_data()
-                        && let Some(global_id) = self.global_id
+                    if target.network == TargetNetwork::Udp && self.option.has_data()
                     {
-                        output.extend_from_slice(&global_id);
+                        // Xray's Mux Writer always reserves the eight-byte GlobalID on a
+                        // packet NEW frame, including the all-zero value used by ordinary
+                        // (non-reattachable) UDP sessions.
+                        output.extend_from_slice(&self.global_id.unwrap_or([0; 8]));
                     }
                 }
             }
@@ -273,7 +274,8 @@ impl FrameMetadata {
         {
             let mut global_id = [0u8; 8];
             global_id.copy_from_slice(&metadata[cursor..cursor + 8]);
-            Some(global_id)
+            // common/mux.ServerWorker explicitly ignores an empty GlobalID.
+            (global_id != [0; 8]).then_some(global_id)
         } else {
             None
         };

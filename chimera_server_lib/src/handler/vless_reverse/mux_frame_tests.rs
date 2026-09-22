@@ -107,6 +107,31 @@ fn udp_global_id_and_packet_transfer_type_round_trip() {
 }
 
 #[test]
+fn ordinary_udp_new_writes_xray_zero_global_id() {
+    let metadata = FrameMetadata {
+        session_id: 13,
+        status: SessionStatus::New,
+        option: FrameOption::default().with_data(),
+        target: Some(destination(
+            TargetNetwork::Udp,
+            Address::Ipv4(Ipv4Addr::LOCALHOST),
+            53,
+        )),
+        source: None,
+        local: None,
+        global_id: None,
+    };
+    let mut encoded = BytesMut::new();
+    metadata.encode(&mut encoded).expect("encode UDP metadata");
+
+    assert_eq!(&encoded[encoded.len() - 8..], &[0; 8]);
+    let decoded = FrameMetadata::decode(&mut encoded, false)
+        .expect("decode UDP metadata")
+        .expect("complete UDP metadata");
+    assert_eq!(decoded, metadata);
+}
+
+#[test]
 fn malformed_length_status_and_address_fail_closed() {
     let mut oversized = BytesMut::from(&[0x02, 0x01][..]);
     let error = FrameMetadata::decode(&mut oversized, true)
