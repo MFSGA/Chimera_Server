@@ -15,6 +15,8 @@ pub mod tls;
 pub mod tls_deframer;
 #[cfg(feature = "vless")]
 pub mod vless_handler;
+#[cfg(feature = "vless-reverse")]
+pub(crate) mod vless_reverse;
 
 #[cfg(feature = "ws")]
 pub mod ws;

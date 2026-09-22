@@ -1,6 +1,6 @@
 # VLESS Reverse 支持设计与实施计划
 
-- 状态：Batch A–B 已实现（feature/config/account/`0x04` 解析与 fail-closed）；Mux、Portal runtime 与互操作尚未实现
+- 状态：Batch A–C 已实现（feature/config/account/`0x04`/Reverse Mux wire 与 fail-closed）；Mux session、Portal runtime 与互操作尚未实现
 - 更新日期：2026-09-22
 - 当前本地 Xray 基线：`ref/xray-core` `v26.9.9`，提交
   `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`
@@ -503,12 +503,13 @@ Chimera Bridge、UDP/XUDP 与更完整的 Reverse 兼容面。每批完成并提
 - 已覆盖普通用户/Reverse 用户 × forward/`0x04` 的授权矩阵、Vision 用户快照路径，以及 Reverse header 每个截断前缀的 `UnexpectedEof` 行为。
 - Batch B 不包含 Xray Mux frame、Reverse control session、worker picker 或 Portal 数据面；这些从 Batch C 开始。
 
-### C. Mux frame codec
+### C. Mux frame codec（已完成）
 
-- 对齐 Xray frame metadata、地址、状态与 transfer type。
-- 对齐 Reverse control protobuf、控制 session 目标和 ACTIVE/DRAINING 状态。
-- 建立固定字节向量和双端 roundtrip 测试。
-- malformed frame、长度溢出、未知状态和 session ID 冲突 fail closed。
+- 已增加独立 Reverse Mux wire codec，对齐 Xray frame metadata 的 session ID、NEW/KEEP/END/KEEPALIVE、option bits、TCP/UDP target、port-then-address、stream/packet transfer type，以及 Reverse NEW frame 的 source/local metadata；现有 XUDP runtime 未在本批改写。
+- 已对齐 `xray.app.reverse.Control` protobuf 的 `ACTIVE = 0` / `DRAIN = 1` 和 `random = 99` wire 字段，并对未知 control state fail closed。
+- 固定字节向量覆盖普通 TCP NEW frame、带 source/local 的 Reverse NEW frame 和 ACTIVE/DRAIN control；同时覆盖 TCP/UDP roundtrip 与 UDP GlobalID。
+- metadata 长度上限保持 Xray 的 512 bytes；未知 session status、截断地址、非法 metadata shape 和重复 NEW session ID 明确失败，END 后允许 ID 重用。
+- Batch C 只提供 wire primitive 与序列校验；尚未创建 client worker、session manager、picker、heartbeat/control session owner 或数据面 task，这些属于 Batch D。
 
 ### D. Mux TCP session core
 
