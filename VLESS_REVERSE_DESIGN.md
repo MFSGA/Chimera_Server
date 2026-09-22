@@ -1,6 +1,6 @@
 # VLESS Reverse 支持设计与实施计划
 
-- 状态：Batch A–C 已实现（feature/config/account/`0x04`/Reverse Mux wire 与 fail-closed）；Mux session、Portal runtime 与互操作尚未实现
+- 状态：Batch A–D 已实现（feature/config/account/`0x04`/Reverse Mux wire/TCP session core 与 fail-closed）；Portal runtime、routing 接入与互操作尚未实现
 - 更新日期：2026-09-22
 - 当前本地 Xray 基线：`ref/xray-core` `v26.9.9`，提交
   `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`
@@ -511,12 +511,14 @@ Chimera Bridge、UDP/XUDP 与更完整的 Reverse 兼容面。每批完成并提
 - metadata 长度上限保持 Xray 的 512 bytes；未知 session status、截断地址、非法 metadata shape 和重复 NEW session ID 明确失败，END 后允许 ID 重用。
 - Batch C 只提供 wire primitive 与序列校验；尚未创建 client worker、session manager、picker、heartbeat/control session owner 或数据面 task，这些属于 Batch D。
 
-### D. Mux TCP session core
+### D. Mux TCP session core（已完成）
 
-- 先实现 Portal 所需的 client worker、session manager、picker、TCP EOF/half-close 与背压。
-- 控制 session 决定 worker 是否可选；未 ACTIVE、已 DRAINING 或已关闭的 worker 不得接收新连接。
-- worker 关闭传播和无可用 worker 错误。
-- 并发与 buffer 上限测试。
+- 已实现 standalone `MuxClientWorker`、session manager、least-loaded picker 和有界逻辑 session stream；单物理 Mux 连接可复用多个 TCP session，frame writer/reader 与每-session channel 都有固定容量并形成真实背压。
+- control session 目标固定为当前 Xray 的 `udp://reverse:0`；只有成功记录 ACTIVE control 的 worker 才进入 picker，DRAIN 为单向状态，DRAIN/CLOSED/PENDING worker 都不得接收新 session，control session 关闭会传播关闭 worker。
+- session allocator 覆盖并发上限、累计连接上限、session ID 冲突与关闭；Portal 的 Xray 阈值 `total_connections > 256` 暴露为 drain 判定，但周期 heartbeat/registry owner 留给 Batch E。
+- TCP EOF 行为按固定 Xray Mux 实现锁定：应用写侧 EOF/shutdown 会发送 `SessionStatusEnd`，远端和本地都把它视为整个逻辑 session 结束，而不是保留 raw TCP 式单向 half-close；孤儿 KEEP 会回 END。
+- 物理 Mux EOF/写失败会关闭 worker 并唤醒逻辑 session；测试覆盖 payload roundtrip、source/local metadata、picker、control lifecycle、关闭传播、并发限制和 bounded-queue backpressure。
+- Batch D 仍是 standalone session core：认证后的 VLESS `0x04` handler 还没有把物理连接注册进 Reverse registry，DokodemoDoor/routing 也尚不能选择这些 worker；这些属于 Batch E。
 
 ### E. 公网 Portal runtime
 

@@ -463,3 +463,7 @@ fn shutdown_worker(core: &WorkerCore, cancellation: &CancellationToken) {
     core.close();
     cancellation.cancel();
 }
+
+#[cfg(test)]
+#[path = "worker_tests.rs"]
+mod tests;
