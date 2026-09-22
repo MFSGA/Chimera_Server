@@ -423,5 +423,10 @@ pub(super) async fn relay_shadowsocks_udp_packet(
             std::io::ErrorKind::InvalidInput,
             format!("TCP proxy outbound {} cannot be used for UDP", outbound.tag),
         )),
+        #[cfg(feature = "vless-reverse")]
+        DirectOutboundAction::VlessReverse { tag } => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("VLESS Reverse outbound {tag} is TCP-only"),
+        )),
     }
 }

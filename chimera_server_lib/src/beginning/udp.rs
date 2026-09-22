@@ -217,6 +217,11 @@ pub(crate) async fn run_bidirectional_udp(
             std::io::ErrorKind::InvalidInput,
             format!("TCP proxy outbound {} cannot be used for UDP", outbound.tag),
         )),
+        #[cfg(feature = "vless-reverse")]
+        DirectOutboundAction::VlessReverse { tag } => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("VLESS Reverse outbound {tag} is TCP-only"),
+        )),
     };
 
     let _ = shutdown_message(&mut *server_stream).await;
@@ -538,6 +543,13 @@ pub(crate) async fn run_session_based_udp(
                         break Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             format!("TCP proxy outbound {} cannot be used for UDP", outbound.tag),
+                        ));
+                    }
+                    #[cfg(feature = "vless-reverse")]
+                    DirectOutboundAction::VlessReverse { tag } => {
+                        break Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("VLESS Reverse outbound {tag} is TCP-only"),
                         ));
                     }
                 }

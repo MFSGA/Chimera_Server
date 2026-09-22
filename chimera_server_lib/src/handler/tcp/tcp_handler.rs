@@ -122,6 +122,13 @@ pub enum TcpServerSetupResult {
         stream: Box<dyn crate::async_stream::AsyncSessionMessageStream>,
         traffic_context: Option<TrafficContext>,
     },
+    #[cfg(feature = "vless-reverse")]
+    ReversePortal {
+        reverse_tag: String,
+        stream: Box<dyn AsyncStream>,
+        connection_success_response: Option<Box<[u8]>>,
+        traffic_context: Option<TrafficContext>,
+    },
     /// The handler has synchronously completed processing this connection.
     /// This does not transfer ownership of detached/background tasks: any
     /// spawned work must already be registered with an existing lifecycle
@@ -175,6 +182,13 @@ pub(crate) enum TcpServerSetupOutcome {
     },
     SessionBasedUdp {
         stream: Box<dyn crate::async_stream::AsyncSessionMessageStream>,
+        traffic_context: Option<TrafficContext>,
+    },
+    #[cfg(feature = "vless-reverse")]
+    ReversePortal {
+        reverse_tag: String,
+        stream: Box<dyn AsyncStream>,
+        connection_success_response: Option<Box<[u8]>>,
         traffic_context: Option<TrafficContext>,
     },
     /// Connection processing is complete. No task ownership is transferred
@@ -318,6 +332,23 @@ impl TcpServerSetupResult {
                         peer_addr_override,
                         outcome: TcpServerSetupOutcome::SessionBasedUdp {
                             stream,
+                            traffic_context,
+                        },
+                    };
+                }
+                #[cfg(feature = "vless-reverse")]
+                TcpServerSetupResult::ReversePortal {
+                    reverse_tag,
+                    stream,
+                    connection_success_response,
+                    traffic_context,
+                } => {
+                    return NormalizedTcpServerSetup {
+                        peer_addr_override,
+                        outcome: TcpServerSetupOutcome::ReversePortal {
+                            reverse_tag,
+                            stream,
+                            connection_success_response,
                             traffic_context,
                         },
                     };

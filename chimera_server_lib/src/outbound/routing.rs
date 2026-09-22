@@ -17,11 +17,25 @@ pub(crate) const USER_DOMAIN_ACCESS_BLACKHOLE_TAG: &str = "user-domain-access";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DirectOutboundAction {
-    Freedom { tag: Option<String> },
-    Blackhole { tag: String },
-    Socks { outbound: OutboundSummary },
-    Vless { outbound: OutboundSummary },
-    Trojan { outbound: OutboundSummary },
+    Freedom {
+        tag: Option<String>,
+    },
+    Blackhole {
+        tag: String,
+    },
+    Socks {
+        outbound: OutboundSummary,
+    },
+    Vless {
+        outbound: OutboundSummary,
+    },
+    #[cfg(feature = "vless-reverse")]
+    VlessReverse {
+        tag: String,
+    },
+    Trojan {
+        outbound: OutboundSummary,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -86,6 +100,13 @@ pub(super) enum TcpRoutePlan {
         target: NetLocation,
         outbound: OutboundSummary,
     },
+    #[cfg(feature = "vless-reverse")]
+    VlessReverse {
+        target: NetLocation,
+        outbound_tag: String,
+        source_addr: SocketAddr,
+        local_addr: Option<SocketAddr>,
+    },
     Trojan {
         target: NetLocation,
         outbound: OutboundSummary,
@@ -120,6 +141,8 @@ pub(super) async fn plan_tcp_route(
     source_addr: SocketAddr,
     routing_metadata: InboundRoutingMetadata,
 ) -> std::io::Result<Option<TcpRoutePlan>> {
+    #[cfg(feature = "vless-reverse")]
+    let reverse_local_addr = routing_metadata.local_addr;
     let (action, target_addr) = select_direct_outbound_for_location(
         resolver,
         remote_location,
@@ -150,6 +173,15 @@ pub(super) async fn plan_tcp_route(
             target: remote_location.clone(),
             outbound,
         })),
+        #[cfg(feature = "vless-reverse")]
+        DirectOutboundAction::VlessReverse { tag } => {
+            Ok(Some(TcpRoutePlan::VlessReverse {
+                target: remote_location.clone(),
+                outbound_tag: tag,
+                source_addr,
+                local_addr: reverse_local_addr,
+            }))
+        }
         DirectOutboundAction::Trojan { outbound } => {
             Ok(Some(TcpRoutePlan::Trojan {
                 target: remote_location.clone(),
@@ -256,6 +288,8 @@ pub(crate) async fn select_direct_outbound_for_location(
         | DirectOutboundAction::Socks { .. }
         | DirectOutboundAction::Vless { .. }
         | DirectOutboundAction::Trojan { .. } => Ok((action, None)),
+        #[cfg(feature = "vless-reverse")]
+        DirectOutboundAction::VlessReverse { .. } => Ok((action, None)),
         DirectOutboundAction::Freedom { .. } => {
             let target_addr = match remote_location.to_socket_addr_nonblocking() {
                 Some(target_addr) => target_addr,
@@ -485,6 +519,10 @@ fn classify_selected_outbound(
         }
         "vless" if network_name.eq_ignore_ascii_case("tcp") => {
             Ok(DirectOutboundAction::Vless { outbound })
+        }
+        #[cfg(feature = "vless-reverse")]
+        "vless-reverse" if network_name.eq_ignore_ascii_case("tcp") => {
+            Ok(DirectOutboundAction::VlessReverse { tag: outbound.tag })
         }
         "trojan"
             if network_name.eq_ignore_ascii_case("tcp")

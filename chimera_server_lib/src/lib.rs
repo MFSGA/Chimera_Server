@@ -528,7 +528,9 @@ impl ValidatedServerPlan {
         }
 
         let inbounds = compile_inbounds(inbounds)?;
-        let outbounds = compile_configured_outbounds(&outbounds)?;
+        let mut outbounds = compile_configured_outbounds(&outbounds)?;
+        #[cfg(feature = "vless-reverse")]
+        append_vless_reverse_outbounds(&inbounds, &mut outbounds)?;
         let resolver = compile_configured_resolver(dns.as_ref())?;
         let routing_state = RoutingState::from_config(routing.as_ref())
             .map_err(Error::InvalidConfig)?;
@@ -649,6 +651,82 @@ pub fn start(opts: Options) -> Result<(), Error> {
             Ok(_) => Ok(()),
         }
     })
+}
+
+#[cfg(feature = "vless-reverse")]
+fn append_vless_reverse_outbounds(
+    inbounds: &[ServerConfig],
+    outbounds: &mut Vec<OutboundSummary>,
+) -> Result<(), Error> {
+    let mut reverse_tags = std::collections::BTreeSet::new();
+    for inbound in inbounds {
+        collect_vless_reverse_tags(&inbound.protocol, &mut reverse_tags);
+    }
+
+    for tag in reverse_tags {
+        if outbounds.iter().any(|outbound| outbound.tag == tag) {
+            return Err(Error::InvalidConfig(format!(
+                "VLESS Reverse tag {tag} conflicts with configured outbound {tag}"
+            )));
+        }
+        outbounds.push(OutboundSummary {
+            tag,
+            protocol: "vless-reverse".to_string(),
+            proxy_settings_type: None,
+            proxy_settings_value: None,
+            sender_settings_type: None,
+            sender_settings_value: None,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "vless-reverse")]
+fn collect_vless_reverse_tags(
+    protocol: &ServerProxyConfig,
+    tags: &mut std::collections::BTreeSet<String>,
+) {
+    match protocol {
+        ServerProxyConfig::Vless { users, .. } => {
+            tags.extend(
+                users
+                    .iter()
+                    .filter_map(|user| user.reverse.as_ref())
+                    .map(|reverse| reverse.tag.clone()),
+            );
+        }
+        #[cfg(feature = "tls")]
+        ServerProxyConfig::Tls(config) => {
+            collect_vless_reverse_tags(&config.inner, tags);
+        }
+        #[cfg(feature = "reality")]
+        ServerProxyConfig::Reality(config) => {
+            collect_vless_reverse_tags(&config.inner, tags);
+        }
+        ServerProxyConfig::Xhttp { inner, .. } => {
+            collect_vless_reverse_tags(inner, tags);
+        }
+        #[cfg(feature = "httpupgrade")]
+        ServerProxyConfig::HttpUpgrade(config) => {
+            collect_vless_reverse_tags(&config.inner, tags);
+        }
+        #[cfg(feature = "grpc_transport")]
+        ServerProxyConfig::Grpc(config) => {
+            collect_vless_reverse_tags(&config.inner, tags);
+        }
+        #[cfg(feature = "ws")]
+        ServerProxyConfig::Websocket { targets } => match targets.as_ref() {
+            crate::util::option::OneOrSome::One(target) => {
+                collect_vless_reverse_tags(&target.protocol, tags);
+            }
+            crate::util::option::OneOrSome::Some(targets) => {
+                for target in targets {
+                    collect_vless_reverse_tags(&target.protocol, tags);
+                }
+            }
+        },
+        _ => {}
+    }
 }
 
 fn compile_configured_outbounds(
@@ -1024,6 +1102,77 @@ mod tests {
 
         ValidatedServerPlan::compile(config)
             .expect("Xray treats a null root reverse pointer as unconfigured");
+    }
+
+    #[cfg(feature = "vless-reverse")]
+    #[test]
+    fn reverse_inbound_publishes_routable_outbound_capability() {
+        let config: crate::config::def::LiteralConfig =
+            serde_json::from_value(serde_json::json!({
+                "inbounds": [{
+                    "listen": "127.0.0.1",
+                    "port": 443,
+                    "protocol": "vless",
+                    "tag": "reverse-in",
+                    "settings": {
+                        "clients": [{
+                            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+                            "reverse": {"tag": "reverse-out"}
+                        }],
+                        "decryption": "none"
+                    }
+                }],
+                "outbounds": []
+            }))
+            .expect("parse Reverse capability config");
+
+        let plan = ValidatedServerPlan::compile(config)
+            .expect("compile Reverse capability");
+        let reverse = plan
+            .outbounds
+            .iter()
+            .find(|outbound| outbound.tag == "reverse-out")
+            .expect("Reverse tag is published as an outbound capability");
+        assert_eq!(reverse.protocol, "vless-reverse");
+        assert!(reverse.proxy_settings_type.is_none());
+        assert!(reverse.sender_settings_type.is_none());
+    }
+
+    #[cfg(feature = "vless-reverse")]
+    #[test]
+    fn reverse_tag_conflict_with_static_outbound_fails_before_startup() {
+        let config: crate::config::def::LiteralConfig =
+            serde_json::from_value(serde_json::json!({
+                "inbounds": [{
+                    "listen": "127.0.0.1",
+                    "port": 443,
+                    "protocol": "vless",
+                    "tag": "reverse-in",
+                    "settings": {
+                        "clients": [{
+                            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+                            "reverse": {"tag": "shared-out"}
+                        }],
+                        "decryption": "none"
+                    }
+                }],
+                "outbounds": [{
+                    "tag": "shared-out",
+                    "protocol": "freedom"
+                }]
+            }))
+            .expect("parse conflicting Reverse capability config");
+
+        let error = match ValidatedServerPlan::compile(config) {
+            Ok(_) => panic!("Reverse tag must not shadow a static outbound"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("VLESS Reverse tag shared-out conflicts"),
+            "{error}"
+        );
     }
 
     #[test]

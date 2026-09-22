@@ -180,6 +180,13 @@ pub(crate) async fn run_shared_udp_relay(
                     ),
                 ));
             }
+            #[cfg(feature = "vless-reverse")]
+            DirectOutboundAction::VlessReverse { tag } => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("VLESS Reverse outbound {tag} is TCP-only"),
+                ));
+            }
         }
         let target_addr = target_addr.ok_or_else(|| {
             std::io::Error::other(
@@ -442,6 +449,13 @@ pub(crate) async fn run_udp_relay_with_expected_client(
                         "TCP proxy outbound {} cannot be used for UDP",
                         outbound.tag
                     ),
+                ));
+            }
+            #[cfg(feature = "vless-reverse")]
+            DirectOutboundAction::VlessReverse { tag } => {
+                break Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("VLESS Reverse outbound {tag} is TCP-only"),
                 ));
             }
         }

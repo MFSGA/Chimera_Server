@@ -680,6 +680,13 @@ pub(super) async fn forward_udp_payload(
                 ),
             ));
         }
+        #[cfg(feature = "vless-reverse")]
+        DirectOutboundAction::VlessReverse { tag } => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("VLESS Reverse outbound {tag} is TCP-only"),
+            ));
+        }
     }
 
     session

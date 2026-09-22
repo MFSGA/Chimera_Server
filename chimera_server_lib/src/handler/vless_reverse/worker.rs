@@ -128,6 +128,46 @@ impl MuxClientWorker {
         self.core.should_begin_drain()
     }
 
+    pub(crate) fn allocate_internal_session(&self) -> std::io::Result<u16> {
+        self.core.allocate_internal_session()
+    }
+
+    pub(crate) fn release_internal_session(&self, session_id: u16) -> bool {
+        self.core.release_session(session_id)
+    }
+
+    pub(crate) async fn send_internal_packet(
+        &self,
+        session_id: u16,
+        status: SessionStatus,
+        target: Option<Destination>,
+        payload: Bytes,
+    ) -> std::io::Result<()> {
+        let option = if payload.is_empty() {
+            FrameOption::default()
+        } else {
+            FrameOption::default().with_data()
+        };
+        send_stream_frame(
+            session_id,
+            status,
+            option,
+            target,
+            None,
+            None,
+            payload,
+            &self.outbound,
+        )
+        .await
+    }
+
+    pub(crate) async fn end_internal_session(
+        &self,
+        session_id: u16,
+    ) -> std::io::Result<()> {
+        send_end_frame(session_id, &self.outbound).await
+    }
+
     pub(crate) fn open_tcp_session(
         &self,
         target: Destination,

@@ -60,7 +60,7 @@ pub(crate) use vision::setup_tls_mixed_vless_server_stream;
 
 const SERVER_RESPONSE_HEADER: &[u8] = &[0u8, 0u8];
 
-type ParsedVlessUser = (Box<[u8]>, String, String, String, u32, bool);
+type ParsedVlessUser = (Box<[u8]>, String, String, String, u32, Option<String>);
 
 #[derive(Debug)]
 pub struct VlessTcpHandler {
@@ -98,7 +98,7 @@ fn parse_vless_users(users: &[VlessUser]) -> Vec<ParsedVlessUser> {
                 user.user_label.clone(),
                 user.flow.clone(),
                 user.user_level,
-                user.reverse.is_some(),
+                user.reverse.as_ref().map(|reverse| reverse.tag.clone()),
             )
         })
         .collect()
@@ -184,14 +184,8 @@ impl VlessTcpHandler {
                 && stored_user_id.as_ref() == user_id.as_slice()
         });
 
-        let Some((
-            _,
-            user_id,
-            user_label,
-            configured_flow,
-            user_level,
-            reverse_only,
-        )) = matched_user
+        let Some((_, user_id, user_label, configured_flow, user_level, reverse_tag)) =
+            matched_user
         else {
             let expected = users
                 .iter()
@@ -212,7 +206,7 @@ impl VlessTcpHandler {
             ));
         };
 
-        authorize_reverse_command(*reverse_only, command)?;
+        authorize_reverse_command(reverse_tag.is_some(), command)?;
 
         validate_request_flow(configured_flow, &request_flow, command)?;
 
@@ -246,7 +240,16 @@ impl VlessTcpHandler {
                 )),
                 traffic_context,
             }),
-            COMMAND_RVS => Err(reverse_portal_runtime_unavailable()),
+            COMMAND_RVS => Ok(TcpServerSetupResult::ReversePortal {
+                reverse_tag: reverse_tag
+                    .clone()
+                    .expect("authorized Reverse command requires a reverse tag"),
+                stream: server_stream,
+                connection_success_response: Some(
+                    SERVER_RESPONSE_HEADER.to_vec().into_boxed_slice(),
+                ),
+                traffic_context,
+            }),
             unknown_protocol_type => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Unknown requested protocol: {unknown_protocol_type}"),
@@ -733,20 +736,32 @@ mod tests {
             .await
             .expect("write reverse VLESS request");
 
-        let error = match handler
+        let result = handler
             .setup_server_stream(Box::new(TestStream(server)))
             .await
-        {
-            Ok(_) => {
-                panic!("Portal runtime is intentionally deferred to a later batch")
-            }
-            Err(error) => error,
+            .expect(
+                "Reverse command should hand the physical stream to Portal runtime",
+            );
+        let TcpServerSetupResult::ReversePortal {
+            reverse_tag,
+            connection_success_response,
+            traffic_context,
+            ..
+        } = result
+        else {
+            panic!("Reverse command must produce a ReversePortal outcome");
         };
-        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
-        assert!(
-            error
-                .to_string()
-                .contains("Portal runtime is not implemented yet")
+        assert_eq!(reverse_tag, "reverse-out");
+        assert_eq!(
+            connection_success_response.as_deref(),
+            Some(SERVER_RESPONSE_HEADER)
+        );
+        assert_eq!(
+            traffic_context
+                .expect("Reverse VLESS traffic context")
+                .identity
+                .as_deref(),
+            Some("reverse-user")
         );
     }
 

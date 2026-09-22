@@ -169,6 +169,14 @@ impl RuntimeState {
         let (routing_events, _) = broadcast::channel(256);
         let routing = Arc::new(RoutingState::default());
         let outbounds = Arc::new(outbounds);
+        #[cfg(feature = "vless-reverse")]
+        let reverse_portals =
+            crate::handler::vless_reverse::portal::ReversePortalRegistry::new(
+                outbounds
+                    .iter()
+                    .filter(|outbound| outbound.protocol == "vless-reverse")
+                    .map(|outbound| outbound.tag.clone()),
+            );
         let data_plane = DataPlaneRuntime(Arc::new(DataPlaneState {
             inbound_manager: Arc::new(InboundManager::new(inbounds)),
             routing_publication: Arc::new(RwLock::new(Arc::new(
@@ -180,6 +188,8 @@ impl RuntimeState {
             balancer_overrides: Arc::new(RwLock::new(Arc::new(HashMap::new()))),
             routing_events,
             connection_tasks: ConnectionTaskOwner::default(),
+            #[cfg(feature = "vless-reverse")]
+            reverse_portals,
         }));
         Self {
             data_plane,

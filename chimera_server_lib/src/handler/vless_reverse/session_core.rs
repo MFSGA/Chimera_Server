@@ -213,6 +213,16 @@ impl WorkerCore {
         self.sessions.allocate()
     }
 
+    pub(crate) fn allocate_internal_session(&self) -> std::io::Result<u16> {
+        if self.phase() == WorkerPhase::Closed {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "Reverse Mux worker is closed",
+            ));
+        }
+        self.sessions.allocate()
+    }
+
     pub(crate) fn release_session(&self, session_id: u16) -> bool {
         self.sessions.release(session_id)
     }

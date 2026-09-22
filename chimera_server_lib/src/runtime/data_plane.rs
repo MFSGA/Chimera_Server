@@ -16,6 +16,15 @@ use crate::handler::shadowsocks::ShadowsocksUserStore;
 use crate::handler::trojan::TrojanUserStore;
 #[cfg(feature = "vmess")]
 use crate::handler::vmess::vmess_handler::VmessUserStore;
+#[cfg(feature = "vless-reverse")]
+use crate::{
+    address::NetLocation,
+    async_stream::AsyncStream,
+    handler::vless_reverse::{
+        portal::{PortalWorkerLease, ReversePortalRegistry},
+        session_stream::ReverseSessionStream,
+    },
+};
 use crate::{
     config::def::PolicyConfig,
     inbound::InboundManager,
@@ -97,20 +106,24 @@ pub(super) struct DataPlaneState {
     pub(super) balancer_overrides: Arc<RwLock<Arc<HashMap<String, String>>>>,
     pub(super) routing_events: broadcast::Sender<RoutingEvent>,
     pub(super) connection_tasks: ConnectionTaskOwner,
+    #[cfg(feature = "vless-reverse")]
+    pub(super) reverse_portals: ReversePortalRegistry,
 }
 
 impl std::fmt::Debug for DataPlaneState {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("DataPlaneState")
+        let mut debug = formatter.debug_struct("DataPlaneState");
+        debug
             .field("inbound_manager", &self.inbound_manager)
             .field("routing_publication", &self.routing_publication)
             .field("policy", &self.policy)
             .field("user_domain_access", &self.user_domain_access)
             .field("balancer_overrides", &self.balancer_overrides)
             .field("routing_events", &self.routing_events)
-            .field("connection_tasks", &self.connection_tasks)
-            .finish_non_exhaustive()
+            .field("connection_tasks", &self.connection_tasks);
+        #[cfg(feature = "vless-reverse")]
+        debug.field("reverse_portals", &self.reverse_portals);
+        debug.finish_non_exhaustive()
     }
 }
 
@@ -556,5 +569,25 @@ impl DataPlaneRuntime {
         observation: OutboundObservation,
     ) {
         self.0.record_passive_outbound_observation(tag, observation);
+    }
+
+    #[cfg(feature = "vless-reverse")]
+    pub(crate) async fn attach_reverse_portal(
+        &self,
+        tag: &str,
+        physical: Box<dyn AsyncStream>,
+    ) -> std::io::Result<PortalWorkerLease> {
+        self.0.reverse_portals.attach_physical(tag, physical).await
+    }
+
+    #[cfg(feature = "vless-reverse")]
+    pub(crate) fn open_reverse_tcp(
+        &self,
+        tag: &str,
+        target: NetLocation,
+        source: std::net::SocketAddr,
+        local: Option<std::net::SocketAddr>,
+    ) -> std::io::Result<ReverseSessionStream> {
+        self.0.reverse_portals.open_tcp(tag, target, source, local)
     }
 }

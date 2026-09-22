@@ -253,6 +253,13 @@ pub(super) async fn run_multi_directional_udp_with_tasks(
                             format!("TCP proxy outbound {} cannot be used for UDP", outbound.tag),
                         ));
                     }
+                    #[cfg(feature = "vless-reverse")]
+                    DirectOutboundAction::VlessReverse { tag } => {
+                        break Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("VLESS Reverse outbound {tag} is TCP-only"),
+                        ));
+                    }
                 }
             }
                 response = response_receiver.recv() => {

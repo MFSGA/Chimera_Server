@@ -572,6 +572,40 @@ where
             )
             .await
         }
+        #[cfg(feature = "vless-reverse")]
+        TcpServerSetupOutcome::ReversePortal {
+            reverse_tag,
+            mut stream,
+            connection_success_response,
+            mut traffic_context,
+        } => {
+            if let Some(context) = traffic_context.as_mut() {
+                context.client_ip = Some(peer_addr.ip());
+                runtime.apply_traffic_stats_policy(context);
+            }
+            let _connection_guard = register_connection(traffic_context.as_ref());
+            if let Some(data) = connection_success_response {
+                stream.write_all(&data).await?;
+                stream.flush().await?;
+            }
+            let lease = runtime
+                .attach_reverse_portal(&reverse_tag, stream)
+                .await
+                .map_err(|error| {
+                    std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "failed to register VLESS Reverse portal {reverse_tag}: {error}"
+                        ),
+                    )
+                })?;
+            info!(
+                reverse_tag = %reverse_tag,
+                worker_id = lease.worker_id(),
+                "registered VLESS Reverse Portal worker"
+            );
+            lease.run().await
+        }
         TcpServerSetupOutcome::Completed => Ok(()),
     }
 }

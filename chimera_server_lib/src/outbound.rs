@@ -241,6 +241,26 @@ async fn connect_planned_tcp_outbound(
     record_observation: bool,
     trojan_command: TrojanCommand,
 ) -> std::io::Result<TcpOutboundConnection> {
+    #[cfg(feature = "vless-reverse")]
+    if let TcpRoutePlan::VlessReverse {
+        target,
+        outbound_tag,
+        source_addr,
+        local_addr,
+    } = &plan
+    {
+        let stream = runtime.open_reverse_tcp(
+            outbound_tag,
+            target.clone(),
+            *source_addr,
+            *local_addr,
+        )?;
+        return Ok(TcpOutboundConnection {
+            stream: Box::new(stream),
+            outbound_tag: Some(outbound_tag.clone()),
+        });
+    }
+
     let (target_addr, outbound_tag, transport, transport_server, handshake) =
         match plan {
             TcpRoutePlan::Freedom {
@@ -278,6 +298,10 @@ async fn connect_planned_tcp_outbound(
                     Some(server),
                     TcpProtocolHandshake::Vless { target, endpoint },
                 )
+            }
+            #[cfg(feature = "vless-reverse")]
+            TcpRoutePlan::VlessReverse { .. } => {
+                unreachable!("Reverse route is handled before socket setup")
             }
             TcpRoutePlan::Trojan { target, outbound } => {
                 let transport = decode_outbound_transport(&outbound)?;
