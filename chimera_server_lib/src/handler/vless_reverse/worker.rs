@@ -35,8 +35,86 @@ const STREAM_CHUNK_SIZE: usize = 8 * 1024;
 
 #[derive(Debug)]
 enum InboundEvent {
-    Data(Bytes),
+    Data {
+        payload: Bytes,
+        target: Option<Destination>,
+    },
     End,
+}
+
+#[derive(Debug)]
+pub(crate) struct ReversePacketSession {
+    session_id: u16,
+    target: Destination,
+    source: Option<Destination>,
+    local: Option<Destination>,
+    first: bool,
+    inbound: mpsc::Receiver<InboundEvent>,
+    outbound: mpsc::Sender<Bytes>,
+    sessions: SessionRoutes,
+    core: Arc<WorkerCore>,
+}
+
+impl ReversePacketSession {
+    pub(crate) async fn send(
+        &mut self,
+        payload: Bytes,
+        target: Option<Destination>,
+    ) -> std::io::Result<()> {
+        let status = if self.first {
+            SessionStatus::New
+        } else {
+            SessionStatus::Keep
+        };
+        let frame_target = if self.first {
+            Some(self.target.clone())
+        } else {
+            target
+        };
+        let source = self.first.then(|| self.source.clone()).flatten();
+        let local = self.first.then(|| self.local.clone()).flatten();
+        send_stream_frame(
+            self.session_id,
+            status,
+            FrameOption::default().with_data(),
+            frame_target,
+            source,
+            local,
+            payload,
+            &self.outbound,
+        )
+        .await?;
+        self.first = false;
+        Ok(())
+    }
+
+    pub(crate) async fn close(&mut self) -> std::io::Result<()> {
+        if self.first {
+            return Ok(());
+        }
+        send_end_frame(self.session_id, &self.outbound).await
+    }
+
+    pub(crate) async fn recv(
+        &mut self,
+    ) -> std::io::Result<Option<(Bytes, Option<Destination>)>> {
+        match self.inbound.recv().await {
+            Some(InboundEvent::Data { payload, target }) => {
+                Ok(Some((payload, target)))
+            }
+            Some(InboundEvent::End) | None => Ok(None),
+        }
+    }
+}
+
+impl Drop for ReversePacketSession {
+    fn drop(&mut self) {
+        self.sessions
+            .lock()
+            .expect("Reverse routes lock poisoned")
+            .remove(&self.session_id);
+        self.core.release_session(self.session_id);
+    }
 }
 
 type SessionRoutes = Arc<Mutex<HashMap<u16, mpsc::Sender<InboundEvent>>>>;
@@ -166,6 +244,44 @@ impl MuxClientWorker {
         session_id: u16,
     ) -> std::io::Result<()> {
         send_end_frame(session_id, &self.outbound).await
+    }
+
+    pub(crate) fn open_packet_session(
+        &self,
+        target: Destination,
+        source: Option<Destination>,
+        local: Option<Destination>,
+    ) -> std::io::Result<ReversePacketSession> {
+        if target.network != super::mux_frame::TargetNetwork::Udp {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Reverse packet session requires a UDP target",
+            ));
+        }
+        let session_id = self.core.allocate_session()?;
+        let (inbound_tx, inbound) = mpsc::channel(INBOUND_FRAME_CAPACITY);
+        {
+            let mut sessions =
+                self.sessions.lock().expect("Reverse routes lock poisoned");
+            if sessions.insert(session_id, inbound_tx).is_some() {
+                self.core.release_session(session_id);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("duplicate Reverse Mux session id: {session_id}"),
+                ));
+            }
+        }
+        Ok(ReversePacketSession {
+            session_id,
+            target,
+            source,
+            local,
+            first: true,
+            inbound,
+            outbound: self.outbound.clone(),
+            sessions: self.sessions.clone(),
+            core: self.core.clone(),
+        })
     }
 
     pub(crate) fn open_tcp_session(
@@ -322,7 +438,10 @@ async fn run_physical_reader<R>(
                 if let Some(route) = route {
                     if frame.metadata.option.has_data()
                         && route
-                            .send(InboundEvent::Data(frame.payload))
+                            .send(InboundEvent::Data {
+                                payload: frame.payload,
+                                target: frame.metadata.target,
+                            })
                             .await
                             .is_err()
                     {
@@ -377,7 +496,7 @@ async fn run_tcp_session(
             _ = cancellation.cancelled() => break,
             event = inbound.recv() => {
                 match event {
-                    Some(InboundEvent::Data(payload)) => {
+                    Some(InboundEvent::Data { payload, .. }) => {
                         if downlink.write_all(&payload).await.is_err() {
                             break;
                         }

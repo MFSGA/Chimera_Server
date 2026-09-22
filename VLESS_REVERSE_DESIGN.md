@@ -534,7 +534,7 @@ Chimera Bridge、UDP/XUDP 与更完整的 Reverse 兼容面。每批完成并提
 - 简化 VLESS outbound 现在会编译为 Reverse Bridge startup plan，并由现有 server `service_tasks` 启动受监督 monitor；仅有 Reverse outbound、没有 inbound 的进程也属于有效 server component。
 - monitor 对齐固定 Xray：启动前等待 2 秒，之后每 2 秒清理失效 worker；没有 ACTIVE worker 或 `active_connections / active_workers > 16` 时补一个 worker。拨号失败只记录安全的 outbound tag/error 并在下一 tick 重试。
 - 物理 worker 复用现有 VLESS account、DNS/TCP dial 与 TLS client transport，发送无地址的 command `0x04` 并校验 VLESS response header；当前支持 RAW TCP 与 TLS，WS/gRPC/REALITY/其他 transport 仍 fail closed。
-- Mux server worker 按 Xray NEW/KEEP/END 处理 TCP logical session，`reverse.tag` 作为逻辑 inbound identity 重新进入现有 routing；source/local metadata 会传播给 dispatcher。`udp://reverse:0` control session 对齐 ACTIVE/DRAIN 生命周期；UDP/XUDP NEW 在 Batch G 前显式 Unsupported 并关闭物理 worker。
+- Mux server worker 按 Xray NEW/KEEP/END 处理 TCP logical session，`reverse.tag` 作为逻辑 inbound identity 重新进入现有 routing；source/local metadata 会传播给 dispatcher。`udp://reverse:0` control session 对齐 ACTIVE/DRAIN 生命周期；普通 UDP packet session 已接入既有 targeted UDP routing，非零 GlobalID 的 XUDP 重附着仍显式 Unsupported。
 - worker/monitor 由 server lifecycle 持有；物理 EOF、非法 frame 或 owner shutdown 会关闭/摘除 worker。定向测试锁定 Xray 的整数平均扩容阈值、worker Drop 关闭物理流和 TCP roundtrip。
 - 固定 Xray-core `v26.9.9` Portal 的真实互操作已验证 RAW 与 TLS：测试会先让 Chimera 首次拨号失败再启动 Xray，确认周期重试；随后重启 Xray Portal，确认 Chimera 自动建立新 worker 并再次完成 DokodemoDoor loopback echo。
 - Batch F 现已额外验证 Chimera Bridge 到 Xray Portal 的 TCP WebSocket（无 early data）；RAW/TLS 仍保持双向验证。UDP/XUDP、Reverse sniffing、动态管理和其他 transport/security 组合仍不在支持范围。
@@ -543,7 +543,9 @@ Chimera Bridge、UDP/XUDP 与更完整的 Reverse 兼容面。每批完成并提
 
 - 实现 packet session、目标覆盖、GlobalID 关联和清理。
 - 避免与现有全局 XUDP registry 形成两套竞争 owner。
-- Mux codec 已先对齐 Xray packet NEW 的 GlobalID wire 细节：携带 DATA 的 UDP NEW 即使没有可重附着 GlobalID，也固定写入 8 字节全零占位；解码时按 Xray server 语义把全零值视为“无 GlobalID”。这只属于 Batch G wire groundwork，不表示 UDP/XUDP runtime 已支持。
+- Mux codec 已先对齐 Xray packet NEW 的 GlobalID wire 细节：携带 DATA 的 UDP NEW 即使没有可重附着 GlobalID，也固定写入 8 字节全零占位；解码时按 Xray server 语义把全零值视为“无 GlobalID”。
+- Portal worker 已具备有界 packet session 原语：首包发 NEW 并传播 Reverse source/local，后续 KEEP 可携带逐包 UDP target override，响应侧也保留 target override。固定目标 DokodemoDoor UDP 已接入该 packet session：routing 可选择 `vless-reverse`，同一 client/target/tag 复用逻辑 session，双向流量受既有 UDP idle timeout 和 data-plane task owner 管理。
+- Chimera Bridge 现可处理无 GlobalID 的 Reverse Mux UDP NEW/KEEP/END；逐包 target override 进入现有 targeted UDP routing，响应 source 作为 Mux UDP target 返回。该路径已有本地 round-trip 测试，但尚未完成固定 Xray UDP 真实互操作；非零 GlobalID/XUDP 仍 fail closed，因此不表示 Batch G 已完成。
 
 ### H. Sniffing 与源地址
 

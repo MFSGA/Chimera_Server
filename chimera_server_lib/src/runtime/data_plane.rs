@@ -23,6 +23,7 @@ use crate::{
     handler::vless_reverse::{
         portal::{PortalWorkerLease, ReversePortalRegistry},
         session_stream::ReverseSessionStream,
+        worker::ReversePacketSession,
     },
 };
 use crate::{
@@ -578,6 +579,17 @@ impl DataPlaneRuntime {
         physical: Box<dyn AsyncStream>,
     ) -> std::io::Result<PortalWorkerLease> {
         self.0.reverse_portals.attach_physical(tag, physical).await
+    }
+
+    #[cfg(feature = "vless-reverse")]
+    pub(crate) fn open_reverse_udp(
+        &self,
+        tag: &str,
+        target: NetLocation,
+        source: std::net::SocketAddr,
+        local: Option<std::net::SocketAddr>,
+    ) -> std::io::Result<ReversePacketSession> {
+        self.0.reverse_portals.open_udp(tag, target, source, local)
     }
 
     #[cfg(feature = "vless-reverse")]

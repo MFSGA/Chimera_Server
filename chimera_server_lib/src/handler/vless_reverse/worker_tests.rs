@@ -29,6 +29,13 @@ fn target(port: u16) -> Destination {
     }
 }
 
+fn udp_target(address: Ipv4Addr, port: u16) -> Destination {
+    Destination {
+        network: TargetNetwork::Udp,
+        location: NetLocation::new(Address::Ipv4(address), port),
+    }
+}
+
 fn worker_with_peer(
     id: u64,
     physical_capacity: usize,
@@ -156,6 +163,83 @@ async fn tcp_session_round_trips_payload_and_xray_end_closes_both_halves() {
         .expect("logical session close must propagate")
         .expect("read logical EOF");
     assert_eq!(read, 0, "Xray Mux END closes the logical session");
+}
+
+#[tokio::test]
+async fn udp_packet_session_matches_xray_reverse_mux_packet_frames() {
+    let (worker, mut peer) = worker_with_peer(6, 4096, SessionLimits::default());
+    worker
+        .control_session_became_active()
+        .expect("activate worker");
+    let original = udp_target(Ipv4Addr::new(192, 0, 2, 53), 53);
+    let source = udp_target(Ipv4Addr::new(198, 51, 100, 7), 40_000);
+    let local = udp_target(Ipv4Addr::new(203, 0, 113, 8), 5353);
+    let mut session = worker
+        .open_packet_session(
+            original.clone(),
+            Some(source.clone()),
+            Some(local.clone()),
+        )
+        .expect("open Reverse UDP packet session");
+
+    session
+        .send(Bytes::from_static(b"query"), None)
+        .await
+        .expect("send first UDP packet");
+    let first = read_frame_with_source_and_local(&mut peer, true)
+        .await
+        .expect("read UDP NEW frame");
+    assert_eq!(first.metadata.status, SessionStatus::New);
+    assert_eq!(first.metadata.target, Some(original));
+    assert_eq!(first.metadata.source, Some(source));
+    assert_eq!(first.metadata.local, Some(local));
+    assert_eq!(first.metadata.global_id, None);
+    assert_eq!(first.payload.as_ref(), b"query");
+    let session_id = first.metadata.session_id;
+
+    let override_target = udp_target(Ipv4Addr::new(192, 0, 2, 54), 5353);
+    session
+        .send(
+            Bytes::from_static(b"query-2"),
+            Some(override_target.clone()),
+        )
+        .await
+        .expect("send UDP packet with target override");
+    let keep = read_frame(&mut peer).await.expect("read UDP KEEP frame");
+    assert_eq!(keep.metadata.status, SessionStatus::Keep);
+    assert_eq!(keep.metadata.target, Some(override_target));
+    assert_eq!(keep.payload.as_ref(), b"query-2");
+
+    let response_target = udp_target(Ipv4Addr::new(192, 0, 2, 99), 53);
+    write_remote_frame(
+        &mut peer,
+        MuxFrame {
+            metadata: FrameMetadata {
+                session_id,
+                status: SessionStatus::Keep,
+                option: FrameOption::default().with_data(),
+                target: Some(response_target.clone()),
+                source: None,
+                local: None,
+                global_id: None,
+            },
+            payload: Bytes::from_static(b"answer"),
+        },
+    )
+    .await;
+    let (payload, target) = session
+        .recv()
+        .await
+        .expect("receive UDP response")
+        .expect("UDP response event");
+    assert_eq!(payload.as_ref(), b"answer");
+    assert_eq!(target, Some(response_target));
+
+    session.close().await.expect("close UDP packet session");
+    let end = read_frame(&mut peer).await.expect("read UDP END frame");
+    assert_eq!(end.metadata.session_id, session_id);
+    assert_eq!(end.metadata.status, SessionStatus::End);
+    assert!(end.payload.is_empty());
 }
 
 #[tokio::test]

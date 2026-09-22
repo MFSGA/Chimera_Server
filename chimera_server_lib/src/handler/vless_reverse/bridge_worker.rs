@@ -36,8 +36,26 @@ const XRAY_SERVER_IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 enum InboundEvent {
-    Data(Bytes),
+    Data {
+        payload: Bytes,
+        target: Option<NetLocation>,
+    },
     End,
+}
+
+pub(crate) struct BridgeUdpRequest {
+    pub(crate) payload: Bytes,
+    pub(crate) target: NetLocation,
+}
+
+pub(crate) struct BridgeUdpResponse {
+    pub(crate) payload: Bytes,
+    pub(crate) source: SocketAddr,
+}
+
+pub(crate) struct BridgeUdpSession {
+    pub(crate) requests: mpsc::Sender<BridgeUdpRequest>,
+    pub(crate) responses: mpsc::Receiver<BridgeUdpResponse>,
 }
 
 type SessionRoutes = Arc<Mutex<HashMap<u16, mpsc::Sender<InboundEvent>>>>;
@@ -51,6 +69,13 @@ pub(crate) trait BridgeTcpDispatcher: Send + Sync {
         source: Option<SocketAddr>,
         local: Option<SocketAddr>,
     ) -> std::io::Result<Box<dyn AsyncStream>>;
+
+    async fn open_udp(
+        &self,
+        reverse_tag: &str,
+        source: Option<SocketAddr>,
+        local: Option<SocketAddr>,
+    ) -> std::io::Result<BridgeUdpSession>;
 }
 
 pub(crate) struct MuxServerWorker {
@@ -224,11 +249,24 @@ async fn handle_new_tcp(
             "Reverse Mux NEW frame is missing its target",
         )
     })?;
-    if target.network != TargetNetwork::Tcp {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "VLESS Reverse Bridge UDP/XUDP is not implemented yet",
-        ));
+    if target.network == TargetNetwork::Udp {
+        if frame.metadata.global_id.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "VLESS Reverse Bridge XUDP reattachment is not implemented yet",
+            ));
+        }
+        return handle_new_udp(
+            frame,
+            reverse_tag,
+            dispatcher,
+            sessions,
+            outbound,
+            cancellation,
+            tasks,
+            session_count,
+        )
+        .await;
     }
     if sessions
         .lock()
@@ -278,6 +316,160 @@ async fn handle_new_tcp(
         .expect("Reverse Bridge task lock poisoned")
         .push(task);
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_new_udp(
+    frame: MuxFrame,
+    reverse_tag: &str,
+    dispatcher: Arc<dyn BridgeTcpDispatcher>,
+    sessions: SessionRoutes,
+    outbound: mpsc::Sender<Bytes>,
+    cancellation: CancellationToken,
+    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    session_count: Arc<AtomicU64>,
+) -> std::io::Result<()> {
+    let target = frame.metadata.target.as_ref().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Reverse Mux UDP NEW frame is missing its target",
+        )
+    })?;
+    if sessions
+        .lock()
+        .expect("Reverse Bridge routes lock poisoned")
+        .contains_key(&frame.metadata.session_id)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "duplicate Reverse Mux session id: {}",
+                frame.metadata.session_id
+            ),
+        ));
+    }
+
+    let source = frame
+        .metadata
+        .source
+        .as_ref()
+        .and_then(destination_socket_addr);
+    let local = frame
+        .metadata
+        .local
+        .as_ref()
+        .and_then(destination_socket_addr);
+    let session = dispatcher.open_udp(reverse_tag, source, local).await?;
+    let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_FRAME_CAPACITY);
+    sessions
+        .lock()
+        .expect("Reverse Bridge routes lock poisoned")
+        .insert(frame.metadata.session_id, inbound_tx);
+    session_count.fetch_add(1, Ordering::Relaxed);
+    let task = tokio::spawn(run_udp_session(
+        frame.metadata.session_id,
+        target.location.clone(),
+        frame.payload,
+        session,
+        inbound_rx,
+        outbound,
+        sessions,
+        cancellation,
+    ));
+    tasks
+        .lock()
+        .expect("Reverse Bridge task lock poisoned")
+        .push(task);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_udp_session(
+    session_id: u16,
+    mut target: NetLocation,
+    initial_payload: Bytes,
+    mut session: BridgeUdpSession,
+    mut inbound: mpsc::Receiver<InboundEvent>,
+    outbound: mpsc::Sender<Bytes>,
+    sessions: SessionRoutes,
+    cancellation: CancellationToken,
+) {
+    if !initial_payload.is_empty()
+        && session
+            .requests
+            .send(BridgeUdpRequest {
+                payload: initial_payload,
+                target: target.clone(),
+            })
+            .await
+            .is_err()
+    {
+        let _ = send_end_frame(session_id, true, &outbound).await;
+        sessions
+            .lock()
+            .expect("Reverse Bridge routes lock poisoned")
+            .remove(&session_id);
+        return;
+    }
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => break,
+            event = inbound.recv() => {
+                match event {
+                    Some(InboundEvent::Data { payload, target: override_target }) => {
+                        if let Some(override_target) = override_target {
+                            target = override_target;
+                        }
+                        if session
+                            .requests
+                            .send(BridgeUdpRequest {
+                                payload,
+                                target: target.clone(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            let _ = send_end_frame(session_id, true, &outbound).await;
+                            break;
+                        }
+                    }
+                    Some(InboundEvent::End) | None => break,
+                }
+            }
+            response = session.responses.recv() => {
+                let Some(response) = response else {
+                    let _ = send_end_frame(session_id, false, &outbound).await;
+                    break;
+                };
+                let response_target = Destination {
+                    network: TargetNetwork::Udp,
+                    location: NetLocation::from_ip_addr(
+                        response.source.ip(),
+                        response.source.port(),
+                    ),
+                };
+                if send_frame(
+                    session_id,
+                    SessionStatus::Keep,
+                    FrameOption::default().with_data(),
+                    Some(response_target),
+                    response.payload,
+                    &outbound,
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
+    sessions
+        .lock()
+        .expect("Reverse Bridge routes lock poisoned")
+        .remove(&session_id);
 }
 
 async fn run_idle_monitor(
@@ -334,7 +526,10 @@ async fn forward_keep(
     if let Some(route) = route {
         if frame.metadata.option.has_data() {
             route
-                .send(InboundEvent::Data(frame.payload))
+                .send(InboundEvent::Data {
+                    payload: frame.payload,
+                    target: frame.metadata.target.map(|target| target.location),
+                })
                 .await
                 .map_err(|_| {
                     std::io::Error::new(
@@ -386,7 +581,7 @@ async fn run_tcp_session(
             _ = cancellation.cancelled() => break,
             event = inbound.recv() => {
                 match event {
-                    Some(InboundEvent::Data(payload)) => {
+                    Some(InboundEvent::Data { payload, .. }) => {
                         if remote_write.write_all(&payload).await.is_err() {
                             break;
                         }
@@ -469,6 +664,7 @@ async fn send_keep_frame(
         session_id,
         SessionStatus::Keep,
         FrameOption::default().with_data(),
+        None,
         payload,
         outbound,
     )
@@ -489,6 +685,7 @@ async fn send_end_frame(
         session_id,
         SessionStatus::End,
         option,
+        None,
         Bytes::new(),
         outbound,
     )
@@ -499,6 +696,7 @@ async fn send_frame(
     session_id: u16,
     status: SessionStatus,
     option: FrameOption,
+    target: Option<Destination>,
     payload: Bytes,
     outbound: &mpsc::Sender<Bytes>,
 ) -> std::io::Result<()> {
@@ -507,7 +705,7 @@ async fn send_frame(
             session_id,
             status,
             option,
-            target: None,
+            target,
             source: None,
             local: None,
             global_id: None,

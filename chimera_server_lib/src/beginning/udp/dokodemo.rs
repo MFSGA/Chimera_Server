@@ -36,9 +36,19 @@ use super::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum UdpOutboundAction {
-    Freedom { tag: Option<String> },
-    Blackhole { tag: String },
-    Trojan { outbound: OutboundSummary },
+    Freedom {
+        tag: Option<String>,
+    },
+    Blackhole {
+        tag: String,
+    },
+    Trojan {
+        outbound: OutboundSummary,
+    },
+    #[cfg(feature = "vless-reverse")]
+    VlessReverse {
+        tag: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -70,6 +80,8 @@ struct UdpRelayState {
     #[cfg(feature = "trojan")]
     trojan_sessions:
         Mutex<HashMap<DokodemoTrojanUdpSessionKey, mpsc::Sender<Vec<u8>>>>,
+    #[cfg(feature = "vless-reverse")]
+    reverse_sessions: Mutex<HashMap<UdpSessionKey, mpsc::Sender<Vec<u8>>>>,
 }
 
 impl UdpRelayState {
@@ -79,6 +91,8 @@ impl UdpRelayState {
             sessions: Mutex::new(HashMap::new()),
             #[cfg(feature = "trojan")]
             trojan_sessions: Mutex::new(HashMap::new()),
+            #[cfg(feature = "vless-reverse")]
+            reverse_sessions: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -223,6 +237,29 @@ async fn relay_dokodemo_udp_datagram(
                 )
             })
         }
+        #[cfg(feature = "vless-reverse")]
+        UdpOutboundAction::VlessReverse { tag } => {
+            let key = UdpSessionKey {
+                client_addr,
+                target_addr,
+                outbound_tag: Some(tag.clone()),
+            };
+            let sender = reverse_udp_session_sender(
+                relay_state,
+                key,
+                target_location,
+                tag.clone(),
+                traffic_context.with_outbound_tag(tag),
+                &runtime,
+            )
+            .await?;
+            sender.send(payload).await.map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "dokodemo-door Reverse UDP session closed before payload was sent",
+                )
+            })
+        }
         UdpOutboundAction::Trojan { outbound } => {
             #[cfg(feature = "trojan")]
             {
@@ -260,6 +297,105 @@ async fn relay_dokodemo_udp_datagram(
             }
         }
     }
+}
+
+#[cfg(feature = "vless-reverse")]
+async fn reverse_udp_session_sender(
+    relay_state: Arc<UdpRelayState>,
+    key: UdpSessionKey,
+    target: NetLocation,
+    tag: String,
+    traffic_context: TrafficContext,
+    runtime: &DataPlaneRuntime,
+) -> std::io::Result<mpsc::Sender<Vec<u8>>> {
+    if let Some(sender) = relay_state
+        .reverse_sessions
+        .lock()
+        .await
+        .get(&key)
+        .filter(|sender| !sender.is_closed())
+        .cloned()
+    {
+        return Ok(sender);
+    }
+
+    let session = runtime.open_reverse_udp(
+        &tag,
+        target.clone(),
+        key.client_addr,
+        relay_state.server_socket.local_addr().ok(),
+    )?;
+    let (sender, receiver) = mpsc::channel(UDP_SESSION_CHANNEL_CAPACITY);
+    let mut sessions = relay_state.reverse_sessions.lock().await;
+    if let Some(existing) = sessions
+        .get(&key)
+        .filter(|sender| !sender.is_closed())
+        .cloned()
+    {
+        return Ok(existing);
+    }
+    sessions.insert(key.clone(), sender.clone());
+    drop(sessions);
+
+    runtime.spawn_inbound_connection(run_reverse_udp_session(
+        relay_state,
+        key,
+        target,
+        tag,
+        traffic_context,
+        session,
+        receiver,
+    ));
+    Ok(sender)
+}
+
+#[cfg(feature = "vless-reverse")]
+async fn run_reverse_udp_session(
+    relay_state: Arc<UdpRelayState>,
+    key: UdpSessionKey,
+    target: NetLocation,
+    tag: String,
+    traffic_context: TrafficContext,
+    mut session: crate::handler::vless_reverse::worker::ReversePacketSession,
+    mut receiver: mpsc::Receiver<Vec<u8>>,
+) {
+    let mut idle = Box::pin(sleep(UDP_SESSION_IDLE_TIMEOUT));
+    loop {
+        tokio::select! {
+            _ = idle.as_mut() => break,
+            maybe_payload = receiver.recv() => {
+                let Some(payload) = maybe_payload else { break; };
+                if let Err(error) = session.send(payload.clone().into(), None).await {
+                    debug!("dokodemo-door Reverse UDP send {} -> {} via {} failed: {}", key.client_addr, target, tag, error);
+                    break;
+                }
+                record_transfer_ref(Some(&traffic_context), payload.len() as u64, 0);
+                idle.as_mut().reset(Instant::now() + UDP_SESSION_IDLE_TIMEOUT);
+            }
+            response = session.recv() => {
+                let (payload, _target_override) = match response {
+                    Ok(Some(response)) => response,
+                    Ok(None) => break,
+                    Err(error) => {
+                        debug!("dokodemo-door Reverse UDP receive from {} via {} failed: {}", target, tag, error);
+                        break;
+                    }
+                };
+                match relay_state.server_socket.send_to(&payload, key.client_addr).await {
+                    Ok(sent) => {
+                        record_transfer_ref(Some(&traffic_context), 0, sent as u64);
+                        idle.as_mut().reset(Instant::now() + UDP_SESSION_IDLE_TIMEOUT);
+                    }
+                    Err(error) => {
+                        debug!("dokodemo-door Reverse UDP response to {} via {} failed: {}", key.client_addr, tag, error);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let _ = session.close().await;
+    relay_state.reverse_sessions.lock().await.remove(&key);
 }
 
 #[cfg(feature = "trojan")]
@@ -598,6 +734,8 @@ pub(super) async fn select_udp_outbound(
         }),
         "blackhole" => Ok(UdpOutboundAction::Blackhole { tag: outbound.tag }),
         "trojan" => Ok(UdpOutboundAction::Trojan { outbound }),
+        #[cfg(feature = "vless-reverse")]
+        "vless-reverse" => Ok(UdpOutboundAction::VlessReverse { tag: outbound.tag }),
         protocol => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(

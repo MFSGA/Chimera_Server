@@ -521,7 +521,10 @@ fn classify_selected_outbound(
             Ok(DirectOutboundAction::Vless { outbound })
         }
         #[cfg(feature = "vless-reverse")]
-        "vless-reverse" if network_name.eq_ignore_ascii_case("tcp") => {
+        "vless-reverse"
+            if network_name.eq_ignore_ascii_case("tcp")
+                || network_name.eq_ignore_ascii_case("udp") =>
+        {
             Ok(DirectOutboundAction::VlessReverse { tag: outbound.tag })
         }
         "trojan"

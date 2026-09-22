@@ -23,7 +23,10 @@ use crate::{
     },
 };
 
-use super::{BridgeTcpDispatcher, MuxServerWorker, idle_snapshot_is_unchanged};
+use super::{
+    BridgeTcpDispatcher, BridgeUdpResponse, BridgeUdpSession, MuxServerWorker,
+    idle_snapshot_is_unchanged,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DispatchCall {
@@ -79,6 +82,39 @@ impl BridgeTcpDispatcher for FakeDispatcher {
             .take()
             .ok_or_else(|| std::io::Error::other("fake stream already consumed"))?;
         Ok(Box::new(ReverseSessionStream::new(stream)))
+    }
+
+    async fn open_udp(
+        &self,
+        _reverse_tag: &str,
+        _source: Option<SocketAddr>,
+        _local: Option<SocketAddr>,
+    ) -> std::io::Result<BridgeUdpSession> {
+        let (requests, mut request_rx) =
+            tokio::sync::mpsc::channel::<super::BridgeUdpRequest>(16);
+        let (response_tx, responses) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(async move {
+            while let Some(request) = request_rx.recv().await {
+                let Some(source) = request.target.to_socket_addr_nonblocking()
+                else {
+                    continue;
+                };
+                if response_tx
+                    .send(BridgeUdpResponse {
+                        payload: request.payload,
+                        source,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Ok(BridgeUdpSession {
+            requests,
+            responses,
+        })
     }
 }
 
@@ -181,7 +217,92 @@ async fn mux_server_routes_tcp_with_reverse_context_and_round_trips_frames() {
 }
 
 #[tokio::test]
-async fn mux_server_rejects_udp_until_xudp_batch() {
+async fn mux_server_routes_udp_packets_and_target_overrides() {
+    let (physical, mut portal) = duplex(16 * 1024);
+    let (local, _local_peer) = duplex(4096);
+    let dispatcher = Arc::new(FakeDispatcher::new(local));
+    let worker = MuxServerWorker::new(
+        Box::new(ReverseSessionStream::new(physical)),
+        "bridge-in".to_string(),
+        dispatcher,
+    );
+
+    for (status, target, payload) in [
+        (SessionStatus::New, 5300, b"one".as_slice()),
+        (SessionStatus::Keep, 5301, b"two".as_slice()),
+    ] {
+        portal
+            .write_all(
+                &encode_frame(&MuxFrame {
+                    metadata: FrameMetadata {
+                        session_id: 8,
+                        status,
+                        option: FrameOption::default().with_data(),
+                        target: Some(Destination {
+                            network: TargetNetwork::Udp,
+                            location: NetLocation::new(
+                                Address::Ipv4(Ipv4Addr::LOCALHOST),
+                                target,
+                            ),
+                        }),
+                        source: None,
+                        local: None,
+                        global_id: None,
+                    },
+                    payload: Bytes::copy_from_slice(payload),
+                })
+                .expect("encode UDP Reverse packet"),
+            )
+            .await
+            .expect("write UDP Reverse packet");
+
+        let response = timeout(Duration::from_secs(1), read_frame(&mut portal))
+            .await
+            .expect("Bridge emitted UDP response")
+            .expect("read UDP response");
+        assert_eq!(response.metadata.session_id, 8);
+        assert_eq!(response.metadata.status, SessionStatus::Keep);
+        assert_eq!(response.payload.as_ref(), payload);
+        assert_eq!(
+            response
+                .metadata
+                .target
+                .expect("UDP response source target")
+                .location,
+            NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), target)
+        );
+    }
+
+    portal
+        .write_all(
+            &encode_frame(&MuxFrame {
+                metadata: FrameMetadata {
+                    session_id: 8,
+                    status: SessionStatus::End,
+                    option: FrameOption::default(),
+                    target: None,
+                    source: None,
+                    local: None,
+                    global_id: None,
+                },
+                payload: Bytes::new(),
+            })
+            .expect("encode UDP Reverse END"),
+        )
+        .await
+        .expect("write UDP Reverse END");
+
+    timeout(Duration::from_secs(1), async {
+        while worker.active_connections() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("UDP logical session is removed after END");
+}
+
+#[tokio::test]
+async fn mux_server_rejects_xudp_until_reattachment_is_implemented() {
     let (physical, mut portal) = duplex(4096);
     let (local, _local_peer) = duplex(4096);
     let dispatcher = Arc::new(FakeDispatcher::new(local));
@@ -193,27 +314,27 @@ async fn mux_server_rejects_udp_until_xudp_batch() {
 
     let request = MuxFrame {
         metadata: FrameMetadata {
-            session_id: 8,
+            session_id: 9,
             status: SessionStatus::New,
-            option: FrameOption::default(),
+            option: FrameOption::default().with_data(),
             target: Some(Destination {
                 network: TargetNetwork::Udp,
                 location: NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 53),
             }),
             source: None,
             local: None,
-            global_id: None,
+            global_id: Some([1, 2, 3, 4, 5, 6, 7, 8]),
         },
-        payload: Bytes::new(),
+        payload: Bytes::from_static(b"dns"),
     };
     portal
-        .write_all(&encode_frame(&request).expect("encode UDP Reverse NEW"))
+        .write_all(&encode_frame(&request).expect("encode XUDP Reverse NEW"))
         .await
-        .expect("write UDP Reverse NEW");
+        .expect("write XUDP Reverse NEW");
 
     timeout(Duration::from_secs(1), worker.wait_closed())
         .await
-        .expect("unsupported UDP frame closes the physical worker");
+        .expect("unsupported XUDP frame closes the physical worker");
     assert!(worker.closed());
 }
 

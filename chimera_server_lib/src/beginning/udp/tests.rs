@@ -3141,6 +3141,31 @@ async fn udp_routing_defaults_to_first_outbound() {
     );
 }
 
+#[cfg(feature = "vless-reverse")]
+#[tokio::test]
+async fn udp_routing_selects_vless_reverse_outbound() {
+    let runtime =
+        runtime_with_outbounds(vec![outbound("reverse-out", "vless-reverse")]);
+
+    let action = select_udp_outbound(
+        &runtime.data_plane(),
+        "dokodemo-udp",
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 12345)),
+        None,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 53)),
+        &NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::LOCALHOST), 53),
+    )
+    .await
+    .expect("Reverse UDP outbound selection should succeed");
+
+    assert_eq!(
+        action,
+        UdpOutboundAction::VlessReverse {
+            tag: "reverse-out".into()
+        }
+    );
+}
+
 #[tokio::test]
 async fn udp_routing_rejects_missing_routed_outbound() {
     let runtime = runtime_with_outbounds(vec![outbound("direct", "freedom")]);

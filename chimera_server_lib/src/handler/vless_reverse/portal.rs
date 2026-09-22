@@ -23,7 +23,7 @@ use super::{
     mux_frame::{Destination, SessionStatus, TargetNetwork},
     session_core::SessionLimits,
     session_stream::ReverseSessionStream,
-    worker::{MuxClientPicker, MuxClientWorker},
+    worker::{MuxClientPicker, MuxClientWorker, ReversePacketSession},
 };
 
 const CONTROL_HEARTBEAT_TICK: Duration = Duration::from_secs(2);
@@ -110,6 +110,36 @@ impl ReversePortalRegistry {
             control,
             control_session_id: Some(control_session_id),
         })
+    }
+
+    pub(crate) fn open_udp(
+        &self,
+        tag: &str,
+        target: NetLocation,
+        source: SocketAddr,
+        local: Option<SocketAddr>,
+    ) -> std::io::Result<ReversePacketSession> {
+        let entry = self
+            .entries
+            .lock()
+            .expect("Reverse portal registry lock poisoned")
+            .get(tag)
+            .cloned()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("VLESS Reverse portal tag {tag} is not configured"),
+                )
+            })?;
+        let worker = entry.picker.pick_available()?;
+        worker.open_packet_session(
+            Destination {
+                network: TargetNetwork::Udp,
+                location: target,
+            },
+            Some(udp_socket_destination(source)),
+            local.map(udp_socket_destination),
+        )
     }
 
     pub(crate) fn open_tcp(
@@ -263,6 +293,17 @@ fn random_control_padding() -> Vec<u8> {
 }
 
 fn socket_destination(address: SocketAddr) -> Destination {
+    socket_destination_with_network(address, TargetNetwork::Tcp)
+}
+
+fn udp_socket_destination(address: SocketAddr) -> Destination {
+    socket_destination_with_network(address, TargetNetwork::Udp)
+}
+
+fn socket_destination_with_network(
+    address: SocketAddr,
+    network: TargetNetwork,
+) -> Destination {
     let net_location = match address {
         SocketAddr::V4(address) => {
             NetLocation::new(Address::Ipv4(*address.ip()), address.port())
@@ -272,7 +313,7 @@ fn socket_destination(address: SocketAddr) -> Destination {
         }
     };
     Destination {
-        network: TargetNetwork::Tcp,
+        network,
         location: net_location,
     }
 }
