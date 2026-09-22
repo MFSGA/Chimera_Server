@@ -29,6 +29,7 @@ const REVERSE_READY_TIMEOUT: Duration = Duration::from_secs(12);
 enum ReverseSecurity {
     Raw,
     Tls,
+    Websocket,
 }
 
 impl ReverseSecurity {
@@ -36,6 +37,7 @@ impl ReverseSecurity {
         match self {
             Self::Raw => "raw",
             Self::Tls => "tls",
+            Self::Websocket => "websocket",
         }
     }
 }
@@ -58,6 +60,11 @@ fn chimera_bridge_round_trips_public_xray_portal_over_raw_vless_reverse() {
 #[test]
 fn chimera_bridge_round_trips_public_xray_portal_over_tls_vless_reverse() {
     run_chimera_bridge_interop(ReverseSecurity::Tls);
+}
+
+#[test]
+fn chimera_bridge_round_trips_public_xray_portal_over_websocket_vless_reverse() {
+    run_chimera_bridge_interop(ReverseSecurity::Websocket);
 }
 
 fn run_chimera_bridge_interop(security: ReverseSecurity) {
@@ -115,6 +122,18 @@ fn run_chimera_bridge_interop(security: ReverseSecurity) {
                 }),
             )
         }
+        ReverseSecurity::Websocket => (
+            json!({
+                "network": "ws",
+                "security": "none",
+                "wsSettings": {"path": "/reverse"}
+            }),
+            json!({
+                "network": "ws",
+                "security": "none",
+                "wsSettings": {"path": "/reverse"}
+            }),
+        ),
     };
 
     write_json(
@@ -301,6 +320,9 @@ fn run_reverse_interop(security: ReverseSecurity) {
                     }
                 }),
             )
+        }
+        ReverseSecurity::Websocket => {
+            unreachable!("Portal-side WebSocket is not exercised here")
         }
     };
 

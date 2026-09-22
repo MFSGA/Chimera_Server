@@ -203,10 +203,35 @@ pub(crate) fn prepare_vless_reverse_bridge(
                 ))
             }
         }
+        OutboundTransport::Websocket { tls, settings } => {
+            if settings.ed != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "VLESS Reverse Bridge WebSocket early data is not implemented yet",
+                ));
+            }
+            #[cfg(not(feature = "ws"))]
+            {
+                let _ = (tls, settings);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "VLESS Reverse Bridge WebSocket requires the ws feature",
+                ));
+            }
+            #[cfg(feature = "ws")]
+            if tls.is_some() && !cfg!(feature = "tls") {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "VLESS Reverse Bridge WebSocket TLS requires the tls feature",
+                ));
+            }
+            #[cfg(feature = "ws")]
+            Ok(Some(endpoint))
+        }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             format!(
-                "VLESS Reverse Bridge outbound {} currently supports only RAW TCP or TLS",
+                "VLESS Reverse Bridge outbound {} uses an unsupported transport/security combination",
                 outbound.tag
             ),
         )),
@@ -243,6 +268,64 @@ pub(crate) async fn connect_vless_reverse_bridge(
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     "VLESS Reverse Bridge TLS requires the tls feature",
+                ));
+            }
+        }
+        OutboundTransport::Websocket { tls, settings } => {
+            if settings.ed != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "VLESS Reverse Bridge WebSocket early data is not implemented yet",
+                ));
+            }
+            #[cfg(feature = "ws")]
+            {
+                let tls_server_name = tls
+                    .as_ref()
+                    .map(|settings| settings.server_name.trim())
+                    .filter(|server_name| !server_name.is_empty())
+                    .map(str::to_string);
+                let base_stream: Box<dyn AsyncStream> = match tls {
+                    None => Box::new(raw_stream),
+                    Some(settings) => {
+                        #[cfg(feature = "tls")]
+                        {
+                            Box::new(
+                                connect_tls_transport(
+                                    raw_stream,
+                                    &settings,
+                                    &endpoint.server,
+                                )
+                                .await?,
+                            )
+                        }
+                        #[cfg(not(feature = "tls"))]
+                        {
+                            let _ = (raw_stream, settings);
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Unsupported,
+                                "VLESS Reverse Bridge WebSocket TLS requires the tls feature",
+                            ));
+                        }
+                    }
+                };
+                Box::new(
+                    connect_websocket_transport(
+                        base_stream,
+                        &settings,
+                        &endpoint.server,
+                        tls_server_name.as_deref(),
+                        None,
+                    )
+                    .await?,
+                )
+            }
+            #[cfg(not(feature = "ws"))]
+            {
+                let _ = (raw_stream, tls, settings);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "VLESS Reverse Bridge WebSocket requires the ws feature",
                 ));
             }
         }

@@ -1,7 +1,11 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -10,6 +14,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, split},
     sync::mpsc,
     task::JoinHandle,
+    time::sleep,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -26,6 +31,8 @@ use super::{
 const OUTBOUND_FRAME_CAPACITY: usize = 16;
 const INBOUND_FRAME_CAPACITY: usize = 16;
 const STREAM_CHUNK_SIZE: usize = 8 * 1024;
+// Xray common/mux.ServerWorker checks for an idle server-side Mux once per minute.
+const XRAY_SERVER_IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 enum InboundEvent {
@@ -63,6 +70,7 @@ impl MuxServerWorker {
         let sessions = Arc::new(Mutex::new(HashMap::new()));
         let cancellation = CancellationToken::new();
         let tasks = Arc::new(Mutex::new(Vec::new()));
+        let session_count = Arc::new(AtomicU64::new(0));
         let (outbound, outbound_rx) = mpsc::channel(OUTBOUND_FRAME_CAPACITY);
         let (reader, writer) = split(physical);
 
@@ -75,6 +83,7 @@ impl MuxServerWorker {
             control.clone(),
             cancellation.clone(),
             tasks.clone(),
+            session_count.clone(),
         ));
         let writer_task = tokio::spawn(run_physical_writer(
             writer,
@@ -82,10 +91,15 @@ impl MuxServerWorker {
             control.clone(),
             cancellation.clone(),
         ));
+        let monitor_task = tokio::spawn(run_idle_monitor(
+            sessions.clone(),
+            session_count,
+            cancellation.clone(),
+        ));
         tasks
             .lock()
             .expect("Reverse Bridge task lock poisoned")
-            .extend([reader_task, writer_task]);
+            .extend([reader_task, writer_task, monitor_task]);
 
         Self {
             control,
@@ -145,6 +159,7 @@ async fn run_physical_reader<R>(
     control: Arc<BridgeControlState>,
     cancellation: CancellationToken,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    session_count: Arc<AtomicU64>,
 ) where
     R: AsyncRead + Unpin,
 {
@@ -173,6 +188,7 @@ async fn run_physical_reader<R>(
                     outbound.clone(),
                     cancellation.clone(),
                     tasks.clone(),
+                    session_count.clone(),
                 )
                 .await
             }
@@ -200,6 +216,7 @@ async fn handle_new_tcp(
     outbound: mpsc::Sender<Bytes>,
     cancellation: CancellationToken,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    session_count: Arc<AtomicU64>,
 ) -> std::io::Result<()> {
     let target = frame.metadata.target.as_ref().ok_or_else(|| {
         std::io::Error::new(
@@ -246,6 +263,7 @@ async fn handle_new_tcp(
         .lock()
         .expect("Reverse Bridge routes lock poisoned")
         .insert(frame.metadata.session_id, inbound_tx);
+    session_count.fetch_add(1, Ordering::Relaxed);
     let task = tokio::spawn(run_tcp_session(
         frame.metadata.session_id,
         stream,
@@ -260,6 +278,47 @@ async fn handle_new_tcp(
         .expect("Reverse Bridge task lock poisoned")
         .push(task);
     Ok(())
+}
+
+async fn run_idle_monitor(
+    sessions: SessionRoutes,
+    session_count: Arc<AtomicU64>,
+    cancellation: CancellationToken,
+) {
+    loop {
+        let check_size = sessions
+            .lock()
+            .expect("Reverse Bridge routes lock poisoned")
+            .len();
+        let check_count = session_count.load(Ordering::Relaxed);
+        tokio::select! {
+            _ = cancellation.cancelled() => return,
+            _ = sleep(XRAY_SERVER_IDLE_CHECK_INTERVAL) => {}
+        }
+        let current_size = sessions
+            .lock()
+            .expect("Reverse Bridge routes lock poisoned")
+            .len();
+        let current_count = session_count.load(Ordering::Relaxed);
+        if idle_snapshot_is_unchanged(
+            check_size,
+            check_count,
+            current_size,
+            current_count,
+        ) {
+            cancellation.cancel();
+            return;
+        }
+    }
+}
+
+fn idle_snapshot_is_unchanged(
+    check_size: usize,
+    check_count: u64,
+    current_size: usize,
+    current_count: u64,
+) -> bool {
+    current_size == 0 && check_size == 0 && current_count == check_count
 }
 
 async fn forward_keep(

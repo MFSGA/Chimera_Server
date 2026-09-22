@@ -23,7 +23,7 @@ use crate::{
     },
 };
 
-use super::{BridgeTcpDispatcher, MuxServerWorker};
+use super::{BridgeTcpDispatcher, MuxServerWorker, idle_snapshot_is_unchanged};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DispatchCall {
@@ -215,6 +215,14 @@ async fn mux_server_rejects_udp_until_xudp_batch() {
         .await
         .expect("unsupported UDP frame closes the physical worker");
     assert!(worker.closed());
+}
+
+#[test]
+fn mux_server_idle_check_matches_xray_two_snapshot_rule() {
+    assert!(idle_snapshot_is_unchanged(0, 7, 0, 7));
+    assert!(!idle_snapshot_is_unchanged(1, 7, 0, 7));
+    assert!(!idle_snapshot_is_unchanged(0, 7, 1, 8));
+    assert!(!idle_snapshot_is_unchanged(0, 7, 0, 8));
 }
 
 #[tokio::test]

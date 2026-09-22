@@ -126,6 +126,25 @@ mod tests {
         assert!(should_add_worker(2, 34));
     }
 
+    fn reverse_outbound_with_stream_settings(
+        stream_settings: serde_json::Value,
+    ) -> OutboundSummary {
+        let item: OutboundItem = serde_json::from_value(serde_json::json!({
+            "tag": "reverse",
+            "protocol": "vless",
+            "settings": {
+                "address": "127.0.0.1",
+                "port": 443,
+                "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+                "encryption": "none",
+                "reverse": {"tag": "bridge-in"}
+            },
+            "streamSettings": stream_settings
+        }))
+        .expect("parse Reverse Bridge outbound");
+        compile_static_outbound(&item).expect("compile Reverse Bridge outbound")
+    }
+
     #[test]
     fn plan_collection_finds_only_reverse_vless_outbounds() {
         let reverse_item: OutboundItem = serde_json::from_value(serde_json::json!({
@@ -159,5 +178,29 @@ mod tests {
             plans[0].endpoint.server.address(),
             &Address::Ipv4(std::net::Ipv4Addr::LOCALHOST)
         );
+    }
+
+    #[cfg(feature = "ws")]
+    #[test]
+    fn plan_accepts_websocket_without_early_data() {
+        let outbound = reverse_outbound_with_stream_settings(serde_json::json!({
+            "network": "ws",
+            "wsSettings": {"path": "/reverse"}
+        }));
+        let plans = prepare_reverse_bridge_plans(&[outbound])
+            .expect("WebSocket Reverse Bridge should be supported");
+        assert_eq!(plans.len(), 1);
+    }
+
+    #[cfg(feature = "ws")]
+    #[test]
+    fn plan_rejects_websocket_early_data_until_handshake_can_carry_it() {
+        let outbound = reverse_outbound_with_stream_settings(serde_json::json!({
+            "network": "ws",
+            "wsSettings": {"path": "/reverse?ed=64"}
+        }));
+        let error = prepare_reverse_bridge_plans(&[outbound])
+            .expect_err("WebSocket early data must fail closed");
+        assert!(error.to_string().contains("early data"));
     }
 }

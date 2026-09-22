@@ -537,7 +537,7 @@ Chimera Bridge、UDP/XUDP 与更完整的 Reverse 兼容面。每批完成并提
 - Mux server worker 按 Xray NEW/KEEP/END 处理 TCP logical session，`reverse.tag` 作为逻辑 inbound identity 重新进入现有 routing；source/local metadata 会传播给 dispatcher。`udp://reverse:0` control session 对齐 ACTIVE/DRAIN 生命周期；UDP/XUDP NEW 在 Batch G 前显式 Unsupported 并关闭物理 worker。
 - worker/monitor 由 server lifecycle 持有；物理 EOF、非法 frame 或 owner shutdown 会关闭/摘除 worker。定向测试锁定 Xray 的整数平均扩容阈值、worker Drop 关闭物理流和 TCP roundtrip。
 - 固定 Xray-core `v26.9.9` Portal 的真实互操作已验证 RAW 与 TLS：测试会先让 Chimera 首次拨号失败再启动 Xray，确认周期重试；随后重启 Xray Portal，确认 Chimera 自动建立新 worker 并再次完成 DokodemoDoor loopback echo。
-- 因此 Batch F 只声明 **Chimera Bridge + Xray Portal + TCP + RAW/TLS**；UDP/XUDP、Reverse sniffing、动态管理和其他 transport/security 组合仍不在支持范围。
+- Batch F 现已额外验证 Chimera Bridge 到 Xray Portal 的 TCP WebSocket（无 early data）；RAW/TLS 仍保持双向验证。UDP/XUDP、Reverse sniffing、动态管理和其他 transport/security 组合仍不在支持范围。
 
 ### G. UDP/XUDP
 
