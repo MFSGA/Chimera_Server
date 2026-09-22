@@ -639,6 +639,7 @@ fn encode_static_vless_config(
         id: user.id,
         flow: user.flow,
         encryption: user.encryption,
+        reverse: None,
     };
     Ok(VlessClientConfigPayload {
         vnext: Some(SocksServerEndpointPayload {

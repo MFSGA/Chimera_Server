@@ -166,6 +166,32 @@ pub(super) fn decode_vless_outbound(
                 format!("invalid VLESS outbound {} account: {error}", outbound.tag),
             )
         })?;
+
+    if let Some(reverse) = account.reverse.as_ref() {
+        #[cfg(not(feature = "vless-reverse"))]
+        {
+            let _ = (&reverse.tag, &reverse.sniffing);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "VLESS outbound reverse requires the vless-reverse feature",
+            ));
+        }
+
+        #[cfg(feature = "vless-reverse")]
+        {
+            if reverse.tag.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "VLESS outbound reverse tag cannot be empty",
+                ));
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Chimera VLESS Reverse Bridge role is not implemented yet",
+            ));
+        }
+    }
+
     if !account.flow.trim().is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,

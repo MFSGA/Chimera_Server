@@ -847,6 +847,53 @@ fn static_vless_outbound_compiles_xray_short_form_and_rejects_transport_downgrad
     assert!(error.contains("refusing to downgrade transport security"));
 }
 
+#[cfg(feature = "vless-reverse")]
+#[test]
+fn encoded_vless_reverse_account_cannot_downgrade_to_forward_outbound() {
+    let account = VlessAccountPayload {
+        id: "3ac9b383-75a1-431c-8184-106c80eb2273".into(),
+        flow: String::new(),
+        encryption: "none".into(),
+        reverse: Some(VlessReversePayload {
+            tag: "reverse-in".into(),
+            sniffing: None,
+        }),
+    };
+    let config = VlessClientConfigPayload {
+        vnext: Some(SocksServerEndpointPayload {
+            address: Some(IpOrDomainPayload {
+                address: Some(ip_or_domain_payload::Address::Ip(vec![127, 0, 0, 1])),
+            }),
+            port: 1234,
+            user: Some(OutboundUserPayload {
+                level: 0,
+                email: "reverse@example.test".into(),
+                account: Some(TypedMessagePayload {
+                    r#type: TYPE_PROXY_VLESS_ACCOUNT.into(),
+                    value: account.encode_to_vec(),
+                }),
+            }),
+        }),
+    };
+    let outbound = OutboundSummary {
+        tag: "reverse-out".into(),
+        protocol: "vless".into(),
+        proxy_settings_type: Some(TYPE_PROXY_VLESS_CLIENT_CONFIG.into()),
+        proxy_settings_value: Some(config.encode_to_vec()),
+        sender_settings_type: None,
+        sender_settings_value: None,
+    };
+
+    let error = decode_vless_outbound(&outbound)
+        .expect_err("Reverse account must not become a normal VLESS outbound");
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert!(
+        error
+            .to_string()
+            .contains("Reverse Bridge role is not implemented")
+    );
+}
+
 #[cfg(all(feature = "vless", not(feature = "vless-reverse")))]
 #[test]
 fn static_vless_reverse_requires_feature() {

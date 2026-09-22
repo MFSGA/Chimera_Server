@@ -220,6 +220,7 @@ fn handler_accepts_raw_vless_outbound_and_rejects_dynamic_transport() {
                         id: "3ac9b383-75a1-431c-8184-106c80eb2273".into(),
                         flow: String::new(),
                         encryption: "none".into(),
+                        reverse: None,
                     }
                     .encode_to_vec(),
                 }),
@@ -255,6 +256,98 @@ fn handler_accepts_raw_vless_outbound_and_rejects_dynamic_transport() {
         })
         .expect_err("dynamic VLESS transport must fail closed");
     assert_eq!(error.code(), Code::Unimplemented);
+}
+
+#[cfg(feature = "vless-reverse")]
+#[test]
+fn handler_rejects_dynamic_vless_reverse_until_bridge_runtime_exists() {
+    let service = HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+    let config = VlessOutboundConfigPayload {
+        vnext: Some(SocksServerEndpointPayload {
+            address: Some(localhost_ip_payload()),
+            port: 1234,
+            user: Some(proto::xray::common::protocol::User {
+                level: 0,
+                email: "reverse@example.test".into(),
+                account: Some(proto::xray::common::serial::TypedMessage {
+                    r#type: TYPE_PROXY_VLESS_ACCOUNT.to_string(),
+                    value: VlessOutboundAccountPayload {
+                        id: "3ac9b383-75a1-431c-8184-106c80eb2273".into(),
+                        flow: String::new(),
+                        encryption: "none".into(),
+                        reverse: Some(VlessReversePayload {
+                            tag: "reverse-in".into(),
+                            sniffing: None,
+                        }),
+                    }
+                    .encode_to_vec(),
+                }),
+            }),
+        }),
+    };
+
+    let error = service
+        .parse_add_outbound(proto::xray::core::OutboundHandlerConfig {
+            tag: "reverse-outbound".into(),
+            proxy_settings: Some(proto::xray::common::serial::TypedMessage {
+                r#type: TYPE_PROXY_VLESS_OUTBOUND_CONFIG.to_string(),
+                value: config.encode_to_vec(),
+            }),
+            ..proto::xray::core::OutboundHandlerConfig::default()
+        })
+        .expect_err("Bridge runtime is not implemented yet");
+    assert_eq!(error.code(), Code::Unimplemented);
+    assert!(
+        error
+            .message()
+            .contains("Reverse Bridge role is not implemented")
+    );
+}
+
+#[cfg(all(feature = "vless", not(feature = "vless-reverse")))]
+#[test]
+fn handler_dynamic_vless_reverse_requires_feature() {
+    let service = HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+    let config = VlessOutboundConfigPayload {
+        vnext: Some(SocksServerEndpointPayload {
+            address: Some(localhost_ip_payload()),
+            port: 1234,
+            user: Some(proto::xray::common::protocol::User {
+                level: 0,
+                email: "reverse@example.test".into(),
+                account: Some(proto::xray::common::serial::TypedMessage {
+                    r#type: TYPE_PROXY_VLESS_ACCOUNT.to_string(),
+                    value: VlessOutboundAccountPayload {
+                        id: "3ac9b383-75a1-431c-8184-106c80eb2273".into(),
+                        flow: String::new(),
+                        encryption: "none".into(),
+                        reverse: Some(VlessReversePayload {
+                            tag: "reverse-in".into(),
+                            sniffing: None,
+                        }),
+                    }
+                    .encode_to_vec(),
+                }),
+            }),
+        }),
+    };
+
+    let error = service
+        .parse_add_outbound(proto::xray::core::OutboundHandlerConfig {
+            tag: "reverse-outbound".into(),
+            proxy_settings: Some(proto::xray::common::serial::TypedMessage {
+                r#type: TYPE_PROXY_VLESS_OUTBOUND_CONFIG.to_string(),
+                value: config.encode_to_vec(),
+            }),
+            ..proto::xray::core::OutboundHandlerConfig::default()
+        })
+        .expect_err("Reverse must fail when the feature is unavailable");
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(
+        error
+            .message()
+            .contains("requires the vless-reverse feature")
+    );
 }
 
 #[cfg(all(feature = "trojan", feature = "reality"))]

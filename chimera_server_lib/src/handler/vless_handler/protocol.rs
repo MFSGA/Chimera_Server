@@ -12,6 +12,7 @@ use crate::{
 pub const COMMAND_TCP: u8 = 1;
 pub const COMMAND_UDP: u8 = 2;
 pub const COMMAND_MUX: u8 = 3;
+pub const COMMAND_RVS: u8 = 4;
 pub const XTLS_VISION_FLOW: &str = "xtls-rprx-vision";
 
 pub struct ParsedVlessHeader {
@@ -60,13 +61,16 @@ where
     };
 
     let command = stream.read_u8().await?;
-    let remote_location = if command == COMMAND_MUX {
-        NetLocation::new(Address::from("v1.mux.cool")?, 0)
-    } else {
-        let mut address_prefix = [0u8; 3];
-        stream.read_exact(&mut address_prefix).await?;
-        let port = ((address_prefix[0] as u16) << 8) | (address_prefix[1] as u16);
-        read_remote_location(stream, address_prefix[2], port).await?
+    let remote_location = match command {
+        COMMAND_MUX => NetLocation::new(Address::from("v1.mux.cool")?, 0),
+        COMMAND_RVS => NetLocation::new(Address::from("v1.rvs.cool")?, 0),
+        _ => {
+            let mut address_prefix = [0u8; 3];
+            stream.read_exact(&mut address_prefix).await?;
+            let port =
+                ((address_prefix[0] as u16) << 8) | (address_prefix[1] as u16);
+            read_remote_location(stream, address_prefix[2], port).await?
+        }
     };
 
     Ok(ParsedVlessHeader {
@@ -301,9 +305,9 @@ mod tests {
     use crate::address::{Address, NetLocation};
 
     use super::{
-        COMMAND_MUX, COMMAND_TCP, XTLS_VISION_FLOW, encode_flow_addon_data,
-        read_addons, read_remote_location, read_request_header, read_varint,
-        vision_flow_addon_data,
+        COMMAND_MUX, COMMAND_RVS, COMMAND_TCP, XTLS_VISION_FLOW,
+        encode_flow_addon_data, read_addons, read_remote_location,
+        read_request_header, read_varint, vision_flow_addon_data,
     };
 
     #[tokio::test]
@@ -330,6 +334,53 @@ mod tests {
         );
         assert_eq!(server.read_u8().await.expect("read first XUDP byte"), 0xaa);
         assert_eq!(server.read_u8().await.expect("read second XUDP byte"), 0xbb);
+    }
+
+    #[tokio::test]
+    async fn reverse_header_has_no_address_and_preserves_body_bytes() {
+        let (mut client, mut server) = duplex(128);
+        let mut request = vec![0];
+        request.extend_from_slice(&[7u8; 16]);
+        request.push(0);
+        request.push(COMMAND_RVS);
+        request.extend_from_slice(&[0xaa, 0xbb]);
+        client
+            .write_all(&request)
+            .await
+            .expect("write VLESS reverse header");
+
+        let header = read_request_header(&mut server)
+            .await
+            .expect("parse VLESS reverse header");
+
+        assert_eq!(header.command, COMMAND_RVS);
+        assert_eq!(
+            header.remote_location,
+            NetLocation::new(Address::from("v1.rvs.cool").unwrap(), 0)
+        );
+        assert_eq!(server.read_u8().await.expect("read first body byte"), 0xaa);
+        assert_eq!(server.read_u8().await.expect("read second body byte"), 0xbb);
+    }
+
+    #[tokio::test]
+    async fn reverse_header_truncated_at_each_prefix_returns_unexpected_eof() {
+        let mut request = vec![0];
+        request.extend_from_slice(&[7u8; 16]);
+        request.push(0);
+        request.push(COMMAND_RVS);
+
+        for prefix_length in 0..request.len() {
+            let mut input = Cursor::new(request[..prefix_length].to_vec());
+            let error = match read_request_header(&mut input).await {
+                Ok(_) => panic!("truncated VLESS reverse header must fail"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::UnexpectedEof,
+                "prefix length {prefix_length}"
+            );
+        }
     }
 
     #[tokio::test]

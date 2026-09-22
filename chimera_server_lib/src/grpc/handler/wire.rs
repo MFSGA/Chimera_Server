@@ -260,6 +260,8 @@ pub(super) struct VlessOutboundAccountPayload {
     pub(super) flow: String,
     #[prost(string, tag = "3")]
     pub(super) encryption: String,
+    #[prost(message, optional, tag = "7")]
+    pub(super) reverse: Option<VlessReversePayload>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -410,7 +412,7 @@ pub(super) struct VlessReversePayload {
     pub(super) sniffing: Option<VlessReverseSniffingPayload>,
 }
 
-#[cfg(feature = "vless")]
+#[cfg(all(feature = "vless", test))]
 #[derive(Clone, PartialEq, Message)]
 pub(super) struct VlessAccountPayload {
     #[prost(string, tag = "1")]

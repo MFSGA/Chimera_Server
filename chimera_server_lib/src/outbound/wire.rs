@@ -110,6 +110,17 @@ pub(super) struct VlessClientConfigPayload {
 }
 
 #[derive(Clone, PartialEq, Message)]
+pub(super) struct VlessReverseSniffingPayload {}
+
+#[derive(Clone, PartialEq, Message)]
+pub(super) struct VlessReversePayload {
+    #[prost(string, tag = "1")]
+    pub(super) tag: String,
+    #[prost(message, optional, tag = "2")]
+    pub(super) sniffing: Option<VlessReverseSniffingPayload>,
+}
+
+#[derive(Clone, PartialEq, Message)]
 pub(super) struct VlessAccountPayload {
     #[prost(string, tag = "1")]
     pub(super) id: String,
@@ -117,6 +128,8 @@ pub(super) struct VlessAccountPayload {
     pub(super) flow: String,
     #[prost(string, tag = "3")]
     pub(super) encryption: String,
+    #[prost(message, optional, tag = "7")]
+    pub(super) reverse: Option<VlessReversePayload>,
 }
 
 #[derive(Clone, PartialEq, Message)]

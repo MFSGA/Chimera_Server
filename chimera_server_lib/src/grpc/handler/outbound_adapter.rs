@@ -92,6 +92,29 @@ impl HandlerServiceImpl {
                                 "invalid vless outbound account payload: {error}"
                             ))
                         })?;
+
+                if let Some(reverse) = account.reverse.as_ref() {
+                    #[cfg(not(feature = "vless-reverse"))]
+                    {
+                        let _ = (&reverse.tag, &reverse.sniffing);
+                        return Err(Status::invalid_argument(
+                            "vless outbound reverse requires the vless-reverse feature",
+                        ));
+                    }
+
+                    #[cfg(feature = "vless-reverse")]
+                    {
+                        if reverse.tag.is_empty() {
+                            return Err(Status::invalid_argument(
+                                "vless outbound reverse.tag cannot be empty",
+                            ));
+                        }
+                        return Err(Status::unimplemented(
+                            "Chimera VLESS Reverse Bridge role is not implemented yet",
+                        ));
+                    }
+                }
+
                 crate::outbound::parse_xray_uuid(&account.id)
                     .map_err(Status::invalid_argument)?;
                 if !account.flow.trim().is_empty() {

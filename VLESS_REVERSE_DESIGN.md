@@ -1,6 +1,6 @@
 # VLESS Reverse 支持设计与实施计划
 
-- 状态：Batch A 已实现（feature/config/fail-closed）；`0x04`、Mux、Portal runtime 与互操作尚未实现
+- 状态：Batch A–B 已实现（feature/config/account/`0x04` 解析与 fail-closed）；Mux、Portal runtime 与互操作尚未实现
 - 更新日期：2026-09-22
 - 当前本地 Xray 基线：`ref/xray-core` `v26.9.9`，提交
   `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`
@@ -495,12 +495,13 @@ Chimera Bridge、UDP/XUDP 与更完整的 Reverse 兼容面。每批完成并提
 - 简化 outbound `reverse` 已识别，但在 Chimera Bridge 落地前返回明确的“该角色尚未实现”错误；`vnext.users[].reverse` 按当前 Xray 配置约束明确拒绝。
 - feature 开关两侧的普通 VLESS 构建与定向测试已验证；Batch A 不声明 `0x04`、Mux、Portal runtime 或互操作支持。
 
-### B. VLESS account 与 command
+### B. VLESS account 与 command（已完成）
 
-- `VlessUser` 和 VLESS outbound account plan 保留 Reverse 配置。
-- protobuf payload 对齐 `reverse = 7`。
-- codec 实现 command `0x04` 的无地址 request header。
-- 覆盖用户/command 授权矩阵和截断输入。
+- `VlessUser`、gRPC/UserManager 以及静态/动态 VLESS outbound account wire payload 保留 Reverse 配置；Bridge runtime 尚未实现时 outbound decode 明确 fail closed。
+- protobuf payload 已对齐 `reverse = 7`，不会把 Reverse account 静默降级为普通 VLESS account。
+- codec 已实现 command `0x04` 的无地址 request header，并映射到 Xray 的 `v1.rvs.cool` 逻辑目标；当前认证通过后在 Portal runtime 边界返回明确 Unsupported。
+- 已覆盖普通用户/Reverse 用户 × forward/`0x04` 的授权矩阵、Vision 用户快照路径，以及 Reverse header 每个截断前缀的 `UnexpectedEof` 行为。
+- Batch B 不包含 Xray Mux frame、Reverse control session、worker picker 或 Portal 数据面；这些从 Batch C 开始。
 
 ### C. Mux frame codec
 

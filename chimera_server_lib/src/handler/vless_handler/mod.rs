@@ -36,7 +36,7 @@ use self::{
         vless_fallback_result,
     },
     protocol::{
-        COMMAND_MUX, COMMAND_TCP, ParsedVlessHeader, XTLS_VISION_FLOW,
+        COMMAND_MUX, COMMAND_RVS, COMMAND_TCP, ParsedVlessHeader, XTLS_VISION_FLOW,
         read_request_header,
     },
     udp_stream::VlessUdpStream,
@@ -212,12 +212,7 @@ impl VlessTcpHandler {
             ));
         };
 
-        if *reverse_only {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "VLESS reverse-only user cannot establish a forward proxy session",
-            ));
-        }
+        authorize_reverse_command(*reverse_only, command)?;
 
         validate_request_flow(configured_flow, &request_flow, command)?;
 
@@ -251,6 +246,7 @@ impl VlessTcpHandler {
                 )),
                 traffic_context,
             }),
+            COMMAND_RVS => Err(reverse_portal_runtime_unavailable()),
             unknown_protocol_type => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Unknown requested protocol: {unknown_protocol_type}"),
@@ -315,6 +311,30 @@ impl TcpServerHandler for VlessTcpHandler {
 
 fn vless_handshake_timeout_error() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::TimedOut, "VLESS handshake timed out")
+}
+
+pub(crate) fn authorize_reverse_command(
+    reverse_only: bool,
+    command: u8,
+) -> std::io::Result<()> {
+    match (reverse_only, command == COMMAND_RVS) {
+        (true, false) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "VLESS reverse-only user cannot establish a forward proxy session",
+        )),
+        (false, true) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "VLESS user is not allowed to establish a reverse proxy session",
+        )),
+        _ => Ok(()),
+    }
+}
+
+pub(crate) fn reverse_portal_runtime_unavailable() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "VLESS reverse command is recognized but Portal runtime is not implemented yet",
+    )
 }
 
 fn validate_request_flow(
@@ -620,7 +640,7 @@ mod tests {
         request.extend_from_slice(&parse_hex(user_id));
         request.push(0);
         request.push(command);
-        if command != COMMAND_MUX {
+        if !matches!(command, COMMAND_MUX | COMMAND_RVS) {
             request.extend_from_slice(&443u16.to_be_bytes());
             request.push(1);
             request.extend_from_slice(&[127, 0, 0, 1]);
@@ -688,6 +708,71 @@ mod tests {
             error.to_string().contains(
                 "reverse-only user cannot establish a forward proxy session"
             )
+        );
+    }
+
+    #[cfg(feature = "vless-reverse")]
+    #[tokio::test]
+    async fn reverse_only_user_can_reach_reverse_command_boundary() {
+        let user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
+        let handler = VlessTcpHandler::new(
+            &[VlessUser {
+                user_id: user_id.into(),
+                user_label: "reverse-user".into(),
+                user_level: 0,
+                flow: String::new(),
+                reverse: Some(VlessReverseConfig {
+                    tag: "reverse-out".into(),
+                }),
+            }],
+            "vless-reverse-test",
+        );
+        let (mut client, server) = duplex(1024);
+        client
+            .write_all(&build_plain_vless_request(user_id, COMMAND_RVS))
+            .await
+            .expect("write reverse VLESS request");
+
+        let error = match handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+        {
+            Ok(_) => {
+                panic!("Portal runtime is intentionally deferred to a later batch")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(
+            error
+                .to_string()
+                .contains("Portal runtime is not implemented yet")
+        );
+    }
+
+    #[cfg(feature = "vless-reverse")]
+    #[tokio::test]
+    async fn ordinary_user_cannot_use_reverse_command() {
+        let user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
+        let handler = plain_vless_handler(user_id, "ordinary-user");
+        let (mut client, server) = duplex(1024);
+        client
+            .write_all(&build_plain_vless_request(user_id, COMMAND_RVS))
+            .await
+            .expect("write reverse VLESS request");
+
+        let error = match handler
+            .setup_server_stream(Box::new(TestStream(server)))
+            .await
+        {
+            Ok(_) => panic!("ordinary VLESS user must not create reverse proxy"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            error
+                .to_string()
+                .contains("not allowed to establish a reverse proxy session")
         );
     }
 

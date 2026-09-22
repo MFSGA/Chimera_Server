@@ -24,7 +24,8 @@ use super::fallback::{
 #[cfg(any(feature = "tls", feature = "reality"))]
 use super::protocol::{COMMAND_MUX, COMMAND_UDP, read_request_header_after_auth};
 use super::protocol::{
-    COMMAND_TCP, ParsedVlessHeader, XTLS_VISION_FLOW, read_request_header,
+    COMMAND_RVS, COMMAND_TCP, ParsedVlessHeader, XTLS_VISION_FLOW,
+    read_request_header,
 };
 #[cfg(any(feature = "tls", feature = "reality"))]
 use super::reality_vision_stream::RealityVisionServerStream;
@@ -33,9 +34,12 @@ use super::tls_vision::{RustlsVisionSession, VisionRecordIo};
 #[cfg(any(feature = "tls", feature = "reality"))]
 use super::udp_stream::VlessUdpStream;
 use super::vision_stream::VisionServerStream;
-use super::{encode_hex, parse_hex};
+use super::{
+    authorize_reverse_command, encode_hex, parse_hex,
+    reverse_portal_runtime_unavailable,
+};
 
-pub(crate) type ParsedVisionUser = (Box<[u8]>, String, String, u32);
+pub(crate) type ParsedVisionUser = (Box<[u8]>, String, String, u32, bool);
 
 #[derive(Debug)]
 pub struct VisionVlessTcpHandler {
@@ -98,6 +102,10 @@ pub async fn setup_reality_mixed_vless_server_stream(
     } = header;
 
     let user = find_matching_vless_user(users, &user_id, inbound_tag)?;
+    authorize_reverse_command(user.reverse.is_some(), command)?;
+    if command == COMMAND_RVS {
+        return Err(reverse_portal_runtime_unavailable());
+    }
     let traffic_context = Some(
         TrafficContext::new("vless")
             .with_identity(user.user_label.clone())
@@ -250,6 +258,10 @@ pub async fn setup_tls_mixed_vless_server_stream(
     } = header;
 
     let user = find_matching_vless_user(users, &user_id, inbound_tag)?;
+    authorize_reverse_command(user.reverse.is_some(), command)?;
+    if command == COMMAND_RVS {
+        return Err(reverse_portal_runtime_unavailable());
+    }
     let user_label = user.user_label.clone();
     let user_level = user.user_level;
     let traffic_context = Some(
@@ -349,7 +361,7 @@ pub async fn setup_reality_vision_server_stream(
     let header = if !fallbacks.is_empty() {
         let (mut prefix, candidate) = read_vless_auth_prefix(&mut tls_stream).await;
         let authenticated = candidate.is_some_and(|candidate| {
-            users.iter().any(|(stored_user_id, _, _, _)| {
+            users.iter().any(|(stored_user_id, _, _, _, _)| {
                 stored_user_id.len() == 16
                     && stored_user_id.as_ref() == candidate.as_slice()
             })
@@ -384,8 +396,12 @@ pub async fn setup_reality_vision_server_stream(
         remote_location,
     } = header;
 
-    let (policy_identity, user_label, user_level) =
+    let (policy_identity, user_label, user_level, reverse_only) =
         find_matching_user_label(users, &user_id, inbound_tag)?;
+    authorize_reverse_command(reverse_only, command)?;
+    if command == COMMAND_RVS {
+        return Err(reverse_portal_runtime_unavailable());
+    }
     validate_vision_request_flow(&request_flow, command)?;
 
     let (tcp, mut session) = tls_stream.into_inner();
@@ -427,9 +443,13 @@ impl VisionVlessTcpHandler {
             remote_location,
         } = read_request_header(&mut server_stream).await?;
 
-        let (policy_identity, user_label, user_level) =
+        let (policy_identity, user_label, user_level, reverse_only) =
             find_matching_user_label(users, &user_id, &self.inbound_tag)?;
 
+        authorize_reverse_command(reverse_only, command)?;
+        if command == COMMAND_RVS {
+            return Err(reverse_portal_runtime_unavailable());
+        }
         validate_vision_request_flow(&request_flow, command)?;
 
         Ok(TcpServerSetupResult::TcpForward {
@@ -483,6 +503,7 @@ pub(crate) fn parse_vision_users(users: &[VlessUser]) -> Vec<ParsedVisionUser> {
                 user.user_id.clone(),
                 user.user_label.clone(),
                 user.user_level,
+                user.reverse.is_some(),
             )
         })
         .collect()
@@ -526,15 +547,17 @@ fn find_matching_user_label(
     users: &[ParsedVisionUser],
     user_id: &[u8; 16],
     inbound_tag: &str,
-) -> std::io::Result<(String, String, u32)> {
-    let matched_user = users.iter().find(|(stored_user_id, _, _, _)| {
+) -> std::io::Result<(String, String, u32, bool)> {
+    let matched_user = users.iter().find(|(stored_user_id, _, _, _, _)| {
         stored_user_id.len() == 16 && stored_user_id.as_ref() == user_id.as_slice()
     });
 
-    let Some((_, policy_identity, user_label, user_level)) = matched_user else {
+    let Some((_, policy_identity, user_label, user_level, reverse_only)) =
+        matched_user
+    else {
         let expected = users
             .iter()
-            .map(|(user_id, _, _, _)| encode_hex(user_id.as_ref()))
+            .map(|(user_id, _, _, _, _)| encode_hex(user_id.as_ref()))
             .collect::<Vec<_>>()
             .join(",");
         let got = encode_hex(user_id);
@@ -551,7 +574,12 @@ fn find_matching_user_label(
         ));
     };
 
-    Ok((policy_identity.clone(), user_label.clone(), *user_level))
+    Ok((
+        policy_identity.clone(),
+        user_label.clone(),
+        *user_level,
+        *reverse_only,
+    ))
 }
 
 fn validate_vision_request_flow(
@@ -580,6 +608,20 @@ mod tests {
     use super::validate_vision_request_flow;
     use crate::handler::vless_handler::protocol::XTLS_VISION_FLOW;
 
+    #[cfg(feature = "vless-reverse")]
+    use tokio::io::{AsyncWriteExt, duplex};
+
+    #[cfg(feature = "vless-reverse")]
+    use super::VisionVlessTcpHandler;
+    #[cfg(feature = "vless-reverse")]
+    use crate::{
+        config::server_config::{VlessReverseConfig, VlessUser},
+        handler::{
+            tcp::tcp_handler::TcpServerHandler,
+            vless_handler::{parse_hex, protocol::COMMAND_RVS},
+        },
+    };
+
     #[test]
     fn validate_vision_request_flow_requires_vision_marker() {
         let err = validate_vision_request_flow("", 1)
@@ -598,5 +640,44 @@ mod tests {
     fn validate_vision_request_flow_accepts_tcp() {
         validate_vision_request_flow(XTLS_VISION_FLOW, 1)
             .expect("vision handler should accept tcp header shape");
+    }
+
+    #[cfg(feature = "vless-reverse")]
+    #[tokio::test]
+    async fn vision_user_snapshot_preserves_reverse_command_boundary() {
+        let user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";
+        let handler = VisionVlessTcpHandler::new(
+            &[VlessUser {
+                user_id: user_id.into(),
+                user_label: "reverse-user".into(),
+                user_level: 0,
+                flow: String::new(),
+                reverse: Some(VlessReverseConfig {
+                    tag: "reverse-out".into(),
+                }),
+            }],
+            "vision-reverse-test",
+        );
+        let (mut client, server) = duplex(128);
+        let mut request = vec![0];
+        request.extend_from_slice(&parse_hex(user_id));
+        request.push(0);
+        request.push(COMMAND_RVS);
+        client
+            .write_all(&request)
+            .await
+            .expect("write reverse VLESS request");
+
+        let error = match handler.setup_server_stream(Box::new(server)).await {
+            Ok(_) => panic!("Portal runtime remains deferred after Vision auth"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(
+            error
+                .to_string()
+                .contains("Portal runtime is not implemented yet")
+        );
     }
 }
