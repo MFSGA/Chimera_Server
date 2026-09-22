@@ -1,6 +1,6 @@
 # VLESS Reverse 支持设计与实施计划
 
-- 状态：Batch A–D 已实现（feature/config/account/`0x04`/Reverse Mux wire/TCP session core 与 fail-closed）；Portal runtime、routing 接入与互操作尚未实现
+- 状态：Batch A–E 已实现（feature/config/account/`0x04`/Reverse Mux wire/TCP session core/Portal runtime 与 RAW+TLS 互操作）；Chimera Bridge、UDP/XUDP、sniffing 与更广 transport 仍未实现
 - 更新日期：2026-09-22
 - 当前本地 Xray 基线：`ref/xray-core` `v26.9.9`，提交
   `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`
@@ -520,14 +520,14 @@ Chimera Bridge、UDP/XUDP 与更完整的 Reverse 兼容面。每批完成并提
 - 物理 Mux EOF/写失败会关闭 worker 并唤醒逻辑 session；测试覆盖 payload roundtrip、source/local metadata、picker、control lifecycle、关闭传播、并发限制和 bounded-queue backpressure。
 - Batch D 仍是 standalone session core：认证后的 VLESS `0x04` handler 还没有把物理连接注册进 Reverse registry，DokodemoDoor/routing 也尚不能选择这些 worker；这些属于 Batch E。
 
-### E. 公网 Portal runtime
+### E. 公网 Portal runtime（已完成，Portal-first TCP 里程碑）
 
-- VLESS inbound Reverse outcome 交给数据面注册。
-- Reverse tag 进入 routing target resolution。
-- 实现动态 worker 注册、选择、摘除和 unavailable 行为。
-- 普通静态 outbound 与 Reverse tag 冲突在启动前失败。
-- 复用现有 DokodemoDoor 固定 TCP 目标与 `inboundTag` routing，完成公网端口到内网服务的纵向路径。
-- 用固定 Xray Bridge 验证 RAW loopback 与 RAW/TLS，形成第一阶段可用里程碑。
+- VLESS inbound `0x04` 已产出 `ReversePortal` outcome，并由 DataPlane 持有的 `ReversePortalRegistry` 注册/管理物理 Mux worker；plain VLESS、TLS mixed 与 REALITY mixed 都保留 Reverse tag、traffic context 和 VLESS response header。
+- inbound `reverse.tag` 会在启动计划中发布为动态 `vless-reverse` outbound capability；routing 可按该 tag 选择 Portal worker，静态 outbound 与 Reverse tag 冲突会在启动前失败。
+- registry 覆盖动态 worker 注册、ACTIVE-only least-loaded 选择、关闭摘除和无 worker 时 `NotConnected` fail closed；control heartbeat 复用 Batch D 的 `udp://reverse:0` ACTIVE/DRAIN 生命周期。
+- TCP route 会把目标、source/local metadata 交给 Reverse Mux worker；现有 DokodemoDoor `inboundTag -> outboundTag` 路径已完成公网固定端口到内网服务的纵向转发测试。
+- 已使用固定 Xray-core `v26.9.9` Bridge 做真实互操作：RAW VLESS/TCP 与 VLESS/TCP+TLS 两条 loopback echo 均通过。测试中的 Xray Freedom 显式 allow `127.0.0.0/8`，因为当前 Xray 对来自 VLESS inbound 的 private IP 目标默认应用阻断 final rule。
+- 该里程碑只声明 **Chimera Portal + Xray Bridge + TCP + RAW/TLS**；Chimera Bridge、UDP/XUDP、sniffing、动态映射和其他 transport/security 组合仍不在 Batch E 支持范围。
 
 ### F. 内网 Bridge runtime
 

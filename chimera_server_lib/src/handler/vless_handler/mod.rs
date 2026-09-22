@@ -240,6 +240,7 @@ impl VlessTcpHandler {
                 )),
                 traffic_context,
             }),
+            #[cfg(feature = "vless-reverse")]
             COMMAND_RVS => Ok(TcpServerSetupResult::ReversePortal {
                 reverse_tag: reverse_tag
                     .clone()

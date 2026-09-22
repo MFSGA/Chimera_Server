@@ -528,7 +528,10 @@ impl ValidatedServerPlan {
         }
 
         let inbounds = compile_inbounds(inbounds)?;
+        #[cfg(feature = "vless-reverse")]
         let mut outbounds = compile_configured_outbounds(&outbounds)?;
+        #[cfg(not(feature = "vless-reverse"))]
+        let outbounds = compile_configured_outbounds(&outbounds)?;
         #[cfg(feature = "vless-reverse")]
         append_vless_reverse_outbounds(&inbounds, &mut outbounds)?;
         let resolver = compile_configured_resolver(dns.as_ref())?;

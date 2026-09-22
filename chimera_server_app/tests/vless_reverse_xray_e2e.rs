@@ -1,0 +1,334 @@
+mod xhttp_support;
+
+use std::{
+    fs::{self, File},
+    io::{BufReader, Read, Write},
+    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+use aws_lc_rs::digest::{SHA256, digest};
+use rustls_pemfile::certs;
+use serde_json::json;
+use xhttp_support::{
+    TEST_UUID, create_test_dir, free_localhost_port, serial_xray_guard,
+    start_chimera, start_xray, wait_for_tcp, workspace_root, write_json,
+    xray_binary,
+};
+
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+const IO_TIMEOUT: Duration = Duration::from_secs(2);
+const REVERSE_READY_TIMEOUT: Duration = Duration::from_secs(12);
+
+#[derive(Clone, Copy)]
+enum ReverseSecurity {
+    Raw,
+    Tls,
+}
+
+impl ReverseSecurity {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Tls => "tls",
+        }
+    }
+}
+
+#[test]
+fn xray_bridge_round_trips_public_dokodemo_tcp_over_raw_vless_reverse() {
+    run_reverse_interop(ReverseSecurity::Raw);
+}
+
+#[test]
+fn xray_bridge_round_trips_public_dokodemo_tcp_over_tls_vless_reverse() {
+    run_reverse_interop(ReverseSecurity::Tls);
+}
+
+fn run_reverse_interop(security: ReverseSecurity) {
+    let workspace = workspace_root();
+    let xray = xray_binary(&workspace);
+    if !xray.is_file() {
+        eprintln!(
+            "skipping VLESS Reverse Xray interoperability test because {} is unavailable; set XRAY_BIN to enable it",
+            xray.display()
+        );
+        return;
+    }
+
+    let _serial = serial_xray_guard();
+    let work_dir = create_test_dir(&format!("vless-reverse-{}", security.name()));
+    let (echo_addr, echoed_bytes) = start_observed_echo_server();
+    let reverse_port = free_localhost_port();
+    let public_port = free_localhost_port();
+    let chimera_config = work_dir.join("chimera.json");
+    let xray_config = work_dir.join("xray.json");
+
+    let (chimera_stream, xray_stream) = match security {
+        ReverseSecurity::Raw => (
+            json!({
+                "network": "tcp",
+                "security": "none"
+            }),
+            json!({
+                "network": "tcp",
+                "security": "none"
+            }),
+        ),
+        ReverseSecurity::Tls => {
+            let (cert_path, key_path) = generate_test_certificate(&work_dir);
+            let pinned_peer_cert_sha256 = first_cert_sha256_hex(&cert_path);
+            (
+                json!({
+                    "network": "tcp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "certificates": [{
+                            "certificateFile": cert_path,
+                            "keyFile": key_path
+                        }]
+                    }
+                }),
+                json!({
+                    "network": "tcp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "pinnedPeerCertSha256": pinned_peer_cert_sha256
+                    }
+                }),
+            )
+        }
+    };
+
+    write_json(
+        &chimera_config,
+        json!({
+            "log": {"loglevel": "debug"},
+            "inbounds": [
+                {
+                    "listen": "127.0.0.1",
+                    "port": reverse_port,
+                    "protocol": "vless",
+                    "tag": "reverse-vless-in",
+                    "settings": {
+                        "clients": [{
+                            "id": TEST_UUID,
+                            "email": "reverse-bridge@example.test",
+                            "reverse": {"tag": "reverse-out"}
+                        }],
+                        "decryption": "none"
+                    },
+                    "streamSettings": chimera_stream
+                },
+                {
+                    "listen": "127.0.0.1",
+                    "port": public_port,
+                    "protocol": "dokodemo-door",
+                    "tag": "public-echo",
+                    "settings": {
+                        "address": echo_addr.ip().to_string(),
+                        "port": echo_addr.port(),
+                        "network": "tcp",
+                        "followRedirect": false
+                    },
+                    "streamSettings": {"network": "tcp"}
+                }
+            ],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["public-echo"],
+                    "network": "tcp",
+                    "outboundTag": "reverse-out"
+                }]
+            }
+        }),
+    );
+
+    write_json(
+        &xray_config,
+        json!({
+            "log": {"loglevel": "debug"},
+            "outbounds": [
+                {
+                    "tag": "reverse-bridge",
+                    "protocol": "vless",
+                    "settings": {
+                        "address": "127.0.0.1",
+                        "port": reverse_port,
+                        "id": TEST_UUID,
+                        "encryption": "none",
+                        "reverse": {"tag": "bridge-in"}
+                    },
+                    "streamSettings": xray_stream
+                },
+                {
+                    "tag": "direct",
+                    "protocol": "freedom",
+                    "settings": {
+                        // Current Xray applies a default private-IP block to
+                        // traffic originating from a VLESS inbound. The echo
+                        // target is intentionally loopback, so allow it
+                        // explicitly for this interoperability fixture.
+                        "finalRules": [{
+                            "action": "allow",
+                            "network": "tcp",
+                            "ip": ["127.0.0.0/8"]
+                        }]
+                    }
+                }
+            ],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["bridge-in"],
+                    "network": "tcp",
+                    "outboundTag": "direct"
+                }]
+            }
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, reverse_port)));
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, public_port)));
+    chimera.assert_running();
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config);
+    xray.assert_running();
+
+    let public_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, public_port));
+    assert_reverse_echo_with_retry(
+        public_addr,
+        format!(
+            "xray bridge through chimera reverse portal ({})",
+            security.name()
+        )
+        .as_bytes(),
+        &echoed_bytes,
+    );
+
+    chimera.assert_running();
+    xray.assert_running();
+}
+
+fn assert_reverse_echo_with_retry(
+    public_addr: SocketAddr,
+    payload: &[u8],
+    echoed_bytes: &AtomicUsize,
+) {
+    let deadline = Instant::now() + REVERSE_READY_TIMEOUT;
+    let mut last_error = None;
+
+    while Instant::now() < deadline {
+        match reverse_echo_once(public_addr, payload) {
+            Ok(()) => return,
+            Err(error) => {
+                last_error = Some(error);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+
+    panic!(
+        "VLESS Reverse worker did not become usable at {public_addr}; target received {} bytes: {}",
+        echoed_bytes.load(Ordering::SeqCst),
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "no connection attempt completed".to_string())
+    );
+}
+
+fn start_observed_echo_server() -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .expect("bind observed Reverse echo server");
+    let address = listener
+        .local_addr()
+        .expect("observed Reverse echo address");
+    let received = Arc::new(AtomicUsize::new(0));
+    let received_worker = received.clone();
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(32) {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let received = received_worker.clone();
+            std::thread::spawn(move || {
+                let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+                let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+                let mut buffer = [0u8; 4096];
+                if let Ok(length) = stream.read(&mut buffer)
+                    && length != 0
+                {
+                    received.fetch_add(length, Ordering::SeqCst);
+                    let _ = stream.write_all(&buffer[..length]);
+                }
+            });
+        }
+    });
+
+    (address, received)
+}
+
+fn reverse_echo_once(
+    public_addr: SocketAddr,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    let mut stream = TcpStream::connect_timeout(&public_addr, CONNECT_TIMEOUT)?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    stream.write_all(payload)?;
+
+    let mut response = vec![0u8; payload.len()];
+    stream.read_exact(&mut response)?;
+    if response != payload {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Reverse echo payload mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn generate_test_certificate(work_dir: &Path) -> (PathBuf, PathBuf) {
+    let signing_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)
+        .expect("generate VLESS Reverse interoperability RSA key");
+    let cert = rcgen::CertificateParams::new(["localhost".to_string()])
+        .expect("build VLESS Reverse certificate params")
+        .self_signed(&signing_key)
+        .expect("generate VLESS Reverse test certificate");
+    let cert_path = work_dir.join("cert.pem");
+    let key_path = work_dir.join("key.pem");
+    fs::write(&cert_path, cert.pem())
+        .expect("write VLESS Reverse interoperability certificate");
+    fs::write(&key_path, signing_key.serialize_pem())
+        .expect("write VLESS Reverse interoperability private key");
+    (cert_path, key_path)
+}
+
+fn first_cert_sha256_hex(cert_path: &Path) -> String {
+    let cert_file =
+        File::open(cert_path).expect("open VLESS Reverse pinned certificate");
+    let first_cert = certs(&mut BufReader::new(cert_file))
+        .next()
+        .expect("VLESS Reverse certificate present")
+        .expect("parse VLESS Reverse certificate");
+    let bytes = digest(&SHA256, first_cert.as_ref());
+    bytes
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}

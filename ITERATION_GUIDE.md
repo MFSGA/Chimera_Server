@@ -332,10 +332,11 @@ SessionRequest → Routing → RouteDecision → OutboundConnector
 
 2026-09-21 用户已明确启动 VLESS Reverse 专项。第一阶段采用 Portal-first：公网 Chimera 复用
 DokodemoDoor 和 routing 暴露固定 TCP 端口，内网侧暂由固定版本 Xray 作为主动 Bridge，从而不等待
-Chimera VLESS outbound、UDP/XUDP 或完整 transport 矩阵。该阶段仍须实现 Xray-compatible VLESS
-`0x04`、Mux TCP 与 Reverse 控制 session，不能用私有 tunnel wire。后续 Chimera Bridge 需要一个受
-监督的 VLESS outbound 主动连接，但不授权扩展其他 outbound 协议；字段、owner、feature、阶段和
-验收边界见 [`VLESS_REVERSE_DESIGN.md`](VLESS_REVERSE_DESIGN.md)。
+Chimera VLESS outbound、UDP/XUDP 或完整 transport 矩阵。2026-09-22 Batch A–E 已完成该 Portal-first
+TCP 里程碑：Xray-compatible VLESS `0x04`、Mux TCP、Reverse 控制 session、Portal registry/routing 和
+固定端口链路已落地，并用固定 Xray-core `v26.9.9` Bridge 验证 RAW 与 TLS。后续 Chimera Bridge 需要
+一个受监督的 VLESS outbound 主动连接，但不授权扩展其他 outbound 协议；UDP/XUDP、sniffing 和更广
+transport 矩阵仍后置。字段、owner、feature、阶段和验收边界见 [`VLESS_REVERSE_DESIGN.md`](VLESS_REVERSE_DESIGN.md)。
 
 ### 12.2 WireGuard
 

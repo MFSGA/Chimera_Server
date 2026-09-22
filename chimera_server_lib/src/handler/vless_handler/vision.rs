@@ -103,9 +103,6 @@ pub async fn setup_reality_mixed_vless_server_stream(
 
     let user = find_matching_vless_user(users, &user_id, inbound_tag)?;
     authorize_reverse_command(user.reverse.is_some(), command)?;
-    if command == COMMAND_RVS {
-        return Err(reverse_portal_runtime_unavailable());
-    }
     let traffic_context = Some(
         TrafficContext::new("vless")
             .with_identity(user.user_label.clone())
@@ -113,6 +110,22 @@ pub async fn setup_reality_mixed_vless_server_stream(
             .with_inbound_tag(inbound_tag.to_string())
             .with_user_level(user.user_level),
     );
+    #[cfg(feature = "vless-reverse")]
+    if command == COMMAND_RVS {
+        return Ok(TcpServerSetupResult::ReversePortal {
+            reverse_tag: user
+                .reverse
+                .as_ref()
+                .expect("authorized Reverse command requires a reverse tag")
+                .tag
+                .clone(),
+            stream: Box::new(tls_stream),
+            connection_success_response: Some(
+                SERVER_RESPONSE_HEADER.to_vec().into_boxed_slice(),
+            ),
+            traffic_context,
+        });
+    }
 
     match request_flow.as_str() {
         "" => {
@@ -259,9 +272,6 @@ pub async fn setup_tls_mixed_vless_server_stream(
 
     let user = find_matching_vless_user(users, &user_id, inbound_tag)?;
     authorize_reverse_command(user.reverse.is_some(), command)?;
-    if command == COMMAND_RVS {
-        return Err(reverse_portal_runtime_unavailable());
-    }
     let user_label = user.user_label.clone();
     let user_level = user.user_level;
     let traffic_context = Some(
@@ -271,6 +281,22 @@ pub async fn setup_tls_mixed_vless_server_stream(
             .with_inbound_tag(inbound_tag.to_string())
             .with_user_level(user_level),
     );
+    #[cfg(feature = "vless-reverse")]
+    if command == COMMAND_RVS {
+        return Ok(TcpServerSetupResult::ReversePortal {
+            reverse_tag: user
+                .reverse
+                .as_ref()
+                .expect("authorized Reverse command requires a reverse tag")
+                .tag
+                .clone(),
+            stream: Box::new(tls_stream),
+            connection_success_response: Some(
+                SERVER_RESPONSE_HEADER.to_vec().into_boxed_slice(),
+            ),
+            traffic_context,
+        });
+    }
 
     match request_flow.as_str() {
         "" => {

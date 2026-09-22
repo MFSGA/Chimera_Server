@@ -368,15 +368,18 @@ outbound 内的当前 `reverse` 字段；根级 `reverse.bridges` / `reverse.por
 补齐独立的 Xray Reverse Mux frame/control wire codec，包括 source/local metadata、ACTIVE/DRAIN control、
 transfer type 和重复 session ID 的 fail-closed 校验。Batch D 在此基础上加入 standalone Mux TCP session
 core：session manager、bounded client worker、least-loaded picker、`udp://reverse:0` control lifecycle、
-Xray END 全关闭语义与物理连接关闭传播均已有定向测试，但尚未接入 Portal registry/routing。
+Xray END 全关闭语义与物理连接关闭传播均已有定向测试。Batch E 已把该 core 接入 DataPlane-owned
+Portal registry/routing：`reverse.tag` 发布为动态 `vless-reverse` outbound capability，`0x04` 物理流注册
+worker，DokodemoDoor 固定 TCP route 可选择 ACTIVE worker 并携带 source/local metadata。
 
 运行时边界选择由数据面 owner 持有 Reverse registry 和 Bridge monitor；VLESS handler 只完成认证、
 command `0x04` 编解码与显式 Reverse outcome，不直接维护全局 outbound 表或 detached task。公网侧
 `reverse.tag` 作为动态 outbound 能力，内网侧 tag 作为逻辑 inbound identity 进入现有 routing；TCP、
 UDP/XUDP、源地址、sniffing、断线恢复和关闭都必须经过现有 policy/traffic/lifecycle 边界。完整字段、
 模块、批次和互操作验收见 [VLESS Reverse 支持设计与实施计划](VLESS_REVERSE_DESIGN.md)。当前已完成
-Batch A–D 的配置/account/`0x04`/Reverse Mux wire/TCP session core 与 fail-closed 边界；Portal runtime、
-routing 接入和 Xray 互操作仍未实现。
+Batch A–E：配置/account/`0x04`/Reverse Mux wire/TCP session core/Portal runtime/routing 均已接通，并以
+固定 Xray-core `v26.9.9` Bridge 验证 RAW VLESS/TCP 与 VLESS/TCP+TLS 的公网固定端口 loopback echo。
+当前互操作声明仍限 Portal-first TCP；Chimera Bridge、UDP/XUDP、sniffing 和更广 transport 矩阵尚未实现。
 
 交付顺序进一步收缩为 Portal-first。第一阶段复用现有 DokodemoDoor 固定 TCP 目标和
 `inboundTag -> outboundTag` routing：公网 Chimera 暴露普通 TCP 端口，内网固定版本 Xray 主动建立
