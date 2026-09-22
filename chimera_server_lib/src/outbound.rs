@@ -14,8 +14,10 @@ mod routing;
 mod static_config;
 mod wire;
 
+#[cfg(all(test, feature = "vless-reverse"))]
+use decode::decode_vless_reverse_bridge;
 #[cfg(feature = "vless-reverse")]
-pub(crate) use decode::decode_vless_reverse_bridge;
+use decode::maybe_decode_vless_reverse_bridge;
 #[cfg(feature = "api")]
 pub(crate) use decode::validate_outbound_sender_settings;
 use decode::{
@@ -36,6 +38,8 @@ use http_transport::connect_websocket_transport;
 #[cfg(all(test, feature = "ws"))]
 use http_transport::websocket_accept_value;
 
+#[cfg(feature = "vless-reverse")]
+use protocol::vless_reverse_connect;
 use protocol::{
     TcpProtocolHandshake, TrojanCommand, build_trojan_request, socks5_connect,
     trojan_connect, vless_tcp_connect,
@@ -172,6 +176,44 @@ struct OutboundRealityClientSettings {
 pub(crate) struct TcpOutboundConnection {
     pub stream: Box<dyn AsyncStream>,
     pub outbound_tag: Option<String>,
+}
+
+#[cfg(feature = "vless-reverse")]
+pub(crate) fn prepare_vless_reverse_bridge(
+    outbound: &OutboundSummary,
+) -> std::io::Result<Option<VlessReverseBridgeEndpoint>> {
+    if outbound.protocol != "vless" {
+        return Ok(None);
+    }
+    let Some(endpoint) = maybe_decode_vless_reverse_bridge(outbound)? else {
+        return Ok(None);
+    };
+    match decode_outbound_transport(outbound)? {
+        OutboundTransport::Raw => Ok(Some(endpoint)),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "VLESS Reverse Bridge outbound {} currently supports only RAW TCP transport",
+                outbound.tag
+            ),
+        )),
+    }
+}
+
+#[cfg(feature = "vless-reverse")]
+pub(crate) async fn connect_vless_reverse_bridge(
+    resolver: &Arc<dyn Resolver>,
+    endpoint: &VlessReverseBridgeEndpoint,
+) -> std::io::Result<Box<dyn AsyncStream>> {
+    let target = resolve_single_address(resolver, &endpoint.server).await?;
+    let socket = new_tcp_socket(None, target.is_ipv6())?;
+    let stream = socket.connect(target).await?;
+    if let Err(error) = stream.set_nodelay(true) {
+        warn!("Failed to set TCP no-delay on Reverse Bridge socket: {error}");
+    }
+    let mut stream: Box<dyn AsyncStream> = Box::new(stream);
+    vless_reverse_connect(&mut *stream, endpoint).await?;
+    Ok(stream)
 }
 
 #[cfg(any(test, feature = "tuic"))]

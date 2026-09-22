@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{address::NetLocation, async_stream::AsyncStream};
 
 use super::{
-    bridge_control::{BridgeControlState, BridgeWorkerPhase},
+    bridge_control::BridgeControlState,
     mux_frame::{
         Destination, FrameMetadata, FrameOption, SessionStatus, TargetNetwork,
     },
@@ -95,10 +95,6 @@ impl MuxServerWorker {
         }
     }
 
-    pub(crate) fn phase(&self) -> BridgeWorkerPhase {
-        self.control.phase()
-    }
-
     pub(crate) fn is_active(&self) -> bool {
         self.control.is_active() && !self.closed()
     }
@@ -119,6 +115,7 @@ impl MuxServerWorker {
         self.cancellation.cancel();
     }
 
+    #[cfg(test)]
     pub(crate) async fn wait_closed(&self) {
         self.cancellation.cancelled().await;
     }

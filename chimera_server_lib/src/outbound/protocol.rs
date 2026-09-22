@@ -5,8 +5,6 @@ use crate::address::{Address, NetLocation};
 #[cfg(feature = "vless-reverse")]
 use super::VlessReverseBridgeEndpoint;
 use super::{SocksOutboundEndpoint, TrojanOutboundEndpoint, VlessOutboundEndpoint};
-#[cfg(feature = "vless-reverse")]
-use super::VlessReverseBridgeEndpoint;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TrojanCommand {
@@ -124,44 +122,6 @@ where
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unexpected VLESS response version {version}"),
-        ));
-    }
-    let addon_len = stream.read_u8().await? as usize;
-    if addon_len > 0 {
-        let mut addons = vec![0u8; addon_len];
-        stream.read_exact(&mut addons).await?;
-    }
-    Ok(())
-}
-
-#[cfg(feature = "vless-reverse")]
-pub(super) async fn vless_reverse_connect<S>(
-    stream: &mut S,
-    endpoint: &VlessReverseBridgeEndpoint,
-) -> std::io::Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized,
-{
-    if !endpoint.flow.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "VLESS Vision Reverse outbound requires transport-aware support",
-        ));
-    }
-
-    let mut request = Vec::with_capacity(20);
-    request.push(0);
-    request.extend_from_slice(&endpoint.user_id);
-    request.push(0); // empty addons
-    request.push(4); // Xray RequestCommandRvs; no destination follows.
-    stream.write_all(&request).await?;
-    stream.flush().await?;
-
-    let version = stream.read_u8().await?;
-    if version != 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("unexpected VLESS Reverse response version {version}"),
         ));
     }
     let addon_len = stream.read_u8().await? as usize;

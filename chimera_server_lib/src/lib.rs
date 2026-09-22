@@ -615,7 +615,21 @@ impl ValidatedServerPlan {
         let api_started = self.api.as_ref().is_some_and(|api| {
             self.resolved_api.listen.is_some() && !api.services.is_empty()
         });
-        if self.inbounds.is_empty() && !api_started && self.mcp.is_none() {
+        #[cfg(feature = "vless-reverse")]
+        let reverse_bridge_started =
+            !crate::handler::vless_reverse::bridge_runtime::prepare_reverse_bridge_plans(
+                &self.outbounds,
+            )
+            .map_err(|error| Error::InvalidConfig(error.to_string()))?
+            .is_empty();
+        #[cfg(not(feature = "vless-reverse"))]
+        let reverse_bridge_started = false;
+
+        if self.inbounds.is_empty()
+            && !api_started
+            && self.mcp.is_none()
+            && !reverse_bridge_started
+        {
             return Err(Error::InvalidConfig(
                 "no servers started; check inbounds/api configuration".into(),
             ));
@@ -815,6 +829,12 @@ async fn start_async(
     log::init(config.log.as_ref(), cwd, log_file)?;
     let plan = ValidatedServerPlan::compile(config)?;
     plan.ensure_server_component()?;
+    #[cfg(feature = "vless-reverse")]
+    let reverse_bridge_plans =
+        crate::handler::vless_reverse::bridge_runtime::prepare_reverse_bridge_plans(
+            &plan.outbounds,
+        )
+        .map_err(|error| Error::InvalidConfig(error.to_string()))?;
     let connection_drain_timeout = plan.shutdown_grace_period;
     let api_config = plan.api;
     let mcp_configured_without_listen = plan.mcp_configured_without_listen;
@@ -876,6 +896,17 @@ async fn start_async(
             )
             .await?;
         has_started_server |= started_inbounds > 0;
+
+        #[cfg(feature = "vless-reverse")]
+        {
+            let bridge_tasks =
+                crate::handler::vless_reverse::bridge_runtime::start_reverse_bridge_monitors(
+                    runtime_state.data_plane(),
+                    reverse_bridge_plans,
+                );
+            has_started_server |= !bridge_tasks.is_empty();
+            join_handles.extend(bridge_tasks);
+        }
 
         if let Some(observer) = routing_observer::start_observer(
             runtime_state.data_plane(),
@@ -1105,6 +1136,32 @@ mod tests {
 
         ValidatedServerPlan::compile(config)
             .expect("Xray treats a null root reverse pointer as unconfigured");
+    }
+
+    #[cfg(feature = "vless-reverse")]
+    #[test]
+    fn reverse_bridge_outbound_counts_as_server_component() {
+        let config: crate::config::def::LiteralConfig =
+            serde_json::from_value(serde_json::json!({
+                "inbounds": [],
+                "outbounds": [{
+                    "tag": "reverse-bridge",
+                    "protocol": "vless",
+                    "settings": {
+                        "address": "127.0.0.1",
+                        "port": 443,
+                        "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+                        "encryption": "none",
+                        "reverse": {"tag": "bridge-in"}
+                    }
+                }]
+            }))
+            .expect("parse bridge-only config");
+
+        ValidatedServerPlan::compile(config)
+            .expect("compile bridge-only config")
+            .ensure_server_component()
+            .expect("supervised Reverse Bridge is a server component");
     }
 
     #[cfg(feature = "vless-reverse")]

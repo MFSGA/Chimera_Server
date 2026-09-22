@@ -126,19 +126,13 @@ pub(super) fn decode_vless_outbound(
 }
 
 #[cfg(feature = "vless-reverse")]
-pub(crate) fn decode_vless_reverse_bridge(
+pub(crate) fn maybe_decode_vless_reverse_bridge(
     outbound: &OutboundSummary,
-) -> std::io::Result<VlessReverseBridgeEndpoint> {
+) -> std::io::Result<Option<VlessReverseBridgeEndpoint>> {
     let (server, account) = decode_vless_server_and_account(outbound)?;
-    let reverse = account.reverse.as_ref().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "VLESS outbound {} does not configure a Reverse Bridge account",
-                outbound.tag
-            ),
-        )
-    })?;
+    let Some(reverse) = account.reverse.as_ref() else {
+        return Ok(None);
+    };
     if reverse.tag.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -155,11 +149,26 @@ pub(crate) fn decode_vless_reverse_bridge(
     let user_id = parse_xray_uuid(&account.id).map_err(|error| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
     })?;
-    Ok(VlessReverseBridgeEndpoint {
+    Ok(Some(VlessReverseBridgeEndpoint {
         server,
         user_id,
         flow: account.flow,
         reverse_tag: reverse.tag.clone(),
+    }))
+}
+
+#[cfg(all(test, feature = "vless-reverse"))]
+pub(crate) fn decode_vless_reverse_bridge(
+    outbound: &OutboundSummary,
+) -> std::io::Result<VlessReverseBridgeEndpoint> {
+    maybe_decode_vless_reverse_bridge(outbound)?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "VLESS outbound {} does not configure a Reverse Bridge account",
+                outbound.tag
+            ),
+        )
     })
 }
 
