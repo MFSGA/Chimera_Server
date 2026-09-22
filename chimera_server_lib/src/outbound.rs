@@ -14,6 +14,8 @@ mod routing;
 mod static_config;
 mod wire;
 
+#[cfg(feature = "vless-reverse")]
+pub(crate) use decode::decode_vless_reverse_bridge;
 #[cfg(feature = "api")]
 pub(crate) use decode::validate_outbound_sender_settings;
 use decode::{
@@ -83,6 +85,15 @@ struct VlessOutboundEndpoint {
     server: NetLocation,
     user_id: [u8; 16],
     flow: String,
+}
+
+#[cfg(feature = "vless-reverse")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VlessReverseBridgeEndpoint {
+    pub(crate) server: NetLocation,
+    pub(crate) user_id: [u8; 16],
+    pub(crate) flow: String,
+    pub(crate) reverse_tag: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

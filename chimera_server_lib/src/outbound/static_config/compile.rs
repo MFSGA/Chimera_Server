@@ -549,31 +549,36 @@ fn encode_static_socks_config(
 fn encode_static_vless_config(
     mut config: StaticVlessClientConfig,
 ) -> Result<VlessClientConfigPayload, String> {
-    if let Some(reverse) = config.reverse.as_ref() {
-        #[cfg(not(feature = "vless-reverse"))]
-        {
-            let _ = (&reverse.tag, &reverse.sniffing);
+    #[cfg(feature = "vless-reverse")]
+    let reverse = if let Some(reverse) = config.reverse.take() {
+        if config.address.is_none() {
             return Err(
-                "VLESS outbound reverse requires the vless-reverse feature".into()
+                "VLESS outbound reverse requires simplified settings with address/port/id"
+                    .into(),
             );
         }
+        if reverse.tag.is_empty() {
+            return Err("VLESS reverse tag cannot be empty".into());
+        }
+        if reverse.sniffing.is_some() {
+            return Err(
+                "VLESS outbound reverse sniffing is not implemented yet".into()
+            );
+        }
+        Some(VlessReversePayload {
+            tag: reverse.tag,
+            sniffing: None,
+        })
+    } else {
+        None
+    };
 
-        #[cfg(feature = "vless-reverse")]
-        {
-            if config.address.is_none() {
-                return Err(
-                    "VLESS outbound reverse requires simplified settings with address/port/id"
-                        .into(),
-                );
-            }
-            if reverse.tag.is_empty() {
-                return Err("VLESS reverse tag cannot be empty".into());
-            }
-            let _ = reverse.sniffing.as_ref();
-            return Err(
-                "Chimera VLESS Reverse Bridge role is not implemented yet".into()
-            );
-        }
+    #[cfg(not(feature = "vless-reverse"))]
+    if let Some(reverse) = config.reverse.as_ref() {
+        let _ = (&reverse.tag, &reverse.sniffing);
+        return Err(
+            "VLESS outbound reverse requires the vless-reverse feature".into()
+        );
     }
 
     let (server, user) = if let Some(address) = config.address.take() {
@@ -639,6 +644,9 @@ fn encode_static_vless_config(
         id: user.id,
         flow: user.flow,
         encryption: user.encryption,
+        #[cfg(feature = "vless-reverse")]
+        reverse,
+        #[cfg(not(feature = "vless-reverse"))]
         reverse: None,
     };
     Ok(VlessClientConfigPayload {

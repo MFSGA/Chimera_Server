@@ -890,8 +890,18 @@ fn encoded_vless_reverse_account_cannot_downgrade_to_forward_outbound() {
     assert!(
         error
             .to_string()
-            .contains("Reverse Bridge role is not implemented")
+            .contains("cannot be used as a normal forward outbound")
     );
+
+    let bridge = decode_vless_reverse_bridge(&outbound)
+        .expect("Reverse account should decode into the Bridge startup role");
+    assert_eq!(bridge.server.to_string(), "127.0.0.1:1234");
+    assert_eq!(bridge.reverse_tag, "reverse-in");
+    assert_eq!(
+        bridge.user_id,
+        parse_xray_uuid("3ac9b383-75a1-431c-8184-106c80eb2273").unwrap()
+    );
+    assert!(bridge.flow.is_empty());
 }
 
 #[cfg(all(feature = "vless", not(feature = "vless-reverse")))]
@@ -920,7 +930,7 @@ fn static_vless_reverse_requires_feature() {
 
 #[cfg(feature = "vless-reverse")]
 #[test]
-fn static_vless_reverse_recognizes_bridge_role_but_does_not_silently_accept_it() {
+fn static_vless_reverse_preserves_bridge_startup_plan() {
     let item: OutboundItem = serde_json::from_value(serde_json::json!({
         "protocol": "vless",
         "tag": "reverse-tunnel",
@@ -934,10 +944,37 @@ fn static_vless_reverse_recognizes_bridge_role_but_does_not_silently_accept_it()
     }))
     .expect("parse reverse VLESS outbound");
 
+    let outbound =
+        compile_static_outbound(&item).expect("compile Reverse Bridge outbound");
+    let bridge = decode_vless_reverse_bridge(&outbound)
+        .expect("decode Reverse Bridge startup plan");
+    assert_eq!(bridge.server.to_string(), "127.0.0.1:1234");
+    assert_eq!(bridge.reverse_tag, "reverse-in");
+}
+
+#[cfg(feature = "vless-reverse")]
+#[test]
+fn static_vless_reverse_sniffing_fails_until_runtime_support_exists() {
+    let item: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "vless",
+        "tag": "reverse-tunnel",
+        "settings": {
+            "address": "127.0.0.1",
+            "port": 1234,
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "encryption": "none",
+            "reverse": {
+                "tag": "reverse-in",
+                "sniffing": {"enabled": true, "destOverride": ["http"]}
+            }
+        }
+    }))
+    .expect("parse Reverse sniffing");
+
     let error = compile_static_outbound(&item)
-        .expect_err("Chimera Bridge is not implemented in batch A");
+        .expect_err("Reverse sniffing must fail closed until Batch H");
     assert!(
-        error.contains("Reverse Bridge role is not implemented yet"),
+        error.contains("reverse sniffing is not implemented"),
         "{error}"
     );
 }

@@ -1,3 +1,6 @@
+pub(crate) mod bridge_control;
+pub(crate) mod bridge_dispatch;
+pub(crate) mod bridge_worker;
 pub(crate) mod control;
 pub(crate) mod control_session;
 pub(crate) mod mux_frame;

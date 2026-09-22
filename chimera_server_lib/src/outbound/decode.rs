@@ -92,6 +92,80 @@ pub(super) fn decode_socks_outbound(
 pub(super) fn decode_vless_outbound(
     outbound: &OutboundSummary,
 ) -> std::io::Result<VlessOutboundEndpoint> {
+    let (server, account) = decode_vless_server_and_account(outbound)?;
+
+    if let Some(reverse) = account.reverse.as_ref() {
+        #[cfg(not(feature = "vless-reverse"))]
+        {
+            let _ = (&reverse.tag, &reverse.sniffing);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "VLESS outbound reverse requires the vless-reverse feature",
+            ));
+        }
+
+        #[cfg(feature = "vless-reverse")]
+        {
+            let _ = (&reverse.tag, &reverse.sniffing);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "VLESS Reverse Bridge account cannot be used as a normal forward outbound",
+            ));
+        }
+    }
+
+    validate_vless_outbound_account(outbound, &account)?;
+    let user_id = parse_xray_uuid(&account.id).map_err(|error| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
+    })?;
+    Ok(VlessOutboundEndpoint {
+        server,
+        user_id,
+        flow: account.flow,
+    })
+}
+
+#[cfg(feature = "vless-reverse")]
+pub(crate) fn decode_vless_reverse_bridge(
+    outbound: &OutboundSummary,
+) -> std::io::Result<VlessReverseBridgeEndpoint> {
+    let (server, account) = decode_vless_server_and_account(outbound)?;
+    let reverse = account.reverse.as_ref().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "VLESS outbound {} does not configure a Reverse Bridge account",
+                outbound.tag
+            ),
+        )
+    })?;
+    if reverse.tag.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "VLESS outbound reverse tag cannot be empty",
+        ));
+    }
+    if reverse.sniffing.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "VLESS outbound reverse sniffing is not implemented yet",
+        ));
+    }
+    validate_vless_outbound_account(outbound, &account)?;
+    let user_id = parse_xray_uuid(&account.id).map_err(|error| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
+    })?;
+    Ok(VlessReverseBridgeEndpoint {
+        server,
+        user_id,
+        flow: account.flow,
+        reverse_tag: reverse.tag.clone(),
+    })
+}
+
+fn decode_vless_server_and_account(
+    outbound: &OutboundSummary,
+) -> std::io::Result<(NetLocation, VlessAccountPayload)> {
     let message_type = outbound
         .proxy_settings_type
         .as_deref()
@@ -166,32 +240,13 @@ pub(super) fn decode_vless_outbound(
                 format!("invalid VLESS outbound {} account: {error}", outbound.tag),
             )
         })?;
+    Ok((NetLocation::new(address, port), account))
+}
 
-    if let Some(reverse) = account.reverse.as_ref() {
-        #[cfg(not(feature = "vless-reverse"))]
-        {
-            let _ = (&reverse.tag, &reverse.sniffing);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "VLESS outbound reverse requires the vless-reverse feature",
-            ));
-        }
-
-        #[cfg(feature = "vless-reverse")]
-        {
-            if reverse.tag.is_empty() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "VLESS outbound reverse tag cannot be empty",
-                ));
-            }
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "Chimera VLESS Reverse Bridge role is not implemented yet",
-            ));
-        }
-    }
-
+fn validate_vless_outbound_account(
+    outbound: &OutboundSummary,
+    account: &VlessAccountPayload,
+) -> std::io::Result<()> {
     if !account.flow.trim().is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -210,14 +265,7 @@ pub(super) fn decode_vless_outbound(
             ),
         ));
     }
-    let user_id = parse_xray_uuid(&account.id).map_err(|error| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
-    })?;
-    Ok(VlessOutboundEndpoint {
-        server: NetLocation::new(address, port),
-        user_id,
-        flow: account.flow,
-    })
+    Ok(())
 }
 
 pub(super) fn decode_trojan_outbound(
