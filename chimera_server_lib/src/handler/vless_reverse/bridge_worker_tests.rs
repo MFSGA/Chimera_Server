@@ -65,6 +65,7 @@ impl BridgeTcpDispatcher for FakeDispatcher {
         target: NetLocation,
         source: Option<SocketAddr>,
         local: Option<SocketAddr>,
+        _sniffing: Option<crate::config::server_config::InboundSniffingConfig>,
     ) -> std::io::Result<Box<dyn AsyncStream>> {
         self.calls
             .lock()

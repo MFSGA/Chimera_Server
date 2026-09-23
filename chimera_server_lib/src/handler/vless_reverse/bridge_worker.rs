@@ -19,7 +19,10 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-use crate::{address::NetLocation, async_stream::AsyncStream};
+use crate::{
+    address::NetLocation, async_stream::AsyncStream,
+    config::server_config::InboundSniffingConfig,
+};
 
 use super::{
     bridge_control::BridgeControlState,
@@ -69,6 +72,7 @@ pub(crate) trait BridgeTcpDispatcher: Send + Sync {
         target: NetLocation,
         source: Option<SocketAddr>,
         local: Option<SocketAddr>,
+        sniffing: Option<InboundSniffingConfig>,
     ) -> std::io::Result<Box<dyn AsyncStream>>;
 
     async fn open_udp(
@@ -87,10 +91,20 @@ pub(crate) struct MuxServerWorker {
 }
 
 impl MuxServerWorker {
+    #[cfg(test)]
     pub(crate) fn new(
         physical: Box<dyn AsyncStream>,
         reverse_tag: String,
         dispatcher: Arc<dyn BridgeTcpDispatcher>,
+    ) -> Self {
+        Self::new_with_sniffing(physical, reverse_tag, dispatcher, None)
+    }
+
+    pub(crate) fn new_with_sniffing(
+        physical: Box<dyn AsyncStream>,
+        reverse_tag: String,
+        dispatcher: Arc<dyn BridgeTcpDispatcher>,
+        sniffing: Option<InboundSniffingConfig>,
     ) -> Self {
         let control = Arc::new(BridgeControlState::new());
         let sessions = Arc::new(Mutex::new(HashMap::new()));
@@ -110,6 +124,7 @@ impl MuxServerWorker {
             cancellation.clone(),
             tasks.clone(),
             session_count.clone(),
+            sniffing,
         ));
         let writer_task = tokio::spawn(run_physical_writer(
             writer,
@@ -186,6 +201,7 @@ async fn run_physical_reader<R>(
     cancellation: CancellationToken,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     session_count: Arc<AtomicU64>,
+    sniffing: Option<InboundSniffingConfig>,
 ) where
     R: AsyncRead + Unpin,
 {
@@ -232,6 +248,7 @@ async fn run_physical_reader<R>(
                     cancellation.clone(),
                     tasks.clone(),
                     session_count.clone(),
+                    sniffing.clone(),
                 )
                 .await
             }
@@ -266,6 +283,7 @@ async fn handle_new_tcp(
     cancellation: CancellationToken,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     session_count: Arc<AtomicU64>,
+    sniffing: Option<InboundSniffingConfig>,
 ) -> std::io::Result<()> {
     let target = frame.metadata.target.as_ref().ok_or_else(|| {
         std::io::Error::new(
@@ -317,7 +335,13 @@ async fn handle_new_tcp(
         .as_ref()
         .and_then(destination_socket_addr);
     let stream = dispatcher
-        .open_tcp(reverse_tag, target.location.clone(), source, local)
+        .open_tcp(
+            reverse_tag,
+            target.location.clone(),
+            source,
+            local,
+            sniffing,
+        )
         .await?;
 
     let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_FRAME_CAPACITY);

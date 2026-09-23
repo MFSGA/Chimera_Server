@@ -7,7 +7,10 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::{io::ReadBuf, sync::mpsc};
+use tokio::{
+    io::{ReadBuf, copy_bidirectional, duplex},
+    sync::mpsc,
+};
 use tokio_util::sync::PollSender;
 
 use crate::{
@@ -18,16 +21,22 @@ use crate::{
         AsyncWriteSourcedMessage,
     },
     beginning::udp::run_multi_directional_udp,
+    config::server_config::InboundSniffingConfig,
     outbound::{InboundRoutingMetadata, connect_tcp_outbound_with_routing_metadata},
     runtime::DataPlaneRuntime,
+    session::sniff::{build_sniffed_route_plan, sniff_stream_protocol},
     traffic::TrafficContext,
 };
 
-use super::bridge_worker::{
-    BridgeTcpDispatcher, BridgeUdpRequest, BridgeUdpResponse, BridgeUdpSession,
+use super::{
+    bridge_worker::{
+        BridgeTcpDispatcher, BridgeUdpRequest, BridgeUdpResponse, BridgeUdpSession,
+    },
+    session_stream::ReverseSessionStream,
 };
 
 const UDP_CHANNEL_CAPACITY: usize = 16;
+const SNIFFING_RELAY_CAPACITY: usize = 16 * 1024;
 
 struct BridgeTargetedUdpStream {
     requests: mpsc::Receiver<BridgeUdpRequest>,
@@ -143,33 +152,98 @@ impl BridgeTcpDispatcher for DataPlaneRuntime {
         target: NetLocation,
         source: Option<SocketAddr>,
         local: Option<SocketAddr>,
+        sniffing: Option<InboundSniffingConfig>,
     ) -> std::io::Result<Box<dyn AsyncStream>> {
         let source =
             source.unwrap_or_else(|| SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)));
-        let metadata = InboundRoutingMetadata {
-            local_addr: local,
-            inbound_protocol: Some("vless-reverse".to_string()),
-            ..InboundRoutingMetadata::default()
-        };
         let resolver = self.resolver();
-        let connection = connect_tcp_outbound_with_routing_metadata(
-            &resolver,
-            &target,
-            self,
-            reverse_tag,
-            "",
-            source,
-            metadata,
-        )
-        .await?
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                format!("routing rejected VLESS Reverse Bridge target {target}"),
-            )
-        })?;
 
-        Ok(connection.stream)
+        let Some(sniffing) = sniffing else {
+            let metadata = InboundRoutingMetadata {
+                local_addr: local,
+                inbound_protocol: Some("vless-reverse".to_string()),
+                ..InboundRoutingMetadata::default()
+            };
+            let connection = connect_tcp_outbound_with_routing_metadata(
+                &resolver,
+                &target,
+                self,
+                reverse_tag,
+                "",
+                source,
+                metadata,
+            )
+            .await?
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    format!("routing rejected VLESS Reverse Bridge target {target}"),
+                )
+            })?;
+
+            return Ok(connection.stream);
+        };
+
+        let (mux_side, route_side) = duplex(SNIFFING_RELAY_CAPACITY);
+        let runtime = self.clone();
+        let reverse_tag = reverse_tag.to_string();
+        let original_target = target.clone();
+        if !self.spawn_inbound_connection(async move {
+            let logical_stream: Box<dyn AsyncStream> =
+                Box::new(ReverseSessionStream::new(route_side));
+            let result = async {
+                let (mut sniffed_stream, sniffed_metadata) =
+                    sniff_stream_protocol(logical_stream, Some(&sniffing)).await?;
+                let mut route_plan = build_sniffed_route_plan(
+                    Some(&sniffing),
+                    sniffed_metadata,
+                    &original_target,
+                    local,
+                );
+                route_plan.routing_metadata.inbound_protocol =
+                    Some("vless-reverse".to_string());
+
+                let connection = connect_tcp_outbound_with_routing_metadata(
+                    &resolver,
+                    &route_plan.outbound_target,
+                    &runtime,
+                    &reverse_tag,
+                    "",
+                    source,
+                    route_plan.routing_metadata,
+                )
+                .await?
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        format!(
+                            "routing rejected sniffed VLESS Reverse Bridge target {}",
+                            route_plan.outbound_target
+                        ),
+                    )
+                })?;
+                let mut remote = connection.stream;
+                copy_bidirectional(&mut sniffed_stream, &mut remote).await?;
+                Ok::<(), std::io::Error>(())
+            }
+            .await;
+
+            if let Err(error) = result {
+                tracing::debug!(
+                    reverse_tag = %reverse_tag,
+                    target = %original_target,
+                    %error,
+                    "VLESS Reverse Bridge sniffed TCP relay ended with error"
+                );
+            }
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "server is shutting down",
+            ));
+        }
+
+        Ok(Box::new(ReverseSessionStream::new(mux_side)))
     }
 
     async fn open_udp(

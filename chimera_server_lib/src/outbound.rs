@@ -92,12 +92,13 @@ struct VlessOutboundEndpoint {
 }
 
 #[cfg(feature = "vless-reverse")]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct VlessReverseBridgeEndpoint {
     pub(crate) server: NetLocation,
     pub(crate) user_id: [u8; 16],
     pub(crate) flow: String,
     pub(crate) reverse_tag: String,
+    pub(crate) sniffing: Option<crate::config::server_config::InboundSniffingConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

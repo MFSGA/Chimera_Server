@@ -47,3 +47,34 @@ message GeoIP {
 message GeoIPList {
   repeated GeoIP entry = 1;
 }
+
+message GeoSiteRule {
+  string file = 1;
+  string code = 2;
+  string attrs = 3;
+}
+
+message DomainRule {
+  oneof value {
+    GeoSiteRule geosite = 1;
+    Domain custom = 2;
+  }
+}
+
+message CIDRRule {
+  CIDR cidr = 1;
+  bool reverse_match = 2;
+}
+
+message GeoIPRule {
+  string file = 1;
+  string code = 2;
+  bool reverse_match = 3;
+}
+
+message IPRule {
+  oneof value {
+    GeoIPRule geoip = 1;
+    CIDRRule custom = 2;
+  }
+}

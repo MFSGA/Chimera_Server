@@ -1,6 +1,6 @@
 # VLESS Reverse 支持设计与实施计划
 
-- 状态：Batch A–F 的 TCP RAW/TLS 角色已实现（Portal + Chimera Bridge 双向 Xray 互操作）；Batch G 的普通 Reverse UDP RAW 已完成双向固定 Xray 互操作，sniffing、动态管理与更广 transport/security 仍待完成
+- 状态：Batch A–F 的 TCP RAW/TLS 角色已实现（Portal + Chimera Bridge 双向 Xray 互操作）；Batch G 的普通 Reverse UDP RAW 已完成双向固定 Xray 互操作；Batch H 已接入 Bridge outbound Reverse HTTP/TLS sniffing、routeOnly 与 domain/IP exclusions，动态管理与更广 transport/security 仍待完成
 - 更新日期：2026-09-23
 - 当前本地 Xray 基线：`ref/xray-core` `v26.9.9`，提交
   `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`
@@ -549,9 +549,10 @@ Chimera Bridge、UDP/XUDP 与更完整的 Reverse 兼容面。每批完成并提
 
 ### H. Sniffing 与源地址
 
-- 复用共享 sniffing compiler 和 dispatcher。
-- 传播 source/local metadata、routing user、policy identity 和 traffic context。
-- 验证 HTTP Host、TLS SNI、routeOnly、排除规则和 PROXY protocol 使用方。
+- Bridge outbound `reverse.sniffing` 已使用固定 Xray `SniffingConfig` protobuf shape（enabled、destinationOverride、domainsExcluded、ipsExcluded、metadataOnly、routeOnly），静态 JSON 不再丢字段或使用私有 wire。
+- Bridge logical TCP session 在启用 sniffing 时复用共享 sniffer：先读取并回放首包，再基于 HTTP Host / TLS SNI 构造 routing metadata 和目标覆盖；未启用 sniffing 时保持原有直连路径。
+- 固定 Xray-core `v26.9.9` Portal -> Chimera Bridge RAW 互操作已验证 HTTP Host、TLS SNI、routeOnly、domain exclusion 和 IP exclusion。`metadataOnly` 与 FakeDNS override 当前仍明确 fail closed；QUIC override 维持与现有 inbound sniffer 一致的兼容 no-op。
+- Reverse Mux NEW 的 source/local metadata 已继续传播进 Bridge routing。routing user、policy identity、traffic context 以及 PROXY protocol 使用方的 Reverse 专项验证仍待完成。
 
 ### I. 动态管理与可观测性
 
@@ -571,7 +572,7 @@ Chimera Bridge、UDP/XUDP 与更完整的 Reverse 兼容面。每批完成并提
 
 - inbound `reverse.tag` 有效、空值、重复值和静态 outbound 冲突；
 - inbound `reverse.sniffing` 明确失败；
-- simplified outbound Reverse 成功；
+- simplified outbound Reverse 成功，`reverse.sniffing` 的 enabled/destOverride/routeOnly/domain/IP exclusions 可编译；metadataOnly/FakeDNS 明确失败；
 - `vnext[].users[].reverse` 明确失败；
 - root legacy Reverse 明确失败；
 - feature 未编译时当前字段明确失败；

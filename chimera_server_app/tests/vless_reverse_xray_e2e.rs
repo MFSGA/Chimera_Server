@@ -68,6 +68,69 @@ fn chimera_bridge_round_trips_public_xray_portal_over_websocket_vless_reverse() 
 }
 
 #[test]
+fn chimera_bridge_sniffs_http_host_over_raw_vless_reverse() {
+    run_chimera_bridge_sniffing_interop(
+        "http-override",
+        "192.0.2.1",
+        json!({"enabled": true, "destOverride": ["http"]}),
+        b"GET /sniff HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+}
+
+#[test]
+fn chimera_bridge_sniffs_tls_sni_over_raw_vless_reverse() {
+    let payload = tls_client_hello_payload("localhost");
+    run_chimera_bridge_sniffing_interop(
+        "tls-override",
+        "192.0.2.1",
+        json!({"enabled": true, "destOverride": ["tls"]}),
+        &payload,
+    );
+}
+
+#[test]
+fn chimera_bridge_reverse_sniffing_route_only_keeps_original_target() {
+    run_chimera_bridge_sniffing_interop(
+        "http-route-only",
+        "127.0.0.1",
+        json!({
+            "enabled": true,
+            "destOverride": ["http"],
+            "routeOnly": true
+        }),
+        b"GET /sniff HTTP/1.1\r\nHost: route-only.test\r\nConnection: close\r\n\r\n",
+    );
+}
+
+#[test]
+fn chimera_bridge_reverse_sniffing_honors_domain_exclusions() {
+    run_chimera_bridge_sniffing_interop(
+        "http-domain-excluded",
+        "127.0.0.1",
+        json!({
+            "enabled": true,
+            "destOverride": ["http"],
+            "domainsExcluded": ["full:excluded.test"]
+        }),
+        b"GET /sniff HTTP/1.1\r\nHost: excluded.test\r\nConnection: close\r\n\r\n",
+    );
+}
+
+#[test]
+fn chimera_bridge_reverse_sniffing_honors_ip_exclusions() {
+    run_chimera_bridge_sniffing_interop(
+        "http-ip-excluded",
+        "127.0.0.1",
+        json!({
+            "enabled": true,
+            "destOverride": ["http"],
+            "ipsExcluded": ["127.0.0.0/8"]
+        }),
+        b"GET /sniff HTTP/1.1\r\nHost: ip-excluded.test\r\nConnection: close\r\n\r\n",
+    );
+}
+
+#[test]
 fn xray_bridge_round_trips_public_dokodemo_udp_over_raw_vless_reverse() {
     run_reverse_udp_interop();
 }
@@ -75,6 +138,138 @@ fn xray_bridge_round_trips_public_dokodemo_udp_over_raw_vless_reverse() {
 #[test]
 fn chimera_bridge_round_trips_public_xray_portal_udp_over_raw_vless_reverse() {
     run_chimera_bridge_udp_interop();
+}
+
+fn run_chimera_bridge_sniffing_interop(
+    name: &str,
+    original_target: &str,
+    sniffing: serde_json::Value,
+    payload: &[u8],
+) {
+    let workspace = workspace_root();
+    let xray = xray_binary(&workspace);
+    if !xray.is_file() {
+        eprintln!(
+            "skipping VLESS Reverse sniffing Xray interoperability test because {} is unavailable; set XRAY_BIN to enable it",
+            xray.display()
+        );
+        return;
+    }
+
+    let _serial = serial_xray_guard();
+    let work_dir =
+        create_test_dir(&format!("vless-reverse-chimera-bridge-sniff-http-{name}"));
+    let (echo_addr, echoed_bytes) = start_observed_echo_server();
+    let reverse_port = free_localhost_port();
+    let public_port = free_localhost_port();
+    let chimera_config = work_dir.join("chimera.json");
+    let xray_config = work_dir.join("xray.json");
+
+    write_json(
+        &xray_config,
+        json!({
+            "log": {"loglevel": "debug"},
+            "inbounds": [
+                {
+                    "listen": "127.0.0.1",
+                    "port": reverse_port,
+                    "protocol": "vless",
+                    "tag": "reverse-vless-in",
+                    "settings": {
+                        "clients": [{
+                            "id": TEST_UUID,
+                            "email": "chimera-bridge-sniff@example.test",
+                            "reverse": {"tag": "reverse-out"}
+                        }],
+                        "decryption": "none"
+                    },
+                    "streamSettings": {"network": "tcp", "security": "none"}
+                },
+                {
+                    "listen": "127.0.0.1",
+                    "port": public_port,
+                    "protocol": "dokodemo-door",
+                    "tag": "public-http",
+                    "settings": {
+                        "address": original_target,
+                        "port": echo_addr.port(),
+                        "network": "tcp",
+                        "followRedirect": false
+                    },
+                    "streamSettings": {"network": "tcp"}
+                }
+            ],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["public-http"],
+                    "network": "tcp",
+                    "outboundTag": "reverse-out"
+                }]
+            }
+        }),
+    );
+
+    write_json(
+        &chimera_config,
+        json!({
+            "log": {"loglevel": "debug"},
+            "inbounds": [],
+            "outbounds": [
+                {
+                    "tag": "reverse-bridge",
+                    "protocol": "vless",
+                    "settings": {
+                        "address": "127.0.0.1",
+                        "port": reverse_port,
+                        "id": TEST_UUID,
+                        "encryption": "none",
+                        "reverse": {
+                            "tag": "bridge-in",
+                            "sniffing": sniffing
+                        }
+                    },
+                    "streamSettings": {"network": "tcp", "security": "none"}
+                },
+                {
+                    "tag": "direct",
+                    "protocol": "freedom"
+                }
+            ],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["bridge-in"],
+                    "network": "tcp",
+                    "outboundTag": "direct"
+                }]
+            }
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config);
+    chimera.assert_running();
+
+    std::thread::sleep(Duration::from_millis(2300));
+    chimera.assert_running();
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, reverse_port)));
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, public_port)));
+    xray.assert_running();
+
+    assert_reverse_echo_with_retry(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, public_port)),
+        payload,
+        &echoed_bytes,
+    );
+
+    chimera.assert_running();
+    xray.assert_running();
 }
 
 fn run_chimera_bridge_udp_interop() {
@@ -697,6 +892,27 @@ fn run_reverse_interop(security: ReverseSecurity) {
 
     chimera.assert_running();
     xray.assert_running();
+}
+
+fn tls_client_hello_payload(server_name: &str) -> Vec<u8> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("default TLS protocol versions")
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+    let server_name =
+        rustls::pki_types::ServerName::try_from(server_name.to_string())
+            .expect("valid TLS sniffing server name");
+    let mut connection =
+        rustls::ClientConnection::new(Arc::new(config), server_name)
+            .expect("create TLS sniffing client");
+    let mut payload = Vec::new();
+    connection
+        .write_tls(&mut payload)
+        .expect("serialize TLS ClientHello");
+    assert!(!payload.is_empty(), "TLS ClientHello must not be empty");
+    payload
 }
 
 fn free_localhost_udp_port() -> u16 {

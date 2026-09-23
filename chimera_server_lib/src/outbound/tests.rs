@@ -984,7 +984,7 @@ fn static_vless_reverse_compiles_tcp_tls_sender_settings() {
 
 #[cfg(feature = "vless-reverse")]
 #[test]
-fn static_vless_reverse_sniffing_fails_until_runtime_support_exists() {
+fn static_vless_reverse_sniffing_round_trips_xray_fields() {
     let item: OutboundItem = serde_json::from_value(serde_json::json!({
         "protocol": "vless",
         "tag": "reverse-tunnel",
@@ -995,18 +995,53 @@ fn static_vless_reverse_sniffing_fails_until_runtime_support_exists() {
             "encryption": "none",
             "reverse": {
                 "tag": "reverse-in",
-                "sniffing": {"enabled": true, "destOverride": ["http"]}
+                "sniffing": {
+                    "enabled": true,
+                    "destOverride": ["http", "https", "quic"],
+                    "domainsExcluded": ["full:blocked.example"],
+                    "ipsExcluded": ["192.0.2.0/24"],
+                    "routeOnly": true
+                }
+            }
+        }
+    }))
+    .expect("parse Reverse sniffing");
+
+    let outbound = compile_static_outbound(&item).expect("compile Reverse sniffing");
+    let bridge = decode_vless_reverse_bridge(&outbound)
+        .expect("decode Reverse sniffing Bridge endpoint");
+    let sniffing = bridge.sniffing.expect("Reverse sniffing config");
+    assert!(sniffing.enabled);
+    assert!(sniffing.route_only);
+    assert!(sniffing.overrides_protocol("http1"));
+    assert!(sniffing.overrides_protocol("tls"));
+    assert!(sniffing.excludes_domain("blocked.example"));
+    assert!(sniffing.excludes_ip("192.0.2.15".parse().unwrap()));
+    assert!(!sniffing.excludes_ip("198.51.100.15".parse().unwrap()));
+}
+
+#[cfg(feature = "vless-reverse")]
+#[test]
+fn static_vless_reverse_sniffing_rejects_unsupported_metadata_only() {
+    let item: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "vless",
+        "tag": "reverse-tunnel",
+        "settings": {
+            "address": "127.0.0.1",
+            "port": 1234,
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "encryption": "none",
+            "reverse": {
+                "tag": "reverse-in",
+                "sniffing": {"enabled": true, "metadataOnly": true}
             }
         }
     }))
     .expect("parse Reverse sniffing");
 
     let error = compile_static_outbound(&item)
-        .expect_err("Reverse sniffing must fail closed until Batch H");
-    assert!(
-        error.contains("reverse sniffing is not implemented"),
-        "{error}"
-    );
+        .expect_err("metadataOnly must fail closed until implemented");
+    assert!(error.contains("metadataOnly is not implemented"), "{error}");
 }
 
 #[cfg(feature = "vless")]

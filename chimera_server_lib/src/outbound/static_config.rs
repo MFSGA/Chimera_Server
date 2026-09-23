@@ -65,7 +65,24 @@ struct StaticVlessReverseConfig {
     #[serde(default)]
     tag: String,
     #[serde(default)]
-    sniffing: Option<serde_json::Value>,
+    sniffing: Option<StaticVlessReverseSniffingConfig>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StaticVlessReverseSniffingConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    dest_override: Vec<String>,
+    #[serde(default)]
+    domains_excluded: Vec<String>,
+    #[serde(default)]
+    ips_excluded: Vec<String>,
+    #[serde(default)]
+    metadata_only: bool,
+    #[serde(default)]
+    route_only: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

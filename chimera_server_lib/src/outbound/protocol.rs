@@ -322,6 +322,7 @@ mod tests {
             ],
             flow: String::new(),
             reverse_tag: "bridge-in".to_string(),
+            sniffing: None,
         };
         let expected_user = endpoint.user_id;
         let (mut client, mut server) = duplex(128);

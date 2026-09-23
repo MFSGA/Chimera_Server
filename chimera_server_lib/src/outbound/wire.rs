@@ -110,7 +110,20 @@ pub(super) struct VlessClientConfigPayload {
 }
 
 #[derive(Clone, PartialEq, Message)]
-pub(super) struct VlessReverseSniffingPayload {}
+pub(super) struct VlessReverseSniffingPayload {
+    #[prost(bool, tag = "1")]
+    pub(super) enabled: bool,
+    #[prost(string, repeated, tag = "2")]
+    pub(super) destination_override: Vec<String>,
+    #[prost(message, repeated, tag = "3")]
+    pub(super) domains_excluded: Vec<crate::geodata::proto::DomainRule>,
+    #[prost(bool, tag = "4")]
+    pub(super) metadata_only: bool,
+    #[prost(bool, tag = "5")]
+    pub(super) route_only: bool,
+    #[prost(message, repeated, tag = "6")]
+    pub(super) ips_excluded: Vec<crate::geodata::proto::IpRule>,
+}
 
 #[derive(Clone, PartialEq, Message)]
 pub(super) struct VlessReversePayload {

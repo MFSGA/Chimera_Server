@@ -579,14 +579,13 @@ fn encode_static_vless_config(
         if reverse.tag.is_empty() {
             return Err("VLESS reverse tag cannot be empty".into());
         }
-        if reverse.sniffing.is_some() {
-            return Err(
-                "VLESS outbound reverse sniffing is not implemented yet".into()
-            );
-        }
+        let sniffing = reverse
+            .sniffing
+            .map(encode_static_reverse_sniffing)
+            .transpose()?;
         Some(VlessReversePayload {
             tag: reverse.tag,
-            sniffing: None,
+            sniffing,
         })
     } else {
         None
@@ -681,6 +680,208 @@ fn encode_static_vless_config(
                 }),
             }),
         }),
+    })
+}
+
+#[cfg(feature = "vless-reverse")]
+fn encode_static_reverse_sniffing(
+    config: StaticVlessReverseSniffingConfig,
+) -> Result<VlessReverseSniffingPayload, String> {
+    if config.metadata_only {
+        return Err(
+            "VLESS outbound reverse sniffing metadataOnly is not implemented yet"
+                .into(),
+        );
+    }
+
+    let destination_override = config
+        .dest_override
+        .into_iter()
+        .map(|protocol| match protocol.trim().to_ascii_lowercase().as_str() {
+            "http" => Ok("http".to_string()),
+            "tls" | "https" | "ssl" => Ok("tls".to_string()),
+            "quic" => Ok("quic".to_string()),
+            "fakedns" | "fakedns+others" => Err(
+                "VLESS outbound reverse sniffing FakeDNS override is not implemented yet"
+                    .to_string(),
+            ),
+            _ => Err(format!(
+                "VLESS outbound reverse sniffing has unknown destOverride protocol {protocol:?}"
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let domains_excluded = config
+        .domains_excluded
+        .into_iter()
+        .map(encode_reverse_domain_rule)
+        .collect::<Result<Vec<_>, _>>()?;
+    let ips_excluded = config
+        .ips_excluded
+        .into_iter()
+        .map(encode_reverse_ip_rule)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(VlessReverseSniffingPayload {
+        enabled: config.enabled,
+        destination_override,
+        domains_excluded,
+        metadata_only: false,
+        route_only: config.route_only,
+        ips_excluded,
+    })
+}
+
+#[cfg(feature = "vless-reverse")]
+fn encode_reverse_domain_rule(
+    mut rule: String,
+) -> Result<crate::geodata::proto::DomainRule, String> {
+    use crate::geodata::proto::{
+        Domain, DomainRule, GeoSiteRule, domain, domain_rule,
+    };
+
+    if let Some(rest) = rule.strip_prefix("geosite:") {
+        rule = format!("ext:geosite.dat:{rest}");
+    }
+    for prefix in ["ext:", "ext-domain:", "ext-site:"] {
+        if let Some(rest) = rule.strip_prefix(prefix) {
+            let (file, code_attrs) = rest.split_once(':').ok_or_else(|| {
+                format!(
+                    "illegal reverse sniffing domain rule {rule:?}: syntax error"
+                )
+            })?;
+            if file.is_empty() {
+                return Err(format!(
+                    "illegal reverse sniffing domain rule {rule:?}: empty file"
+                ));
+            }
+            if code_attrs.ends_with('@') || code_attrs.contains("@@") {
+                return Err(format!(
+                    "illegal reverse sniffing domain rule {rule:?}: empty attr"
+                ));
+            }
+            let (code, attrs) =
+                code_attrs.split_once('@').unwrap_or((code_attrs, ""));
+            if code.is_empty() {
+                return Err(format!(
+                    "illegal reverse sniffing domain rule {rule:?}: empty code"
+                ));
+            }
+            return Ok(DomainRule {
+                value: Some(domain_rule::Value::Geosite(GeoSiteRule {
+                    file: file.to_string(),
+                    code: code.to_ascii_uppercase(),
+                    attrs: attrs.to_ascii_lowercase(),
+                })),
+            });
+        }
+    }
+
+    let (rule_type, value) = if let Some(value) = rule.strip_prefix("regexp:") {
+        (domain::Type::Regex, value.to_string())
+    } else if let Some(value) = rule.strip_prefix("domain:") {
+        (domain::Type::Domain, value.to_string())
+    } else if let Some(value) = rule.strip_prefix("full:") {
+        (domain::Type::Full, value.to_string())
+    } else if let Some(value) = rule.strip_prefix("keyword:") {
+        (domain::Type::Substr, value.to_string())
+    } else if let Some(value) = rule.strip_prefix("dotless:") {
+        if value.contains('.') {
+            return Err(format!(
+                "illegal reverse sniffing domain rule {rule:?}: dotless substring contains a dot"
+            ));
+        }
+        (
+            domain::Type::Regex,
+            if value.is_empty() {
+                "^[^.]*$".to_string()
+            } else {
+                format!("^[^.]*{value}[^.]*$")
+            },
+        )
+    } else {
+        (domain::Type::Substr, rule)
+    };
+
+    Ok(DomainRule {
+        value: Some(domain_rule::Value::Custom(Domain {
+            r#type: rule_type as i32,
+            value,
+            attribute: Vec::new(),
+        })),
+    })
+}
+
+#[cfg(feature = "vless-reverse")]
+fn encode_reverse_ip_rule(
+    mut rule: String,
+) -> Result<crate::geodata::proto::IpRule, String> {
+    use crate::geodata::proto::{Cidr, CidrRule, GeoIpRule, IpRule, ip_rule};
+
+    let mut reverse_match = false;
+    while let Some(rest) = rule.strip_prefix('!') {
+        reverse_match = !reverse_match;
+        rule = rest.to_string();
+    }
+    if let Some(rest) = rule.strip_prefix("geoip:") {
+        rule = format!("ext:geoip.dat:{rest}");
+    }
+    for prefix in ["ext:", "ext-ip:"] {
+        if let Some(rest) = rule.strip_prefix(prefix) {
+            let (file, mut code) = rest.split_once(':').ok_or_else(|| {
+                format!("illegal reverse sniffing IP rule {rule:?}: syntax error")
+            })?;
+            if file.is_empty() {
+                return Err(format!(
+                    "illegal reverse sniffing IP rule {rule:?}: empty file"
+                ));
+            }
+            while let Some(rest) = code.strip_prefix('!') {
+                reverse_match = !reverse_match;
+                code = rest;
+            }
+            if code.is_empty() {
+                return Err(format!(
+                    "illegal reverse sniffing IP rule {rule:?}: empty code"
+                ));
+            }
+            return Ok(IpRule {
+                value: Some(ip_rule::Value::Geoip(GeoIpRule {
+                    file: file.to_string(),
+                    code: code.to_ascii_uppercase(),
+                    reverse_match,
+                })),
+            });
+        }
+    }
+
+    let (ip_text, prefix_text) = rule
+        .split_once('/')
+        .map_or((rule.as_str(), None), |(ip, prefix)| (ip, Some(prefix)));
+    let ip = ip_text.parse::<std::net::IpAddr>().map_err(|_| {
+        format!("illegal reverse sniffing IP rule {rule:?}: invalid IP address")
+    })?;
+    let max_prefix = if ip.is_ipv4() { 32 } else { 128 };
+    let prefix = match prefix_text {
+        Some(prefix) => prefix.parse::<u32>().map_err(|_| {
+            format!("illegal reverse sniffing IP rule {rule:?}: invalid CIDR prefix")
+        })?,
+        None => max_prefix,
+    };
+    if prefix > max_prefix {
+        return Err(format!(
+            "illegal reverse sniffing IP rule {rule:?}: CIDR prefix {prefix} exceeds {max_prefix}"
+        ));
+    }
+    let ip = match ip {
+        std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
+        std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
+    };
+    Ok(IpRule {
+        value: Some(ip_rule::Value::Custom(CidrRule {
+            cidr: Some(Cidr { ip, prefix }),
+            reverse_match,
+        })),
     })
 }
 

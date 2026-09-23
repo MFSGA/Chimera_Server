@@ -139,12 +139,7 @@ pub(crate) fn maybe_decode_vless_reverse_bridge(
             "VLESS outbound reverse tag cannot be empty",
         ));
     }
-    if reverse.sniffing.is_some() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "VLESS outbound reverse sniffing is not implemented yet",
-        ));
-    }
+    let sniffing = decode_reverse_sniffing(reverse.sniffing.as_ref())?;
     validate_vless_outbound_account(outbound, &account)?;
     let user_id = parse_xray_uuid(&account.id).map_err(|error| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
@@ -154,6 +149,197 @@ pub(crate) fn maybe_decode_vless_reverse_bridge(
         user_id,
         flow: account.flow,
         reverse_tag: reverse.tag.clone(),
+        sniffing,
+    }))
+}
+
+#[cfg(feature = "vless-reverse")]
+fn decode_reverse_sniffing(
+    sniffing: Option<&VlessReverseSniffingPayload>,
+) -> std::io::Result<Option<crate::config::server_config::InboundSniffingConfig>> {
+    use crate::{
+        config::server_config::InboundSniffingConfig,
+        geodata::proto::{domain, domain_rule, ip_rule},
+        routing_state::SniffExclusionMatcher,
+    };
+
+    let Some(sniffing) = sniffing else {
+        return Ok(None);
+    };
+    if sniffing.metadata_only {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "VLESS outbound reverse sniffing metadataOnly is not implemented yet",
+        ));
+    }
+
+    let mut dest_override_http = false;
+    let mut dest_override_tls = false;
+    for protocol in &sniffing.destination_override {
+        match protocol.trim().to_ascii_lowercase().as_str() {
+            "http" => dest_override_http = true,
+            "tls" | "https" | "ssl" => dest_override_tls = true,
+            "quic" => {}
+            "fakedns" | "fakedns+others" => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "VLESS outbound reverse sniffing FakeDNS override is not implemented yet",
+                ));
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "VLESS outbound reverse sniffing has unknown destOverride protocol {protocol:?}"
+                    ),
+                ));
+            }
+        }
+    }
+
+    let domains = sniffing
+        .domains_excluded
+        .iter()
+        .map(|rule| match rule.value.as_ref() {
+            Some(domain_rule::Value::Geosite(rule)) => {
+                if rule.file.is_empty() || rule.code.is_empty() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "VLESS reverse sniffing geosite exclusion requires file and code",
+                    ));
+                }
+                let attrs = if rule.attrs.is_empty() {
+                    String::new()
+                } else {
+                    format!("@{}", rule.attrs.to_ascii_lowercase())
+                };
+                if rule.file == "geosite.dat" {
+                    Ok(format!(
+                        "geosite:{}{}",
+                        rule.code.to_ascii_uppercase(),
+                        attrs
+                    ))
+                } else {
+                    Ok(format!(
+                        "ext:{}:{}{}",
+                        rule.file,
+                        rule.code.to_ascii_uppercase(),
+                        attrs
+                    ))
+                }
+            }
+            Some(domain_rule::Value::Custom(rule)) => {
+                let rule_type = domain::Type::try_from(rule.r#type).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "VLESS reverse sniffing domain exclusion has unknown type {}",
+                            rule.r#type
+                        ),
+                    )
+                })?;
+                let prefix = match rule_type {
+                    domain::Type::Substr => "keyword:",
+                    domain::Type::Regex => "regexp:",
+                    domain::Type::Domain => "domain:",
+                    domain::Type::Full => "full:",
+                };
+                Ok(format!("{prefix}{}", rule.value))
+            }
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "VLESS reverse sniffing domain exclusion is empty",
+            )),
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+
+    let ips = sniffing
+        .ips_excluded
+        .iter()
+        .map(|rule| match rule.value.as_ref() {
+            Some(ip_rule::Value::Geoip(rule)) => {
+                if rule.file.is_empty() || rule.code.is_empty() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "VLESS reverse sniffing geoip exclusion requires file and code",
+                    ));
+                }
+                let reverse = if rule.reverse_match { "!" } else { "" };
+                if rule.file == "geoip.dat" {
+                    Ok(format!(
+                        "{reverse}geoip:{}",
+                        rule.code.to_ascii_uppercase()
+                    ))
+                } else {
+                    Ok(format!(
+                        "{reverse}ext:{}:{}",
+                        rule.file,
+                        rule.code.to_ascii_uppercase()
+                    ))
+                }
+            }
+            Some(ip_rule::Value::Custom(rule)) => {
+                let cidr = rule.cidr.as_ref().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "VLESS reverse sniffing custom IP exclusion is missing CIDR",
+                    )
+                })?;
+                let address = match cidr.ip.as_slice() {
+                    [a, b, c, d] => std::net::IpAddr::V4(
+                        std::net::Ipv4Addr::new(*a, *b, *c, *d),
+                    ),
+                    bytes if bytes.len() == 16 => std::net::IpAddr::V6(
+                        std::net::Ipv6Addr::from(
+                            <[u8; 16]>::try_from(bytes).expect("length checked"),
+                        ),
+                    ),
+                    _ => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "VLESS reverse sniffing CIDR has invalid IP length",
+                        ));
+                    }
+                };
+                let max_prefix = if address.is_ipv4() { 32 } else { 128 };
+                if cidr.prefix > max_prefix {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "VLESS reverse sniffing CIDR prefix {} exceeds {}",
+                            cidr.prefix, max_prefix
+                        ),
+                    ));
+                }
+                Ok(format!(
+                    "{}{address}/{}",
+                    if rule.reverse_match { "!" } else { "" },
+                    cidr.prefix
+                ))
+            }
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "VLESS reverse sniffing IP exclusion is empty",
+            )),
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+
+    let exclusions =
+        SniffExclusionMatcher::compile(domains, ips).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid VLESS reverse sniffing exclusions: {error}"),
+            )
+        })?;
+    if !sniffing.enabled {
+        return Ok(None);
+    }
+    Ok(Some(InboundSniffingConfig {
+        enabled: true,
+        dest_override_http,
+        dest_override_tls,
+        route_only: sniffing.route_only,
+        exclusions: std::sync::Arc::new(exclusions),
     }))
 }
 

@@ -83,10 +83,11 @@ async fn run_bridge_monitor(runtime: DataPlaneRuntime, plan: ReverseBridgePlan) 
             .await
             {
                 Ok(physical) => {
-                    workers.push(MuxServerWorker::new(
+                    workers.push(MuxServerWorker::new_with_sniffing(
                         physical,
                         plan.endpoint.reverse_tag.clone(),
                         dispatcher.clone(),
+                        plan.endpoint.sniffing.clone(),
                     ));
                 }
                 Err(error) => {
