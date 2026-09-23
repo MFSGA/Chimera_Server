@@ -559,8 +559,8 @@ Chimera Bridge、UDP/XUDP 与更完整的 Reverse 兼容面。每批完成并提
 - VLESS `AddUser` 已支持带 `reverse.tag` 的动态用户，并复用 live user store 热更新：不会重启 listener，也不会在 AddUser 时提前发布 Reverse route。新增用户可立即认证 command `0x04`。
 - 首次已认证 RVS 按固定 Xray `GetReverse` 语义懒创建 Portal tag，并原子发布 `vless-reverse` 虚拟 outbound；若同 tag 已被普通 outbound 占用则明确失败。routing publication 的动态更新与现有 AddOutbound/RemoveOutbound 共用同一 update mutex。
 - `RemoveUser(email)` 按固定 Xray 顺序撤掉该用户 reverse tag 的 routing/registry mapping，再从 live validator 删除用户；mapping 删除不会主动关闭已持有引用的物理 worker lease。VLESS UserManager email 唯一性与 RemoveUser 已改为 Xray 的大小写不敏感语义，空 email 不参与唯一性。
-- 当前这些动态语义有 gRPC/handler/registry 本地回归，固定 Xray 源码基线已逐项复核；尚未增加网络 API -> 动态 Reverse 的真实 Xray 互操作 fixture。共享 reverse tag 的多用户边界、动态 tag 与普通 outbound 冲突后的 RemoveUser 破坏性语义仍需专项覆盖。
-- 可观测性下一步增加安全的 tag、worker/session count、重连和失败原因指标；日志不得包含 UUID、认证 payload、private key 或完整配置。
+- 动态语义除 gRPC/handler/registry 本地回归外，已增加真实 HandlerService 网络 fixture 与固定 Xray-core `v26.9.9` 对照：`AlterInbound(AddUser reverse)` -> 原生 VLESS command `0x04` -> lazy Reverse outbound 出现 -> `RemoveUser` -> route/user 撤销，两端均通过。共享 reverse tag 的多用户边界已覆盖：删除任一用户会撤掉共享 tag，幸存用户下一次 RVS 可重新懒建；动态 tag 与普通 outbound 冲突时首次 RVS 明确失败且不会替换该 outbound。冲突用户随后 RemoveUser 时 Xray 会无条件 RemoveHandler 的破坏性边界尚未在 Chimera 专项锁定。
+- 可观测性已增加安全的结构化 Reverse lifecycle 日志：Bridge monitor 仅在 worker/session 状态变化时报告 tag、worker/active-session counts，dial 区分 initial/reconnect/scale 并携带 consecutive failure/recovery count；Portal attach/open 报告 tag、worker id、ACTIVE worker 与 Mux session count。logical connection/bytes 继续走既有 traffic/StatsService。VLESS HandlerService `GetInboundUsers` 现按 Xray 保留 `User.level`，包括动态 Reverse 用户。日志不记录 UUID、email、认证 payload、private key 或完整配置。
 
 ### J. 真实互操作与文档收口
 

@@ -1224,6 +1224,76 @@ async fn handler_dynamic_vless_reverse_lazily_publishes_and_removes_route() {
                 && outbound.protocol == "freedom")
     );
 
+    let destructive_email = unique_tag("dynamic-reverse-conflict-user");
+    let add_conflicting = proto::xray::app::proxyman::command::AddUserOperation {
+        user: Some(proto::xray::common::protocol::User {
+            level: 0,
+            email: destructive_email.clone(),
+            account: Some(proto::xray::common::serial::TypedMessage {
+                r#type: TYPE_PROXY_VLESS_ACCOUNT.to_string(),
+                value: VlessAccountWirePayload {
+                    id: "b87cbba9-dcae-4ec7-98f1-28b80a07a2b3".to_string(),
+                    flow: String::new(),
+                    reverse: Some(VlessReversePayload {
+                        tag: "direct".to_string(),
+                        sniffing: None,
+                    }),
+                }
+                .encode_to_vec(),
+            }),
+        }),
+    };
+    service
+        .alter_inbound(Request::new(
+            proto::xray::app::proxyman::command::AlterInboundRequest {
+                tag: inbound_tag.clone(),
+                operation: Some(proto::xray::common::serial::TypedMessage {
+                    r#type: TYPE_ADD_USER_OPERATION.to_string(),
+                    value: add_conflicting.encode_to_vec(),
+                }),
+            },
+        ))
+        .await
+        .expect("conflicting Reverse user is accepted before first RVS");
+    runtime
+        .data_plane()
+        .ensure_reverse_portal("direct")
+        .expect_err("conflicting Reverse user still cannot publish over freedom");
+    let remove_conflicting =
+        proto::xray::app::proxyman::command::RemoveUserOperation {
+            email: destructive_email,
+        };
+    service
+        .alter_inbound(Request::new(
+            proto::xray::app::proxyman::command::AlterInboundRequest {
+                tag: inbound_tag.clone(),
+                operation: Some(proto::xray::common::serial::TypedMessage {
+                    r#type: TYPE_REMOVE_USER_OPERATION.to_string(),
+                    value: remove_conflicting.encode_to_vec(),
+                }),
+            },
+        ))
+        .await
+        .expect("RemoveUser follows Xray RemoveReverse ordering");
+    assert!(
+        runtime
+            .outbounds()
+            .iter()
+            .all(|outbound| outbound.tag != "direct"),
+        "Xray RemoveReverse removes the conflicting outbound tag unconditionally"
+    );
+
+    runtime
+        .add_outbound(OutboundSummary {
+            tag: "direct".to_string(),
+            protocol: "freedom".to_string(),
+            proxy_settings_type: None,
+            proxy_settings_value: None,
+            sender_settings_type: None,
+            sender_settings_value: None,
+        })
+        .expect("restore direct outbound after destructive Xray parity check");
+
     let add_operation = proto::xray::app::proxyman::command::AddUserOperation {
         user: Some(proto::xray::common::protocol::User {
             level: 7,
@@ -2803,6 +2873,7 @@ fn handler_vless_reverse_account_round_trips_without_downgrade() {
     let exposed = service
         .get_user_manager_users(&protocol)
         .expect("VLESS exposes UserManager reads");
+    assert_eq!(exposed[0].level, 7);
     let account = exposed[0]
         .account
         .as_ref()

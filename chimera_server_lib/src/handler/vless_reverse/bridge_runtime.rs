@@ -63,9 +63,14 @@ async fn run_bridge_monitor(runtime: DataPlaneRuntime, plan: ReverseBridgePlan) 
     let resolver = runtime.resolver();
     let dispatcher: Arc<dyn BridgeTcpDispatcher> = Arc::new(runtime);
     let mut workers = Vec::<MuxServerWorker>::new();
+    let mut previous_state = None;
+    let mut successful_dials = 0u64;
+    let mut consecutive_failures = 0u64;
 
     loop {
+        let before_retain = workers.len();
         workers.retain(|worker| !worker.closed());
+        let removed_workers = before_retain.saturating_sub(workers.len());
 
         let mut active_workers = 0usize;
         let mut active_connections = 0usize;
@@ -76,7 +81,31 @@ async fn run_bridge_monitor(runtime: DataPlaneRuntime, plan: ReverseBridgePlan) 
             }
         }
 
+        let state = (workers.len(), active_workers, active_connections);
+        if previous_state != Some(state) || removed_workers != 0 {
+            tracing::debug!(
+                event = "vless_reverse_bridge_state",
+                outbound_tag = %plan.outbound_tag,
+                reverse_tag = %plan.endpoint.reverse_tag,
+                worker_count = state.0,
+                active_workers = state.1,
+                active_sessions = state.2,
+                removed_workers,
+                "VLESS Reverse Bridge monitor state changed"
+            );
+            previous_state = Some(state);
+        }
+
         if should_add_worker(active_workers, active_connections) {
+            let dial_reason = if active_workers == 0 {
+                if successful_dials == 0 {
+                    "initial"
+                } else {
+                    "reconnect"
+                }
+            } else {
+                "scale"
+            };
             match connect_vless_reverse_bridge(
                 &resolver,
                 &plan.outbound,
@@ -85,6 +114,9 @@ async fn run_bridge_monitor(runtime: DataPlaneRuntime, plan: ReverseBridgePlan) 
             .await
             {
                 Ok(physical) => {
+                    successful_dials = successful_dials.saturating_add(1);
+                    let recovered_after_failures = consecutive_failures;
+                    consecutive_failures = 0;
                     workers.push(MuxServerWorker::new_with_context(
                         physical,
                         plan.endpoint.reverse_tag.clone(),
@@ -96,10 +128,24 @@ async fn run_bridge_monitor(runtime: DataPlaneRuntime, plan: ReverseBridgePlan) 
                             user_level: plan.endpoint.user_level,
                         },
                     ));
+                    tracing::info!(
+                        event = "vless_reverse_bridge_worker_connected",
+                        outbound_tag = %plan.outbound_tag,
+                        reverse_tag = %plan.endpoint.reverse_tag,
+                        dial_reason,
+                        worker_count = workers.len(),
+                        recovered_after_failures,
+                        "connected VLESS Reverse Bridge worker"
+                    );
                 }
                 Err(error) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
                     tracing::warn!(
+                        event = "vless_reverse_bridge_worker_connect_failed",
                         outbound_tag = %plan.outbound_tag,
+                        reverse_tag = %plan.endpoint.reverse_tag,
+                        dial_reason,
+                        consecutive_failures,
                         %error,
                         "failed to create VLESS Reverse Bridge worker"
                     );

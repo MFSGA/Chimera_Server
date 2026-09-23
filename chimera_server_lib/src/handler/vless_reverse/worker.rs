@@ -355,11 +355,35 @@ pub(crate) struct MuxClientPicker {
 }
 
 impl MuxClientPicker {
-    pub(crate) fn add(&self, worker: Arc<MuxClientWorker>) {
-        self.workers
+    pub(crate) fn add(&self, worker: Arc<MuxClientWorker>) -> usize {
+        let mut workers = self
+            .workers
             .lock()
-            .expect("Reverse client picker lock poisoned")
-            .push(worker);
+            .expect("Reverse client picker lock poisoned");
+        workers.retain(|worker| worker.phase() != WorkerPhase::Closed);
+        workers.push(worker);
+        workers.len()
+    }
+
+    pub(crate) fn observation(&self) -> (usize, usize, usize) {
+        let workers = self
+            .workers
+            .lock()
+            .expect("Reverse client picker lock poisoned");
+        let worker_count = workers
+            .iter()
+            .filter(|worker| worker.phase() != WorkerPhase::Closed)
+            .count();
+        let active_workers = workers
+            .iter()
+            .filter(|worker| worker.phase() == WorkerPhase::Active)
+            .count();
+        let mux_sessions = workers
+            .iter()
+            .filter(|worker| worker.phase() != WorkerPhase::Closed)
+            .map(|worker| worker.active_connections())
+            .sum();
+        (worker_count, active_workers, mux_sessions)
     }
 
     pub(crate) fn pick_available(&self) -> std::io::Result<Arc<MuxClientWorker>> {

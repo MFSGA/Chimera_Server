@@ -74,6 +74,9 @@ const VLESS_USER_A_ID: &str = "3ac9b383-75a1-431c-8184-106c80eb2273";
 const VLESS_USER_B_ID: &str = "e041e73e-a0a0-49f5-9754-6401aa621fb7";
 const VLESS_ADDED_USER_EMAIL: &str = "vless-added-user@example.com";
 const VLESS_ADDED_USER_ID: &str = "b189e879-7097-4a1b-a2f2-7a6e6f5dba4b";
+const VLESS_REVERSE_DYNAMIC_EMAIL: &str = "vless-reverse-dynamic@example.com";
+const VLESS_REVERSE_DYNAMIC_ID: &str = "61f00c0d-8d5f-4c13-bd3e-fabc5aaaca8c";
+const VLESS_REVERSE_DYNAMIC_TAG: &str = "vless-reverse-dynamic-out";
 
 const PATH_STATS_GET_STATS: &str = "/xray.app.stats.command.StatsService/GetStats";
 const PATH_STATS_GET_STATS_ONLINE: &str =
@@ -1068,6 +1071,7 @@ fn grpc_inbound_failure_status_compat_with_xray_core() {
                     value: VlessAccount {
                         id: VLESS_ADDED_USER_ID.to_string(),
                         flow: String::new(),
+                        reverse: None,
                     }
                     .encode_to_vec(),
                 }),
@@ -1373,6 +1377,64 @@ fn grpc_vless_multi_user_compat_with_xray_core() {
             steps_normalized_summary(&xray_steps),
         );
     }
+}
+
+#[test]
+#[ignore = "runs dynamic VLESS Reverse HandlerService compatibility against xray baseline"]
+fn grpc_dynamic_vless_reverse_lifecycle_matches_xray_core() {
+    trace_step(
+        "==== test grpc_dynamic_vless_reverse_lifecycle_matches_xray_core start ====",
+    );
+    let _guard = acquire_global_test_lock();
+
+    let chimera_grpc_port =
+        free_localhost_port().expect("failed to allocate chimera grpc port");
+    let mut chimera_vless_port =
+        free_localhost_port().expect("failed to allocate chimera vless port");
+    while chimera_vless_port == chimera_grpc_port {
+        chimera_vless_port =
+            free_localhost_port().expect("failed to re-allocate chimera vless port");
+    }
+
+    let mut xray_grpc_port =
+        free_localhost_port().expect("failed to allocate xray grpc port");
+    while xray_grpc_port == chimera_grpc_port || xray_grpc_port == chimera_vless_port
+    {
+        xray_grpc_port =
+            free_localhost_port().expect("failed to re-allocate xray grpc port");
+    }
+
+    let mut xray_vless_port =
+        free_localhost_port().expect("failed to allocate xray vless port");
+    while xray_vless_port == chimera_grpc_port
+        || xray_vless_port == chimera_vless_port
+        || xray_vless_port == xray_grpc_port
+    {
+        xray_vless_port =
+            free_localhost_port().expect("failed to re-allocate xray vless port");
+    }
+
+    let chimera = Harness::start_with_config(
+        TargetKind::Chimera,
+        GrpcTarget::Tcp(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            chimera_grpc_port,
+        ))),
+        build_chimera_vless_multi_user_config(chimera_grpc_port, chimera_vless_port),
+    )
+    .expect("failed to start chimera dynamic Reverse harness");
+    let xray = Harness::start_with_config(
+        TargetKind::Xray,
+        GrpcTarget::Tcp(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            xray_grpc_port,
+        ))),
+        build_xray_vless_multi_user_config(xray_grpc_port, xray_vless_port),
+    )
+    .expect("failed to start xray dynamic Reverse harness");
+
+    run_dynamic_reverse_lifecycle(&chimera, chimera_vless_port);
+    run_dynamic_reverse_lifecycle(&xray, xray_vless_port);
 }
 
 fn run_case(case: &CaseDef) -> io::Result<CompatCaseResult> {
@@ -2348,6 +2410,7 @@ fn mutate_add_vless_user_snapshot(harness: &Harness, tag: &str) -> CompatSnapsho
                 value: VlessAccount {
                     id: VLESS_ADDED_USER_ID.to_string(),
                     flow: String::new(),
+                    reverse: None,
                 }
                 .encode_to_vec(),
             }),
@@ -2430,6 +2493,195 @@ fn run_vless_multi_user_flow(harness: &Harness) -> Vec<CompatStepResult> {
             query_get_inbound_users_count_for_tag(harness, VLESS_TAG),
         ),
     ]
+}
+
+fn run_dynamic_reverse_lifecycle(harness: &Harness, vless_port: u16) {
+    let add_operation = AddUserOperation {
+        user: Some(User {
+            level: 7,
+            email: VLESS_REVERSE_DYNAMIC_EMAIL.to_string(),
+            account: Some(TypedMessage {
+                r#type: "xray.proxy.vless.Account".to_string(),
+                value: VlessAccount {
+                    id: VLESS_REVERSE_DYNAMIC_ID.to_string(),
+                    flow: String::new(),
+                    reverse: Some(VlessReverse {
+                        tag: VLESS_REVERSE_DYNAMIC_TAG.to_string(),
+                    }),
+                }
+                .encode_to_vec(),
+            }),
+        }),
+    };
+    let _: AlterInboundResponse = harness
+        .unary(
+            PATH_HANDLER_ALTER_INBOUND,
+            AlterInboundRequest {
+                tag: VLESS_TAG.to_string(),
+                operation: Some(TypedMessage {
+                    r#type: "xray.app.proxyman.command.AddUserOperation".to_string(),
+                    value: add_operation.encode_to_vec(),
+                }),
+            },
+        )
+        .expect("dynamic Reverse AddUser RPC must succeed");
+
+    let users: GetInboundUserResponse = harness
+        .unary(
+            PATH_HANDLER_GET_INBOUND_USERS,
+            GetInboundUserRequest {
+                tag: VLESS_TAG.to_string(),
+                email: VLESS_REVERSE_DYNAMIC_EMAIL.to_string(),
+            },
+        )
+        .expect("query dynamic Reverse user");
+    assert_eq!(users.users.len(), 1);
+    assert_eq!(users.users[0].email, VLESS_REVERSE_DYNAMIC_EMAIL);
+    assert_eq!(users.users[0].level, 7);
+    assert!(
+        !list_outbound_tags(harness)
+            .expect("list outbounds before Reverse auth")
+            .contains(VLESS_REVERSE_DYNAMIC_TAG),
+        "Reverse route must be lazy until command 0x04 authenticates"
+    );
+
+    let physical =
+        trigger_vless_reverse_session(vless_port, VLESS_REVERSE_DYNAMIC_ID)
+            .expect("dynamic Reverse user must authorize command 0x04");
+    wait_for_outbound_tag(harness, VLESS_REVERSE_DYNAMIC_TAG, true)
+        .expect("authenticated Reverse session must publish its route");
+
+    let remove_operation = RemoveUserOperation {
+        email: VLESS_REVERSE_DYNAMIC_EMAIL.to_string(),
+    };
+    let _: AlterInboundResponse = harness
+        .unary(
+            PATH_HANDLER_ALTER_INBOUND,
+            AlterInboundRequest {
+                tag: VLESS_TAG.to_string(),
+                operation: Some(TypedMessage {
+                    r#type: "xray.app.proxyman.command.RemoveUserOperation"
+                        .to_string(),
+                    value: remove_operation.encode_to_vec(),
+                }),
+            },
+        )
+        .expect("dynamic Reverse RemoveUser RPC must succeed");
+    wait_for_outbound_tag(harness, VLESS_REVERSE_DYNAMIC_TAG, false)
+        .expect("RemoveUser must unpublish the dynamic Reverse route");
+
+    let users: GetInboundUserResponse = harness
+        .unary(
+            PATH_HANDLER_GET_INBOUND_USERS,
+            GetInboundUserRequest {
+                tag: VLESS_TAG.to_string(),
+                email: String::new(),
+            },
+        )
+        .expect("query users after dynamic Reverse removal");
+    assert!(
+        users
+            .users
+            .iter()
+            .all(|user| user.email != VLESS_REVERSE_DYNAMIC_EMAIL),
+        "removed Reverse user must disappear from the UserManager list"
+    );
+
+    // Keep the authenticated physical Reverse connection alive through
+    // RemoveUser. Xray removes the handler mapping but does not synchronously
+    // invalidate an already-held worker reference.
+    drop(physical);
+}
+
+fn list_outbound_tags(harness: &Harness) -> Result<BTreeSet<String>, Status> {
+    let response: ListOutboundsResponse =
+        harness.unary(PATH_HANDLER_LIST_OUTBOUNDS, ListOutboundsRequest {})?;
+    Ok(response
+        .outbounds
+        .into_iter()
+        .map(|outbound| outbound.tag)
+        .collect())
+}
+
+fn wait_for_outbound_tag(
+    harness: &Harness,
+    tag: &str,
+    expected: bool,
+) -> io::Result<()> {
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let tags = list_outbound_tags(harness).map_err(|error| {
+            io::Error::other(format!("ListOutbounds failed: {error}"))
+        })?;
+        if tags.contains(tag) == expected {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "timed out waiting for outbound tag {tag:?} presence={expected}; current={tags:?}"
+                ),
+            ));
+        }
+        thread::sleep(CONNECT_RETRY_INTERVAL);
+    }
+}
+
+fn trigger_vless_reverse_session(port: u16, user_id: &str) -> io::Result<TcpStream> {
+    let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let mut stream = loop {
+        match TcpStream::connect_timeout(&address, GRPC_CONNECT_ATTEMPT_TIMEOUT) {
+            Ok(stream) => break stream,
+            Err(error) if Instant::now() < deadline => {
+                let _ = error;
+                thread::sleep(CONNECT_RETRY_INTERVAL);
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+
+    let mut request = Vec::with_capacity(19);
+    request.push(0);
+    request.extend_from_slice(&parse_uuid_bytes(user_id)?);
+    request.push(0);
+    request.push(4);
+    stream.write_all(&request)?;
+
+    let mut response = [0u8; 2];
+    stream.read_exact(&mut response)?;
+    if response != [0, 0] {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected VLESS Reverse response header: {response:?}"),
+        ));
+    }
+    Ok(stream)
+}
+
+fn parse_uuid_bytes(value: &str) -> io::Result<[u8; 16]> {
+    let compact = value.chars().filter(|ch| *ch != '-').collect::<String>();
+    if compact.len() != 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid UUID length for {value:?}"),
+        ));
+    }
+    let mut bytes = [0u8; 16];
+    for (index, slot) in bytes.iter_mut().enumerate() {
+        let offset = index * 2;
+        *slot =
+            u8::from_str_radix(&compact[offset..offset + 2], 16).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid UUID hex for {value:?}"),
+                )
+            })?;
+    }
+    Ok(bytes)
 }
 
 fn mutate_override_balancer_step(
@@ -2946,6 +3198,14 @@ struct VlessAccount {
     id: String,
     #[prost(string, tag = "2")]
     flow: String,
+    #[prost(message, optional, tag = "7")]
+    reverse: Option<VlessReverse>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct VlessReverse {
+    #[prost(string, tag = "1")]
+    tag: String,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]

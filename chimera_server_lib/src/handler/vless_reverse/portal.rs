@@ -131,7 +131,17 @@ impl ReversePortalRegistry {
             return Err(error);
         }
         control.on_control_sent(&active)?;
-        entry.picker.add(worker.clone());
+        let worker_count = entry.picker.add(worker.clone());
+        let (_, active_workers, mux_sessions) = entry.picker.observation();
+        tracing::info!(
+            event = "vless_reverse_portal_worker_attached",
+            reverse_tag = %tag,
+            worker_id,
+            worker_count,
+            active_workers,
+            mux_sessions,
+            "attached VLESS Reverse Portal worker"
+        );
 
         Ok(PortalWorkerLease {
             worker,
@@ -160,14 +170,25 @@ impl ReversePortalRegistry {
                 )
             })?;
         let worker = entry.picker.pick_available()?;
-        worker.open_packet_session(
+        let session = worker.open_packet_session(
             Destination {
                 network: TargetNetwork::Udp,
                 location: target,
             },
             Some(udp_socket_destination(source)),
             local.map(udp_socket_destination),
-        )
+        )?;
+        let (_, active_workers, mux_sessions) = entry.picker.observation();
+        tracing::debug!(
+            event = "vless_reverse_portal_session_opened",
+            reverse_tag = %tag,
+            network = "udp",
+            worker_id = worker.id(),
+            active_workers,
+            mux_sessions,
+            "opened VLESS Reverse Portal logical session"
+        );
+        Ok(session)
     }
 
     pub(crate) fn open_tcp(
@@ -190,14 +211,25 @@ impl ReversePortalRegistry {
                 )
             })?;
         let worker = entry.picker.pick_available()?;
-        worker.open_tcp_session(
+        let session = worker.open_tcp_session(
             Destination {
                 network: TargetNetwork::Tcp,
                 location: target,
             },
             Some(socket_destination(source)),
             local.map(socket_destination),
-        )
+        )?;
+        let (_, active_workers, mux_sessions) = entry.picker.observation();
+        tracing::debug!(
+            event = "vless_reverse_portal_session_opened",
+            reverse_tag = %tag,
+            network = "tcp",
+            worker_id = worker.id(),
+            active_workers,
+            mux_sessions,
+            "opened VLESS Reverse Portal logical session"
+        );
+        Ok(session)
     }
 }
 

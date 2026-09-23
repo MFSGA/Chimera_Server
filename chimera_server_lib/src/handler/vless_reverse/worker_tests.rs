@@ -319,6 +319,36 @@ async fn bounded_mux_queues_backpressure_application_writes() {
 }
 
 #[tokio::test]
+async fn picker_observation_tracks_live_workers_and_mux_sessions() {
+    let (first, _first_peer) = worker_with_peer(20, 4096, SessionLimits::default());
+    let (second, _second_peer) =
+        worker_with_peer(21, 4096, SessionLimits::default());
+    first
+        .control_session_became_active()
+        .expect("activate first worker");
+    let first = Arc::new(first);
+    let second = Arc::new(second);
+    let picker = MuxClientPicker::default();
+
+    assert_eq!(picker.add(first.clone()), 1);
+    assert_eq!(picker.add(second.clone()), 2);
+    assert_eq!(picker.observation(), (2, 1, 0));
+
+    let _session = first
+        .open_tcp_session(target(9100), None, None)
+        .expect("open observed Mux session");
+    assert_eq!(picker.observation(), (2, 1, 1));
+
+    second
+        .control_session_became_active()
+        .expect("activate second worker");
+    assert_eq!(picker.observation(), (2, 2, 1));
+
+    first.close();
+    assert_eq!(picker.observation(), (1, 1, 0));
+}
+
+#[tokio::test]
 async fn runtime_picker_uses_least_loaded_active_worker_only() {
     let (first, _first_peer) = worker_with_peer(10, 4096, SessionLimits::default());
     let (second, _second_peer) =
