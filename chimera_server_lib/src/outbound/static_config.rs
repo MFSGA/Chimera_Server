@@ -226,6 +226,14 @@ struct StaticOutboundXhttpSettings {
     #[serde(default)]
     x_padding_obfs_mode: bool,
     #[serde(default)]
+    x_padding_key: String,
+    #[serde(default)]
+    x_padding_header: String,
+    #[serde(default)]
+    x_padding_placement: String,
+    #[serde(default)]
+    x_padding_method: String,
+    #[serde(default)]
     download_settings: Option<serde_json::Value>,
     #[serde(default)]
     xmux: Option<serde_json::Value>,

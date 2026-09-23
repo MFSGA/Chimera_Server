@@ -825,16 +825,72 @@ pub(super) fn decode_sender_transport(
                     ),
                 ));
             }
-            if settings.download_settings.is_some() || settings.xmux.is_some() {
+            if settings.download_settings.is_some() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
-                    "XHTTP outbound downloadSettings/xmux is not implemented yet",
+                    "XHTTP outbound downloadSettings is not implemented yet",
                 ));
             }
-            if settings.x_padding_obfs_mode {
+            let padding_key = if settings.x_padding_key.is_empty() {
+                "x_padding".to_string()
+            } else {
+                settings.x_padding_key.clone()
+            };
+            let padding_header = if settings.x_padding_header.is_empty() {
+                "X-Padding".to_string()
+            } else {
+                settings.x_padding_header.clone()
+            };
+            let padding_placement = match settings.x_padding_placement.as_str() {
+                "" | "queryInHeader" => {
+                    crate::config::server_config::XhttpPaddingPlacement::QueryInHeader
+                }
+                "cookie" => {
+                    crate::config::server_config::XhttpPaddingPlacement::Cookie
+                }
+                "header" => {
+                    crate::config::server_config::XhttpPaddingPlacement::Header
+                }
+                "query" => {
+                    crate::config::server_config::XhttpPaddingPlacement::Query
+                }
+                placement => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "unsupported XHTTP outbound xPaddingPlacement {placement:?}"
+                        ),
+                    ));
+                }
+            };
+            let padding_method = match settings.x_padding_method.as_str() {
+                "" | "repeat-x" => {
+                    crate::config::server_config::XhttpPaddingMethod::RepeatX
+                }
+                "tokenish" => {
+                    crate::config::server_config::XhttpPaddingMethod::Tokenish
+                }
+                method => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "unsupported XHTTP outbound xPaddingMethod {method:?}"
+                        ),
+                    ));
+                }
+            };
+            if matches!(
+                padding_placement,
+                crate::config::server_config::XhttpPaddingPlacement::Header
+                    | crate::config::server_config::XhttpPaddingPlacement::QueryInHeader
+            ) && http::header::HeaderName::from_bytes(padding_header.as_bytes())
+                .is_err()
+            {
                 return Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "XHTTP outbound xPaddingObfsMode is not implemented yet",
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "invalid XHTTP outbound xPaddingHeader {padding_header:?}"
+                    ),
                 ));
             }
             let session_placement = match settings.session_id_placement.as_str() {
@@ -934,9 +990,32 @@ pub(super) fn decode_sender_transport(
                     headers: settings.headers,
                     padding_from: padding.from.min(padding.to),
                     padding_to: padding.from.max(padding.to),
+                    padding_obfs_mode: settings.x_padding_obfs_mode,
+                    padding_key,
+                    padding_header,
+                    padding_placement,
+                    padding_method,
                     no_grpc_header: settings.no_grpc_header,
                     uplink_http_method,
                     session_placement,
+                    xmux: settings.xmux.map(|xmux| OutboundXhttpXmuxSettings {
+                        max_concurrency: xmux
+                            .max_concurrency
+                            .map(|r| (r.from, r.to)),
+                        max_connections: xmux
+                            .max_connections
+                            .map(|r| (r.from, r.to)),
+                        c_max_reuse_times: xmux
+                            .c_max_reuse_times
+                            .map(|r| (r.from, r.to)),
+                        h_max_request_times: xmux
+                            .h_max_request_times
+                            .map(|r| (r.from, r.to)),
+                        h_max_reusable_secs: xmux
+                            .h_max_reusable_secs
+                            .map(|r| (r.from, r.to)),
+                        h_keep_alive_period: xmux.h_keep_alive_period,
+                    }),
                 },
             })
         }

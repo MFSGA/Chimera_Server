@@ -324,8 +324,44 @@ fn encode_static_xhttp_config(
     if config.xmux.is_some() {
         return Err("XHTTP outbound xmux is not implemented yet".into());
     }
-    if config.x_padding_obfs_mode {
-        return Err("XHTTP outbound xPaddingObfsMode is not implemented yet".into());
+    let x_padding_key = if config.x_padding_key.is_empty() {
+        "x_padding".to_string()
+    } else {
+        config.x_padding_key.clone()
+    };
+    let x_padding_header = if config.x_padding_header.is_empty() {
+        "X-Padding".to_string()
+    } else {
+        config.x_padding_header.clone()
+    };
+    let x_padding_placement = match config.x_padding_placement.as_str() {
+        "" => "queryInHeader",
+        "cookie" => "cookie",
+        "header" => "header",
+        "query" => "query",
+        "queryInHeader" => "queryInHeader",
+        placement => {
+            return Err(format!(
+                "unsupported XHTTP outbound xPaddingPlacement {placement:?}"
+            ));
+        }
+    };
+    let x_padding_method = match config.x_padding_method.as_str() {
+        "" => "repeat-x",
+        "repeat-x" => "repeat-x",
+        "tokenish" => "tokenish",
+        method => {
+            return Err(format!(
+                "unsupported XHTTP outbound xPaddingMethod {method:?}"
+            ));
+        }
+    };
+    if matches!(x_padding_placement, "header" | "queryInHeader")
+        && http::header::HeaderName::from_bytes(x_padding_header.as_bytes()).is_err()
+    {
+        return Err(format!(
+            "invalid XHTTP outbound xPaddingHeader {x_padding_header:?}"
+        ));
     }
     if !config.seq_placement.trim().is_empty()
         || !config.seq_key.trim().is_empty()
@@ -415,11 +451,11 @@ fn encode_static_xhttp_config(
         sc_stream_up_server_secs: None,
         xmux: None,
         download_settings: None,
-        x_padding_obfs_mode: false,
-        x_padding_key: String::new(),
-        x_padding_header: String::new(),
-        x_padding_placement: String::new(),
-        x_padding_method: String::new(),
+        x_padding_obfs_mode: config.x_padding_obfs_mode,
+        x_padding_key,
+        x_padding_header,
+        x_padding_placement: x_padding_placement.to_string(),
+        x_padding_method: x_padding_method.to_string(),
         uplink_http_method: method,
         session_id_placement: session_placement.to_string(),
         session_id_key: session_key,

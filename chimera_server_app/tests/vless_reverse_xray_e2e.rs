@@ -31,6 +31,7 @@ enum ReverseSecurity {
     Tls,
     Websocket,
     XhttpTls,
+    XhttpTlsObfs,
 }
 
 impl ReverseSecurity {
@@ -40,6 +41,7 @@ impl ReverseSecurity {
             Self::Tls => "tls",
             Self::Websocket => "websocket",
             Self::XhttpTls => "xhttp-tls",
+            Self::XhttpTlsObfs => "xhttp-tls-obfs",
         }
     }
 }
@@ -95,6 +97,16 @@ fn chimera_bridge_round_trips_public_xray_portal_over_xhttp_tls_vless_reverse() 
 #[test]
 fn xray_bridge_round_trips_public_chimera_portal_over_xhttp_tls_vless_reverse() {
     run_reverse_interop(ReverseSecurity::XhttpTls);
+}
+
+#[test]
+fn chimera_bridge_round_trips_xray_portal_over_xhttp_tls_obfs_vless_reverse() {
+    run_chimera_bridge_interop(ReverseSecurity::XhttpTlsObfs, None);
+}
+
+#[test]
+fn xray_bridge_round_trips_chimera_portal_over_xhttp_tls_obfs_vless_reverse() {
+    run_reverse_interop(ReverseSecurity::XhttpTlsObfs);
 }
 
 #[test]
@@ -997,6 +1009,64 @@ fn run_chimera_bridge_interop(
                 }),
             )
         }
+        ReverseSecurity::XhttpTlsObfs => {
+            let (cert_path, key_path) = generate_test_certificate(&work_dir);
+            (
+                json!({
+                    "network": "xhttp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "certificates": [{
+                            "certificateFile": cert_path,
+                            "keyFile": key_path
+                        }]
+                    },
+                    "xhttpSettings": {
+                        "host": "cdn.reverse.test",
+                        "path": "/reverse-xhttp-obfs/?edge=portal",
+                        "mode": "stream-up",
+                        "sessionIDPlacement": "header",
+                        "sessionIDKey": "X-Reverse-Session",
+                        "xPaddingBytes": 64,
+                        "xPaddingObfsMode": true,
+                        "xPaddingPlacement": "queryInHeader",
+                        "xPaddingHeader": "X-Reverse-Padding",
+                        "xPaddingKey": "x_reverse_pad",
+                        "xPaddingMethod": "tokenish"
+                    }
+                }),
+                json!({
+                    "network": "xhttp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "disableSystemRoot": true,
+                        "certificates": [{
+                            "certificateFile": cert_path,
+                            "usage": "verify"
+                        }]
+                    },
+                    "xhttpSettings": {
+                        "host": "cdn.reverse.test",
+                        "path": "/reverse-xhttp-obfs/?edge=bridge",
+                        "mode": "stream-up",
+                        "sessionIDPlacement": "header",
+                        "sessionIDKey": "X-Reverse-Session",
+                        "xPaddingBytes": 64,
+                        "xPaddingObfsMode": true,
+                        "xPaddingPlacement": "queryInHeader",
+                        "xPaddingHeader": "X-Reverse-Padding",
+                        "xPaddingKey": "x_reverse_pad",
+                        "xPaddingMethod": "tokenish",
+                        "headers": {
+                            "User-Agent": "chimera-reverse-xhttp-obfs",
+                            "X-Reverse-Edge": "chimera-bridge-obfs"
+                        }
+                    }
+                }),
+            )
+        }
     };
 
     let reverse_bridge_outbound = json!({
@@ -1247,6 +1317,61 @@ fn run_reverse_interop(security: ReverseSecurity) {
                             "X-Reverse-Edge": "xray-bridge"
                         },
                         "xPaddingBytes": 1
+                    }
+                }),
+            )
+        }
+        ReverseSecurity::XhttpTlsObfs => {
+            let (cert_path, key_path) = generate_test_certificate(&work_dir);
+            let pinned_peer_cert_sha256 = first_cert_sha256_hex(&cert_path);
+            (
+                json!({
+                    "network": "xhttp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "certificates": [{
+                            "certificateFile": cert_path,
+                            "keyFile": key_path
+                        }]
+                    },
+                    "xhttpSettings": {
+                        "host": "cdn.reverse.test",
+                        "path": "/reverse-xhttp-obfs/?edge=portal",
+                        "mode": "stream-up",
+                        "sessionIDPlacement": "header",
+                        "sessionIDKey": "X-Reverse-Session",
+                        "xPaddingBytes": 64,
+                        "xPaddingObfsMode": true,
+                        "xPaddingPlacement": "queryInHeader",
+                        "xPaddingHeader": "X-Reverse-Padding",
+                        "xPaddingKey": "x_reverse_pad",
+                        "xPaddingMethod": "tokenish"
+                    }
+                }),
+                json!({
+                    "network": "xhttp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "pinnedPeerCertSha256": pinned_peer_cert_sha256
+                    },
+                    "xhttpSettings": {
+                        "host": "cdn.reverse.test",
+                        "path": "/reverse-xhttp-obfs/?edge=bridge",
+                        "mode": "stream-up",
+                        "sessionIDPlacement": "header",
+                        "sessionIDKey": "X-Reverse-Session",
+                        "xPaddingBytes": 64,
+                        "xPaddingObfsMode": true,
+                        "xPaddingPlacement": "queryInHeader",
+                        "xPaddingHeader": "X-Reverse-Padding",
+                        "xPaddingKey": "x_reverse_pad",
+                        "xPaddingMethod": "tokenish",
+                        "headers": {
+                            "User-Agent": "xray-reverse-xhttp-obfs",
+                            "X-Reverse-Edge": "xray-bridge-obfs"
+                        }
                     }
                 }),
             )

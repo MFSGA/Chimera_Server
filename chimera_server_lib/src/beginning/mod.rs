@@ -55,6 +55,7 @@ pub(crate) use tcp_relay::copy_bidirectional;
 mod transport_plan;
 pub(crate) mod udp;
 mod xhttp;
+pub(crate) use xhttp::{generate_padding, random_xray_range};
 
 pub(crate) use crate::transport::tcp::{
     TcpAcceptHealth, accept_tcp_with_health, apply_tcp_socket_policy,

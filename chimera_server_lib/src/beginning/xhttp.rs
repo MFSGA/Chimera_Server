@@ -60,6 +60,7 @@ mod session;
 use h3_transport::*;
 
 use request::*;
+pub(crate) use request::{generate_padding, random_xray_range};
 use response::*;
 use session::{
     IncomingBodyReader, SessionCleanupGuard, SessionStore, XhttpLogicalStream,

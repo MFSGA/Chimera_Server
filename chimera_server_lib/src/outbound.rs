@@ -166,15 +166,31 @@ enum OutboundXhttpSessionPlacement {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct OutboundXhttpXmuxSettings {
+    max_concurrency: Option<(i32, i32)>,
+    max_connections: Option<(i32, i32)>,
+    c_max_reuse_times: Option<(i32, i32)>,
+    h_max_request_times: Option<(i32, i32)>,
+    h_max_reusable_secs: Option<(i32, i32)>,
+    h_keep_alive_period: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct OutboundXhttpClientSettings {
     host: String,
     path: String,
     headers: HashMap<String, String>,
     padding_from: i32,
     padding_to: i32,
+    padding_obfs_mode: bool,
+    padding_key: String,
+    padding_header: String,
+    padding_placement: crate::config::server_config::XhttpPaddingPlacement,
+    padding_method: crate::config::server_config::XhttpPaddingMethod,
     no_grpc_header: bool,
     uplink_http_method: String,
     session_placement: OutboundXhttpSessionPlacement,
+    xmux: Option<OutboundXhttpXmuxSettings>,
 }
 
 #[cfg(feature = "grpc_transport")]

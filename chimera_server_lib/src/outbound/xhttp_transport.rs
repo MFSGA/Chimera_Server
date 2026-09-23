@@ -27,6 +27,8 @@ use super::{OutboundXhttpClientSettings, OutboundXhttpSessionPlacement};
 use crate::{
     address::{Address, NetLocation},
     async_stream::{AsyncPing, AsyncStream},
+    beginning::{generate_padding, random_xray_range},
+    config::server_config::XhttpPaddingPlacement,
 };
 
 const XHTTP_PIPE_CAPACITY: usize = 64 * 1024;
@@ -118,10 +120,17 @@ pub(super) async fn connect_xhttp_stream_up_h2(
     server: &NetLocation,
     tls_server_name: Option<&str>,
 ) -> io::Result<XhttpOutboundStream> {
+    if settings.xmux.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "XHTTP xmux runtime reuse is not implemented yet",
+        ));
+    }
     let authority = xhttp_authority(settings, server, tls_server_name);
     let session_id = xhttp_session_id();
-    let request_uri = xhttp_request_uri(settings, &authority, &session_id)?;
-    let referer = xhttp_padding_referer(settings, &authority)?;
+    let downlink_padding = xhttp_padding_value(settings)?;
+    let downlink_uri =
+        xhttp_request_uri(settings, &authority, &session_id, &downlink_padding)?;
 
     let mut builder = client_http2::Builder::new(TokioExecutor::new());
     builder.initial_stream_window_size(1024 * 1024);
@@ -153,13 +162,13 @@ pub(super) async fn connect_xhttp_stream_up_h2(
     let get_body = Empty::<Bytes>::new()
         .map_err(|never: Infallible| match never {})
         .boxed_unsync();
-    let mut downlink_request = Request::builder()
-        .method(Method::GET)
-        .uri(request_uri.clone());
+    let mut downlink_request =
+        Request::builder().method(Method::GET).uri(downlink_uri);
     downlink_request = apply_xhttp_headers(
         downlink_request,
         settings,
-        &referer,
+        &authority,
+        &downlink_padding,
         &session_id,
         false,
     )?;
@@ -205,9 +214,18 @@ pub(super) async fn connect_xhttp_stream_up_h2(
                 ),
             )
         })?;
-    let mut uplink_request = Request::builder().method(method).uri(request_uri);
-    uplink_request =
-        apply_xhttp_headers(uplink_request, settings, &referer, &session_id, true)?;
+    let uplink_padding = xhttp_padding_value(settings)?;
+    let uplink_uri =
+        xhttp_request_uri(settings, &authority, &session_id, &uplink_padding)?;
+    let mut uplink_request = Request::builder().method(method).uri(uplink_uri);
+    uplink_request = apply_xhttp_headers(
+        uplink_request,
+        settings,
+        &authority,
+        &uplink_padding,
+        &session_id,
+        true,
+    )?;
     let uplink_request = uplink_request.body(upload_body).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -291,7 +309,8 @@ pub(super) async fn connect_xhttp_stream_up_h2(
 fn apply_xhttp_headers(
     mut builder: http::request::Builder,
     settings: &OutboundXhttpClientSettings,
-    referer: &str,
+    authority: &str,
+    padding: &str,
     session_id: &str,
     upload: bool,
 ) -> io::Result<http::request::Builder> {
@@ -317,19 +336,46 @@ fn apply_xhttp_headers(
             "XHTTP outbound request builder has no header map",
         )
     })?;
-    headers.insert(
-        header::REFERER,
-        HeaderValue::from_str(referer).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid XHTTP Referer value: {error}"),
-            )
-        })?,
-    );
-    if upload && !settings.no_grpc_header {
+
+    if settings.padding_obfs_mode {
+        match settings.padding_placement {
+            XhttpPaddingPlacement::Header => {
+                xhttp_set_header(
+                    headers,
+                    &settings.padding_header,
+                    padding,
+                    "xPaddingHeader",
+                )?;
+            }
+            XhttpPaddingPlacement::QueryInHeader => {
+                let value = xhttp_padding_header_url(settings, authority, padding);
+                xhttp_set_header(
+                    headers,
+                    &settings.padding_header,
+                    &value,
+                    "xPaddingHeader",
+                )?;
+            }
+            XhttpPaddingPlacement::Cookie => {
+                xhttp_append_cookie(
+                    headers,
+                    &settings.padding_key,
+                    padding,
+                    "padding",
+                )?;
+            }
+            XhttpPaddingPlacement::Query => {}
+        }
+    } else {
+        let referer = xhttp_legacy_padding_referer(settings, authority, padding);
         headers.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/grpc"),
+            header::REFERER,
+            HeaderValue::from_str(&referer).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid XHTTP Referer value: {error}"),
+                )
+            })?,
         );
     }
 
@@ -337,44 +383,71 @@ fn apply_xhttp_headers(
         OutboundXhttpSessionPlacement::Path
         | OutboundXhttpSessionPlacement::Query(_) => {}
         OutboundXhttpSessionPlacement::Header(key) => {
-            let name = HeaderName::from_bytes(key.as_bytes()).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("invalid XHTTP sessionIDKey header {key:?}: {error}"),
-                )
-            })?;
-            headers.insert(
-                name,
-                HeaderValue::from_str(session_id).map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("invalid XHTTP session ID: {error}"),
-                    )
-                })?,
-            );
+            xhttp_set_header(headers, key, session_id, "sessionIDKey")?;
         }
         OutboundXhttpSessionPlacement::Cookie(key) => {
-            let cookie = match headers
-                .get(header::COOKIE)
-                .and_then(|value| value.to_str().ok())
-                .filter(|value| !value.is_empty())
-            {
-                Some(existing) => format!("{existing}; {key}={session_id}"),
-                None => format!("{key}={session_id}"),
-            };
-            headers.insert(
-                header::COOKIE,
-                HeaderValue::from_str(&cookie).map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("invalid XHTTP session cookie {key:?}: {error}"),
-                    )
-                })?,
-            );
+            xhttp_append_cookie(headers, key, session_id, "session")?;
         }
     }
 
+    if upload && !settings.no_grpc_header {
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/grpc"),
+        );
+    }
+
     Ok(builder)
+}
+
+fn xhttp_set_header(
+    headers: &mut hyper::HeaderMap,
+    key: &str,
+    value: &str,
+    field: &str,
+) -> io::Result<()> {
+    let name = HeaderName::from_bytes(key.as_bytes()).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid XHTTP {field} header {key:?}: {error}"),
+        )
+    })?;
+    headers.insert(
+        name,
+        HeaderValue::from_str(value).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid XHTTP {field} value: {error}"),
+            )
+        })?,
+    );
+    Ok(())
+}
+
+fn xhttp_append_cookie(
+    headers: &mut hyper::HeaderMap,
+    key: &str,
+    value: &str,
+    field: &str,
+) -> io::Result<()> {
+    let cookie = match headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+    {
+        Some(existing) => format!("{existing}; {key}={value}"),
+        None => format!("{key}={value}"),
+    };
+    headers.insert(
+        header::COOKIE,
+        HeaderValue::from_str(&cookie).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid XHTTP {field} cookie {key:?}: {error}"),
+            )
+        })?,
+    );
+    Ok(())
 }
 
 fn xhttp_authority(
@@ -399,21 +472,32 @@ fn xhttp_request_uri(
     settings: &OutboundXhttpClientSettings,
     authority: &str,
     session_id: &str,
+    padding: &str,
 ) -> io::Result<Uri> {
     let raw_query = settings.path.split_once('?').map(|(_, query)| query);
     let base_path = xhttp_normalized_base_path(settings);
-    let (path, query) = match &settings.session_placement {
-        OutboundXhttpSessionPlacement::Path => (
-            format!("{base_path}{session_id}"),
-            raw_query.map(str::to_string),
-        ),
+    let mut query = raw_query.map(str::to_string);
+
+    if settings.padding_obfs_mode
+        && settings.padding_placement == XhttpPaddingPlacement::Query
+    {
+        query = Some(xhttp_query_set(
+            query.as_deref(),
+            &settings.padding_key,
+            padding,
+        ));
+    }
+
+    let path = match &settings.session_placement {
+        OutboundXhttpSessionPlacement::Path => {
+            format!("{base_path}{session_id}")
+        }
         OutboundXhttpSessionPlacement::Query(key) => {
-            (base_path, Some(xhttp_query_set(raw_query, key, session_id)))
+            query = Some(xhttp_query_set(query.as_deref(), key, session_id));
+            base_path
         }
         OutboundXhttpSessionPlacement::Header(_)
-        | OutboundXhttpSessionPlacement::Cookie(_) => {
-            (base_path, raw_query.map(str::to_string))
-        }
+        | OutboundXhttpSessionPlacement::Cookie(_) => base_path,
     };
     let uri = match query.filter(|query| !query.is_empty()) {
         Some(query) => format!("https://{authority}{path}?{query}"),
@@ -427,23 +511,44 @@ fn xhttp_request_uri(
     })
 }
 
-fn xhttp_padding_referer(
+fn xhttp_padding_value(
     settings: &OutboundXhttpClientSettings,
-    authority: &str,
 ) -> io::Result<String> {
-    let padding = if settings.padding_from == settings.padding_to {
-        settings.padding_from
-    } else {
-        rand::rng().random_range(settings.padding_from..=settings.padding_to)
-    };
-    let padding = "X".repeat(usize::try_from(padding).map_err(|_| {
+    let from = usize::try_from(settings.padding_from).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "XHTTP outbound padding length is invalid",
+            "XHTTP outbound padding lower bound is invalid",
         )
-    })?);
+    })?;
+    let to = usize::try_from(settings.padding_to).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "XHTTP outbound padding upper bound is invalid",
+        )
+    })?;
+    let target_len = random_xray_range(from, to);
+    Ok(generate_padding(settings.padding_method, target_len))
+}
+
+fn xhttp_legacy_padding_referer(
+    settings: &OutboundXhttpClientSettings,
+    authority: &str,
+    padding: &str,
+) -> String {
     let path = xhttp_normalized_base_path(settings);
-    Ok(format!("https://{authority}{path}?x_padding={padding}"))
+    format!("https://{authority}{path}?x_padding={padding}")
+}
+
+fn xhttp_padding_header_url(
+    settings: &OutboundXhttpClientSettings,
+    authority: &str,
+    padding: &str,
+) -> String {
+    let path = xhttp_normalized_base_path(settings);
+    format!(
+        "https://{authority}{path}?{}={padding}",
+        settings.padding_key
+    )
 }
 
 fn xhttp_normalized_base_path(settings: &OutboundXhttpClientSettings) -> String {
@@ -619,22 +724,30 @@ mod tests {
             headers: Default::default(),
             padding_from: 4,
             padding_to: 4,
+            padding_obfs_mode: false,
+            padding_key: "x_padding".to_string(),
+            padding_header: "X-Padding".to_string(),
+            padding_placement: XhttpPaddingPlacement::QueryInHeader,
+            padding_method:
+                crate::config::server_config::XhttpPaddingMethod::RepeatX,
             no_grpc_header: false,
             uplink_http_method: "POST".to_string(),
             session_placement: OutboundXhttpSessionPlacement::Path,
+            xmux: None,
         }
     }
 
     #[test]
     fn path_session_and_legacy_padding_match_xray_shape() {
         let settings = settings();
-        let uri = xhttp_request_uri(&settings, "example.com", "session").unwrap();
+        let uri =
+            xhttp_request_uri(&settings, "example.com", "session", "XXXX").unwrap();
         assert_eq!(
             uri.to_string(),
             "https://example.com/reverse/session?existing=1"
         );
         assert_eq!(
-            xhttp_padding_referer(&settings, "example.com").unwrap(),
+            xhttp_legacy_padding_referer(&settings, "example.com", "XXXX"),
             "https://example.com/reverse/?x_padding=XXXX"
         );
     }
@@ -659,13 +772,13 @@ mod tests {
             "cdn.reverse.test"
         );
 
-        let referer = xhttp_padding_referer(&settings, "cdn.reverse.test").unwrap();
         let request = apply_xhttp_headers(
             Request::builder()
                 .method(Method::GET)
                 .uri("https://cdn.reverse.test/reverse/session"),
             &settings,
-            &referer,
+            "cdn.reverse.test",
+            "XXXX",
             "session",
             false,
         )
@@ -692,7 +805,7 @@ mod tests {
             OutboundXhttpSessionPlacement::Query("x_session".to_string());
         settings.path = "/reverse?z=2&a=1".to_string();
         assert_eq!(
-            xhttp_request_uri(&settings, "example.com", "session")
+            xhttp_request_uri(&settings, "example.com", "session", "XXXX")
                 .unwrap()
                 .to_string(),
             "https://example.com/reverse/?a=1&x_session=session&z=2"
@@ -700,12 +813,14 @@ mod tests {
 
         settings.session_placement =
             OutboundXhttpSessionPlacement::Header("X-Session".to_string());
-        let uri = xhttp_request_uri(&settings, "example.com", "session").unwrap();
+        let uri =
+            xhttp_request_uri(&settings, "example.com", "session", "XXXX").unwrap();
         assert_eq!(uri.to_string(), "https://example.com/reverse/?z=2&a=1");
         let request = apply_xhttp_headers(
             Request::builder().method(Method::GET).uri(uri),
             &settings,
-            "https://example.com/reverse/?x_padding=XXXX",
+            "example.com",
+            "XXXX",
             "session",
             false,
         )
@@ -719,11 +834,13 @@ mod tests {
         settings
             .headers
             .insert("Cookie".to_string(), "existing=1".to_string());
-        let uri = xhttp_request_uri(&settings, "example.com", "session").unwrap();
+        let uri =
+            xhttp_request_uri(&settings, "example.com", "session", "XXXX").unwrap();
         let request = apply_xhttp_headers(
             Request::builder().method(Method::GET).uri(uri),
             &settings,
-            "https://example.com/reverse/?x_padding=XXXX",
+            "example.com",
+            "XXXX",
             "session",
             false,
         )
@@ -734,6 +851,102 @@ mod tests {
             request.headers().get(header::COOKIE).unwrap(),
             "existing=1; x_session=session"
         );
+    }
+
+    #[test]
+    fn padding_obfs_placements_match_xray_request_order() {
+        let mut settings = settings();
+        settings.padding_obfs_mode = true;
+        settings.padding_key = "x_pad".to_string();
+        settings.padding_header = "X-Pad".to_string();
+        settings.session_placement =
+            OutboundXhttpSessionPlacement::Query("x_session".to_string());
+        settings.path = "/reverse?z=2".to_string();
+
+        settings.padding_placement = XhttpPaddingPlacement::Query;
+        assert_eq!(
+            xhttp_request_uri(&settings, "example.com", "session", "PP")
+                .unwrap()
+                .to_string(),
+            "https://example.com/reverse/?x_pad=PP&x_session=session&z=2"
+        );
+
+        settings.padding_placement = XhttpPaddingPlacement::Header;
+        settings.session_placement =
+            OutboundXhttpSessionPlacement::Header("X-Session".to_string());
+        let uri =
+            xhttp_request_uri(&settings, "example.com", "session", "PP").unwrap();
+        let request = apply_xhttp_headers(
+            Request::builder().method(Method::GET).uri(uri),
+            &settings,
+            "example.com",
+            "PP",
+            "session",
+            false,
+        )
+        .unwrap()
+        .body(())
+        .unwrap();
+        assert_eq!(request.headers().get("X-Pad").unwrap(), "PP");
+        assert_eq!(request.headers().get("X-Session").unwrap(), "session");
+        assert!(request.headers().get(header::REFERER).is_none());
+
+        settings.padding_placement = XhttpPaddingPlacement::QueryInHeader;
+        let request = apply_xhttp_headers(
+            Request::builder()
+                .method(Method::GET)
+                .uri("https://example.com/reverse/"),
+            &settings,
+            "example.com",
+            "PP",
+            "session",
+            false,
+        )
+        .unwrap()
+        .body(())
+        .unwrap();
+        assert_eq!(
+            request.headers().get("X-Pad").unwrap(),
+            "https://example.com/reverse/?x_pad=PP"
+        );
+
+        settings.padding_placement = XhttpPaddingPlacement::Cookie;
+        settings.session_placement =
+            OutboundXhttpSessionPlacement::Cookie("x_session".to_string());
+        settings
+            .headers
+            .insert("Cookie".to_string(), "existing=1".to_string());
+        let request = apply_xhttp_headers(
+            Request::builder()
+                .method(Method::GET)
+                .uri("https://example.com/reverse/"),
+            &settings,
+            "example.com",
+            "PP",
+            "session",
+            false,
+        )
+        .unwrap()
+        .body(())
+        .unwrap();
+        assert_eq!(
+            request.headers().get(header::COOKIE).unwrap(),
+            "existing=1; x_pad=PP; x_session=session"
+        );
+    }
+
+    #[test]
+    fn tokenish_padding_reuses_xhttp_server_generator() {
+        let mut settings = settings();
+        settings.padding_method =
+            crate::config::server_config::XhttpPaddingMethod::Tokenish;
+        settings.padding_from = 64;
+        settings.padding_to = 64;
+        let padding = xhttp_padding_value(&settings).unwrap();
+        assert!(!padding.is_empty());
+        assert!(padding.bytes().all(|byte| byte.is_ascii_alphanumeric()
+            || byte == b'X'
+            || byte == b'Z'));
     }
 
     #[test]

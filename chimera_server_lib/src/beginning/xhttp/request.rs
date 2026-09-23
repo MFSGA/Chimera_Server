@@ -429,7 +429,7 @@ pub(super) fn request_head_bytes<B>(request: &Request<B>) -> usize {
     )
 }
 
-pub(super) fn random_xray_range(from: usize, to: usize) -> usize {
+pub(crate) fn random_xray_range(from: usize, to: usize) -> usize {
     let low = from.min(to);
     let high = from.max(to);
     if low == high {
@@ -462,7 +462,7 @@ pub(super) fn is_padding_valid(
     }
 }
 
-pub(super) fn generate_padding(
+pub(crate) fn generate_padding(
     method: XhttpPaddingMethod,
     target_len: usize,
 ) -> String {

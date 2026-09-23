@@ -1001,6 +1001,62 @@ fn static_vless_reverse_preserves_bridge_startup_plan() {
 
 #[cfg(all(feature = "vless-reverse", feature = "tls"))]
 #[test]
+fn static_vless_reverse_xhttp_obfs_round_trips_config() {
+    let item: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "vless",
+        "tag": "reverse-xhttp-obfs",
+        "settings": {
+            "address": "127.0.0.1",
+            "port": 443,
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "encryption": "none",
+            "reverse": {"tag": "bridge-in"}
+        },
+        "streamSettings": {
+            "network": "xhttp",
+            "security": "tls",
+            "tlsSettings": {"serverName": "localhost"},
+            "xhttpSettings": {
+                "host": "cdn.reverse.test",
+                "path": "/reverse-obfs/",
+                "mode": "stream-up",
+                "sessionIDPlacement": "header",
+                "sessionIDKey": "X-Reverse-Session",
+                "xPaddingBytes": 64,
+                "xPaddingObfsMode": true,
+                "xPaddingPlacement": "queryInHeader",
+                "xPaddingHeader": "X-Reverse-Padding",
+                "xPaddingKey": "x_reverse_pad",
+                "xPaddingMethod": "tokenish"
+            }
+        }
+    }))
+    .expect("parse XHTTP obfs Reverse Bridge outbound");
+
+    let outbound = compile_static_outbound(&item)
+        .expect("compile XHTTP obfs Reverse Bridge outbound");
+    let transport = super::decode::decode_outbound_transport(&outbound)
+        .expect("decode XHTTP obfs transport");
+    let OutboundTransport::Xhttp { settings, .. } = transport else {
+        panic!("expected XHTTP transport");
+    };
+    assert!(settings.padding_obfs_mode);
+    assert_eq!(settings.padding_key, "x_reverse_pad");
+    assert_eq!(settings.padding_header, "X-Reverse-Padding");
+    assert_eq!(
+        settings.padding_placement,
+        crate::config::server_config::XhttpPaddingPlacement::QueryInHeader
+    );
+    assert_eq!(
+        settings.padding_method,
+        crate::config::server_config::XhttpPaddingMethod::Tokenish
+    );
+    assert_eq!(settings.padding_from, 64);
+    assert_eq!(settings.padding_to, 64);
+}
+
+#[cfg(all(feature = "vless-reverse", feature = "tls"))]
+#[test]
 fn static_vless_reverse_compiles_tcp_tls_sender_settings() {
     let item: OutboundItem = serde_json::from_value(serde_json::json!({
         "protocol": "vless",

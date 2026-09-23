@@ -436,7 +436,7 @@ Reverse 是 VLESS account/command 能力，物理连接继续使用 VLESS outbou
 | RAW/TLS | 第一阶段部署验收；Chimera 只需已有 inbound TLS，主动拨号由 Xray Bridge 完成 |
 | REALITY | Portal 侧可在现有 inbound 能力上追加验证；Chimera Bridge 方向后续单独验证 |
 | WebSocket | Chimera Bridge -> Xray Portal 已验证（无 early data） |
-| XHTTP `stream-up` + TLS/H2 | 已完成 Chimera Bridge <-> Xray Portal 双向固定 Xray 互操作；已验证 HTTP authority/`host` 与 TLS SNI 分离、已有 path query、custom headers、`sessionIDPlacement=header` 和 reconnect。client request-shape/config 回归另覆盖 path/query/cookie placement；显式非 `h2` ALPN 在 H1/H3 client 未实现前 fail closed；packet-up/stream-one/xmux/downloadSettings/H3 暂不声明 |
+| XHTTP `stream-up` + TLS/H2 | 已完成 Chimera Bridge <-> Xray Portal 双向固定 Xray 互操作；已验证 HTTP authority/`host` 与 TLS SNI 分离、已有 path query、custom headers、`sessionIDPlacement=header`、reconnect，以及 `xPaddingObfsMode` 的 `queryInHeader` + `tokenish` 组合。client request-shape/config 回归另覆盖 session path/query/header/cookie、padding query/header/queryInHeader/cookie placement 与 repeat-x/tokenish 生成；显式非 `h2` ALPN 在 H1/H3 client 未实现前 fail closed；packet-up/stream-one/xmux/downloadSettings/H3 暂不声明 |
 | HTTPUpgrade / gRPC | 按现有 feature 和 connector 能力分别验证 |
 | Vision | 独立 VLESS flow 能力，不因 Reverse 自动宣称支持 |
 | ML-KEM VLESS Encryption | 独立加密能力，不因当前字段存在而静默接受 |
