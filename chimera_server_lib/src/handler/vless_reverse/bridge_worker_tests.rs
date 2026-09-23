@@ -302,7 +302,7 @@ async fn mux_server_routes_udp_packets_and_target_overrides() {
 }
 
 #[tokio::test]
-async fn mux_server_rejects_xudp_until_reattachment_is_implemented() {
+async fn mux_server_rejects_non_reverse_global_id_wire_as_invalid_metadata() {
     let (physical, mut portal) = duplex(4096);
     let (local, _local_peer) = duplex(4096);
     let dispatcher = Arc::new(FakeDispatcher::new(local));
@@ -334,7 +334,7 @@ async fn mux_server_rejects_xudp_until_reattachment_is_implemented() {
 
     timeout(Duration::from_secs(1), worker.wait_closed())
         .await
-        .expect("unsupported XUDP frame closes the physical worker");
+        .expect("non-Reverse GlobalID metadata closes the Reverse worker");
     assert!(worker.closed());
 }
 

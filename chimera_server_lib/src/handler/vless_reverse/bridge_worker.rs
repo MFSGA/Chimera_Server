@@ -17,6 +17,7 @@ use tokio::{
     time::sleep,
 };
 use tokio_util::sync::CancellationToken;
+use tracing::debug;
 
 use crate::{address::NetLocation, async_stream::AsyncStream};
 
@@ -194,15 +195,32 @@ async fn run_physical_reader<R>(
             _ = cancellation.cancelled() => break,
             frame = read_frame_with_source_and_local(&mut reader, true) => frame,
         };
-        let Ok(frame) = frame else {
-            break;
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(error) => {
+                debug!(
+                    reverse_tag = %reverse_tag,
+                    error = %error,
+                    "VLESS Reverse Bridge failed to read Mux frame"
+                );
+                break;
+            }
         };
         match control.handle_frame(&frame) {
             Ok(true) => continue,
             Ok(false) => {}
-            Err(_) => break,
+            Err(error) => {
+                debug!(
+                    reverse_tag = %reverse_tag,
+                    session_id = frame.metadata.session_id,
+                    error = %error,
+                    "VLESS Reverse Bridge rejected control frame"
+                );
+                break;
+            }
         }
 
+        let session_id = frame.metadata.session_id;
         let result = match frame.metadata.status {
             SessionStatus::New => {
                 handle_new_tcp(
@@ -224,7 +242,13 @@ async fn run_physical_reader<R>(
             }
             SessionStatus::KeepAlive => Ok(()),
         };
-        if result.is_err() {
+        if let Err(error) = result {
+            debug!(
+                reverse_tag = %reverse_tag,
+                session_id,
+                error = %error,
+                "VLESS Reverse Bridge failed to handle Mux session frame"
+            );
             break;
         }
     }

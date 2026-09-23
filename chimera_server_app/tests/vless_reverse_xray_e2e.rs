@@ -3,7 +3,7 @@ mod xhttp_support;
 use std::{
     fs::{self, File},
     io::{BufReader, Read, Write},
-    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -65,6 +65,263 @@ fn chimera_bridge_round_trips_public_xray_portal_over_tls_vless_reverse() {
 #[test]
 fn chimera_bridge_round_trips_public_xray_portal_over_websocket_vless_reverse() {
     run_chimera_bridge_interop(ReverseSecurity::Websocket);
+}
+
+#[test]
+fn xray_bridge_round_trips_public_dokodemo_udp_over_raw_vless_reverse() {
+    run_reverse_udp_interop();
+}
+
+#[test]
+fn chimera_bridge_round_trips_public_xray_portal_udp_over_raw_vless_reverse() {
+    run_chimera_bridge_udp_interop();
+}
+
+fn run_chimera_bridge_udp_interop() {
+    let workspace = workspace_root();
+    let xray = xray_binary(&workspace);
+    if !xray.is_file() {
+        eprintln!(
+            "skipping VLESS Reverse UDP Xray interoperability test because {} is unavailable; set XRAY_BIN to enable it",
+            xray.display()
+        );
+        return;
+    }
+
+    let _serial = serial_xray_guard();
+    let work_dir = create_test_dir("vless-reverse-chimera-bridge-udp-raw");
+    let (echo_addr, echoed_bytes) = start_observed_udp_echo_server();
+    let reverse_port = free_localhost_port();
+    let public_port = free_localhost_udp_port();
+    let chimera_config = work_dir.join("chimera.json");
+    let xray_config = work_dir.join("xray.json");
+
+    write_json(
+        &xray_config,
+        json!({
+            "log": {"loglevel": "debug"},
+            "inbounds": [
+                {
+                    "listen": "127.0.0.1",
+                    "port": reverse_port,
+                    "protocol": "vless",
+                    "tag": "reverse-vless-in",
+                    "settings": {
+                        "clients": [{
+                            "id": TEST_UUID,
+                            "email": "chimera-bridge-udp@example.test",
+                            "reverse": {"tag": "reverse-out"}
+                        }],
+                        "decryption": "none"
+                    },
+                    "streamSettings": {"network": "tcp", "security": "none"}
+                },
+                {
+                    "listen": "127.0.0.1",
+                    "port": public_port,
+                    "protocol": "dokodemo-door",
+                    "tag": "public-udp",
+                    "settings": {
+                        "address": echo_addr.ip().to_string(),
+                        "port": echo_addr.port(),
+                        "network": "udp",
+                        "followRedirect": false
+                    }
+                }
+            ],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["public-udp"],
+                    "network": "udp",
+                    "outboundTag": "reverse-out"
+                }]
+            }
+        }),
+    );
+
+    write_json(
+        &chimera_config,
+        json!({
+            "log": {"loglevel": "debug"},
+            "inbounds": [],
+            "outbounds": [
+                {
+                    "tag": "reverse-bridge",
+                    "protocol": "vless",
+                    "settings": {
+                        "address": "127.0.0.1",
+                        "port": reverse_port,
+                        "id": TEST_UUID,
+                        "encryption": "none",
+                        "reverse": {"tag": "bridge-in"}
+                    },
+                    "streamSettings": {"network": "tcp", "security": "none"}
+                },
+                {
+                    "tag": "direct",
+                    "protocol": "freedom"
+                }
+            ],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["bridge-in"],
+                    "network": "udp",
+                    "outboundTag": "direct"
+                }]
+            }
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config);
+    chimera.assert_running();
+
+    // Exercise the same supervised retry path as the TCP fixture.
+    std::thread::sleep(Duration::from_millis(2300));
+    chimera.assert_running();
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, reverse_port)));
+    xray.assert_running();
+
+    assert_reverse_udp_echo_with_retry(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, public_port)),
+        b"chimera bridge through xray reverse portal udp",
+        &echoed_bytes,
+    );
+
+    chimera.assert_running();
+    xray.assert_running();
+}
+
+fn run_reverse_udp_interop() {
+    let workspace = workspace_root();
+    let xray = xray_binary(&workspace);
+    if !xray.is_file() {
+        eprintln!(
+            "skipping VLESS Reverse UDP Xray interoperability test because {} is unavailable; set XRAY_BIN to enable it",
+            xray.display()
+        );
+        return;
+    }
+
+    let _serial = serial_xray_guard();
+    let work_dir = create_test_dir("vless-reverse-xray-bridge-udp-raw");
+    let (echo_addr, echoed_bytes) = start_observed_udp_echo_server();
+    let reverse_port = free_localhost_port();
+    let public_port = free_localhost_udp_port();
+    let chimera_config = work_dir.join("chimera.json");
+    let xray_config = work_dir.join("xray.json");
+
+    write_json(
+        &chimera_config,
+        json!({
+            "log": {"loglevel": "debug"},
+            "inbounds": [
+                {
+                    "listen": "127.0.0.1",
+                    "port": reverse_port,
+                    "protocol": "vless",
+                    "tag": "reverse-vless-in",
+                    "settings": {
+                        "clients": [{
+                            "id": TEST_UUID,
+                            "email": "xray-bridge-udp@example.test",
+                            "reverse": {"tag": "reverse-out"}
+                        }],
+                        "decryption": "none"
+                    },
+                    "streamSettings": {"network": "tcp", "security": "none"}
+                },
+                {
+                    "listen": "127.0.0.1",
+                    "port": public_port,
+                    "protocol": "dokodemo-door",
+                    "tag": "public-udp",
+                    "settings": {
+                        "address": echo_addr.ip().to_string(),
+                        "port": echo_addr.port(),
+                        "network": "udp",
+                        "followRedirect": false
+                    },
+                    "streamSettings": {"network": "udp"}
+                }
+            ],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["public-udp"],
+                    "network": "udp",
+                    "outboundTag": "reverse-out"
+                }]
+            }
+        }),
+    );
+
+    write_json(
+        &xray_config,
+        json!({
+            "log": {"loglevel": "debug"},
+            "outbounds": [
+                {
+                    "tag": "reverse-bridge",
+                    "protocol": "vless",
+                    "settings": {
+                        "address": "127.0.0.1",
+                        "port": reverse_port,
+                        "id": TEST_UUID,
+                        "encryption": "none",
+                        "reverse": {"tag": "bridge-in"}
+                    },
+                    "streamSettings": {"network": "tcp", "security": "none"}
+                },
+                {
+                    "tag": "direct",
+                    "protocol": "freedom",
+                    "settings": {
+                        "finalRules": [{
+                            "action": "allow",
+                            "network": "udp",
+                            "ip": ["127.0.0.0/8"]
+                        }]
+                    }
+                }
+            ],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["bridge-in"],
+                    "network": "udp",
+                    "outboundTag": "direct"
+                }]
+            }
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, reverse_port)));
+    chimera.assert_running();
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config);
+    xray.assert_running();
+
+    assert_reverse_udp_echo_with_retry(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, public_port)),
+        b"xray bridge through chimera reverse portal udp",
+        &echoed_bytes,
+    );
+
+    chimera.assert_running();
+    xray.assert_running();
 }
 
 fn run_chimera_bridge_interop(security: ReverseSecurity) {
@@ -440,6 +697,95 @@ fn run_reverse_interop(security: ReverseSecurity) {
 
     chimera.assert_running();
     xray.assert_running();
+}
+
+fn free_localhost_udp_port() -> u16 {
+    let socket =
+        UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind temporary UDP port");
+    socket
+        .local_addr()
+        .expect("temporary UDP local address")
+        .port()
+}
+
+fn assert_reverse_udp_echo_with_retry(
+    public_addr: SocketAddr,
+    payload: &[u8],
+    echoed_bytes: &AtomicUsize,
+) {
+    let deadline = Instant::now() + REVERSE_READY_TIMEOUT;
+    let mut last_error = None;
+
+    while Instant::now() < deadline {
+        match reverse_udp_echo_once(public_addr, payload) {
+            Ok(()) => return,
+            Err(error) => {
+                last_error = Some(error);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+
+    panic!(
+        "VLESS Reverse UDP worker did not become usable at {public_addr}; target received {} bytes: {}",
+        echoed_bytes.load(Ordering::SeqCst),
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "no UDP exchange completed".to_string())
+    );
+}
+
+fn start_observed_udp_echo_server() -> (SocketAddr, Arc<AtomicUsize>) {
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .expect("bind observed Reverse UDP echo server");
+    socket
+        .set_read_timeout(Some(REVERSE_READY_TIMEOUT))
+        .expect("set Reverse UDP echo timeout");
+    let address = socket
+        .local_addr()
+        .expect("observed Reverse UDP echo address");
+    let received = Arc::new(AtomicUsize::new(0));
+    let received_worker = received.clone();
+
+    std::thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        for _ in 0..32 {
+            let Ok((length, peer)) = socket.recv_from(&mut buffer) else {
+                break;
+            };
+            received_worker.fetch_add(length, Ordering::SeqCst);
+            let _ = socket.send_to(&buffer[..length], peer);
+        }
+    });
+
+    (address, received)
+}
+
+fn reverse_udp_echo_once(
+    public_addr: SocketAddr,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+    socket.set_read_timeout(Some(IO_TIMEOUT))?;
+    socket.send_to(payload, public_addr)?;
+
+    let mut response = vec![0u8; payload.len().max(1)];
+    let (length, source) = socket.recv_from(&mut response)?;
+    if source != public_addr {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Reverse UDP reply came from unexpected source {source}"),
+        ));
+    }
+    response.truncate(length);
+    if response != payload {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Reverse UDP echo payload mismatch",
+        ));
+    }
+
+    Ok(())
 }
 
 fn assert_reverse_echo_with_retry(

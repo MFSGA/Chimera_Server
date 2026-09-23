@@ -1,6 +1,6 @@
 # VLESS Reverse 支持设计与实施计划
 
-- 状态：Batch A–F 的 TCP RAW/TLS 角色已实现（Portal + Chimera Bridge 双向 Xray 互操作）；UDP/XUDP、sniffing、动态管理与更广 transport/security 仍未实现
+- 状态：Batch A–F 的 TCP RAW/TLS 角色已实现（Portal + Chimera Bridge 双向 Xray 互操作）；Batch G 的普通 Reverse UDP RAW 已完成双向固定 Xray 互操作，sniffing、动态管理与更广 transport/security 仍待完成
 - 更新日期：2026-09-23
 - 当前本地 Xray 基线：`ref/xray-core` `v26.9.9`，提交
   `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`
@@ -292,7 +292,7 @@ Reverse 认证连接建立。
 ### 4.4 TCP、UDP 与元数据
 
 - TCP session 保持双向 EOF、half-close、超时和背压。
-- UDP/XUDP 保留原始 domain、IP、port、GlobalID 及目标覆盖语义。
+- Reverse UDP 保留原始 domain、IP、port 与目标覆盖语义。固定 Xray `v26.9.9` 的 Reverse Mux NEW 在携带 source/local inbound metadata 时不会同时写 GlobalID；因此不得为 Reverse 私自增加 GlobalID wire。
 - Mux metadata 中的 visitor source/local address 投影到 Chimera session/routing context。
 - 源地址只作为路由、审计和显式 PROXY protocol 等行为输入，不能替代认证身份。
 - sniffing 在内网侧 Reverse 逻辑入口执行，结果进入现有 routing 流程。
@@ -537,15 +537,15 @@ Chimera Bridge、UDP/XUDP 与更完整的 Reverse 兼容面。每批完成并提
 - Mux server worker 按 Xray NEW/KEEP/END 处理 TCP logical session，`reverse.tag` 作为逻辑 inbound identity 重新进入现有 routing；source/local metadata 会传播给 dispatcher。`udp://reverse:0` control session 对齐 ACTIVE/DRAIN 生命周期；普通 UDP packet session 已接入既有 targeted UDP routing，非零 GlobalID 的 XUDP 重附着仍显式 Unsupported。
 - worker/monitor 由 server lifecycle 持有；物理 EOF、非法 frame 或 owner shutdown 会关闭/摘除 worker。定向测试锁定 Xray 的整数平均扩容阈值、worker Drop 关闭物理流和 TCP roundtrip。
 - 固定 Xray-core `v26.9.9` Portal 的真实互操作已验证 RAW 与 TLS：测试会先让 Chimera 首次拨号失败再启动 Xray，确认周期重试；随后重启 Xray Portal，确认 Chimera 自动建立新 worker 并再次完成 DokodemoDoor loopback echo。
-- Batch F 现已额外验证 Chimera Bridge 到 Xray Portal 的 TCP WebSocket（无 early data）；RAW/TLS 仍保持双向验证。UDP/XUDP、Reverse sniffing、动态管理和其他 transport/security 组合仍不在支持范围。
+- Batch F 现已额外验证 Chimera Bridge 到 Xray Portal 的 TCP WebSocket（无 early data）；RAW/TLS 仍保持双向验证。后续 Batch G 已增加 RAW Reverse UDP 双向互操作；Reverse sniffing、动态管理和其他 transport/security 组合仍不在支持范围。
 
 ### G. UDP/XUDP
 
-- 实现 packet session、目标覆盖、GlobalID 关联和清理。
-- 避免与现有全局 XUDP registry 形成两套竞争 owner。
-- Mux codec 已先对齐 Xray packet NEW 的 GlobalID wire 细节：携带 DATA 的 UDP NEW 即使没有可重附着 GlobalID，也固定写入 8 字节全零占位；解码时按 Xray server 语义把全零值视为“无 GlobalID”。
+- 实现 packet session、目标覆盖和清理，并区分普通 Mux XUDP 与 Reverse Mux metadata 形态。
+- 避免与现有全局 XUDP registry 形成两套竞争 owner；只有固定 Xray wire 实际携带 GlobalID 的路径才能进入该 registry。
+- Mux codec 已对齐普通 Xray packet NEW 的 GlobalID wire：非 Reverse UDP NEW 在携带 DATA 时写 8 字节 GlobalID（无 GlobalID 时为全零）。但固定 `v26.9.9` 的 Reverse writer 在 `Inbound != nil` 时优先写 source/local metadata，跳过 GlobalID；Bridge 以 `readSourceAndLocal=true` 解码，因此 Reverse UDP 不得复用普通 XUDP GlobalID wire。
 - Portal worker 已具备有界 packet session 原语：首包发 NEW 并传播 Reverse source/local，后续 KEEP 可携带逐包 UDP target override，响应侧也保留 target override。固定目标 DokodemoDoor UDP 已接入该 packet session：routing 可选择 `vless-reverse`，同一 client/target/tag 复用逻辑 session，双向流量受既有 UDP idle timeout 和 data-plane task owner 管理。
-- Chimera Bridge 现可处理无 GlobalID 的 Reverse Mux UDP NEW/KEEP/END；逐包 target override 进入现有 targeted UDP routing，响应 source 作为 Mux UDP target 返回。该路径已有本地 round-trip 测试，但尚未完成固定 Xray UDP 真实互操作；非零 GlobalID/XUDP 仍 fail closed，因此不表示 Batch G 已完成。
+- Chimera Bridge 现可处理固定基线实际发送的 Reverse Mux UDP NEW/KEEP/END；逐包 target override 进入现有 targeted UDP routing，响应 source 作为 Mux UDP target 返回。codec 回归测试锁定 Reverse source/local 与普通 GlobalID metadata 的互斥关系，防止以后发明私有 Reverse XUDP wire。固定 Xray-core `v26.9.9` RAW UDP 已完成双向真实互操作：Xray Bridge -> Chimera Portal 与 Chimera Bridge -> Xray Portal 均通过 DokodemoDoor UDP loopback echo。Batch G 仍不声明普通 Mux XUDP GlobalID 重附着为 Reverse wire 能力。
 
 ### H. Sniffing 与源地址
 

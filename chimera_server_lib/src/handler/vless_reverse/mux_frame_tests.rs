@@ -107,6 +107,47 @@ fn udp_global_id_and_packet_transfer_type_round_trip() {
 }
 
 #[test]
+fn reverse_udp_source_metadata_omits_global_id_like_xray() {
+    let metadata = FrameMetadata {
+        session_id: 14,
+        status: SessionStatus::New,
+        option: FrameOption::default().with_data(),
+        target: Some(destination(
+            TargetNetwork::Udp,
+            Address::Ipv4(Ipv4Addr::new(10, 0, 0, 53)),
+            53,
+        )),
+        source: Some(destination(
+            TargetNetwork::Udp,
+            Address::Ipv4(Ipv4Addr::new(192, 0, 2, 10)),
+            50_000,
+        )),
+        local: Some(destination(
+            TargetNetwork::Udp,
+            Address::Ipv4(Ipv4Addr::new(198, 51, 100, 20)),
+            8443,
+        )),
+        global_id: Some([1, 2, 3, 4, 5, 6, 7, 8]),
+    };
+    let mut encoded = BytesMut::new();
+    metadata
+        .encode(&mut encoded)
+        .expect("encode Reverse UDP metadata");
+
+    // Xray FrameMetadata.WriteTo uses Inbound metadata instead of GlobalID.
+    // The caller may still carry a GlobalID internally, but it is absent on
+    // Reverse Mux wire whenever source/local metadata is present.
+    let decoded = FrameMetadata::decode(&mut encoded, true)
+        .expect("decode Reverse UDP metadata")
+        .expect("complete Reverse UDP metadata");
+    assert_eq!(decoded.session_id, metadata.session_id);
+    assert_eq!(decoded.target, metadata.target);
+    assert_eq!(decoded.source, metadata.source);
+    assert_eq!(decoded.local, metadata.local);
+    assert_eq!(decoded.global_id, None);
+}
+
+#[test]
 fn ordinary_udp_new_writes_xray_zero_global_id() {
     let metadata = FrameMetadata {
         session_id: 13,
